@@ -1,0 +1,11 @@
+aiohttp==3.11.13
+beautifulsoup4==4.13.3
+python-docx==1.1.2
+Flask==3.1.0
+openai==1.66.3
+Pillow==11.1.0
+PyPDF2==3.0.1
+pytesseract==0.3.13
+quart==0.20.0
+Requests==2.32.3
+Werkzeug==3.1.3
