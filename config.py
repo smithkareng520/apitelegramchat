@@ -13,8 +13,9 @@ WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
 
 WEBHOOK_URL = f"{os.getenv('WEBHOOK_URL')}?token={WEBHOOK_TOKEN}"  # 将 Token 附加到 URL
 
-
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+user_role_selections = {}  # 存储用户的角色选择状态
 
 SUPPORTED_MODELS = {
     "anthropic/claude-3.7-sonnet:thinking": {
