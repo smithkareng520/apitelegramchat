@@ -164,6 +164,13 @@ async def update_role_list(chat_id: int, message_id: int, role_list: list, curre
 
 async def send_new_role_list(chat_id: int, role_list: list, current_role: str) -> None:
     """Send a new role list and update role_message_ids"""
+    async with global_lock:
+        # 删除旧的角色列表消息（如果存在）
+        if chat_id in role_message_ids:
+            old_message_id = role_message_ids[chat_id]
+            await delete_message(chat_id, old_message_id)
+            del role_message_ids[chat_id]  # 清理旧记录
+
     formatted_roles = []
     for role in role_list:
         if role == current_role:
@@ -332,6 +339,11 @@ async def webhook() -> tuple:
                     role_list = ["neko_catgirl", "succubus"]
                     async with global_lock:
                         current_role = user_role_selections.get(chat_id, None)
+                        # 删除旧的角色列表消息（如果存在）
+                        if chat_id in role_message_ids:
+                            old_message_id = role_message_ids[chat_id]
+                            await delete_message(chat_id, old_message_id)
+                            del role_message_ids[chat_id]
 
                     if chat_id in role_message_ids:
                         success = await update_role_list(chat_id, role_message_ids[chat_id], role_list, current_role)
@@ -457,6 +469,11 @@ async def webhook() -> tuple:
                 return "OK", 200
 
             async with global_lock:
+                # 验证 message_id 是否有效
+                if chat_id not in role_message_ids or role_message_ids[chat_id] != message_id:
+                    await send_message(chat_id, "❌ 该角色列表已过期，请重新使用 /role 命令", max_chars=4000, pre_escaped=False)
+                    return "OK", 200
+
                 current_role = user_role_selections.get(chat_id)
                 role_list = ["neko_catgirl", "succubus"]
                 if selected_data in role_list:
