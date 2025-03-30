@@ -7,7 +7,7 @@ import re
 from PIL import Image
 from openai import OpenAI
 from config import SUPPORTED_MODELS, OPENROUTER_API_KEY, GEMINI_API_KEY, XAI_API_KEY, DEEPSEEK_API_KEY, BASE_URL, \
-    global_lock, TELEGRAM_BOT_TOKEN
+    global_lock, TELEGRAM_BOT_TOKEN, user_role_selections
 from utils import escape_html, fix_html_tags
 from search_engine import universal_search
 from file_handlers import get_file_path
@@ -22,8 +22,6 @@ openrouter_client = OpenAI(
 )
 grok_client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
-# 全局变量，用于存储用户角色选择（需要在app.py中定义并导入）
-from app import user_role_selections  # 假设在app.py中定义了这个全局变量
 
 async def build_system_prompt(chat_id: int = None) -> str:
     """Builds the system prompt, defining HTML formatting rules and restricting abuse"""
