@@ -22,7 +22,7 @@ role_message_ids = {}  # 存储每个 chat_id 的角色列表消息 ID
 
 MAX_CHARS = 120000
 MEDIA_GROUP_TIMEOUT = 5
-ROLE_LIST_TIMEOUT = 10  # 设置角色选择消息的自动删除时间为 10 秒
+ROLE_LIST_TIMEOUT = 6  # 设置角色选择消息的自动删除时间为 10 秒
 
 async def set_webhook() -> None:
     async with aiohttp.ClientSession() as session:
