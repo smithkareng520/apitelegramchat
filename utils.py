@@ -186,8 +186,8 @@ def fix_html_tags(text: str) -> str:
     return "".join(result)
 
 
-async def send_list_with_timeout(chat_id: int, prompt: str, items: List[str], timeout: int = 8) -> None:
-    """Send list with buttons that times out"""
+async def send_list_with_timeout(chat_id: int, prompt: str, items: List[str], timeout: int = 8) -> int:
+    """Send list with buttons that times out and return message_id"""
     keyboard = {
         "inline_keyboard": [
             [{"text": item, "callback_data": item}] for item in items
@@ -200,16 +200,19 @@ async def send_list_with_timeout(chat_id: int, prompt: str, items: List[str], ti
         "parse_mode": "HTML",
         "reply_markup": json.dumps(keyboard)
     }
+    message_id = None
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(f"{BASE_URL}/sendMessage", json=payload) as response:
                 if response.status == 200:
-                    message_id = (await response.json()).get("result", {}).get("message_id")
+                    result = await response.json()
+                    message_id = result.get("result", {}).get("message_id")
                     if message_id:
                         await asyncio.sleep(timeout)
                         await delete_message(chat_id, message_id)
     except Exception:
         pass
+    return message_id
 
 
 async def delete_message(chat_id: int, message_id: int) -> None:
@@ -485,40 +488,3 @@ async def check_openrouter_balance() -> float:
     except Exception as e:
         logger.error(f"查询 OpenRouter 余额时出错: {str(e)}")
         return 0
-
-async def edit_message(chat_id: int, message_id: int, text: str, reply_markup: dict = None) -> None:
-    """Edit an existing message in Telegram"""
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": "HTML",
-    }
-    if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(f"{BASE_URL}/editMessageText", json=payload) as response:
-                if response.status == 200:
-                    logger.info(f"Message {message_id} edited successfully")
-                else:
-                    logger.error(f"Failed to edit message: {await response.text()}")
-    except Exception as e:
-        logger.error(f"Error editing message: {str(e)}")
-
-async def send_message_with_keyboard(chat_id: int, text: str, reply_markup: dict) -> None:
-    """Send a message with an inline keyboard"""
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "reply_markup": json.dumps(reply_markup)
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(f"{BASE_URL}/sendMessage", json=payload) as response:
-                if response.status != 200:
-                    logger.error(f"Failed to send message with keyboard: {await response.text()}")
-    except Exception as e:
-        logger.error(f"Error sending message with keyboard: {str(e)}")
