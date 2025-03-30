@@ -163,7 +163,7 @@ async def update_role_list(chat_id: int, message_id: int, role_list: list, curre
 
 
 async def send_role_list(chat_id: int, role_list: list, current_role: str) -> int:
-    """Send a persistent role list message and return message_id, delete after 6 seconds"""
+    """Send a role list message and return message_id, delete after 6 seconds"""
     formatted_roles = []
     for role in role_list:
         if role == current_role:
@@ -188,8 +188,12 @@ async def send_role_list(chat_id: int, role_list: list, current_role: str) -> in
                 result = await response.json()
                 message_id = result.get("result", {}).get("message_id")
                 logger.debug(f"Sent role list for chat_id: {chat_id}, message_id: {message_id}")
-                # 6秒后自动删除消息
-                asyncio.create_task(asyncio.sleep(6) and delete_message(chat_id, message_id))
+                # 定义异步删除任务，确保等待6秒后再删除
+                async def delete_after_delay():
+                    await asyncio.sleep(6)
+                    await delete_message(chat_id, message_id)
+                    logger.debug(f"Deleted role list message_id: {message_id} for chat_id: {chat_id}")
+                asyncio.create_task(delete_after_delay())
                 return message_id
             logger.error(f"Failed to send role list: {await response.text()}")
             await send_message(chat_id, "❌ 无法显示角色列表，请重试", max_chars=4000, pre_escaped=False)
