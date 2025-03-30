@@ -17,6 +17,7 @@ user_contexts = {}
 user_models = {}
 media_groups = {}
 processed_updates = set()
+role_message_ids = {}  # 新增：存储每个 chat_id 的角色列表消息 ID
 
 MAX_CHARS = 120000
 MEDIA_GROUP_TIMEOUT = 5
@@ -130,6 +131,33 @@ async def process_media_group(chat_id: int, media_group_id: str) -> None:
         await trim_conversation_history(chat_id, assistant_message)
     else:
         await send_message(chat_id, full_response, max_chars=4000, pre_escaped=True)
+
+
+async def update_role_list(chat_id: int, message_id: int, role_list: list, current_role: str) -> None:
+    """Update the existing role list message with new selections"""
+    formatted_roles = []
+    for role in role_list:
+        if role == current_role:
+            formatted_roles.append(f"{role} √")
+        else:
+            formatted_roles.append(role)
+
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": role_text, "callback_data": role}] for role_text, role in zip(formatted_roles, role_list)
+        ]
+    }
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": "选择角色设定 (再次点击取消):",
+        "parse_mode": "HTML",
+        "reply_markup": json.dumps(keyboard)
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f"{BASE_URL}/editMessageText", json=payload) as response:
+            if response.status != 200:
+                logger.error(f"Failed to update role list: {await response.text()}")
 
 
 @app.route('/webhook', methods=['POST'])
@@ -294,7 +322,6 @@ async def webhook() -> tuple:
                         "neko_catgirl",  # 猫娘角色
                         "succubus"      # 魅魔角色
                     ]
-                    # 显示当前选择状态
                     async with global_lock:
                         current_role = user_role_selections.get(chat_id, None)
                         formatted_roles = []
@@ -304,11 +331,18 @@ async def webhook() -> tuple:
                             else:
                                 formatted_roles.append(role)
 
-                    try:
-                        await send_list_with_timeout(chat_id, "选择角色设定 (再次点击取消):", formatted_roles, timeout=10)
-                    except Exception as e:
-                        logger.error(f"Failed to send role list: {str(e)}")
-                        await send_message(chat_id, "❌ 无法显示角色列表，请重试", max_chars=4000, pre_escaped=False)
+                    # 如果已有角色列表消息，则更新它；否则发送新消息
+                    if chat_id in role_message_ids:
+                        await update_role_list(chat_id, role_message_ids[chat_id], role_list, current_role)
+                    else:
+                        try:
+                            message_id = await send_list_with_timeout(chat_id, "选择角色设定 (再次点击取消):", formatted_roles, timeout=10)
+                            if message_id:
+                                async with global_lock:
+                                    role_message_ids[chat_id] = message_id
+                        except Exception as e:
+                            logger.error(f"Failed to send role list: {str(e)}")
+                            await send_message(chat_id, "❌ 无法显示角色列表，请重试", max_chars=4000, pre_escaped=False)
                     return "OK", 200
 
                 elif user_input.startswith("/balance"):
@@ -447,17 +481,20 @@ async def webhook() -> tuple:
             # 处理角色选择
             async with global_lock:
                 current_role = user_role_selections.get(chat_id)
-                if selected_data in ["neko_catgirl", "succubus"]:
+                role_list = ["neko_catgirl", "succubus"]
+                if selected_data in role_list:
                     if current_role == selected_data:
                         # 取消选择
                         user_role_selections.pop(chat_id, None)
                         role_name = "已取消角色设定"
+                        await update_role_list(chat_id, message_id, role_list, None)
+                        await send_message(chat_id, f"✅ {role_name}", max_chars=4000, pre_escaped=False)
                     else:
                         # 切换角色
                         user_role_selections[chat_id] = selected_data
                         role_name = f"已切换到: <b>{'猫娘' if selected_data == 'neko_catgirl' else '魅魔'}</b>"
-                    await send_message(chat_id, f"✅ {role_name}", max_chars=4000, pre_escaped=False)
-                    await delete_message(chat_id, message_id)
+                        await update_role_list(chat_id, message_id, role_list, selected_data)
+                        await send_message(chat_id, f"✅ {role_name}", max_chars=4000, pre_escaped=False)
 
                 # 处理模型选择
                 elif selected_data in SUPPORTED_MODELS:
