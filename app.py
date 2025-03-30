@@ -4,7 +4,7 @@ import aiohttp
 from utils import send_message, send_list_with_timeout, delete_message, escape_html, check_deepseek_balance, \
     check_openrouter_balance
 from ai_handlers import get_ai_response
-from config import BASE_URL, WEBHOOK_URL, SUPPORTED_MODELS, AUTHORIZED_USER, TELEGRAM_BOT_TOKEN, global_lock
+from config import BASE_URL, WEBHOOK_URL, SUPPORTED_MODELS, AUTHORIZED_USER, TELEGRAM_BOT_TOKEN, global_lock, user_role_selections
 from file_handlers import parse_file
 import re
 import logging
@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 user_contexts = {}
 user_models = {}
-user_role_selections = {}  # 新增：存储用户的角色选择状态
 media_groups = {}
 processed_updates = set()
 
