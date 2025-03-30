@@ -188,6 +188,8 @@ def fix_html_tags(text: str) -> str:
 
 async def send_list_with_timeout(chat_id: int, prompt: str, items: List[str], timeout: int = 8) -> int:
     """Send list with buttons that times out and return message_id"""
+    from app import role_message_ids, global_lock  # 导入 app 中的全局变量
+
     keyboard = {
         "inline_keyboard": [
             [{"text": item, "callback_data": item}] for item in items
@@ -210,8 +212,11 @@ async def send_list_with_timeout(chat_id: int, prompt: str, items: List[str], ti
                     if message_id:
                         await asyncio.sleep(timeout)
                         await delete_message(chat_id, message_id)
-    except Exception:
-        pass
+                        async with global_lock:
+                            if chat_id in role_message_ids and role_message_ids[chat_id] == message_id:
+                                del role_message_ids[chat_id]  # 清理 role_message_ids
+    except Exception as e:
+        logger.error(f"Error in send_list_with_timeout: {str(e)}")
     return message_id
 
 
