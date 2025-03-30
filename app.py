@@ -1,7 +1,7 @@
 from quart import Quart, request
 import asyncio
 import aiohttp
-from utils import send_message, send_message_with_keyboard, edit_message, delete_message, escape_html, check_deepseek_balance, \
+from utils import send_message, send_list_with_timeout, delete_message, escape_html, check_deepseek_balance, \
     check_openrouter_balance
 from ai_handlers import get_ai_response
 from config import BASE_URL, WEBHOOK_URL, SUPPORTED_MODELS, AUTHORIZED_USER, TELEGRAM_BOT_TOKEN, global_lock, user_role_selections
@@ -290,7 +290,11 @@ async def webhook() -> tuple:
                     return "OK", 200
 
                 elif user_input.startswith("/role"):
-                    role_list = ["neko_catgirl", "succubus"]
+                    role_list = [
+                        "neko_catgirl",  # 猫娘角色
+                        "succubus"      # 魅魔角色
+                    ]
+                    # 显示当前选择状态
                     async with global_lock:
                         current_role = user_role_selections.get(chat_id, None)
                         formatted_roles = []
@@ -299,14 +303,9 @@ async def webhook() -> tuple:
                                 formatted_roles.append(f"{role} √")
                             else:
                                 formatted_roles.append(role)
-                    message_text = "选择角色设定 (再次点击取消):\n" + "\n".join(formatted_roles)
-                    keyboard = {
-                        "inline_keyboard": [
-                            [{"text": item, "callback_data": item.split(" ")[0]}] for item in formatted_roles
-                        ]
-                    }
+
                     try:
-                        await send_message_with_keyboard(chat_id, message_text, keyboard)
+                        await send_list_with_timeout(chat_id, "选择角色设定 (再次点击取消):", formatted_roles, timeout=10)
                     except Exception as e:
                         logger.error(f"Failed to send role list: {str(e)}")
                         await send_message(chat_id, "❌ 无法显示角色列表，请重试", max_chars=4000, pre_escaped=False)
@@ -458,22 +457,7 @@ async def webhook() -> tuple:
                         user_role_selections[chat_id] = selected_data
                         role_name = f"已切换到: <b>{'猫娘' if selected_data == 'neko_catgirl' else '魅魔'}</b>"
                     await send_message(chat_id, f"✅ {role_name}", max_chars=4000, pre_escaped=False)
-                    # 更新原始消息
-                    role_list = ["neko_catgirl", "succubus"]
-                    formatted_roles = []
-                    current_role = user_role_selections.get(chat_id, None)  # 获取更新后的角色
-                    for role in role_list:
-                        if role == current_role:
-                            formatted_roles.append(f"{role} √")
-                        else:
-                            formatted_roles.append(role)
-                    updated_text = "选择角色设定 (再次点击取消):\n" + "\n".join(formatted_roles)
-                    keyboard = {
-                        "inline_keyboard": [
-                            [{"text": item, "callback_data": item.split(" ")[0]}] for item in formatted_roles
-                        ]
-                    }
-                    await edit_message(chat_id, message_id, updated_text, keyboard)
+                    await delete_message(chat_id, message_id)
 
                 # 处理模型选择
                 elif selected_data in SUPPORTED_MODELS:
