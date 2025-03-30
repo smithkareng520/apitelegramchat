@@ -346,16 +346,10 @@ async def webhook() -> tuple:
                     role_list = ["neko_catgirl", "succubus"]
                     async with global_lock:
                         current_role = user_role_selections.get(chat_id, None)
-                        if chat_id not in role_message_ids or not role_message_ids[chat_id]:
-                            message_id = await send_role_list(chat_id, role_list, current_role)
-                            if message_id:
-                                role_message_ids[chat_id] = message_id
-                        else:
-                            success = await update_role_list(chat_id, role_message_ids[chat_id], role_list, current_role)
-                            if not success:
-                                message_id = await send_role_list(chat_id, role_list, current_role)
-                                if message_id:
-                                    role_message_ids[chat_id] = message_id
+                        # 使用 send_list_with_timeout 发送角色列表，6秒后自动删除
+                        message_id = await send_list_with_timeout(chat_id, "选择角色设定 (再次点击取消):", role_list, timeout=6)
+                        if message_id:
+                            role_message_ids[chat_id] = message_id
                     return "OK", 200
 
                 elif user_input.startswith("/balance"):
@@ -484,15 +478,15 @@ async def webhook() -> tuple:
                         user_role_selections[chat_id] = selected_data
                         role_name = f"已切换到: <b>{'猫娘' if selected_data == 'neko_catgirl' else '魅魔'}</b>"
                     
-                    # 更新角色列表消息
+                    # 更新角色列表消息（如果需要保持一致性，但这里消息已通过 send_list_with_timeout 删除）
                     if chat_id in role_message_ids and role_message_ids[chat_id] == message_id:
                         success = await update_role_list(chat_id, message_id, role_list, user_role_selections.get(chat_id))
                         if not success:
-                            new_message_id = await send_role_list(chat_id, role_list, user_role_selections.get(chat_id))
+                            new_message_id = await send_list_with_timeout(chat_id, "选择角色设定 (再次点击取消):", role_list, timeout=6)
                             if new_message_id:
                                 role_message_ids[chat_id] = new_message_id
                     else:
-                        new_message_id = await send_role_list(chat_id, role_list, user_role_selections.get(chat_id))
+                        new_message_id = await send_list_with_timeout(chat_id, "选择角色设定 (再次点击取消):", role_list, timeout=6)
                         if new_message_id:
                             role_message_ids[chat_id] = new_message_id
                     
