@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 user_contexts = {}
 user_models = {}
+user_role_selections = {}  # 新增：存储用户的角色选择状态
 media_groups = {}
 processed_updates = set()
 
@@ -275,6 +276,7 @@ async def webhook() -> tuple:
 
                     <b>Commands:</b>
                     - <code>/model</code>: Switch AI models (use grok-2-image for images)
+                    - <code>/role</code>: Select role persona (catgirl or succubus)
                     - <code>/clear</code>: Clear chat history
                     - <code>/search</code>: Toggle search mode
                     - <code>/balance [service]</code>: Check API balance
@@ -286,6 +288,28 @@ async def webhook() -> tuple:
                     - Upload multiple images/files supported
                     """
                     await send_message(chat_id, welcome_message, max_chars=4000, pre_escaped=False)
+                    return "OK", 200
+
+                elif user_input.startswith("/role"):
+                    role_list = [
+                        "neko_catgirl",  # 猫娘角色
+                        "succubus"      # 魅魔角色
+                    ]
+                    # 显示当前选择状态
+                    async with global_lock:
+                        current_role = user_role_selections.get(chat_id, None)
+                        formatted_roles = []
+                        for role in role_list:
+                            if role == current_role:
+                                formatted_roles.append(f"{role} √")
+                            else:
+                                formatted_roles.append(role)
+
+                    try:
+                        await send_list_with_timeout(chat_id, "选择角色设定 (再次点击取消):", formatted_roles, timeout=10)
+                    except Exception as e:
+                        logger.error(f"Failed to send role list: {str(e)}")
+                        await send_message(chat_id, "❌ 无法显示角色列表，请重试", max_chars=4000, pre_escaped=False)
                     return "OK", 200
 
                 elif user_input.startswith("/balance"):
@@ -414,19 +438,34 @@ async def webhook() -> tuple:
             chat_id = callback["message"]["chat"]["id"]
             user_id = callback["from"]["id"]
             message_id = callback["message"]["message_id"]
-            selected_model = callback["data"]
+            selected_data = callback["data"]
 
             if str(user_id) != str(chat_id):
                 await send_message(chat_id, "❌ Unauthorized to change other users' settings", max_chars=4000,
                                    pre_escaped=False)
                 return "OK", 200
 
-            if selected_model in SUPPORTED_MODELS:
-                async with global_lock:
-                    user_models[chat_id] = selected_model
-                model_name = f"✅ Switched model to: <b>{SUPPORTED_MODELS[selected_model]['name']}</b>"
-                await send_message(chat_id, model_name, max_chars=4000, pre_escaped=False)
-                await delete_message(chat_id, message_id)
+            # 处理角色选择
+            async with global_lock:
+                current_role = user_role_selections.get(chat_id)
+                if selected_data in ["neko_catgirl", "succubus"]:
+                    if current_role == selected_data:
+                        # 取消选择
+                        user_role_selections.pop(chat_id, None)
+                        role_name = "已取消角色设定"
+                    else:
+                        # 切换角色
+                        user_role_selections[chat_id] = selected_data
+                        role_name = f"已切换到: <b>{'猫娘' if selected_data == 'neko_catgirl' else '魅魔'}</b>"
+                    await send_message(chat_id, f"✅ {role_name}", max_chars=4000, pre_escaped=False)
+                    await delete_message(chat_id, message_id)
+
+                # 处理模型选择
+                elif selected_data in SUPPORTED_MODELS:
+                    user_models[chat_id] = selected_data
+                    model_name = f"✅ Switched model to: <b>{SUPPORTED_MODELS[selected_data]['name']}</b>"
+                    await send_message(chat_id, model_name, max_chars=4000, pre_escaped=False)
+                    await delete_message(chat_id, message_id)
 
             async with aiohttp.ClientSession() as session:
                 async with session.post(
