@@ -1,7 +1,7 @@
 from quart import Quart, request
 import asyncio
-import json
 import aiohttp
+import json
 from utils import send_message, send_list_with_timeout, delete_message, escape_html, check_deepseek_balance, \
     check_openrouter_balance
 from ai_handlers import get_ai_response
@@ -18,7 +18,7 @@ user_contexts = {}
 user_models = {}
 media_groups = {}
 processed_updates = set()
-role_message_ids = {}  # 新增：存储每个 chat_id 的角色列表消息 ID
+role_message_ids = {}  # 存储每个 chat_id 的角色列表消息 ID
 
 MAX_CHARS = 120000
 MEDIA_GROUP_TIMEOUT = 5
@@ -44,7 +44,6 @@ async def trim_conversation_history(chat_id: int, new_message: dict) -> None:
             content = new_message["content"]
             logger.debug(f"Processing message content: {content[:100]}...")
 
-            # Clean code blocks
             if "<pre>" in content:
                 content = re.sub(
                     r'<pre>(.*?)</pre>',
@@ -134,8 +133,8 @@ async def process_media_group(chat_id: int, media_group_id: str) -> None:
         await send_message(chat_id, full_response, max_chars=4000, pre_escaped=True)
 
 
-async def update_role_list(chat_id: int, message_id: int, role_list: list, current_role: str) -> None:
-    """Update the existing role list message with new selections"""
+async def update_role_list(chat_id: int, message_id: int, role_list: list, current_role: str) -> bool:
+    """Update the existing role list message with new selections, return True if successful"""
     formatted_roles = []
     for role in role_list:
         if role == current_role:
@@ -157,25 +156,39 @@ async def update_role_list(chat_id: int, message_id: int, role_list: list, curre
     }
     async with aiohttp.ClientSession() as session:
         async with session.post(f"{BASE_URL}/editMessageText", json=payload) as response:
-            if response.status != 200:
-                logger.error(f"Failed to update role list: {await response.text()}")
+            if response.status == 200:
+                return True
+            logger.error(f"Failed to update role list: {await response.text()}")
+            return False
+
+
+async def send_new_role_list(chat_id: int, role_list: list, current_role: str) -> None:
+    """Send a new role list and update role_message_ids"""
+    formatted_roles = []
+    for role in role_list:
+        if role == current_role:
+            formatted_roles.append(f"{role} √")
+        else:
+            formatted_roles.append(role)
+    try:
+        message_id = await send_list_with_timeout(chat_id, "选择角色设定 (再次点击取消):", formatted_roles, timeout=10)
+        if message_id:
+            async with global_lock:
+                role_message_ids[chat_id] = message_id
+    except Exception as e:
+        logger.error(f"Failed to send role list: {str(e)}")
+        await send_message(chat_id, "❌ 无法显示角色列表，请重试", max_chars=4000, pre_escaped=False)
 
 
 @app.route('/webhook', methods=['POST'])
 async def webhook() -> tuple:
     try:
-        # 获取 URL 中的 token 参数
         received_token = request.args.get("token")
-
-        # 从 config 中获取预设的 WEBHOOK_TOKEN
         from config import WEBHOOK_TOKEN
-
-        # 验证 Token
         if not received_token or received_token != WEBHOOK_TOKEN:
             logger.warning(f"Webhook token 验证失败: 接收到的 token={received_token}")
             return "Forbidden: Invalid or missing token", 403
 
-        # Token 验证通过，继续处理
         data = await request.json
         update_id = data.get('update_id')
         logger.info(f"[REQUEST] Received update: {update_id}")
@@ -235,8 +248,7 @@ async def webhook() -> tuple:
                         "content": f"{user_input}<br><br>{photo_header}{content}" if user_input else f"{photo_header}Please analyze this image:<br>{content}"
                     }
 
-                full_response, clean_content = await get_ai_response(chat_id, user_models, user_contexts,
-                                                                     user_message=user_message)
+                full_response, clean_content = await get_ai_response(chat_id, user_models, user_contexts, user_message=user_message)
                 if full_response == "IMAGE_SENT":
                     await trim_conversation_history(chat_id, user_message)
                     assistant_message = {"role": "assistant", "content": clean_content.strip()}
@@ -271,8 +283,7 @@ async def webhook() -> tuple:
                 else:
                     content = await parse_file(file_id, file_name)
                     if content is None:
-                        await send_message(chat_id, "❌ File parsing failed or unsupported file type", max_chars=4000,
-                                           pre_escaped=False)
+                        await send_message(chat_id, "❌ File parsing failed or unsupported file type", max_chars=4000, pre_escaped=False)
                         return "OK", 200
                     file_header = f"📄 <b>Filename</b>: <code>{file_name}</code><br><br>"
                     user_message = {
@@ -280,8 +291,7 @@ async def webhook() -> tuple:
                         "content": f"{user_input}<br><br>{file_header}File content:<br>{content}" if user_input else f"{file_header}Please analyze this file:<br>{content}"
                     }
 
-                full_response, clean_content = await get_ai_response(chat_id, user_models, user_contexts,
-                                                                     user_message=user_message)
+                full_response, clean_content = await get_ai_response(chat_id, user_models, user_contexts, user_message=user_message)
                 if full_response == "IMAGE_SENT":
                     await trim_conversation_history(chat_id, user_message)
                     assistant_message = {"role": "assistant", "content": clean_content.strip()}
@@ -319,31 +329,16 @@ async def webhook() -> tuple:
                     return "OK", 200
 
                 elif user_input.startswith("/role"):
-                    role_list = [
-                        "neko_catgirl",  # 猫娘角色
-                        "succubus"      # 魅魔角色
-                    ]
+                    role_list = ["neko_catgirl", "succubus"]
                     async with global_lock:
                         current_role = user_role_selections.get(chat_id, None)
-                        formatted_roles = []
-                        for role in role_list:
-                            if role == current_role:
-                                formatted_roles.append(f"{role} √")
-                            else:
-                                formatted_roles.append(role)
 
-                    # 如果已有角色列表消息，则更新它；否则发送新消息
                     if chat_id in role_message_ids:
-                        await update_role_list(chat_id, role_message_ids[chat_id], role_list, current_role)
+                        success = await update_role_list(chat_id, role_message_ids[chat_id], role_list, current_role)
+                        if not success:
+                            await send_new_role_list(chat_id, role_list, current_role)
                     else:
-                        try:
-                            message_id = await send_list_with_timeout(chat_id, "选择角色设定 (再次点击取消):", formatted_roles, timeout=10)
-                            if message_id:
-                                async with global_lock:
-                                    role_message_ids[chat_id] = message_id
-                        except Exception as e:
-                            logger.error(f"Failed to send role list: {str(e)}")
-                            await send_message(chat_id, "❌ 无法显示角色列表，请重试", max_chars=4000, pre_escaped=False)
+                        await send_new_role_list(chat_id, role_list, current_role)
                     return "OK", 200
 
                 elif user_input.startswith("/balance"):
@@ -359,9 +354,7 @@ async def webhook() -> tuple:
                                 f"💰 <b>DeepSeek 余额</b>: {deepseek_balance} {deepseek_currency}"
                             )
                         else:
-                            balance_message_parts.append(
-                                "⚠️ <b>DeepSeek</b>: 查询失败"
-                            )
+                            balance_message_parts.append("⚠️ <b>DeepSeek</b>: 查询失败")
 
                         openrouter_balance = await check_openrouter_balance()
                         if openrouter_balance is not None:
@@ -369,9 +362,7 @@ async def webhook() -> tuple:
                                 f"💰 <b>OpenRouter 余额</b>: ${openrouter_balance:.3f} USD"
                             )
                         else:
-                            balance_message_parts.append(
-                                "⚠️ <b>OpenRouter</b>: 查询失败"
-                            )
+                            balance_message_parts.append("⚠️ <b>OpenRouter</b>: 查询失败")
 
                     elif service in ["deepseek", "ds"]:
                         deepseek_balance, deepseek_currency = await check_deepseek_balance()
@@ -380,9 +371,7 @@ async def webhook() -> tuple:
                                 f"💰 <b>DeepSeek 余额</b>: {deepseek_balance} {deepseek_currency}"
                             )
                         else:
-                            balance_message_parts.append(
-                                "⚠️ <b>DeepSeek</b>: 查询失败"
-                            )
+                            balance_message_parts.append("⚠️ <b>DeepSeek</b>: 查询失败")
 
                     elif service in ["openrouter", "or"]:
                         openrouter_balance = await check_openrouter_balance()
@@ -391,9 +380,7 @@ async def webhook() -> tuple:
                                 f"💰 <b>OpenRouter 余额</b>: ${openrouter_balance:.3f} USD"
                             )
                         else:
-                            balance_message_parts.append(
-                                "⚠️ <b>OpenRouter</b>: 查询失败"
-                            )
+                            balance_message_parts.append("⚠️ <b>OpenRouter</b>: 查询失败")
 
                     else:
                         balance_message_parts.append(
@@ -406,8 +393,7 @@ async def webhook() -> tuple:
 
                 elif user_input.startswith("/model"):
                     if data["message"]["chat"]["type"] != "private":
-                        await send_message(chat_id, "❌ Model switching only available in private chats", max_chars=4000,
-                                           pre_escaped=False)
+                        await send_message(chat_id, "❌ Model switching only available in private chats", max_chars=4000, pre_escaped=False)
                         return "OK", 200
 
                     model_list = list(SUPPORTED_MODELS.keys())
@@ -415,8 +401,7 @@ async def webhook() -> tuple:
                         await send_list_with_timeout(chat_id, "Choose a model:", model_list, timeout=8)
                     except Exception as e:
                         logger.error(f"Failed to send model list: {str(e)}")
-                        await send_message(chat_id, "❌ Failed to send model list, please try again", max_chars=4000,
-                                           pre_escaped=False)
+                        await send_message(chat_id, "❌ Failed to send model list, please try again", max_chars=4000, pre_escaped=False)
                     return "OK", 200
 
                 elif user_input.startswith("/clear"):
@@ -430,13 +415,9 @@ async def webhook() -> tuple:
                         current_mode = user_contexts[chat_id]["search_mode"]
                         user_contexts[chat_id]["search_mode"] = not current_mode
                         if user_contexts[chat_id]["search_mode"]:
-                            await send_message(chat_id,
-                                               "🔍 <b>Search mode enabled</b>. Enter your search query. Use <code>/search</code> again to disable.",
-                                               max_chars=4000, pre_escaped=False)
+                            await send_message(chat_id, "🔍 <b>Search mode enabled</b>. Enter your search query. Use <code>/search</code> again to disable.", max_chars=4000, pre_escaped=False)
                         else:
-                            await send_message(chat_id, "✅ <b>Search mode disabled</b>, returning to normal mode.",
-                                               max_chars=4000,
-                                               pre_escaped=False)
+                            await send_message(chat_id, "✅ <b>Search mode disabled</b>, returning to normal mode.", max_chars=4000, pre_escaped=False)
                     return "OK", 200
 
                 async with global_lock:
@@ -445,14 +426,11 @@ async def webhook() -> tuple:
                 user_message = {"role": "user", "content": user_input}
                 if search_mode:
                     if not user_input.strip():
-                        await send_message(chat_id, "❌ Please provide search content", max_chars=4000,
-                                           pre_escaped=False)
+                        await send_message(chat_id, "❌ Please provide search content", max_chars=4000, pre_escaped=False)
                         return "OK", 200
-                    full_response, clean_content = await get_ai_response(chat_id, user_models, user_contexts,
-                                                                         is_search=True, user_message=user_message)
+                    full_response, clean_content = await get_ai_response(chat_id, user_models, user_contexts, is_search=True, user_message=user_message)
                 else:
-                    full_response, clean_content = await get_ai_response(chat_id, user_models, user_contexts,
-                                                                         user_message=user_message)
+                    full_response, clean_content = await get_ai_response(chat_id, user_models, user_contexts, user_message=user_message)
 
                 if full_response == "IMAGE_SENT":
                     await trim_conversation_history(chat_id, user_message)
@@ -475,29 +453,28 @@ async def webhook() -> tuple:
             selected_data = callback["data"]
 
             if str(user_id) != str(chat_id):
-                await send_message(chat_id, "❌ Unauthorized to change other users' settings", max_chars=4000,
-                                   pre_escaped=False)
+                await send_message(chat_id, "❌ Unauthorized to change other users' settings", max_chars=4000, pre_escaped=False)
                 return "OK", 200
 
-            # 处理角色选择
             async with global_lock:
                 current_role = user_role_selections.get(chat_id)
                 role_list = ["neko_catgirl", "succubus"]
                 if selected_data in role_list:
                     if current_role == selected_data:
-                        # 取消选择
                         user_role_selections.pop(chat_id, None)
                         role_name = "已取消角色设定"
-                        await update_role_list(chat_id, message_id, role_list, None)
+                        success = await update_role_list(chat_id, message_id, role_list, None)
+                        if not success:
+                            await send_new_role_list(chat_id, role_list, None)
                         await send_message(chat_id, f"✅ {role_name}", max_chars=4000, pre_escaped=False)
                     else:
-                        # 切换角色
                         user_role_selections[chat_id] = selected_data
                         role_name = f"已切换到: <b>{'猫娘' if selected_data == 'neko_catgirl' else '魅魔'}</b>"
-                        await update_role_list(chat_id, message_id, role_list, selected_data)
+                        success = await update_role_list(chat_id, message_id, role_list, selected_data)
+                        if not success:
+                            await send_new_role_list(chat_id, role_list, selected_data)
                         await send_message(chat_id, f"✅ {role_name}", max_chars=4000, pre_escaped=False)
 
-                # 处理模型选择
                 elif selected_data in SUPPORTED_MODELS:
                     user_models[chat_id] = selected_data
                     model_name = f"✅ Switched model to: <b>{SUPPORTED_MODELS[selected_data]['name']}</b>"
