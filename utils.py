@@ -485,3 +485,40 @@ async def check_openrouter_balance() -> float:
     except Exception as e:
         logger.error(f"查询 OpenRouter 余额时出错: {str(e)}")
         return 0
+
+async def edit_message(chat_id: int, message_id: int, text: str, reply_markup: dict = None) -> None:
+    """Edit an existing message in Telegram"""
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+    }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{BASE_URL}/editMessageText", json=payload) as response:
+                if response.status == 200:
+                    logger.info(f"Message {message_id} edited successfully")
+                else:
+                    logger.error(f"Failed to edit message: {await response.text()}")
+    except Exception as e:
+        logger.error(f"Error editing message: {str(e)}")
+
+async def send_message_with_keyboard(chat_id: int, text: str, reply_markup: dict) -> None:
+    """Send a message with an inline keyboard"""
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "reply_markup": json.dumps(reply_markup)
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{BASE_URL}/sendMessage", json=payload) as response:
+                if response.status != 200:
+                    logger.error(f"Failed to send message with keyboard: {await response.text()}")
+    except Exception as e:
+        logger.error(f"Error sending message with keyboard: {str(e)}")
