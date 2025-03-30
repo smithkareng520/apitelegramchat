@@ -22,7 +22,7 @@ role_message_ids = {}  # 存储每个 chat_id 的角色列表消息 ID
 
 MAX_CHARS = 120000
 MEDIA_GROUP_TIMEOUT = 5
-
+ROLE_LIST_TIMEOUT = 10  # 设置角色选择消息的自动删除时间为 10 秒
 
 async def set_webhook() -> None:
     async with aiohttp.ClientSession() as session:
@@ -31,7 +31,6 @@ async def set_webhook() -> None:
                 logger.info("[INIT] Webhook configured successfully")
             else:
                 logger.error(f"[ERROR] Webhook setup failed: {await response.text()}")
-
 
 async def trim_conversation_history(chat_id: int, new_message: dict) -> None:
     """Add message to history and trim"""
@@ -72,8 +71,7 @@ async def trim_conversation_history(chat_id: int, new_message: dict) -> None:
         logger.debug(
             f"Updated conversation history: {len(history)} messages, latest: {new_message.get('content', '')[:50]}...")
 
-
-async def process_media_group(chat_id: intAO, media_group_id: str) -> None:
+async def process_media_group(chat_id: int, media_group_id: str) -> None:
     await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
     async with global_lock:
         if media_group_id not in media_groups:
@@ -112,7 +110,7 @@ async def process_media_group(chat_id: intAO, media_group_id: str) -> None:
             "type": "photo_group"
         }
     else:
-        photo_header = "�(click to expand) <b>Image Contents</b>:<br><br>"
+        photo_header = "📸 <b>Image Contents</b>:<br><br>"
         combined_content = "<br><br>".join(f"Image {i + 1}:<br>{content}" for i, content in enumerate(contents))
         user_message = {
             "role": "user",
@@ -132,6 +130,45 @@ async def process_media_group(chat_id: intAO, media_group_id: str) -> None:
     else:
         await send_message(chat_id, full_response, max_chars=4000, pre_escaped=True)
 
+async def send_role_list_with_timeout(chat_id: int, role_list: list, current_role: str) -> int:
+    """Send role list message with timeout and return message_id"""
+    formatted_roles = []
+    for role in role_list:
+        if role == current_role:
+            formatted_roles.append(f"{role} √")
+        else:
+            formatted_roles.append(role)
+
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": role_text, "callback_data": role}] for role_text, role in zip(formatted_roles, role_list)
+        ]
+    }
+    payload = {
+        "chat_id": chat_id,
+        "text": "选择角色设定 (再次点击取消):",
+        "parse_mode": "HTML",
+        "reply_markup": json.dumps(keyboard)
+    }
+    message_id = None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{BASE_URL}/sendMessage", json=payload) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    message_id = result.get("result", {}).get("message_id")
+                    if message_id:
+                        await asyncio.sleep(ROLE_LIST_TIMEOUT)  # 等待指定时间后删除
+                        await delete_message(chat_id, message_id)
+                        async with global_lock:
+                            if chat_id in role_message_ids and role_message_ids[chat_id] == message_id:
+                                del role_message_ids[chat_id]  # 清理 role_message_ids
+                else:
+                    logger.error(f"Failed to send role list: {await response.text()}")
+                    await send_message(chat_id, "❌ 无法显示角色列表，请重试", max_chars=4000, pre_escaped=False)
+    except Exception as e:
+        logger.error(f"Error in send_role_list_with_timeout: {str(e)}")
+    return message_id
 
 @app.route('/webhook', methods=['POST'])
 async def webhook() -> tuple:
@@ -285,17 +322,10 @@ async def webhook() -> tuple:
                     role_list = ["neko_catgirl", "succubus"]
                     async with global_lock:
                         current_role = user_role_selections.get(chat_id, None)
-                        # 使用 send_list_with_timeout 发送角色列表，并在指定时间后删除
-                        message_id = await send_list_with_timeout(
-                            chat_id, 
-                            "选择角色设定 (再次点击取消):",
-                            role_list,
-                            timeout=30  # 设置30秒后自动删除，可以根据需要调整时间
-                        )
+                        # 发送角色列表并设置自动删除
+                        message_id = await send_role_list_with_timeout(chat_id, role_list, current_role)
                         if message_id:
                             role_message_ids[chat_id] = message_id
-                        else:
-                            await send_message(chat_id, "❌ 无法显示角色列表，请重试", max_chars=4000, pre_escaped=False)
                     return "OK", 200
 
                 elif user_input.startswith("/balance"):
@@ -350,7 +380,7 @@ async def webhook() -> tuple:
 
                 elif user_input.startswith("/model"):
                     if data["message"]["chat"]["type"] != "private":
-                        await send_message(chat_id, "❌ Model switching only available in private chats", max_chars=4000, pre_escaped=FalseBMW)
+                        await send_message(chat_id, "❌ Model switching only available in private chats", max_chars=4000, pre_escaped=False)
                         return "OK", 200
 
                     model_list = list(SUPPORTED_MODELS.keys())
@@ -424,27 +454,11 @@ async def webhook() -> tuple:
                         user_role_selections[chat_id] = selected_data
                         role_name = f"已切换到: <b>{'猫娘' if selected_data == 'neko_catgirl' else '魅魔'}</b>"
                     
-                    # 发送确认消息，并在10秒后删除
-                    confirm_message_id = await send_list_with_timeout(
-                        chat_id,
-                        f"✅ {role_name}",
-                        [],  # 空列表表示没有按钮
-                        timeout=10  # 确认消息10秒后删除
-                    )
-                    
-                    # 如果这是最新的角色选择消息，更新 role_message_ids
+                    # 发送确认消息并立即删除角色选择消息
+                    await send_message(chat_id, f"✅ {role_name}", max_chars=4000, pre_escaped=False)
+                    await delete_message(chat_id, message_id)
                     if chat_id in role_message_ids and role_message_ids[chat_id] == message_id:
-                        # 删除旧的角色选择消息
-                        await delete_message(chat_id, message_id)
-                        # 发送新的角色列表，并在30秒后删除
-                        new_message_id = await send_list_with_timeout(
-                            chat_id,
-                            "选择角色设定 (再次点击取消):",
-                            role_list,
-                            timeout=30
-                        )
-                        if new_message_id:
-                            role_message_ids[chat_id] = new_message_id
+                        del role_message_ids[chat_id]
 
                 elif selected_data in SUPPORTED_MODELS:
                     user_models[chat_id] = selected_data
@@ -467,11 +481,9 @@ async def webhook() -> tuple:
         logger.error(f"Error processing request: {str(e)}")
         return "Internal Server Error", 500
 
-
 async def main():
     await set_webhook()
     await app.run_task(host="0.0.0.0", port=5000)
-
 
 if __name__ == '__main__':
     asyncio.run(main())
