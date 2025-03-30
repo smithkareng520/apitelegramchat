@@ -1,7 +1,8 @@
 from quart import Quart, request
 import asyncio
 import aiohttp
-from utils import send_message, send_list_with_timeout, delete_message, escape_html, check_deepseek_balance, check_openrouter_balance
+from utils import send_message, send_list_with_timeout, delete_message, escape_html, check_deepseek_balance, \
+    check_openrouter_balance
 from ai_handlers import get_ai_response
 from config import BASE_URL, WEBHOOK_URL, SUPPORTED_MODELS, AUTHORIZED_USER, TELEGRAM_BOT_TOKEN, global_lock
 from file_handlers import parse_file
@@ -134,6 +135,18 @@ async def process_media_group(chat_id: int, media_group_id: str) -> None:
 @app.route('/webhook', methods=['POST'])
 async def webhook() -> tuple:
     try:
+        # 获取 URL 中的 token 参数
+        received_token = request.args.get("token")
+
+        # 从 config 中获取预设的 WEBHOOK_TOKEN
+        from config import WEBHOOK_TOKEN
+
+        # 验证 Token
+        if not received_token or received_token != WEBHOOK_TOKEN:
+            logger.warning(f"Webhook token 验证失败: 接收到的 token={received_token}")
+            return "Forbidden: Invalid or missing token", 403
+
+        # Token 验证通过，继续处理
         data = await request.json
         update_id = data.get('update_id')
         logger.info(f"[REQUEST] Received update: {update_id}")
@@ -259,7 +272,7 @@ async def webhook() -> tuple:
                 if user_input.startswith("/start"):
                     welcome_message = """
                     <b>Welcome to AI Assistant!</b> 😊
-                    
+
                     <b>Commands:</b>
                     - <code>/model</code>: Switch AI models (use grok-2-image for images)
                     - <code>/clear</code>: Clear chat history
@@ -268,24 +281,20 @@ async def webhook() -> tuple:
                       • No args or <code>all</code>: Show all balances
                       • <code>deepseek</code> or <code>ds</code>: DeepSeek only
                       • <code>openrouter</code> or <code>or</code>: OpenRouter only
-                    
+
                     <b>Features:</b>
                     - Upload multiple images/files supported
                     """
                     await send_message(chat_id, welcome_message, max_chars=4000, pre_escaped=False)
                     return "OK", 200
 
-                # 在第三个文档的 webhook 函数中修改 /balance 部分
                 elif user_input.startswith("/balance"):
-                    # 分割命令和参数
                     parts = user_input.split(maxsplit=1)
                     service = parts[1].lower() if len(parts) > 1 else None
 
                     balance_message_parts = []
 
-                    # 如果没有指定服务或指定 "all"，查询所有服务
                     if not service or service == "all":
-                        # 查询 DeepSeek 余额
                         deepseek_balance, deepseek_currency = await check_deepseek_balance()
                         if deepseek_balance and deepseek_currency:
                             balance_message_parts.append(
@@ -296,7 +305,6 @@ async def webhook() -> tuple:
                                 "⚠️ <b>DeepSeek</b>: 查询失败"
                             )
 
-                        # 查询 OpenRouter 余额
                         openrouter_balance = await check_openrouter_balance()
                         if openrouter_balance is not None:
                             balance_message_parts.append(
@@ -307,7 +315,6 @@ async def webhook() -> tuple:
                                 "⚠️ <b>OpenRouter</b>: 查询失败"
                             )
 
-                    # 只查询 DeepSeek
                     elif service in ["deepseek", "ds"]:
                         deepseek_balance, deepseek_currency = await check_deepseek_balance()
                         if deepseek_balance and deepseek_currency:
@@ -319,7 +326,6 @@ async def webhook() -> tuple:
                                 "⚠️ <b>DeepSeek</b>: 查询失败"
                             )
 
-                    # 只查询 OpenRouter
                     elif service in ["openrouter", "or"]:
                         openrouter_balance = await check_openrouter_balance()
                         if openrouter_balance is not None:
@@ -331,7 +337,6 @@ async def webhook() -> tuple:
                                 "⚠️ <b>OpenRouter</b>: 查询失败"
                             )
 
-                    # 无效的服务参数
                     else:
                         balance_message_parts.append(
                             "❌ 无效的服务名称\n可用选项: <code>deepseek</code>, <code>openrouter</code>, <code>all</code>"

@@ -8,7 +8,12 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+# 添加 Webhook Token
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
+
+WEBHOOK_URL = f"{os.getenv('WEBHOOK_URL')}?token={WEBHOOK_TOKEN}"  # 将 Token 附加到 URL
+
+
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 SUPPORTED_MODELS = {
