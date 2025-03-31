@@ -604,7 +604,6 @@ async def get_ai_response(chat_id: int, user_models: dict, user_contexts: dict, 
                 stream=False,
                 temperature=generation_params["temperature"],
                 top_p=generation_params["top_p"],
-                presence_penalty=generation_params["presence_penalty"],
                 max_tokens=generation_params["max_tokens"],
             )
             content = completion.choices[0].message.content.strip()
