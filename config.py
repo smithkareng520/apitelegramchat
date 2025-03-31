@@ -86,7 +86,8 @@ SUPPORTED_MODELS = {
         "api_type": "gemini",
         "vision": True,
         "document": False,
-        "supports_search": False
+        "supports_search": False,
+        "audio": True  # 新增 audio 支持
     },
     "grok-2-vision-latest": {
         "name": "grok-2",
