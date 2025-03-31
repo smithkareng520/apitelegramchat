@@ -81,6 +81,14 @@ SUPPORTED_MODELS = {
         "document": False,
         "supports_search": False
     },
+    "gemini-2.5-pro-exp-03-25": {
+        "name": "gemini-2.5-pro",
+        "api_type": "gemini",
+        "vision": True,
+        "document": False,
+        "supports_search": False,
+        "audio": True  # 新增，表示支持音频
+    },
     "grok-2-vision-latest": {
         "name": "grok-2",
         "api_type": "grok",
