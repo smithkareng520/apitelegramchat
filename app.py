@@ -18,11 +18,10 @@ user_contexts = {}
 user_models = {}
 media_groups = {}
 processed_updates = set()
-role_message_ids = {}  # 存储每个 chat_id 的角色列表消息 ID
+role_message_ids = {}
 
 MAX_CHARS = 120000
 MEDIA_GROUP_TIMEOUT = 5
-
 
 async def set_webhook() -> None:
     async with aiohttp.ClientSession() as session:
@@ -31,7 +30,6 @@ async def set_webhook() -> None:
                 logger.info("[INIT] Webhook configured successfully")
             else:
                 logger.error(f"[ERROR] Webhook setup failed: {await response.text()}")
-
 
 async def trim_conversation_history(chat_id: int, new_message: dict) -> None:
     """Add message to history and trim"""
@@ -71,7 +69,6 @@ async def trim_conversation_history(chat_id: int, new_message: dict) -> None:
         user_contexts[chat_id]["conversation_history"] = history[-50:]
         logger.debug(
             f"Updated conversation history: {len(history)} messages, latest: {new_message.get('content', '')[:50]}...")
-
 
 async def process_media_group(chat_id: int, media_group_id: str) -> None:
     await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
@@ -132,7 +129,6 @@ async def process_media_group(chat_id: int, media_group_id: str) -> None:
     else:
         await send_message(chat_id, full_response, max_chars=4000, pre_escaped=True)
 
-
 async def update_role_list(chat_id: int, message_id: int, role_list: list, current_role: str) -> bool:
     """Update the existing role list message with new selections"""
     formatted_roles = []
@@ -161,7 +157,6 @@ async def update_role_list(chat_id: int, message_id: int, role_list: list, curre
             logger.error(f"Failed to update role list: {await response.text()}")
             return False
 
-
 async def send_role_list(chat_id: int, role_list: list, current_role: str) -> int:
     """Send a role list message and return message_id, delete after 6 seconds"""
     formatted_roles = []
@@ -188,7 +183,6 @@ async def send_role_list(chat_id: int, role_list: list, current_role: str) -> in
                 result = await response.json()
                 message_id = result.get("result", {}).get("message_id")
                 logger.debug(f"Sent role list for chat_id: {chat_id}, message_id: {message_id}")
-                # 定义异步删除任务，确保等待6秒后再删除
                 async def delete_after_delay():
                     await asyncio.sleep(6)
                     await delete_message(chat_id, message_id)
@@ -198,7 +192,6 @@ async def send_role_list(chat_id: int, role_list: list, current_role: str) -> in
             logger.error(f"Failed to send role list: {await response.text()}")
             await send_message(chat_id, "❌ 无法显示角色列表，请重试", max_chars=4000, pre_escaped=False)
             return None
-
 
 @app.route('/webhook', methods=['POST'])
 async def webhook() -> tuple:
@@ -325,6 +318,92 @@ async def webhook() -> tuple:
                     await send_message(chat_id, full_response, max_chars=4000, pre_escaped=True)
                 return "OK", 200
 
+            elif "voice" in data["message"]:
+                async with global_lock:
+                    user_contexts[chat_id]["search_mode"] = False
+                    current_model = user_models.get(chat_id, "grok-2-vision-latest")
+                    model_info = SUPPORTED_MODELS.get(current_model, {})
+                    supports_audio = model_info.get("audio", False)
+
+                file_id = data["message"]["voice"]["file_id"]
+                file_name = f"voice_{file_id}.ogg"  # Telegram voice 是 OGG 格式
+                user_input = data["message"].get("caption", "").strip()
+
+                if supports_audio and current_model == "gemini-2.5-pro-exp-03-25":
+                    user_message = {
+                        "role": "user",
+                        "content": user_input or "Transcribe this voice message",
+                        "file_id": file_id,
+                        "type": "voice"
+                    }
+                else:
+                    content = await parse_file(file_id, file_name)
+                    if content is None:
+                        await send_message(chat_id, "❌ Voice parsing failed or unsupported model", max_chars=4000, pre_escaped=False)
+                        return "OK", 200
+                    voice_header = "🎙️ <b>Voice Content</b>:<br><br>"
+                    user_message = {
+                        "role": "user",
+                        "content": f"{user_input}<br><br>{voice_header}{content}" if user_input else f"{voice_header}Please analyze this voice:<br>{content}"
+                    }
+
+                full_response, clean_content = await get_ai_response(chat_id, user_models, user_contexts, user_message=user_message)
+                if full_response == "IMAGE_SENT":
+                    await trim_conversation_history(chat_id, user_message)
+                    assistant_message = {"role": "assistant", "content": clean_content.strip()}
+                    await trim_conversation_history(chat_id, assistant_message)
+                elif full_response and not full_response.startswith("⏳") and not full_response.startswith("⚠️"):
+                    await trim_conversation_history(chat_id, user_message)
+                    await send_message(chat_id, full_response, max_chars=4000, pre_escaped=True)
+                    assistant_message = {"role": "assistant", "content": clean_content.strip()}
+                    await trim_conversation_history(chat_id, assistant_message)
+                else:
+                    await send_message(chat_id, full_response, max_chars=4000, pre_escaped=True)
+                return "OK", 200
+
+            elif "audio" in data["message"]:
+                async with global_lock:
+                    user_contexts[chat_id]["search_mode"] = False
+                    current_model = user_models.get(chat_id, "grok-2-vision-latest")
+                    model_info = SUPPORTED_MODELS.get(current_model, {})
+                    supports_audio = model_info.get("audio", False)
+
+                file_id = data["message"]["audio"]["file_id"]
+                file_name = data["message"]["audio"]["file_name"]
+                user_input = data["message"].get("caption", "").strip()
+
+                if supports_audio and current_model == "gemini-2.5-pro-exp-03-25":
+                    user_message = {
+                        "role": "user",
+                        "content": user_input or "Transcribe this audio",
+                        "file_id": file_id,
+                        "type": "audio"
+                    }
+                else:
+                    content = await parse_file(file_id, file_name)
+                    if content is None:
+                        await send_message(chat_id, "❌ Audio parsing failed or unsupported model", max_chars=4000, pre_escaped=False)
+                        return "OK", 200
+                    audio_header = f"🎵 <b>Audio Filename</b>: <code>{file_name}</code><br><br>"
+                    user_message = {
+                        "role": "user",
+                        "content": f"{user_input}<br><br>{audio_header}Audio content:<br>{content}" if user_input else f"{audio_header}Please analyze this audio:<br>{content}"
+                    }
+
+                full_response, clean_content = await get_ai_response(chat_id, user_models, user_contexts, user_message=user_message)
+                if full_response == "IMAGE_SENT":
+                    await trim_conversation_history(chat_id, user_message)
+                    assistant_message = {"role": "assistant", "content": clean_content.strip()}
+                    await trim_conversation_history(chat_id, assistant_message)
+                elif full_response and not full_response.startswith("⏳") and not full_response.startswith("⚠️"):
+                    await trim_conversation_history(chat_id, user_message)
+                    await send_message(chat_id, full_response, max_chars=4000, pre_escaped=True)
+                    assistant_message = {"role": "assistant", "content": clean_content.strip()}
+                    await trim_conversation_history(chat_id, assistant_message)
+                else:
+                    await send_message(chat_id, full_response, max_chars=4000, pre_escaped=True)
+                return "OK", 200
+
             elif "text" in data["message"]:
                 user_input = data["message"]["text"]
 
@@ -344,6 +423,7 @@ async def webhook() -> tuple:
 
                     <b>Features:</b>
                     - Upload multiple images/files supported
+                    - Audio (WAV/MP3) and voice supported with Gemini-2.5-pro
                     """
                     await send_message(chat_id, welcome_message, max_chars=4000, pre_escaped=False)
                     return "OK", 200
@@ -489,8 +569,7 @@ async def webhook() -> tuple:
                     else:
                         user_role_selections[chat_id] = selected_data
                         role_name = f"已切换到: <b>{'猫娘' if selected_data == 'neko_catgirl' else '魅魔'}</b>"
-                    
-                    # 更新角色列表消息
+
                     if chat_id in role_message_ids and role_message_ids[chat_id] == message_id:
                         success = await update_role_list(chat_id, message_id, role_list, user_role_selections.get(chat_id))
                         if not success:
@@ -501,7 +580,7 @@ async def webhook() -> tuple:
                         new_message_id = await send_role_list(chat_id, role_list, user_role_selections.get(chat_id))
                         if new_message_id:
                             role_message_ids[chat_id] = new_message_id
-                    
+
                     await send_message(chat_id, f"✅ {role_name}", max_chars=4000, pre_escaped=False)
 
                 elif selected_data in SUPPORTED_MODELS:
@@ -525,11 +604,9 @@ async def webhook() -> tuple:
         logger.error(f"Error processing request: {str(e)}")
         return "Internal Server Error", 500
 
-
 async def main():
     await set_webhook()
     await app.run_task(host="0.0.0.0", port=5000)
-
 
 if __name__ == '__main__':
     asyncio.run(main())
