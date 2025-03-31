@@ -460,8 +460,10 @@ async def get_ai_response(chat_id: int, user_models: dict, user_contexts: dict, 
                         messages[-1]["content"] += "\n" + str(content)
                     else:
                         messages.append({"role": "user", "content": content})
-                elif file_type in ("audio", "voice") and supports_audio:
-                    temp_file = f"temp_{file_id}.wav"
+
+                # 修改 audio/voice 处理部分
+                elif file_type in ("audio", "voice") and supports_audio:  # 移除 current_model 限制
+                    temp_file = f"temp_{file_id}.wav"  # Gemini 只接受 WAV 或 MP3，这里统一用 WAV
                     async with aiohttp.ClientSession() as session:
                         async with session.get(file_url) as response:
                             if response.status != 200:
@@ -472,10 +474,13 @@ async def get_ai_response(chat_id: int, user_models: dict, user_contexts: dict, 
                                 f.write(audio_data)
                         with open(temp_file, "rb") as audio_file:
                             base64_audio = base64.b64encode(audio_file.read()).decode('utf-8')
-                    # 修改默认指令
-                    default_instruction = "Transcribe this voice message and provide a response based on its content"
+                    # 根据 file_type 设置默认指令
+                    if file_type == "voice":
+                        default_prompt = "Transcribe this voice and respond based on its content"
+                    else:  # audio
+                        default_prompt = "Transcribe this audio and respond based on its content"
                     content = [
-                        {"type": "text", "text": user_input or default_instruction},
+                        {"type": "text", "text": user_input or default_prompt},
                         {"type": "input_audio", "input_audio": {"data": base64_audio, "format": "wav"}}
                     ]
                     if api_type == "deepseek" and messages[-1]["role"] == "user":
