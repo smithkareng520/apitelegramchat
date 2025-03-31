@@ -460,7 +460,7 @@ async def get_ai_response(chat_id: int, user_models: dict, user_contexts: dict, 
                         messages[-1]["content"] += "\n" + str(content)
                     else:
                         messages.append({"role": "user", "content": content})
-                elif file_type in ("audio", "voice") and supports_audio and current_model == "gemini-2.5-pro-exp-03-25":
+                elif file_type in ("audio", "voice") and supports_audio:
                     temp_file = f"temp_{file_id}.wav"
                     async with aiohttp.ClientSession() as session:
                         async with session.get(file_url) as response:
