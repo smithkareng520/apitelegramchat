@@ -188,6 +188,7 @@ async def send_role_list(chat_id: int, role_list: list, current_role: str) -> in
                 result = await response.json()
                 message_id = result.get("result", {}).get("message_id")
                 logger.debug(f"Sent role list for chat_id: {chat_id}, message_id: {message_id}")
+                # 定义异步删除任务，确保等待6秒后再删除
                 async def delete_after_delay():
                     await asyncio.sleep(6)
                     await delete_message(chat_id, message_id)
@@ -287,24 +288,12 @@ async def webhook() -> tuple:
                     current_model = user_models.get(chat_id, "grok-2-vision-latest")
                     model_info = SUPPORTED_MODELS.get(current_model, {})
                     supports_document = model_info.get("document", False)
-                    supports_audio = model_info.get("audio", False)  # 新增检查
-                    logger.debug(f"Model: {current_model}, supports_audio: {supports_audio}, supports_document: {supports_document}")
 
                 file_id = data["message"]["document"]["file_id"]
                 file_name = data["message"]["document"]["file_name"]
                 user_input = data["message"].get("caption", "").strip()
 
-                # 优先处理音频文件
-                audio_extensions = (".mp3", ".wav", ".ogg")  # 支持的音频格式
-                if supports_audio and file_name.lower().endswith(audio_extensions):
-                    user_message = {
-                        "role": "user",
-                        "content": user_input or "Please analyze this audio",
-                        "file_id": file_id,
-                        "type": "document",
-                        "file_name": file_name  # 传递文件名以便调试
-                    }
-                elif supports_document:
+                if supports_document:
                     user_message = {
                         "role": "user",
                         "content": user_input or "Please analyze this document",
@@ -501,6 +490,7 @@ async def webhook() -> tuple:
                         user_role_selections[chat_id] = selected_data
                         role_name = f"已切换到: <b>{'猫娘' if selected_data == 'neko_catgirl' else '魅魔'}</b>"
                     
+                    # 更新角色列表消息
                     if chat_id in role_message_ids and role_message_ids[chat_id] == message_id:
                         success = await update_role_list(chat_id, message_id, role_list, user_role_selections.get(chat_id))
                         if not success:
