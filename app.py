@@ -317,22 +317,22 @@ async def webhook() -> tuple:
                 else:
                     await send_message(chat_id, full_response, max_chars=4000, pre_escaped=True)
                 return "OK", 200
-
+            
             elif "voice" in data["message"]:
                 async with global_lock:
                     user_contexts[chat_id]["search_mode"] = False
                     current_model = user_models.get(chat_id, "grok-2-vision-latest")
                     model_info = SUPPORTED_MODELS.get(current_model, {})
                     supports_audio = model_info.get("audio", False)
-
+            
                 file_id = data["message"]["voice"]["file_id"]
-                file_name = f"voice_{file_id}.ogg"  # Telegram voice 是 OGG 格式
-                user_input = data["message"].get("caption", "").strip()
-
-                if supports_audio and current_model == "gemini-2.5-pro-exp-03-25":
+                file_name = f"voice_{file_id}.ogg"
+                user_input = data["message"].get("caption", "").strip()  # caption 可为空
+            
+                if supports_audio:  # 移除 current_model 限制
                     user_message = {
                         "role": "user",
-                        "content": user_input or "Transcribe this voice message",
+                        "content": user_input,  # 如果没有 caption，将使用默认指令
                         "file_id": file_id,
                         "type": "voice"
                     }
@@ -346,7 +346,7 @@ async def webhook() -> tuple:
                         "role": "user",
                         "content": f"{user_input}<br><br>{voice_header}{content}" if user_input else f"{voice_header}Please analyze this voice:<br>{content}"
                     }
-
+            
                 full_response, clean_content = await get_ai_response(chat_id, user_models, user_contexts, user_message=user_message)
                 if full_response == "IMAGE_SENT":
                     await trim_conversation_history(chat_id, user_message)
@@ -367,15 +367,15 @@ async def webhook() -> tuple:
                     current_model = user_models.get(chat_id, "grok-2-vision-latest")
                     model_info = SUPPORTED_MODELS.get(current_model, {})
                     supports_audio = model_info.get("audio", False)
-
+            
                 file_id = data["message"]["audio"]["file_id"]
                 file_name = data["message"]["audio"]["file_name"]
                 user_input = data["message"].get("caption", "").strip()
-
-                if supports_audio and current_model == "gemini-2.5-pro-exp-03-25":
+            
+                if supports_audio:  # 移除 current_model 限制
                     user_message = {
                         "role": "user",
-                        "content": user_input or "Transcribe this audio",
+                        "content": user_input,  # 如果有 caption 则使用，否则用默认指令
                         "file_id": file_id,
                         "type": "audio"
                     }
@@ -389,7 +389,7 @@ async def webhook() -> tuple:
                         "role": "user",
                         "content": f"{user_input}<br><br>{audio_header}Audio content:<br>{content}" if user_input else f"{audio_header}Please analyze this audio:<br>{content}"
                     }
-
+            
                 full_response, clean_content = await get_ai_response(chat_id, user_models, user_contexts, user_message=user_message)
                 if full_response == "IMAGE_SENT":
                     await trim_conversation_history(chat_id, user_message)
@@ -403,7 +403,7 @@ async def webhook() -> tuple:
                 else:
                     await send_message(chat_id, full_response, max_chars=4000, pre_escaped=True)
                 return "OK", 200
-
+            
             elif "text" in data["message"]:
                 user_input = data["message"]["text"]
 
