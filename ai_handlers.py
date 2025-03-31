@@ -543,7 +543,6 @@ async def get_ai_response(chat_id: int, user_models: dict, user_contexts: dict, 
         generation_params = {
             "temperature": 0.6,
             "top_p": 0.9,
-            "presence_penalty": 0.7,
             "max_tokens": 8192,
         }
 
@@ -584,7 +583,6 @@ async def get_ai_response(chat_id: int, user_models: dict, user_contexts: dict, 
                 "messages": messages,
                 "temperature": generation_params["temperature"],
                 "top_p": generation_params["top_p"],
-                "presence_penalty": generation_params["presence_penalty"],
                 "reasoning": reasoning_param
             }
             logger.info(f"发送请求: model={current_model}")
