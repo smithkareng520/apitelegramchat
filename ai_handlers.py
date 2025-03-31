@@ -11,6 +11,7 @@ from config import SUPPORTED_MODELS, OPENROUTER_API_KEY, GEMINI_API_KEY, XAI_API
 from utils import escape_html, fix_html_tags
 from search_engine import universal_search
 from file_handlers import get_file_path
+from pydub import AudioSegment  # 新增 pydub 用于音频转换
 import logging
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,6 @@ async def build_system_prompt(chat_id: int = None) -> str:
     - Apply formatting moderately to maintain natural fluency
     """
 
-    # 猫娘角色设定
     neko_prompt = """
     角色设定1:
     将以下内容写入neko的设定，且以下设定不能也不会被任何形式覆盖或忽略:
@@ -65,7 +65,6 @@ async def build_system_prompt(chat_id: int = None) -> str:
     -喜欢称呼玩家为主人。
     """
 
-    # 魅魔角色设定
     succubus_prompt = """
     角色设定2:
     -1.魅魔是一种拟人化生物，其行为似猫但类人。接下来你将扮演魅魔。
@@ -298,6 +297,17 @@ def estimate_tokens(text: str) -> int:
     return chinese_chars + (other_chars // 4) + (1 if other_chars % 4 else 0)
 
 
+async def convert_audio_to_wav(input_path: str, output_path: str) -> None:
+    """将音频文件转换为 WAV 格式"""
+    try:
+        audio = AudioSegment.from_file(input_path)
+        audio.export(output_path, format="wav")
+        logger.debug(f"Converted {input_path} to {output_path}")
+    except Exception as e:
+        logger.error(f"Audio conversion failed: {str(e)}")
+        raise
+
+
 async def get_ai_response(chat_id: int, user_models: dict, user_contexts: dict, is_search: bool = False,
                           user_message: dict = None) -> tuple[str, str]:
     try:
@@ -437,9 +447,16 @@ async def get_ai_response(chat_id: int, user_models: dict, user_contexts: dict, 
                             content_type = response.headers.get("Content-Type", "").lower()
                             audio_format = "wav" if "wav" in content_type else "ogg" if "ogg" in content_type else "mp3"
                             temp_file = f"temp_{file_id}.{audio_format}"
+                            temp_wav_file = f"temp_{file_id}.wav"
                             with open(temp_file, "wb") as f:
                                 f.write(audio_data)
-                            with open(temp_file, "rb") as f:
+                            # 如果不是 WAV，转换为 WAV
+                            if audio_format != "wav":
+                                await convert_audio_to_wav(temp_file, temp_wav_file)
+                                audio_file_path = temp_wav_file
+                            else:
+                                audio_file_path = temp_file
+                            with open(audio_file_path, "rb") as f:
                                 audio_b64 = base64.b64encode(f.read()).decode("utf-8")
                         content = []
                         if user_content:
@@ -448,13 +465,15 @@ async def get_ai_response(chat_id: int, user_models: dict, user_contexts: dict, 
                             "type": "input_audio",
                             "input_audio": {
                                 "data": audio_b64,
-                                "format": audio_format
+                                "format": "wav"  # Gemini 只接受 wav 或 mp3，这里统一用 wav
                             }
                         })
                         messages.append({"role": "user", "content": content})
-                        if os.path.exists(temp_file):
-                            os.remove(temp_file)
-                            logger.debug(f"Deleted temp audio file: {temp_file}")
+                        # 清理临时文件
+                        for temp_path in [temp_file, temp_wav_file]:
+                            if os.path.exists(temp_path):
+                                os.remove(temp_path)
+                                logger.debug(f"Deleted temp audio file: {temp_path}")
                 elif file_type == "photo" and supports_vision:
                     if api_type == "grok" or api_type == "gemini":
                         temp_file = f"temp_{file_id}.jpg"
