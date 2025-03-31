@@ -480,7 +480,7 @@ async def get_ai_response(chat_id: int, user_models: dict, user_contexts: dict, 
                     else:  # audio
                         default_prompt = "Transcribe this audio and respond based on its content"
                     content = [
-                        {"type": "text", "text": user_input or default_prompt},
+                        {"type": "text", "text": user_content or default_prompt},  # 将 user_input 改为 user_content
                         {"type": "input_audio", "input_audio": {"data": base64_audio, "format": "wav"}}
                     ]
                     if api_type == "deepseek" and messages[-1]["role"] == "user":
