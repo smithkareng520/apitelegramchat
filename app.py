@@ -1,3 +1,4 @@
+# app.py
 from quart import Quart, request
 import asyncio
 import aiohttp
@@ -5,7 +6,7 @@ import json
 from utils import send_message, send_list_with_timeout, delete_message, escape_html, check_deepseek_balance, \
     check_openrouter_balance
 from ai_handlers import get_ai_response
-from config import BASE_URL, WEBHOOK_URL, SUPPORTED_MODELS, AUTHORIZED_USER, TELEGRAM_BOT_TOKEN, global_lock, user_role_selections
+from config import BASE_URL, WEBHOOK_URL, SUPPORTED_MODELS, SUPPORTED_ROLES, AUTHORIZED_USER, TELEGRAM_BOT_TOKEN, global_lock, user_role_selections
 from file_handlers import parse_file
 import re
 import logging
@@ -327,12 +328,12 @@ async def webhook() -> tuple:
             
                 file_id = data["message"]["voice"]["file_id"]
                 file_name = f"voice_{file_id}.ogg"
-                user_input = data["message"].get("caption", "").strip()  # caption 可为空
+                user_input = data["message"].get("caption", "").strip()
             
-                if supports_audio:  # 移除 current_model 限制
+                if supports_audio:
                     user_message = {
                         "role": "user",
-                        "content": user_input,  # 如果没有 caption，将使用默认指令
+                        "content": user_input,
                         "file_id": file_id,
                         "type": "voice"
                     }
@@ -372,10 +373,10 @@ async def webhook() -> tuple:
                 file_name = data["message"]["audio"]["file_name"]
                 user_input = data["message"].get("caption", "").strip()
             
-                if supports_audio:  # 移除 current_model 限制
+                if supports_audio:
                     user_message = {
                         "role": "user",
-                        "content": user_input,  # 如果有 caption 则使用，否则用默认指令
+                        "content": user_input,
                         "file_id": file_id,
                         "type": "audio"
                     }
@@ -413,7 +414,7 @@ async def webhook() -> tuple:
 
                     <b>Commands:</b>
                     - <code>/model</code>: Switch AI models (use grok-2-image for images)
-                    - <code>/role</code>: Select role persona (catgirl or succubus)
+                    - <code>/role</code>: Select role persona (catgirl, succubus, or Isla)
                     - <code>/clear</code>: Clear chat history
                     - <code>/search</code>: Toggle search mode
                     - <code>/balance [service]</code>: Check API balance
@@ -429,17 +430,16 @@ async def webhook() -> tuple:
                     return "OK", 200
 
                 elif user_input.startswith("/role"):
-                    role_list = ["neko_catgirl", "succubus", "isla"]
                     async with global_lock:
                         current_role = user_role_selections.get(chat_id, None)
                         if chat_id not in role_message_ids or not role_message_ids[chat_id]:
-                            message_id = await send_role_list(chat_id, role_list, current_role)
+                            message_id = await send_role_list(chat_id, SUPPORTED_ROLES, current_role)
                             if message_id:
                                 role_message_ids[chat_id] = message_id
                         else:
-                            success = await update_role_list(chat_id, role_message_ids[chat_id], role_list, current_role)
+                            success = await update_role_list(chat_id, role_message_ids[chat_id], SUPPORTED_ROLES, current_role)
                             if not success:
-                                message_id = await send_role_list(chat_id, role_list, current_role)
+                                message_id = await send_role_list(chat_id, SUPPORTED_ROLES, current_role)
                                 if message_id:
                                     role_message_ids[chat_id] = message_id
                     return "OK", 200
@@ -560,24 +560,29 @@ async def webhook() -> tuple:
                 return "OK", 200
 
             async with global_lock:
-                role_list = ["neko_catgirl", "succubus"]
-                if selected_data in role_list:
+                if selected_data in SUPPORTED_ROLES:
                     current_role = user_role_selections.get(chat_id)
+                    role_names = {
+                        "neko_catgirl": "猫娘",
+                        "succubus": "魅魔",
+                        "isla": "Isla"
+                    }
                     if current_role == selected_data:
                         user_role_selections.pop(chat_id, None)
                         role_name = "已取消角色设定"
                     else:
                         user_role_selections[chat_id] = selected_data
-                        role_name = f"已切换到: <b>{'猫娘' if selected_data == 'neko_catgirl' else '魅魔'}</b>"
+                        role_name = f"已切换到: <b>{role_names[selected_data]}</b>"
+                        logger.info(f"Switched role for chat_id {chat_id} to {selected_data}")
 
                     if chat_id in role_message_ids and role_message_ids[chat_id] == message_id:
-                        success = await update_role_list(chat_id, message_id, role_list, user_role_selections.get(chat_id))
+                        success = await update_role_list(chat_id, message_id, SUPPORTED_ROLES, user_role_selections.get(chat_id))
                         if not success:
-                            new_message_id = await send_role_list(chat_id, role_list, user_role_selections.get(chat_id))
+                            new_message_id = await send_role_list(chat_id, SUPPORTED_ROLES, user_role_selections.get(chat_id))
                             if new_message_id:
                                 role_message_ids[chat_id] = new_message_id
                     else:
-                        new_message_id = await send_role_list(chat_id, role_list, user_role_selections.get(chat_id))
+                        new_message_id = await send_role_list(chat_id, SUPPORTED_ROLES, user_role_selections.get(chat_id))
                         if new_message_id:
                             role_message_ids[chat_id] = new_message_id
 
