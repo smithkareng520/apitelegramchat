@@ -429,7 +429,7 @@ async def webhook() -> tuple:
                     return "OK", 200
 
                 elif user_input.startswith("/role"):
-                    role_list = ["neko_catgirl", "succubus"]
+                    role_list = ["neko_catgirl", "succubus", "isla"]
                     async with global_lock:
                         current_role = user_role_selections.get(chat_id, None)
                         if chat_id not in role_message_ids or not role_message_ids[chat_id]:
