@@ -17,6 +17,9 @@ BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 user_role_selections = {}  # 存储用户的角色选择状态
 
+# 支持的角色列表
+SUPPORTED_ROLES = ["neko_catgirl", "succubus", "isla"]
+
 SUPPORTED_MODELS = {
     "anthropic/claude-3.7-sonnet:thinking": {
         "name": "claude-3.7-sonnet",
