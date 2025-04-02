@@ -1,4 +1,3 @@
-# app.py
 from quart import Quart, request
 import asyncio
 import aiohttp
@@ -194,7 +193,7 @@ async def send_role_list(chat_id: int, role_list: list, current_role: str) -> in
             await send_message(chat_id, "❌ 无法显示角色列表，请重试", max_chars=4000, pre_escaped=False)
             return None
 
-@app.route('/webhook', methods=['POST'])
+@app.route('/webhook', methods=['GET', 'POST'])
 async def webhook() -> tuple:
     try:
         received_token = request.args.get("token")
@@ -203,6 +202,11 @@ async def webhook() -> tuple:
             logger.warning(f"Webhook token 验证失败: 接收到的 token={received_token}")
             return "Forbidden: Invalid or missing token", 403
 
+        if request.method == 'GET':
+            # 为 UptimeRobot 返回简单的状态响应
+            return "OK - Webhook is alive", 200
+
+        # 以下为原有的 POST 请求处理逻辑
         data = await request.json
         update_id = data.get('update_id')
         logger.info(f"[REQUEST] Received update: {update_id}")
