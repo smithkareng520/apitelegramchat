@@ -193,20 +193,24 @@ async def send_role_list(chat_id: int, role_list: list, current_role: str) -> in
             await send_message(chat_id, "❌ 无法显示角色列表，请重试", max_chars=4000, pre_escaped=False)
             return None
 
-@app.route('/webhook', methods=['GET', 'POST'])
+@app.route('/webhook', methods=['GET', 'POST', 'HEAD'])
 async def webhook() -> tuple:
     try:
-        received_token = request.args.get("token")
+        # 安全获取查询参数，处理 request.args 为 None 的情况
+        args = request.args if request.args is not None else {}
+        received_token = args.get("token")
+        logger.info(f"Received request: method={request.method}, token={received_token}")
+
         from config import WEBHOOK_TOKEN
         if not received_token or received_token != WEBHOOK_TOKEN:
-            logger.warning(f"Webhook token 验证失败: 接收到的 token={received_token}")
+            logger.warning(f"Webhook token validation failed: received token={received_token}")
             return "Forbidden: Invalid or missing token", 403
 
-        if request.method == 'GET':
-            # 为 UptimeRobot 返回简单的状态响应
+        if request.method in ['GET', 'HEAD']:
+            logger.info(f"Handling {request.method} request for monitoring")
             return "OK - Webhook is alive", 200
 
-        # 以下为原有的 POST 请求处理逻辑
+        # POST 请求处理逻辑
         data = await request.json
         update_id = data.get('update_id')
         logger.info(f"[REQUEST] Received update: {update_id}")
@@ -610,7 +614,7 @@ async def webhook() -> tuple:
 
         return "OK", 200
     except Exception as e:
-        logger.error(f"Error processing request: {str(e)}")
+        logger.error(f"Error processing request: {str(e)}", exc_info=True)
         return "Internal Server Error", 500
 
 async def main():
