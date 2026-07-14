@@ -597,6 +597,8 @@ def _render_memory_detail(m: dict) -> str:
 
 
 # ---------- 工具定义（OpenAI function-calling schema） ----------
+# 注意：description 字段是给 AI 阅读的「工具说明书」，全部用纯文本，
+# 不使用 Markdown 语法，与系统提示词风格保持一致。
 MEMORY_TOOL = {
     "type": "function",
     "function": {
@@ -605,7 +607,7 @@ MEMORY_TOOL = {
             "Persistent per-chat long-term memory store. Use this to remember facts, "
             "preferences, people, events, or any note that should survive across "
             "sessions (unlike conversation history which is short-lived). "
-            "Supports add / get / list / search / update / delete / clear. "
+            "Supports 7 actions: add / get / list / search / update / delete / clear. "
             "Each memory has a category, tags, and importance (low/medium/high). "
             "When the user mentions something they want you to remember, write it to memory; "
             "when answering, optionally search memory for relevant context."
@@ -615,7 +617,7 @@ MEMORY_TOOL = {
             "properties": {
                 "_description": {
                     "type": "string",
-                    "description": "A short description of what you are doing (max 60 chars). Example: '保存用户偏好：喜欢清淡口味'"
+                    "description": "A short description of what you are doing (max 60 chars). Example: 保存用户偏好：喜欢清淡口味"
                 },
                 "action": {
                     "type": "string",
@@ -628,7 +630,7 @@ MEMORY_TOOL = {
                 },
                 "memory_id": {
                     "type": "string",
-                    "description": "Target memory id (8-char hex) or display seq (with or without '#'). Required for get/update/delete."
+                    "description": "Target memory id (8-char hex) or display seq (with or without #). Required for get/update/delete."
                 },
                 "category": {
                     "type": "string",
@@ -650,7 +652,7 @@ MEMORY_TOOL = {
                 },
                 "scope": {
                     "type": "string",
-                    "description": "Clear scope. Options: 'all' (default), 'category:<name>', 'tag:<name>'."
+                    "description": "Clear scope. Options: all (default), category:<name>, tag:<name>."
                 },
                 "limit": {
                     "type": "integer",
@@ -659,7 +661,7 @@ MEMORY_TOOL = {
                 },
                 "source": {
                     "type": "string",
-                    "description": "Who wrote this memory. 'agent' (default) or 'user'."
+                    "description": "Who wrote this memory. agent (default) or user."
                 }
             },
             "required": ["action"]

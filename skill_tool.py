@@ -623,7 +623,9 @@ def render_skill_card(payload: dict, max_items: int = 30) -> str:
     return f"<p>{_esc(payload)}</p>"
 
 
-# ---------- 工具定义 ----------
+# ---------- 工具定义（OpenAI function-calling schema） ----------
+# 注意：description 字段是给 AI 阅读的「工具说明书」，全部用纯文本，
+# 不使用 Markdown 语法，与系统提示词风格保持一致。
 SKILL_TOOL = {
     "type": "function",
     "function": {
@@ -633,17 +635,17 @@ SKILL_TOOL = {
             "summarizer, coder, reviewer, explainer, brainstormer, planner, or "
             "any user-defined custom skill). Each skill bundles a system_prompt "
             "and an optional tool whitelist. "
-            "Actions: list / info / use / register / update / delete. "
-            "Use `use` to activate a skill — its system_prompt will guide your "
+            "6 actions: list / info / use / register / update / delete. "
+            "Use use to activate a skill — its system_prompt will guide your "
             "behavior until the user switches or cancels. "
-            "Use `register` to let the user define their own skill."
+            "Use register to let the user define their own skill."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "_description": {
                     "type": "string",
-                    "description": "A short description of what you are doing (max 60 chars). Example: '激活 summarizer 技能'"
+                    "description": "A short description of what you are doing (max 60 chars). Example: 激活 summarizer 技能"
                 },
                 "action": {
                     "type": "string",
@@ -668,7 +670,7 @@ SKILL_TOOL = {
                 "tools": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional tool whitelist (register/update only). E.g. ['bash','text_editor']. Empty list = no tools."
+                    "description": "Optional tool whitelist (register/update only). E.g. [bash, text_editor]. Empty list = no tools."
                 },
                 "examples": {
                     "type": "array",

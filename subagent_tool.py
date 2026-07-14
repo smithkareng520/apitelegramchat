@@ -158,15 +158,26 @@ async def _subagent_agentic_loop(
     tools: list,
     chat_id: int,
     timeout_overall: float,
+    progress_callback=None,
 ) -> dict:
     """
     最小化的 OpenAI 兼容 agentic loop。
     返回 dict：{ok, rounds, tool_calls, answer, error}
+
+    progress_callback: 可选的 async 回调，签名 async (status_text: str) -> None。
+    每轮 LLM 调用前 / 工具执行前 / 完成后都会调用，让外层能实时刷新 UI 草稿。
     """
     start = time.monotonic()
     rounds = 0
     total_tool_calls = 0
     last_error = None
+
+    async def _report(status_text: str):
+        if progress_callback:
+            try:
+                await progress_callback(status_text)
+            except Exception:
+                pass  # 进度回调失败不能影响子 agent 主流程
 
     # 支持工具调用？
     model_info = SUPPORTED_MODELS.get(model)
@@ -175,10 +186,13 @@ async def _subagent_agentic_loop(
     # 用于工具结果回填
     loop_messages = list(messages)
 
+    await _report(f"启动子 agent（模型 {getattr(model_info, 'name', model)}，{len(tools)} 个工具可用）")
+
     while rounds < MAX_SUBAGENT_ROUNDS:
         rounds += 1
         elapsed = time.monotonic() - start
         if elapsed > timeout_overall:
+            await _report(f"整体超时（{timeout_overall}s）")
             return {
                 "ok": False,
                 "error": f"子 agent 整体超时（{timeout_overall}s）",
@@ -186,6 +200,8 @@ async def _subagent_agentic_loop(
                 "tool_calls": total_tool_calls,
                 "elapsed": elapsed,
             }
+
+        await _report(f"第 {rounds}/{MAX_SUBAGENT_ROUNDS} 轮：LLM 思考中…（已耗时 {elapsed:.0f}s）")
 
         try:
             create_params = {
@@ -205,12 +221,14 @@ async def _subagent_agentic_loop(
         except asyncio.TimeoutError:
             last_error = "LLM 调用超时"
             logger.warning(f"subagent: LLM call timed out (round {rounds})")
+            await _report(f"第 {rounds} 轮 LLM 调用超时")
             break
         except asyncio.CancelledError:
             raise
         except Exception as e:
             last_error = f"LLM 调用失败: {str(e)[:200]}"
             logger.exception(f"subagent: LLM call failed (round {rounds}): {e}")
+            await _report(f"第 {rounds} 轮 LLM 调用失败")
             break
 
         # 解析返回
@@ -219,6 +237,7 @@ async def _subagent_agentic_loop(
             msg = choice.message
         except (AttributeError, IndexError, TypeError) as e:
             last_error = f"无法解析 LLM 返回: {e}"
+            await _report(f"第 {rounds} 轮返回解析失败")
             break
 
         content = getattr(msg, "content", None) or ""
@@ -229,6 +248,7 @@ async def _subagent_agentic_loop(
             answer = (content or "").strip()
             if len(answer) > MAX_ANSWER_LEN:
                 answer = answer[:MAX_ANSWER_LEN] + "\n…[子 agent 答复已截断]"
+            await _report(f"完成：{rounds} 轮，{total_tool_calls} 次工具调用，{time.monotonic() - start:.0f}s")
             return {
                 "ok": True,
                 "rounds": rounds,
@@ -259,6 +279,13 @@ async def _subagent_agentic_loop(
             pass
         loop_messages.append(assistant_msg)
 
+        # 报告即将执行的工具
+        tool_names = [tc_entry["function"]["name"] for tc_entry in tc_list]
+        await _report(
+            f"第 {rounds}/{MAX_SUBAGENT_ROUNDS} 轮：执行工具 {' + '.join(tool_names)}…"
+            f"（已耗时 {time.monotonic() - start:.0f}s）"
+        )
+
         # 并发执行
         async def _exec_one(tc_entry: dict) -> tuple[str, str]:
             tc_id = tc_entry["id"]
@@ -288,6 +315,7 @@ async def _subagent_agentic_loop(
             total_tool_calls += 1
 
     # 跑出循环仍未拿到最终答复
+    await _report(f"结束：达到最大轮数或出错（{rounds} 轮，{total_tool_calls} 次工具调用）")
     return {
         "ok": False,
         "error": last_error or f"子 agent 达到最大轮数 {MAX_SUBAGENT_ROUNDS}",
@@ -305,6 +333,7 @@ async def execute_subagent(
     model: Optional[str] = None,
     allowed_tools: Optional[list[str]] = None,
     timeout: Optional[int] = None,
+    progress_callback=None,
 ) -> str:
     """
     subagent 工具主入口。返回 JSON 字符串供父 agent 阅读。
@@ -315,6 +344,9 @@ async def execute_subagent(
       model         指定子 agent 使用的模型 ID（可选，默认与父同款 DEFAULT_MODEL）
       allowed_tools 工具白名单（可选，None=默认白名单，[]=不允许任何工具）
       timeout       整体超时秒数（可选，默认 90）
+      progress_callback  可选的 async 回调 async (status_text: str) -> None，
+                         每轮 LLM 调用前 / 工具执行前 / 完成后都会调用，
+                         让外层能实时刷新 UI 草稿。
     """
     task = (task or "").strip()
     if not task:
@@ -365,7 +397,10 @@ async def execute_subagent(
 
     try:
         result = await asyncio.wait_for(
-            _subagent_agentic_loop(client, chosen_model, messages, tools, chat_id, timeout_s),
+            _subagent_agentic_loop(
+                client, chosen_model, messages, tools, chat_id, timeout_s,
+                progress_callback=progress_callback,
+            ),
             timeout=timeout_s + 10,  # 外层多给 10s 缓冲
         )
     except asyncio.TimeoutError:
@@ -435,7 +470,9 @@ def render_subagent_card(payload: dict) -> str:
     )
 
 
-# ---------- 工具定义 ----------
+# ---------- 工具定义（OpenAI function-calling schema） ----------
+# 注意：description 字段是给 AI 阅读的「工具说明书」，全部用纯文本，
+# 不使用 Markdown 语法，与系统提示词风格保持一致。
 SUBAGENT_TOOL = {
     "type": "function",
     "function": {
@@ -455,7 +492,7 @@ SUBAGENT_TOOL = {
             "properties": {
                 "_description": {
                     "type": "string",
-                    "description": "A short description of what you are doing (max 60 chars). Example: '派子 agent 调研量子计算最新进展'"
+                    "description": "A short description of what you are doing (max 60 chars). Example: 派子 agent 调研量子计算最新进展"
                 },
                 "task": {
                     "type": "string",
@@ -475,7 +512,7 @@ SUBAGENT_TOOL = {
                     "description": (
                         "Optional tool whitelist for the sub-agent. If omitted, a safe default set is used "
                         "(web_search, fetch_url, wikipedia, weather, bash, text_editor, todo, etc.). "
-                        "Pass [] to forbid all tools. "
+                        "Pass an empty list to forbid all tools. "
                         "Forbidden regardless: subagent, memory, skill (recursion / state safety)."
                     )
                 },

@@ -838,22 +838,25 @@ async def list_all(chat_id: int, filter_: str = "all") -> dict:
 
 
 # ---------- 工具定义（OpenAI function-calling schema） ----------
+# 注意：description 字段是给 AI 阅读的「工具说明书」。
+# 全部用纯文本，不使用 Markdown 语法（如 **bold**、`code`、# 标题等），
+# 与系统提示词风格保持一致——AI 输出时也不会把这些符号带进回复。
 TODO_TOOL = {
     "type": "function",
     "function": {
         "name": "todo",
         "description": (
             "Manage a persistent per-chat todo / task list. "
-            "Supports: add / list / done / undone / toggle / delete / clear / edit. "
+            "Supports 8 actions: add / list / done / undone / toggle / delete / clear / edit. "
             "Todos are stored in the user's workspace and survive across sessions. "
-            "Always call `list` after add/done/undone/delete/edit/clear so the user sees the updated list."
+            "Always call list after add/done/undone/delete/edit/clear so the user sees the updated list."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "_description": {
                     "type": "string",
-                    "description": "A short description of what you are doing (max 60 chars). Example: '添加一条买菜的待办'"
+                    "description": "A short description of what you are doing (max 60 chars). Example: 添加一条买菜的待办"
                 },
                 "action": {
                     "type": "string",
@@ -867,8 +870,8 @@ TODO_TOOL = {
                 "todo_id": {
                     "type": "string",
                     "description": (
-                        "Target todo id. Can be the short `id` (8-char hex) or the display `seq` number "
-                        "(with or without leading '#'). Required for done/undone/toggle/delete/edit."
+                        "Target todo id. Can be the short id (8-char hex) or the display seq number "
+                        "(with or without leading #). Required for done/undone/toggle/delete/edit."
                     )
                 },
                 "priority": {
@@ -888,7 +891,7 @@ TODO_TOOL = {
                 "filter": {
                     "type": "string",
                     "enum": ["all", "pending", "done"],
-                    "description": "Filter for list/clear. For clear, 'done' (default) only clears completed; 'all' clears everything."
+                    "description": "Filter for list/clear. For clear, done (default) only clears completed; all clears everything."
                 },
                 "tag": {
                     "type": "string",

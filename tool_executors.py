@@ -1491,7 +1491,7 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
 
 
 # ---------- 工具分发 ----------
-async def dispatch_tool_call(name: str, arguments: dict, chat_id: int) -> str:
+async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_callback=None) -> str:
     if chat_id is None:
         # 早期失败：避免创建 ./workspace/None 造成跨会话数据泄漏
         return json.dumps({"error": "chat_id is required for tool dispatch"})
@@ -1691,6 +1691,7 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int) -> str:
         # ========== Subagent 工具分支 ==========
         # 子 agent。返回 JSON（含 answer / rounds / tool_calls）给父 agent 阅读；
         # UI 由 format_tool_result 渲染成「子 agent 已完成」卡片。
+        # progress_callback 让子 agent 每轮能向主 agent 的草稿推送进度，避免 90s 黑屏。
         elif name == "subagent":
             return await execute_subagent(
                 chat_id=chat_id,
@@ -1699,6 +1700,7 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int) -> str:
                 model=arguments.get("model"),
                 allowed_tools=arguments.get("allowed_tools"),
                 timeout=arguments.get("timeout"),
+                progress_callback=progress_callback,
             )
         elif name == "present_files":
             paths = arguments.get("paths", [])

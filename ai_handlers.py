@@ -1923,9 +1923,26 @@ async def _run_tool_calls_and_append(
                 timeout = LONG_TOOL_CALL_TIMEOUT
             else:
                 timeout = TOOL_CALL_TIMEOUT
+
+            # 子 agent 专用：每轮 LLM 调用前 / 工具执行前向 builder 推送进度，
+            # 实时刷新草稿，避免 90s 黑屏。
+            subagent_progress_callback = None
+            if fn_name in SUBAGENT_TOOLS:
+                async def subagent_progress_callback(status_text: str):
+                    try:
+                        # 用进度文本更新工具气泡的 preview，状态保持 running
+                        preview = f"<i>🤖 {status_text}</i>"
+                        builder.update_tool_preview(tc_id, preview, summary=f"🤖 子 agent 运行中")
+                        await builder.flush(force=True)
+                    except Exception:
+                        pass  # 进度推送失败不能影响主流程
+
             try:
                 result_str = await asyncio.wait_for(
-                    dispatch_tool_call(fn_name, fn_args, chat_id=builder.chat_id),
+                    dispatch_tool_call(
+                        fn_name, fn_args, chat_id=builder.chat_id,
+                        progress_callback=subagent_progress_callback,
+                    ),
                     timeout=timeout
                 )
             except asyncio.CancelledError:
