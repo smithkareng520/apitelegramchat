@@ -618,16 +618,16 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web for real-time information. Returns a list of results with titles, snippets, and URLs. You may call **multiple independent searches** in the same response if they are unrelated. After receiving search results, you may call `fetch_url` to read full content of a promising link, but do so one URL at a time.",
+            "description": "Search the web for real-time information (titles, snippets, URLs). Multiple independent queries can be issued in one response. To read a result in depth, follow up with fetch_url (one URL per call).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '搜索2024年诺贝尔奖'"
+                        "description": "简述本次操作目的（≤60字）。示例：搜索2024年诺贝尔奖"
                     },
-                    "query": {"type": "string", "description": "Search query"},
-                    "num_results": {"type": "integer", "description": "Number of results (1-10)", "default": 10}
+                    "query": {"type": "string", "description": "搜索关键词"},
+                    "num_results": {"type": "integer", "description": "返回结果数（1-10）", "default": 10}
                 },
                 "required": ["query"]
             },
@@ -641,11 +641,11 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "fetch_url",
-            "description": "Fetch full content of a specific URL. Use when a search result needs deeper reading or user provided a URL. Fetch only ONE URL at a time.",
+            "description": "Fetch and read full content of a specific URL. Use when a search result needs deeper reading or the user gave you a link. One URL per call.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "Full URL"}
+                    "url": {"type": "string", "description": "完整的 URL"}
                 },
                 "required": ["url"]
             }
@@ -655,12 +655,12 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "wikipedia",
-            "description": "Look up a topic on Wikipedia for encyclopedic summary.",
+            "description": "Look up a topic on Wikipedia and return an encyclopedic summary. Prefer for factual / definitional queries.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Topic"},
-                    "lang": {"type": "string", "description": "Language code (zh/en)", "default": "zh"}
+                    "query": {"type": "string", "description": "条目标题或关键词"},
+                    "lang": {"type": "string", "description": "语言代码（zh/en）", "default": "zh"}
                 },
                 "required": ["query"]
             }
@@ -670,16 +670,16 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "exchange_rate",
-            "description": "Get real-time exchange rates for a base currency.",
+            "description": "Get real-time exchange rates for a base currency. Optionally filter to a single target currency.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '查询美元兑人民币汇率'"
+                        "description": "简述本次操作目的（≤60字）。示例：查询美元兑人民币汇率"
                     },
-                    "base": {"type": "string", "description": "Base currency code (USD, CNY, etc.)"},
-                    "target": {"type": "string", "description": "Target currency (optional)"}
+                    "base": {"type": "string", "description": "基础货币代码（如 USD、CNY）"},
+                    "target": {"type": "string", "description": "目标货币（可选）"}
                 },
                 "required": ["base"]
             }
@@ -689,11 +689,11 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "hacker_news",
-            "description": "Get top stories from Hacker News.",
+            "description": "Get current top stories from Hacker News (title, link, score, comments).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "limit": {"type": "integer", "default": 10, "description": "Number of stories (1-20)"}
+                    "limit": {"type": "integer", "default": 10, "description": "返回条数（1-20）"}
                 }
             }
         }
@@ -702,15 +702,15 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "book_lookup",
-            "description": "Look up book info by title, author, or ISBN.",
+            "description": "Look up book metadata (title, author, cover, rating, abstract) by title, author, or ISBN.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '查找三体作者'"
+                        "description": "简述本次操作目的（≤60字）。示例：查找三体作者"
                     },
-                    "query": {"type": "string", "description": "Title, author, or ISBN"}
+                    "query": {"type": "string", "description": "书名、作者或 ISBN"}
                 },
                 "required": ["query"]
             }
@@ -721,22 +721,22 @@ SEARCH_TOOLS = [
         "function": {
             "name": "weather",
             "description": (
-                "Get comprehensive weather data for a city. Returns a JSON object with three parts:\n"
-                "- 'current': all current conditions (temp, feels_like, humidity, wind, wind_gust, pressure, visibility, cloudcover, uvIndex, precip, wind_dir, condition, obs_time)\n"
-                "- 'hourly': list of up to 24 hours with all fields (temp, condition, precip, humidity, pressure, wind_gust, uvIndex, cloudcover, visibility, wind_speed, wind_dir, 10+ probabilities, DewPoint, HeatIndex, WindChill, shortRad, diffRad)\n"
-                "- 'daily': list of up to 5 days with max/min/avg temp, condition, uvIndex, sunrise, sunset, moonrise, moonset, moon_phase, moon_illumination, and probabilities.\n"
-                "Use this tool for detailed weather forecasts."
+                "Get comprehensive weather data for a city. Returns three blocks:\n"
+                "- current: temp, feels_like, humidity, wind, pressure, visibility, uvIndex, precip, condition, obs_time.\n"
+                "- hourly: up to 24 hours of forecast (temp, condition, precip, wind, uvIndex, etc.).\n"
+                "- daily: up to 5 days (max/min/avg temp, condition, sunrise/sunset, moon phase, probabilities).\n"
+                "Use for any weather-related question."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '查询北京今日天气'"
+                        "description": "简述本次操作目的（≤60字）。示例：查询北京今日天气"
                     },
-                    "city": {"type": "string", "description": "City name (e.g., Beijing, Shanghai)"},
+                    "city": {"type": "string", "description": "城市名（如 Beijing、Shanghai）"},
                     "unit": {"type": "string", "enum": ["c", "f"], "default": "c"},
-                    "hours": {"type": "integer", "default": 6, "description": "Number of hours to show in summary (full data always available)"}
+                    "hours": {"type": "integer", "default": 6, "description": "摘要中展示的小时数（完整数据始终可用）"}
                 },
                 "required": ["city"]
             },
@@ -750,12 +750,12 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "news",
-            "description": "Get latest news headlines from major sources.",
+            "description": "Get latest headlines from major news sources (bbc / reuters / cna / cnn / nytimes / guardian / zaobao / xinhua / all).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "source": {"type": "string", "enum": ["bbc", "reuters", "cna", "cnn", "nytimes", "guardian", "zaobao", "xinhua", "all"], "default": "bbc"},
-                    "limit": {"type": "integer", "default": 5, "description": "Number of headlines (1-10)"}
+                    "limit": {"type": "integer", "default": 5, "description": "返回条数（1-10）"}
                 }
             }
         }
@@ -764,16 +764,16 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "crypto_price",
-            "description": "Get current price of a cryptocurrency.",
+            "description": "Get the current spot price of a cryptocurrency (btc / eth / doge / etc.) in the requested currency.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '查询比特币价格'"
+                        "description": "简述本次操作目的（≤60字）。示例：查询比特币价格"
                     },
-                    "coin": {"type": "string", "description": "Coin symbol (btc, eth, doge, etc.)"},
-                    "currency": {"type": "string", "default": "usd", "description": "Target currency"}
+                    "coin": {"type": "string", "description": "币种符号（btc、eth、doge 等）"},
+                    "currency": {"type": "string", "default": "usd", "description": "计价货币"}
                 },
                 "required": ["coin"]
             }
@@ -783,11 +783,11 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "ip_geo",
-            "description": "Get geolocation info for an IP address (or server IP if omitted).",
+            "description": "Get geolocation info (country, region, city, ISP, ASN) for an IPv4 address. If ip omitted, queries the server's own IP.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "ip": {"type": "string", "description": "IPv4 address (optional)"}
+                    "ip": {"type": "string", "description": "IPv4 地址（可选，缺省时查服务器自身）"}
                 }
             }
         }
@@ -796,11 +796,11 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "qr_code",
-            "description": "Generate a QR code image from given text/URL. Returns the image URL uploaded to R2.",
+            "description": "Generate a QR code image from text or URL and return its R2 URL.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "text": {"type": "string", "description": "Text or URL to encode"}
+                    "text": {"type": "string", "description": "要编码的文本或 URL"}
                 },
                 "required": ["text"]
             }
@@ -810,16 +810,16 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "image_search",
-            "description": "Search the web for images and return the image URLs uploaded to R2. Use this when the user asks to see a picture of something. You can then embed these images in your final answer using <img> tags.",
+            "description": "Search the web for images matching a query and return their R2 URLs. Use when the user asks to see a picture of something. Embed returned URLs in your final reply via <img> tags if needed.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '搜索猫的图片'"
+                        "description": "简述本次操作目的（≤60字）。示例：搜索猫的图片"
                     },
-                    "query": {"type": "string", "description": "Search query for images"},
-                    "num_results": {"type": "integer", "description": "Number of images to return (1-10)", "default": 3}
+                    "query": {"type": "string", "description": "图片搜索关键词"},
+                    "num_results": {"type": "integer", "description": "返回图片数（1-10）", "default": 3}
                 },
                 "required": ["query"]
             }
@@ -830,13 +830,13 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "geocode",
-            "description": "将地址或地名转换为经纬度坐标（地理编码）。返回包含纬度、经度、完整地址及地址各组成部分。",
+            "description": "将地址或地名转换为经纬度坐标（地理编码）。返回纬度、经度、完整规范化地址及各组成部分。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '将北京西站转为坐标'"
+                        "description": "简述本次操作目的（≤60字）。示例：将北京西站转为坐标"
                     },
                     "address": {"type": "string", "description": "地址或地名，如 '北京市海淀区中关村'"}
                 },
@@ -848,13 +848,13 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "route",
-            "description": "规划两个地点之间的路线（驾车/步行/骑行/公交）。返回距离、时间、分段指引及起终点坐标。",
+            "description": "规划两点之间的路线（driving / walking / cycling / transit）。返回总距离、总时间、分段指引及起终点坐标。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '规划从家到公司的驾车路线'"
+                        "description": "简述本次操作目的（≤60字）。示例：规划从家到公司的驾车路线"
                     },
                     "start": {"type": "string", "description": "起点地址或坐标（lat,lon）"},
                     "end": {"type": "string", "description": "终点地址或坐标"},
@@ -872,13 +872,13 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "distance",
-            "description": "计算地球上两点之间的直线距离（大圆距离），返回公里和英里。",
+            "description": "计算地球上两点之间的大圆直线距离，返回公里和英里。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '计算北京到上海的直线距离'"
+                        "description": "简述本次操作目的（≤60字）。示例：计算北京到上海的直线距离"
                     },
                     "from_lat": {"type": "number", "description": "起点纬度"},
                     "from_lon": {"type": "number", "description": "起点经度"},
@@ -893,13 +893,13 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "place_details",
-            "description": "获取地点详细信息，包括名称、电话、网站、营业时间、菜系、无障碍设施、Wi-Fi、评分等。需要提供地点名称或坐标。",
+            "description": "获取地点详情：名称、电话、网站、营业时间、菜系、评分、无障碍设施、Wi-Fi 等。需提供地点名称或坐标。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '查询故宫的开放时间'"
+                        "description": "简述本次操作目的（≤60字）。示例：查询故宫的开放时间"
                     },
                     "query": {"type": "string", "description": "地点名称，如 '故宫博物院'"},
                     "lat": {"type": "number", "description": "可选：已知纬度，提高搜索精度"},
@@ -913,13 +913,13 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "elevation",
-            "description": "查询某经纬度点的海拔（米）。",
+            "description": "查询某经纬度点的海拔高度（米）。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '查询珠穆朗玛峰海拔'"
+                        "description": "简述本次操作目的（≤60字）。示例：查询珠穆朗玛峰海拔"
                     },
                     "lat": {"type": "number", "description": "纬度"},
                     "lon": {"type": "number", "description": "经度"}
@@ -932,13 +932,13 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "traffic",
-            "description": "获取指定位置周边的实时交通事件信息（拥堵、事故等）。注意：需要配置 TomTom API Key。",
+            "description": "获取指定位置周边的实时交通事件（拥堵、事故、施工等）。需配置 TomTom API Key。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '查询天安门附近的交通状况'"
+                        "description": "简述本次操作目的（≤60字）。示例：查询天安门附近的交通状况"
                     },
                     "lat": {"type": "number", "description": "纬度"},
                     "lon": {"type": "number", "description": "经度"},
@@ -952,13 +952,13 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "isochrone",
-            "description": "计算从某点出发，在给定时间内可达范围的多边形（等时圈）。需要配置 OpenRouteService API 密钥。",
+            "description": "计算从某点出发、给定时间内可达范围的多边形（等时圈）。需配置 OpenRouteService API Key。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '计算10分钟驾车可达范围'"
+                        "description": "简述本次操作目的（≤60字）。示例：计算10分钟驾车可达范围"
                     },
                     "lat": {"type": "number", "description": "中心纬度"},
                     "lon": {"type": "number", "description": "中心经度"},
@@ -973,13 +973,13 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "search_poi",
-            "description": "按关键词搜索兴趣点（POI），如 '天安门'、'故宫'。返回匹配的地点列表及详细信息。",
+            "description": "以某点为中心、按关键词搜索周边兴趣点（POI），如 '天安门'、'故宫'。返回匹配地点列表及详情。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '搜索故宫'"
+                        "description": "简述本次操作目的（≤60字）。示例：搜索故宫"
                     },
                     "lat": {"type": "number", "description": "中心纬度"},
                     "lon": {"type": "number", "description": "中心经度"},
@@ -996,94 +996,92 @@ SEARCH_TOOLS = [
         "function": {
             "name": "text_editor",
             "description": (
-                "View, create, edit, delete, and undo changes to text files or directories.\n"
-                "Prefer Claude Code style editing:\n"
-                "  1. Use 'view' once to inspect the target area. Optionally pass 'search_terms' to quickly locate keywords with context.\n"
-                "  2. For line-accurate edits, use command='replace_lines' with 'delete_range' and 'new_str'.\n"
-                "  3. For text matches, use command='str_replace' with a narrow 'start_line'/'end_line' scope.\n"
+                "View / create / edit / delete / undo text files (and directories). Recommended workflow:\n"
+                "  1. 'view' once to inspect the target area; pass 'search_terms' to jump to keywords.\n"
+                "  2. For line-accurate edits use command='replace_lines' with 'delete_range' + 'new_str'.\n"
+                "  3. For text matches use command='str_replace' with a narrow start_line/end_line scope.\n"
                 "  4. If a replacement misses, re-view the smallest relevant range instead of retrying blindly.\n"
-                "  5. For repeated structures, set 'allow_multi'=True or use 'use_regex'=True.\n"
-                "For **delete**, specify 'delete_range' (e.g., [10, 20]) to delete lines.\n"
-                "For **undo**, call command='undo_edit' to revert the last edit on that file."
+                "  5. For repeated structures set 'allow_multi'=True or 'use_regex'=True.\n"
+                "For delete use 'delete_range' (e.g. [10, 20]); for undo use command='undo_edit'."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '创建配置文件'"
+                        "description": "简述本次操作目的（≤60字）。示例：创建配置文件"
                     },
                     "command": {
                         "type": "string",
                         "enum": ["view", "str_replace", "replace_lines", "create", "insert", "delete", "undo_edit"],
-                        "description": "The command to execute."
+                        "description": "要执行的命令。"
                     },
                     "path": {
                         "type": "string",
-                        "description": "Path to the file or directory. Directories should end with slash."
+                        "description": "文件或目录路径。目录需以 / 结尾。"
                     },
                     "view_range": {
                         "type": "array",
                         "items": {"type": "integer"},
                         "minItems": 2,
                         "maxItems": 2,
-                        "description": "Optional start and end line numbers (1-indexed). End -1 means to end."
+                        "description": "view 命令的 [起始行, 结束行]（1-indexed，-1 表示到末尾）。"
                     },
                     "search_terms": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional list of keywords to search within the file when using 'view' command. Returns each match with line number and surrounding context."
+                        "description": "view 时可选的关键词列表，返回每个匹配的行号与上下文。"
                     },
                     "old_str": {
                         "type": "string",
-                        "description": "Text to replace (for str_replace). If use_regex=True, treat as regex."
+                        "description": "str_replace 时要替换的文本。use_regex=True 时作为正则。"
                     },
                     "new_str": {
                         "type": "string",
-                        "description": "New text (for str_replace)."
+                        "description": "str_replace / replace_lines 的新文本。"
                     },
                     "start_line": {
                         "type": "integer",
-                        "description": "Starting line for replacement/delete scope (1-indexed). Default 1."
+                        "description": "替换/删除范围的起始行（1-indexed，默认 1）。"
                     },
                     "end_line": {
                         "type": "integer",
-                        "description": "Ending line for scope (1-indexed). -1 means end of file. Default -1."
+                        "description": "范围的结束行（1-indexed，-1 表示到末尾，默认 -1）。"
                     },
                     "occurrence": {
                         "type": "integer",
-                        "description": "Replace only the Nth occurrence (1-indexed). Used only when allow_multi=False. If not provided and multiple matches, the first match is replaced."
+                        "description": "仅 allow_multi=False 时有效：替换第 N 次出现（1-indexed）。未提供且多处匹配时替换首个。"
                     },
                     "allow_multi": {
                         "type": "boolean",
-                        "description": "If True, replace all occurrences in the scope. Default False."
+                        "description": "True 则替换范围内的所有匹配。默认 False。"
                     },
                     "use_regex": {
                         "type": "boolean",
-                        "description": "If True, treat old_str as a regular expression. Default False."
+                        "description": "True 则将 old_str 作为正则。默认 False。"
                     },
                     "delete_range": {
                         "type": "array",
                         "items": {"type": "integer"},
                         "minItems": 2,
                         "maxItems": 2,
-                        "description": "For 'delete' command, specify [start_line, end_line] to delete (1-indexed)."
+                        "description": "delete 命令的 [起始行, 结束行]（1-indexed）。"
                     },
                     "insert_line": {
                         "type": "integer",
-                        "description": "Line number after which to insert (0 for beginning of file)."
+                        "description": "insert 命令插入位置（0 表示文件开头）。"
                     },
                     "insert_text": {
                         "type": "string",
-                        "description": "Text to insert."
+                        "description": "insert 命令要插入的文本。"
                     },
                     "file_text": {
                         "type": "string",
-                        "description": "Content for create command."
+                        "description": "create 命令的文件内容。"
                     },
                     "confirm": {
                         "type": "boolean",
-                        "description": "REQUIRED for delete command on directories. Must be true."
+                        "description": "删除目录时必填，必须为 true。"
                     }
                 },
                 "required": ["command", "path"]
@@ -1095,26 +1093,23 @@ SEARCH_TOOLS = [
         "function": {
             "name": "bash",
             "description": (
-                "Execute shell commands in a persistent bash session. "
-                "The session maintains environment variables and working directory across calls. "
-                "Use this for system operations, running scripts, file manipulation, etc. "
-                "Avoid interactive commands (like vim, top) and long-running processes. "
-                "To restart the session (e.g., to clear environment), set 'restart' to true."
+                "Execute shell commands in a persistent bash session (env vars and cwd persist across calls). "
+                "Use for system operations, running scripts, file manipulation. Avoid interactive commands (vim, top) and long-running processes. Set 'restart'=true to reset the session."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "A short description of what you are doing (max 60 chars). Example: '查看项目文件列表'"
+                        "description": "简述本次操作目的（≤60字）。示例：查看项目文件列表"
                     },
                     "command": {
                         "type": "string",
-                        "description": "The bash command to execute."
+                        "description": "要执行的 bash 命令。"
                     },
                     "restart": {
                         "type": "boolean",
-                        "description": "Set to true to restart the bash session (clears state)."
+                        "description": "true 则重启 bash 会话（清空状态）。"
                     }
                 }
             },
@@ -1131,11 +1126,8 @@ SEARCH_TOOLS = [
         "function": {
             "name": "present_files",
             "description": (
-                "Send one or more files (created by text_editor or bash) to the chat. "
-                "Use this when the user asks to see or receive the files you've created. "
-                "The files are read from the current workspace (synced with R2). "
-                "You may pass a list of file paths (relative to workspace root). "
-                "Wildcards are not supported; provide exact paths."
+                "Send one or more workspace files (created via text_editor or bash) to the chat as attachments. "
+                "Pass exact paths relative to workspace root; wildcards are not supported."
             ),
             "parameters": {
                 "type": "object",
@@ -1143,7 +1135,7 @@ SEARCH_TOOLS = [
                     "paths": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "List of file paths to send."
+                        "description": "要发送的文件路径列表。"
                     }
                 },
                 "required": ["paths"]
@@ -1156,19 +1148,18 @@ SEARCH_TOOLS = [
             "function": {
                 "name": "generate_image_from_text",
                 "description": (
-                    "Generate a completely new image from a text prompt only. "
-                    "Use this when the user wants to create an image from scratch, without any reference image. "
+                    "Generate a new image from a text prompt only (no reference image). Use when the user wants to create an image from scratch. "
                     f"Available models: {', '.join(TEXT_ONLY_MODELS)}"
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "_description": {"type": "string", "description": "Short description of what you're doing"},
-                        "prompt": {"type": "string", "description": "Detailed image description"},
+                        "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
+                        "prompt": {"type": "string", "description": "详细的图片描述"},
                         "model": {
                             "type": "string",
                             "enum": TEXT_ONLY_MODELS,
-                            "description": "Choose a model that supports text-to-image only."
+                            "description": "选择一个支持文生图的模型。"
                         },
                         "aspect_ratio": {
                             "type": "string",
@@ -1199,27 +1190,22 @@ SEARCH_TOOLS = [
             "function": {
                 "name": "edit_image_with_reference",
                 "description": (
-                    "Edit or modify an existing image using a reference image and a text prompt. "
-                    "Use this when the user provides an image (e.g., uploaded photo) and wants to change something "
-                    "(style, object, background, angle, etc.). "
+                    "Edit an existing image using a reference image + a text prompt. Use when the user provides an image and wants to change something (style, object, background, angle, etc.). "
                     f"Available models: {', '.join(EDIT_MODELS)}"
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "_description": {"type": "string", "description": "Short description of what you're doing"},
-                        "prompt": {"type": "string", "description": "Edit instruction (e.g., 'make it look like a painting')"},
+                        "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
+                        "prompt": {"type": "string", "description": "编辑指令（如 '改成水彩画风格'）"},
                         "image_url": {
                             "type": "string",
-                            "description": (
-                                "The URL or base64 data of the reference image to edit. "
-                                "You MUST provide this if the user has uploaded an image."
-                            )
+                            "description": "参考图的 URL 或 base64 数据。用户上传过图片时必填。"
                         },
                         "model": {
                             "type": "string",
                             "enum": EDIT_MODELS,
-                            "description": "Choose a model that supports image-to-image editing."
+                            "description": "选择一个支持图生图编辑的模型。"
                         },
                         "aspect_ratio": {
                             "type": "string",
@@ -1250,32 +1236,25 @@ SEARCH_TOOLS = [
             "function": {
                 "name": "generate_video",
                 "description": (
-                    "Generate a short video from a text prompt. "
-                    "Use this when the user explicitly asks to create / generate / make a video (视频). "
-                    "Do NOT use this for animated images, GIFs, or images that just 'look moving' — use generate_image_from_text instead. "
-                    "Generation is asynchronous and may take 1-5 minutes. "
-                    "The tool returns the video URL. The video is automatically embedded in the tool result card. "
-                    "You MAY also inline the video in your final reply using "
-                    "<figure><video src=\"URL\"></video></figure> — the system will automatically HTML-escape "
-                    "the URL, so just paste it verbatim. "
+                    "Generate a short video from a text prompt. Use when the user explicitly asks to create / generate / make a video. Do NOT use for animated images or GIFs (use generate_image_from_text instead). Generation is async and may take 1-5 minutes; the returned URL is auto-embedded in the tool card and can also be inlined via <figure><video src=\"URL\"></video></figure>. "
                     f"Available models: {', '.join(VIDEO_MODELS) if VIDEO_MODELS else '(none configured)'}"
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "_description": {"type": "string", "description": "Short description of what you're doing"},
+                        "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
                         "prompt": {
                             "type": "string",
-                            "description": "Detailed description of the video scene, subject, motion, camera, style, etc."
+                            "description": "视频场景详细描述（主体、运动、镜头、风格等）。"
                         },
                         "model": {
                             "type": "string",
                             "enum": VIDEO_MODELS,
-                            "description": "Choose a model that supports text-to-video generation."
+                            "description": "选择一个支持文生视频的模型。"
                         },
                         "duration": {
                             "type": "integer",
-                            "description": "Video duration in seconds. Range 3-30. Default 5.",
+                            "description": "视频时长（秒），范围 3-30，默认 5。",
                             "default": 5,
                             "minimum": 3,
                             "maximum": 30

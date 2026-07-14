@@ -1240,49 +1240,15 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 - For HTML generation tasks: write the file ONCE with create. If it already exists from a previous turn in the same chat, use str_replace to swap the whole content (old_str = entire old content, new_str = entire new content), or delete+create. Do not generate new filenames like 2.txt, 3.txt, etc. just to dodge the "already exists" error.
 
 <tool_description_guide>
-当你调用以下工具时，请在参数中添加一个 `_description` 字段，用简短的句子（不超过60字）描述你正在做什么：
-- bash：描述你要执行的命令的目的
-- text_editor：描述你要对文件做什么操作
-- book_lookup：描述你要查什么书
-- nearby_search：描述你要搜索什么类别
-- route：描述你要规划什么路线
-- distance：描述你要计算什么距离
-- exchange_rate：描述你要查询什么汇率
-- crypto_price：描述你要查询什么加密货币
-- weather：描述你要查询哪个城市的天气
-- search_poi：描述你要搜索什么兴趣点
-- todo：描述你要对待办清单做什么操作（新增/列出/完成/删除/清空/编辑）
-- memory：描述你要保存/查找/更新什么长期记忆
-- skill：描述你要查看/激活/注册什么技能
-- subagent：描述你要派子 agent 完成什么子任务
-
-示例：
-- bash: {"command": "ls -la", "_description": "查看当前目录所有文件"}
-- text_editor: {"command": "view", "path": "config.json", "_description": "查看配置文件内容"}
-- weather: {"city": "北京", "_description": "查询北京今日天气"}
-- todo: {"action": "add", "title": "买牛奶", "priority": "high", "tags": ["购物"], "_description": "新增一条买牛奶的高优先级待办"}
-- memory: {"action": "add", "content": "用户对花生过敏", "category": "fact", "importance": "high", "_description": "保存用户过敏信息"}
-- skill: {"action": "use", "name": "summarizer", "_description": "激活长文摘要技能"}
-- subagent: {"task": "调研 2025 年 3 个开源 LLM", "_description": "派子 agent 做 LLM 调研"}
-
-这个描述会显示给用户，帮助他们理解你的操作。
+为每个工具调用添加 `_description` 字段（≤60字，纯文本），简述本次操作目的。该字段会显示给用户，帮助他们理解你在做什么。示例见各工具定义的 input_examples。
 </tool_description_guide>
 
-<todo_tool_guide>
-<b>待办清单（todo）</b>：持久化任务清单，跨会话保留。8 种操作：add/list/done/undone/toggle/delete/clear/edit。写操作后紧跟一次 list 让用户看到最新状态。用户说"记一下""提醒我"时优先用 todo。
-</todo_tool_guide>
-
-<memory_tool_guide>
-<b>长期记忆（memory）</b>：跨会话永久保留事实/偏好/人物/事件，不同于会自动修剪的对话历史。7 种操作：add/get/list/search/update/delete/clear。用户说"记住…"/提到长期偏好/过敏/重要他人/截止日期时写入；回答涉及偏好的问题前先 search。
-</memory_tool_guide>
-
-<skill_tool_guide>
-<b>技能（skill）</b>：激活可复用能力模板。内置 7 技能：translator/summarizer/coder/reviewer/explainer/brainstormer/planner。操作：list/info/use/register/update/delete。use 后按该技能的 system_prompt 调整回复风格。用户可 register 自定义技能。
-</skill_tool_guide>
-
-<subagent_tool_guide>
-<b>子 agent（subagent）</b>：派生干净上下文的子 agent 处理独立子任务。子 agent 不继承主对话历史，只看到 task + context。可并发调用多个子 agent。安全护栏：不能递归调 subagent/memory/skill；最大 8 轮/90s。简单问题自己答，不要滥用。
-</subagent_tool_guide>
+<tool_usage_guide>
+- todo：用户说"记一下""提醒我"时优先用。写操作（add/done/undone/delete/edit/clear）后紧跟一次 list，让用户看到最新状态。
+- memory：用户说"记住…"或提到长期偏好/过敏/重要他人/截止日期时写入；回答涉及偏好的问题前先 search。
+- skill：use 后按该技能的 system_prompt 调整回复风格，直到用户切换或取消。
+- subagent：可并发派多个；简单问题自己答，不要滥用。子 agent 不继承主对话历史，只看到 task + context。
+</tool_usage_guide>
 """
     else:
         base_prompt += """

@@ -728,11 +728,13 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 img_url = img_match.group(1)
                 content_text = content_match.group(1) if content_match else "已编码内容"
                 summary = "📱 二维码已生成"
+                # 转义 URL（R2 presigned URL 含大量 & 需转义为 &amp;）
+                safe_url = escape_html(img_url)
                 details_html = (
-                    f'<img src="{img_url}"/><br/>'
+                    f'<img src="{safe_url}"/><br/>'
                     f'<b>✅ 二维码生成成功</b><br/>'
                     f'<b>内容：</b>{escape_text(content_text)}<br/>'
-                    f'<b>链接：</b><a href="{img_url}">📷 点击查看/下载二维码</a>'
+                    f'<b>链接：</b><a href="{safe_url}">📷 点击查看 / 下载二维码</a>'
                 )
                 return summary, details_html
         summary = "📱 二维码"
@@ -746,8 +748,14 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             if urls:
                 count = len(urls)
                 summary = f"🎨 Generated {count} image" + ("" if count == 1 else "s")
-                img_tags = "".join(f'<img src="{u}"/>' for u in urls)
-                details_html = f'<tg-collage>{img_tags}<figcaption>{escape_text(result_str)}</figcaption></tg-collage>'
+                img_tags = "".join(f'<img src="{escape_html(u)}"/>' for u in urls)
+                # 用简短的"图片 1 / 图片 2"文本链接替代裸 URL，避免长 R2 presigned URL 刷屏
+                link_items = "".join(
+                    f'<li><a href="{escape_html(u)}">图片 {i + 1}</a></li>'
+                    for i, u in enumerate(urls)
+                )
+                caption = f"已生成 {count} 张图片：<ul>{link_items}</ul>"
+                details_html = f'<tg-collage>{img_tags}<figcaption>{caption}</figcaption></tg-collage>'
                 return summary, details_html
         summary = "🎨 Image generation"
         details_html = escape_text(result_str)
@@ -760,8 +768,13 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             if urls:
                 count = len(urls)
                 summary = f"🎨 Edited {count} image" + ("" if count == 1 else "s")
-                img_tags = "".join(f'<img src="{u}"/>' for u in urls)
-                details_html = f'<tg-collage>{img_tags}<figcaption>{escape_text(result_str)}</figcaption></tg-collage>'
+                img_tags = "".join(f'<img src="{escape_html(u)}"/>' for u in urls)
+                link_items = "".join(
+                    f'<li><a href="{escape_html(u)}">图片 {i + 1}</a></li>'
+                    for i, u in enumerate(urls)
+                )
+                caption = f"已编辑 {count} 张图片：<ul>{link_items}</ul>"
+                details_html = f'<tg-collage>{img_tags}<figcaption>{caption}</figcaption></tg-collage>'
                 return summary, details_html
         summary = "🎨 Image editing"
         details_html = escape_text(result_str)
@@ -787,8 +800,12 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                     duration_str = f" · {m.group(1)}s"
                 summary = f"🎬 Video generated{duration_str}"
                 # <figure><video> 是一个独立 media block，可以与其他 block 同消息发送；
-                # 不附 figcaption —— 与图片工具行为对称，卡片里只展示视频本体
-                details_html = f'<figure><video src="{escape_html(video_url)}"></video></figure>'
+                # 附带简短文本链接 caption，避免裸 R2 presigned URL 刷屏
+                details_html = (
+                    f'<figure><video src="{escape_html(video_url)}"></video>'
+                    f'<figcaption><a href="{escape_html(video_url)}">下载 / 查看视频</a></figcaption>'
+                    f'</figure>'
+                )
                 return summary, details_html
         summary = "🎬 Video generation"
         details_html = escape_text(result_str)
@@ -801,10 +818,10 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             if urls:
                 summary = f"🖼️ 找到 {len(urls)} 张图片"
                 img_tags = "".join(f'<img src="{html.escape(u)}"/>' for u in urls)
+                # 用简短的"图片 1 / 图片 2"文本链接替代裸 URL，避免长 R2 presigned URL 刷屏
                 link_items = ""
-                for u in urls:
-                    domain = extract_domain(u)
-                    link_items += f'<li><a href="{html.escape(u)}">{domain}</a></li>'
+                for i, u in enumerate(urls):
+                    link_items += f'<li><a href="{html.escape(u)}">图片 {i + 1}</a></li>'
                 link_list = f"<ul>{link_items}</ul>" if link_items else ""
                 details_html = (
                     f'<tg-collage>{img_tags}<figcaption>点击图片查看大图</figcaption></tg-collage>'

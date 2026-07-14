@@ -604,64 +604,58 @@ MEMORY_TOOL = {
     "function": {
         "name": "memory",
         "description": (
-            "Persistent per-chat long-term memory store. Use this to remember facts, "
-            "preferences, people, events, or any note that should survive across "
-            "sessions (unlike conversation history which is short-lived). "
-            "Supports 7 actions: add / get / list / search / update / delete / clear. "
-            "Each memory has a category, tags, and importance (low/medium/high). "
-            "When the user mentions something they want you to remember, write it to memory; "
-            "when answering, optionally search memory for relevant context."
+            "Persistent per-chat long-term memory store. Use to remember facts, preferences, people, events, or any note that should survive across sessions (unlike short-lived conversation history). 7 actions: add / get / list / search / update / delete / clear. Each memory carries category, tags, and importance (low/medium/high). Write when the user mentions something worth remembering; search before answering preference-related questions."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "_description": {
                     "type": "string",
-                    "description": "A short description of what you are doing (max 60 chars). Example: 保存用户偏好：喜欢清淡口味"
+                    "description": "简述本次操作目的（≤60字）。示例：保存用户偏好：喜欢清淡口味"
                 },
                 "action": {
                     "type": "string",
                     "enum": ["add", "get", "list", "search", "update", "delete", "clear"],
-                    "description": "Operation to perform. Default: list."
+                    "description": "要执行的操作。默认 list。"
                 },
                 "content": {
                     "type": "string",
-                    "description": "Memory content. Required for add/update. Max 2000 chars."
+                    "description": "记忆内容。add/update 必填。最长 2000 字符。"
                 },
                 "memory_id": {
                     "type": "string",
-                    "description": "Target memory id (8-char hex) or display seq (with or without #). Required for get/update/delete."
+                    "description": "目标记忆 id：8 位 hex 或显示序号（带/不带 # 前缀均可）。get/update/delete 必填。"
                 },
                 "category": {
                     "type": "string",
-                    "description": "Memory category. Built-in: fact / preference / person / event / note. Or any custom string."
+                    "description": "记忆分类。内置：fact / preference / person / event / note；也可用自定义字符串。"
                 },
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional tags. Up to 8 tags, each <=24 chars. Also accepts comma/space-separated string."
+                    "description": "可选标签，最多 8 个，每个 ≤24 字符。也接受逗号/空格分隔的字符串。"
                 },
                 "importance": {
                     "type": "string",
                     "enum": ["low", "medium", "high"],
-                    "description": "Importance level. Default medium."
+                    "description": "重要程度，默认 medium。"
                 },
                 "query": {
                     "type": "string",
-                    "description": "Search query (search action only). Substring match against content+tags+category."
+                    "description": "搜索查询（仅 search）。对 content+tags+category 做子串匹配。"
                 },
                 "scope": {
                     "type": "string",
-                    "description": "Clear scope. Options: all (default), category:<name>, tag:<name>."
+                    "description": "清除范围。可选：all（默认）、category:<名称>、tag:<名称>。"
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Max items to return for list/search. Default 50, max 500.",
+                    "description": "list/search 返回上限。默认 50，最大 500。",
                     "default": 50
                 },
                 "source": {
                     "type": "string",
-                    "description": "Who wrote this memory. agent (default) or user."
+                    "description": "记忆来源。agent（默认）或 user。"
                 }
             },
             "required": ["action"]

@@ -631,51 +631,41 @@ SKILL_TOOL = {
     "function": {
         "name": "skill",
         "description": (
-            "Skill registry — apply a reusable capability template (translator, "
-            "summarizer, coder, reviewer, explainer, brainstormer, planner, or "
-            "any user-defined custom skill). Each skill bundles a system_prompt "
-            "and an optional tool whitelist. "
-            "6 actions: list / info / use / register / update / delete. "
-            "Use use to activate a skill — its system_prompt will guide your "
-            "behavior until the user switches or cancels. "
-            "Use register to let the user define their own skill."
+            "Skill registry — apply a reusable capability template (translator / summarizer / coder / reviewer / explainer / brainstormer / planner, or any user-defined custom skill). Each skill bundles a system_prompt and an optional tool whitelist. 6 actions: list / info / use / register / update / delete. Use 'use' to activate a skill — its system_prompt will guide your behavior until the user switches or cancels. Use 'register' to let the user define their own skill."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "_description": {
                     "type": "string",
-                    "description": "A short description of what you are doing (max 60 chars). Example: 激活 summarizer 技能"
+                    "description": "简述本次操作目的（≤60字）。示例：激活 summarizer 技能"
                 },
                 "action": {
                     "type": "string",
                     "enum": ["list", "info", "use", "register", "update", "delete"],
-                    "description": "Operation to perform. Default: list."
+                    "description": "要执行的操作。默认 list。"
                 },
                 "name": {
                     "type": "string",
-                    "description": (
-                        "Skill name. Lowercase letters/digits/underscore, must start with a letter, "
-                        "length 2-32. Required for info/use/register/update/delete."
-                    )
+                    "description": "技能名称。小写字母/数字/下划线，首字母必须是字母，长度 2-32。info/use/register/update/delete 必填。"
                 },
                 "description": {
                     "type": "string",
-                    "description": "One-line description (register/update only). Max 200 chars."
+                    "description": "一句话描述（仅 register/update）。最长 200 字符。"
                 },
                 "system_prompt": {
                     "type": "string",
-                    "description": "The skill's system prompt fragment (register/update only). Max 4000 chars."
+                    "description": "技能的 system_prompt 片段（仅 register/update）。最长 4000 字符。"
                 },
                 "tools": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional tool whitelist (register/update only). E.g. [bash, text_editor]. Empty list = no tools."
+                    "description": "可选的工具白名单（仅 register/update）。如 [bash, text_editor]。空数组表示不允许任何工具。"
                 },
                 "examples": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional trigger example phrases (register/update only). Up to 10, each <=80 chars."
+                    "description": "可选的触发示例话术（仅 register/update）。最多 10 条，每条 ≤80 字符。"
                 }
             },
             "required": ["action"]

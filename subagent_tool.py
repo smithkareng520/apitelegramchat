@@ -478,47 +478,35 @@ SUBAGENT_TOOL = {
     "function": {
         "name": "subagent",
         "description": (
-            "Spawn a sub-agent to handle an isolated sub-task with a fresh context. "
-            "The sub-agent does NOT inherit the parent's conversation history — it only "
-            "sees the task description and an optional context string you provide. "
-            "It can call a restricted set of tools (you can further narrow the whitelist). "
-            "It runs a mini agentic loop and returns a final answer. "
-            "Use this for: research sub-tasks, parallelizable independent sub-problems, "
-            "or any case where you want to delegate a self-contained piece of work. "
-            "The sub-agent CANNOT recursively call subagent / memory / skill (forbidden)."
+            "Spawn a sub-agent to handle an isolated sub-task with a fresh context. The sub-agent does NOT inherit the parent's conversation history — it only sees the task description and an optional context string you provide. It runs a mini agentic loop with a restricted tool whitelist and returns a final answer. Use for: research sub-tasks, parallelizable independent sub-problems, or any case where you want to delegate a self-contained piece of work. The sub-agent CANNOT recursively call subagent / memory / skill."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "_description": {
                     "type": "string",
-                    "description": "A short description of what you are doing (max 60 chars). Example: 派子 agent 调研量子计算最新进展"
+                    "description": "简述本次操作目的（≤60字）。示例：派子 agent 调研量子计算最新进展"
                 },
                 "task": {
                     "type": "string",
-                    "description": "The sub-task description. Be specific about what the sub-agent should produce. Max 4000 chars."
+                    "description": "子任务描述。明确说明要让子 agent 产出什么。最长 4000 字符。"
                 },
                 "context": {
                     "type": "string",
-                    "description": "Optional background context to give the sub-agent. Max 8000 chars. Use this to pass relevant facts from the parent conversation."
+                    "description": "可选的背景上下文。最长 8000 字符。可用来传递父对话中的相关信息。"
                 },
                 "model": {
                     "type": "string",
-                    "description": "Optional model ID to use (from SUPPORTED_MODELS). Defaults to the same model the parent uses."
+                    "description": "可选的模型 ID（来自 SUPPORTED_MODELS）。默认与父 agent 同款。"
                 },
                 "allowed_tools": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": (
-                        "Optional tool whitelist for the sub-agent. If omitted, a safe default set is used "
-                        "(web_search, fetch_url, wikipedia, weather, bash, text_editor, todo, etc.). "
-                        "Pass an empty list to forbid all tools. "
-                        "Forbidden regardless: subagent, memory, skill (recursion / state safety)."
-                    )
+                    "description": "可选的工具白名单。缺省时使用安全默认集（web_search/fetch_url/wikipedia/weather/bash/text_editor/todo 等）。传空数组则禁用所有工具。无论是否指定，subagent/memory/skill 始终禁用。"
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Overall timeout in seconds. Default 90, max 300.",
+                    "description": "整体超时（秒）。默认 90，最大 300。",
                     "default": 90
                 }
             },

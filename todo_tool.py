@@ -846,56 +846,51 @@ TODO_TOOL = {
     "function": {
         "name": "todo",
         "description": (
-            "Manage a persistent per-chat todo / task list. "
-            "Supports 8 actions: add / list / done / undone / toggle / delete / clear / edit. "
-            "Todos are stored in the user's workspace and survive across sessions. "
-            "Always call list after add/done/undone/delete/edit/clear so the user sees the updated list."
+            "Persistent per-chat todo list. 8 actions: add / list / done / undone / toggle / delete / clear / edit. "
+            "Todos are stored in the user's workspace and survive across sessions. After any write action (add/done/undone/delete/edit/clear) immediately call list so the user sees the updated state."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "_description": {
                     "type": "string",
-                    "description": "A short description of what you are doing (max 60 chars). Example: 添加一条买菜的待办"
+                    "description": "简述本次操作目的（≤60字）。示例：添加一条买菜的待办"
                 },
                 "action": {
                     "type": "string",
                     "enum": ["add", "list", "done", "undone", "toggle", "delete", "clear", "edit"],
-                    "description": "Operation to perform. Default: list."
+                    "description": "要执行的操作。默认 list。"
                 },
                 "title": {
                     "type": "string",
-                    "description": "Todo title. Required for add; optional for edit. Max 200 chars."
+                    "description": "待办标题。add 必填，edit 可选。最长 200 字符。"
                 },
                 "todo_id": {
                     "type": "string",
-                    "description": (
-                        "Target todo id. Can be the short id (8-char hex) or the display seq number "
-                        "(with or without leading #). Required for done/undone/toggle/delete/edit."
-                    )
+                    "description": "目标待办 id：8 位 hex 或显示序号（带/不带 # 前缀均可）。done/undone/toggle/delete/edit 必填。"
                 },
                 "priority": {
                     "type": "string",
                     "enum": ["low", "medium", "high"],
-                    "description": "Priority. Default medium. Used by add/edit/list(filter)."
+                    "description": "优先级，默认 medium。add/edit/list(filter) 使用。"
                 },
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional tags. Up to 8 tags, each <=24 chars. Also accepts comma/space-separated string."
+                    "description": "可选标签，最多 8 个，每个 ≤24 字符。也接受逗号/空格分隔的字符串。"
                 },
                 "note": {
                     "type": "string",
-                    "description": "Optional longer note (max 500 chars). Used by add/edit."
+                    "description": "可选的较长备注（≤500 字符）。add/edit 使用。"
                 },
                 "filter": {
                     "type": "string",
                     "enum": ["all", "pending", "done"],
-                    "description": "Filter for list/clear. For clear, done (default) only clears completed; all clears everything."
+                    "description": "list/clear 的过滤条件。clear 时 done（默认）仅清除已完成，all 清空全部。"
                 },
                 "tag": {
                     "type": "string",
-                    "description": "Filter by tag (list only)."
+                    "description": "按标签过滤（仅 list）。"
                 }
             },
             "required": ["action"]
