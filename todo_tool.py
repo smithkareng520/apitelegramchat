@@ -591,6 +591,111 @@ def _render_todo_item(t: dict) -> str:
     return f"<li>{line}</li>"
 
 
+# ---------- Basic HTML 渲染（sendMessage 兼容） ----------
+# Telegram 的 sendMessage(parse_mode=HTML) 只支持：b/strong/i/em/u/ins/s/strike/del/
+# code/pre/a/blockquote/tg-spoiler/span class="tg-spoiler"。不支持 h1-h6/table/ol/
+# ul/li/hr/p/div/br 等。sendRichMessage 才支持全部富标签。
+# 这里专门给 sendMessage / editMessageText 用一份精简渲染。
+
+def render_todo_card_basic(payload: dict, max_items: int = 20) -> str:
+    """sendMessage 兼容版渲染——只用基本 HTML 标签。"""
+    if not isinstance(payload, dict):
+        return _esc(payload)
+
+    if not payload.get("ok"):
+        return f"❌ <b>待办操作失败</b>\n{_esc(payload.get('error', '未知错误'))}"
+
+    action = payload.get("action", "list")
+
+    if action == "add":
+        t = payload.get("todo", {})
+        return (
+            f"➕ <b>已新增待办</b> <code>#{t.get('seq')}</code>\n"
+            f"{_priority_badge_basic(t)} {_esc(t.get('title'))} {_tag_chips(t)}\n"
+            f"<i>当前共 {payload.get('total', 0)} 项，待办 {payload.get('pending', 0)} 项</i>"
+        )
+    if action in ("done", "undone", "toggle"):
+        t = payload.get("todo", {})
+        icon = "✅" if t.get("done") else "↩️"
+        verb = "标记为已完成" if t.get("done") else "标记为未完成"
+        if not payload.get("changed", True):
+            verb = f"状态未变化（仍为{'已完成' if t.get('done') else '未完成'}）"
+        return (
+            f"{icon} <b>{verb}</b> <code>#{t.get('seq')}</code>\n"
+            f"{_priority_badge_basic(t)} {_esc(t.get('title'))} {_tag_chips(t)}\n"
+            f"<i>剩余 {payload.get('pending', 0)} / {payload.get('total', 0)} 项未完成</i>"
+        )
+    if action == "delete":
+        t = payload.get("todo", {})
+        return (
+            f"🗑️ <b>已删除</b> <code>#{t.get('seq')}</code>\n"
+            f"<s>{_priority_badge_basic(t)} {_esc(t.get('title'))}</s> {_tag_chips(t)}\n"
+            f"<i>剩余 {payload.get('total', 0)} 项</i>"
+        )
+    if action == "clear":
+        return (
+            f"🧹 <b>{_esc(payload.get('message', '已清空'))}</b>\n"
+            f"<i>剩余 {payload.get('total', 0)} 项，未完成 {payload.get('pending', 0)} 项</i>"
+        )
+    if action == "edit":
+        t = payload.get("todo", {})
+        return (
+            f"📝 <b>已编辑</b> <code>#{t.get('seq')}</code>\n"
+            f"{_priority_badge_basic(t)} {_esc(t.get('title'))} {_tag_chips(t)}\n"
+            f"<i>修改字段：{', '.join(payload.get('changed', [])) or '无'}</i>"
+        )
+
+    # ---- list 渲染（basic）----
+    todos = payload.get("todos", []) or []
+    total = payload.get("total", 0)
+    done = payload.get("done", 0)
+    pending = payload.get("pending", 0)
+    filter_ = payload.get("filter", "all")
+
+    lines = ["<b>📋 待办清单</b>\n"]
+    lines.append(f"共 <b>{total}</b> 项 · 已完成 <b>{done}</b> · 待办 <b>{pending}</b>")
+
+    filter_desc = {"all": "全部", "pending": "仅未完成", "done": "仅已完成"}.get(filter_, "全部")
+    lines.append(f"<i>筛选：{filter_desc}</i>")
+
+    if not todos:
+        lines.append("\n🎉 当前筛选下没有待办项")
+        return "\n".join(lines)
+
+    lines.append("———————————")
+    for i, t in enumerate(todos[:max_items]):
+        badge = _priority_badge_basic(t)
+        title = _esc(t.get("title", ""))
+        if t.get("done"):
+            title = f"<s>{title}</s>"
+            status = "✅"
+        else:
+            title = f"<b>{title}</b>"
+            status = "⬜"
+        seq = f"<code>#{t.get('seq', '?')}</code>"
+        tags = _tag_chips(t)
+        note = t.get("note", "")
+        line = f"{status} {badge} {seq} {title}"
+        if tags:
+            line += f" {tags}"
+        if note:
+            line += f"\n   <blockquote>{_esc(note)}</blockquote>"
+        lines.append(line)
+
+    extra = len(todos) - max_items
+    if extra > 0:
+        lines.append(f"\n<i>… 还有 {extra} 项未显示</i>")
+
+    return "\n".join(lines)
+
+
+def _priority_badge_basic(t: dict) -> str:
+    """基本 HTML 版优先级徽章——用 emoji + 文字，不用 <b> 嵌套。"""
+    p = t.get("priority", "medium")
+    meta = PRIORITY_META.get(p, PRIORITY_META["medium"])
+    return f"{meta['emoji']}{meta['label']}"
+
+
 # ---------- InlineKeyboard ----------
 def build_todo_keyboard(payload: dict, max_buttons: int = 12) -> dict | None:
     """
@@ -644,23 +749,18 @@ async def send_todo_card_with_keyboard(
     """
     将 list 结果作为一条带 InlineKeyboard 的 sendMessage 发出去。
     走 sendMessage(parse_mode=HTML) 而非 sendRichMessage，避免和活跃草稿抢位置。
+
+    ⚠️ sendMessage 的 HTML 解析器只支持基本标签（b/i/u/s/code/pre/a/blockquote），
+    不支持 h3/table/ol/hr 等。所以这里用 render_todo_card_basic() 而非 render_todo_card()。
     成功返回 message_id，失败返回 False。
     """
-    html_content = render_todo_card(payload)
+    html_content = render_todo_card_basic(payload)
     if not html_content or not html_content.strip():
         return False
     keyboard = build_todo_keyboard(payload)
-    text = (
-        html_content
-        .replace("<br/>", "\n")
-        .replace("<br>", "\n")
-        .replace("</br>", "\n")
-        .replace("<br />", "\n")
-        .replace("<hr/>", "\n——\n")
-    )
     payload_req = {
         "chat_id": chat_id,
-        "text": text,
+        "text": html_content,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
@@ -691,22 +791,14 @@ async def send_todo_card_with_keyboard(
 async def reapply_keyboard_for_message(chat_id: int, message_id: int, payload: dict) -> bool:
     """
     当用户通过按钮点击变更状态后，重新渲染该消息的文本与键盘。
-    使用 editMessageText。
+    使用 editMessageText。同样用 basic HTML（sendMessage 兼容）。
     """
-    html_content = render_todo_card(payload)
+    html_content = render_todo_card_basic(payload)
     keyboard = build_todo_keyboard(payload)
-    text = (
-        html_content
-        .replace("<br/>", "\n")
-        .replace("<br>", "\n")
-        .replace("</br>", "\n")
-        .replace("<br />", "\n")
-        .replace("<hr/>", "\n——\n")
-    )
     payload_req = {
         "chat_id": chat_id,
         "message_id": message_id,
-        "text": text,
+        "text": html_content,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
