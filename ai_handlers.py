@@ -1265,68 +1265,19 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 </tool_description_guide>
 
 <todo_tool_guide>
-你拥有一个持久化的 <b>待办清单（todo）工具</b>，可以为用户记录、跟踪、管理任务。
-- 数据按会话隔离，存储在用户工作区（与 R2 自动同步），跨会话保留。
-- 支持 8 种操作：add / list / done / undone / toggle / delete / clear / edit。
-- 优先级：low / medium / high（默认 medium）。支持给待办打标签、附加较长的 note。
-- todo_id 既支持短 id（8 位十六进制），也支持显示用的序号 seq（带或不带 #）。
-- <b>调用约定</b>：执行完任意写操作（add/done/undone/toggle/delete/edit/clear）后，
-  紧接着再调用一次 <code>action="list"</code>，让用户在结果卡片里看到最新状态。
-- 用户也可以直接在 Telegram 里点工具结果附带的 InlineKeyboard 按钮一键完成 / 删除，
-  无需重新打字。
-- 当用户说“记一下…”“提醒我…”“我要做的事…”“我有哪些任务”等，优先用 todo 工具，
-  而不是把列表写在对话里——清单会随会话消失，工具里的不会。
+<b>待办清单（todo）</b>：持久化任务清单，跨会话保留。8 种操作：add/list/done/undone/toggle/delete/clear/edit。写操作后紧跟一次 list 让用户看到最新状态。用户说"记一下""提醒我"时优先用 todo。
 </todo_tool_guide>
 
 <memory_tool_guide>
-你拥有一个持久化的 <b>长期记忆（memory）工具</b>，可以记住跨会话的事实、偏好、人物、事件。
-- <b>与对话历史的区别</b>：对话历史会被自动修剪（60 条上限），memory 跨会话永久保留。
-- 数据按会话隔离，存储在用户工作区，随 R2 自动同步。
-- 支持 7 种操作：add / get / list / search / update / delete / clear。
-- 每条记忆有：category（fact/preference/person/event/note/自定义）、tags、importance。
-- memory_id 支持短 id 或显示序号 seq（带或不带 #）。
-- <b>何时写入 memory</b>：用户主动说“记住…”、提到长期偏好（口味/过敏/工作）、
-  介绍自己或重要他人、提到截止日期或重要事件时。
-- <b>何时读取 memory</b>：在回答涉及用户偏好的问题前，先 <code>action="search"</code>
-  看看是否有相关记忆。例如用户问“今天吃啥”前先搜“口味”“过敏”。
-- 不要把对话中临时性的内容（如“今天天气不错”）写入 memory——只存值得跨会话保留的。
-- <b>调用约定</b>：写入后立即调用 <code>action="list"</code> 或 <code>action="get"</code>
-  让用户看到刚保存的内容，便于确认。
+<b>长期记忆（memory）</b>：跨会话永久保留事实/偏好/人物/事件，不同于会自动修剪的对话历史。7 种操作：add/get/list/search/update/delete/clear。用户说"记住…"/提到长期偏好/过敏/重要他人/截止日期时写入；回答涉及偏好的问题前先 search。
 </memory_tool_guide>
 
 <skill_tool_guide>
-你拥有一个 <b>技能（skill）工具</b>，可以激活可复用的能力模板。
-- <b>内置 7 个技能</b>：translator（中英互译）、summarizer（长文摘要）、
-  coder（工程化代码生成）、reviewer（代码评审）、explainer（概念解释）、
-  brainstormer（头脑风暴）、planner（任务拆解）。
-- <b>4 种核心操作</b>：list（列出所有）/ info（查看详情）/ use（激活）/ register（注册自定义）。
-- <b>激活语义</b>：调用 <code>action="use"</code> 后，返回的 system_prompt 会指导你
-  接下来的回复风格与格式，直到用户切换或取消。激活后请主动按该 prompt 调整行为。
-- <b>自定义技能</b>：用户可以描述“我希望你以后用 X 方式回复”——你帮他 register 一个
-  custom skill（name 用 snake_case，必填 description + system_prompt）。
-- 内置技能不可删除/更新；自定义技能可以 update / delete。
-- <b>何时用</b>：用户表达“帮我翻译”“总结一下”“写代码”“评审一下”等明确意图时，
-  先 <code>use</code> 对应技能，再开始处理。这会让回复更专业、更结构化。
+<b>技能（skill）</b>：激活可复用能力模板。内置 7 技能：translator/summarizer/coder/reviewer/explainer/brainstormer/planner。操作：list/info/use/register/update/delete。use 后按该技能的 system_prompt 调整回复风格。用户可 register 自定义技能。
 </skill_tool_guide>
 
 <subagent_tool_guide>
-你拥有一个 <b>子 agent（subagent）工具</b>，可以把独立的子任务派给一个干净上下文的子 agent。
-- <b>核心价值</b>：子 agent 不继承你的对话历史，只看到你给的 task + context，
-  可以避免主对话上下文被污染，也便于把可并行的子任务独立开。
-- <b>典型用法</b>：
-  - 多步研究：“派子 agent 调研 X 的最新进展，返回要点”——主 agent 拿到要点继续推理。
-  - 独立子问题：“把这段长文本翻译成英文”——派子 agent 干，主 agent 不被长输出干扰。
-  - 并行任务：可在一次回复里多次调用 subagent，子任务并发执行。
-- <b>关键参数</b>：
-  - task：清晰的子任务描述（必填）。
-  - context：可选的背景信息（如相关事实、用户偏好）。
-  - allowed_tools：可选工具白名单。None=默认安全白名单；[]=不允许任何工具。
-  - model / timeout：可选，默认与父同款 / 90 秒。
-- <b>安全护栏</b>：子 agent <b>不能</b>递归调用 subagent / memory / skill（防爆炸）。
-  最大循环 8 轮，整体超时 90 秒（可调到 300 秒）。
-- <b>返回</b>：JSON 含 <code>answer</code>（子 agent 最终答复）、<code>rounds</code>、
-  <code>tool_calls</code>、<code>elapsed</code>。请把 answer 整合进你的最终回复。
-- <b>不要滥用</b>：简单问题自己答即可，不要为每个问题都派子 agent——会显著增加延迟与 token 成本。
+<b>子 agent（subagent）</b>：派生干净上下文的子 agent 处理独立子任务。子 agent 不继承主对话历史，只看到 task + context。可并发调用多个子 agent。安全护栏：不能递归调 subagent/memory/skill；最大 8 轮/90s。简单问题自己答，不要滥用。
 </subagent_tool_guide>
 """
     else:

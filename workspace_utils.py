@@ -118,6 +118,60 @@ async def _async_sync_workspace_to_r2(chat_id: int):
         logger.error(f"异步全量同步失败: {e}")
 
 
+# ========== 单文件定向同步（轻量级，用于 todo/memory/skill 等小 JSON 文件） ==========
+# 旧的全量同步（_sync_workspace_from_r2 / _sync_workspace_to_r2）会下载/上传
+# workspace 里的所有文件。当 workspace 积累了几十个文件后，每次工具调用都要
+# 等 30+ 秒做全量同步——模型流式输出超时，返回空内容。
+#
+# 这组新函数只同步指定的单个文件，把延迟从 O(所有文件) 降到 O(1)。
+
+async def _sync_file_from_r2(chat_id: int, filename: str) -> None:
+    """
+    仅从 R2 下载指定的单个文件到本地 workspace。
+    如果 R2 上没有该文件，则不做什么（本地可能也没有，或本地是新建的）。
+    """
+    workspace = Path(f"./workspace/{chat_id}").resolve()
+    workspace.mkdir(parents=True, exist_ok=True)
+    local_path = workspace / filename
+
+    # 路径安全校验
+    safe_name = os.path.normpath(filename)
+    if safe_name == "." or safe_name.startswith("..") or os.path.isabs(safe_name):
+        logger.warning(f"拒绝路径遍历的 filename: {filename!r}")
+        return
+
+    key = f"editor/{chat_id}/{safe_name}"
+    data = await download_from_r2(key)
+    if data is not None:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(data)
+    # 如果 R2 上没有该文件，本地保留现状（可能是首次创建）
+
+
+async def _sync_file_to_r2(chat_id: int, filename: str) -> None:
+    """
+    仅将本地指定的单个文件上传到 R2。
+    如果本地文件不存在，则删除 R2 上的对应文件（如果有的话）。
+    """
+    workspace = Path(f"./workspace/{chat_id}").resolve()
+    local_path = workspace / filename
+
+    safe_name = os.path.normpath(filename)
+    if safe_name == "." or safe_name.startswith("..") or os.path.isabs(safe_name):
+        logger.warning(f"拒绝路径遍历的 filename: {filename!r}")
+        return
+
+    key = f"editor/{chat_id}/{safe_name}"
+    if local_path.is_file():
+        with open(local_path, "rb") as f:
+            data = f.read()
+        await upload_bytes_to_r2(data, key, "application/json")
+    else:
+        # 本地没有此文件，清理 R2 上的残留
+        await delete_r2_object(key)
+
+
 # ========== 可选：初始化工作区（后台执行） ==========
 
 async def init_workspace(chat_id: int):

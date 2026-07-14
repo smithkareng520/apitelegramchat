@@ -48,8 +48,8 @@ from typing import Any, Optional
 
 from workspace_utils import (
     _get_workspace_lock,
-    _sync_workspace_from_r2,
-    _async_sync_workspace_to_r2,
+    _sync_file_from_r2,
+    _sync_file_to_r2,
 )
 
 logger = logging.getLogger(__name__)
@@ -261,10 +261,13 @@ class _SkillError(Exception):
 
 
 async def _mutate(chat_id: int, fn) -> dict:
+    """
+    性能优化：只同步 skills.json 单个文件（而非全量 workspace）。
+    """
     lock = await _get_workspace_lock(chat_id)
     async with lock:
         try:
-            await _sync_workspace_from_r2(chat_id)
+            await _sync_file_from_r2(chat_id, SKILLS_FILENAME)
         except Exception as e:
             logger.warning(f"skill: R2→local 同步失败 (chat={chat_id}): {e}")
         store = _load_local(chat_id)
@@ -273,7 +276,10 @@ async def _mutate(chat_id: int, fn) -> dict:
         except _SkillError as e:
             return {"ok": False, "error": str(e), "code": e.code}
         _save_local(chat_id, store)
-        asyncio.create_task(_async_sync_workspace_to_r2(chat_id))
+        try:
+            await _sync_file_to_r2(chat_id, SKILLS_FILENAME)
+        except Exception as e:
+            logger.warning(f"skill: local→R2 同步失败 (chat={chat_id}): {e}")
         return payload
 
 
@@ -358,7 +364,7 @@ def _op_register(store: dict, name: str, description: str, system_prompt: str,
     return store, {
         "ok": True,
         "action": "register",
-        "skill": _skill_summary(skill),
+        "skill": _skill_brief(skill),
         "total_custom": len(store["skills"]),
     }
 
@@ -394,7 +400,7 @@ def _op_update(store: dict, name: str, description: Optional[str],
     return store, {
         "ok": True,
         "action": "update",
-        "skill": _skill_summary(skill),
+        "skill": _skill_brief(skill),
         "changed": changed,
     }
 
@@ -411,7 +417,7 @@ def _op_delete(store: dict, name: str) -> dict:
     return store, {
         "ok": True,
         "action": "delete",
-        "skill": _skill_summary(skill),
+        "skill": _skill_brief(skill),
         "total_custom": len(store.get("skills", [])),
     }
 
@@ -450,6 +456,7 @@ def _normalize_examples(examples: Any) -> list[str]:
 
 
 def _skill_summary(s: dict) -> dict:
+    """完整摘要（含 system_prompt）——仅用于 info / use 动作。"""
     return {
         "name": s.get("name"),
         "description": s.get("description", ""),
@@ -457,6 +464,22 @@ def _skill_summary(s: dict) -> dict:
         "tools": list(s.get("tools", []) or []),
         "examples": list(s.get("examples", []) or []),
         "system_prompt": s.get("system_prompt", ""),
+        "id": s.get("id"),
+        "created_at": s.get("created_at"),
+        "updated_at": s.get("updated_at"),
+    }
+
+
+def _skill_brief(s: dict) -> dict:
+    """精简摘要（不含 system_prompt）——用于 register / update / delete / list。
+    避免把 LLM 刚写的 system_prompt 原样回传，浪费 token 且可能让模型困惑。
+    """
+    return {
+        "name": s.get("name"),
+        "description": s.get("description", ""),
+        "builtin": bool(s.get("builtin")),
+        "tools": list(s.get("tools", []) or []),
+        "examples": list(s.get("examples", []) or []),
         "id": s.get("id"),
         "created_at": s.get("created_at"),
         "updated_at": s.get("updated_at"),

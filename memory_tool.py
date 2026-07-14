@@ -44,8 +44,8 @@ from typing import Any, Optional
 
 from workspace_utils import (
     _get_workspace_lock,
-    _sync_workspace_from_r2,
-    _async_sync_workspace_to_r2,
+    _sync_file_from_r2,
+    _sync_file_to_r2,
 )
 from config import BASE_URL  # noqa: F401  — 保留给将来扩展（推送卡片用）
 
@@ -175,10 +175,13 @@ class _MemoryError(Exception):
 
 
 async def _mutate(chat_id: int, fn) -> dict:
+    """
+    性能优化：只同步 memories.json 单个文件（而非全量 workspace）。
+    """
     lock = await _get_workspace_lock(chat_id)
     async with lock:
         try:
-            await _sync_workspace_from_r2(chat_id)
+            await _sync_file_from_r2(chat_id, MEMORY_FILENAME)
         except Exception as e:
             logger.warning(f"memory: R2→local 同步失败 (chat={chat_id}): {e}")
         store = _load_local(chat_id)
@@ -187,7 +190,10 @@ async def _mutate(chat_id: int, fn) -> dict:
         except _MemoryError as e:
             return {"ok": False, "error": str(e), "code": e.code}
         _save_local(chat_id, store)
-        asyncio.create_task(_async_sync_workspace_to_r2(chat_id))
+        try:
+            await _sync_file_to_r2(chat_id, MEMORY_FILENAME)
+        except Exception as e:
+            logger.warning(f"memory: local→R2 同步失败 (chat={chat_id}): {e}")
         return payload
 
 
