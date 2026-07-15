@@ -3309,11 +3309,31 @@ async def _agentic_loop_openai_compat(
                         }
                 if not content_acc and not tool_calls_acc:
                     content_acc = "（模型未返回任何内容）"
+                try:
+                    fallback_tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc.keys())] if tool_calls_acc else []
+                    logger.info(
+                        f"[{api_label}] 第 {_round + 1} 轮模型原始返回(回退): tool_calls={len(fallback_tool_calls)}, "
+                        f"ids={[tc.get('id', '') or '' for tc in fallback_tool_calls]}, "
+                        f"names={[tc.get('function', {}).get('name', '') or '' for tc in fallback_tool_calls]}, "
+                        f"content_len={len(content_acc.strip())}"
+                    )
+                except Exception:
+                    logger.exception(f"[{api_label}] 记录回退 tool_calls 日志失败")
             except Exception as e:
                 logger.exception(f"非流式回退失败: {e}")
                 content_acc = "请求失败，请稍后重试。"
 
         tool_calls_list = [tool_calls_acc[i] for i in sorted(tool_calls_acc.keys())] if tool_calls_acc else []
+        try:
+            tool_call_names = [tc.get("function", {}).get("name", "") or "" for tc in tool_calls_list]
+            tool_call_ids = [tc.get("id", "") or "" for tc in tool_calls_list]
+            logger.info(
+                f"[{api_label}] 第 {_round + 1} 轮模型原始返回: tool_calls={len(tool_calls_list)}, "
+                f"ids={tool_call_ids}, names={tool_call_names}, content_len={len(content_acc.strip())}, "
+                f"reasoning_len={len(reasoning_acc.strip())}"
+            )
+        except Exception:
+            logger.exception(f"[{api_label}] 记录 tool_calls 日志失败")
         for idx, tc in enumerate(tool_calls_list):
             if not tc.get("id"):
                 tc["id"] = f"call_{_round}_{idx}_{uuid.uuid4().hex[:8]}"

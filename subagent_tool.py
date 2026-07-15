@@ -244,6 +244,18 @@ async def _subagent_agentic_loop(
 
         content = getattr(msg, "content", None) or ""
         tool_calls = getattr(msg, "tool_calls", None) or []
+        try:
+            tool_call_names = [
+                getattr(getattr(tc, "function", None), "name", "") or ""
+                for tc in tool_calls
+            ]
+            tool_call_ids = [getattr(tc, "id", "") or "" for tc in tool_calls]
+            logger.info(
+                f"subagent: round={rounds}, raw_tool_calls={len(tool_calls)}, ids={tool_call_ids}, "
+                f"names={tool_call_names}, content_len={len(content.strip())}"
+            )
+        except Exception:
+            logger.exception("subagent: tool_calls 日志记录失败")
 
         # 没有 tool_calls → 任务结束
         if not tool_calls:
