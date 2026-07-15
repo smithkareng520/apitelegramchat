@@ -217,7 +217,8 @@ class BashSession:
                 return f"Error: Command rejected for security reasons: {command}"
 
             marker = f"__END_{random.randint(100000, 999999)}__"
-            full_cmd = f"cd {self.workspace.absolute()} && {command}; echo '{marker} $?'\n"
+            workspace_dir = shlex.quote(str(self.workspace.absolute()))
+            full_cmd = f"cd {workspace_dir} && {command}; echo '{marker} $?'\n"
 
             try:
                 self.proc.stdin.write(full_cmd.encode('utf-8'))
@@ -296,7 +297,16 @@ class BashSession:
                     self.proc.kill()
                 except ProcessLookupError:
                     pass
-            await self.proc.wait()
+                try:
+                    await asyncio.wait_for(self.proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    logger.warning("bash session force-close wait timed out chat_id=%s", self.chat_id)
+            except Exception:
+                logger.exception("bash session close wait failed chat_id=%s", self.chat_id)
+            finally:
+                self.proc = None
+                self._started = False
+            return
         self.proc = None
         self._started = False
 

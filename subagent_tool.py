@@ -21,9 +21,9 @@
     4. 直到 LLM 不再返回 tool_calls，取最终 content 作为答复
 - 工具白名单：默认允许所有 SEARCH_TOOLS，调用方可限制为子集
 - 安全护栏：
-    - 最大循环轮数：MAX_SUBAGENT_ROUNDS = 8
-    - 最大单次工具结果长度：MAX_SUBAGENT_RESULT_LEN = 4000
-    - 总体超时：DEFAULT_TIMEOUT = 90s
+    - 最大循环轮数：MAX_SUBAGENT_ROUNDS = 16（可通过环境变量 SUBAGENT_MAX_ROUNDS 调整）
+    - 最大单次工具结果长度：MAX_SUBAGENT_RESULT_LEN = 8000（可通过环境变量 SUBAGENT_MAX_RESULT_LEN 调整）
+    - 总体超时：DEFAULT_TIMEOUT = 180s（可通过环境变量 SUBAGENT_DEFAULT_TIMEOUT 调整）
     - 禁止子 agent 递归调用 subagent 工具（防爆炸）
 - 不带流式输出（子 agent 是后台任务，用户不需要看 token 流），用普通 chat.completions.create
 
@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import traceback
 from typing import Any, Optional
@@ -47,18 +48,37 @@ from config import SUPPORTED_MODELS, DEFAULT_MODEL
 
 logger = logging.getLogger(__name__)
 
+
+def _env_int(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    """读取整数型环境变量，解析失败时回退默认值，并可选地夹紧范围。"""
+    raw = os.getenv(name)
+    try:
+        value = int(str(raw).strip()) if raw is not None and str(raw).strip() else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
 # ---------- 安全护栏 ----------
-MAX_SUBAGENT_ROUNDS = 8
-MAX_SUBAGENT_RESULT_LEN = 4000
-DEFAULT_TIMEOUT = 90  # 秒
-MAX_TASK_LEN = 4000
-MAX_CONTEXT_LEN = 8000
-MAX_ANSWER_LEN = 8000
+MAX_SUBAGENT_ROUNDS = _env_int("SUBAGENT_MAX_ROUNDS", 16, min_value=1, max_value=64)
+MAX_SUBAGENT_RESULT_LEN = _env_int("SUBAGENT_MAX_RESULT_LEN", 8000, min_value=1000, max_value=50000)
+DEFAULT_TIMEOUT = _env_int("SUBAGENT_DEFAULT_TIMEOUT", 180, min_value=30, max_value=600)  # 秒
+MAX_TASK_LEN = _env_int("SUBAGENT_MAX_TASK_LEN", 8000, min_value=1000, max_value=50000)
+MAX_CONTEXT_LEN = _env_int("SUBAGENT_MAX_CONTEXT_LEN", 16000, min_value=1000, max_value=100000)
+MAX_ANSWER_LEN = _env_int("SUBAGENT_MAX_ANSWER_LEN", 12000, min_value=1000, max_value=100000)
+
 
 # 子 agent 不允许调用的工具（防递归 / 防爆炸 / 防资源滥用）
 FORBIDDEN_TOOLS = {"subagent", "memory", "skill"}
 # 注意：todo / bash / text_editor 仍允许，因为子 agent 可能需要查 / 写工作区文件
 # 但 memory / skill 跨会话状态复杂，子 agent 不应触碰
+
+SUBAGENT_LLM_TIMEOUT = _env_int("SUBAGENT_LLM_TIMEOUT", 120, min_value=30, max_value=600)
+SUBAGENT_TOOL_TIMEOUT = _env_int("SUBAGENT_TOOL_TIMEOUT", 60, min_value=5, max_value=600)
 
 # 子 agent 默认可用的工具白名单（如果调用方未指定）
 DEFAULT_ALLOWED_TOOLS = {
@@ -67,7 +87,7 @@ DEFAULT_ALLOWED_TOOLS = {
     "image_search", "geocode", "search_poi", "route", "distance",
     "place_details", "elevation", "traffic", "isochrone",
     "bash", "text_editor", "todo",
-    # 不含 generate_image / video / present_files / subagent / memory / skill
+    # 不含 generate_image / video / subagent / memory / skill
 }
 
 SUBAGENT_SYSTEM_PROMPT_TEMPLATE = """\
@@ -141,7 +161,7 @@ async def _execute_tool_for_subagent(
     try:
         result = await asyncio.wait_for(
             dispatch_tool_call(name, arguments or {}, chat_id=chat_id),
-            timeout=30,
+            timeout=SUBAGENT_TOOL_TIMEOUT,
         )
         return _truncate(str(result))
     except asyncio.TimeoutError:
@@ -209,7 +229,7 @@ async def _subagent_agentic_loop(
                 "model": model,
                 "messages": loop_messages,
                 "stream": False,
-                "max_tokens": 4096,
+                "max_tokens": (model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192),
             }
             if supports_tools:
                 create_params["tools"] = tools
@@ -218,7 +238,7 @@ async def _subagent_agentic_loop(
 
             resp = await asyncio.wait_for(
                 client.chat.completions.create(**create_params),
-                timeout=60,
+                timeout=SUBAGENT_LLM_TIMEOUT,
             )
         except asyncio.TimeoutError:
             last_error = "LLM 调用超时"
@@ -275,9 +295,9 @@ async def _subagent_agentic_loop(
         # 有 tool_calls → 把 assistant 消息塞回去，然后并发执行所有工具
         # 构造 assistant message（OpenAI 格式）
         assistant_msg: dict = {"role": "assistant", "content": content or ""}
+        tc_list: list[dict] = []
         # tool_calls 需要保留原结构供 API 识别
         try:
-            tc_list = []
             for tc in tool_calls:
                 tc_id = getattr(tc, "id", None) or ""
                 fn = getattr(getattr(tc, "function", None), "name", "") or ""
@@ -294,7 +314,7 @@ async def _subagent_agentic_loop(
         loop_messages.append(assistant_msg)
 
         # 报告即将执行的工具
-        tool_names = [tc_entry["function"]["name"] for tc_entry in tc_list]
+        tool_names = [tc_entry["function"]["name"] for tc_entry in tc_list if tc_entry.get("function")]
         await _report(
             f"第 {rounds}/{MAX_SUBAGENT_ROUNDS} 轮：执行工具 {' + '.join(tool_names)}…"
             f"（已耗时 {time.monotonic() - start:.0f}s）"
@@ -407,7 +427,7 @@ async def execute_subagent(
     # 工具白名单
     tools = _filter_tools(allowed_tools)
 
-    timeout_s = max(15, min(int(timeout or DEFAULT_TIMEOUT), 300))
+    timeout_s = max(15, min(int(timeout or DEFAULT_TIMEOUT), 600))
 
     try:
         result = await asyncio.wait_for(
@@ -503,11 +523,11 @@ SUBAGENT_TOOL = {
                 },
                 "task": {
                     "type": "string",
-                    "description": "子任务描述。明确说明要让子 agent 产出什么。最长 4000 字符。"
+                    "description": "子任务描述。明确说明要让子 agent 产出什么。最长 8000 字符。"
                 },
                 "context": {
                     "type": "string",
-                    "description": "可选的背景上下文。最长 8000 字符。可用来传递父对话中的相关信息。"
+                    "description": "可选的背景上下文。最长 16000 字符。可用来传递父对话中的相关信息。"
                 },
                 "model": {
                     "type": "string",
@@ -520,8 +540,8 @@ SUBAGENT_TOOL = {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "整体超时（秒）。默认 90，最大 300。",
-                    "default": 90
+                    "description": "整体超时（秒）。默认 180，最大 600。",
+                    "default": 180
                 }
             },
             "required": ["task"]
