@@ -429,10 +429,10 @@ SUPPORTED_MODELS["Qwen/Qwen-Image-Edit-2511"] = make_model_config(
     max_context=32768,
     max_output_tokens=4000,
 )
-SUPPORTED_MODELS["MAILAND/majicflus_v1"] = make_model_config(
-    model_id="MAILAND/majicflus_v1",
+SUPPORTED_MODELS["MusePublic/489_ckpt_FLUX_1"] = make_model_config(
+    model_id="MusePublic/489_ckpt_FLUX_1",
     provider="modelscope",
-    name="Majicflus v1",
+    name="FLUX.1 dev",
     native_image=True,
     max_context=32768,
     max_output_tokens=4000,

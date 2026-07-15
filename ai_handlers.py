@@ -1176,10 +1176,8 @@ Single video: <video src="URL"/>
 Single audio or voice note: <audio src="URL"/>
 Wrap media in a figure element when you want a caption or credit:
 <figure><img src="URL"/><figcaption>Caption text<cite>Credit</cite></figcaption></figure>
-For up to four media items in a grid, place them inside:
-<tg-collage><img src="..."/><video src="..."/><figcaption>Caption<cite>Credit</cite></figcaption></tg-collage>
-For five or more media items in a swipeable slideshow, place them inside:
-<tg-slideshow><img src="..."/><video src="..."/><figcaption>Caption</figcaption></tg-slideshow>
+For 2 or more media items, use a swipeable slideshow:
+<tg-slideshow><img src="URL1"/><img src="URL2"/><img src="URL3"/><figcaption>Optional caption</figcaption></tg-slideshow>
 </media>
 
 <anchors_and_references>
@@ -1203,7 +1201,7 @@ Choose elements based on content type:
 - Section divisions → <h1> through <h6> headings
 - Mathematical formulas → <tg-math> (inline) or <tg-math-block> (block)
 - Location data → <tg-map>
-- Multiple images (≤4) → <tg-collage>, (≥5) → <tg-slideshow>
+- Single image → <figure>, multiple images (≥2) → <tg-slideshow>
 </element_selection_guide>
 
 <escaping_rules>
@@ -3762,7 +3760,11 @@ async def _agentic_loop_native_image(
                 img_tags = "".join(f'<img src="{u}"/>' for u in uploaded_urls)
                 caption_text = _format_image_metadata_caption(image_bytes_list[0],
                                                               current_model) if image_bytes_list else "Generated image"
-                rich_html = f'<tg-collage>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></tg-collage>'
+                # 单图用 <figure>，多图用 <tg-slideshow> 轮播
+                if len(uploaded_urls) == 1:
+                    rich_html = f'<figure>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></figure>'
+                else:
+                    rich_html = f'<tg-slideshow>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></tg-slideshow>'
                 await send_rich_html_message(chat_id, rich_html)
                 final_notice = caption_text
             else:
@@ -3877,7 +3879,11 @@ async def _agentic_loop_native_image(
         img_tags = "".join(f'<img src="{u}"/>' for u in uploaded_urls)
         caption_text = _format_image_metadata_caption(image_bytes_list[0],
                                                       current_model) if image_bytes_list else "Generated image"
-        rich_html = f'<tg-collage>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></tg-collage>'
+        # 单图用 <figure>，多图用 <tg-slideshow> 轮播
+        if len(uploaded_urls) == 1:
+            rich_html = f'<figure>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></figure>'
+        else:
+            rich_html = f'<tg-slideshow>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></tg-slideshow>'
         await send_rich_html_message(chat_id, rich_html)
         final_notice = caption_text
     else:

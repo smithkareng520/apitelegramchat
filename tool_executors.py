@@ -755,7 +755,11 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                     for i, u in enumerate(urls)
                 )
                 caption = f"已生成 {count} 张图片：<ul>{link_items}</ul>"
-                details_html = f'<tg-collage>{img_tags}<figcaption>{caption}</figcaption></tg-collage>'
+                # 单图用 <figure>，多图用 <tg-slideshow> 轮播
+                if count == 1:
+                    details_html = f'<figure>{img_tags}<figcaption>{caption}</figcaption></figure>'
+                else:
+                    details_html = f'<tg-slideshow>{img_tags}<figcaption>{caption}</figcaption></tg-slideshow>'
                 return summary, details_html
         summary = "🎨 Image generation"
         details_html = escape_text(result_str)
@@ -774,7 +778,11 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                     for i, u in enumerate(urls)
                 )
                 caption = f"已编辑 {count} 张图片：<ul>{link_items}</ul>"
-                details_html = f'<tg-collage>{img_tags}<figcaption>{caption}</figcaption></tg-collage>'
+                # 单图用 <figure>，多图用 <tg-slideshow> 轮播
+                if count == 1:
+                    details_html = f'<figure>{img_tags}<figcaption>{caption}</figcaption></figure>'
+                else:
+                    details_html = f'<tg-slideshow>{img_tags}<figcaption>{caption}</figcaption></tg-slideshow>'
                 return summary, details_html
         summary = "🎨 Image editing"
         details_html = escape_text(result_str)
@@ -823,8 +831,13 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 for i, u in enumerate(urls):
                     link_items += f'<li><a href="{html.escape(u)}">图片 {i + 1}</a></li>'
                 link_list = f"<ul>{link_items}</ul>" if link_items else ""
+                # 单图用 <figure>，多图用 <tg-slideshow> 轮播
+                if len(urls) == 1:
+                    media_html = f'<figure>{img_tags}<figcaption>点击图片查看大图</figcaption></figure>'
+                else:
+                    media_html = f'<tg-slideshow>{img_tags}<figcaption>点击图片查看大图</figcaption></tg-slideshow>'
                 details_html = (
-                    f'<tg-collage>{img_tags}<figcaption>点击图片查看大图</figcaption></tg-collage>'
+                    f'{media_html}'
                     f'<br/>{link_list}'
                 )
                 return summary, details_html
