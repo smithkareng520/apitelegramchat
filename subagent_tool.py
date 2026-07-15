@@ -77,6 +77,7 @@ SUBAGENT_SYSTEM_PROMPT_TEMPLATE = """\
 - 你只看到本任务描述和给定的上下文，看不到父对话历史。
 - 专心完成本任务，不要扩展话题。
 - 可以调用提供的工具来获取信息或操作文件。
+- 如果有多个彼此独立的检索、查询或操作目标，请在同一轮中一次性发出多个工具调用，不要拆成串行多轮。
 - 禁止调用 subagent 工具（不能递归派生子 agent）。
 - 完成后用一段简洁的中文答复给父 agent，长度不超过 2000 字。
 - 答复里直接给结论 / 数据 / 代码 / 步骤，不要寒暄。
@@ -213,6 +214,7 @@ async def _subagent_agentic_loop(
             if supports_tools:
                 create_params["tools"] = tools
                 create_params["tool_choice"] = "auto"
+                create_params["parallel_tool_calls"] = True
 
             resp = await asyncio.wait_for(
                 client.chat.completions.create(**create_params),
@@ -478,7 +480,7 @@ SUBAGENT_TOOL = {
     "function": {
         "name": "subagent",
         "description": (
-            "Spawn a sub-agent to handle an isolated sub-task with a fresh context. The sub-agent does NOT inherit the parent's conversation history — it only sees the task description and an optional context string you provide. It runs a mini agentic loop with a restricted tool whitelist and returns a final answer. Use for: research sub-tasks, parallelizable independent sub-problems, or any case where you want to delegate a self-contained piece of work. The sub-agent CANNOT recursively call subagent / memory / skill."
+            "Spawn a sub-agent to handle an isolated sub-task with a fresh context. The sub-agent does NOT inherit the parent's conversation history — it only sees the task description and an optional context string you provide. It runs a mini agentic loop with a restricted tool whitelist and returns a final answer. Use for: research sub-tasks, parallelizable independent sub-problems, or any case where you want to delegate a self-contained piece of work. When multiple independent subtasks exist, call subagent multiple times in the same assistant turn instead of serializing them. The sub-agent CANNOT recursively call subagent / memory / skill."
         ),
         "parameters": {
             "type": "object",
