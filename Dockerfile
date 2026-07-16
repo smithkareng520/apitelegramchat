@@ -17,7 +17,6 @@ COPY requirements.txt pyproject.toml ./
 COPY src ./src
 COPY README.md ./
 COPY app.py ./
-COPY render.yaml ./
 
 RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir .
 
