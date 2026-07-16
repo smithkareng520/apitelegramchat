@@ -12,7 +12,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
     aioboto3 = None
     ClientError = Exception
 
-from config import (
+from apitelegramchat.config import (
     R2_ENDPOINT,
     R2_ACCESS_KEY,
     R2_SECRET_KEY,
@@ -20,7 +20,7 @@ from config import (
     R2_PUBLIC_URL,
     R2_REGION,
 )
-from workspace_paths import data_root
+from apitelegramchat.workspace_paths import data_root
 
 logger = logging.getLogger(__name__)
 

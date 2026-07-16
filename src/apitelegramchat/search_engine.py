@@ -36,7 +36,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
             return {"entries": []}
     feedparser = _FeedParserStub()  # type: ignore
 from pathlib import Path
-from workspace_paths import workspace_root
+from apitelegramchat.workspace_paths import workspace_root
 try:
     import qrcode  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
@@ -48,9 +48,9 @@ try:
     from lxml import html as lxml_html  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
     lxml_html = None  # type: ignore
-from state import get_editor_file_state, set_editor_file_state, clear_editor_file_state
+from apitelegramchat.state import get_editor_file_state, set_editor_file_state, clear_editor_file_state
 
-from config import (
+from apitelegramchat.config import (
     GOOGLE_CSE_KEY, GOOGLE_CSE_ID,
     BASE_URL, OPENROUTER_API_KEY, MODELSCOPE_API_KEY, IMGBB_KEY,
     TOMTOM_API_KEY,
@@ -61,16 +61,16 @@ from config import (
     SUPPORTED_MODELS,
     DDG_SEARCH_API_URL,
 )
-from utils import retry_async, send_rich_html_message
-from s3_utils import upload_bytes_to_r2
-from workspace_utils import _get_workspace_lock, _sync_workspace_from_r2, _sync_workspace_to_r2
+from apitelegramchat.utils import retry_async, send_rich_html_message
+from apitelegramchat.s3_utils import upload_bytes_to_r2
+from apitelegramchat.workspace_utils import _get_workspace_lock, _sync_workspace_from_r2, _sync_workspace_to_r2
 # 任务工具：定义在 todo_tool.py / memory_tool.py / skill_tool.py / subagent_tool.py
 # 本文件只做注册与转出
-from todo_tool import TODO_TOOL, execute_todo  # noqa: E402
-from memory_tool import MEMORY_TOOL, execute_memory  # noqa: E402
-from skill_tool import SKILL_TOOL, execute_skill  # noqa: E402
+from apitelegramchat.todo_tool import TODO_TOOL, execute_todo  # noqa: E402
+from apitelegramchat.memory_tool import MEMORY_TOOL, execute_memory  # noqa: E402
+from apitelegramchat.skill_tool import SKILL_TOOL, execute_skill  # noqa: E402
 try:  # noqa: E402
-    from subagent_tool import SUBAGENT_TOOL, execute_subagent  # type: ignore
+    from apitelegramchat.subagent_tool import SUBAGENT_TOOL, execute_subagent  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
     SUBAGENT_TOOL = []
     async def execute_subagent(*args, **kwargs):  # type: ignore
@@ -2329,7 +2329,7 @@ async def execute_generate_image(
     num_images: int = 1,
     image_url: Optional[str] = None,
 ) -> str:
-    from ai_handlers import _request_modelscope_native_image
+    from apitelegramchat.ai_handlers import _request_modelscope_native_image
     MODEL_ALIAS_MAP = {
         "flux-schnell": "black-forest-labs/flux-schnell",
         "flux-1.1-pro": "black-forest-labs/flux-1.1-pro",
@@ -2544,7 +2544,7 @@ async def execute_generate_video(
         视频链接：https://...
     """
     # 局部导入避免与 ai_handlers 产生循环依赖
-    from ai_handlers import (
+    from apitelegramchat.ai_handlers import (
         _request_agnes_video,
         _request_openrouter_video,
     )
@@ -3444,8 +3444,8 @@ try:
 except Exception:  # pragma: no cover - optional dependency fallback
     aioboto3 = None  # type: ignore
     ClientError = Exception
-from s3_utils import upload_bytes_to_r2, download_from_r2, file_exists_in_r2
-from config import (
+from apitelegramchat.s3_utils import upload_bytes_to_r2, download_from_r2, file_exists_in_r2
+from apitelegramchat.config import (
     R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY,
     R2_BUCKET_NAME, R2_REGION
 )

@@ -1,5 +1,5 @@
 """Search / editor / geo MCP adapters."""
-from search_engine import (
+from apitelegramchat.search_engine import (
     execute_book_lookup, execute_crypto_price, execute_done, execute_distance, execute_elevation,
     execute_exchange_rate, execute_fetch_url, execute_geocode, execute_generate_image,
     execute_generate_video, execute_hacker_news, execute_image_search, execute_ip_geo,

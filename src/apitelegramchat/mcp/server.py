@@ -10,7 +10,7 @@ from typing import Any
 from .prompts import list_prompts, get_prompt
 from .resources import list_resources, read_resource
 from .registry import call_tool, list_tools
-from workspace_paths import data_root
+from apitelegramchat.workspace_paths import data_root
 
 logger = logging.getLogger("apitelegramchat.mcp")
 

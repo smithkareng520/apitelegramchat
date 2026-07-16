@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from workspace_paths import data_root, sanitize_namespace, workspace_root, workspace_file
+from apitelegramchat.workspace_paths import data_root, sanitize_namespace, workspace_root, workspace_file
 from .settings import get_mcp_scope
 
 

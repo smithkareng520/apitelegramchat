@@ -5,13 +5,13 @@ import asyncio
 import logging
 from urllib.parse import quote
 
-from config import (
+from apitelegramchat.config import (
     TELEGRAM_BOT_TOKEN,
     BASE_URL,
     PARSE_TIMEOUT,
 )
 
-from s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2
+from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +135,7 @@ async def _parse_audio_file(file_path: str, file_name: str) -> str:
         ext = os.path.splitext(file_name)[1] or ".ogg"
         with open(file_path, "rb") as f:
             audio_bytes = f.read()
-        from utils import transcribe_audio_with_groq
+        from apitelegramchat.utils import transcribe_audio_with_groq
         # 使用配置的 PARSE_TIMEOUT 而非硬编码 30 秒
         return await asyncio.wait_for(
             transcribe_audio_with_groq(audio_bytes, ext),

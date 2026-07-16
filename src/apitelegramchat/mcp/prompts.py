@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from skill_tool import execute_skill
+from apitelegramchat.skill_tool import execute_skill
 from .registry import _chat_id, _skill_prompt_text
 
 

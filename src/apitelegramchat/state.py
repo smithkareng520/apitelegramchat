@@ -2,7 +2,7 @@
 import asyncio
 import time
 from typing import Optional
-from config import DEFAULT_MODEL
+from apitelegramchat.config import DEFAULT_MODEL
 
 # ---------- 用户会话 ----------
 user_contexts: dict = {}

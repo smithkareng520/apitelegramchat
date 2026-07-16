@@ -113,7 +113,7 @@ async def check_sandbox_isolation(bwrap_ok: bool):
         warn("4.x 沙箱隔离测试", "bwrap 不可用，跳过")
         return
 
-    from sandbox import build_bwrap_argv
+    from apitelegramchat.sandbox import build_bwrap_argv
 
     workspace = Path("/tmp/verify_workspace").absolute()
     workspace.mkdir(parents=True, exist_ok=True)

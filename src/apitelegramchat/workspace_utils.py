@@ -3,9 +3,9 @@ import asyncio
 import os
 import logging
 from pathlib import Path
-from workspace_paths import workspace_root
+from apitelegramchat.workspace_paths import workspace_root
 
-from s3_utils import (
+from apitelegramchat.s3_utils import (
     upload_bytes_to_r2,
     download_from_r2,
     file_exists_in_r2,

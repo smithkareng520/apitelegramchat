@@ -9,23 +9,23 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, get_args, get_origin
 from uuid import uuid4
 
-from memory_tool import execute_memory
-from skill_tool import execute_skill
+from apitelegramchat.memory_tool import execute_memory
+from apitelegramchat.skill_tool import execute_skill
 try:
-    from subagent_tool import execute_subagent
+    from apitelegramchat.subagent_tool import execute_subagent
 except Exception:  # pragma: no cover - optional dependency fallback
     async def execute_subagent(*args, **kwargs):  # type: ignore
         return "Error: subagent tool is unavailable in this environment."
-from todo_tool import execute_todo
-from tool_executors import execute_bash, execute_present_files
-from search_engine import (
+from apitelegramchat.todo_tool import execute_todo
+from apitelegramchat.tool_executors import execute_bash, execute_present_files
+from apitelegramchat.search_engine import (
     execute_book_lookup, execute_crypto_price, execute_done, execute_distance, execute_elevation,
     execute_exchange_rate, execute_fetch_url, execute_geocode, execute_generate_image,
     execute_generate_video, execute_hacker_news, execute_image_search, execute_ip_geo,
     execute_isochrone, execute_news, execute_place_details, execute_qr_code, execute_route,
     execute_search_poi, execute_text_editor, execute_weather, execute_web_search, execute_wikipedia,
 )
-from workspace_paths import data_root, workspace_root
+from apitelegramchat.workspace_paths import data_root, workspace_root
 from ..core.settings import get_mcp_scope
 
 logger = logging.getLogger("apitelegramchat.mcp")

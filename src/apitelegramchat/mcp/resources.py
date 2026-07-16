@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .registry import _chat_id
-from workspace_paths import workspace_root
+from apitelegramchat.workspace_paths import workspace_root
 
 
 def _resource_paths(root: Path) -> list[tuple[str, str]]:

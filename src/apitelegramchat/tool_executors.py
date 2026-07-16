@@ -8,26 +8,26 @@ import aiohttp
 import json
 import hashlib
 from pathlib import Path
-from workspace_paths import workspace_root
+from apitelegramchat.workspace_paths import workspace_root
 import re
 import html
 import logging
 from typing import Optional, List
 from urllib.parse import urlparse
-from workspace_utils import (
+from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
     _sync_workspace_from_r2,
     _sync_workspace_to_r2,
     _async_sync_workspace_to_r2,  # 新增导入
 )
 
-from sandbox import (
+from apitelegramchat.sandbox import (
     build_bwrap_argv, build_fallback_argv, build_fallback_env,
     is_bwrap_available, watchdog, apply_prlimit, _preexec_fallback,
     SANDBOX_TIMEOUT_SEC,
 )
 
-from config import (
+from apitelegramchat.config import (
     R2_PUBLIC_URL,
     MAX_CONCURRENT_TOOLS,
     BASE_URL,
@@ -39,8 +39,8 @@ from config import (
 _TOOL_TIMEOUT_MARKER = "__TOOL_TIMEOUT__"
 
 import shutil
-from s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2, list_r2_objects, delete_r2_object
-from search_engine import (
+from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2, list_r2_objects, delete_r2_object
+from apitelegramchat.search_engine import (
     execute_web_search,
     execute_fetch_url,
     execute_wikipedia,
@@ -75,19 +75,19 @@ from search_engine import (
     # 子 agent 工具
     execute_subagent,
 )
-from todo_tool import (
+from apitelegramchat.todo_tool import (
     render_todo_card,
     build_todo_keyboard,
     send_todo_card_with_keyboard,
 )
-from memory_tool import render_memory_card
-from skill_tool import render_skill_card
+from apitelegramchat.memory_tool import render_memory_card
+from apitelegramchat.skill_tool import render_skill_card
 try:
-    from subagent_tool import render_subagent_card
+    from apitelegramchat.subagent_tool import render_subagent_card
 except Exception:  # pragma: no cover - optional dependency fallback
     def render_subagent_card(*args, **kwargs):
         return "<b>Subagent</b>"
-from utils import escape_html
+from apitelegramchat.utils import escape_html
 
 logger = logging.getLogger(__name__)
 

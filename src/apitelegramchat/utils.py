@@ -10,11 +10,11 @@ import time
 import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from config import BASE_URL, DEEPSEEK_API_KEY, OPENROUTER_API_KEY, LOG_LEVEL
+from apitelegramchat.config import BASE_URL, DEEPSEEK_API_KEY, OPENROUTER_API_KEY, LOG_LEVEL
 from typing import Optional, Dict, Any, List, Union
 from contextlib import asynccontextmanager
 import sys
-from config import GROQ_API_KEY
+from apitelegramchat.config import GROQ_API_KEY
 
 # ---------- 配置日志 ----------
 def setup_logging():
@@ -186,7 +186,7 @@ class RateLimitError(Exception):
 
 @retry_async(max_retries=5, delay=0.5, backoff=3.0, exceptions=(aiohttp.ClientError, asyncio.TimeoutError, RateLimitError))
 async def delete_message(chat_id: int, message_id: int) -> None:
-    from state import deleted_message_ids, deleted_messages_lock, is_protected_message
+    from apitelegramchat.state import deleted_message_ids, deleted_messages_lock, is_protected_message
     if await is_protected_message(message_id):
         logger.info(f"deleteMessage 跳过受保护消息: chat={chat_id} msg={message_id}")
         return
@@ -219,7 +219,7 @@ async def delete_message_fast(chat_id: int, message_id: int) -> bool:
     if not message_id:
         return False
     try:
-        from state import deleted_message_ids, deleted_messages_lock
+        from apitelegramchat.state import deleted_message_ids, deleted_messages_lock
         async with deleted_messages_lock:
             if message_id in deleted_message_ids:
                 return True
@@ -235,7 +235,7 @@ async def delete_message_fast(chat_id: int, message_id: int) -> bool:
             ) as r:
                 if r.status == 200:
                     try:
-                        from state import deleted_message_ids, deleted_messages_lock
+                        from apitelegramchat.state import deleted_message_ids, deleted_messages_lock
                         async with deleted_messages_lock:
                             deleted_message_ids.add(message_id)
                     except Exception:
@@ -245,7 +245,7 @@ async def delete_message_fast(chat_id: int, message_id: int) -> bool:
                     body = await r.text()
                     if "not found" in body.lower() or "to delete not found" in body.lower():
                         try:
-                            from state import deleted_message_ids, deleted_messages_lock
+                            from apitelegramchat.state import deleted_message_ids, deleted_messages_lock
                             async with deleted_messages_lock:
                                 deleted_message_ids.add(message_id)
                         except Exception:
@@ -309,7 +309,7 @@ async def _is_current_active_draft(chat_id: int, draft_id) -> bool:
     except (ValueError, TypeError):
         return False
     try:
-        from state import get_active_draft_info
+        from apitelegramchat.state import get_active_draft_info
         info = await get_active_draft_info(chat_id)
     except Exception:
         # 取不到状态时不要误伤发送，交给死亡标记兜底
@@ -393,7 +393,7 @@ async def serialize_with_active_draft(chat_id: int, *, reassert: bool = True):
     """
     draft_id = None
     try:
-        from state import get_active_draft_info
+        from apitelegramchat.state import get_active_draft_info
         info = await get_active_draft_info(chat_id)
         if info:
             draft_id = int(info[0])

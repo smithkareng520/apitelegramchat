@@ -10,9 +10,9 @@ import re
 import os
 import mimetypes
 from pathlib import Path
-from workspace_paths import workspace_root
+from apitelegramchat.workspace_paths import workspace_root
 
-from utils import (
+from apitelegramchat.utils import (
     send_message,
     send_rich_html_message,
     delete_message,
@@ -26,8 +26,8 @@ from utils import (
     extract_message_text,
     transcribe_audio_with_groq,
 )
-from ai_handlers import get_ai_response, get_cached_image_data, _get_cached_audio_data
-from config import (
+from apitelegramchat.ai_handlers import get_ai_response, get_cached_image_data, _get_cached_audio_data
+from apitelegramchat.config import (
     BASE_URL,
     WEBHOOK_URL,
     SUPPORTED_MODELS,
@@ -44,7 +44,7 @@ from config import (
     LOG_LEVEL,
     global_lock,
 )
-from state import (
+from apitelegramchat.state import (
     user_contexts,
     user_models,
     media_groups,
@@ -67,11 +67,11 @@ from state import (
     mark_preserved_draft,
     mark_protected_message,
 )
-from file_handlers import download_file
-from s3_utils import upload_bytes_to_r2, file_exists_in_r2
-from workspace_utils import _get_workspace_lock
+from apitelegramchat.file_handlers import download_file
+from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2
+from apitelegramchat.workspace_utils import _get_workspace_lock
 # 任务工具：用于处理 todo:* 回调按钮
-from todo_tool import (
+from apitelegramchat.todo_tool import (
     toggle_by_id as todo_toggle_by_id,
     delete_by_id as todo_delete_by_id,
     clear_done as todo_clear_done,

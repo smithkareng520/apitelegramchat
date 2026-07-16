@@ -43,8 +43,8 @@ import time
 import traceback
 from typing import Any, Optional
 
-from api_client import api_client
-from config import SUPPORTED_MODELS, DEFAULT_MODEL
+from apitelegramchat.api_client import api_client
+from apitelegramchat.config import SUPPORTED_MODELS, DEFAULT_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,7 @@ SUBAGENT_SYSTEM_PROMPT_TEMPLATE = """\
 def _filter_tools(allowed: Optional[list[str]]) -> list[dict]:
     """根据白名单从 SEARCH_TOOLS 里挑出子 agent 可用的工具定义。"""
     try:
-        from search_engine import SEARCH_TOOLS
+        from apitelegramchat.search_engine import SEARCH_TOOLS
     except Exception as e:
         logger.error(f"subagent: 无法导入 SEARCH_TOOLS: {e}")
         return []
@@ -155,7 +155,7 @@ async def _execute_tool_for_subagent(
     if name in FORBIDDEN_TOOLS:
         return f"Error: tool '{name}' is forbidden in subagent context."
     try:
-        from tool_executors import dispatch_tool_call
+        from apitelegramchat.tool_executors import dispatch_tool_call
     except Exception as e:
         return f"Error: cannot import dispatch_tool_call: {e}"
     try:

@@ -1,1 +1,1 @@
-from app import *  # noqa: F401,F403
+from apitelegramchat.app import app  # noqa: F401

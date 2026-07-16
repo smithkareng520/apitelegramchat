@@ -40,15 +40,15 @@ import os
 import time
 import uuid
 from pathlib import Path
-from workspace_paths import workspace_root
+from apitelegramchat.workspace_paths import workspace_root
 from typing import Any, Optional
 
-from workspace_utils import (
+from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
     _sync_file_from_r2,
     _sync_file_to_r2,
 )
-from config import BASE_URL  # noqa: F401  — 保留给将来扩展（推送卡片用）
+from apitelegramchat.config import BASE_URL  # noqa: F401  — 保留给将来扩展（推送卡片用）
 
 logger = logging.getLogger(__name__)
 

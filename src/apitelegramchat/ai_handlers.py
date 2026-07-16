@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from openai import AsyncOpenAI
 from cachetools import TTLCache
 
-from config import (
+from apitelegramchat.config import (
     SUPPORTED_MODELS,
     OPENROUTER_API_KEY,
     AGNES_API_KEY,
@@ -41,7 +41,7 @@ from config import (
     STREAM_SILENT_FORCE_FLUSH,
     STREAM_FLUSH_CHARS,
 )
-from utils import (
+from apitelegramchat.utils import (
     get_current_time,
     retry_async,
     send_rich_message_draft,
@@ -56,17 +56,17 @@ from utils import (
     mark_draft_dead,
     RateLimitError,
 )
-from file_handlers import get_file_path
-from s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2
-from tool_executors import (
+from apitelegramchat.file_handlers import get_file_path
+from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2
+from apitelegramchat.tool_executors import (
     dispatch_tool_call,
     format_tool_result,
     _truncate_tool_result,
     tool_semaphore,
     _TOOL_TIMEOUT_MARKER,
 )
-from api_client import api_client
-import state
+from apitelegramchat.api_client import api_client
+import apitelegramchat.state as state
 
 logger = get_logger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -3077,7 +3077,7 @@ async def _agentic_loop_openai_compat(
         builder: "RichMessageBuilder", tools: list = None, supports_tools: bool = True
 ) -> tuple[str | None, object | None, list]:
     if tools is None:
-        from search_engine import SEARCH_TOOLS
+        from apitelegramchat.search_engine import SEARCH_TOOLS
         tools = SEARCH_TOOLS
     loop_messages = list(messages)
     final_content = None
@@ -4520,7 +4520,7 @@ async def get_ai_response(
         # 先登记为当前活跃草稿，让首帧和后续流式刷新都能通过 active 校验。
         # message_id 先占位为 0，等首帧真正发出后再回填真实 message_id。
         try:
-            from state import set_active_draft
+            from apitelegramchat.state import set_active_draft
             await set_active_draft(chat_id, builder.draft_id, 0)
         except Exception:
             pass
@@ -4528,7 +4528,7 @@ async def get_ai_response(
         # 首帧发出后，用真实 message_id 覆盖占位值。
         if builder.draft_message_id:
             try:
-                from state import set_active_draft
+                from apitelegramchat.state import set_active_draft
                 await set_active_draft(chat_id, builder.draft_id, builder.draft_message_id)
             except Exception:
                 pass
@@ -4565,7 +4565,7 @@ async def get_ai_response(
             await send_rich_html_message(chat_id, error_html, reassert_draft=False)
             if builder.draft_message_id:
                 try:
-                    from state import is_preserved_draft
+                    from apitelegramchat.state import is_preserved_draft
                     if not await is_preserved_draft(builder.draft_id):
                         await delete_message(chat_id, builder.draft_message_id)
                 except Exception as e:
@@ -4583,7 +4583,7 @@ async def get_ai_response(
             # 图片路径通常已发过永久消息；仍尝试清理草稿气泡
             if builder.draft_message_id:
                 try:
-                    from state import is_preserved_draft
+                    from apitelegramchat.state import is_preserved_draft
                     if not await is_preserved_draft(builder.draft_id):
                         await delete_message(chat_id, builder.draft_message_id)
                 except Exception as e:
@@ -4599,7 +4599,7 @@ async def get_ai_response(
             await send_rich_html_message(chat_id, error_html, reassert_draft=False)
             if builder.draft_message_id:
                 try:
-                    from state import is_preserved_draft
+                    from apitelegramchat.state import is_preserved_draft
                     if not await is_preserved_draft(builder.draft_id):
                         await delete_message(chat_id, builder.draft_message_id)
                 except Exception as e:
@@ -4618,7 +4618,7 @@ async def get_ai_response(
                 logger.debug("[NativeVideo] 保存到对话历史的 assistant 消息: %s", history_summary)
             if builder.draft_message_id:
                 try:
-                    from state import is_preserved_draft
+                    from apitelegramchat.state import is_preserved_draft
                     if not await is_preserved_draft(builder.draft_id):
                         await delete_message(chat_id, builder.draft_message_id)
                 except Exception as e:
@@ -4638,7 +4638,7 @@ async def get_ai_response(
             await send_rich_html_message(chat_id, fallback, reassert_draft=False)
             if builder.draft_message_id:
                 try:
-                    from state import is_preserved_draft
+                    from apitelegramchat.state import is_preserved_draft
                     if not await is_preserved_draft(builder.draft_id):
                         await delete_message(chat_id, builder.draft_message_id)
                 except Exception as e:
@@ -4667,7 +4667,7 @@ async def get_ai_response(
         # （注意：本函数在 stop_flush 后也会 mark_dead，故不能再用 is_draft_dead 判断是否删除。）
         if builder.draft_message_id:
             try:
-                from state import is_preserved_draft
+                from apitelegramchat.state import is_preserved_draft
                 if await is_preserved_draft(builder.draft_id):
                     logger.info(
                         f"[{chat_id}] 草稿 {builder.draft_id} 已保留，跳过删除 "
@@ -4753,7 +4753,7 @@ async def get_ai_response(
                 logger.debug(f"stop_flush_loop 异常（可忽略）: {e}")
             # 只清理自己的 active_draft 注册（带 draft_id 校验，避免清掉下一个任务的）
             try:
-                from state import clear_active_draft
+                from apitelegramchat.state import clear_active_draft
                 await clear_active_draft(chat_id, builder.draft_id)
             except Exception:
                 pass
@@ -4768,7 +4768,7 @@ async def _call_api(
         tools: list = None
 ) -> tuple[str | None, object | None, list]:
     if tools is None:
-        from search_engine import SEARCH_TOOLS
+        from apitelegramchat.search_engine import SEARCH_TOOLS
         tools = SEARCH_TOOLS
 
     api_type = model_info.provider
