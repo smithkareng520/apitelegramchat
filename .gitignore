@@ -1,0 +1,88 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv
+.env
+
+# 环境变量 / 敏感配置（非常重要！）
+.env
+.env.local
+.env.*.local
+*.secret
+*.key
+*.pem
+*.crt
+
+# 日志文件
+*.log
+logs/
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*~
+*.pid
+
+# IDE 和编辑器
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+*.sublime-*
+
+# 项目运行时生成的文件（工作区数据，可能包含用户敏感信息）
+workspace/
+workspace_*/          # 你可能会有多个 chat 的工作区
+
+# 数据库文件（如果有）
+*.db
+*.sqlite
+*.sqlite3
+
+# 单元测试和覆盖率报告
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# 部署相关（渲染、Docker 等）
+*.pyo
+*.pyd
+
+# 其他不需要上传的本地文件
+.vagrant/
+*.tar.gz
+*.zip
+*.7z
+# 如果你有本地测试图片、音频等
+test_media/
+sample_*.png
+sample_*.jpg

@@ -12,16 +12,13 @@ services:
   - type: web
     name: telegram-bot
     runtime: docker
-    plan: starter              # 至少 starter，free 实例易被杀
-    region: singapore          # 或选离用户最近的
+    plan: starter
+    region: singapore
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    healthCheckPath: /
+    healthCheckPath: /health
     autoDeploy: true
-    # 关键: 不开启特权模式（Render 默认就不开，这里只是声明）
-    # Render 不支持 docker run 参数，但 Dockerfile 里的 USER + bwrap 已经够用
     envVars:
-      # ----- 必需: 标记为 Secret -----
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: WEBHOOK_TOKEN
@@ -36,7 +33,6 @@ services:
         sync: false
       - key: GROQ_API_KEY
         sync: false
-      # ----- R2 -----
       - key: R2_ENDPOINT
         sync: false
       - key: R2_ACCESS_KEY
@@ -49,7 +45,6 @@ services:
         sync: false
       - key: R2_REGION
         value: auto
-      # ----- 第三方服务 -----
       - key: GEOAPIFY_KEY
         sync: false
       - key: IMGBB_KEY
@@ -60,20 +55,16 @@ services:
         sync: false
       - key: WEBHOOK_URL
         sync: false
-      # ----- DuckDuckGo 免费搜索 API（非敏感，Plain Text）-----
-      # 默认指向 my-search-api onrender 实例；如自部署请改为自己服务的地址。
-      # 调用方式：<DDG_SEARCH_API_URL>?text=<quoted query>
       - key: DDG_SEARCH_API_URL
         value: https://my-search-api-08cb.onrender.com/duckduckgo/search
-      # ----- 沙箱配置（非敏感，Plain Text）-----
       - key: SANDBOX_UNSHARE_NET
-        value: "1"             # 改成 "1" 可完全断网（最严格）
+        value: "1"
       - key: SANDBOX_MAX_PROCS
         value: "50"
       - key: SANDBOX_MAX_CPU_SEC
         value: "300"
       - key: SANDBOX_MAX_FILE_SIZE
-        value: "104857600"     # 100 MB
+        value: "104857600"
       - key: SANDBOX_MAX_OPEN_FILES
         value: "256"
       - key: SANDBOX_TIMEOUT_SEC
@@ -88,8 +79,7 @@ services:
         value: "60"
       - key: LOG_LEVEL
         value: INFO
-    # 资源限制（Render 层面）
-    disk:                      # Render 不挂持久盘 — workspace 走 R2
+    disk:
       name: tmp
       mountPath: /tmp
-      sizeGB: 1                # 临时盘，重启清空
+      sizeGB: 1

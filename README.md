@@ -14,4 +14,7 @@ pip install .
 python -m apitelegramchat.entrypoints.mcp_server
 ```
 
-Telegram Webhook 模式可直接使用 `apitelegramchat.app:app` 交给 Quart / Gunicorn。
+## 运行 Webhook 服务
+
+本项目的 Web 入口是 `app:app`，但项目根目录已经提供了兼容包装，
+部署时也可以直接使用 `app:app` 或 `apitelegramchat.app:app`。
