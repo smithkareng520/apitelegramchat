@@ -1,5 +1,6 @@
 # utils.py
 import json
+import os
 import re
 import aiohttp
 import asyncio
@@ -31,7 +32,9 @@ def setup_logging():
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
 
-    console_handler = logging.StreamHandler(sys.stdout)
+    _log_mode = os.getenv("APP_MODE", "telegram").strip().lower()
+    _console_stream = sys.stderr if _log_mode == "mcp" or os.getenv("MCP_STDIO", "").strip().lower() in {"1", "true", "yes", "on"} else sys.stdout
+    console_handler = logging.StreamHandler(_console_stream)
     console_handler.setFormatter(logging.Formatter(
         '{"time": "%(asctime)s", "level": "%(levelname)s", "name": "%(name)s", "message": "%(message)s"}'
     ))
@@ -46,7 +49,7 @@ def setup_logging():
         ))
         root_logger.addHandler(file_handler)
     except Exception as e:
-        print(f"Warning: 无法创建文件日志: {e}")
+        logger.warning(f"无法创建文件日志: {e}")
 
 setup_logging()
 

@@ -406,3 +406,30 @@ R2_REGION=auto
 
 *维护者：[smithkareng520](https://github.com/smithkareng520)*  
 *最后更新：2026年6月*
+
+
+---
+
+## 🧩 MCP 支持
+
+项目新增了标准的 MCP 暴露层，现有工具可以直接被 MCP 客户端发现和调用，而原有 Telegram 机器人功能保持不变。
+
+### 启动方式
+
+```bash
+APP_MODE=mcp python mcp_server.py
+```
+
+默认使用 stdio 传输，适合 Claude Desktop、MCP Inspector 以及其他支持 MCP 的本地客户端。
+
+### 工具分区
+
+- `web_search`、`fetch_url`、`weather`、`news` 等工具是无状态的，可直接调用。
+- `todo`、`memory`、`skill`、`subagent`、`bash`、`text_editor`、`present_files` 是有状态的，建议在参数里传入 `workspace_id`，这样可以隔离不同客户端或任务空间。
+- 不传 `workspace_id` 时，服务器会自动使用默认工作区。
+
+### 资源与提示词
+
+- `project://tool-catalog`：返回完整工具目录的 JSON
+- `project-brief`：返回一段适合放进系统提示词的项目说明
+

@@ -26,11 +26,20 @@ GLM_API_KEY = os.getenv("GLM_API_KEY", "")
 MODELSCOPE_API_KEY = os.getenv("MODELSCOPE_API_KEY", "")
 AGNES_API_KEY = os.getenv("AGNES_API_KEY", "")
 
+
+# ---------- 运行模式 ----------
+# telegram: 原有机器人模式（保持现状）
+# mcp:      仅启动 MCP 服务器 / 工具生态，允许缺少 Telegram 相关环境变量
+# 其它值也按 telegram 处理
+APP_MODE = os.getenv("APP_MODE", "telegram").strip().lower()
+SKIP_REQUIRED_ENV_CHECK = os.getenv("SKIP_REQUIRED_ENV_CHECK", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ---------- DuckDuckGo 免费搜索 API（HTML 抓取回退已废弃）----------
 # 通过环境变量配置 my-search-api 服务地址，避免反爬/封锁。
 # 调用方式：<DDG_SEARCH_API_URL>?text=<quoted query>
 # 返回 JSON，results[] 内每条至少包含 title / url / snippet。
-DDG_SEARCH_API_URL = os.getenv("DDG_SEARCH_API_URL").strip()
+DDG_SEARCH_API_URL = os.getenv("DDG_SEARCH_API_URL", "").strip()
 
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
@@ -43,8 +52,14 @@ BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_T
 LOG_TRUNCATE_LIMIT = int(os.getenv("LOG_TRUNCATE_LIMIT", "5000"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
+
 # ---------- 必需环境变量检查 ----------
 def _check_required_keys():
+    # MCP 模式下允许缺省 Telegram / webhook 配置，
+    # 这样同一份代码可以既作为 Telegram bot 运行，也可以作为独立 MCP 服务器运行。
+    if APP_MODE == "mcp" or SKIP_REQUIRED_ENV_CHECK:
+        return
+
     required = {
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "WEBHOOK_TOKEN": WEBHOOK_TOKEN,
