@@ -6,6 +6,7 @@ FROM python:3.10-slim
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONPATH=/app/src
+ENV APITELEGRAMCHAT_DATA_DIR=/tmp/apitelegramchat_data
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgl1 libglib2.0-0 libgomp1 && rm -rf /var/lib/apt/lists/*
 

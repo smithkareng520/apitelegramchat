@@ -10,9 +10,16 @@ _NAMESPACE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 @lru_cache(maxsize=1)
 def data_root() -> Path:
-    base = os.getenv("APITELEGRAMCHAT_DATA_DIR", ".apitelegramchat_data")
+    # Use a writable location by default. On managed deploys the app directory may
+    # be read-only for the runtime user, so default to /tmp unless explicitly set.
+    base = os.getenv("APITELEGRAMCHAT_DATA_DIR", "/tmp/apitelegramchat_data")
     root = Path(base).expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        fallback = Path("/tmp/apitelegramchat_data").resolve()
+        fallback.mkdir(parents=True, exist_ok=True)
+        root = fallback
     return root
 
 

@@ -22,7 +22,7 @@ def get_mcp_scope() -> RuntimeScope:
 
 
 def get_data_dir() -> str:
-    return os.getenv("APITELEGRAMCHAT_DATA_DIR", ".apitelegramchat_data")
+    return os.getenv("APITELEGRAMCHAT_DATA_DIR", "/tmp/apitelegramchat_data")
 
 
 def validate_telegram_runtime(strict: bool = False) -> None:
