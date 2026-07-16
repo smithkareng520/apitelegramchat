@@ -8,6 +8,7 @@ import aiohttp
 import json
 import hashlib
 from pathlib import Path
+from workspace_paths import workspace_root
 import re
 import html
 import logging
@@ -81,7 +82,11 @@ from todo_tool import (
 )
 from memory_tool import render_memory_card
 from skill_tool import render_skill_card
-from subagent_tool import render_subagent_card
+try:
+    from subagent_tool import render_subagent_card
+except Exception:  # pragma: no cover - optional dependency fallback
+    def render_subagent_card(*args, **kwargs):
+        return "<b>Subagent</b>"
 from utils import escape_html
 
 logger = logging.getLogger(__name__)
@@ -113,7 +118,7 @@ class BashSession:
         self.chat_id = chat_id
         self.proc: Optional[asyncio.subprocess.Process] = None
         self._started = False
-        self.workspace = Path(f"./workspace/{chat_id}").resolve()
+        self.workspace = workspace_root(chat_id)
         self._watchdog_task: Optional[asyncio.Task] = None
         self._sandbox_mode: Optional[str] = None  # "bwrap" | "fallback"
 
@@ -1473,7 +1478,7 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
         # 1. 从 R2 同步最新文件到本地
         await _sync_workspace_from_r2(chat_id)
 
-        workspace = Path(f"./workspace/{chat_id}").resolve()
+        workspace = workspace_root(chat_id)
         sent = []
         failed = []
         # 文件大小上限：50MB，防止 OOM

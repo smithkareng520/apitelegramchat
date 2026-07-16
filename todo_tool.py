@@ -26,6 +26,7 @@ import os
 import time
 import uuid
 from pathlib import Path
+from workspace_paths import workspace_root
 from typing import Any, Optional
 
 import aiohttp
@@ -56,7 +57,7 @@ PRIORITY_META = {
 
 # ---------- 存储层 ----------
 def _workspace_path(chat_id: int) -> Path:
-    return Path(f"./workspace/{chat_id}").resolve()
+    return workspace_root(chat_id)
 
 
 def _todo_path(chat_id: int) -> Path:

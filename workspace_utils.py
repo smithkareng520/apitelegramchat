@@ -3,6 +3,7 @@ import asyncio
 import os
 import logging
 from pathlib import Path
+from workspace_paths import workspace_root
 
 from s3_utils import (
     upload_bytes_to_r2,
@@ -32,7 +33,7 @@ async def _sync_workspace_from_r2(chat_id: int):
     从 R2 拉取所有文件到本地 workspace，并删除本地多余文件。
     全量同步，用于初始化或恢复。
     """
-    workspace = Path(f"./workspace/{chat_id}").resolve()
+    workspace = workspace_root(chat_id)
     workspace.mkdir(parents=True, exist_ok=True)
     prefix = f"editor/{chat_id}/"
     keys = await list_r2_objects(prefix)
@@ -84,7 +85,7 @@ async def _sync_workspace_to_r2(chat_id: int):
     将本地所有文件上传到 R2，并删除远程多余文件。
     全量同步，用于 bash 等可能产生大量变更的场景。
     """
-    workspace = Path(f"./workspace/{chat_id}").resolve()
+    workspace = workspace_root(chat_id)
     if not workspace.exists():
         return
     prefix = f"editor/{chat_id}/"
@@ -130,7 +131,7 @@ async def _sync_file_from_r2(chat_id: int, filename: str) -> None:
     仅从 R2 下载指定的单个文件到本地 workspace。
     如果 R2 上没有该文件，则不做什么（本地可能也没有，或本地是新建的）。
     """
-    workspace = Path(f"./workspace/{chat_id}").resolve()
+    workspace = workspace_root(chat_id)
     workspace.mkdir(parents=True, exist_ok=True)
     local_path = workspace / filename
 
@@ -154,7 +155,7 @@ async def _sync_file_to_r2(chat_id: int, filename: str) -> None:
     仅将本地指定的单个文件上传到 R2。
     如果本地文件不存在，则删除 R2 上的对应文件（如果有的话）。
     """
-    workspace = Path(f"./workspace/{chat_id}").resolve()
+    workspace = workspace_root(chat_id)
     local_path = workspace / filename
 
     safe_name = os.path.normpath(filename)

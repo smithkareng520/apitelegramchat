@@ -17,16 +17,37 @@ from datetime import datetime
 import shutil
 from urllib.parse import unquote, quote, urljoin, urlparse, urlsplit, urlunsplit, parse_qs
 from typing import Optional, List, Dict, Any
-import trafilatura
-from trafilatura.settings import use_config
-from curl_cffi.requests import AsyncSession
-import feedparser
+try:
+    import trafilatura  # type: ignore
+    from trafilatura.settings import use_config  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    trafilatura = None
+    def use_config():  # type: ignore
+        return None
+try:
+    from curl_cffi.requests import AsyncSession  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    AsyncSession = None  # type: ignore
+try:
+    import feedparser  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    class _FeedParserStub:
+        def parse(self, *args, **kwargs):
+            return {"entries": []}
+    feedparser = _FeedParserStub()  # type: ignore
 from pathlib import Path
-import qrcode
+from workspace_paths import workspace_root
+try:
+    import qrcode  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    qrcode = None  # type: ignore
 from io import BytesIO
 import html
 from cachetools import TTLCache
-from lxml import html as lxml_html
+try:
+    from lxml import html as lxml_html  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    lxml_html = None  # type: ignore
 from state import get_editor_file_state, set_editor_file_state, clear_editor_file_state
 
 from config import (
@@ -48,7 +69,12 @@ from workspace_utils import _get_workspace_lock, _sync_workspace_from_r2, _sync_
 from todo_tool import TODO_TOOL, execute_todo  # noqa: E402
 from memory_tool import MEMORY_TOOL, execute_memory  # noqa: E402
 from skill_tool import SKILL_TOOL, execute_skill  # noqa: E402
-from subagent_tool import SUBAGENT_TOOL, execute_subagent  # noqa: E402
+try:  # noqa: E402
+    from subagent_tool import SUBAGENT_TOOL, execute_subagent  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    SUBAGENT_TOOL = []
+    async def execute_subagent(*args, **kwargs):  # type: ignore
+        return "Error: subagent tool is unavailable in this environment."
 logger = logging.getLogger(__name__)
 
 WIKIPEDIA_USER_AGENTS = [
@@ -89,7 +115,11 @@ def _get_ddg_lock() -> asyncio.Lock:
     return _ddg_lock
 
 _TRAFILATURA_CONFIG = use_config()
-_TRAFILATURA_CONFIG.set("DEFAULT", "DOWNLOAD_TIMEOUT", str(TRAFILATURA_TIMEOUT))
+if _TRAFILATURA_CONFIG is not None:
+    try:
+        _TRAFILATURA_CONFIG.set("DEFAULT", "DOWNLOAD_TIMEOUT", str(TRAFILATURA_TIMEOUT))
+    except Exception:
+        pass
 
 # ---------- 缓存 ----------
 _search_cache = TTLCache(maxsize=200, ttl=SEARCH_CACHE_TTL)
@@ -117,7 +147,7 @@ async def _validate_edit(chat_id: int, path: str, old_str: str, start_line: int,
     """
     已废弃：不再被 str_replace 使用，仅保留兼容性。
     """
-    workspace = Path(f"./workspace/{chat_id}").resolve()
+    workspace = workspace_root(chat_id)
     local_path = workspace / path
     if not local_path.exists():
         return False, f"File not found: {path}", None, None, None, None
@@ -255,7 +285,7 @@ async def execute_text_editor(
     async with lock:
         await _sync_workspace_from_r2(chat_id)
 
-        workspace = Path(f"./workspace/{chat_id}").resolve()
+        workspace = workspace_root(chat_id)
         local_path = workspace / safe_path
 
         # ----- view (增强：支持搜索关键词) -----
@@ -3408,8 +3438,12 @@ import os
 import re
 import hashlib
 from urllib.parse import quote
-import aioboto3
-from botocore.exceptions import ClientError
+try:
+    import aioboto3  # type: ignore
+    from botocore.exceptions import ClientError  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    aioboto3 = None  # type: ignore
+    ClientError = Exception
 from s3_utils import upload_bytes_to_r2, download_from_r2, file_exists_in_r2
 from config import (
     R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY,

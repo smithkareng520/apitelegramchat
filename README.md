@@ -6,6 +6,12 @@
 
 一个高性能的 **异步 Webhook 架构** Telegram AI 机器人，采用 Quart 框架构建。支持多款顶级 AI 模型灵活切换、全面的多模态输入处理（文本/图像/音频/文档）、云存储集成（Cloudflare R2）以及智能的 AI 驱动搜索能力。
 
+
+
+## 🧩 MCP 版本说明
+
+本版本已经把能力层真正收敛到 MCP：`mcp_server.py` 只是入口，规范实现放在 `src/apitelegramchat/mcp/`，工具定义采用懒加载注册，资源与 prompts 单独拆分，Telegram 机器人继续保留为兼容模式。默认数据目录仍然落在隐藏的 `.apitelegramchat_data/` 下，并按 MCP scope 做隔离，避免污染项目工作区。
+
 ---
 
 ## 🚀 核心功能
@@ -46,7 +52,7 @@
 - **上下文保留**：模型切换时自动保留对话上下文
 
 ### 📋 待办清单（Task / Todo 工具）
-- **持久化存储**：每个 chat 一份清单，落在 `./workspace/{chat_id}/todos.json`，并随 Cloudflare R2 自动同步——会话结束后任务依旧保留。
+- **持久化存储**：每个 chat 一份清单，落在 `.apitelegramchat_data/workspaces/chat_{chat_id}/todos.json`，并随 Cloudflare R2 自动同步——会话结束后任务依旧保留。
 - **8 种操作**：`add` / `list` / `done` / `undone` / `toggle` / `delete` / `clear` / `edit`，由 AI 自主决策调用。
 - **富文本卡片**：列表以富 HTML 卡片渲染——优先级徽章（🔴 高 / 🟡 中 / 🟢 低）、已完成项自动加删除线、底部统计区显示「总数 · 已完成 · 待办」。
 - **可点击 InlineKeyboard**：当条目不超过 12 项时，列表卡片附带可点击按钮：
@@ -58,7 +64,7 @@
 - **AI 调用约定**：执行任何写操作后，AI 会自动再调用一次 `list`，让用户在结果卡片里立刻看到最新状态。
 
 ### 🧠 长期记忆（Memory 工具）
-- **跨会话保留**：与对话历史（自动修剪 60 条）不同，memory 永久存储在 `./workspace/{chat_id}/memories.json`，并随 R2 同步——下次对话开始时仍可检索。
+- **跨会话保留**：与对话历史（自动修剪 60 条）不同，memory 永久存储在 `.apitelegramchat_data/workspaces/chat_{chat_id}/memories.json`，并随 R2 同步——下次对话开始时仍可检索。
 - **7 种操作**：`add` / `get` / `list` / `search` / `update` / `delete` / `clear`。
 - **结构化字段**：每条记忆有 `category`（fact / preference / person / event / note / 自定义）、`tags`、`importance`（low/medium/high）。
 - **零依赖检索**：`search` 用大小写不敏感的子串匹配扫 content + tags + category，无需外部向量数据库。
@@ -69,7 +75,7 @@
 - **7 个内置技能**：`translator`（中英互译）、`summarizer`（长文摘要）、`coder`（工程化代码生成）、`reviewer`（代码评审）、`explainer`（概念解释）、`brainstormer`（头脑风暴）、`planner`（任务拆解）。
 - **6 种操作**：`list` / `info` / `use` / `register` / `update` / `delete`。
 - **激活语义**：调用 `use` 后，技能的 `system_prompt` 会指导 AI 接下来的回复风格与格式，直到用户切换或取消。
-- **自定义技能**：用户可以描述"我希望你以后用 X 方式回复"，AI 帮他 `register` 一个 custom skill（name 用 snake_case，必填 description + system_prompt）。自定义技能存放在 `./workspace/{chat_id}/skills.json`，跨会话保留。
+- **自定义技能**：用户可以描述"我希望你以后用 X 方式回复"，AI 帮他 `register` 一个 custom skill（name 用 snake_case，必填 description + system_prompt）。自定义技能存放在 `.apitelegramchat_data/workspaces/chat_{chat_id}/skills.json`，跨会话保留。
 - **表格化列表**：所有可用技能以 `<table bordered striped>` 渲染，列 = 技能 / 类型（内置/自定义）/ 说明 / 可用工具。
 - **保护机制**：内置技能不可删除/更新；自定义技能可自由 update / delete。
 
@@ -93,20 +99,28 @@
 ### 文件结构
 ```
 apitelegramchat/
-├── app.py                  # Webhook 服务器、消息路由与分发
-├── ai_handlers.py          # AI 推理核心、模型调用、Agentic loop
-├── search_engine.py        # 搜索工具集（Google CSE + 免费 DuckDuckGo JSON API 回退）
-├── file_handlers.py        # 文件解析引擎（PDF、文档、图像处理）
-├── s3_utils.py            # Cloudflare R2 云存储集成
-├── todo_tool.py           # 📋 待办清单工具：存储 + 富文本渲染 + InlineKeyboard
-├── memory_tool.py         # 🧠 长期记忆工具：跨会话事实/偏好/人物存储
-├── skill_tool.py          # 🎯 技能注册表：内置 7 技能 + 自定义技能
-├── subagent_tool.py       # 🤖 子 agent 工具：派生独立子任务的最小 agentic loop
-├── config.py              # 环境配置、模型定义、API Key 管理
-├── state.py               # 运行时状态管理、用户上下文、锁机制
-├── utils.py               # 工具函数集（日志、消息发送、API 调用）
-├── requirements.txt       # Python 依赖清单
-└── Dockerfile            # 容器化部署配置
+├── app.py                        # Telegram Webhook 兼容入口
+├── mcp_server.py                 # MCP stdio 兼容入口
+├── src/
+│   └── apitelegramchat/
+│       ├── core/                 # 配置、作用域、工作区隔离
+│       ├── mcp/                  # MCP registry / prompts / resources / transport
+│       ├── tools/                # 轻量适配层（对接 legacy 实现）
+│       └── entrypoints/          # 规范入口
+├── ai_handlers.py                # 兼容保留：AI 推理核心
+├── search_engine.py              # 兼容保留：搜索 / 编辑 / 地理工具实现
+├── file_handlers.py              # 文件解析引擎
+├── s3_utils.py                   # R2 + 本地缓存降级
+├── todo_tool.py                  # Todo 工具实现
+├── memory_tool.py                # Memory 工具实现
+├── skill_tool.py                 # Skill 工具实现
+├── subagent_tool.py              # Subagent 工具实现
+├── config.py                     # 环境配置、模型定义、API Key 管理
+├── state.py                      # 运行时状态管理
+├── workspace_paths.py            # 工作区根路径与命名空间隔离
+├── workspace_utils.py            # 工作区与 R2 同步
+├── requirements.txt              # Python 依赖清单
+└── Dockerfile                    # 容器化部署配置
 ```
 
 ### 关键特性
@@ -122,8 +136,9 @@ apitelegramchat/
 
 ### 前置要求
 - Python 3.10+
-- 从 [BotFather](https://t.me/BotFather) 获取 Telegram Bot Token
+- 从 [BotFather](https://t.me/BotFather) 获取 Telegram Bot Token（Telegram 模式）
 - 至少一个 AI 模型 API Key（Gemini / Grok / DeepSeek / OpenRouter 等）
+- 如果只跑 MCP 模式，Telegram 变量可以不配
 
 ### 1️⃣ 克隆与安装
 
@@ -175,10 +190,13 @@ SANDBOX_UNSHARE_NET=1    (启用断网)
 ### 3️⃣ 启动服务
 
 ```bash
-# 本地开发运行
+# 本地开发运行 Telegram 兼容模式
 python app.py
 
-# 或使用 Gunicorn（生产环境推荐）
+# 启动 MCP stdio 服务
+python mcp_server.py
+
+# 或使用 Gunicorn（生产环境推荐，Telegram 模式）
 gunicorn -w 4 -b 0.0.0.0:5000 app:app
 ```
 
@@ -406,30 +424,3 @@ R2_REGION=auto
 
 *维护者：[smithkareng520](https://github.com/smithkareng520)*  
 *最后更新：2026年6月*
-
-
----
-
-## 🧩 MCP 支持
-
-项目新增了标准的 MCP 暴露层，现有工具可以直接被 MCP 客户端发现和调用，而原有 Telegram 机器人功能保持不变。
-
-### 启动方式
-
-```bash
-APP_MODE=mcp python mcp_server.py
-```
-
-默认使用 stdio 传输，适合 Claude Desktop、MCP Inspector 以及其他支持 MCP 的本地客户端。
-
-### 工具分区
-
-- `web_search`、`fetch_url`、`weather`、`news` 等工具是无状态的，可直接调用。
-- `todo`、`memory`、`skill`、`subagent`、`bash`、`text_editor`、`present_files` 是有状态的，建议在参数里传入 `workspace_id`，这样可以隔离不同客户端或任务空间。
-- 不传 `workspace_id` 时，服务器会自动使用默认工作区。
-
-### 资源与提示词
-
-- `project://tool-catalog`：返回完整工具目录的 JSON
-- `project-brief`：返回一段适合放进系统提示词的项目说明
-

@@ -40,6 +40,7 @@ import os
 import time
 import uuid
 from pathlib import Path
+from workspace_paths import workspace_root
 from typing import Any, Optional
 
 from workspace_utils import (
@@ -77,7 +78,7 @@ CATEGORY_EMOJI = {
 
 # ---------- 存储层 ----------
 def _workspace_path(chat_id: int) -> Path:
-    return Path(f"./workspace/{chat_id}").resolve()
+    return workspace_root(chat_id)
 
 
 def _memory_path(chat_id: int) -> Path:
