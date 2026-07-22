@@ -331,10 +331,10 @@ SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
     max_context=1000000,
     max_output_tokens=128000,
 )
-SUPPORTED_MODELS["poolside/laguna-m.1:free"] = make_model_config(
-    model_id="poolside/laguna-m.1:free",
+SUPPORTED_MODELS["poolside/laguna-s-2.1:free"] = make_model_config(
+    model_id="poolside/laguna-s-2.1:free",
     provider="openrouter",
-    name="Laguna m.1 Free",
+    name="Laguna s-2.1 Free",
     max_context=262000,
     max_output_tokens=33000,
 )
@@ -383,10 +383,10 @@ SUPPORTED_MODELS["deepseek-ai/DeepSeek-V4-Pro"] = make_model_config(
 )
 
 # ---------- Gemini 系列 ----------
-SUPPORTED_MODELS["gemini-3.5-flash"] = make_model_config(
-    model_id="gemini-3.5-flash",
+SUPPORTED_MODELS["gemini-3.6-flash"] = make_model_config(
+    model_id="gemini-3.6-flash",
     provider="gemini",
-    name="Gemini 3.5 Flash",
+    name="Gemini 3.6 Flash",
     vision=True,
     max_context=1000000,
     max_output_tokens=65535,

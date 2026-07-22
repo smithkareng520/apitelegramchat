@@ -917,94 +917,165 @@ def _strip_prefix_error_message(text: str) -> str:
     cleaned = text.strip()
     if cleaned.startswith("⚠️ "):
         cleaned = cleaned[2:].strip()
+    # 常见 SDK/HTTP 客户端会把真正的报错放在 message='...'
+    # 这一段里，先把外层包装去掉，便于后续 JSON 解析与摘要提取。
+    m = re.search(r'message\s*=\s*([\'"])(.*?)(?:\1(?:,|$)|$)', cleaned, re.S)
+    if m:
+        cleaned = m.group(2).strip()
     if " - {" in cleaned:
         cleaned = cleaned.split(" - ", 1)[1].strip()
     return cleaned
 
+def _coerce_error_payload(payload_text: str) -> Any:
+    """尽量把错误文本还原成 dict/list，便于抽取关键信息。"""
+    if not payload_text:
+        return None
+    text = _strip_prefix_error_message(payload_text).strip()
+    if not text:
+        return None
 
-# ========== 修复点：将 _extract_error_details 改为 async def ==========
-async def _extract_error_details(
-        error_message: str = "",
-        exception: Optional[Exception] = None,
-) -> tuple[str, str]:
-    """
-    尽量从原始异常或响应体中提取：
-    - 详情 message
-    - request_id
-    不做任何错误类型映射，只做结构化包装。
-    """
-    detail = ""
-    request_id = ""
+    candidates = [text]
+    if "{" in text:
+        candidates.append(text[text.find("{"):].strip())
+    if "[" in text:
+        candidates.append(text[text.find("["):].strip())
 
-    def _consume_payload(payload_text: str) -> bool:
-        nonlocal detail, request_id
-        if not payload_text:
-            return False
-
-        candidate = _strip_prefix_error_message(payload_text)
-        if not candidate:
-            return False
-
-        parsed = None
-        # 先尝试 JSON，再尝试 Python 字面量（部分 SDK 会返回 dict repr）
-        for blob in (candidate, candidate[candidate.find("{"):] if "{" in candidate else ""):
-            blob = blob.strip()
-            if not blob or not (blob.startswith("{") or blob.startswith("[")):
+    for blob in candidates:
+        blob = blob.strip()
+        if not blob:
+            continue
+        if not (blob.startswith("{") or blob.startswith("[")):
+            continue
+        try:
+            return json.loads(blob)
+        except Exception:
+            try:
+                return ast.literal_eval(blob)
+            except Exception:
                 continue
-            try:
-                parsed = json.loads(blob)
-            except Exception:
-                try:
-                    parsed = ast.literal_eval(blob)
-                except Exception:
-                    parsed = None
-            if isinstance(parsed, dict):
-                err_obj = parsed.get("error")
-                if isinstance(err_obj, dict):
-                    detail = (
-                            err_obj.get("message")
-                            or err_obj.get("detail")
-                            or parsed.get("message")
-                            or candidate
-                    )
-                    request_id = (
-                            err_obj.get("request_id")
-                            or parsed.get("request_id")
-                            or ""
-                    )
-                    return True
-                if isinstance(err_obj, str):
-                    detail = err_obj
-                    request_id = parsed.get("request_id") or ""
-                    return True
-                message = parsed.get("message")
-                if message:
-                    detail = str(message)
-                    request_id = parsed.get("request_id") or ""
-                    return True
-        # 非 JSON/字面量，直接采用原文
-        detail = candidate
-        # 轻量提取 request_id
-        m = re.search(r"request_id['\"]?\s*[:=]\s*['\"]?([a-zA-Z0-9\-]+)", candidate)
+    return None
+
+
+def _extract_detail_lines_from_payload(payload: Any) -> list[str]:
+    lines: list[str] = []
+
+    def _push(label: str, value: Any):
+        if value is None:
+            return
+        if isinstance(value, str):
+            value = re.sub(r"\s+", " ", value.strip())
+        if value == "":
+            return
+        lines.append(f"{label}：{value}")
+
+    def _walk(obj: Any):
+        if obj is None:
+            return
+        if isinstance(obj, list):
+            for item in obj[:5]:
+                _walk(item)
+            return
+        if not isinstance(obj, dict):
+            _push("详情", obj)
+            return
+
+        # 常见结构：{"error": {...}}
+        err = obj.get("error")
+        if isinstance(err, dict):
+            obj = err
+        elif isinstance(err, str):
+            _push("消息", err)
+
+        # 基础字段
+        for key, label in (
+            ("code", "代码"),
+            ("status", "状态"),
+            ("message", "消息"),
+            ("detail", "详情"),
+            ("request_id", "Request ID"),
+            ("requestId", "Request ID"),
+            ("type", "类型"),
+        ):
+            _push(label, obj.get(key))
+
+        # Gemini / Google 风格的配额与帮助信息
+        details = obj.get("details")
+        if isinstance(details, list):
+            for item in details[:5]:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("@type") or "")
+                if "QuotaFailure" in item_type:
+                    violations = item.get("violations")
+                    if isinstance(violations, list):
+                        for v in violations[:5]:
+                            if not isinstance(v, dict):
+                                continue
+                            _push("配额指标", v.get("quotaMetric"))
+                            _push("限制", v.get("limit"))
+                            _push("主体", v.get("subject"))
+                            _push("说明", v.get("description"))
+                elif "Help" in item_type:
+                    links = item.get("links")
+                    if isinstance(links, list) and links:
+                        first = links[0]
+                        if isinstance(first, dict):
+                            _push("帮助", first.get("description"))
+                            _push("链接", first.get("url"))
+
+        # 兜底：把少量有用字段也列出来
+        for key in ("quotaMetric", "limit", "subject", "description", "retryAfter", "retry_after"):
+            if key in obj:
+                label = {
+                    "quotaMetric": "配额指标",
+                    "limit": "限制",
+                    "subject": "主体",
+                    "description": "说明",
+                    "retryAfter": "重试等待",
+                    "retry_after": "重试等待",
+                }.get(key, key)
+                _push(label, obj.get(key))
+
+        # 有些 JSON 里把真正信息塞在 message 里，顺手把常见的 retry 提示补出来
+        message = str(obj.get("message") or obj.get("detail") or "")
+        m = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", message, re.I)
         if m:
-            request_id = m.group(1)
-        return True
+            _push("建议重试", f"{m.group(1)}s 后重试")
 
-    if error_message:
-        _consume_payload(error_message)
+    _walk(payload)
 
-    if not detail and exception:
-        if hasattr(exception, "response") and hasattr(exception.response, "text"):
-            try:
-                body = await exception.response.text()  # 现在在 async 函数中，合法
-                _consume_payload(body)
-            except Exception:
-                pass
-        if not detail:
-            detail = _strip_prefix_error_message(str(exception))
+    # 去重并保留顺序
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        norm = line.strip()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        deduped.append(norm)
+    return deduped
 
-    return detail, request_id
 
+def _format_error_detail_for_display(detail: str) -> str:
+    """把原始错误详情转成更适合聊天窗口阅读的 HTML 文本。"""
+    if not detail:
+        return ""
+    clean = strip_html_tags(str(detail)).strip()
+    if not clean:
+        return ""
+
+    payload = _coerce_error_payload(clean)
+    if payload is not None:
+        lines = _extract_detail_lines_from_payload(payload)
+        if lines:
+            return "<br/>".join(escape_html(line) for line in lines)
+
+    # fallback：按行输出，先把转义序列恢复成可读文本
+    clean = clean.replace("\\r\\n", "\\n").replace("\\r", "\\n").replace("\\n", "\n")
+    lines = [line.strip() for line in clean.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return "<br/>".join(escape_html(line) for line in lines)
 
 def _format_api_error_notice(
         *,
@@ -1018,17 +1089,14 @@ def _format_api_error_notice(
     parts = [f"⚠️ <b>{escape_html(api_name)} 请求失败</b>"]
     if error_code:
         parts.append(f"HTTP 状态：{error_code}")
-    if endpoint:
-        parts.append(f"端点：{escape_html(endpoint)}")
     if model:
         parts.append(f"模型：{escape_html(model)}")
     if request_id:
         parts.append(f"Request ID：{escape_html(request_id)}")
     if detail:
-        clean_detail = strip_html_tags(detail).strip()
-        if len(clean_detail) > 1000:
-            clean_detail = clean_detail[:1000] + "…"
-        parts.append(f"详情：{escape_html(clean_detail)}")
+        formatted_detail = _format_error_detail_for_display(detail)
+        if formatted_detail:
+            parts.append(f"详情：{formatted_detail}")
     return "<br/>".join(parts)
 
 

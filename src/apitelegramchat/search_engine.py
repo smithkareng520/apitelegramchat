@@ -2304,21 +2304,21 @@ async def _images_response_to_bytes(data: dict) -> list[bytes]:
 
 
 def _format_image_api_error(api_name: str, status_code: int, detail: str = "", request_id: str = "", endpoint: str = "", model: str = "") -> str:
-    parts = [f"❌ {api_name} 请求失败"]
+    parts = [f"❌ {html.escape(api_name)} 请求失败"]
     if status_code:
         parts.append(f"HTTP 状态：{status_code}")
-    if endpoint:
-        parts.append(f"端点：{endpoint}")
     if model:
-        parts.append(f"模型：{model}")
+        parts.append(f"模型：{html.escape(model)}")
     if request_id:
-        parts.append(f"Request ID：{request_id}")
+        parts.append(f"Request ID：{html.escape(request_id)}")
     if detail:
-        clean = detail.strip().replace("\r", " ").replace("\n", " ")
-        if len(clean) > 500:
-            clean = clean[:500] + "…"
+        clean = detail.strip().replace("\r\n", "\n").replace("\r", "\n")
+        lines = [line.strip() for line in clean.split("\n") if line.strip()]
+        clean = "<br/>".join(html.escape(line) for line in lines)
+        if len(clean) > 800:
+            clean = clean[:800] + "…"
         parts.append(f"详情：{clean}")
-    return "\n".join(parts)
+    return "<br/>".join(parts)
 
 
 async def execute_generate_image(
