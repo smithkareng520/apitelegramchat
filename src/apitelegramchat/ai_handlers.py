@@ -250,7 +250,7 @@ async def _request_modelscope_native_image(
             if parsed and isinstance(parsed, dict):
                 request_id = str(parsed.get('request_id') or parsed.get('requestId') or '').strip()
             if resp.status != 200:
-                detail, req_id = await _extract_error_details(body_text)
+                detail, req_id = _extract_error_details(body_text)
                 return None, resp.status, detail or body_text, req_id or request_id
             if parsed is not None:
                 if not quiet:
@@ -1455,7 +1455,7 @@ async def get_error_notification_message(
     """
     不做错误映射，只把原始错误包装成更易读的结构化消息。
     """
-    raw_detail, request_id = await _extract_error_details(error_message, exception)  # 加上 await
+    raw_detail, request_id = _extract_error_details(error_message, exception)
     return _format_api_error_notice(
         api_name=api_name,
         error_code=error_code,
