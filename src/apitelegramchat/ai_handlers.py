@@ -956,6 +956,64 @@ def _coerce_error_payload(payload_text: str) -> Any:
     return None
 
 
+def _extract_error_details(error_message: str = "", exception: Optional[Exception] = None) -> tuple[str, str]:
+    """从原始异常文本中提取更适合展示的错误摘要与 request_id。"""
+    chunks: list[str] = []
+    for item in (error_message, exception):
+        if not item:
+            continue
+        try:
+            chunks.append(str(item))
+        except Exception:
+            continue
+
+    raw_text = "\n".join(part for part in chunks if part).strip()
+    if not raw_text:
+        return "", ""
+
+    # 先尝试把外层包装剥掉，再解析 JSON / Python 字面量。
+    cleaned = _strip_prefix_error_message(raw_text)
+    payload = _coerce_error_payload(cleaned)
+    if payload is None and cleaned != raw_text:
+        payload = _coerce_error_payload(raw_text)
+
+    if payload is not None:
+        # 尽量从 payload 里提取 request_id
+        request_id = ""
+
+        def _find_request_id(obj: Any) -> str:
+            if isinstance(obj, dict):
+                for key in ("request_id", "requestId", "requestID", "x-request-id", "x_request_id"):
+                    value = obj.get(key)
+                    if value:
+                        return str(value).strip()
+                for value in obj.values():
+                    found = _find_request_id(value)
+                    if found:
+                        return found
+            elif isinstance(obj, list):
+                for item in obj[:10]:
+                    found = _find_request_id(item)
+                    if found:
+                        return found
+            return ""
+
+        request_id = _find_request_id(payload)
+        lines = _extract_detail_lines_from_payload(payload)
+        if lines:
+            return "\n".join(lines), request_id
+
+    # 兜底：把常见的转义换行展开，保留少量有用内容。
+    fallback = cleaned.replace("\\r\\n", "\n").replace("\\r", "\n").replace("\\n", "\n")
+    lines = [line.strip() for line in fallback.splitlines() if line.strip()]
+    if not lines:
+        return "", ""
+
+    # 只保留前几行，避免把超长原始响应全打出来。
+    trimmed = lines[:12]
+    return "\n".join(trimmed), ""
+
+
 def _extract_detail_lines_from_payload(payload: Any) -> list[str]:
     lines: list[str] = []
 
