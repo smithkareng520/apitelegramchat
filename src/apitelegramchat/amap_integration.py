@@ -988,9 +988,11 @@ async def execute_route_amap(start: str, end: str, profile: str = "driving") -> 
         f"https://maps.google.com/maps?saddr={start_lat},{start_lon}"
         f"&daddr={end_lat},{end_lon}&dirflg={'d' if prof == 'driving' else 'w'}"
     )
+    start_lng_gcj, start_lat_gcj = wgs84_to_gcj02(start_lon, start_lat)
+    end_lng_gcj, end_lat_gcj = wgs84_to_gcj02(end_lon, end_lat)
     nav_gaode = (
-        f"https://uri.amap.com/navigation?from={start_lon},{start_lat},"
-        f"{quote(start_name[:20])}&to={end_lon},{end_lat},{quote(end_name[:20])}"
+        f"https://uri.amap.com/navigation?from={start_lng_gcj},{start_lat_gcj},{quote(start_name[:20])}"
+        f"&to={end_lng_gcj},{end_lat_gcj},{quote(end_name[:20])}"
         f"&mode={'car' if prof == 'driving' else ('walk' if prof == 'walking' else ('ride' if prof == 'bicycling' else 'bus'))}"
         f"&callnative=1"
     )
