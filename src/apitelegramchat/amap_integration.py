@@ -185,7 +185,7 @@ def _build_nav_links(
         # Baidu marker supports coord_type; passing gcj02 prevents the ~hundreds of meters
         # offset that happens when Baidu assumes bd09ll.
         "baidu": (
-            f"https://map.baidu.com/?q={_fmt_coord(lat_gcj)},{_fmt_coord(lon_gcj)}"
+            f"https://api.map.baidu.com/marker?location={_fmt_coord(lat_wgs)},{_fmt_coord(lon_wgs)}&title=&content={quote(display_name[:40])}&output=html"
         ),
     }
 
@@ -811,8 +811,8 @@ async def execute_place_details_amap(
                     poiid=poiid,
                 ),
                 "baidu": (
-                    f"http://api.map.baidu.com/marker?location={lat_wgs},{lng_wgs}"
-                    f"&title={quote(name[:40])}&content={quote(name[:40])}&coord_type=wgs84&output=html"
+                    f"https://api.map.baidu.com/marker?location={lat_wgs},{lng_wgs}"
+                    f"&title=&content={quote((address_parts or name)[:80])}&output=html"
                 ),
             },
         },

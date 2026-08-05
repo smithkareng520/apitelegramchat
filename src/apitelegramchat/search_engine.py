@@ -71,7 +71,7 @@ def _build_nav_links(
         "apple": f"https://maps.apple.com/?q={_fmt_coord(lat_gcj)},{_fmt_coord(lon_gcj)}",
         "gaode": f"https://uri.amap.com/marker?position={_fmt_coord(lon_gcj)},{_fmt_coord(lat_gcj)}",
         "baidu": (
-            f"http://api.map.baidu.com/marker?location={_fmt_coord(lat_wgs)},{_fmt_coord(lon_wgs)}&title={safe_name}&content={safe_name}&coord_type=wgs84&output=html"
+            f"https://api.map.baidu.com/marker?location={_fmt_coord(lat_wgs)},{_fmt_coord(lon_wgs)}&title=&content={safe_name}&output=html"
         ),
     }
 
@@ -3152,7 +3152,7 @@ out center tags 1;
         "nav_links": {
             "google": f"https://maps.google.com/?q={_fmt_coord(el_lat)},{_fmt_coord(el_lon)}",
             "gaode":  (f"https://uri.amap.com/marker?position={_fmt_coord(el_lon)},{_fmt_coord(el_lat)}"),
-            "baidu":  (f"http://api.map.baidu.com/marker?location={_fmt_coord(el_lat)},{_fmt_coord(el_lon)}&title={quote(name[:40])}&content={quote(name[:40])}&coord_type=wgs84&output=html"),
+            "baidu":  (f"https://api.map.baidu.com/marker?location={_fmt_coord(el_lat)},{_fmt_coord(el_lon)}&title=&content={quote(name[:40])}&output=html"),
         }
     }
     return json.dumps(result, ensure_ascii=False)
