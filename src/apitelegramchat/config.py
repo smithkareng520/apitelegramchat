@@ -311,55 +311,30 @@ def make_model_config(
 # =============================================================================
 SUPPORTED_MODELS: Dict[str, ModelConfig] = {}
 
-# ---------- OpenRouter 免费模型 ----------
+# ---------- OpenRouter 模型 ----------
 SUPPORTED_MODELS["nvidia/nemotron-3-ultra-550b-a55b:free"] = make_model_config(
     model_id="nvidia/nemotron-3-ultra-550b-a55b:free",
     provider="openrouter",
-    name="Nemotron 3 Ultra 550B A55B Free",
-    supports_tools=True,
+    name="Nemotron 3 Ultra 550b A55b Free",
     max_context=1000000,
     max_output_tokens=66000,
+)
+SUPPORTED_MODELS["inclusionai/ling-3.0-flash:free"] = make_model_config(
+    model_id="inclusionai/ling-3.0-flash:free",
+    provider="openrouter",
+    name="Ling 3.0 Flash Free",
+    max_context=262000,
+    max_output_tokens=64000,
 )
 SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
     model_id="anthropic/claude-sonnet-5",
     provider="openrouter",
     name="Claude Sonnet 5",
-    supports_tools=True,
     vision=True,
     native_document=True,
     supports_prompt_cache=True,
     max_context=1000000,
     max_output_tokens=128000,
-)
-SUPPORTED_MODELS["poolside/laguna-s-2.1:free"] = make_model_config(
-    model_id="poolside/laguna-s-2.1:free",
-    provider="openrouter",
-    name="Laguna s-2.1 Free",
-    max_context=262000,
-    max_output_tokens=33000,
-)
-SUPPORTED_MODELS["cohere/north-mini-code:free"] = make_model_config(
-    model_id="cohere/north-mini-code:free",
-    provider="openrouter",
-    name="North Mini Code Free",
-    max_context=256000,
-    max_output_tokens=64000,
-)
-SUPPORTED_MODELS["tencent/hy3:free"] = make_model_config(
-    model_id="tencent/hy3:free",
-    provider="openrouter",
-    name="Hy3 Free",
-    max_context=262000,
-    max_output_tokens=64000,
-)
-SUPPORTED_MODELS["google/gemma-4-31b-it:free"] = make_model_config(
-    model_id="google/gemma-4-31b-it:free",
-    provider="openrouter",
-    name="Gemma 4 31B it",
-    supports_tools=True,
-    vision=True,
-    max_context=262000,
-    max_output_tokens=8000,
 )
 
 # ---------- Agnes 免费模型 ----------
@@ -419,28 +394,11 @@ SUPPORTED_MODELS["agnes-image-2.1-flash"] = make_model_config(
     max_context=32768,
     max_output_tokens=4000,
 )
-SUPPORTED_MODELS["fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA"] = make_model_config(
-    model_id="fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA",
-    provider="modelscope",
-    name="Qwen Image Edit 2511 Multiple Angles LoRA",
-    vision=True,
-    native_image=True,
-    max_context=32768,
-    max_output_tokens=4000,
-)
 SUPPORTED_MODELS["Qwen/Qwen-Image-Edit-2511"] = make_model_config(
     model_id="Qwen/Qwen-Image-Edit-2511",
     provider="modelscope",
     name="Qwen Image Edit 2511",
     vision=True,
-    native_image=True,
-    max_context=32768,
-    max_output_tokens=4000,
-)
-SUPPORTED_MODELS["MusePublic/489_ckpt_FLUX_1"] = make_model_config(
-    model_id="MusePublic/489_ckpt_FLUX_1",
-    provider="modelscope",
-    name="FLUX.1 dev",
     native_image=True,
     max_context=32768,
     max_output_tokens=4000,
@@ -495,7 +453,7 @@ SUPPORTED_MODELS["agnes-video-v2.0"] = make_model_config(
 )
 
 # ========== 默认模型 ==========
-DEFAULT_MODEL = "tencent/hy3:free"
+DEFAULT_MODEL = "inclusionai/ling-3.0-flash:free"
 assert DEFAULT_MODEL in SUPPORTED_MODELS, f"默认模型 {DEFAULT_MODEL} 未定义"
 
 
