@@ -57,6 +57,25 @@ except Exception:  # pragma: no cover - optional dependency fallback
     lxml_html = None  # type: ignore
 from apitelegramchat.state import get_editor_file_state, set_editor_file_state, clear_editor_file_state
 
+def _build_nav_links(
+    lat_wgs: float,
+    lon_wgs: float,
+    lat_gcj: float,
+    lon_gcj: float,
+    display_name: str,
+) -> dict[str, str]:
+    """Build map links using each provider's preferred coordinate system."""
+    safe_name = quote(display_name[:40])
+    return {
+        "google": f"https://www.google.com/maps/search/?api=1&query={lat_wgs},{lon_wgs}",
+        "apple": f"https://maps.apple.com/?ll={lat_gcj},{lon_gcj}&q={safe_name}",
+        "gaode": f"https://uri.amap.com/marker?position={lon_gcj},{lat_gcj}&coordinate=gcj02&name={safe_name}",
+        "baidu": (
+            f"http://api.map.baidu.com/marker?location={lat_gcj},{lon_gcj}"
+            f"&title={safe_name}&content={safe_name}&coord_type=gcj02&output=html"
+        ),
+    }
+
 from apitelegramchat.config import (
     GOOGLE_CSE_KEY, GOOGLE_CSE_ID,
     BASE_URL, OPENROUTER_API_KEY, MODELSCOPE_API_KEY, IMGBB_KEY,
@@ -2803,11 +2822,7 @@ async def execute_geocode(address: str) -> str:
         "state":    addr.get("state", ""),
         "country":  addr.get("country", ""),
         "postcode": addr.get("postcode", ""),
-        "nav_links": {
-            "google": f"https://maps.google.com/?q={lat},{lon}",
-            "gaode":  f"https://uri.amap.com/marker?position={lng_gcj},{lat_gcj}&coordinate=gcj02&name={quote(display_name[:40])}",
-            "baidu":  f"http://api.map.baidu.com/marker?location={lat},{lon}&title={quote(display_name[:40])}&output=html",
-        }
+        "nav_links": _build_nav_links(lat, lon, lat_gcj, lng_gcj, display_name)
     }
     return json.dumps(result, ensure_ascii=False)
 
@@ -2988,8 +3003,8 @@ async def execute_route(start: str, end: str, profile: str = "driving") -> str:
     center_lat = (start_lat + end_lat) / 2
     center_lon = (start_lon + end_lon) / 2
 
-    nav_google = (f"https://maps.google.com/maps?saddr={start_lat},{start_lon}"
-                  f"&daddr={end_lat},{end_lon}&dirflg={'d' if prof=='driving' else 'w'}")
+    nav_google = (f"https://www.google.com/maps/dir/?api=1&origin={start_lat},{start_lon}"
+                  f"&destination={end_lat},{end_lon}&travelmode={'driving' if prof=='driving' else 'walking'}")
     start_lng_gcj, start_lat_gcj = _wgs84_to_gcj02(start_lon, start_lat)
     end_lng_gcj, end_lat_gcj = _wgs84_to_gcj02(end_lon, end_lat)
     nav_gaode  = (f"https://uri.amap.com/navigation?from={start_lng_gcj},{start_lat_gcj},"
@@ -3044,8 +3059,8 @@ async def execute_distance(from_lat: float, from_lon: float,
         "center_lat":  center_lat,
         "center_lon":  center_lon,
         "nav_links": {
-            "google": (f"https://maps.google.com/maps?saddr={from_lat},{from_lon}"
-                       f"&daddr={to_lat},{to_lon}"),
+            "google": (f"https://www.google.com/maps/dir/?api=1&origin={from_lat},{from_lon}"
+                       f"&destination={to_lat},{to_lon}"),
             "gaode":  (f"https://uri.amap.com/navigation?from={from_lon},{from_lat}"
                        f"&to={to_lon},{to_lat}&mode=car&callnative=1"),
         }
@@ -3136,11 +3151,11 @@ out center tags 1;
         "fee":             tags.get("fee",             ""),
         "capacity":        tags.get("capacity",        ""),
         "nav_links": {
-            "google": f"https://maps.google.com/?q={el_lat},{el_lon}",
+            "google": f"https://www.google.com/maps/search/?api=1&query={el_lat},{el_lon}",
             "gaode":  (f"https://uri.amap.com/marker?position={el_lon},{el_lat}&coordinate=wgs84"
                        f"&name={quote(name[:40])}"),
             "baidu":  (f"http://api.map.baidu.com/marker?location={el_lat},{el_lon}"
-                       f"&title={quote(name[:40])}&output=html"),
+                       f"&title={quote(name[:40])}&content={quote(name[:40])}&coord_type=wgs84&output=html"),
         }
     }
     return json.dumps(result, ensure_ascii=False)
@@ -3505,7 +3520,7 @@ async def _run_overpass_poi(overpass_query: str,
             "distance":      dist,
             "nav_gaode": (f"https://uri.amap.com/marker?position={el_lon},{el_lat}&coordinate=wgs84"
                           f"&name={quote(name[:40])}"),
-            "nav_google": f"https://maps.google.com/?q={el_lat},{el_lon}",
+            "nav_google": f"https://www.google.com/maps/search/?api=1&query={el_lat},{el_lon}",
         })
 
         if len(results) >= max_results:

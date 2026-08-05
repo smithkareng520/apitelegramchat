@@ -157,6 +157,34 @@ def wgs84_to_gcj02(lng: float, lat: float) -> tuple[float, float]:
     return lng + dlng, lat + dlat
 
 
+def _build_nav_links(
+    lat_wgs: float,
+    lon_wgs: float,
+    lat_gcj: float,
+    lon_gcj: float,
+    display_name: str,
+) -> dict[str, str]:
+    """Build map links using each provider's preferred coordinate system."""
+    safe_name = quote(display_name[:40])
+    return {
+        # Google Maps URLs accept comma-separated latitude/longitude in the query parameter.
+        # Use WGS-84 here to avoid introducing a China-specific offset.
+        "google": f"https://www.google.com/maps/search/?api=1&query={lat_wgs},{lon_wgs}",
+        # Apple Maps on iPhone/macOS resolves the map pin from ll/q; we pass GCJ-02 here
+        # for China addresses so the pin follows the same mainland coordinate reference
+        # used by Amap.
+        "apple": f"https://maps.apple.com/?ll={lat_gcj},{lon_gcj}&q={safe_name}",
+        # Amap expects GCJ-02 for China mainland locations.
+        "gaode": f"https://uri.amap.com/marker?position={lon_gcj},{lat_gcj}&coordinate=gcj02&name={safe_name}",
+        # Baidu marker supports coord_type; passing gcj02 prevents the ~hundreds of meters
+        # offset that happens when Baidu assumes bd09ll.
+        "baidu": (
+            f"http://api.map.baidu.com/marker?location={lat_gcj},{lon_gcj}"
+            f"&title={safe_name}&content={safe_name}&coord_type=gcj02&output=html"
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # 内部工具
 # ---------------------------------------------------------------------------
@@ -467,14 +495,7 @@ async def execute_geocode_amap(address: str) -> str:
             "state": addr_comp.get("province", "") or "",
             "country": "中国",
             "postcode": addr_comp.get("adcode", "") or "",
-            "nav_links": {
-                "google": f"https://maps.google.com/?q={lat},{lon}",
-                "gaode": f"https://uri.amap.com/marker?position={lng_gcj},{lat_gcj}&coordinate=gcj02&name={quote(display_name[:40])}",
-                "baidu": (
-                    f"http://api.map.baidu.com/marker?location={lat},{lon}"
-                    f"&title={quote(display_name[:40])}&output=html"
-                ),
-            },
+            "nav_links": _build_nav_links(lat, lon, lat_gcj, lng_gcj, display_name),
         },
         ensure_ascii=False,
     )
@@ -641,7 +662,7 @@ async def execute_search_poi_amap(
                     name=name,
                     poiid=poiid,
                 ),
-                "nav_google": f"https://maps.google.com/?q={lat_wgs},{lng_wgs}",
+                "nav_google": f"https://www.google.com/maps/search/?api=1&query={lat_wgs},{lng_wgs}",
             }
         )
 
@@ -777,7 +798,7 @@ async def execute_place_details_amap(
             "fee": "",
             "capacity": "",
             "nav_links": {
-                "google": f"https://maps.google.com/?q={lat_wgs},{lng_wgs}",
+                "google": f"https://www.google.com/maps/search/?api=1&query={lat_wgs},{lng_wgs}",
                 "gaode": _gaode_marker_url(
                     lat=lat_wgs,
                     lon=lng_wgs,
@@ -786,7 +807,7 @@ async def execute_place_details_amap(
                 ),
                 "baidu": (
                     f"http://api.map.baidu.com/marker?location={lat_wgs},{lng_wgs}"
-                    f"&title={quote(name[:40])}&output=html"
+                    f"&title={quote(name[:40])}&content={quote(name[:40])}&coord_type=wgs84&output=html"
                 ),
             },
         },
@@ -988,8 +1009,8 @@ async def execute_route_amap(start: str, end: str, profile: str = "driving") -> 
     center_lon = (start_lon + end_lon) / 2
 
     nav_google = (
-        f"https://maps.google.com/maps?saddr={start_lat},{start_lon}"
-        f"&daddr={end_lat},{end_lon}&dirflg={'d' if prof == 'driving' else 'w'}"
+        f"https://www.google.com/maps/dir/?api=1&origin={start_lat},{start_lon}"
+        f"&destination={end_lat},{end_lon}&travelmode={'driving' if prof == 'driving' else 'walking'}"
     )
     start_lng_gcj, start_lat_gcj = wgs84_to_gcj02(start_lon, start_lat)
     end_lng_gcj, end_lat_gcj = wgs84_to_gcj02(end_lon, end_lat)
