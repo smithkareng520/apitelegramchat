@@ -454,8 +454,12 @@ async def execute_geocode_amap(address: str) -> str:
     return json.dumps(
         {
             "status": "success",
+            "coord_system": "WGS-84",
+            "source_coord_system": "GCJ-02",
             "lat": lat,
             "lon": lon,
+            "gcj02_lat": lat_gcj,
+            "gcj02_lon": lng_gcj,
             "display_name": display_name,
             "road": addr_comp.get("road", "") or "",
             "city": addr_comp.get("city", "") or addr_comp.get("province", "") or "",
@@ -465,7 +469,7 @@ async def execute_geocode_amap(address: str) -> str:
             "postcode": addr_comp.get("adcode", "") or "",
             "nav_links": {
                 "google": f"https://maps.google.com/?q={lat},{lon}",
-                "gaode": _gaode_marker_url(lat=lat, lon=lon, name=display_name),
+                "gaode": f"https://uri.amap.com/marker?position={lng_gcj},{lat_gcj}&coordinate=gcj02&name={quote(display_name[:40])}",
                 "baidu": (
                     f"http://api.map.baidu.com/marker?location={lat},{lon}"
                     f"&title={quote(display_name[:40])}&output=html"

@@ -2787,10 +2787,15 @@ async def execute_geocode(address: str) -> str:
         item = {}
 
     addr = item.get("address", {})
+    lng_gcj, lat_gcj = wgs84_to_gcj02(lon, lat)
     result = {
         "status": "success",
+        "coord_system": "WGS-84",
+        "source_coord_system": "WGS-84",
         "lat": lat,
         "lon": lon,
+        "gcj02_lat": lat_gcj,
+        "gcj02_lon": lng_gcj,
         "display_name": display_name,
         "road":     addr.get("road", addr.get("pedestrian", "")),
         "city":     addr.get("city", addr.get("town", addr.get("village", ""))),
@@ -2800,7 +2805,7 @@ async def execute_geocode(address: str) -> str:
         "postcode": addr.get("postcode", ""),
         "nav_links": {
             "google": f"https://maps.google.com/?q={lat},{lon}",
-            "gaode":  f"https://uri.amap.com/marker?position={lon},{lat}&coordinate=wgs84&name={quote(display_name[:40])}",
+            "gaode":  f"https://uri.amap.com/marker?position={lng_gcj},{lat_gcj}&coordinate=gcj02&name={quote(display_name[:40])}",
             "baidu":  f"http://api.map.baidu.com/marker?location={lat},{lon}&title={quote(display_name[:40])}&output=html",
         }
     }

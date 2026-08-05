@@ -901,12 +901,19 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 state = data.get("state", "")
                 country = data.get("country", "")
                 postcode = data.get("postcode", "")
+                gcj_lat = data.get("gcj02_lat")
+                gcj_lon = data.get("gcj02_lon")
+                coord_system = data.get("coord_system", "WGS-84")
                 summary = f"📍 {lat:.4f}, {lon:.4f}"
                 map_img_url = await _get_static_map_image(lat, lon, zoom=15)
                 map_html = f'<img src="{map_img_url}"/>' if map_img_url else f'<tg-map lat="{lat}" long="{lon}" zoom="15"/>'
+                gcj_html = ""
+                if gcj_lat is not None and gcj_lon is not None:
+                    gcj_html = f"<b>🧭 高德坐标（GCJ-02）：</b>{gcj_lat:.6f}, {gcj_lon:.6f}<br/>"
                 details_html = f"""
 {map_html}
-<b>📍 坐标：</b>{lat:.6f}, {lon:.6f}<br/>
+<b>📍 坐标（{escape_text(coord_system)}）：</b>{lat:.6f}, {lon:.6f}<br/>
+{gcj_html}
 <b>📌 完整地址：</b>{escape_text(name)}<br/>
 <b>🏠 道路：</b>{escape_text(road) or '无'}<br/>
 <b>🏙️ 城市：</b>{escape_text(city) or '无'}<br/>
