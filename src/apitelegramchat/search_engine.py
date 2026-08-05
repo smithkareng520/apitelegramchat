@@ -2886,6 +2886,41 @@ async def execute_route(start: str, end: str, profile: str = "driving") -> str:
     start_lat, start_lon, start_name = start_result
     end_lat,   end_lon,   end_name   = end_result
 
+    def _wgs84_to_gcj02(lon: float, lat: float) -> tuple[float, float]:
+        """尽量复用高德模块的转换；不可用时退回本地实现。"""
+        if _amap is not None and hasattr(_amap, "wgs84_to_gcj02"):
+            return _amap.wgs84_to_gcj02(lon, lat)  # type: ignore[attr-defined]
+        # 本地兜底：和高德/coordtransform 兼容的标准算法
+        _PI = 3.141592653589793
+        _EE = 0.00669342162296594323
+        _A = 6378245.0
+        def _out_of_china(lng: float, lat: float) -> bool:
+            return not (73.66 < lng < 135.05 and 3.86 < lat < 53.55)
+        def _transform_lat(x: float, y: float) -> float:
+            ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * abs(x) ** 0.5
+            ret += (20.0 * __import__('math').sin(6.0 * x * _PI) + 20.0 * __import__('math').sin(2.0 * x * _PI)) * 2.0 / 3.0
+            ret += (20.0 * __import__('math').sin(y * _PI) + 40.0 * __import__('math').sin(y / 3.0 * _PI)) * 2.0 / 3.0
+            ret += (160.0 * __import__('math').sin(y / 12.0 * _PI) + 320 * __import__('math').sin(y * _PI / 30.0)) * 2.0 / 3.0
+            return ret
+        def _transform_lng(x: float, y: float) -> float:
+            ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * abs(x) ** 0.5
+            ret += (20.0 * __import__('math').sin(6.0 * x * _PI) + 20.0 * __import__('math').sin(2.0 * x * _PI)) * 2.0 / 3.0
+            ret += (20.0 * __import__('math').sin(x * _PI) + 40.0 * __import__('math').sin(x / 3.0 * _PI)) * 2.0 / 3.0
+            ret += (150.0 * __import__('math').sin(x / 12.0 * _PI) + 300.0 * __import__('math').sin(x / 30.0 * _PI)) * 2.0 / 3.0
+            return ret
+        if _out_of_china(lon, lat):
+            return lon, lat
+        import math
+        dlat = _transform_lat(lon - 105.0, lat - 35.0)
+        dlng = _transform_lng(lon - 105.0, lat - 35.0)
+        radlat = lat / 180.0 * _PI
+        magic = math.sin(radlat)
+        magic = 1 - _EE * magic * magic
+        sqrtmagic = math.sqrt(magic)
+        dlat = (dlat * 180.0) / ((_A * (1 - _EE)) / (magic * sqrtmagic) * _PI)
+        dlng = (dlng * 180.0) / (_A / sqrtmagic * math.cos(radlat) * _PI)
+        return lon + dlng, lat + dlat
+
     profile_map = {
         "driving":  "driving",
         "walking":  "walking",
@@ -2950,8 +2985,10 @@ async def execute_route(start: str, end: str, profile: str = "driving") -> str:
 
     nav_google = (f"https://maps.google.com/maps?saddr={start_lat},{start_lon}"
                   f"&daddr={end_lat},{end_lon}&dirflg={'d' if prof=='driving' else 'w'}")
-    nav_gaode  = (f"https://uri.amap.com/navigation?from={start_lon},{start_lat},"
-                  f"{quote(start_name[:20])}&to={end_lon},{end_lat},{quote(end_name[:20])}"
+    start_lng_gcj, start_lat_gcj = _wgs84_to_gcj02(start_lon, start_lat)
+    end_lng_gcj, end_lat_gcj = _wgs84_to_gcj02(end_lon, end_lat)
+    nav_gaode  = (f"https://uri.amap.com/navigation?from={start_lng_gcj},{start_lat_gcj},"
+                  f"{quote(start_name[:20])}&to={end_lng_gcj},{end_lat_gcj},{quote(end_name[:20])}"
                   f"&mode={'car' if prof=='driving' else 'walk'}&callnative=1")
 
     result = {
