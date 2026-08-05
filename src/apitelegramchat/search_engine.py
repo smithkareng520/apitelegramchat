@@ -67,12 +67,11 @@ def _build_nav_links(
     """Build map links using each provider's preferred coordinate system."""
     safe_name = quote(display_name[:40])
     return {
-        "google": f"https://www.google.com/maps/search/?api=1&query={lat_wgs},{lon_wgs}",
-        "apple": f"https://maps.apple.com/?ll={lat_gcj},{lon_gcj}&q={safe_name}",
-        "gaode": f"https://uri.amap.com/marker?position={lon_gcj},{lat_gcj}&coordinate=gcj02&name={safe_name}",
+        "google": f"https://maps.google.com/?q={_fmt_coord(lat_wgs)},{_fmt_coord(lon_wgs)}",
+        "apple": f"https://maps.apple.com/?q={_fmt_coord(lat_gcj)},{_fmt_coord(lon_gcj)}",
+        "gaode": f"https://uri.amap.com/marker?position={_fmt_coord(lon_gcj)},{_fmt_coord(lat_gcj)}",
         "baidu": (
-            f"http://api.map.baidu.com/marker?location={lat_gcj},{lon_gcj}"
-            f"&title={safe_name}&content={safe_name}&coord_type=gcj02&output=html"
+            f"http://api.map.baidu.com/marker?location={_fmt_coord(lat_wgs)},{_fmt_coord(lon_wgs)}&title={safe_name}&content={safe_name}&coord_type=wgs84&output=html"
         ),
     }
 
@@ -3151,11 +3150,9 @@ out center tags 1;
         "fee":             tags.get("fee",             ""),
         "capacity":        tags.get("capacity",        ""),
         "nav_links": {
-            "google": f"https://www.google.com/maps/search/?api=1&query={el_lat},{el_lon}",
-            "gaode":  (f"https://uri.amap.com/marker?position={el_lon},{el_lat}&coordinate=wgs84"
-                       f"&name={quote(name[:40])}"),
-            "baidu":  (f"http://api.map.baidu.com/marker?location={el_lat},{el_lon}"
-                       f"&title={quote(name[:40])}&content={quote(name[:40])}&coord_type=wgs84&output=html"),
+            "google": f"https://maps.google.com/?q={_fmt_coord(el_lat)},{_fmt_coord(el_lon)}",
+            "gaode":  (f"https://uri.amap.com/marker?position={_fmt_coord(el_lon)},{_fmt_coord(el_lat)}"),
+            "baidu":  (f"http://api.map.baidu.com/marker?location={_fmt_coord(el_lat)},{_fmt_coord(el_lon)}&title={quote(name[:40])}&content={quote(name[:40])}&coord_type=wgs84&output=html"),
         }
     }
     return json.dumps(result, ensure_ascii=False)
@@ -3518,9 +3515,8 @@ async def _run_overpass_poi(overpass_query: str,
             "opening_hours": tags.get("opening_hours", ""),
             "cuisine":       tags.get("cuisine",       ""),
             "distance":      dist,
-            "nav_gaode": (f"https://uri.amap.com/marker?position={el_lon},{el_lat}&coordinate=wgs84"
-                          f"&name={quote(name[:40])}"),
-            "nav_google": f"https://www.google.com/maps/search/?api=1&query={el_lat},{el_lon}",
+            "nav_gaode": (f"https://uri.amap.com/marker?position={_fmt_coord(el_lon)},{_fmt_coord(el_lat)}"),
+            "nav_google": f"https://maps.google.com/?q={_fmt_coord(el_lat)},{_fmt_coord(el_lon)}",
         })
 
         if len(results) >= max_results:
@@ -3539,6 +3535,12 @@ import os
 import re
 import hashlib
 from urllib.parse import quote
+
+
+
+def _fmt_coord(value: float) -> str:
+    """Format coordinates compactly while keeping map precision adequate."""
+    return f"{value:.6f}".rstrip("0").rstrip(".")
 try:
     import aioboto3  # type: ignore
     from botocore.exceptions import ClientError  # type: ignore

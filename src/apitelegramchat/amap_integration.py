@@ -54,6 +54,12 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
 
+
+
+def _fmt_coord(value: float) -> str:
+    """Format coordinates compactly while keeping map precision adequate."""
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
 import aiohttp
 
 from apitelegramchat import config as app_config
@@ -169,18 +175,17 @@ def _build_nav_links(
     return {
         # Google Maps URLs accept comma-separated latitude/longitude in the query parameter.
         # Use WGS-84 here to avoid introducing a China-specific offset.
-        "google": f"https://www.google.com/maps/search/?api=1&query={lat_wgs},{lon_wgs}",
+        "google": f"https://maps.google.com/?q={_fmt_coord(lat_wgs)},{_fmt_coord(lon_wgs)}",
         # Apple Maps on iPhone/macOS resolves the map pin from ll/q; we pass GCJ-02 here
         # for China addresses so the pin follows the same mainland coordinate reference
         # used by Amap.
-        "apple": f"https://maps.apple.com/?ll={lat_gcj},{lon_gcj}&q={safe_name}",
+        "apple": f"https://maps.apple.com/?q={_fmt_coord(lat_gcj)},{_fmt_coord(lon_gcj)}",
         # Amap expects GCJ-02 for China mainland locations.
-        "gaode": f"https://uri.amap.com/marker?position={lon_gcj},{lat_gcj}&coordinate=gcj02&name={safe_name}",
+        "gaode": f"https://uri.amap.com/marker?position={_fmt_coord(lon_gcj)},{_fmt_coord(lat_gcj)}",
         # Baidu marker supports coord_type; passing gcj02 prevents the ~hundreds of meters
         # offset that happens when Baidu assumes bd09ll.
         "baidu": (
-            f"http://api.map.baidu.com/marker?location={lat_gcj},{lon_gcj}"
-            f"&title={safe_name}&content={safe_name}&coord_type=gcj02&output=html"
+            f"https://map.baidu.com/?q={_fmt_coord(lat_gcj)},{_fmt_coord(lon_gcj)}"
         ),
     }
 
