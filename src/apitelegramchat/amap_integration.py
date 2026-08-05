@@ -69,8 +69,8 @@ AMAP_TIMEOUT = 12  # 单次请求超时
 # 高德 Web 服务 endpoint
 AMAP_GEOCODE_URL = "https://restapi.amap.com/v3/geocode/geo"
 AMAP_REGEO_URL = "https://restapi.amap.com/v3/geocode/regeo"
-AMAP_PLACE_AROUND_URL = "https://restapi.amap.com/v3/place/around"
-AMAP_PLACE_TEXT_URL = "https://restapi.amap.com/v3/place/text"
+AMAP_PLACE_AROUND_URL = "https://restapi.amap.com/v5/place/around"
+AMAP_PLACE_TEXT_URL = "https://restapi.amap.com/v5/place/text"
 AMAP_DRIVING_URL = "https://restapi.amap.com/v3/direction/driving"
 AMAP_WALKING_URL = "https://restapi.amap.com/v3/direction/walking"
 AMAP_BICYCLING_URL = "https://restapi.amap.com/v4/direction/bicycling"
@@ -218,6 +218,89 @@ def _haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> int
         + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
     )
     return round(2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+
+
+def _gaode_marker_url(
+    *,
+    lat: float | None = None,
+    lon: float | None = None,
+    name: str = "",
+    poiid: str | None = None,
+    coordinate: str = "wgs84",
+) -> str:
+    """高德单点标注链接：优先用 POI ID，其次用坐标。"""
+    safe_name = quote((name or "")[:40])
+    if poiid:
+        return f"https://uri.amap.com/marker?poiid={quote(str(poiid))}&name={safe_name}&src=apitelegramchat"
+    if lat is None or lon is None:
+        return ""
+    return (
+        f"https://uri.amap.com/marker?position={lon},{lat}"
+        f"&coordinate={coordinate}&name={safe_name}&src=apitelegramchat"
+    )
+
+
+def _normalize_text(s: str) -> str:
+    return re.sub(r"\s+", "", (s or "")).lower()
+
+
+def _extract_poi_location(poi: dict[str, Any]) -> tuple[float, float, str] | None:
+    """优先返回入口坐标，其次导航点，最后 POI 中心点。"""
+    for key in ("entr_location", "location"):
+        raw = poi.get(key) or ""
+        if isinstance(raw, str) and "," in raw:
+            try:
+                lng_gcj, lat_gcj = (float(x) for x in raw.split(",", 1))
+            except Exception:
+                continue
+            lng_wgs, lat_wgs = gcj02_to_wgs84(lng_gcj, lat_gcj)
+            return lat_wgs, lng_wgs, key
+    return None
+
+
+def _poi_score(poi: dict[str, Any], query: str, lat: float | None = None, lon: float | None = None) -> float:
+    """按名称精度 + 位置贴近度给 POI 打分。"""
+    q = _normalize_text(query)
+    name = _normalize_text(str(poi.get("name") or ""))
+    alias = _normalize_text(str(poi.get("alias") or ""))
+    brand = _normalize_text(str(poi.get("brand") or ""))
+    score = 0.0
+
+    if q and name == q:
+        score += 1000
+    elif q and (name.startswith(q) or q in name):
+        score += 700
+    elif q and (alias == q or q in alias or brand == q or q in brand):
+        score += 500
+
+    if poi.get("navi_poiid"):
+        score += 60
+    if poi.get("entr_location"):
+        score += 40
+    if poi.get("parent"):
+        score -= 5
+
+    if lat is not None and lon is not None:
+        loc = poi.get("entr_location") or poi.get("location") or ""
+        if isinstance(loc, str) and "," in loc:
+            try:
+                lng_gcj, lat_gcj = (float(x) for x in loc.split(",", 1))
+                lng_wgs, lat_wgs = gcj02_to_wgs84(lng_gcj, lat_gcj)
+                dist = _haversine_meters(lat, lon, lat_wgs, lng_wgs)
+                score -= min(dist / 20.0, 300.0)
+            except Exception:
+                pass
+    return score
+
+
+def _poi_address(poi: dict[str, Any]) -> str:
+    parts = [
+        poi.get("pname", ""),
+        poi.get("cityname", ""),
+        poi.get("adname", ""),
+        poi.get("address", ""),
+    ]
+    return " ".join(filter(None, parts))
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +464,7 @@ async def execute_geocode_amap(address: str) -> str:
             "nav_links": {
                 "google": f"https://maps.google.com/?q={lat},{lon}",
                 "gaode": (
-                    f"https://uri.amap.com/marker?position={lon},{lat}"
+                    f"https://uri.amap.com/marker?position={lon},{lat}&coordinate=wgs84"
                     f"&name={quote(display_name[:40])}"
                 ),
                 "baidu": (
@@ -401,7 +484,7 @@ async def execute_geocode_amap(address: str) -> str:
 async def reverse_geocode(lat: float, lon: float) -> Optional[dict[str, Any]]:
     """
     坐标 (WGS-84) → 中文地址
-    返回 {"formatted": "...", "province": "...", "city": "...", "district": "...", "adcode": "..."}
+    返回 {"formatted": "...", "province": "...", "city": "...", "district": "...", "adcode": "...", "citycode": "..."}
     """
     lng_gcj, lat_gcj = wgs84_to_gcj02(lon, lat)
     data = await _amap_get(
@@ -418,6 +501,7 @@ async def reverse_geocode(lat: float, lon: float) -> Optional[dict[str, Any]]:
         "city": comp.get("city", "") or comp.get("province", "") or "",
         "district": comp.get("district", "") or "",
         "adcode": comp.get("adcode", "") or "",
+        "citycode": comp.get("citycode", "") or "",
     }
 
 
@@ -466,18 +550,22 @@ async def execute_search_poi_amap(
 
     # 3) 调用高德
     lng_gcj, lat_gcj = wgs84_to_gcj02(lon, lat)
-    data = await _amap_get(
-        AMAP_PLACE_AROUND_URL,
-        {
-            "location": f"{lng_gcj},{lat_gcj}",
-            "keywords": query,
-            "radius": str(radius),
-            "sortrule": "distance",
-            "offset": str(max_results),
-            "page": "1",
-            "extensions": "all",
-        },
-    )
+    region_info = await reverse_geocode(lat, lon)
+    params = {
+        "location": f"{lng_gcj},{lat_gcj}",
+        "radius": str(radius),
+        "sortrule": "distance",
+        "page_size": str(max_results),
+        "page_num": "1",
+        "show_fields": ",".join(["children", "adcode", "citycode", "alias", "business", "navi", "photos"]),
+    }
+    if query.strip():
+        params["keywords"] = query.strip()
+    if region_info and region_info.get("adcode"):
+        params["region"] = region_info["adcode"]
+        params["city_limit"] = "true"
+
+    data = await _amap_get(AMAP_PLACE_AROUND_URL, params)
 
     if not data or data.get("status") != "1":
         # 不消耗配额的失败，不递增计数
@@ -509,10 +597,13 @@ async def execute_search_poi_amap(
             continue
         seen_names.add(name)
 
-        loc = poi.get("location") or ""
+        loc = poi.get("entr_location") or poi.get("location") or ""
         if "," not in loc:
             continue
-        lng_gcj_p, lat_gcj_p = (float(x) for x in loc.split(","))
+        try:
+            lng_gcj_p, lat_gcj_p = (float(x) for x in loc.split(","))
+        except Exception:
+            continue
         lng_wgs, lat_wgs = gcj02_to_wgs84(lng_gcj_p, lat_gcj_p)
 
         # 距离（米）
@@ -522,17 +613,10 @@ async def execute_search_poi_amap(
         except (ValueError, TypeError):
             dist = _haversine_meters(lat, lon, lat_wgs, lng_wgs)
 
-        address = " ".join(
-            filter(
-                None,
-                [
-                    poi.get("pname", ""),
-                    poi.get("cityname", ""),
-                    poi.get("adname", ""),
-                    poi.get("address", ""),
-                ],
-            )
-        )
+        address = _poi_address(poi)
+        business = poi.get("business") or {}
+        navi = poi.get("navi") or {}
+        poiid = (navi.get("navi_poiid", "") if isinstance(navi, dict) else "") or (poi.get("id", "") or "")
 
         results.append(
             {
@@ -542,12 +626,17 @@ async def execute_search_poi_amap(
                 "address": address,
                 "phone": poi.get("tel", "") or "",
                 "website": "",
-                "opening_hours": poi.get("business_hours", "") or "",
+                "opening_hours": business.get("opentime_today", "") if isinstance(business, dict) else "",
                 "cuisine": poi.get("type", "") or "",
                 "distance": dist,
-                "nav_gaode": (
-                    f"https://uri.amap.com/marker?position={lng_wgs},{lat_wgs}"
-                    f"&name={quote(name[:40])}"
+                "amap_poiid": poi.get("id", "") or "",
+                "navi_poiid": navi.get("navi_poiid", "") if isinstance(navi, dict) else "",
+                "entr_location": poi.get("entr_location", "") or "",
+                "nav_gaode": _gaode_marker_url(
+                    lat=lat_wgs,
+                    lon=lng_wgs,
+                    name=name,
+                    poiid=poiid,
                 ),
                 "nav_google": f"https://maps.google.com/?q={lat_wgs},{lng_wgs}",
             }
@@ -585,7 +674,7 @@ async def execute_place_details_amap(
     lon: Optional[float] = None,
 ) -> str:
     """
-    按名称查询地点详情。若提供 lat/lon，则优先在该坐标所在城市搜索。
+    按名称查询地点详情。若提供 lat/lon，则优先在该坐标所在区域搜索。
     返回 JSON 与 execute_place_details 兼容。
     """
     if not _amap_key():
@@ -604,22 +693,19 @@ async def execute_place_details_amap(
             ensure_ascii=False,
         )
 
-    # 用 lat/lon 反查城市名（开销小）
-    city_param = ""
+    region_info = None
     if lat is not None and lon is not None:
-        rev = await reverse_geocode(lat, lon)
-        if rev and rev.get("city"):
-            city_param = rev["city"]
+        region_info = await reverse_geocode(lat, lon)
 
     params = {
         "keywords": query,
-        "offset": "1",
-        "page": "1",
-        "extensions": "all",
+        "page_size": "10",
+        "page_num": "1",
+        "show_fields": ",".join(["children", "business", "navi", "alias", "photos"]),
     }
-    if city_param:
-        params["city"] = city_param
-        params["citylimit"] = "true"
+    if region_info and region_info.get("adcode"):
+        params["region"] = region_info["adcode"]
+        params["city_limit"] = "true"
 
     data = await _amap_get(AMAP_PLACE_TEXT_URL, params)
     if not data or data.get("status") != "1":
@@ -637,26 +723,30 @@ async def execute_place_details_amap(
             ensure_ascii=False,
         )
 
-    poi = pois[0]
-    loc = poi.get("location") or ""
-    if "," in loc:
-        lng_gcj_p, lat_gcj_p = (float(x) for x in loc.split(","))
-        lng_wgs, lat_wgs = gcj02_to_wgs84(lng_gcj_p, lat_gcj_p)
+    ranked = sorted(
+        pois,
+        key=lambda p: _poi_score(p, query, lat=lat, lon=lon),
+        reverse=True,
+    )
+    poi = ranked[0]
+
+    loc_src = poi.get("entr_location") or poi.get("location") or ""
+    if "," in loc_src:
+        try:
+            lng_gcj_p, lat_gcj_p = (float(x) for x in loc_src.split(","))
+            lng_wgs, lat_wgs = gcj02_to_wgs84(lng_gcj_p, lat_gcj_p)
+        except Exception:
+            lat_wgs, lng_wgs = (lat or 0.0), (lon or 0.0)
     elif lat is not None and lon is not None:
         lat_wgs, lng_wgs = lat, lon
     else:
         lat_wgs, lng_wgs = 0.0, 0.0
 
     name = poi.get("name", query)
-    address_parts = filter(
-        None,
-        [
-            poi.get("pname", ""),
-            poi.get("cityname", ""),
-            poi.get("adname", ""),
-            poi.get("address", ""),
-        ],
-    )
+    address_parts = _poi_address(poi)
+    navi = poi.get("navi") or {}
+    nav_poiid = navi.get("navi_poiid", "") if isinstance(navi, dict) else ""
+    poiid = nav_poiid or (poi.get("id", "") or "")
 
     return json.dumps(
         {
@@ -664,9 +754,12 @@ async def execute_place_details_amap(
             "name": name,
             "lat": lat_wgs,
             "lon": lng_wgs,
+            "amap_poiid": poi.get("id", "") or "",
+            "navi_poiid": nav_poiid,
+            "entr_location": poi.get("entr_location", "") or "",
             "phone": poi.get("tel", "") or "",
             "website": "",
-            "opening_hours": poi.get("business_hours", "") or "",
+            "opening_hours": ((poi.get("business") or {}).get("opentime_today", "") if isinstance(poi.get("business"), dict) else ""),
             "cuisine": poi.get("type", "") or "",
             "wheelchair": "",
             "smoking": "",
@@ -676,15 +769,17 @@ async def execute_place_details_amap(
             "brand": poi.get("brand", "") or "",
             "operator": "",
             "email": "",
-            "addr_full": " ".join(address_parts),
+            "addr_full": address_parts,
             "description": poi.get("intro", "") or poi.get("tag", "") or "",
             "fee": "",
             "capacity": "",
             "nav_links": {
                 "google": f"https://maps.google.com/?q={lat_wgs},{lng_wgs}",
-                "gaode": (
-                    f"https://uri.amap.com/marker?position={lng_wgs},{lat_wgs}"
-                    f"&name={quote(name[:40])}"
+                "gaode": _gaode_marker_url(
+                    lat=lat_wgs,
+                    lon=lng_wgs,
+                    name=name,
+                    poiid=poiid,
                 ),
                 "baidu": (
                     f"http://api.map.baidu.com/marker?location={lat_wgs},{lng_wgs}"

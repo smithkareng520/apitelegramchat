@@ -2800,7 +2800,7 @@ async def execute_geocode(address: str) -> str:
         "postcode": addr.get("postcode", ""),
         "nav_links": {
             "google": f"https://maps.google.com/?q={lat},{lon}",
-            "gaode":  f"https://uri.amap.com/marker?position={lon},{lat}&name={quote(display_name[:40])}",
+            "gaode":  f"https://uri.amap.com/marker?position={lon},{lat}&coordinate=wgs84&name={quote(display_name[:40])}",
             "baidu":  f"http://api.map.baidu.com/marker?location={lat},{lon}&title={quote(display_name[:40])}&output=html",
         }
     }
@@ -3095,7 +3095,7 @@ out center tags 1;
         "capacity":        tags.get("capacity",        ""),
         "nav_links": {
             "google": f"https://maps.google.com/?q={el_lat},{el_lon}",
-            "gaode":  (f"https://uri.amap.com/marker?position={el_lon},{el_lat}"
+            "gaode":  (f"https://uri.amap.com/marker?position={el_lon},{el_lat}&coordinate=wgs84"
                        f"&name={quote(name[:40])}"),
             "baidu":  (f"http://api.map.baidu.com/marker?location={el_lat},{el_lon}"
                        f"&title={quote(name[:40])}&output=html"),
@@ -3461,7 +3461,7 @@ async def _run_overpass_poi(overpass_query: str,
             "opening_hours": tags.get("opening_hours", ""),
             "cuisine":       tags.get("cuisine",       ""),
             "distance":      dist,
-            "nav_gaode": (f"https://uri.amap.com/marker?position={el_lon},{el_lat}"
+            "nav_gaode": (f"https://uri.amap.com/marker?position={el_lon},{el_lat}&coordinate=wgs84"
                           f"&name={quote(name[:40])}"),
             "nav_google": f"https://maps.google.com/?q={el_lat},{el_lon}",
         })
