@@ -1108,6 +1108,44 @@ async def webhook() -> tuple:
                 user_models.setdefault(chat_id, DEFAULT_MODEL)
             username = ctx["username"]
 
+            # ── Telegram 原生 location（用户分享位置 / 实时位置） ───────
+            # === [amap_integration patch] ===
+            if "location" in msg and "text" not in msg:
+                loc = msg["location"]
+                lat = loc.get("latitude")
+                lon = loc.get("longitude")
+                if lat is None or lon is None:
+                    return "OK", 200
+
+                # 反查中文地址（可选，需要 AMAP_KEY）
+                addr_text = f"{lat:.6f},{lon:.6f}"
+                try:
+                    from apitelegramchat import amap_integration as _amap
+                    if _amap.is_enabled():
+                        rev = await _amap.reverse_geocode(lat, lon)
+                        if rev and rev.get("formatted"):
+                            addr_text = rev["formatted"]
+                except Exception:
+                    pass
+
+                content_text = (
+                    f"📎 用户分享了当前位置\n"
+                    f"坐标：{lat:.6f}, {lon:.6f} (WGS-84)\n"
+                    f"地址：{addr_text}\n\n"
+                    f"如果用户问起『附近』『周边』等，请直接以此坐标作为中心点，"
+                    f"调用 search_poi / route / distance 等工具，无需再调用 geocode。"
+                ).replace("\\n", "\n")
+                user_message = {"role": "user", "content": content_text}
+                await _interrupt_active_generation(chat_id)
+                task = asyncio.create_task(
+                    _handle_text_message(chat_id, content_text, username, user_message)
+                )
+                async with active_tasks_lock:
+                    active_tasks[chat_id] = task
+                task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
+                return "OK", 200
+            # === [/amap_integration patch] ===
+
             # ── 媒体组（图片） ─────────────────────────────────────────────
             if "media_group_id" in msg and "photo" in msg:
                 mg = msg["media_group_id"]

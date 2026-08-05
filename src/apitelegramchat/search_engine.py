@@ -37,6 +37,13 @@ except Exception:  # pragma: no cover - optional dependency fallback
     feedparser = _FeedParserStub()  # type: ignore
 from pathlib import Path
 from apitelegramchat.workspace_paths import workspace_root
+
+# === [amap_integration patch] 高德地图数据源 ===
+try:
+    from apitelegramchat import amap_integration as _amap
+except Exception:  # pragma: no cover
+    _amap = None
+# === [/amap_integration patch] ===
 try:
     import qrcode  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
@@ -2102,6 +2109,10 @@ async def execute_crypto_price(coin: str, currency: str = "usd") -> str:
 
 # --------------------- ip_geo ---------------------
 async def execute_ip_geo(ip: str = None) -> str:
+    # === [amap_integration patch] 高德优先 ===
+    if _amap is not None and _amap.is_enabled():
+        return await _amap.execute_ip_geo_amap(ip)
+    # === [/amap_integration patch] ===
     url = f"http://ip-api.com/json/{ip if ip else ''}?fields=status,country,city,regionName,lat,lon,isp,query"
     try:
         async with aiohttp.ClientSession() as session:
@@ -2705,6 +2716,10 @@ _geocode_cache = TTLCache(maxsize=500, ttl=3600)
 # ---------------------------------------------------------------------------
 async def _geocode_coords(address: str) -> tuple[float, float, str] | None:
     key = address.lower().strip()
+    # === [amap_integration patch] 高德优先 ===
+    if _amap is not None and _amap.is_enabled():
+        return await _amap._amap_geocode_coords(address)
+    # === [/amap_integration patch] ===
     if key in _geocode_cache:
         return _geocode_cache[key]
 
@@ -2742,6 +2757,10 @@ async def _geocode_coords(address: str) -> tuple[float, float, str] | None:
 # 1. 地理编码
 # ---------------------------------------------------------------------------
 async def execute_geocode(address: str) -> str:
+    # === [amap_integration patch] 高德优先 ===
+    if _amap is not None and _amap.is_enabled():
+        return await _amap.execute_geocode_amap(address)
+    # === [/amap_integration patch] ===
     if not address.strip():
         return json.dumps({"status": "error", "message": "地址为空"})
 
@@ -2792,6 +2811,17 @@ async def execute_geocode(address: str) -> str:
 # 3. POI 搜索
 # ---------------------------------------------------------------------------
 async def execute_search_poi(lat: float, lon: float, query: str, radius: int = 1000, max_results: int = 15) -> str:
+    # === [amap_integration patch] 高德优先 ===
+    if _amap is not None and _amap.is_enabled():
+        result = await _amap.execute_search_poi_amap(lat, lon, query, radius=radius, max_results=max_results)
+        # 配额耗尽时降级回 Overpass；其它情况（成功/无结果/错误）直接返回
+        try:
+            _r = json.loads(result)
+            if _r.get("status") != "quota_exceeded":
+                return result
+        except Exception:
+            return result
+    # === [/amap_integration patch] ===
     radius = min(max(int(radius), 100), 10000)
     tag_filter = _CATEGORY_TAGS.get(query.lower())
     if tag_filter:
@@ -2827,6 +2857,10 @@ out center tags {max_results};
 # 4. 路线规划
 # ---------------------------------------------------------------------------
 async def execute_route(start: str, end: str, profile: str = "driving") -> str:
+    # === [amap_integration patch] 高德优先 ===
+    if _amap is not None and _amap.is_enabled():
+        return await _amap.execute_route_amap(start, end, profile)
+    # === [/amap_integration patch] ===
     async def _parse_location(loc: str):
         loc = loc.strip()
         coord_match = re.match(
@@ -2982,6 +3016,16 @@ async def execute_distance(from_lat: float, from_lon: float,
 async def execute_place_details(query: str,
                                 lat: float = None,
                                 lon: float = None) -> str:
+    # === [amap_integration patch] 高德优先 ===
+    if _amap is not None and _amap.is_enabled():
+        result = await _amap.execute_place_details_amap(query, lat=lat, lon=lon)
+        try:
+            _r = json.loads(result)
+            if _r.get("status") != "quota_exceeded":
+                return result
+        except Exception:
+            return result
+    # === [/amap_integration patch] ===
     if lat is None or lon is None:
         coords = await _geocode_coords(query)
         if coords is None:

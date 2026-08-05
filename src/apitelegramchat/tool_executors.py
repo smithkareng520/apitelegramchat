@@ -394,6 +394,34 @@ async def _get_static_map_image(
         if R2_PUBLIC_URL:
             return f"{R2_PUBLIC_URL.rstrip('/')}/{r2_key}"
 
+    # === [amap_integration patch] 高德静态地图优先 ===
+    try:
+        from apitelegramchat import amap_integration as _amap
+        if _amap.is_enabled():
+            amap_url = _amap.static_map_url_amap(
+                lat, lon,
+                markers=[{'lat': m['lat'], 'lon': m['lon']} for m in markers] if markers else None,
+                zoom=zoom, width=width, height=height,
+            )
+            if amap_url:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            amap_url,
+                            timeout=aiohttp.ClientTimeout(total=12)
+                        ) as resp:
+                            if resp.status == 200:
+                                img_bytes = await resp.read()
+                                if len(img_bytes) > 500 and img_bytes[:1] not in (b'{', b'['):
+                                    uploaded_url = await upload_bytes_to_r2(
+                                        img_bytes, r2_key, 'image/png'
+                                    )
+                                    return uploaded_url
+                except Exception as e:
+                    logger.warning(f'高德静态地图失败: {e}')
+    except Exception:
+        pass
+    # === [/amap_integration patch] ===
     # 备用来源列表
     marker_str = ""
     if markers:

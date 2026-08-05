@@ -25,6 +25,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GLM_API_KEY = os.getenv("GLM_API_KEY", "")
 MODELSCOPE_API_KEY = os.getenv("MODELSCOPE_API_KEY", "")
 AGNES_API_KEY = os.getenv("AGNES_API_KEY", "")
+AMAP_KEY = os.getenv("AMAP_KEY", "").strip()
 
 # ---------- DuckDuckGo 免费搜索 API（HTML 抓取回退已废弃）----------
 # 通过环境变量配置 my-search-api 服务地址，避免反爬/封锁。
