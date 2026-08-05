@@ -85,6 +85,18 @@ def is_enabled() -> bool:
     return bool(AMAP_KEY)
 
 
+def _gaode_marker_url(*, lat: float | None = None, lon: float | None = None, name: str = "") -> str:
+    """高德单点标注链接：统一把 WGS-84 转成 GCJ-02 再生成 URL。"""
+    if lat is None or lon is None:
+        return ""
+    safe_name = quote((name or "")[:40])
+    lng_gcj, lat_gcj = wgs84_to_gcj02(lon, lat)
+    return (
+        f"https://uri.amap.com/marker?position={lng_gcj},{lat_gcj}"
+        f"&name={safe_name}&src=apitelegramchat"
+    )
+
+
 # ---------------------------------------------------------------------------
 # GCJ-02 ↔ WGS-84 坐标转换
 # 算法来自 https://github.com/wandergis/coordtransform
@@ -369,10 +381,7 @@ async def execute_geocode_amap(address: str) -> str:
             "postcode": addr_comp.get("adcode", "") or "",
             "nav_links": {
                 "google": f"https://maps.google.com/?q={lat},{lon}",
-                "gaode": (
-                    f"https://uri.amap.com/marker?position={lon},{lat}"
-                    f"&name={quote(display_name[:40])}"
-                ),
+                "gaode": _gaode_marker_url(lat=lat, lon=lon, name=display_name),
                 "baidu": (
                     f"http://api.map.baidu.com/marker?location={lat},{lon}"
                     f"&title={quote(display_name[:40])}&output=html"
@@ -534,10 +543,7 @@ async def execute_search_poi_amap(
                 "opening_hours": poi.get("business_hours", "") or "",
                 "cuisine": poi.get("type", "") or "",
                 "distance": dist,
-                "nav_gaode": (
-                    f"https://uri.amap.com/marker?position={lng_wgs},{lat_wgs}"
-                    f"&name={quote(name[:40])}"
-                ),
+                "nav_gaode": _gaode_marker_url(lat=lat_wgs, lon=lng_wgs, name=name),
                 "nav_google": f"https://maps.google.com/?q={lat_wgs},{lng_wgs}",
             }
         )
@@ -671,10 +677,7 @@ async def execute_place_details_amap(
             "capacity": "",
             "nav_links": {
                 "google": f"https://maps.google.com/?q={lat_wgs},{lng_wgs}",
-                "gaode": (
-                    f"https://uri.amap.com/marker?position={lng_wgs},{lat_wgs}"
-                    f"&name={quote(name[:40])}"
-                ),
+                "gaode": _gaode_marker_url(lat=lat_wgs, lon=lng_wgs, name=name),
                 "baidu": (
                     f"http://api.map.baidu.com/marker?location={lat_wgs},{lng_wgs}"
                     f"&title={quote(name[:40])}&output=html"

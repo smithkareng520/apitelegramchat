@@ -234,9 +234,11 @@ def _gaode_marker_url(
         return f"https://uri.amap.com/marker?poiid={quote(str(poiid))}&name={safe_name}&src=apitelegramchat"
     if lat is None or lon is None:
         return ""
+    # 方法一：无论外部传入什么经纬度基准，都先统一转成 GCJ-02 再给高德。
+    lng_gcj, lat_gcj = wgs84_to_gcj02(lon, lat)
     return (
-        f"https://uri.amap.com/marker?position={lon},{lat}"
-        f"&coordinate={coordinate}&name={safe_name}&src=apitelegramchat"
+        f"https://uri.amap.com/marker?position={lng_gcj},{lat_gcj}"
+        f"&name={safe_name}&src=apitelegramchat"
     )
 
 
@@ -463,10 +465,7 @@ async def execute_geocode_amap(address: str) -> str:
             "postcode": addr_comp.get("adcode", "") or "",
             "nav_links": {
                 "google": f"https://maps.google.com/?q={lat},{lon}",
-                "gaode": (
-                    f"https://uri.amap.com/marker?position={lon},{lat}&coordinate=wgs84"
-                    f"&name={quote(display_name[:40])}"
-                ),
+                "gaode": _gaode_marker_url(lat=lat, lon=lon, name=display_name),
                 "baidu": (
                     f"http://api.map.baidu.com/marker?location={lat},{lon}"
                     f"&title={quote(display_name[:40])}&output=html"
