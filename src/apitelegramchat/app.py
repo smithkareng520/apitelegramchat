@@ -330,8 +330,6 @@ def _estimate_content_tokens(content) -> int:
             return estimate_tokens(str(content.get("text", "")))
         if part_type in {"image_url", "image", "input_image"}:
             return _MEDIA_TOKEN_OVERHEAD
-        if part_type in {"input_audio", "audio"}:
-            return _MEDIA_TOKEN_OVERHEAD * 2
         if part_type in {"file", "input_file", "document"}:
             filename = ""
             file_obj = content.get("file")
@@ -340,12 +338,6 @@ def _estimate_content_tokens(content) -> int:
             return _MEDIA_TOKEN_OVERHEAD * 2 + estimate_tokens(filename)
 
         total = _MEDIA_TOKEN_OVERHEAD
-        for key in ("file_id", "file_ids", "file_name", "file_names", "mime_type", "mime_types", "type"):
-            val = content.get(key)
-            if isinstance(val, str):
-                total += estimate_tokens(val)
-            elif isinstance(val, (list, tuple)):
-                total += sum(estimate_tokens(str(v)) for v in val if v)
         for value in content.values():
             if isinstance(value, (str, list, dict)):
                 total += _estimate_content_tokens(value)
@@ -636,8 +628,14 @@ async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
             "role": "user",
             "content": content_text,
             "file_ids": file_ids,
-            "file_names": [f"photo_{fid[:8]}.jpg" for fid in file_ids],
             "type": "photo_group",
+            "attachments": [
+                {
+                    "kind": "photo",
+                    "file_id": fid,
+                }
+                for fid in file_ids
+            ],
         }
 
         is_safe = await pre_flight_context_check(chat_id, user_message)
@@ -719,6 +717,15 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
             "file_names": file_names,
             "mime_types": mime_types,
             "type": "document_group",
+            "attachments": [
+                {
+                    "kind": "document",
+                    "file_id": fid,
+                    "file_name": fname,
+                    "mime_type": mime,
+                }
+                for fid, fname, mime in zip(file_ids, file_names, mime_types)
+            ],
         }
     else:
         workspace = workspace_root(chat_id)
@@ -758,14 +765,7 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
             else:
                 content_text += "\n\n请根据用户指令处理这些文档。你可以使用工具（如 text_editor 或 bash）查看文件内容。"
 
-        user_message = {
-            "role": "user",
-            "content": content_text,
-            "file_ids": file_ids,
-            "file_names": file_names,
-            "mime_types": mime_types,
-            "type": "document_group",
-        }
+        user_message = {"role": "user", "content": content_text, "file_ids": file_ids, "file_names": file_names, "mime_types": mime_types, "type": "document_group", "attachments": [{"kind": "document", "file_id": fid, "file_name": fname, "mime_type": mime} for fid, fname, mime in zip(file_ids, file_names, mime_types)]}
 
     lock = await get_chat_lock(chat_id)
     async with lock:
@@ -1197,7 +1197,14 @@ async def webhook() -> tuple:
                     "content": content_text,
                     "file_ids": [fid],
                     "file_names": [file_name],
-                    "type": "photo_group" if len(msg.get("photo", [])) > 1 else "photo",
+                    "type": "photo_group",
+                    "attachments": [
+                        {
+                            "kind": "photo",
+                            "file_id": fid,
+                            "file_name": file_name,
+                        }
+                    ],
                 }
 
                 await _interrupt_active_generation(chat_id)
@@ -1236,6 +1243,14 @@ async def webhook() -> tuple:
                         "file_name": fname,
                         "mime_type": mime_type,
                         "type": "document",
+                        "attachments": [
+                            {
+                                "kind": "document",
+                                "file_id": fid,
+                                "file_name": fname,
+                                "mime_type": mime_type,
+                            }
+                        ],
                     }
                 else:
                     workspace = workspace_root(chat_id)
@@ -1262,14 +1277,7 @@ async def webhook() -> tuple:
                         else:
                             content_text = f"📎 用户上传了文档「{safe_fname}」，但下载失败，请稍后重试。"
 
-                    user_message = {
-                        "role": "user",
-                        "content": content_text,
-                        "file_id": fid,
-                        "file_name": safe_fname,
-                        "mime_type": mime_type,
-                        "type": "document",
-                    }
+                    user_message = {"role": "user", "content": content_text, "file_id": fid, "file_name": safe_fname, "mime_type": mime_type, "type": "document", "attachments": [{"kind": "document", "file_id": fid, "file_name": safe_fname, "mime_type": mime_type}]}
 
                 await _interrupt_active_generation(chat_id)
                 task = asyncio.create_task(_handle_document_message(chat_id, user_message, username))
@@ -1304,8 +1312,14 @@ async def webhook() -> tuple:
                         "role": "user",
                         "content": content_text,
                         "file_id": fid,
-                        "file_name": fname,
                         "type": media_key,
+                        "attachments": [
+                            {
+                                "kind": media_key,
+                                "file_id": fid,
+                                "file_name": fname,
+                            }
+                        ],
                     }
                     await _interrupt_active_generation(chat_id)
                     task = asyncio.create_task(_handle_audio_message(chat_id, user_message, username))
@@ -1314,71 +1328,42 @@ async def webhook() -> tuple:
                     task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
                     return "OK", 200
                 else:
-                    if not GROQ_API_KEY:
-                        content_text = (
-                            f"📎 用户上传了音频「{fname}」，当前模型不支持直接解析，且未配置转录服务。"
-                            f"\n\n请切换到支持音频的模型，或配置 Groq 转录后再试。"
-                        )
-                        if cap:
-                            content_text += f"\n\n附加说明：{cap}"
-                        user_message = {
-                            "role": "user",
-                            "content": content_text,
-                            "file_id": fid,
-                            "file_name": fname,
-                            "type": media_key,
-                        }
-                        await _interrupt_active_generation(chat_id)
-                        task = asyncio.create_task(_handle_text_message(chat_id, content_text, username, user_message))
-                        async with active_tasks_lock:
-                            active_tasks[chat_id] = task
-                        task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                        return "OK", 200
-                    audio_bytes = await _get_cached_audio_data(chat_id, fid)
-                    if not audio_bytes:
-                        await send_rich_html_message(chat_id, "❌ 无法获取音频数据，请稍后重试。", reply_parameters=_reply_params(msg["message_id"]))
-                        return "OK", 200
-                    ext = os.path.splitext(fname)[1] or ".ogg"
-                    try:
-                        transcribed_text = await transcribe_audio_with_groq(audio_bytes, ext)
-                    except Exception as e:
-                        logger.error(f"Groq 转录失败: {e}")
-                        await send_rich_html_message(chat_id, f"""
-❌ <b>语音转录失败</b>
-<code>{str(e)[:100]}</code>
-💡 <b>备选方案：</b>
-• 请尝试使用支持音频的模型（如有），或更换其他模型
-• 输入 <code>/model</code> 切换模型
-• 或者直接发送文字消息
-""")
-                        return "OK", 200
-                    if not transcribed_text:
-                        await send_rich_html_message(chat_id, """
-⚠️ <b>转录结果为空</b>
-音频可能不清晰或无声。
-💡 建议：
-• 尝试重新录制语音
-• 使用支持音频的模型（<code>/model</code> 切换）
-• 直接发送文字消息
-""")
-                        return "OK", 200
-                    content_text = f"📎 用户上传了音频「{fname}」\n\n（语音转录）\n{transcribed_text}"
+                    content_text = f"📎 用户上传了音频「{fname}」"
                     if cap:
                         content_text += f"\n\n{cap}"
+                    else:
+                        content_text += "\n\n请分析这段音频"
+                    if GROQ_API_KEY:
+                        audio_bytes = await _get_cached_audio_data(chat_id, fid)
+                        if audio_bytes:
+                            ext = os.path.splitext(fname)[1] or ".ogg"
+                            try:
+                                transcribed_text = await transcribe_audio_with_groq(audio_bytes, ext)
+                                if transcribed_text:
+                                    content_text += f"\n\n转录文本：{transcribed_text}"
+                            except Exception as e:
+                                logger.error(f"Groq 转录失败: {e}")
+                                content_text += "\n\n（转录失败，已保留原始音频链接占位）"
                     user_message = {
                         "role": "user",
                         "content": content_text,
                         "file_id": fid,
                         "file_name": fname,
                         "type": media_key,
+                        "attachments": [
+                            {
+                                "kind": media_key,
+                                "file_id": fid,
+                                "file_name": fname,
+                            }
+                        ],
                     }
                     await _interrupt_active_generation(chat_id)
-                    task = asyncio.create_task(_handle_text_message(chat_id, content_text, username, user_message))
+                    task = asyncio.create_task(_handle_audio_message(chat_id, user_message, username))
                     async with active_tasks_lock:
                         active_tasks[chat_id] = task
                     task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
                     return "OK", 200
-
             # ── 文本消息 ──────────────────────────────────────────────────
             if "text" in msg:
                 user_input = msg["text"]
@@ -1486,20 +1471,27 @@ async def webhook() -> tuple:
                     file_name = reply_media.get("file_name", f"{media_type}_{reply_media.get('file_id', '')[:8]}")
 
                     if media_type == "photo":
-                        if supports_vision:
-                            file_ids = reply_media.get("file_ids", [])
-                            content_text = f"📎 用户引用了图片「{file_name}」"
-                            if user_input:
-                                content_text += f"\n\n{user_input}"
-                            else:
-                                content_text += "\n\n请分析这张图片"
-                            user_message = {
-                                "role": "user",
-                                "content": content_text,
-                                "file_ids": file_ids,
-                                "file_names": [f"photo_{fid[:8]}.jpg" for fid in file_ids],
-                                "type": "photo_group",
-                            }
+                        file_ids = reply_media.get("file_ids", [])
+                        content_text = f"📎 用户引用了图片「{file_name}」"
+                        if user_input:
+                            content_text += f"\n\n{user_input}"
+                        else:
+                            content_text += "\n\n请分析这张图片"
+                        user_message = {
+                            "role": "user",
+                            "content": content_text,
+                            "file_ids": file_ids,
+                            "type": "photo_group",
+                            "attachments": [
+                                {
+                                    "kind": "photo",
+                                    "file_id": fid,
+                                    "file_name": file_name,
+                                }
+                                for fid in file_ids
+                            ],
+                        }
+
                     elif media_type == "document":
                         safe_fname = os.path.basename(file_name)
                         mime_type = reply_media.get("mime_type") or mimetypes.guess_type(safe_fname)[0] or "application/pdf"
@@ -1542,21 +1534,56 @@ async def webhook() -> tuple:
                                     content_text += "\n\n请根据用户指令处理该文档。"
                             user_message = {"role": "user", "content": content_text}
 
-                    elif media_type in ("audio", "voice") and supports_audio:
-                        content_text = f"📎 用户引用了音频「{file_name}」\n\n{user_input}"
+                    elif media_type in ("audio", "voice"):
+                        content_text = f"📎 用户引用了音频「{file_name}」"
+                        if user_input:
+                            content_text += f"\n\n{user_input}"
+                        else:
+                            content_text += "\n\n请分析这段音频"
+                        if GROQ_API_KEY:
+                            audio_bytes = await _get_cached_audio_data(chat_id, reply_media["file_id"])
+                            if audio_bytes:
+                                ext = os.path.splitext(file_name)[1] or ".ogg"
+                                try:
+                                    transcribed_text = await transcribe_audio_with_groq(audio_bytes, ext)
+                                    if transcribed_text:
+                                        content_text += f"\n\n转录文本：{transcribed_text}"
+                                except Exception as e:
+                                    logger.error(f"Groq 转录失败: {e}")
+                                    content_text += "\n\n（转录失败，已保留原始音频链接占位）"
                         user_message = {
                             "role": "user",
                             "content": content_text,
                             "file_id": reply_media["file_id"],
+                            "file_name": file_name,
                             "type": media_type,
+                            "attachments": [
+                                {
+                                    "kind": media_type,
+                                    "file_id": reply_media["file_id"],
+                                    "file_name": file_name,
+                                }
+                            ],
                         }
-                    elif media_type == "video" and supports_vision:
-                        content_text = f"📎 用户引用了视频「{file_name}」\n\n{user_input}"
+                    elif media_type == "video":
+                        content_text = f"📎 用户引用了视频「{file_name}」"
+                        if user_input:
+                            content_text += f"\n\n{user_input}"
+                        else:
+                            content_text += "\n\n请分析这个视频"
                         user_message = {
                             "role": "user",
                             "content": content_text,
                             "file_id": reply_media["file_id"],
+                            "file_name": file_name,
                             "type": "video",
+                            "attachments": [
+                                {
+                                    "kind": "video",
+                                    "file_id": reply_media["file_id"],
+                                    "file_name": file_name,
+                                }
+                            ],
                         }
                     else:
                         content_text = f"📎 用户引用了媒体「{file_name}」\n\n{user_input}" if user_input else f"📎 用户引用了媒体「{file_name}」"
