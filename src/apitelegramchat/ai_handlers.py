@@ -1587,9 +1587,8 @@ async def _build_audio_fallback_text(
     file_name: str,
     user_text: str,
 ) -> str:
-    """为音频/语音附件生成文本降级内容，优先保留转录文本。"""
+    """将音频转录结果作为普通文本注入上下文。"""
     safe_name = str(file_name or f"audio_{file_id[:8]}.ogg").strip() or f"audio_{file_id[:8]}.ogg"
-    lines: list[str] = [f"📎 用户上传了音频「{safe_name}」"]
 
     audio_bytes = await _get_cached_audio_data(chat_id, file_id) if chat_id is not None else None
     transcript = ""
@@ -1601,22 +1600,8 @@ async def _build_audio_fallback_text(
             logger.debug(f"[AudioFallback] 转录失败 {file_id[:12]}: {e}")
 
     if transcript:
-        lines.append(f"转录文本：{transcript}")
-    else:
-        lines.append("（转录失败，已保留原始音频链接占位）")
-
-    url = await _resolve_public_attachment_url(file_id) if file_id else ""
-    if url:
-        lines.append(f"链接：{url}")
-
-    if user_text:
-        lines.append("")
-        lines.append(f"用户原始指令：{user_text}")
-    else:
-        lines.append("")
-        lines.append("用户未附加文字，请根据音频转录文本和上下文处理。")
-
-    return "\n".join(lines)
+        return transcript
+    return user_text or ""
 
 
 async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_type: str, chat_id: int = None):

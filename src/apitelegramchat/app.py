@@ -1340,7 +1340,7 @@ async def webhook() -> tuple:
                             try:
                                 transcribed_text = await transcribe_audio_with_groq(audio_bytes, ext)
                                 if transcribed_text:
-                                    content_text += f"\n\n转录文本：{transcribed_text}"
+                                    content_text += f"\n\n{transcribed_text}"
                             except Exception as e:
                                 logger.error(f"Groq 转录失败: {e}")
                                 content_text += "\n\n（转录失败，已保留原始音频链接占位）"
@@ -1547,7 +1547,7 @@ async def webhook() -> tuple:
                                 try:
                                     transcribed_text = await transcribe_audio_with_groq(audio_bytes, ext)
                                     if transcribed_text:
-                                        content_text += f"\n\n转录文本：{transcribed_text}"
+                                        content_text += f"\n\n{transcribed_text}"
                                 except Exception as e:
                                     logger.error(f"Groq 转录失败: {e}")
                                     content_text += "\n\n（转录失败，已保留原始音频链接占位）"
