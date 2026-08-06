@@ -1450,14 +1450,10 @@ async def webhook() -> tuple:
                 # 普通文本对话
                 context_prefix = _get_reply_context(msg)
                 # 先记录原始输入是否为空，再拼接引用上下文（避免上下文使空输入检查失效）
-                original_input_empty = not user_input.strip()
                 if context_prefix:
                     user_input = context_prefix + user_input
 
                 reply_media = _get_reply_media(msg)
-
-                if original_input_empty and reply_media:
-                    user_input = (context_prefix or "") + "请分析我引用的内容"
 
                 async with lock:
                     cm = get_user_model(chat_id)
@@ -1535,36 +1531,58 @@ async def webhook() -> tuple:
                             user_message = {"role": "user", "content": content_text}
 
                     elif media_type in ("audio", "voice"):
-                        content_text_parts = []
-                        if user_input:
-                            content_text_parts.append(user_input)
-                        if GROQ_API_KEY:
-                            audio_bytes = await _get_cached_audio_data(chat_id, reply_media["file_id"])
-                            if audio_bytes:
-                                ext = os.path.splitext(file_name)[1] or ".ogg"
-                                try:
-                                    transcribed_text = await transcribe_audio_with_groq(audio_bytes, ext)
-                                    if transcribed_text:
-                                        content_text_parts.append(transcribed_text)
-                                except Exception as e:
-                                    logger.error(f"Groq 转录失败: {e}")
-                        if not content_text_parts:
-                            content_text_parts.append("请分析这段音频")
-                        content_text = "\n\n".join(content_text_parts)
-                        user_message = {
-                            "role": "user",
-                            "content": content_text,
-                            "file_id": reply_media["file_id"],
-                            "file_name": file_name,
-                            "type": media_type,
-                            "attachments": [
-                                {
-                                    "kind": media_type,
-                                    "file_id": reply_media["file_id"],
-                                    "file_name": file_name,
-                                }
-                            ],
-                        }
+                        if supports_audio:
+                            content_text = f"📎 用户引用了音频「{file_name}」"
+                            if user_input:
+                                content_text += f"\n\n{user_input}"
+                            else:
+                                content_text += "\n\n请分析这段音频"
+                            user_message = {
+                                "role": "user",
+                                "content": content_text,
+                                "file_id": reply_media["file_id"],
+                                "file_name": file_name,
+                                "type": media_type,
+                                "attachments": [
+                                    {
+                                        "kind": media_type,
+                                        "file_id": reply_media["file_id"],
+                                        "file_name": file_name,
+                                    }
+                                ],
+                            }
+                        else:
+                            content_text_parts = []
+                            if user_input:
+                                content_text_parts.append(user_input)
+                            if GROQ_API_KEY:
+                                audio_bytes = await _get_cached_audio_data(chat_id, reply_media["file_id"])
+                                if audio_bytes:
+                                    ext = os.path.splitext(file_name)[1] or ".ogg"
+                                    try:
+                                        transcribed_text = await transcribe_audio_with_groq(audio_bytes, ext)
+                                        if transcribed_text:
+                                            content_text_parts.append(transcribed_text)
+                                    except Exception as e:
+                                        logger.error(f"Groq 转录失败: {e}")
+                            if not content_text_parts:
+                                content_text_parts.append("请分析这段音频")
+                            content_text = "\n\n".join(content_text_parts)
+                            user_message = {
+                                "role": "user",
+                                "content": content_text,
+                                "file_id": reply_media["file_id"],
+                                "file_name": file_name,
+                                "type": media_type,
+                                "attachments": [
+                                    {
+                                        "kind": media_type,
+                                        "file_id": reply_media["file_id"],
+                                        "file_name": file_name,
+                                    }
+                                ],
+                            }
+                    elif media_type == "video":
                         content_text = f"📎 用户引用了视频「{file_name}」"
                         if user_input:
                             content_text += f"\n\n{user_input}"

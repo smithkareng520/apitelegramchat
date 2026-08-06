@@ -651,16 +651,10 @@ async def _upload_and_mark(file_id: str, data: bytes, r2_key: str):
 
 
 async def _get_cached_audio_data(chat_id: int, file_id: str) -> Optional[bytes]:
+    """仅在内存中缓存音频字节，不做磁盘或 R2 持久化。"""
     cache_key = file_id
     if cache_key in _audio_cache:
         return _audio_cache[cache_key]
-
-    r2_key = _get_r2_key(file_id)
-    if await file_exists_in_r2(r2_key):
-        data = await download_from_r2(r2_key)
-        if data:
-            _audio_cache[cache_key] = data
-            return data
 
     tg_path = await get_file_path(file_id)
     if not tg_path:
@@ -672,7 +666,6 @@ async def _get_cached_audio_data(chat_id: int, file_id: str) -> Optional[bytes]:
                 if resp.status == 200:
                     data = await resp.read()
                     _audio_cache[cache_key] = data
-                    _track_task(upload_bytes_to_r2(data, r2_key, "audio/ogg"))
                     return data
     except Exception as e:
         logger.exception(f"音频下载失败 {file_id}: {e}")
@@ -1604,7 +1597,7 @@ async def _build_audio_fallback_text(
         parts.append(user_text)
     if transcript:
         parts.append(transcript)
-    return "\n\n".join(parts) if parts else user_text
+    return "\n\n".join(parts) if parts else (user_text or "请分析这段音频")
 
 
 
@@ -1710,8 +1703,11 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_ty
                 audio_bytes = await _get_cached_audio_data(chat_id, fid)
                 if audio_bytes:
                     b64_data = base64.b64encode(audio_bytes).decode()
+                    audio_format = (Path(file_name).suffix.lstrip(".") or "ogg").lower()
+                    if audio_format == "oga":
+                        audio_format = "ogg"
                     return [
-                        {"type": "input_audio", "input_audio": {"data": b64_data, "format": "ogg"}},
+                        {"type": "input_audio", "input_audio": {"data": b64_data, "format": audio_format}},
                         {"type": "text", "text": user_text or "请分析这段音频"}
                     ]
             return await _build_audio_fallback_text(
