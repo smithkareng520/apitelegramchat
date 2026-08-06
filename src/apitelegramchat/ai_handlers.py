@@ -1587,7 +1587,7 @@ async def _build_audio_fallback_text(
     file_name: str,
     user_text: str,
 ) -> str:
-    """将音频转录结果作为普通文本注入上下文。"""
+    """为不支持音频的模型生成纯文本降级内容。"""
     safe_name = str(file_name or f"audio_{file_id[:8]}.ogg").strip() or f"audio_{file_id[:8]}.ogg"
 
     audio_bytes = await _get_cached_audio_data(chat_id, file_id) if chat_id is not None else None
@@ -1599,9 +1599,13 @@ async def _build_audio_fallback_text(
         except Exception as e:
             logger.debug(f"[AudioFallback] 转录失败 {file_id[:12]}: {e}")
 
+    parts: list[str] = []
+    if user_text:
+        parts.append(user_text)
     if transcript:
-        return transcript
-    return user_text or ""
+        parts.append(transcript)
+    return "\n\n".join(parts) if parts else user_text
+
 
 
 async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_type: str, chat_id: int = None):

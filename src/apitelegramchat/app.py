@@ -1328,11 +1328,9 @@ async def webhook() -> tuple:
                     task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
                     return "OK", 200
                 else:
-                    content_text = f"📎 用户上传了音频「{fname}」"
+                    content_text_parts = []
                     if cap:
-                        content_text += f"\n\n{cap}"
-                    else:
-                        content_text += "\n\n请分析这段音频"
+                        content_text_parts.append(cap)
                     if GROQ_API_KEY:
                         audio_bytes = await _get_cached_audio_data(chat_id, fid)
                         if audio_bytes:
@@ -1340,10 +1338,12 @@ async def webhook() -> tuple:
                             try:
                                 transcribed_text = await transcribe_audio_with_groq(audio_bytes, ext)
                                 if transcribed_text:
-                                    content_text += f"\n\n{transcribed_text}"
+                                    content_text_parts.append(transcribed_text)
                             except Exception as e:
                                 logger.error(f"Groq 转录失败: {e}")
-                                content_text += "\n\n（转录失败，已保留原始音频链接占位）"
+                    if not content_text_parts:
+                        content_text_parts.append("请分析这段音频")
+                    content_text = "\n\n".join(content_text_parts)
                     user_message = {
                         "role": "user",
                         "content": content_text,
@@ -1535,11 +1535,9 @@ async def webhook() -> tuple:
                             user_message = {"role": "user", "content": content_text}
 
                     elif media_type in ("audio", "voice"):
-                        content_text = f"📎 用户引用了音频「{file_name}」"
+                        content_text_parts = []
                         if user_input:
-                            content_text += f"\n\n{user_input}"
-                        else:
-                            content_text += "\n\n请分析这段音频"
+                            content_text_parts.append(user_input)
                         if GROQ_API_KEY:
                             audio_bytes = await _get_cached_audio_data(chat_id, reply_media["file_id"])
                             if audio_bytes:
@@ -1547,10 +1545,12 @@ async def webhook() -> tuple:
                                 try:
                                     transcribed_text = await transcribe_audio_with_groq(audio_bytes, ext)
                                     if transcribed_text:
-                                        content_text += f"\n\n{transcribed_text}"
+                                        content_text_parts.append(transcribed_text)
                                 except Exception as e:
                                     logger.error(f"Groq 转录失败: {e}")
-                                    content_text += "\n\n（转录失败，已保留原始音频链接占位）"
+                        if not content_text_parts:
+                            content_text_parts.append("请分析这段音频")
+                        content_text = "\n\n".join(content_text_parts)
                         user_message = {
                             "role": "user",
                             "content": content_text,
@@ -1565,7 +1565,6 @@ async def webhook() -> tuple:
                                 }
                             ],
                         }
-                    elif media_type == "video":
                         content_text = f"📎 用户引用了视频「{file_name}」"
                         if user_input:
                             content_text += f"\n\n{user_input}"
