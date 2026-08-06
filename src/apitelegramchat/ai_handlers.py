@@ -1466,6 +1466,7 @@ async def get_error_notification_message(
     )
 
 
+
 def _build_initial_messages(api_type: str, system_prompt: str) -> list:
     return [{"role": "system", "content": system_prompt}]
 
@@ -1476,145 +1477,266 @@ def _strip_reply_prefix(content):
     return content
 
 
-async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_type: str, chat_id: int = None):
-    supports_vision = model_info.vision
-    supports_audio = model_info.audio
-    supports_native_documents = bool(getattr(model_info, "native_document", False))
-    user_text = msg.get("content", "")
-    if isinstance(user_text, str):
-        user_text = _strip_reply_prefix(user_text)
+def _normalize_media_attachments(msg: dict) -> list[dict]:
+    """
+    将消息中的媒体信息统一成附件列表，便于按模型能力编译。
+    每个附件至少包含:
+    - kind: photo/document/audio/voice/video
+    - file_id
+    - file_name
+    - mime_type
+    - index
+    """
+    attachments: list[dict] = []
 
-    if "file_ids" in msg and supports_vision:
-        file_ids = msg["file_ids"]
+    explicit = msg.get("attachments")
+    if isinstance(explicit, list):
+        for idx, item in enumerate(explicit):
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or item.get("type") or item.get("media_type") or "").strip().lower()
+            file_id = str(item.get("file_id") or "").strip()
+            if not kind or not file_id:
+                continue
+            attachments.append({
+                "kind": kind,
+                "file_id": file_id,
+                "file_name": str(item.get("file_name") or item.get("name") or "").strip(),
+                "mime_type": str(item.get("mime_type") or "").strip(),
+                "index": idx,
+            })
+        if attachments:
+            return attachments
 
-        async def process_one(fid):
-            img_bytes = await get_cached_image_data(chat_id, fid) if chat_id else None
-            if not img_bytes:
-                return None
-            try:
-                img = Image.open(io.BytesIO(img_bytes))
-                fmt = img.format.lower() if img.format else "jpeg"
-                if fmt not in ("jpeg", "png"):
-                    fmt = "jpeg"
-                if fmt == "png" and img.mode == "RGBA":
-                    buf = io.BytesIO()
-                    img.save(buf, format="PNG")
-                    b64 = base64.b64encode(buf.getvalue()).decode()
-                else:
-                    img_rgb = img.convert("RGB")
-                    buf = io.BytesIO()
-                    img_rgb.save(buf, format=fmt.upper())
-                    b64 = base64.b64encode(buf.getvalue()).decode()
-                img.close()
-                return {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/{fmt};base64,{b64}", "detail": "high"}
-                }
-            except Exception as e:
-                logger.exception(f"处理图片 {fid} 失败: {e}")
-                return None
+    media_type = str(msg.get("type") or "").strip().lower()
 
-        results = await asyncio.gather(*[process_one(fid) for fid in file_ids])
-        content_parts = [r for r in results if r is not None]
-        if content_parts:
-            content_parts.append({"type": "text", "text": user_text})
-            return content_parts
+    file_ids = msg.get("file_ids")
+    if isinstance(file_ids, (list, tuple)) and file_ids:
+        file_names = list(msg.get("file_names") or [])
+        mime_types = list(msg.get("mime_types") or [])
+        if media_type in {"photo_group", "photo", "image_group", "image"}:
+            kind = "photo"
+        elif media_type in {"document_group", "document"}:
+            kind = "document"
+        elif media_type in {"audio_group", "audio", "voice"}:
+            kind = "audio" if media_type == "audio" else "voice"
+        elif media_type in {"video_group", "video"}:
+            kind = "video"
         else:
-            return user_text
+            kind = media_type or "file"
+        for idx, fid in enumerate(file_ids):
+            if not fid:
+                continue
+            attachments.append({
+                "kind": kind,
+                "file_id": str(fid),
+                "file_name": str(file_names[idx]) if idx < len(file_names) else "",
+                "mime_type": str(mime_types[idx]) if idx < len(mime_types) else "",
+                "index": idx,
+            })
+        if attachments:
+            return attachments
 
-    if supports_native_documents:
-        doc_file_ids = []
-        doc_file_names = []
-        doc_mime_types = []
+    file_id = msg.get("file_id")
+    if file_id:
+        if media_type in {"photo", "image"}:
+            kind = "photo"
+        elif media_type in {"document"}:
+            kind = "document"
+        elif media_type in {"audio"}:
+            kind = "audio"
+        elif media_type in {"voice"}:
+            kind = "voice"
+        elif media_type in {"video"}:
+            kind = "video"
+        else:
+            kind = media_type or "file"
+        attachments.append({
+            "kind": kind,
+            "file_id": str(file_id),
+            "file_name": str(msg.get("file_name") or msg.get("name") or ""),
+            "mime_type": str(msg.get("mime_type") or ""),
+            "index": 0,
+        })
 
-        if "file_id" in msg and msg.get("type") in ("document", "document_group"):
-            doc_file_ids = [msg["file_id"]]
-            doc_file_names = [msg.get("file_name", "document.pdf")]
-            doc_mime_types = [msg.get("mime_type", "")]
-        elif "file_ids" in msg and msg.get("type") in ("document_group", "document"):
-            doc_file_ids = list(msg.get("file_ids") or [])
-            doc_file_names = list(msg.get("file_names") or [])
-            doc_mime_types = list(msg.get("mime_types") or [])
+    return attachments
 
-        if doc_file_ids:
-            content_parts = []
-            if user_text:
-                content_parts.append({"type": "text", "text": user_text})
-            else:
-                content_parts.append(
-                    {"type": "text", "text": "请分析这些文档。" if len(doc_file_ids) > 1 else "请分析这个文档。"})
 
-            for idx, fid in enumerate(doc_file_ids):
-                file_name = doc_file_names[idx] if idx < len(doc_file_names) else f"document_{fid[:8]}.pdf"
-                mime_type = doc_mime_types[idx] if idx < len(doc_mime_types) else ""
-                part = await _build_native_document_part(chat_id, fid, file_name=file_name, mime_type=mime_type)
+def _build_media_placeholder_text(msg: dict, attachments: list[dict] | None = None) -> str:
+    """
+    为不支持对应媒体能力的模型生成稳定的文本占位。
+    这里保留文件名/数量/类型等元信息，避免历史回放时丢失语义。
+    """
+    attachments = attachments if attachments is not None else _normalize_media_attachments(msg)
+    base_text = msg.get("content", "")
+    if isinstance(base_text, str):
+        base_text = _strip_reply_prefix(base_text).strip()
+    else:
+        base_text = str(base_text).strip()
+
+    if not attachments:
+        return base_text
+
+    media_type = str(msg.get("type") or attachments[0].get("kind") or "media").lower()
+    type_label = {
+        "photo": "图片",
+        "photo_group": "图片组",
+        "image": "图片",
+        "image_group": "图片组",
+        "document": "文档",
+        "document_group": "文档组",
+        "audio": "音频",
+        "voice": "语音",
+        "video": "视频",
+    }.get(media_type, "媒体")
+
+    count = len(attachments)
+    names = [a.get("file_name", "") for a in attachments if a.get("file_name")]
+    name_text = ""
+    if names:
+        shown = names[:3]
+        name_text = f"：{', '.join(shown)}"
+        if len(names) > 3:
+            name_text += f" 等 {len(names)} 个文件"
+
+    meta_lines = [f"📎 用户上传了{type_label}（共 {count} 个）{name_text}".rstrip()]
+    for att in attachments[:6]:
+        parts = [f"- {att.get('kind') or 'media'}"]
+        if att.get("file_name"):
+            parts.append(f"文件名：{att['file_name']}")
+        if att.get("mime_type"):
+            parts.append(f"MIME：{att['mime_type']}")
+        parts.append(f"file_id：{att.get('file_id', '')[:12]}")
+        meta_lines.append("，".join(parts))
+
+    if base_text:
+        meta_lines.append("")
+        meta_lines.append(base_text)
+
+    return "\n".join(meta_lines).strip()
+
+
+async def _compile_message_for_model(msg: dict, model_info: ModelConfig, api_type: str, chat_id: int = None) -> dict:
+    """
+    将历史消息/当前消息编译成适合目标模型的 messages 项。
+    支持：
+    - 支持视觉/音频/原生文档：发送原件
+    - 不支持：降级为稳定文本占位，同时保留原始附件元数据在历史里
+    """
+    if not isinstance(msg, dict):
+        return {"role": "user", "content": str(msg)}
+
+    role = msg.get("role")
+    if role not in ("user", "assistant", "tool", "system"):
+        role = "user"
+
+    out_msg = {"role": role}
+
+    if role != "user":
+        content = msg.get("content")
+        if isinstance(content, str):
+            out_msg["content"] = _strip_reply_prefix(content)
+        else:
+            out_msg["content"] = content
+        for key in ["tool_calls", "tool_call_id", "name", "reasoning_content"]:
+            if key in msg:
+                out_msg[key] = msg[key]
+        return out_msg
+
+    supports_vision = bool(getattr(model_info, "vision", False))
+    supports_audio = bool(getattr(model_info, "audio", False))
+    supports_native_documents = bool(getattr(model_info, "native_document", False))
+
+    base_text = msg.get("content", "")
+    if isinstance(base_text, str):
+        base_text = _strip_reply_prefix(base_text).strip()
+    elif base_text is None:
+        base_text = ""
+    else:
+        base_text = str(base_text).strip()
+
+    attachments = _normalize_media_attachments(msg)
+
+    if not attachments:
+        out_msg["content"] = base_text
+        return out_msg
+
+    compiled_parts = []
+    fallback_attachments = []
+
+    for att in attachments:
+        kind = str(att.get("kind") or "").lower()
+
+        if kind in {"photo", "image"} and supports_vision:
+            file_id = att.get("file_id")
+            if file_id:
+                img_bytes = await get_cached_image_data(chat_id, file_id) if chat_id else None
+                if img_bytes:
+                    try:
+                        img = Image.open(io.BytesIO(img_bytes))
+                        fmt = img.format.lower() if img.format else "jpeg"
+                        if fmt not in ("jpeg", "png"):
+                            fmt = "jpeg"
+                        if fmt == "png" and img.mode == "RGBA":
+                            buf = io.BytesIO()
+                            img.save(buf, format="PNG")
+                            b64 = base64.b64encode(buf.getvalue()).decode()
+                        else:
+                            img_rgb = img.convert("RGB")
+                            buf = io.BytesIO()
+                            img_rgb.save(buf, format=fmt.upper())
+                            b64 = base64.b64encode(buf.getvalue()).decode()
+                        img.close()
+                        compiled_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/{fmt};base64,{b64}", "detail": "high"},
+                        })
+                        continue
+                    except Exception as e:
+                        logger.exception(f"处理历史/当前图片 {file_id} 失败: {e}")
+
+        if kind == "document" and supports_native_documents:
+            file_id = att.get("file_id")
+            file_name = att.get("file_name") or "document.pdf"
+            mime_type = att.get("mime_type") or ""
+            if file_id:
+                part = await _build_native_document_part(chat_id, file_id, file_name=file_name, mime_type=mime_type)
                 if part:
-                    content_parts.append(part)
+                    compiled_parts.append(part)
+                    continue
 
-            if len(content_parts) > 1:
-                return content_parts
-            return user_text
+        if kind in {"audio", "voice"} and supports_audio:
+            file_id = att.get("file_id")
+            if file_id:
+                audio_bytes = await _get_cached_audio_data(chat_id, file_id)
+                if audio_bytes:
+                    compiled_parts.append({
+                        "type": "input_audio",
+                        "input_audio": {"data": base64.b64encode(audio_bytes).decode(), "format": "ogg"},
+                    })
+                    continue
 
-    if "file_id" in msg:
-        fid = msg["file_id"]
-        file_type = msg.get("type")
-        tg_path = await get_file_path(fid)
-        if not tg_path:
-            return user_text
+        fallback_attachments.append(att)
 
-        if file_type == "photo" and supports_vision:
-            img_bytes = await get_cached_image_data(chat_id, fid) if chat_id else None
-            if not img_bytes:
-                return user_text
-            try:
-                img = Image.open(io.BytesIO(img_bytes))
-                fmt = img.format.lower() if img.format else "jpeg"
-                if fmt not in ("jpeg", "png"):
-                    fmt = "jpeg"
-                if fmt == "png" and img.mode == "RGBA":
-                    buf = io.BytesIO()
-                    img.save(buf, format="PNG")
-                    b64 = base64.b64encode(buf.getvalue()).decode()
-                else:
-                    img_rgb = img.convert("RGB")
-                    buf = io.BytesIO()
-                    img_rgb.save(buf, format=fmt.upper())
-                    b64 = base64.b64encode(buf.getvalue()).decode()
-                img.close()
-                return [
-                    {"type": "image_url", "image_url": {"url": f"data:image/{fmt};base64,{b64}", "detail": "high"}},
-                    {"type": "text", "text": user_text or "Describe this image."}
-                ]
-            except Exception as e:
-                logger.exception(f"单张图片处理失败 {fid}: {e}")
-                return user_text
+    if compiled_parts:
+        text_to_attach = base_text or _build_media_placeholder_text(msg, fallback_attachments or attachments)
+        if text_to_attach:
+            compiled_parts.append({"type": "text", "text": text_to_attach})
+        out_msg["content"] = compiled_parts
+    else:
+        out_msg["content"] = _build_media_placeholder_text(msg, attachments)
 
-        elif file_type in ("audio", "voice") and supports_audio:
-            audio_bytes = await _get_cached_audio_data(chat_id, fid)
-            if not audio_bytes:
-                return user_text
-            b64_data = base64.b64encode(audio_bytes).decode()
-            return [
-                {"type": "input_audio", "input_audio": {"data": b64_data, "format": "ogg"}},
-                {"type": "text", "text": user_text or "请分析这段音频"}
-            ]
+    return out_msg
 
-    return user_text
 
+async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_type: str, chat_id: int = None):
+    compiled = await _compile_message_for_model(msg, model_info, api_type, chat_id=chat_id)
+    return compiled.get("content", "")
 
 async def _append_history_async(messages: list, history: list, api_type: str, model_info: ModelConfig) -> None:
     for msg in history:
         if msg.get("role") in ("user", "assistant", "tool", "system"):
-            out_msg = {"role": msg["role"]}
-            if "content" in msg:
-                content = msg["content"]
-                if isinstance(content, str):
-                    out_msg["content"] = _strip_reply_prefix(content)
-                else:
-                    out_msg["content"] = content
-            for key in ["tool_calls", "tool_call_id", "name", "reasoning_content"]:
-                if key in msg:
-                    out_msg[key] = msg[key]
+            out_msg = await _compile_message_for_model(msg, model_info, api_type)
             messages.append(out_msg)
 
 
