@@ -1658,41 +1658,50 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_ty
             mime_types=mime_types,
         )
 
-    # ---------- 原生文档 ----------
-    if supports_native_documents:
-        doc_file_ids = []
-        doc_file_names = []
-        doc_mime_types = []
-
-        if "file_id" in msg and msg.get("type") in ("document", "document_group"):
+    # ---------- 原生文档 / 文档组 ----------
+    doc_file_ids = []
+    doc_file_names = []
+    doc_mime_types = []
+    if ("file_id" in msg or "file_ids" in msg) and msg.get("type") in ("document", "document_group"):
+        if "file_id" in msg:
             doc_file_ids = [msg["file_id"]]
             doc_file_names = [msg.get("file_name", "document.pdf")]
             doc_mime_types = [msg.get("mime_type", "")]
-        elif "file_ids" in msg and msg.get("type") in ("document_group", "document"):
+        else:
             doc_file_ids = list(msg.get("file_ids") or [])
             doc_file_names = list(msg.get("file_names") or [])
             doc_mime_types = list(msg.get("mime_types") or [])
 
-        if doc_file_ids:
-            content_parts = []
-            if user_text:
-                content_parts.append({"type": "text", "text": user_text})
-            else:
-                content_parts.append(
-                    {"type": "text", "text": "请分析这些文档。" if len(doc_file_ids) > 1 else "请分析这个文档。"})
+        if supports_native_documents:
+            if doc_file_ids:
+                content_parts = []
+                if user_text:
+                    content_parts.append({"type": "text", "text": user_text})
+                else:
+                    content_parts.append(
+                        {"type": "text", "text": "请分析这些文档。" if len(doc_file_ids) > 1 else "请分析这个文档。"})
 
-            for idx, fid in enumerate(doc_file_ids):
-                file_name = doc_file_names[idx] if idx < len(doc_file_names) else f"document_{fid[:8]}.pdf"
-                mime_type = doc_mime_types[idx] if idx < len(doc_mime_types) else ""
-                part = await _build_native_document_part(chat_id, fid, file_name=file_name, mime_type=mime_type)
-                if part:
-                    content_parts.append(part)
+                for idx, fid in enumerate(doc_file_ids):
+                    file_name = doc_file_names[idx] if idx < len(doc_file_names) else f"document_{fid[:8]}.pdf"
+                    mime_type = doc_mime_types[idx] if idx < len(doc_mime_types) else ""
+                    part = await _build_native_document_part(chat_id, fid, file_name=file_name, mime_type=mime_type)
+                    if part:
+                        content_parts.append(part)
 
-            if len(content_parts) > 1:
-                return content_parts
-            return user_text
+                if len(content_parts) > 1:
+                    return content_parts
+                return user_text
+        elif doc_file_ids:
+            return await _build_attachment_fallback_text(
+                kind="document",
+                file_ids=doc_file_ids,
+                user_text=user_text,
+                chat_id=chat_id,
+                file_names=doc_file_names,
+                mime_types=doc_mime_types,
+            )
 
-    # ---------- 单文件回退（文档 / 音频 / 其他） ----------
+    # ---------- 单文件回退（音频 / 其他） ----------
     if "file_id" in msg:
         fid = msg["file_id"]
         file_type = str(msg.get("type") or "").lower()
@@ -1754,16 +1763,23 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_ty
     return user_text
 
 
-async def _append_history_async(messages: list, history: list, api_type: str, model_info: ModelConfig) -> None:
+async def _append_history_async(messages: list, history: list, api_type: str, model_info: ModelConfig, chat_id: int | None = None) -> None:
     for msg in history:
         if msg.get("role") in ("user", "assistant", "tool", "system"):
             out_msg = {"role": msg["role"]}
-            if "content" in msg:
-                content = msg["content"]
-                if isinstance(content, str):
-                    out_msg["content"] = _strip_reply_prefix(content)
-                else:
-                    out_msg["content"] = content
+            if msg.get("role") == "user":
+                resolved = await _resolve_multimodal_content(dict(msg), model_info, api_type, chat_id=chat_id)
+                out_msg["content"] = resolved
+                for key in ("file_id", "file_ids", "file_name", "file_names", "mime_type", "mime_types", "type", "attachments"):
+                    if key in msg:
+                        out_msg[key] = msg[key]
+            else:
+                if "content" in msg:
+                    content = msg["content"]
+                    if isinstance(content, str):
+                        out_msg["content"] = _strip_reply_prefix(content)
+                    else:
+                        out_msg["content"] = content
             for key in ["tool_calls", "tool_call_id", "name", "reasoning_content"]:
                 if key in msg:
                     out_msg[key] = msg[key]
@@ -4696,7 +4712,7 @@ async def get_ai_response(
 
         system_prompt = await build_system_prompt(chat_id, username, supports_tools=supports_tools)
         messages = _build_initial_messages(api_type, system_prompt)
-        await _append_history_async(messages, history, api_type, model_info)
+        await _append_history_async(messages, history, api_type, model_info, chat_id=chat_id)
         if model_info.supports_prompt_cache:
             _apply_cache_control(messages)
         if user_message:
