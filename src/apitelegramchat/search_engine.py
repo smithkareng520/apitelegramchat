@@ -1532,6 +1532,34 @@ def _format_search_results(items: list, query: str, engine: str, requested: int 
     return "\n".join(lines)
 
 
+async def execute_web_search(query: str, num_results: int = 5) -> str:
+    """Search the web with Google first, then DuckDuckGo fallback.
+
+    This keeps the public tool contract stable while allowing Google to be removed
+    later without changing the call sites. The response format is intentionally
+    identical for both providers so the UI and result counting logic stay aligned.
+    """
+    query = (query or "").strip()
+    requested = min(max(int(num_results or 5), 1), 10)
+    if not query:
+        return "❌ 搜索关键词为空。"
+
+    providers = (
+        ("Google", _search_google),
+        ("DuckDuckGo", _search_duckduckgo),
+    )
+    for engine_name, provider in providers:
+        try:
+            items = await provider(query, requested)
+        except Exception as e:
+            logger.warning(f"{engine_name} 搜索失败: {e}")
+            items = None
+        if items:
+            return _format_search_results(items, query, engine_name, requested=requested)
+
+    return f"❌ 未找到与「{query}」相关的结果。"
+
+
 # --------------------- fetch_url (增加重试循环) ---------------------
 async def _extract_with_trafilatura(url: str) -> str | None:
     try:
