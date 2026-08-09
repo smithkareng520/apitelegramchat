@@ -69,34 +69,6 @@ def _new_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
-def _migrate_store(store: dict) -> dict:
-    """把旧数据迁移到稳定 id 方案，同时保留兼容字段。"""
-    todos = store.get("todos", [])
-    if not isinstance(todos, list):
-        todos = []
-        store["todos"] = todos
-    seen_ids = set()
-    for idx, todo in enumerate(todos, start=1):
-        if not isinstance(todo, dict):
-            continue
-        tid = str(todo.get("id") or "").strip()
-        if not tid or tid in seen_ids:
-            tid = _new_id()
-        while tid in seen_ids:
-            tid = _new_id()
-        todo["id"] = tid
-        seen_ids.add(tid)
-        todo.setdefault("created_at", idx)
-        todo.setdefault("completed_at", None)
-        todo.setdefault("done", bool(todo.get("done", False)))
-        todo.setdefault("priority", "medium")
-        todo.setdefault("tags", [])
-        todo.setdefault("note", "")
-    store.setdefault("next_seq", len(todos) + 1)
-    store.setdefault("updated_at", 0)
-    return store
-
-
 def _empty_store() -> dict:
     return {"todos": [], "next_seq": 1, "updated_at": 0}
 
@@ -111,9 +83,7 @@ def _load_local(chat_id: int) -> dict:
         data = json.loads(raw)
         if not isinstance(data, dict) or not isinstance(data.get("todos"), list):
             return _empty_store()
-        data.setdefault("next_seq", 1)
-        data.setdefault("updated_at", 0)
-        return _migrate_store(data)
+        return data
     except (json.JSONDecodeError, OSError) as e:
         logger.warning(f"todos.json 读取失败 (chat={chat_id}): {e}")
         return _empty_store()
@@ -130,12 +100,12 @@ def _save_local(chat_id: int, store: dict) -> None:
 
 
 def _find_todo(todos: list, todo_id: str) -> tuple[int, dict] | None:
-    """返回 (index, todo) 或 None。同时兼容旧的 seq 查找。"""
+    """返回 (index, todo) 或 None。"""
     if not todo_id:
         return None
     target = str(todo_id).lstrip("#")
     for i, t in enumerate(todos):
-        if t.get("id") == todo_id or str(t.get("seq", "")) == target:
+        if t.get("id") == todo_id:
             return i, t
     return None
 

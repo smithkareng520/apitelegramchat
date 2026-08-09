@@ -104,7 +104,7 @@ def _load_local(chat_id: int) -> dict:
             return _empty_store()
         data.setdefault("next_seq", 1)
         data.setdefault("updated_at", 0)
-        return data
+        return _migrate_store(data)
     except (json.JSONDecodeError, OSError) as e:
         logger.warning(f"memories.json 读取失败 (chat={chat_id}): {e}")
         return _empty_store()
@@ -124,7 +124,7 @@ def _find_memory(memories: list, mid: str) -> tuple[int, dict] | None:
         return None
     target = str(mid).lstrip("#")
     for i, m in enumerate(memories):
-        if m.get("id") == mid or str(m.get("seq", "")) == target:
+        if m.get("id") == mid:
             return i, m
     return None
 
@@ -208,7 +208,12 @@ def _op_add(store: dict, content: str, category: str, tags: list[str],
     if len(store["memories"]) >= MAX_MEMORIES:
         raise _MemoryError(f"记忆数量已达上限 {MAX_MEMORIES}，请先清理", "too_many")
 
-    seq = store.get("next_seq", 1)
+    max_seq = max((int(m.get("seq", 0)) for m in store["memories"] if isinstance(m, dict)), default=0)
+    try:
+        seq = int(store.get("next_seq", 1))
+    except (TypeError, ValueError):
+        seq = 1
+    seq = max(seq, max_seq + 1)
     now = int(time.time())
     mem = {
         "id": _new_id(),
@@ -222,7 +227,7 @@ def _op_add(store: dict, content: str, category: str, tags: list[str],
         "source": (source or "agent").strip().lower()[:16] or "agent",
     }
     store["memories"].append(mem)
-    store["next_seq"] = seq + 1
+    store["next_seq"] = max(seq + 1, max((int(m.get("seq", 0)) for m in store["memories"] if isinstance(m, dict)), default=seq) + 1)
     return store, {
         "ok": True,
         "action": "add",
@@ -247,8 +252,12 @@ def _op_list(store: dict, category: Optional[str], tag: Optional[str],
     weight = {"high": 3, "medium": 2, "low": 1}
     memories_sorted = sorted(
         memories,
-        key=lambda m: (-weight.get(m.get("importance", "medium"), 2),
-                       -m.get("seq", 0)),
+        key=lambda m: (
+            -weight.get(m.get("importance", "medium"), 2),
+            -int(m.get("created_at", 0) or 0),
+            -int(m.get("seq", 0) or 0),
+            str(m.get("id", "")),
+        ),
     )
 
     filtered = []
@@ -292,8 +301,12 @@ def _op_search(store: dict, query: str, limit: int) -> dict:
             matches.append(m)
     # 同样的排序
     weight = {"high": 3, "medium": 2, "low": 1}
-    matches.sort(key=lambda m: (-weight.get(m.get("importance", "medium"), 2),
-                                -m.get("seq", 0)))
+    matches.sort(key=lambda m: (
+        -weight.get(m.get("importance", "medium"), 2),
+        -int(m.get("created_at", 0) or 0),
+        -int(m.get("seq", 0) or 0),
+        str(m.get("id", "")),
+    ))
     if limit and len(matches) > limit:
         matches = matches[:limit]
 

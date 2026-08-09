@@ -203,7 +203,6 @@ def _load_local(chat_id: int) -> dict:
         data = json.loads(raw)
         if not isinstance(data, dict) or not isinstance(data.get("skills"), list):
             return _empty_store()
-        data.setdefault("updated_at", 0)
         return data
     except (json.JSONDecodeError, OSError) as e:
         logger.warning(f"skills.json 读取失败 (chat={chat_id}): {e}")
