@@ -2201,11 +2201,8 @@ async def _run_tool_calls_and_append(
             final_summary = llm_content[:100] if len(llm_content) > 100 else llm_content
             status = "error"
         else:
-            # 成功：使用 _generate_tool_summary_done 生成描述，并优先使用自定义描述
+            # 成功：使用 _generate_tool_summary_done 生成描述
             final_summary = _generate_tool_summary_done(fn_name, fn_args, safe_content)
-            custom_desc = _get_tool_description_from_args(fn_args)
-            if custom_desc:
-                final_summary = custom_desc
             status = "done"
 
         builder.update_tool_item(tc_id, final_summary, details_html, status=status)
@@ -2286,9 +2283,6 @@ def _tool_result_is_failure(fn_name: str, fn_args: dict, result_content: Any, de
 def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str) -> str:
     """生成当前工具完成后的用户可见摘要。"""
     fn_args = fn_args or {}
-    custom_desc = _get_tool_description_from_args(fn_args)
-    if custom_desc:
-        return custom_desc
 
     if fn_name == "web_search":
         query = (fn_args.get("query") or "").strip()
@@ -2296,6 +2290,10 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         if query and count is not None:
             return f"{query} {count} result" if count == 1 else f"{query} {count} results"
         return "Searched the web"
+
+    custom_desc = _get_tool_description_from_args(fn_args)
+    if custom_desc:
+        return custom_desc
 
     if fn_name == "fetch_url":
         url = (fn_args.get("url") or "").strip()
