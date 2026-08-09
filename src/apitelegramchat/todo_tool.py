@@ -70,7 +70,7 @@ def _new_id() -> str:
 
 
 def _empty_store() -> dict:
-    return {"todos": [], "next_seq": 1, "updated_at": 0}
+    return {"todos": [], "updated_at": 0}
 
 
 def _load_local(chat_id: int) -> dict:
@@ -192,10 +192,8 @@ def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optio
     if len(store["todos"]) >= MAX_TODOS:
         raise _TodoError(f"待办数量已达上限 {MAX_TODOS}，请先清理", "too_many")
 
-    seq = store.get("next_seq", 1)
     todo = {
         "id": _new_id(),
-        "seq": seq,
         "title": title,
         "done": False,
         "priority": _normalize_priority(priority),
@@ -205,7 +203,6 @@ def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optio
         "completed_at": None,
     }
     store["todos"].append(todo)
-    store["next_seq"] = seq + 1
     payload = {
         "ok": True,
         "action": "add",
@@ -219,7 +216,7 @@ def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optio
 def _op_list(store: dict, filter_: str, tag: Optional[str], priority: Optional[str]) -> dict:
     todos = store["todos"]
     # 默认排序：未完成在前，再按优先级降序，再按创建时间升序。
-    # 不再把“展示顺序”绑定到可见编号上，避免删除/重启后出现补号问题。
+    # 展示顺序完全由 created_at + id 决定，不依赖可见编号。
     def sort_key(t: dict):
         return (
             1 if t.get("done") else 0,

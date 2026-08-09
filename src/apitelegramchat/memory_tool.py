@@ -14,7 +14,6 @@
 每条 memory：
   {
     "id":        8 位短 id
-    "seq":       显示用序号
     "content":   记忆正文（<=2000 字符）
     "category":  分类标签（fact / preference / person / event / note / custom...）
     "tags":      [str, ...]   可选标签
@@ -90,7 +89,7 @@ def _new_id() -> str:
 
 
 def _empty_store() -> dict:
-    return {"memories": [], "next_seq": 1, "updated_at": 0}
+    return {"memories": [], "updated_at": 0}
 
 
 def _load_local(chat_id: int) -> dict:
@@ -102,9 +101,8 @@ def _load_local(chat_id: int) -> dict:
         data = json.loads(raw)
         if not isinstance(data, dict) or not isinstance(data.get("memories"), list):
             return _empty_store()
-        data.setdefault("next_seq", 1)
         data.setdefault("updated_at", 0)
-        return _migrate_store(data)
+        return data
     except (json.JSONDecodeError, OSError) as e:
         logger.warning(f"memories.json 读取失败 (chat={chat_id}): {e}")
         return _empty_store()
@@ -124,7 +122,7 @@ def _find_memory(memories: list, mid: str) -> tuple[int, dict] | None:
         return None
     target = str(mid).lstrip("#")
     for i, m in enumerate(memories):
-        if m.get("id") == mid:
+        if str(m.get("id", "")).lstrip("#") == target:
             return i, m
     return None
 
@@ -208,16 +206,9 @@ def _op_add(store: dict, content: str, category: str, tags: list[str],
     if len(store["memories"]) >= MAX_MEMORIES:
         raise _MemoryError(f"记忆数量已达上限 {MAX_MEMORIES}，请先清理", "too_many")
 
-    max_seq = max((int(m.get("seq", 0)) for m in store["memories"] if isinstance(m, dict)), default=0)
-    try:
-        seq = int(store.get("next_seq", 1))
-    except (TypeError, ValueError):
-        seq = 1
-    seq = max(seq, max_seq + 1)
     now = int(time.time())
     mem = {
         "id": _new_id(),
-        "seq": seq,
         "content": content,
         "category": _normalize_category(category),
         "tags": _normalize_tags(tags),
@@ -227,7 +218,6 @@ def _op_add(store: dict, content: str, category: str, tags: list[str],
         "source": (source or "agent").strip().lower()[:16] or "agent",
     }
     store["memories"].append(mem)
-    store["next_seq"] = max(seq + 1, max((int(m.get("seq", 0)) for m in store["memories"] if isinstance(m, dict)), default=seq) + 1)
     return store, {
         "ok": True,
         "action": "add",
@@ -248,14 +238,13 @@ def _op_get(store: dict, mid: str) -> dict:
 def _op_list(store: dict, category: Optional[str], tag: Optional[str],
              importance: Optional[str], limit: int) -> dict:
     memories = store["memories"]
-    # 默认排序：重要性降序，再按 seq 倒序（新的在前）
+    # 默认排序：重要性降序，再按创建时间倒序（新的在前）
     weight = {"high": 3, "medium": 2, "low": 1}
     memories_sorted = sorted(
         memories,
         key=lambda m: (
             -weight.get(m.get("importance", "medium"), 2),
             -int(m.get("created_at", 0) or 0),
-            -int(m.get("seq", 0) or 0),
             str(m.get("id", "")),
         ),
     )
@@ -304,7 +293,6 @@ def _op_search(store: dict, query: str, limit: int) -> dict:
     matches.sort(key=lambda m: (
         -weight.get(m.get("importance", "medium"), 2),
         -int(m.get("created_at", 0) or 0),
-        -int(m.get("seq", 0) or 0),
         str(m.get("id", "")),
     ))
     if limit and len(matches) > limit:
@@ -401,7 +389,6 @@ def _op_clear(store: dict, scope: str) -> dict:
 def _mem_summary(m: dict) -> dict:
     return {
         "id": m.get("id"),
-        "seq": m.get("seq"),
         "content": m.get("content", ""),
         "category": m.get("category", "note"),
         "tags": list(m.get("tags", [])),
@@ -518,7 +505,7 @@ def render_memory_card(payload: dict, max_items: int = 30) -> str:
     if action == "add":
         m = payload.get("memory", {})
         return (
-            f"<p>🧠 <b>已保存记忆</b> <code>#{m.get('seq')}</code></p>"
+            f"<p>🧠 <b>已保存记忆</b> <code>#{m.get('id', '?')}</code></p>"
             f"<p>{_importance_badge(m)} {_category_badge(m)} {_tag_chips(m)}</p>"
             f"<blockquote>{_esc(m.get('content'))}</blockquote>"
         )
@@ -528,7 +515,7 @@ def render_memory_card(payload: dict, max_items: int = 30) -> str:
     if action == "update":
         m = payload.get("memory", {})
         return (
-            f"<p>📝 <b>已更新记忆</b> <code>#{m.get('seq')}</code></p>"
+            f"<p>📝 <b>已更新记忆</b> <code>#{m.get('id', '?')}</code></p>"
             f"<p>{_importance_badge(m)} {_category_badge(m)} {_tag_chips(m)}</p>"
             f"<blockquote>{_esc(m.get('content'))}</blockquote>"
             f"<p><i>修改字段：{', '.join(payload.get('changed', [])) or '无'}</i></p>"
@@ -536,7 +523,7 @@ def render_memory_card(payload: dict, max_items: int = 30) -> str:
     if action == "delete":
         m = payload.get("memory", {})
         return (
-            f"<p>🗑️ <b>已删除记忆</b> <code>#{m.get('seq')}</code></p>"
+            f"<p>🗑️ <b>已删除记忆</b> <code>#{m.get('id', '?')}</code></p>"
             f"<blockquote><s>{_esc(m.get('content'))}</s></blockquote>"
         )
     if action == "clear":
@@ -585,13 +572,13 @@ def render_memory_card(payload: dict, max_items: int = 30) -> str:
 def _render_memory_item(m: dict) -> str:
     badge = _importance_badge(m)
     cat = _category_badge(m)
-    seq = f"<code>#{m.get('seq', '?')}</code>"
+    mid = f"<code>#{_esc(m.get('id', '?'))}</code>"
     content = _esc(m.get("content", ""))
     # 内容超过 ~200 字截断
     if len(content) > 400:
         content = content[:400] + "…"
     tags = _tag_chips(m)
-    parts = [f"{badge} {cat} {seq}", f"<blockquote>{content}</blockquote>"]
+    parts = [f"{badge} {cat} {mid}", f"<blockquote>{content}</blockquote>"]
     if tags:
         parts.append(tags)
     return f"<li>{' '.join(parts[:1])} {' '.join(parts[1:])}</li>"
@@ -601,7 +588,7 @@ def _render_memory_detail(m: dict) -> str:
     if not m:
         return "<p>记忆不存在</p>"
     parts = [
-        f"<h3>🧠 记忆 #{m.get('seq', '?')}</h3>",
+        f"<h3>🧠 记忆 #{_esc(m.get('id', '?'))}</h3>",
         f"<p>{_importance_badge(m)} {_category_badge(m)} {_tag_chips(m)}</p>",
         f"<blockquote>{_esc(m.get('content'))}</blockquote>",
     ]
@@ -638,7 +625,7 @@ MEMORY_TOOL = {
                 },
                 "memory_id": {
                     "type": "string",
-                    "description": "目标记忆 id：8 位 hex 或显示序号（带/不带 # 前缀均可）。get/update/delete 必填。"
+                    "description": "目标记忆 id：8 位 hex。可带 # 前缀。get/update/delete 必填。"
                 },
                 "category": {
                     "type": "string",
@@ -678,8 +665,8 @@ MEMORY_TOOL = {
             {"action": "add", "content": "用户对花生过敏", "category": "fact", "importance": "high", "tags": ["健康", "过敏"]},
             {"action": "search", "query": "过敏"},
             {"action": "list", "category": "preference"},
-            {"action": "update", "memory_id": "3", "content": "用户对花生和海鲜过敏", "importance": "high"},
-            {"action": "delete", "memory_id": "5"},
+            {"action": "update", "memory_id": "a1b2c3d4", "content": "用户对花生和海鲜过敏", "importance": "high"},
+            {"action": "delete", "memory_id": "a1b2c3d4"},
             {"action": "clear", "scope": "tag:temp"}
         ]
     }

@@ -1278,7 +1278,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
     # ===================== Todo 工具格式化 =====================
     # execute_todo 返回 JSON 字符串（给 AI 阅读）。UI 这里把它渲染成富文本卡片：
     #   - 顶部统计：总数 / 已完成 / 待办
-    #   - 列表项：状态 emoji + 优先级徽章 + 序号 + 标题（完成则加删除线）+ 标签 chips
+    #   - 列表项：状态 emoji + 优先级徽章 + 标题（完成则加删除线）+ 标签 chips
     #   - 长列表自动截断并提示
     # 注意：list 动作在 dispatch_tool_call 里已经额外推送了一条带 InlineKeyboard 的可交互消息；
     # 这里的 details_html 只是工具调用气泡里的折叠预览，两者共用 render_todo_card。
@@ -1359,16 +1359,16 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             summary = f"🔎 记忆搜索：{payload.get('matches', 0)} / {payload.get('total', 0)} 条命中"
         elif action == "add":
             m = payload.get("memory", {})
-            summary = f"🧠 保存 #{m.get('seq', '?')} {m.get('content', '')[:30]}"
+            summary = f"🧠 保存 #{m.get('id', '?')} {m.get('content', '')[:30]}"
         elif action == "get":
             m = payload.get("memory", {})
-            summary = f"🧠 查看 #{m.get('seq', '?')} {m.get('content', '')[:30]}"
+            summary = f"🧠 查看 #{m.get('id', '?')} {m.get('content', '')[:30]}"
         elif action == "update":
             m = payload.get("memory", {})
-            summary = f"📝 更新 #{m.get('seq', '?')} {m.get('content', '')[:30]}"
+            summary = f"📝 更新 #{m.get('id', '?')} {m.get('content', '')[:30]}"
         elif action == "delete":
             m = payload.get("memory", {})
-            summary = f"🗑️ 删除 #{m.get('seq', '?')} {m.get('content', '')[:30]}"
+            summary = f"🗑️ 删除 #{m.get('id', '?')} {m.get('content', '')[:30]}"
         elif action == "clear":
             summary = f"🧹 清理 {payload.get('removed', 0)} 条记忆"
         else:
