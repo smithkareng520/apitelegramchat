@@ -2864,6 +2864,7 @@ class RichMessageBuilder:
         "wikipedia": ("Looked up on Wikipedia", "Looked up on Wikipedia"),
         "news": ("Fetched news", "Fetched news from {n} sources"),
         "hacker_news": ("Fetched Hacker News", "Fetched Hacker News"),
+        "fetch_url": ("Fetched a page", "Fetched {n} pages"),
         "book_lookup": ("Looked up a book", "Looked up {n} books"),
         "ip_geo": ("Looked up IP location", "Looked up IP location"),
         "geocode": ("Geocoded an address", "Geocoded {n} addresses"),
