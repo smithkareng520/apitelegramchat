@@ -77,8 +77,6 @@ from apitelegramchat.search_engine import (
 )
 from apitelegramchat.todo_tool import (
     render_todo_card,
-    build_todo_keyboard,
-    send_todo_card_with_keyboard,
 )
 from apitelegramchat.memory_tool import render_memory_card
 from apitelegramchat.skill_tool import render_skill_card
@@ -1715,7 +1713,7 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
         # 当 action == "list" 且项数适中时，额外推送一条带 InlineKeyboard 的可交互消息，
         # 让用户能直接点击按钮完成 / 删除，不必再打字。
         elif name == "todo":
-            result_str = await execute_todo(
+            return await execute_todo(
                 chat_id=chat_id,
                 action=arguments.get("action", "list"),
                 title=arguments.get("title"),
@@ -1726,20 +1724,6 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 filter=arguments.get("filter"),
                 tag=arguments.get("tag"),
             )
-            # 副作用：list 动作附带一条可交互卡片（不阻塞工具返回）
-            try:
-                import json as _json
-                payload = _json.loads(result_str)
-                if isinstance(payload, dict) and payload.get("ok") and payload.get("action") == "list":
-                    # 仅在项数适中时附带键盘，避免按钮过多撑爆屏幕
-                    if build_todo_keyboard(payload) is not None:
-                        asyncio.create_task(
-                            send_todo_card_with_keyboard(chat_id, payload)
-                        )
-            except Exception:
-                # 副作用失败不影响工具结果回传给 AI
-                logger.debug("todo: 附带可交互卡片失败（忽略）")
-            return result_str
         # ========== Memory 工具分支 ==========
         # 长期记忆库。返回 JSON 给 AI；UI 由 format_tool_result 渲染富文本卡片。
         elif name == "memory":

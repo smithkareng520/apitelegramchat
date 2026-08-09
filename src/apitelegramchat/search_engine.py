@@ -1349,6 +1349,10 @@ SEARCH_TOOLS = [
 # DuckDuckGo 搜索现在直接走 JSON API（环境变量 DDG_SEARCH_API_URL），无需解析 HTML。
 
 # --------------------- web_search ---------------------
+
+class GoogleQuotaExceeded(Exception):
+    """Google CSE 触发限流/配额，应该立即回落到 DuckDuckGo。"""
+
 @retry_async(max_retries=2, delay=1, exceptions=(aiohttp.ClientError, asyncio.TimeoutError))
 async def _search_google(query: str, num_results: int) -> list[dict] | None:
     if not GOOGLE_CSE_KEY or not GOOGLE_CSE_ID:
@@ -1356,14 +1360,16 @@ async def _search_google(query: str, num_results: int) -> list[dict] | None:
     params = {"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_ID, "q": query, "num": min(max(num_results, 1), 10)}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SHORT)) as session:
         async with session.get("https://www.googleapis.com/customsearch/v1", params=params) as resp:
-            # 429 / 503 是临时限流——抛 TimeoutError 让 retry_async 重试，
-            # 而不是静默吞掉降级到 DDG（DDG 此时很可能也被并发打挂了）
-            if resp.status in (429, 503):
+            # 429 表示配额或限流，直接回落 DuckDuckGo，不再重试 Google。
+            if resp.status == 429:
+                raise GoogleQuotaExceeded("Google CSE HTTP 429")
+            if resp.status == 503:
                 raise asyncio.TimeoutError(f"Google CSE HTTP {resp.status}")
             if resp.status != 200:
                 return None
             data = await resp.json()
     items = data.get("items", [])
+    logger.info(f"Google CSE -> {len(items[:num_results])} 条结果")
     return [{"title": item.get("title", "无标题"), "link": item.get("link", ""), "snippet": item.get("snippet", "").replace("\n", " ")} for item in items[:num_results]]
 
 
@@ -1521,7 +1527,7 @@ async def _search_duckduckgo_via_api(query: str, num_results: int) -> list[dict]
 
 
 def _format_search_results(items: list, query: str, engine: str) -> str:
-    lines = [f"🔍 [成功: {engine}] 搜索「{query}」的结果：\n"]
+    lines = [f"🔍 [成功: {engine}] 搜索「{query}」的结果（{len(items)} 条）：\n"]
     for i, item in enumerate(items, 1):
         title = item.get("title", "无标题")
         link = item.get("link", "")
@@ -1539,13 +1545,15 @@ async def execute_web_search(query: str, num_results: int = 5) -> str:
 
     items = None
     engine_used = "Google"
-    last_error = None
+    google_quota_exceeded = False
+
     try:
         items = await _search_google(query, num_results)
+    except GoogleQuotaExceeded as e:
+        google_quota_exceeded = True
+        logger.info(f"Google 搜索触发配额/限流，立即回落到 DuckDuckGo: {e}")
     except Exception as e:
-        last_error = str(e)
         logger.info(f"Google 搜索失败，准备切换到 DuckDuckGo: {e}")
-        items = None
 
     if not items:
         logger.info("切换到 DuckDuckGo")
@@ -1553,12 +1561,14 @@ async def execute_web_search(query: str, num_results: int = 5) -> str:
         try:
             items = await _search_duckduckgo(query, num_results)
         except Exception as e:
-            last_error = str(e)
             logger.info(f"DuckDuckGo 搜索异常: {e}")
             items = None
+
     if not items:
         # ⚠️ 不要缓存失败结果——原实现把失败字符串塞进 TTLCache 长达 5 分钟，
         # 导致用户即使立刻重试也只能拿到缓存的失败消息。这里改为只返回，不缓存。
+        if google_quota_exceeded:
+            return f"失败：Google 搜索配额已耗尽，DuckDuckGo 也暂时无结果。请稍后重试或换个关键词。"
         return f"失败：搜索「{query}」无结果。请尝试换个关键词。"
 
     result = _format_search_results(items, query, engine_used)

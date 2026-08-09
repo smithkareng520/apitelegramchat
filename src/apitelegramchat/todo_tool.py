@@ -69,6 +69,22 @@ def _new_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _next_seq(store: dict) -> int:
+    """返回当前待办中最小的可用序号，从 1 开始补空位。"""
+    used = set()
+    for t in store.get("todos", []):
+        try:
+            seq = int(t.get("seq", 0))
+        except (TypeError, ValueError):
+            continue
+        if seq > 0:
+            used.add(seq)
+    seq = 1
+    while seq in used:
+        seq += 1
+    return seq
+
+
 def _empty_store() -> dict:
     return {"todos": [], "next_seq": 1, "updated_at": 0}
 
@@ -194,7 +210,7 @@ def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optio
     if len(store["todos"]) >= MAX_TODOS:
         raise _TodoError(f"待办数量已达上限 {MAX_TODOS}，请先清理", "too_many")
 
-    seq = store.get("next_seq", 1)
+    seq = _next_seq(store)
     todo = {
         "id": _new_id(),
         "seq": seq,
@@ -207,7 +223,6 @@ def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optio
         "completed_at": None,
     }
     store["todos"].append(todo)
-    store["next_seq"] = seq + 1
     payload = {
         "ok": True,
         "action": "add",
@@ -740,53 +755,6 @@ def build_todo_keyboard(payload: dict, max_buttons: int = 12) -> dict | None:
     ]
     rows.append(bottom)
     return {"inline_keyboard": rows}
-
-
-async def send_todo_card_with_keyboard(
-    chat_id: int,
-    payload: dict,
-    reply_to_message_id: int | None = None,
-) -> int | bool:
-    """
-    将 list 结果作为一条带 InlineKeyboard 的 sendMessage 发出去。
-    走 sendMessage(parse_mode=HTML) 而非 sendRichMessage，避免和活跃草稿抢位置。
-
-    ⚠️ sendMessage 的 HTML 解析器只支持基本标签（b/i/u/s/code/pre/a/blockquote），
-    不支持 h3/table/ol/hr 等。所以这里用 render_todo_card_basic() 而非 render_todo_card()。
-    成功返回 message_id，失败返回 False。
-    """
-    html_content = render_todo_card_basic(payload)
-    if not html_content or not html_content.strip():
-        return False
-    keyboard = build_todo_keyboard(payload)
-    payload_req = {
-        "chat_id": chat_id,
-        "text": html_content,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    if reply_to_message_id:
-        payload_req["reply_parameters"] = {
-            "message_id": reply_to_message_id,
-            "allow_sending_without_reply": True,
-        }
-    if keyboard:
-        payload_req["reply_markup"] = json.dumps(keyboard)
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{BASE_URL}/sendMessage", json=payload_req) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    mid = data.get("result", {}).get("message_id")
-                    if isinstance(mid, int) and mid > 0:
-                        return mid
-                else:
-                    body = await resp.text()
-                    logger.error(f"send_todo_card_with_keyboard failed: {resp.status} {body[:200]}")
-    except Exception as e:
-        logger.exception(f"send_todo_card_with_keyboard exception: {e}")
-    return False
 
 
 async def reapply_keyboard_for_message(chat_id: int, message_id: int, payload: dict) -> bool:

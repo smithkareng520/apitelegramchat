@@ -313,17 +313,17 @@ def make_model_config(
 SUPPORTED_MODELS: Dict[str, ModelConfig] = {}
 
 # ---------- OpenRouter 模型 ----------
-SUPPORTED_MODELS["nvidia/nemotron-3-ultra-550b-a55b:free"] = make_model_config(
-    model_id="nvidia/nemotron-3-ultra-550b-a55b:free",
+SUPPORTED_MODELS["openai/gpt-oss-20b:free"] = make_model_config(
+    model_id="openai/gpt-oss-20b:free",
     provider="openrouter",
-    name="Nemotron 3 Ultra 550b A55b Free",
-    max_context=1000000,
-    max_output_tokens=66000,
+    name="GPT OSS 20b Free",
+    max_context=131000,
+    max_output_tokens=33000,
 )
-SUPPORTED_MODELS["inclusionai/ling-3.0-flash:free"] = make_model_config(
-    model_id="inclusionai/ling-3.0-flash:free",
+SUPPORTED_MODELS["poolside/laguna-s-2.1:free"] = make_model_config(
+    model_id="poolside/laguna-s-2.1:free",
     provider="openrouter",
-    name="Ling 3.0 Flash Free",
+    name="Laguna S 2.1 Free",
     max_context=262000,
     max_output_tokens=64000,
 )
@@ -350,10 +350,18 @@ SUPPORTED_MODELS["agnes-2.0-flash"] = make_model_config(
 )
 
 # ---------- ModelScope 免费模型 ----------
-SUPPORTED_MODELS["deepseek-ai/DeepSeek-V4-Pro"] = make_model_config(
-    model_id="deepseek-ai/DeepSeek-V4-Pro",
+SUPPORTED_MODELS["deepseek-ai/DeepSeek-V4-Flash-0731"] = make_model_config(
+    model_id="deepseek-ai/DeepSeek-V4-Flash-0731",
     provider="modelscope",
-    name="Deepseek V4 Pro",
+    name="Deepseek V4 Flash",
+    max_context=1000000,
+    max_output_tokens=65536,
+)
+
+SUPPORTED_MODELS["ZhipuAI/GLM-5.2"] = make_model_config(
+    model_id="ZhipuAI/GLM-5.2",
+    provider="modelscope",
+    name="GLM 5.2",
     max_context=1000000,
     max_output_tokens=65536,
 )
@@ -454,7 +462,7 @@ SUPPORTED_MODELS["agnes-video-v2.0"] = make_model_config(
 )
 
 # ========== 默认模型 ==========
-DEFAULT_MODEL = "inclusionai/ling-3.0-flash:free"
+DEFAULT_MODEL = "poolside/laguna-s-2.1:free"
 assert DEFAULT_MODEL in SUPPORTED_MODELS, f"默认模型 {DEFAULT_MODEL} 未定义"
 
 

@@ -76,8 +76,6 @@ from apitelegramchat.todo_tool import (
     delete_by_id as todo_delete_by_id,
     clear_done as todo_clear_done,
     list_all as todo_list_all,
-    render_todo_card as render_todo_card,
-    build_todo_keyboard as build_todo_keyboard,
     reapply_keyboard_for_message as todo_reapply_keyboard,
 )
 import hashlib
