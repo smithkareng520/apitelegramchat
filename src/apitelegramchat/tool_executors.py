@@ -531,8 +531,21 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
     if fn_name == "web_search":
         query = fn_args.get('query', '')
-        num_results = result_str.count("标题：") if "标题：" in result_str else 0
-        summary = f"🔍 {query}  {num_results} results"
+        # execute_web_search 返回固定 envelope：成功数/请求数；只在旧格式下
+        # 才回退到标题计数，避免把失败误报成 0 results。
+        count_match = re.search(r'\[成功:[^\]]+\].*?[（(]\s*(\d+)\s*/\s*(\d+)\s*[）)]', result_str or "", re.S)
+        if count_match:
+            num_results = int(count_match.group(1))
+        else:
+            num_results = result_str.count("标题：") if "标题：" in result_str else 0
+        if result_str.lstrip().startswith("❌"):
+            summary = "Search failed"
+        elif query and num_results == 1:
+            summary = f"{query} 1 result"
+        elif query:
+            summary = f"{query} {num_results} results"
+        else:
+            summary = "Searched the web"
         if "标题：" in result_str and "链接：" in result_str:
             items_html = ""
             current_title = ""

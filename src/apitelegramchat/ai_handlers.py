@@ -1793,79 +1793,41 @@ def _coerce_positive_int(value: Any, default: int = 1) -> int:
 
 
 def _extract_web_search_result_count(result_content: Any) -> Optional[int]:
-    """尽量只在高置信度时提取搜索结果数量，避免误报。"""
+    """Extract the authoritative successful-result count from the search envelope."""
     if result_content is None:
         return None
-
-    if isinstance(result_content, (list, tuple)):
-        return len(result_content)
-
     if isinstance(result_content, dict):
+        for key in ("count", "result_count", "success_count"):
+            try:
+                value = result_content.get(key)
+                if value is not None and int(value) >= 0:
+                    return int(value)
+            except (TypeError, ValueError):
+                pass
         for key in ("results", "items", "search_results", "organic_results"):
-            val = result_content.get(key)
-            if isinstance(val, list):
-                return len(val)
-            if isinstance(val, dict):
-                for subkey in ("results", "items", "organic_results"):
-                    subval = val.get(subkey)
-                    if isinstance(subval, list):
-                        return len(subval)
-        return None
-
+            value = result_content.get(key)
+            if isinstance(value, list):
+                return len(value)
     text = str(result_content).strip()
     if not text:
         return None
-
+    m = re.search(r'\[成功:[^\]]+\].*?[（(]\s*(\d+)\s*/\s*(\d+)\s*[）)]', text, re.S)
+    if m:
+        return int(m.group(1))
     for pattern in (
-            r'Found\s+(\d+)\s+results?',
-            r'(\d+)\s+results?\s+found',
-            r'共有\s*(\d+)\s*(?:条|个)?\s*结果',
-            r'找到\s*(\d+)\s*(?:条|个)?\s*结果',
+        r'Found\s+(\d+)\s+results?',
+        r'(\d+)\s+results?\s+found',
+        r'共有\s*(\d+)\s*(?:条|个)?\s*结果',
+        r'找到\s*(\d+)\s*(?:条|个)?\s*结果',
     ):
         m = re.search(pattern, text, re.I)
         if m:
-            try:
-                return int(m.group(1))
-            except (TypeError, ValueError):
-                pass
-
-    # 其次：按"编号列表"统计实际结果条数（多数搜索工具以 "1. 标题" 的形式逐条罗列结果，
-    # 这是比正文中偶然出现的数字更可靠的计数依据）。要求编号从小到大基本连续，避免误判。
-    numbered = re.findall(r'(?m)^\s*(\d{1,3})[.\)、]\s+\S', text)
+            return int(m.group(1))
+    numbered = re.findall(r'(?m)^\s*(\d{1,3})[.、)、]\s+\S', text)
     if numbered:
-        try:
-            nums = [int(n) for n in numbered]
-            max_n = max(nums)
-            if 1 <= max_n <= 50 and max_n == len(set(nums)):
-                return max_n
-        except (TypeError, ValueError):
-            pass
-
-    for blob in (text, text[text.find('{'):] if '{' in text else '', text[text.find('['):] if '[' in text else ''):
-        blob = blob.strip()
-        if not blob or not blob.startswith(('{', '[')):
-            continue
-        parsed = None
-        try:
-            parsed = json.loads(blob)
-        except Exception:
-            try:
-                parsed = ast.literal_eval(blob)
-            except Exception:
-                parsed = None
-        if isinstance(parsed, list):
-            return len(parsed)
-        if isinstance(parsed, dict):
-            for key in ("results", "items", "search_results", "organic_results"):
-                val = parsed.get(key)
-                if isinstance(val, list):
-                    return len(val)
-                if isinstance(val, dict):
-                    for subkey in ("results", "items", "organic_results"):
-                        subval = val.get(subkey)
-                        if isinstance(subval, list):
-                            return len(subval)
-
+        nums = [int(n) for n in numbered]
+        if nums and max(nums) <= 50 and len(set(nums)) == max(nums):
+            return max(nums)
     return None
 
 
@@ -1876,14 +1838,17 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     优先使用自定义 _description，否则按照规范显示固定进行时文本。
     """
     fn_args = fn_args or {}
+
+    # web_search 单工具进行态固定显示搜索词。
+    if fn_name == "web_search":
+        query = (fn_args.get("query") or "").strip()
+        return query if query else "Searching the web"
+
     custom_desc = _get_tool_description_from_args(fn_args)
     if custom_desc:
         return custom_desc
 
     # ---------- 特殊处理 ----------
-    if fn_name == "web_search":
-        query = (fn_args.get("query") or "").strip()
-        return query if query else "Searching the web"
 
     if fn_name == "fetch_url":
         url = (fn_args.get("url") or "").strip()
@@ -2229,10 +2194,8 @@ async def _run_tool_calls_and_append(
         # 元组字段顺序: (fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content)
         fn_name, tc_id, _, details_html, llm_content, fn_args, safe_content = res
 
-        # 判断是否失败（llm_content 形如 "Error: ..." 也算失败）
-        is_error = (llm_content.startswith("Error:") or
-                    llm_content.startswith("Exception:") or
-                    safe_content == _TOOL_TIMEOUT_MARKER)
+        # 失败工具不进入工具组成功统计。
+        is_error = _tool_result_is_failure(fn_name, fn_args, safe_content, details_html)
         if is_error:
             # 失败：显示 llm_content（友好错误提示）的截断版本，状态标记为 error
             final_summary = llm_content[:100] if len(llm_content) > 100 else llm_content
@@ -2299,114 +2262,90 @@ async def _run_tool_calls_and_append(
     return "continue"
 
 
+def _tool_result_is_failure(fn_name: str, fn_args: dict, result_content: Any, details_html: str = "") -> bool:
+    """统一判断工具是否失败；失败项不会进入工具组成功统计。"""
+    if result_content == _TOOL_TIMEOUT_MARKER:
+        return True
+    text = str(result_content or "").strip()
+    lower = text.lower()
+    if lower.startswith(("error:", "exception:", "failed:", "timeout:", "❌")):
+        return True
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict) and payload.get("error"):
+                return True
+        except Exception:
+            pass
+    if fn_name == "bash" and details_html and "Exit code: 0" not in details_html:
+        return True
+    return False
+
+
 # ========== 新增：结束态摘要生成函数（规范四） ==========
 def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str) -> str:
-    """
-    生成单个工具结束后的摘要（成功或失败）。
-    优先使用自定义 _description，否则按照规范显示固定结束文本。
-    """
+    """生成当前工具完成后的用户可见摘要。"""
     fn_args = fn_args or {}
     custom_desc = _get_tool_description_from_args(fn_args)
     if custom_desc:
         return custom_desc
 
-    # ---------- web_search ----------
     if fn_name == "web_search":
         query = (fn_args.get("query") or "").strip()
-        # ★ 直接统计结果条数（通过 "标题：" 的出现次数）
-        count = result_content.count("标题：") if isinstance(result_content, str) else 0
-        # 如果 count 为 0，再用旧方法兜底
-        if count == 0:
-            count = _extract_web_search_result_count(result_content) or 0
-        if count > 0 and query:
-            if count == 1:
-                return f"{query} 1 result"
-            return f"{query} {count} results"
-        return query if query else "Searched the web"
+        count = _extract_web_search_result_count(result_content)
+        if query and count is not None:
+            return f"{query} {count} result" if count == 1 else f"{query} {count} results"
+        return "Searched the web"
 
-    # ---------- fetch_url ----------
     if fn_name == "fetch_url":
         url = (fn_args.get("url") or "").strip()
         domain = extract_domain(url) if url else ""
-        content_str = (result_content or "").strip()
-        if re.match(r'^(Error|Exception|Timeout|Failed):', content_str, re.I):
+        text = str(result_content or "").strip()
+        if _tool_result_is_failure(fn_name, fn_args, result_content):
             return f"Failed to fetch {domain}" if domain else "Failed to fetch page"
-        title_match = re.search(r'🏷️\s+([^\n]+)', content_str)
-        if title_match:
-            title = title_match.group(1).strip()
-            if title:
-                return f"Fetched: {title}"
         title = None
-        if isinstance(result_content, str) and result_content:
-            m = re.search(r'<title>(.*?)</title>', result_content, re.I | re.S)
+        m = re.search(r'🏷️\s+([^\n]+)', text)
+        if m:
+            title = m.group(1).strip()
+        if not title:
+            m = re.search(r'<title>(.*?)</title>', text, re.I | re.S)
             if m:
                 title = re.sub(r'<[^>]+>', '', m.group(1)).strip()
                 title = re.sub(r'\s+', ' ', title)
-            if not title:
-                m2 = re.search(r'(?m)^\s{0,3}#\s+(.+)$', result_content)
-                if m2:
-                    title = m2.group(1).strip()
-        if title:
-            return f"Fetched: {title}"
-        else:
-            return f"Fetched: {domain}" if domain else "Fetched a page"
+        return f"Fetched: {title}" if title else (f"Fetched: {domain}" if domain else "Fetched a page")
 
-    # ---------- bash ----------
     if fn_name == "bash":
-        cmd = (fn_args.get("command") or "").strip()
-        if cmd:
-            short = cmd[:30] + "..." if len(cmd) > 30 else cmd
-            return short
         return "Ran a command"
 
-    # ---------- text_editor ----------
     if fn_name == "text_editor":
-        command = fn_args.get("command", "")
-        path = fn_args.get("path", "")
-        verb_map = {
-            "view": "Viewed",
-            "create": "Created",
-            "str_replace": "Edited",
-            "replace_lines": "Edited (lines)",
-            "insert": "Edited",
-            "delete": "Deleted",
-        }
-        verb = verb_map.get(command, "Edited")
-        return f"{verb} {path}" if path else f"{verb} file"
+        return {
+            "view": "Viewed a file",
+            "create": "Created a file",
+            "str_replace": "Edited a file",
+            "replace_lines": "Edited a file",
+            "insert": "Edited a file",
+            "delete": "Deleted a file",
+        }.get(fn_args.get("command", ""), "Edited a file")
 
-    # ---------- present_files ----------
     if fn_name == "present_files":
         paths = fn_args.get("paths", [])
-        if isinstance(paths, list) and paths:
-            n = len(paths)
-            if n == 1:
-                return "Presented 1 file"
-            return f"Presented {n} files"
-        return "Presented file(s)"
-
-    # ---------- 图片类 ----------
-    if fn_name == "generate_image_from_text":
-        num_images = _coerce_positive_int(fn_args.get("num_images"), 1)
-        if num_images == 1:
-            return "Generated an image"
-        return f"Generated {num_images} images"
-
-    if fn_name == "edit_image_with_reference":
-        num_images = _coerce_positive_int(fn_args.get("num_images"), 1)
-        if num_images == 1:
-            return "Edited an image"
-        return f"Edited {num_images} images"
-
-    if fn_name == "generate_video":
-        return "Generated a video"
+        n = len(paths) if isinstance(paths, list) else 0
+        return "Presented file" if n <= 1 else f"Presented {n} files"
 
     if fn_name == "image_search":
-        num_results = _coerce_positive_int(fn_args.get("num_results"), 3)
-        if num_results == 1:
-            return "Searched 1 image"
-        return f"Searched {num_results} images"
+        n = _coerce_positive_int(fn_args.get("num_results"), 1)
+        return f"Searched {n} image" + ("" if n == 1 else "s")
+    if fn_name == "generate_image_from_text":
+        n = _coerce_positive_int(fn_args.get("num_images"), 1)
+        return "Generated an image" if n == 1 else f"Generated {n} images"
+    if fn_name == "edit_image_with_reference":
+        n = _coerce_positive_int(fn_args.get("num_images"), 1)
+        return "Edited an image" if n == 1 else f"Edited {n} images"
+    if fn_name == "generate_video":
+        return "Generated a video"
+    if fn_name == "qr_code":
+        return "Generated a QR code"
 
-    # ---------- 其他工具 ----------
     mapping = {
         "wikipedia": "Looked up on Wikipedia",
         "news": "Fetched news",
@@ -2414,6 +2353,8 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         "book_lookup": "Looked up a book",
         "ip_geo": "Looked up IP location",
         "geocode": "Geocoded an address",
+        "reverse_geocode": "Reverse-geocoded coordinates",
+        "nearby_search": "Searched nearby",
         "route": "Planned a route",
         "distance": "Measured a distance",
         "elevation": "Looked up elevation",
@@ -2422,12 +2363,12 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         "place_details": "Fetched place details",
         "exchange_rate": "Checked exchange rates",
         "crypto_price": "Fetched crypto prices",
+        "public_holidays": "Looked up holidays",
         "weather": "Fetched weather",
-        "qr_code": "Generated a QR code",
+        "convert": "Calculated a result",
         "search_poi": "Searched for points of interest",
     }
-    default = mapping.get(fn_name, f"Ran {fn_name}")
-    return default[0].upper() + default[1:]
+    return mapping.get(fn_name, "Ran an action")
 
 
 # ========== 流式工具预览辅助 ==========
@@ -2711,12 +2652,10 @@ class RichMessageBuilder:
         group = self._tool_groups[group_idx]
 
         new_summary = summary
-        # 只有当工具没有提供自定义 _description 时，才用 search_query/domain 优化展示
-        if not _get_tool_description_from_args(fn_args or {}):
-            if search_query:
-                new_summary = search_query  # web_search 只显示搜索词
-            elif domain:
-                new_summary = f"Fetching from {domain}"
+        # web_search 的单工具进行态摘要就是搜索词；不要再生成 Search for ...。
+        # fetch_url 则按规范显示目标域名。
+        if not _get_tool_description_from_args(fn_args or {}) and domain:
+            new_summary = f"Fetching from {domain}"
 
         for item in group["items"]:
             if item["id"] == tool_id:
@@ -2800,6 +2739,12 @@ class RichMessageBuilder:
         t = target["type"]
         fn_args = target.get("fn_args", {})
 
+        # web_search 工具组进行态固定为 Searching the web。
+        if t == "web_search":
+            group["outer_summary"] = "Searching the web"
+            self.request_flush(force=False)
+            return
+
         custom_desc = _get_tool_description_from_args(fn_args)
         if custom_desc:
             group["outer_summary"] = custom_desc
@@ -2807,8 +2752,6 @@ class RichMessageBuilder:
             return
 
         # ---------- 按规范进行时文本 ----------
-        if t == "web_search":
-            group["outer_summary"] = "Searching the web"
         elif t == "fetch_url":
             url = (fn_args.get("url") or "").strip()
             domain = extract_domain(url) if url else ""
@@ -2905,11 +2848,13 @@ class RichMessageBuilder:
         "text_editor_delete": ("Deleted a file", "Deleted {n} files"),
         "present_files": ("Presented a file", "Presented {n} files"),
         "wikipedia": ("Looked up on Wikipedia", "Looked up on Wikipedia"),
-        "news": ("Fetched news", "Fetched {n} news sources"),
+        "news": ("Fetched news", "Fetched news from {n} sources"),
         "hacker_news": ("Fetched Hacker News", "Fetched Hacker News"),
         "book_lookup": ("Looked up a book", "Looked up {n} books"),
         "ip_geo": ("Looked up IP location", "Looked up IP location"),
         "geocode": ("Geocoded an address", "Geocoded {n} addresses"),
+        "reverse_geocode": ("Reverse-geocoded coordinates", "Reverse-geocoded coordinates"),
+        "nearby_search": ("Searched nearby", "Searched nearby for {n} categories"),
         "route": ("Planned a route", "Planned {n} routes"),
         "distance": ("Measured a distance", "Measured a distance"),
         "elevation": ("Looked up elevation", "Looked up elevation"),
@@ -2918,7 +2863,9 @@ class RichMessageBuilder:
         "place_details": ("Fetched place details", "Fetched details for {n} places"),
         "exchange_rate": ("Checked exchange rates", "Checked exchange rates"),
         "crypto_price": ("Fetched crypto prices", "Fetched price for {n} coins"),
+        "public_holidays": ("Looked up holidays", "Looked up holidays for {n} countries"),
         "weather": ("Fetched weather", "Fetched weather for {n} cities"),
+        "convert": ("Calculated a result", "Ran {n} calculations"),
         "qr_code": ("Generated a QR code", "Generated {n} QR codes"),
         "image_search": ("Searched for images", "Searched for images"),
         "generate_image_from_text": ("Generated an image", "Generated {n} images"),
@@ -2927,37 +2874,23 @@ class RichMessageBuilder:
     }
 
     def _get_group_type_for_item(self, item: dict) -> str:
-        """根据工具项返回用于分组的类型标识（字符串）"""
         t = item.get("type", "unknown")
-        # 对 text_editor 根据 command 细分
         if t == "text_editor":
             command = item.get("fn_args", {}).get("command", "")
             if command == "view":
                 return "text_editor_view"
-            elif command == "create":
+            if command == "create":
                 return "text_editor_create"
-            elif command == "delete":
+            if command == "delete":
                 return "text_editor_delete"
-            else:  # str_replace, replace_lines, insert 等视为编辑
-                return "text_editor_edit"
-        # 其他工具直接使用类型名
-        # 但需统一搜索工具
-        if t in ("search", "web-search", "web_search") or "search" in t.lower():
-            return "web_search"
+            return "text_editor_edit"
         return t
 
     def _generate_group_summary(self, group: dict) -> str:
-        """
-        生成工具组完成后的摘要（结束态）
-        只统计成功的工具（status == "done"），按类型分组，去重，保持出现顺序。
-        每个类型使用固定模板，支持单复数，首字母大写，英文逗号分隔。
-        """
-        items = group.get("items", [])
-        done_items = [it for it in items if it.get("status") == "done"]
+        """完成态工具组摘要：只统计成功工具；同类工具只展示一次，顺序按首次成功调用。"""
+        done_items = [it for it in group.get("items", []) if it.get("status") == "done"]
         if not done_items:
             return ""
-
-        # 统计每种组类型的成功次数，并记录首次出现顺序
         type_order = []
         type_counts = {}
         for item in done_items:
@@ -2966,32 +2899,13 @@ class RichMessageBuilder:
                 type_order.append(gtype)
                 type_counts[gtype] = 0
             type_counts[gtype] += 1
-
         descs = []
         for gtype in type_order:
             count = type_counts[gtype]
-            template_pair = self._GROUP_SUMMARY_TEMPLATES.get(gtype)
-            if template_pair is None:
-                # 未知类型，使用通用描述
-                if count == 1:
-                    desc = "Ran an action"
-                else:
-                    desc = f"Ran {count} actions"
-            else:
-                singular, plural = template_pair
-                if count == 1:
-                    desc = singular
-                else:
-                    desc = plural.format(n=count)
-            # 首字母大写（但模板可能已有大写）
-            if desc:
-                descs.append(desc[0].upper() + desc[1:] if desc else desc)
-
-        if not descs:
-            return ""
-
-        result = ", ".join(descs)
-        return result
+            singular, plural = self._GROUP_SUMMARY_TEMPLATES.get(gtype, ("Ran an action", "Ran {n} actions"))
+            desc = singular if count == 1 else plural.format(n=count)
+            descs.append(desc[:1].upper() + desc[1:] if desc else desc)
+        return ", ".join(descs)
 
     # ---- 修改点5：finish_group 增加默认标题 ----
     def finish_group(self, group_idx: int = None):
