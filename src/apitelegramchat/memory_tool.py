@@ -39,13 +39,13 @@ import os
 import time
 import uuid
 from pathlib import Path
-from apitelegramchat.workspace_paths import memory_state_file
+from apitelegramchat.workspace_paths import memory_state_file, workspace_root
 from typing import Any, Optional
 
 from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
-    _sync_named_file_from_r2,
-    _sync_named_file_to_r2,
+    _sync_state_file_from_r2,
+    _sync_state_file_to_r2,
 )
 from apitelegramchat.config import BASE_URL  # noqa: F401  — 保留给将来扩展（推送卡片用）
 
@@ -78,6 +78,7 @@ CATEGORY_EMOJI = {
 # ---------- 存储层 ----------
 def _memory_path(chat_id: int) -> Path:
     return memory_state_file(chat_id)
+
 
 
 def _new_id() -> str:
@@ -169,14 +170,32 @@ class _MemoryError(Exception):
         self.code = code
 
 
-async def _mutate(chat_id: int, fn) -> dict:
+async def _read_store(chat_id: int, fn) -> dict:
     """
-    性能优化：只同步 memories.json 单个文件（而非全量 workspace）。
+    读取型操作：先从 R2 拉取最新内容到本地，再执行读取，不回写 store。
     """
     lock = await _get_workspace_lock(chat_id)
     async with lock:
         try:
-            await _sync_named_file_from_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
+            await _sync_state_file_from_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
+        except Exception as e:
+            logger.warning(f"memory: R2→local 同步失败 (chat={chat_id}): {e}")
+        store = _load_local(chat_id)
+        try:
+            _store, payload = fn(store)
+        except _MemoryError as e:
+            return {"ok": False, "error": str(e), "code": e.code}
+        return payload
+
+
+async def _mutate(chat_id: int, fn) -> dict:
+    """
+    写入型操作：R2 → 本地 → 修改 → 保存 → 回传 R2。
+    """
+    lock = await _get_workspace_lock(chat_id)
+    async with lock:
+        try:
+            await _sync_state_file_from_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
         except Exception as e:
             logger.warning(f"memory: R2→local 同步失败 (chat={chat_id}): {e}")
         store = _load_local(chat_id)
@@ -186,7 +205,7 @@ async def _mutate(chat_id: int, fn) -> dict:
             return {"ok": False, "error": str(e), "code": e.code}
         _save_local(chat_id, store)
         try:
-            await _sync_named_file_to_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
+            await _sync_state_file_to_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
         except Exception as e:
             logger.warning(f"memory: local→R2 同步失败 (chat={chat_id}): {e}")
         return payload
@@ -231,7 +250,7 @@ def _op_get(store: dict, mid: str) -> dict:
                    "total": len(store["memories"])}
 
 
-def _op_list(store: dict, category: Optional[str], tag: Optional[str],
+def _op_list(store: dict, category: Optional[str], tag: Any,
              importance: Optional[str], limit: int) -> dict:
     memories = store["memories"]
     # 默认排序：重要性降序，再按创建时间倒序（新的在前）
@@ -248,12 +267,13 @@ def _op_list(store: dict, category: Optional[str], tag: Optional[str],
     filtered = []
     cat_filter = _normalize_category(category) if category else None
     imp_filter = _normalize_importance(importance) if importance else None
+    tag_filters = _normalize_tags(tag)
     for m in memories_sorted:
         if cat_filter and m.get("category") != cat_filter:
             continue
         if imp_filter and m.get("importance") != imp_filter:
             continue
-        if tag and tag not in m.get("tags", []):
+        if tag_filters and not any(t in m.get("tags", []) for t in tag_filters):
             continue
         filtered.append(m)
         if limit and len(filtered) >= limit:
@@ -263,7 +283,8 @@ def _op_list(store: dict, category: Optional[str], tag: Optional[str],
         "ok": True,
         "action": "list",
         "category": category,
-        "tag": tag,
+        "tag": tag if isinstance(tag, str) else None,
+        "tags": tag_filters or None,
         "importance": importance,
         "memories": [_mem_summary(m) for m in filtered],
         "total": len(memories),
@@ -428,17 +449,17 @@ async def execute_memory(
         )
     if action == "get":
         return json.dumps(
-            await _mutate(chat_id, lambda s: _op_get(s, memory_id)),
+            await _read_store(chat_id, lambda s: _op_get(s, memory_id)),
             ensure_ascii=False,
         )
     if action == "list":
         return json.dumps(
-            await _mutate(chat_id, lambda s: _op_list(s, category, tags, importance, limit_i)),
+            await _read_store(chat_id, lambda s: _op_list(s, category, tags, importance, limit_i)),
             ensure_ascii=False,
         )
     if action == "search":
         return json.dumps(
-            await _mutate(chat_id, lambda s: _op_search(s, query or "", limit_i)),
+            await _read_store(chat_id, lambda s: _op_search(s, query or "", limit_i)),
             ensure_ascii=False,
         )
     if action == "update":
@@ -547,7 +568,13 @@ def render_memory_card(payload: dict, max_items: int = 30) -> str:
     extra_desc = []
     if payload.get("category"):
         extra_desc.append(f"分类=<code>{_esc(payload['category'])}</code>")
-    if payload.get("tag"):
+    if payload.get("tags"):
+        tags_value = payload["tags"]
+        if isinstance(tags_value, list):
+            extra_desc.append("标签=" + " ".join(f"<code>#{_esc(t)}</code>" for t in tags_value[:MAX_TAGS]))
+        else:
+            extra_desc.append(f"标签=<code>#{_esc(tags_value)}</code>")
+    elif payload.get("tag"):
         extra_desc.append(f"标签=<code>#{_esc(payload['tag'])}</code>")
     if payload.get("importance"):
         p = payload["importance"]

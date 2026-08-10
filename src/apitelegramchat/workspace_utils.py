@@ -182,7 +182,61 @@ async def _sync_file_to_r2(chat_id: int, filename: str) -> None:
     await _sync_named_file_to_r2(chat_id, workspace / filename, filename)
 
 
+# ========== 状态文件同步（memory/todo 等，不属于 workspace） ==========
+
+async def _sync_state_file_from_r2(chat_id: int, local_path: Path, remote_name: str) -> None:
+    """同步独立状态文件。状态文件使用 state/{namespace}/，禁止进入 editor workspace。"""
+    safe_name = os.path.normpath(remote_name)
+    if safe_name == "." or safe_name.startswith("..") or os.path.isabs(safe_name):
+        return
+    key = f"state/{workspace_namespace(chat_id)}/{safe_name}"
+    data = await download_from_r2(key)
+    if data is not None:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(data)
+
+
+async def _sync_state_file_to_r2(chat_id: int, local_path: Path, remote_name: str) -> None:
+    """上传独立状态文件到 state namespace。"""
+    safe_name = os.path.normpath(remote_name)
+    if safe_name == "." or safe_name.startswith("..") or os.path.isabs(safe_name):
+        return
+    key = f"state/{workspace_namespace(chat_id)}/{safe_name}"
+    if local_path.is_file():
+        await upload_bytes_to_r2(local_path.read_bytes(), key, "application/json")
+    else:
+        await delete_r2_object(key)
+
+
 # ========== 可选：初始化工作区（后台执行） ==========
+
+# ========== 状态文件同步（memory/todo 等，不属于 workspace） ==========
+
+async def _sync_state_file_from_r2(chat_id: int, local_path: Path, remote_name: str) -> None:
+    """同步独立状态文件。状态文件使用 state/{namespace}/，禁止进入 editor workspace。"""
+    safe_name = os.path.normpath(remote_name)
+    if safe_name == "." or safe_name.startswith("..") or os.path.isabs(safe_name):
+        return
+    key = f"state/{workspace_namespace(chat_id)}/{safe_name}"
+    data = await download_from_r2(key)
+    if data is not None:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(data)
+
+
+async def _sync_state_file_to_r2(chat_id: int, local_path: Path, remote_name: str) -> None:
+    """上传独立状态文件到 state namespace。"""
+    safe_name = os.path.normpath(remote_name)
+    if safe_name == "." or safe_name.startswith("..") or os.path.isabs(safe_name):
+        return
+    key = f"state/{workspace_namespace(chat_id)}/{safe_name}"
+    if local_path.is_file():
+        await upload_bytes_to_r2(local_path.read_bytes(), key, "application/json")
+    else:
+        await delete_r2_object(key)
+
 
 # ========== 可选：初始化工作区（后台执行） ==========
 

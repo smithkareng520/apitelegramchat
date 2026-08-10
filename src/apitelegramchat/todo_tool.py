@@ -26,15 +26,15 @@ import os
 import time
 import uuid
 from pathlib import Path
-from apitelegramchat.workspace_paths import todo_state_file
+from apitelegramchat.workspace_paths import todo_state_file, workspace_root
 from typing import Any, Optional
 
 import aiohttp
 
 from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
-    _sync_named_file_from_r2,
-    _sync_named_file_to_r2,
+    _sync_state_file_from_r2,
+    _sync_state_file_to_r2,
 )
 from apitelegramchat.config import BASE_URL
 
@@ -58,6 +58,7 @@ PRIORITY_META = {
 # ---------- 存储层 ----------
 def _todo_path(chat_id: int) -> Path:
     return todo_state_file(chat_id)
+
 
 
 def _new_id() -> str:
@@ -101,7 +102,7 @@ def _find_todo(todos: list, todo_id: str) -> tuple[int, dict] | None:
         return None
     target = str(todo_id).lstrip("#")
     for i, t in enumerate(todos):
-        if t.get("id") == todo_id:
+        if str(t.get("id", "")).lstrip("#") == target:
             return i, t
     return None
 
@@ -141,6 +142,24 @@ def _normalize_tags(tags: Any) -> list[str]:
 
 
 # ---------- 业务逻辑 ----------
+async def _read_store(chat_id: int, fn) -> dict:
+    """
+    读取型操作：先从 R2 拉取最新内容到本地，再执行读取，不回写 store。
+    """
+    lock = await _get_workspace_lock(chat_id)
+    async with lock:
+        try:
+            await _sync_state_file_from_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
+        except Exception as e:
+            logger.warning(f"todos: R2→local 同步失败 (chat={chat_id}): {e}")
+        store = _load_local(chat_id)
+        try:
+            _store, payload = fn(store)
+        except _TodoError as e:
+            return {"ok": False, "error": str(e), "code": e.code}
+        return payload
+
+
 async def _mutate(chat_id: int, fn) -> dict:
     """
     在 workspace 锁保护下：从 R2 同步 → 加载 → 调用 fn(store) → 保存 → 同步回 R2。
@@ -152,7 +171,7 @@ async def _mutate(chat_id: int, fn) -> dict:
     lock = await _get_workspace_lock(chat_id)
     async with lock:
         try:
-            await _sync_named_file_from_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
+            await _sync_state_file_from_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
         except Exception as e:
             logger.warning(f"todos: R2→local 同步失败 (chat={chat_id}): {e}")
         store = _load_local(chat_id)
@@ -163,7 +182,7 @@ async def _mutate(chat_id: int, fn) -> dict:
         _save_local(chat_id, store)
         # 同步回 R2（单文件，同步等待——JSON 文件很小，<1s）
         try:
-            await _sync_named_file_to_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
+            await _sync_state_file_to_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
         except Exception as e:
             logger.warning(f"todos: local→R2 同步失败 (chat={chat_id}): {e}")
         return payload
@@ -390,7 +409,7 @@ async def execute_todo(
         )
     if action == "list":
         return json.dumps(
-            await _mutate(chat_id, lambda s: _op_list(s, filter_, tag, priority)),
+            await _read_store(chat_id, lambda s: _op_list(s, filter_, tag, priority)),
             ensure_ascii=False,
         )
     if action == "done":
@@ -823,7 +842,7 @@ async def clear_done(chat_id: int) -> dict:
 
 
 async def list_all(chat_id: int, filter_: str = "all") -> dict:
-    return await _mutate(chat_id, lambda s: _op_list(s, filter_, None, None))
+    return await _read_store(chat_id, lambda s: _op_list(s, filter_, None, None))
 
 
 # ---------- 工具定义（OpenAI function-calling schema） ----------
