@@ -139,6 +139,7 @@ class SkillRecord:
     skill_id: str
     name: str
     description: str
+    when_to_use: str
     path: str
     root: str
     priority: int
@@ -150,6 +151,7 @@ class SkillRecord:
             "skill_id": self.skill_id,
             "name": self.name,
             "description": self.description,
+            "when_to_use": self.when_to_use,
             "path": self.path,
             "priority": self.priority,
             "effort": self.effort,
@@ -164,6 +166,7 @@ def load_skill_records() -> list[SkillRecord]:
         skill_id = skill_md.parent.name
         name = str(meta.get("name") or skill_id)
         description = str(meta.get("description") or "").strip()
+        when_to_use = str(meta.get("when_to_use") or meta.get("when-to-use") or "").strip()
         priority_raw = meta.get("priority") or 0
         priority = int(priority_raw) if str(priority_raw).lstrip("-").isdigit() else 0
         effort = meta.get("effort")
@@ -180,6 +183,7 @@ def load_skill_records() -> list[SkillRecord]:
                 skill_id=skill_id,
                 name=name,
                 description=description,
+                when_to_use=when_to_use,
                 path=str(skill_md.relative_to(root)),
                 root=str(root),
                 priority=priority,
@@ -202,7 +206,7 @@ def _read_full_skill(skill_path: Path) -> tuple[dict[str, Any], str]:
 
 
 def _skill_text_for_matching(rec: SkillRecord) -> str:
-    parts = [rec.skill_id, rec.name, rec.description, rec.path]
+    parts = [rec.skill_id, rec.name, rec.description, rec.when_to_use, rec.path]
     return " ".join(part for part in parts if part).lower()
 
 
@@ -343,6 +347,9 @@ def build_skill_system_message(skill_id: str, *, include_body: bool = True) -> d
         f"Name: {skill.get('name')}",
         f"Description: {skill.get('description')}",
     ]
+    when_to_use = skill.get('when_to_use') or frontmatter.get('when_to_use')
+    if when_to_use:
+        header_lines.append(f"When to use: {when_to_use}")
     if frontmatter.get("allowed_tools"):
         header_lines.append("Allowed tools: " + ", ".join(map(str, frontmatter.get("allowed_tools", []))))
     if frontmatter.get("priority"):
@@ -380,6 +387,7 @@ def read_skill(skill_id: str) -> dict[str, Any]:
             meta, body = _read_full_skill(skill_path)
             meta.setdefault("name", rec.name)
             meta.setdefault("description", rec.description)
+            meta.setdefault("when_to_use", rec.when_to_use)
             meta.setdefault("priority", rec.priority)
             meta.setdefault("effort", rec.effort)
             meta.setdefault("allowed_tools", rec.allowed_tools)
@@ -419,7 +427,11 @@ def catalog_text() -> str:
         lines.append(f"Featured skill: {catalog['featured']}")
     for item in catalog["skills"]:
         desc = item["description"] or "(no description)"
-        lines.append(f"- {item['skill_id']}: {item['name']} — {desc}")
+        when = item.get("when_to_use") or ""
+        if when:
+            lines.append(f"- {item['skill_id']}: {item['name']} — {desc} | when: {when}")
+        else:
+            lines.append(f"- {item['skill_id']}: {item['name']} — {desc}")
     return "\n".join(lines)
 
 
