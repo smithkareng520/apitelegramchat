@@ -167,3 +167,7 @@ rm src/apitelegramchat/amap_integration.py
 - IP 定位：https://lbs.amap.com/api/webservice/guide/api/ipre
 - 静态地图：https://lbs.amap.com/api/webservice/guide/api/staticmaps
 - 配额说明：https://lbs.amap.com/api/webservice/guide/tools/flowlevel
+
+
+## Skills
+This repository ships Anthropic-compatible skills under `.claude/skills/` and does not expose a custom prompt-skill registry.

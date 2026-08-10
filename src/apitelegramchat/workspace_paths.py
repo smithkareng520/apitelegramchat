@@ -5,8 +5,24 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
+
 _NAMESPACE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _WORKDIR_NAME = os.getenv("APITELEGRAMCHAT_WORKDIR_NAME", "workspace").strip() or "workspace"
+_STATE_DIR_NAME = os.getenv("APITELEGRAMCHAT_STATE_DIR_NAME", "state").strip() or "state"
+
+
+def _resolved_namespace(chat_id: object, namespace: object | None = None) -> str:
+    if namespace is not None:
+        return sanitize_namespace(namespace)
+    try:
+        from apitelegramchat.state import get_current_user_namespace
+
+        current = get_current_user_namespace()
+        if current:
+            return sanitize_namespace(current)
+    except Exception:
+        pass
+    return sanitize_namespace(f"chat_{chat_id}")
 
 
 @lru_cache(maxsize=1)
@@ -32,18 +48,47 @@ def sanitize_namespace(value: object) -> str:
 
 
 def workspace_root(chat_id: object, namespace: object | None = None) -> Path:
-    ns = namespace if namespace is not None else f"chat_{chat_id}"
-    root = data_root() / "workspaces" / sanitize_namespace(ns)
+    ns = _resolved_namespace(chat_id, namespace)
+    root = data_root() / "workspaces" / ns
     root.mkdir(parents=True, exist_ok=True)
     return root.resolve()
 
 
 def workspace_workdir(chat_id: object, namespace: object | None = None) -> Path:
+    # Keep the shell workdir at the chat root so the workspace tree stays flat.
     root = workspace_root(chat_id, namespace)
-    workdir = root / _WORKDIR_NAME
-    workdir.mkdir(parents=True, exist_ok=True)
-    return workdir.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
 
 
 def workspace_file(chat_id: object, filename: str, namespace: object | None = None) -> Path:
     return workspace_root(chat_id, namespace) / filename
+
+
+def state_root() -> Path:
+    root = data_root() / _STATE_DIR_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
+
+
+def chat_state_root(chat_id: object, namespace: object | None = None) -> Path:
+    ns = _resolved_namespace(chat_id, namespace)
+    root = state_root() / ns
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
+
+
+def state_file(chat_id: object, filename: str, namespace: object | None = None) -> Path:
+    return chat_state_root(chat_id, namespace) / filename
+
+
+def memory_state_file(chat_id: object, namespace: object | None = None) -> Path:
+    return state_file(chat_id, "memories.json", namespace)
+
+
+def todo_state_file(chat_id: object, namespace: object | None = None) -> Path:
+    return state_file(chat_id, "todos.json", namespace)
+
+
+def workspace_namespace(chat_id: object, namespace: object | None = None) -> str:
+    return _resolved_namespace(chat_id, namespace)

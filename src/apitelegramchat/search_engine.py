@@ -36,7 +36,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
             return {"entries": []}
     feedparser = _FeedParserStub()  # type: ignore
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root
+from apitelegramchat.workspace_paths import workspace_root, workspace_namespace
 
 # === [amap_integration patch] 高德地图数据源 ===
 try:
@@ -93,11 +93,10 @@ OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 
 from apitelegramchat.s3_utils import upload_bytes_to_r2
 from apitelegramchat.workspace_utils import _get_workspace_lock, _sync_workspace_from_r2, _sync_workspace_to_r2
-# 任务工具：定义在 todo_tool.py / memory_tool.py / skill_tool.py / subagent_tool.py
+# 任务工具：定义在 todo_tool.py / memory_tool.py / subagent_tool.py
 # 本文件只做注册与转出
 from apitelegramchat.todo_tool import TODO_TOOL, execute_todo  # noqa: E402
 from apitelegramchat.memory_tool import MEMORY_TOOL, execute_memory  # noqa: E402
-from apitelegramchat.skill_tool import SKILL_TOOL, execute_skill  # noqa: E402
 try:  # noqa: E402
     from apitelegramchat.subagent_tool import SUBAGENT_TOOL, execute_subagent  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
@@ -243,7 +242,7 @@ async def _validate_edit(chat_id: int, path: str, old_str: str, start_line: int,
 # ===================== 异步上传单个编辑文件 =====================
 async def _upload_edited_file(chat_id: int, rel_path: str, content: str):
     try:
-        key = f"editor/{chat_id}/{rel_path}"
+        key = f"editor/{workspace_namespace(chat_id)}/{rel_path}"
         await upload_bytes_to_r2(content.encode('utf-8'), key, 'text/plain')
         logger.debug(f"异步上传成功：{key}")
     except Exception as e:
@@ -1327,20 +1326,16 @@ SEARCH_TOOLS = [
     ),
     # ===================== 任务 / 待办工具 =====================
     # 让 agent 拥有持久化的待办清单能力：add/list/done/undone/delete/clear/edit。
-    # 数据按 chat 隔离，存放在 ./workspace/{chat_id}/workspace/todos.json 并随 R2 同步。
+    # 数据按用户隔离，存放在 ./state/{user_id}/todos.json 并随 R2 同步。
     # 渲染层走 sendRichMessage 富文本卡片 + InlineKeyboard 一键操作。
     TODO_TOOL,
     # ===================== 长期记忆工具 =====================
     # 跨会话保留的事实/偏好/人物/事件——不同于会自动修剪的对话历史。
-    # 数据落在 ./workspace/{chat_id}/workspace/memories.json，随 R2 同步。
+    # 数据落在 ./state/{user_id}/memories.json，随 R2 同步。
     MEMORY_TOOL,
-    # ===================== 技能注册表 =====================
-    # 内置 7 个能力模板（translator/summarizer/coder/reviewer/explainer/
-    # brainstormer/planner），用户也可注册自定义技能；自定义数据按 chat 落盘。
-    SKILL_TOOL,
     # ===================== 子 Agent 工具 =====================
     # 派生一个干净上下文的子 agent 处理子任务，自带最小 agentic loop，
-    # 工具白名单受控，禁递归调用 subagent/memory/skill。
+    # 工具白名单受控，禁递归调用 subagent/memory。
     SUBAGENT_TOOL,
 ]
 

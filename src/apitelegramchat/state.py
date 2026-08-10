@@ -1,5 +1,6 @@
 # state.py
 import asyncio
+import contextvars
 import time
 from typing import Optional
 from apitelegramchat.config import DEFAULT_MODEL
@@ -7,6 +8,23 @@ from apitelegramchat.config import DEFAULT_MODEL
 # ---------- 用户会话 ----------
 user_contexts: dict = {}
 user_models: dict = {}
+
+# ---------- 当前用户命名空间（用于按 user_id 隔离工作区/状态文件） ----------
+_current_user_namespace: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "apitelegramchat_current_user_namespace", default=None
+)
+
+
+def set_current_user_namespace(namespace: str | int | None) -> None:
+    if namespace is None:
+        _current_user_namespace.set(None)
+        return
+    value = str(namespace).strip()
+    _current_user_namespace.set(value or None)
+
+
+def get_current_user_namespace() -> str | None:
+    return _current_user_namespace.get()
 
 # ---------- 细粒度锁 ----------
 _chat_locks: dict = {}

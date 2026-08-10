@@ -71,7 +71,6 @@ from apitelegramchat.search_engine import (
     # 长期记忆工具
     execute_memory,
     # 技能注册表
-    execute_skill,
     # 子 agent 工具
     execute_subagent,
 )
@@ -79,7 +78,6 @@ from apitelegramchat.todo_tool import (
     render_todo_card,
 )
 from apitelegramchat.memory_tool import render_memory_card
-from apitelegramchat.skill_tool import render_skill_card
 try:
     from apitelegramchat.subagent_tool import render_subagent_card
 except Exception:  # pragma: no cover - optional dependency fallback
@@ -94,19 +92,16 @@ tool_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TOOLS)
 
 MAX_TOOL_RESPONSE_LEN = 16000
 
-
 def _truncate_tool_result(result: str) -> str:
     if len(result) > MAX_TOOL_RESPONSE_LEN:
         return result[:MAX_TOOL_RESPONSE_LEN] + "\n…[内容过长已截断]"
     return result
-
 
 def extract_domain(url: str) -> str:
     if not url:
         return "unknown"
     parsed = urlparse(url)
     return parsed.netloc or parsed.path.split('/')[0]
-
 
 # =====================================================================
 # BashSession —— 每会话独立沙箱
@@ -316,7 +311,6 @@ class BashSession:
         self.proc = None
         self._started = False
 
-
 # =====================================================================
 # BashSessionManager —— 多 chat 共享管理
 # =====================================================================
@@ -359,9 +353,7 @@ class BashSessionManager:
                     pass
             self._sessions.clear()
 
-
 _bash_manager = BashSessionManager()
-
 
 # =====================================================================
 # execute_bash —— 工具调用入口（保持原签名，外部无需修改）
@@ -377,7 +369,6 @@ async def execute_bash(chat_id: int, command: str = "", restart: bool = False) -
     session = await _bash_manager.get_session(chat_id)
     # 执行命令，内部已包含异步同步
     return await session.execute(command)
-
 
 # ---------- 静态地图生成 ----------
 async def _get_static_map_image(
@@ -483,7 +474,6 @@ async def _get_static_map_image(
 
     return None
 
-
 # ---------- 工具结果格式化 ----------
 
 # Magic marker emitted by ai_handlers.run_one on asyncio.TimeoutError.
@@ -517,7 +507,6 @@ _TOOL_TIMEOUT_LABELS = {
     "bash": "Bash command",
     "present_files": "File presentation",
 }
-
 
 async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tuple[str, str]:
     def escape_text(text):
@@ -1379,34 +1368,6 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = render_memory_card(payload)
         return summary, details_html
 
-    # ===================== Skill 工具格式化 =====================
-    elif fn_name == "skill":
-        try:
-            payload = json.loads(result_str)
-        except (json.JSONDecodeError, TypeError):
-            payload = None
-        if not isinstance(payload, dict):
-            summary = "🎯 技能"
-            details_html = escape_text(result_str)
-            return summary, details_html
-        if not payload.get("ok"):
-            summary = f"❌ 技能失败：{payload.get('code', '')}"
-            details_html = f"<p>{escape_text(payload.get('error', '未知错误'))}</p>"
-            return summary, details_html
-        action = payload.get("action", "list")
-        if action == "list":
-            summary = f"🎯 技能：{payload.get('total', 0)} 个可用"
-        elif action == "use":
-            s = payload.get("skill", {})
-            summary = f"🧩 已加载：{s.get('name', '')}"
-        elif action == "info":
-            s = payload.get("skill", {})
-            summary = f"🧩 详情：{s.get('name', '')}"
-        else:
-            summary = "🎯 技能"
-        details_html = render_skill_card(payload)
-        return summary, details_html
-
     # ===================== Subagent 工具格式化 =====================
     # execute_subagent 返回 JSON，含 answer / rounds / tool_calls / elapsed。
     # 父 agent 在工具气泡里看到完整子 agent 答复；用户也能从气泡折叠区阅读。
@@ -1508,7 +1469,6 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = escape_text(result_str)
         return summary, details_html
 
-
 async def execute_present_files(chat_id: int, paths: List[str]) -> str:
     if not paths:
         return json.dumps({"sent": [], "failed": [], "error": "No paths provided."})
@@ -1574,7 +1534,6 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
             except Exception as e:
                 failed.append(f"{path} (error: {str(e)[:50]})")
         return json.dumps({"sent": sent, "failed": failed, "error": None})
-
 
 # ---------- 工具分发 ----------
 async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_callback=None) -> str:
@@ -1746,18 +1705,6 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 scope=arguments.get("scope"),
                 limit=arguments.get("limit", 50),
                 source=arguments.get("source", "agent"),
-            )
-        # ========== Skill 工具分支 ==========
-        # 技能注册表。返回 JSON 给 AI；UI 由 format_tool_result 渲染表格 / 详情卡片。
-        elif name == "skill":
-            return await execute_skill(
-                chat_id=chat_id,
-                action=arguments.get("action", "list"),
-                name=arguments.get("name"),
-                description=arguments.get("description"),
-                system_prompt=arguments.get("system_prompt"),
-                tools=arguments.get("tools"),
-                examples=arguments.get("examples"),
             )
         # ========== Subagent 工具分支 ==========
         # 子 agent。返回 JSON（含 answer / rounds / tool_calls）给父 agent 阅读；

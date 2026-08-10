@@ -66,6 +66,7 @@ from apitelegramchat.state import (
     clear_active_draft,
     mark_preserved_draft,
     mark_protected_message,
+    set_current_user_namespace,
 )
 from apitelegramchat.file_handlers import download_file
 from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2
@@ -593,6 +594,7 @@ async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
 
         first_msg = messages[0]
         username, user_id = get_user_info(first_msg)
+        set_current_user_namespace(user_id or str(chat_id))
         if not is_authorized(username, user_id):
             await reply_unauthorized(chat_id, first_msg.get("message_id"))
             return
@@ -677,6 +679,7 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
 
     first_msg = messages[0]
     username, user_id = get_user_info(first_msg)
+    set_current_user_namespace(user_id or str(chat_id))
     if not is_authorized(username, user_id):
         await reply_unauthorized(chat_id, first_msg.get("message_id"))
         return
@@ -746,7 +749,7 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
                 try:
                     with open(target_path, "rb") as f:
                         file_data = f.read()
-                    editor_key = f"editor/{chat_id}/{target_path.name}"
+                    editor_key = f"editor/{workspace_root(chat_id).name}/{target_path.name}"
                     await upload_bytes_to_r2(file_data, editor_key, "application/octet-stream")
                 except Exception as e:
                     logger.warning(f"上传文档组文件到 editor 前缀失败: {e}")
@@ -1030,6 +1033,7 @@ async def webhook() -> tuple:
                 return "OK", 200
             from_user = msg.get("from", {})
             username, user_id = get_user_info(msg)
+            set_current_user_namespace(user_id or str(chat_id))
 
             text = msg.get("text", "") or ""
             # 使用更严格的命令匹配：以 / 开头并按空格/ @ 切分首段
@@ -1265,7 +1269,7 @@ async def webhook() -> tuple:
                             try:
                                 with open(target_path, "rb") as f:
                                     file_data = f.read()
-                                editor_key = f"editor/{chat_id}/{safe_fname}"
+                                editor_key = f"editor/{workspace_root(chat_id).name}/{safe_fname}"
                                 await upload_bytes_to_r2(file_data, editor_key, "application/octet-stream")
                             except Exception as e:
                                 logger.warning(f"上传文档到 editor 前缀失败: {e}")
@@ -1517,7 +1521,7 @@ async def webhook() -> tuple:
                                     try:
                                         with open(target_path, "rb") as f:
                                             file_data = f.read()
-                                        editor_key = f"editor/{chat_id}/{safe_fname}"
+                                        editor_key = f"editor/{workspace_root(chat_id).name}/{safe_fname}"
                                         await upload_bytes_to_r2(file_data, editor_key, "application/octet-stream")
                                     except Exception as e:
                                         logger.warning(f"上传引用文档到 editor 前缀失败: {e}")
@@ -1667,6 +1671,7 @@ async def webhook() -> tuple:
                     await delete_message(chat_id, mid)
                     return "OK", 200
                 elif isinstance(sel, str) and sel.startswith("todo:"):
+                    set_current_user_namespace(uid or str(chat_id))
                     # ── 待办清单的 InlineKeyboard 回调 ──
                     # callback_data 格式：
                     #   todo:t:<id>     切换完成状态

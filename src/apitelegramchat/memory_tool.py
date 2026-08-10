@@ -6,7 +6,7 @@
 ----
 - 不同于对话历史（短期、会被自动修剪），memory 是用户希望长期保留的事实、
   偏好、要点——跨会话持久化。
-- 按 chat 隔离，落在 ./workspace/{chat_id}/workspace/memories.json，复用既有 R2 同步链路。
+- 按用户隔离，落在 ./state/{user_id}/memories.json，复用既有 R2 同步链路。
 - 给 AI 一组 CRUD + 检索接口：add / get / list / search / update / delete / clear。
 
 数据模型
@@ -39,13 +39,13 @@ import os
 import time
 import uuid
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root
+from apitelegramchat.workspace_paths import memory_state_file
 from typing import Any, Optional
 
 from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
-    _sync_file_from_r2,
-    _sync_file_to_r2,
+    _sync_named_file_from_r2,
+    _sync_named_file_to_r2,
 )
 from apitelegramchat.config import BASE_URL  # noqa: F401  — 保留给将来扩展（推送卡片用）
 
@@ -76,12 +76,8 @@ CATEGORY_EMOJI = {
 
 
 # ---------- 存储层 ----------
-def _workspace_path(chat_id: int) -> Path:
-    return workspace_root(chat_id)
-
-
 def _memory_path(chat_id: int) -> Path:
-    return _workspace_path(chat_id) / MEMORY_FILENAME
+    return memory_state_file(chat_id)
 
 
 def _new_id() -> str:
@@ -180,7 +176,7 @@ async def _mutate(chat_id: int, fn) -> dict:
     lock = await _get_workspace_lock(chat_id)
     async with lock:
         try:
-            await _sync_file_from_r2(chat_id, MEMORY_FILENAME)
+            await _sync_named_file_from_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
         except Exception as e:
             logger.warning(f"memory: R2→local 同步失败 (chat={chat_id}): {e}")
         store = _load_local(chat_id)
@@ -190,7 +186,7 @@ async def _mutate(chat_id: int, fn) -> dict:
             return {"ok": False, "error": str(e), "code": e.code}
         _save_local(chat_id, store)
         try:
-            await _sync_file_to_r2(chat_id, MEMORY_FILENAME)
+            await _sync_named_file_to_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
         except Exception as e:
             logger.warning(f"memory: local→R2 同步失败 (chat={chat_id}): {e}")
         return payload

@@ -4,7 +4,6 @@ description: Telegram AI assistant capabilities for chat, search, memory, todos,
 allowed-tools:
   - memory.manage
   - todo.manage
-  - skill.manage
   - subagent.run
   - workspace.present
   - shell.exec
@@ -21,7 +20,7 @@ Use this skill when the user wants the Telegram assistant to do real work inside
 
 ## Core behavior
 - Prefer the smallest tool needed.
-- Use `skill.manage` only to inspect available skills or load one by name.
+- Choose the smallest skill whose description matches the task.
 - Keep replies concise and grounded in the tool result.
 - For long-running or multi-step tasks, break the work into clear steps and avoid inventing state.
 

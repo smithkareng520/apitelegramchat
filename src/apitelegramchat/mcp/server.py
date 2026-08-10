@@ -7,13 +7,11 @@ import os
 import sys
 from typing import Any
 
-from .prompts import list_prompts, get_prompt
 from .resources import list_resources, read_resource
 from .registry import call_tool, list_tools
 from apitelegramchat.workspace_paths import data_root
 
 logger = logging.getLogger("apitelegramchat.mcp")
-
 
 async def handle_message(msg: dict[str, Any]) -> dict[str, Any] | None:
     method = msg.get("method")
@@ -28,7 +26,7 @@ async def handle_message(msg: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": msg.get("params", {}).get("protocolVersion", "2025-06-18"),
                 "serverInfo": {"name": "apitelegramchat", "version": "2.1.0-mcp-native"},
-                "capabilities": {"tools": {"listChanged": False}, "prompts": {"listChanged": False}, "resources": {"listChanged": False, "subscribe": False}},
+                "capabilities": {"tools": {"listChanged": False}, "resources": {"listChanged": False, "subscribe": False}},
             },
         }
     if method == "notifications/initialized":
@@ -38,14 +36,6 @@ async def handle_message(msg: dict[str, Any]) -> dict[str, Any] | None:
     if method == "tools/call":
         params = msg.get("params", {}) or {}
         result = await call_tool(params.get("name", ""), params.get("arguments", {}) or {})
-        if "error" in result:
-            return {"jsonrpc": "2.0", "id": req_id, "error": result["error"]}
-        return {"jsonrpc": "2.0", "id": req_id, "result": result}
-    if method == "prompts/list":
-        return {"jsonrpc": "2.0", "id": req_id, "result": {"prompts": await list_prompts()}}
-    if method == "prompts/get":
-        params = msg.get("params", {}) or {}
-        result = await get_prompt(params.get("name", ""), params.get("arguments", {}) or {})
         if "error" in result:
             return {"jsonrpc": "2.0", "id": req_id, "error": result["error"]}
         return {"jsonrpc": "2.0", "id": req_id, "result": result}
@@ -60,7 +50,6 @@ async def handle_message(msg: dict[str, Any]) -> dict[str, Any] | None:
     if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
-
 
 async def run_stdio() -> None:
     reader = asyncio.StreamReader()
@@ -85,12 +74,10 @@ async def run_stdio() -> None:
             writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
             await writer.drain()
 
-
 def main() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     logger.info("Starting MCP server data_root=%s", data_root())
     asyncio.run(run_stdio())
-
 
 if __name__ == "__main__":
     main()

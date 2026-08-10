@@ -6,7 +6,7 @@
 --------
 1. 给 AI agent 一个轻量、持久的任务管理能力——支持新增、列表、完成、
    反完成、删除、清空、编辑、改优先级。
-2. 数据按 chat 隔离，落在 ./workspace/{chat_id}/workspace/todos.json，复用既有
+2. 数据按用户隔离，落在 ./state/{user_id}/todos.json，复用既有
    workspace_utils 的 R2 同步链路，无需额外存储。
 3. 给 Telegram 客户端一套富文本渲染：状态 emoji、优先级颜色、删除线、
    可折叠统计区，以及可点击的 InlineKeyboard 按钮（一键完成/删除）。
@@ -26,15 +26,15 @@ import os
 import time
 import uuid
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root
+from apitelegramchat.workspace_paths import todo_state_file
 from typing import Any, Optional
 
 import aiohttp
 
 from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
-    _sync_file_from_r2,
-    _sync_file_to_r2,
+    _sync_named_file_from_r2,
+    _sync_named_file_to_r2,
 )
 from apitelegramchat.config import BASE_URL
 
@@ -56,12 +56,8 @@ PRIORITY_META = {
 
 
 # ---------- 存储层 ----------
-def _workspace_path(chat_id: int) -> Path:
-    return workspace_root(chat_id)
-
-
 def _todo_path(chat_id: int) -> Path:
-    return _workspace_path(chat_id) / TODO_FILENAME
+    return todo_state_file(chat_id)
 
 
 def _new_id() -> str:
@@ -156,7 +152,7 @@ async def _mutate(chat_id: int, fn) -> dict:
     lock = await _get_workspace_lock(chat_id)
     async with lock:
         try:
-            await _sync_file_from_r2(chat_id, TODO_FILENAME)
+            await _sync_named_file_from_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
         except Exception as e:
             logger.warning(f"todos: R2→local 同步失败 (chat={chat_id}): {e}")
         store = _load_local(chat_id)
@@ -167,7 +163,7 @@ async def _mutate(chat_id: int, fn) -> dict:
         _save_local(chat_id, store)
         # 同步回 R2（单文件，同步等待——JSON 文件很小，<1s）
         try:
-            await _sync_file_to_r2(chat_id, TODO_FILENAME)
+            await _sync_named_file_to_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
         except Exception as e:
             logger.warning(f"todos: local→R2 同步失败 (chat={chat_id}): {e}")
         return payload
@@ -840,7 +836,7 @@ TODO_TOOL = {
         "name": "todo",
         "description": (
             "Persistent per-chat todo list. 8 actions: add / list / done / undone / toggle / delete / clear / edit. "
-            "Todos are stored in the user's workspace and survive across sessions. After any write action (add/done/undone/delete/edit/clear) immediately call list so the user sees the updated state."
+            "Todos are stored in the dedicated state store and survive across sessions. After any write action (add/done/undone/delete/edit/clear) immediately call list so the user sees the updated state."
         ),
         "parameters": {
             "type": "object",

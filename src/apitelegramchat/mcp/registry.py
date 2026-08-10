@@ -10,7 +10,6 @@ from typing import Any, Awaitable, Callable, get_args, get_origin
 from uuid import uuid4
 
 from apitelegramchat.memory_tool import execute_memory
-from apitelegramchat.skill_tool import execute_skill
 try:
     from apitelegramchat.subagent_tool import execute_subagent
 except Exception:  # pragma: no cover - optional dependency fallback
@@ -30,19 +29,16 @@ from ..core.settings import get_mcp_scope
 
 logger = logging.getLogger("apitelegramchat.mcp")
 
-
 def _chat_id() -> int:
     scope = get_mcp_scope().name
     import hashlib
     digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()
     return int(digest[:12], 16)
 
-
 def _clean_args(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {}
     return {k: v for k, v in data.items() if v is not None}
-
 
 def _jsonable(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
@@ -54,7 +50,6 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_jsonable(v) for v in value]
     return str(value)
-
 
 def _schema_for(fn: Callable[..., Any], *, title: str | None = None) -> dict[str, Any]:
     sig = inspect.signature(fn)
@@ -101,7 +96,6 @@ def _schema_for(fn: Callable[..., Any], *, title: str | None = None) -> dict[str
         schema["title"] = title
     return schema
 
-
 @dataclass(frozen=True)
 class ToolSpec:
     name: str
@@ -109,42 +103,30 @@ class ToolSpec:
     fn: Callable[..., Awaitable[str] | str]
     schema: dict[str, Any]
 
-
 async def _call(fn: Callable[..., Awaitable[str] | str], **kwargs: Any) -> Any:
     result = fn(**kwargs)
     if inspect.isawaitable(result):
         return await result
     return result
 
-
 async def _tool_memory(**kwargs: Any) -> str:
     return await execute_memory(_chat_id(), **_clean_args(kwargs))
-
 
 async def _tool_todo(**kwargs: Any) -> str:
     return await execute_todo(_chat_id(), **_clean_args(kwargs))
 
-
-async def _tool_skill(**kwargs: Any) -> str:
-    return await execute_skill(_chat_id(), **_clean_args(kwargs))
-
-
 async def _tool_subagent(**kwargs: Any) -> str:
     return await execute_subagent(_chat_id(), **_clean_args(kwargs))
-
 
 async def _tool_bash(**kwargs: Any) -> str:
     return await execute_bash(_chat_id(), **_clean_args(kwargs))
 
-
 async def _tool_present_files(**kwargs: Any) -> str:
     return await execute_present_files(_chat_id(), **_clean_args(kwargs))
-
 
 TOOL_SPECS: list[ToolSpec] = [
     ToolSpec("memory.manage", "Manage persistent long-term memory.", _tool_memory, _schema_for(execute_memory, title="memory.manage")),
     ToolSpec("todo.manage", "Create, inspect, update, and clear todos.", _tool_todo, _schema_for(execute_todo, title="todo.manage")),
-    ToolSpec("skill.manage", "List, inspect, and load file-based skills.", _tool_skill, _schema_for(execute_skill, title="skill.manage")),
     ToolSpec("subagent.run", "Spawn a bounded subagent to complete a task.", _tool_subagent, _schema_for(execute_subagent, title="subagent.run")),
     ToolSpec("shell.exec", "Run a sandboxed shell command within the workspace.", _tool_bash, _schema_for(execute_bash, title="shell.exec")),
     ToolSpec("workspace.present", "Return workspace files to the client.", _tool_present_files, _schema_for(execute_present_files, title="workspace.present")),
@@ -175,26 +157,8 @@ TOOL_SPECS: list[ToolSpec] = [
 
 TOOL_MAP = {spec.name: spec for spec in TOOL_SPECS}
 
-
-def _skill_prompt_text(payload: dict[str, Any]) -> str:
-    skill = payload.get("skill") if isinstance(payload.get("skill"), dict) else {}
-    name = skill.get("name") or payload.get("name") or "skill"
-    desc = skill.get("description") or payload.get("description") or ""
-    tools = skill.get("allowed_tools") or payload.get("allowed_tools") or payload.get("tools") or []
-    body = payload.get("instruction") or payload.get("body") or payload.get("content") or ""
-    lines: list[str] = [f"<b>Skill:</b> {name}"]
-    if desc:
-        lines.append(f"<b>Description:</b> {desc}")
-    if tools:
-        lines.append("<b>Allowed tools:</b> " + ", ".join(map(str, tools)))
-    if body:
-        lines.append(body)
-    return "\n".join(lines).strip()
-
-
 async def list_tools() -> list[dict[str, Any]]:
     return [{"name": spec.name, "description": spec.description, "inputSchema": spec.schema} for spec in TOOL_SPECS]
-
 
 async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     spec = TOOL_MAP.get(name)

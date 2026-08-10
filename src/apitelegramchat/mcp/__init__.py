@@ -1,1 +1,1 @@
-"""MCP transport, resources, prompts, and registry."""
+"""MCP transport, resources, registry, and runtime adapters."""

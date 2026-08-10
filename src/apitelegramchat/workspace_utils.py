@@ -3,7 +3,7 @@ import asyncio
 import os
 import logging
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root, workspace_workdir
+from apitelegramchat.workspace_paths import workspace_root, workspace_workdir, workspace_namespace
 
 from apitelegramchat.s3_utils import (
     upload_bytes_to_r2,
@@ -20,12 +20,13 @@ _workspace_locks = {}
 _workspace_locks_lock = asyncio.Lock()
 
 
-async def _get_workspace_lock(chat_id: int) -> asyncio.Lock:
-    """获取或创建该 chat 的 workspace 锁"""
+async def _get_workspace_lock(chat_id: int, namespace: str | None = None) -> asyncio.Lock:
+    """获取或创建该用户/作用域的 workspace 锁。"""
+    key = workspace_namespace(chat_id, namespace)
     async with _workspace_locks_lock:
-        if chat_id not in _workspace_locks:
-            _workspace_locks[chat_id] = asyncio.Lock()
-        return _workspace_locks[chat_id]
+        if key not in _workspace_locks:
+            _workspace_locks[key] = asyncio.Lock()
+        return _workspace_locks[key]
 
 
 async def _sync_workspace_from_r2(chat_id: int):
@@ -36,7 +37,7 @@ async def _sync_workspace_from_r2(chat_id: int):
     workspace = workspace_root(chat_id)
     workspace.mkdir(parents=True, exist_ok=True)
     workspace_workdir(chat_id)
-    prefix = f"editor/{chat_id}/"
+    prefix = f"editor/{workspace_namespace(chat_id)}/"
     keys = await list_r2_objects(prefix)
     remote_rels = set()
     # 防止路径遍历：在写入前对每个 rel 做严格校验
@@ -92,7 +93,7 @@ async def _sync_workspace_to_r2(chat_id: int):
     if not workspace.exists():
         return
     workdir = workspace_workdir(chat_id)
-    prefix = f"editor/{chat_id}/"
+    prefix = f"editor/{workspace_namespace(chat_id)}/"
     local_rels = set()
     for root, dirs, files in os.walk(workspace):
         for file in files:
@@ -123,53 +124,43 @@ async def _async_sync_workspace_to_r2(chat_id: int):
         logger.error(f"异步全量同步失败: {e}")
 
 
-# ========== 单文件定向同步（轻量级，用于 todo/memory/skill 等小 JSON 文件） ==========
+# ========== 单文件定向同步（轻量级，用于 todo/memory 等小 JSON 文件） ==========
 # 旧的全量同步（_sync_workspace_from_r2 / _sync_workspace_to_r2）会下载/上传
 # workspace 里的所有文件。当 workspace 积累了几十个文件后，每次工具调用都要
 # 等 30+ 秒做全量同步——模型流式输出超时，返回空内容。
 #
 # 这组新函数只同步指定的单个文件，把延迟从 O(所有文件) 降到 O(1)。
 
-async def _sync_file_from_r2(chat_id: int, filename: str) -> None:
+async def _sync_named_file_from_r2(chat_id: int, local_path: Path, remote_name: str) -> None:
     """
-    仅从 R2 下载指定的单个文件到本地 workspace。
+    仅从 R2 下载指定的单个文件到本地指定路径。
     如果 R2 上没有该文件，则不做什么（本地可能也没有，或本地是新建的）。
     """
-    workspace = workspace_root(chat_id)
-    workspace.mkdir(parents=True, exist_ok=True)
-    workspace_workdir(chat_id)
-    local_path = workspace / filename
-
-    # 路径安全校验
-    safe_name = os.path.normpath(filename)
+    safe_name = os.path.normpath(remote_name)
     if safe_name == "." or safe_name.startswith("..") or os.path.isabs(safe_name):
-        logger.warning(f"拒绝路径遍历的 filename: {filename!r}")
+        logger.warning(f"拒绝路径遍历的 remote_name: {remote_name!r}")
         return
 
-    key = f"editor/{chat_id}/{safe_name}"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    key = f"editor/{workspace_namespace(chat_id)}/{safe_name}"
     data = await download_from_r2(key)
     if data is not None:
-        local_path.parent.mkdir(parents=True, exist_ok=True)
         with open(local_path, "wb") as f:
             f.write(data)
     # 如果 R2 上没有该文件，本地保留现状（可能是首次创建）
 
 
-async def _sync_file_to_r2(chat_id: int, filename: str) -> None:
+async def _sync_named_file_to_r2(chat_id: int, local_path: Path, remote_name: str) -> None:
     """
     仅将本地指定的单个文件上传到 R2。
     如果本地文件不存在，则删除 R2 上的对应文件（如果有的话）。
     """
-    workspace = workspace_root(chat_id)
-    workspace_workdir(chat_id)
-    local_path = workspace / filename
-
-    safe_name = os.path.normpath(filename)
+    safe_name = os.path.normpath(remote_name)
     if safe_name == "." or safe_name.startswith("..") or os.path.isabs(safe_name):
-        logger.warning(f"拒绝路径遍历的 filename: {filename!r}")
+        logger.warning(f"拒绝路径遍历的 remote_name: {remote_name!r}")
         return
 
-    key = f"editor/{chat_id}/{safe_name}"
+    key = f"editor/{workspace_namespace(chat_id)}/{safe_name}"
     if local_path.is_file():
         with open(local_path, "rb") as f:
             data = f.read()
@@ -178,6 +169,20 @@ async def _sync_file_to_r2(chat_id: int, filename: str) -> None:
         # 本地没有此文件，清理 R2 上的残留
         await delete_r2_object(key)
 
+
+async def _sync_file_from_r2(chat_id: int, filename: str) -> None:
+    """兼容旧接口：同步 workspace 根目录下的文件。"""
+    workspace = workspace_root(chat_id)
+    await _sync_named_file_from_r2(chat_id, workspace / filename, filename)
+
+
+async def _sync_file_to_r2(chat_id: int, filename: str) -> None:
+    """兼容旧接口：同步 workspace 根目录下的文件。"""
+    workspace = workspace_root(chat_id)
+    await _sync_named_file_to_r2(chat_id, workspace / filename, filename)
+
+
+# ========== 可选：初始化工作区（后台执行） ==========
 
 # ========== 可选：初始化工作区（后台执行） ==========
 
