@@ -1386,7 +1386,7 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 <tool_usage_guide>
 - todo：用户说"记一下""提醒我"时优先用。写操作（add/done/undone/delete/edit/clear）后紧跟一次 list，让用户看到最新状态。
 - memory：用户说"记住…"或提到长期偏好/过敏/重要他人/截止日期时写入；回答涉及偏好的问题前先 search。
-- skills：自动发现并按需加载 .claude/skills/*/SKILL.md 中的技能说明；技能描述先进入系统提示，正文仅在相关时加载。
+- skills：运行时自动管理 .claude/skills/*/SKILL.md。不要把 skill 当作聊天工具或函数；技能由 agent runtime 自动发现、加载并注入上下文。
 - subagent：彼此独立的子任务请在同一轮里一次性并发派多个 subagent 工具调用，不要一个做完再发下一个；简单问题自己答，不要滥用。子 agent 不继承主对话历史，只看到 task + context。
 </tool_usage_guide>
 """
@@ -1398,9 +1398,10 @@ Available skills:
 {catalog_text}
 
 Skill policy:
-- If the user's request strongly matches a skill, activate it automatically for this turn and keep it active for follow-up turns until the topic changes.
-- If the user explicitly cancels skills, clear the active skill for this chat.
-- Only load the full skill body when the request actually needs it; otherwise rely on the catalog summary.
+- The runtime, not the user-facing model, loads matching skill instructions.
+- Treat loaded <active_skill_context> as authoritative workflow instructions.
+- Never claim that skills are unavailable if a skill catalog or active skill context is present.
+- Never ask for a skill tool or function; skills are not tools.
 </skill_directory>
 """
     else:
@@ -4788,7 +4789,12 @@ async def get_ai_response(
         )
         messages = _build_initial_messages(api_type, system_prompt)
         if skill_context_message and "error" not in skill_context_message:
-            messages.append(skill_context_message)
+            # Some providers do not reliably preserve additional system messages.
+            # Merge active skill instructions into the primary system message so the
+            # model always receives the loaded skill context.
+            skill_content = str(skill_context_message.get("content") or "").strip()
+            if skill_content:
+                messages[0]["content"] += "\\n\\n<active_skill_context>\\n" + skill_content + "\\n</active_skill_context>"
         await _append_history_async(messages, history, api_type, model_info, chat_id=chat_id)
         if model_info.supports_prompt_cache:
             _apply_cache_control(messages)

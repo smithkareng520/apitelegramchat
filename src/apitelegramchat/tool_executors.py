@@ -74,6 +74,7 @@ from apitelegramchat.search_engine import (
     # 子 agent 工具
     execute_subagent,
 )
+from apitelegramchat.skills import catalog_text as skill_catalog_text, read_skill_text as skill_read_text, activate_skill as skill_activate_skill
 from apitelegramchat.todo_tool import (
     render_todo_card,
 )
@@ -1569,6 +1570,12 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                     logger.exception(f"fetch_url unexpected error: {e}")
                     return "⚠️ 页面抓取失败，请稍后重试或检查URL。"
             return "⚠️ 页面抓取失败，请稍后重试。"
+        elif name == "skill_catalog":
+            return skill_catalog_text()
+        elif name == "skill_read":
+            return skill_read_text(arguments.get("skill_id", ""))
+        elif name == "skill_activate":
+            return json.dumps(skill_activate_skill(arguments.get("skill_id", ""), include_body=arguments.get("include_body", True)), ensure_ascii=False, indent=2)
         elif name == "wikipedia":
             return await execute_wikipedia(arguments.get("query", ""), arguments.get("lang", "zh"))
         elif name == "exchange_rate":

@@ -662,6 +662,60 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "skill_catalog",
+            "description": "List available Claude-style skills discovered from .claude/skills and show where they were loaded from.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "_description": {
+                        "type": "string",
+                        "description": "简述本次操作目的（≤60字）。示例：查看可用技能列表"
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_read",
+            "description": "Read the full SKILL.md body for a skill so the model can follow its instructions exactly.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "_description": {
+                        "type": "string",
+                        "description": "简述本次操作目的（≤60字）。示例：读取docx技能说明"
+                    },
+                    "skill_id": {"type": "string", "description": "技能目录名或名称"},
+                    "include_body": {"type": "boolean", "default": True, "description": "是否返回正文"}
+                },
+                "required": ["skill_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_activate",
+            "description": "Activate a skill and return the activation payload, including the full body when needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "_description": {
+                        "type": "string",
+                        "description": "简述本次操作目的（≤60字）。示例：激活docx技能"
+                    },
+                    "skill_id": {"type": "string", "description": "技能目录名或名称"},
+                    "include_body": {"type": "boolean", "default": True, "description": "是否返回正文"}
+                },
+                "required": ["skill_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "wikipedia",
             "description": "Look up a topic on Wikipedia and return an encyclopedic summary. Prefer for factual / definitional queries.",
             "parameters": {
