@@ -57,6 +57,9 @@ except Exception:  # pragma: no cover - optional dependency fallback
     lxml_html = None  # type: ignore
 from apitelegramchat.state import get_editor_file_state, set_editor_file_state, clear_editor_file_state
 
+OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
+
+
 def _build_nav_links(
     lat_wgs: float,
     lon_wgs: float,
@@ -2446,6 +2449,7 @@ async def execute_generate_image(
             "image_size": image_size,
         },
         "n": num_images,
+        "provider": OPENROUTER_PROVIDER_PREFERENCES,
     }
 
     try:

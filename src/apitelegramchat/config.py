@@ -14,6 +14,10 @@ AUTHORIZED_USER = "dearella"
 IMGBB_KEY = os.getenv("IMGBB_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# OpenRouter 全局路由偏好：默认价格优先、允许自动回退；可用环境变量覆盖。
+OPENROUTER_PROVIDER_SORT = (os.getenv("OPENROUTER_PROVIDER_SORT") or "price").strip() or "price"
+OPENROUTER_ALLOW_FALLBACKS = os.getenv("OPENROUTER_ALLOW_FALLBACKS", "true").strip().lower() in {"1", "true", "yes", "on"}
+OPENROUTER_REQUIRE_PARAMETERS = os.getenv("OPENROUTER_REQUIRE_PARAMETERS", "false").strip().lower() in {"1", "true", "yes", "on"}
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 XAI_API_KEY = os.getenv("XAI_API_KEY")
@@ -273,6 +277,17 @@ def _merge_with_defaults(provider: str, overrides: dict) -> dict:
         if value is not None:
             merged[key] = value
     return merged
+
+
+def get_openrouter_provider_preferences() -> dict:
+    """返回所有 OpenRouter 请求共用的路由偏好。"""
+    prefs = {
+        "sort": OPENROUTER_PROVIDER_SORT,
+        "allow_fallbacks": OPENROUTER_ALLOW_FALLBACKS,
+    }
+    if OPENROUTER_REQUIRE_PARAMETERS:
+        prefs["require_parameters"] = True
+    return prefs
 
 
 def make_model_config(

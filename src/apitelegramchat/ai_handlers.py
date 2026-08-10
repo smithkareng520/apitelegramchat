@@ -37,6 +37,7 @@ from apitelegramchat.config import (
     GROQ_API_KEY,
     MODELSCOPE_API_KEY,
     ModelConfig,
+    get_openrouter_provider_preferences,
     STREAM_FLUSH_INTERVAL,
     STREAM_SILENT_FORCE_FLUSH,
     STREAM_FLUSH_CHARS,
@@ -77,6 +78,7 @@ MAX_TOOL_RESPONSE_LEN = 100000
 MAX_TOOL_CALLS = 40
 TOOL_ERROR_STREAK_LIMIT = 3
 TOOL_CALL_TIMEOUT = 12
+OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 # 网络类工具：内部已有自己的超时控制（fetch_url 30s 总超时，web_search 多端点 + warmup），
 # 但外层 12s 会过早杀掉它们，给一个更宽松的 45s 上限兜底。
 LONG_RUNNING_TOOLS = {"web_search", "fetch_url"}
@@ -2223,11 +2225,13 @@ async def _run_tool_calls_and_append(
 
         builder.update_tool_item(tc_id, final_summary, details_html, status=status)
 
-        # ========== 修复问题三：验证 bash 退出码 ==========
-        if fn_name == "bash" and "Exit code: 0" not in details_html:
-            logger.warning(
-                f"[bash] 非零退出码，命令可能失败: {safe_content[:300]!r}"
-            )
+        # ========== bash 退出码告警（仅用于日志，不影响最终成功判断） ==========
+        if fn_name == "bash":
+            exit_match = re.search(r"Exit code:\s*(\d+)", str(safe_content or ""))
+            if exit_match and exit_match.group(1) != "0":
+                logger.warning(
+                    f"[bash] 非零退出码，命令可能失败: {safe_content[:300]!r}"
+                )
 
         # 向 LLM 发送实际工具输出（safe_content），以便 LLM 准确推理
         tool_msg = {"role": "tool", "tool_call_id": tc_id, "name": fn_name, "content": safe_content}
@@ -2281,6 +2285,14 @@ def _tool_result_is_failure(fn_name: str, fn_args: dict, result_content: Any, de
         return True
     text = str(result_content or "").strip()
     lower = text.lower()
+    if fn_name == "bash":
+        # bash 的成功/失败以退出码为准；仅在明确看不到退出码时，再回退到错误前缀判断。
+        m = re.search(r"Exit code:\s*(\d+)", text)
+        if m:
+            return m.group(1) != "0"
+        if lower.startswith(("error:", "exception:", "failed:", "timeout:", "❌")):
+            return True
+        return False
     if lower.startswith(("error:", "exception:", "failed:", "timeout:", "❌")):
         return True
     if text.startswith("{"):
@@ -2290,8 +2302,6 @@ def _tool_result_is_failure(fn_name: str, fn_args: dict, result_content: Any, de
                 return True
         except Exception:
             pass
-    if fn_name == "bash" and details_html and "Exit code: 0" not in details_html:
-        return True
     return False
 
 
@@ -3337,6 +3347,8 @@ async def _agentic_loop_openai_compat(
                 create_params["tools"] = tools
                 create_params["tool_choice"] = "auto"
                 create_params["parallel_tool_calls"] = parallel_tool_calls
+            if api_label == "openrouter":
+                create_params["extra_body"] = _openrouter_extra_body()
 
             comp_stream = await client.chat.completions.create(**create_params)
             async for chunk in comp_stream:
@@ -3503,6 +3515,8 @@ async def _agentic_loop_openai_compat(
                     fallback_params["tools"] = tools
                     fallback_params["tool_choice"] = "auto"
                     fallback_params["parallel_tool_calls"] = parallel_tool_calls
+                if api_label == "openrouter":
+                    fallback_params["extra_body"] = _openrouter_extra_body()
 
                 resp = await client.chat.completions.create(**fallback_params)
                 msg = resp.choices[0].message
@@ -4016,7 +4030,7 @@ async def _agentic_loop_native_image(
                 messages=messages,
                 temperature=0.6,
                 max_tokens=max_tokens,
-                extra_body={"modalities": ["image", "text"]},
+                extra_body={"modalities": ["image", "text"], "provider": OPENROUTER_PROVIDER_PREFERENCES},
                 stream=False,
             )
         except Exception as e:
@@ -4029,7 +4043,7 @@ async def _agentic_loop_native_image(
                 messages=messages,
                 temperature=0.6,
                 max_tokens=max_tokens,
-                extra_body={"modalities": ["image"]},
+                extra_body={"modalities": ["image"], "provider": OPENROUTER_PROVIDER_PREFERENCES},
                 stream=False,
             )
     except Exception as e:
@@ -4389,6 +4403,7 @@ async def _request_openrouter_video(
         "duration": duration,
         "aspect_ratio": "16:9",
         "resolution": "720p",
+        "provider": OPENROUTER_PROVIDER_PREFERENCES,
     }
 
     try:
@@ -5014,6 +5029,10 @@ def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict):
         entry["function"]["name"] += fn["name"]
     if fn.get("arguments"):
         entry["function"]["arguments"] += fn["arguments"]
+
+
+def _openrouter_extra_body() -> dict:
+    return {"provider": OPENROUTER_PROVIDER_PREFERENCES.copy()}
 
 
 
