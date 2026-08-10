@@ -4,8 +4,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from apitelegramchat.skills import discover_skill_roots, get_skill_catalog, load_skill_records, read_skill_text
 from .registry import _chat_id
 from apitelegramchat.workspace_paths import workspace_root, memory_state_file, todo_state_file
+
 
 def _resource_paths(root: Path) -> list[tuple[str, str]]:
     items: list[tuple[str, str]] = []
@@ -15,17 +17,25 @@ def _resource_paths(root: Path) -> list[tuple[str, str]]:
     ]:
         if path.exists():
             items.append((uri, path.name))
+
+    # Skill discovery chain
+    items.append(("workspace://current/skills", "skills.json"))
+    for rec in load_skill_records():
+        items.append((f"workspace://current/skills/{rec.skill_id}", f"{rec.skill_id}.json"))
+
     items.append(("workspace://current/files", "files"))
     items.append(("workspace://current/manifest", "manifest.json"))
     return items
+
 
 async def list_resources() -> list[dict[str, Any]]:
     root = workspace_root(_chat_id())
     items = []
     for uri, rel in _resource_paths(root):
-        mime = "application/json" if rel in {"files", "manifest.json"} or rel.endswith(".json") else "text/plain"
+        mime = "application/json" if rel in {"files", "manifest.json", "skills.json"} or rel.endswith(".json") else "text/plain"
         items.append({"uri": uri, "name": rel, "mimeType": mime})
     return items
+
 
 async def read_resource(uri: str) -> dict[str, Any]:
     root = workspace_root(_chat_id())
@@ -35,9 +45,24 @@ async def read_resource(uri: str) -> dict[str, Any]:
             if path.is_file():
                 payload.append({"path": str(path.relative_to(root)), "size": path.stat().st_size})
         return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload, ensure_ascii=False)}]}
+
     if uri == "workspace://current/manifest":
         payload = {"workspace": str(root), "files": [str(p.relative_to(root)) for p in sorted(root.rglob("*")) if p.is_file()]}
         return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload, ensure_ascii=False)}]}
+
+    if uri == "workspace://current/skills":
+        return {
+            "contents": [{
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": json.dumps(get_skill_catalog(), ensure_ascii=False, indent=2),
+            }]
+        }
+
+    if uri.startswith("workspace://current/skills/"):
+        skill_id = uri.rsplit("/", 1)[-1]
+        return {"contents": [{"uri": uri, "mimeType": "application/json", "text": read_skill_text(skill_id)}]}
+
     mapping = {"workspace://current/todos": todo_state_file(_chat_id()), "workspace://current/memories": memory_state_file(_chat_id())}
     path = mapping.get(uri)
     if path is None:

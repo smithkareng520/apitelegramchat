@@ -1,37 +1,40 @@
 ---
-name: telegram-assistant
-description: Telegram AI assistant capabilities for chat, search, memory, todos, workspace files, and bounded subagents.
+name: universal-workflow
+description: General-purpose on-demand skill for discovering the right skill, selecting the smallest tool, and executing multi-step work safely.
+effort: medium
+priority: 100
 allowed-tools:
-  - memory.manage
-  - todo.manage
-  - subagent.run
-  - workspace.present
-  - shell.exec
+  - skill.catalog
+  - skill.read
+  - skill.activate
   - search.web
   - search.fetch
-  - search.weather
-  - search.news
-  - search.wikipedia
+  - subagent.run
+  - shell.exec
+  - workspace.present
+  - todo.manage
+  - memory.manage
 ---
 
-# Telegram Assistant
+# Universal Workflow Skill
 
-Use this skill when the user wants the Telegram assistant to do real work inside the app.
+Use this skill when the task is broad, multi-step, or benefits from choosing the right skill before acting.
 
-## Core behavior
-- Prefer the smallest tool needed.
-- Choose the smallest skill whose description matches the task.
-- Keep replies concise and grounded in the tool result.
-- For long-running or multi-step tasks, break the work into clear steps and avoid inventing state.
-
-## Tool guidance
-- `memory.manage` for durable facts and preferences.
-- `todo.manage` for reminders and task lists.
-- `workspace.present` when files need to be shown back to the user.
-- `shell.exec` only for bounded workspace-safe commands.
-- `subagent.run` for isolated subproblems that do not need the full conversation.
+## What to do
+1. Inspect the skill catalog when the best route is not obvious.
+2. Activate the smallest skill that actually matches the task.
+3. Read only the selected skill body before doing work.
+4. Batch independent tool calls together; keep dependent calls serial.
+5. Prefer deterministic tools, workspace files, todos, and memory over repeating context in chat.
+6. Use a subagent only for a clearly isolated subproblem.
 
 ## Guardrails
-- Do not claim a skill was updated or saved unless the tool output says so.
-- Do not rely on hidden prompt state; treat the skill file as the source of truth.
-- When a tool says no result or an error, report that clearly and stop.
+- Do not load or execute extra skills “just in case”.
+- Do not invent results, file contents, or tool output.
+- Report failures, missing inputs, and permission limits plainly.
+- Keep the final response concise and grounded in the available evidence.
+
+## Output style
+- Lead with the answer or the next concrete step.
+- Use short, direct sentences.
+- Include links, file paths, or tool results only when they help the user act.

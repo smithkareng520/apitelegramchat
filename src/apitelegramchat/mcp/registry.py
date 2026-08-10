@@ -3,11 +3,9 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, get_args, get_origin
-from uuid import uuid4
 
 from apitelegramchat.memory_tool import execute_memory
 try:
@@ -24,10 +22,12 @@ from apitelegramchat.search_engine import (
     execute_isochrone, execute_news, execute_place_details, execute_qr_code, execute_route,
     execute_search_poi, execute_text_editor, execute_weather, execute_web_search, execute_wikipedia,
 )
+from apitelegramchat.skills import activate_skill, catalog_text, read_skill_text
 from apitelegramchat.workspace_paths import data_root, workspace_root
 from ..core.settings import get_mcp_scope
 
 logger = logging.getLogger("apitelegramchat.mcp")
+
 
 def _chat_id() -> int:
     scope = get_mcp_scope().name
@@ -35,10 +35,12 @@ def _chat_id() -> int:
     digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()
     return int(digest[:12], 16)
 
+
 def _clean_args(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {}
     return {k: v for k, v in data.items() if v is not None}
+
 
 def _jsonable(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
@@ -50,6 +52,7 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_jsonable(v) for v in value]
     return str(value)
+
 
 def _schema_for(fn: Callable[..., Any], *, title: str | None = None) -> dict[str, Any]:
     sig = inspect.signature(fn)
@@ -96,6 +99,7 @@ def _schema_for(fn: Callable[..., Any], *, title: str | None = None) -> dict[str
         schema["title"] = title
     return schema
 
+
 @dataclass(frozen=True)
 class ToolSpec:
     name: str
@@ -103,26 +107,46 @@ class ToolSpec:
     fn: Callable[..., Awaitable[str] | str]
     schema: dict[str, Any]
 
+
 async def _call(fn: Callable[..., Awaitable[str] | str], **kwargs: Any) -> Any:
     result = fn(**kwargs)
     if inspect.isawaitable(result):
         return await result
     return result
 
+
 async def _tool_memory(**kwargs: Any) -> str:
     return await execute_memory(_chat_id(), **_clean_args(kwargs))
+
 
 async def _tool_todo(**kwargs: Any) -> str:
     return await execute_todo(_chat_id(), **_clean_args(kwargs))
 
+
 async def _tool_subagent(**kwargs: Any) -> str:
     return await execute_subagent(_chat_id(), **_clean_args(kwargs))
+
 
 async def _tool_bash(**kwargs: Any) -> str:
     return await execute_bash(_chat_id(), **_clean_args(kwargs))
 
+
 async def _tool_present_files(**kwargs: Any) -> str:
     return await execute_present_files(_chat_id(), **_clean_args(kwargs))
+
+
+async def _tool_skill_catalog(**kwargs: Any) -> str:
+    return catalog_text()
+
+
+async def _tool_skill_read(skill_id: str, **kwargs: Any) -> str:
+    return read_skill_text(skill_id)
+
+
+async def _tool_skill_activate(skill_id: str, include_body: bool = True, **kwargs: Any) -> str:
+    result = activate_skill(skill_id, include_body=include_body)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
 
 TOOL_SPECS: list[ToolSpec] = [
     ToolSpec("memory.manage", "Manage persistent long-term memory.", _tool_memory, _schema_for(execute_memory, title="memory.manage")),
@@ -130,6 +154,9 @@ TOOL_SPECS: list[ToolSpec] = [
     ToolSpec("subagent.run", "Spawn a bounded subagent to complete a task.", _tool_subagent, _schema_for(execute_subagent, title="subagent.run")),
     ToolSpec("shell.exec", "Run a sandboxed shell command within the workspace.", _tool_bash, _schema_for(execute_bash, title="shell.exec")),
     ToolSpec("workspace.present", "Return workspace files to the client.", _tool_present_files, _schema_for(execute_present_files, title="workspace.present")),
+    ToolSpec("skill.catalog", "Discover available skills from .claude/skills.", _tool_skill_catalog, _schema_for(_tool_skill_catalog, title="skill.catalog")),
+    ToolSpec("skill.read", "Load one skill body on demand.", _tool_skill_read, _schema_for(_tool_skill_read, title="skill.read")),
+    ToolSpec("skill.activate", "Select a skill and return its activation payload.", _tool_skill_activate, _schema_for(_tool_skill_activate, title="skill.activate")),
     ToolSpec("search.web", "Search the web.", lambda **kw: _call(execute_web_search, **_clean_args(kw)), _schema_for(execute_web_search, title="search.web")),
     ToolSpec("search.fetch", "Fetch and extract a URL.", lambda **kw: _call(execute_fetch_url, **_clean_args(kw)), _schema_for(execute_fetch_url, title="search.fetch")),
     ToolSpec("search.wikipedia", "Query Wikipedia.", lambda **kw: _call(execute_wikipedia, **_clean_args(kw)), _schema_for(execute_wikipedia, title="search.wikipedia")),
@@ -157,8 +184,10 @@ TOOL_SPECS: list[ToolSpec] = [
 
 TOOL_MAP = {spec.name: spec for spec in TOOL_SPECS}
 
+
 async def list_tools() -> list[dict[str, Any]]:
     return [{"name": spec.name, "description": spec.description, "inputSchema": spec.schema} for spec in TOOL_SPECS]
+
 
 async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     spec = TOOL_MAP.get(name)
