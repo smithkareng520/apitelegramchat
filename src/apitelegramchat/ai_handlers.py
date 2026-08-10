@@ -60,6 +60,11 @@ from apitelegramchat.utils import (
 )
 from apitelegramchat.file_handlers import get_file_path
 from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2
+from apitelegramchat.skills import (
+    build_skill_system_message,
+    match_skill_for_text,
+    skill_catalog_brief,
+)
 from apitelegramchat.tool_executors import (
     dispatch_tool_call,
     format_tool_result,
@@ -83,6 +88,11 @@ OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 # 但外层 12s 会过早杀掉它们，给一个更宽松的 45s 上限兜底。
 LONG_RUNNING_TOOLS = {"web_search", "fetch_url"}
 LONG_TOOL_CALL_TIMEOUT = 45
+# bash 工具：模型会用它跑 skill 脚本（docx-js / reportlab / pdfplumber 等），
+# 12s 太短——node 启动 + require('docx') 就要 3-5s，npm install 更是 30s+。
+# 给 90s 上限，仍小于沙箱内部的 SANDBOX_TIMEOUT_SEC=120s，让沙箱先兜底。
+BASH_TOOLS = {"bash"}
+BASH_TOOL_TIMEOUT = 90
 # 子 agent 工具：内部跑自己的多轮 agentic loop（每轮一次 LLM 调用 + 可能的工具调用），
 # 默认 90s，用户可配到 300s。外层必须给足够长的超时，否则 12s 一定会杀掉它。
 SUBAGENT_TOOLS = {"subagent"}
@@ -1206,7 +1216,12 @@ def _format_image_safety_notice(detail: str = "", model: str = "") -> str:
 
 
 # ========== 系统提示 ==========
-async def build_system_prompt(chat_id: int = None, username: str = "用户", supports_tools: bool = True) -> str:
+async def build_system_prompt(
+    chat_id: int = None,
+    username: str = "用户",
+    supports_tools: bool = True,
+    skill_catalog_text: str | None = None,
+) -> str:
     current_time = get_current_time()
     base_prompt = f"""
 <System Instruction - Top Priority>
@@ -1351,6 +1366,7 @@ When the user message contains attachment placeholders, treat them as preserved 
 </attachment_handling>
 """
     if supports_tools:
+        catalog_text = skill_catalog_text or skill_catalog_brief()
         base_prompt += """
 <u>Agentic Search Workflow</u>
 Call multiple independent tools in parallel when possible. If a tool fails, continue with successful results. Never hallucinate missing data.
@@ -1375,9 +1391,25 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 <tool_usage_guide>
 - todo：用户说"记一下""提醒我"时优先用。写操作（add/done/undone/delete/edit/clear）后紧跟一次 list，让用户看到最新状态。
 - memory：用户说"记住…"或提到长期偏好/过敏/重要他人/截止日期时写入；回答涉及偏好的问题前先 search。
-- skill：use 后按该技能的文件式 instruction 调整回复风格，直到用户切换或取消。
+- skills：运行时自动管理 .claude/skills/*/SKILL.md。匹配上的技能会被 agent runtime 自动加载，并作为 <active_skill_context> 注入系统提示。技能不是聊天工具或函数；不要尝试"激活"技能——直接按 <active_skill_context> 里的步骤执行。当 <active_skill_context> 出现时，里面的"Skill package root"是技能包在磁盘上的绝对路径；技能包内的脚本在 bash 沙箱中以只读+可执行方式挂载，用 `cd "$SKILL_DIR_<ID>" && python scripts/foo.py` 即可调用；写文件要写到当前 workspace，不要写进技能包。skill_catalog / skill_read 仅供跨技能查阅（例如一个技能的正文引用了另一个技能），不要拿它们当"激活"用。
 - subagent：彼此独立的子任务请在同一轮里一次性并发派多个 subagent 工具调用，不要一个做完再发下一个；简单问题自己答，不要滥用。子 agent 不继承主对话历史，只看到 task + context。
 </tool_usage_guide>
+"""
+        base_prompt += f"""
+
+<skill_directory>
+Claude-style skills are available in this workspace. The runtime auto-activates the best-matching skill and injects it as <active_skill_context> in the system prompt — you do not need to call any tool to "turn on" a skill.
+Available skills:
+{catalog_text}
+
+Skill policy:
+- The runtime, not the model, decides which skill to load. Treat the loaded <active_skill_context> as authoritative workflow instructions and follow its steps exactly.
+- The <active_skill_context> block tells you the skill package's absolute root path ("Skill package root: ..."), the package's file manifest, and the env var that expands to it ($SKILL_DIR_<ID>). Use these paths to invoke skill-provided scripts.
+- The bash sandbox grants READ-ONLY + EXECUTE access to skill package roots. You can `cd` into a skill package and run its scripts (e.g. `python scripts/office/soffice.py`). You CANNOT write into the skill package — write all output files into the workspace (the shell's current working directory).
+- All skill dependencies are PRE-INSTALLED in the image: node + docx (global npm), pandoc, python pypdf/pdfplumber/reportlab/pytesseract/pdf2image, tesseract-ocr, poppler-utils. Do NOT run `npm install`, `pip install`, or `apt-get install` — they will waste the 90s bash timeout and fail. If a skill script says "Install: ...", assume it is already installed and skip that step.
+- Never claim that skills are unavailable if a skill catalog or active skill context is present.
+- skill_catalog and skill_read are info-only tools for inspecting skills that were NOT auto-activated (e.g. cross-skill reference). Do not call them to "enable" a skill — the runtime handles activation.
+</skill_directory>
 """
     else:
         base_prompt += """
@@ -2139,11 +2171,14 @@ async def _run_tool_calls_and_append(
             # 图像 / 视频工具不设超时（内部已有轮询超时控制）
             # 子 agent 走 310s 超时（内部默认 90s，用户可配到 300s）
             # 网络类工具（web_search / fetch_url）走 45s 宽松超时，避免外层 12s 误杀
+            # bash 工具走 90s 超时（skill 脚本 / npm / reportlab 都需要时间）
             # 其他工具保持 12 秒
             if fn_name in MEDIA_GEN_TOOLS:
                 timeout = None
             elif fn_name in SUBAGENT_TOOLS:
                 timeout = SUBAGENT_TOOL_TIMEOUT
+            elif fn_name in BASH_TOOLS:
+                timeout = BASH_TOOL_TIMEOUT
             elif fn_name in LONG_RUNNING_TOOLS:
                 timeout = LONG_TOOL_CALL_TIMEOUT
             else:
@@ -4725,9 +4760,51 @@ async def get_ai_response(
             # 复制历史快照，避免在锁外被并发请求追加导致竞态
             history = list(user_contexts.get(chat_id, {}).get("conversation_history", []))
             supports_tools = model_info.supports_tools
+            active_skill = user_contexts.get(chat_id, {}).get("active_skill")
 
-        system_prompt = await build_system_prompt(chat_id, username, supports_tools=supports_tools)
+        active_skill_id = active_skill.get("skill_id") if isinstance(active_skill, dict) else None
+        skill_request_text = _extract_skill_request_text(user_message)
+        skill_match = match_skill_for_text(skill_request_text, current_skill_id=active_skill_id)
+
+        skill_context_message: dict[str, Any] | None = None
+        skill_to_use: str | None = None
+
+        if skill_match is not None:
+            skill_to_use = skill_match.get("skill_id")
+            if skill_to_use is None:
+                async with lock:
+                    ctx = state.get_or_init_context(chat_id)
+                    ctx["active_skill"] = None
+            elif skill_to_use != active_skill_id:
+                skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
+                async with lock:
+                    ctx = state.get_or_init_context(chat_id)
+                    ctx["active_skill"] = {
+                        "skill_id": skill_to_use,
+                        "reason": skill_match.get("reason", "自动匹配"),
+                        "score": skill_match.get("score", 0),
+                        "updated_at": time.time(),
+                    }
+            else:
+                skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
+        elif active_skill_id:
+            skill_to_use = active_skill_id
+            skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
+
+        system_prompt = await build_system_prompt(
+            chat_id,
+            username,
+            supports_tools=supports_tools,
+            skill_catalog_text=skill_catalog_brief(),
+        )
         messages = _build_initial_messages(api_type, system_prompt)
+        if skill_context_message and "error" not in skill_context_message:
+            # Some providers do not reliably preserve additional system messages.
+            # Merge active skill instructions into the primary system message so the
+            # model always receives the loaded skill context.
+            skill_content = str(skill_context_message.get("content") or "").strip()
+            if skill_content:
+                messages[0]["content"] += "\\n\\n<active_skill_context>\\n" + skill_content + "\\n</active_skill_context>"
         await _append_history_async(messages, history, api_type, model_info, chat_id=chat_id)
         if model_info.supports_prompt_cache:
             _apply_cache_control(messages)
@@ -5033,6 +5110,29 @@ def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict):
 
 def _openrouter_extra_body() -> dict:
     return {"provider": OPENROUTER_PROVIDER_PREFERENCES.copy()}
+
+
+def _extract_skill_request_text(user_message: dict | None) -> str:
+    if not isinstance(user_message, dict):
+        return ""
+
+    parts: list[str] = []
+    content = user_message.get("content")
+    if isinstance(content, str) and content.strip():
+        parts.append(content)
+    elif content is not None:
+        parts.append(str(content))
+
+    for key in ("file_name", "file_names", "mime_type", "mime_types", "type", "attachments"):
+        value = user_message.get(key)
+        if not value:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            parts.extend(str(item) for item in value if str(item).strip())
+        else:
+            parts.append(str(value))
+
+    return "\n".join(parts)
 
 
 

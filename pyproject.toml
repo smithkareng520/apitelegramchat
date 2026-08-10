@@ -20,6 +20,12 @@ dependencies = [
   "cachetools==5.5.0",
   "aioboto3==12.4.0",
   "numpy<2.0.0",
+  # skill dependencies (pre-installed so the model doesn't pip install at runtime)
+  "pypdf>=4.0.0",
+  "pdfplumber>=0.11.0",
+  "reportlab>=4.0.0",
+  "pytesseract>=0.3.10",
+  "pdf2image>=1.17.0",
 ]
 
 [project.scripts]

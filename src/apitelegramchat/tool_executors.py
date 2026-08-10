@@ -74,6 +74,7 @@ from apitelegramchat.search_engine import (
     # 子 agent 工具
     execute_subagent,
 )
+from apitelegramchat.skills import catalog_text as skill_catalog_text, read_skill_text as skill_read_text
 from apitelegramchat.todo_tool import (
     render_todo_card,
 )
@@ -96,6 +97,36 @@ def _truncate_tool_result(result: str) -> str:
     if len(result) > MAX_TOOL_RESPONSE_LEN:
         return result[:MAX_TOOL_RESPONSE_LEN] + "\n…[内容过长已截断]"
     return result
+
+
+def _collect_skill_roots() -> list[str]:
+    """Return absolute paths of all discovered skill package directories.
+
+    Used to extend the bash Landlock sandbox so the agent can read & execute
+    skill-provided scripts. Errors are logged and ignored — skill access is
+    a privilege, not a hard requirement for the sandbox to start.
+    """
+    try:
+        from apitelegramchat.skills import discover_skill_roots
+        roots: list[str] = []
+        for root in discover_skill_roots():
+            try:
+                roots.append(str(root.resolve()))
+            except Exception:
+                roots.append(str(root))
+            try:
+                for child in sorted(root.iterdir()):
+                    if child.is_dir() and (child / "SKILL.md").is_file():
+                        try:
+                            roots.append(str(child.resolve()))
+                        except Exception:
+                            roots.append(str(child))
+            except Exception:
+                pass
+        return roots
+    except Exception as exc:
+        logger.debug("Failed to collect skill roots for sandbox: %s", exc)
+        return []
 
 def extract_domain(url: str) -> str:
     if not url:
@@ -131,11 +162,19 @@ class BashSession:
 
         # ★ Landlock：把文件系统访问限制在 workspace 目录内，
         #   拒绝访问 /tmp 其他子目录（state/、r2_cache/）、/app 源码等。
-        #   通过 functools.partial 把 workspace 路径传给 preexec。
+        #   同时授权 .claude/skills/*/ 只读+可执行，让 agent 能跑技能包脚本。
+        #   HOME 目录（/tmp/apitelegramchat_home/<chat_id>）也授权可写，
+        #   这样即使模型违规跑 pip --user，产物也落在 HOME 里，不污染 workspace→R2。
+        #   通过 functools.partial 把 workspace 路径 + skill roots + home 传给 preexec。
         import functools
+        skill_roots = _collect_skill_roots()
+        home_dir = env.get("HOME")
+        extra_rw = [home_dir] if home_dir and home_dir != str(self.workdir.absolute()) else []
         preexec = functools.partial(
             _preexec_sandbox,
             str(self.workdir.absolute()),
+            skill_roots,
+            extra_rw,
         )
 
         logger.info(f"Starting bash session chat_id={self.chat_id}")
@@ -185,6 +224,52 @@ class BashSession:
          "anonymous fork function"),
     ]
 
+    # ===================== 包管理器拦截 =====================
+    # 模型经常无视 system prompt 里"依赖已预装"的提示，硬跑 pip/npm/apt install。
+    # 后果：
+    #   1. 12-90s 必超时（npm install docx ~30s，pip install python-docx ~20s）
+    #   2. 产物落到 ~/.local/ 或 ~/.cache/，污染 workspace→R2 同步（一次上千个 PUT）
+    #   3. 装错包（模型把 docx-js 当成 python-docx 装）
+    # 策略：检测到这些命令就直接返回友好提示，不真正执行。提示里明确告诉模型
+    # 依赖已预装、应该怎么用，让它在下一轮直接用对的方式。
+    _PKG_MANAGER_PATTERNS = [
+        # pip install / pip3 install / python -m pip install
+        (re.compile(r'\b(?:pip|pip3)\s+install\b'), "pip install"),
+        (re.compile(r'\bpython3?\s+-m\s+pip\s+install\b'), "python -m pip install"),
+        # npm install / npm i / npm add（但允许 npm run / npm start / npm list）
+        (re.compile(r'\bnpm\s+(?:install|i|add)\b(?!\s*-g)'), "npm install (local)"),
+        # apt-get install / apt install
+        (re.compile(r'\bapt(?:-get)?\s+install\b'), "apt install"),
+        # cargo install
+        (re.compile(r'\bcargo\s+install\b'), "cargo install"),
+        # gem install
+        (re.compile(r'\bgem\s+install\b'), "gem install"),
+        # yarn add / yarn install（但允许 yarn build 等）
+        (re.compile(r'\byarn\s+(?:add|install)\b'), "yarn add/install"),
+    ]
+
+    def _check_package_manager(self, command: str) -> str | None:
+        """检测包管理器命令。返回提示字符串（应直接作为命令输出返回），或 None（放行）。"""
+        for pattern, name in self._PKG_MANAGER_PATTERNS:
+            if pattern.search(command):
+                logger.info(f"📦 Bash blocked ({name}) chat_id={self.chat_id}: {command[:200]}")
+                return (
+                    f"[blocked: {name}]\n"
+                    f"All skill dependencies are PRE-INSTALLED in the image. Do NOT run package managers.\n"
+                    f"\n"
+                    f"Pre-installed:\n"
+                    f"  - Python: pypdf, pdfplumber, reportlab, pytesseract, pdf2image, Pillow, lxml\n"
+                    f"  - Node.js: docx (global, `require('docx')` works directly)\n"
+                    f"  - System: pandoc, tesseract-ocr, poppler-utils (pdftoppm/pdftotext)\n"
+                    f"\n"
+                    f"If you need a package that is genuinely missing, ask the user to rebuild the image.\n"
+                    f"If you were trying to use docx (Word documents), it is the JavaScript npm package — "
+                    f"write a .js file and run it with `node file.js`, do NOT pip install python-docx.\n"
+                    f"If you were trying to use pdf tools, use `import pypdf` / `import pdfplumber` / "
+                    f"`import reportlab` directly in Python — they are already importable.\n"
+                )
+        return None
+
     def _is_safe(self, command: str) -> bool:
         """最小黑名单，仅拦极端操作；其余靠沙箱"""
         if not command or not command.strip():
@@ -211,6 +296,17 @@ class BashSession:
 
             if not self._is_safe(command):
                 return f"Error: Command rejected for security reasons: {command}"
+
+            # ★ 包管理器拦截：pip/npm/apt install 等命令直接返回提示，不执行。
+            # 依赖已在镜像里预装，跑这些只会超时 + 污染 R2 同步。
+            pkg_msg = self._check_package_manager(command)
+            if pkg_msg is not None:
+                return (
+                    f"Command: {command}\n"
+                    f"Exit code: 0 (blocked before exec)\n"
+                    f"Sandbox: landlock (skipped)\n"
+                    f"Output:\n{pkg_msg}"
+                )
 
             marker = f"__END_{random.randint(100000, 999999)}__"
             workspace_dir = shlex.quote(str(self.workdir.absolute()))
@@ -1569,6 +1665,10 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                     logger.exception(f"fetch_url unexpected error: {e}")
                     return "⚠️ 页面抓取失败，请稍后重试或检查URL。"
             return "⚠️ 页面抓取失败，请稍后重试。"
+        elif name == "skill_catalog":
+            return skill_catalog_text()
+        elif name == "skill_read":
+            return skill_read_text(arguments.get("skill_id", ""))
         elif name == "wikipedia":
             return await execute_wikipedia(arguments.get("query", ""), arguments.get("lang", "zh"))
         elif name == "exchange_rate":
