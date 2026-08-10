@@ -24,7 +24,7 @@ from apitelegramchat.workspace_utils import (
 from apitelegramchat.sandbox import (
     build_bwrap_argv, build_fallback_argv, build_fallback_env,
     is_bwrap_available, watchdog, apply_prlimit, _preexec_fallback,
-    SANDBOX_TIMEOUT_SEC,
+    SANDBOX_TIMEOUT_SEC, SANDBOX_ALLOW_FALLBACK,
 )
 
 from apitelegramchat.config import (
@@ -134,6 +134,8 @@ class BashSession:
             # bwrap 模式：父进程不传任何环境变量（bwrap --clearenv 已清）
             env = {}
         else:
+            if not SANDBOX_ALLOW_FALLBACK:
+                raise RuntimeError("bash sandbox unavailable: bwrap is required for workspace-only access")
             argv = build_fallback_argv(self.workspace, self.chat_id)
             self._sandbox_mode = "fallback"
             # fallback 模式：只传白名单 env
@@ -366,7 +368,10 @@ async def execute_bash(chat_id: int, command: str = "", restart: bool = False) -
         return result
     if not command:
         return "Error: command is required (or set restart=true)"
-    session = await _bash_manager.get_session(chat_id)
+    try:
+        session = await _bash_manager.get_session(chat_id)
+    except RuntimeError as e:
+        return f"Error: {e}"
     # 执行命令，内部已包含异步同步
     return await session.execute(command)
 

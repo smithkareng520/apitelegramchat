@@ -3,9 +3,9 @@
 # =====================================================================
 # 设计原则:
 #   1. 每个 chat_id 拿到独立的 mount/pid/ipc/uts/cgroup 命名空间
-#   2. workspace 之外的所有路径只读
+#   2. 只暴露用户工作区与最小系统运行时，不挂载应用目录
 #   3. 敏感环境变量不传入子进程
-#   4. bwrap 不可用时回落到弱模式 (env 清洗 + rlimit + no-new-privs)
+#   4. bwrap 不可用时默认禁用 bash，以免退回到不隔离的主机环境
 #   5. 看门狗监控进程树大小，超过阈值杀掉沙箱 (防 fork bomb)
 # =====================================================================
 
@@ -32,6 +32,7 @@ SANDBOX_MAX_CPU_SEC = int(os.getenv("SANDBOX_MAX_CPU_SEC", "300"))   # 5 分钟 
 SANDBOX_MAX_FILE_SIZE = int(os.getenv("SANDBOX_MAX_FILE_SIZE", str(100 * 1024 * 1024)))  # 100MB/文件
 SANDBOX_MAX_OPEN_FILES = int(os.getenv("SANDBOX_MAX_OPEN_FILES", "256"))
 SANDBOX_TIMEOUT_SEC = int(os.getenv("SANDBOX_TIMEOUT_SEC", "120"))
+SANDBOX_ALLOW_FALLBACK = os.getenv("SANDBOX_ALLOW_FALLBACK", "0") == "1"
 
 # ---------- 只读共享的系统目录（每个会话只读挂载） ----------
 _RO_BINDS = [
@@ -40,7 +41,6 @@ _RO_BINDS = [
     "/etc/passwd", "/etc/group",          # 仅元数据，无密码
     "/etc/resolv.conf", "/etc/hosts",     # DNS 必需
     "/etc/nsswitch.conf",
-    "/app",                                # 应用代码只读
 ]
 
 # ---------- libc (用于 prctl / prlimit) ----------
@@ -114,9 +114,9 @@ def build_bwrap_argv(workspace: Path, chat_id: int) -> list:
     workspace: 该 chat 的根工作区绝对路径
     """
     ws = str(workspace.absolute())
-    ws_parent = str(workspace.parent.absolute())
+    workspace_mount = "/workspace"
     workdir = workspace_workdir(chat_id)
-    workdir_abs = str(workdir.absolute())
+    workdir_abs = workspace_mount
 
     argv = [
         BWRAP,
@@ -145,10 +145,9 @@ def build_bwrap_argv(workspace: Path, chat_id: int) -> list:
         if Path(d).exists():
             argv += ["--ro-bind", d, d]
 
-    # workspace 父目录：以空 dir 形式挂载，沙箱内看不到兄弟目录
-    argv += ["--dir", ws_parent]
-    # workspace 自身：可读写挂载
-    argv += ["--bind", ws, ws]
+    # 将用户工作区仅挂载到沙箱内部的 /workspace，避免暴露主机上的真实路径
+    argv += ["--dir", workspace_mount]
+    argv += ["--bind", ws, workspace_mount]
 
     # ===== 网络 =====
     if SANDBOX_UNSHARE_NET:
@@ -175,7 +174,7 @@ def build_bwrap_argv(workspace: Path, chat_id: int) -> list:
         argv += ["--setenv", k, v]
 
     # ===== workspace =====
-    argv += ["--chdir", workdir_abs]
+    argv += ["--chdir", workspace_mount]
 
     # ===== 实际启动的进程 =====
     argv += ["/bin/bash", "--noprofile", "--norc", "-s"]

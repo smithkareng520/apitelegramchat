@@ -33,8 +33,8 @@ import aiohttp
 
 from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
-    _sync_state_file_from_r2,
-    _sync_state_file_to_r2,
+    _sync_named_file_from_r2,
+    _sync_named_file_to_r2,
 )
 from apitelegramchat.config import BASE_URL
 
@@ -60,6 +60,30 @@ def _todo_path(chat_id: int) -> Path:
     return todo_state_file(chat_id)
 
 
+def _legacy_todo_path(chat_id: int) -> Path:
+    return workspace_root(chat_id) / TODO_FILENAME
+
+
+def _cleanup_legacy_todo_copy(chat_id: int) -> None:
+    """
+    清理旧版残留：早期版本会把 todos.json 放在 workspace 根目录。
+    现在状态文件统一放到 state/{id}/ 下，这里顺手迁移/删除旧文件。
+    """
+    legacy = _legacy_todo_path(chat_id)
+    current = _todo_path(chat_id)
+    if legacy == current:
+        return
+    try:
+        if not legacy.exists():
+            return
+        current.parent.mkdir(parents=True, exist_ok=True)
+        if not current.exists():
+            os.replace(legacy, current)
+            return
+        legacy.unlink()
+    except OSError as e:
+        logger.warning(f"todos.json 旧路径清理失败 (chat={chat_id}): {e}")
+
 
 def _new_id() -> str:
     """8 位短 id，足够避免单 chat 内冲突，callback_data 也装得下。"""
@@ -72,6 +96,7 @@ def _empty_store() -> dict:
 
 def _load_local(chat_id: int) -> dict:
     """从本地读取 todos.json。文件不存在或损坏时返回空 store。"""
+    _cleanup_legacy_todo_copy(chat_id)
     path = _todo_path(chat_id)
     if not path.is_file():
         return _empty_store()
@@ -88,6 +113,7 @@ def _load_local(chat_id: int) -> dict:
 
 def _save_local(chat_id: int, store: dict) -> None:
     """写入本地，并保证目录存在。"""
+    _cleanup_legacy_todo_copy(chat_id)
     path = _todo_path(chat_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     store["updated_at"] = int(time.time())
@@ -149,7 +175,7 @@ async def _read_store(chat_id: int, fn) -> dict:
     lock = await _get_workspace_lock(chat_id)
     async with lock:
         try:
-            await _sync_state_file_from_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
+            await _sync_named_file_from_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
         except Exception as e:
             logger.warning(f"todos: R2→local 同步失败 (chat={chat_id}): {e}")
         store = _load_local(chat_id)
@@ -171,7 +197,7 @@ async def _mutate(chat_id: int, fn) -> dict:
     lock = await _get_workspace_lock(chat_id)
     async with lock:
         try:
-            await _sync_state_file_from_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
+            await _sync_named_file_from_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
         except Exception as e:
             logger.warning(f"todos: R2→local 同步失败 (chat={chat_id}): {e}")
         store = _load_local(chat_id)
@@ -182,7 +208,7 @@ async def _mutate(chat_id: int, fn) -> dict:
         _save_local(chat_id, store)
         # 同步回 R2（单文件，同步等待——JSON 文件很小，<1s）
         try:
-            await _sync_state_file_to_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
+            await _sync_named_file_to_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
         except Exception as e:
             logger.warning(f"todos: local→R2 同步失败 (chat={chat_id}): {e}")
         return payload
