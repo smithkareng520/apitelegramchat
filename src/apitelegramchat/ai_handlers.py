@@ -60,6 +60,11 @@ from apitelegramchat.utils import (
 )
 from apitelegramchat.file_handlers import get_file_path
 from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2
+from apitelegramchat.skills import (
+    build_skill_system_message,
+    match_skill_for_text,
+    skill_catalog_brief,
+)
 from apitelegramchat.tool_executors import (
     dispatch_tool_call,
     format_tool_result,
@@ -1206,7 +1211,12 @@ def _format_image_safety_notice(detail: str = "", model: str = "") -> str:
 
 
 # ========== 系统提示 ==========
-async def build_system_prompt(chat_id: int = None, username: str = "用户", supports_tools: bool = True) -> str:
+async def build_system_prompt(
+    chat_id: int = None,
+    username: str = "用户",
+    supports_tools: bool = True,
+    skill_catalog_text: str | None = None,
+) -> str:
     current_time = get_current_time()
     base_prompt = f"""
 <System Instruction - Top Priority>
@@ -1351,6 +1361,7 @@ When the user message contains attachment placeholders, treat them as preserved 
 </attachment_handling>
 """
     if supports_tools:
+        catalog_text = skill_catalog_text or skill_catalog_brief()
         base_prompt += """
 <u>Agentic Search Workflow</u>
 Call multiple independent tools in parallel when possible. If a tool fails, continue with successful results. Never hallucinate missing data.
@@ -1378,6 +1389,19 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 - skill：use 后按该技能的文件式 instruction 调整回复风格，直到用户切换或取消。
 - subagent：彼此独立的子任务请在同一轮里一次性并发派多个 subagent 工具调用，不要一个做完再发下一个；简单问题自己答，不要滥用。子 agent 不继承主对话历史，只看到 task + context。
 </tool_usage_guide>
+"""
+        base_prompt += f"""
+
+<skill_directory>
+Claude-style skills are available in this workspace. Use the catalog below to infer when a request should activate a skill automatically.
+Available skills:
+{catalog_text}
+
+Skill policy:
+- If the user's request strongly matches a skill, activate it automatically for this turn and keep it active for follow-up turns until the topic changes.
+- If the user explicitly cancels skills, clear the active skill for this chat.
+- Only load the full skill body when the request actually needs it; otherwise rely on the catalog summary.
+</skill_directory>
 """
     else:
         base_prompt += """
@@ -4725,9 +4749,46 @@ async def get_ai_response(
             # 复制历史快照，避免在锁外被并发请求追加导致竞态
             history = list(user_contexts.get(chat_id, {}).get("conversation_history", []))
             supports_tools = model_info.supports_tools
+            active_skill = user_contexts.get(chat_id, {}).get("active_skill")
 
-        system_prompt = await build_system_prompt(chat_id, username, supports_tools=supports_tools)
+        active_skill_id = active_skill.get("skill_id") if isinstance(active_skill, dict) else None
+        skill_request_text = _extract_skill_request_text(user_message)
+        skill_match = match_skill_for_text(skill_request_text, current_skill_id=active_skill_id)
+
+        skill_context_message: dict[str, Any] | None = None
+        skill_to_use: str | None = None
+
+        if skill_match is not None:
+            skill_to_use = skill_match.get("skill_id")
+            if skill_to_use is None:
+                async with lock:
+                    ctx = state.get_or_init_context(chat_id)
+                    ctx["active_skill"] = None
+            elif skill_to_use != active_skill_id:
+                skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
+                async with lock:
+                    ctx = state.get_or_init_context(chat_id)
+                    ctx["active_skill"] = {
+                        "skill_id": skill_to_use,
+                        "reason": skill_match.get("reason", "自动匹配"),
+                        "score": skill_match.get("score", 0),
+                        "updated_at": time.time(),
+                    }
+            else:
+                skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
+        elif active_skill_id:
+            skill_to_use = active_skill_id
+            skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
+
+        system_prompt = await build_system_prompt(
+            chat_id,
+            username,
+            supports_tools=supports_tools,
+            skill_catalog_text=skill_catalog_brief(),
+        )
         messages = _build_initial_messages(api_type, system_prompt)
+        if skill_context_message and "error" not in skill_context_message:
+            messages.append(skill_context_message)
         await _append_history_async(messages, history, api_type, model_info, chat_id=chat_id)
         if model_info.supports_prompt_cache:
             _apply_cache_control(messages)
@@ -5033,6 +5094,29 @@ def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict):
 
 def _openrouter_extra_body() -> dict:
     return {"provider": OPENROUTER_PROVIDER_PREFERENCES.copy()}
+
+
+def _extract_skill_request_text(user_message: dict | None) -> str:
+    if not isinstance(user_message, dict):
+        return ""
+
+    parts: list[str] = []
+    content = user_message.get("content")
+    if isinstance(content, str) and content.strip():
+        parts.append(content)
+    elif content is not None:
+        parts.append(str(content))
+
+    for key in ("file_name", "file_names", "mime_type", "mime_types", "type", "attachments"):
+        value = user_message.get(key)
+        if not value:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            parts.extend(str(item) for item in value if str(item).strip())
+        else:
+            parts.append(str(value))
+
+    return "\n".join(parts)
 
 
 

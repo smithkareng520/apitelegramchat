@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -198,6 +199,164 @@ def _read_full_skill(skill_path: Path) -> tuple[dict[str, Any], str]:
         return {}, text.strip()
     header, body = match.group(1), match.group(2).strip()
     return _parse_frontmatter_lines(header.splitlines()), body
+
+
+def _skill_text_for_matching(rec: SkillRecord) -> str:
+    parts = [rec.skill_id, rec.name, rec.description, rec.path]
+    return " ".join(part for part in parts if part).lower()
+
+
+def _normalize_request_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def _tokenize_request_text(text: str) -> set[str]:
+    normalized = _normalize_request_text(text)
+    if not normalized:
+        return set()
+    pieces = set(re.findall(r"[\w.-]+|[\u4e00-\u9fff]+", normalized))
+    for phrase in ("word 文档", "word文档", ".docx", ".pdf", "前端设计", "界面设计", "生成图片"):
+        if phrase in normalized:
+            pieces.add(phrase)
+    return pieces
+
+
+def _score_skill_match(skill: SkillRecord, request_text: str) -> tuple[int, str]:
+    text = _normalize_request_text(request_text)
+    if not text:
+        return 0, ""
+
+    haystack = _skill_text_for_matching(skill)
+    score = 0
+    reasons: list[str] = []
+
+    exact_hits = {
+        "pdf": [".pdf", "pdf", "ocr", "扫描", "合并", "拆分", "水印", "表单", "填表", "抽取文本", "提取文本"],
+        "docx": [".docx", "docx", "word", "word文档", "word 文档", "报告", "备忘录", "信函", "模板", "批注", "修订"],
+        "frontend-design": [
+            "frontend", "前端", "ui", "界面", "页面", "布局", "tailwind", "react", "组件", "设计",
+            "登录页", "落地页", "仪表盘", "dashboard", "responsive", "样式", "配色", "排版", "动效",
+        ],
+    }
+
+    for token in exact_hits.get(skill.skill_id, []):
+        if token in text:
+            score += 5
+            reasons.append(token)
+
+    tokens = _tokenize_request_text(text)
+    skill_tokens = set(re.findall(r"[\w.-]+|[\u4e00-\u9fff]+", haystack))
+    overlap = tokens & skill_tokens
+    if overlap:
+        score += min(6, len(overlap) * 2)
+        reasons.extend(sorted(overlap)[:3])
+
+    if skill.description:
+        score += 1 if len(skill.description) < 180 else 0
+
+    return score, ", ".join(dict.fromkeys(reasons))
+
+
+@lru_cache(maxsize=1)
+def _cached_skill_catalog_text() -> str:
+    return catalog_text()
+
+
+def refresh_skill_cache() -> None:
+    """清空 skill 目录缓存；在运行时新增/删除 skill 后可调用。"""
+    _cached_skill_catalog_text.cache_clear()
+
+
+def skill_catalog_brief() -> str:
+    """给系统提示用的精简技能目录。"""
+    return _cached_skill_catalog_text()
+
+
+def match_skill_for_text(
+    request_text: str,
+    *,
+    current_skill_id: str | None = None,
+    minimum_score: int = 5,
+) -> dict[str, Any] | None:
+    """根据用户请求自动匹配最合适的 skill。"""
+    records = load_skill_records()
+    if not records:
+        return None
+
+    text = _normalize_request_text(request_text)
+    if not text:
+        return None
+
+    if any(phrase in text for phrase in ("取消技能", "关闭技能", "不使用技能", "不需要技能", "clear skill", "disable skill")):
+        return {"skill_id": None, "reason": "用户明确要求取消技能", "score": 0}
+
+    best: SkillRecord | None = None
+    best_score = -1
+    best_reason = ""
+    for rec in records:
+        score, reason = _score_skill_match(rec, text)
+        if score > best_score:
+            best = rec
+            best_score = score
+            best_reason = reason
+
+    if best is None or best_score < minimum_score:
+        if current_skill_id:
+            for rec in records:
+                if rec.skill_id == current_skill_id:
+                    score, reason = _score_skill_match(rec, text)
+                    if score >= max(2, minimum_score - 2):
+                        return {
+                            "skill_id": rec.skill_id,
+                            "reason": reason or "沿用当前 skill",
+                            "score": score,
+                        }
+        return None
+
+    if current_skill_id and best.skill_id != current_skill_id:
+        current_rec = next((r for r in records if r.skill_id == current_skill_id), None)
+        if current_rec is not None:
+            current_score, _ = _score_skill_match(current_rec, text)
+            if best_score - current_score < 3:
+                return {
+                    "skill_id": current_rec.skill_id,
+                    "reason": "继续沿用当前 skill",
+                    "score": current_score,
+                }
+
+    return {
+        "skill_id": best.skill_id,
+        "reason": best_reason or "自动匹配",
+        "score": best_score,
+    }
+
+
+def build_skill_system_message(skill_id: str, *, include_body: bool = True) -> dict[str, Any]:
+    data = read_skill(skill_id)
+    if "error" in data:
+        return {"error": data["error"]}
+
+    skill = data["skill"]
+    frontmatter = skill.get("frontmatter") or {}
+    header_lines = [
+        f"Active skill: {skill.get('skill_id')}",
+        f"Name: {skill.get('name')}",
+        f"Description: {skill.get('description')}",
+    ]
+    if frontmatter.get("allowed_tools"):
+        header_lines.append("Allowed tools: " + ", ".join(map(str, frontmatter.get("allowed_tools", []))))
+    if frontmatter.get("priority"):
+        header_lines.append(f"Priority: {frontmatter.get('priority')}")
+    body = data.get("body", "") if include_body else ""
+    content = "\n".join(header_lines)
+    if body:
+        content += "\n\nInstructions:\n" + body
+    return {
+        "role": "system",
+        "name": f"skill:{skill.get('skill_id')}",
+        "content": content,
+        "skill": skill,
+    }
 
 
 def get_skill_catalog() -> dict[str, Any]:
