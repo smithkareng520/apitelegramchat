@@ -57,9 +57,6 @@ except Exception:  # pragma: no cover - optional dependency fallback
     lxml_html = None  # type: ignore
 from apitelegramchat.state import get_editor_file_state, set_editor_file_state, clear_editor_file_state
 
-OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
-
-
 def _build_nav_links(
     lat_wgs: float,
     lon_wgs: float,
@@ -91,6 +88,9 @@ from apitelegramchat.config import (
     get_openrouter_provider_preferences,
 )
 from apitelegramchat.utils import retry_async, send_rich_html_message
+
+OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
+
 from apitelegramchat.s3_utils import upload_bytes_to_r2
 from apitelegramchat.workspace_utils import _get_workspace_lock, _sync_workspace_from_r2, _sync_workspace_to_r2
 # 任务工具：定义在 todo_tool.py / memory_tool.py / skill_tool.py / subagent_tool.py
