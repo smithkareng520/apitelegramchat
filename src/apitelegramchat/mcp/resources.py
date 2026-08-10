@@ -6,14 +6,16 @@ from typing import Any
 
 from .registry import _chat_id
 from apitelegramchat.workspace_paths import workspace_root
+from apitelegramchat.skill_tool import discover_skills
 
 
 def _resource_paths(root: Path) -> list[tuple[str, str]]:
     items: list[tuple[str, str]] = []
-    for rel in ["todos.json", "memories.json", "skills.json"]:
+    for rel in ["todos.json", "memories.json"]:
         path = root / rel
         if path.exists():
             items.append((f"workspace://current/{rel[:-5]}", rel))
+    items.append(("workspace://current/skills", "skills"))
     items.append(("workspace://current/files", "files"))
     items.append(("workspace://current/manifest", "manifest.json"))
     return items
@@ -23,7 +25,7 @@ async def list_resources() -> list[dict[str, Any]]:
     root = workspace_root(_chat_id())
     items = []
     for uri, rel in _resource_paths(root):
-        mime = "application/json" if rel.endswith(".json") or rel in {"files", "manifest.json"} else "text/plain"
+        mime = "application/json" if rel in {"skills", "files", "manifest.json"} or rel.endswith(".json") else "text/plain"
         items.append({"uri": uri, "name": rel, "mimeType": mime})
     return items
 
@@ -37,9 +39,13 @@ async def read_resource(uri: str) -> dict[str, Any]:
                 payload.append({"path": str(path.relative_to(root)), "size": path.stat().st_size})
         return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload, ensure_ascii=False)}]}
     if uri == "workspace://current/manifest":
-        payload = {"workspace": str(root), "files": [str(p.relative_to(root)) for p in sorted(root.rglob("*")) if p.is_file()] }
+        payload = {"workspace": str(root), "files": [str(p.relative_to(root)) for p in sorted(root.rglob("*")) if p.is_file()]}
         return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload, ensure_ascii=False)}]}
-    mapping = {"workspace://current/todos": "todos.json", "workspace://current/memories": "memories.json", "workspace://current/skills": "skills.json"}
+    if uri == "workspace://current/skills":
+        skills = discover_skills(_chat_id())
+        payload = {"skills": skills, "total": len(skills)}
+        return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload, ensure_ascii=False)}]}
+    mapping = {"workspace://current/todos": "todos.json", "workspace://current/memories": "memories.json"}
     rel = mapping.get(uri)
     if not rel:
         return {"error": {"code": -32602, "message": f"Unknown resource: {uri}"}}

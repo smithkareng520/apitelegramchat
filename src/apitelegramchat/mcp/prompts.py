@@ -13,7 +13,7 @@ async def list_prompts() -> list[dict[str, Any]]:
         payload = json.loads(raw)
     except Exception:
         payload = {"ok": False, "skills": []}
-    prompts = []
+    prompts: list[dict[str, Any]] = []
     for skill in payload.get("skills", []) or []:
         prompts.append({
             "name": f"skill.{skill.get('name')}",

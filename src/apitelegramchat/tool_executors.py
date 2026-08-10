@@ -1386,11 +1386,11 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         except (json.JSONDecodeError, TypeError):
             payload = None
         if not isinstance(payload, dict):
-            summary = "🎯 技能操作"
+            summary = "🎯 技能"
             details_html = escape_text(result_str)
             return summary, details_html
         if not payload.get("ok"):
-            summary = f"❌ 技能操作失败：{payload.get('code', '')}"
+            summary = f"❌ 技能失败：{payload.get('code', '')}"
             details_html = f"<p>{escape_text(payload.get('error', '未知错误'))}</p>"
             return summary, details_html
         action = payload.get("action", "list")
@@ -1398,21 +1398,12 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             summary = f"🎯 技能：{payload.get('total', 0)} 个可用"
         elif action == "use":
             s = payload.get("skill", {})
-            summary = f"🧩 激活技能：{s.get('name', '')}"
+            summary = f"🧩 已加载：{s.get('name', '')}"
         elif action == "info":
             s = payload.get("skill", {})
-            summary = f"🧩 技能详情：{s.get('name', '')}"
-        elif action == "register":
-            s = payload.get("skill", {})
-            summary = f"⭐ 注册技能：{s.get('name', '')}"
-        elif action == "update":
-            s = payload.get("skill", {})
-            summary = f"📝 更新技能：{s.get('name', '')}"
-        elif action == "delete":
-            s = payload.get("skill", {})
-            summary = f"🗑️ 删除技能：{s.get('name', '')}"
+            summary = f"🧩 详情：{s.get('name', '')}"
         else:
-            summary = "🎯 技能操作"
+            summary = "🎯 技能"
         details_html = render_skill_card(payload)
         return summary, details_html
 

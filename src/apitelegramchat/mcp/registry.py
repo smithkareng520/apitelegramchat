@@ -85,6 +85,8 @@ def _schema_for(fn: Callable[..., Any], *, title: str | None = None) -> dict[str
     for name, param in sig.parameters.items():
         if name in {"chat_id", "progress_callback"}:
             continue
+        if param.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}:
+            continue
         schema: dict[str, Any] = {"description": f"{name} parameter", "type": _type_to_schema(param.annotation)}
         if param.default is not inspect._empty:
             schema["default"] = _jsonable(param.default)
@@ -142,7 +144,7 @@ async def _tool_present_files(**kwargs: Any) -> str:
 TOOL_SPECS: list[ToolSpec] = [
     ToolSpec("memory.manage", "Manage persistent long-term memory.", _tool_memory, _schema_for(execute_memory, title="memory.manage")),
     ToolSpec("todo.manage", "Create, inspect, update, and clear todos.", _tool_todo, _schema_for(execute_todo, title="todo.manage")),
-    ToolSpec("skill.manage", "List, inspect, activate, and maintain reusable skills.", _tool_skill, _schema_for(execute_skill, title="skill.manage")),
+    ToolSpec("skill.manage", "List, inspect, and load file-based skills.", _tool_skill, _schema_for(execute_skill, title="skill.manage")),
     ToolSpec("subagent.run", "Spawn a bounded subagent to complete a task.", _tool_subagent, _schema_for(execute_subagent, title="subagent.run")),
     ToolSpec("shell.exec", "Run a sandboxed shell command within the workspace.", _tool_bash, _schema_for(execute_bash, title="shell.exec")),
     ToolSpec("workspace.present", "Return workspace files to the client.", _tool_present_files, _schema_for(execute_present_files, title="workspace.present")),
@@ -175,21 +177,18 @@ TOOL_MAP = {spec.name: spec for spec in TOOL_SPECS}
 
 
 def _skill_prompt_text(payload: dict[str, Any]) -> str:
-    lines = []
-    name = payload.get("name", "skill")
-    desc = payload.get("description", "")
-    prompt = payload.get("system_prompt", "")
-    tools = payload.get("tools", []) or []
-    examples = payload.get("examples", []) or []
-    lines.append(f"<b>Skill:</b> {name}")
+    skill = payload.get("skill") if isinstance(payload.get("skill"), dict) else {}
+    name = skill.get("name") or payload.get("name") or "skill"
+    desc = skill.get("description") or payload.get("description") or ""
+    tools = skill.get("allowed_tools") or payload.get("allowed_tools") or payload.get("tools") or []
+    body = payload.get("instruction") or payload.get("body") or payload.get("content") or ""
+    lines: list[str] = [f"<b>Skill:</b> {name}"]
     if desc:
         lines.append(f"<b>Description:</b> {desc}")
-    if prompt:
-        lines.append(prompt)
     if tools:
         lines.append("<b>Allowed tools:</b> " + ", ".join(map(str, tools)))
-    if examples:
-        lines.append("<b>Examples:</b> " + "; ".join(map(str, examples)))
+    if body:
+        lines.append(body)
     return "\n".join(lines).strip()
 
 
