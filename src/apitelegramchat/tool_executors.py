@@ -133,13 +133,23 @@ class BashSession:
             self._sandbox_mode = "bwrap"
             # bwrap 模式：父进程不传任何环境变量（bwrap --clearenv 已清）
             env = {}
+            preexec = None
         else:
             if not SANDBOX_ALLOW_FALLBACK:
-                raise RuntimeError("bash sandbox unavailable: bwrap is required for workspace-only access")
+                raise RuntimeError(
+                    "bash sandbox unavailable: bwrap is required for workspace-only access. "
+                    "Set SANDBOX_ALLOW_FALLBACK=1 to enable fallback mode (no namespace "
+                    "isolation, uses bash + rlimits + no-new-privs + per-command cd enforcement), "
+                    "or install bubblewrap and run with --privileged / "
+                    "unprivileged_userns_clone=1."
+                )
             argv = build_fallback_argv(self.workspace, self.chat_id)
             self._sandbox_mode = "fallback"
             # fallback 模式：只传白名单 env
             env = build_fallback_env(self.workspace, self.chat_id)
+            # ★ 关键修复：之前 _preexec_fallback 定义了但从未被调用，
+            # 导致 no-new-privs + setrlimit 都没生效。这里补上。
+            preexec = _preexec_fallback
 
         logger.info(f"Starting bash session chat_id={self.chat_id} mode={self._sandbox_mode}")
 
@@ -152,6 +162,7 @@ class BashSession:
             bufsize=0,
             env=env,  # ★ 关键: 不传任何敏感变量
             start_new_session=True,  # ★ 关键: 创建新会话，便于 killpg
+            preexec_fn=preexec,  # fallback 模式下设置 no-new-privs + rlimit
         )
 
         # 应用资源限制（bwrap 外层套一层 rlimit）

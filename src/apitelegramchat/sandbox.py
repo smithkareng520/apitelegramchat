@@ -32,7 +32,10 @@ SANDBOX_MAX_CPU_SEC = int(os.getenv("SANDBOX_MAX_CPU_SEC", "300"))   # 5 分钟 
 SANDBOX_MAX_FILE_SIZE = int(os.getenv("SANDBOX_MAX_FILE_SIZE", str(100 * 1024 * 1024)))  # 100MB/文件
 SANDBOX_MAX_OPEN_FILES = int(os.getenv("SANDBOX_MAX_OPEN_FILES", "256"))
 SANDBOX_TIMEOUT_SEC = int(os.getenv("SANDBOX_TIMEOUT_SEC", "120"))
-SANDBOX_ALLOW_FALLBACK = os.getenv("SANDBOX_ALLOW_FALLBACK", "0") == "1"
+# 默认允许 fallback：很多托管平台（Render / Heroku / 非 privileged Docker）
+# 内核不允许 unprivileged user namespace，bwrap 永远起不来。强制要求 bwrap 会让
+# bash 工具彻底无法用，因此把默认值改成 "1"。需要严格隔离时显式设置 0。
+SANDBOX_ALLOW_FALLBACK = os.getenv("SANDBOX_ALLOW_FALLBACK", "1") == "1"
 
 # ---------- 只读共享的系统目录（每个会话只读挂载） ----------
 _RO_BINDS = [
@@ -71,27 +74,44 @@ _bwrap_available: Optional[bool] = None
 
 
 async def _test_bwrap() -> bool:
-    """测试 bwrap 是否能在当前容器内创建沙箱"""
+    """测试 bwrap 是否能在当前容器内创建沙箱。
+
+    用 build_bwrap_argv 用的同一组 -try 参数构造一个最小测试命令，
+    避免“测试通过但实际跑会失败”的假阳性。"""
     if not Path(BWRAP).exists():
         return False
+    # 找一个最小的可执行：/bin/true
+    if not Path("/bin/true").exists():
+        return False
     try:
-        proc = await asyncio.create_subprocess_exec(
+        # 用 -try 变体跑一个最小骨架，跟 build_bwrap_argv 真实参数一致
+        argv = [
             BWRAP,
             "--unshare-user-try",
             "--unshare-pid-try",
             "--unshare-ipc-try",
+            "--unshare-uts-try",
+            "--unshare-cgroup-try",
             "--die-with-parent",
-            "--ro-bind", "/", "/",
+            "--new-session",
             "--dev", "/dev",
             "--proc", "/proc",
+            "--tmpfs", "/tmp",
+            "--tmpfs", "/run",
+            "--tmpfs", "/var/tmp",
+            "--ro-bind", "/", "/",
+            "--chdir", "/",
             "/bin/true",
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
             err = stderr.decode("utf-8", errors="replace") if stderr else ""
-            logger.warning(f"bwrap test failed (rc={proc.returncode}): {err}")
+            logger.warning(f"bwrap test failed (rc={proc.returncode}): {err.strip()[:300]}")
             return False
         return True
     except Exception as e:
@@ -120,12 +140,15 @@ def build_bwrap_argv(workspace: Path, chat_id: int) -> list:
 
     argv = [
         BWRAP,
-        # ===== 命名空间隔离 =====
-        "--unshare-user",            # 新 user namespace
-        "--unshare-pid",             # 新 PID namespace（看不见宿主进程）
-        "--unshare-ipc",             # IPC 隔离
-        "--unshare-uts",             # hostname 隔离
-        "--unshare-cgroup-try",      # cgroup 隔离（best-effort）
+        # ===== 命名空间隔离（用 -try 变体，允许部分失败） =====
+        # 部分容器平台（Render / 非 privileged Docker）内核只允许 user namespace
+        # 而禁止 pid/ipc/uts；用 -try 让 bwrap 在拿不到的 namespace 上继续运行，
+        # 而不是直接退出。沙箱强度可能下降，但比直接禁用 bash 强。
+        "--unshare-user-try",
+        "--unshare-pid-try",
+        "--unshare-ipc-try",
+        "--unshare-uts-try",
+        "--unshare-cgroup-try",
 
         # ===== 生命周期绑定 =====
         "--die-with-parent",         # Python 进程死亡时沙箱一起死
@@ -184,7 +207,15 @@ def build_bwrap_argv(workspace: Path, chat_id: int) -> list:
 
 # ---------- 构造 fallback argv（无 bwrap 时） ----------
 def build_fallback_argv(workspace: Path, chat_id: int) -> list:
-    """弱模式：仅 env 清洗 + no-new-privs（无命名空间隔离）"""
+    """弱模式：仅 env 清洗 + no-new-privs（无命名空间隔离）
+
+    不能用 rbash —— 虽然 rbash 禁止 cd 到任意目录，但 BashSession.execute()
+    每条命令前会 `cd $HOME && ...`，rbash 会把这个 cd 也拦掉，导致整个 bash
+    工具不可用。
+
+    所以 fallback 走普通 bash + 应用层 cd 强制 + setrlimit + no-new-privs。
+    隔离强度弱于 bwrap（无 mount/pid/net namespace 隔离），但比直接禁用 bash 强。
+    """
     return ["/bin/bash", "--noprofile", "--norc", "-s"]
 
 

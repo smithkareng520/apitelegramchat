@@ -8,7 +8,19 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONPATH=/app/src
 ENV APITELEGRAMCHAT_DATA_DIR=/tmp/apitelegramchat_data
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgl1 libglib2.0-0 libgomp1 && rm -rf /var/lib/apt/lists/*
+# bubblewrap 提供 bwrap 沙箱（用于 bash 工具的命名空间隔离）。
+# 即使装了，Render / Heroku / 非 privileged Docker 也起不来 unprivileged
+# userns，所以默认让 SANDBOX_ALLOW_FALLBACK=1 —— fallback 用 bash + rlimits
+# + no-new-privs + 每命令 cd 强制兜底，bwrap 可用时自动升级到全隔离模式。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libgl1 libglib2.0-0 libgomp1 \
+        bubblewrap bash \
+    && rm -rf /var/lib/apt/lists/*
+
+# 默认允许 fallback；需要严格隔离时显式覆盖为 0
+ENV SANDBOX_ALLOW_FALLBACK=1
+# Render 容器内核不允许 unshare-net，关掉避免 bwrap 模式起不来
+ENV SANDBOX_UNSHARE_NET=0
 
 RUN groupadd -g 2000 app && useradd -u 2000 -g 2000 -m -d /home/app -s /usr/sbin/nologin app
 

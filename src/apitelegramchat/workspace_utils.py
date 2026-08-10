@@ -36,7 +36,7 @@ async def _sync_workspace_from_r2(chat_id: int):
     """
     workspace = workspace_root(chat_id)
     workspace.mkdir(parents=True, exist_ok=True)
-    workspace_workdir(chat_id)
+    workdir = workspace_workdir(chat_id)  # 修复：之前未赋值就在下面引用了
     prefix = f"editor/{workspace_namespace(chat_id)}/"
     keys = await list_r2_objects(prefix)
     remote_rels = set()

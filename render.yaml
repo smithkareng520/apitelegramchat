@@ -58,6 +58,8 @@ services:
       - key: DDG_SEARCH_API_URL
         value: https://my-search-api-08cb.onrender.com/duckduckgo/search
       - key: SANDBOX_UNSHARE_NET
+        value: "0"
+      - key: SANDBOX_ALLOW_FALLBACK
         value: "1"
       - key: SANDBOX_MAX_PROCS
         value: "50"

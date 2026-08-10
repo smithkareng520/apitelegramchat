@@ -171,3 +171,96 @@ rm src/apitelegramchat/amap_integration.py
 
 ## Skills
 This repository ships Anthropic-compatible skills under `.claude/skills/` and does not expose a custom prompt-skill registry.
+
+
+## 十、Bash 沙箱（bwrap）与 fallback 模式
+
+### 1. 三种模式
+
+| 模式 | 触发条件 | 隔离强度 | 适用环境 |
+|---|---|---|---|
+| **bwrap** | bwrap 已安装 + 内核允许 unprivileged userns | 强（mount/pid/ipc/uts/net 命名空间隔离） | 本地 dev / privileged 容器 / VPS |
+| **fallback** | bwrap 不可用 / 内核禁 userns，且 `SANDBOX_ALLOW_FALLBACK=1` | 弱（bash + rlimits + no-new-privs + 每命令 `cd $HOME` 强制，无 namespace 隔离） | Render / Heroku / 非 privileged Docker |
+| **禁用 bash** | bwrap 不可用 且 `SANDBOX_ALLOW_FALLBACK=0` | — | 需要严格安全审计的环境 |
+
+### 2. 默认行为
+
+`SANDBOX_ALLOW_FALLBACK` 默认值为 `1`（见 `sandbox.py`）。
+Dockerfile 也通过 `ENV SANDBOX_ALLOW_FALLBACK=1` 显式设了同样的值。
+也就是说，**开箱即用，bash 永远能用**（除非显式覆盖）。
+
+### 3. Render 部署常见错误
+
+#### 错误 1
+```
+bash sandbox unavailable: bwrap is required for workspace-only access
+```
+**原因**：旧版本默认 `SANDBOX_ALLOW_FALLBACK=0`，而 Render 容器内核禁了 userns。
+**修复**：已修复，默认 `1`。如果之前在 Render 控制台手动设过 `SANDBOX_ALLOW_FALLBACK=0`，请改成 `1` 或删除。
+
+#### 错误 2
+模型尝试用 `text_editor view ./` 列目录，返回
+```
+Invalid path: empty or root path not allowed
+```
+或
+```
+Invalid path: directory traversal not allowed
+```
+**原因**：旧版 `text_editor` 只支持文件，不支持目录列表；bash 又因 bwrap 不可用而禁用，模型陷入死循环。
+**修复**：新版 `text_editor` 加了 `list` 命令，专门用来列目录：
+```
+text_editor list path=""
+text_editor list path="subdir/"
+text_editor list path="."
+```
+也支持 `view` 一个目录路径，会自动转走 `list` 逻辑。
+
+### 4. 想要严格隔离？
+
+设置环境变量：
+```
+SANDBOX_ALLOW_FALLBACK=0
+SANDBOX_UNSHARE_NET=1
+```
+并在容器启动时加 `--privileged` 或在 Kubernetes pod spec 加：
+```yaml
+securityContext:
+  sysctls:
+    - name: kernel.unprivileged_userns_clone
+      value: "1"
+  capabilities:
+    add: ["SYS_ADMIN"]
+```
+然后跑 `python -m apitelegramchat.verify_security` 自检。
+
+### 5. 看门狗（fork bomb 防护）
+
+不论 bwrap 还是 fallback 模式，`watchdog()` 都会每秒统计子进程树大小，
+超过 `SANDBOX_MAX_PROCS`（默认 50）会立即 `SIGKILL` 整个进程组。
+所以即使沙箱内被诱导执行 `:(){ :| :& };:` 也不会拖垮宿主。
+
+### 6. 资源限制
+
+通过 `prlimit`（bwrap 模式，父进程对子进程施加）或 `setrlimit`（fallback 模式，
+通过 `preexec_fn` 在 fork 后 exec 前施加）限制：
+- `SANDBOX_MAX_CPU_SEC`：单会话总 CPU 时间（默认 300s）
+- `SANDBOX_MAX_FILE_SIZE`：单文件最大写入（默认 100MB）
+- `SANDBOX_MAX_OPEN_FILES`：fd 上限（默认 256）
+- `SANDBOX_TIMEOUT_SEC`：单命令超时（默认 120s）
+
+所有这些值都可通过环境变量覆盖。
+
+### 7. 修复的旧 Bug
+
+旧版本有两个隐藏 Bug，本次一并修复：
+
+1. **`_preexec_fallback` 是死代码**：定义了但从未传给 `create_subprocess_exec`，
+   导致 fallback 模式下 `no-new-privs` 和 `setrlimit` 都没生效。
+   修复：`tool_executors.py` 在 fallback 分支显式传 `preexec_fn=_preexec_fallback`。
+
+2. **`_sync_workspace_from_r2` 引用未定义的 `workdir`**：`workspace_utils.py:39`
+   调用 `workspace_workdir(chat_id)` 但忘了赋值，第 81 行又引用 `workdir`，
+   导致同步函数在删除空目录时直接 `NameError`。
+   修复：把第 39 行改成 `workdir = workspace_workdir(chat_id)`。
+

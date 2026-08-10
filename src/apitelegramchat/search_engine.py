@@ -304,8 +304,15 @@ async def execute_text_editor(
     file_text: str | None = None,
     confirm: bool = False,
 ) -> str:
+    # list 命令 + view 命令遇到目录时，允许 path 为空 / "." / "./"，对应 workspace 根
+    allow_root_path = command in ("list", "view") and (
+        not path or not isinstance(path, str) or path.strip() in ("", "/", ".", "./")
+    )
     try:
-        safe_path = _editor_safe_path(path)
+        if allow_root_path:
+            safe_path = "."
+        else:
+            safe_path = _editor_safe_path(path)
     except ValueError as e:
         return f"Error: {e}"
 
@@ -314,12 +321,15 @@ async def execute_text_editor(
         await _sync_workspace_from_r2(chat_id)
 
         workspace = workspace_root(chat_id)
-        local_path = workspace / safe_path
+        local_path = workspace if allow_root_path else (workspace / safe_path)
 
         # ----- view (增强：支持搜索关键词) -----
         if command == "view":
             if not local_path.exists():
                 return f"Error: File not found: {path}"
+            # 如果是目录，转走 list 命令的逻辑（向后兼容）
+            if local_path.is_dir():
+                return _list_directory(local_path, path)
             with open(local_path, "r", encoding="utf-8") as f:
                 content = f.read()
             # 自动更新状态（隐式 view）
@@ -375,6 +385,15 @@ async def execute_text_editor(
             else:
                 numbered = [_format_editor_line(idx+1, line, width) for idx, line in enumerate(lines)]
                 return "\n".join(numbered)
+
+        # ----- list (列出目录内容；如果 bash 沙箱不可用，这是模型查看
+        # 工作区文件结构的唯一途径) -----
+        elif command == "list":
+            display = path.strip() if path and path.strip() not in ("", "/", ".", "./") else "./"
+            if not local_path.exists():
+                # 兜底：列出 workspace 根
+                return _list_directory(workspace, "./")
+            return _list_directory(local_path, display)
 
         # ----- create -----
         elif command == "create":
@@ -1071,12 +1090,12 @@ SEARCH_TOOLS = [
                     },
                     "command": {
                         "type": "string",
-                        "enum": ["view", "str_replace", "replace_lines", "create", "insert", "delete", "undo_edit"],
-                        "description": "要执行的命令。"
+                        "enum": ["view", "list", "str_replace", "replace_lines", "create", "insert", "delete", "undo_edit"],
+                        "description": "要执行的命令。list 用于列出工作区目录内容（即使 bash 沙箱不可用也能用）。"
                     },
                     "path": {
                         "type": "string",
-                        "description": "文件或目录路径。目录需以 / 结尾。"
+                        "description": "文件或目录路径。list 命令时传空串、'.' 或 './' 表示列出 workspace 根。目录可省略尾 / 。"
                     },
                     "view_range": {
                         "type": "array",
@@ -1152,7 +1171,9 @@ SEARCH_TOOLS = [
             "name": "bash",
             "description": (
                 "Execute shell commands in a persistent bash session (env vars and cwd persist across calls). "
-                "Use for system operations, running scripts, file manipulation. Avoid interactive commands (vim, top) and long-running processes. Set 'restart'=true to reset the session."
+                "Use for system operations, running scripts, file manipulation. Avoid interactive commands (vim, top) and long-running processes. Set 'restart'=true to reset the session. "
+                "Note: each invocation is automatically prefixed with `cd $HOME && ` so the working directory is always reset to the user's workspace. "
+                "To list files in the workspace without bash (e.g. when sandbox is unavailable), use text_editor command='list'."
             ),
             "parameters": {
                 "type": "object",
@@ -3577,3 +3598,33 @@ def _editor_get_backup_key(chat_id: int, path: str) -> str:
     """生成备份文件的R2键。"""
     safe = _editor_safe_path(path)
     return f"{EDITOR_PREFIX}/{chat_id}/{safe}.backup"
+
+
+def _list_directory(dir_path: Path, display_path: str) -> str:
+    """列出工作区内某个目录的内容。
+
+    用于 text_editor 的 list 命令 / view 命令遇到目录时的兜底返回。
+    返回带类型标记的列表（dir/file/size），便于模型快速定位文件。
+    """
+    if not dir_path.exists():
+        return f"Error: Directory not found: {display_path}"
+    if not dir_path.is_dir():
+        return f"Error: Not a directory: {display_path}"
+    try:
+        entries = sorted(dir_path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except PermissionError:
+        return f"Error: Permission denied: {display_path}"
+    if not entries:
+        return f"Directory {display_path} is empty."
+    out = [f"Directory: {display_path} ({len(entries)} entries)"]
+    for p in entries:
+        try:
+            st = p.stat()
+            if p.is_dir():
+                out.append(f"  [dir ]  {p.name}/")
+            else:
+                size = st.st_size
+                out.append(f"  [file]  {p.name}  ({size} bytes)")
+        except OSError as e:
+            out.append(f"  [????]  {p.name}  (stat failed: {e})")
+    return "\n".join(out)
