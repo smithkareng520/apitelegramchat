@@ -264,3 +264,16 @@ securityContext:
    导致同步函数在删除空目录时直接 `NameError`。
    修复：把第 39 行改成 `workdir = workspace_workdir(chat_id)`。
 
+3. **`todos.json` / `memories.json` 被 bash 全量同步污染回 workspace**：
+   根因是 `_sync_named_file_to_r2` 把这俩文件用 `editor/{ns}/todos.json` 这个
+   R2 key 上传，和 workspace 文件同一个 prefix；bash 执行时调
+   `_sync_workspace_from_r2` 会列出所有 `editor/{ns}/*` 并下载到 workspace，
+   把这两个 state 文件也拉回 workspace 根目录，结果就是「明明写到 state/ 了，
+   下次 bash 一跑又出现在 workspace 里」。
+   修复：
+   - state 文件改用独立的 `state/{ns}/{filename}` prefix 上传/下载
+   - 两个 prefix（`editor/` vs `state/`）天然隔离，**不做文件名黑名单**
+   - 即使用户在 workspace 里手动放一个名叫 `todos.json` 的文件（和 state 无关），
+     也能正常上传到 `editor/` 并同步，不会跟 state 的 `todos.json` 冲突
+   - 测试覆盖：`scripts/test_state_isolation.py`
+

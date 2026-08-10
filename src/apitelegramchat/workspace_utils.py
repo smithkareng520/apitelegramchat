@@ -8,7 +8,6 @@ from apitelegramchat.workspace_paths import workspace_root, workspace_workdir, w
 from apitelegramchat.s3_utils import (
     upload_bytes_to_r2,
     download_from_r2,
-    file_exists_in_r2,
     list_r2_objects,
     delete_r2_object,
 )
@@ -29,14 +28,19 @@ async def _get_workspace_lock(chat_id: int, namespace: str | None = None) -> asy
         return _workspace_locks[key]
 
 
+# ========== workspace 全量同步（editor/ 域） ==========
+# 这些函数同步 workspace 根目录下的所有文件，用 R2 的 editor/{ns}/ prefix。
+# state 文件（todos.json / memories.json）用另一组单文件同步函数 + state/{ns}/ prefix，
+# 两个 prefix 天然隔离，不需要文件名黑名单。
+
 async def _sync_workspace_from_r2(chat_id: int):
     """
-    从 R2 拉取所有文件到本地 workspace，并删除本地多余文件。
-    全量同步，用于初始化或恢复。
+    从 R2 拉取 editor/{ns}/ 下所有文件到本地 workspace，并删除本地多余文件。
+    全量同步，用于 bash 工具执行前的初始化。
     """
     workspace = workspace_root(chat_id)
     workspace.mkdir(parents=True, exist_ok=True)
-    workdir = workspace_workdir(chat_id)  # 修复：之前未赋值就在下面引用了
+    workdir = workspace_workdir(chat_id)
     prefix = f"editor/{workspace_namespace(chat_id)}/"
     keys = await list_r2_objects(prefix)
     remote_rels = set()
@@ -86,8 +90,8 @@ async def _sync_workspace_from_r2(chat_id: int):
 
 async def _sync_workspace_to_r2(chat_id: int):
     """
-    将本地所有文件上传到 R2，并删除远程多余文件。
-    全量同步，用于 bash 等可能产生大量变更的场景。
+    将本地 workspace 所有文件上传到 R2 的 editor/{ns}/ prefix，并删除远程多余文件。
+    全量同步，用于 bash 工具执行后。
     """
     workspace = workspace_root(chat_id)
     if not workspace.exists():
@@ -114,9 +118,7 @@ async def _sync_workspace_to_r2(chat_id: int):
 
 
 async def _async_sync_workspace_to_r2(chat_id: int):
-    """
-    异步全量同步（用于 bash 后），不阻塞主流程。
-    """
+    """异步全量同步（用于 bash 后），不阻塞主流程。"""
     try:
         await _sync_workspace_to_r2(chat_id)
         logger.debug(f"异步全量同步完成: chat_id={chat_id}")
@@ -124,17 +126,15 @@ async def _async_sync_workspace_to_r2(chat_id: int):
         logger.error(f"异步全量同步失败: {e}")
 
 
-# ========== 单文件定向同步（轻量级，用于 todo/memory 等小 JSON 文件） ==========
-# 旧的全量同步（_sync_workspace_from_r2 / _sync_workspace_to_r2）会下载/上传
-# workspace 里的所有文件。当 workspace 积累了几十个文件后，每次工具调用都要
-# 等 30+ 秒做全量同步——模型流式输出超时，返回空内容。
-#
-# 这组新函数只同步指定的单个文件，把延迟从 O(所有文件) 降到 O(1)。
+# ========== 单文件定向同步（state/ 域） ==========
+# 用于 todo / memory 等小 JSON 文件。这些文件的本地路径在 state/{ns}/ 目录，
+# R2 key 也在 state/{ns}/ prefix 下，和 workspace 的 editor/{ns}/ 天然隔离。
+# 不做文件名黑名单 —— 用户在 workspace 里放同名文件也互不影响。
 
 async def _sync_named_file_from_r2(chat_id: int, local_path: Path, remote_name: str) -> None:
     """
-    仅从 R2 下载指定的单个文件到本地指定路径。
-    如果 R2 上没有该文件，则不做什么（本地可能也没有，或本地是新建的）。
+    从 R2 的 state/{ns}/{remote_name} 下载到 local_path。
+    如果 R2 上没有该文件，本地保留现状（可能是首次创建）。
     """
     safe_name = os.path.normpath(remote_name)
     if safe_name == "." or safe_name.startswith("..") or os.path.isabs(safe_name):
@@ -142,54 +142,36 @@ async def _sync_named_file_from_r2(chat_id: int, local_path: Path, remote_name: 
         return
 
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    key = f"editor/{workspace_namespace(chat_id)}/{safe_name}"
+    key = f"state/{workspace_namespace(chat_id)}/{safe_name}"
     data = await download_from_r2(key)
     if data is not None:
         with open(local_path, "wb") as f:
             f.write(data)
-    # 如果 R2 上没有该文件，本地保留现状（可能是首次创建）
 
 
 async def _sync_named_file_to_r2(chat_id: int, local_path: Path, remote_name: str) -> None:
     """
-    仅将本地指定的单个文件上传到 R2。
-    如果本地文件不存在，则删除 R2 上的对应文件（如果有的话）。
+    将 local_path 上传到 R2 的 state/{ns}/{remote_name}。
+    如果本地文件不存在，则删除 R2 上的对应文件。
     """
     safe_name = os.path.normpath(remote_name)
     if safe_name == "." or safe_name.startswith("..") or os.path.isabs(safe_name):
         logger.warning(f"拒绝路径遍历的 remote_name: {remote_name!r}")
         return
 
-    key = f"editor/{workspace_namespace(chat_id)}/{safe_name}"
+    key = f"state/{workspace_namespace(chat_id)}/{safe_name}"
     if local_path.is_file():
         with open(local_path, "rb") as f:
             data = f.read()
         await upload_bytes_to_r2(data, key, "application/json")
     else:
-        # 本地没有此文件，清理 R2 上的残留
         await delete_r2_object(key)
 
-
-async def _sync_file_from_r2(chat_id: int, filename: str) -> None:
-    """兼容旧接口：同步 workspace 根目录下的文件。"""
-    workspace = workspace_root(chat_id)
-    await _sync_named_file_from_r2(chat_id, workspace / filename, filename)
-
-
-async def _sync_file_to_r2(chat_id: int, filename: str) -> None:
-    """兼容旧接口：同步 workspace 根目录下的文件。"""
-    workspace = workspace_root(chat_id)
-    await _sync_named_file_to_r2(chat_id, workspace / filename, filename)
-
-
-# ========== 可选：初始化工作区（后台执行） ==========
 
 # ========== 可选：初始化工作区（后台执行） ==========
 
 async def init_workspace(chat_id: int):
-    """
-    后台初始化工作区，从 R2 拉取文件。可在首次消息时调用。
-    """
+    """后台初始化工作区，从 R2 拉取文件。可在首次消息时调用。"""
     try:
         await _sync_workspace_from_r2(chat_id)
         logger.info(f"Workspace 初始化完成: chat_id={chat_id}")
