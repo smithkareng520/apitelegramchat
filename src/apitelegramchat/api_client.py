@@ -76,18 +76,6 @@ class APIClient:
     # -------------------- 向后兼容的旧方法 --------------------
     # 以下方法保留以兼容现有代码，但内部统一使用 get_client
 
-    def get_openrouter(self) -> AsyncOpenAI:
-        return self.get_client("openrouter")
-
-    def get_gemini(self) -> AsyncOpenAI:
-        return self.get_client("gemini")
-
-    def get_grok(self) -> AsyncOpenAI:
-        return self.get_client("grok")
-
-    def get_deepseek(self) -> AsyncOpenAI:
-        return self.get_client("deepseek")
-
     # -------------------- 可选：获取所有已配置厂商 --------------------
     def list_providers(self) -> list:
         """返回所有已配置的厂商名称列表"""

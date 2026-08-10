@@ -71,6 +71,7 @@ if os.getenv("APITELEGRAMCHAT_REQUIRE_STRICT_CONFIG", "0") in {"1", "true", "yes
     validate_runtime_config(strict=True)
 
 # ---------- 全局锁（保留兼容） ----------
+# ---------- 全局锁 ----------
 global_lock = asyncio.Lock()
 
 # ---------- 角色相关 ----------

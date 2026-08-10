@@ -23,7 +23,6 @@ WORKDIR /app
 COPY requirements.txt pyproject.toml ./
 COPY src ./src
 COPY README.md ./
-COPY app.py ./
 
 RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir .
 
@@ -35,4 +34,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD pytho
 
 EXPOSE 5000
 
-CMD ["sh", "-c", "exec python -m quart run --app app:app --host 0.0.0.0 --port ${PORT:-5000}"]
+CMD ["sh", "-c", "exec python -m quart run --app apitelegramchat.app:app --host 0.0.0.0 --port ${PORT:-5000}"]

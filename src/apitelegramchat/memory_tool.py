@@ -39,7 +39,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from apitelegramchat.workspace_paths import memory_state_file, workspace_root
+from apitelegramchat.workspace_paths import memory_state_file
 from typing import Any, Optional
 
 from apitelegramchat.workspace_utils import (
@@ -80,31 +80,6 @@ def _memory_path(chat_id: int) -> Path:
     return memory_state_file(chat_id)
 
 
-def _legacy_memory_path(chat_id: int) -> Path:
-    return workspace_root(chat_id) / MEMORY_FILENAME
-
-
-def _cleanup_legacy_memory_copy(chat_id: int) -> None:
-    """
-    清理旧版残留：早期版本会把 memories.json 放在 workspace 根目录。
-    现在状态文件统一放到 state/{id}/ 下，这里顺手迁移/删除旧文件。
-    """
-    legacy = _legacy_memory_path(chat_id)
-    current = _memory_path(chat_id)
-    if legacy == current:
-        return
-    try:
-        if not legacy.exists():
-            return
-        current.parent.mkdir(parents=True, exist_ok=True)
-        if not current.exists():
-            os.replace(legacy, current)
-            return
-        legacy.unlink()
-    except OSError as e:
-        logger.warning(f"memories.json 旧路径清理失败 (chat={chat_id}): {e}")
-
-
 def _new_id() -> str:
     return uuid.uuid4().hex[:8]
 
@@ -114,7 +89,6 @@ def _empty_store() -> dict:
 
 
 def _load_local(chat_id: int) -> dict:
-    _cleanup_legacy_memory_copy(chat_id)
     path = _memory_path(chat_id)
     if not path.is_file():
         return _empty_store()
@@ -131,7 +105,6 @@ def _load_local(chat_id: int) -> dict:
 
 
 def _save_local(chat_id: int, store: dict) -> None:
-    _cleanup_legacy_memory_copy(chat_id)
     path = _memory_path(chat_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     store["updated_at"] = int(time.time())
