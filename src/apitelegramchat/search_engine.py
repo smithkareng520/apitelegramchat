@@ -88,6 +88,7 @@ from apitelegramchat.config import (
     FETCH_CACHE_TTL,
     SUPPORTED_MODELS,
     DDG_SEARCH_API_URL,
+    get_openrouter_provider_preferences,
 )
 from apitelegramchat.utils import retry_async, send_rich_html_message
 from apitelegramchat.s3_utils import upload_bytes_to_r2
