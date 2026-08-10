@@ -41,14 +41,16 @@ except OSError:
 PR_SET_NO_NEW_PRIVS = 38
 
 
-def _set_no_new_privs() -> None:
-    """阻止 setuid 提权"""
+def _set_no_new_privs() -> bool:
+    """阻止 setuid 提权；失败时返回 False。"""
     if _libc is None:
-        return
+        return False
     rc = _libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
     if rc != 0:
         err = ctypes.get_errno()
-        logger.warning(f"prctl(NO_NEW_PRIVS) failed: {os.strerror(err)}")
+        logger.error("prctl(NO_NEW_PRIVS) failed: %s", os.strerror(err))
+        return False
+    return True
 
 
 # =====================================================================
@@ -83,9 +85,21 @@ LANDLOCK_ACCESS_FS_MAKE_BLOCK = 1 << 11
 LANDLOCK_ACCESS_FS_MAKE_SYM = 1 << 12
 
 # x86_64 syscall 号
-SYS_LANDLOCK_CREATE_RULESET = 444
-SYS_LANDLOCK_ADD_RULE = 445
-SYS_LANDLOCK_RESTRICT_SELF = 446
+# x86_64 syscall numbers. The deployment image is x86_64; fail closed on
+# unsupported architectures rather than guessing syscall numbers.
+_SYS_LANDLOCK_SYSCALLS = {
+    "x86_64": (444, 445, 446),
+    "amd64": (444, 445, 446),
+    "aarch64": (444, 445, 446),
+    "arm64": (444, 445, 446),
+}
+
+LANDLOCK_CREATE_RULESET_VERSION = 1 << 0
+
+try:
+    SYS_LANDLOCK_CREATE_RULESET, SYS_LANDLOCK_ADD_RULE, SYS_LANDLOCK_RESTRICT_SELF = _SYS_LANDLOCK_SYSCALLS[os.uname().machine]
+except KeyError:
+    SYS_LANDLOCK_CREATE_RULESET = SYS_LANDLOCK_ADD_RULE = SYS_LANDLOCK_RESTRICT_SELF = -1
 
 # 所有 v1 的 access flags（Linux 5.13+ 通用）
 _LANDLOCK_ALL_ACCESS_V1 = (
@@ -123,42 +137,74 @@ class _LandlockPathBeneathAttr(ctypes.Structure):
     ]
 
 
-_landlock_tested: Optional[bool] = None
+class SandboxSetupError(RuntimeError):
+    """The filesystem sandbox could not be installed."""
+
+
+_landlock_abi: Optional[int] = None
+
+
+def _landlock_abi_version() -> int:
+    """Return the Landlock ABI version, or 0 when unavailable.
+
+    The VERSION flag is mandatory here. Calling landlock_create_ruleset(NULL, 0, 0)
+    is not a valid feature probe and returns ENOSYS/EFAULT on many kernels.
+    """
+    global _landlock_abi
+    if _landlock_abi is not None:
+        return _landlock_abi
+    if _libc is None or SYS_LANDLOCK_CREATE_RULESET < 0:
+        _landlock_abi = 0
+        return 0
+    ctypes.set_errno(0)
+    rc = _libc.syscall(
+        SYS_LANDLOCK_CREATE_RULESET,
+        None,
+        0,
+        LANDLOCK_CREATE_RULESET_VERSION,
+    )
+    if rc < 0:
+        _landlock_abi = 0
+        return 0
+    _landlock_abi = int(rc)
+    logger.info("Landlock supported (ABI %d)", _landlock_abi)
+    return _landlock_abi
 
 
 def _landlock_supported() -> bool:
-    """检测当前内核是否支持 Landlock（结果缓存）"""
-    global _landlock_tested
-    if _landlock_tested is not None:
-        return _landlock_tested
-    if _libc is None:
-        _landlock_tested = False
-        return False
-    try:
-        # landlock_create_ruleset(NULL, 0, 0) 返回支持的属性数量
-        rc = _libc.syscall(SYS_LANDLOCK_CREATE_RULESET, None, 0, 0)
-        _landlock_tested = rc >= 0
-        if _landlock_tested:
-            logger.info(f"Landlock supported (v{rc} attributes)")
-    except Exception:
-        _landlock_tested = False
-    return _landlock_tested
+    return _landlock_abi_version() >= 1
+
+
+def _handled_access_mask(abi: int) -> int:
+    """Return only access bits understood by the detected ABI."""
+    mask = _LANDLOCK_ALL_ACCESS_V1
+    # ABI 2: LANDLOCK_ACCESS_FS_REFER
+    if abi >= 2:
+        mask |= 1 << 13
+    # ABI 3: LANDLOCK_ACCESS_FS_TRUNCATE
+    if abi >= 3:
+        mask |= 1 << 14
+    return mask
 
 
 def _apply_landlock(workspace_path: str) -> bool:
-    """
-    在当前进程上应用 Landlock 限制。
-    必须在 fork 后、exec 前调用（即 preexec_fn 里）。
+    """Install a deny-by-default Landlock filesystem policy for the child.
 
-    workspace_path: 允许读写的目录（递归）
-    返回 True 表示成功施加限制，False 表示 Landlock 不可用或失败。
+    The workspace is the only writable tree. System trees needed to execute
+    bash are explicitly read/execute-only. Every syscall and every rule-add
+    operation is checked; a partial policy is never accepted.
     """
-    if not _landlock_supported():
+    abi = _landlock_abi_version()
+    if abi < 1:
         return False
 
+    handled = _handled_access_mask(abi)
     try:
-        # 1. 创建 ruleset
-        attr = _LandlockRulesetAttr(handled_access_fs=_LANDLOCK_ALL_ACCESS_V1)
+        workspace = os.path.realpath(workspace_path)
+        if not os.path.isdir(workspace):
+            raise SandboxSetupError(f"workspace is not a directory: {workspace}")
+
+        attr = _LandlockRulesetAttr(handled_access_fs=handled)
         ruleset_fd = _libc.syscall(
             SYS_LANDLOCK_CREATE_RULESET,
             ctypes.byref(attr),
@@ -166,66 +212,50 @@ def _apply_landlock(workspace_path: str) -> bool:
             0,
         )
         if ruleset_fd < 0:
-            logger.warning(f"landlock_create_ruleset failed: {ctypes.get_errno()}")
+            logger.error("landlock_create_ruleset failed: errno=%s", ctypes.get_errno())
             return False
 
         try:
-            # 2. 添加 workspace 规则（全权限：读写执行创建删除）
-            ws_fd = os.open(workspace_path, os.O_PATH | os.O_CLOEXEC)
-            try:
-                beneath = _LandlockPathBeneathAttr(
-                    allowed_access=_LANDLOCK_ALL_ACCESS_V1,
-                    parent_fd=ws_fd,
-                )
-                rc = _libc.syscall(
-                    SYS_LANDLOCK_ADD_RULE,
-                    ruleset_fd,
-                    LANDLOCK_RULE_PATH_BENEATH,
-                    ctypes.byref(beneath),
-                    0,
-                )
-                if rc < 0:
-                    logger.warning(f"landlock_add_rule(workspace) failed: {ctypes.get_errno()}")
-                    return False
-            finally:
-                os.close(ws_fd)
-
-            # 3. 添加只读系统目录规则（bash/python 能跑、库能加载）
-            for d in ("/usr", "/bin", "/sbin", "/lib", "/lib64",
-                      "/etc", "/dev", "/proc", "/sys"):
-                if not os.path.exists(d):
-                    continue
+            def add_path_rule(path: str, allowed: int) -> None:
+                fd = os.open(path, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
                 try:
-                    d_fd = os.open(d, os.O_PATH | os.O_CLOEXEC)
-                except OSError:
-                    continue
-                try:
-                    beneath = _LandlockPathBeneathAttr(
-                        allowed_access=_LANDLOCK_READ_EXEC,
-                        parent_fd=d_fd,
+                    rule = _LandlockPathBeneathAttr(
+                        allowed_access=allowed,
+                        parent_fd=fd,
                     )
-                    _libc.syscall(
+                    rc = _libc.syscall(
                         SYS_LANDLOCK_ADD_RULE,
                         ruleset_fd,
                         LANDLOCK_RULE_PATH_BENEATH,
-                        ctypes.byref(beneath),
+                        ctypes.byref(rule),
                         0,
                     )
-                except OSError:
-                    pass
+                    if rc < 0:
+                        raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
                 finally:
-                    os.close(d_fd)
+                    os.close(fd)
 
-            # 4. 施加限制（不可逆）
+            # The only writable/readable user tree. Since Landlock is scoped to
+            # this directory fd, ../ resolves outside the rule and is denied.
+            add_path_rule(workspace, handled)
+
+            # Read/execute-only runtime dependencies. No WRITE/MAKE/REMOVE bits
+            # are granted here, so the shell cannot modify the application image.
+            runtime_ro = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_EXECUTE
+            for d in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/dev", "/proc", "/sys"):
+                if not os.path.isdir(d):
+                    continue
+                add_path_rule(d, runtime_ro)
+
             rc = _libc.syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0)
             if rc < 0:
-                logger.warning(f"landlock_restrict_self failed: {ctypes.get_errno()}")
+                logger.error("landlock_restrict_self failed: errno=%s", ctypes.get_errno())
                 return False
             return True
         finally:
             os.close(ruleset_fd)
-    except Exception as e:
-        logger.warning(f"Landlock apply failed: {e}")
+    except Exception as exc:
+        logger.error("Landlock policy installation failed: %s", exc)
         return False
 
 
@@ -233,24 +263,22 @@ def _apply_landlock(workspace_path: str) -> bool:
 # preexec_fn —— fork 后 exec 前调用
 # =====================================================================
 def _preexec_sandbox(workspace_path: str):
-    """
-    在子进程 fork 后、exec 前调用：
-    1. no-new-privs（阻止 setuid 提权）
-    2. Landlock（文件系统隔离，限制在 workspace 内）
-    3. setrlimit（CPU / 文件大小 / fd 上限）
-
-    workspace_path: bash 进程允许读写的唯一目录。
-    """
+    """Install all mandatory child restrictions before exec("bash")."""
     import resource
-    _set_no_new_privs()
+
+    if _libc is None:
+        raise SandboxSetupError("libc is unavailable; cannot install sandbox")
+
+    # no_new_privs is part of the sandbox contract, not a best-effort warning.
+    if _set_no_new_privs() is False:
+        raise SandboxSetupError("PR_SET_NO_NEW_PRIVS failed")
+
     if not _apply_landlock(workspace_path):
-        logger.warning("Landlock 不可用，仅靠 rlimit + no-new-privs（无文件系统隔离）")
-    try:
-        resource.setrlimit(resource.RLIMIT_CPU, (SANDBOX_MAX_CPU_SEC, SANDBOX_MAX_CPU_SEC))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (SANDBOX_MAX_FILE_SIZE, SANDBOX_MAX_FILE_SIZE))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (SANDBOX_MAX_OPEN_FILES, SANDBOX_MAX_OPEN_FILES))
-    except (ValueError, OSError) as e:
-        logger.warning(f"setrlimit failed: {e}")
+        raise SandboxSetupError("Landlock filesystem sandbox could not be installed")
+
+    resource.setrlimit(resource.RLIMIT_CPU, (SANDBOX_MAX_CPU_SEC, SANDBOX_MAX_CPU_SEC))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (SANDBOX_MAX_FILE_SIZE, SANDBOX_MAX_FILE_SIZE))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (SANDBOX_MAX_OPEN_FILES, SANDBOX_MAX_OPEN_FILES))
 
 
 # =====================================================================

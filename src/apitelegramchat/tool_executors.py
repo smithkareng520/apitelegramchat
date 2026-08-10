@@ -148,6 +148,7 @@ class BashSession:
             text=False,
             bufsize=0,
             env=env,  # ★ 关键: 不传任何敏感变量
+            cwd=str(self.workdir.absolute()),  # ★ 关键: 沙箱进程启动即位于 workspace
             start_new_session=True,  # ★ 关键: 创建新会话，便于 killpg
             preexec_fn=preexec,  # Landlock + no-new-privs + rlimit
         )

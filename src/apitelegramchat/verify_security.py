@@ -92,87 +92,78 @@ def check_landlock():
 # 4. 沙箱内隔离测试
 # ----------------------------------------------------------------------
 async def check_sandbox_isolation(landlock_ok: bool):
-    """在沙箱里跑一组命令，验证隔离性"""
+    """Run independent commands and assert filesystem confinement."""
     if not landlock_ok:
-        warn("4.x 沙箱隔离测试", "Landlock 不可用，跳过")
+        report("4.0 Landlock sandbox available", False, "Landlock unavailable: sandbox cannot be considered safe")
         return
 
     import functools
     from apitelegramchat.sandbox import build_sandbox_argv, build_sandbox_env, _preexec_sandbox
 
     workspace = Path("/tmp/verify_workspace").absolute()
+    parent_probe = workspace.parent / "landlock-parent-probe.txt"
+    outside_target = workspace.parent / "landlock-outside-target.txt"
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "secret.txt").write_text("THIS_IS_SECRET_12345")
+    parent_probe.unlink(missing_ok=True)
+    outside_target.write_text("OUTSIDE_SECRET_98765")
 
-    argv = build_sandbox_argv()
-    env = build_sandbox_env(workspace, 999999)
-    preexec = functools.partial(_preexec_sandbox, str(workspace))
-
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        text=False, bufsize=0,
-        env=env,
-        start_new_session=True,
-        preexec_fn=preexec,
-    )
-
-    tests = [
-        # (命令, 期望通过/失败, 说明)
-        ("env\n",                           False, "4.1 env 不应包含任何 KEY/TOKEN"),
-        ("cat /etc/shadow 2>&1\n",          False, "4.2 /etc/shadow 应不可读（Landlock 拒绝）"),
-        ("ls /app/config.py 2>&1\n",        False, "4.3 /app/config.py 应不可见（Landlock 拒绝）"),
-        ("echo DATA > /app/test 2>&1\n",    False, "4.4 /app 应不可写（Landlock 拒绝）"),
-        ("cat /proc/1/cmdline 2>&1\n",      False, "4.5 /proc/1 应不可见（Landlock 拒绝）"),
-        ("sudo ls 2>&1\n",                  False, "4.6 sudo 应不可用"),
-        ("cat secret.txt\n",                True,  "4.7 workspace 内文件可读"),
-        ("ls ../ 2>&1\n",                   False, "4.8 父目录应被 Landlock 拒绝"),
-        ("python3 -c \"import os; print(os.environ)\" 2>&1\n", True, "4.9 Python 子进程 env 干净"),
-    ]
-
-    for cmd, should_pass, desc in tests:
+    async def run(cmd: str) -> tuple[int, str]:
+        argv = build_sandbox_argv()
+        env = build_sandbox_env(workspace, 999999)
+        preexec = functools.partial(_preexec_sandbox, str(workspace))
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            text=False,
+            bufsize=0,
+            env=env,
+            cwd=str(workspace),
+            start_new_session=True,
+            preexec_fn=preexec,
+        )
         try:
-            proc.stdin.write(cmd.encode())
-            await proc.stdin.drain()
-            await asyncio.sleep(0.3)
-            line = await asyncio.wait_for(proc.stdout.readline(), timeout=2)
-            output = line.decode("utf-8", errors="replace").strip()
-            # 简化判断：检查输出是否包含敏感关键字
-            if "4.1" in desc:
-                # 期望 env 不含 KEY/TOKEN
-                bad = bool(re.search(r'(KEY|TOKEN|SECRET|PASSWORD)=', output))
-                report(desc, not bad, output[:200])
-            elif "4.2" in desc:
-                report(desc, "Permission denied" in output or "No such file" in output,
-                       output[:200])
-            elif "4.3" in desc:
-                report(desc, "Permission denied" in output or "No such file" in output,
-                       output[:200])
-            elif "4.4" in desc:
-                report(desc, "Permission denied" in output or "read-only" in output,
-                       output[:200])
-            elif "4.5" in desc:
-                report(desc, "Permission denied" in output or "No such file" in output,
-                       output[:200])
-            elif "4.6" in desc:
-                report(desc, "not found" in output.lower() or "Permission denied" in output,
-                       output[:200])
-            elif "4.7" in desc:
-                report(desc, "THIS_IS_SECRET_12345" in output, output[:200])
-            elif "4.8" in desc:
-                report(desc, "999999" in output or output.count("\n") <= 2,
-                       output[:200])
-            elif "4.9" in desc:
-                bad = bool(re.search(r'(KEY|TOKEN|SECRET|PASSWORD)=', output))
-                report(desc, not bad, output[:300])
-        except Exception as e:
-            report(desc, False, f"exception: {e}")
+            out, _ = await asyncio.wait_for(proc.communicate(cmd.encode()), timeout=5)
+            return proc.returncode or 0, out.decode("utf-8", errors="replace")
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
 
-    proc.kill()
-    await proc.wait()
-    shutil.rmtree(workspace, ignore_errors=True)
+    try:
+        rc, out = await run("printf ok > inside.txt\ncat inside.txt\n")
+        report("4.1 workspace 内读写", rc == 0 and "ok" in out, out[:200])
+
+        rc, out = await run("printf x > ../landlock-parent-probe.txt\n")
+        report("4.2 ../ 写入被拒绝", rc != 0 and not parent_probe.exists(), out[:200])
+
+        rc, out = await run("cat ../landlock-outside-target.txt 2>&1\n")
+        report("4.3 ../ 读取被拒绝", rc != 0 and "OUTSIDE_SECRET_98765" not in out, out[:200])
+
+        rc, out = await run("ln -s ../landlock-outside-target.txt escape-link\ncat escape-link 2>&1\n")
+        report("4.4 symlink 逃逸被拒绝", "OUTSIDE_SECRET_98765" not in out, out[:200])
+
+        rc, out = await run("cat /app/config.py 2>&1\n")
+        report("4.5 应用源码不可读", "Permission denied" in out or "No such file" in out, out[:200])
+
+        rc, out = await run("printf x > /app/landlock-write-probe 2>&1\n")
+        report("4.6 应用目录不可写", "Permission denied" in out or "Read-only" in out, out[:200])
+
+        rc, out = await run("cat /etc/shadow 2>&1\n")
+        report("4.7 /etc/shadow 不可读", "Permission denied" in out or "No such file" in out, out[:200])
+
+        rc, out = await run("cat /proc/1/cmdline 2>&1\n")
+        report("4.8 /proc 不可访问", "Permission denied" in out or "No such file" in out, out[:200])
+
+        rc, out = await run("env\n")
+        bad = bool(re.search(r'(KEY|TOKEN|SECRET|PASSWORD)=', out))
+        report("4.9 子进程环境无密钥", not bad, out[:300])
+    finally:
+        parent_probe.unlink(missing_ok=True)
+        outside_target.unlink(missing_ok=True)
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 # ----------------------------------------------------------------------

@@ -175,6 +175,22 @@ This repository ships Anthropic-compatible skills under `.claude/skills/` and do
 
 ## 十、Bash 沙箱（Landlock）
 
+### Landlock 探测修复
+
+Landlock 的可用性探测必须调用 `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`。旧实现使用 flags=0，这不是正确的 ABI 版本探测，在某些内核/运行时会得到失败结果，从而让后续执行层误以为 Landlock 不可用。
+
+现在沙箱会：
+- 正确探测 Landlock ABI；
+- 只使用当前 ABI 支持的 access bits；
+- workspace 使用 `PATH_BENEATH` 规则作为唯一可写树；
+- `/usr`、`/bin`、`/lib` 等运行时依赖只授予读/执行；
+- 每一次 `landlock_add_rule()` 和 `landlock_restrict_self()` 都检查返回值；
+- `PR_SET_NO_NEW_PRIVS` 失败也会阻止启动受限 shell；
+- bash 启动时 `cwd` 直接设置为 workspace。
+
+回归测试必须实际验证 `printf x > ../1.txt`、`cat ../outside`、symlink 指向 workspace 外部等路径均被内核拒绝。
+
+
 ### 1. 隔离方案
 
 用 **Linux Landlock**（5.13+ 内核特性）做文件系统隔离。每个 chat_id 的 bash 进程在启动时（fork 后 exec 前）施加 Landlock 规则：
