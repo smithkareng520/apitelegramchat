@@ -34,4 +34,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD pytho
 
 EXPOSE 5000
 
-CMD ["sh", "-c", "exec python -m quart run --app apitelegramchat.app:app --host 0.0.0.0 --port ${PORT:-5000}"]
+CMD ["sh", "-c", "exec python -m quart --app apitelegramchat.app:app run --host 0.0.0.0 --port ${PORT:-5000}"]
