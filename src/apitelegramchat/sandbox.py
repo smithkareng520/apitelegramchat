@@ -18,6 +18,8 @@ import signal
 from pathlib import Path
 from typing import Optional
 
+from apitelegramchat.workspace_paths import workspace_workdir
+
 logger = logging.getLogger(__name__)
 
 # ---------- bwrap 路径 ----------
@@ -109,10 +111,12 @@ async def is_bwrap_available() -> bool:
 def build_bwrap_argv(workspace: Path, chat_id: int) -> list:
     """
     为单个 chat_id 构造 bwrap 启动参数
-    workspace: 该 chat 的工作目录绝对路径
+    workspace: 该 chat 的根工作区绝对路径
     """
     ws = str(workspace.absolute())
     ws_parent = str(workspace.parent.absolute())
+    workdir = workspace_workdir(chat_id)
+    workdir_abs = str(workdir.absolute())
 
     argv = [
         BWRAP,
@@ -156,19 +160,22 @@ def build_bwrap_argv(workspace: Path, chat_id: int) -> list:
     # bwrap --clearenv 会清空所有环境，然后我们只放白名单
     safe_env = {
         "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
-        "HOME": ws,
+        "HOME": workdir_abs,
         "USER": f"chat{chat_id}",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "TERM": "xterm-256color",
         "SHELL": "/bin/bash",
+        "HISTFILE": "/dev/null",
+        "HISTSIZE": "0",
+        "HISTFILESIZE": "0",
     }
     argv += ["--clearenv"]
     for k, v in safe_env.items():
         argv += ["--setenv", k, v]
 
     # ===== 工作目录 =====
-    argv += ["--chdir", ws]
+    argv += ["--chdir", workdir_abs]
 
     # ===== 实际启动的进程 =====
     argv += ["/bin/bash", "--noprofile", "--norc", "-i"]
@@ -184,16 +191,20 @@ def build_fallback_argv(workspace: Path, chat_id: int) -> list:
 
 def build_fallback_env(workspace: Path, chat_id: int) -> dict:
     """fallback 模式下的最小 env（同样不传任何 API Key）"""
-    ws = str(workspace.absolute())
+    workdir = workspace_workdir(chat_id)
+    workdir_abs = str(workdir.absolute())
     return {
         "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
-        "HOME": ws,
+        "HOME": workdir_abs,
         "USER": f"chat{chat_id}",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "TERM": "xterm-256color",
         "SHELL": "/bin/bash",
-        "PWD": ws,
+        "PWD": workdir_abs,
+        "HISTFILE": "/dev/null",
+        "HISTSIZE": "0",
+        "HISTFILESIZE": "0",
         # ★ 刻意不带任何 *API_KEY *TOKEN *SECRET *PASSWORD
     }
 

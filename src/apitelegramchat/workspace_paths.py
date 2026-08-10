@@ -6,6 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 
 _NAMESPACE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+_WORKDIR_NAME = os.getenv("APITELEGRAMCHAT_WORKDIR_NAME", "工作目录").strip() or "工作目录"
 
 
 @lru_cache(maxsize=1)
@@ -35,6 +36,13 @@ def workspace_root(chat_id: object, namespace: object | None = None) -> Path:
     root = data_root() / "workspaces" / sanitize_namespace(ns)
     root.mkdir(parents=True, exist_ok=True)
     return root.resolve()
+
+
+def workspace_workdir(chat_id: object, namespace: object | None = None) -> Path:
+    root = workspace_root(chat_id, namespace)
+    workdir = root / _WORKDIR_NAME
+    workdir.mkdir(parents=True, exist_ok=True)
+    return workdir.resolve()
 
 
 def workspace_file(chat_id: object, filename: str, namespace: object | None = None) -> Path:

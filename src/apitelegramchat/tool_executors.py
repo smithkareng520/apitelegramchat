@@ -8,7 +8,7 @@ import aiohttp
 import json
 import hashlib
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root
+from apitelegramchat.workspace_paths import workspace_root, workspace_workdir
 import re
 import html
 import logging
@@ -117,6 +117,7 @@ class BashSession:
         self.proc: Optional[asyncio.subprocess.Process] = None
         self._started = False
         self.workspace = workspace_root(chat_id)
+        self.workdir = workspace_workdir(chat_id)
         self._watchdog_task: Optional[asyncio.Task] = None
         self._sandbox_mode: Optional[str] = None  # "bwrap" | "fallback"
 
@@ -127,7 +128,9 @@ class BashSession:
 
         # workspace 目录权限 700，防跨 chat 读取
         self.workspace.mkdir(parents=True, exist_ok=True)
+        self.workdir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.workspace, 0o700)
+        os.chmod(self.workdir, 0o700)
 
         use_bwrap = await is_bwrap_available()
         if use_bwrap:
@@ -220,7 +223,7 @@ class BashSession:
                 return f"Error: Command rejected for security reasons: {command}"
 
             marker = f"__END_{random.randint(100000, 999999)}__"
-            workspace_dir = shlex.quote(str(self.workspace.absolute()))
+            workspace_dir = shlex.quote(str(self.workdir.absolute()))
             full_cmd = f"cd {workspace_dir} && {command}; echo '{marker} $?'\n"
 
             try:
@@ -1525,6 +1528,7 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
         await _sync_workspace_from_r2(chat_id)
 
         workspace = workspace_root(chat_id)
+        workspace_workdir(chat_id)
         sent = []
         failed = []
         # 文件大小上限：50MB，防止 OOM

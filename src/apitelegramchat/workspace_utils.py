@@ -3,7 +3,7 @@ import asyncio
 import os
 import logging
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root
+from apitelegramchat.workspace_paths import workspace_root, workspace_workdir
 
 from apitelegramchat.s3_utils import (
     upload_bytes_to_r2,
@@ -35,6 +35,7 @@ async def _sync_workspace_from_r2(chat_id: int):
     """
     workspace = workspace_root(chat_id)
     workspace.mkdir(parents=True, exist_ok=True)
+    workspace_workdir(chat_id)
     prefix = f"editor/{chat_id}/"
     keys = await list_r2_objects(prefix)
     remote_rels = set()
@@ -76,6 +77,8 @@ async def _sync_workspace_from_r2(chat_id: int):
         # 删除空目录（可选）
         for dir_name in dirs:
             dir_path = os.path.join(root, dir_name)
+            if os.path.abspath(dir_path) == os.path.abspath(workdir):
+                continue
             if not os.listdir(dir_path):
                 os.rmdir(dir_path)
 
@@ -88,6 +91,7 @@ async def _sync_workspace_to_r2(chat_id: int):
     workspace = workspace_root(chat_id)
     if not workspace.exists():
         return
+    workdir = workspace_workdir(chat_id)
     prefix = f"editor/{chat_id}/"
     local_rels = set()
     for root, dirs, files in os.walk(workspace):
@@ -133,6 +137,7 @@ async def _sync_file_from_r2(chat_id: int, filename: str) -> None:
     """
     workspace = workspace_root(chat_id)
     workspace.mkdir(parents=True, exist_ok=True)
+    workspace_workdir(chat_id)
     local_path = workspace / filename
 
     # 路径安全校验
@@ -156,6 +161,7 @@ async def _sync_file_to_r2(chat_id: int, filename: str) -> None:
     如果本地文件不存在，则删除 R2 上的对应文件（如果有的话）。
     """
     workspace = workspace_root(chat_id)
+    workspace_workdir(chat_id)
     local_path = workspace / filename
 
     safe_name = os.path.normpath(filename)

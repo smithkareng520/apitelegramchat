@@ -1327,12 +1327,12 @@ SEARCH_TOOLS = [
     ),
     # ===================== 任务 / 待办工具 =====================
     # 让 agent 拥有持久化的待办清单能力：add/list/done/undone/delete/clear/edit。
-    # 数据按 chat 隔离，存放在 ./workspace/{chat_id}/todos.json 并随 R2 同步。
+    # 数据按 chat 隔离，存放在 ./workspace/{chat_id}/工作目录/todos.json 并随 R2 同步。
     # 渲染层走 sendRichMessage 富文本卡片 + InlineKeyboard 一键操作。
     TODO_TOOL,
     # ===================== 长期记忆工具 =====================
     # 跨会话保留的事实/偏好/人物/事件——不同于会自动修剪的对话历史。
-    # 数据落在 ./workspace/{chat_id}/memories.json，随 R2 同步。
+    # 数据落在 ./workspace/{chat_id}/工作目录/memories.json，随 R2 同步。
     MEMORY_TOOL,
     # ===================== 技能注册表 =====================
     # 内置 7 个能力模板（translator/summarizer/coder/reviewer/explainer/

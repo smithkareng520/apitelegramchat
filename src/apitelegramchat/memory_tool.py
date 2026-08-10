@@ -6,7 +6,7 @@
 ----
 - 不同于对话历史（短期、会被自动修剪），memory 是用户希望长期保留的事实、
   偏好、要点——跨会话持久化。
-- 按 chat 隔离，落在 ./workspace/{chat_id}/memories.json，复用既有 R2 同步链路。
+- 按 chat 隔离，落在 ./workspace/{chat_id}/工作目录/memories.json，复用既有 R2 同步链路。
 - 给 AI 一组 CRUD + 检索接口：add / get / list / search / update / delete / clear。
 
 数据模型

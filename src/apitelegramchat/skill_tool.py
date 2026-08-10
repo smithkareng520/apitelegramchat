@@ -23,7 +23,7 @@ skill 是可复用的「能力模板」：每个 skill 由
   planner      — 任务拆解，输出可执行步骤
 
 用户也可以自己注册 custom skill：定义 name + description + prompt + 可选 tools。
-custom skill 落在 ./workspace/{chat_id}/skills.json，随 R2 同步，跨会话保留。
+custom skill 落在 ./workspace/{chat_id}/工作目录/skills.json，随 R2 同步，跨会话保留。
 
 操作
 ----
