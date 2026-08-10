@@ -6,7 +6,7 @@
 --------
 1. 给 AI agent 一个轻量、持久的任务管理能力——支持新增、列表、完成、
    反完成、删除、清空、编辑、改优先级。
-2. 数据按 chat 隔离，落在 ./workspace/{chat_id}/工作目录/todos.json，复用既有
+2. 数据按 chat 隔离，落在 ./workspace/{chat_id}/workspace/todos.json，复用既有
    workspace_utils 的 R2 同步链路，无需额外存储。
 3. 给 Telegram 客户端一套富文本渲染：状态 emoji、优先级颜色、删除线、
    可折叠统计区，以及可点击的 InlineKeyboard 按钮（一键完成/删除）。

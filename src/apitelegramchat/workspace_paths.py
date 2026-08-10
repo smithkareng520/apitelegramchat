@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 
 _NAMESPACE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
-_WORKDIR_NAME = os.getenv("APITELEGRAMCHAT_WORKDIR_NAME", "工作目录").strip() or "工作目录"
+_WORKDIR_NAME = os.getenv("APITELEGRAMCHAT_WORKDIR_NAME", "workspace").strip() or "workspace"
 
 
 @lru_cache(maxsize=1)

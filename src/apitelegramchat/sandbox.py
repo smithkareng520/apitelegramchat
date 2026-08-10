@@ -174,11 +174,11 @@ def build_bwrap_argv(workspace: Path, chat_id: int) -> list:
     for k, v in safe_env.items():
         argv += ["--setenv", k, v]
 
-    # ===== 工作目录 =====
+    # ===== workspace =====
     argv += ["--chdir", workdir_abs]
 
     # ===== 实际启动的进程 =====
-    argv += ["/bin/bash", "--noprofile", "--norc", "-i"]
+    argv += ["/bin/bash", "--noprofile", "--norc", "-s"]
 
     return argv
 
@@ -186,7 +186,7 @@ def build_bwrap_argv(workspace: Path, chat_id: int) -> list:
 # ---------- 构造 fallback argv（无 bwrap 时） ----------
 def build_fallback_argv(workspace: Path, chat_id: int) -> list:
     """弱模式：仅 env 清洗 + no-new-privs（无命名空间隔离）"""
-    return ["/bin/bash", "--noprofile", "--norc", "-i"]
+    return ["/bin/bash", "--noprofile", "--norc", "-s"]
 
 
 def build_fallback_env(workspace: Path, chat_id: int) -> dict:
