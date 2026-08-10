@@ -239,12 +239,212 @@ def build_fallback_env(workspace: Path, chat_id: int) -> dict:
     }
 
 
+# ---------- Landlock（非特权文件系统隔离） ----------
+# Linux 5.13+ 的 Landlock 允许非特权进程限制自己的文件系统访问范围。
+# 不需要 userns / CAP_SYS_ADMIN / privileged 容器——这是 Render / Heroku /
+# 非 privileged Docker 上唯一可行的文件系统隔离方案。
+#
+# 原理：fork 后 exec 前，在子进程里调 landlock_create_ruleset +
+# landlock_add_rule + landlock_restrict_self，给自己加规则：
+#   - workspace 目录：可读写
+#   - /usr /bin /lib /etc：只读 + 可执行
+#   - /dev /proc /sys：只读（/dev/null /dev/urandom 等可读）
+#   - 其他（/tmp 外部、/home、/app 源码、R2 cache）：全部拒绝
+# 限制不可逆，子进程继承。
+
+import ctypes.util
+
+# Landlock 常量（<linux/landlock.h>）
+LANDLOCK_CREATE_RULESET_VERSION = 1 << 0
+LANDLOCK_RULE_PATH_BENEATH = 1
+
+LANDLOCK_ACCESS_FS_EXECUTE = 1 << 0
+LANDLOCK_ACCESS_FS_WRITE_FILE = 1 << 1
+LANDLOCK_ACCESS_FS_READ_FILE = 1 << 2
+LANDLOCK_ACCESS_FS_READ_DIR = 1 << 3
+LANDLOCK_ACCESS_FS_REMOVE_DIR = 1 << 4
+LANDLOCK_ACCESS_FS_REMOVE_FILE = 1 << 5
+LANDLOCK_ACCESS_FS_MAKE_CHAR = 1 << 6
+LANDLOCK_ACCESS_FS_MAKE_DIR = 1 << 7
+LANDLOCK_ACCESS_FS_MAKE_REG = 1 << 8
+LANDLOCK_ACCESS_FS_MAKE_SOCK = 1 << 9
+LANDLOCK_ACCESS_FS_MAKE_FIFO = 1 << 10
+LANDLOCK_ACCESS_FS_MAKE_BLOCK = 1 << 11
+LANDLOCK_ACCESS_FS_MAKE_SYM = 1 << 12
+
+# x86_64 syscall 号
+SYS_LANDLOCK_CREATE_RULESET = 444
+SYS_LANDLOCK_ADD_RULE = 445
+SYS_LANDLOCK_RESTRICT_SELF = 446
+
+# 所有 v1 的 access flags（Linux 5.13+ 通用）
+_LANDLOCK_ALL_ACCESS_V1 = (
+    LANDLOCK_ACCESS_FS_EXECUTE |
+    LANDLOCK_ACCESS_FS_WRITE_FILE |
+    LANDLOCK_ACCESS_FS_READ_FILE |
+    LANDLOCK_ACCESS_FS_READ_DIR |
+    LANDLOCK_ACCESS_FS_REMOVE_DIR |
+    LANDLOCK_ACCESS_FS_REMOVE_FILE |
+    LANDLOCK_ACCESS_FS_MAKE_CHAR |
+    LANDLOCK_ACCESS_FS_MAKE_DIR |
+    LANDLOCK_ACCESS_FS_MAKE_REG |
+    LANDLOCK_ACCESS_FS_MAKE_SOCK |
+    LANDLOCK_ACCESS_FS_MAKE_FIFO |
+    LANDLOCK_ACCESS_FS_MAKE_BLOCK |
+    LANDLOCK_ACCESS_FS_MAKE_SYM
+)
+
+# 只读 + 可执行
+_LANDLOCK_READ_EXEC = (
+    LANDLOCK_ACCESS_FS_READ_FILE |
+    LANDLOCK_ACCESS_FS_READ_DIR |
+    LANDLOCK_ACCESS_FS_EXECUTE
+)
+
+
+class _LandlockRulesetAttr(ctypes.Structure):
+    _fields_ = [("handled_access_fs", ctypes.c_uint64)]
+
+
+class _LandlockPathBeneathAttr(ctypes.Structure):
+    _fields_ = [
+        ("allowed_access", ctypes.c_uint64),
+        ("parent_fd", ctypes.c_int32),
+    ]
+
+
+_landlock_tested: Optional[bool] = None
+
+
+def _landlock_supported() -> bool:
+    """检测当前内核是否支持 Landlock（结果缓存）"""
+    global _landlock_tested
+    if _landlock_tested is not None:
+        return _landlock_tested
+    if _libc is None:
+        _landlock_tested = False
+        return False
+    try:
+        # landlock_create_ruleset(NULL, 0, 0) 返回支持的属性数量
+        # 如果内核不支持，返回 -1 且 errno=ENOSYS 或 EOPNOTSUPP
+        rc = _libc.syscall(SYS_LANDLOCK_CREATE_RULESET, None, 0, 0)
+        _landlock_tested = rc >= 0
+        if _landlock_tested:
+            logger.info(f"Landlock supported (v{rc} attributes)")
+    except Exception:
+        _landlock_tested = False
+    return _landlock_tested
+
+
+def _apply_landlock(workspace_path: str) -> bool:
+    """
+    在当前进程上应用 Landlock 限制。
+    必须在 fork 后、exec 前调用（即 preexec_fn 里）。
+
+    workspace_path: 允许读写的目录（递归）
+    返回 True 表示成功施加限制，False 表示 Landlock 不可用或失败。
+    """
+    if not _landlock_supported():
+        return False
+
+    try:
+        # 1. 创建 ruleset
+        attr = _LandlockRulesetAttr(handled_access_fs=_LANDLOCK_ALL_ACCESS_V1)
+        ruleset_fd = _libc.syscall(
+            SYS_LANDLOCK_CREATE_RULESET,
+            ctypes.byref(attr),
+            ctypes.sizeof(attr),
+            0,
+        )
+        if ruleset_fd < 0:
+            logger.warning(f"landlock_create_ruleset failed: {ctypes.get_errno()}")
+            return False
+
+        try:
+            # 2. 添加 workspace 规则（全权限）
+            ws_fd = os.open(workspace_path, os.O_PATH | os.O_CLOEXEC)
+            try:
+                beneath = _LandlockPathBeneathAttr(
+                    allowed_access=_LANDLOCK_ALL_ACCESS_V1,
+                    parent_fd=ws_fd,
+                )
+                rc = _libc.syscall(
+                    SYS_LANDLOCK_ADD_RULE,
+                    ruleset_fd,
+                    LANDLOCK_RULE_PATH_BENEATH,
+                    ctypes.byref(beneath),
+                    0,
+                )
+                if rc < 0:
+                    logger.warning(f"landlock_add_rule(workspace) failed: {ctypes.get_errno()}")
+                    return False
+            finally:
+                os.close(ws_fd)
+
+            # 3. 添加只读系统目录规则
+            for d in ("/usr", "/bin", "/sbin", "/lib", "/lib64",
+                      "/etc", "/dev", "/proc", "/sys"):
+                if not os.path.exists(d):
+                    continue
+                try:
+                    d_fd = os.open(d, os.O_PATH | os.O_CLOEXEC)
+                except OSError:
+                    continue
+                try:
+                    beneath = _LandlockPathBeneathAttr(
+                        allowed_access=_LANDLOCK_READ_EXEC,
+                        parent_fd=d_fd,
+                    )
+                    _libc.syscall(
+                        SYS_LANDLOCK_ADD_RULE,
+                        ruleset_fd,
+                        LANDLOCK_RULE_PATH_BENEATH,
+                        ctypes.byref(beneath),
+                        0,
+                    )
+                    # 忽略单条失败，best-effort
+                except OSError:
+                    pass
+                finally:
+                    os.close(d_fd)
+
+            # 4. 施加限制（不可逆）
+            rc = _libc.syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0)
+            if rc < 0:
+                logger.warning(f"landlock_restrict_self failed: {ctypes.get_errno()}")
+                return False
+            return True
+        finally:
+            os.close(ruleset_fd)
+    except Exception as e:
+        logger.warning(f"Landlock apply failed: {e}")
+        return False
+
+
 # ---------- preexec_fn（仅 fallback 模式） ----------
 def _preexec_fallback():
-    """在子进程 fork 后、exec 前调用"""
+    """在子进程 fork 后、exec 前调用（旧接口，无 Landlock）"""
     import resource
     _set_no_new_privs()
-    # Python 3.12+ 已移除 resource.error，统一使用 OSError
+    try:
+        resource.setrlimit(resource.RLIMIT_CPU, (SANDBOX_MAX_CPU_SEC, SANDBOX_MAX_CPU_SEC))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (SANDBOX_MAX_FILE_SIZE, SANDBOX_MAX_FILE_SIZE))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (SANDBOX_MAX_OPEN_FILES, SANDBOX_MAX_OPEN_FILES))
+    except (ValueError, OSError) as e:
+        logger.warning(f"setrlimit failed: {e}")
+
+
+def _preexec_fallback_with_landlock(workspace_path: str):
+    """
+    fork 后 exec 前调用：no-new-privs + setrlimit + Landlock 文件系统隔离。
+
+    workspace_path: bash 进程允许读写的唯一目录。
+    """
+    import resource
+    _set_no_new_privs()
+    # 先施加 Landlock（限制文件系统），再设 rlimit（限制资源）
+    if not _apply_landlock(workspace_path):
+        logger.warning("Landlock 不可用，fallback 仅靠 rlimit + no-new-privs（无文件系统隔离）")
     try:
         resource.setrlimit(resource.RLIMIT_CPU, (SANDBOX_MAX_CPU_SEC, SANDBOX_MAX_CPU_SEC))
         resource.setrlimit(resource.RLIMIT_FSIZE, (SANDBOX_MAX_FILE_SIZE, SANDBOX_MAX_FILE_SIZE))

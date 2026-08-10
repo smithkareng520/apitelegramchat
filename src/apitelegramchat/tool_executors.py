@@ -23,7 +23,8 @@ from apitelegramchat.workspace_utils import (
 
 from apitelegramchat.sandbox import (
     build_bwrap_argv, build_fallback_argv, build_fallback_env,
-    is_bwrap_available, watchdog, apply_prlimit, _preexec_fallback,
+    is_bwrap_available, watchdog, apply_prlimit,
+    _preexec_fallback, _preexec_fallback_with_landlock,
     SANDBOX_TIMEOUT_SEC, SANDBOX_ALLOW_FALLBACK,
 )
 
@@ -138,18 +139,22 @@ class BashSession:
             if not SANDBOX_ALLOW_FALLBACK:
                 raise RuntimeError(
                     "bash sandbox unavailable: bwrap is required for workspace-only access. "
-                    "Set SANDBOX_ALLOW_FALLBACK=1 to enable fallback mode (no namespace "
-                    "isolation, uses bash + rlimits + no-new-privs + per-command cd enforcement), "
-                    "or install bubblewrap and run with --privileged / "
-                    "unprivileged_userns_clone=1."
+                    "Set SANDBOX_ALLOW_FALLBACK=1 to enable fallback mode (bash + Landlock "
+                    "filesystem isolation + rlimits + no-new-privs), or install bubblewrap "
+                    "and run with --privileged / unprivileged_userns_clone=1."
                 )
             argv = build_fallback_argv(self.workspace, self.chat_id)
             self._sandbox_mode = "fallback"
             # fallback 模式：只传白名单 env
             env = build_fallback_env(self.workspace, self.chat_id)
-            # ★ 关键修复：之前 _preexec_fallback 定义了但从未被调用，
-            # 导致 no-new-privs + setrlimit 都没生效。这里补上。
-            preexec = _preexec_fallback
+            # ★ Landlock：把文件系统访问限制在 workspace 目录内，
+            #   拒绝访问 /tmp 其他子目录（state/、r2_cache/）、/app 源码等。
+            #   通过 functools.partial 把 workspace 路径传给 preexec。
+            import functools
+            preexec = functools.partial(
+                _preexec_fallback_with_landlock,
+                str(self.workdir.absolute()),
+            )
 
         logger.info(f"Starting bash session chat_id={self.chat_id} mode={self._sandbox_mode}")
 
@@ -162,7 +167,7 @@ class BashSession:
             bufsize=0,
             env=env,  # ★ 关键: 不传任何敏感变量
             start_new_session=True,  # ★ 关键: 创建新会话，便于 killpg
-            preexec_fn=preexec,  # fallback 模式下设置 no-new-privs + rlimit
+            preexec_fn=preexec,  # fallback: Landlock + no-new-privs + rlimit
         )
 
         # 应用资源限制（bwrap 外层套一层 rlimit）
@@ -232,7 +237,11 @@ class BashSession:
 
             marker = f"__END_{random.randint(100000, 999999)}__"
             workspace_dir = shlex.quote(str(self.workdir.absolute()))
-            full_cmd = f"cd {workspace_dir} && {command}; echo '{marker} $?'\n"
+            # ★ 关键：在 echo marker 前先输出一个换行，确保 marker 单独占一行。
+            #   如果命令输出不以换行结尾（如 cat 无换行文件、printf 无 \n），
+            #   echo 的输出会粘在前一行，readline() 永远读不到以 marker 开头的行，
+            #   导致整个会话 hang 死。
+            full_cmd = f"cd {workspace_dir} && {command}; echo; echo '{marker} $?'\n"
 
             try:
                 self.proc.stdin.write(full_cmd.encode('utf-8'))
@@ -248,12 +257,18 @@ class BashSession:
                         if not line:
                             break
                         line_str = line.decode('utf-8', errors='replace')
-                        output_lines.append(line_str)
-                        if line_str.startswith(marker):
+                        # ★ 用 in 而不是 startswith：即使 marker 前面有残留字符
+                        #   （命令输出没换行的情况），也能检测到。
+                        if marker in line_str:
                             parts = line_str.split()
-                            exit_code = parts[1] if len(parts) >= 2 else "unknown"
-                            output_lines.pop()
+                            # marker 在某个位置，exit code 在它后面
+                            try:
+                                idx = parts.index(marker)
+                                exit_code = parts[idx + 1] if idx + 1 < len(parts) else "unknown"
+                            except (ValueError, IndexError):
+                                exit_code = "unknown"
                             break
+                        output_lines.append(line_str)
 
                 await asyncio.wait_for(read_until_marker(), timeout=timeout)
 

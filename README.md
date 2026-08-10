@@ -180,7 +180,8 @@ This repository ships Anthropic-compatible skills under `.claude/skills/` and do
 | 模式 | 触发条件 | 隔离强度 | 适用环境 |
 |---|---|---|---|
 | **bwrap** | bwrap 已安装 + 内核允许 unprivileged userns | 强（mount/pid/ipc/uts/net 命名空间隔离） | 本地 dev / privileged 容器 / VPS |
-| **fallback** | bwrap 不可用 / 内核禁 userns，且 `SANDBOX_ALLOW_FALLBACK=1` | 弱（bash + rlimits + no-new-privs + 每命令 `cd $HOME` 强制，无 namespace 隔离） | Render / Heroku / 非 privileged Docker |
+| **fallback + Landlock** | bwrap 不可用，内核 5.13+ 支持 Landlock | 中（Landlock 文件系统隔离 + rlimits + no-new-privs，无命名空间隔离） | Render / Heroku / 非 privileged Docker（Ubuntu 22.04+） |
+| **fallback 裸跑** | bwrap 不可用 且 Landlock 不可用（内核 < 5.13） | 弱（仅 rlimits + no-new-privs，无文件系统隔离） | 旧内核 VPS / 老版 Docker |
 | **禁用 bash** | bwrap 不可用 且 `SANDBOX_ALLOW_FALLBACK=0` | — | 需要严格安全审计的环境 |
 
 ### 2. 默认行为
@@ -253,27 +254,32 @@ securityContext:
 
 ### 7. 修复的旧 Bug
 
-旧版本有两个隐藏 Bug，本次一并修复：
+旧版本有四个隐藏 Bug，本次一并修复：
 
 1. **`_preexec_fallback` 是死代码**：定义了但从未传给 `create_subprocess_exec`，
    导致 fallback 模式下 `no-new-privs` 和 `setrlimit` 都没生效。
-   修复：`tool_executors.py` 在 fallback 分支显式传 `preexec_fn=_preexec_fallback`。
+   修复：`tool_executors.py` 在 fallback 分支显式传 `preexec_fn`。
 
-2. **`_sync_workspace_from_r2` 引用未定义的 `workdir`**：`workspace_utils.py:39`
-   调用 `workspace_workdir(chat_id)` 但忘了赋值，第 81 行又引用 `workdir`，
+2. **`_sync_workspace_from_r2` 引用未定义的 `workdir`**：`workspace_utils.py`
+   调用 `workspace_workdir(chat_id)` 但忘了赋值，后面又引用 `workdir`，
    导致同步函数在删除空目录时直接 `NameError`。
-   修复：把第 39 行改成 `workdir = workspace_workdir(chat_id)`。
+   修复：赋值 `workdir = workspace_workdir(chat_id)`。
 
 3. **`todos.json` / `memories.json` 被 bash 全量同步污染回 workspace**：
    根因是 `_sync_named_file_to_r2` 把这俩文件用 `editor/{ns}/todos.json` 这个
    R2 key 上传，和 workspace 文件同一个 prefix；bash 执行时调
    `_sync_workspace_from_r2` 会列出所有 `editor/{ns}/*` 并下载到 workspace，
-   把这两个 state 文件也拉回 workspace 根目录，结果就是「明明写到 state/ 了，
-   下次 bash 一跑又出现在 workspace 里」。
+   把这两个 state 文件也拉回 workspace 根目录。
+   修复：state 文件改用独立的 `state/{ns}/{filename}` prefix 上传/下载，
+   两个 prefix 天然隔离，不做文件名黑名单。
+
+4. **bash 命令输出不以换行结尾时整个会话 hang 死**：
+   `BashSession.execute()` 用 `echo '{marker} $?'` 标记命令结束，
+   然后用 `readline()` + `startswith(marker)` 检测。如果命令输出没有尾换行
+   （如 `cat` 一个无换行文件、`printf` 无 `\n`），echo 的输出会粘在前一行，
+   `startswith` 永远不匹配，`readline()` 无限等待，会话彻底卡死。
    修复：
-   - state 文件改用独立的 `state/{ns}/{filename}` prefix 上传/下载
-   - 两个 prefix（`editor/` vs `state/`）天然隔离，**不做文件名黑名单**
-   - 即使用户在 workspace 里手动放一个名叫 `todos.json` 的文件（和 state 无关），
-     也能正常上传到 `editor/` 并同步，不会跟 state 的 `todos.json` 冲突
-   - 测试覆盖：`scripts/test_state_isolation.py`
+   - echo marker 前先 `echo` 一个空行，保证 marker 单独占一行
+   - 检测改成 `marker in line_str`，即使粘行也能找到
+   - 这也是为什么之前 `ls ../state` 之后模型卡住的根本原因之一
 
