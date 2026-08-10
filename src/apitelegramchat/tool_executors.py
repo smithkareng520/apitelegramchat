@@ -22,10 +22,9 @@ from apitelegramchat.workspace_utils import (
 )
 
 from apitelegramchat.sandbox import (
-    build_bwrap_argv, build_fallback_argv, build_fallback_env,
-    is_bwrap_available, watchdog, apply_prlimit,
-    _preexec_fallback, _preexec_fallback_with_landlock,
-    SANDBOX_TIMEOUT_SEC, SANDBOX_ALLOW_FALLBACK,
+    build_sandbox_argv, build_sandbox_env,
+    watchdog, _preexec_sandbox,
+    SANDBOX_TIMEOUT_SEC,
 )
 
 from apitelegramchat.config import (
@@ -115,10 +114,9 @@ class BashSession:
         self.workspace = workspace_root(chat_id)
         self.workdir = workspace_workdir(chat_id)
         self._watchdog_task: Optional[asyncio.Task] = None
-        self._sandbox_mode: Optional[str] = None  # "bwrap" | "fallback"
 
     async def start(self):
-        """启动 bash 进程，自动选择 bwrap 或 fallback 模式"""
+        """启动 bash 进程，套上 Landlock 沙箱 + rlimit + no-new-privs"""
         if self.proc is not None and self.proc.returncode is None:
             return
 
@@ -128,35 +126,19 @@ class BashSession:
         os.chmod(self.workspace, 0o700)
         os.chmod(self.workdir, 0o700)
 
-        use_bwrap = await is_bwrap_available()
-        if use_bwrap:
-            argv = build_bwrap_argv(self.workspace, self.chat_id)
-            self._sandbox_mode = "bwrap"
-            # bwrap 模式：父进程不传任何环境变量（bwrap --clearenv 已清）
-            env = {}
-            preexec = None
-        else:
-            if not SANDBOX_ALLOW_FALLBACK:
-                raise RuntimeError(
-                    "bash sandbox unavailable: bwrap is required for workspace-only access. "
-                    "Set SANDBOX_ALLOW_FALLBACK=1 to enable fallback mode (bash + Landlock "
-                    "filesystem isolation + rlimits + no-new-privs), or install bubblewrap "
-                    "and run with --privileged / unprivileged_userns_clone=1."
-                )
-            argv = build_fallback_argv(self.workspace, self.chat_id)
-            self._sandbox_mode = "fallback"
-            # fallback 模式：只传白名单 env
-            env = build_fallback_env(self.workspace, self.chat_id)
-            # ★ Landlock：把文件系统访问限制在 workspace 目录内，
-            #   拒绝访问 /tmp 其他子目录（state/、r2_cache/）、/app 源码等。
-            #   通过 functools.partial 把 workspace 路径传给 preexec。
-            import functools
-            preexec = functools.partial(
-                _preexec_fallback_with_landlock,
-                str(self.workdir.absolute()),
-            )
+        argv = build_sandbox_argv()
+        env = build_sandbox_env(self.workspace, self.chat_id)
 
-        logger.info(f"Starting bash session chat_id={self.chat_id} mode={self._sandbox_mode}")
+        # ★ Landlock：把文件系统访问限制在 workspace 目录内，
+        #   拒绝访问 /tmp 其他子目录（state/、r2_cache/）、/app 源码等。
+        #   通过 functools.partial 把 workspace 路径传给 preexec。
+        import functools
+        preexec = functools.partial(
+            _preexec_sandbox,
+            str(self.workdir.absolute()),
+        )
+
+        logger.info(f"Starting bash session chat_id={self.chat_id}")
 
         self.proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -167,14 +149,8 @@ class BashSession:
             bufsize=0,
             env=env,  # ★ 关键: 不传任何敏感变量
             start_new_session=True,  # ★ 关键: 创建新会话，便于 killpg
-            preexec_fn=preexec,  # fallback: Landlock + no-new-privs + rlimit
+            preexec_fn=preexec,  # Landlock + no-new-privs + rlimit
         )
-
-        # 应用资源限制（bwrap 外层套一层 rlimit）
-        try:
-            apply_prlimit(self.proc)
-        except Exception as e:
-            logger.warning(f"apply_prlimit failed: {e}")
 
         # 启动看门狗（fork bomb 防护）
         if self._watchdog_task is None or self._watchdog_task.done():
@@ -282,7 +258,7 @@ class BashSession:
 
                 return (f"Command: {command}\n"
                         f"Exit code: {exit_code}\n"
-                        f"Sandbox: {self._sandbox_mode}\n"
+                        f"Sandbox: landlock\n"
                         f"Output:\n{output}")
 
             except asyncio.TimeoutError:
@@ -369,7 +345,7 @@ class BashSessionManager:
             new_session = BashSession(chat_id)
             await new_session.start()
             self._sessions[chat_id] = new_session
-            return f"Bash session restarted (sandbox={new_session._sandbox_mode})"
+            return f"Bash session restarted (sandbox=landlock)"
 
     async def cleanup_all(self):
         """优雅关闭所有会话（应用退出时调用）"""

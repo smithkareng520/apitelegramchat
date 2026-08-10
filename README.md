@@ -173,78 +173,46 @@ rm src/apitelegramchat/amap_integration.py
 This repository ships Anthropic-compatible skills under `.claude/skills/` and does not expose a custom prompt-skill registry.
 
 
-## 十、Bash 沙箱（bwrap）与 fallback 模式
+## 十、Bash 沙箱（Landlock）
 
-### 1. 三种模式
+### 1. 隔离方案
 
-| 模式 | 触发条件 | 隔离强度 | 适用环境 |
-|---|---|---|---|
-| **bwrap** | bwrap 已安装 + 内核允许 unprivileged userns | 强（mount/pid/ipc/uts/net 命名空间隔离） | 本地 dev / privileged 容器 / VPS |
-| **fallback + Landlock** | bwrap 不可用，内核 5.13+ 支持 Landlock | 中（Landlock 文件系统隔离 + rlimits + no-new-privs，无命名空间隔离） | Render / Heroku / 非 privileged Docker（Ubuntu 22.04+） |
-| **fallback 裸跑** | bwrap 不可用 且 Landlock 不可用（内核 < 5.13） | 弱（仅 rlimits + no-new-privs，无文件系统隔离） | 旧内核 VPS / 老版 Docker |
-| **禁用 bash** | bwrap 不可用 且 `SANDBOX_ALLOW_FALLBACK=0` | — | 需要严格安全审计的环境 |
+用 **Linux Landlock**（5.13+ 内核特性）做文件系统隔离。每个 chat_id 的 bash 进程在启动时（fork 后 exec 前）施加 Landlock 规则：
 
-### 2. 默认行为
+| 路径 | 权限 |
+|---|---|
+| **workspace 目录**（`/tmp/apitelegramchat_data/workspaces/chat_xxx/`） | 全权限（读写执行创建删除） |
+| `/usr` `/bin` `/sbin` `/lib` `/lib64` `/etc` | 只读 + 可执行（bash/python 能跑、库能加载） |
+| `/dev` `/proc` `/sys` | 只读 |
+| **其他所有路径**（state/、r2_cache/、/home、/app 源码） | **全部拒绝** |
 
-`SANDBOX_ALLOW_FALLBACK` 默认值为 `1`（见 `sandbox.py`）。
-Dockerfile 也通过 `ENV SANDBOX_ALLOW_FALLBACK=1` 显式设了同样的值。
-也就是说，**开箱即用，bash 永远能用**（除非显式覆盖）。
+限制不可逆，子进程继承。模型 `ls ../state` 会被直接拒绝，返回 `Permission denied`。
 
-### 3. Render 部署常见错误
+**为什么不用 bwrap**：Render / Heroku / 非 privileged Docker 内核禁了 unprivileged userns，bwrap 永远起不来。Landlock 是 Linux 5.13+ 的非特权文件系统隔离方案，不需要任何 capability，Render 上开箱即用。
 
-#### 错误 1
+### 2. 验证
+
+部署后跑：
+```bash
+python -m apitelegramchat.verify_security
 ```
-bash sandbox unavailable: bwrap is required for workspace-only access
+应看到：
 ```
-**原因**：旧版本默认 `SANDBOX_ALLOW_FALLBACK=0`，而 Render 容器内核禁了 userns。
-**修复**：已修复，默认 `1`。如果之前在 Render 控制台手动设过 `SANDBOX_ALLOW_FALLBACK=0`，请改成 `1` 或删除。
+[PASS] 3.1 Landlock 内核支持 — OK
+[PASS] 4.2 /etc/shadow 应不可读（Landlock 拒绝）
+[PASS] 4.3 /app/config.py 应不可见（Landlock 拒绝）
+[PASS] 4.8 父目录应被 Landlock 拒绝
+```
 
-#### 错误 2
-模型尝试用 `text_editor view ./` 列目录，返回
-```
-Invalid path: empty or root path not allowed
-```
-或
-```
-Invalid path: directory traversal not allowed
-```
-**原因**：旧版 `text_editor` 只支持文件，不支持目录列表；bash 又因 bwrap 不可用而禁用，模型陷入死循环。
-**修复**：新版 `text_editor` 加了 `list` 命令，专门用来列目录：
-```
-text_editor list path=""
-text_editor list path="subdir/"
-text_editor list path="."
-```
-也支持 `view` 一个目录路径，会自动转走 `list` 逻辑。
+或直接让模型在 bash 里跑 `ls -la ../../state`，应返回 `Permission denied`。
 
-### 4. 想要严格隔离？
+### 3. 看门狗（fork bomb 防护）
 
-设置环境变量：
-```
-SANDBOX_ALLOW_FALLBACK=0
-SANDBOX_UNSHARE_NET=1
-```
-并在容器启动时加 `--privileged` 或在 Kubernetes pod spec 加：
-```yaml
-securityContext:
-  sysctls:
-    - name: kernel.unprivileged_userns_clone
-      value: "1"
-  capabilities:
-    add: ["SYS_ADMIN"]
-```
-然后跑 `python -m apitelegramchat.verify_security` 自检。
+`watchdog()` 每秒统计子进程树大小，超过 `SANDBOX_MAX_PROCS`（默认 50）会立即 `SIGKILL` 整个进程组。即使沙箱内被诱导执行 `:(){ :| :& };:` 也不会拖垮宿主。
 
-### 5. 看门狗（fork bomb 防护）
+### 4. 资源限制
 
-不论 bwrap 还是 fallback 模式，`watchdog()` 都会每秒统计子进程树大小，
-超过 `SANDBOX_MAX_PROCS`（默认 50）会立即 `SIGKILL` 整个进程组。
-所以即使沙箱内被诱导执行 `:(){ :| :& };:` 也不会拖垮宿主。
-
-### 6. 资源限制
-
-通过 `prlimit`（bwrap 模式，父进程对子进程施加）或 `setrlimit`（fallback 模式，
-通过 `preexec_fn` 在 fork 后 exec 前施加）限制：
+通过 `setrlimit`（在 `preexec_fn` 里 fork 后 exec 前施加）限制：
 - `SANDBOX_MAX_CPU_SEC`：单会话总 CPU 时间（默认 300s）
 - `SANDBOX_MAX_FILE_SIZE`：单文件最大写入（默认 100MB）
 - `SANDBOX_MAX_OPEN_FILES`：fd 上限（默认 256）
@@ -252,34 +220,19 @@ securityContext:
 
 所有这些值都可通过环境变量覆盖。
 
-### 7. 修复的旧 Bug
+### 5. 修复的旧 Bug
 
-旧版本有四个隐藏 Bug，本次一并修复：
+1. **`_preexec_fallback` 是死代码**：定义了但从未传给 `create_subprocess_exec`，导致 `no-new-privs` 和 `setrlimit` 都没生效。
+   修复：`tool_executors.py` 显式传 `preexec_fn`。
 
-1. **`_preexec_fallback` 是死代码**：定义了但从未传给 `create_subprocess_exec`，
-   导致 fallback 模式下 `no-new-privs` 和 `setrlimit` 都没生效。
-   修复：`tool_executors.py` 在 fallback 分支显式传 `preexec_fn`。
-
-2. **`_sync_workspace_from_r2` 引用未定义的 `workdir`**：`workspace_utils.py`
-   调用 `workspace_workdir(chat_id)` 但忘了赋值，后面又引用 `workdir`，
-   导致同步函数在删除空目录时直接 `NameError`。
+2. **`_sync_workspace_from_r2` 引用未定义的 `workdir`**：调用 `workspace_workdir(chat_id)` 但忘了赋值，后面又引用 `workdir`，导致同步函数在删除空目录时直接 `NameError`。
    修复：赋值 `workdir = workspace_workdir(chat_id)`。
 
 3. **`todos.json` / `memories.json` 被 bash 全量同步污染回 workspace**：
-   根因是 `_sync_named_file_to_r2` 把这俩文件用 `editor/{ns}/todos.json` 这个
-   R2 key 上传，和 workspace 文件同一个 prefix；bash 执行时调
-   `_sync_workspace_from_r2` 会列出所有 `editor/{ns}/*` 并下载到 workspace，
-   把这两个 state 文件也拉回 workspace 根目录。
-   修复：state 文件改用独立的 `state/{ns}/{filename}` prefix 上传/下载，
-   两个 prefix 天然隔离，不做文件名黑名单。
+   根因是 `_sync_named_file_to_r2` 把这俩文件用 `editor/{ns}/todos.json` 这个 R2 key 上传，和 workspace 文件同一个 prefix；bash 执行时调 `_sync_workspace_from_r2` 会列出所有 `editor/{ns}/*` 并下载到 workspace，把这两个 state 文件也拉回 workspace 根目录。
+   修复：state 文件改用独立的 `state/{ns}/{filename}` prefix 上传/下载，两个 prefix 天然隔离，不做文件名黑名单。
 
 4. **bash 命令输出不以换行结尾时整个会话 hang 死**：
-   `BashSession.execute()` 用 `echo '{marker} $?'` 标记命令结束，
-   然后用 `readline()` + `startswith(marker)` 检测。如果命令输出没有尾换行
-   （如 `cat` 一个无换行文件、`printf` 无 `\n`），echo 的输出会粘在前一行，
-   `startswith` 永远不匹配，`readline()` 无限等待，会话彻底卡死。
-   修复：
-   - echo marker 前先 `echo` 一个空行，保证 marker 单独占一行
-   - 检测改成 `marker in line_str`，即使粘行也能找到
-   - 这也是为什么之前 `ls ../state` 之后模型卡住的根本原因之一
+   `BashSession.execute()` 用 `echo '{marker} $?'` 标记命令结束，然后用 `readline()` + `startswith(marker)` 检测。如果命令输出没有尾换行（如 `cat` 一个无换行文件、`printf` 无 `\n`），echo 的输出会粘在前一行，`startswith` 永远不匹配，`readline()` 无限等待，会话彻底卡死。
+   修复：echo marker 前先 `echo` 一个空行，保证 marker 单独占一行；检测改成 `marker in line_str`，即使粘行也能找到。
 

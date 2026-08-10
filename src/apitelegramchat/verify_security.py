@@ -78,48 +78,35 @@ def check_env_scrubbed():
 
 
 # ----------------------------------------------------------------------
-# 3. bwrap 沙箱可用性
+# 3. Landlock 沙箱可用性
 # ----------------------------------------------------------------------
-def check_bwrap():
-    bwrap = shutil.which("bwrap")
-    if not bwrap:
-        report("3.1 bwrap 已安装", False, "bwrap not found in PATH")
-        return False
-    report("3.1 bwrap 已安装", True, f"path={bwrap}")
-
-    # 测试能否启动沙箱
-    try:
-        rc = subprocess.run(
-            [bwrap, "--unshare-user-try", "--unshare-pid-try",
-             "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-             "/bin/true"],
-            capture_output=True, timeout=5
-        )
-        ok = rc.returncode == 0
-        report("3.2 bwrap 可创建沙箱", ok,
-               f"rc={rc.returncode} stderr={rc.stderr.decode()[:200]}")
-        return ok
-    except Exception as e:
-        report("3.2 bwrap 可创建沙箱", False, str(e))
-        return False
+def check_landlock():
+    from apitelegramchat.sandbox import _landlock_supported
+    ok = _landlock_supported()
+    report("3.1 Landlock 内核支持", ok,
+           "Linux 5.13+ required" if not ok else "OK")
+    return ok
 
 
 # ----------------------------------------------------------------------
 # 4. 沙箱内隔离测试
 # ----------------------------------------------------------------------
-async def check_sandbox_isolation(bwrap_ok: bool):
+async def check_sandbox_isolation(landlock_ok: bool):
     """在沙箱里跑一组命令，验证隔离性"""
-    if not bwrap_ok:
-        warn("4.x 沙箱隔离测试", "bwrap 不可用，跳过")
+    if not landlock_ok:
+        warn("4.x 沙箱隔离测试", "Landlock 不可用，跳过")
         return
 
-    from apitelegramchat.sandbox import build_bwrap_argv
+    import functools
+    from apitelegramchat.sandbox import build_sandbox_argv, build_sandbox_env, _preexec_sandbox
 
     workspace = Path("/tmp/verify_workspace").absolute()
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "secret.txt").write_text("THIS_IS_SECRET_12345")
 
-    argv = build_bwrap_argv(workspace, 999999)
+    argv = build_sandbox_argv()
+    env = build_sandbox_env(workspace, 999999)
+    preexec = functools.partial(_preexec_sandbox, str(workspace))
 
     proc = await asyncio.create_subprocess_exec(
         *argv,
@@ -127,19 +114,21 @@ async def check_sandbox_isolation(bwrap_ok: bool):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         text=False, bufsize=0,
-        env={},
+        env=env,
+        start_new_session=True,
+        preexec_fn=preexec,
     )
 
     tests = [
         # (命令, 期望通过/失败, 说明)
         ("env\n",                           False, "4.1 env 不应包含任何 KEY/TOKEN"),
-        ("cat /etc/shadow 2>&1\n",          False, "4.2 /etc/shadow 应不可读"),
-        ("ls /app/config.py 2>&1\n",        True,  "4.3 /app/config.py 只读可见"),
-        ("echo DATA > /app/test 2>&1\n",    False, "4.4 /app 应不可写"),
-        ("cat /proc/1/cmdline 2>&1\n",      False, "4.5 /proc/1 应不可见或显示自己"),
+        ("cat /etc/shadow 2>&1\n",          False, "4.2 /etc/shadow 应不可读（Landlock 拒绝）"),
+        ("ls /app/config.py 2>&1\n",        False, "4.3 /app/config.py 应不可见（Landlock 拒绝）"),
+        ("echo DATA > /app/test 2>&1\n",    False, "4.4 /app 应不可写（Landlock 拒绝）"),
+        ("cat /proc/1/cmdline 2>&1\n",      False, "4.5 /proc/1 应不可见（Landlock 拒绝）"),
         ("sudo ls 2>&1\n",                  False, "4.6 sudo 应不可用"),
         ("cat secret.txt\n",                True,  "4.7 workspace 内文件可读"),
-        ("ls ../ 2>&1\n",                   False, "4.8 父目录应只看到自己"),
+        ("ls ../ 2>&1\n",                   False, "4.8 父目录应被 Landlock 拒绝"),
         ("python3 -c \"import os; print(os.environ)\" 2>&1\n", True, "4.9 Python 子进程 env 干净"),
     ]
 
@@ -151,8 +140,6 @@ async def check_sandbox_isolation(bwrap_ok: bool):
             line = await asyncio.wait_for(proc.stdout.readline(), timeout=2)
             output = line.decode("utf-8", errors="replace").strip()
             # 简化判断：检查输出是否包含敏感关键字
-            if "should_pass" in desc:
-                pass
             if "4.1" in desc:
                 # 期望 env 不含 KEY/TOKEN
                 bad = bool(re.search(r'(KEY|TOKEN|SECRET|PASSWORD)=', output))
@@ -161,13 +148,13 @@ async def check_sandbox_isolation(bwrap_ok: bool):
                 report(desc, "Permission denied" in output or "No such file" in output,
                        output[:200])
             elif "4.3" in desc:
-                report(desc, "/app/config.py" in output, output[:200])
+                report(desc, "Permission denied" in output or "No such file" in output,
+                       output[:200])
             elif "4.4" in desc:
                 report(desc, "Permission denied" in output or "read-only" in output,
                        output[:200])
             elif "4.5" in desc:
-                report(desc, "self" in output.lower() or "Permission denied" in output
-                       or "No such file" in output or "bash" in output.lower(),
+                report(desc, "Permission denied" in output or "No such file" in output,
                        output[:200])
             elif "4.6" in desc:
                 report(desc, "not found" in output.lower() or "Permission denied" in output,
@@ -263,7 +250,7 @@ async def main():
     print()
 
     print("--- 1. 容器身份 ---")
-    bwrap_ok = check_user()
+    check_user()
     check_no_sudo()
     print()
 
@@ -271,12 +258,12 @@ async def main():
     check_env_scrubbed()
     print()
 
-    print("--- 3. bwrap 可用性 ---")
-    bwrap_ok = check_bwrap() and bwrap_ok
+    print("--- 3. Landlock 可用性 ---")
+    landlock_ok = check_landlock()
     print()
 
     print("--- 4. 沙箱隔离 ---")
-    await check_sandbox_isolation(bwrap_ok)
+    await check_sandbox_isolation(landlock_ok)
     print()
 
     print("--- 5. 资源限制 ---")
