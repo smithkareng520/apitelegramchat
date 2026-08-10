@@ -88,6 +88,11 @@ OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 # 但外层 12s 会过早杀掉它们，给一个更宽松的 45s 上限兜底。
 LONG_RUNNING_TOOLS = {"web_search", "fetch_url"}
 LONG_TOOL_CALL_TIMEOUT = 45
+# bash 工具：模型会用它跑 skill 脚本（docx-js / reportlab / pdfplumber 等），
+# 12s 太短——node 启动 + require('docx') 就要 3-5s，npm install 更是 30s+。
+# 给 90s 上限，仍小于沙箱内部的 SANDBOX_TIMEOUT_SEC=120s，让沙箱先兜底。
+BASH_TOOLS = {"bash"}
+BASH_TOOL_TIMEOUT = 90
 # 子 agent 工具：内部跑自己的多轮 agentic loop（每轮一次 LLM 调用 + 可能的工具调用），
 # 默认 90s，用户可配到 300s。外层必须给足够长的超时，否则 12s 一定会杀掉它。
 SUBAGENT_TOOLS = {"subagent"}
@@ -1401,6 +1406,7 @@ Skill policy:
 - The runtime, not the model, decides which skill to load. Treat the loaded <active_skill_context> as authoritative workflow instructions and follow its steps exactly.
 - The <active_skill_context> block tells you the skill package's absolute root path ("Skill package root: ..."), the package's file manifest, and the env var that expands to it ($SKILL_DIR_<ID>). Use these paths to invoke skill-provided scripts.
 - The bash sandbox grants READ-ONLY + EXECUTE access to skill package roots. You can `cd` into a skill package and run its scripts (e.g. `python scripts/office/soffice.py`). You CANNOT write into the skill package — write all output files into the workspace (the shell's current working directory).
+- All skill dependencies are PRE-INSTALLED in the image: node + docx (global npm), pandoc, python pypdf/pdfplumber/reportlab/pytesseract/pdf2image, tesseract-ocr, poppler-utils. Do NOT run `npm install`, `pip install`, or `apt-get install` — they will waste the 90s bash timeout and fail. If a skill script says "Install: ...", assume it is already installed and skip that step.
 - Never claim that skills are unavailable if a skill catalog or active skill context is present.
 - skill_catalog and skill_read are info-only tools for inspecting skills that were NOT auto-activated (e.g. cross-skill reference). Do not call them to "enable" a skill — the runtime handles activation.
 </skill_directory>
@@ -2165,11 +2171,14 @@ async def _run_tool_calls_and_append(
             # 图像 / 视频工具不设超时（内部已有轮询超时控制）
             # 子 agent 走 310s 超时（内部默认 90s，用户可配到 300s）
             # 网络类工具（web_search / fetch_url）走 45s 宽松超时，避免外层 12s 误杀
+            # bash 工具走 90s 超时（skill 脚本 / npm / reportlab 都需要时间）
             # 其他工具保持 12 秒
             if fn_name in MEDIA_GEN_TOOLS:
                 timeout = None
             elif fn_name in SUBAGENT_TOOLS:
                 timeout = SUBAGENT_TOOL_TIMEOUT
+            elif fn_name in BASH_TOOLS:
+                timeout = BASH_TOOL_TIMEOUT
             elif fn_name in LONG_RUNNING_TOOLS:
                 timeout = LONG_TOOL_CALL_TIMEOUT
             else:

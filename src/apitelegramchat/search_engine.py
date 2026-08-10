@@ -1139,7 +1139,11 @@ SEARCH_TOOLS = [
                 "Execute shell commands in a persistent bash session (env vars and cwd persist across calls). "
                 "Use for system operations, running scripts, file manipulation. Avoid interactive commands (vim, top) and long-running processes. Set 'restart'=true to reset the session. "
                 "Note: each invocation is automatically prefixed with `cd $HOME && ` so the working directory is always reset to the user's workspace. "
-                "To list files in the workspace without bash (e.g. when sandbox is unavailable), use text_editor command='list'."
+                "To list files in the workspace without bash (e.g. when sandbox is unavailable), use text_editor command='list'. "
+                "TIMEOUT: each bash call has a 90-second limit. Do NOT run `npm install`, `pip install`, `apt-get install`, or other package managers — their dependencies are already pre-installed in the image. "
+                "If a command might exceed 90s, split it into smaller steps (write script with text_editor, then run it). "
+                "Pre-installed: python3 + pypdf/pdfplumber/reportlab/pytesseract/pdf2image, node + docx (global), pandoc, tesseract-ocr, poppler-utils. "
+                "Skill scripts live under $SKILL_DIR_<ID> (e.g. $SKILL_DIR_DOCX) and are mounted read-only."
             ),
             "parameters": {
                 "type": "object",
@@ -1150,7 +1154,7 @@ SEARCH_TOOLS = [
                     },
                     "command": {
                         "type": "string",
-                        "description": "要执行的 bash 命令。"
+                        "description": "要执行的 bash 命令。避免运行 npm install / pip install / apt-get install——依赖已预装。"
                     },
                     "restart": {
                         "type": "boolean",
@@ -1162,6 +1166,7 @@ SEARCH_TOOLS = [
                 {"command": "ls -la"},
                 {"command": "pwd"},
                 {"command": "python3 script.py", "restart": False},
+                {"command": "cd \"$SKILL_DIR_DOCX\" && python scripts/office/soffice.py --help"},
                 {"restart": True}
             ]
         }
