@@ -1,4 +1,4 @@
-aiohttp==3.11.13
+aiohttp==3.11.15
 openai==1.66.3
 Pillow==11.1.0
 quart==0.20.0
