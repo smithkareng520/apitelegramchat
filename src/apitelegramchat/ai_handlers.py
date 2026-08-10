@@ -63,8 +63,10 @@ from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, down
 from apitelegramchat.skills import (
     build_skill_system_message,
     match_skill_for_text,
+    prepare_skill_resources,
     skill_catalog_brief,
 )
+from apitelegramchat.workspace_paths import workspace_root
 from apitelegramchat.tool_executors import (
     dispatch_tool_call,
     format_tool_result,
@@ -1386,7 +1388,7 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 <tool_usage_guide>
 - todo：用户说"记一下""提醒我"时优先用。写操作（add/done/undone/delete/edit/clear）后紧跟一次 list，让用户看到最新状态。
 - memory：用户说"记住…"或提到长期偏好/过敏/重要他人/截止日期时写入；回答涉及偏好的问题前先 search。
-- skills：运行时自动管理 .claude/skills/*/SKILL.md。不要把 skill 当作聊天工具或函数；技能由 agent runtime 自动发现、加载并注入上下文。
+- skills：运行时自动发现并注入匹配的 .claude/skills/*/SKILL.md 到 <active_skill_context>。完整阅读注入的 Instructions，并按其中的 Skill package path 访问 scripts/ 与 REFERENCE.md 等资源。不要把 skill 当成必须先调用的聊天工具。
 - subagent：彼此独立的子任务请在同一轮里一次性并发派多个 subagent 工具调用，不要一个做完再发下一个；简单问题自己答，不要滥用。子 agent 不继承主对话历史，只看到 task + context。
 </tool_usage_guide>
 """
@@ -1398,10 +1400,11 @@ Available skills:
 {catalog_text}
 
 Skill policy:
-- The runtime, not the user-facing model, loads matching skill instructions.
-- Treat loaded <active_skill_context> as authoritative workflow instructions.
+- The runtime, not the user-facing model, loads matching skill instructions into <active_skill_context>.
+- Treat loaded <active_skill_context> as authoritative workflow instructions. Read the entire Instructions section carefully and follow it.
+- When the skill mentions additional files (REFERENCE.md, FORMS.md, scripts/...), they are available under the Skill package path shown in the active context (usually .skills/<skill_id>/). Use text_editor or bash to access them.
 - Never claim that skills are unavailable if a skill catalog or active skill context is present.
-- Never ask for a skill tool or function; skills are not tools.
+- Prefer the auto-loaded context. skill_catalog / skill_read / skill_activate tools exist only as fallbacks.
 </skill_directory>
 """
     else:
@@ -4759,6 +4762,19 @@ async def get_ai_response(
         skill_context_message: dict[str, Any] | None = None
         skill_to_use: str | None = None
 
+        def _load_skill_context(sid: str) -> dict[str, Any]:
+            """Prepare skill resources into the workspace and build the system message."""
+            resource_base = None
+            try:
+                ws = workspace_root(chat_id)
+                ws.mkdir(parents=True, exist_ok=True)
+                resource_base = prepare_skill_resources(sid, ws)
+            except Exception:
+                resource_base = None
+            return build_skill_system_message(
+                sid, include_body=True, resource_base=resource_base
+            )
+
         if skill_match is not None:
             skill_to_use = skill_match.get("skill_id")
             if skill_to_use is None:
@@ -4766,7 +4782,7 @@ async def get_ai_response(
                     ctx = state.get_or_init_context(chat_id)
                     ctx["active_skill"] = None
             elif skill_to_use != active_skill_id:
-                skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
+                skill_context_message = _load_skill_context(skill_to_use)
                 async with lock:
                     ctx = state.get_or_init_context(chat_id)
                     ctx["active_skill"] = {
@@ -4776,10 +4792,10 @@ async def get_ai_response(
                         "updated_at": time.time(),
                     }
             else:
-                skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
+                skill_context_message = _load_skill_context(skill_to_use)
         elif active_skill_id:
             skill_to_use = active_skill_id
-            skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
+            skill_context_message = _load_skill_context(skill_to_use)
 
         system_prompt = await build_system_prompt(
             chat_id,
@@ -4794,7 +4810,12 @@ async def get_ai_response(
             # model always receives the loaded skill context.
             skill_content = str(skill_context_message.get("content") or "").strip()
             if skill_content:
-                messages[0]["content"] += "\\n\\n<active_skill_context>\\n" + skill_content + "\\n</active_skill_context>"
+                # Use real newlines so the model can actually parse the long skill body.
+                messages[0]["content"] += (
+                    "\n\n<active_skill_context>\n"
+                    + skill_content
+                    + "\n</active_skill_context>"
+                )
         await _append_history_async(messages, history, api_type, model_info, chat_id=chat_id)
         if model_info.supports_prompt_cache:
             _apply_cache_control(messages)

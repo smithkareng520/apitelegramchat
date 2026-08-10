@@ -331,7 +331,60 @@ def match_skill_for_text(
     }
 
 
-def build_skill_system_message(skill_id: str, *, include_body: bool = True) -> dict[str, Any]:
+def prepare_skill_resources(skill_id: str, workspace: Path) -> str | None:
+    """Make a skill's package (scripts/, REFERENCE.md, etc.) available inside the
+    chat workspace so sandboxed tools (bash, text_editor) can read them.
+
+    Creates workspace/.skills/<skill_id> as a symlink to the discovered skill
+    directory (falls back to a shallow copy on failure). Returns the relative
+    path from workspace, or None if the skill cannot be located.
+    """
+    skill_id = str(skill_id or "").strip()
+    if not skill_id or not workspace:
+        return None
+    try:
+        workspace = Path(workspace).resolve()
+    except Exception:
+        return None
+
+    src: Path | None = None
+    for root in discover_skill_roots():
+        candidate = root / skill_id
+        if candidate.is_dir() and (candidate / "SKILL.md").is_file():
+            src = candidate.resolve()
+            break
+    if src is None:
+        return None
+
+    dest_parent = workspace / ".skills"
+    dest = dest_parent / skill_id
+    rel = f".skills/{skill_id}"
+
+    try:
+        import shutil
+        dest_parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists() or dest.is_symlink():
+            # Always refresh so updates to the skill package are picked up.
+            if dest.is_symlink():
+                dest.unlink()
+            elif dest.is_dir():
+                shutil.rmtree(dest)
+            else:
+                dest.unlink()
+        # Copy (not symlink): Landlock sandbox only allows the workspace tree;
+        # a symlink target outside workspace would be denied at runtime.
+        shutil.copytree(src, dest, dirs_exist_ok=True)
+        return rel
+    except Exception:
+        return None
+
+
+def build_skill_system_message(
+    skill_id: str,
+    *,
+    include_body: bool = True,
+    resource_base: str | None = None,
+) -> dict[str, Any]:
     data = read_skill(skill_id)
     if "error" in data:
         return {"error": data["error"]}
@@ -347,6 +400,16 @@ def build_skill_system_message(skill_id: str, *, include_body: bool = True) -> d
         header_lines.append("Allowed tools: " + ", ".join(map(str, frontmatter.get("allowed_tools", []))))
     if frontmatter.get("priority"):
         header_lines.append(f"Priority: {frontmatter.get('priority')}")
+    if resource_base:
+        header_lines.append(
+            f"Skill package path (inside workspace): {resource_base}/"
+        )
+        header_lines.append(
+            "When the instructions below refer to REFERENCE.md, FORMS.md, "
+            "scripts/, or any other relative path, resolve them under that "
+            "skill package path. Use text_editor (view) or bash to read or "
+            "run those files."
+        )
     body = data.get("body", "") if include_body else ""
     content = "\n".join(header_lines)
     if body:
@@ -356,6 +419,7 @@ def build_skill_system_message(skill_id: str, *, include_body: bool = True) -> d
         "name": f"skill:{skill.get('skill_id')}",
         "content": content,
         "skill": skill,
+        "resource_base": resource_base,
     }
 
 
