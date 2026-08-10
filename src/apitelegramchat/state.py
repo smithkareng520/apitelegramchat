@@ -90,7 +90,6 @@ def get_or_init_context(chat_id: int) -> dict:
             "username": f"User_{chat_id}",
             "total_prompt_tokens": 0,
             "last_usage": None,
-            "active_skill": None,
         }
     return user_contexts[chat_id]
 
@@ -129,30 +128,6 @@ async def safe_clear_history(chat_id: int) -> None:
     async with lock:
         ctx = get_or_init_context(chat_id)
         ctx["conversation_history"] = []
-
-
-def get_active_skill(chat_id: int) -> dict | None:
-    ctx = user_contexts.get(chat_id)
-    if not ctx:
-        return None
-    return ctx.get("active_skill")
-
-
-async def safe_get_active_skill(chat_id: int) -> dict | None:
-    lock = await get_chat_lock(chat_id)
-    async with lock:
-        return get_active_skill(chat_id)
-
-
-async def safe_set_active_skill(chat_id: int, skill: dict | None) -> None:
-    lock = await get_chat_lock(chat_id)
-    async with lock:
-        ctx = get_or_init_context(chat_id)
-        ctx["active_skill"] = skill
-
-
-async def safe_clear_active_skill(chat_id: int) -> None:
-    await safe_set_active_skill(chat_id, None)
 
 def get_history_length(chat_id: int) -> int:
     ctx = user_contexts.get(chat_id)

@@ -61,7 +61,6 @@ from apitelegramchat.state import (
     pop_media_group,
     get_user_role,
     set_user_role,
-    safe_clear_active_skill,
     get_active_draft_message_id,
     get_active_draft_info,
     clear_active_draft,
@@ -1443,7 +1442,6 @@ async def webhook() -> tuple:
                 if user_input.startswith("/clear"):
                     await _interrupt_active_generation(chat_id)
                     await safe_clear_history(chat_id)
-                    await safe_clear_active_skill(chat_id)
                     lock = await get_chat_lock(chat_id)
                     async with lock:
                         ctx = get_or_init_context(chat_id)

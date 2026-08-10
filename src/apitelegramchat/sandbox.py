@@ -187,14 +187,12 @@ def _handled_access_mask(abi: int) -> int:
     return mask
 
 
-def _apply_landlock(workspace_path: str, extra_ro_paths: list[str] | None = None) -> bool:
+def _apply_landlock(workspace_path: str) -> bool:
     """Install a deny-by-default Landlock filesystem policy for the child.
 
     The workspace is the only writable tree. System trees needed to execute
-    bash are explicitly read/execute-only. ``extra_ro_paths`` grants
-    read+execute+read-dir to additional directories (used for skill package
-    roots so the agent can run skill scripts). Every syscall and every
-    rule-add operation is checked; a partial policy is never accepted.
+    bash are explicitly read/execute-only. Every syscall and every rule-add
+    operation is checked; a partial policy is never accepted.
     """
     abi = _landlock_abi_version()
     if abi < 1:
@@ -249,31 +247,6 @@ def _apply_landlock(workspace_path: str, extra_ro_paths: list[str] | None = None
                     continue
                 add_path_rule(d, runtime_ro)
 
-            # Grant read+execute to skill package roots so the agent can run
-            # skill-provided scripts (e.g. .claude/skills/docx/scripts/...).
-            # These directories are owned by the application, not the user, so
-            # they must remain read-only — no write/make/remove bits granted.
-            seen_ro: set[str] = set()
-            for raw_path in (extra_ro_paths or []):
-                if not raw_path:
-                    continue
-                try:
-                    resolved = os.path.realpath(raw_path)
-                except Exception:
-                    continue
-                if not resolved or not os.path.isdir(resolved):
-                    continue
-                if resolved in seen_ro:
-                    continue
-                seen_ro.add(resolved)
-                try:
-                    add_path_rule(resolved, runtime_ro)
-                except OSError as exc:
-                    # Don't fail the whole sandbox if one skill root is
-                    # unreadable; just log and skip. The agent will see a
-                    # permission error if it tries to use that skill.
-                    logger.warning("Landlock: skipping skill root %s: %s", resolved, exc)
-
             rc = _libc.syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0)
             if rc < 0:
                 logger.error("landlock_restrict_self failed: errno=%s", ctypes.get_errno())
@@ -289,13 +262,8 @@ def _apply_landlock(workspace_path: str, extra_ro_paths: list[str] | None = None
 # =====================================================================
 # preexec_fn —— fork 后 exec 前调用
 # =====================================================================
-def _preexec_sandbox(workspace_path: str, extra_ro_paths: list[str] | None = None):
-    """Install all mandatory child restrictions before exec("bash").
-
-    ``extra_ro_paths`` is a list of additional directories to grant
-    read+execute access to (used for skill package roots). The workspace
-    remains the only writable tree.
-    """
+def _preexec_sandbox(workspace_path: str):
+    """Install all mandatory child restrictions before exec("bash")."""
     import resource
 
     if _libc is None:
@@ -305,7 +273,7 @@ def _preexec_sandbox(workspace_path: str, extra_ro_paths: list[str] | None = Non
     if _set_no_new_privs() is False:
         raise SandboxSetupError("PR_SET_NO_NEW_PRIVS failed")
 
-    if not _apply_landlock(workspace_path, extra_ro_paths=extra_ro_paths):
+    if not _apply_landlock(workspace_path):
         raise SandboxSetupError("Landlock filesystem sandbox could not be installed")
 
     resource.setrlimit(resource.RLIMIT_CPU, (SANDBOX_MAX_CPU_SEC, SANDBOX_MAX_CPU_SEC))
@@ -322,14 +290,10 @@ def build_sandbox_argv() -> list:
 
 
 def build_sandbox_env(workspace: Path, chat_id: int) -> dict:
-    """沙箱环境变量（白名单，不传任何 API Key / Token / Secret）
-
-    注入 SKILL_DIR_<ID> 与 SKILLS_DIR 环境变量，让 agent 在 bash 中能定位
-    技能包根目录。技能包根目录在 Landlock 中以只读+可执行方式授权。
-    """
+    """沙箱环境变量（白名单，不传任何 API Key / Token / Secret）"""
     workdir = workspace_workdir(chat_id)
     workdir_abs = str(workdir.absolute())
-    env = {
+    return {
         "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
         "HOME": workdir_abs,
         "USER": f"chat{chat_id}",
@@ -343,28 +307,6 @@ def build_sandbox_env(workspace: Path, chat_id: int) -> dict:
         "HISTFILESIZE": "0",
         # ★ 刻意不带任何 *API_KEY *TOKEN *SECRET *PASSWORD
     }
-
-    # Expose skill package roots so the agent can run skill scripts.
-    # SKILLS_DIR is the parent directory (.claude/skills); SKILL_DIR_<ID>
-    # points to each individual skill package. Failures here are
-    # non-fatal — the agent simply won't see the env vars.
-    try:
-        from apitelegramchat.skills import discover_skill_roots  # late import to avoid cycle
-        roots = discover_skill_roots()
-        if roots:
-            env["SKILLS_DIR"] = ":".join(str(r) for r in roots)
-            for root in roots:
-                for skill_dir in root.iterdir():
-                    if not skill_dir.is_dir():
-                        continue
-                    if not (skill_dir / "SKILL.md").is_file():
-                        continue
-                    env_key = "SKILL_DIR_" + skill_dir.name.upper().replace("-", "_")
-                    env[env_key] = str(skill_dir.resolve())
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Failed to inject skill env vars: %s", exc)
-
-    return env
 
 
 # =====================================================================

@@ -74,7 +74,6 @@ from apitelegramchat.search_engine import (
     # 子 agent 工具
     execute_subagent,
 )
-from apitelegramchat.skills import catalog_text as skill_catalog_text, read_skill_text as skill_read_text
 from apitelegramchat.todo_tool import (
     render_todo_card,
 )
@@ -97,36 +96,6 @@ def _truncate_tool_result(result: str) -> str:
     if len(result) > MAX_TOOL_RESPONSE_LEN:
         return result[:MAX_TOOL_RESPONSE_LEN] + "\n…[内容过长已截断]"
     return result
-
-
-def _collect_skill_roots() -> list[str]:
-    """Return absolute paths of all discovered skill package directories.
-
-    Used to extend the bash Landlock sandbox so the agent can read & execute
-    skill-provided scripts. Errors are logged and ignored — skill access is
-    a privilege, not a hard requirement for the sandbox to start.
-    """
-    try:
-        from apitelegramchat.skills import discover_skill_roots
-        roots: list[str] = []
-        for root in discover_skill_roots():
-            try:
-                roots.append(str(root.resolve()))
-            except Exception:
-                roots.append(str(root))
-            try:
-                for child in sorted(root.iterdir()):
-                    if child.is_dir() and (child / "SKILL.md").is_file():
-                        try:
-                            roots.append(str(child.resolve()))
-                        except Exception:
-                            roots.append(str(child))
-            except Exception:
-                pass
-        return roots
-    except Exception as exc:
-        logger.debug("Failed to collect skill roots for sandbox: %s", exc)
-        return []
 
 def extract_domain(url: str) -> str:
     if not url:
@@ -162,14 +131,11 @@ class BashSession:
 
         # ★ Landlock：把文件系统访问限制在 workspace 目录内，
         #   拒绝访问 /tmp 其他子目录（state/、r2_cache/）、/app 源码等。
-        #   同时授权 .claude/skills/*/ 只读+可执行，让 agent 能跑技能包脚本。
-        #   通过 functools.partial 把 workspace 路径 + skill roots 传给 preexec。
+        #   通过 functools.partial 把 workspace 路径传给 preexec。
         import functools
-        skill_roots = _collect_skill_roots()
         preexec = functools.partial(
             _preexec_sandbox,
             str(self.workdir.absolute()),
-            skill_roots,
         )
 
         logger.info(f"Starting bash session chat_id={self.chat_id}")
@@ -1603,10 +1569,6 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                     logger.exception(f"fetch_url unexpected error: {e}")
                     return "⚠️ 页面抓取失败，请稍后重试或检查URL。"
             return "⚠️ 页面抓取失败，请稍后重试。"
-        elif name == "skill_catalog":
-            return skill_catalog_text()
-        elif name == "skill_read":
-            return skill_read_text(arguments.get("skill_id", ""))
         elif name == "wikipedia":
             return await execute_wikipedia(arguments.get("query", ""), arguments.get("lang", "zh"))
         elif name == "exchange_rate":

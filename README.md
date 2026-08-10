@@ -38,7 +38,3 @@ Run this in the deployed Linux container after enabling the shell tool:
 ```bash
 python -m apitelegramchat.verify_security
 ```
-
-## Skill discovery
-
-The MCP server now exposes a skill catalog backed by `.claude/skills/*/SKILL.md`, with on-demand reading for individual skill bodies.
