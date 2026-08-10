@@ -73,15 +73,10 @@ async def _sync_workspace_from_r2(chat_id: int):
         if data is not None:
             with open(local_path, "wb") as f:
                 f.write(data)
-    # 删除本地多余文件（远程没有的）。跳过 .skills（技能包本地副本，不参与 R2 同步）
+    # 删除本地多余文件（远程没有的）
     for root, dirs, files in os.walk(workspace):
-        # prune .skills so we neither delete nor recurse into it
-        if ".skills" in dirs:
-            dirs.remove(".skills")
         for file in files:
             rel = os.path.relpath(os.path.join(root, file), workspace)
-            if rel.startswith(".skills" + os.sep) or rel == ".skills":
-                continue
             if rel not in remote_rels:
                 os.remove(os.path.join(root, file))
         # 删除空目录（可选）
@@ -105,14 +100,9 @@ async def _sync_workspace_to_r2(chat_id: int):
     prefix = f"editor/{workspace_namespace(chat_id)}/"
     local_rels = set()
     for root, dirs, files in os.walk(workspace):
-        # 跳过 .skills（技能包本地副本，不上传 R2）
-        if ".skills" in dirs:
-            dirs.remove(".skills")
         for file in files:
             abs_path = os.path.join(root, file)
             rel = os.path.relpath(abs_path, workspace)
-            if rel.startswith(".skills" + os.sep) or rel == ".skills":
-                continue
             local_rels.add(rel)
             key = prefix + rel
             with open(abs_path, "rb") as f:

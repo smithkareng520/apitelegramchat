@@ -331,60 +331,53 @@ def match_skill_for_text(
     }
 
 
-def prepare_skill_resources(skill_id: str, workspace: Path) -> str | None:
-    """Make a skill's package (scripts/, REFERENCE.md, etc.) available inside the
-    chat workspace so sandboxed tools (bash, text_editor) can read them.
+def _skill_package_root(skill_id: str) -> Path | None:
+    """Return the absolute path of a skill's package directory, or None."""
+    for rec in load_skill_records():
+        if rec.skill_id == skill_id or rec.name == skill_id:
+            return Path(rec.root) / rec.skill_id
+    return None
 
-    Creates workspace/.skills/<skill_id> as a symlink to the discovered skill
-    directory (falls back to a shallow copy on failure). Returns the relative
-    path from workspace, or None if the skill cannot be located.
+
+def _skill_manifest_lines(skill_id: str, *, max_entries: int = 60) -> list[str]:
+    """Return a brief manifest of files inside the skill package.
+
+    Walks the package directory and lists files (skipping noisy paths like
+    __pycache__, .git, node_modules). Output is capped to keep the system
+    prompt small; deeper files are summarized as "… (N more entries)".
     """
-    skill_id = str(skill_id or "").strip()
-    if not skill_id or not workspace:
-        return None
+    pkg = _skill_package_root(skill_id)
+    if pkg is None or not pkg.is_dir():
+        return []
+
+    skip_dirs = {"__pycache__", ".git", ".mypy_cache", ".pytest_cache", "node_modules", ".venv", "venv"}
+    entries: list[str] = []
     try:
-        workspace = Path(workspace).resolve()
-    except Exception:
-        return None
-
-    src: Path | None = None
-    for root in discover_skill_roots():
-        candidate = root / skill_id
-        if candidate.is_dir() and (candidate / "SKILL.md").is_file():
-            src = candidate.resolve()
-            break
-    if src is None:
-        return None
-
-    dest_parent = workspace / ".skills"
-    dest = dest_parent / skill_id
-    rel = f".skills/{skill_id}"
-
-    try:
-        import shutil
-        dest_parent.mkdir(parents=True, exist_ok=True)
-        if dest.exists() or dest.is_symlink():
-            # Always refresh so updates to the skill package are picked up.
-            if dest.is_symlink():
-                dest.unlink()
-            elif dest.is_dir():
-                shutil.rmtree(dest)
+        for path in sorted(pkg.rglob("*")):
+            if any(part in skip_dirs for part in path.parts):
+                continue
+            try:
+                rel = path.relative_to(pkg)
+            except Exception:
+                continue
+            if path.is_dir():
+                entries.append(f"{rel}/")
             else:
-                dest.unlink()
-        # Copy (not symlink): Landlock sandbox only allows the workspace tree;
-        # a symlink target outside workspace would be denied at runtime.
-        shutil.copytree(src, dest, dirs_exist_ok=True)
-        return rel
+                entries.append(str(rel))
+            if len(entries) >= max_entries:
+                remaining = sum(
+                    1 for p in pkg.rglob("*")
+                    if not any(part in skip_dirs for part in p.parts)
+                ) - len(entries)
+                if remaining > 0:
+                    entries.append(f"… ({remaining} more entries)")
+                break
     except Exception:
-        return None
+        return []
+    return entries
 
 
-def build_skill_system_message(
-    skill_id: str,
-    *,
-    include_body: bool = True,
-    resource_base: str | None = None,
-) -> dict[str, Any]:
+def build_skill_system_message(skill_id: str, *, include_body: bool = True) -> dict[str, Any]:
     data = read_skill(skill_id)
     if "error" in data:
         return {"error": data["error"]}
@@ -400,16 +393,32 @@ def build_skill_system_message(
         header_lines.append("Allowed tools: " + ", ".join(map(str, frontmatter.get("allowed_tools", []))))
     if frontmatter.get("priority"):
         header_lines.append(f"Priority: {frontmatter.get('priority')}")
-    if resource_base:
+
+    # ★ Critical addition: tell the model where the skill package lives on
+    # disk and how to invoke its scripts. Without this, the model reads the
+    # body (which says things like `python scripts/office/soffice.py`) but
+    # has no idea what the path is relative to, and the bash sandbox will
+    # refuse access to the package because it lives outside the workspace.
+    pkg_root = _skill_package_root(skill.get("skill_id", ""))
+    if pkg_root is not None:
+        pkg_root_abs = str(pkg_root.resolve())
+        header_lines.append(f"Skill package root: {pkg_root_abs}")
         header_lines.append(
-            f"Skill package path (inside workspace): {resource_base}/"
+            "Skill resources are mounted READ-ONLY in the bash sandbox. "
+            "Invoke skill scripts with their absolute path, e.g.:\n"
+            f'  cd "{pkg_root_abs}" && python scripts/office/soffice.py --help\n'
+            f"  or:  python \"{pkg_root_abs}/scripts/office/soffice.py\" --help\n"
+            "Output files must be written to the workspace (the current working "
+            "directory of the shell), never into the skill package."
         )
-        header_lines.append(
-            "When the instructions below refer to REFERENCE.md, FORMS.md, "
-            "scripts/, or any other relative path, resolve them under that "
-            "skill package path. Use text_editor (view) or bash to read or "
-            "run those files."
-        )
+        manifest = _skill_manifest_lines(skill.get("skill_id", ""))
+        if manifest:
+            header_lines.append("Package contents:")
+            header_lines.extend("  " + line for line in manifest)
+        # Also surface the env var so the model can use $SKILL_DIR_<ID> in bash.
+        env_key = "SKILL_DIR_" + skill.get("skill_id", "").upper().replace("-", "_")
+        header_lines.append(f"Env var: ${env_key} (expands to the skill package root)")
+
     body = data.get("body", "") if include_body else ""
     content = "\n".join(header_lines)
     if body:
@@ -419,7 +428,6 @@ def build_skill_system_message(
         "name": f"skill:{skill.get('skill_id')}",
         "content": content,
         "skill": skill,
-        "resource_base": resource_base,
     }
 
 
@@ -491,8 +499,20 @@ def read_skill_text(skill_id: str) -> str:
     data = read_skill(skill_id)
     if "error" in data:
         return data["error"]
+    skill_id_resolved = data["skill"].get("skill_id", skill_id)
+    pkg_root = _skill_package_root(skill_id_resolved)
+    manifest = _skill_manifest_lines(skill_id_resolved)
+    env_key = "SKILL_DIR_" + skill_id_resolved.upper().replace("-", "_")
     payload = {
         "skill": data["skill"],
+        "skill_package_root": str(pkg_root.resolve()) if pkg_root else None,
+        "skill_env_var": env_key if pkg_root else None,
+        "package_contents": manifest,
+        "usage_note": (
+            "Skill scripts are mounted READ-ONLY in the bash sandbox. "
+            "Run them with their absolute path or via the env var, e.g. "
+            f'cd "${env_key}" && python scripts/foo.py' if pkg_root else ""
+        ),
         "body": data["body"],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)

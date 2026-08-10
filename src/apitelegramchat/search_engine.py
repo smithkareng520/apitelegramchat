@@ -663,7 +663,7 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "skill_catalog",
-            "description": "List available Claude-style skills discovered from .claude/skills and show where they were loaded from.",
+            "description": "INFO-ONLY: list available Claude-style skills discovered from .claude/skills, plus the absolute paths they were loaded from. The runtime auto-activates the best-matching skill — you do NOT need to call this to enable a skill. Use it only when you need to inspect the catalog (e.g. to cross-reference another skill's location).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -679,32 +679,13 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "skill_read",
-            "description": "Read the full SKILL.md body for a skill so the model can follow its instructions exactly.",
+            "description": "INFO-ONLY: read the full SKILL.md body (plus package root path + file manifest) for a skill that was NOT auto-activated. The auto-activated skill is already in <active_skill_context> — do not re-read it. Use this only for cross-skill reference, e.g. when the active skill body says 'see the pdf skill for OCR' and you need to load that other skill's instructions.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：读取docx技能说明"
-                    },
-                    "skill_id": {"type": "string", "description": "技能目录名或名称"},
-                    "include_body": {"type": "boolean", "default": True, "description": "是否返回正文"}
-                },
-                "required": ["skill_id"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "skill_activate",
-            "description": "Activate a skill and return the activation payload, including the full body when needed.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：激活docx技能"
+                        "description": "简述本次操作目的（≤60字）。示例：读取pdf技能说明（跨技能引用）"
                     },
                     "skill_id": {"type": "string", "description": "技能目录名或名称"},
                     "include_body": {"type": "boolean", "default": True, "description": "是否返回正文"}

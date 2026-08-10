@@ -63,10 +63,8 @@ from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, down
 from apitelegramchat.skills import (
     build_skill_system_message,
     match_skill_for_text,
-    prepare_skill_resources,
     skill_catalog_brief,
 )
-from apitelegramchat.workspace_paths import workspace_root
 from apitelegramchat.tool_executors import (
     dispatch_tool_call,
     format_tool_result,
@@ -1388,23 +1386,23 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 <tool_usage_guide>
 - todo：用户说"记一下""提醒我"时优先用。写操作（add/done/undone/delete/edit/clear）后紧跟一次 list，让用户看到最新状态。
 - memory：用户说"记住…"或提到长期偏好/过敏/重要他人/截止日期时写入；回答涉及偏好的问题前先 search。
-- skills：运行时自动发现并注入匹配的 .claude/skills/*/SKILL.md 到 <active_skill_context>。完整阅读注入的 Instructions，并按其中的 Skill package path 访问 scripts/ 与 REFERENCE.md 等资源。不要把 skill 当成必须先调用的聊天工具。
+- skills：运行时自动管理 .claude/skills/*/SKILL.md。匹配上的技能会被 agent runtime 自动加载，并作为 <active_skill_context> 注入系统提示。技能不是聊天工具或函数；不要尝试"激活"技能——直接按 <active_skill_context> 里的步骤执行。当 <active_skill_context> 出现时，里面的"Skill package root"是技能包在磁盘上的绝对路径；技能包内的脚本在 bash 沙箱中以只读+可执行方式挂载，用 `cd "$SKILL_DIR_<ID>" && python scripts/foo.py` 即可调用；写文件要写到当前 workspace，不要写进技能包。skill_catalog / skill_read 仅供跨技能查阅（例如一个技能的正文引用了另一个技能），不要拿它们当"激活"用。
 - subagent：彼此独立的子任务请在同一轮里一次性并发派多个 subagent 工具调用，不要一个做完再发下一个；简单问题自己答，不要滥用。子 agent 不继承主对话历史，只看到 task + context。
 </tool_usage_guide>
 """
         base_prompt += f"""
 
 <skill_directory>
-Claude-style skills are available in this workspace. Use the catalog below to infer when a request should activate a skill automatically.
+Claude-style skills are available in this workspace. The runtime auto-activates the best-matching skill and injects it as <active_skill_context> in the system prompt — you do not need to call any tool to "turn on" a skill.
 Available skills:
 {catalog_text}
 
 Skill policy:
-- The runtime, not the user-facing model, loads matching skill instructions into <active_skill_context>.
-- Treat loaded <active_skill_context> as authoritative workflow instructions. Read the entire Instructions section carefully and follow it.
-- When the skill mentions additional files (REFERENCE.md, FORMS.md, scripts/...), they are available under the Skill package path shown in the active context (usually .skills/<skill_id>/). Use text_editor or bash to access them.
+- The runtime, not the model, decides which skill to load. Treat the loaded <active_skill_context> as authoritative workflow instructions and follow its steps exactly.
+- The <active_skill_context> block tells you the skill package's absolute root path ("Skill package root: ..."), the package's file manifest, and the env var that expands to it ($SKILL_DIR_<ID>). Use these paths to invoke skill-provided scripts.
+- The bash sandbox grants READ-ONLY + EXECUTE access to skill package roots. You can `cd` into a skill package and run its scripts (e.g. `python scripts/office/soffice.py`). You CANNOT write into the skill package — write all output files into the workspace (the shell's current working directory).
 - Never claim that skills are unavailable if a skill catalog or active skill context is present.
-- Prefer the auto-loaded context. skill_catalog / skill_read / skill_activate tools exist only as fallbacks.
+- skill_catalog and skill_read are info-only tools for inspecting skills that were NOT auto-activated (e.g. cross-skill reference). Do not call them to "enable" a skill — the runtime handles activation.
 </skill_directory>
 """
     else:
@@ -4762,19 +4760,6 @@ async def get_ai_response(
         skill_context_message: dict[str, Any] | None = None
         skill_to_use: str | None = None
 
-        def _load_skill_context(sid: str) -> dict[str, Any]:
-            """Prepare skill resources into the workspace and build the system message."""
-            resource_base = None
-            try:
-                ws = workspace_root(chat_id)
-                ws.mkdir(parents=True, exist_ok=True)
-                resource_base = prepare_skill_resources(sid, ws)
-            except Exception:
-                resource_base = None
-            return build_skill_system_message(
-                sid, include_body=True, resource_base=resource_base
-            )
-
         if skill_match is not None:
             skill_to_use = skill_match.get("skill_id")
             if skill_to_use is None:
@@ -4782,7 +4767,7 @@ async def get_ai_response(
                     ctx = state.get_or_init_context(chat_id)
                     ctx["active_skill"] = None
             elif skill_to_use != active_skill_id:
-                skill_context_message = _load_skill_context(skill_to_use)
+                skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
                 async with lock:
                     ctx = state.get_or_init_context(chat_id)
                     ctx["active_skill"] = {
@@ -4792,10 +4777,10 @@ async def get_ai_response(
                         "updated_at": time.time(),
                     }
             else:
-                skill_context_message = _load_skill_context(skill_to_use)
+                skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
         elif active_skill_id:
             skill_to_use = active_skill_id
-            skill_context_message = _load_skill_context(skill_to_use)
+            skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
 
         system_prompt = await build_system_prompt(
             chat_id,
@@ -4810,12 +4795,7 @@ async def get_ai_response(
             # model always receives the loaded skill context.
             skill_content = str(skill_context_message.get("content") or "").strip()
             if skill_content:
-                # Use real newlines so the model can actually parse the long skill body.
-                messages[0]["content"] += (
-                    "\n\n<active_skill_context>\n"
-                    + skill_content
-                    + "\n</active_skill_context>"
-                )
+                messages[0]["content"] += "\\n\\n<active_skill_context>\\n" + skill_content + "\\n</active_skill_context>"
         await _append_history_async(messages, history, api_type, model_info, chat_id=chat_id)
         if model_info.supports_prompt_cache:
             _apply_cache_control(messages)
