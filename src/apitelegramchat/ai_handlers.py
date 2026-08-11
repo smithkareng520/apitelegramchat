@@ -91,13 +91,11 @@ LONG_TOOL_CALL_TIMEOUT = 45
 # bash 工具单独一档，比 LONG_RUNNING_TOOLS 更宽松：
 #   - 沙箱首次启动要 fork+exec+安装 Landlock 规则；
 #   - skill 工作流常见的命令（pip/npm 安装、LibreOffice soffice 转换、pandoc）
-#     冷启动经常需要 10~30s+，12s／45s 都不够，会触发"连续超时熔断"，
-#     模型永远看不到真实的命令输出。
-#   内层沙箱自身有 SANDBOX_TIMEOUT_SEC（默认 120s）作为最终兜底；这里给外层
-#   wait_for 一个略高于内层默认值的上限，确保永远是内层先超时、外层只是兜底，
-#   而不是外层抢先把还在正常运行的沙箱进程杀掉。
+#     冷启动经常需要 10~30s+，甚至更久。
+#   - 内层沙箱默认允许单个命令运行 300s；外层给 310s，额外留 10s 清理缓冲，
+#     确保不会出现外层先杀掉仍在正常运行的沙箱进程。
 BASH_TOOLS = {"bash"}
-BASH_TOOL_CALL_TIMEOUT = 130
+BASH_TOOL_CALL_TIMEOUT = 310
 # 子 agent 工具：内部跑自己的多轮 agentic loop（每轮一次 LLM 调用 + 可能的工具调用），
 # 默认 90s，用户可配到 300s。外层必须给足够长的超时，否则 12s 一定会杀掉它。
 SUBAGENT_TOOLS = {"subagent"}
@@ -2198,7 +2196,7 @@ async def _run_tool_calls_and_append(
         async with tool_semaphore:
             # 图像 / 视频工具不设超时（内部已有轮询超时控制）
             # 子 agent 走 310s 超时（内部默认 90s，用户可配到 300s）
-            # bash 走 130s（沙箱启动 + skill 工作流命令常见耗时更长）
+            # bash 走 310s（内层沙箱 300s + 10s 外层缓冲）
             # 网络类工具（web_search / fetch_url / text_editor）走 45s 宽松超时，避免外层 12s 误杀
             # 其他工具保持 12 秒
             if fn_name in MEDIA_GEN_TOOLS:
