@@ -58,7 +58,6 @@ from apitelegramchat.search_engine import (
     execute_done,
     execute_generate_image,
     execute_generate_video,
-    execute_image_search,
     # 地图工具
     execute_geocode,
     execute_search_poi,
@@ -745,7 +744,6 @@ _TOOL_TIMEOUT_LABELS = {
     "ip_geo": "IP geolocation",
     "qr_code": "QR code generation",
     "generate_video": "Video generation",
-    "image_search": "Image search",
     "geocode": "Geocoding",
     "search_poi": "POI search",
     "route": "Route planning",
@@ -1114,32 +1112,6 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 )
                 return summary, details_html
         summary = "🎬 Video generation"
-        details_html = escape_text(result_str)
-        return summary, details_html
-
-    elif fn_name == "image_search":
-        if "✅" in result_str:
-            lines = result_str.splitlines()
-            urls = [line.strip() for line in lines if line.strip().startswith(("http://", "https://"))]
-            if urls:
-                summary = f"🖼️ 找到 {len(urls)} 张图片"
-                img_tags = "".join(f'<img src="{html.escape(u)}"/>' for u in urls)
-                # 用简短的"图片 1 / 图片 2"文本链接替代裸 URL，避免长 R2 presigned URL 刷屏
-                link_items = ""
-                for i, u in enumerate(urls):
-                    link_items += f'<li><a href="{html.escape(u)}">图片 {i + 1}</a></li>'
-                link_list = f"<ul>{link_items}</ul>" if link_items else ""
-                # 单图用 <figure>，多图用 <tg-slideshow> 轮播
-                if len(urls) == 1:
-                    media_html = f'<figure>{img_tags}<figcaption>点击图片查看大图</figcaption></figure>'
-                else:
-                    media_html = f'<tg-slideshow>{img_tags}<figcaption>点击图片查看大图</figcaption></tg-slideshow>'
-                details_html = (
-                    f'{media_html}'
-                    f'<br/>{link_list}'
-                )
-                return summary, details_html
-        summary = "🖼️ 图片搜索"
         details_html = escape_text(result_str)
         return summary, details_html
 
@@ -2000,11 +1972,6 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 model=arguments.get("model"),
                 duration=arguments.get("duration", 5),
                 chat_id=chat_id,
-            )
-        elif name == "image_search":
-            return await execute_image_search(
-                arguments.get("query", ""),
-                arguments.get("num_results", 3)
             )
         # 地图工具
         elif name == "geocode":

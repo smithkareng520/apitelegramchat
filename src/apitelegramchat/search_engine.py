@@ -869,25 +869,6 @@ SEARCH_TOOLS = [
             }
         }
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "image_search",
-            "description": "Search the web for images matching a query and return their R2 URLs. Use when the user asks to see a picture of something. Embed returned URLs in your final reply via <img> tags if needed.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：搜索猫的图片"
-                    },
-                    "query": {"type": "string", "description": "图片搜索关键词"},
-                    "num_results": {"type": "integer", "description": "返回图片数（1-10）", "default": 3}
-                },
-                "required": ["query"]
-            }
-        }
-    },
     # ===================== 地图工具 =====================
     {
         "type": "function",
@@ -2723,63 +2704,6 @@ async def execute_generate_video(
         f"视频链接：{final_video_url}"
     )
 
-
-
-# ========== 图片搜索 ==========
-@retry_async(max_retries=2, delay=1, exceptions=(aiohttp.ClientError, asyncio.TimeoutError))
-async def _search_images_google(query: str, num_results: int) -> list[dict] | None:
-    if not GOOGLE_CSE_KEY or not GOOGLE_CSE_ID:
-        return None
-    params = {
-        "key": GOOGLE_CSE_KEY,
-        "cx": GOOGLE_CSE_ID,
-        "q": query,
-        "num": min(max(num_results, 1), 10),
-        "searchType": "image",
-        "imgSize": "medium",
-        "safe": "active"
-    }
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SHORT)) as session:
-        async with session.get("https://www.googleapis.com/customsearch/v1", params=params) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-    items = data.get("items", [])
-    return [{
-        "title": item.get("title", "无标题"),
-        "link": item.get("link", ""),
-        "snippet": item.get("snippet", ""),
-        "displayLink": item.get("displayLink", "")
-    } for item in items[:num_results]]
-
-
-async def execute_image_search(query: str, num_results: int = 3) -> str:
-    items = await _search_images_google(query, num_results)
-    if not items:
-        return f"❌ 未找到与「{query}」相关的图片。"
-
-    uploaded_urls = []
-    for item in items[:num_results]:
-        img_url = item.get("link")
-        if not img_url:
-            continue
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(img_url, timeout=15) as resp:
-                    if resp.status == 200:
-                        img_bytes = await resp.read()
-                        key = f"imagesearch/{hashlib.md5(img_bytes).hexdigest()}.jpg"
-                        uploaded = await upload_bytes_to_r2(img_bytes, key, "image/jpeg")
-                        if uploaded:
-                            uploaded_urls.append(uploaded)
-        except Exception as e:
-            logger.warning(f"下载或上传图片失败: {e}")
-
-    if not uploaded_urls:
-        return f"⚠️ 找到 {len(items)} 张图片，但全部上传失败，请稍后重试。"
-
-    links_text = "\n".join(uploaded_urls)
-    return f"✅ 成功获取 {len(uploaded_urls)} 张图片（已上传 R2）。\n图片链接：\n{links_text}"
 
 
 # ===================== 地图工具实现 =====================

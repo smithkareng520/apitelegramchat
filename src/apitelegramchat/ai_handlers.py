@@ -1950,12 +1950,6 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     if fn_name == "ask_user":
         return "Waiting for your answer"
 
-    if fn_name == "image_search":
-        num_results = _coerce_positive_int(fn_args.get("num_results"), 3)
-        if num_results == 1:
-            return "Searching 1 image"
-        return f"Searching {num_results} images"
-
     # ---------- 其他工具，按规范进行时文本 ----------
     mapping = {
         "present_files": "Presenting file(s)",
@@ -2014,7 +2008,6 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
         "ip_geo": "located an IP",
         "qr_code": "generated a QR code",
         "generate_video": "generated a video",
-        "image_search": "searched for images",
         "geocode": "geocoded an address",
         "search_poi": "searched for points of interest",
         "route": "planned a route",
@@ -2495,9 +2488,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
     if fn_name == "list_upload":
         return "Listed upload/"
 
-    if fn_name == "image_search":
-        n = _coerce_positive_int(fn_args.get("num_results"), 1)
-        return f"Searched {n} image" + ("" if n == 1 else "s")
     if fn_name == "generate_image_from_text":
         n = _coerce_positive_int(fn_args.get("num_images"), 1)
         return "Generated an image" if n == 1 else f"Generated {n} images"
@@ -2702,10 +2692,6 @@ def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, s
     if fn_name in ("generate_image_from_text", "edit_image_with_reference"):
         num_images = args_obj.get("num_images", 1)
         preview_html = f"生成 {num_images} 张图"
-
-    elif fn_name == "image_search":
-        num_results = args_obj.get("num_results", 3)
-        preview_html = f"搜索 {num_results} 张图"
 
     elif fn_name == "weather":
         city = args_obj.get("city", "")
@@ -2985,12 +2971,6 @@ class RichMessageBuilder:
             group["outer_summary"] = "Fetching weather"
         elif t == "qr_code":
             group["outer_summary"] = "Generating QR code"
-        elif t == "image_search":
-            num_results = _coerce_positive_int(fn_args.get("num_results"), 3)
-            if num_results == 1:
-                group["outer_summary"] = "Searching 1 image"
-            else:
-                group["outer_summary"] = f"Searching {num_results} images"
         elif t == "generate_image_from_text":
             num_images = _coerce_positive_int(fn_args.get("num_images"), 1)
             if num_images == 1:
@@ -3047,7 +3027,6 @@ class RichMessageBuilder:
         "weather": ("Fetched weather", "Fetched weather for {n} cities"),
         "convert": ("Calculated a result", "Ran {n} calculations"),
         "qr_code": ("Generated a QR code", "Generated {n} QR codes"),
-        "image_search": ("Searched for images", "Searched for images"),
         "generate_image_from_text": ("Generated an image", "Generated {n} images"),
         "edit_image_with_reference": ("Edited an image", "Edited {n} images"),
         "search_poi": ("Searched for points of interest", "Searched for {n} POIs"),

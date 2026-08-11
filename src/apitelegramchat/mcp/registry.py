@@ -21,7 +21,7 @@ from apitelegramchat.tool_executors import (
 from apitelegramchat.search_engine import (
     execute_book_lookup, execute_crypto_price, execute_done, execute_distance, execute_elevation,
     execute_exchange_rate, execute_fetch_url, execute_geocode, execute_generate_image,
-    execute_generate_video, execute_image_search, execute_ip_geo,
+    execute_generate_video, execute_ip_geo,
     execute_isochrone, execute_news, execute_place_details, execute_qr_code, execute_route,
     execute_search_poi, execute_file_editor, execute_weather, execute_web_search, execute_wikipedia,
 )
@@ -175,7 +175,6 @@ TOOL_SPECS: list[ToolSpec] = [
     ToolSpec("search.done", "Return a done marker.", lambda **kw: _call(execute_done, **_clean_args(kw)), _schema_for(execute_done, title="search.done")),
     ToolSpec("search.generate_image", "Generate an image.", lambda **kw: _call(execute_generate_image, **_clean_args(kw)), _schema_for(execute_generate_image, title="search.generate_image")),
     ToolSpec("search.generate_video", "Generate a video.", lambda **kw: _call(execute_generate_video, **_clean_args(kw)), _schema_for(execute_generate_video, title="search.generate_video")),
-    ToolSpec("search.image_search", "Search images.", lambda **kw: _call(execute_image_search, **_clean_args(kw)), _schema_for(execute_image_search, title="search.image_search")),
     ToolSpec("geo.geocode", "Geocode an address.", lambda **kw: _call(execute_geocode, **_clean_args(kw)), _schema_for(execute_geocode, title="geo.geocode")),
     ToolSpec("geo.search_poi", "Search points of interest.", lambda **kw: _call(execute_search_poi, **_clean_args(kw)), _schema_for(execute_search_poi, title="geo.search_poi")),
     ToolSpec("geo.route", "Calculate a route.", lambda **kw: _call(execute_route, **_clean_args(kw)), _schema_for(execute_route, title="geo.route")),
