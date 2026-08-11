@@ -1121,7 +1121,7 @@ SEARCH_TOOLS = [
                 "Use for installs, tests, builds, scripts, and system operations. Changes made by Bash are sandbox-local until explicitly saved with workspace_commit. "
                 "Do not expect node_modules, virtualenvs, caches, build outputs, or other generated files to persist automatically. "
                 "Avoid interactive commands (vim, top) and long-running processes. Set 'restart'=true to reset the session. "
-                "When a skill is active, the model should explicitly `cd ../skills/<skill_id>` when the skill instructions require it. "
+                "When the model chooses to use a skill, it should explicitly `cd ../skills/<skill_id>` when the skill instructions require it. "
                 "To persist a file changed by Bash, call workspace_commit with its exact path. To list files without Bash, use text_editor command='list'.\n"
                 "\n"
                 "CRITICAL — upload/ and download/ are staging buffers, not execution roots:\n"

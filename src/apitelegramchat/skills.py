@@ -216,61 +216,6 @@ def _read_full_skill(skill_path: Path) -> tuple[dict[str, Any], str]:
     return _parse_frontmatter_lines(header.splitlines()), body
 
 
-def _skill_text_for_matching(rec: SkillRecord) -> str:
-    parts = [rec.skill_id, rec.name, rec.description, rec.path]
-    return " ".join(part for part in parts if part).lower()
-
-
-def _normalize_request_text(text: str) -> str:
-    return re.sub(r"\s+", " ", str(text or "").strip().lower())
-
-
-def _tokenize_request_text(text: str) -> set[str]:
-    normalized = _normalize_request_text(text)
-    if not normalized:
-        return set()
-    pieces = set(re.findall(r"[\w.-]+|[\u4e00-\u9fff]+", normalized))
-    for phrase in ("word 文档", "word文档", ".docx", ".pdf", "前端设计", "界面设计", "生成图片"):
-        if phrase in normalized:
-            pieces.add(phrase)
-    return pieces
-
-
-def _score_skill_match(skill: SkillRecord, request_text: str) -> tuple[int, str]:
-    text = _normalize_request_text(request_text)
-    if not text:
-        return 0, ""
-
-    haystack = _skill_text_for_matching(skill)
-    score = 0
-    reasons: list[str] = []
-
-    exact_hits = {
-        "pdf": [".pdf", "pdf", "ocr", "扫描", "合并", "拆分", "水印", "表单", "填表", "抽取文本", "提取文本"],
-        "docx": [".docx", "docx", "word", "word文档", "word 文档", "报告", "备忘录", "信函", "模板", "批注", "修订"],
-        "frontend-design": [
-            "frontend", "前端", "ui", "界面", "页面", "布局", "tailwind", "react", "组件", "设计",
-            "登录页", "落地页", "仪表盘", "dashboard", "responsive", "样式", "配色", "排版", "动效",
-        ],
-    }
-
-    for token in exact_hits.get(skill.skill_id, []):
-        if token in text:
-            score += 5
-            reasons.append(token)
-
-    tokens = _tokenize_request_text(text)
-    skill_tokens = set(re.findall(r"[\w.-]+|[\u4e00-\u9fff]+", haystack))
-    overlap = tokens & skill_tokens
-    if overlap:
-        score += min(6, len(overlap) * 2)
-        reasons.extend(sorted(overlap)[:3])
-
-    if skill.description:
-        score += 1 if len(skill.description) < 180 else 0
-
-    return score, ", ".join(dict.fromkeys(reasons))
-
 
 @lru_cache(maxsize=1)
 def _cached_skill_catalog_text() -> str:
@@ -285,65 +230,6 @@ def refresh_skill_cache() -> None:
 def skill_catalog_brief() -> str:
     """给系统提示用的精简技能目录。"""
     return _cached_skill_catalog_text()
-
-
-def match_skill_for_text(
-    request_text: str,
-    *,
-    current_skill_id: str | None = None,
-    minimum_score: int = 5,
-) -> dict[str, Any] | None:
-    """根据用户请求自动匹配最合适的 skill。"""
-    records = load_skill_records()
-    if not records:
-        return None
-
-    text = _normalize_request_text(request_text)
-    if not text:
-        return None
-
-    if any(phrase in text for phrase in ("取消技能", "关闭技能", "不使用技能", "不需要技能", "clear skill", "disable skill")):
-        return {"skill_id": None, "reason": "用户明确要求取消技能", "score": 0}
-
-    best: SkillRecord | None = None
-    best_score = -1
-    best_reason = ""
-    for rec in records:
-        score, reason = _score_skill_match(rec, text)
-        if score > best_score:
-            best = rec
-            best_score = score
-            best_reason = reason
-
-    if best is None or best_score < minimum_score:
-        if current_skill_id:
-            for rec in records:
-                if rec.skill_id == current_skill_id:
-                    score, reason = _score_skill_match(rec, text)
-                    if score >= max(2, minimum_score - 2):
-                        return {
-                            "skill_id": rec.skill_id,
-                            "reason": reason or "沿用当前 skill",
-                            "score": score,
-                        }
-        return None
-
-    if current_skill_id and best.skill_id != current_skill_id:
-        current_rec = next((r for r in records if r.skill_id == current_skill_id), None)
-        if current_rec is not None:
-            current_score, _ = _score_skill_match(current_rec, text)
-            if best_score - current_score < 3:
-                return {
-                    "skill_id": current_rec.skill_id,
-                    "reason": "继续沿用当前 skill",
-                    "score": current_score,
-                }
-
-    return {
-        "skill_id": best.skill_id,
-        "reason": best_reason or "自动匹配",
-        "score": best_score,
-    }
 
 
 def build_skill_system_message(skill_id: str, *, include_body: bool = True) -> dict[str, Any]:
@@ -369,22 +255,17 @@ def build_skill_system_message(skill_id: str, *, include_body: bool = True) -> d
     if body:
         content += "\n\nInstructions:\n" + body
         content += (
-            "\n\nIMPORTANT — how to run the commands above:\n"
-            f"1. bash tool: your shell's working directory is AUTOMATICALLY set to "
-            f"`{assets_relpath}/` (this skill's own folder) for every command you run while "
-            "this skill is active. This means every relative path written in the "
-            "instructions above — `scripts/office/unpack.py`, `REFERENCE.md`, "
-            "`python scripts/accept_changes.py input.docx output.docx`, etc. — already works "
-            "exactly as written. Do NOT prefix them with anything; do NOT `cd` elsewhere "
-            "first. If a command needs to read/write a file the user uploaded or a file "
-            f"you created earlier in this conversation, that file lives one level up, at "
-            f"`../` relative to your current directory (i.e. the workspace root) — use "
-            f"`../document.docx` or an absolute path from the `Cwd:` line in the bash "
-            "tool's output to reach it.\n"
-            f"2. text_editor tool: unlike bash, every path you pass to text_editor is "
-            "resolved relative to the workspace root, NOT this skill's folder. So to open "
-            f"a skill asset with text_editor you must write the full path, e.g. "
-            f"`{assets_relpath}/scripts/office/unpack.py`."
+            "\n\nIMPORTANT — explicit skill usage:\n"
+            f"1. The complete skill package is available at `{assets_relpath}/`. "
+            "Read its `SKILL.md` first, then follow the instructions only when you "
+            "have explicitly decided this skill is useful for the current task.\n"
+            f"2. bash starts in the workspace execution directory. To run commands from "
+            f"this skill, use `cd ../{assets_relpath}` first, or invoke scripts with an "
+            f"explicit path such as `python ../{assets_relpath}/scripts/example.py`. "
+            "After changing directory, the persistent bash session keeps that cwd. "
+            "User files remain in the workspace and can be reached with `../` as usual.\n"
+            f"3. text_editor paths are resolved from the workspace root, so use "
+            f"`{assets_relpath}/...` for skill assets."
         )
     return {
         "role": "system",
@@ -428,36 +309,21 @@ def read_skill(skill_id: str) -> dict[str, Any]:
     return {"error": f"Unknown skill: {skill_id}"}
 
 
-def _iter_asset_files(skill_dir: Path) -> Iterable[Path]:
-    """遍历 skill 目录下除 SKILL.md 外的所有文件（资源：scripts/、*.md 参考文档等）。"""
+def _iter_skill_package_files(skill_dir: Path) -> Iterable[Path]:
+    """Yield every file in a trusted packaged skill, including SKILL.md."""
     for path in skill_dir.rglob("*"):
-        if path.is_dir():
-            continue
-        if path.name == "SKILL.md" and path.parent == skill_dir:
-            continue
-        yield path
+        if path.is_file():
+            yield path
 
 
 def skill_assets_workspace_relpath(skill_id: str) -> str:
-    """该 skill 的资源在 workspace 内的相对路径（bash/text_editor 可直接使用）。"""
+    """该 skill 在 workspace 内的相对路径。"""
     return f"{SKILL_ASSETS_DIRNAME}/{skill_id}"
 
 
 def sync_skill_assets_to_workspace(skill_id: str, workspace_root: Path) -> dict[str, Any]:
-    """
-    把 skill 目录下除 SKILL.md 外的全部资源（scripts/、REFERENCE.md、FORMS.md 等）
-    复制到 <workspace_root>/skills/<skill_id>/ 下。
-
-    这一步是必须的：沙箱的 Landlock 策略只放行 workspace_root 本身和只读系统目录，
-    `.claude/skills/<id>/` 所在的应用源码树完全不在白名单里。SKILL.md 正文里写的
-    `scripts/xxx.py`、`REFERENCE.md` 等相对路径，只有先把文件"物理搬"进 workspace，
-    bash / text_editor 工具才有可能访问到。
-
-    增量同步：只有当目标文件不存在，或大小/mtime 与源文件不同才重写，避免每轮对话
-    都重新拷贝体积较大的资源（例如 docx skill 里的 XSD schema 集合）。
-    """
+    """同步一个完整 skill 包到 workspace/skills/<skill_id>/。"""
     result: dict[str, Any] = {"skill_id": skill_id, "synced": False, "files": 0, "error": None}
-
     rec = next((r for r in load_skill_records() if r.skill_id == skill_id or r.name == skill_id), None)
     if rec is None:
         result["error"] = f"Unknown skill: {skill_id}"
@@ -468,20 +334,15 @@ def sync_skill_assets_to_workspace(skill_id: str, workspace_root: Path) -> dict[
         result["error"] = f"Skill directory missing: {skill_dir}"
         return result
 
-    # Skill 资源始终进入独立的 workspace/skills 层，不进入 workspace/files。
-    # workspace_utils 只同步 files/，因此这里无需任何黑名单/白名单。
-    workspace_path = Path(workspace_root)
-    dest_root = workspace_path / SKILL_ASSETS_DIRNAME / rec.skill_id
-
+    dest_root = Path(workspace_root) / SKILL_ASSETS_DIRNAME / rec.skill_id
     try:
         dest_root.mkdir(parents=True, exist_ok=True)
         copied = 0
         source_files: set[str] = set()
-        for src_path in _iter_asset_files(skill_dir):
+        for src_path in _iter_skill_package_files(skill_dir):
             rel = src_path.relative_to(skill_dir)
-            source_files.add(str(rel))
+            source_files.add(rel.as_posix())
             dst_path = dest_root / rel
-
             needs_copy = True
             if dst_path.exists():
                 try:
@@ -493,45 +354,47 @@ def sync_skill_assets_to_workspace(skill_id: str, workspace_root: Path) -> dict[
                     )
                 except OSError:
                     needs_copy = True
-
             if needs_copy:
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src_path, dst_path)
                 copied += 1
 
-        # 清理目标目录里源端已经不存在的陈旧文件（skill 更新/删除资源后跟着同步）
         for existing in list(dest_root.rglob("*")):
             if existing.is_dir():
                 continue
-            rel = str(existing.relative_to(dest_root))
+            rel = existing.relative_to(dest_root).as_posix()
             if rel not in source_files:
                 try:
                     existing.unlink()
                 except OSError:
                     pass
-        # 清理空目录
-        for existing_dir in sorted(
-            (p for p in dest_root.rglob("*") if p.is_dir()), reverse=True
-        ):
+
+        for existing_dir in sorted((p for p in dest_root.rglob("*") if p.is_dir()), reverse=True):
             try:
-                next(existing_dir.iterdir())
-            except StopIteration:
-                try:
+                if not any(existing_dir.iterdir()):
                     existing_dir.rmdir()
-                except OSError:
-                    pass
             except OSError:
                 pass
 
-        result["synced"] = True
-        result["files"] = len(source_files)
-        result["copied"] = copied
-        result["path"] = str(dest_root)
-    except Exception as exc:  # pragma: no cover - defensive
+        result.update({"synced": True, "files": len(source_files), "copied": copied, "path": str(dest_root)})
+    except Exception as exc:
         logger.error("同步 skill 资源失败 skill_id=%s: %s", skill_id, exc)
         result["error"] = str(exc)
-
     return result
+
+
+def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
+    """把所有可信 skill 包同步到 workspace/skills，供 AI 自主选择并使用。"""
+    records = load_skill_records()
+    summary = {"synced": 0, "files": 0, "errors": []}
+    for rec in records:
+        result = sync_skill_assets_to_workspace(rec.skill_id, workspace_root)
+        if result.get("synced"):
+            summary["synced"] += 1
+            summary["files"] += int(result.get("files") or 0)
+        elif result.get("error"):
+            summary["errors"].append(f"{rec.skill_id}: {result['error']}")
+    return summary
 
 
 def catalog_text() -> str:

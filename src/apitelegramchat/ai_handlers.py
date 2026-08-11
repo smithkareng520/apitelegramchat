@@ -60,12 +60,7 @@ from apitelegramchat.utils import (
 )
 from apitelegramchat.file_handlers import get_file_path
 from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2
-from apitelegramchat.skills import (
-    build_skill_system_message,
-    match_skill_for_text,
-    skill_catalog_brief,
-    sync_skill_assets_to_workspace,
-)
+from apitelegramchat.skills import skill_catalog_brief
 from apitelegramchat.workspace_paths import workspace_root as _skill_workspace_root
 from apitelegramchat.tool_executors import (
     dispatch_tool_call,
@@ -1415,7 +1410,7 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 <tool_usage_guide>
 - todo：用户说"记一下""提醒我"时优先用。写操作（add/done/undone/delete/edit/clear）后紧跟一次 list，让用户看到最新状态。
 - memory：用户说"记住…"或提到长期偏好/过敏/重要他人/截止日期时写入；回答涉及偏好的问题前先 search。
-- skills：技能指令存储在 workspace/skills/&lt;技能名&gt;/SKILL.md，运行时会自动匹配并加载相关技能到上下文。需要查看技能详情时可用 bash 读取对应 SKILL.md，无需专用工具。
+- skills：技能包存储在 workspace/skills/&lt;技能名&gt;/。由你主动判断是否需要某个 skill；需要时先读取对应 SKILL.md，再按其说明调用脚本或参考文件，不会自动替你激活技能。
 - subagent：彼此独立的子任务请在同一轮里一次性并发派多个 subagent 工具调用，不要一个做完再发下一个；简单问题自己答，不要滥用。子 agent 不继承主对话历史，只看到 task + context。
 </tool_usage_guide>
 """
@@ -1424,7 +1419,7 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 <skill_directory>
 以下是当前可用的技能列表，格式为「技能名 - 描述」。技能资源位于 workspace 的 skills/ 目录下，每个技能对应一个子目录（目录名与技能名相同），其中包含 SKILL.md 及相关脚本/参考文件。
 
-当用户请求与某个技能的描述匹配时，运行时会自动将该技能的完整指令加载到上下文。你也可以主动用 bash 读取 skills/&lt;技能名&gt;/SKILL.md 来获取详细操作指南。
+你必须自行判断是否需要使用某个技能。需要时用 bash 读取 `skills/&lt;技能名&gt;/SKILL.md` 获取详细操作指南，并按需进入对应技能目录运行其中脚本。系统不会根据用户文本自动匹配或自动加载任何技能。
 
 {catalog_text}
 </skill_directory>
@@ -4847,55 +4842,6 @@ async def get_ai_response(
             # 复制历史快照，避免在锁外被并发请求追加导致竞态
             history = list(user_contexts.get(chat_id, {}).get("conversation_history", []))
             supports_tools = model_info.supports_tools
-            active_skill = user_contexts.get(chat_id, {}).get("active_skill")
-
-        active_skill_id = active_skill.get("skill_id") if isinstance(active_skill, dict) else None
-        skill_request_text = _extract_skill_request_text(user_message)
-        skill_match = match_skill_for_text(skill_request_text, current_skill_id=active_skill_id)
-
-        skill_context_message: dict[str, Any] | None = None
-        skill_to_use: str | None = None
-
-        if skill_match is not None:
-            skill_to_use = skill_match.get("skill_id")
-            if skill_to_use is None:
-                async with lock:
-                    ctx = state.get_or_init_context(chat_id)
-                    ctx["active_skill"] = None
-            elif skill_to_use != active_skill_id:
-                skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
-                async with lock:
-                    ctx = state.get_or_init_context(chat_id)
-                    ctx["active_skill"] = {
-                        "skill_id": skill_to_use,
-                        "reason": skill_match.get("reason", "自动匹配"),
-                        "score": skill_match.get("score", 0),
-                        "updated_at": time.time(),
-                    }
-            else:
-                skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
-        elif active_skill_id:
-            skill_to_use = active_skill_id
-            skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
-
-        if skill_to_use:
-            # ★ 关键：把 skill 目录下除 SKILL.md 外的资源（scripts/、REFERENCE.md 等）
-            # 同步复制到该 chat 的 workspace/skills/<skill_id>/ 下。Landlock 沙箱只放行
-            # workspace_root(chat_id) 之外的应用源码树，模型的 bash / text_editor 工具永远无法触达
-            # .claude/skills/<id>/ 这个应用源码路径；不做这一步，SKILL.md 里写的
-            # `scripts/xxx.py`、`REFERENCE.md` 等相对路径在沙箱里全部是"文件不存在"。
-            try:
-                sync_result = await asyncio.to_thread(
-                    sync_skill_assets_to_workspace,
-                    skill_to_use,
-                    _skill_workspace_root(chat_id),
-                )
-                if sync_result.get("error"):
-                    logger.warning(
-                        "同步 skill 资源失败 skill_id=%s: %s", skill_to_use, sync_result["error"]
-                    )
-            except Exception:
-                logger.exception("同步 skill 资源到 workspace 时发生异常 skill_id=%s", skill_to_use)
 
         system_prompt = await build_system_prompt(
             chat_id,
@@ -4904,13 +4850,6 @@ async def get_ai_response(
             skill_catalog_text=skill_catalog_brief(),
         )
         messages = _build_initial_messages(api_type, system_prompt)
-        if skill_context_message and "error" not in skill_context_message:
-            # Some providers do not reliably preserve additional system messages.
-            # Merge active skill instructions into the primary system message so the
-            # model always receives the loaded skill context.
-            skill_content = str(skill_context_message.get("content") or "").strip()
-            if skill_content:
-                messages[0]["content"] += "\\n\\n<active_skill_context>\\n" + skill_content + "\\n</active_skill_context>"
         await _append_history_async(messages, history, api_type, model_info, chat_id=chat_id)
         if model_info.supports_prompt_cache:
             _apply_cache_control(messages)
@@ -5216,29 +5155,4 @@ def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict):
 
 def _openrouter_extra_body() -> dict:
     return {"provider": OPENROUTER_PROVIDER_PREFERENCES.copy()}
-
-
-def _extract_skill_request_text(user_message: dict | None) -> str:
-    if not isinstance(user_message, dict):
-        return ""
-
-    parts: list[str] = []
-    content = user_message.get("content")
-    if isinstance(content, str) and content.strip():
-        parts.append(content)
-    elif content is not None:
-        parts.append(str(content))
-
-    for key in ("file_name", "file_names", "mime_type", "mime_types", "type", "attachments"):
-        value = user_message.get(key)
-        if not value:
-            continue
-        if isinstance(value, (list, tuple, set)):
-            parts.extend(str(item) for item in value if str(item).strip())
-        else:
-            parts.append(str(value))
-
-    return "\n".join(parts)
-
-
 

@@ -196,18 +196,11 @@ class BashSession:
         self._watchdog_task: Optional[asyncio.Task] = None
         self._runtime_state: Optional[dict] = None
         self._runtime_prepare_lock = asyncio.Lock()
-        # active skill 只作为上下文状态保留，不再改变 Bash 的 cwd。
-        # cwd 必须由模型通过 `cd` 自己控制，这样 persistent bash 才真正保持
-        # 环境变量、当前目录和 shell 状态，且不会因为 skill 匹配而把工作区
-        # 根目录意外切到 `../skills/<skill_id>`。
-        self._active_skill_id: Optional[str] = None
+        # cwd 必须由模型通过 `cd` 自己控制；选择使用 skill 后可进入
+        # `../skills/<skill_id>`，persistent bash 会保持当前目录与 shell 状态。
         # 跟踪上一次命令结束后的真实 PWD，用于在 upload/ 或 download/ 子树内
         # 拒绝执行下一条命令。None 表示尚未执行过命令，假定位于 workdir。
         self._last_cwd: Optional[str] = str(self.workdir.absolute())
-
-    def set_active_skill(self, skill_id: Optional[str]) -> None:
-        """记录当前 skill 上下文；不修改 Bash 当前工作目录。"""
-        self._active_skill_id = skill_id or None
 
     async def start(self):
         """启动 bash 进程，套上 Landlock 沙箱 + rlimit + no-new-privs"""
@@ -349,7 +342,7 @@ class BashSession:
         #   （在 _ensure_workspace_initialized 内部获取），与 workspace lock 独立。
         #   init 失败不阻断 bash：本地 workspace 可能不全但 bash 仍可运行。
         try:
-            await _ensure_workspace_initialized(self.chat_id)
+            await _ensure_runtime_workspace(self.chat_id)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -385,9 +378,8 @@ class BashSession:
 
             marker = f"__END_{random.randint(100000, 999999)}__"
             cwd_marker = f"__CWD_{random.randint(100000, 999999)}__"
-            # 不要在每次调用前强制 `cd`：模型可以在 persistent bash 中自行
-            # `cd ../skills/<skill_id>`，后续命令会继续留在该目录。默认 shell
-            # 启动目录仍然是 workspace 根目录。
+            # 默认 shell 启动目录为 workspace/runtime/exec。模型决定使用 skill 后，
+            # 可自行 `cd ../skills/<skill_id>`；persistent bash 会保留该 cwd。
             # ★ 关键：在 echo marker 前先输出一个换行，确保 marker 单独占一行。
             #   如果命令输出不以换行结尾（如 cat 无换行文件、printf 无 \n），
             #   echo 的输出会粘在前一行，readline() 永远读不到以 marker 开头的行，
@@ -617,7 +609,7 @@ _bash_manager = BashSessionManager()
 # =====================================================================
 # execute_bash —— 工具调用入口（保持原签名，外部无需修改）
 # =====================================================================
-async def execute_bash(chat_id: int, command: str = "", restart: bool = False, skill_id: Optional[str] = None, progress_callback=None) -> str:
+async def execute_bash(chat_id: int, command: str = "", restart: bool = False, progress_callback=None) -> str:
     if restart:
         result = await _bash_manager.restart_session(chat_id)
         return result
@@ -627,9 +619,6 @@ async def execute_bash(chat_id: int, command: str = "", restart: bool = False, s
         session = await _bash_manager.get_session(chat_id)
     except RuntimeError as e:
         return f"Error: {e}"
-    # active skill 作为上下文同步，但不改变 persistent bash 的 cwd。
-    # cwd 由模型在需要使用 skill 时自行 `cd ../skills/<skill_id>` 控制。
-    session.set_active_skill(skill_id)
     # 执行命令，结束后由 workspace sync scheduler 合并同步到 R2。
     return await session.execute(command, progress_callback=progress_callback)
 
@@ -2124,22 +2113,10 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             )
         # ========== Bash 工具分支 ==========
         elif name == "bash":
-            # 读取当前 chat 的 active skill 作为模型上下文，但不替模型改变 cwd。
-            # 使用 skill 时由模型自己 `cd ../skills/<id>`；persistent bash 会保留该 cwd。
-            active_skill_id = None
-            try:
-                from apitelegramchat import state as _state
-                ctx = _state.user_contexts.get(chat_id, {})
-                active_skill = ctx.get("active_skill")
-                if isinstance(active_skill, dict):
-                    active_skill_id = active_skill.get("skill_id")
-            except Exception:
-                active_skill_id = None
             return await execute_bash(
                 chat_id=chat_id,
                 command=arguments.get("command", ""),
                 restart=arguments.get("restart", False),
-                skill_id=active_skill_id,
                 progress_callback=progress_callback,
             )
         # ========== Todo 工具分支 ==========

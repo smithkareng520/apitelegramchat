@@ -87,13 +87,23 @@ def _copy_persistent_tree_to_runtime(chat_id: int, namespace: str | None = None)
 
 
 async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) -> None:
-    """Ensure Bash/text-editor tools share the same ephemeral working tree.
-
-    Non-blocking: if init is in progress, this returns immediately and the
-    incremental copy handles whatever local state is available.
-    """
+    """Ensure the execution tree contains persistent files and all packaged skills."""
     await _ensure_workspace_initialized(chat_id, namespace)
     await asyncio.to_thread(_copy_persistent_tree_to_runtime, chat_id, namespace)
+    try:
+        from apitelegramchat.skills import sync_all_skill_assets_to_workspace
+        summary = await asyncio.to_thread(
+            sync_all_skill_assets_to_workspace,
+            workspace_root(chat_id, namespace),
+        )
+        if summary.get("errors"):
+            logger.warning(
+                "部分 skill 包同步失败 chat_id=%s: %s",
+                chat_id,
+                "; ".join(summary["errors"]),
+            )
+    except Exception as exc:
+        logger.warning("同步 skill 包到 workspace 失败 chat_id=%s: %s", chat_id, exc)
 
 
 def _safe_workspace_relpath(rel_path: str) -> str:
