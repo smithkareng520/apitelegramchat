@@ -2142,7 +2142,8 @@ async def _run_tool_calls_and_append(
                 preview_html = f"在第{insert_line}行后插入：<br/>" + _format_code_block(insert_text,
                                                                                        header="insert_text")
             elif cmd == "delete":
-                preview_html = "准备删除文件..."
+                # 删除不再显示多余的“准备删除”中间态；最终工具结果直接反馈。
+                preview_html = ""
         elif fn_name == "bash":
             command = fn_args.get("command", "")
             preview_html = _format_code_block(command, header="bash")
@@ -2558,7 +2559,8 @@ def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, s
                 tail = _tail_lines(raw, 7)
                 preview_html = _format_code_block(tail, header="", show_line_numbers=False, show_size=False)
             else:
-                preview_html = "<i>正在准备编辑器操作...</i>"
+                # 参数尚未完整解析时不显示额外的编辑器中间态噪声。
+                preview_html = ""
         else:
             preview_html = _format_code_block(args_str, header="arguments (streaming)")
         return new_summary, preview_html
@@ -2609,11 +2611,11 @@ def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, s
             else:
                 preview_html = f"在第{insert_line}行后插入..."
         elif cmd == "delete":
-            preview_html = "<code>准备删除文件...</code>"
+            preview_html = ""
         elif cmd == "view":
             preview_html = ""
         else:
-            preview_html = "<i>正在执行编辑器操作...</i>"
+            preview_html = ""
 
     elif fn_name == "bash":
         command = args_obj.get("command", "")

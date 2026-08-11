@@ -195,29 +195,15 @@ class BashSession:
         self._watchdog_task: Optional[asyncio.Task] = None
         self._runtime_state: Optional[dict] = None
         self._runtime_prepare_lock = asyncio.Lock()
-        # 当前激活的 skill id（如有）。非 None 时，execute() 里每条命令执行前
-        # 会 cd 到该 skill 的资源目录（workspace/.skills/<skill_id>/），而不是
-        # workspace 根 —— 这样 SKILL.md 里写的相对路径（如
-        # `python scripts/office/soffice.py ...`）天然成立，不需要模型自己
-        # 拼接 `.skills/<id>/` 前缀，也不用担心拼接出错。
+        # active skill 只作为上下文状态保留，不再改变 Bash 的 cwd。
+        # cwd 必须由模型通过 `cd` 自己控制，这样 persistent bash 才真正保持
+        # 环境变量、当前目录和 shell 状态，且不会因为 skill 匹配而把工作区
+        # 根目录意外切到 `.skills/<skill_id>`。
         self._active_skill_id: Optional[str] = None
 
     def set_active_skill(self, skill_id: Optional[str]) -> None:
-        """设置/清除当前激活的 skill，影响下一次 execute() 的 cwd。"""
+        """记录当前 skill 上下文；不修改 Bash 当前工作目录。"""
         self._active_skill_id = skill_id or None
-
-    def _effective_cwd(self) -> Path:
-        """返回本次命令应该在哪个目录下执行。
-
-        有 active skill 且该 skill 的资源目录确实已经同步到本地时，
-        cwd 切到 skill 目录本身（渐进式披露：模型此时"就在"该 skill 包内，
-        SKILL.md 里的相对路径不需要任何改写）。否则退回 workspace 根。
-        """
-        if self._active_skill_id:
-            skill_dir = self.workdir / SKILL_ASSETS_DIRNAME / self._active_skill_id
-            if skill_dir.is_dir():
-                return skill_dir
-        return self.workdir
 
     async def start(self):
         """启动 bash 进程，套上 Landlock 沙箱 + rlimit + no-new-privs"""
@@ -330,13 +316,19 @@ class BashSession:
                 return f"Error: Command rejected for security reasons: {command}"
 
             marker = f"__END_{random.randint(100000, 999999)}__"
-            effective_cwd = self._effective_cwd()
-            workspace_dir = shlex.quote(str(effective_cwd.absolute()))
+            cwd_marker = f"__CWD_{random.randint(100000, 999999)}__"
+            # 不要在每次调用前强制 `cd`：模型可以在 persistent bash 中自行
+            # `cd .skills/<skill_id>`，后续命令会继续留在该目录。默认 shell
+            # 启动目录仍然是 workspace 根目录。
             # ★ 关键：在 echo marker 前先输出一个换行，确保 marker 单独占一行。
             #   如果命令输出不以换行结尾（如 cat 无换行文件、printf 无 \n），
             #   echo 的输出会粘在前一行，readline() 永远读不到以 marker 开头的行，
             #   导致整个会话 hang 死。
-            full_cmd = f"cd {workspace_dir} && {command}; echo; echo '{marker} $?'\n"
+            # 同时记录命令结束后的真实 PWD，用于结果显示；不会改变 shell 状态。
+            full_cmd = (
+                f"{command}; echo; printf '{cwd_marker} %s\n' \"$PWD\"; "
+                f"echo '{marker} $?'\n"
+            )
 
             try:
                 self.proc.stdin.write(full_cmd.encode('utf-8'))
@@ -413,11 +405,18 @@ class BashSession:
                     output = output[:20000] + "\n... (truncated)"
                 output = re.sub(r'\x1b\[[0-9;]*m', '', output)
 
+                # 提取命令结束后的真实 PWD，同时把内部 marker 从用户输出中移除。
+                actual_cwd = str(self.workdir.absolute())
+                cwd_match = re.search(rf'(?m)^' + re.escape(cwd_marker) + r' (.+)$', output)
+                if cwd_match:
+                    actual_cwd = cwd_match.group(1).strip()
+                    output = re.sub(rf'(?m)^' + re.escape(cwd_marker) + r' .*$\n?', '', output)
+
                 # 同步回 R2（异步，不阻塞返回）
                 asyncio.create_task(_async_sync_workspace_to_r2(self.chat_id))
 
                 return (f"Command: {command}\n"
-                        f"Cwd: {effective_cwd.absolute()}\n"
+                        f"Cwd: {actual_cwd}\n"
                         f"Exit code: {exit_code}\n"
                         f"Sandbox: landlock\n"
                         f"Output:\n{output}")
@@ -535,8 +534,8 @@ async def execute_bash(chat_id: int, command: str = "", restart: bool = False, s
         session = await _bash_manager.get_session(chat_id)
     except RuntimeError as e:
         return f"Error: {e}"
-    # ★ 每次调用都同步当前 active skill，使 cwd 与最新的 skill 激活状态一致
-    #   （skill 可能在上一轮对话里才切换，session 是跨轮复用的）。
+    # active skill 作为上下文同步，但不改变 persistent bash 的 cwd。
+    # cwd 由模型在需要使用 skill 时自行 `cd .skills/<skill_id>` 控制。
     session.set_active_skill(skill_id)
     # 执行命令，内部已包含异步同步
     return await session.execute(command, progress_callback=progress_callback)
@@ -1881,9 +1880,8 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             )
         # ========== Bash 工具分支 ==========
         elif name == "bash":
-            # 读取当前 chat 的 active skill，让沙箱 cwd 与之保持一致
-            # （渐进式披露：有 active skill 时 cwd 直接落在该 skill 的
-            # workspace/.skills/<id>/ 目录下，SKILL.md 的相对路径不需要改写）。
+            # 读取当前 chat 的 active skill 作为模型上下文，但不替模型改变 cwd。
+            # 使用 skill 时由模型自己 `cd .skills/<id>`；persistent bash 会保留该 cwd。
             active_skill_id = None
             try:
                 from apitelegramchat import state as _state

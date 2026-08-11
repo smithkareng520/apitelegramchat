@@ -1155,9 +1155,9 @@ SEARCH_TOOLS = [
         "function": {
             "name": "bash",
             "description": (
-                "Execute shell commands in a persistent bash session (env vars and cwd persist across calls). "
+                "Execute shell commands in a persistent bash session (env vars, cwd, and shell state persist across calls). "
                 "Use for system operations, running scripts, file manipulation. Avoid interactive commands (vim, top) and long-running processes. Set 'restart'=true to reset the session. "
-                "Note: each invocation is automatically prefixed with `cd $HOME && ` so the working directory is always reset to the user's workspace. "
+                "Bash starts in the workspace root. When a skill is active, the model should explicitly `cd .skills/<skill_id>` when the skill instructions require it; the server does not force a cwd change on every call. "
                 "To list files in the workspace without bash (e.g. when sandbox is unavailable), use text_editor command='list'."
             ),
             "parameters": {
