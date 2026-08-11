@@ -159,14 +159,18 @@ async def _execute_tool_for_subagent(
     if name in FORBIDDEN_TOOLS:
         return f"Error: tool '{name}' is forbidden in subagent context."
     try:
-        from apitelegramchat.tool_executors import dispatch_tool_call
+        from apitelegramchat.tool_executors import dispatch_tool_call, tool_semaphore
     except Exception as e:
         return f"Error: cannot import dispatch_tool_call: {e}"
     try:
-        result = await asyncio.wait_for(
-            dispatch_tool_call(name, arguments or {}, chat_id=chat_id),
-            timeout=SUBAGENT_TOOL_TIMEOUT,
-        )
+        # 复用主 agent 同一个全局信号量：多个子 agent 并行运行时，
+        # 各自发起的工具调用（web_search / bash 等）仍受总并发上限约束，
+        # 避免 N 个子 agent 同时爆发出 N×M 个不受控的外部请求。
+        async with tool_semaphore:
+            result = await asyncio.wait_for(
+                dispatch_tool_call(name, arguments or {}, chat_id=chat_id),
+                timeout=SUBAGENT_TOOL_TIMEOUT,
+            )
         return _truncate(str(result))
     except asyncio.TimeoutError:
         return f"Error: tool '{name}' timed out in subagent context."
@@ -381,7 +385,7 @@ async def execute_subagent(
       context       给子 agent 的额外背景信息（可选）
       model         指定子 agent 使用的模型 ID（可选，默认与父同款 DEFAULT_MODEL）
       allowed_tools 工具白名单（可选，None=默认白名单，[]=不允许任何工具）
-      timeout       整体超时秒数（可选，默认 90）
+      timeout       整体超时秒数（可选，默认 DEFAULT_TIMEOUT=900，最大 1800）
       progress_callback  可选的 async 回调 async (status_text: str) -> None，
                          每轮 LLM 调用前 / 工具执行前 / 完成后都会调用，
                          让外层能实时刷新 UI 草稿。

@@ -75,11 +75,7 @@ from apitelegramchat.todo_tool import (
     render_todo_card,
 )
 from apitelegramchat.memory_tool import execute_memory, render_memory_card
-try:
-    from apitelegramchat.subagent_tool import execute_subagent, render_subagent_card
-except Exception:  # pragma: no cover - optional dependency fallback
-    def render_subagent_card(*args, **kwargs):
-        return "<b>Subagent</b>"
+from apitelegramchat.subagent_tool import execute_subagent, render_subagent_card
 from apitelegramchat.utils import escape_html
 
 logger = logging.getLogger(__name__)
