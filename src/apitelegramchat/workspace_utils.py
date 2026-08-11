@@ -95,6 +95,10 @@ async def _sync_workspace_from_r2(chat_id: int):
         rel = key[len(prefix):]
         if not rel:
             continue
+        # .runtime_cache 永远是本地运行时缓存，不允许从 R2 下载。
+        # 这里必须在 resolve/symlink 检查之前过滤，避免历史缓存对象污染同步。
+        if _is_local_only_rel(rel):
+            continue
         # 拒绝包含 .. 或绝对路径的 rel，防止通过 R2 key 注入路径遍历
         if "\x00" in rel:
             logger.warning(f"拒绝含 null 字节的 R2 key: {key!r}")

@@ -24,6 +24,13 @@ from apitelegramchat.workspace_paths import data_root
 
 logger = logging.getLogger(__name__)
 
+
+def _is_runtime_cache_key(key: str) -> bool:
+    """.runtime_cache 是运行时缓存，永远不进入 R2 持久化。"""
+    normalized = str(key).replace("\\", "/")
+    return any(part == ".runtime_cache" for part in normalized.split("/"))
+
+
 session = aioboto3.Session() if aioboto3 is not None else None
 _LOCAL_R2_ROOT = data_root() / "r2_cache"
 
@@ -57,6 +64,9 @@ async def upload_bytes_to_r2(
     content_type: str = "application/octet-stream",
 ) -> str | None:
     """Upload bytes to R2, or fall back to a local cache when R2 is unavailable."""
+    if _is_runtime_cache_key(key):
+        logger.debug("Skip R2 upload for runtime cache: %s", key)
+        return None
     if not _use_remote_r2():
         try:
             path = _safe_local_key_path(key)
@@ -144,6 +154,9 @@ async def file_exists_in_r2(key: str) -> bool:
 
 
 async def download_from_r2(key: str) -> bytes | None:
+    if _is_runtime_cache_key(key):
+        logger.debug("Skip R2 download for runtime cache: %s", key)
+        return None
     if not _use_remote_r2():
         path = _safe_local_key_path(key)
         if path.exists() and path.is_file():
@@ -169,6 +182,8 @@ async def download_from_r2(key: str) -> bytes | None:
 
 
 async def list_r2_objects(prefix: str) -> List[str]:
+    if _is_runtime_cache_key(prefix):
+        return []
     if not _use_remote_r2():
         root = _LOCAL_R2_ROOT / prefix
         if not root.exists():
@@ -177,7 +192,8 @@ async def list_r2_objects(prefix: str) -> List[str]:
         for path in root.rglob("*"):
             if path.is_file():
                 rel = path.relative_to(_LOCAL_R2_ROOT).as_posix()
-                items.append(rel)
+                if not _is_runtime_cache_key(rel):
+                    items.append(rel)
         return items
 
     keys: List[str] = []
@@ -203,6 +219,9 @@ async def list_r2_objects(prefix: str) -> List[str]:
 
 
 async def delete_r2_object(key: str) -> bool:
+    if _is_runtime_cache_key(key):
+        logger.debug("Skip R2 delete for runtime cache: %s", key)
+        return True
     if not _use_remote_r2():
         path = _safe_local_key_path(key)
         try:
