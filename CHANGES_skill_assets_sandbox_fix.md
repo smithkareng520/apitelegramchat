@@ -214,3 +214,9 @@ pip 安装等耗时命令不会被外层过早杀掉、触发熔断。
 - File edits remain asynchronously persisted to R2, so creating multiple files no longer serializes on repeated remote list/download operations.
 - A dedicated initialization lock prevents duplicate first-use syncs without reusing the normal workspace file-operation lock (avoids nested-lock deadlocks).
 
+
+## Bash frontend heartbeat refresh
+- Bash tool execution now uses the same forced heartbeat pattern as long-running subagent/media tools.
+- While Bash is running, the active draft is reasserted every 2 seconds even when stdout is unchanged.
+- Incremental stdout still updates through the existing throttled progress callback.
+- This avoids `force=False` + unchanged-content short-circuiting, which previously made long-running Bash appear frozen in the frontend.

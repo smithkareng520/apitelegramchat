@@ -2166,13 +2166,19 @@ async def _run_tool_calls_and_append(
     stop_refresh = asyncio.Event()
 
     has_image_tool = any(fn_name in MEDIA_GEN_TOOLS for fn_name, _, _ in tool_tasks)
+    has_bash_tool = any(fn_name in BASH_TOOLS for fn_name, _, _ in tool_tasks)
+    # Bash 与子 agent 一样，可能长时间没有新的文本增量。
+    # 普通 force=False flush 会被 send_rich_message_draft 的“内容未变化”短路，
+    # 因此前端看不到持续运行中的 Bash 状态。每 2 秒强制 reassert 一帧，保持
+    # 草稿在前端持续活跃；真正有 stdout 增量时仍由 progress_callback 节流刷新。
+    force_tool_refresh = has_image_tool or has_bash_tool
 
     async def refresh_loop():
-        await builder.flush(force=has_image_tool)
+        await builder.flush(force=force_tool_refresh)
         while not stop_refresh.is_set():
             await asyncio.sleep(2.0)
             if not stop_refresh.is_set():
-                await builder.flush(force=has_image_tool)
+                await builder.flush(force=force_tool_refresh)
 
     refresh_task = asyncio.create_task(refresh_loop())
 
