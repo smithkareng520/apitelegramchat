@@ -2718,7 +2718,11 @@ class RichMessageBuilder:
     # 工具结果只用于草稿 UI 展示，不能让一个或多个工具的超长原始输出
     # 把整个 rich draft 撑爆。这里仅限制“工具详情展示”，不会影响发送给模型的
     # tool message，也不会截断最终 AI 回复。
+    #
+    # 只对 bash 和 file_editor 的详情展示做截断/简化；其他工具（包括
+    # web_search）的展示内容保持原样，不受此限制影响。
     MAX_TOOL_UI_DETAIL_CHARS = 500
+    TRUNCATED_DETAIL_TOOL_TYPES = {"bash", "file_editor"}
 
     def __init__(self, chat_id: int):
         self.chat_id = chat_id
@@ -3204,9 +3208,16 @@ class RichMessageBuilder:
 
         # 仅限制单个工具的 UI 详情长度；工具组不设置总展示上限。
         # 注意：这只影响草稿 UI，不影响发送给模型的原始 tool message。
+        # 只有 bash / file_editor 的详情会被截断简化；其他工具（如
+        # web_search）按原始内容完整展示。
         for item in items:
+            item_limit = (
+                self.MAX_TOOL_UI_DETAIL_CHARS
+                if item.get("type") in self.TRUNCATED_DETAIL_TOOL_TYPES
+                else None
+            )
             inner_parts.append(
-                self._get_inner_content(item, detail_limit=self.MAX_TOOL_UI_DETAIL_CHARS)
+                self._get_inner_content(item, detail_limit=item_limit)
             )
 
         inner_html = "\n".join(inner_parts)
