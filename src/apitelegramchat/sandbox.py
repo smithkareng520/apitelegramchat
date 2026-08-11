@@ -306,7 +306,21 @@ def build_sandbox_env(workspace: Path, chat_id: int) -> dict:
     ccache_dir = cache_root / "ccache"
     tmp_dir = cache_root / "tmp"
     runtime_bin = cache_root / "bin"
-    for d in (pip_cache, ccache_dir, tmp_dir, runtime_bin):
+
+    # All common ML/model-download caches are explicitly rooted in runtime.
+    # Do not rely only on HOME: some libraries use their own environment variables.
+    xdg_cache = cache_root / "xdg_cache"
+    hf_home = cache_root / "huggingface"
+    hf_hub_cache = hf_home / "hub"
+    hf_datasets_cache = hf_home / "datasets"
+    hf_modules_cache = hf_home / "modules"
+    torch_home = cache_root / "torch"
+    transformers_cache = cache_root / "transformers"
+    for d in (
+        pip_cache, ccache_dir, tmp_dir, runtime_bin,
+        xdg_cache, hf_home, hf_hub_cache, hf_datasets_cache,
+        hf_modules_cache, torch_home, transformers_cache,
+    ):
         d.mkdir(parents=True, exist_ok=True)
 
     # ccache is installed in the image, so make compiler invocation cache-aware
@@ -352,6 +366,16 @@ def build_sandbox_env(workspace: Path, chat_id: int) -> dict:
         "RUSTUP_HOME": str(cache_root / "rustup"),
         "CCACHE_DIR": str(ccache_dir),
         "PYTHONPYCACHEPREFIX": str(cache_root / "pycache"),
+        # Explicit ML/model caches: keep downloaded weights and package metadata
+        # out of workspace/files even when a library does not derive the path from HOME.
+        "XDG_CACHE_HOME": str(xdg_cache),
+        "HF_HOME": str(hf_home),
+        "HF_HUB_CACHE": str(hf_hub_cache),
+        "HF_DATASETS_CACHE": str(hf_datasets_cache),
+        "HF_MODULES_CACHE": str(hf_modules_cache),
+        "TRANSFORMERS_CACHE": str(transformers_cache),
+        "TORCH_HOME": str(torch_home),
+        "KERAS_HOME": str(cache_root / "keras"),
     }
 
 
