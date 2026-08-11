@@ -636,6 +636,54 @@ def _get_video_models() -> list[str]:
 VIDEO_MODELS = _get_video_models()
 
 # ---------- 工具定义 ----------
+ASK_USER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "ask_user",
+        "description": (
+            "Pause the agent and ask the current user for a required clarification or choice. "
+            "Use this only when the next step materially depends on missing user preference or confirmation. "
+            "The tool suspends until the user answers in Telegram, then returns a structured result and the same agent turn continues. "
+            "Prefer 2-6 concise options. Do not use for information you can reasonably infer or discover yourself. "
+            "Never call this tool more than once in the same tool-call batch; ask one question at a time."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "清晰、具体的问题。不要重复用户已经明确提供的信息。"
+                },
+                "options": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "稳定的内部选项 ID。"},
+                            "label": {"type": "string", "description": "按钮上显示的简短文字。"},
+                            "description": {"type": "string", "description": "可选的补充说明。"}
+                        },
+                        "required": ["id", "label"]
+                    }
+                },
+                "multiple": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "是否允许多选。多选时用户需要点击提交。"
+                },
+                "allow_custom": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否允许用户放弃预设选项，直接输入自定义回答。"
+                }
+            },
+            "required": ["question", "options"]
+        }
+    }
+}
+
 SEARCH_TOOLS = [
     {
         "type": "function",
@@ -1407,10 +1455,11 @@ SEARCH_TOOLS = [
         }]
         if VIDEO_MODELS else []
     ),
+    ASK_USER_TOOL,
     # ===================== 任务 / 待办工具 =====================
     # 让 agent 拥有持久化的待办清单能力：add/list/done/undone/delete/clear/edit。
     # 数据按用户隔离，存放在 ./state/{user_id}/todos.json 并随 R2 同步。
-    # 渲染层走 sendRichMessage 富文本卡片 + InlineKeyboard 一键操作。
+    # 仅在工具结果区显示富文本摘要；交互由 ask_user 工具统一处理。
     TODO_TOOL,
     # ===================== 长期记忆工具 =====================
     # 跨会话保留的事实/偏好/人物/事件——不同于会自动修剪的对话历史。

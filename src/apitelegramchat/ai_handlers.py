@@ -70,6 +70,11 @@ from apitelegramchat.tool_executors import (
     _TOOL_TIMEOUT_MARKER,
 )
 from apitelegramchat.api_client import api_client
+from apitelegramchat.ask_user_tool import (
+    create_ask_user_interaction,
+    wait_for_answer,
+    answer_to_tool_result,
+)
 import apitelegramchat.state as state
 
 logger = get_logger(__name__)
@@ -1953,6 +1958,9 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     if fn_name == "generate_video":
         return "Generating a video"
 
+    if fn_name == "ask_user":
+        return "Waiting for your answer"
+
     if fn_name == "image_search":
         num_results = _coerce_positive_int(fn_args.get("num_results"), 3)
         if num_results == 1:
@@ -2034,6 +2042,7 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
         "stage_upload": "staged files to upload/",
         "list_download": "listed download/",
         "list_upload": "listed upload/",
+        "ask_user": "asked for your input",
     }
     return mapping.get(fn_name, f"ran {fn_name}")
 
@@ -2177,11 +2186,12 @@ async def _run_tool_calls_and_append(
 
     has_image_tool = any(fn_name in MEDIA_GEN_TOOLS for fn_name, _, _ in tool_tasks)
     has_bash_tool = any(fn_name in BASH_TOOLS for fn_name, _, _ in tool_tasks)
+    has_ask_user_tool = any(fn_name == "ask_user" for fn_name, _, _ in tool_tasks)
     # Bash 与子 agent 一样，可能长时间没有新的文本增量。
     # 普通 force=False flush 会被 send_rich_message_draft 的“内容未变化”短路，
     # 因此前端看不到持续运行中的 Bash 状态。每 2 秒强制 reassert 一帧，保持
     # 草稿在前端持续活跃；真正有 stdout 增量时仍由 progress_callback 节流刷新。
-    force_tool_refresh = has_image_tool or has_bash_tool
+    force_tool_refresh = has_image_tool or has_bash_tool or has_ask_user_tool
 
     async def refresh_loop():
         await builder.flush(force=force_tool_refresh)
@@ -2254,13 +2264,35 @@ async def _run_tool_calls_and_append(
                         pass  # UI 推送失败不能影响 Bash 本身执行
 
             try:
-                result_str = await asyncio.wait_for(
-                    dispatch_tool_call(
-                        fn_name, fn_args, chat_id=builder.chat_id,
-                        progress_callback=(bash_progress_callback or subagent_progress_callback),
-                    ),
-                    timeout=timeout
-                )
+                if fn_name == "ask_user":
+                    question = fn_args.get("question", "")
+                    options = fn_args.get("options", [])
+                    multiple = bool(fn_args.get("multiple", False))
+                    allow_custom = bool(fn_args.get("allow_custom", True))
+                    interaction = await create_ask_user_interaction(
+                        builder.chat_id,
+                        question,
+                        options,
+                        multiple=multiple,
+                        allow_custom=allow_custom,
+                    )
+                    builder.update_tool_item(
+                        tc_id,
+                        "Waiting for your answer",
+                        f"<p>{escape_html(str(question)[:200])}</p>",
+                        status="waiting",
+                    )
+                    await builder.flush(force=True)
+                    answer = await wait_for_answer(interaction)
+                    result_str = answer_to_tool_result(answer)
+                else:
+                    result_str = await asyncio.wait_for(
+                        dispatch_tool_call(
+                            fn_name, fn_args, chat_id=builder.chat_id,
+                            progress_callback=(bash_progress_callback or subagent_progress_callback),
+                        ),
+                        timeout=timeout
+                    )
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
@@ -2428,6 +2460,22 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
                 title = re.sub(r'<[^>]+>', '', m.group(1)).strip()
                 title = re.sub(r'\s+', ' ', title)
         return f"Fetched: {title}" if title else (f"Fetched: {domain}" if domain else "Fetched a page")
+
+    if fn_name == "ask_user":
+        try:
+            payload = json.loads(str(result_content or "{}"))
+            if payload.get("type") == "choice":
+                labels = [str(x.get("label", "")) for x in (payload.get("selected") or []) if isinstance(x, dict)]
+                return "Selected: " + ", ".join([x for x in labels if x][:3]) if labels else "User answered"
+            if payload.get("type") == "custom":
+                return "User provided a custom answer"
+            if payload.get("type") == "cancelled":
+                return "User cancelled"
+            if payload.get("type") == "expired":
+                return "User answer expired"
+        except Exception:
+            pass
+        return "User answered"
 
     if fn_name == "bash":
         return "Ran a command"
@@ -2868,8 +2916,8 @@ class RichMessageBuilder:
             self.request_flush(force=False)
             return
 
-        running_items = [it for it in items if it["status"] == "running"]
-        target = running_items[-1] if running_items else items[-1]
+        active_items = [it for it in items if it["status"] in ("running", "waiting")]
+        target = active_items[-1] if active_items else items[-1]
         t = target["type"]
         fn_args = target.get("fn_args", {})
 
@@ -2919,6 +2967,8 @@ class RichMessageBuilder:
             group["outer_summary"] = "Listing download/"
         elif t == "list_upload":
             group["outer_summary"] = "Listing upload/"
+        elif t == "ask_user":
+            group["outer_summary"] = "Waiting for your answer"
         elif t == "wikipedia":
             group["outer_summary"] = "Looking up on Wikipedia"
         elif t == "news":
@@ -3018,6 +3068,7 @@ class RichMessageBuilder:
         "generate_image_from_text": ("Generated an image", "Generated {n} images"),
         "edit_image_with_reference": ("Edited an image", "Edited {n} images"),
         "search_poi": ("Searched for points of interest", "Searched for {n} POIs"),
+        "ask_user": ("Asked you a question", "Asked you questions"),
     }
 
     def _get_group_type_for_item(self, item: dict) -> str:

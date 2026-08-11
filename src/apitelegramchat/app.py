@@ -69,19 +69,14 @@ from apitelegramchat.state import (
     mark_protected_message,
     set_current_user_namespace,
 )
+from apitelegramchat.ask_user_tool import (
+    get_pending_for_chat,
+    resolve_callback as resolve_ask_user_callback,
+    resolve_text as resolve_ask_user_text,
+)
 from apitelegramchat.file_handlers import download_file
 from apitelegramchat.s3_utils import file_exists_in_r2
 from apitelegramchat.workspace_utils import _get_workspace_lock, init_workspace
-# 任务工具：用于处理 todo:* 回调按钮
-from apitelegramchat.todo_tool import (
-    toggle_by_id as todo_toggle_by_id,
-    delete_by_id as todo_delete_by_id,
-    clear_done as todo_clear_done,
-    list_all as todo_list_all,
-    render_todo_card as render_todo_card,
-    build_todo_keyboard as build_todo_keyboard,
-    reapply_keyboard_for_message as todo_reapply_keyboard,
-)
 import hashlib
 
 app = Quart(__name__)
@@ -806,71 +801,6 @@ async def update_role_list(chat_id: int, message_id: int, role_list: list, curre
             return resp.status == 200
 
 
-# ---------------------------------------------------------------------------
-# 待办清单（todo 工具）的回调处理
-# ---------------------------------------------------------------------------
-# callback_data 协议（必须 <=64 字节）：
-#   todo:t:<id>     切换某条待办的完成状态
-#   todo:d:<id>     删除某条待办
-#   todo:cd         清空所有已完成的待办
-#   todo:s:<filter> 切换列表过滤（all / pending / done）
-# ---------------------------------------------------------------------------
-async def _handle_todo_callback(chat_id: int, message_id: int, sel: str) -> str:
-    """
-    处理 todo:* 回调，原地刷新消息文本与 InlineKeyboard。
-    返回给 answerCallbackQuery 的简短提示文本。
-    """
-    parts = sel.split(":")
-    # parts[0] == "todo"
-    op = parts[1] if len(parts) > 1 else ""
-    arg = parts[2] if len(parts) > 2 else ""
-
-    try:
-        if op == "t" and arg:
-            payload = await todo_toggle_by_id(chat_id, arg)
-            todo = payload.get("todo", {}) if isinstance(payload, dict) else {}
-            if payload.get("ok"):
-                notice = "已完成 ✅" if todo.get("done") else "已恢复 ↩️"
-            else:
-                notice = payload.get("error", "操作失败")
-            # 切换后用 all 过滤重新渲染，让用户继续看到上下文
-            list_payload = await todo_list_all(chat_id, "all")
-            await todo_reapply_keyboard(chat_id, message_id, list_payload)
-            return notice
-
-        if op == "d" and arg:
-            payload = await todo_delete_by_id(chat_id, arg)
-            todo = payload.get("todo", {}) if isinstance(payload, dict) else {}
-            if payload.get("ok"):
-                notice = "已删除"
-            else:
-                notice = payload.get("error", "操作失败")
-            list_payload = await todo_list_all(chat_id, "all")
-            await todo_reapply_keyboard(chat_id, message_id, list_payload)
-            return notice
-
-        if op == "cd":
-            payload = await todo_clear_done(chat_id)
-            if payload.get("ok"):
-                notice = payload.get("message", "已清空已完成")
-            else:
-                notice = payload.get("error", "操作失败")
-            list_payload = await todo_list_all(chat_id, "all")
-            await todo_reapply_keyboard(chat_id, message_id, list_payload)
-            return notice
-
-        if op == "s" and arg in ("all", "pending", "done"):
-            list_payload = await todo_list_all(chat_id, arg)
-            await todo_reapply_keyboard(chat_id, message_id, list_payload)
-            label = {"all": "全部", "pending": "未完成", "done": "已完成"}.get(arg, arg)
-            return f"筛选：{label}"
-
-        return "未知操作"
-    except Exception as e:
-        logger.exception(f"_handle_todo_callback error: {e}")
-        return "操作失败"
-
-
 async def _del_after(chat_id, msg_id, delay):
     await asyncio.sleep(delay)
     await delete_message(chat_id, msg_id)
@@ -1379,6 +1309,13 @@ async def webhook() -> tuple:
             if "text" in msg:
                 user_input = msg["text"]
 
+                # 若当前 ask_user 正在等待自由文本，优先把这条消息交给原 agent turn，
+                # 不要启动新的 AI turn。命令仍保留为真正的 bot 指令入口。
+                pending_ask = await get_pending_for_chat(chat_id)
+                if pending_ask and pending_ask.awaiting_text and not user_input.startswith("/"):
+                    if await resolve_ask_user_text(chat_id, user_input):
+                        return "OK", 200
+
                 if user_input.startswith("/role"):
                     cr = await get_user_role(chat_id)
                     prev_mid = role_message_ids.get(chat_id)
@@ -1676,19 +1613,22 @@ async def webhook() -> tuple:
                     )
                     await delete_message(chat_id, mid)
                     return "OK", 200
-                elif isinstance(sel, str) and sel.startswith("todo:"):
-                    set_current_user_namespace(uid or str(chat_id))
-                    # ── 待办清单的 InlineKeyboard 回调 ──
-                    # callback_data 格式：
-                    #   todo:t:<id>     切换完成状态
-                    #   todo:d:<id>     删除单条
-                    #   todo:cd         清空已完成
-                    #   todo:s:<filter> 切换列表过滤（all / pending / done）
-                    notice = await _handle_todo_callback(chat_id, mid, sel)
+                elif isinstance(sel, str) and sel.startswith("ask:"):
+                    parts = sel.split(":", 3)
+                    interaction_id = parts[1] if len(parts) > 1 else ""
+                    action = parts[2] if len(parts) > 2 else ""
+                    arg = parts[3] if len(parts) > 3 else ""
+                    ok, notice = await resolve_ask_user_callback(
+                        chat_id, uid, interaction_id, action, arg
+                    )
                     async with aiohttp.ClientSession() as s:
                         await s.post(
                             f"{BASE_URL}/answerCallbackQuery",
-                            json={"callback_query_id": cb["id"], "text": notice, "show_alert": False},
+                            json={
+                                "callback_query_id": cb["id"],
+                                "text": notice[:200],
+                                "show_alert": not ok,
+                            },
                         )
                     return "OK", 200
                 else:

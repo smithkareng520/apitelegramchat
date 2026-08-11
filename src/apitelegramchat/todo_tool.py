@@ -8,18 +8,11 @@
    反完成、删除、清空、编辑、改优先级。
 2. 数据按用户隔离，落在 ./state/{user_id}/todos.json，复用既有
    workspace_utils 的 R2 同步链路，无需额外存储。
-3. 给 Telegram 客户端一套富文本渲染：状态 emoji、优先级颜色、删除线、
-   可折叠统计区，以及可点击的 InlineKeyboard 按钮（一键完成/删除）。
-4. callback_data 严格控制在 64 字节以内（Telegram 硬限制），格式：
-       todo:t:<id>     切换完成状态
-       todo:d:<id>     删除单条
-       todo:cd         清空已完成
-       todo:s:<filter> 切换列表过滤（all/done/pending）
+3. 给 Agent 工具结果提供富文本渲染：状态 emoji、优先级、删除线、可折叠统计区。
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -29,14 +22,12 @@ from pathlib import Path
 from apitelegramchat.workspace_paths import todo_state_file
 from typing import Any, Optional
 
-import aiohttp
 
 from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
     _sync_named_file_from_r2,
     _sync_named_file_to_r2,
 )
-from apitelegramchat.config import BASE_URL
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +52,7 @@ def _todo_path(chat_id: int) -> Path:
 
 
 def _new_id() -> str:
-    """8 位短 id，足够避免单 chat 内冲突，callback_data 也装得下。"""
+    """8 位短 id，足够避免单 chat 内冲突。"""
     return uuid.uuid4().hex[:8]
 
 
@@ -450,7 +441,7 @@ async def execute_todo(
 
 # ---------- 富文本渲染 ----------
 def _esc(text: Any) -> str:
-    """HTML 转义，保证 Telegram sendMessage(HTML) 与 sendRichMessage 都安全。"""
+    """HTML 转义，保证 Telegram 富文本发送安全。"""
     s = "" if text is None else str(text)
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -599,249 +590,6 @@ def _render_todo_item(t: dict) -> str:
     if note_html:
         line += note_html
     return f"<li>{line}</li>"
-
-
-# ---------- Basic HTML 渲染（sendMessage 兼容） ----------
-# Telegram 的 sendMessage(parse_mode=HTML) 只支持：b/strong/i/em/u/ins/s/strike/del/
-# code/pre/a/blockquote/tg-spoiler/span class="tg-spoiler"。不支持 h1-h6/table/ol/
-# ul/li/hr/p/div/br 等。sendRichMessage 才支持全部富标签。
-# 这里专门给 sendMessage / editMessageText 用一份精简渲染。
-
-def render_todo_card_basic(payload: dict, max_items: int = 20) -> str:
-    """sendMessage 兼容版渲染——只用基本 HTML 标签。"""
-    if not isinstance(payload, dict):
-        return _esc(payload)
-
-    if not payload.get("ok"):
-        return f"❌ <b>待办操作失败</b>\n{_esc(payload.get('error', '未知错误'))}"
-
-    action = payload.get("action", "list")
-
-    if action == "add":
-        t = payload.get("todo", {})
-        return (
-            f"➕ <b>已新增待办</b>\n"
-            f"{_priority_badge_basic(t)} {_esc(t.get('title'))} {_tag_chips(t)}\n"
-            f"<i>当前共 {payload.get('total', 0)} 项，待办 {payload.get('pending', 0)} 项</i>"
-        )
-    if action in ("done", "undone", "toggle"):
-        t = payload.get("todo", {})
-        icon = "✅" if t.get("done") else "↩️"
-        verb = "标记为已完成" if t.get("done") else "标记为未完成"
-        if not payload.get("changed", True):
-            verb = f"状态未变化（仍为{'已完成' if t.get('done') else '未完成'}）"
-        return (
-            f"{icon} <b>{verb}</b>\n"
-            f"{_priority_badge_basic(t)} {_esc(t.get('title'))} {_tag_chips(t)}\n"
-            f"<i>剩余 {payload.get('pending', 0)} / {payload.get('total', 0)} 项未完成</i>"
-        )
-    if action == "delete":
-        t = payload.get("todo", {})
-        return (
-            f"🗑️ <b>已删除</b>\n"
-            f"<s>{_priority_badge_basic(t)} {_esc(t.get('title'))}</s> {_tag_chips(t)}\n"
-            f"<i>剩余 {payload.get('total', 0)} 项</i>"
-        )
-    if action == "clear":
-        return (
-            f"🧹 <b>{_esc(payload.get('message', '已清空'))}</b>\n"
-            f"<i>剩余 {payload.get('total', 0)} 项，未完成 {payload.get('pending', 0)} 项</i>"
-        )
-    if action == "edit":
-        t = payload.get("todo", {})
-        return (
-            f"📝 <b>已编辑</b>\n"
-            f"{_priority_badge_basic(t)} {_esc(t.get('title'))} {_tag_chips(t)}\n"
-            f"<i>修改字段：{', '.join(payload.get('changed', [])) or '无'}</i>"
-        )
-
-    # ---- list 渲染（basic）----
-    todos = payload.get("todos", []) or []
-    total = payload.get("total", 0)
-    done = payload.get("done", 0)
-    pending = payload.get("pending", 0)
-    filter_ = payload.get("filter", "all")
-
-    lines = ["<b>📋 待办清单</b>\n"]
-    lines.append(f"共 <b>{total}</b> 项 · 已完成 <b>{done}</b> · 待办 <b>{pending}</b>")
-
-    filter_desc = {"all": "全部", "pending": "仅未完成", "done": "仅已完成"}.get(filter_, "全部")
-    lines.append(f"<i>筛选：{filter_desc}</i>")
-
-    if not todos:
-        lines.append("\n🎉 当前筛选下没有待办项")
-        return "\n".join(lines)
-
-    lines.append("———————————")
-    for i, t in enumerate(todos[:max_items]):
-        badge = _priority_badge_basic(t)
-        title = _esc(t.get("title", ""))
-        if t.get("done"):
-            title = f"<s>{title}</s>"
-            status = "✅"
-        else:
-            title = f"<b>{title}</b>"
-            status = "⬜"
-        tags = _tag_chips(t)
-        note = t.get("note", "")
-        line = f"{status} {badge} {title}"
-        if tags:
-            line += f" {tags}"
-        if note:
-            line += f"\n   <blockquote>{_esc(note)}</blockquote>"
-        lines.append(line)
-
-    extra = len(todos) - max_items
-    if extra > 0:
-        lines.append(f"\n<i>… 还有 {extra} 项未显示</i>")
-
-    return "\n".join(lines)
-
-
-def _priority_badge_basic(t: dict) -> str:
-    """基本 HTML 版优先级徽章——用 emoji + 文字，不用 <b> 嵌套。"""
-    p = t.get("priority", "medium")
-    meta = PRIORITY_META.get(p, PRIORITY_META["medium"])
-    return f"{meta['emoji']}{meta['label']}"
-
-
-# ---------- InlineKeyboard ----------
-def build_todo_keyboard(payload: dict, max_buttons: int = 12) -> dict | None:
-    """
-    根据 list 动作返回的 payload 构造 InlineKeyboard：
-      - 每条未完成 todo 一个 [✓] 按钮
-      - 每条 todo 一个 [✕] 按钮
-      - 底部一行：[清空已完成] / [仅未完成] / [全部]
-    只在 list 且项数 <= max_buttons 时返回，避免键盘过长。
-
-    callback_data 严格控制在 64 字节内。
-    """
-    if not isinstance(payload, dict) or payload.get("action") != "list":
-        return None
-    todos = payload.get("todos", []) or []
-    if not todos:
-        return None
-    if len(todos) > max_buttons:
-        # 太多按钮会撑爆屏幕，回退到无键盘
-        return None
-
-    rows: list[list[dict]] = []
-    for t in todos:
-        tid = t.get("id", "")
-        done = bool(t.get("done"))
-        toggle_text = "↩️" if done else "✓"
-        toggle_cb = f"todo:t:{tid}"
-        del_cb = f"todo:d:{tid}"
-        rows.append([
-            {"text": f"{toggle_text}", "callback_data": toggle_cb[:64]},
-            {"text": f"✕", "callback_data": del_cb[:64]},
-        ])
-
-    # 底部一行：清空已完成 + 切换筛选
-    bottom = [
-        {"text": "🧹 清空已完成", "callback_data": "todo:cd"},
-        {"text": "📋 全部", "callback_data": "todo:s:all"},
-        {"text": "⏳ 未完成", "callback_data": "todo:s:pending"},
-        {"text": "✅ 已完成", "callback_data": "todo:s:done"},
-    ]
-    rows.append(bottom)
-    return {"inline_keyboard": rows}
-
-
-async def send_todo_card_with_keyboard(
-    chat_id: int,
-    payload: dict,
-    reply_to_message_id: int | None = None,
-) -> int | bool:
-    """
-    将 list 结果作为一条带 InlineKeyboard 的 sendMessage 发出去。
-    走 sendMessage(parse_mode=HTML) 而非 sendRichMessage，避免和活跃草稿抢位置。
-
-    ⚠️ sendMessage 的 HTML 解析器只支持基本标签（b/i/u/s/code/pre/a/blockquote），
-    不支持 h3/table/ol/hr 等。所以这里用 render_todo_card_basic() 而非 render_todo_card()。
-    成功返回 message_id，失败返回 False。
-    """
-    html_content = render_todo_card_basic(payload)
-    if not html_content or not html_content.strip():
-        return False
-    keyboard = build_todo_keyboard(payload)
-    payload_req = {
-        "chat_id": chat_id,
-        "text": html_content,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    if reply_to_message_id:
-        payload_req["reply_parameters"] = {
-            "message_id": reply_to_message_id,
-            "allow_sending_without_reply": True,
-        }
-    if keyboard:
-        payload_req["reply_markup"] = json.dumps(keyboard)
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{BASE_URL}/sendMessage", json=payload_req) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    mid = data.get("result", {}).get("message_id")
-                    if isinstance(mid, int) and mid > 0:
-                        return mid
-                else:
-                    body = await resp.text()
-                    logger.error(f"send_todo_card_with_keyboard failed: {resp.status} {body[:200]}")
-    except Exception as e:
-        logger.exception(f"send_todo_card_with_keyboard exception: {e}")
-    return False
-
-
-async def reapply_keyboard_for_message(chat_id: int, message_id: int, payload: dict) -> bool:
-    """
-    当用户通过按钮点击变更状态后，重新渲染该消息的文本与键盘。
-    使用 editMessageText。同样用 basic HTML（sendMessage 兼容）。
-    """
-    html_content = render_todo_card_basic(payload)
-    keyboard = build_todo_keyboard(payload)
-    payload_req = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": html_content,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    if keyboard:
-        payload_req["reply_markup"] = json.dumps(keyboard)
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{BASE_URL}/editMessageText", json=payload_req) as resp:
-                if resp.status == 200:
-                    return True
-                body = await resp.text()
-                # 400 + message is not modified 是常态（状态切换前后渲染一致），不算错误
-                if "not modified" in body.lower():
-                    return True
-                logger.warning(f"reapply_keyboard_for_message: {resp.status} {body[:200]}")
-    except Exception as e:
-        logger.exception(f"reapply_keyboard_for_message exception: {e}")
-    return False
-
-
-# ---------- 给 callback_query 用的快捷操作 ----------
-async def toggle_by_id(chat_id: int, todo_id: str) -> dict:
-    return await _mutate(chat_id, lambda s: _op_toggle(s, todo_id, None))
-
-
-async def delete_by_id(chat_id: int, todo_id: str) -> dict:
-    return await _mutate(chat_id, lambda s: _op_delete(s, todo_id))
-
-
-async def clear_done(chat_id: int) -> dict:
-    return await _mutate(chat_id, lambda s: _op_clear(s, "done"))
-
-
-async def list_all(chat_id: int, filter_: str = "all") -> dict:
-    return await _read_store(chat_id, lambda s: _op_list(s, filter_, None, None))
 
 
 # ---------- 工具定义（OpenAI function-calling schema） ----------

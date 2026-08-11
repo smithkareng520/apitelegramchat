@@ -1527,8 +1527,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
     #   - 顶部统计：总数 / 已完成 / 待办
     #   - 列表项：状态 emoji + 优先级徽章 + 标题（完成则加删除线）+ 标签 chips
     #   - 长列表自动截断并提示
-    # 注意：list 动作在 dispatch_tool_call 里已经额外推送了一条带 InlineKeyboard 的可交互消息；
-    # 这里的 details_html 只是工具调用气泡里的折叠预览，两者共用 render_todo_card。
+    # 这里仅渲染工具调用气泡里的折叠预览。
     elif fn_name == "todo":
         try:
             import json as _json
