@@ -1408,16 +1408,16 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 <tool_usage_guide>
 - todo：用户说"记一下""提醒我"时优先用。写操作（add/done/undone/delete/edit/clear）后紧跟一次 list，让用户看到最新状态。
 - memory：用户说"记住…"或提到长期偏好/过敏/重要他人/截止日期时写入；回答涉及偏好的问题前先 search。
-- skills：技能包存储在 workspace/skills/&lt;技能名&gt;/。由你主动判断是否需要某个 skill；需要时先读取对应 SKILL.md，再按其说明调用脚本或参考文件，不会自动替你激活技能。
+- skills：技能包存储在当前工作目录下。由你主动判断是否需要某个 skill；需要时先读取对应 SKILL.md，再按其说明调用脚本或参考文件，不会自动替你激活技能。
 - subagent：彼此独立的子任务请在同一轮里一次性并发派多个 subagent 工具调用，不要一个做完再发下一个；简单问题自己答，不要滥用。子 agent 不继承主对话历史，只看到 task + context。
 </tool_usage_guide>
 """
         base_prompt += f"""
 
 <skill_directory>
-以下是当前可用的技能列表，格式为「技能名 - 描述」。技能资源位于 workspace 的 skills/ 目录下，每个技能对应一个子目录（目录名与技能名相同），其中包含 SKILL.md 及相关脚本/参考文件。
+以下是当前可用的技能列表，格式为「技能名 - 描述」。技能资源位于 当前工作空间的 的 skills/ 目录下，每个技能对应一个子目录（目录名与技能名相同），其中包含 SKILL.md 及相关脚本/参考文件。
 
-你必须自行判断是否需要使用某个技能。需要时用 bash 读取 `skills/&lt;技能名&gt;/SKILL.md` 获取详细操作指南，并按需进入对应技能目录运行其中脚本。系统不会根据用户文本自动匹配或自动加载任何技能。
+你必须自行判断是否需要使用某个技能。需要时用 bash 读取 `skills/技能名/SKILL.md` 获取详细操作指南，并按需进入对应技能目录运行其中脚本。系统不会根据用户文本自动匹配或自动加载任何技能。
 
 {catalog_text}
 </skill_directory>

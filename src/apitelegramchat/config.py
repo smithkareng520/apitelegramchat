@@ -478,7 +478,7 @@ SUPPORTED_MODELS["agnes-video-v2.0"] = make_model_config(
 )
 
 # ========== 默认模型 ==========
-DEFAULT_MODEL = "poolside/laguna-s-2.1:free"
+DEFAULT_MODEL = "agnes-2.0-flash"
 assert DEFAULT_MODEL in SUPPORTED_MODELS, f"默认模型 {DEFAULT_MODEL} 未定义"
 
 

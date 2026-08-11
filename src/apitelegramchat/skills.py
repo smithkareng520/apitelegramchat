@@ -308,9 +308,25 @@ def read_skill(skill_id: str) -> dict[str, Any]:
     return {"error": f"Unknown skill: {skill_id}"}
 
 
-def _iter_skill_package_files(skill_dir: Path) -> Iterable[Path]:
-    """Yield every file in a trusted packaged skill, including SKILL.md."""
-    for path in skill_dir.rglob("*"):
+def _project_skill_source_root() -> Path | None:
+    """Return the highest-priority packaged skill root to mirror into the workspace.
+
+    The workspace skill tree is a runtime copy of the project skill tree.  We
+    intentionally mirror the whole directory instead of reconstructing it from
+    parsed ``SKILL.md`` records, so every packaged asset is available locally.
+    """
+    for root in _candidate_skill_roots():
+        try:
+            root = root.resolve()
+        except Exception:
+            continue
+        if root.is_dir():
+            return root
+    return None
+
+
+def _iter_files(root: Path) -> Iterable[Path]:
+    for path in root.rglob("*"):
         if path.is_file():
             yield path
 
@@ -321,29 +337,58 @@ def skill_assets_workspace_relpath(skill_id: str) -> str:
 
 
 def sync_skill_assets_to_workspace(skill_id: str, workspace_root: Path) -> dict[str, Any]:
-    """同步一个完整 skill 包到 workspace/skills/<skill_id>/。"""
-    result: dict[str, Any] = {"skill_id": skill_id, "synced": False, "files": 0, "error": None}
-    rec = next((r for r in load_skill_records() if r.skill_id == skill_id or r.name == skill_id), None)
-    if rec is None:
-        result["error"] = f"Unknown skill: {skill_id}"
-        return result
+    """向后兼容接口：同步项目 skills 整棵目录，而不是只同步一个 skill。"""
+    summary = sync_all_skill_assets_to_workspace(workspace_root)
+    if skill_id not in {rec.skill_id for rec in load_skill_records()}:
+        return {
+            "skill_id": skill_id,
+            "synced": False,
+            "files": 0,
+            "copied": 0,
+            "error": f"Unknown skill: {skill_id}",
+        }
+    return {
+        "skill_id": skill_id,
+        "synced": not bool(summary.get("errors")),
+        "files": int(summary.get("files") or 0),
+        "copied": int(summary.get("copied") or 0),
+        "error": "; ".join(summary.get("errors") or []) or None,
+        "path": str(Path(workspace_root) / SKILL_ASSETS_DIRNAME),
+    }
 
-    skill_dir = Path(rec.root) / rec.skill_id
-    if not skill_dir.is_dir():
-        result["error"] = f"Skill directory missing: {skill_dir}"
-        return result
 
-    dest_root = Path(workspace_root) / SKILL_ASSETS_DIRNAME / rec.skill_id
+def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
+    """把项目 skill 根目录的全部内容原样镜像到 workspace/skills。
+
+    源目录通常是项目中的 ``.claude/skills``。这里不再依据 ``SKILL.md``
+    做二次筛选，也不按当前激活 skill 选择性复制，因此每一个 skill 子目录、
+    脚本、参考资料和其他附属文件都会直接落到工作目录的 ``skills/`` 下。
+    """
+    source_root = _project_skill_source_root()
+    dest_root = Path(workspace_root) / SKILL_ASSETS_DIRNAME
+    summary: dict[str, Any] = {
+        "synced": 0,
+        "files": 0,
+        "copied": 0,
+        "errors": [],
+        "source": str(source_root) if source_root else None,
+        "path": str(dest_root),
+    }
+    if source_root is None:
+        summary["errors"].append("No packaged skill directory found")
+        return summary
+
     try:
         dest_root.mkdir(parents=True, exist_ok=True)
-        copied = 0
         source_files: set[str] = set()
-        for src_path in _iter_skill_package_files(skill_dir):
-            rel = src_path.relative_to(skill_dir)
-            source_files.add(rel.as_posix())
+        copied = 0
+        for src_path in _iter_files(source_root):
+            rel = src_path.relative_to(source_root)
+            rel_key = rel.as_posix()
+            source_files.add(rel_key)
             dst_path = dest_root / rel
             needs_copy = True
-            if dst_path.exists():
+            if dst_path.is_file():
                 try:
                     src_stat = src_path.stat()
                     dst_stat = dst_path.stat()
@@ -353,16 +398,21 @@ def sync_skill_assets_to_workspace(skill_id: str, workspace_root: Path) -> dict[
                     )
                 except OSError:
                     needs_copy = True
+            elif dst_path.exists():
+                # A source file cannot coexist with a destination directory.
+                shutil.rmtree(dst_path)
+
             if needs_copy:
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src_path, dst_path)
                 copied += 1
 
-        for existing in list(dest_root.rglob("*")):
-            if existing.is_dir():
-                continue
-            rel = existing.relative_to(dest_root).as_posix()
-            if rel not in source_files:
+        # skills/ is application-managed, so remove files no longer present in
+        # the packaged project tree. This keeps deleted/renamed skills from
+        # lingering in existing user workspaces.
+        for existing in list(_iter_files(dest_root)):
+            rel_key = existing.relative_to(dest_root).as_posix()
+            if rel_key not in source_files:
                 try:
                     existing.unlink()
                 except OSError:
@@ -375,24 +425,16 @@ def sync_skill_assets_to_workspace(skill_id: str, workspace_root: Path) -> dict[
             except OSError:
                 pass
 
-        result.update({"synced": True, "files": len(source_files), "copied": copied, "path": str(dest_root)})
+        skill_ids = {p.name for p in source_root.iterdir() if p.is_dir()}
+        summary.update({
+            "synced": len(skill_ids),
+            "files": len(source_files),
+            "copied": copied,
+        })
     except Exception as exc:
-        logger.error("同步 skill 资源失败 skill_id=%s: %s", skill_id, exc)
-        result["error"] = str(exc)
-    return result
+        logger.error("同步项目 skills 到 workspace 失败: %s", exc)
+        summary["errors"].append(str(exc))
 
-
-def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
-    """把所有可信 skill 包同步到 workspace/skills，供 AI 自主选择并使用。"""
-    records = load_skill_records()
-    summary = {"synced": 0, "files": 0, "errors": []}
-    for rec in records:
-        result = sync_skill_assets_to_workspace(rec.skill_id, workspace_root)
-        if result.get("synced"):
-            summary["synced"] += 1
-            summary["files"] += int(result.get("files") or 0)
-        elif result.get("error"):
-            summary["errors"].append(f"{rec.skill_id}: {result['error']}")
     return summary
 
 

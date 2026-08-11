@@ -41,7 +41,7 @@ python -m apitelegramchat.verify_security
 
 ## Skill discovery
 
-The MCP server now exposes a skill catalog backed by `.claude/skills/*/SKILL.md`, with on-demand reading for individual skill bodies.
+The MCP server exposes a skill catalog backed by `.claude/skills/*/SKILL.md`. At workspace initialization, the entire project `.claude/skills` tree is mirrored to the workspace `skills/` directory, including scripts and reference files, so the runtime tree stays identical to the packaged project skills.
 
 ## Skill runtime dependencies
 
