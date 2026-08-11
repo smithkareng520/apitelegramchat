@@ -69,20 +69,14 @@ from apitelegramchat.search_engine import (
     execute_traffic,
     execute_isochrone,
     execute_file_editor,
-    # 任务工具
-    execute_todo,
-    # 长期记忆工具
-    execute_memory,
-    # 技能注册表
-    # 子 agent 工具
-    execute_subagent,
 )
 from apitelegramchat.todo_tool import (
+    execute_todo,
     render_todo_card,
 )
-from apitelegramchat.memory_tool import render_memory_card
+from apitelegramchat.memory_tool import execute_memory, render_memory_card
 try:
-    from apitelegramchat.subagent_tool import render_subagent_card
+    from apitelegramchat.subagent_tool import execute_subagent, render_subagent_card
 except Exception:  # pragma: no cover - optional dependency fallback
     def render_subagent_card(*args, **kwargs):
         return "<b>Subagent</b>"
