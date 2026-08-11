@@ -47,33 +47,59 @@ async def _get_workspace_init_lock(key: str) -> asyncio.Lock:
 
 
 async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) -> None:
-    """Ensure the local user workspace and packaged skills are available.
+    """Ensure only the runtime workspace directory exists.
 
-    The workspace is never hydrated from or mirrored wholesale to R2.
+    This function is intentionally safe to call before every tool invocation.
+    It MUST NOT synchronize packaged skills: ``workspace/skills`` is runtime
+    state and may contain files created or edited by the agent/user.
     """
-    # Namespace is resolved once by the caller when tools are coordinated.
-    # Do not re-read ContextVar state in the middle of an operation.
     workspace = workspace_root(chat_id, namespace)
     workspace.mkdir(parents=True, exist_ok=True)
-    try:
-        from apitelegramchat.skills import sync_all_skill_assets_to_workspace
-        summary = await asyncio.to_thread(sync_all_skill_assets_to_workspace, workspace)
-        if summary.get("errors"):
-            logger.warning(
-                "部分 skill 包同步失败 chat_id=%s: %s",
-                chat_id,
-                "; ".join(summary["errors"]),
-            )
-    except Exception as exc:
-        logger.warning("同步 skill 包到 workspace 失败 chat_id=%s: %s", chat_id, exc)
 
 
 async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = None) -> None:
-    """Compatibility entry point: initialize only the local workspace/skills.
+    """Run one-time workspace skill initialization.
 
-    No R2 workspace synchronization is performed.
+    Initialization is protected by a per-workspace lock and a persistent marker
+    so repeated calls never re-run the packaged-skill sync.
     """
-    await _ensure_runtime_workspace(chat_id, namespace)
+    resolved_namespace = workspace_namespace(chat_id, namespace)
+    key = resolved_namespace
+    lock = await _get_workspace_init_lock(key)
+    async with lock:
+        workspace = workspace_root(chat_id, resolved_namespace)
+        workspace.mkdir(parents=True, exist_ok=True)
+        marker = workspace / ".skills_initialized"
+
+        if key in _workspace_initialized or marker.is_file():
+            _workspace_initialized.add(key)
+            return
+
+        try:
+            from apitelegramchat.skills import sync_all_skill_assets_to_workspace
+
+            summary = await asyncio.to_thread(
+                sync_all_skill_assets_to_workspace,
+                workspace,
+            )
+            if summary.get("errors"):
+                logger.warning(
+                    "部分 skill 包初始化失败 namespace=%s: %s",
+                    resolved_namespace,
+                    "; ".join(summary["errors"]),
+                )
+                return
+
+            marker.write_text("initialized\n", encoding="utf-8")
+            _workspace_initialized.add(key)
+        except Exception as exc:
+            logger.warning(
+                "初始化 skill 包到 workspace 失败 namespace=%s: %s",
+                resolved_namespace,
+                exc,
+            )
+
+
 
 
 # ========== 单文件定向同步（state/ 域） ==========
@@ -349,8 +375,8 @@ async def list_upload_files(chat_id: int, *, namespace: str | None = None) -> li
 # ========== 可选：初始化工作区（后台执行） ==========
 
 async def init_workspace(chat_id: int, namespace: str | None = None):
-    """Initialize the local workspace and materialize packaged skills only."""
+    """Initialize the workspace and packaged skills once for this workspace."""
     try:
-        await _ensure_runtime_workspace(chat_id, namespace)
+        await _ensure_workspace_initialized(chat_id, namespace)
     except Exception as e:
         logger.error(f"Workspace 初始化失败: {e}")

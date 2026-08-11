@@ -309,11 +309,10 @@ def read_skill(skill_id: str) -> dict[str, Any]:
 
 
 def _project_skill_source_root() -> Path | None:
-    """Return the highest-priority packaged skill root to mirror into the workspace.
+    """Return the highest-priority packaged skill root used for bootstrap.
 
-    The workspace skill tree is a runtime copy of the project skill tree.  We
-    intentionally mirror the whole directory instead of reconstructing it from
-    parsed ``SKILL.md`` records, so every packaged asset is available locally.
+    The packaged tree is only the initial source for populating a workspace.
+    ``workspace/skills`` remains runtime-owned after initialization.
     """
     for root in _candidate_skill_roots():
         try:
@@ -337,7 +336,7 @@ def skill_assets_workspace_relpath(skill_id: str) -> str:
 
 
 def sync_skill_assets_to_workspace(skill_id: str, workspace_root: Path) -> dict[str, Any]:
-    """向后兼容接口：同步项目 skills 整棵目录，而不是只同步一个 skill。"""
+    """向后兼容接口：补齐 workspace 中缺失的 packaged skill 资源。"""
     summary = sync_all_skill_assets_to_workspace(workspace_root)
     if skill_id not in {rec.skill_id for rec in load_skill_records()}:
         return {
@@ -358,11 +357,11 @@ def sync_skill_assets_to_workspace(skill_id: str, workspace_root: Path) -> dict[
 
 
 def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
-    """把项目 skill 根目录的全部内容原样镜像到 workspace/skills。
+    """Copy missing packaged skill assets into ``workspace/skills``.
 
-    源目录通常是项目中的 ``.claude/skills``。这里不再依据 ``SKILL.md``
-    做二次筛选，也不按当前激活 skill 选择性复制，因此每一个 skill 子目录、
-    脚本、参考资料和其他附属文件都会直接落到工作目录的 ``skills/`` 下。
+    This is a one-time bootstrap operation, not a destructive mirror. Existing
+    workspace files are treated as runtime state and are never overwritten or
+    deleted, even when they differ from the packaged source.
     """
     source_root = _project_skill_source_root()
     dest_root = Path(workspace_root) / SKILL_ASSETS_DIRNAME
@@ -387,43 +386,15 @@ def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
             rel_key = rel.as_posix()
             source_files.add(rel_key)
             dst_path = dest_root / rel
-            needs_copy = True
-            if dst_path.is_file():
-                try:
-                    src_stat = src_path.stat()
-                    dst_stat = dst_path.stat()
-                    needs_copy = (
-                        src_stat.st_size != dst_stat.st_size
-                        or int(src_stat.st_mtime) > int(dst_stat.st_mtime)
-                    )
-                except OSError:
-                    needs_copy = True
-            elif dst_path.exists():
-                # A source file cannot coexist with a destination directory.
-                shutil.rmtree(dst_path)
 
-            if needs_copy:
-                dst_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src_path, dst_path)
-                copied += 1
+            if dst_path.exists():
+                # Runtime workspace owns existing content. Never overwrite a
+                # file or delete a directory that may contain user-created data.
+                continue
 
-        # skills/ is application-managed, so remove files no longer present in
-        # the packaged project tree. This keeps deleted/renamed skills from
-        # lingering in existing user workspaces.
-        for existing in list(_iter_files(dest_root)):
-            rel_key = existing.relative_to(dest_root).as_posix()
-            if rel_key not in source_files:
-                try:
-                    existing.unlink()
-                except OSError:
-                    pass
-
-        for existing_dir in sorted((p for p in dest_root.rglob("*") if p.is_dir()), reverse=True):
-            try:
-                if not any(existing_dir.iterdir()):
-                    existing_dir.rmdir()
-            except OSError:
-                pass
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+            copied += 1
 
         skill_ids = {p.name for p in source_root.iterdir() if p.is_dir()}
         summary.update({
