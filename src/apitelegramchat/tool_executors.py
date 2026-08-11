@@ -9,7 +9,7 @@ import json
 import hashlib
 import time
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root, workspace_workdir
+from apitelegramchat.workspace_paths import workspace_root, workspace_workdir, runtime_cache_root
 import re
 import html
 import logging
@@ -112,6 +112,77 @@ def extract_domain(url: str) -> str:
     return parsed.netloc or parsed.path.split('/')[0]
 
 # =====================================================================
+# Persistent runtime state
+# =====================================================================
+
+_RUNTIME_STATE_FILENAME = ".runtime_cache/runtime.json"
+
+
+def _runtime_state_path(chat_id: int) -> Path:
+    return workspace_root(chat_id) / _RUNTIME_STATE_FILENAME
+
+
+def _tool_version(exe: str) -> str | None:
+    path = shutil.which(exe)
+    if not path:
+        return None
+    try:
+        proc = subprocess.run(
+            [path, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=2,
+            check=False,
+            env={
+                "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
+                "LC_ALL": "C.UTF-8",
+                "LANG": "C.UTF-8",
+            },
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    line = (proc.stdout or "").splitlines()
+    return line[0].strip()[:300] if line else None
+
+
+def _prepare_runtime_once(chat_id: int, cache_root: Path) -> dict:
+    """Record host toolchain discovery once per persistent workspace.
+
+    This deliberately does *not* install compilers per Bash invocation. The base image
+    owns the toolchain; the workspace owns only reusable caches and a small manifest.
+    """
+    state_path = _runtime_state_path(chat_id)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(state, dict) and state.get("schema") == 1:
+                return state
+        except (OSError, ValueError, TypeError):
+            pass
+
+    tools = {
+        name: {
+            "path": shutil.which(name),
+            "version": _tool_version(name),
+        }
+        for name in ("python3", "gcc", "g++", "clang", "clang++", "make", "cmake", "ccache")
+    }
+    state = {
+        "schema": 1,
+        "prepared": True,
+        "cache_root": str(cache_root),
+        "tools": tools,
+    }
+    try:
+        state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Unable to persist runtime state chat_id=%s: %s", chat_id, exc)
+    return state
+
+
+# =====================================================================
 # BashSession —— 每会话独立沙箱
 # =====================================================================
 class BashSession:
@@ -122,6 +193,8 @@ class BashSession:
         self.workspace = workspace_root(chat_id)
         self.workdir = workspace_workdir(chat_id)
         self._watchdog_task: Optional[asyncio.Task] = None
+        self._runtime_state: Optional[dict] = None
+        self._runtime_prepare_lock = asyncio.Lock()
         # 当前激活的 skill id（如有）。非 None 时，execute() 里每条命令执行前
         # 会 cd 到该 skill 的资源目录（workspace/.skills/<skill_id>/），而不是
         # workspace 根 —— 这样 SKILL.md 里写的相对路径（如
@@ -159,6 +232,14 @@ class BashSession:
 
         argv = build_sandbox_argv()
         env = build_sandbox_env(self.workspace, self.chat_id)
+        cache_root = runtime_cache_root(self.chat_id)
+        async with self._runtime_prepare_lock:
+            if self._runtime_state is None:
+                # One-time discovery per persistent workspace. Subsequent Bash restarts
+                # reuse the manifest instead of "preparing" the toolchain again.
+                self._runtime_state = await asyncio.to_thread(
+                    _prepare_runtime_once, self.chat_id, cache_root
+                )
 
         # ★ Landlock：把文件系统访问限制在 workspace 目录内，
         #   拒绝访问 /tmp 其他子目录（state/、r2_cache/）、/app 源码等。
@@ -169,7 +250,12 @@ class BashSession:
             str(self.workdir.absolute()),
         )
 
-        logger.info(f"Starting bash session chat_id={self.chat_id}")
+        logger.info(
+            "Starting bash session chat_id=%s runtime_prepared=%s cache=%s",
+            self.chat_id,
+            bool(self._runtime_state and self._runtime_state.get("prepared")),
+            cache_root,
+        )
 
         self.proc = await asyncio.create_subprocess_exec(
             *argv,

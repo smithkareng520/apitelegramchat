@@ -13,7 +13,13 @@ ENV APITELEGRAMCHAT_DATA_DIR=/tmp/apitelegramchat_data
 # 不需要 bubblewrap —— bwrap 在 Render 的非 privileged 容器里永远起不来
 # （内核禁了 unprivileged userns），留着只会造成误导。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libgl1 libglib2.0-0 libgomp1 \
+        ca-certificates \
+        build-essential \
+        cmake \
+        ccache \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -g 2000 app && useradd -u 2000 -g 2000 -m -d /home/app -s /usr/sbin/nologin app

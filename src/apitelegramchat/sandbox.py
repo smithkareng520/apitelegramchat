@@ -21,7 +21,7 @@ import signal
 from pathlib import Path
 from typing import Optional
 
-from apitelegramchat.workspace_paths import workspace_workdir
+from apitelegramchat.workspace_paths import workspace_workdir, runtime_cache_root
 
 logger = logging.getLogger(__name__)
 
@@ -290,11 +290,43 @@ def build_sandbox_argv() -> list:
 
 
 def build_sandbox_env(workspace: Path, chat_id: int) -> dict:
-    """沙箱环境变量（白名单，不传任何 API Key / Token / Secret）"""
+    """Build the shell environment from persistent, workspace-local runtime paths.
+
+    Runtime caches live under the same workspace tree that Landlock already permits.
+    Nothing is installed on every command: the host toolchain (/usr/bin/python3, gcc,
+    etc.) is reused and package/build caches survive Bash session restarts.
+    """
     workdir = workspace_workdir(chat_id)
     workdir_abs = str(workdir.absolute())
+    cache_root = runtime_cache_root(chat_id)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    pip_cache = cache_root / "pip"
+    ccache_dir = cache_root / "ccache"
+    tmp_dir = cache_root / "tmp"
+    runtime_bin = cache_root / "bin"
+    for d in (pip_cache, ccache_dir, tmp_dir, runtime_bin):
+        d.mkdir(parents=True, exist_ok=True)
+
+    # ccache is installed in the image, so make compiler invocation cache-aware
+    # without modifying files under /usr. These symlinks are idempotent and survive
+    # Bash session restarts because they live under the workspace runtime cache.
+    ccache_path = "/usr/bin/ccache"
+    if os.path.isfile(ccache_path) and os.access(ccache_path, os.X_OK):
+        for compiler_name in ("gcc", "g++", "cc", "c++"):
+            link = runtime_bin / compiler_name
+            try:
+                if link.is_symlink() or link.exists():
+                    if link.is_symlink() and os.readlink(link) == ccache_path:
+                        continue
+                    link.unlink()
+                link.symlink_to(ccache_path)
+            except OSError as exc:
+                logger.debug("Unable to prepare ccache wrapper %s: %s", link, exc)
+
+    # Keep runtime_bin first only for local wrappers. The actual compiler remains the
+    # system toolchain baked into the image; no apt/pip install happens per Bash run.
     return {
-        "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
+        "PATH": f"{runtime_bin}:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
         "HOME": workdir_abs,
         "USER": f"chat{chat_id}",
         "LANG": "C.UTF-8",
@@ -305,10 +337,13 @@ def build_sandbox_env(workspace: Path, chat_id: int) -> dict:
         "HISTFILE": "/dev/null",
         "HISTSIZE": "0",
         "HISTFILESIZE": "0",
-        # 让 python3 在 stdout=PIPE 时也逐步把日志交给上层；否则 Python
-        # 默认会对管道做块缓冲，前端只能等进程结束才看到输出。
+        "TMPDIR": str(tmp_dir),
+        "TEMP": str(tmp_dir),
+        "TMP": str(tmp_dir),
         "PYTHONUNBUFFERED": "1",
-        # ★ 刻意不带任何 *API_KEY *TOKEN *SECRET *PASSWORD
+        "PIP_CACHE_DIR": str(pip_cache),
+        "CCACHE_DIR": str(ccache_dir),
+        "PYTHONPYCACHEPREFIX": str(cache_root / "pycache"),
     }
 
 

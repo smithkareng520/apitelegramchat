@@ -92,3 +92,10 @@ def todo_state_file(chat_id: object, namespace: object | None = None) -> Path:
 
 def workspace_namespace(chat_id: object, namespace: object | None = None) -> str:
     return _resolved_namespace(chat_id, namespace)
+
+
+def runtime_cache_root(chat_id: object, namespace: object | None = None) -> Path:
+    """持久化运行时缓存（python/pip/编译缓存），避免每次 bash 重建。"""
+    root = workspace_root(chat_id, namespace) / ".runtime_cache"
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
