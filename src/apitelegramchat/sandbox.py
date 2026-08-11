@@ -219,7 +219,10 @@ def _apply_landlock(workspace_path: str) -> bool:
 
         try:
             def add_path_rule(path: str, allowed: int) -> None:
-                fd = os.open(path, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+                # O_PATH works for both directories and individual device/file nodes.
+                # O_DIRECTORY would make it impossible to grant a narrowly-scoped
+                # rule to /dev/null.
+                fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
                 try:
                     rule = _LandlockPathBeneathAttr(
                         allowed_access=allowed,
@@ -248,6 +251,17 @@ def _apply_landlock(workspace_path: str) -> bool:
                 if not os.path.isdir(d):
                     continue
                 add_path_rule(d, runtime_ro)
+
+            # /dev is intentionally read/execute-only, but normal shell usage
+            # commonly redirects output to /dev/null (for example `cmd >/dev/null`).
+            # Grant write access only to that single device node instead of making
+            # the whole /dev tree writable. This also keeps bash from failing when
+            # it attempts to use HISTFILE=/dev/null.
+            if os.path.exists("/dev/null"):
+                add_path_rule(
+                    "/dev/null",
+                    LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE,
+                )
 
             rc = _libc.syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0)
             if rc < 0:

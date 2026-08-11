@@ -150,11 +150,14 @@ async def check_sandbox_isolation(landlock_ok: bool):
         rc, out = await run("printf x > /app/landlock-write-probe 2>&1\n")
         report("4.6 应用目录不可写", "Permission denied" in out or "Read-only" in out, out[:200])
 
+        rc, out = await run("printf sandbox-ok > /dev/null\n")
+        report("4.7 /dev/null 可写", rc == 0, out[:200])
+
         rc, out = await run("cat /etc/shadow 2>&1\n")
-        report("4.7 /etc/shadow 不可读", "Permission denied" in out or "No such file" in out, out[:200])
+        report("4.8 /etc/shadow 不可读", "Permission denied" in out or "No such file" in out, out[:200])
 
         rc, out = await run("cat /proc/1/cmdline 2>&1\n")
-        report("4.8 /proc 不可访问", "Permission denied" in out or "No such file" in out, out[:200])
+        report("4.9 /proc 不可访问", "Permission denied" in out or "No such file" in out, out[:200])
 
         rc, out = await run("env\n")
         bad = bool(re.search(r'(KEY|TOKEN|SECRET|PASSWORD)=', out))
