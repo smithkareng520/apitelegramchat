@@ -25,3 +25,8 @@
 
 - Python `compileall` 通过。
 - DDG semaphore 并发测试通过：6 个并发查询的峰值并发数为 6，不再被全局锁压成 1。
+
+## 2026-08-11 hotfix
+- 修复 `ai_handlers.py` 缺少 `import os` 导致线上启动时 `NameError`。
+- 拆分 `SUBAGENT_OUTER_TIMEOUT` 与 `SUBAGENT_TOOL_TIMEOUT`：前者控制主工具层包裹整个 subagent 的 930 秒超时，后者控制子 agent 单次工具调用的 120 秒超时，避免环境变量语义冲突。
+- 更新 `render.yaml`：`SUBAGENT_MAX_ROUNDS=32`、`SUBAGENT_DEFAULT_TIMEOUT=900`、`SUBAGENT_LLM_TIMEOUT=180`、`SUBAGENT_TOOL_TIMEOUT=120`、`SUBAGENT_OUTER_TIMEOUT=930`、`DDG_MAX_CONCURRENCY=8`、`MAX_CONCURRENT_TOOLS=16`。
