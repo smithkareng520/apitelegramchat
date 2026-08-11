@@ -2232,12 +2232,15 @@ async def _run_tool_calls_and_append(
 
                 async def bash_progress_callback(output_text: str):
                     try:
-                        safe_output = escape_html(output_text[-8000:])
-                        if safe_output:
+                        # 伪刷新式终端预览：每次收到新输出都用“最新 10 行”替换旧内容。
+                        # 这里只影响 Telegram 草稿 UI，不影响发送给模型的原始 tool 输出。
+                        live_tail = _tail_lines(output_text, 10)
+                        if live_tail:
                             preview = (
                                 f"{_format_code_block(command_preview, header='bash')}"
-                                f"<details open><summary>实时输出</summary>"
-                                f"<pre><code>{safe_output}</code></pre></details>"
+                                f"<details open><summary>实时输出 · 最新 10 行</summary>"
+                                f"{_format_code_block(live_tail, header='', show_line_numbers=False, show_size=False, max_lines=10)}"
+                                f"</details>"
                             )
                         else:
                             preview = _format_code_block(command_preview, header="bash")
@@ -2694,6 +2697,11 @@ async def _swallow_flush_task(t: "asyncio.Task", name: str, draft_id: int) -> No
 
 # ========== RichMessageBuilder 类 ==========
 class RichMessageBuilder:
+    # 工具结果只用于草稿 UI 展示，不能让一个或多个工具的超长原始输出
+    # 把整个 rich draft 撑爆。这里仅限制“工具详情展示”，不会影响发送给模型的
+    # tool message，也不会截断最终 AI 回复。
+    MAX_TOOL_UI_DETAIL_CHARS = 500
+
     def __init__(self, chat_id: int):
         self.chat_id = chat_id
         # draft_id 必须在 2^53 (9007199254740992) 以内，否则 JSON 双精度浮点解析会丢失精度，
@@ -3150,6 +3158,21 @@ class RichMessageBuilder:
     def finalize_reasoning_block(self, has_tool_calls: bool = False):
         self._commit_stream_buffer()
 
+    def _truncate_tool_ui_detail(self, html_content: str, limit: int) -> str:
+        """仅截断工具结果的 UI 展示内容，并尽量避免破坏 HTML。"""
+        if not html_content:
+            return ""
+        if len(html_content) <= limit:
+            return html_content
+        # 长工具输出的详情重点是给用户查看概览；截断部分改成纯文本，
+        # 避免直接按字符切 HTML 标签造成整块 rich message 解析失败。
+        plain = re.sub(r"<[^>]*>", " ", html_content)
+        plain = html.unescape(plain)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        if len(plain) > max(0, limit - 24):
+            plain = plain[:max(0, limit - 24)].rstrip()
+        return f"{escape_html(plain)}\n<i>…工具输出已截断</i>"
+
     def _build_tool_group_html(self, group: dict) -> str:
         items = group.get("items", [])
         if not items:
@@ -3167,16 +3190,23 @@ class RichMessageBuilder:
             inner_parts.append(reasoning_html)
         if text_content:
             inner_parts.append(f"<p>{text_content}</p>")
+
+        # 仅限制单个工具的 UI 详情长度；工具组不设置总展示上限。
+        # 注意：这只影响草稿 UI，不影响发送给模型的原始 tool message。
         for item in items:
-            inner_parts.append(self._get_inner_content(item))
+            inner_parts.append(
+                self._get_inner_content(item, detail_limit=self.MAX_TOOL_UI_DETAIL_CHARS)
+            )
 
         inner_html = "\n".join(inner_parts)
         return f"<details><summary>{outer_summary}</summary>\n{inner_html}\n</details>"
 
-    def _get_inner_content(self, item: dict) -> str:
+    def _get_inner_content(self, item: dict, detail_limit: int | None = None) -> str:
         inner_summary = item["summary"]
         if item["details_html"].strip():
             inner_body = item["details_html"]
+            if detail_limit is not None:
+                inner_body = self._truncate_tool_ui_detail(inner_body, detail_limit)
             return f"<details><summary>{inner_summary}</summary>\n{inner_body}\n</details>"
         else:
             # 修复 RICH_MESSAGE_CONTENT_REQUIRED：
