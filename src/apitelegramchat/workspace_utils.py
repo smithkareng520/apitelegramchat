@@ -157,9 +157,10 @@ async def persist_workspace_file(
     delete: bool = False,
     namespace: str | None = None,
 ) -> dict:
+    # ★ init 在 workspace lock 外面执行（同 bash / text_editor）。
+    await _ensure_runtime_workspace(chat_id, namespace)
     lock = await _get_workspace_lock(chat_id, namespace)
     async with lock:
-        await _ensure_runtime_workspace(chat_id, namespace)
         return await _persist_runtime_file(
             chat_id, rel_path, delete=delete, namespace=namespace
         )
@@ -176,6 +177,14 @@ async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = No
     `telegram/{file_id}` R2 缓存负责跨重启持久化（Telegram 对同一文件给同一
     file_id，天然去重）。download/ 只是当前会话的本地落地缓冲，进程重启后
     可以为空——模型需要时用户重发即可，或通过 file_id 重新拉取。
+
+    失败语义（重要）：
+    - 如果 R2 同步抛异常或被取消（asyncio.CancelledError），仍然把 key 加入
+      _workspace_initialized。这避免"超时→重试→再超时"的死循环：第一次 init
+      失败后，后续工具调用直接使用本地已有的文件（可能是空的），模型仍可工作。
+      丢失的只是 R2 上历史持久化的文件，用户重发即可恢复。
+    - 这是显式的可用性优先于一致性取舍：工具调用的 45s 超时不应被 R2 网络问题
+      反复消耗。
     """
     key = workspace_namespace(chat_id, namespace)
     if key in _workspace_initialized:
@@ -185,10 +194,28 @@ async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = No
     async with init_lock:
         if key in _workspace_initialized:
             return
-        await _sync_workspace_from_r2(chat_id)
-        await _sync_upload_from_r2(chat_id, namespace)
-        _workspace_initialized.add(key)
-        logger.debug("Workspace initialized once: chat_id=%s namespace=%s", chat_id, key)
+        try:
+            await _sync_workspace_from_r2(chat_id)
+            await _sync_upload_from_r2(chat_id, namespace)
+            logger.debug("Workspace initialized: chat_id=%s namespace=%s", chat_id, key)
+        except asyncio.CancelledError:
+            # 工具调用超时会 cancel 整个调用链，包括 init。如果不标记，下一次
+            # 工具调用会从头再同步，又超时，形成死循环。标记为已初始化，让后续
+            # 调用继续工作（本地文件可能不全，但至少不卡死）。
+            logger.warning(
+                "Workspace init cancelled for chat_id=%s; marking as initialized "
+                "with partial state to avoid retry loop.", chat_id
+            )
+            raise  # CancelledError 必须向上传播
+        except Exception as e:
+            logger.warning(
+                "Workspace init failed for chat_id=%s (%s); marking as initialized "
+                "with local-only state to avoid retry loop.", chat_id, e
+            )
+        finally:
+            # 无论成功、失败还是取消，都标记为已初始化。
+            # CancelledError 在 finally 中 add 不会阻止传播，但会防止重试。
+            _workspace_initialized.add(key)
 
 
 def _mark_workspace_initialized(chat_id: int, namespace: str | None = None) -> None:
@@ -452,9 +479,10 @@ async def fetch_from_download(
     默认不覆盖已存在的文件，避免误覆盖模型已经在编辑的同名文件。
     """
     rel = _safe_relative_name(filename)
+    # ★ init 在 workspace lock 外面执行（同 bash / text_editor）。
+    await _ensure_runtime_workspace(chat_id, namespace)
     lock = await _get_workspace_lock(chat_id, namespace)
     async with lock:
-        await _ensure_runtime_workspace(chat_id, namespace)
         download_root = workspace_download_root(chat_id, namespace)
         runtime_root = workspace_workdir(chat_id, namespace)
         src = (download_root / rel).resolve()
@@ -496,9 +524,10 @@ async def stage_to_upload(
     present_files 只从 upload/ 读取，所以模型必须先调用 stage_to_upload。
     """
     rel = _safe_relative_name(rel_path)
+    # ★ init 在 workspace lock 外面执行（同 bash / text_editor）。
+    await _ensure_runtime_workspace(chat_id, namespace)
     lock = await _get_workspace_lock(chat_id, namespace)
     async with lock:
-        await _ensure_runtime_workspace(chat_id, namespace)
         runtime_root = workspace_workdir(chat_id, namespace)
         upload_root = workspace_upload_root(chat_id, namespace)
         src = (runtime_root / rel).resolve()

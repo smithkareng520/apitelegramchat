@@ -71,7 +71,7 @@ from apitelegramchat.state import (
 )
 from apitelegramchat.file_handlers import download_file
 from apitelegramchat.s3_utils import file_exists_in_r2
-from apitelegramchat.workspace_utils import _get_workspace_lock
+from apitelegramchat.workspace_utils import _get_workspace_lock, init_workspace
 # 任务工具：用于处理 todo:* 回调按钮
 from apitelegramchat.todo_tool import (
     toggle_by_id as todo_toggle_by_id,
@@ -503,6 +503,10 @@ async def _cleanup_task(chat_id: int, task: asyncio.Task):
 # -------------------- 各类型消息处理 --------------------
 async def _handle_text_message(chat_id: int, user_input: str, username: str, user_message: dict):
     await send_chat_action(chat_id, "typing")
+    # 后台预初始化 workspace：与模型生成响应并行，避免第一个工具调用
+    # 的 45s 超时被 R2 同步吃掉。init_workspace 内部有幂等检查，重复调用
+    # 是 no-op。
+    asyncio.create_task(init_workspace(chat_id))
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
@@ -522,6 +526,7 @@ async def _handle_text_message(chat_id: int, user_input: str, username: str, use
 
 async def _handle_photo_message(chat_id: int, user_message: dict, username: str):
     await send_chat_action(chat_id, "upload_photo")
+    asyncio.create_task(init_workspace(chat_id))
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
@@ -541,6 +546,7 @@ async def _handle_photo_message(chat_id: int, user_message: dict, username: str)
 
 async def _handle_document_message(chat_id: int, user_message: dict, username: str):
     await send_chat_action(chat_id, "upload_document")
+    asyncio.create_task(init_workspace(chat_id))
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
@@ -560,6 +566,7 @@ async def _handle_document_message(chat_id: int, user_message: dict, username: s
 
 async def _handle_audio_message(chat_id: int, user_message: dict, username: str):
     await send_chat_action(chat_id, "upload_voice")
+    asyncio.create_task(init_workspace(chat_id))
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
@@ -672,6 +679,7 @@ def _schedule_media_group(chat_id: int, media_group_id: str) -> None:
 
 async def _process_document_group_once(chat_id: int, media_group_id: str) -> None:
     await send_chat_action(chat_id, "upload_document")
+    asyncio.create_task(init_workspace(chat_id))
     await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
     messages = await pop_media_group(media_group_id)
     _document_group_tasks.pop(media_group_id, None)

@@ -8,9 +8,11 @@ from typing import List
 try:
     import aioboto3  # type: ignore
     from botocore.exceptions import ClientError  # type: ignore
+    from botocore.config import Config  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
     aioboto3 = None
     ClientError = Exception
+    Config = None
 
 from apitelegramchat.config import (
     R2_ENDPOINT,
@@ -27,6 +29,17 @@ logger = logging.getLogger(__name__)
 
 session = aioboto3.Session() if aioboto3 is not None else None
 _LOCAL_R2_ROOT = data_root() / "r2_cache"
+
+# R2 超时配置：connect 5s，read 10s，不重试（由调用方决定重试策略）。
+# 默认 botocore 配置是 connect 60s / read 60s / 3 retries，冷启动时一次
+# 挂掉的 R2 调用会卡 60s+60s*3 = 240s，远超工具调用的 45s 超时。
+# 用短超时让 R2 快速失败，上层 init 逻辑会把失败视为"R2 暂不可用"并继续。
+_R2_CONFIG = Config(
+    connect_timeout=5,
+    read_timeout=10,
+    retries={"max_attempts": 1, "mode": "standard"},
+    max_pool_connections=10,
+) if Config is not None else None
 
 
 def _safe_local_key_path(key: str) -> Path:
@@ -78,6 +91,7 @@ async def upload_bytes_to_r2(
                 aws_access_key_id=R2_ACCESS_KEY,
                 aws_secret_access_key=R2_SECRET_KEY,
                 region_name=R2_REGION,
+                config=_R2_CONFIG,
             ) as s3:
                 await s3.put_object(
                     Bucket=R2_BUCKET_NAME,
@@ -111,6 +125,7 @@ async def generate_presigned_url(
         aws_access_key_id=R2_ACCESS_KEY,
         aws_secret_access_key=R2_SECRET_KEY,
         region_name=R2_REGION,
+        config=_R2_CONFIG,
     ) as s3:
         return await s3.generate_presigned_url(
             "get_object",
@@ -130,6 +145,7 @@ async def file_exists_in_r2(key: str) -> bool:
             aws_access_key_id=R2_ACCESS_KEY,
             aws_secret_access_key=R2_SECRET_KEY,
             region_name=R2_REGION,
+            config=_R2_CONFIG,
         ) as s3:
             await s3.head_object(Bucket=R2_BUCKET_NAME, Key=key)
         return True
@@ -161,6 +177,7 @@ async def download_from_r2(key: str) -> bytes | None:
             aws_access_key_id=R2_ACCESS_KEY,
             aws_secret_access_key=R2_SECRET_KEY,
             region_name=R2_REGION,
+            config=_R2_CONFIG,
         ) as s3:
             resp = await s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)
             return await resp["Body"].read()
@@ -193,6 +210,7 @@ async def list_r2_objects(prefix: str) -> List[str]:
             aws_access_key_id=R2_ACCESS_KEY,
             aws_secret_access_key=R2_SECRET_KEY,
             region_name=R2_REGION,
+            config=_R2_CONFIG,
         ) as s3:
             resp = await s3.list_objects_v2(**kwargs)
         for obj in resp.get("Contents", []):
@@ -221,6 +239,7 @@ async def delete_r2_object(key: str) -> bool:
             aws_access_key_id=R2_ACCESS_KEY,
             aws_secret_access_key=R2_SECRET_KEY,
             region_name=R2_REGION,
+            config=_R2_CONFIG,
         ) as s3:
             await s3.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
         return True

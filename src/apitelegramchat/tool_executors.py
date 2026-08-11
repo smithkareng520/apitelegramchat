@@ -351,16 +351,21 @@ class BashSession:
     # ===================== 执行命令 =====================
     async def execute(self, command: str, timeout: int = SANDBOX_TIMEOUT_SEC, progress_callback=None) -> str:
         """在沙箱中执行 bash 命令，超时自动终止"""
+        # ★ init 在 workspace lock 外面执行：R2 网络同步可能耗时数秒，
+        #   不应阻塞其他工具调用获取 workspace lock。init 只需要 init_lock
+        #   （在 _ensure_workspace_initialized 内部获取），与 workspace lock 独立。
+        #   init 失败不阻断 bash：本地 workspace 可能不全但 bash 仍可运行。
+        try:
+            await _ensure_workspace_initialized(self.chat_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"_ensure_workspace_initialized failed (continue): {e}")
+
         lock = await _get_workspace_lock(self.chat_id)
         async with lock:
             if self.proc is None or self.proc.returncode is not None:
                 await self.start()
-
-            # 首次访问时初始化一次；后续命令直接使用 persistent workspace。
-            try:
-                await _ensure_workspace_initialized(self.chat_id)
-            except Exception as e:
-                logger.warning(f"_ensure_workspace_initialized failed (continue): {e}")
 
             if not self._is_safe(command):
                 # 给出更可操作的错误信息，让模型知道为什么被拒、该怎么做。
@@ -1857,11 +1862,11 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
             "error": "No paths provided. Files must be staged under upload/ first.",
         })
 
+    # ★ init 在 workspace lock 外面执行（同 bash / text_editor）。
+    await _ensure_runtime_workspace(chat_id)
+
     lock = await _get_workspace_lock(chat_id)
     async with lock:
-        # 确保三棵持久化子树都已同步，upload/ 可见。
-        await _ensure_runtime_workspace(chat_id)
-
         upload_root = workspace_upload_root(chat_id)
         sent = []
         failed = []

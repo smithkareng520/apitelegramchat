@@ -250,12 +250,13 @@ async def execute_text_editor(
     except ValueError as e:
         return f"Error: {e}"
 
+    # ★ init 在 workspace lock 外面执行：R2 网络同步可能耗时数秒，
+    #   不应阻塞其他工具调用获取 workspace lock。init 只需要 init_lock
+    #   （在 _ensure_workspace_initialized 内部获取），与 workspace lock 独立。
+    await _ensure_runtime_workspace(chat_id)
+
     lock = await _get_workspace_lock(chat_id)
     async with lock:
-        # 初始化一次持久化文件树，然后在同一隔离执行树里操作。
-        # R2 只接收显式 text_editor 提交的单个文件，不做工作区全量镜像。
-        await _ensure_runtime_workspace(chat_id)
-
         workspace = workspace_workdir(chat_id)
         local_path = workspace if allow_root_path else (workspace / safe_path)
 
