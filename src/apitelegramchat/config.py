@@ -27,7 +27,14 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GLM_API_KEY = os.getenv("GLM_API_KEY", "")
 MODELSCOPE_API_KEY = os.getenv("MODELSCOPE_API_KEY", "")
 AGNES_API_KEY = os.getenv("AGNES_API_KEY", "")
-AMAP_KEY = os.getenv("AMAP_KEY", "").strip()
+
+# ---------- 高德地图 MCP 服务（@amap/amap-maps on ModelScope）----------
+# 通过 streamable_http 调用，使用 Bearer token 鉴权。
+# 替代了原先的 amap_integration.py 直接调用高德 Web 服务 API 的方式。
+# 未配置 GAODE_MCP_TOKEN 时该 MCP 服务不可用（mcp_client.py 会跳过注册）。
+GAODE_MCP_ENABLED = os.getenv("GAODE_MCP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+GAODE_MCP_URL = (os.getenv("GAODE_MCP_URL") or "https://mcp.api-inference.modelscope.net/3331c36972ff42/mcp").strip()
+GAODE_MCP_TOKEN = (os.getenv("GAODE_MCP_TOKEN") or "").strip()
 
 # ---------- 网页搜索：外部 MCP 搜索服务（bing-cn-mcp-server）----------
 # Google CSE / DuckDuckGo 已移除，网页搜索改为通过外部 MCP 服务调用。
@@ -583,7 +590,7 @@ _SENSITIVE_EXACT = {
     "R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY",
     "R2_BUCKET_NAME", "R2_PUBLIC_URL", "R2_REGION",
     "GEOAPIFY_KEY", "IMGBB_KEY", "TOMTOM_API_KEY", "ORS_API_KEY",
-    "BING_CN_MCP_TOKEN",
+    "BING_CN_MCP_TOKEN", "GAODE_MCP_TOKEN",
     "WEBHOOK_TOKEN", "WEBHOOK_URL",
 }
 

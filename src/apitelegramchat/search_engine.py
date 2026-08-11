@@ -16,7 +16,7 @@ import math
 import shutil
 import mimetypes
 from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
-from typing import Optional
+from typing import Any, Optional
 try:
     import trafilatura  # type: ignore
     from trafilatura.settings import use_config  # type: ignore
@@ -38,12 +38,10 @@ except Exception:  # pragma: no cover - optional dependency fallback
 from pathlib import Path
 from apitelegramchat.workspace_paths import workspace_workdir, workspace_namespace
 
-# === [amap_integration patch] 高德地图数据源 ===
-try:
-    from apitelegramchat import amap_integration as _amap
-except Exception:  # pragma: no cover
-    _amap = None
-# === [/amap_integration patch] ===
+# 高德地图能力现已迁移到外部 MCP 服务 `amap-maps`（@amap/amap-maps on
+# ModelScope）。所有地理编码 / POI / 路径 / 距离 / IP 定位工具都通过
+# `call_mcp_tool("amap-maps", ...)` 调用该 MCP 的 maps_* 工具，不再保留任何
+# 直接调用高德 Web 服务 API 或 OSM/Nominatim/Overpass/OSRM 的本地实现。
 try:
     import qrcode  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
@@ -57,28 +55,8 @@ except Exception:  # pragma: no cover - optional dependency fallback
     lxml_html = None  # type: ignore
 from apitelegramchat.state import set_editor_file_state, clear_editor_file_state
 
-def _build_nav_links(
-    lat_wgs: float,
-    lon_wgs: float,
-    lat_gcj: float,
-    lon_gcj: float,
-    display_name: str,
-) -> dict[str, str]:
-    """Build map links using each provider's preferred coordinate system."""
-    safe_name = quote(display_name[:40])
-    return {
-        "google": f"https://maps.google.com/?q={_fmt_coord(lat_wgs)},{_fmt_coord(lon_wgs)}",
-        "apple": f"https://maps.apple.com/?q={_fmt_coord(lat_gcj)},{_fmt_coord(lon_gcj)}",
-        "gaode": f"https://uri.amap.com/marker?position={_fmt_coord(lon_gcj)},{_fmt_coord(lat_gcj)}",
-        "baidu": (
-            f"https://api.map.baidu.com/marker?location={_fmt_coord(lat_wgs)},{_fmt_coord(lon_wgs)}&title=&content={safe_name}&output=html"
-        ),
-    }
-
 from apitelegramchat.config import (
     OPENROUTER_API_KEY,
-    TOMTOM_API_KEY,
-    ORS_API_KEY,
     SEARCH_CACHE_TTL,
     FETCH_CACHE_TTL,
     SUPPORTED_MODELS,
@@ -825,7 +803,7 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "ip_geo",
-            "description": "Get geolocation info (country, region, city, ISP, ASN) for an IPv4 address. If ip omitted, queries the server's own IP.",
+            "description": "Get geolocation info (country, region, city, ISP, ASN) for an IPv4 address via the amap-maps MCP `maps_ip_location` tool. If ip omitted, queries the server's own IP.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -848,12 +826,12 @@ SEARCH_TOOLS = [
             }
         }
     },
-    # ===================== 地图工具 =====================
+    # ===================== 地图工具（全部由 amap-maps MCP 提供） =====================
     {
         "type": "function",
         "function": {
             "name": "geocode",
-            "description": "将地址或地名转换为经纬度坐标（地理编码）。返回纬度、经度、完整规范化地址及各组成部分。",
+            "description": "将地址或地名转换为经纬度坐标（地理编码）。委托给 amap-maps MCP 的 maps_geo 工具。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -871,7 +849,7 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "route",
-            "description": "规划两点之间的路线（driving / walking / cycling / transit）。返回总距离、总时间、分段指引及起终点坐标。",
+            "description": "规划两点之间的路线（driving / walking / cycling / transit）。委托给 amap-maps MCP 的 maps_direction_* 工具。返回总距离、总时间、分段指引及起终点坐标。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -895,7 +873,7 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "distance",
-            "description": "计算地球上两点之间的大圆直线距离，返回公里和英里。",
+            "description": "计算地球上两点之间的直线距离。委托给 amap-maps MCP 的 maps_distance 工具。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -916,7 +894,7 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "place_details",
-            "description": "获取地点详情：名称、电话、网站、营业时间、菜系、评分、无障碍设施、Wi-Fi 等。需提供地点名称或坐标。",
+            "description": "获取地点详情：名称、电话、网站、营业时间、菜系、评分、无障碍设施、Wi-Fi 等。委托给 amap-maps MCP 的 maps_text_search 工具。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -935,68 +913,8 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "elevation",
-            "description": "查询某经纬度点的海拔高度（米）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：查询珠穆朗玛峰海拔"
-                    },
-                    "lat": {"type": "number", "description": "纬度"},
-                    "lon": {"type": "number", "description": "经度"}
-                },
-                "required": ["lat", "lon"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "traffic",
-            "description": "获取指定位置周边的实时交通事件（拥堵、事故、施工等）。需配置 TomTom API Key。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：查询天安门附近的交通状况"
-                    },
-                    "lat": {"type": "number", "description": "纬度"},
-                    "lon": {"type": "number", "description": "经度"},
-                    "radius": {"type": "number", "description": "半径（米），默认 5000"}
-                },
-                "required": ["lat", "lon"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "isochrone",
-            "description": "计算从某点出发、给定时间内可达范围的多边形（等时圈）。需配置 OpenRouteService API Key。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：计算10分钟驾车可达范围"
-                    },
-                    "lat": {"type": "number", "description": "中心纬度"},
-                    "lon": {"type": "number", "description": "中心经度"},
-                    "time": {"type": "integer", "description": "时间（分钟），默认 10"},
-                    "profile": {"type": "string", "enum": ["driving", "walking", "cycling"], "default": "driving"}
-                },
-                "required": ["lat", "lon"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "search_poi",
-            "description": "以某点为中心、按关键词搜索周边兴趣点（POI），如 '天安门'、'故宫'。返回匹配地点列表及详情。",
+            "description": "以某点为中心、按关键词搜索周边兴趣点（POI）。委托给 amap-maps MCP 的 maps_around_search 工具。返回匹配地点列表及详情。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2093,27 +2011,25 @@ async def execute_crypto_price(coin: str, currency: str = "usd") -> str:
 
 # --------------------- ip_geo ---------------------
 async def execute_ip_geo(ip: str = None) -> str:
-    # === [amap_integration patch] 高德优先 ===
-    if _amap is not None and _amap.is_enabled():
-        return await _amap.execute_ip_geo_amap(ip)
-    # === [/amap_integration patch] ===
-    url = f"http://ip-api.com/json/{ip if ip else ''}?fields=status,country,city,regionName,lat,lon,isp,query"
+    """IP 地理位置：委托给 amap-maps MCP 的 maps_ip_location 工具。
+
+    未配置 GAODE_MCP_TOKEN 时 mcp_client.py 不会注册 amap-maps 服务，
+    调用会以 MCPToolError 形式抛回，这里转成 JSON 错误信息给上层。
+    """
+    args: dict[str, Any] = {}
+    if ip:
+        args["ip"] = ip
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=HTTP_TIMEOUT_SHORT) as resp:
-                if resp.status != 200:
-                    return "失败：IP 查询失败。"
-                data = await resp.json()
-    except Exception as e:
-        return f"失败：IP 查询异常：{str(e)[:100]}"
-    if data.get("status") != "success":
-        return f"失败：无法查询 IP：{ip or '当前机器'}"
-    return (f"<b>IP 地理位置</b><br/>"
-            f"📌 IP：{data['query']}<br/>"
-            f"🌍 国家：{data['country']}<br/>"
-            f"🏙️ 城市：{data['city']}, {data['regionName']}<br/>"
-            f"📍 坐标：{data['lat']}, {data['lon']}<br/>"
-            f"🔌 ISP：{data['isp']}")
+        raw = await call_mcp_tool("amap-maps", "maps_ip_location", args)
+    except MCPToolError as e:
+        return json.dumps(
+            {"status": "error", "message": f"amap-maps MCP 调用失败：{e}"},
+            ensure_ascii=False,
+        )
+    return raw if raw else json.dumps(
+        {"status": "error", "message": "amap-maps 返回空"},
+        ensure_ascii=False,
+    )
 
 
 # --------------------- qr_code ---------------------
@@ -2623,829 +2539,211 @@ async def execute_generate_video(
 
 
 
-# ===================== 地图工具实现 =====================
+# ===================== 地图工具实现（amap-maps MCP 委托） =====================
 # ---------------------------------------------------------------------------
-# 常量
+# 内部：调用 amap-maps MCP 工具的统一封装
 # ---------------------------------------------------------------------------
-USER_AGENT = "TelegramAIAssistant/1.0 (dearella@proton.me)"
-NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
-NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse"
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-OSRM_URL = "http://router.project-osrm.org/route/v1"
-ELEVATION_URL = "https://api.open-elevation.com/api/v1/lookup"
+async def _call_amap_mcp(tool_name: str, arguments: dict[str, Any]) -> str:
+    """调用 amap-maps MCP 服务的某个工具，返回 MCP 输出的纯文本。
+
+    出错时返回 JSON 错误信息（{"status": "error", "message": ...}），让上层
+    工具的调用方（LLM / format_tool_result）能直接看到失败原因。
+    """
+    try:
+        raw = await call_mcp_tool("amap-maps", tool_name, arguments)
+    except MCPToolError as e:
+        return json.dumps(
+            {"status": "error", "message": f"amap-maps MCP 调用失败（{tool_name}）：{e}"},
+            ensure_ascii=False,
+        )
+    if not raw:
+        return json.dumps(
+            {"status": "error", "message": f"amap-maps MCP 返回空（{tool_name}）"},
+            ensure_ascii=False,
+        )
+    return raw
+
+
+def _empty_mcp_error(tool_name: str) -> str:
+    return json.dumps(
+        {"status": "error", "message": f"amap-maps MCP 返回空（{tool_name}）"},
+        ensure_ascii=False,
+    )
+
 
 # ---------------------------------------------------------------------------
-# 地理编码缓存（1小时有效期，最多500条）
-# ---------------------------------------------------------------------------
-_geocode_cache = TTLCache(maxsize=500, ttl=3600)
-
-# ---------------------------------------------------------------------------
-# 内部辅助：仅返回坐标（带缓存）
+# 内部辅助：通过 amap-maps MCP 把地址转坐标
 # ---------------------------------------------------------------------------
 async def _geocode_coords(address: str) -> tuple[float, float, str] | None:
-    key = address.lower().strip()
-    # === [amap_integration patch] 高德优先 ===
-    if _amap is not None and _amap.is_enabled():
-        return await _amap._amap_geocode_coords(address)
-    # === [/amap_integration patch] ===
-    if key in _geocode_cache:
-        return _geocode_cache[key]
+    """通过 amap-maps MCP 的 maps_geo 工具将地址转为坐标。
 
-    await asyncio.sleep(0.1)
-    params = {
-        "q": address,
-        "format": "json",
-        "limit": 1,
-        "addressdetails": 1,
-    }
-    headers = {"User-Agent": USER_AGENT, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(NOMINATIM_SEARCH, params=params,
-                                   headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-                if not data:
-                    return None
-                item = data[0]
-                result = (
-                    float(item["lat"]),
-                    float(item["lon"]),
-                    item.get("display_name", address),
-                )
-                _geocode_cache[key] = result
-                return result
-    except Exception as e:
-        logger.warning(f"_geocode_coords 失败: {e}")
+    返回 (lat, lon, display_name)；调用失败或解析失败时返回 None。
+    适配 amap-maps MCP 的常见返回 schema：
+        {"location": "lng,lat", "formatted_address": "...", ...}
+        或
+        {"lat": ..., "lon": ..., "formatted_address": "..."}
+    """
+    if not address or not address.strip():
         return None
+    try:
+        raw = await call_mcp_tool("amap-maps", "maps_geo", {"address": address.strip()})
+    except MCPToolError:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    # 优先取 amap 标准的 "location": "lng,lat" 字段
+    location = data.get("location") or data.get("pos") or data.get("coord")
+    if isinstance(location, str) and "," in location:
+        parts = [p.strip() for p in location.split(",")]
+        if len(parts) >= 2:
+            try:
+                lng = float(parts[0])
+                lat = float(parts[1])
+                name = data.get("formatted_address") or data.get("address") or address
+                return lat, lng, name
+            except ValueError:
+                pass
+
+    # 回退：直接读 lat/lon 字段
+    lat = data.get("lat") or data.get("latitude")
+    lon = data.get("lon") or data.get("lng") or data.get("longitude")
+    if lat is not None and lon is not None:
+        try:
+            return (
+                float(lat),
+                float(lon),
+                data.get("formatted_address") or data.get("address") or address,
+            )
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 # ---------------------------------------------------------------------------
 # 1. 地理编码
 # ---------------------------------------------------------------------------
 async def execute_geocode(address: str) -> str:
-    # === [amap_integration patch] 高德优先 ===
-    if _amap is not None and _amap.is_enabled():
-        return await _amap.execute_geocode_amap(address)
-    # === [/amap_integration patch] ===
-    if not address.strip():
-        return json.dumps({"status": "error", "message": "地址为空"})
+    """地理编码：地址 -> 经纬度。委托给 amap-maps MCP 的 maps_geo 工具。"""
+    if not address or not address.strip():
+        return json.dumps({"status": "error", "message": "地址为空"}, ensure_ascii=False)
+    return await _call_amap_mcp("maps_geo", {"address": address.strip()})
 
-    coords = await _geocode_coords(address)
-    if coords is None:
-        return json.dumps({"status": "error", "message": f"未找到地址：{address}"})
 
-    lat, lon, display_name = coords
+# ---------------------------------------------------------------------------
+# 2. POI 搜索
+# ---------------------------------------------------------------------------
+async def execute_search_poi(lat: float, lon: float, query: str,
+                              radius: int = 1000, max_results: int = 15) -> str:
+    """周边 POI 搜索。委托给 amap-maps MCP 的 maps_around_search 工具。
 
-    await asyncio.sleep(0.1)
-    params = {
-        "q": address,
-        "format": "json",
-        "limit": 1,
-        "addressdetails": 1,
+    amap 接受 "经度,纬度" 顺序的 location，半径单位米，范围 [100, 50000]。
+    """
+    if not query or not query.strip():
+        return json.dumps({"status": "error", "message": "搜索关键词为空"}, ensure_ascii=False)
+    radius_clamped = min(max(int(radius or 1000), 100), 50000)
+    arguments: dict[str, Any] = {
+        "location": f"{lon},{lat}",
+        "keywords": query.strip(),
+        "radius": str(radius_clamped),
     }
-    headers = {"User-Agent": USER_AGENT, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(NOMINATIM_SEARCH, params=params,
-                                   headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                item = (await resp.json() or [{}])[0] if resp.status == 200 else {}
-    except Exception:
-        item = {}
-
-    addr = item.get("address", {})
-    lng_gcj, lat_gcj = wgs84_to_gcj02(lon, lat)
-    result = {
-        "status": "success",
-        "coord_system": "WGS-84",
-        "source_coord_system": "WGS-84",
-        "lat": lat,
-        "lon": lon,
-        "gcj02_lat": lat_gcj,
-        "gcj02_lon": lng_gcj,
-        "display_name": display_name,
-        "road":     addr.get("road", addr.get("pedestrian", "")),
-        "city":     addr.get("city", addr.get("town", addr.get("village", ""))),
-        "county":   addr.get("county", ""),
-        "state":    addr.get("state", ""),
-        "country":  addr.get("country", ""),
-        "postcode": addr.get("postcode", ""),
-        "nav_links": _build_nav_links(lat, lon, lat_gcj, lng_gcj, display_name)
-    }
-    return json.dumps(result, ensure_ascii=False)
+    return await _call_amap_mcp("maps_around_search", arguments)
 
 
 # ---------------------------------------------------------------------------
-# 3. POI 搜索
-# ---------------------------------------------------------------------------
-async def execute_search_poi(lat: float, lon: float, query: str, radius: int = 1000, max_results: int = 15) -> str:
-    # === [amap_integration patch] 高德优先 ===
-    if _amap is not None and _amap.is_enabled():
-        result = await _amap.execute_search_poi_amap(lat, lon, query, radius=radius, max_results=max_results)
-        # 配额耗尽时降级回 Overpass；其它情况（成功/无结果/错误）直接返回
-        try:
-            _r = json.loads(result)
-            if _r.get("status") != "quota_exceeded":
-                return result
-        except Exception:
-            return result
-    # === [/amap_integration patch] ===
-    radius = min(max(int(radius), 100), 10000)
-    tag_filter = _CATEGORY_TAGS.get(query.lower())
-    if tag_filter:
-        overpass_query = f"""
-[out:json][timeout:25];
-(
-  node{tag_filter}(around:{radius},{lat},{lon});
-  way{tag_filter}(around:{radius},{lat},{lon});
-  relation{tag_filter}(around:{radius},{lat},{lon});
-);
-out center tags {max_results};
-"""
-    else:
-        safe_query = re.sub(r'[.*+?^${}()|[\]\\]', r'\\\g<0>', query)
-        overpass_query = f"""
-[out:json][timeout:25];
-(
-  node["name"~"{safe_query}",i](around:{radius},{lat},{lon});
-  way["name"~"{safe_query}",i](around:{radius},{lat},{lon});
-  relation["name"~"{safe_query}",i](around:{radius},{lat},{lon});
-  node["amenity"~"{safe_query}",i](around:{radius},{lat},{lon});
-  way["amenity"~"{safe_query}",i](around:{radius},{lat},{lon});
-  node["shop"~"{safe_query}",i](around:{radius},{lat},{lon});
-  way["shop"~"{safe_query}",i](around:{radius},{lat},{lon});
-  node["tourism"~"{safe_query}",i](around:{radius},{lat},{lon});
-);
-out center tags {max_results};
-"""
-    return await _run_overpass_poi(overpass_query, lat, lon, max_results=max_results)
-
-
-# ---------------------------------------------------------------------------
-# 4. 路线规划
+# 3. 路线规划
 # ---------------------------------------------------------------------------
 async def execute_route(start: str, end: str, profile: str = "driving") -> str:
-    # === [amap_integration patch] 高德优先 ===
-    if _amap is not None and _amap.is_enabled():
-        return await _amap.execute_route_amap(start, end, profile)
-    # === [/amap_integration patch] ===
-    async def _parse_location(loc: str):
-        loc = loc.strip()
-        coord_match = re.match(
-            r'^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$', loc
-        )
-        if coord_match:
-            return (
-                float(coord_match.group(1)),
-                float(coord_match.group(2)),
-                loc,
-            )
-        return await _geocode_coords(loc)
+    """路线规划。委托给 amap-maps MCP 的 maps_direction_* 工具。
 
-    start_result, end_result = await asyncio.gather(
-        _parse_location(start),
-        _parse_location(end),
-    )
-    if start_result is None:
-        return json.dumps({"status": "error", "message": f"无法解析起点：{start}"})
-    if end_result is None:
-        return json.dumps({"status": "error", "message": f"无法解析终点：{end}"})
-
-    start_lat, start_lon, start_name = start_result
-    end_lat,   end_lon,   end_name   = end_result
-
-    def _wgs84_to_gcj02(lon: float, lat: float) -> tuple[float, float]:
-        """尽量复用高德模块的转换；不可用时退回本地实现。"""
-        if _amap is not None and hasattr(_amap, "wgs84_to_gcj02"):
-            return _amap.wgs84_to_gcj02(lon, lat)  # type: ignore[attr-defined]
-        # 本地兜底：和高德/coordtransform 兼容的标准算法
-        _PI = 3.141592653589793
-        _EE = 0.00669342162296594323
-        _A = 6378245.0
-        def _out_of_china(lng: float, lat: float) -> bool:
-            return not (73.66 < lng < 135.05 and 3.86 < lat < 53.55)
-        def _transform_lat(x: float, y: float) -> float:
-            ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * abs(x) ** 0.5
-            ret += (20.0 * __import__('math').sin(6.0 * x * _PI) + 20.0 * __import__('math').sin(2.0 * x * _PI)) * 2.0 / 3.0
-            ret += (20.0 * __import__('math').sin(y * _PI) + 40.0 * __import__('math').sin(y / 3.0 * _PI)) * 2.0 / 3.0
-            ret += (160.0 * __import__('math').sin(y / 12.0 * _PI) + 320 * __import__('math').sin(y * _PI / 30.0)) * 2.0 / 3.0
-            return ret
-        def _transform_lng(x: float, y: float) -> float:
-            ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * abs(x) ** 0.5
-            ret += (20.0 * __import__('math').sin(6.0 * x * _PI) + 20.0 * __import__('math').sin(2.0 * x * _PI)) * 2.0 / 3.0
-            ret += (20.0 * __import__('math').sin(x * _PI) + 40.0 * __import__('math').sin(x / 3.0 * _PI)) * 2.0 / 3.0
-            ret += (150.0 * __import__('math').sin(x / 12.0 * _PI) + 300.0 * __import__('math').sin(x / 30.0 * _PI)) * 2.0 / 3.0
-            return ret
-        if _out_of_china(lon, lat):
-            return lon, lat
-        import math
-        dlat = _transform_lat(lon - 105.0, lat - 35.0)
-        dlng = _transform_lng(lon - 105.0, lat - 35.0)
-        radlat = lat / 180.0 * _PI
-        magic = math.sin(radlat)
-        magic = 1 - _EE * magic * magic
-        sqrtmagic = math.sqrt(magic)
-        dlat = (dlat * 180.0) / ((_A * (1 - _EE)) / (magic * sqrtmagic) * _PI)
-        dlng = (dlng * 180.0) / (_A / sqrtmagic * math.cos(radlat) * _PI)
-        return lon + dlng, lat + dlat
-
-    profile_map = {
-        "driving":  "driving",
-        "walking":  "walking",
-        "cycling":  "cycling",
-        "transit":  "driving",
+    起终点支持 "lat,lon" 坐标对或地址文本。地址会先通过 maps_geo 解析为坐标。
+    """
+    profile_to_tool = {
+        "driving":  "maps_direction_driving",
+        "walking":  "maps_direction_walking",
+        "cycling":  "maps_direction_bicycling",
+        "transit":  "maps_direction_transit_integrated",
     }
-    prof = profile_map.get(profile, "driving")
-    url = f"{OSRM_URL}/{prof}/{start_lon},{start_lat};{end_lon},{end_lat}"
-    params = {
-        "overview":  "simplified",
-        "steps":     "true",
-        "language":  "zh",
-        "annotations": "false",
-    }
+    tool_name = profile_to_tool.get((profile or "driving").strip().lower(), "maps_direction_driving")
+
+    async def _resolve_location(loc: str) -> str | None:
+        """把 "lat,lon" 或地址文本解析为 amap 期望的 "lng,lat" 字符串。"""
+        loc = (loc or "").strip()
+        if not loc:
+            return None
+        m = re.match(r'^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$', loc)
+        if m:
+            lat, lon = float(m.group(1)), float(m.group(2))
+            return f"{lon},{lat}"
+        coords = await _geocode_coords(loc)
+        if coords is None:
+            return None
+        lat, lon, _ = coords
+        return f"{lon},{lat}"
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params,
-                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    return json.dumps({"status": "error",
-                                       "message": f"路线规划失败：HTTP {resp.status}"})
-                data = await resp.json()
+        origin, destination = await asyncio.gather(
+            _resolve_location(start),
+            _resolve_location(end),
+        )
     except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)[:100]})
+        return json.dumps(
+            {"status": "error", "message": f"解析起终点失败：{str(e)[:120]}"},
+            ensure_ascii=False,
+        )
+    if origin is None:
+        return json.dumps({"status": "error", "message": f"无法解析起点：{start}"}, ensure_ascii=False)
+    if destination is None:
+        return json.dumps({"status": "error", "message": f"无法解析终点：{end}"}, ensure_ascii=False)
 
-    if data.get("code") != "Ok" or not data.get("routes"):
-        return json.dumps({"status": "error",
-                           "message": data.get("message", "路线规划失败：无路线")})
-
-    route = data["routes"][0]
-    distance_km  = round(route["distance"] / 1000, 2)
-    duration_min = round(route["duration"] / 60,   1)
-
-    steps = []
-    for leg in route.get("legs", []):
-        for step in leg.get("steps", []):
-            maneuver = step.get("maneuver", {})
-            name     = step.get("name", "")
-            mode     = maneuver.get("type", "")
-            modifier = maneuver.get("modifier", "")
-            if mode == "depart":
-                steps.append(f"出发：{name}" if name else "出发")
-            elif mode == "arrive":
-                steps.append(f"到达终点：{name}" if name else "到达终点")
-            elif mode == "turn":
-                dir_map = {
-                    "left": "左转", "right": "右转",
-                    "slight left": "稍向左", "slight right": "稍向右",
-                    "sharp left": "急左转", "sharp right": "急右转",
-                    "straight": "直行", "uturn": "掉头",
-                }
-                direction = dir_map.get(modifier, modifier)
-                dist_m = round(step.get("distance", 0))
-                steps.append(f"{direction}进入 {name}（{dist_m}m）" if name
-                              else f"{direction}（{dist_m}m）")
-            elif name:
-                steps.append(f"沿 {name} 行驶 {round(step.get('distance', 0))}m")
-
-    center_lat = (start_lat + end_lat) / 2
-    center_lon = (start_lon + end_lon) / 2
-
-    nav_google = (f"https://www.google.com/maps/dir/?api=1&origin={start_lat},{start_lon}"
-                  f"&destination={end_lat},{end_lon}&travelmode={'driving' if prof=='driving' else 'walking'}")
-    start_lng_gcj, start_lat_gcj = _wgs84_to_gcj02(start_lon, start_lat)
-    end_lng_gcj, end_lat_gcj = _wgs84_to_gcj02(end_lon, end_lat)
-    nav_gaode  = (f"https://uri.amap.com/navigation?from={start_lng_gcj},{start_lat_gcj},"
-                  f"{quote(start_name[:20])}&to={end_lng_gcj},{end_lat_gcj},{quote(end_name[:20])}"
-                  f"&mode={'car' if prof=='driving' else 'walk'}&callnative=1")
-
-    result = {
-        "status":       "success",
-        "distance_km":  distance_km,
-        "duration_min": duration_min,
-        "start_name":   start_name,
-        "end_name":     end_name,
-        "start_lat":    start_lat,
-        "start_lon":    start_lon,
-        "end_lat":      end_lat,
-        "end_lon":      end_lon,
-        "center_lat":   center_lat,
-        "center_lon":   center_lon,
-        "steps":        steps[:12],
-        "nav_links": {
-            "google": nav_google,
-            "gaode":  nav_gaode,
-        }
-    }
-    return json.dumps(result, ensure_ascii=False)
+    arguments: dict[str, Any] = {"origin": origin, "destination": destination}
+    if tool_name == "maps_direction_transit_integrated":
+        # amap 公交路径要求 city 参数；无法从坐标稳定推断时让服务端兜底。
+        arguments["city"] = "全国"
+    return await _call_amap_mcp(tool_name, arguments)
 
 
 # ---------------------------------------------------------------------------
-# 5. 两点距离
+# 4. 两点距离
 # ---------------------------------------------------------------------------
 async def execute_distance(from_lat: float, from_lon: float,
                            to_lat: float, to_lon: float) -> str:
-    R = 6371.0
-    lat1, lon1, lat2, lon2 = map(math.radians,
-                                  [from_lat, from_lon, to_lat, to_lon])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    distance_km = round(R * c, 2)
-    distance_mi = round(distance_km * 0.621371, 2)
+    """两点直线距离。委托给 amap-maps MCP 的 maps_distance 工具。
 
-    center_lat = (from_lat + to_lat) / 2
-    center_lon = (from_lon + to_lon) / 2
-
-    return json.dumps({
-        "status":      "success",
-        "distance_km": distance_km,
-        "distance_mi": distance_mi,
-        "from":        {"lat": from_lat, "lon": from_lon},
-        "to":          {"lat": to_lat,   "lon": to_lon},
-        "center_lat":  center_lat,
-        "center_lon":  center_lon,
-        "nav_links": {
-            "google": (f"https://www.google.com/maps/dir/?api=1&origin={from_lat},{from_lon}"
-                       f"&destination={to_lat},{to_lon}"),
-            "gaode":  (f"https://uri.amap.com/navigation?from={from_lon},{from_lat}"
-                       f"&to={to_lon},{to_lat}&mode=car&callnative=1"),
-        }
-    }, ensure_ascii=False)
+    amap 接受 "经度,纬度" 顺序，type=1 表示直线距离。
+    """
+    arguments = {
+        "origins": f"{from_lon},{from_lat}",
+        "destination": f"{to_lon},{to_lat}",
+        "type": "1",
+    }
+    return await _call_amap_mcp("maps_distance", arguments)
 
 
 # ---------------------------------------------------------------------------
-# 6. 地点详情
+# 5. 地点详情
 # ---------------------------------------------------------------------------
 async def execute_place_details(query: str,
                                 lat: float = None,
                                 lon: float = None) -> str:
-    # === [amap_integration patch] 高德优先 ===
-    if _amap is not None and _amap.is_enabled():
-        result = await _amap.execute_place_details_amap(query, lat=lat, lon=lon)
-        try:
-            _r = json.loads(result)
-            if _r.get("status") != "quota_exceeded":
-                return result
-        except Exception:
-            return result
-    # === [/amap_integration patch] ===
-    if lat is None or lon is None:
-        coords = await _geocode_coords(query)
-        if coords is None:
-            return json.dumps({"status": "error", "message": f"未找到地点：{query}"})
-        lat, lon, _ = coords
+    """地点详情。委托给 amap-maps MCP 的 maps_text_search 工具。
 
-    overpass_query = f"""
-[out:json][timeout:20];
-(
-  node["name"~"{query}",i](around:200,{lat},{lon});
-  way["name"~"{query}",i](around:200,{lat},{lon});
-  relation["name"~"{query}",i](around:200,{lat},{lon});
-);
-out center tags 1;
-"""
-    headers = {"User-Agent": USER_AGENT}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(OVERPASS_URL,
-                                    data={"data": overpass_query},
-                                    headers=headers,
-                                    timeout=aiohttp.ClientTimeout(total=25)) as resp:
-                if resp.status != 200:
-                    return json.dumps({"status": "error", "message": f"HTTP {resp.status}"})
-                data = await resp.json()
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)[:100]})
-
-    elements = data.get("elements", [])
-    if not elements:
-        return json.dumps({"status": "error",
-                           "message": f"未找到地点：{query}"})
-
-    elem = elements[0]
-    tags = elem.get("tags", {})
-    el_lat = elem.get("lat") or elem.get("center", {}).get("lat") or lat
-    el_lon = elem.get("lon") or elem.get("center", {}).get("lon") or lon
-    name   = tags.get("name", query)
-
-    result = {
-        "status":          "success",
-        "name":            name,
-        "lat":             el_lat,
-        "lon":             el_lon,
-        "phone":           tags.get("phone",           tags.get("contact:phone", "")),
-        "website":         tags.get("website",         tags.get("url", "")),
-        "opening_hours":   tags.get("opening_hours",   ""),
-        "cuisine":         tags.get("cuisine",         ""),
-        "wheelchair":      tags.get("wheelchair",      ""),
-        "smoking":         tags.get("smoking",         ""),
-        "internet_access": tags.get("internet_access", ""),
-        "stars":           tags.get("stars",           ""),
-        "wikidata":        tags.get("wikidata",        ""),
-        "brand":           tags.get("brand",           ""),
-        "operator":        tags.get("operator",        ""),
-        "email":           tags.get("email",           tags.get("contact:email", "")),
-        "addr_full":       ", ".join(filter(None, [
-                               tags.get("addr:country", ""),
-                               tags.get("addr:province", ""),
-                               tags.get("addr:city", ""),
-                               tags.get("addr:district", ""),
-                               tags.get("addr:street", ""),
-                               tags.get("addr:housenumber", ""),
-                           ])),
-        "description":     tags.get("description",    ""),
-        "fee":             tags.get("fee",             ""),
-        "capacity":        tags.get("capacity",        ""),
-        "nav_links": {
-            "google": f"https://maps.google.com/?q={_fmt_coord(el_lat)},{_fmt_coord(el_lon)}",
-            "gaode":  (f"https://uri.amap.com/marker?position={_fmt_coord(el_lon)},{_fmt_coord(el_lat)}"),
-            "baidu":  (f"https://api.map.baidu.com/marker?location={_fmt_coord(el_lat)},{_fmt_coord(el_lon)}&title=&content={quote(name[:40])}&output=html"),
-        }
-    }
-    return json.dumps(result, ensure_ascii=False)
-
-
-# ---------------------------------------------------------------------------
-# 7. 周边分类搜索
-# ---------------------------------------------------------------------------
-_CATEGORY_TAGS: dict[str, str] = {
-    "restaurant": '["amenity"="restaurant"]',
-    "餐厅": '["amenity"="restaurant"]',
-    "cafe": '["amenity"="cafe"]',
-    "咖啡": '["amenity"="cafe"]',
-    "咖啡店": '["amenity"="cafe"]',
-    "bar": '["amenity"="bar"]',
-    "酒吧": '["amenity"="bar"]',
-    "fast_food": '["amenity"="fast_food"]',
-    "快餐": '["amenity"="fast_food"]',
-    "pub": '["amenity"="pub"]',
-    "食堂": '["amenity"~"restaurant|cafeteria|food_court"]',
-    "hotel": '["tourism"="hotel"]',
-    "酒店": '["tourism"="hotel"]',
-    "hostel": '["tourism"="hostel"]',
-    "青旅": '["tourism"="hostel"]',
-    "motel": '["tourism"="motel"]',
-    "parking": '["amenity"="parking"]',
-    "停车场": '["amenity"="parking"]',
-    "bus_stop": '["highway"="bus_stop"]',
-    "公交站": '["highway"="bus_stop"]',
-    "subway": '["station"="subway"]',
-    "地铁": '["station"="subway"]',
-    "gas_station": '["amenity"="fuel"]',
-    "加油站": '["amenity"="fuel"]',
-    "supermarket": '["shop"="supermarket"]',
-    "超市": '["shop"="supermarket"]',
-    "mall": '["shop"="mall"]',
-    "shopping_mall": '["shop"="mall"]',
-    "商场": '["shop"="mall"]',
-    "convenience": '["shop"="convenience"]',
-    "便利店": '["shop"="convenience"]',
-    "hospital": '["amenity"="hospital"]',
-    "医院": '["amenity"="hospital"]',
-    "pharmacy": '["amenity"="pharmacy"]',
-    "药店": '["amenity"="pharmacy"]',
-    "clinic": '["amenity"="clinic"]',
-    "诊所": '["amenity"="clinic"]',
-    "school": '["amenity"="school"]',
-    "学校": '["amenity"="school"]',
-    "university": '["amenity"="university"]',
-    "大学": '["amenity"="university"]',
-    "library": '["amenity"="library"]',
-    "图书馆": '["amenity"="library"]',
-    "bank": '["amenity"="bank"]',
-    "银行": '["amenity"="bank"]',
-    "atm": '["amenity"="atm"]',
-    "cinema": '["amenity"="cinema"]',
-    "电影院": '["amenity"="cinema"]',
-    "theatre": '["amenity"="theatre"]',
-    "剧院": '["amenity"="theatre"]',
-    "nightclub": '["amenity"="nightclub"]',
-    "酒吧夜总会": '["amenity"="nightclub"]',
-    "gym": '["leisure"="fitness_centre"]',
-    "健身房": '["leisure"="fitness_centre"]',
-    "park": '["leisure"="park"]',
-    "公园": '["leisure"="park"]',
-    "museum": '["tourism"="museum"]',
-    "博物馆": '["tourism"="museum"]',
-    "tourist_attraction": '["tourism"="attraction"]',
-    "景点": '["tourism"~"attraction|viewpoint|museum|artwork"]',
-    "post_office": '["amenity"="post_office"]',
-    "邮局": '["amenity"="post_office"]',
-    "police": '["amenity"="police"]',
-    "警察局": '["amenity"="police"]',
-    "toilet": '["amenity"="toilets"]',
-    "厕所": '["amenity"="toilets"]',
-    "洗手间": '["amenity"="toilets"]',
-    "wifi": '["internet_access"="wlan"]',
-    "wifi热点": '["internet_access"="wlan"]',
-    "洗车": '["shop"="car_wash"]',
-    "car_wash": '["shop"="car_wash"]',
-    "汽车服务": '["shop"~"car|car_repair|car_parts"]',
-    "充电桩": '["amenity"="charging_station"]',
-    "charging_station": '["amenity"="charging_station"]',
-    "花店": '["shop"="florist"]',
-    "florist": '["shop"="florist"]',
-    "书店": '["shop"="books"]',
-    "bookstore": '["shop"="books"]',
-    "理发": '["shop"~"hairdresser|barber"]',
-    "理发店": '["shop"~"hairdresser|barber"]',
-    "美发": '["shop"~"hairdresser|beauty"]',
-    "nail": '["shop"="nail_salon"]',
-    "美甲": '["shop"="nail_salon"]',
-    "宠物店": '["shop"="pet"]',
-    "pet_store": '["shop"="pet"]',
-    "电器店": '["shop"~"electronics|mobile_phone|computer"]',
-    "electronics": '["shop"="electronics"]',
-    "服装店": '["shop"~"clothes|fashion"]',
-    "clothes": '["shop"="clothes"]',
-    "kindergarten": '["amenity"="kindergarten"]',
-    "幼儿园": '["amenity"="kindergarten"]',
-    "place_of_worship": '["amenity"="place_of_worship"]',
-    "教堂": '["amenity"="place_of_worship"]["religion"="christian"]',
-    "清真寺": '["amenity"="place_of_worship"]["religion"="muslim"]',
-    "寺庙": '["amenity"~"place_of_worship|monastery"]["religion"~"buddhist|taoist"]',
-    "dentist": '["amenity"="dentist"]',
-    "牙科": '["amenity"="dentist"]',
-    "veterinary": '["amenity"="veterinary"]',
-    "宠物医院": '["amenity"="veterinary"]',
-    "spa": '["leisure"~"spa|sauna"]',
-    "温泉": '["leisure"~"spa|water_park"]',
-    "swimming_pool": '["leisure"="swimming_pool"]',
-    "游泳馆": '["leisure"~"swimming_pool|sports_centre"]',
-    "stadium": '["leisure"="stadium"]',
-    "体育场": '["leisure"~"stadium|sports_centre|pitch"]',
-    "golf": '["leisure"="golf_course"]',
-    "高尔夫": '["leisure"="golf_course"]',
-    "playground": '["leisure"="playground"]',
-    "游乐场": '["leisure"~"playground|amusement_arcade"]',
-    "viewpoint": '["tourism"="viewpoint"]',
-    "观景台": '["tourism"="viewpoint"]',
-    "信息中心": '["tourism"="information"]',
-    "tourist_info": '["tourism"="information"]',
-}
-
-
-# ---------------------------------------------------------------------------
-# 8. 海拔
-# ---------------------------------------------------------------------------
-async def execute_elevation(lat: float, lon: float) -> str:
-    try:
-        import ssl
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{ELEVATION_URL}?locations={lat},{lon}",
-                timeout=aiohttp.ClientTimeout(total=10),
-                ssl=ssl_ctx,
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    results = data.get("results", [])
-                    if results:
-                        elev = results[0].get("elevation", 0)
-                        return json.dumps({
-                            "status":      "success",
-                            "elevation_m": round(elev, 1),
-                            "lat":         lat,
-                            "lon":         lon,
-                        }, ensure_ascii=False)
-    except Exception as e:
-        logger.warning(f"open-elevation 失败，尝试备用: {e}")
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://api.opentopodata.org/v1/srtm90m?locations={lat},{lon}",
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    results = data.get("results", [])
-                    if results and results[0].get("elevation") is not None:
-                        elev = results[0]["elevation"]
-                        return json.dumps({
-                            "status":      "success",
-                            "elevation_m": round(elev, 1),
-                            "lat":         lat,
-                            "lon":         lon,
-                            "source":      "opentopodata/srtm90m",
-                        }, ensure_ascii=False)
-    except Exception as e:
-        logger.warning(f"opentopodata 也失败: {e}")
-
-    return json.dumps({"status": "error", "message": "海拔数据获取失败，两个数据源均不可用"})
-
-
-# ---------------------------------------------------------------------------
-# 9. 交通态势
-# ---------------------------------------------------------------------------
-async def execute_traffic(lat: float, lon: float, radius: int = 5000) -> str:
-    if not TOMTOM_API_KEY:
-        return json.dumps({
-            "status":  "unavailable",
-            "message": "交通态势功能需要 TomTom API Key（环境变量 TOMTOM_API_KEY）。"
-                       "可在 https://developer.tomtom.com/ 免费申请。",
-        })
-
-    lat_deg = radius / 111320.0
-    lon_deg = radius / (111320.0 * math.cos(math.radians(lat)))
-    bbox = f"{lon - lon_deg:.6f},{lat - lat_deg:.6f},{lon + lon_deg:.6f},{lat + lat_deg:.6f}"
-
-    url = "https://api.tomtom.com/traffic/services/5/incidentDetails"
-    params = {
-        "key":      TOMTOM_API_KEY,
-        "bbox":     bbox,
-        "language": "zh-CN",
-        "t":        10,
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params,
-                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    return json.dumps({"status": "error",
-                                       "message": f"TomTom HTTP {resp.status}"})
-                data = await resp.json()
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)[:100]})
-
-    incidents = data.get("incidents", [])
-    if not incidents:
-        return json.dumps({
-            "status":  "success",
-            "incidents": [],
-            "message": f"周边 {radius}m 内暂无交通事件",
-        })
-
-    results = []
-    for inc in incidents[:20]:
-        props = inc.get("properties", {})
-        results.append({
-            "category":    props.get("iconCategory", "未知"),
-            "description": props.get("description", ""),
-            "severity":    props.get("magnitudeOfDelay", 0),
-            "road":        ", ".join(props.get("roadNumbers", [])),
-            "from":        props.get("from", ""),
-            "to":          props.get("to", ""),
-            "delay_sec":   props.get("delay", 0),
-        })
-
-    return json.dumps({
-        "status":    "success",
-        "incidents": results,
-        "count":     len(results),
-    }, ensure_ascii=False)
-
-
-# ---------------------------------------------------------------------------
-# 10. 等时圈
-# ---------------------------------------------------------------------------
-async def execute_isochrone(lat: float, lon: float,
-                             time: int = 10,
-                             profile: str = "driving") -> str:
-    if not ORS_API_KEY:
-        return json.dumps({
-            "status":  "unavailable",
-            "message": "等时圈功能需要 OpenRouteService API Key（环境变量 ORS_API_KEY）。"
-                       "可在 https://openrouteservice.org/ 免费申请。",
-        })
-
-    profile_map = {
-        "driving": "driving-car",
-        "walking": "foot-walking",
-        "cycling": "cycling-regular",
-    }
-    ors_profile = profile_map.get(profile, "driving-car")
-    url = f"https://api.openrouteservice.org/v2/isochrone/{ors_profile}"
-    headers = {"Authorization": ORS_API_KEY, "Content-Type": "application/json"}
-    payload = {
-        "locations":   [[lon, lat]],
-        "range":       [time * 60],
-        "range_type":  "time",
-        "attributes":  ["area", "reachfactor"],
-        "units":       "m",
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload,
-                                    timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                if resp.status != 200:
-                    err = await resp.text()
-                    return json.dumps({"status": "error",
-                                       "message": f"ORS HTTP {resp.status}: {err[:150]}"})
-                data = await resp.json()
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)[:100]})
-
-    features = data.get("features", [])
-    if not features:
-        return json.dumps({"status": "success",
-                           "message": "未能生成等时圈（时间可能太短，或位置偏远）"})
-
-    props = features[0].get("properties", {})
-    return json.dumps({
-        "status":       "success",
-        "area_sq_m":    round(props.get("area", 0), 2),
-        "reach_factor": round(props.get("reachfactor", 0), 4),
-        "center_lat":   lat,
-        "center_lon":   lon,
-        "time_minutes": time,
-        "profile":      profile,
-    }, ensure_ascii=False)
-
-
-# ---------------------------------------------------------------------------
-# 内部：执行 Overpass 查询
-# ---------------------------------------------------------------------------
-async def _run_overpass_poi(overpass_query: str,
-                             center_lat: float,
-                             center_lon: float,
-                             max_results: int = 15) -> str:
-    headers = {"User-Agent": USER_AGENT}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(OVERPASS_URL,
-                                    data={"data": overpass_query},
-                                    headers=headers,
-                                    timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                if resp.status != 200:
-                    return json.dumps({"status": "error",
-                                       "message": f"Overpass HTTP {resp.status}"})
-                data = await resp.json()
-    except asyncio.TimeoutError:
-        return json.dumps({"status": "error", "message": "Overpass 查询超时，请缩小搜索范围"})
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)[:100]})
-
-    elements = data.get("elements", [])
-    results = []
-    seen_names: set[str] = set()
-
-    for elem in elements:
-        tags = elem.get("tags", {})
-        name = tags.get("name") or tags.get("name:zh") or tags.get("brand", "")
-        if not name:
-            continue
-        if name in seen_names:
-            continue
-        seen_names.add(name)
-
-        el_lat = elem.get("lat") or elem.get("center", {}).get("lat")
-        el_lon = elem.get("lon") or elem.get("center", {}).get("lon")
-        if el_lat is None or el_lon is None:
-            continue
-
-        R = 6371000
-        dlat = math.radians(el_lat - center_lat)
-        dlon = math.radians(el_lon - center_lon)
-        a = (math.sin(dlat/2)**2
-             + math.cos(math.radians(center_lat))
-             * math.cos(math.radians(el_lat))
-             * math.sin(dlon/2)**2)
-        dist = round(2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
-
-        addr_parts = filter(None, [
-            tags.get("addr:street", ""),
-            tags.get("addr:housenumber", ""),
-        ])
-        address = " ".join(addr_parts)
-
-        results.append({
-            "name":          name,
-            "lat":           el_lat,
-            "lon":           el_lon,
-            "address":       address,
-            "phone":         tags.get("phone",         tags.get("contact:phone", "")),
-            "website":       tags.get("website",       tags.get("url", "")),
-            "opening_hours": tags.get("opening_hours", ""),
-            "cuisine":       tags.get("cuisine",       ""),
-            "distance":      dist,
-            "nav_gaode": (f"https://uri.amap.com/marker?position={_fmt_coord(el_lon)},{_fmt_coord(el_lat)}"),
-            "nav_google": f"https://maps.google.com/?q={_fmt_coord(el_lat)},{_fmt_coord(el_lon)}",
-        })
-
-        if len(results) >= max_results:
-            break
-
-    if not results:
-        return json.dumps({"status": "no_results",
-                           "message": "附近未找到符合条件的地点，尝试扩大搜索范围或更换关键词"})
-
-    results.sort(key=lambda x: x["distance"])
-    return json.dumps({"status": "success", "results": results}, ensure_ascii=False)
+    若提供 lat/lon，附加 location 参数以提升搜索精度。
+    """
+    if not query or not query.strip():
+        return json.dumps({"status": "error", "message": "地点名称为空"}, ensure_ascii=False)
+    arguments: dict[str, Any] = {"keywords": query.strip()}
+    if lat is not None and lon is not None:
+        arguments["location"] = f"{lon},{lat}"
+    return await _call_amap_mcp("maps_text_search", arguments)
 
 
 # ===================== 文件编辑器工具实现 =====================
 
-
-def _fmt_coord(value: float) -> str:
-    """Format coordinates compactly while keeping map precision adequate."""
-    return f"{value:.6f}".rstrip("0").rstrip(".")
 
 # 编辑器配置
 MAX_EDITOR_FILE_SIZE = 5 * 1024 * 1024  # 1MB

@@ -27,9 +27,22 @@ docker run --env-file .env -p 5000:5000 apitelegramchat
 apitelegramchat-mcp
 ```
 
-## Optional map integration
+## Map integration (amap-maps MCP)
 
-Set `AMAP_KEY` to enable Gaode map services. Without it, the standard geographic providers remain available.
+All geo / POI / routing / distance / IP-geolocation tools are delegated to the
+external `amap-maps` MCP server (`@amap/amap-maps` on ModelScope) over
+`streamable_http`. Configure it via:
+
+```
+GAODE_MCP_ENABLED=true
+GAODE_MCP_URL=https://mcp.api-inference.modelscope.net/<your-id>/mcp
+GAODE_MCP_TOKEN=<your-bearer-token>
+```
+
+If `GAODE_MCP_TOKEN` is unset, `mcp_client.py` skips registration and all geo
+tools return an MCP-not-configured error. There is no longer any self-hosted
+fallback (Nominatim / Overpass / OSRM / TomTom / ORS / Geoapify static maps
+were removed together with `amap_integration.py`).
 
 ## Security verification
 

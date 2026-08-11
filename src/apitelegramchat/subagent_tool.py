@@ -86,12 +86,14 @@ DEFAULT_ALLOWED_TOOLS = {
     "web_search", "fetch_url", "wikipedia", "exchange_rate",
     "book_lookup", "weather", "news", "crypto_price", "ip_geo", "qr_code",
     "geocode", "search_poi", "route", "distance",
-    "place_details", "elevation", "traffic", "isochrone",
+    "place_details",
     "bash", "file_editor", "todo",
     # upload/download 显式跨边界工具：子 agent 也允许使用
     "fetch_download", "stage_upload", "list_download", "list_upload",
     "present_files",
     # 不含 generate_image / video / subagent / memory / skill
+    # 注：elevation / traffic / isochrone 工具已随 amap_integration.py 迁移到
+    # amap-maps MCP 而移除（MCP 不提供等价能力）。
 }
 
 SUBAGENT_SYSTEM_PROMPT_TEMPLATE = """\

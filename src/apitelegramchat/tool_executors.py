@@ -58,15 +58,12 @@ from apitelegramchat.search_engine import (
     execute_done,
     execute_generate_image,
     execute_generate_video,
-    # 地图工具
+    # 地图工具（全部委托给 amap-maps MCP）
     execute_geocode,
     execute_search_poi,
     execute_route,
     execute_distance,
     execute_place_details,
-    execute_elevation,
-    execute_traffic,
-    execute_isochrone,
     execute_file_editor,
 )
 from apitelegramchat.todo_tool import (
@@ -637,35 +634,11 @@ async def _get_static_map_image(
         if R2_PUBLIC_URL:
             return f"{R2_PUBLIC_URL.rstrip('/')}/{r2_key}"
 
-    # === [amap_integration patch] 高德静态地图优先 ===
-    try:
-        from apitelegramchat import amap_integration as _amap
-        if _amap.is_enabled():
-            amap_url = _amap.static_map_url_amap(
-                lat, lon,
-                markers=[{'lat': m['lat'], 'lon': m['lon']} for m in markers] if markers else None,
-                zoom=zoom, width=width, height=height,
-            )
-            if amap_url:
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            amap_url,
-                            timeout=aiohttp.ClientTimeout(total=12)
-                        ) as resp:
-                            if resp.status == 200:
-                                img_bytes = await resp.read()
-                                if len(img_bytes) > 500 and img_bytes[:1] not in (b'{', b'['):
-                                    uploaded_url = await upload_bytes_to_r2(
-                                        img_bytes, r2_key, 'image/png'
-                                    )
-                                    return uploaded_url
-                except Exception as e:
-                    logger.warning(f'高德静态地图失败: {e}')
-    except Exception:
-        pass
-    # === [/amap_integration patch] ===
-    # 备用来源列表
+    # 静态地图来源：Geoapify（若配置 GEOAPIFY_KEY）或 OSM staticmap。
+    # 原高德静态地图分支（amap_integration.static_map_url_amap）已随
+    # amap_integration.py 一并删除——高德能力统一改由 amap-maps MCP 服务
+    # 提供，仅用于结构化数据查询（geocode/POI/route/distance/ip_geo），
+    # 静态地图预览继续走通用 Geoapify / OSM 渲染管线。
     marker_str = ""
     if markers:
         colors = ['blue', 'green', 'orange', 'purple', 'brown', 'red']
@@ -749,9 +722,6 @@ _TOOL_TIMEOUT_LABELS = {
     "route": "Route planning",
     "distance": "Distance calculation",
     "place_details": "Place details fetch",
-    "elevation": "Elevation lookup",
-    "traffic": "Traffic lookup",
-    "isochrone": "Isochrone calculation",
     "file_editor": "Editor operation",
     "bash": "Bash command",
     "present_files": "File presentation",
@@ -1010,12 +980,6 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = result_str
         return summary, details_html
 
-    elif fn_name == "ip_geo":
-        ip = fn_args.get('ip', '')
-        summary = f"🌍 IP 地理位置" + (f" {ip}" if ip else "")
-        details_html = result_str
-        return summary, details_html
-
     elif fn_name == "qr_code":
         if "✅ 二维码生成成功" in result_str:
             img_match = re.search(r'图片链接：([^\s]+)', result_str)
@@ -1115,340 +1079,41 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = escape_text(result_str)
         return summary, details_html
 
-    # ===================== 地图工具 =====================
-    elif fn_name == "geocode":
+    # ===================== 地图工具（amap-maps MCP 直通） =====================
+    # 所有地理 / 路径 / POI / 距离 / IP 工具现在都委托给 amap-maps MCP 服务，
+    # 返回内容是该 MCP 的原生输出（通常是 JSON 文本）。这里不再尝试解析特定
+    # schema（旧 amap_integration.py / Overpass / OSRM / TomTom / ORS 的字段
+    # 都已废弃），改为：
+    #   - 若解析出 JSON 且含 status=error，则显示为失败
+    #   - 否则把原始输出转义后直接展示给用户，让 LLM 在后续轮次里自由解读。
+    elif fn_name in ("geocode", "search_poi", "route", "distance",
+                     "place_details", "ip_geo"):
+        label_map = {
+            "geocode":       "📍 地理编码",
+            "search_poi":    "📍 POI 搜索",
+            "route":         "🚗 路线规划",
+            "distance":      "📏 距离",
+            "place_details": "📍 地点详情",
+            "ip_geo":        "🌍 IP 地理位置",
+        }
+        base_label = label_map.get(fn_name, fn_name)
+
+        # 尝试 JSON 解析；只用于识别明确的 error 状态。
         try:
             data = json.loads(result_str)
-            if data.get("status") == "success":
-                lat, lon = data["lat"], data["lon"]
-                name = data.get("display_name", "未知地址")
-                road = data.get("road", "")
-                city = data.get("city", "")
-                county = data.get("county", "")
-                state = data.get("state", "")
-                country = data.get("country", "")
-                postcode = data.get("postcode", "")
-                gcj_lat = data.get("gcj02_lat")
-                gcj_lon = data.get("gcj02_lon")
-                coord_system = data.get("coord_system", "WGS-84")
-                summary = f"📍 {lat:.4f}, {lon:.4f}"
-                map_img_url = await _get_static_map_image(lat, lon, zoom=15)
-                map_html = f'<img src="{map_img_url}"/>' if map_img_url else f'<tg-map lat="{lat}" long="{lon}" zoom="15"/>'
-                gcj_html = ""
-                if gcj_lat is not None and gcj_lon is not None:
-                    gcj_html = f"<b>🧭 高德坐标（GCJ-02）：</b>{gcj_lat:.6f}, {gcj_lon:.6f}<br/>"
-                details_html = f"""
-{map_html}
-<b>📍 坐标（{escape_text(coord_system)}）：</b>{lat:.6f}, {lon:.6f}<br/>
-{gcj_html}
-<b>📌 完整地址：</b>{escape_text(name)}<br/>
-<b>🏠 道路：</b>{escape_text(road) or '无'}<br/>
-<b>🏙️ 城市：</b>{escape_text(city) or '无'}<br/>
-<b>🗺️ 县/区：</b>{escape_text(county) or '无'}<br/>
-<b>🏛️ 州/省：</b>{escape_text(state) or '无'}<br/>
-<b>🌍 国家：</b>{escape_text(country) or '无'}<br/>
-<b>📮 邮编：</b>{escape_text(postcode) or '无'}<br/>
-"""
-                return summary, details_html
-            else:
-                summary = "❌ 地理编码失败"
-                details_html = escape_text(result_str)
-                return summary, details_html
-        except Exception:
-            summary = "📍 地理编码"
-            details_html = escape_text(result_str)
+        except (json.JSONDecodeError, TypeError):
+            data = None
+
+        if isinstance(data, dict) and data.get("status") == "error":
+            message = data.get("message") or result_str
+            summary = f"❌ {base_label}失败"
+            details_html = escape_text(str(message))
             return summary, details_html
 
-    elif fn_name == "search_poi":
-        try:
-            data = json.loads(result_str)
-            if data.get("status") == "success":
-                results = data.get("results", [])
-                if not results:
-                    summary = "📍 未找到结果"
-                    details_html = "附近未找到符合条件的地点。"
-                    return summary, details_html
-                summary = f"📍 找到 {len(results)} 个结果"
-                center_lat = results[0]["lat"]
-                center_lon = results[0]["lon"]
-                markers = [{"lat": r["lat"], "lon": r["lon"]} for r in results[:10]]
-                map_img_url = await _get_static_map_image(center_lat, center_lon, markers=markers, zoom=13)
-                map_html = f'<img src="{map_img_url}"/>' if map_img_url else ""
-
-                items_html = ""
-                for idx, item in enumerate(results[:10]):
-                    label = chr(65 + idx)
-                    name = escape_text(item["name"])
-                    addr = escape_text(item.get("address", ""))
-                    dist = item.get("distance", 0)
-                    lat, lon = item["lat"], item["lon"]
-                    phone = escape_text(item.get("phone", ""))
-                    website = escape_text(item.get("website", ""))
-                    opening = escape_text(item.get("opening_hours", ""))
-                    items_html += f"""
-<li>
-<b>{label}. {name}</b><br/>
-地址：{addr}（约 {dist:.0f} 米）<br/>
-"""
-                    if phone:
-                        items_html += f"📞 {phone}<br/>"
-                    if website:
-                        items_html += f"🌐 <a href=\"{website}\">{website}</a><br/>"
-                    if opening:
-                        items_html += f"🕒 {opening}<br/>"
-                    items_html += "</li>"
-                details_html = f"{map_html}<ul>{items_html}</ul>"
-                return summary, details_html
-            elif data.get("status") == "no_results":
-                summary = "📍 未找到 POI"
-                details_html = data.get("message", "附近未找到相关地点。")
-                return summary, details_html
-            else:
-                summary = "❌ POI 搜索失败"
-                details_html = escape_text(result_str)
-                return summary, details_html
-        except Exception:
-            summary = "📍 POI 结果"
-            details_html = escape_text(result_str)
-            return summary, details_html
-
-    elif fn_name == "route":
-        try:
-            data = json.loads(result_str)
-            if data.get("status") == "success":
-                summary = f"🚗 {data['distance_km']} km, {data['duration_min']} min"
-                steps_html = "".join(f"<li>{escape_text(s)}</li>" for s in data.get("steps", []))
-                start_name = escape_text(data['start_name'])
-                end_name = escape_text(data['end_name'])
-                start_lat = data.get('start_lat', 0)
-                start_lon = data.get('start_lon', 0)
-                end_lat = data.get('end_lat', 0)
-                end_lon = data.get('end_lon', 0)
-                markers = [{"lat": start_lat, "lon": start_lon}, {"lat": end_lat, "lon": end_lon}]
-                center_lat = (start_lat + end_lat) / 2
-                center_lon = (start_lon + end_lon) / 2
-                map_img_url = await _get_static_map_image(center_lat, center_lon, markers=markers, zoom=10)
-                map_html = f'<img src="{map_img_url}"/>' if map_img_url else f'<tg-map lat="{start_lat}" long="{start_lon}" zoom="12"/>'
-                details_html = f"""
-{map_html}
-<b>从</b> {start_name}<br/>
-<b>到</b> {end_name}<br/>
-📏 距离：{data['distance_km']} km<br/>
-⏱️ 时间：{data['duration_min']} 分钟<br/>
-📍 起点坐标：{start_lat:.6f}, {start_lon:.6f}<br/>
-📍 终点坐标：{end_lat:.6f}, {end_lon:.6f}<br/>
-<details><summary>详细步骤</summary><ol>{steps_html}</ol></details>
-"""
-                return summary, details_html
-            else:
-                summary = "❌ 路线规划失败"
-                details_html = escape_text(result_str)
-                return summary, details_html
-        except Exception:
-            summary = "🚗 路线"
-            details_html = escape_text(result_str)
-            return summary, details_html
-
-    elif fn_name == "distance":
-        try:
-            data = json.loads(result_str)
-            if data.get("status") == "success":
-                summary = f"📏 {data['distance_km']} km"
-                from_lat, from_lon = data['from']['lat'], data['from']['lon']
-                to_lat, to_lon = data['to']['lat'], data['to']['lon']
-                map_center_lat = (from_lat + to_lat) / 2
-                map_center_lon = (from_lon + to_lon) / 2
-                markers = [{"lat": from_lat, "lon": from_lon}, {"lat": to_lat, "lon": to_lon}]
-                map_img_url = await _get_static_map_image(map_center_lat, map_center_lon, markers=markers, zoom=10)
-                map_html = f'<img src="{map_img_url}"/>' if map_img_url else f'<tg-map lat="{map_center_lat}" long="{map_center_lon}" zoom="10"/>'
-                details_html = f"""
-{map_html}
-<b>两点直线距离</b><br/>
-距离：{data['distance_km']} km（{data['distance_mi']} mi）<br/>
-起点坐标：({from_lat:.6f}, {from_lon:.6f})<br/>
-终点坐标：({to_lat:.6f}, {to_lon:.6f})<br/>
-"""
-                return summary, details_html
-            else:
-                summary = "❌ 距离计算失败"
-                details_html = escape_text(result_str)
-                return summary, details_html
-        except Exception:
-            summary = "📏 距离"
-            details_html = escape_text(result_str)
-            return summary, details_html
-
-    elif fn_name == "place_details":
-        try:
-            data = json.loads(result_str)
-            if data.get("status") == "success":
-                name = escape_text(data.get("name", "未命名"))
-                phone = escape_text(data.get("phone", "无"))
-                website = escape_text(data.get("website", ""))
-                opening = escape_text(data.get("opening_hours", "无"))
-                cuisine = escape_text(data.get("cuisine", "无"))
-                wheelchair = escape_text(data.get("wheelchair", "无"))
-                smoking = escape_text(data.get("smoking", "无"))
-                internet = escape_text(data.get("internet_access", "无"))
-                brand = escape_text(data.get("brand", ""))
-                email = escape_text(data.get("email", ""))
-                addr_full = escape_text(data.get("addr_full", ""))
-                description = escape_text(data.get("description", ""))
-                fee = escape_text(data.get("fee", ""))
-                lat, lon = data.get("lat", 0), data.get("lon", 0)
-
-                summary = f"📍 {name}"
-                map_img_url = await _get_static_map_image(lat, lon, zoom=16)
-                map_html = (f'<img src="{html.escape(str(map_img_url), quote=True)}"/>' if map_img_url
-                            else f'<tg-map lat="{lat}" long="{lon}" zoom="16"/>')
-                if website:
-                    ws_esc = html.escape(str(website), quote=True)
-                    website_link = f'<a href="{ws_esc}">{ws_esc}</a>'
-                else:
-                    website_link = "无"
-
-                # 导航链接
-                nav = data.get("nav_links", {})
-                nav_parts = []
-                # 关键：使用 html.escape(..., quote=True) 转义 URL，防止属性注入
-                if nav.get("google"):
-                    nav_parts.append(f'<a href="{html.escape(str(nav["google"]), quote=True)}">Google Maps</a>')
-                if nav.get("gaode"):
-                    nav_parts.append(f'<a href="{html.escape(str(nav["gaode"]), quote=True)}">高德地图</a>')
-                if nav.get("baidu"):
-                    nav_parts.append(f'<a href="{html.escape(str(nav["baidu"]), quote=True)}">百度地图</a>')
-                nav_html = " · ".join(nav_parts) if nav_parts else ""
-
-                # 逐行拼接，只显示有值的字段
-                lines = [map_html, f"<b>{name}</b><br/>"]
-                if brand:
-                    lines.append(f"🏷️ 品牌：{brand}<br/>")
-                if addr_full:
-                    lines.append(f"📌 地址：{addr_full}<br/>")
-                if phone != "无" and phone:
-                    lines.append(f"📞 电话：{phone}<br/>")
-                if email:
-                    lines.append(f"📧 邮箱：{email}<br/>")
-                if website:
-                    lines.append(f"🌐 网站：{website_link}<br/>")
-                if opening != "无" and opening:
-                    lines.append(f"🕒 营业时间：{opening}<br/>")
-                if cuisine != "无" and cuisine:
-                    lines.append(f"🍽️ 菜系：{cuisine}<br/>")
-                if fee:
-                    lines.append(f"💰 收费：{fee}<br/>")
-                if wheelchair != "无" and wheelchair:
-                    lines.append(f"♿ 无障碍：{wheelchair}<br/>")
-                if smoking != "无" and smoking:
-                    lines.append(f"🚬 吸烟：{smoking}<br/>")
-                if internet != "无" and internet:
-                    lines.append(f"📶 Wi-Fi：{internet}<br/>")
-                if description:
-                    lines.append(f"📝 简介：{description}<br/>")
-                if nav_html:
-                    lines.append(f"🗺️ 导航：{nav_html}<br/>")
-
-                details_html = "\n".join(lines)
-                return summary, details_html
-            else:
-                summary = "❌ 地点详情失败"
-                details_html = escape_text(result_str)
-                return summary, details_html
-        except Exception:
-            summary = "📍 地点详情"
-            details_html = escape_text(result_str)
-            return summary, details_html
-
-    elif fn_name == "elevation":
-        try:
-            data = json.loads(result_str)
-            if data.get("status") == "success":
-                elev = data['elevation_m']
-                lat, lon = data['lat'], data['lon']
-                summary = f"⛰️ {elev:.1f} m"
-                map_img_url = await _get_static_map_image(lat, lon, zoom=14)
-                map_html = f'<img src="{map_img_url}"/>' if map_img_url else f'<tg-map lat="{lat}" long="{lon}" zoom="14"/>'
-                details_html = f"""
-{map_html}
-<b>海拔信息</b><br/>
-📍 坐标：{lat:.6f}, {lon:.6f}<br/>
-⛰️ 海拔：{elev:.1f} 米<br/>
-"""
-                return summary, details_html
-            else:
-                summary = "❌ 海拔查询失败"
-                details_html = escape_text(result_str)
-                return summary, details_html
-        except Exception:
-            summary = "⛰️ 海拔"
-            details_html = escape_text(result_str)
-            return summary, details_html
-
-    elif fn_name == "traffic":
-        try:
-            data = json.loads(result_str)
-            status = data.get("status")
-            if status == "unavailable":
-                summary = "🚦 交通（未启用）"
-                details_html = data.get("message", "需要配置 API 密钥。")
-            elif status == "success":
-                incidents = data.get("incidents", [])
-                count = data.get("count", 0)
-                summary = f"🚦 交通事件：{count} 起"
-                if incidents:
-                    rows = ""
-                    for inc in incidents[:10]:
-                        category = escape_text(inc.get("category", "未知"))
-                        desc = escape_text(inc.get("description", ""))
-                        severity = inc.get("severity", 0)
-                        road = escape_text(inc.get("road", ""))
-                        rows += f"<tr><td>{category}</td><td>{desc}</td><td>{severity}</td><td>{road}</td></tr>"
-                    details_html = f"""
-<table bordered striped>
-<tr><th>类型</th><th>描述</th><th>严重度</th><th>道路</th></tr>
-{rows}
-</table>
-"""
-                else:
-                    details_html = data.get("message", "周边无交通事件")
-            else:
-                summary = "❌ 交通查询失败"
-                details_html = escape_text(result_str)
-            return summary, details_html
-        except Exception:
-            summary = "🚦 交通"
-            details_html = escape_text(result_str)
-            return summary, details_html
-
-    elif fn_name == "isochrone":
-        try:
-            data = json.loads(result_str)
-            status = data.get("status")
-            if status == "unavailable":
-                summary = "⏱️ 等时圈（未启用）"
-                details_html = data.get("message", "需要配置 API 密钥。")
-            elif status == "success":
-                area = data.get("area_sq_m", 0)
-                reach = data.get("reach_factor", 0)
-                time_min = data.get("time_minutes", 0)
-                profile = data.get("profile", "driving")
-                summary = f"⏱️ {time_min}分钟 {profile} 可达范围"
-                details_html = f"""
-<b>等时圈结果</b><br/>
-⏱️ 时间：{time_min} 分钟<br/>
-🚗 出行方式：{profile}<br/>
-📐 面积：{area:.0f} 平方米<br/>
-📈 可达因子：{reach:.2f}<br/>
-<i>（多边形坐标已省略，仅展示概要）</i>
-"""
-            else:
-                summary = "❌ 等时圈计算失败"
-                details_html = escape_text(result_str)
-            return summary, details_html
-        except Exception:
-            summary = "⏱️ 等时圈"
-            details_html = escape_text(result_str)
-            return summary, details_html
+        ip = fn_args.get('ip') if fn_name == "ip_geo" else None
+        summary = base_label + (f" {ip}" if ip else "")
+        details_html = escape_text(result_str)
+        return summary, details_html
 
     elif fn_name == "file_editor":
         command = fn_args.get("command", "")
@@ -2002,14 +1667,6 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 arguments.get("lat"),
                 arguments.get("lon")
             )
-        elif name == "elevation":
-            return await execute_elevation(arguments.get("lat", 0), arguments.get("lon", 0))
-        elif name == "traffic":
-            return await execute_traffic(arguments.get("lat", 0), arguments.get("lon", 0),
-                                         arguments.get("radius", 5000))
-        elif name == "isochrone":
-            return await execute_isochrone(arguments.get("lat", 0), arguments.get("lon", 0), arguments.get("time", 10),
-                                           arguments.get("profile", "driving"))
         elif name == "file_editor":
             return await execute_file_editor(
                 chat_id=chat_id,

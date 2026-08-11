@@ -1964,9 +1964,6 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
         "geocode": "Geocoding address",
         "route": "Planning route",
         "distance": "Measuring distance",
-        "elevation": "Looking up elevation",
-        "isochrone": "Calculating isochrone",
-        "traffic": "Checking traffic",
         "place_details": "Fetching place details",
         "exchange_rate": "Checking exchange rates",
         "crypto_price": "Fetching crypto prices",
@@ -2013,9 +2010,6 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
         "route": "planned a route",
         "distance": "measured a distance",
         "place_details": "fetched place details",
-        "elevation": "checked elevation",
-        "traffic": "checked traffic",
-        "isochrone": "calculated an isochrone",
         "bash": "ran a command",
         "present_files": "presented files",
         "fetch_download": "fetched files from download/",
@@ -2505,13 +2499,9 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         "book_lookup": "Looked up a book",
         "ip_geo": "Looked up IP location",
         "geocode": "Geocoded an address",
-        "reverse_geocode": "Reverse-geocoded coordinates",
         "nearby_search": "Searched nearby",
         "route": "Planned a route",
         "distance": "Measured a distance",
-        "elevation": "Looked up elevation",
-        "isochrone": "Calculated an isochrone",
-        "traffic": "Checked traffic",
         "place_details": "Fetched place details",
         "exchange_rate": "Checked exchange rates",
         "crypto_price": "Fetched crypto prices",
@@ -2959,12 +2949,6 @@ class RichMessageBuilder:
             group["outer_summary"] = "Planning route"
         elif t == "distance":
             group["outer_summary"] = "Measuring distance"
-        elif t == "elevation":
-            group["outer_summary"] = "Looking up elevation"
-        elif t == "isochrone":
-            group["outer_summary"] = "Calculating isochrone"
-        elif t == "traffic":
-            group["outer_summary"] = "Checking traffic"
         elif t == "place_details":
             group["outer_summary"] = "Fetching place details"
         elif t == "exchange_rate":
@@ -3017,13 +3001,9 @@ class RichMessageBuilder:
         "book_lookup": ("Looked up a book", "Looked up {n} books"),
         "ip_geo": ("Looked up IP location", "Looked up IP location"),
         "geocode": ("Geocoded an address", "Geocoded {n} addresses"),
-        "reverse_geocode": ("Reverse-geocoded coordinates", "Reverse-geocoded coordinates"),
         "nearby_search": ("Searched nearby", "Searched nearby for {n} categories"),
         "route": ("Planned a route", "Planned {n} routes"),
         "distance": ("Measured a distance", "Measured a distance"),
-        "elevation": ("Looked up elevation", "Looked up elevation"),
-        "isochrone": ("Calculated an isochrone", "Calculated {n} isochrones"),
-        "traffic": ("Checked traffic", "Checked traffic"),
         "place_details": ("Fetched place details", "Fetched details for {n} places"),
         "exchange_rate": ("Checked exchange rates", "Checked exchange rates"),
         "crypto_price": ("Fetched crypto prices", "Fetched price for {n} coins"),

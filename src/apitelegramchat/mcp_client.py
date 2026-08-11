@@ -61,11 +61,37 @@ def _build_bing_cn_server() -> Optional[MCPServerConfig]:
     return MCPServerConfig(name="bing-cn-mcp-server", url=url, headers=headers, timeout=30.0)
 
 
+def _build_amap_maps_server() -> Optional[MCPServerConfig]:
+    """高德地图 MCP 服务（@amap/amap-maps on ModelScope）。
+
+    通过 streamable_http 调用 https://mcp.api-inference.modelscope.net/.../mcp，
+    使用 GAODE_MCP_TOKEN 作为 Bearer 鉴权。这是替代旧的
+    amap_integration.py 直接调用高德 Web 服务 API 的新实现：所有地理 /
+    路径 / POI / IP 定位 / 静态地图能力都由该 MCP 服务提供。
+
+    连接地址与 Token 完全从 config.py（即环境变量 GAODE_MCP_URL /
+    GAODE_MCP_TOKEN）读取；未配置 Token 时直接不注册该服务。
+    """
+    if not _config.GAODE_MCP_ENABLED:
+        return None
+    url = _config.GAODE_MCP_URL
+    if not url:
+        logger.warning("GAODE_MCP_URL 未配置，amap-maps MCP 服务不可用")
+        return None
+    headers: dict[str, str] = {}
+    if _config.GAODE_MCP_TOKEN:
+        headers["Authorization"] = f"Bearer {_config.GAODE_MCP_TOKEN}"
+    else:
+        logger.warning("GAODE_MCP_TOKEN 未配置，amap-maps MCP 服务不可用")
+        return None
+    return MCPServerConfig(name="amap-maps", url=url, headers=headers, timeout=30.0)
+
+
 # 已配置的外部 MCP server 注册表。新增服务时在此追加一个 _build_xxx_server()
 # 并加入下面的字典即可，其余调用方代码无需改动。
 def _load_servers() -> dict[str, MCPServerConfig]:
     servers: dict[str, MCPServerConfig] = {}
-    for cfg in (_build_bing_cn_server(),):
+    for cfg in (_build_bing_cn_server(), _build_amap_maps_server()):
         if cfg is not None:
             servers[cfg.name] = cfg
     return servers

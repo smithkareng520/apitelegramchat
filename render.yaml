@@ -59,6 +59,10 @@ services:
         sync: false
       - key: BING_CN_MCP_TOKEN
         sync: false
+      - key: GAODE_MCP_URL
+        sync: false
+      - key: GAODE_MCP_TOKEN
+        sync: false
       - key: SANDBOX_MAX_PROCS
         value: "50"
       - key: SANDBOX_MAX_CPU_SEC
