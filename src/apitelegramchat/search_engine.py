@@ -1477,11 +1477,42 @@ async def _search_via_mcp(query: str, num_results: int) -> list[dict] | None:
 
 
 def _parse_bing_mcp_result(raw_text: str, num_results: int) -> list[dict]:
-    """解析 bing-cn-mcp-server 的 bing_search 纯文本返回，提取 title/link/snippet。"""
+    """解析 bing-cn-mcp-server 的 bing_search 返回，提取 title/link/snippet。
+
+    当前服务端返回的是 JSON 字符串（见 test_mcp_bing_search.py 实测输出）：
+        {"query": "...", "results": [{"uuid","title","url","snippet","displayUrl"}, ...], "totalResults": N}
+    优先按 JSON 解析；如果服务端将来又切回旧的纯文本格式
+        [1] 标题
+            链接: https://...
+            摘要: ...
+    则回退到原来的正则解析，保证兼容两种返回。
+    """
     if not raw_text:
         return []
 
-    items: list[dict] = []
+    # ---- 优先尝试 JSON 格式 ----
+    try:
+        data = json.loads(raw_text)
+    except (json.JSONDecodeError, TypeError):
+        data = None
+
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        items: list[dict] = []
+        for r in data["results"]:
+            if not isinstance(r, dict):
+                continue
+            title = (r.get("title") or "").strip() or "无标题"
+            link = (r.get("url") or r.get("link") or "").strip()
+            snippet = (r.get("snippet") or "").strip()
+            if not link:
+                continue
+            items.append({"title": title, "link": link, "snippet": snippet})
+            if len(items) >= num_results:
+                break
+        return items
+
+    # ---- 回退：旧的纯文本格式 ----
+    items = []
     entry_re = re.compile(
         r'^\s*\[\d+\]\s*(?P<title>.+?)\s*$'
         r'(?:\n\s*链接[:：]\s*(?P<link>\S+))?'
