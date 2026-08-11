@@ -9,7 +9,7 @@ import json
 import hashlib
 import time
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root, workspace_workdir, runtime_cache_root
+from apitelegramchat.workspace_paths import workspace_root, workspace_workdir, workspace_files_root, runtime_cache_root
 import re
 import html
 import logging
@@ -115,7 +115,7 @@ def extract_domain(url: str) -> str:
 # Persistent runtime state
 # =====================================================================
 
-_RUNTIME_STATE_FILENAME = ".runtime_cache/runtime.json"
+_RUNTIME_STATE_FILENAME = "runtime.json"
 
 
 def _runtime_state_path(chat_id: int) -> Path:
@@ -198,7 +198,7 @@ class BashSession:
         # active skill 只作为上下文状态保留，不再改变 Bash 的 cwd。
         # cwd 必须由模型通过 `cd` 自己控制，这样 persistent bash 才真正保持
         # 环境变量、当前目录和 shell 状态，且不会因为 skill 匹配而把工作区
-        # 根目录意外切到 `.skills/<skill_id>`。
+        # 根目录意外切到 `../skills/<skill_id>`。
         self._active_skill_id: Optional[str] = None
 
     def set_active_skill(self, skill_id: Optional[str]) -> None:
@@ -227,13 +227,13 @@ class BashSession:
                     _prepare_runtime_once, self.chat_id, cache_root
                 )
 
-        # ★ Landlock：把文件系统访问限制在 workspace 目录内，
-        #   拒绝访问 /tmp 其他子目录（state/、r2_cache/）、/app 源码等。
+        # ★ Landlock：把文件系统访问限制在该 chat 的 workspace 层，
+        #   files/、runtime/、skills/ 都在这里；R2 同步只取 files/。
         #   通过 functools.partial 把 workspace 路径传给 preexec。
         import functools
         preexec = functools.partial(
             _preexec_sandbox,
-            str(self.workdir.absolute()),
+            str(self.workspace.absolute()),
         )
 
         logger.info(
@@ -318,7 +318,7 @@ class BashSession:
             marker = f"__END_{random.randint(100000, 999999)}__"
             cwd_marker = f"__CWD_{random.randint(100000, 999999)}__"
             # 不要在每次调用前强制 `cd`：模型可以在 persistent bash 中自行
-            # `cd .skills/<skill_id>`，后续命令会继续留在该目录。默认 shell
+            # `cd ../skills/<skill_id>`，后续命令会继续留在该目录。默认 shell
             # 启动目录仍然是 workspace 根目录。
             # ★ 关键：在 echo marker 前先输出一个换行，确保 marker 单独占一行。
             #   如果命令输出不以换行结尾（如 cat 无换行文件、printf 无 \n），
@@ -550,7 +550,7 @@ async def execute_bash(chat_id: int, command: str = "", restart: bool = False, s
     except RuntimeError as e:
         return f"Error: {e}"
     # active skill 作为上下文同步，但不改变 persistent bash 的 cwd。
-    # cwd 由模型在需要使用 skill 时自行 `cd .skills/<skill_id>` 控制。
+    # cwd 由模型在需要使用 skill 时自行 `cd ../skills/<skill_id>` 控制。
     session.set_active_skill(skill_id)
     # 执行命令，结束后由 workspace sync scheduler 合并同步到 R2。
     return await session.execute(command, progress_callback=progress_callback)
@@ -1663,8 +1663,7 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
         # 1. 首次访问时初始化一次；之后直接读取 persistent workspace。
         await _ensure_workspace_initialized(chat_id)
 
-        workspace = workspace_root(chat_id)
-        workspace_workdir(chat_id)
+        workspace = workspace_files_root(chat_id)
         sent = []
         failed = []
         # 文件大小上限：50MB，防止 OOM
@@ -1756,11 +1755,11 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             if "error" not in payload:
                 # 用规范化后的真实 skill_id（而非用户可能传入的 name 别名），
                 # 保证和 sync_skill_assets_to_workspace() 落盘的目录名、以及
-                # bash 分支读取 active_skill 后拼接的 .skills/<id>/ 完全一致。
+                # bash 分支读取 active_skill 后拼接的 ../skills/<id>/ 完全一致。
                 resolved_skill_id = str(
                     (payload.get("activated") or {}).get("skill_id") or skill_id_arg
                 )
-                # ★ 手动激活同样必须同步资源到 workspace/.skills/<id>/，
+                # ★ 手动激活同样必须同步资源到 workspace/skills/<id>/，
                 # 否则模型即使读到了 SKILL.md 正文，bash/text_editor 依然
                 # 因为 Landlock 拒绝而访问不到 scripts/、REFERENCE.md 等文件。
                 try:
@@ -1896,7 +1895,7 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
         # ========== Bash 工具分支 ==========
         elif name == "bash":
             # 读取当前 chat 的 active skill 作为模型上下文，但不替模型改变 cwd。
-            # 使用 skill 时由模型自己 `cd .skills/<id>`；persistent bash 会保留该 cwd。
+            # 使用 skill 时由模型自己 `cd ../skills/<id>`；persistent bash 会保留该 cwd。
             active_skill_id = None
             try:
                 from apitelegramchat import state as _state

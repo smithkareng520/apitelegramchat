@@ -8,14 +8,14 @@ import shutil
 from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
+
 from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
-# workspace 内用于存放已激活 skill 资源的子目录名。
-# 必须与 workspace_utils.py 中 R2 全量同步的排除规则保持一致，
-# 否则同步逻辑会把这里的文件当成"远程没有的多余文件"删掉。
-SKILL_ASSETS_DIRNAME = ".skills"
+# Skill 资源层位于 workspace/skills，与用户文件 workspace/files 完全分离。
+# R2 同步只遍历 workspace/files，因此 skill 资源天然不会被同步或删除。
+SKILL_ASSETS_DIRNAME = "skills"
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
 
@@ -446,7 +446,7 @@ def skill_assets_workspace_relpath(skill_id: str) -> str:
 def sync_skill_assets_to_workspace(skill_id: str, workspace_root: Path) -> dict[str, Any]:
     """
     把 skill 目录下除 SKILL.md 外的全部资源（scripts/、REFERENCE.md、FORMS.md 等）
-    复制到 <workspace_root>/.skills/<skill_id>/ 下。
+    复制到 <workspace_root>/skills/<skill_id>/ 下。
 
     这一步是必须的：沙箱的 Landlock 策略只放行 workspace_root 本身和只读系统目录，
     `.claude/skills/<id>/` 所在的应用源码树完全不在白名单里。SKILL.md 正文里写的
@@ -468,7 +468,10 @@ def sync_skill_assets_to_workspace(skill_id: str, workspace_root: Path) -> dict[
         result["error"] = f"Skill directory missing: {skill_dir}"
         return result
 
-    dest_root = Path(workspace_root) / SKILL_ASSETS_DIRNAME / rec.skill_id
+    # Skill 资源始终进入独立的 workspace/skills 层，不进入 workspace/files。
+    # workspace_utils 只同步 files/，因此这里无需任何黑名单/白名单。
+    workspace_path = Path(workspace_root)
+    dest_root = workspace_path / SKILL_ASSETS_DIRNAME / rec.skill_id
 
     try:
         dest_root.mkdir(parents=True, exist_ok=True)

@@ -3,7 +3,7 @@ import asyncio
 import os
 import logging
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root, workspace_workdir, workspace_namespace
+from apitelegramchat.workspace_paths import workspace_root, workspace_workdir, workspace_files_root, workspace_namespace
 
 from apitelegramchat.s3_utils import (
     upload_bytes_to_r2,
@@ -14,16 +14,7 @@ from apitelegramchat.s3_utils import (
 
 logger = logging.getLogger(__name__)
 
-# workspace 根目录下，这些顶层子目录名不参与 R2 全量同步（既不上传，也不因为
-# 远程没有就被删除）。.skills/ 是本地 skill 资源；.runtime_cache/ 是沙箱运行时
-# 缓存（pip/ccache/tmp/pycache 等），不属于用户文件，也不应该进入 R2。
-_LOCAL_ONLY_TOPLEVEL_DIRS = {".skills", ".runtime_cache"}
-
-
-def _is_local_only_rel(rel: str) -> bool:
-    """判断相对路径的顶层目录是否属于本地专用（跳过 R2 同步）的目录。"""
-    top = rel.split(os.sep, 1)[0]
-    return top in _LOCAL_ONLY_TOPLEVEL_DIRS
+# R2 只同步 workspace/files；运行时、skill 和其他内部目录天然不会进入同步。
 
 # workspace 访问锁：保护同一聊天的本地文件操作，避免并发修改。
 _workspace_locks = {}
@@ -86,7 +77,7 @@ async def _sync_workspace_from_r2(chat_id: int):
     """
     workspace = workspace_root(chat_id)
     workspace.mkdir(parents=True, exist_ok=True)
-    workdir = workspace_workdir(chat_id)
+    files_root = workspace_files_root(chat_id)
     prefix = f"editor/{workspace_namespace(chat_id)}/"
     keys = await list_r2_objects(prefix)
     remote_rels = set()
@@ -95,10 +86,7 @@ async def _sync_workspace_from_r2(chat_id: int):
         rel = key[len(prefix):]
         if not rel:
             continue
-        # .runtime_cache 永远是本地运行时缓存，不允许从 R2 下载。
-        # 这里必须在 resolve/symlink 检查之前过滤，避免历史缓存对象污染同步。
-        if _is_local_only_rel(rel):
-            continue
+        # resolve() 解析符号链接后再校验仍在 files 层之下
         # 拒绝包含 .. 或绝对路径的 rel，防止通过 R2 key 注入路径遍历
         if "\x00" in rel:
             logger.warning(f"拒绝含 null 字节的 R2 key: {key!r}")
@@ -107,14 +95,14 @@ async def _sync_workspace_from_r2(chat_id: int):
         if norm_rel == "." or norm_rel.startswith("..") or os.path.isabs(norm_rel):
             logger.warning(f"拒绝路径遍历的 R2 key: {key!r} -> rel={rel!r}")
             continue
-        local_path = workspace / norm_rel
-        # resolve() 解析符号链接后再校验仍在 workspace 之下
+        local_path = files_root / norm_rel
+        # resolve() 解析符号链接后再校验仍在 files 层之下
         try:
             resolved = local_path.resolve()
         except Exception:
             logger.warning(f"resolve 失败: {local_path}")
             continue
-        if resolved != workspace and workspace not in resolved.parents:
+        if resolved != files_root and files_root not in resolved.parents:
             logger.warning(f"拒绝越界路径: {key!r} -> {resolved}")
             continue
         remote_rels.add(norm_rel)
@@ -123,26 +111,17 @@ async def _sync_workspace_from_r2(chat_id: int):
         if data is not None:
             with open(local_path, "wb") as f:
                 f.write(data)
-    # 删除本地多余文件（远程没有的）—— 跳过本地专用目录（如 .skills/）
-    for root, dirs, files in os.walk(workspace):
-        # 就地过滤 dirs，防止 os.walk 继续深入本地专用目录
-        dirs[:] = [
-            d for d in dirs
-            if not _is_local_only_rel(os.path.relpath(os.path.join(root, d), workspace))
-        ]
-        for file in files:
-            rel = os.path.relpath(os.path.join(root, file), workspace)
-            if _is_local_only_rel(rel):
-                continue
-            if rel not in remote_rels:
-                os.remove(os.path.join(root, file))
-        # 删除空目录（可选）
-        for dir_name in dirs:
-            dir_path = os.path.join(root, dir_name)
-            if os.path.abspath(dir_path) == os.path.abspath(workdir):
-                continue
-            if not os.listdir(dir_path):
-                os.rmdir(dir_path)
+    # 远程没有的用户文件从 files 层删除；其他 workspace 层不受影响。
+    if files_root.exists():
+        for root, dirs, files in os.walk(files_root):
+            for file in files:
+                rel = os.path.relpath(os.path.join(root, file), files_root)
+                if rel not in remote_rels:
+                    os.remove(os.path.join(root, file))
+            for dir_name in list(dirs):
+                dir_path = os.path.join(root, dir_name)
+                if not os.listdir(dir_path):
+                    os.rmdir(dir_path)
 
 
 async def _sync_workspace_to_r2(chat_id: int):
@@ -150,29 +129,21 @@ async def _sync_workspace_to_r2(chat_id: int):
     将本地 workspace 所有文件上传到 R2 的 editor/{ns}/ prefix，并删除远程多余文件。
     全量同步，用于 bash 工具执行后。
     """
-    workspace = workspace_root(chat_id)
-    if not workspace.exists():
+    files_root = workspace_files_root(chat_id)
+    if not files_root.exists():
         return
-    workdir = workspace_workdir(chat_id)
     prefix = f"editor/{workspace_namespace(chat_id)}/"
     local_rels = set()
-    for root, dirs, files in os.walk(workspace):
-        # 就地过滤 dirs，本地专用目录（如 .skills/）不参与遍历，不上传
-        dirs[:] = [
-            d for d in dirs
-            if not _is_local_only_rel(os.path.relpath(os.path.join(root, d), workspace))
-        ]
+    for root, _dirs, files in os.walk(files_root):
         for file in files:
             abs_path = os.path.join(root, file)
-            rel = os.path.relpath(abs_path, workspace)
-            if _is_local_only_rel(rel):
-                continue
+            rel = os.path.relpath(abs_path, files_root)
             local_rels.add(rel)
             key = prefix + rel
             with open(abs_path, "rb") as f:
                 data = f.read()
             await upload_bytes_to_r2(data, key, "application/octet-stream")
-    # 删除远程多余文件（本地专用目录从不产生远程 key，天然不受影响）
+    # 删除远程多余文件；R2 只代表 files 层。
     remote_keys = await list_r2_objects(prefix)
     remote_rels = {key[len(prefix):] for key in remote_keys if key.startswith(prefix)}
     to_delete = remote_rels - local_rels

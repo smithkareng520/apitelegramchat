@@ -9,6 +9,9 @@ from pathlib import Path
 _NAMESPACE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _WORKDIR_NAME = os.getenv("APITELEGRAMCHAT_WORKDIR_NAME", "workspace").strip() or "workspace"
 _STATE_DIR_NAME = os.getenv("APITELEGRAMCHAT_STATE_DIR_NAME", "state").strip() or "state"
+_FILES_DIR_NAME = os.getenv("APITELEGRAMCHAT_FILES_DIR_NAME", "files").strip() or "files"
+_RUNTIME_DIR_NAME = os.getenv("APITELEGRAMCHAT_RUNTIME_DIR_NAME", "runtime").strip() or "runtime"
+_SKILLS_DIR_NAME = os.getenv("APITELEGRAMCHAT_SKILLS_DIR_NAME", "skills").strip() or "skills"
 
 
 def _resolved_namespace(chat_id: object, namespace: object | None = None) -> str:
@@ -54,15 +57,20 @@ def workspace_root(chat_id: object, namespace: object | None = None) -> Path:
     return root.resolve()
 
 
-def workspace_workdir(chat_id: object, namespace: object | None = None) -> Path:
-    # Keep the shell workdir at the chat root so the workspace tree stays flat.
-    root = workspace_root(chat_id, namespace)
+def workspace_files_root(chat_id: object, namespace: object | None = None) -> Path:
+    """User-owned files only. This is the sole directory mirrored to R2."""
+    root = workspace_root(chat_id, namespace) / _FILES_DIR_NAME
     root.mkdir(parents=True, exist_ok=True)
     return root.resolve()
 
 
+def workspace_workdir(chat_id: object, namespace: object | None = None) -> Path:
+    # Bash/editor cwd is the isolated user-files layer, never the runtime root.
+    return workspace_files_root(chat_id, namespace)
+
+
 def workspace_file(chat_id: object, filename: str, namespace: object | None = None) -> Path:
-    return workspace_root(chat_id, namespace) / filename
+    return workspace_files_root(chat_id, namespace) / filename
 
 
 def state_root() -> Path:
@@ -95,7 +103,13 @@ def workspace_namespace(chat_id: object, namespace: object | None = None) -> str
 
 
 def runtime_cache_root(chat_id: object, namespace: object | None = None) -> Path:
-    """持久化运行时缓存（python/pip/编译缓存），避免每次 bash 重建。"""
-    root = workspace_root(chat_id, namespace) / ".runtime_cache"
+    """持久化运行时目录，完全独立于用户文件同步层。"""
+    root = workspace_root(chat_id, namespace) / _RUNTIME_DIR_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
+
+def workspace_skills_root(chat_id: object, namespace: object | None = None) -> Path:
+    """本地 skill 资源层，不参与用户文件同步。"""
+    root = workspace_root(chat_id, namespace) / _SKILLS_DIR_NAME
     root.mkdir(parents=True, exist_ok=True)
     return root.resolve()

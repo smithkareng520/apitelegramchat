@@ -6,7 +6,7 @@ from typing import Any
 
 from apitelegramchat.skills import discover_skill_roots, get_skill_catalog, load_skill_records, read_skill_text
 from .registry import _chat_id
-from apitelegramchat.workspace_paths import workspace_root, memory_state_file, todo_state_file
+from apitelegramchat.workspace_paths import workspace_root, workspace_files_root, memory_state_file, todo_state_file
 
 
 def _resource_paths(root: Path) -> list[tuple[str, str]]:
@@ -29,7 +29,7 @@ def _resource_paths(root: Path) -> list[tuple[str, str]]:
 
 
 async def list_resources() -> list[dict[str, Any]]:
-    root = workspace_root(_chat_id())
+    root = workspace_files_root(_chat_id())
     items = []
     for uri, rel in _resource_paths(root):
         mime = "application/json" if rel in {"files", "manifest.json", "skills.json"} or rel.endswith(".json") else "text/plain"
@@ -38,7 +38,7 @@ async def list_resources() -> list[dict[str, Any]]:
 
 
 async def read_resource(uri: str) -> dict[str, Any]:
-    root = workspace_root(_chat_id())
+    root = workspace_files_root(_chat_id())
     if uri == "workspace://current/files":
         payload = []
         for path in sorted(root.rglob("*")):

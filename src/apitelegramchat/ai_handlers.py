@@ -4837,8 +4837,8 @@ async def get_ai_response(
 
         if skill_to_use:
             # ★ 关键：把 skill 目录下除 SKILL.md 外的资源（scripts/、REFERENCE.md 等）
-            # 同步复制到该 chat 的 workspace/.skills/<skill_id>/ 下。Landlock 沙箱只放行
-            # workspace_root(chat_id) 本身，模型的 bash / text_editor 工具永远无法触达
+            # 同步复制到该 chat 的 workspace/skills/<skill_id>/ 下。Landlock 沙箱只放行
+            # workspace_root(chat_id) 之外的应用源码树，模型的 bash / text_editor 工具永远无法触达
             # .claude/skills/<id>/ 这个应用源码路径；不做这一步，SKILL.md 里写的
             # `scripts/xxx.py`、`REFERENCE.md` 等相对路径在沙箱里全部是"文件不存在"。
             try:

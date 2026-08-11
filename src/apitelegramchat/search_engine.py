@@ -36,7 +36,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
             return {"entries": []}
     feedparser = _FeedParserStub()  # type: ignore
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root, workspace_namespace
+from apitelegramchat.workspace_paths import workspace_root, workspace_files_root, workspace_namespace
 
 # === [amap_integration patch] 高德地图数据源 ===
 try:
@@ -253,7 +253,7 @@ async def execute_text_editor(
         # 使用本地持久 workspace，避免连续 text_editor 调用被 R2 网络 I/O 拖到超时。
         await _ensure_workspace_initialized(chat_id)
 
-        workspace = workspace_root(chat_id)
+        workspace = workspace_files_root(chat_id)
         local_path = workspace if allow_root_path else (workspace / safe_path)
 
         # ----- view (增强：支持搜索关键词) -----
@@ -1159,7 +1159,7 @@ SEARCH_TOOLS = [
             "description": (
                 "Execute shell commands in a persistent bash session (env vars, cwd, and shell state persist across calls). "
                 "Use for system operations, running scripts, file manipulation. Avoid interactive commands (vim, top) and long-running processes. Set 'restart'=true to reset the session. "
-                "Bash starts in the workspace root. When a skill is active, the model should explicitly `cd .skills/<skill_id>` when the skill instructions require it; the server does not force a cwd change on every call. "
+                "Bash starts in the user files layer. When a skill is active, the model should explicitly `cd ../skills/<skill_id>` when the skill instructions require it; the server does not force a cwd change on every call. "
                 "To list files in the workspace without bash (e.g. when sandbox is unavailable), use text_editor command='list'."
             ),
             "parameters": {

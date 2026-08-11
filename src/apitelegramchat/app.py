@@ -10,7 +10,7 @@ import re
 import os
 import mimetypes
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root
+from apitelegramchat.workspace_paths import workspace_root, workspace_files_root
 
 from apitelegramchat.utils import (
     send_message,
@@ -732,7 +732,7 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
             ],
         }
     else:
-        workspace = workspace_root(chat_id)
+        workspace = workspace_files_root(chat_id)
         workspace.mkdir(parents=True, exist_ok=True)
         downloaded = []
         failed = []
@@ -1258,7 +1258,7 @@ async def webhook() -> tuple:
                         ],
                     }
                 else:
-                    workspace = workspace_root(chat_id)
+                    workspace = workspace_files_root(chat_id)
                     workspace.mkdir(parents=True, exist_ok=True)
                     safe_fname = os.path.basename(fname)
                     target_path = workspace / safe_fname
@@ -1513,7 +1513,7 @@ async def webhook() -> tuple:
                                 "type": "document",
                             }
                         else:
-                            workspace = workspace_root(chat_id)
+                            workspace = workspace_files_root(chat_id)
                             workspace.mkdir(parents=True, exist_ok=True)
                             target_path = workspace / safe_fname
                             lock = await _get_workspace_lock(chat_id)

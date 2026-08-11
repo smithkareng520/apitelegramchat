@@ -190,7 +190,9 @@ def _handled_access_mask(abi: int) -> int:
 def _apply_landlock(workspace_path: str) -> bool:
     """Install a deny-by-default Landlock filesystem policy for the child.
 
-    The workspace is the only writable tree. System trees needed to execute
+    The workspace tree is the writable application sandbox. R2 persistence is
+    deliberately handled by workspace_utils and only mirrors its files/ layer.
+    System trees needed to execute
     bash are explicitly read/execute-only. Every syscall and every rule-add
     operation is checked; a partial policy is never accepted.
     """
@@ -326,8 +328,8 @@ def build_sandbox_env(workspace: Path, chat_id: int) -> dict:
     # Keep runtime_bin first only for local wrappers. The actual compiler remains the
     # system toolchain baked into the image; no apt/pip install happens per Bash run.
     return {
-        "PATH": f"{runtime_bin}:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
-        "HOME": workdir_abs,
+        "PATH": f"{runtime_bin}:{cache_root / 'python_user' / 'bin'}:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
+        "HOME": str(cache_root),
         "USER": f"chat{chat_id}",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
@@ -341,8 +343,13 @@ def build_sandbox_env(workspace: Path, chat_id: int) -> dict:
         "TEMP": str(tmp_dir),
         "TMP": str(tmp_dir),
         "PYTHONUNBUFFERED": "1",
-        # Python bytecode 不是用户文件；禁止写入 .runtime_cache，避免 workspace\n        # 持久化/同步时产生大量无意义的 .pyc。\n        "PYTHONDONTWRITEBYTECODE": "1",
+        # Python bytecode 不是用户文件；禁止写入用户 files 层，避免进入 R2 同步。
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PIP_CACHE_DIR": str(pip_cache),
+        "PYTHONUSERBASE": str(cache_root / "python_user"),
+        "npm_config_cache": str(cache_root / "npm"),
+        "CARGO_HOME": str(cache_root / "cargo"),
+        "RUSTUP_HOME": str(cache_root / "rustup"),
         "CCACHE_DIR": str(ccache_dir),
         "PYTHONPYCACHEPREFIX": str(cache_root / "pycache"),
     }
