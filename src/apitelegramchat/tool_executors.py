@@ -19,7 +19,7 @@ from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
     _ensure_workspace_initialized,
     _sync_workspace_to_r2,
-    _async_sync_workspace_to_r2,  # 新增导入
+    schedule_workspace_sync,
 )
 
 from apitelegramchat.sandbox import (
@@ -412,14 +412,29 @@ class BashSession:
                     actual_cwd = cwd_match.group(1).strip()
                     output = re.sub(rf'(?m)^' + re.escape(cwd_marker) + r' .*$\n?', '', output)
 
-                # 同步回 R2（异步，不阻塞返回）
-                asyncio.create_task(_async_sync_workspace_to_r2(self.chat_id))
+                # 合并后台同步；不会为每次 Bash 创建一个新的全量上传任务。
+                schedule_workspace_sync(self.chat_id)
 
                 return (f"Command: {command}\n"
                         f"Cwd: {actual_cwd}\n"
                         f"Exit code: {exit_code}\n"
                         f"Sandbox: landlock\n"
                         f"Output:\n{output}")
+
+            except asyncio.CancelledError:
+                # 外层 asyncio.wait_for 超时、请求取消或应用关闭时，必须同步清理
+                # 当前 bash 进程；否则“工具已超时”但实际命令仍在后台继续执行，
+                # 下一次 Bash 还可能复用同一个脏 session。
+                logger.warning(
+                    "Bash execution cancelled; killing session chat_id=%s cmd=%s",
+                    self.chat_id,
+                    command[:100],
+                )
+                try:
+                    await asyncio.shield(self.close())
+                except Exception:
+                    logger.exception("Failed to clean up cancelled bash session chat_id=%s", self.chat_id)
+                raise
 
             except asyncio.TimeoutError:
                 logger.warning(f"Bash timeout chat_id={self.chat_id} cmd={command[:100]}")
@@ -525,8 +540,8 @@ _bash_manager = BashSessionManager()
 async def execute_bash(chat_id: int, command: str = "", restart: bool = False, skill_id: Optional[str] = None, progress_callback=None) -> str:
     if restart:
         result = await _bash_manager.restart_session(chat_id)
-        # 重启后也异步同步一次
-        asyncio.create_task(_async_sync_workspace_to_r2(chat_id))
+        # 重启后调度一次合并后的 workspace 同步。
+        schedule_workspace_sync(chat_id)
         return result
     if not command:
         return "Error: command is required (or set restart=true)"
@@ -537,7 +552,7 @@ async def execute_bash(chat_id: int, command: str = "", restart: bool = False, s
     # active skill 作为上下文同步，但不改变 persistent bash 的 cwd。
     # cwd 由模型在需要使用 skill 时自行 `cd .skills/<skill_id>` 控制。
     session.set_active_skill(skill_id)
-    # 执行命令，内部已包含异步同步
+    # 执行命令，结束后由 workspace sync scheduler 合并同步到 R2。
     return await session.execute(command, progress_callback=progress_callback)
 
 # ---------- 静态地图生成 ----------

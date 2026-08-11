@@ -341,6 +341,7 @@ def build_sandbox_env(workspace: Path, chat_id: int) -> dict:
         "TEMP": str(tmp_dir),
         "TMP": str(tmp_dir),
         "PYTHONUNBUFFERED": "1",
+        # Python bytecode 不是用户文件；禁止写入 .runtime_cache，避免 workspace\n        # 持久化/同步时产生大量无意义的 .pyc。\n        "PYTHONDONTWRITEBYTECODE": "1",
         "PIP_CACHE_DIR": str(pip_cache),
         "CCACHE_DIR": str(ccache_dir),
         "PYTHONPYCACHEPREFIX": str(cache_root / "pycache"),

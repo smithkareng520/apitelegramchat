@@ -15,11 +15,9 @@ from apitelegramchat.s3_utils import (
 logger = logging.getLogger(__name__)
 
 # workspace 根目录下，这些顶层子目录名不参与 R2 全量同步（既不上传，也不因为
-# 远程没有就被删除）。目前只有 .skills/ —— 它是本地从 .claude/skills/<id>/
-# 复制过来的 skill 资源（scripts/、REFERENCE.md 等），由 skills.py 的
-# sync_skill_assets_to_workspace() 独立管理生命周期，不属于用户持久化数据，
-# 不应该被同步到 R2，也不该被"远程没有→本地删除"的清理逻辑误删。
-_LOCAL_ONLY_TOPLEVEL_DIRS = {".skills"}
+# 远程没有就被删除）。.skills/ 是本地 skill 资源；.runtime_cache/ 是沙箱运行时
+# 缓存（pip/ccache/tmp/pycache 等），不属于用户文件，也不应该进入 R2。
+_LOCAL_ONLY_TOPLEVEL_DIRS = {".skills", ".runtime_cache"}
 
 
 def _is_local_only_rel(rel: str) -> bool:
@@ -179,13 +177,44 @@ async def _sync_workspace_to_r2(chat_id: int):
         await delete_r2_object(key)
 
 
+# Bash 可能连续修改 workspace；只允许每个 workspace 同时存在一个后台同步任务，
+# 并用短 debounce 合并连续修改，避免每个 Bash 都启动一次并发的全量 R2 上传。
+_workspace_sync_tasks: dict[str, asyncio.Task] = {}
+_workspace_sync_tasks_lock = asyncio.Lock()
+
+
 async def _async_sync_workspace_to_r2(chat_id: int):
-    """异步全量同步（用于 bash 后），不阻塞主流程。"""
+    """后台同步 workspace；同步本身不属于工具调用的响应路径。"""
     try:
-        await _sync_workspace_to_r2(chat_id)
-        logger.debug(f"异步全量同步完成: chat_id={chat_id}")
+        # 给连续 Bash 一个很短的合并窗口；期间的修改由最后一次快照统一上传。
+        await asyncio.sleep(0.75)
+        lock = await _get_workspace_lock(chat_id)
+        async with lock:
+            await _sync_workspace_to_r2(chat_id)
+        logger.debug("异步 workspace 同步完成: chat_id=%s", chat_id)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        logger.error(f"异步全量同步失败: {e}")
+        logger.error("异步 workspace 同步失败: %s", e)
+    finally:
+        key = workspace_namespace(chat_id)
+        async with _workspace_sync_tasks_lock:
+            task = _workspace_sync_tasks.get(key)
+            if task is asyncio.current_task():
+                _workspace_sync_tasks.pop(key, None)
+
+
+def schedule_workspace_sync(chat_id: int) -> None:
+    """调度/合并 workspace R2 同步；不会为每个 Bash 创建并发上传任务。"""
+    key = workspace_namespace(chat_id)
+    task = _workspace_sync_tasks.get(key)
+    if task is not None and not task.done():
+        return
+    task = asyncio.create_task(
+        _async_sync_workspace_to_r2(chat_id),
+        name=f"workspace-sync-{key}",
+    )
+    _workspace_sync_tasks[key] = task
 
 
 # ========== 单文件定向同步（state/ 域） ==========
