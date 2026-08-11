@@ -10,11 +10,3 @@ qrcode==7.4.2
 cachetools==5.5.0
 aioboto3==12.4.0
 numpy<2.0.0
-# ---- skill dependencies (pre-installed so the model doesn't have to pip install at runtime) ----
-# pdf skill: pypdf for read/merge/split, pdfplumber for text+table extraction,
-# reportlab for creating PDFs, pytesseract+pdf2image for OCR.
-pypdf>=4.0.0
-pdfplumber>=0.11.0
-reportlab>=4.0.0
-pytesseract>=0.3.10
-pdf2image>=1.17.0

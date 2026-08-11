@@ -64,7 +64,9 @@ from apitelegramchat.skills import (
     build_skill_system_message,
     match_skill_for_text,
     skill_catalog_brief,
+    sync_skill_assets_to_workspace,
 )
+from apitelegramchat.workspace_paths import workspace_root as _skill_workspace_root
 from apitelegramchat.tool_executors import (
     dispatch_tool_call,
     format_tool_result,
@@ -88,11 +90,6 @@ OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 # 但外层 12s 会过早杀掉它们，给一个更宽松的 45s 上限兜底。
 LONG_RUNNING_TOOLS = {"web_search", "fetch_url"}
 LONG_TOOL_CALL_TIMEOUT = 45
-# bash 工具：模型会用它跑 skill 脚本（docx-js / reportlab / pdfplumber 等），
-# 12s 太短——node 启动 + require('docx') 就要 3-5s，npm install 更是 30s+。
-# 给 90s 上限，仍小于沙箱内部的 SANDBOX_TIMEOUT_SEC=120s，让沙箱先兜底。
-BASH_TOOLS = {"bash"}
-BASH_TOOL_TIMEOUT = 90
 # 子 agent 工具：内部跑自己的多轮 agentic loop（每轮一次 LLM 调用 + 可能的工具调用），
 # 默认 90s，用户可配到 300s。外层必须给足够长的超时，否则 12s 一定会杀掉它。
 SUBAGENT_TOOLS = {"subagent"}
@@ -1391,24 +1388,22 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 <tool_usage_guide>
 - todo：用户说"记一下""提醒我"时优先用。写操作（add/done/undone/delete/edit/clear）后紧跟一次 list，让用户看到最新状态。
 - memory：用户说"记住…"或提到长期偏好/过敏/重要他人/截止日期时写入；回答涉及偏好的问题前先 search。
-- skills：运行时自动管理 .claude/skills/*/SKILL.md。匹配上的技能会被 agent runtime 自动加载，并作为 <active_skill_context> 注入系统提示。技能不是聊天工具或函数；不要尝试"激活"技能——直接按 <active_skill_context> 里的步骤执行。当 <active_skill_context> 出现时，里面的"Skill package root"是技能包在磁盘上的绝对路径；技能包内的脚本在 bash 沙箱中以只读+可执行方式挂载，用 `cd "$SKILL_DIR_<ID>" && python scripts/foo.py` 即可调用；写文件要写到当前 workspace，不要写进技能包。skill_catalog / skill_read 仅供跨技能查阅（例如一个技能的正文引用了另一个技能），不要拿它们当"激活"用。
+- skills：运行时自动管理 .claude/skills/*/SKILL.md。不要把 skill 当作聊天工具或函数；技能由 agent runtime 自动发现、加载并注入上下文。
 - subagent：彼此独立的子任务请在同一轮里一次性并发派多个 subagent 工具调用，不要一个做完再发下一个；简单问题自己答，不要滥用。子 agent 不继承主对话历史，只看到 task + context。
 </tool_usage_guide>
 """
         base_prompt += f"""
 
 <skill_directory>
-Claude-style skills are available in this workspace. The runtime auto-activates the best-matching skill and injects it as <active_skill_context> in the system prompt — you do not need to call any tool to "turn on" a skill.
+Claude-style skills are available in this workspace. Use the catalog below to infer when a request should activate a skill automatically.
 Available skills:
 {catalog_text}
 
 Skill policy:
-- The runtime, not the model, decides which skill to load. Treat the loaded <active_skill_context> as authoritative workflow instructions and follow its steps exactly.
-- The <active_skill_context> block tells you the skill package's absolute root path ("Skill package root: ..."), the package's file manifest, and the env var that expands to it ($SKILL_DIR_<ID>). Use these paths to invoke skill-provided scripts.
-- The bash sandbox grants READ-ONLY + EXECUTE access to skill package roots. You can `cd` into a skill package and run its scripts (e.g. `python scripts/office/soffice.py`). You CANNOT write into the skill package — write all output files into the workspace (the shell's current working directory).
-- All skill dependencies are PRE-INSTALLED in the image: node + docx (global npm), pandoc, python pypdf/pdfplumber/reportlab/pytesseract/pdf2image, tesseract-ocr, poppler-utils. Do NOT run `npm install`, `pip install`, or `apt-get install` — they will waste the 90s bash timeout and fail. If a skill script says "Install: ...", assume it is already installed and skip that step.
+- The runtime, not the user-facing model, loads matching skill instructions.
+- Treat loaded <active_skill_context> as authoritative workflow instructions.
 - Never claim that skills are unavailable if a skill catalog or active skill context is present.
-- skill_catalog and skill_read are info-only tools for inspecting skills that were NOT auto-activated (e.g. cross-skill reference). Do not call them to "enable" a skill — the runtime handles activation.
+- Never ask for a skill tool or function; skills are not tools.
 </skill_directory>
 """
     else:
@@ -2171,14 +2166,11 @@ async def _run_tool_calls_and_append(
             # 图像 / 视频工具不设超时（内部已有轮询超时控制）
             # 子 agent 走 310s 超时（内部默认 90s，用户可配到 300s）
             # 网络类工具（web_search / fetch_url）走 45s 宽松超时，避免外层 12s 误杀
-            # bash 工具走 90s 超时（skill 脚本 / npm / reportlab 都需要时间）
             # 其他工具保持 12 秒
             if fn_name in MEDIA_GEN_TOOLS:
                 timeout = None
             elif fn_name in SUBAGENT_TOOLS:
                 timeout = SUBAGENT_TOOL_TIMEOUT
-            elif fn_name in BASH_TOOLS:
-                timeout = BASH_TOOL_TIMEOUT
             elif fn_name in LONG_RUNNING_TOOLS:
                 timeout = LONG_TOOL_CALL_TIMEOUT
             else:
@@ -4790,6 +4782,25 @@ async def get_ai_response(
         elif active_skill_id:
             skill_to_use = active_skill_id
             skill_context_message = build_skill_system_message(skill_to_use, include_body=True)
+
+        if skill_to_use:
+            # ★ 关键：把 skill 目录下除 SKILL.md 外的资源（scripts/、REFERENCE.md 等）
+            # 同步复制到该 chat 的 workspace/.skills/<skill_id>/ 下。Landlock 沙箱只放行
+            # workspace_root(chat_id) 本身，模型的 bash / text_editor 工具永远无法触达
+            # .claude/skills/<id>/ 这个应用源码路径；不做这一步，SKILL.md 里写的
+            # `scripts/xxx.py`、`REFERENCE.md` 等相对路径在沙箱里全部是"文件不存在"。
+            try:
+                sync_result = await asyncio.to_thread(
+                    sync_skill_assets_to_workspace,
+                    skill_to_use,
+                    _skill_workspace_root(chat_id),
+                )
+                if sync_result.get("error"):
+                    logger.warning(
+                        "同步 skill 资源失败 skill_id=%s: %s", skill_to_use, sync_result["error"]
+                    )
+            except Exception:
+                logger.exception("同步 skill 资源到 workspace 时发生异常 skill_id=%s", skill_to_use)
 
         system_prompt = await build_system_prompt(
             chat_id,

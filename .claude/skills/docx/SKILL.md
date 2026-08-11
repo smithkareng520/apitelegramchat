@@ -10,13 +10,6 @@ license: Proprietary. LICENSE.txt has complete terms
 
 A .docx file is a ZIP archive containing XML files.
 
-> **CRITICAL — language**: This skill uses **JavaScript (Node.js)** with the
-> `docx` npm package (docx-js) to CREATE new documents. It is NOT the Python
-> `python-docx` package. Do NOT run `pip install python-docx`. The `docx` npm
-> package is pre-installed globally — `require('docx')` works directly. Write
-> a `.js` file and run it with `node file.js`. Python is only used for the
-> skill's own helper scripts under `scripts/` (unpack.py, pack.py, etc.).
-
 ## Quick Reference
 
 | Task | Approach |

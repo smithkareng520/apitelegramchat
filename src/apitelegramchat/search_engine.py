@@ -663,7 +663,7 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "skill_catalog",
-            "description": "INFO-ONLY: list available Claude-style skills discovered from .claude/skills, plus the absolute paths they were loaded from. The runtime auto-activates the best-matching skill — you do NOT need to call this to enable a skill. Use it only when you need to inspect the catalog (e.g. to cross-reference another skill's location).",
+            "description": "List available Claude-style skills discovered from .claude/skills and show where they were loaded from.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -679,13 +679,32 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "skill_read",
-            "description": "INFO-ONLY: read the full SKILL.md body (plus package root path + file manifest) for a skill that was NOT auto-activated. The auto-activated skill is already in <active_skill_context> — do not re-read it. Use this only for cross-skill reference, e.g. when the active skill body says 'see the pdf skill for OCR' and you need to load that other skill's instructions.",
+            "description": "Read the full SKILL.md body for a skill so the model can follow its instructions exactly.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：读取pdf技能说明（跨技能引用）"
+                        "description": "简述本次操作目的（≤60字）。示例：读取docx技能说明"
+                    },
+                    "skill_id": {"type": "string", "description": "技能目录名或名称"},
+                    "include_body": {"type": "boolean", "default": True, "description": "是否返回正文"}
+                },
+                "required": ["skill_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_activate",
+            "description": "Activate a skill and return the activation payload, including the full body when needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "_description": {
+                        "type": "string",
+                        "description": "简述本次操作目的（≤60字）。示例：激活docx技能"
                     },
                     "skill_id": {"type": "string", "description": "技能目录名或名称"},
                     "include_body": {"type": "boolean", "default": True, "description": "是否返回正文"}
@@ -1139,11 +1158,7 @@ SEARCH_TOOLS = [
                 "Execute shell commands in a persistent bash session (env vars and cwd persist across calls). "
                 "Use for system operations, running scripts, file manipulation. Avoid interactive commands (vim, top) and long-running processes. Set 'restart'=true to reset the session. "
                 "Note: each invocation is automatically prefixed with `cd $HOME && ` so the working directory is always reset to the user's workspace. "
-                "To list files in the workspace without bash (e.g. when sandbox is unavailable), use text_editor command='list'. "
-                "TIMEOUT: each bash call has a 90-second limit. Do NOT run `npm install`, `pip install`, `apt-get install`, or other package managers — their dependencies are already pre-installed in the image. "
-                "If a command might exceed 90s, split it into smaller steps (write script with text_editor, then run it). "
-                "Pre-installed: python3 + pypdf/pdfplumber/reportlab/pytesseract/pdf2image, node + docx (global), pandoc, tesseract-ocr, poppler-utils. "
-                "Skill scripts live under $SKILL_DIR_<ID> (e.g. $SKILL_DIR_DOCX) and are mounted read-only."
+                "To list files in the workspace without bash (e.g. when sandbox is unavailable), use text_editor command='list'."
             ),
             "parameters": {
                 "type": "object",
@@ -1154,7 +1169,7 @@ SEARCH_TOOLS = [
                     },
                     "command": {
                         "type": "string",
-                        "description": "要执行的 bash 命令。避免运行 npm install / pip install / apt-get install——依赖已预装。"
+                        "description": "要执行的 bash 命令。"
                     },
                     "restart": {
                         "type": "boolean",
@@ -1166,7 +1181,6 @@ SEARCH_TOOLS = [
                 {"command": "ls -la"},
                 {"command": "pwd"},
                 {"command": "python3 script.py", "restart": False},
-                {"command": "cd \"$SKILL_DIR_DOCX\" && python scripts/office/soffice.py --help"},
                 {"restart": True}
             ]
         }

@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import shutil
 from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+logger = logging.getLogger(__name__)
+
+# workspace 内用于存放已激活 skill 资源的子目录名。
+# 必须与 workspace_utils.py 中 R2 全量同步的排除规则保持一致，
+# 否则同步逻辑会把这里的文件当成"远程没有的多余文件"删掉。
+SKILL_ASSETS_DIRNAME = ".skills"
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
 
@@ -159,9 +168,15 @@ class SkillRecord:
 
 def load_skill_records() -> list[SkillRecord]:
     records: list[SkillRecord] = []
+    seen_skill_ids: set[str] = set()
     for root, skill_md in _iter_skill_files():
-        meta = _read_skill_header(skill_md)
         skill_id = skill_md.parent.name
+        # 多个 skill root 里出现同名目录时，只取先发现的一份（roots 按优先级排列），
+        # 避免同一个 skill 在目录/系统提示里重复出现。
+        if skill_id in seen_skill_ids:
+            continue
+        seen_skill_ids.add(skill_id)
+        meta = _read_skill_header(skill_md)
         name = str(meta.get("name") or skill_id)
         description = str(meta.get("description") or "").strip()
         priority_raw = meta.get("priority") or 0
@@ -331,52 +346,6 @@ def match_skill_for_text(
     }
 
 
-def _skill_package_root(skill_id: str) -> Path | None:
-    """Return the absolute path of a skill's package directory, or None."""
-    for rec in load_skill_records():
-        if rec.skill_id == skill_id or rec.name == skill_id:
-            return Path(rec.root) / rec.skill_id
-    return None
-
-
-def _skill_manifest_lines(skill_id: str, *, max_entries: int = 60) -> list[str]:
-    """Return a brief manifest of files inside the skill package.
-
-    Walks the package directory and lists files (skipping noisy paths like
-    __pycache__, .git, node_modules). Output is capped to keep the system
-    prompt small; deeper files are summarized as "… (N more entries)".
-    """
-    pkg = _skill_package_root(skill_id)
-    if pkg is None or not pkg.is_dir():
-        return []
-
-    skip_dirs = {"__pycache__", ".git", ".mypy_cache", ".pytest_cache", "node_modules", ".venv", "venv"}
-    entries: list[str] = []
-    try:
-        for path in sorted(pkg.rglob("*")):
-            if any(part in skip_dirs for part in path.parts):
-                continue
-            try:
-                rel = path.relative_to(pkg)
-            except Exception:
-                continue
-            if path.is_dir():
-                entries.append(f"{rel}/")
-            else:
-                entries.append(str(rel))
-            if len(entries) >= max_entries:
-                remaining = sum(
-                    1 for p in pkg.rglob("*")
-                    if not any(part in skip_dirs for part in p.parts)
-                ) - len(entries)
-                if remaining > 0:
-                    entries.append(f"… ({remaining} more entries)")
-                break
-    except Exception:
-        return []
-    return entries
-
-
 def build_skill_system_message(skill_id: str, *, include_body: bool = True) -> dict[str, Any]:
     data = read_skill(skill_id)
     if "error" in data:
@@ -384,45 +353,30 @@ def build_skill_system_message(skill_id: str, *, include_body: bool = True) -> d
 
     skill = data["skill"]
     frontmatter = skill.get("frontmatter") or {}
+    assets_relpath = skill_assets_workspace_relpath(skill.get("skill_id", skill_id))
     header_lines = [
         f"Active skill: {skill.get('skill_id')}",
         f"Name: {skill.get('name')}",
         f"Description: {skill.get('description')}",
+        f"Skill assets path (in this workspace): {assets_relpath}/",
     ]
     if frontmatter.get("allowed_tools"):
         header_lines.append("Allowed tools: " + ", ".join(map(str, frontmatter.get("allowed_tools", []))))
     if frontmatter.get("priority"):
         header_lines.append(f"Priority: {frontmatter.get('priority')}")
-
-    # ★ Critical addition: tell the model where the skill package lives on
-    # disk and how to invoke its scripts. Without this, the model reads the
-    # body (which says things like `python scripts/office/soffice.py`) but
-    # has no idea what the path is relative to, and the bash sandbox will
-    # refuse access to the package because it lives outside the workspace.
-    pkg_root = _skill_package_root(skill.get("skill_id", ""))
-    if pkg_root is not None:
-        pkg_root_abs = str(pkg_root.resolve())
-        header_lines.append(f"Skill package root: {pkg_root_abs}")
-        header_lines.append(
-            "Skill resources are mounted READ-ONLY in the bash sandbox. "
-            "Invoke skill scripts with their absolute path, e.g.:\n"
-            f'  cd "{pkg_root_abs}" && python scripts/office/soffice.py --help\n'
-            f"  or:  python \"{pkg_root_abs}/scripts/office/soffice.py\" --help\n"
-            "Output files must be written to the workspace (the current working "
-            "directory of the shell), never into the skill package."
-        )
-        manifest = _skill_manifest_lines(skill.get("skill_id", ""))
-        if manifest:
-            header_lines.append("Package contents:")
-            header_lines.extend("  " + line for line in manifest)
-        # Also surface the env var so the model can use $SKILL_DIR_<ID> in bash.
-        env_key = "SKILL_DIR_" + skill.get("skill_id", "").upper().replace("-", "_")
-        header_lines.append(f"Env var: ${env_key} (expands to the skill package root)")
-
     body = data.get("body", "") if include_body else ""
     content = "\n".join(header_lines)
     if body:
         content += "\n\nInstructions:\n" + body
+        content += (
+            "\n\nIMPORTANT — resolving paths above: any relative path this skill's "
+            "instructions mention (e.g. `scripts/...`, `REFERENCE.md`, `FORMS.md`) has been "
+            f"copied into your workspace under `{assets_relpath}/`. "
+            f"For example `scripts/office/unpack.py` is actually at "
+            f"`{assets_relpath}/scripts/office/unpack.py` — use that full path when running "
+            "bash commands or reading files with the editor tool. Paths written elsewhere in "
+            "this workspace (outside that folder) are your own working files, not skill assets."
+        )
     return {
         "role": "system",
         "name": f"skill:{skill.get('skill_id')}",
@@ -465,6 +419,109 @@ def read_skill(skill_id: str) -> dict[str, Any]:
     return {"error": f"Unknown skill: {skill_id}"}
 
 
+def _iter_asset_files(skill_dir: Path) -> Iterable[Path]:
+    """遍历 skill 目录下除 SKILL.md 外的所有文件（资源：scripts/、*.md 参考文档等）。"""
+    for path in skill_dir.rglob("*"):
+        if path.is_dir():
+            continue
+        if path.name == "SKILL.md" and path.parent == skill_dir:
+            continue
+        yield path
+
+
+def skill_assets_workspace_relpath(skill_id: str) -> str:
+    """该 skill 的资源在 workspace 内的相对路径（bash/text_editor 可直接使用）。"""
+    return f"{SKILL_ASSETS_DIRNAME}/{skill_id}"
+
+
+def sync_skill_assets_to_workspace(skill_id: str, workspace_root: Path) -> dict[str, Any]:
+    """
+    把 skill 目录下除 SKILL.md 外的全部资源（scripts/、REFERENCE.md、FORMS.md 等）
+    复制到 <workspace_root>/.skills/<skill_id>/ 下。
+
+    这一步是必须的：沙箱的 Landlock 策略只放行 workspace_root 本身和只读系统目录，
+    `.claude/skills/<id>/` 所在的应用源码树完全不在白名单里。SKILL.md 正文里写的
+    `scripts/xxx.py`、`REFERENCE.md` 等相对路径，只有先把文件"物理搬"进 workspace，
+    bash / text_editor 工具才有可能访问到。
+
+    增量同步：只有当目标文件不存在，或大小/mtime 与源文件不同才重写，避免每轮对话
+    都重新拷贝体积较大的资源（例如 docx skill 里的 XSD schema 集合）。
+    """
+    result: dict[str, Any] = {"skill_id": skill_id, "synced": False, "files": 0, "error": None}
+
+    rec = next((r for r in load_skill_records() if r.skill_id == skill_id or r.name == skill_id), None)
+    if rec is None:
+        result["error"] = f"Unknown skill: {skill_id}"
+        return result
+
+    skill_dir = Path(rec.root) / rec.skill_id
+    if not skill_dir.is_dir():
+        result["error"] = f"Skill directory missing: {skill_dir}"
+        return result
+
+    dest_root = Path(workspace_root) / SKILL_ASSETS_DIRNAME / rec.skill_id
+
+    try:
+        dest_root.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        source_files: set[str] = set()
+        for src_path in _iter_asset_files(skill_dir):
+            rel = src_path.relative_to(skill_dir)
+            source_files.add(str(rel))
+            dst_path = dest_root / rel
+
+            needs_copy = True
+            if dst_path.exists():
+                try:
+                    src_stat = src_path.stat()
+                    dst_stat = dst_path.stat()
+                    needs_copy = (
+                        src_stat.st_size != dst_stat.st_size
+                        or int(src_stat.st_mtime) > int(dst_stat.st_mtime)
+                    )
+                except OSError:
+                    needs_copy = True
+
+            if needs_copy:
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_path, dst_path)
+                copied += 1
+
+        # 清理目标目录里源端已经不存在的陈旧文件（skill 更新/删除资源后跟着同步）
+        for existing in list(dest_root.rglob("*")):
+            if existing.is_dir():
+                continue
+            rel = str(existing.relative_to(dest_root))
+            if rel not in source_files:
+                try:
+                    existing.unlink()
+                except OSError:
+                    pass
+        # 清理空目录
+        for existing_dir in sorted(
+            (p for p in dest_root.rglob("*") if p.is_dir()), reverse=True
+        ):
+            try:
+                next(existing_dir.iterdir())
+            except StopIteration:
+                try:
+                    existing_dir.rmdir()
+                except OSError:
+                    pass
+            except OSError:
+                pass
+
+        result["synced"] = True
+        result["files"] = len(source_files)
+        result["copied"] = copied
+        result["path"] = str(dest_root)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("同步 skill 资源失败 skill_id=%s: %s", skill_id, exc)
+        result["error"] = str(exc)
+
+    return result
+
+
 def activate_skill(skill_id: str, include_body: bool = True) -> dict[str, Any]:
     result = read_skill(skill_id)
     if "error" in result:
@@ -499,20 +556,8 @@ def read_skill_text(skill_id: str) -> str:
     data = read_skill(skill_id)
     if "error" in data:
         return data["error"]
-    skill_id_resolved = data["skill"].get("skill_id", skill_id)
-    pkg_root = _skill_package_root(skill_id_resolved)
-    manifest = _skill_manifest_lines(skill_id_resolved)
-    env_key = "SKILL_DIR_" + skill_id_resolved.upper().replace("-", "_")
     payload = {
         "skill": data["skill"],
-        "skill_package_root": str(pkg_root.resolve()) if pkg_root else None,
-        "skill_env_var": env_key if pkg_root else None,
-        "package_contents": manifest,
-        "usage_note": (
-            "Skill scripts are mounted READ-ONLY in the bash sandbox. "
-            "Run them with their absolute path or via the env var, e.g. "
-            f'cd "${env_key}" && python scripts/foo.py' if pkg_root else ""
-        ),
         "body": data["body"],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
