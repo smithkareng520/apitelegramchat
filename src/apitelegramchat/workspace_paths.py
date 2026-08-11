@@ -9,7 +9,6 @@ from pathlib import Path
 _NAMESPACE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _WORKDIR_NAME = os.getenv("APITELEGRAMCHAT_WORKDIR_NAME", "workspace").strip() or "workspace"
 _STATE_DIR_NAME = os.getenv("APITELEGRAMCHAT_STATE_DIR_NAME", "state").strip() or "state"
-_FILES_DIR_NAME = os.getenv("APITELEGRAMCHAT_FILES_DIR_NAME", "files").strip() or "files"
 _RUNTIME_DIR_NAME = os.getenv("APITELEGRAMCHAT_RUNTIME_DIR_NAME", "runtime").strip() or "runtime"
 _SKILLS_DIR_NAME = os.getenv("APITELEGRAMCHAT_SKILLS_DIR_NAME", "skills").strip() or "skills"
 _UPLOAD_DIR_NAME = os.getenv("APITELEGRAMCHAT_UPLOAD_DIR_NAME", "upload").strip() or "upload"
@@ -27,7 +26,7 @@ def _resolved_namespace(chat_id: object, namespace: object | None = None) -> str
             return sanitize_namespace(current)
     except Exception:
         pass
-    return sanitize_namespace(f"chat_{chat_id}")
+    return sanitize_namespace(chat_id)
 
 
 @lru_cache(maxsize=1)
@@ -59,47 +58,22 @@ def workspace_root(chat_id: object, namespace: object | None = None) -> Path:
     return root.resolve()
 
 
-def workspace_files_root(chat_id: object, namespace: object | None = None) -> Path:
-    """User-owned files only. This is the sole directory mirrored to R2."""
-    root = workspace_root(chat_id, namespace) / _FILES_DIR_NAME
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
 
 
 def workspace_workdir(chat_id: object, namespace: object | None = None) -> Path:
-    """Ephemeral execution working directory, deliberately outside the R2 persistence tree.
+    """Use the user workspace root directly as the agent working directory.
 
-    The agent shell works on a sandbox-local copy under runtime/exec. Only explicit
-    persistence operations copy selected files into files/ and R2. This prevents
-    package managers, build systems, caches, and generated dependency trees from
-    ever becoming part of the persistence boundary.
+    The workspace is local-only and is never mirrored wholesale to R2. Packaged
+    skills live under ``skills/``; runtime/ remains available for local caches.
     """
-    root = runtime_cache_root(chat_id, namespace) / "exec"
+    root = workspace_root(chat_id, namespace)
     root.mkdir(parents=True, exist_ok=True)
-
-    # Skill instructions historically use ../skills/<skill_id> from the shell cwd.
-    # Keep that path stable without placing skills inside the persistent files tree.
-    bridge = root.parent / "skills"
-    target = workspace_skills_root(chat_id, namespace)
-    try:
-        if bridge.is_symlink():
-            if bridge.resolve() != target.resolve():
-                bridge.unlink()
-        elif bridge.exists():
-            # A real directory here is runtime-owned state; leave it alone rather
-            # than deleting user data.
-            target = None
-        if target is not None and not bridge.exists():
-            bridge.symlink_to(target, target_is_directory=True)
-    except OSError:
-        # The sandbox can still operate without the convenience bridge; callers can
-        # use an absolute/known skill path when necessary.
-        pass
+    workspace_skills_root(chat_id, namespace)
     return root.resolve()
 
 
 def workspace_file(chat_id: object, filename: str, namespace: object | None = None) -> Path:
-    return workspace_files_root(chat_id, namespace) / filename
+    return workspace_root(chat_id, namespace) / filename
 
 
 def state_root() -> Path:
@@ -167,7 +141,7 @@ def workspace_download_root(chat_id: object, namespace: object | None = None) ->
     When a user sends a document and the active model does not support
     native document input, the file is saved here (not into files/).
     The model can list this directory and explicitly fetch files into
-    its ephemeral workspace (`runtime/exec/`) via the `fetch_download`
+    its local workspace via the `fetch_download`
     tool before working on them.
 
     Bash is allowed to read files here (`../download/<name>`), but the

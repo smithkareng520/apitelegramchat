@@ -1379,10 +1379,10 @@ Call multiple independent tools in parallel when possible. If a tool fails, cont
 After each search result, append: source emoji [Source Name](URL). Use the source name, not raw URL.
 
 <u>File Operation Rules (CRITICAL — read before calling text_editor)</u>
-<u>Workspace Persistence Boundary</u>
-- Bash runs inside an ephemeral runtime copy (runtime/exec/). Bash-created or Bash-modified files are not persisted automatically.
-- Use <code>workspace_commit</code> with exact file paths when a Bash-created/modified file must persist to the long-term files/ layer (R2 prefix editor/{ns}/).
-- Never commit dependency/runtime trees such as node_modules, virtualenvs, caches, build output, or generated tool state.
+<u>Workspace Boundary</u>
+- Bash runs directly inside the user workspace at <code>/tmp/apitelegramchat_data/workspaces/&lt;user_id&gt;/</code>. The workspace is local-only and is not synchronized wholesale to R2.
+- Files created or modified by Bash remain in this local workspace. They are not synchronized wholesale to R2.
+- When using a skill, read its <code>skills/&lt;skill_id&gt;/SKILL.md</code> and run its scripts from that local skill directory as needed.
 - <code>text_editor</code> edits are persisted automatically for the specific file being edited.
 - text_editor "create" will return "Error: File already exists" if a file with the same path exists anywhere in this chat's workspace (cloud storage is shared across the whole session). Do NOT retry create with the same path or a slightly different name hoping for success — that will loop forever.
 - If create fails with "File already exists", do ONE of these on your NEXT call, never retry create:
@@ -2031,7 +2031,6 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
         "traffic": "checked traffic",
         "isochrone": "calculated an isochrone",
         "bash": "ran a command",
-        "workspace_commit": "saved workspace files",
         "present_files": "presented files",
         "fetch_download": "fetched files from download/",
         "stage_upload": "staged files to upload/",

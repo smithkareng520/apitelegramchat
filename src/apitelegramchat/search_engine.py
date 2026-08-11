@@ -94,7 +94,6 @@ OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 from apitelegramchat.s3_utils import upload_bytes_to_r2
 from apitelegramchat.workspace_utils import (
     _get_workspace_lock, _ensure_workspace_initialized, _ensure_runtime_workspace,
-    persist_workspace_file,
 )
 # 任务工具：定义在 todo_tool.py / memory_tool.py / subagent_tool.py
 # 本文件只做注册与转出
@@ -1117,12 +1116,10 @@ SEARCH_TOOLS = [
         "function": {
             "name": "bash",
             "description": (
-                "Execute shell commands in an isolated persistent session. The cwd is an ephemeral runtime copy, not the R2-persisted file tree. "
-                "Use for installs, tests, builds, scripts, and system operations. Changes made by Bash are sandbox-local until explicitly saved with workspace_commit. "
-                "Do not expect node_modules, virtualenvs, caches, build outputs, or other generated files to persist automatically. "
+                "Execute shell commands in the user workspace. The workspace is local-only and is never synchronized wholesale to R2. "
+                "Use for installs, tests, builds, scripts, and system operations. Generated files and dependencies remain local to this workspace. "
                 "Avoid interactive commands (vim, top) and long-running processes. Set 'restart'=true to reset the session. "
-                "When the model chooses to use a skill, it should explicitly `cd ../skills/<skill_id>` when the skill instructions require it. "
-                "To persist a file changed by Bash, call workspace_commit with its exact path. To list files without Bash, use text_editor command='list'.\n"
+                "When the model chooses to use a skill, it can `cd skills/<skill_id>` and read the skill instructions there. To list files without Bash, use text_editor command='list'.\n"
                 "\n"
                 "CRITICAL — upload/ and download/ are staging buffers, not execution roots:\n"
                 "- You MAY read and write files in upload/ and download/ via relative paths from your cwd, "
@@ -1163,44 +1160,9 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "workspace_commit",
-            "description": (
-                "Persist explicitly selected files from the agent's ephemeral workspace into the user workspace (files/) and R2. "
-                "This is the only way for Bash-created/modified files to cross the persistence boundary into the long-term files/ layer. "
-                "Pass exact file paths relative to the workspace root; directories and wildcards are not accepted. "
-                "Never use this to persist dependency trees such as node_modules or virtual environments.\n"
-                "\n"
-                "Note: workspace_commit persists files to the files/ layer (R2 prefix editor/{ns}/). It is NOT how you "
-                "send files to the user — use stage_upload + present_files for that."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次保存目的（≤60字）。"
-                    },
-                    "paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1,
-                        "description": "要保存的文件路径列表。每个路径必须是相对工作区根目录的具体文件路径。"
-                    }
-                },
-                "required": ["paths"]
-            },
-            "input_examples": [
-                {"paths": ["package.json", "src/app.py"]},
-                {"paths": ["README.md"]}
-            ]
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "fetch_download",
             "description": (
-                "Copy one or more user-uploaded files from download/ into the agent's ephemeral workdir (runtime/exec/). "
+                "Copy one or more user-uploaded files from download/ into the agent's ephemeral workdir (workspace root/). "
                 "User-uploaded documents land in download/ automatically when the model cannot ingest them natively; bash "
                 "cannot `cd` into download/, so this tool is the canonical way to make a downloaded file available to "
                 "text_editor / bash / other tools. After fetch_download the file lives at the same relative path inside "
@@ -1241,7 +1203,7 @@ SEARCH_TOOLS = [
         "function": {
             "name": "stage_upload",
             "description": (
-                "Copy one or more files from the agent's ephemeral workdir (runtime/exec/) into upload/, the staging "
+                "Copy one or more files from the agent workspace (workspace root/) into upload/, the staging "
                 "area for outgoing attachments. present_files ONLY reads from upload/, so you must call stage_upload "
                 "before present_files can send a file to the user. The staged file is also mirrored to R2 so it "
                 "survives process restarts.\n"
@@ -1258,7 +1220,7 @@ SEARCH_TOOLS = [
                         "type": "array",
                         "items": {"type": "string"},
                         "minItems": 1,
-                        "description": "要暂存的文件路径列表（相对工作区根，runtime/exec/ 之下）。"
+                        "description": "要暂存的文件路径列表（相对工作区根，workspace root/ 之下）。"
                     }
                 },
                 "required": ["paths"]

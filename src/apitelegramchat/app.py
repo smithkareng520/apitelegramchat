@@ -504,7 +504,6 @@ async def _cleanup_task(chat_id: int, task: asyncio.Task):
 async def _handle_text_message(chat_id: int, user_input: str, username: str, user_message: dict):
     await send_chat_action(chat_id, "typing")
     # 后台预初始化 workspace：与模型生成响应并行，避免第一个工具调用
-    # 的 45s 超时被 R2 同步吃掉。init_workspace 内部有幂等检查，重复调用
     # 是 no-op。
     asyncio.create_task(init_workspace(chat_id))
     try:

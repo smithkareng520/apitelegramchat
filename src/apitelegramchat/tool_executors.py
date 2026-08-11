@@ -23,7 +23,6 @@ from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
     _ensure_workspace_initialized,
     _ensure_runtime_workspace,
-    persist_workspace_file,
     fetch_from_download,
     stage_to_upload,
     list_download_files,
@@ -197,7 +196,7 @@ class BashSession:
         self._runtime_state: Optional[dict] = None
         self._runtime_prepare_lock = asyncio.Lock()
         # cwd 必须由模型通过 `cd` 自己控制；选择使用 skill 后可进入
-        # `../skills/<skill_id>`，persistent bash 会保持当前目录与 shell 状态。
+        # `skills/<skill_id>`，persistent bash 会保持当前目录与 shell 状态。
         # 跟踪上一次命令结束后的真实 PWD，用于在 upload/ 或 download/ 子树内
         # 拒绝执行下一条命令。None 表示尚未执行过命令，假定位于 workdir。
         self._last_cwd: Optional[str] = str(self.workdir.absolute())
@@ -229,7 +228,7 @@ class BashSession:
                 )
 
         # ★ Landlock：把文件系统访问限制在该 chat 的 workspace 层，
-        #   files/、runtime/、skills/ 都在这里；R2 不再对工作区做全量同步。
+        #   runtime/、skills/ 都在这里；R2 不再对工作区做全量同步。
         #   通过 functools.partial 把 workspace 路径传给 preexec。
         import functools
         preexec = functools.partial(
@@ -252,7 +251,7 @@ class BashSession:
             text=False,
             bufsize=0,
             env=env,  # ★ 关键: 不传任何敏感变量
-            cwd=str(self.workdir.absolute()),  # ★ 关键: 沙箱进程启动即位于 runtime/exec
+            cwd=str(self.workdir.absolute()),  # ★ 关键: 沙箱进程启动即位于 workspace root
             start_new_session=True,  # ★ 关键: 创建新会话，便于 killpg
             preexec_fn=preexec,  # Landlock + no-new-privs + rlimit
         )
@@ -378,8 +377,8 @@ class BashSession:
 
             marker = f"__END_{random.randint(100000, 999999)}__"
             cwd_marker = f"__CWD_{random.randint(100000, 999999)}__"
-            # 默认 shell 启动目录为 workspace/runtime/exec。模型决定使用 skill 后，
-            # 可自行 `cd ../skills/<skill_id>`；persistent bash 会保留该 cwd。
+            # 默认 shell 启动目录为 workspace/workspace root。模型决定使用 skill 后，
+            # 可自行 `cd skills/<skill_id>`；persistent bash 会保留该 cwd。
             # ★ 关键：在 echo marker 前先输出一个换行，确保 marker 单独占一行。
             #   如果命令输出不以换行结尾（如 cat 无换行文件、printf 无 \n），
             #   echo 的输出会粘在前一行，readline() 永远读不到以 marker 开头的行，
@@ -619,7 +618,7 @@ async def execute_bash(chat_id: int, command: str = "", restart: bool = False, p
         session = await _bash_manager.get_session(chat_id)
     except RuntimeError as e:
         return f"Error: {e}"
-    # 执行命令，结束后由 workspace sync scheduler 合并同步到 R2。
+    # 执行命令；workspace 本地文件不会自动同步到 R2。
     return await session.execute(command, progress_callback=progress_callback)
 
 # ---------- 静态地图生成 ----------
@@ -757,7 +756,6 @@ _TOOL_TIMEOUT_LABELS = {
     "isochrone": "Isochrone calculation",
     "text_editor": "Editor operation",
     "bash": "Bash command",
-    "workspace_commit": "Workspace commit",
     "present_files": "File presentation",
     "fetch_download": "Fetch from download/",
     "stage_upload": "Stage to upload/",
@@ -1661,26 +1659,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             summary = f"🖥 {cmd_line}"
         details_html = f"<pre><code>{escape_text(result_str)}</code></pre>"
         return summary, details_html
-    elif fn_name == "workspace_commit":
-        try:
-            data = json.loads(result_str)
-        except (json.JSONDecodeError, TypeError):
-            data = None
-        if not isinstance(data, dict):
-            return "Committed workspace files", f"<pre><code>{escape_text(result_str)}</code></pre>"
-        committed = data.get("committed") or []
-        failed = data.get("failed") or []
-        summary = f"Saved {len(committed)} file" if len(committed) == 1 else f"Saved {len(committed)} files"
-        if failed:
-            summary += f" · {len(failed)} failed"
-        details = []
-        if committed:
-            items = "".join(f"<li>{escape_text(str(x.get('path')))}</li>" for x in committed if isinstance(x, dict))
-            details.append(f"<b>Saved to persistent workspace</b><ul>{items}</ul>")
-        if failed:
-            items = "".join(f"<li>{escape_text(str(x))}</li>" for x in failed)
-            details.append(f"<b>Failed</b><ul>{items}</ul>")
-        return summary, "<br/>".join(details) or "<i>No files were committed.</i>"
+
     elif fn_name == "present_files":
         # ---- Decoupled data abstraction ----
         # execute_present_files returns a JSON payload:
@@ -1801,32 +1780,6 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = escape_text(result_str)
         return summary, details_html
 
-async def execute_workspace_commit(chat_id: int, paths: List[str]) -> str:
-    """Persist exactly the files the agent explicitly names.
-
-    There is intentionally no "sync whole workspace" mode. This is the hard
-    boundary that keeps node_modules, virtualenvs, build trees, caches, and other
-    runtime materialization out of R2 regardless of what commands created them.
-    """
-    if not isinstance(paths, list) or not paths:
-        return json.dumps({"committed": [], "failed": [], "error": "paths must be a non-empty list."})
-
-    committed = []
-    failed = []
-    for raw in paths:
-        try:
-            result = await persist_workspace_file(chat_id, str(raw))
-            committed.append({
-                "path": result["path"],
-                "bytes": result.get("bytes", 0),
-            })
-        except Exception as exc:
-            failed.append(f"{raw}: {str(exc)[:160]}")
-    return json.dumps(
-        {"committed": committed, "failed": failed, "error": None if not failed else "Some files were not committed."},
-        ensure_ascii=False,
-    )
-
 
 async def execute_present_files(chat_id: int, paths: List[str]) -> str:
     """Send files from the upload/ staging tree to the chat as attachments.
@@ -1834,7 +1787,7 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
     Files MUST live under upload/ (the dedicated outgoing-artifact buffer).
     The model is responsible for staging artifacts there first — either via
     the `stage_upload` tool or via bash using a relative path such as
-    `cp out.txt ../upload/out.txt`. Files left in runtime/exec/ are not
+    `cp out.txt ../upload/out.txt`. Files left in workspace root/ are not
     directly sendable; this is the persistence/execution boundary.
     """
     if not paths:
@@ -2164,11 +2117,6 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 timeout=arguments.get("timeout"),
                 progress_callback=progress_callback,
             )
-        elif name == "workspace_commit":
-            paths = arguments.get("paths", [])
-            if isinstance(paths, str):
-                paths = [paths]
-            return await execute_workspace_commit(chat_id, paths)
         elif name == "present_files":
             paths = arguments.get("paths", [])
             if isinstance(paths, str):

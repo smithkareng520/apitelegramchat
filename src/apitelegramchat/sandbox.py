@@ -191,7 +191,7 @@ def _apply_landlock(workspace_path: str) -> bool:
     """Install a deny-by-default Landlock filesystem policy for the child.
 
     The workspace tree is the writable application sandbox. R2 persistence is
-    deliberately handled by workspace_utils and only mirrors its files/ layer.
+    deliberately handled outside the workspace tree; the workspace is never mirrored wholesale to R2.
     System trees needed to execute
     bash are explicitly read/execute-only. Every syscall and every rule-add
     operation is checked; a partial policy is never accepted.
@@ -367,7 +367,7 @@ def build_sandbox_env(workspace: Path, chat_id: int) -> dict:
         "CCACHE_DIR": str(ccache_dir),
         "PYTHONPYCACHEPREFIX": str(cache_root / "pycache"),
         # Explicit ML/model caches: keep downloaded weights and package metadata
-        # out of workspace/files even when a library does not derive the path from HOME.
+        # out of the workspace tree even when a library does not derive the path from HOME.
         "XDG_CACHE_HOME": str(xdg_cache),
         "HF_HOME": str(hf_home),
         "HF_HUB_CACHE": str(hf_hub_cache),

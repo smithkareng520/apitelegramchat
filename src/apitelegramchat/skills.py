@@ -13,8 +13,7 @@ from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
-# Skill 资源层位于 workspace/skills，与用户文件 workspace/files 完全分离。
-# R2 同步只遍历 workspace/files，因此 skill 资源天然不会被同步或删除。
+# Skill 资源层位于 workspace/skills。workspace 本身不做 R2 全量同步。
 SKILL_ASSETS_DIRNAME = "skills"
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
