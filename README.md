@@ -65,3 +65,13 @@ The bundled `.claude/skills` runtime has project-managed dependencies so the mod
 - Tesseract OCR (`tesseract`)
 
 Node dependencies are declared in `package.json`; Python dependencies are declared in both `requirements.txt` and `pyproject.toml`.
+
+## Workspace persistence boundary
+
+Bash/text tools share an ephemeral runtime workspace under `runtime/exec`.
+R2 is no longer a mirror of the working directory. `text_editor` persists only
+the file it explicitly edits, while Bash-created/modified files must be saved
+with the `workspace_commit` tool using explicit file paths. This keeps package
+manager outputs such as `node_modules`, virtual environments, caches, and build
+trees out of R2 without relying on a growing blacklist.
+

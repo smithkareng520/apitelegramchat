@@ -87,6 +87,9 @@ DEFAULT_ALLOWED_TOOLS = {
     "image_search", "geocode", "search_poi", "route", "distance",
     "place_details", "elevation", "traffic", "isochrone",
     "bash", "text_editor", "todo",
+    # upload/download 显式跨边界工具：子 agent 也允许使用
+    "fetch_download", "stage_upload", "list_download", "list_upload",
+    "present_files",
     # 不含 generate_image / video / subagent / memory / skill
 }
 

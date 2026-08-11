@@ -10,7 +10,7 @@ import re
 import os
 import mimetypes
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root, workspace_files_root
+from apitelegramchat.workspace_paths import workspace_download_root
 
 from apitelegramchat.utils import (
     send_message,
@@ -70,7 +70,7 @@ from apitelegramchat.state import (
     set_current_user_namespace,
 )
 from apitelegramchat.file_handlers import download_file
-from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2
+from apitelegramchat.s3_utils import file_exists_in_r2
 from apitelegramchat.workspace_utils import _get_workspace_lock
 # 任务工具：用于处理 todo:* 回调按钮
 from apitelegramchat.todo_tool import (
@@ -732,7 +732,7 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
             ],
         }
     else:
-        workspace = workspace_files_root(chat_id)
+        workspace = workspace_download_root(chat_id)
         workspace.mkdir(parents=True, exist_ok=True)
         downloaded = []
         failed = []
@@ -744,16 +744,11 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
                 name, ext = os.path.splitext(safe_fname)
                 target_path = workspace / f"{name}_{counter}{ext}"
                 counter += 1
+            # download_file 内部已经把字节缓存到 R2 的 telegram/{file_id} 前缀，
+            # download/ 只是本地落地缓冲，不需要再往 R2 镜像一份。
             success = await download_file(fid, str(target_path))
             if success:
                 downloaded.append(target_path.name)
-                try:
-                    with open(target_path, "rb") as f:
-                        file_data = f.read()
-                    editor_key = f"editor/{workspace_root(chat_id).name}/{target_path.name}"
-                    await upload_bytes_to_r2(file_data, editor_key, "application/octet-stream")
-                except Exception as e:
-                    logger.warning(f"上传文档组文件到 editor 前缀失败: {e}")
             else:
                 failed.append(safe_fname)
 
@@ -761,13 +756,19 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
             content_text = "📎 用户上传了文档组，但所有文件下载失败，请稍后重试。"
         else:
             file_list = "、".join(downloaded)
-            content_text = f"📎 用户上传了文档组（共 {len(downloaded)} 个文件）：{file_list}，已保存在工作区。"
+            content_text = (
+                f"📎 用户上传了文档组（共 {len(downloaded)} 个文件）：{file_list}，"
+                f"已保存在 download/ 目录。使用 fetch_download 工具把它们逐个取到工作区后再处理。"
+            )
             if failed:
                 content_text += f"\n⚠️ 以下文件下载失败：{', '.join(failed)}，请重新发送。"
             if combined_caption:
                 content_text += f"\n\n用户指令：{combined_caption}"
             else:
-                content_text += "\n\n请根据用户指令处理这些文档。你可以使用工具（如 text_editor 或 bash）查看文件内容。"
+                content_text += (
+                    "\n\n请根据用户指令处理这些文档。先用 list_download 查看可用文件，"
+                    "再用 fetch_download 把需要的文件取到工作区，然后用 text_editor 或 bash 查看。"
+                )
 
         user_message = {"role": "user", "content": content_text, "file_ids": file_ids, "file_names": file_names, "mime_types": mime_types, "type": "document_group", "attachments": [{"kind": "document", "file_id": fid, "file_name": fname, "mime_type": mime} for fid, fname, mime in zip(file_ids, file_names, mime_types)]}
 
@@ -1258,27 +1259,25 @@ async def webhook() -> tuple:
                         ],
                     }
                 else:
-                    workspace = workspace_files_root(chat_id)
+                    workspace = workspace_download_root(chat_id)
                     workspace.mkdir(parents=True, exist_ok=True)
                     safe_fname = os.path.basename(fname)
                     target_path = workspace / safe_fname
 
                     lock = await _get_workspace_lock(chat_id)
                     async with lock:
+                        # download_file 内部已经把字节缓存到 R2 的 telegram/{file_id} 前缀，
+                        # download/ 只是本地落地缓冲，不需要再往 R2 镜像一份。
                         success = await download_file(fid, str(target_path))
                         if success:
-                            try:
-                                with open(target_path, "rb") as f:
-                                    file_data = f.read()
-                                editor_key = f"editor/{workspace_root(chat_id).name}/{safe_fname}"
-                                await upload_bytes_to_r2(file_data, editor_key, "application/octet-stream")
-                            except Exception as e:
-                                logger.warning(f"上传文档到 editor 前缀失败: {e}")
-                            content_text = f"📎 用户上传了文档「{safe_fname}」，已保存在工作区（路径：{safe_fname}）。"
+                            content_text = (
+                                f"📎 用户上传了文档「{safe_fname}」，已保存在 download/ 目录。"
+                                f"使用 fetch_download 工具把它取到工作区后再处理（fetch_download filenames=[\"{safe_fname}\"]）。"
+                            )
                             if cap:
                                 content_text += f"\n\n用户指令：{cap}"
                             else:
-                                content_text += "\n\n请根据用户指令处理该文档。你可以使用工具（如 text_editor 或 bash）查看文件内容。"
+                                content_text += "\n\n请根据用户指令处理该文档。取到工作区后可用 text_editor 或 bash 查看。"
                         else:
                             content_text = f"📎 用户上传了文档「{safe_fname}」，但下载失败，请稍后重试。"
 
@@ -1513,21 +1512,19 @@ async def webhook() -> tuple:
                                 "type": "document",
                             }
                         else:
-                            workspace = workspace_files_root(chat_id)
+                            workspace = workspace_download_root(chat_id)
                             workspace.mkdir(parents=True, exist_ok=True)
                             target_path = workspace / safe_fname
                             lock = await _get_workspace_lock(chat_id)
                             async with lock:
+                                # download_file 内部已经把字节缓存到 R2 的 telegram/{file_id} 前缀，
+                                # download/ 只是本地落地缓冲，不需要再往 R2 镜像一份。
                                 success = await download_file(reply_media["file_id"], str(target_path))
                                 if success:
-                                    try:
-                                        with open(target_path, "rb") as f:
-                                            file_data = f.read()
-                                        editor_key = f"editor/{workspace_root(chat_id).name}/{safe_fname}"
-                                        await upload_bytes_to_r2(file_data, editor_key, "application/octet-stream")
-                                    except Exception as e:
-                                        logger.warning(f"上传引用文档到 editor 前缀失败: {e}")
-                                    content_text = f"📎 用户引用了文档「{safe_fname}」，已保存在工作区（路径：{safe_fname}）。"
+                                    content_text = (
+                                        f"📎 用户引用了文档「{safe_fname}」，已保存在 download/ 目录。"
+                                        f"使用 fetch_download 工具把它取到工作区后再处理（fetch_download filenames=[\"{safe_fname}\"]）。"
+                                    )
                                 else:
                                     content_text = f"📎 用户引用了文档「{safe_fname}」，但下载失败。"
                                 if user_input:

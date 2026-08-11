@@ -89,9 +89,8 @@ OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 # 网络类工具：内部已有自己的超时控制（fetch_url 30s 总超时，web_search 多端点 + warmup），
 # 但外层 12s 会过早杀掉它们，给一个更宽松的 45s 上限兜底。
 #
-# text_editor 同样归入这一档：每次调用都会先做一次 R2 全量同步
-# （_sync_workspace_from_r2），网络抖动时可能超过 12s，但纯文件操作本身很快，
-# 45s 足够。
+# text_editor 需要初始化一次隔离 workspace，但不再做工作区级 R2 全量同步。
+# 编辑操作只持久化被编辑的具体文件。
 LONG_RUNNING_TOOLS = {"web_search", "fetch_url", "text_editor"}
 LONG_TOOL_CALL_TIMEOUT = 45
 # bash 工具单独一档，比 LONG_RUNNING_TOOLS 更宽松：
@@ -1385,6 +1384,11 @@ Call multiple independent tools in parallel when possible. If a tool fails, cont
 After each search result, append: source emoji [Source Name](URL). Use the source name, not raw URL.
 
 <u>File Operation Rules (CRITICAL — read before calling text_editor)</u>
+<u>Workspace Persistence Boundary</u>
+- Bash runs inside an ephemeral runtime copy (runtime/exec/). Bash-created or Bash-modified files are not persisted automatically.
+- Use <code>workspace_commit</code> with exact file paths when a Bash-created/modified file must persist to the long-term files/ layer (R2 prefix editor/{ns}/).
+- Never commit dependency/runtime trees such as node_modules, virtualenvs, caches, build output, or generated tool state.
+- <code>text_editor</code> edits are persisted automatically for the specific file being edited.
 - text_editor "create" will return "Error: File already exists" if a file with the same path exists anywhere in this chat's workspace (cloud storage is shared across the whole session). Do NOT retry create with the same path or a slightly different name hoping for success — that will loop forever.
 - If create fails with "File already exists", do ONE of these on your NEXT call, never retry create:
   1. Use command="str_replace" with old_str/new_str to edit the existing file in place.
@@ -1394,6 +1398,15 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 - "Error: No match found for replacement text" means your old_str is wrong. Use command="view" to see the current content, then retry with the exact string.
 - After 2 consecutive text_editor errors of the same kind, STOP calling text_editor and explain the situation to the user in your final reply.
 - For HTML generation tasks: write the file ONCE with create. If it already exists from a previous turn in the same chat, use str_replace to swap the whole content (old_str = entire old content, new_str = entire new content), or delete+create. Do not generate new filenames like 2.txt, 3.txt, etc. just to dodge the "already exists" error.
+
+<u>upload/ and download/ — staging buffers (CRITICAL — do not cd into them)</u>
+- The workspace has two dedicated staging buffers beside your workdir:
+  - <b>download/</b> — files the user uploaded via Telegram land here (local-only, not mirrored to R2). When a user sends a document and your model does not support native document input, the file is saved here for the current session. Call <code>list_download</code> to see what's available, then <code>fetch_download</code> to copy a file into your workdir before processing it. If download/ is empty after a process restart, ask the user to re-send the document.
+  - <b>upload/</b> — files you want to send to the user as attachments must be staged here first (mirrored to R2 prefix upload/{ns}/). <code>present_files</code> ONLY reads from upload/. Call <code>stage_upload</code> to copy a file from your workdir into upload/, then <code>present_files</code> to send it.
+- You MAY read and write files in upload/ and download/ via relative paths from your workdir (e.g. <code>cp out.txt ../upload/out.txt</code>, <code>cat ../download/brief.pdf</code>).
+- You MAY NOT <code>cd</code> into upload/ or download/, and you MAY NOT execute any command while your cwd is inside them. The sandbox will reject the command with an explanation. This is intentional: it prevents <code>pip install</code> / <code>npm install</code> / build tools from polluting the staging area and corrupting outgoing attachments or user-supplied originals.
+- Typical send-a-file flow: produce the file in your workdir → <code>stage_upload paths=["report.pdf"]</code> → <code>present_files paths=["report.pdf"]</code>.
+- Typical receive-a-file flow: <code>list_download</code> → <code>fetch_download filenames=["brief.pdf"]</code> → process <code>brief.pdf</code> in your workdir with text_editor / bash.
 
 <tool_description_guide>
 为每个工具调用添加 `_description` 字段（≤60字，纯文本），简述本次操作目的。该字段会显示给用户，帮助他们理解你在做什么。示例见各工具定义的 input_examples。
@@ -1960,6 +1973,10 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     # ---------- 其他工具，按规范进行时文本 ----------
     mapping = {
         "present_files": "Presenting file(s)",
+        "fetch_download": "Fetching from download/",
+        "stage_upload": "Staging to upload/",
+        "list_download": "Listing download/",
+        "list_upload": "Listing upload/",
         "wikipedia": "Looking up on Wikipedia",
         "news": "Fetching news",
         "hacker_news": "Fetching Hacker News",
@@ -2023,7 +2040,12 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
         "traffic": "checked traffic",
         "isochrone": "calculated an isochrone",
         "bash": "ran a command",
+        "workspace_commit": "saved workspace files",
         "present_files": "presented files",
+        "fetch_download": "fetched files from download/",
+        "stage_upload": "staged files to upload/",
+        "list_download": "listed download/",
+        "list_upload": "listed upload/",
     }
     return mapping.get(fn_name, f"ran {fn_name}")
 
@@ -2433,6 +2455,19 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         paths = fn_args.get("paths", [])
         n = len(paths) if isinstance(paths, list) else 0
         return "Presented file" if n <= 1 else f"Presented {n} files"
+
+    if fn_name == "fetch_download":
+        filenames = fn_args.get("filenames", [])
+        n = len(filenames) if isinstance(filenames, list) else 0
+        return "Fetched a file" if n <= 1 else f"Fetched {n} files"
+    if fn_name == "stage_upload":
+        paths = fn_args.get("paths", [])
+        n = len(paths) if isinstance(paths, list) else 0
+        return "Staged a file" if n <= 1 else f"Staged {n} files"
+    if fn_name == "list_download":
+        return "Listed download/"
+    if fn_name == "list_upload":
+        return "Listed upload/"
 
     if fn_name == "image_search":
         n = _coerce_positive_int(fn_args.get("num_results"), 1)
@@ -2880,6 +2915,14 @@ class RichMessageBuilder:
             group["outer_summary"] = mapping.get(command, "Editing file")
         elif t == "present_files":
             group["outer_summary"] = "Presenting file(s)"
+        elif t == "fetch_download":
+            group["outer_summary"] = "Fetching from download/"
+        elif t == "stage_upload":
+            group["outer_summary"] = "Staging to upload/"
+        elif t == "list_download":
+            group["outer_summary"] = "Listing download/"
+        elif t == "list_upload":
+            group["outer_summary"] = "Listing upload/"
         elif t == "wikipedia":
             group["outer_summary"] = "Looking up on Wikipedia"
         elif t == "news":
@@ -2950,6 +2993,10 @@ class RichMessageBuilder:
         "text_editor_create": ("Created a file", "Created {n} files"),
         "text_editor_delete": ("Deleted a file", "Deleted {n} files"),
         "present_files": ("Presented a file", "Presented {n} files"),
+        "fetch_download": ("Fetched a file from download/", "Fetched {n} files from download/"),
+        "stage_upload": ("Staged a file to upload/", "Staged {n} files to upload/"),
+        "list_download": ("Listed download/", "Listed download/"),
+        "list_upload": ("Listed upload/", "Listed upload/"),
         "wikipedia": ("Looked up on Wikipedia", "Looked up on Wikipedia"),
         "news": ("Fetched news", "Fetched news from {n} sources"),
         "hacker_news": ("Fetched Hacker News", "Fetched Hacker News"),

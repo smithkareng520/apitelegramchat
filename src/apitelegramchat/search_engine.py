@@ -36,7 +36,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
             return {"entries": []}
     feedparser = _FeedParserStub()  # type: ignore
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root, workspace_files_root, workspace_namespace
+from apitelegramchat.workspace_paths import workspace_root, workspace_workdir, workspace_namespace
 
 # === [amap_integration patch] 高德地图数据源 ===
 try:
@@ -92,7 +92,10 @@ from apitelegramchat.utils import retry_async, send_rich_html_message
 OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 
 from apitelegramchat.s3_utils import upload_bytes_to_r2
-from apitelegramchat.workspace_utils import _get_workspace_lock, _ensure_workspace_initialized, _sync_workspace_to_r2
+from apitelegramchat.workspace_utils import (
+    _get_workspace_lock, _ensure_workspace_initialized, _ensure_runtime_workspace,
+    persist_workspace_file,
+)
 # 任务工具：定义在 todo_tool.py / memory_tool.py / subagent_tool.py
 # 本文件只做注册与转出
 from apitelegramchat.todo_tool import TODO_TOOL, execute_todo  # noqa: E402
@@ -170,14 +173,14 @@ def _normalize_fetch_cache_key(url: str) -> str:
         return url
 
 
-# ===================== 异步上传单个编辑文件 =====================
-async def _upload_edited_file(chat_id: int, rel_path: str, content: str):
+# ===================== 显式持久化单个编辑文件 =====================
+async def _persist_edited_file(chat_id: int, rel_path: str, *, delete: bool = False):
+    """Persist only the file explicitly changed through text_editor."""
     try:
-        key = f"editor/{workspace_namespace(chat_id)}/{rel_path}"
-        await upload_bytes_to_r2(content.encode('utf-8'), key, 'text/plain')
-        logger.debug(f"异步上传成功：{key}")
+        result = await persist_workspace_file(chat_id, rel_path, delete=delete)
+        logger.debug("显式持久化成功：%s", result.get("key", rel_path))
     except Exception as e:
-        logger.error(f"异步上传文件失败 {rel_path}: {e}")
+        logger.error("显式持久化失败 %s: %s", rel_path, e)
 
 
 def _normalize_editor_text(text: str) -> str:
@@ -249,11 +252,11 @@ async def execute_text_editor(
 
     lock = await _get_workspace_lock(chat_id)
     async with lock:
-        # 只在本进程首次访问该 workspace 时从 R2 做一次全量同步；后续编辑直接
-        # 使用本地持久 workspace，避免连续 text_editor 调用被 R2 网络 I/O 拖到超时。
-        await _ensure_workspace_initialized(chat_id)
+        # 初始化一次持久化文件树，然后在同一隔离执行树里操作。
+        # R2 只接收显式 text_editor 提交的单个文件，不做工作区全量镜像。
+        await _ensure_runtime_workspace(chat_id)
 
-        workspace = workspace_files_root(chat_id)
+        workspace = workspace_workdir(chat_id)
         local_path = workspace if allow_root_path else (workspace / safe_path)
 
         # ----- view (增强：支持搜索关键词) -----
@@ -339,7 +342,7 @@ async def execute_text_editor(
                 f.write(file_text)
             mtime = local_path.stat().st_mtime
             set_editor_file_state(chat_id, safe_path, file_text, mtime)
-            asyncio.create_task(_upload_edited_file(chat_id, safe_path, file_text))
+            asyncio.create_task(_persist_edited_file(chat_id, safe_path))
             return f"File created successfully: {path}"
 
         # ----- replace_lines -----
@@ -367,7 +370,7 @@ async def execute_text_editor(
             _write_editor_file(local_path, new_full)
             mtime = local_path.stat().st_mtime
             set_editor_file_state(chat_id, safe_path, new_full, mtime)
-            asyncio.create_task(_upload_edited_file(chat_id, safe_path, new_full))
+            asyncio.create_task(_persist_edited_file(chat_id, safe_path))
             preview_lines = new_full.splitlines()
             preview = _line_range_preview(preview_lines, start_del, min(len(preview_lines), start_del + max(0, len(replacement_text.splitlines()) - 1) if replacement_text else start_del), highlight_line=start_del)
             return f"Successfully replaced lines {start_del}-{end_del} in {path}.\n\nResult around edit:\n{preview}"
@@ -452,7 +455,7 @@ async def execute_text_editor(
             _write_editor_file(local_path, new_full)
             mtime = local_path.stat().st_mtime
             set_editor_file_state(chat_id, safe_path, new_full, mtime)
-            asyncio.create_task(_upload_edited_file(chat_id, safe_path, new_full))
+            asyncio.create_task(_persist_edited_file(chat_id, safe_path))
 
             # 生成预览
             new_lines = new_full.splitlines()
@@ -504,7 +507,16 @@ async def execute_text_editor(
                     return "Error: Directory deletion requires confirm=True."
                 if not local_path.exists():
                     return f"Directory {path} does not exist."
+                # Directory deletion is local to the runtime tree. Persist deletions
+                # for each existing file explicitly; the commit boundary is still file-based.
+                removed = []
+                for child in local_path.rglob("*"):
+                    if child.is_file() and not child.is_symlink():
+                        rel = child.relative_to(workspace).as_posix()
+                        removed.append(rel)
                 shutil.rmtree(local_path)
+                for rel in removed:
+                    await _persist_edited_file(chat_id, rel, delete=True)
                 clear_editor_file_state(chat_id, safe_path)
                 return f"Successfully deleted directory: {path}"
             else:
@@ -533,6 +545,7 @@ async def execute_text_editor(
                         return f"Error: File not found: {path}"
                     os.remove(local_path)
                     clear_editor_file_state(chat_id, safe_path)
+                    await _persist_edited_file(chat_id, safe_path, delete=True)
                     return f"Successfully deleted file: {path}"
 
         # ----- undo_edit -----
@@ -548,7 +561,7 @@ async def execute_text_editor(
                 content = f.read()
             mtime = local_path.stat().st_mtime
             set_editor_file_state(chat_id, safe_path, content, mtime)
-            asyncio.create_task(_upload_edited_file(chat_id, safe_path, content))
+            asyncio.create_task(_persist_edited_file(chat_id, safe_path))
             return f"Undo successful. Reverted {path} to previous version."
 
         else:
@@ -1157,10 +1170,22 @@ SEARCH_TOOLS = [
         "function": {
             "name": "bash",
             "description": (
-                "Execute shell commands in a persistent bash session (env vars, cwd, and shell state persist across calls). "
-                "Use for system operations, running scripts, file manipulation. Avoid interactive commands (vim, top) and long-running processes. Set 'restart'=true to reset the session. "
-                "Bash starts in the user files layer. When a skill is active, the model should explicitly `cd ../skills/<skill_id>` when the skill instructions require it; the server does not force a cwd change on every call. "
-                "To list files in the workspace without bash (e.g. when sandbox is unavailable), use text_editor command='list'."
+                "Execute shell commands in an isolated persistent session. The cwd is an ephemeral runtime copy, not the R2-persisted file tree. "
+                "Use for installs, tests, builds, scripts, and system operations. Changes made by Bash are sandbox-local until explicitly saved with workspace_commit. "
+                "Do not expect node_modules, virtualenvs, caches, build outputs, or other generated files to persist automatically. "
+                "Avoid interactive commands (vim, top) and long-running processes. Set 'restart'=true to reset the session. "
+                "When a skill is active, the model should explicitly `cd ../skills/<skill_id>` when the skill instructions require it. "
+                "To persist a file changed by Bash, call workspace_commit with its exact path. To list files without Bash, use text_editor command='list'.\n"
+                "\n"
+                "CRITICAL — upload/ and download/ are staging buffers, not execution roots:\n"
+                "- You MAY read and write files in upload/ and download/ via relative paths from your cwd, "
+                "e.g. `cp out.txt ../upload/out.txt` or `cat ../download/brief.pdf > /dev/null`.\n"
+                "- You MAY NOT `cd` into upload/ or download/, and you MAY NOT execute any command while your "
+                "cwd is inside them. The sandbox enforces this: `cd ../upload/...` is rejected, and any "
+                "command run after a forbidden cd will also be rejected.\n"
+                "- This prevents dependency installs / build tools from polluting the staging area.\n"
+                "- To move a file from your workdir into upload/ prefer `stage_upload`; to move a file from "
+                "download/ into your workdir use `fetch_download`."
             ),
             "parameters": {
                 "type": "object",
@@ -1183,6 +1208,7 @@ SEARCH_TOOLS = [
                 {"command": "ls -la"},
                 {"command": "pwd"},
                 {"command": "python3 script.py", "restart": False},
+                {"command": "cp report.pdf ../upload/report.pdf"},
                 {"restart": True}
             ]
         }
@@ -1190,10 +1216,150 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "workspace_commit",
+            "description": (
+                "Persist explicitly selected files from the agent's ephemeral workspace into the user workspace (files/) and R2. "
+                "This is the only way for Bash-created/modified files to cross the persistence boundary into the long-term files/ layer. "
+                "Pass exact file paths relative to the workspace root; directories and wildcards are not accepted. "
+                "Never use this to persist dependency trees such as node_modules or virtual environments.\n"
+                "\n"
+                "Note: workspace_commit persists files to the files/ layer (R2 prefix editor/{ns}/). It is NOT how you "
+                "send files to the user — use stage_upload + present_files for that."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "_description": {
+                        "type": "string",
+                        "description": "简述本次保存目的（≤60字）。"
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "description": "要保存的文件路径列表。每个路径必须是相对工作区根目录的具体文件路径。"
+                    }
+                },
+                "required": ["paths"]
+            },
+            "input_examples": [
+                {"paths": ["package.json", "src/app.py"]},
+                {"paths": ["README.md"]}
+            ]
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_download",
+            "description": (
+                "Copy one or more user-uploaded files from download/ into the agent's ephemeral workdir (runtime/exec/). "
+                "User-uploaded documents land in download/ automatically when the model cannot ingest them natively; bash "
+                "cannot `cd` into download/, so this tool is the canonical way to make a downloaded file available to "
+                "text_editor / bash / other tools. After fetch_download the file lives at the same relative path inside "
+                "the workdir.\n"
+                "download/ is a local-only buffer (not mirrored to R2); if it is empty after a process restart, ask the "
+                "user to re-send the document.\n"
+                "Call list_download first when you do not know the exact filenames."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "_description": {
+                        "type": "string",
+                        "description": "简述本次操作目的（≤60字）。"
+                    },
+                    "filenames": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "description": "要取回的文件相对路径列表（相对 download/ 根）。"
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "true 则覆盖工作区已存在的同名文件；默认 false 会跳过并返回 skipped。"
+                    }
+                },
+                "required": ["filenames"]
+            },
+            "input_examples": [
+                {"filenames": ["brief.pdf"]},
+                {"filenames": ["data.csv", "notes.txt"], "overwrite": true}
+            ]
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stage_upload",
+            "description": (
+                "Copy one or more files from the agent's ephemeral workdir (runtime/exec/) into upload/, the staging "
+                "area for outgoing attachments. present_files ONLY reads from upload/, so you must call stage_upload "
+                "before present_files can send a file to the user. The staged file is also mirrored to R2 so it "
+                "survives process restarts.\n"
+                "Pass exact file paths relative to the workdir root; directories and wildcards are not accepted."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "_description": {
+                        "type": "string",
+                        "description": "简述本次操作目的（≤60字）。"
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "description": "要暂存的文件路径列表（相对工作区根，runtime/exec/ 之下）。"
+                    }
+                },
+                "required": ["paths"]
+            },
+            "input_examples": [
+                {"paths": ["report.pdf"]},
+                {"paths": ["out/data.csv", "out/summary.md"]}
+            ]
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_download",
+            "description": (
+                "List all files currently in download/ (user-upplied documents that have not been fetched into the "
+                "workdir yet). Returns JSON: {\"files\": [{\"path\": ..., \"size\": ...}], \"count\": N}."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_upload",
+            "description": (
+                "List all files currently staged in upload/ (waiting to be sent to the user via present_files). "
+                "Returns JSON: {\"files\": [{\"path\": ..., \"size\": ...}], \"count\": N}."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "present_files",
             "description": (
-                "Send one or more workspace files (created via text_editor or bash) to the chat as attachments. "
-                "Pass exact paths relative to workspace root; wildcards are not supported."
+                "Send one or more files from the upload/ staging tree to the chat as attachments. "
+                "Files MUST already be staged under upload/ — either via the stage_upload tool or via bash "
+                "(e.g. `cp out.txt ../upload/out.txt`). Files left in the ephemeral workdir are NOT directly "
+                "sendable; this is the execution/persistence boundary.\n"
+                "Pass exact paths relative to upload/; wildcards are not supported."
             ),
             "parameters": {
                 "type": "object",
@@ -1201,7 +1367,7 @@ SEARCH_TOOLS = [
                     "paths": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "要发送的文件路径列表。"
+                        "description": "要发送的文件路径列表（相对 upload/ 根）。"
                     }
                 },
                 "required": ["paths"]

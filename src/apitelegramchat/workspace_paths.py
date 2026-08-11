@@ -12,6 +12,8 @@ _STATE_DIR_NAME = os.getenv("APITELEGRAMCHAT_STATE_DIR_NAME", "state").strip() o
 _FILES_DIR_NAME = os.getenv("APITELEGRAMCHAT_FILES_DIR_NAME", "files").strip() or "files"
 _RUNTIME_DIR_NAME = os.getenv("APITELEGRAMCHAT_RUNTIME_DIR_NAME", "runtime").strip() or "runtime"
 _SKILLS_DIR_NAME = os.getenv("APITELEGRAMCHAT_SKILLS_DIR_NAME", "skills").strip() or "skills"
+_UPLOAD_DIR_NAME = os.getenv("APITELEGRAMCHAT_UPLOAD_DIR_NAME", "upload").strip() or "upload"
+_DOWNLOAD_DIR_NAME = os.getenv("APITELEGRAMCHAT_DOWNLOAD_DIR_NAME", "download").strip() or "download"
 
 
 def _resolved_namespace(chat_id: object, namespace: object | None = None) -> str:
@@ -65,8 +67,35 @@ def workspace_files_root(chat_id: object, namespace: object | None = None) -> Pa
 
 
 def workspace_workdir(chat_id: object, namespace: object | None = None) -> Path:
-    # Bash/editor cwd is the isolated user-files layer, never the runtime root.
-    return workspace_files_root(chat_id, namespace)
+    """Ephemeral execution working directory, deliberately outside the R2 persistence tree.
+
+    The agent shell works on a sandbox-local copy under runtime/exec. Only explicit
+    persistence operations copy selected files into files/ and R2. This prevents
+    package managers, build systems, caches, and generated dependency trees from
+    ever becoming part of the persistence boundary.
+    """
+    root = runtime_cache_root(chat_id, namespace) / "exec"
+    root.mkdir(parents=True, exist_ok=True)
+
+    # Skill instructions historically use ../skills/<skill_id> from the shell cwd.
+    # Keep that path stable without placing skills inside the persistent files tree.
+    bridge = root.parent / "skills"
+    target = workspace_skills_root(chat_id, namespace)
+    try:
+        if bridge.is_symlink():
+            if bridge.resolve() != target.resolve():
+                bridge.unlink()
+        elif bridge.exists():
+            # A real directory here is runtime-owned state; leave it alone rather
+            # than deleting user data.
+            target = None
+        if target is not None and not bridge.exists():
+            bridge.symlink_to(target, target_is_directory=True)
+    except OSError:
+        # The sandbox can still operate without the convenience bridge; callers can
+        # use an absolute/known skill path when necessary.
+        pass
+    return root.resolve()
 
 
 def workspace_file(chat_id: object, filename: str, namespace: object | None = None) -> Path:
@@ -113,3 +142,74 @@ def workspace_skills_root(chat_id: object, namespace: object | None = None) -> P
     root = workspace_root(chat_id, namespace) / _SKILLS_DIR_NAME
     root.mkdir(parents=True, exist_ok=True)
     return root.resolve()
+
+
+def workspace_upload_root(chat_id: object, namespace: object | None = None) -> Path:
+    """Staging area for files the model wants to send to the user.
+
+    This directory is the sole source for `present_files`. The model must
+    explicitly stage artifacts here (via bash `cp`/redirect or via the
+    `stage_upload` tool) before they can be attached to a chat message.
+
+    Bash is allowed to read/write files here through relative paths
+    (`../upload/<name>`), but the sandbox refuses to `cd` into this tree
+    or execute any command while the cwd is inside it. This prevents
+    package managers / build tools from polluting the staging area.
+    """
+    root = workspace_root(chat_id, namespace) / _UPLOAD_DIR_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
+
+
+def workspace_download_root(chat_id: object, namespace: object | None = None) -> Path:
+    """Landing area for files the user uploaded via Telegram.
+
+    When a user sends a document and the active model does not support
+    native document input, the file is saved here (not into files/).
+    The model can list this directory and explicitly fetch files into
+    its ephemeral workspace (`runtime/exec/`) via the `fetch_download`
+    tool before working on them.
+
+    Bash is allowed to read files here (`../download/<name>`), but the
+    sandbox refuses to `cd` into this tree or execute any command while
+    the cwd is inside it. This keeps user-supplied files immutable from
+    the model's execution perspective.
+    """
+    root = workspace_root(chat_id, namespace) / _DOWNLOAD_DIR_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
+
+
+def is_inside_upload_or_download(path: object) -> bool:
+    """Return True if *path* resolves inside any chat's upload/ or download/ tree.
+
+    Used by the bash sandbox to refuse execution while cwd is inside one
+    of these staging directories. The check is intentionally conservative:
+    it walks the parent chain looking for a directory whose name matches
+    the upload/download dir name AND whose parent looks like a workspace
+    root (i.e. lives under data_root()/workspaces).
+    """
+    try:
+        resolved = Path(path).expanduser().resolve() if path is not None else None
+    except Exception:
+        return False
+    if resolved is None:
+        return False
+    try:
+        ws_root = data_root() / "workspaces"
+        ws_resolved = ws_root.resolve()
+    except Exception:
+        return False
+    # Walk up: if any ancestor is named upload/ or download/ AND that
+    # ancestor's parent is itself under workspaces/, we're inside.
+    target_names = {_UPLOAD_DIR_NAME, _DOWNLOAD_DIR_NAME}
+    current = resolved
+    for _ in range(32):  # bounded climb to avoid pathological loops
+        if current.name in target_names:
+            parent = current.parent
+            if parent == ws_resolved or ws_resolved in parent.parents:
+                return True
+        if current == current.parent:
+            break
+        current = current.parent
+    return False

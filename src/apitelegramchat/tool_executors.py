@@ -9,7 +9,11 @@ import json
 import hashlib
 import time
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root, workspace_workdir, workspace_files_root, runtime_cache_root
+from apitelegramchat.workspace_paths import (
+    workspace_root, workspace_workdir, runtime_cache_root,
+    workspace_upload_root, workspace_download_root,
+    is_inside_upload_or_download,
+)
 import re
 import html
 import logging
@@ -18,8 +22,12 @@ from urllib.parse import urlparse
 from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
     _ensure_workspace_initialized,
-    _sync_workspace_to_r2,
-    schedule_workspace_sync,
+    _ensure_runtime_workspace,
+    persist_workspace_file,
+    fetch_from_download,
+    stage_to_upload,
+    list_download_files,
+    list_upload_files,
 )
 
 from apitelegramchat.sandbox import (
@@ -200,6 +208,9 @@ class BashSession:
         # 环境变量、当前目录和 shell 状态，且不会因为 skill 匹配而把工作区
         # 根目录意外切到 `../skills/<skill_id>`。
         self._active_skill_id: Optional[str] = None
+        # 跟踪上一次命令结束后的真实 PWD，用于在 upload/ 或 download/ 子树内
+        # 拒绝执行下一条命令。None 表示尚未执行过命令，假定位于 workdir。
+        self._last_cwd: Optional[str] = str(self.workdir.absolute())
 
     def set_active_skill(self, skill_id: Optional[str]) -> None:
         """记录当前 skill 上下文；不修改 Bash 当前工作目录。"""
@@ -216,6 +227,10 @@ class BashSession:
         os.chmod(self.workspace, 0o700)
         os.chmod(self.workdir, 0o700)
 
+        # 新进程的 cwd 必然是 workdir；重置 _last_cwd，避免上一次会话
+        # 残留的 cwd 状态误拒下一条命令。
+        self._last_cwd = str(self.workdir.absolute())
+
         argv = build_sandbox_argv()
         env = build_sandbox_env(self.workspace, self.chat_id)
         cache_root = runtime_cache_root(self.chat_id)
@@ -228,7 +243,7 @@ class BashSession:
                 )
 
         # ★ Landlock：把文件系统访问限制在该 chat 的 workspace 层，
-        #   files/、runtime/、skills/ 都在这里；R2 同步只取 files/。
+        #   files/、runtime/、skills/ 都在这里；R2 不再对工作区做全量同步。
         #   通过 functools.partial 把 workspace 路径传给 preexec。
         import functools
         preexec = functools.partial(
@@ -251,7 +266,7 @@ class BashSession:
             text=False,
             bufsize=0,
             env=env,  # ★ 关键: 不传任何敏感变量
-            cwd=str(self.workdir.absolute()),  # ★ 关键: 沙箱进程启动即位于 workspace
+            cwd=str(self.workdir.absolute()),  # ★ 关键: 沙箱进程启动即位于 runtime/exec
             start_new_session=True,  # ★ 关键: 创建新会话，便于 killpg
             preexec_fn=preexec,  # Landlock + no-new-privs + rlimit
         )
@@ -288,6 +303,29 @@ class BashSession:
          "anonymous fork function"),
     ]
 
+    # ===================== upload/ & download/ 子树保护 =====================
+    # 这两棵子树是“产物暂存区”和“用户上传落地”，不允许 bash 在其中执行命令。
+    # 主要威胁：模型 cd 进 upload/ 之后跑 `pip install`，会把整个依赖树装进
+    # upload/，污染即将发给用户的产物；同理 download/ 也不允许被执行污染。
+    #
+    # 检测策略：
+    #   1. 命令字符串里的 `cd` 目标若指向 upload/ 或 download/（任意前缀形式：
+    #      `upload/`, `./upload/`, `../upload/`, `../upload/sub`, 绝对路径等）
+    #      直接拒绝。
+    #   2. 每次执行前检查 _last_cwd；若已经在 upload/ 或 download/ 内，拒绝执行
+    #      并提示模型先 `cd` 回 workdir。
+    _UPLOAD_DOWNLOAD_CD_PATTERN = re.compile(
+        r"""(?:^|[\s;&|`(])       # 命令起始或分隔符
+            cd\s+                 # cd 命令
+            (?:['"]?)             # 可选引号
+            (?:\./)?              # 可选 ./
+            (?:\.\./)*            # 任意数量的 ../
+            (?:upload|download)   # 目标目录名
+            (?:/|['"]|\s|$)       # 后续分隔
+        """,
+        re.VERBOSE,
+    )
+
     def _is_safe(self, command: str) -> bool:
         """最小黑名单，仅拦极端操作；其余靠沙箱"""
         if not command or not command.strip():
@@ -296,6 +334,18 @@ class BashSession:
             if pattern.search(command):
                 logger.warning(f"🚫 Bash rejected ({name}) chat_id={self.chat_id}: {command[:200]}")
                 return False
+        # 拒绝 cd 进入 upload/ 或 download/ 子树
+        if self._UPLOAD_DOWNLOAD_CD_PATTERN.search(command):
+            logger.warning(
+                f"🚫 Bash rejected (cd into upload/download) chat_id={self.chat_id}: {command[:200]}"
+            )
+            return False
+        # 拒绝在 upload/ 或 download/ 子树内执行任何命令
+        if self._last_cwd and is_inside_upload_or_download(self._last_cwd):
+            logger.warning(
+                f"🚫 Bash rejected (cwd inside upload/download) chat_id={self.chat_id} cwd={self._last_cwd}"
+            )
+            return False
         return True
 
     # ===================== 执行命令 =====================
@@ -313,6 +363,26 @@ class BashSession:
                 logger.warning(f"_ensure_workspace_initialized failed (continue): {e}")
 
             if not self._is_safe(command):
+                # 给出更可操作的错误信息，让模型知道为什么被拒、该怎么做。
+                if self._last_cwd and is_inside_upload_or_download(self._last_cwd):
+                    return (
+                        f"Error: Command rejected — current shell cwd is inside an "
+                        f"upload/ or download/ staging tree ({self._last_cwd}). "
+                        f"These directories are read/write data buffers, not execution "
+                        f"roots: running commands here (e.g. pip install) would pollute "
+                        f"the staging area. Run `cd` to return to your workdir first, "
+                        f"then re-issue the command."
+                    )
+                if self._UPLOAD_DOWNLOAD_CD_PATTERN.search(command):
+                    return (
+                        f"Error: Command rejected — `cd` into upload/ or download/ is "
+                        f"not allowed. These directories are staging buffers: read and "
+                        f"write files in them via relative paths (e.g. "
+                        f"`cp out.txt ../upload/out.txt`, `cat ../download/doc.pdf`), "
+                        f"but never execute commands from inside them. To move a file "
+                        f"into upload/ use the stage_upload tool; to pull a file from "
+                        f"download/ use the fetch_download tool."
+                    )
                 return f"Error: Command rejected for security reasons: {command}"
 
             marker = f"__END_{random.randint(100000, 999999)}__"
@@ -412,8 +482,20 @@ class BashSession:
                     actual_cwd = cwd_match.group(1).strip()
                     output = re.sub(rf'(?m)^' + re.escape(cwd_marker) + r' .*$\n?', '', output)
 
+                # 记录最新 cwd，下一次 _is_safe 会据此拒绝在 upload/ 或 download/
+                # 子树内继续执行命令。即便 cd 进入被拒，模型也可能通过 pushd /
+                # 子 shell 等方式间接进入，这里再做一次防御性检查。
+                self._last_cwd = actual_cwd
+                if is_inside_upload_or_download(actual_cwd):
+                    # 不在这里 return error —— 命令已经执行完了，输出仍然有用。
+                    # 但在下一次调用时 _is_safe 会拒绝继续执行。
+                    output += (
+                        "\n[warning] cwd is now inside upload/ or download/. "
+                        "The next command will be rejected; run `cd` (back to your "
+                        "workdir) first."
+                    )
+
                 # 合并后台同步；不会为每次 Bash 创建一个新的全量上传任务。
-                schedule_workspace_sync(self.chat_id)
 
                 return (f"Command: {command}\n"
                         f"Cwd: {actual_cwd}\n"
@@ -540,8 +622,6 @@ _bash_manager = BashSessionManager()
 async def execute_bash(chat_id: int, command: str = "", restart: bool = False, skill_id: Optional[str] = None, progress_callback=None) -> str:
     if restart:
         result = await _bash_manager.restart_session(chat_id)
-        # 重启后调度一次合并后的 workspace 同步。
-        schedule_workspace_sync(chat_id)
         return result
     if not command:
         return "Error: command is required (or set restart=true)"
@@ -690,7 +770,12 @@ _TOOL_TIMEOUT_LABELS = {
     "isochrone": "Isochrone calculation",
     "text_editor": "Editor operation",
     "bash": "Bash command",
+    "workspace_commit": "Workspace commit",
     "present_files": "File presentation",
+    "fetch_download": "Fetch from download/",
+    "stage_upload": "Stage to upload/",
+    "list_download": "List download/",
+    "list_upload": "List upload/",
 }
 
 async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tuple[str, str]:
@@ -1589,6 +1674,26 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             summary = f"🖥 {cmd_line}"
         details_html = f"<pre><code>{escape_text(result_str)}</code></pre>"
         return summary, details_html
+    elif fn_name == "workspace_commit":
+        try:
+            data = json.loads(result_str)
+        except (json.JSONDecodeError, TypeError):
+            data = None
+        if not isinstance(data, dict):
+            return "Committed workspace files", f"<pre><code>{escape_text(result_str)}</code></pre>"
+        committed = data.get("committed") or []
+        failed = data.get("failed") or []
+        summary = f"Saved {len(committed)} file" if len(committed) == 1 else f"Saved {len(committed)} files"
+        if failed:
+            summary += f" · {len(failed)} failed"
+        details = []
+        if committed:
+            items = "".join(f"<li>{escape_text(str(x.get('path')))}</li>" for x in committed if isinstance(x, dict))
+            details.append(f"<b>Saved to persistent workspace</b><ul>{items}</ul>")
+        if failed:
+            items = "".join(f"<li>{escape_text(str(x))}</li>" for x in failed)
+            details.append(f"<b>Failed</b><ul>{items}</ul>")
+        return summary, "<br/>".join(details) or "<i>No files were committed.</i>"
     elif fn_name == "present_files":
         # ---- Decoupled data abstraction ----
         # execute_present_files returns a JSON payload:
@@ -1649,21 +1754,115 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
         details_html = "<br/>".join(details_parts)
         return summary, details_html
+    elif fn_name in ("fetch_download", "stage_upload"):
+        # 这些工具返回 {"fetched"|"staged": [...], "failed": [...], "error": ...}
+        try:
+            data = json.loads(result_str)
+        except (json.JSONDecodeError, TypeError):
+            data = None
+        if not isinstance(data, dict):
+            return f"📦 {fn_name}", f"<pre><code>{escape_text(result_str)}</code></pre>"
+        ok_key = "fetched" if fn_name == "fetch_download" else "staged"
+        ok_items = data.get(ok_key) or []
+        failed_items = data.get("failed") or []
+        verb = "Fetched" if fn_name == "fetch_download" else "Staged"
+        if not ok_items:
+            summary = f"📦 No files {verb.lower()}"
+        elif len(ok_items) == 1:
+            summary = f"📦 {verb} 1 file"
+        else:
+            summary = f"📦 {verb} {len(ok_items)} files"
+        if failed_items:
+            summary += f" · {len(failed_items)} failed"
+        details_parts: List[str] = []
+        if ok_items:
+            items = "".join(
+                f"<li>{escape_text(str(it.get('path')))}</li>"
+                for it in ok_items if isinstance(it, dict)
+            )
+            label = "file" if len(ok_items) == 1 else "files"
+            details_parts.append(f"<b>✅ {verb} ({len(ok_items)} {label})</b><ul>{items}</ul>")
+        if failed_items:
+            items = "".join(f"<li>{escape_text(str(x))}</li>" for x in failed_items)
+            label = "file" if len(failed_items) == 1 else "files"
+            details_parts.append(f"<b>❌ Failed ({len(failed_items)} {label})</b><ul>{items}</ul>")
+        if not details_parts:
+            details_parts.append("<i>No files were processed.</i>")
+        return summary, "<br/>".join(details_parts)
+    elif fn_name in ("list_download", "list_upload"):
+        try:
+            data = json.loads(result_str)
+        except (json.JSONDecodeError, TypeError):
+            data = None
+        if not isinstance(data, dict):
+            return f"📋 {fn_name}", f"<pre><code>{escape_text(result_str)}</code></pre>"
+        files = data.get("files") or []
+        count = data.get("count", len(files))
+        label = "download/" if fn_name == "list_download" else "upload/"
+        summary = f"📋 {count} file(s) in {label}"
+        if not files:
+            details_html = f"<i>{label} is empty.</i>"
+        else:
+            items = "".join(
+                f"<li>{escape_text(str(f.get('path')))} <i>({f.get('size')} bytes)</i></li>"
+                for f in files if isinstance(f, dict)
+            )
+            details_html = f"<b>{label}</b><ul>{items}</ul>"
+        return summary, details_html
     else:
         summary = f"🔧 {fn_name}"
         details_html = escape_text(result_str)
         return summary, details_html
 
+async def execute_workspace_commit(chat_id: int, paths: List[str]) -> str:
+    """Persist exactly the files the agent explicitly names.
+
+    There is intentionally no "sync whole workspace" mode. This is the hard
+    boundary that keeps node_modules, virtualenvs, build trees, caches, and other
+    runtime materialization out of R2 regardless of what commands created them.
+    """
+    if not isinstance(paths, list) or not paths:
+        return json.dumps({"committed": [], "failed": [], "error": "paths must be a non-empty list."})
+
+    committed = []
+    failed = []
+    for raw in paths:
+        try:
+            result = await persist_workspace_file(chat_id, str(raw))
+            committed.append({
+                "path": result["path"],
+                "bytes": result.get("bytes", 0),
+            })
+        except Exception as exc:
+            failed.append(f"{raw}: {str(exc)[:160]}")
+    return json.dumps(
+        {"committed": committed, "failed": failed, "error": None if not failed else "Some files were not committed."},
+        ensure_ascii=False,
+    )
+
+
 async def execute_present_files(chat_id: int, paths: List[str]) -> str:
+    """Send files from the upload/ staging tree to the chat as attachments.
+
+    Files MUST live under upload/ (the dedicated outgoing-artifact buffer).
+    The model is responsible for staging artifacts there first — either via
+    the `stage_upload` tool or via bash using a relative path such as
+    `cp out.txt ../upload/out.txt`. Files left in runtime/exec/ are not
+    directly sendable; this is the persistence/execution boundary.
+    """
     if not paths:
-        return json.dumps({"sent": [], "failed": [], "error": "No paths provided."})
+        return json.dumps({
+            "sent": [],
+            "failed": [],
+            "error": "No paths provided. Files must be staged under upload/ first.",
+        })
 
     lock = await _get_workspace_lock(chat_id)
     async with lock:
-        # 1. 首次访问时初始化一次；之后直接读取 persistent workspace。
-        await _ensure_workspace_initialized(chat_id)
+        # 确保三棵持久化子树都已同步，upload/ 可见。
+        await _ensure_runtime_workspace(chat_id)
 
-        workspace = workspace_files_root(chat_id)
+        upload_root = workspace_upload_root(chat_id)
         sent = []
         failed = []
         # 文件大小上限：50MB，防止 OOM
@@ -1680,22 +1879,25 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
             if safe_path == "." or safe_path.startswith("..") or os.path.isabs(safe_path):
                 failed.append(f"{path} (invalid path)")
                 continue
-            local_path = workspace / safe_path
-            # 关键：使用 resolve() 跟随符号链接，再校验最终路径仍在 workspace 之下
+            local_path = upload_root / safe_path
+            # 关键：使用 resolve() 跟随符号链接，再校验最终路径仍在 upload/ 之下
             try:
                 resolved = local_path.resolve()
             except Exception:
                 failed.append(f"{path} (invalid path)")
                 continue
             try:
-                workspace_resolved = workspace.resolve()
+                upload_resolved = upload_root.resolve()
             except Exception:
-                workspace_resolved = workspace
-            if resolved != workspace_resolved and workspace_resolved not in resolved.parents:
+                upload_resolved = upload_root
+            if resolved != upload_resolved and upload_resolved not in resolved.parents:
                 failed.append(f"{path} (invalid path)")
                 continue
             if not resolved.is_file():
-                failed.append(f"{path} (file not found)")
+                failed.append(
+                    f"{path} (file not found in upload/ — use stage_upload to copy "
+                    f"it from your workdir first)"
+                )
                 continue
             try:
                 file_size = resolved.stat().st_size
@@ -1718,6 +1920,76 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
             except Exception as e:
                 failed.append(f"{path} (error: {str(e)[:50]})")
         return json.dumps({"sent": sent, "failed": failed, "error": None})
+
+
+async def execute_fetch_download(chat_id: int, filenames: List[str], overwrite: bool = False) -> str:
+    """Copy one or more files from download/ into the runtime workdir.
+
+    User-uploaded documents land in download/ (Telegram → R2 → local). bash
+    cannot `cd` into download/, and the model is expected to fetch only the
+    files it actually needs rather than hydrate the whole tree. After
+    fetch_download, the file is available in the workdir under the same
+    relative path and can be opened with text_editor / bash / etc.
+    """
+    if not isinstance(filenames, list) or not filenames:
+        return json.dumps({
+            "fetched": [],
+            "failed": [],
+            "error": "filenames must be a non-empty list.",
+        })
+    fetched = []
+    failed = []
+    for raw in filenames:
+        name = raw if isinstance(raw, str) else str(raw)
+        try:
+            result = await fetch_from_download(chat_id, name, overwrite=overwrite)
+            fetched.append(result)
+        except Exception as exc:
+            failed.append(f"{name}: {str(exc)[:160]}")
+    return json.dumps(
+        {"fetched": fetched, "failed": failed, "error": None if not failed else "Some files were not fetched."},
+        ensure_ascii=False,
+    )
+
+
+async def execute_stage_upload(chat_id: int, paths: List[str]) -> str:
+    """Copy one or more files from the runtime workdir into upload/.
+
+    upload/ is the sole source for present_files. Staging is explicit so
+    that dependency trees, build artifacts, and other runtime material
+    never accidentally get sent to the user.
+    """
+    if not isinstance(paths, list) or not paths:
+        return json.dumps({
+            "staged": [],
+            "failed": [],
+            "error": "paths must be a non-empty list.",
+        })
+    staged = []
+    failed = []
+    for raw in paths:
+        rel = raw if isinstance(raw, str) else str(raw)
+        try:
+            result = await stage_to_upload(chat_id, rel)
+            staged.append(result)
+        except Exception as exc:
+            failed.append(f"{rel}: {str(exc)[:160]}")
+    return json.dumps(
+        {"staged": staged, "failed": failed, "error": None if not failed else "Some files were not staged."},
+        ensure_ascii=False,
+    )
+
+
+async def execute_list_download(chat_id: int) -> str:
+    """List files in download/ (user-uploaded documents)."""
+    items = await list_download_files(chat_id)
+    return json.dumps({"files": items, "count": len(items)}, ensure_ascii=False)
+
+
+async def execute_list_upload(chat_id: int) -> str:
+    """List files in upload/ (staged outgoing artifacts)."""
+    items = await list_upload_files(chat_id)
+    return json.dumps({"files": items, "count": len(items)}, ensure_ascii=False)
 
 # ---------- 工具分发 ----------
 async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_callback=None) -> str:
@@ -1957,11 +2229,31 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 timeout=arguments.get("timeout"),
                 progress_callback=progress_callback,
             )
+        elif name == "workspace_commit":
+            paths = arguments.get("paths", [])
+            if isinstance(paths, str):
+                paths = [paths]
+            return await execute_workspace_commit(chat_id, paths)
         elif name == "present_files":
             paths = arguments.get("paths", [])
             if isinstance(paths, str):
                 paths = [paths]
             return await execute_present_files(chat_id, paths)
+        elif name == "fetch_download":
+            filenames = arguments.get("filenames", [])
+            if isinstance(filenames, str):
+                filenames = [filenames]
+            overwrite = bool(arguments.get("overwrite", False))
+            return await execute_fetch_download(chat_id, filenames, overwrite=overwrite)
+        elif name == "stage_upload":
+            paths = arguments.get("paths", [])
+            if isinstance(paths, str):
+                paths = [paths]
+            return await execute_stage_upload(chat_id, paths)
+        elif name == "list_download":
+            return await execute_list_download(chat_id)
+        elif name == "list_upload":
+            return await execute_list_upload(chat_id)
         else:
             return f"失败：未知工具: {name}。"
     except asyncio.CancelledError:

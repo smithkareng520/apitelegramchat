@@ -14,7 +14,11 @@ except Exception:  # pragma: no cover - optional dependency fallback
     async def execute_subagent(*args, **kwargs):  # type: ignore
         return "Error: subagent tool is unavailable in this environment."
 from apitelegramchat.todo_tool import execute_todo
-from apitelegramchat.tool_executors import execute_bash, execute_present_files
+from apitelegramchat.tool_executors import (
+    execute_bash, execute_present_files,
+    execute_fetch_download, execute_stage_upload,
+    execute_list_download, execute_list_upload,
+)
 from apitelegramchat.search_engine import (
     execute_book_lookup, execute_crypto_price, execute_done, execute_distance, execute_elevation,
     execute_exchange_rate, execute_fetch_url, execute_geocode, execute_generate_image,
@@ -135,6 +139,22 @@ async def _tool_present_files(**kwargs: Any) -> str:
     return await execute_present_files(_chat_id(), **_clean_args(kwargs))
 
 
+async def _tool_fetch_download(**kwargs: Any) -> str:
+    return await execute_fetch_download(_chat_id(), **_clean_args(kwargs))
+
+
+async def _tool_stage_upload(**kwargs: Any) -> str:
+    return await execute_stage_upload(_chat_id(), **_clean_args(kwargs))
+
+
+async def _tool_list_download(**kwargs: Any) -> str:
+    return await execute_list_download(_chat_id())
+
+
+async def _tool_list_upload(**kwargs: Any) -> str:
+    return await execute_list_upload(_chat_id())
+
+
 async def _tool_skill_catalog(**kwargs: Any) -> str:
     return catalog_text()
 
@@ -153,7 +173,11 @@ TOOL_SPECS: list[ToolSpec] = [
     ToolSpec("todo.manage", "Create, inspect, update, and clear todos.", _tool_todo, _schema_for(execute_todo, title="todo.manage")),
     ToolSpec("subagent.run", "Spawn a bounded subagent to complete a task.", _tool_subagent, _schema_for(execute_subagent, title="subagent.run")),
     ToolSpec("shell.exec", "Run a sandboxed shell command within the workspace.", _tool_bash, _schema_for(execute_bash, title="shell.exec")),
-    ToolSpec("workspace.present", "Return workspace files to the client.", _tool_present_files, _schema_for(execute_present_files, title="workspace.present")),
+    ToolSpec("workspace.present", "Send files from upload/ to the chat as attachments.", _tool_present_files, _schema_for(execute_present_files, title="workspace.present")),
+    ToolSpec("workspace.fetch_download", "Copy files from download/ into the workdir.", _tool_fetch_download, _schema_for(execute_fetch_download, title="workspace.fetch_download")),
+    ToolSpec("workspace.stage_upload", "Stage workdir files into upload/ for sending.", _tool_stage_upload, _schema_for(execute_stage_upload, title="workspace.stage_upload")),
+    ToolSpec("workspace.list_download", "List files in download/.", _tool_list_download, _schema_for(execute_list_download, title="workspace.list_download")),
+    ToolSpec("workspace.list_upload", "List files in upload/.", _tool_list_upload, _schema_for(execute_list_upload, title="workspace.list_upload")),
     ToolSpec("skill.catalog", "Discover available skills from .claude/skills.", _tool_skill_catalog, _schema_for(_tool_skill_catalog, title="skill.catalog")),
     ToolSpec("skill.read", "Load one skill body on demand.", _tool_skill_read, _schema_for(_tool_skill_read, title="skill.read")),
     ToolSpec("skill.activate", "Select a skill and return its activation payload.", _tool_skill_activate, _schema_for(_tool_skill_activate, title="skill.activate")),
