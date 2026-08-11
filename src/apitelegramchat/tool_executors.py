@@ -227,7 +227,7 @@ class BashSession:
         return True
 
     # ===================== 执行命令 =====================
-    async def execute(self, command: str, timeout: int = SANDBOX_TIMEOUT_SEC) -> str:
+    async def execute(self, command: str, timeout: int = SANDBOX_TIMEOUT_SEC, progress_callback=None) -> str:
         """在沙箱中执行 bash 命令，超时自动终止"""
         lock = await _get_workspace_lock(self.chat_id)
         async with lock:
@@ -256,32 +256,73 @@ class BashSession:
                 self.proc.stdin.write(full_cmd.encode('utf-8'))
                 await self.proc.stdin.drain()
 
-                output_lines = []
+                output_parts = []
                 exit_code = "unknown"
+                progress_last_emit = 0.0
+                progress_chars_at_emit = 0
+                progress_min_interval = 0.20
+                progress_min_chars = 256
+
+                async def emit_progress(force: bool = False):
+                    nonlocal progress_last_emit, progress_chars_at_emit
+                    if progress_callback is None or not output_parts:
+                        return
+                    output_text = "".join(output_parts)
+                    now = time.monotonic()
+                    grew = len(output_text) - progress_chars_at_emit
+                    if not force and grew < progress_min_chars and (now - progress_last_emit) < progress_min_interval:
+                        return
+                    # 前端草稿只需要最近一段日志；完整输出仍由最终结果保留。
+                    preview_text = output_text[-8000:]
+                    try:
+                        result = progress_callback(preview_text)
+                        if asyncio.iscoroutine(result):
+                            await result
+                        progress_last_emit = now
+                        progress_chars_at_emit = len(output_text)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as cb_error:
+                        # UI 推送失败绝不能影响 Bash 本身执行。
+                        logger.debug(f"bash progress callback failed: {cb_error}")
 
                 async def read_until_marker():
                     nonlocal exit_code
+                    # marker 可能跨 chunk 被拆开，因此只保留一个很小的尾部用于跨 chunk 匹配；
+                    # 已经确定不可能包含 marker 的前缀立即写入 output_parts，避免每次都 O(n) 拼接。
+                    pending = ""
+                    keep_tail = len(marker) + 64
                     while True:
-                        line = await self.proc.stdout.readline()
-                        if not line:
+                        chunk = await self.proc.stdout.read(4096)
+                        if not chunk:
+                            if pending:
+                                output_parts.append(pending)
+                                pending = ""
                             break
-                        line_str = line.decode('utf-8', errors='replace')
-                        # ★ 用 in 而不是 startswith：即使 marker 前面有残留字符
-                        #   （命令输出没换行的情况），也能检测到。
-                        if marker in line_str:
-                            parts = line_str.split()
-                            # marker 在某个位置，exit code 在它后面
-                            try:
-                                idx = parts.index(marker)
-                                exit_code = parts[idx + 1] if idx + 1 < len(parts) else "unknown"
-                            except (ValueError, IndexError):
-                                exit_code = "unknown"
+
+                        pending += chunk.decode('utf-8', errors='replace')
+                        marker_pos = pending.find(marker)
+                        if marker_pos >= 0:
+                            # marker 前是命令真实输出；后面紧接着是 echo 的退出码。
+                            if marker_pos:
+                                output_parts.append(pending[:marker_pos])
+                            marker_tail = pending[marker_pos:]
+                            match = re.search(rf"{re.escape(marker)}\s+(-?\d+)", marker_tail)
+                            if match:
+                                exit_code = match.group(1)
+                            pending = ""
+                            await emit_progress(force=True)
                             break
-                        output_lines.append(line_str)
+
+                        if len(pending) > keep_tail:
+                            output_parts.append(pending[:-keep_tail])
+                            pending = pending[-keep_tail:]
+
+                        await emit_progress(force=False)
 
                 await asyncio.wait_for(read_until_marker(), timeout=timeout)
 
-                output = "".join(output_lines)
+                output = "".join(output_parts)
                 if len(output) > 20000:
                     output = output[:20000] + "\n... (truncated)"
                 output = re.sub(r'\x1b\[[0-9;]*m', '', output)
@@ -396,7 +437,7 @@ _bash_manager = BashSessionManager()
 # =====================================================================
 # execute_bash —— 工具调用入口（保持原签名，外部无需修改）
 # =====================================================================
-async def execute_bash(chat_id: int, command: str = "", restart: bool = False, skill_id: Optional[str] = None) -> str:
+async def execute_bash(chat_id: int, command: str = "", restart: bool = False, skill_id: Optional[str] = None, progress_callback=None) -> str:
     if restart:
         result = await _bash_manager.restart_session(chat_id)
         # 重启后也异步同步一次
@@ -412,7 +453,7 @@ async def execute_bash(chat_id: int, command: str = "", restart: bool = False, s
     #   （skill 可能在上一轮对话里才切换，session 是跨轮复用的）。
     session.set_active_skill(skill_id)
     # 执行命令，内部已包含异步同步
-    return await session.execute(command)
+    return await session.execute(command, progress_callback=progress_callback)
 
 # ---------- 静态地图生成 ----------
 async def _get_static_map_image(
@@ -1771,6 +1812,7 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 command=arguments.get("command", ""),
                 restart=arguments.get("restart", False),
                 skill_id=active_skill_id,
+                progress_callback=progress_callback,
             )
         # ========== Todo 工具分支 ==========
         # 任务 / 待办清单。返回 JSON 字符串给 AI 上下文；UI 渲染由 format_tool_result 处理。

@@ -305,6 +305,9 @@ def build_sandbox_env(workspace: Path, chat_id: int) -> dict:
         "HISTFILE": "/dev/null",
         "HISTSIZE": "0",
         "HISTFILESIZE": "0",
+        # 让 python3 在 stdout=PIPE 时也逐步把日志交给上层；否则 Python
+        # 默认会对管道做块缓冲，前端只能等进程结束才看到输出。
+        "PYTHONUNBUFFERED": "1",
         # ★ 刻意不带任何 *API_KEY *TOKEN *SECRET *PASSWORD
     }
 

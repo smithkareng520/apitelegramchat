@@ -2206,11 +2206,38 @@ async def _run_tool_calls_and_append(
                     except Exception:
                         pass  # 进度推送失败不能影响主流程
 
+            bash_progress_callback = None
+            if fn_name in BASH_TOOLS:
+                command_preview = str(fn_args.get("command") or "").strip()
+                short_command = command_preview[:30] + "…" if len(command_preview) > 30 else command_preview
+
+                async def bash_progress_callback(output_text: str):
+                    try:
+                        safe_output = escape_html(output_text[-8000:])
+                        if safe_output:
+                            preview = (
+                                f"{_format_code_block(command_preview, header='bash')}"
+                                f"<details open><summary>实时输出</summary>"
+                                f"<pre><code>{safe_output}</code></pre></details>"
+                            )
+                        else:
+                            preview = _format_code_block(command_preview, header="bash")
+                        builder.update_tool_preview(
+                            tc_id,
+                            preview,
+                            summary=f"Running: {short_command}" if short_command else "Running command",
+                        )
+                        # 和 Codex 的 outputDelta 类似：执行层只推送增量，真正的网络刷新由
+                        # builder 自己节流，避免 Python/Node 高频 stdout 把 Telegram API 打爆。
+                        builder.request_flush(force=False)
+                    except Exception:
+                        pass  # UI 推送失败不能影响 Bash 本身执行
+
             try:
                 result_str = await asyncio.wait_for(
                     dispatch_tool_call(
                         fn_name, fn_args, chat_id=builder.chat_id,
-                        progress_callback=subagent_progress_callback,
+                        progress_callback=(bash_progress_callback or subagent_progress_callback),
                     ),
                     timeout=timeout
                 )
