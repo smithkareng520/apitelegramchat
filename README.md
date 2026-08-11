@@ -42,3 +42,26 @@ python -m apitelegramchat.verify_security
 ## Skill discovery
 
 The MCP server now exposes a skill catalog backed by `.claude/skills/*/SKILL.md`, with on-demand reading for individual skill bodies.
+
+## Skill runtime dependencies
+
+The bundled `.claude/skills` runtime has project-managed dependencies so the model does not need to install tools at task time.
+
+### Python packages
+- `pypdf`, `pdfplumber`, `reportlab`, `pypdfium2`, `pdf2image`, `pytesseract`, `pandas`
+- `defusedxml` for DOCX XML handling
+
+### Node.js packages
+- Node.js 22
+- `docx` 9.7.1 for JavaScript DOCX generation
+- `pdf-lib` 1.17.1 and `pdfjs-dist` 6.1.200 for advanced PDF JavaScript workflows
+
+### System tools
+- LibreOffice (`soffice`)
+- Poppler utilities (`pdftoppm`, `pdftotext`, `pdfimages`)
+- `qpdf`
+- Pandoc
+- ImageMagick (`magick`)
+- Tesseract OCR (`tesseract`)
+
+Node dependencies are declared in `package.json`; Python dependencies are declared in both `requirements.txt` and `pyproject.toml`.
