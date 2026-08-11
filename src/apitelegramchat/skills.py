@@ -534,33 +534,13 @@ def sync_skill_assets_to_workspace(skill_id: str, workspace_root: Path) -> dict[
     return result
 
 
-def activate_skill(skill_id: str, include_body: bool = True) -> dict[str, Any]:
-    result = read_skill(skill_id)
-    if "error" in result:
-        return result
-    payload = {
-        "activated": result["skill"],
-        "activation_note": (
-            "Use this skill as the authoritative on-demand workflow. "
-            "Load only the body when the task matches, and keep execution narrow."
-        ),
-    }
-    if include_body:
-        payload["body"] = result["body"]
-    return payload
-
-
 def catalog_text() -> str:
-    catalog = get_skill_catalog()
-    lines = [
-        f"Skill roots: {', '.join(catalog['roots']) if catalog['roots'] else '(none)'}",
-        f"Discovered skills: {catalog['count']}",
-    ]
-    if catalog.get("featured"):
-        lines.append(f"Featured skill: {catalog['featured']}")
-    for item in catalog["skills"]:
-        desc = item["description"] or "(no description)"
-        lines.append(f"- {item['skill_id']}: {item['name']} — {desc}")
+    """生成系统提示词用的 skill 目录，每行格式：name - description。"""
+    records = load_skill_records()
+    lines = []
+    for rec in records:
+        desc = rec.description.strip() if rec.description else "(no description)"
+        lines.append(f"{rec.name} - {desc}")
     return "\n".join(lines)
 
 

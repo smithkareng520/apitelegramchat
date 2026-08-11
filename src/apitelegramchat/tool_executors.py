@@ -83,13 +83,6 @@ from apitelegramchat.search_engine import (
     # 子 agent 工具
     execute_subagent,
 )
-from apitelegramchat.skills import (
-    catalog_text as skill_catalog_text,
-    read_skill_text as skill_read_text,
-    activate_skill as skill_activate_skill,
-    sync_skill_assets_to_workspace as _skill_sync_assets,
-    SKILL_ASSETS_DIRNAME,
-)
 from apitelegramchat.todo_tool import (
     render_todo_card,
 )
@@ -2022,46 +2015,6 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                     logger.exception(f"fetch_url unexpected error: {e}")
                     return "⚠️ 页面抓取失败，请稍后重试或检查URL。"
             return "⚠️ 页面抓取失败，请稍后重试。"
-        elif name == "skill_catalog":
-            return skill_catalog_text()
-        elif name == "skill_read":
-            return skill_read_text(arguments.get("skill_id", ""))
-        elif name == "skill_activate":
-            skill_id_arg = arguments.get("skill_id", "")
-            payload = skill_activate_skill(skill_id_arg, include_body=arguments.get("include_body", True))
-            if "error" not in payload:
-                # 用规范化后的真实 skill_id（而非用户可能传入的 name 别名），
-                # 保证和 sync_skill_assets_to_workspace() 落盘的目录名、以及
-                # bash 分支读取 active_skill 后拼接的 ../skills/<id>/ 完全一致。
-                resolved_skill_id = str(
-                    (payload.get("activated") or {}).get("skill_id") or skill_id_arg
-                )
-                # ★ 手动激活同样必须同步资源到 workspace/skills/<id>/，
-                # 否则模型即使读到了 SKILL.md 正文，bash/text_editor 依然
-                # 因为 Landlock 拒绝而访问不到 scripts/、REFERENCE.md 等文件。
-                try:
-                    sync_result = await asyncio.to_thread(
-                        _skill_sync_assets, resolved_skill_id, workspace_root(chat_id)
-                    )
-                    payload["assets_sync"] = sync_result
-                except Exception as e:
-                    payload["assets_sync"] = {"synced": False, "error": str(e)}
-                # 同步写入 active_skill 状态，保证与 ai_handlers.py 的自动匹配路径
-                # 语义一致：下一次 bash 调用能读到这次手动激活，cwd 才会切到
-                # 该 skill 目录。不这么做的话，模型手动 skill_activate 之后，
-                # bash 依旧会落在 workspace 根，SKILL.md 的相对路径又对不上。
-                try:
-                    from apitelegramchat import state as _state
-                    ctx = _state.user_contexts.setdefault(chat_id, {})
-                    ctx["active_skill"] = {
-                        "skill_id": resolved_skill_id,
-                        "reason": "手动激活 (skill_activate)",
-                        "score": None,
-                        "updated_at": time.time(),
-                    }
-                except Exception:
-                    pass
-            return json.dumps(payload, ensure_ascii=False, indent=2)
         elif name == "wikipedia":
             return await execute_wikipedia(arguments.get("query", ""), arguments.get("lang", "zh"))
         elif name == "exchange_rate":

@@ -1415,22 +1415,18 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 <tool_usage_guide>
 - todo：用户说"记一下""提醒我"时优先用。写操作（add/done/undone/delete/edit/clear）后紧跟一次 list，让用户看到最新状态。
 - memory：用户说"记住…"或提到长期偏好/过敏/重要他人/截止日期时写入；回答涉及偏好的问题前先 search。
-- skills：运行时自动管理 .claude/skills/*/SKILL.md。不要把 skill 当作聊天工具或函数；技能由 agent runtime 自动发现、加载并注入上下文。
+- skills：技能指令存储在 workspace/skills/&lt;技能名&gt;/SKILL.md，运行时会自动匹配并加载相关技能到上下文。需要查看技能详情时可用 bash 读取对应 SKILL.md，无需专用工具。
 - subagent：彼此独立的子任务请在同一轮里一次性并发派多个 subagent 工具调用，不要一个做完再发下一个；简单问题自己答，不要滥用。子 agent 不继承主对话历史，只看到 task + context。
 </tool_usage_guide>
 """
         base_prompt += f"""
 
 <skill_directory>
-Claude-style skills are available in this workspace. Use the catalog below to infer when a request should activate a skill automatically.
-Available skills:
-{catalog_text}
+以下是当前可用的技能列表，格式为「技能名 - 描述」。技能资源位于 workspace 的 skills/ 目录下，每个技能对应一个子目录（目录名与技能名相同），其中包含 SKILL.md 及相关脚本/参考文件。
 
-Skill policy:
-- The runtime, not the user-facing model, loads matching skill instructions.
-- Treat loaded <active_skill_context> as authoritative workflow instructions.
-- Never claim that skills are unavailable if a skill catalog or active skill context is present.
-- Never ask for a skill tool or function; skills are not tools.
+当用户请求与某个技能的描述匹配时，运行时会自动将该技能的完整指令加载到上下文。你也可以主动用 bash 读取 skills/&lt;技能名&gt;/SKILL.md 来获取详细操作指南。
+
+{catalog_text}
 </skill_directory>
 """
     else:

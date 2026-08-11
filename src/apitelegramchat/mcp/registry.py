@@ -26,7 +26,6 @@ from apitelegramchat.search_engine import (
     execute_isochrone, execute_news, execute_place_details, execute_qr_code, execute_route,
     execute_search_poi, execute_text_editor, execute_weather, execute_web_search, execute_wikipedia,
 )
-from apitelegramchat.skills import activate_skill, catalog_text, read_skill_text
 from apitelegramchat.workspace_paths import data_root, workspace_root
 from ..core.settings import get_mcp_scope
 
@@ -155,19 +154,6 @@ async def _tool_list_upload(**kwargs: Any) -> str:
     return await execute_list_upload(_chat_id())
 
 
-async def _tool_skill_catalog(**kwargs: Any) -> str:
-    return catalog_text()
-
-
-async def _tool_skill_read(skill_id: str, **kwargs: Any) -> str:
-    return read_skill_text(skill_id)
-
-
-async def _tool_skill_activate(skill_id: str, include_body: bool = True, **kwargs: Any) -> str:
-    result = activate_skill(skill_id, include_body=include_body)
-    return json.dumps(result, ensure_ascii=False, indent=2)
-
-
 TOOL_SPECS: list[ToolSpec] = [
     ToolSpec("memory.manage", "Manage persistent long-term memory.", _tool_memory, _schema_for(execute_memory, title="memory.manage")),
     ToolSpec("todo.manage", "Create, inspect, update, and clear todos.", _tool_todo, _schema_for(execute_todo, title="todo.manage")),
@@ -178,9 +164,6 @@ TOOL_SPECS: list[ToolSpec] = [
     ToolSpec("workspace.stage_upload", "Stage workdir files into upload/ for sending.", _tool_stage_upload, _schema_for(execute_stage_upload, title="workspace.stage_upload")),
     ToolSpec("workspace.list_download", "List files in download/.", _tool_list_download, _schema_for(execute_list_download, title="workspace.list_download")),
     ToolSpec("workspace.list_upload", "List files in upload/.", _tool_list_upload, _schema_for(execute_list_upload, title="workspace.list_upload")),
-    ToolSpec("skill.catalog", "Discover available skills from .claude/skills.", _tool_skill_catalog, _schema_for(_tool_skill_catalog, title="skill.catalog")),
-    ToolSpec("skill.read", "Load one skill body on demand.", _tool_skill_read, _schema_for(_tool_skill_read, title="skill.read")),
-    ToolSpec("skill.activate", "Select a skill and return its activation payload.", _tool_skill_activate, _schema_for(_tool_skill_activate, title="skill.activate")),
     ToolSpec("search.web", "Search the web.", lambda **kw: _call(execute_web_search, **_clean_args(kw)), _schema_for(execute_web_search, title="search.web")),
     ToolSpec("search.fetch", "Fetch and extract a URL.", lambda **kw: _call(execute_fetch_url, **_clean_args(kw)), _schema_for(execute_fetch_url, title="search.fetch")),
     ToolSpec("search.wikipedia", "Query Wikipedia.", lambda **kw: _call(execute_wikipedia, **_clean_args(kw)), _schema_for(execute_wikipedia, title="search.wikipedia")),
