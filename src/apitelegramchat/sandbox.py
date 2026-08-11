@@ -291,16 +291,20 @@ def build_sandbox_argv() -> list:
     return ["/bin/bash", "--noprofile", "--norc", "-s"]
 
 
-def build_sandbox_env(workspace: Path, chat_id: int) -> dict:
+def build_sandbox_env(
+    workspace: Path,
+    chat_id: int,
+    namespace: str | None = None,
+) -> dict:
     """Build the shell environment from persistent, workspace-local runtime paths.
 
     Runtime caches live under the same workspace tree that Landlock already permits.
     Nothing is installed on every command: the host toolchain (/usr/bin/python3, gcc,
     etc.) is reused and package/build caches survive Bash session restarts.
     """
-    workdir = workspace_workdir(chat_id)
+    workdir = workspace_workdir(chat_id, namespace)
     workdir_abs = str(workdir.absolute())
-    cache_root = runtime_cache_root(chat_id)
+    cache_root = runtime_cache_root(chat_id, namespace)
     cache_root.mkdir(parents=True, exist_ok=True)
     pip_cache = cache_root / "pip"
     ccache_dir = cache_root / "ccache"

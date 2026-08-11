@@ -102,7 +102,23 @@ def todo_state_file(chat_id: object, namespace: object | None = None) -> Path:
 
 
 def workspace_namespace(chat_id: object, namespace: object | None = None) -> str:
+    """Return the canonical workspace namespace for this tool invocation.
+
+    Callers that coordinate multiple tools should resolve this once and pass the
+    returned value explicitly to every workspace operation. This avoids relying on
+    the request ContextVar repeatedly across async tasks/subtasks.
+    """
     return _resolved_namespace(chat_id, namespace)
+
+
+def workspace_identity(chat_id: object, namespace: object | None = None) -> tuple[str, Path]:
+    """Resolve the stable namespace and root together.
+
+    The tuple is intentionally cheap to pass through tool dispatch so file_editor,
+    bash, skill sync, and persistence all operate on the exact same filesystem tree.
+    """
+    resolved = workspace_namespace(chat_id, namespace)
+    return resolved, workspace_root(chat_id, resolved)
 
 
 def runtime_cache_root(chat_id: object, namespace: object | None = None) -> Path:

@@ -51,6 +51,8 @@ async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) 
 
     The workspace is never hydrated from or mirrored wholesale to R2.
     """
+    # Namespace is resolved once by the caller when tools are coordinated.
+    # Do not re-read ContextVar state in the middle of an operation.
     workspace = workspace_root(chat_id, namespace)
     workspace.mkdir(parents=True, exist_ok=True)
     try:

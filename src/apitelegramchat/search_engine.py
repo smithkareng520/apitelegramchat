@@ -14,6 +14,7 @@ import socket
 import uuid
 import math
 import shutil
+import mimetypes
 from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
 from typing import Optional
 try:
@@ -35,7 +36,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
             return {"entries": []}
     feedparser = _FeedParserStub()  # type: ignore
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_workdir
+from apitelegramchat.workspace_paths import workspace_workdir, workspace_namespace
 
 # === [amap_integration patch] 高德地图数据源 ===
 try:
@@ -89,7 +90,7 @@ from apitelegramchat.utils import retry_async
 
 OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 
-from apitelegramchat.s3_utils import upload_bytes_to_r2
+from apitelegramchat.s3_utils import upload_bytes_to_r2, delete_r2_object
 from apitelegramchat.workspace_utils import (
     _get_workspace_lock, _ensure_runtime_workspace,
 )
@@ -169,10 +170,18 @@ def _normalize_fetch_cache_key(url: str) -> str:
 
 
 # ===================== 显式持久化单个编辑文件 =====================
-async def _persist_edited_file(chat_id: int, rel_path: str, *, delete: bool = False):
+async def _persist_edited_file(
+    chat_id: int,
+    rel_path: str,
+    *,
+    delete: bool = False,
+    namespace: str | None = None,
+):
     """Persist only the file explicitly changed through file_editor."""
     try:
-        result = await persist_workspace_file(chat_id, rel_path, delete=delete)
+        result = await persist_workspace_file(
+            chat_id, rel_path, delete=delete, namespace=namespace
+        )
         logger.debug("显式持久化成功：%s", result.get("key", rel_path))
     except Exception as e:
         logger.error("显式持久化失败 %s: %s", rel_path, e)
@@ -218,6 +227,7 @@ async def execute_file_editor(
     chat_id: int,
     command: str,
     path: str,
+    namespace: str | None = None,
     view_range: list[int] | None = None,
     search_terms: list[str] | None = None,        # 新增：view 搜索关键词
     old_str: str | None = None,
@@ -248,11 +258,12 @@ async def execute_file_editor(
     # ★ init 在 workspace lock 外面执行：R2 网络同步可能耗时数秒，
     #   不应阻塞其他工具调用获取 workspace lock。init 只需要 init_lock
     #   （在 _ensure_workspace_initialized 内部获取），与 workspace lock 独立。
-    await _ensure_runtime_workspace(chat_id)
+    resolved_namespace = workspace_namespace(chat_id, namespace)
+    await _ensure_runtime_workspace(chat_id, resolved_namespace)
 
-    lock = await _get_workspace_lock(chat_id)
+    lock = await _get_workspace_lock(chat_id, resolved_namespace)
     async with lock:
-        workspace = workspace_workdir(chat_id)
+        workspace = workspace_workdir(chat_id, resolved_namespace)
         local_path = workspace if allow_root_path else (workspace / safe_path)
 
         # ----- view (增强：支持搜索关键词) -----
@@ -338,7 +349,7 @@ async def execute_file_editor(
                 f.write(file_text)
             mtime = local_path.stat().st_mtime
             set_editor_file_state(chat_id, safe_path, file_text, mtime)
-            asyncio.create_task(_persist_edited_file(chat_id, safe_path))
+            asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
             return f"File created successfully: {path}"
 
         # ----- replace_lines -----
@@ -366,7 +377,7 @@ async def execute_file_editor(
             _write_editor_file(local_path, new_full)
             mtime = local_path.stat().st_mtime
             set_editor_file_state(chat_id, safe_path, new_full, mtime)
-            asyncio.create_task(_persist_edited_file(chat_id, safe_path))
+            asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
             preview_lines = new_full.splitlines()
             preview = _line_range_preview(preview_lines, start_del, min(len(preview_lines), start_del + max(0, len(replacement_text.splitlines()) - 1) if replacement_text else start_del), highlight_line=start_del)
             return f"Successfully replaced lines {start_del}-{end_del} in {path}.\n\nResult around edit:\n{preview}"
@@ -451,7 +462,7 @@ async def execute_file_editor(
             _write_editor_file(local_path, new_full)
             mtime = local_path.stat().st_mtime
             set_editor_file_state(chat_id, safe_path, new_full, mtime)
-            asyncio.create_task(_persist_edited_file(chat_id, safe_path))
+            asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
 
             # 生成预览
             new_lines = new_full.splitlines()
@@ -557,7 +568,7 @@ async def execute_file_editor(
                 content = f.read()
             mtime = local_path.stat().st_mtime
             set_editor_file_state(chat_id, safe_path, content, mtime)
-            asyncio.create_task(_persist_edited_file(chat_id, safe_path))
+            asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
             return f"Undo successful. Reverted {path} to previous version."
 
         else:
@@ -3641,6 +3652,43 @@ def _editor_get_backup_key(chat_id: int, path: str) -> str:
     """生成备份文件的R2键。"""
     safe = _editor_safe_path(path)
     return f"{EDITOR_PREFIX}/{chat_id}/{safe}.backup"
+
+
+async def persist_workspace_file(
+    chat_id: int,
+    rel_path: str,
+    *,
+    delete: bool = False,
+    namespace: str | None = None,
+) -> dict[str, str | bool]:
+    """Persist exactly one file edited by file_editor.
+
+    The local workspace is always the source of truth. This helper only mirrors
+    the explicitly changed file to the existing R2 editor namespace; it never
+    scans or syncs the whole workspace. Namespace is accepted so callers can keep
+    a single workspace identity end-to-end, while the legacy R2 key remains keyed
+    by chat_id for backward compatibility.
+    """
+    # Resolve the namespace here as an integrity check even though the current R2
+    # key format remains chat-id based for compatibility.
+    resolved_namespace = workspace_namespace(chat_id, namespace)
+    workspace = workspace_workdir(chat_id, resolved_namespace)
+    safe = _editor_safe_path(rel_path)
+    local_path = (workspace / safe).resolve()
+    if local_path != workspace and workspace not in local_path.parents:
+        raise ValueError("path escapes workspace")
+
+    key = _editor_get_r2_key(chat_id, safe)
+    if delete:
+        deleted = await delete_r2_object(key)
+        return {"key": key, "deleted": bool(deleted)}
+
+    if not local_path.is_file():
+        raise FileNotFoundError(f"workspace file not found: {safe}")
+    data = await asyncio.to_thread(local_path.read_bytes)
+    content_type = mimetypes.guess_type(safe)[0] or "application/octet-stream"
+    url = await upload_bytes_to_r2(data, key, content_type)
+    return {"key": key, "persisted": url is not None}
 
 
 def _list_directory(dir_path: Path, display_path: str) -> str:

@@ -9,7 +9,7 @@ import hashlib
 import time
 from pathlib import Path
 from apitelegramchat.workspace_paths import (
-    workspace_root, workspace_workdir, runtime_cache_root,
+    workspace_root, workspace_workdir, runtime_cache_root, workspace_namespace,
     workspace_upload_root,
     is_inside_upload_or_download,
 )
@@ -107,8 +107,8 @@ def extract_domain(url: str) -> str:
 _RUNTIME_STATE_FILENAME = "runtime.json"
 
 
-def _runtime_state_path(chat_id: int) -> Path:
-    return workspace_root(chat_id) / _RUNTIME_STATE_FILENAME
+def _runtime_state_path(chat_id: int, namespace: str | None = None) -> Path:
+    return workspace_root(chat_id, namespace) / _RUNTIME_STATE_FILENAME
 
 
 def _tool_version(exe: str) -> str | None:
@@ -135,13 +135,17 @@ def _tool_version(exe: str) -> str | None:
     return line[0].strip()[:300] if line else None
 
 
-def _prepare_runtime_once(chat_id: int, cache_root: Path) -> dict:
+def _prepare_runtime_once(
+    chat_id: int,
+    cache_root: Path,
+    namespace: str | None = None,
+) -> dict:
     """Record host toolchain discovery once per persistent workspace.
 
     This deliberately does *not* install compilers per Bash invocation. The base image
     owns the toolchain; the workspace owns only reusable caches and a small manifest.
     """
-    state_path = _runtime_state_path(chat_id)
+    state_path = _runtime_state_path(chat_id, namespace)
     state_path.parent.mkdir(parents=True, exist_ok=True)
     if state_path.exists():
         try:
@@ -175,12 +179,13 @@ def _prepare_runtime_once(chat_id: int, cache_root: Path) -> dict:
 # BashSession —— 每会话独立沙箱
 # =====================================================================
 class BashSession:
-    def __init__(self, chat_id: int):
+    def __init__(self, chat_id: int, namespace: str | None = None):
         self.chat_id = chat_id
+        self.namespace = workspace_namespace(chat_id, namespace)
         self.proc: Optional[asyncio.subprocess.Process] = None
         self._started = False
-        self.workspace = workspace_root(chat_id)
-        self.workdir = workspace_workdir(chat_id)
+        self.workspace = workspace_root(chat_id, self.namespace)
+        self.workdir = workspace_workdir(chat_id, self.namespace)
         self._watchdog_task: Optional[asyncio.Task] = None
         self._runtime_state: Optional[dict] = None
         self._runtime_prepare_lock = asyncio.Lock()
@@ -206,14 +211,14 @@ class BashSession:
         self._last_cwd = str(self.workdir.absolute())
 
         argv = build_sandbox_argv()
-        env = build_sandbox_env(self.workspace, self.chat_id)
-        cache_root = runtime_cache_root(self.chat_id)
+        env = build_sandbox_env(self.workspace, self.chat_id, self.namespace)
+        cache_root = runtime_cache_root(self.chat_id, self.namespace)
         async with self._runtime_prepare_lock:
             if self._runtime_state is None:
                 # One-time discovery per persistent workspace. Subsequent Bash restarts
                 # reuse the manifest instead of "preparing" the toolchain again.
                 self._runtime_state = await asyncio.to_thread(
-                    _prepare_runtime_once, self.chat_id, cache_root
+                    _prepare_runtime_once, self.chat_id, cache_root, self.namespace
                 )
 
         # ★ Landlock：把文件系统访问限制在该 chat 的 workspace 层，
@@ -558,28 +563,32 @@ class BashSessionManager:
         self._sessions: dict = {}
         self._lock = asyncio.Lock()
 
-    async def get_session(self, chat_id: int) -> BashSession:
+    async def get_session(self, chat_id: int, namespace: str | None = None) -> BashSession:
+        resolved_namespace = workspace_namespace(chat_id, namespace)
+        key = (chat_id, resolved_namespace)
         async with self._lock:
-            if chat_id not in self._sessions:
-                session = BashSession(chat_id)
+            if key not in self._sessions:
+                session = BashSession(chat_id, resolved_namespace)
                 await session.start()
-                self._sessions[chat_id] = session
+                self._sessions[key] = session
             else:
                 # 进程已死则重建
-                s = self._sessions[chat_id]
+                s = self._sessions[key]
                 if s.proc is None or s.proc.returncode is not None:
                     await s.start()
-            return self._sessions[chat_id]
+            return self._sessions[key]
 
-    async def restart_session(self, chat_id: int) -> str:
+    async def restart_session(self, chat_id: int, namespace: str | None = None) -> str:
+        resolved_namespace = workspace_namespace(chat_id, namespace)
+        key = (chat_id, resolved_namespace)
         async with self._lock:
-            session = self._sessions.get(chat_id)
+            session = self._sessions.get(key)
             if session:
                 await session.close()
-                del self._sessions[chat_id]
-            new_session = BashSession(chat_id)
+                del self._sessions[key]
+            new_session = BashSession(chat_id, resolved_namespace)
             await new_session.start()
-            self._sessions[chat_id] = new_session
+            self._sessions[key] = new_session
             return f"Bash session restarted (sandbox=landlock)"
 
     async def cleanup_all(self):
@@ -597,14 +606,21 @@ _bash_manager = BashSessionManager()
 # =====================================================================
 # execute_bash —— 工具调用入口（保持原签名，外部无需修改）
 # =====================================================================
-async def execute_bash(chat_id: int, command: str = "", restart: bool = False, progress_callback=None) -> str:
+async def execute_bash(
+    chat_id: int,
+    command: str = "",
+    restart: bool = False,
+    progress_callback=None,
+    namespace: str | None = None,
+) -> str:
+    resolved_namespace = workspace_namespace(chat_id, namespace)
     if restart:
-        result = await _bash_manager.restart_session(chat_id)
+        result = await _bash_manager.restart_session(chat_id, resolved_namespace)
         return result
     if not command:
         return "Error: command is required (or set restart=true)"
     try:
-        session = await _bash_manager.get_session(chat_id)
+        session = await _bash_manager.get_session(chat_id, resolved_namespace)
     except RuntimeError as e:
         return f"Error: {e}"
     # 执行命令；workspace 本地文件不会自动同步到 R2。
@@ -1920,6 +1936,10 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
     if chat_id is None:
         # 早期失败：避免创建 ./workspace/None 造成跨会话数据泄漏
         return json.dumps({"error": "chat_id is required for tool dispatch"})
+    # Resolve workspace identity exactly once for this tool invocation.
+    # Every workspace-facing operation below receives this explicit namespace, so
+    # async tasks/subtasks cannot accidentally resolve a different ContextVar.
+    resolved_namespace = workspace_namespace(chat_id)
     try:
         if name == "web_search":
             return await execute_web_search(arguments.get("query", ""), arguments.get("num_results", 5))
@@ -2030,6 +2050,7 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
         elif name == "file_editor":
             return await execute_file_editor(
                 chat_id=chat_id,
+                namespace=resolved_namespace,
                 command=arguments.get("command", ""),
                 path=arguments.get("path", ""),
                 view_range=arguments.get("view_range"),
@@ -2050,6 +2071,7 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
         elif name == "bash":
             return await execute_bash(
                 chat_id=chat_id,
+                namespace=resolved_namespace,
                 command=arguments.get("command", ""),
                 restart=arguments.get("restart", False),
                 progress_callback=progress_callback,
