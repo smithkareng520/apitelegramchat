@@ -76,17 +76,16 @@ def _build_nav_links(
     }
 
 from apitelegramchat.config import (
-    GOOGLE_CSE_KEY, GOOGLE_CSE_ID,
     OPENROUTER_API_KEY,
     TOMTOM_API_KEY,
     ORS_API_KEY,
     SEARCH_CACHE_TTL,
     FETCH_CACHE_TTL,
     SUPPORTED_MODELS,
-    DDG_SEARCH_API_URL,
     get_openrouter_provider_preferences,
 )
 from apitelegramchat.utils import retry_async
+from apitelegramchat.mcp_client import call_mcp_tool, MCPToolError
 
 OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 
@@ -118,26 +117,6 @@ HTTP_TIMEOUT_FETCH = 15
 CURL_TIMEOUT = 20
 
 BACKUP_TIMEOUT = 10
-# DuckDuckGo 免费 API（my-search-api on Render free tier）请求超时：
-# 实测 warm 请求 ~11s（见 took_ms），cold start 可能 30s+，留足余量。
-DDG_TIMEOUT = 30
-# DuckDuckGo 搜索现在走免费 my-search-api 服务（地址由环境变量 DDG_SEARCH_API_URL 配置）。
-# 旧的 HTML 抓取端点（html.duckduckgo.com / lite.duckduckgo.com / duckduckgo.com/html/）已废弃——
-# 反爬太严，curl_cffi + chrome120 指纹也压不住 202 anti-bot challenge。
-
-# ---------- DDG 有限并发 + 请求级退避 ----------
-# 研究型任务会同时运行 6 个 subagent；这里不能再用全局 Lock 把搜索压成单路。
-# 用有限并发 semaphore 控制对单实例免费 API 的压力，同时让其它请求继续前进。
-DDG_MAX_CONCURRENCY = int(os.getenv("DDG_MAX_CONCURRENCY", "8"))
-_ddg_semaphore: Optional[asyncio.Semaphore] = None
-
-
-def _get_ddg_semaphore() -> asyncio.Semaphore:
-    """懒初始化 DDG 并发池，避免模块导入时绑定错误的 event loop。"""
-    global _ddg_semaphore
-    if _ddg_semaphore is None:
-        _ddg_semaphore = asyncio.Semaphore(max(1, DDG_MAX_CONCURRENCY))
-    return _ddg_semaphore
 
 _TRAFILATURA_CONFIG = use_config()
 if _TRAFILATURA_CONFIG is not None:
@@ -1449,165 +1428,77 @@ SEARCH_TOOLS = [
 # 工具实现
 # =============================================================================
 
-# 旧的 _normalize_ddg_link / _extract_ddg_results 已随 HTML 抓取方案一起废弃。
-# DuckDuckGo 搜索现在直接走 JSON API（环境变量 DDG_SEARCH_API_URL），无需解析 HTML。
+# Google CSE / DuckDuckGo 抓取实现已移除，搜索改为通过外部 MCP 服务
+# （bing-cn-mcp-server，见 mcp_client.py）调用其 bing_search 工具。
 
-# --------------------- web_search ---------------------
-@retry_async(max_retries=2, delay=1, exceptions=(aiohttp.ClientError, asyncio.TimeoutError))
-async def _search_google(query: str, num_results: int) -> list[dict] | None:
-    if not GOOGLE_CSE_KEY or not GOOGLE_CSE_ID:
-        return None
-    params = {"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_ID, "q": query, "num": min(max(num_results, 1), 10)}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SHORT)) as session:
-        async with session.get("https://www.googleapis.com/customsearch/v1", params=params) as resp:
-            # 429 / 503 直接回落到 DuckDuckGo，避免在失败侧拖住前台草稿/回复链路。
-            if resp.status in (429, 503):
-                logger.info(f"Google CSE HTTP {resp.status}, fallback to DuckDuckGo")
-                return None
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-    items = data.get("items", [])
-    return [{"title": item.get("title", "无标题"), "link": item.get("link", ""), "snippet": item.get("snippet", "").replace("\n", " ")} for item in items[:num_results]]
-
-
-# 专门用于触发 retry_async 重试的临时异常——DDG API 限流/5xx 或空结果时抛出
-# 这样 retry_async 装饰器才会真正生效（原实现直接 return None，重试装饰器无效）
-class DDGTransientError(Exception):
-    """DDG API 临时不可用 / 空结果，可重试。"""
+# 专门用于触发 retry_async 重试的临时异常——MCP 搜索服务限流/超时或空结果时抛出
+class MCPSearchTransientError(Exception):
+    """外部 MCP 搜索服务临时不可用 / 空结果，可重试。"""
 
 
 @retry_async(max_retries=2, delay=1.5, backoff=2.0,
-            exceptions=(aiohttp.ClientError, asyncio.TimeoutError, DDGTransientError))
-async def _search_duckduckgo(query: str, num_results: int) -> list[dict] | None:
-    """
-    DuckDuckGo 搜索主路径：直接调用免费 my-search-api 服务（环境变量 DDG_SEARCH_API_URL）。
-    关键改动：
-      - 抛弃了旧的 curl_cffi + chrome120 TLS 指纹 + HTML 抓取方案（被 DDG 反爬打到没法用）
-      - 改为 GET <DDG_SEARCH_API_URL>?text=<quoted query>，解析 JSON 返回结果
-      - 使用 DDG_MAX_CONCURRENCY 有限并发，避免单实例 API 雪崩，同时支持 6 个研究 agent 持续并行检索
+            exceptions=(MCPToolError, MCPSearchTransientError, asyncio.TimeoutError))
+async def _search_via_mcp(query: str, num_results: int) -> list[dict] | None:
+    """通过外部 MCP 服务（bing-cn-mcp-server 的 bing_search 工具）执行网页搜索。
+
+    工具协议：bing_search(query: str, count?: int, offset?: int) -> 纯文本，
+    形如：
+        搜索关键词: ...
+        找到约 N 条结果
+        返回前 M 条结果:
+        ====...====
+        [1] 标题
+            链接: https://...
+            摘要: ...
+        [2] ...
+    这里把该文本解析为统一的 {title, link, snippet} 列表，交给
+    _format_search_results 统一格式化，保持对外的返回格式不变。
     """
     query = (query or "").strip()
     if not query:
         return None
-    if not DDG_SEARCH_API_URL:
-        logger.warning("DDG_SEARCH_API_URL 未配置，DuckDuckGo 回退不可用")
-        raise DDGTransientError("DDG_SEARCH_API_URL not configured")
 
-    # 使用有限并发池，而不是全局锁。单请求遇到 429/5xx 时由 retry_async 做请求级退避，
-    # 不阻断其它研究 agent 的搜索。
-    async with _get_ddg_semaphore():
-        items = await _search_duckduckgo_via_api(query, num_results)
+    try:
+        raw_text = await call_mcp_tool(
+            "bing-cn-mcp-server",
+            "bing_search",
+            {"query": query, "count": num_results},
+        )
+    except MCPToolError as e:
+        logger.warning(f"MCP 搜索调用失败: {e}")
+        raise
 
+    items = _parse_bing_mcp_result(raw_text, num_results)
     if items:
         return items
 
-    # API 调用成功但没拿到结果——大概率是 query 太冷门，抛出以便上层重试一次
-    logger.info("DuckDuckGo API returned no results")
-    raise DDGTransientError("DDG returned no results")
+    logger.info("MCP 搜索服务返回空结果")
+    raise MCPSearchTransientError("MCP search returned no results")
 
 
-def _ddg_pick_ua() -> str:
-    """随机选一个现代浏览器 UA，用于 API 请求头。"""
-    uas = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    ]
-    import random
-    return random.choice(uas)
+def _parse_bing_mcp_result(raw_text: str, num_results: int) -> list[dict]:
+    """解析 bing-cn-mcp-server 的 bing_search 纯文本返回，提取 title/link/snippet。"""
+    if not raw_text:
+        return []
 
-
-async def _search_duckduckgo_via_api(query: str, num_results: int) -> list[dict] | None:
-    """通过免费 my-search-api 服务获取 DuckDuckGo 搜索结果。
-
-    调用约定（参考 https://my-search-api-08cb.onrender.com/duckduckgo/search?text=牛奶）：
-      GET <DDG_SEARCH_API_URL>?text=<URL-encoded query>
-      返回 JSON：{
-        "query": {...},
-        "results": [
-          {"title": "...", "url": "...", "snippet": "...", "domain": "...", ...},
-          ...
-        ],
-        "serp_features": [...],
-        ...
-      }
-
-    本函数只负责一次 HTTP 调用 + JSON 解析；限流/重试由调用方 _search_duckduckgo 处理。
-    调用方已经通过 DDG semaphore 获得一个并发槽；本函数本身不再做额外同步。
-    """
-
-    api_base = (DDG_SEARCH_API_URL or "").strip().rstrip("/")
-    if not api_base:
-        logger.warning("DDG_SEARCH_API_URL 为空，跳过 DuckDuckGo 搜索")
-        return None
-
-    # 兼容两种配置方式：
-    #   1) 只填 base：https://my-search-api-08cb.onrender.com/duckduckgo/search
-    #      -> 自动拼 ?text=<quoted query>
-    #   2) 用户已经把占位符 {query} 写进了 URL，例如 .../search?text={query}
-    #      -> 直接 str.format 替换（query 已 URL-encode）
-    if "{query}" in api_base:
-        request_url = api_base.format(query=quote(query))
-    else:
-        request_url = f"{api_base}?text={quote(query)}"
-
-    headers = {
-        "User-Agent": _ddg_pick_ua(),
-        # ⚠️ 不要写成 "application/json, text/plain, */*"——该 API 的内容协商有 bug，
-        # 会优先返回 text/plain 的 HTML 视图，导致 JSON 解析失败。
-        # 必须明确指定 application/json（或者 */* 也可以，但 application/json 最稳）。
-        "Accept": "application/json",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    }
-
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=DDG_TIMEOUT)) as session:
-            async with session.get(request_url, headers=headers) as resp:
-                # 429 / 5xx 仅让当前请求失败；上层 retry_async 会做指数退避。
-                # 不设置全局 cooldown，避免一个失败请求把 6 个 research agent 全部停住。
-                if resp.status == 429 or resp.status >= 500:
-                    logger.info(f"DDG API HTTP {resp.status}, request-level retry")
-                    return None
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.warning(f"DDG API HTTP {resp.status}: {body[:200]}")
-                    return None
-                try:
-                    data = await resp.json(content_type=None)
-                except Exception as je:
-                    body = await resp.text()
-                    logger.warning(f"DDG API JSON 解析失败: {je}; body[:200]={body[:200]}")
-                    return None
-    except asyncio.TimeoutError as e:
-        logger.warning(f"DDG API 请求超时: {e}")
-        raise  # 让 retry_async 重试
-    except aiohttp.ClientError as e:
-        logger.warning(f"DDG API 请求失败: {e}")
-        raise  # 让 retry_async 重试
-    except Exception as e:
-        logger.warning(f"DDG API 未知异常: {e}")
-        return None
-
-    # 解析 results[] —— 兼容字段 url / link 两种命名
-    raw_results = data.get("results", []) if isinstance(data, dict) else []
     items: list[dict] = []
-    seen_links: set[str] = set()
-    for r in raw_results:
-        if not isinstance(r, dict):
+    entry_re = re.compile(
+        r'^\s*\[\d+\]\s*(?P<title>.+?)\s*$'
+        r'(?:\n\s*链接[:：]\s*(?P<link>\S+))?'
+        r'(?:\n\s*摘要[:：]\s*(?P<snippet>.*?))?'
+        r'(?=\n\s*\[\d+\]|\Z)',
+        re.MULTILINE | re.DOTALL,
+    )
+    for m in entry_re.finditer(raw_text):
+        title = (m.group("title") or "").strip() or "无标题"
+        link = (m.group("link") or "").strip()
+        snippet = (m.group("snippet") or "").replace("\n", " ").strip()
+        if not link:
             continue
-        link = (r.get("url") or r.get("link") or "").strip()
-        if not link or link in seen_links:
-            continue
-        title = (r.get("title") or "无标题").strip()
-        snippet = (r.get("snippet") or "").replace("\n", " ").strip()
-        seen_links.add(link)
         items.append({"title": title, "link": link, "snippet": snippet})
         if len(items) >= num_results:
             break
-
-    logger.info(f"DDG API -> {len(items)} 条结果")
-    return items or None
+    return items
 
 
 def _format_search_results(items: list, query: str, engine: str, requested: int | None = None) -> str:
@@ -1623,29 +1514,24 @@ def _format_search_results(items: list, query: str, engine: str, requested: int 
 
 
 async def execute_web_search(query: str, num_results: int = 5) -> str:
-    """Search the web with Google first, then DuckDuckGo fallback.
+    """通过外部 MCP 搜索服务（bing-cn-mcp-server）执行网页搜索。
 
-    This keeps the public tool contract stable while allowing Google to be removed
-    later without changing the call sites. The response format is intentionally
-    identical for both providers so the UI and result counting logic stay aligned.
+    对外的函数签名 / 返回文本格式保持不变，仅内部实现从
+    Google CSE + DuckDuckGo 换成了 MCP 工具调用，调用方无需改动。
     """
     query = (query or "").strip()
     requested = min(max(int(num_results or 5), 1), 10)
     if not query:
         return "❌ 搜索关键词为空。"
 
-    providers = (
-        ("Google", _search_google),
-        ("DuckDuckGo", _search_duckduckgo),
-    )
-    for engine_name, provider in providers:
-        try:
-            items = await provider(query, requested)
-        except Exception as e:
-            logger.warning(f"{engine_name} 搜索失败: {e}")
-            items = None
-        if items:
-            return _format_search_results(items, query, engine_name, requested=requested)
+    try:
+        items = await _search_via_mcp(query, requested)
+    except Exception as e:
+        logger.warning(f"MCP 搜索失败: {e}")
+        items = None
+
+    if items:
+        return _format_search_results(items, query, "Bing", requested=requested)
 
     return f"❌ 未找到与「{query}」相关的结果。"
 

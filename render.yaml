@@ -55,8 +55,10 @@ services:
         sync: false
       - key: WEBHOOK_URL
         sync: false
-      - key: DDG_SEARCH_API_URL
-        value: https://my-search-api-08cb.onrender.com/duckduckgo/search
+      - key: BING_CN_MCP_URL
+        sync: false
+      - key: BING_CN_MCP_TOKEN
+        sync: false
       - key: SANDBOX_MAX_PROCS
         value: "50"
       - key: SANDBOX_MAX_CPU_SEC
@@ -77,8 +79,6 @@ services:
         value: "120"
       - key: SUBAGENT_OUTER_TIMEOUT
         value: "930"
-      - key: DDG_MAX_CONCURRENCY
-        value: "8"
       - key: MAX_CONCURRENT_TOOLS
         value: "16"
       - key: LOG_LEVEL

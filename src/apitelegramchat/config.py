@@ -21,8 +21,6 @@ OPENROUTER_REQUIRE_PARAMETERS = os.getenv("OPENROUTER_REQUIRE_PARAMETERS", "fals
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 XAI_API_KEY = os.getenv("XAI_API_KEY")
-GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY")
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY")
 ORS_API_KEY = os.getenv("ORS_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -31,11 +29,13 @@ MODELSCOPE_API_KEY = os.getenv("MODELSCOPE_API_KEY", "")
 AGNES_API_KEY = os.getenv("AGNES_API_KEY", "")
 AMAP_KEY = os.getenv("AMAP_KEY", "").strip()
 
-# ---------- DuckDuckGo 免费搜索 API（HTML 抓取回退已废弃）----------
-# 通过环境变量配置 my-search-api 服务地址，避免反爬/封锁。
-# 调用方式：<DDG_SEARCH_API_URL>?text=<quoted query>
-# 返回 JSON，results[] 内每条至少包含 title / url / snippet。
-DDG_SEARCH_API_URL = (os.getenv("DDG_SEARCH_API_URL") or "").strip()
+# ---------- 网页搜索：外部 MCP 搜索服务（bing-cn-mcp-server）----------
+# Google CSE / DuckDuckGo 已移除，网页搜索改为通过外部 MCP 服务调用。
+# 连接地址与鉴权 Token 完全由环境变量提供，代码中不含任何明文默认值——
+# 未配置时该搜索服务不可用（mcp_client.py 会跳过注册）。
+BING_CN_MCP_ENABLED = os.getenv("BING_CN_MCP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+BING_CN_MCP_URL = (os.getenv("BING_CN_MCP_URL") or "").strip()
+BING_CN_MCP_TOKEN = (os.getenv("BING_CN_MCP_TOKEN") or "").strip()
 
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
@@ -583,7 +583,7 @@ _SENSITIVE_EXACT = {
     "R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY",
     "R2_BUCKET_NAME", "R2_PUBLIC_URL", "R2_REGION",
     "GEOAPIFY_KEY", "IMGBB_KEY", "TOMTOM_API_KEY", "ORS_API_KEY",
-    "GOOGLE_CSE_KEY", "GOOGLE_CSE_ID",
+    "BING_CN_MCP_TOKEN",
     "WEBHOOK_TOKEN", "WEBHOOK_URL",
 }
 

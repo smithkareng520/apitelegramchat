@@ -9,6 +9,7 @@ description = "Telegram AI assistant with MCP-native tool exposure"
 requires-python = ">=3.10"
 dependencies = [
   "aiohttp==3.11.15",
+  "mcp>=1.12,<2",
   "openai==1.66.3",
   "Pillow==11.1.0",
   "quart==0.20.0",
