@@ -22,7 +22,7 @@ from apitelegramchat.tool_executors import (
 from apitelegramchat.search_engine import (
     execute_book_lookup, execute_crypto_price, execute_done, execute_distance, execute_elevation,
     execute_exchange_rate, execute_fetch_url, execute_geocode, execute_generate_image,
-    execute_generate_video, execute_hacker_news, execute_image_search, execute_ip_geo,
+    execute_generate_video, execute_image_search, execute_ip_geo,
     execute_isochrone, execute_news, execute_place_details, execute_qr_code, execute_route,
     execute_search_poi, execute_text_editor, execute_weather, execute_web_search, execute_wikipedia,
 )
@@ -168,7 +168,6 @@ TOOL_SPECS: list[ToolSpec] = [
     ToolSpec("search.fetch", "Fetch and extract a URL.", lambda **kw: _call(execute_fetch_url, **_clean_args(kw)), _schema_for(execute_fetch_url, title="search.fetch")),
     ToolSpec("search.wikipedia", "Query Wikipedia.", lambda **kw: _call(execute_wikipedia, **_clean_args(kw)), _schema_for(execute_wikipedia, title="search.wikipedia")),
     ToolSpec("search.exchange_rate", "Get exchange rates.", lambda **kw: _call(execute_exchange_rate, **_clean_args(kw)), _schema_for(execute_exchange_rate, title="search.exchange_rate")),
-    ToolSpec("search.hacker_news", "Fetch Hacker News stories.", lambda **kw: _call(execute_hacker_news, **_clean_args(kw)), _schema_for(execute_hacker_news, title="search.hacker_news")),
     ToolSpec("search.book_lookup", "Look up books.", lambda **kw: _call(execute_book_lookup, **_clean_args(kw)), _schema_for(execute_book_lookup, title="search.book_lookup")),
     ToolSpec("search.weather", "Fetch weather information.", lambda **kw: _call(execute_weather, **_clean_args(kw)), _schema_for(execute_weather, title="search.weather")),
     ToolSpec("search.news", "Fetch news summaries.", lambda **kw: _call(execute_news, **_clean_args(kw)), _schema_for(execute_news, title="search.news")),

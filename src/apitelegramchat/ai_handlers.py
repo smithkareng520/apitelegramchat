@@ -1976,7 +1976,6 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
         "list_upload": "Listing upload/",
         "wikipedia": "Looking up on Wikipedia",
         "news": "Fetching news",
-        "hacker_news": "Fetching Hacker News",
         "book_lookup": "Looking up a book",
         "ip_geo": "Looking up IP location",
         "geocode": "Geocoding address",
@@ -2019,7 +2018,6 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
         "fetch_url": "fetched a page",
         "wikipedia": "looked up Wikipedia",
         "exchange_rate": "checked exchange rates",
-        "hacker_news": "fetched Hacker News",
         "book_lookup": "looked up a book",
         "weather": "fetched weather",
         "news": "fetched news",
@@ -2525,7 +2523,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
     mapping = {
         "wikipedia": "Looked up on Wikipedia",
         "news": "Fetched news",
-        "hacker_news": "Fetched Hacker News",
         "book_lookup": "Looked up a book",
         "ip_geo": "Looked up IP location",
         "geocode": "Geocoded an address",
@@ -2973,8 +2970,6 @@ class RichMessageBuilder:
             group["outer_summary"] = "Looking up on Wikipedia"
         elif t == "news":
             group["outer_summary"] = "Fetching news"
-        elif t == "hacker_news":
-            group["outer_summary"] = "Fetching Hacker News"
         elif t == "book_lookup":
             group["outer_summary"] = "Looking up a book"
         elif t == "ip_geo":
@@ -3045,7 +3040,6 @@ class RichMessageBuilder:
         "list_upload": ("Listed upload/", "Listed upload/"),
         "wikipedia": ("Looked up on Wikipedia", "Looked up on Wikipedia"),
         "news": ("Fetched news", "Fetched news from {n} sources"),
-        "hacker_news": ("Fetched Hacker News", "Fetched Hacker News"),
         "fetch_url": ("Fetched a page", "Fetched {n} pages"),
         "book_lookup": ("Looked up a book", "Looked up {n} books"),
         "ip_geo": ("Looked up IP location", "Looked up IP location"),

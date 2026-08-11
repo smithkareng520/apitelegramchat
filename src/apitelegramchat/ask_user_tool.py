@@ -85,26 +85,54 @@ def _normalized_options(options: Any) -> list[dict[str, str]]:
 
 
 def _build_keyboard(interaction: AskUserInteraction) -> dict:
+    """Build a compact inline keyboard attached to this question only."""
     if interaction.awaiting_text:
         return {
             "inline_keyboard": [[
-                {"text": "取消自定义回答", "callback_data": f"ask:{interaction.id}:cancel"}
+                {
+                    "text": "取消自定义回答",
+                    "style": "danger",
+                    "callback_data": f"ask:{interaction.id}:cancel",
+                }
             ]]
         }
+
     rows: list[list[dict[str, str]]] = []
+    option_buttons: list[dict[str, str]] = []
     for idx, option in enumerate(interaction.options):
         prefix = "✅ " if idx in interaction.selected_indices else ""
-        rows.append([{
+        option_buttons.append({
             "text": f"{prefix}{option['label']}",
+            "style": "primary",
             "callback_data": f"ask:{interaction.id}:o:{idx}",
-        }])
-    if interaction.allow_custom and not interaction.multiple:
-        rows.append([{"text": "✏️ 自定义回答", "callback_data": f"ask:{interaction.id}:custom"}])
+        })
+
+    # Short choices look substantially better in two columns; long labels stay one per row.
+    two_columns = all(len(b["text"]) <= 18 for b in option_buttons) and len(option_buttons) <= 6
+    if two_columns:
+        for i in range(0, len(option_buttons), 2):
+            rows.append(option_buttons[i:i + 2])
+    else:
+        rows.extend([[button] for button in option_buttons])
+
     if interaction.multiple:
-        rows.append([{"text": "✅ 提交选择", "callback_data": f"ask:{interaction.id}:submit"}])
-        if interaction.allow_custom:
-            rows.append([{"text": "✏️ 自定义回答", "callback_data": f"ask:{interaction.id}:custom"}])
-    rows.append([{"text": "取消", "callback_data": f"ask:{interaction.id}:cancel"}])
+        rows.append([{
+            "text": "✅ 提交选择",
+            "style": "success",
+            "callback_data": f"ask:{interaction.id}:submit",
+        }])
+
+    if interaction.allow_custom:
+        rows.append([{
+            "text": "✏️ 自定义回答",
+            "callback_data": f"ask:{interaction.id}:custom",
+        }])
+
+    rows.append([{
+        "text": "取消",
+        "style": "danger",
+        "callback_data": f"ask:{interaction.id}:cancel",
+    }])
     return {"inline_keyboard": rows}
 
 
@@ -217,6 +245,45 @@ async def _set_markup(message_id: int, chat_id: int, markup: dict | None) -> Non
         logger.debug("ask_user editMessageReplyMarkup exception: %s", exc)
 
 
+async def _edit_question_message(interaction: AskUserInteraction, body_html: str) -> None:
+    if not interaction.message_id:
+        return
+    payload = {
+        "chat_id": interaction.chat_id,
+        "message_id": interaction.message_id,
+        "rich_message": {
+            "content": body_html,
+            "html": body_html,
+        },
+        "reply_markup": {"inline_keyboard": []},
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8, connect=3)) as session:
+            async with session.post(f"{BASE_URL}/editMessageText", json=payload) as resp:
+                if resp.status != 200:
+                    logger.debug("ask_user editMessageText failed: %s %s", resp.status, (await resp.text())[:200])
+    except Exception as exc:
+        logger.debug("ask_user editMessageText exception: %s", exc)
+
+
+def _answered_html(interaction: AskUserInteraction, answer: dict[str, Any]) -> str:
+    q = html.escape(interaction.question)
+    kind = answer.get("type")
+    if kind == "choice":
+        selected = answer.get("selected") or []
+        labels = [html.escape(str(item.get("label", ""))) for item in selected if isinstance(item, dict)]
+        chosen = "、".join(x for x in labels if x) or "已选择"
+        return f"<p>✅ <b>已收到你的选择</b></p><p>{q}</p><p><b>{chosen}</b></p>"
+    if kind == "custom":
+        value = html.escape(str(answer.get("value", "")))[:4000]
+        return f"<p>✅ <b>已收到你的回答</b></p><p>{q}</p><p><blockquote>{value}</blockquote></p>"
+    if kind == "cancelled":
+        return f"<p>✖️ <b>已取消</b></p><p>{q}</p>"
+    if kind == "expired":
+        return f"<p>⌛ <b>问题已过期</b></p><p>{q}</p>"
+    return f"<p>✅ <b>已收到回答</b></p><p>{q}</p>"
+
+
 async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: str, action: str, arg: str = "") -> tuple[bool, str]:
     async with _lock:
         interaction = _pending.get(interaction_id)
@@ -255,7 +322,7 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
                 notice = f"已选择：{interaction.options[idx]['label']}"
                 message_id = interaction.message_id
                 await _clear_pending_unlocked(interaction)
-                asyncio.create_task(_set_markup(message_id, interaction.chat_id, markup))
+                asyncio.create_task(_edit_question_message(interaction, _answered_html(interaction, answer)))
                 return True, notice
         elif action == "submit":
             if not interaction.multiple:
@@ -274,7 +341,7 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
             notice = "已提交选择"
             message_id = interaction.message_id
             await _clear_pending_unlocked(interaction)
-            asyncio.create_task(_set_markup(message_id, interaction.chat_id, markup))
+            asyncio.create_task(_edit_question_message(interaction, _answered_html(interaction, answer)))
             return True, notice
         elif action == "custom":
             if not interaction.allow_custom:
@@ -290,7 +357,7 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
                 interaction.future.set_result({"type": "cancelled"})
             message_id = interaction.message_id
             await _clear_pending_unlocked(interaction)
-            asyncio.create_task(_set_markup(message_id, interaction.chat_id, None))
+            asyncio.create_task(_edit_question_message(interaction, _answered_html(interaction, {"type": "cancelled"})))
             return True, "已取消"
         else:
             return False, "未知操作"
@@ -314,7 +381,7 @@ async def resolve_text(chat_id: int, text: str) -> bool:
             interaction.future.set_result(answer)
         message_id = interaction.message_id
         await _clear_pending_unlocked(interaction)
-    asyncio.create_task(_set_markup(message_id, chat_id, None))
+    asyncio.create_task(_edit_question_message(interaction, _answered_html(interaction, answer)))
     return True
 
 
@@ -325,14 +392,14 @@ async def wait_for_answer(interaction: AskUserInteraction) -> dict[str, Any]:
         interaction.status = "expired"
         if interaction.future and not interaction.future.done():
             interaction.future.set_result({"type": "expired"})
-        await _set_markup(interaction.message_id, interaction.chat_id, None)
+        await _edit_question_message(interaction, _answered_html(interaction, {"type": "expired"}))
         await _clear_pending(interaction)
         return {"type": "expired"}
     except asyncio.CancelledError:
         interaction.status = "cancelled"
         if interaction.future and not interaction.future.done():
             interaction.future.cancel()
-        await _set_markup(interaction.message_id, interaction.chat_id, None)
+        await _edit_question_message(interaction, _answered_html(interaction, {"type": "cancelled"}))
         await _clear_pending(interaction)
         raise
 

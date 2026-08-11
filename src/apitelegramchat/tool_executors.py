@@ -53,7 +53,6 @@ from apitelegramchat.search_engine import (
     execute_fetch_url,
     execute_wikipedia,
     execute_exchange_rate,
-    execute_hacker_news,
     execute_book_lookup,
     execute_weather,
     execute_news,
@@ -737,7 +736,6 @@ _TOOL_TIMEOUT_LABELS = {
     "fetch_url": "Page fetch",
     "wikipedia": "Wikipedia lookup",
     "exchange_rate": "Exchange rate lookup",
-    "hacker_news": "Hacker News fetch",
     "book_lookup": "Book lookup",
     "weather": "Weather fetch",
     "news": "News fetch",
@@ -991,9 +989,6 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         summary = f"💱 {base} 汇率"
         details_html = result_str
         return summary, details_html
-
-    elif fn_name == "hacker_news":
-        summary = "📰 Hacker News"
         details_html = result_str
         return summary, details_html
 
@@ -1960,8 +1955,6 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             return await execute_wikipedia(arguments.get("query", ""), arguments.get("lang", "zh"))
         elif name == "exchange_rate":
             return await execute_exchange_rate(arguments.get("base", "USD"), arguments.get("target"))
-        elif name == "hacker_news":
-            return await execute_hacker_news(arguments.get("limit", 10))
         elif name == "book_lookup":
             return await execute_book_lookup(arguments.get("query", ""))
         elif name == "weather":

@@ -83,7 +83,7 @@ SUBAGENT_TOOL_TIMEOUT = _env_int("SUBAGENT_TOOL_TIMEOUT", 60, min_value=5, max_v
 
 # 子 agent 默认可用的工具白名单（如果调用方未指定）
 DEFAULT_ALLOWED_TOOLS = {
-    "web_search", "fetch_url", "wikipedia", "exchange_rate", "hacker_news",
+    "web_search", "fetch_url", "wikipedia", "exchange_rate",
     "book_lookup", "weather", "news", "crypto_price", "ip_geo", "qr_code",
     "image_search", "geocode", "search_poi", "route", "distance",
     "place_details", "elevation", "traffic", "isochrone",

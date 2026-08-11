@@ -759,19 +759,6 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "hacker_news",
-            "description": "Get current top stories from Hacker News (title, link, score, comments).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "default": 10, "description": "返回条数（1-20）"}
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "book_lookup",
             "description": "Look up book metadata (title, author, cover, rating, abstract) by title, author, or ISBN.",
             "parameters": {
@@ -1968,41 +1955,6 @@ async def execute_exchange_rate(base: str, target: str = None) -> str:
         return "<br/>".join(lines)
     except Exception as e:
         return f"失败：汇率查询出错：{str(e)[:100]}"
-
-
-# --------------------- hacker_news ---------------------
-async def execute_hacker_news(limit: int = 10) -> str:
-    limit = min(max(limit, 1), 20)
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://hacker-news.firebaseio.com/v0/topstories.json", timeout=HTTP_TIMEOUT_SHORT) as resp:
-                if resp.status != 200:
-                    return f"失败：Hacker News 请求失败（HTTP {resp.status}）"
-                story_ids = await resp.json()
-            async def fetch_story(sid):
-                try:
-                    async with session.get(f"https://hacker-news.firebaseio.com/v0/item/{sid}.json", timeout=8) as r:
-                        if r.status == 200:
-                            return await r.json()
-                except Exception:
-                    return None
-            tasks = [fetch_story(sid) for sid in story_ids[:limit]]
-            stories = await asyncio.gather(*tasks)
-        lines = [f"<b>Hacker News Top {limit} 热门</b><br/>"]
-        count = 0
-        for story in stories:
-            if not story or story.get("type") != "story":
-                continue
-            count += 1
-            title = story.get("title", "无标题")
-            url = story.get("url", f"https://news.ycombinator.com/item?id={story.get('id')}")
-            score = story.get("score", 0)
-            comments = story.get("descendants", 0)
-            hn_link = f"https://news.ycombinator.com/item?id={story.get('id')}"
-            lines.append(f"{count}. {title}<br/>   👍 {score} 分  💬 {comments} 评论<br/>   原文：{url}<br/>   讨论：{hn_link}<br/>")
-        return "<br/>".join(lines)
-    except Exception as e:
-        return f"失败：Hacker News 出错：{str(e)[:100]}"
 
 
 # --------------------- book_lookup ---------------------
