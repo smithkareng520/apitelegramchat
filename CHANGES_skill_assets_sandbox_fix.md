@@ -208,3 +208,9 @@ pip 安装等耗时命令不会被外层过早杀掉、触发熔断。
   部署后用一次真实的 "激活 docx skill → 上传/生成一个 .docx → 让模型跑
   `pandoc`/`soffice` 转换" 流程验证 cwd 切换和超时是否符合预期。
 
+### Persistent workspace sync / text_editor timeout fix
+- `text_editor`, `bash`, and `present_files` no longer perform a full R2 workspace sync on every tool call.
+- Each workspace is initialized from R2 once per process lifecycle; subsequent operations use the local persistent workspace.
+- File edits remain asynchronously persisted to R2, so creating multiple files no longer serializes on repeated remote list/download operations.
+- A dedicated initialization lock prevents duplicate first-use syncs without reusing the normal workspace file-operation lock (avoids nested-lock deadlocks).
+

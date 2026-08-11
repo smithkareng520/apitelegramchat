@@ -17,7 +17,7 @@ from typing import Optional, List
 from urllib.parse import urlparse
 from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
-    _sync_workspace_from_r2,
+    _ensure_workspace_initialized,
     _sync_workspace_to_r2,
     _async_sync_workspace_to_r2,  # 新增导入
 )
@@ -306,11 +306,11 @@ class BashSession:
             if self.proc is None or self.proc.returncode is not None:
                 await self.start()
 
-            # 从 R2 拉取最新文件（保留原行为）
+            # 首次访问时初始化一次；后续命令直接使用 persistent workspace。
             try:
-                await _sync_workspace_from_r2(self.chat_id)
+                await _ensure_workspace_initialized(self.chat_id)
             except Exception as e:
-                logger.warning(f"_sync_from_r2 failed (continue): {e}")
+                logger.warning(f"_ensure_workspace_initialized failed (continue): {e}")
 
             if not self._is_safe(command):
                 return f"Error: Command rejected for security reasons: {command}"
@@ -1645,8 +1645,8 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
 
     lock = await _get_workspace_lock(chat_id)
     async with lock:
-        # 1. 从 R2 同步最新文件到本地
-        await _sync_workspace_from_r2(chat_id)
+        # 1. 首次访问时初始化一次；之后直接读取 persistent workspace。
+        await _ensure_workspace_initialized(chat_id)
 
         workspace = workspace_root(chat_id)
         workspace_workdir(chat_id)

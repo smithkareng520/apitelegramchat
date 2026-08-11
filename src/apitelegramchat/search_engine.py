@@ -92,7 +92,7 @@ from apitelegramchat.utils import retry_async, send_rich_html_message
 OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 
 from apitelegramchat.s3_utils import upload_bytes_to_r2
-from apitelegramchat.workspace_utils import _get_workspace_lock, _sync_workspace_from_r2, _sync_workspace_to_r2
+from apitelegramchat.workspace_utils import _get_workspace_lock, _ensure_workspace_initialized, _sync_workspace_to_r2
 # 任务工具：定义在 todo_tool.py / memory_tool.py / subagent_tool.py
 # 本文件只做注册与转出
 from apitelegramchat.todo_tool import TODO_TOOL, execute_todo  # noqa: E402
@@ -249,7 +249,9 @@ async def execute_text_editor(
 
     lock = await _get_workspace_lock(chat_id)
     async with lock:
-        await _sync_workspace_from_r2(chat_id)
+        # 只在本进程首次访问该 workspace 时从 R2 做一次全量同步；后续编辑直接
+        # 使用本地持久 workspace，避免连续 text_editor 调用被 R2 网络 I/O 拖到超时。
+        await _ensure_workspace_initialized(chat_id)
 
         workspace = workspace_root(chat_id)
         local_path = workspace if allow_root_path else (workspace / safe_path)

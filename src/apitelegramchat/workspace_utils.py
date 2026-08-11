@@ -27,9 +27,16 @@ def _is_local_only_rel(rel: str) -> bool:
     top = rel.split(os.sep, 1)[0]
     return top in _LOCAL_ONLY_TOPLEVEL_DIRS
 
-# 全局锁管理
+# workspace 访问锁：保护同一聊天的本地文件操作，避免并发修改。
 _workspace_locks = {}
 _workspace_locks_lock = asyncio.Lock()
+
+# 每个进程生命周期内，每个 workspace 只做一次 R2 全量初始化。
+# 后续 text_editor / bash / present_files 直接使用本地 workspace，避免每次工具调用
+# 都重新 list/download R2 而触发超时。
+_workspace_initialized: set[str] = set()
+_workspace_init_locks = {}
+_workspace_init_locks_lock = asyncio.Lock()
 
 
 async def _get_workspace_lock(chat_id: int, namespace: str | None = None) -> asyncio.Lock:
@@ -41,6 +48,34 @@ async def _get_workspace_lock(chat_id: int, namespace: str | None = None) -> asy
         return _workspace_locks[key]
 
 
+async def _get_workspace_init_lock(key: str) -> asyncio.Lock:
+    """获取 workspace 初始化专用锁；与文件操作锁分离，避免嵌套死锁。"""
+    async with _workspace_init_locks_lock:
+        if key not in _workspace_init_locks:
+            _workspace_init_locks[key] = asyncio.Lock()
+        return _workspace_init_locks[key]
+
+
+async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = None) -> None:
+    """首次访问 workspace 时从 R2 初始化一次；之后本地 workspace 即为工作副本。"""
+    key = workspace_namespace(chat_id, namespace)
+    if key in _workspace_initialized:
+        return
+
+    init_lock = await _get_workspace_init_lock(key)
+    async with init_lock:
+        if key in _workspace_initialized:
+            return
+        await _sync_workspace_from_r2(chat_id)
+        _workspace_initialized.add(key)
+        logger.debug("Workspace initialized once: chat_id=%s namespace=%s", chat_id, key)
+
+
+def _mark_workspace_initialized(chat_id: int, namespace: str | None = None) -> None:
+    """在外部已完成可靠初始化后标记 workspace，避免再次全量同步。"""
+    _workspace_initialized.add(workspace_namespace(chat_id, namespace))
+
+
 # ========== workspace 全量同步（editor/ 域） ==========
 # 这些函数同步 workspace 根目录下的所有文件，用 R2 的 editor/{ns}/ prefix。
 # state 文件（todos.json / memories.json）用另一组单文件同步函数 + state/{ns}/ prefix，
@@ -49,7 +84,7 @@ async def _get_workspace_lock(chat_id: int, namespace: str | None = None) -> asy
 async def _sync_workspace_from_r2(chat_id: int):
     """
     从 R2 拉取 editor/{ns}/ 下所有文件到本地 workspace，并删除本地多余文件。
-    全量同步，用于 bash 工具执行前的初始化。
+    这是一次性初始化原语；调用方应优先使用 _ensure_workspace_initialized()。
     """
     workspace = workspace_root(chat_id)
     workspace.mkdir(parents=True, exist_ok=True)
@@ -198,9 +233,9 @@ async def _sync_named_file_to_r2(chat_id: int, local_path: Path, remote_name: st
 # ========== 可选：初始化工作区（后台执行） ==========
 
 async def init_workspace(chat_id: int):
-    """后台初始化工作区，从 R2 拉取文件。可在首次消息时调用。"""
+    """后台初始化工作区；同一进程内只初始化一次。"""
     try:
-        await _sync_workspace_from_r2(chat_id)
+        await _ensure_workspace_initialized(chat_id)
         logger.info(f"Workspace 初始化完成: chat_id={chat_id}")
     except Exception as e:
         logger.error(f"Workspace 初始化失败: {e}")
