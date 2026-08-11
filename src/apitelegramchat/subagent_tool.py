@@ -21,9 +21,9 @@
     4. 直到 LLM 不再返回 tool_calls，取最终 content 作为答复
 - 工具白名单：默认允许所有 SEARCH_TOOLS，调用方可限制为子集
 - 安全护栏：
-    - 最大循环轮数：MAX_SUBAGENT_ROUNDS = 16（可通过环境变量 SUBAGENT_MAX_ROUNDS 调整）
+    - 最大循环轮数：MAX_SUBAGENT_ROUNDS = 32（可通过环境变量 SUBAGENT_MAX_ROUNDS 调整）
     - 最大单次工具结果长度：MAX_SUBAGENT_RESULT_LEN = 8000（可通过环境变量 SUBAGENT_MAX_RESULT_LEN 调整）
-    - 总体超时：DEFAULT_TIMEOUT = 180s（可通过环境变量 SUBAGENT_DEFAULT_TIMEOUT 调整）
+    - 总体超时：DEFAULT_TIMEOUT = 900s（可通过环境变量 SUBAGENT_DEFAULT_TIMEOUT 调整）
     - 禁止子 agent 递归调用 subagent 工具（防爆炸）
 - 不带流式输出（子 agent 是后台任务，用户不需要看 token 流），用普通 chat.completions.create
 
@@ -64,9 +64,9 @@ def _env_int(name: str, default: int, *, min_value: int | None = None, max_value
 
 
 # ---------- 安全护栏 ----------
-MAX_SUBAGENT_ROUNDS = _env_int("SUBAGENT_MAX_ROUNDS", 16, min_value=1, max_value=64)
+MAX_SUBAGENT_ROUNDS = _env_int("SUBAGENT_MAX_ROUNDS", 32, min_value=1, max_value=128)
 MAX_SUBAGENT_RESULT_LEN = _env_int("SUBAGENT_MAX_RESULT_LEN", 8000, min_value=1000, max_value=50000)
-DEFAULT_TIMEOUT = _env_int("SUBAGENT_DEFAULT_TIMEOUT", 180, min_value=30, max_value=600)  # 秒
+DEFAULT_TIMEOUT = _env_int("SUBAGENT_DEFAULT_TIMEOUT", 900, min_value=60, max_value=1800)  # 秒
 MAX_TASK_LEN = _env_int("SUBAGENT_MAX_TASK_LEN", 8000, min_value=1000, max_value=50000)
 MAX_CONTEXT_LEN = _env_int("SUBAGENT_MAX_CONTEXT_LEN", 16000, min_value=1000, max_value=100000)
 MAX_ANSWER_LEN = _env_int("SUBAGENT_MAX_ANSWER_LEN", 12000, min_value=1000, max_value=100000)
@@ -78,8 +78,8 @@ FORBIDDEN_TOOLS = {"subagent", "memory", "skill", "ask_user"}
 # ask_user 不允许由子 agent 调用，否则会让父 agent 陷入不可控的嵌套人工等待。
 # 但 memory / skill 跨会话状态复杂，子 agent 不应触碰
 
-SUBAGENT_LLM_TIMEOUT = _env_int("SUBAGENT_LLM_TIMEOUT", 120, min_value=30, max_value=600)
-SUBAGENT_TOOL_TIMEOUT = _env_int("SUBAGENT_TOOL_TIMEOUT", 60, min_value=5, max_value=600)
+SUBAGENT_LLM_TIMEOUT = _env_int("SUBAGENT_LLM_TIMEOUT", 180, min_value=30, max_value=900)
+SUBAGENT_TOOL_TIMEOUT = _env_int("SUBAGENT_TOOL_TIMEOUT", 120, min_value=5, max_value=900)
 
 # 子 agent 默认可用的工具白名单（如果调用方未指定）
 DEFAULT_ALLOWED_TOOLS = {
@@ -431,7 +431,7 @@ async def execute_subagent(
     # 工具白名单
     tools = _filter_tools(allowed_tools)
 
-    timeout_s = max(15, min(int(timeout or DEFAULT_TIMEOUT), 600))
+    timeout_s = max(60, min(int(timeout or DEFAULT_TIMEOUT), 1800))
 
     try:
         result = await asyncio.wait_for(
@@ -439,7 +439,7 @@ async def execute_subagent(
                 client, chosen_model, messages, tools, chat_id, timeout_s,
                 progress_callback=progress_callback,
             ),
-            timeout=timeout_s + 10,  # 外层多给 10s 缓冲
+            timeout=timeout_s + 30,  # 外层多给 30s 缓冲，避免内层刚完成时被外层提前取消
         )
     except asyncio.TimeoutError:
         return json.dumps({

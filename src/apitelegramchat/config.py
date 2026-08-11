@@ -563,7 +563,7 @@ STREAM_FLUSH_CHARS = 200
 STREAM_SILENT_FORCE_FLUSH = 4.0
 
 # ---------- 工具调用并发数 ----------
-MAX_CONCURRENT_TOOLS = 4
+MAX_CONCURRENT_TOOLS = int(os.getenv("MAX_CONCURRENT_TOOLS", "16"))
 
 # ---------- 文件解析配置 ----------
 PARSE_CONCURRENCY_LIMIT = int(os.getenv("PARSE_CONCURRENCY_LIMIT", "5"))

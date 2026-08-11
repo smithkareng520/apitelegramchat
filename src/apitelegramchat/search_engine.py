@@ -125,21 +125,19 @@ DDG_TIMEOUT = 30
 # 旧的 HTML 抓取端点（html.duckduckgo.com / lite.duckduckgo.com / duckduckgo.com/html/）已废弃——
 # 反爬太严，curl_cffi + chrome120 指纹也压不住 202 anti-bot challenge。
 
-# ---------- DDG 并发串行化 + 限流退避 ----------
-# 即便走的是免费 API，仍然串行化所有请求：
-#   1) my-search-api 单实例（Render free tier）并发能力有限，避免雪崩
-#   2) 触发 429 / 5xx 后短时间内直接放弃，给服务端喘息时间
-_ddg_lock: Optional[asyncio.Lock] = None
-# DDG 限流冷却到期时间（monotonic）；429/5xx 后短时间内直接放弃，不再打 API
-_ddg_cooldown_until: float = 0.0
+# ---------- DDG 有限并发 + 请求级退避 ----------
+# 研究型任务会同时运行 6 个 subagent；这里不能再用全局 Lock 把搜索压成单路。
+# 用有限并发 semaphore 控制对单实例免费 API 的压力，同时让其它请求继续前进。
+DDG_MAX_CONCURRENCY = int(os.getenv("DDG_MAX_CONCURRENCY", "8"))
+_ddg_semaphore: Optional[asyncio.Semaphore] = None
 
 
-def _get_ddg_lock() -> asyncio.Lock:
-    """懒初始化全局锁，避免在模块导入时绑定错误的 event loop（Python<3.10 兼容）。"""
-    global _ddg_lock
-    if _ddg_lock is None:
-        _ddg_lock = asyncio.Lock()
-    return _ddg_lock
+def _get_ddg_semaphore() -> asyncio.Semaphore:
+    """懒初始化 DDG 并发池，避免模块导入时绑定错误的 event loop。"""
+    global _ddg_semaphore
+    if _ddg_semaphore is None:
+        _ddg_semaphore = asyncio.Semaphore(max(1, DDG_MAX_CONCURRENCY))
+    return _ddg_semaphore
 
 _TRAFILATURA_CONFIG = use_config()
 if _TRAFILATURA_CONFIG is not None:
@@ -1506,7 +1504,7 @@ async def _search_duckduckgo(query: str, num_results: int) -> list[dict] | None:
     关键改动：
       - 抛弃了旧的 curl_cffi + chrome120 TLS 指纹 + HTML 抓取方案（被 DDG 反爬打到没法用）
       - 改为 GET <DDG_SEARCH_API_URL>?text=<quoted query>，解析 JSON 返回结果
-      - 仍保留 _ddg_lock 串行化 + 冷却期机制，避免对单实例免费 API 雪崩
+      - 使用 DDG_MAX_CONCURRENCY 有限并发，避免单实例 API 雪崩，同时支持 6 个研究 agent 持续并行检索
     """
     query = (query or "").strip()
     if not query:
@@ -1515,19 +1513,9 @@ async def _search_duckduckgo(query: str, num_results: int) -> list[dict] | None:
         logger.warning("DDG_SEARCH_API_URL 未配置，DuckDuckGo 回退不可用")
         raise DDGTransientError("DDG_SEARCH_API_URL not configured")
 
-    # 冷却期内直接放弃，不浪费一次锁等待 + 网络请求
-    import time as _time
-    now = _time.monotonic()
-    if now < _ddg_cooldown_until:
-        logger.info(f"DDG in cooldown ({_ddg_cooldown_until - now:.1f}s left), skip")
-        raise DDGTransientError("DDG cooldown")
-
-    # 通过锁串行化所有 DDG 请求——单实例免费 API 经不起并发
-    async with _get_ddg_lock():
-        # 拿到锁后再检查一次冷却期（前一个协程可能刚触发 429）
-        now = _time.monotonic()
-        if now < _ddg_cooldown_until:
-            raise DDGTransientError("DDG cooldown (post-lock)")
+    # 使用有限并发池，而不是全局锁。单请求遇到 429/5xx 时由 retry_async 做请求级退避，
+    # 不阻断其它研究 agent 的搜索。
+    async with _get_ddg_semaphore():
         items = await _search_duckduckgo_via_api(query, num_results)
 
     if items:
@@ -1565,11 +1553,8 @@ async def _search_duckduckgo_via_api(query: str, num_results: int) -> list[dict]
       }
 
     本函数只负责一次 HTTP 调用 + JSON 解析；限流/重试由调用方 _search_duckduckgo 处理。
-    调用方必须已经持有 _ddg_lock——本函数不再单独加锁，避免重入死锁。
+    调用方已经通过 DDG semaphore 获得一个并发槽；本函数本身不再做额外同步。
     """
-    global _ddg_cooldown_until
-    import random as _random
-    import time as _time
 
     api_base = (DDG_SEARCH_API_URL or "").strip().rstrip("/")
     if not api_base:
@@ -1598,11 +1583,10 @@ async def _search_duckduckgo_via_api(query: str, num_results: int) -> list[dict]
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=DDG_TIMEOUT)) as session:
             async with session.get(request_url, headers=headers) as resp:
-                # 429 / 5xx -> 触发冷却期，让并发协程直接放弃
+                # 429 / 5xx 仅让当前请求失败；上层 retry_async 会做指数退避。
+                # 不设置全局 cooldown，避免一个失败请求把 6 个 research agent 全部停住。
                 if resp.status == 429 or resp.status >= 500:
-                    cooldown = 8.0 + _random.random() * 7.0
-                    _ddg_cooldown_until = _time.monotonic() + cooldown
-                    logger.info(f"DDG API HTTP {resp.status}, cooldown {cooldown:.1f}s")
+                    logger.info(f"DDG API HTTP {resp.status}, request-level retry")
                     return None
                 if resp.status != 200:
                     body = await resp.text()

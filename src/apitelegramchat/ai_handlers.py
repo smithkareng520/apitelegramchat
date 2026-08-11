@@ -89,10 +89,10 @@ LONG_TOOL_CALL_TIMEOUT = 45
 #     确保不会出现外层先杀掉仍在正常运行的沙箱进程。
 BASH_TOOLS = {"bash"}
 BASH_TOOL_CALL_TIMEOUT = 310
-# 子 agent 工具：内部跑自己的多轮 agentic loop（每轮一次 LLM 调用 + 可能的工具调用），
-# 默认 90s，用户可配到 300s。外层必须给足够长的超时，否则 12s 一定会杀掉它。
+# 子 agent 工具：内部跑自己的多轮 agentic loop（每轮一次 LLM 调用 + 可能的工具调用）。
+# 默认 900s，用户可配到 1800s。外层必须给足够长的超时，否则主工具层会提前杀掉它。
 SUBAGENT_TOOLS = {"subagent"}
-SUBAGENT_TOOL_TIMEOUT = 310  # 300s 子 agent 上限 + 10s 缓冲
+SUBAGENT_TOOL_TIMEOUT = int(os.getenv("SUBAGENT_TOOL_TIMEOUT", "930"))  # 900s 子 agent 上限 + 30s 缓冲
 IMAGE_GEN_TOOLS = {"generate_image_from_text", "edit_image_with_reference"}
 # 视频生成工具：内部已有 5 分钟轮询超时，外层 wait_for 必须不设超时，
 # 否则会被 TOOL_CALL_TIMEOUT=10 秒杀掉（与 IMAGE_GEN_TOOLS 同样的处理）。
@@ -2191,7 +2191,7 @@ async def _run_tool_calls_and_append(
     async def run_one(fn_name, fn_args, tc_id):
         async with tool_semaphore:
             # 图像 / 视频工具不设超时（内部已有轮询超时控制）
-            # 子 agent 走 310s 超时（内部默认 90s，用户可配到 300s）
+            # 子 agent 走 930s 超时（内部默认 900s，用户可配到 1800s）
             # bash 走 310s（内层沙箱 300s + 10s 外层缓冲）
             # 网络类工具（web_search / fetch_url / file_editor）走 45s 宽松超时，避免外层 12s 误杀
             # 其他工具保持 12 秒
