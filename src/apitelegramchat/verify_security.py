@@ -12,7 +12,6 @@ import os
 import re
 import shutil
 import sys
-import subprocess
 from pathlib import Path
 
 PASS = "\033[32m[PASS]\033[0m"

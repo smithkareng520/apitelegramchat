@@ -69,7 +69,7 @@ Node dependencies are declared in `package.json`; Python dependencies are declar
 ## Workspace persistence boundary
 
 Bash/text tools share an ephemeral runtime workspace under `runtime/exec`.
-R2 is no longer a mirror of the working directory. `text_editor` persists only
+R2 is no longer a mirror of the working directory. `file_editor` persists only
 the file it explicitly edits, while Bash-created/modified files must be saved
 with the `workspace_commit` tool using explicit file paths. This keeps package
 manager outputs such as `node_modules`, virtual environments, caches, and build

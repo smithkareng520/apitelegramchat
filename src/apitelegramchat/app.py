@@ -9,15 +9,12 @@ import uuid
 import re
 import os
 import mimetypes
-from pathlib import Path
 from apitelegramchat.workspace_paths import workspace_download_root
 
 from apitelegramchat.utils import (
-    send_message,
     send_rich_html_message,
     delete_message,
     mark_draft_dead,
-    send_rich_message_draft,
     check_deepseek_balance,
     check_openrouter_balance,
     send_chat_action,
@@ -26,7 +23,7 @@ from apitelegramchat.utils import (
     extract_message_text,
     transcribe_audio_with_groq,
 )
-from apitelegramchat.ai_handlers import get_ai_response, get_cached_image_data, _get_cached_audio_data
+from apitelegramchat.ai_handlers import get_ai_response, _get_cached_audio_data
 from apitelegramchat.config import (
     BASE_URL,
     WEBHOOK_URL,
@@ -36,9 +33,7 @@ from apitelegramchat.config import (
     DEFAULT_MODEL,
     WHITELIST_USERS,
     ADMIN_USERS,
-    load_whitelist,
     save_whitelist,
-    R2_PUBLIC_URL,
     GROQ_API_KEY,
     LOG_TRUNCATE_LIMIT,
     LOG_LEVEL,
@@ -47,14 +42,11 @@ from apitelegramchat.config import (
 from apitelegramchat.state import (
     user_contexts,
     user_models,
-    media_groups,
     processed_updates,
     role_message_ids,
     get_or_init_context,
     get_user_model,
-    set_user_model,
     safe_clear_history,
-    safe_get_user_model,
     safe_set_user_model,
     get_chat_lock,
     add_media_group_message,
@@ -62,7 +54,6 @@ from apitelegramchat.state import (
     get_user_role,
     set_user_role,
     safe_clear_active_skill,
-    get_active_draft_message_id,
     get_active_draft_info,
     clear_active_draft,
     mark_preserved_draft,
@@ -75,9 +66,7 @@ from apitelegramchat.ask_user_tool import (
     resolve_text as resolve_ask_user_text,
 )
 from apitelegramchat.file_handlers import download_file
-from apitelegramchat.s3_utils import file_exists_in_r2
 from apitelegramchat.workspace_utils import _get_workspace_lock, init_workspace
-import hashlib
 
 app = Quart(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
@@ -769,7 +758,7 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
             else:
                 content_text += (
                     "\n\n请根据用户指令处理这些文档。先用 list_download 查看可用文件，"
-                    "再用 fetch_download 把需要的文件取到工作区，然后用 text_editor 或 bash 查看。"
+                    "再用 fetch_download 把需要的文件取到工作区，然后用 file_editor 或 bash 查看。"
                 )
 
         user_message = {"role": "user", "content": content_text, "file_ids": file_ids, "file_names": file_names, "mime_types": mime_types, "type": "document_group", "attachments": [{"kind": "document", "file_id": fid, "file_name": fname, "mime_type": mime} for fid, fname, mime in zip(file_ids, file_names, mime_types)]}
@@ -1214,7 +1203,7 @@ async def webhook() -> tuple:
                             if cap:
                                 content_text += f"\n\n用户指令：{cap}"
                             else:
-                                content_text += "\n\n请根据用户指令处理该文档。取到工作区后可用 text_editor 或 bash 查看。"
+                                content_text += "\n\n请根据用户指令处理该文档。取到工作区后可用 file_editor 或 bash 查看。"
                         else:
                             content_text = f"📎 用户上传了文档「{safe_fname}」，但下载失败，请稍后重试。"
 

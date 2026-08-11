@@ -32,7 +32,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -47,7 +46,6 @@ from apitelegramchat.workspace_utils import (
     _sync_named_file_from_r2,
     _sync_named_file_to_r2,
 )
-from apitelegramchat.config import BASE_URL  # noqa: F401  — 保留给将来扩展（推送卡片用）
 
 logger = logging.getLogger(__name__)
 

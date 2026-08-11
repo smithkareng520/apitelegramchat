@@ -12,7 +12,7 @@ from typing import Dict, Optional
 from openai import AsyncOpenAI
 
 # 从 config 导入厂商配置、ProviderConfig 以及所有 API Key 变量
-from apitelegramchat.config import PROVIDERS, ProviderConfig
+from apitelegramchat.config import PROVIDERS
 import apitelegramchat.config as app_config
 
 logger = logging.getLogger(__name__)

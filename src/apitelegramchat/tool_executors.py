@@ -2,7 +2,6 @@
 import asyncio
 import os
 import subprocess
-import shlex
 import random
 import aiohttp
 import json
@@ -11,7 +10,7 @@ import time
 from pathlib import Path
 from apitelegramchat.workspace_paths import (
     workspace_root, workspace_workdir, runtime_cache_root,
-    workspace_upload_root, workspace_download_root,
+    workspace_upload_root,
     is_inside_upload_or_download,
 )
 import re
@@ -21,7 +20,6 @@ from typing import Optional, List
 from urllib.parse import urlparse
 from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
-    _ensure_workspace_initialized,
     _ensure_runtime_workspace,
     fetch_from_download,
     stage_to_upload,
@@ -40,14 +38,12 @@ from apitelegramchat.config import (
     MAX_CONCURRENT_TOOLS,
     BASE_URL,
     GEOAPIFY_KEY,
-    TOMTOM_API_KEY,
-    ORS_API_KEY,
 )
 
 _TOOL_TIMEOUT_MARKER = "__TOOL_TIMEOUT__"
 
 import shutil
-from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2, list_r2_objects, delete_r2_object
+from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2
 from apitelegramchat.search_engine import (
     execute_web_search,
     execute_fetch_url,
@@ -72,7 +68,7 @@ from apitelegramchat.search_engine import (
     execute_elevation,
     execute_traffic,
     execute_isochrone,
-    execute_text_editor,
+    execute_file_editor,
     # 任务工具
     execute_todo,
     # 长期记忆工具
@@ -752,7 +748,7 @@ _TOOL_TIMEOUT_LABELS = {
     "elevation": "Elevation lookup",
     "traffic": "Traffic lookup",
     "isochrone": "Isochrone calculation",
-    "text_editor": "Editor operation",
+    "file_editor": "Editor operation",
     "bash": "Bash command",
     "present_files": "File presentation",
     "fetch_download": "Fetch from download/",
@@ -1476,7 +1472,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             details_html = escape_text(result_str)
             return summary, details_html
 
-    elif fn_name == "text_editor":
+    elif fn_name == "file_editor":
         command = fn_args.get("command", "")
         path = fn_args.get("path", "")
 
@@ -1791,7 +1787,7 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
             "error": "No paths provided. Files must be staged under upload/ first.",
         })
 
-    # ★ init 在 workspace lock 外面执行（同 bash / text_editor）。
+    # ★ init 在 workspace lock 外面执行（同 bash / file_editor）。
     await _ensure_runtime_workspace(chat_id)
 
     lock = await _get_workspace_lock(chat_id)
@@ -1863,7 +1859,7 @@ async def execute_fetch_download(chat_id: int, filenames: List[str], overwrite: 
     cannot `cd` into download/, and the model is expected to fetch only the
     files it actually needs rather than hydrate the whole tree. After
     fetch_download, the file is available in the workdir under the same
-    relative path and can be opened with text_editor / bash / etc.
+    relative path and can be opened with file_editor / bash / etc.
     """
     if not isinstance(filenames, list) or not filenames:
         return json.dumps({
@@ -2037,8 +2033,8 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
         elif name == "isochrone":
             return await execute_isochrone(arguments.get("lat", 0), arguments.get("lon", 0), arguments.get("time", 10),
                                            arguments.get("profile", "driving"))
-        elif name == "text_editor":
-            return await execute_text_editor(
+        elif name == "file_editor":
+            return await execute_file_editor(
                 chat_id=chat_id,
                 command=arguments.get("command", ""),
                 path=arguments.get("path", ""),

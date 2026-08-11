@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import inspect
-import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,9 +23,8 @@ from apitelegramchat.search_engine import (
     execute_exchange_rate, execute_fetch_url, execute_geocode, execute_generate_image,
     execute_generate_video, execute_image_search, execute_ip_geo,
     execute_isochrone, execute_news, execute_place_details, execute_qr_code, execute_route,
-    execute_search_poi, execute_text_editor, execute_weather, execute_web_search, execute_wikipedia,
+    execute_search_poi, execute_file_editor, execute_weather, execute_web_search, execute_wikipedia,
 )
-from apitelegramchat.workspace_paths import data_root, workspace_root
 from ..core.settings import get_mcp_scope
 
 logger = logging.getLogger("apitelegramchat.mcp")
@@ -185,7 +183,7 @@ TOOL_SPECS: list[ToolSpec] = [
     ToolSpec("geo.place_details", "Fetch place details.", lambda **kw: _call(execute_place_details, **_clean_args(kw)), _schema_for(execute_place_details, title="geo.place_details")),
     ToolSpec("geo.elevation", "Fetch elevation data.", lambda **kw: _call(execute_elevation, **_clean_args(kw)), _schema_for(execute_elevation, title="geo.elevation")),
     ToolSpec("geo.isochrone", "Fetch isochrone contours.", lambda **kw: _call(execute_isochrone, **_clean_args(kw)), _schema_for(execute_isochrone, title="geo.isochrone")),
-    ToolSpec("workspace.editor", "Edit workspace files with guarded operations.", lambda **kw: _call(execute_text_editor, **_clean_args(kw)), _schema_for(execute_text_editor, title="workspace.editor")),
+    ToolSpec("workspace.editor", "Edit workspace files with guarded operations.", lambda **kw: _call(execute_file_editor, **_clean_args(kw)), _schema_for(execute_file_editor, title="workspace.editor")),
 ]
 
 TOOL_MAP = {spec.name: spec for spec in TOOL_SPECS}

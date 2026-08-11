@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from apitelegramchat.skills import discover_skill_roots, get_skill_catalog, load_skill_records, read_skill_text
+from apitelegramchat.skills import get_skill_catalog, load_skill_records, read_skill_text
 from .registry import _chat_id
 from apitelegramchat.workspace_paths import (
     workspace_root,

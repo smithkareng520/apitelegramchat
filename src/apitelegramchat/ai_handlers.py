@@ -5,17 +5,15 @@ import json
 import aiohttp
 import base64
 from PIL import Image
-import os
 import io
 import re
 import uuid
 import random
 import html
-import hashlib
 import logging
 import mimetypes
 import time
-from typing import List, Dict, Optional, Callable, Awaitable, Any
+from typing import List, Optional, Any
 from urllib.parse import urlparse
 from openai import AsyncOpenAI
 from cachetools import TTLCache
@@ -25,16 +23,11 @@ from apitelegramchat.config import (
     OPENROUTER_API_KEY,
     AGNES_API_KEY,
     GEMINI_API_KEY,
-    XAI_API_KEY,
-    DEEPSEEK_API_KEY,
-    BASE_URL,
-    global_lock,
     DEFAULT_MODEL,
     TELEGRAM_BOT_TOKEN,
     PROVIDERS,
     CACHE_TTL,
     R2_PUBLIC_URL,
-    GROQ_API_KEY,
     MODELSCOPE_API_KEY,
     ModelConfig,
     get_openrouter_provider_preferences,
@@ -44,16 +37,12 @@ from apitelegramchat.config import (
 )
 from apitelegramchat.utils import (
     get_current_time,
-    retry_async,
     send_rich_message_draft,
     send_rich_html_message,
     strip_html_tags,
     escape_html,
-    send_chat_action,
     get_logger,
-    set_request_id,
     delete_message,
-    is_draft_dead,
     mark_draft_dead,
     RateLimitError,
     transcribe_audio_with_groq,
@@ -61,7 +50,6 @@ from apitelegramchat.utils import (
 from apitelegramchat.file_handlers import get_file_path
 from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2
 from apitelegramchat.skills import skill_catalog_brief
-from apitelegramchat.workspace_paths import workspace_root as _skill_workspace_root
 from apitelegramchat.tool_executors import (
     dispatch_tool_call,
     format_tool_result,
@@ -89,9 +77,9 @@ OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 # 网络类工具：内部已有自己的超时控制（fetch_url 30s 总超时，web_search 多端点 + warmup），
 # 但外层 12s 会过早杀掉它们，给一个更宽松的 45s 上限兜底。
 #
-# text_editor 需要初始化一次隔离 workspace，但不再做工作区级 R2 全量同步。
+# file_editor 需要初始化一次隔离 workspace，但不再做工作区级 R2 全量同步。
 # 编辑操作只持久化被编辑的具体文件。
-LONG_RUNNING_TOOLS = {"web_search", "fetch_url", "text_editor"}
+LONG_RUNNING_TOOLS = {"web_search", "fetch_url", "file_editor"}
 LONG_TOOL_CALL_TIMEOUT = 45
 # bash 工具单独一档，比 LONG_RUNNING_TOOLS 更宽松：
 #   - 沙箱首次启动要 fork+exec+安装 Landlock 规则；
@@ -1381,20 +1369,20 @@ Call multiple independent tools in parallel when possible. If a tool fails, cont
 <u>Citation Rules</u>
 After each search result, append: source emoji [Source Name](URL). Use the source name, not raw URL.
 
-<u>File Operation Rules (CRITICAL — read before calling text_editor)</u>
+<u>File Operation Rules (CRITICAL — read before calling file_editor)</u>
 <u>Workspace Boundary</u>
 - Bash runs directly inside the user workspace at <code>/tmp/apitelegramchat_data/workspaces/&lt;user_id&gt;/</code>. The workspace is local-only and is not synchronized wholesale to R2.
 - Files created or modified by Bash remain in this local workspace. They are not synchronized wholesale to R2.
 - When using a skill, read its <code>skills/&lt;skill_id&gt;/SKILL.md</code> and run its scripts from that local skill directory as needed.
-- <code>text_editor</code> edits are persisted automatically for the specific file being edited.
-- text_editor "create" will return "Error: File already exists" if a file with the same path exists anywhere in this chat's workspace (cloud storage is shared across the whole session). Do NOT retry create with the same path or a slightly different name hoping for success — that will loop forever.
+- <code>file_editor</code> edits are persisted automatically for the specific file being edited.
+- file_editor "create" will return "Error: File already exists" if a file with the same path exists anywhere in this chat's workspace (cloud storage is shared across the whole session). Do NOT retry create with the same path or a slightly different name hoping for success — that will loop forever.
 - If create fails with "File already exists", do ONE of these on your NEXT call, never retry create:
   1. Use command="str_replace" with old_str/new_str to edit the existing file in place.
   2. Use command="view" first to see the existing content, then str_replace or insert.
   3. Use command="delete" with confirm=true to remove it, then create. NEVER call delete without confirm=true — it will always fail.
 - "Error: Deletion requires confirm=true" means you forgot confirm=true. Retry ONCE with confirm=true. Do not retry more than once.
 - "Error: No match found for replacement text" means your old_str is wrong. Use command="view" to see the current content, then retry with the exact string.
-- After 2 consecutive text_editor errors of the same kind, STOP calling text_editor and explain the situation to the user in your final reply.
+- After 2 consecutive file_editor errors of the same kind, STOP calling file_editor and explain the situation to the user in your final reply.
 - For HTML generation tasks: write the file ONCE with create. If it already exists from a previous turn in the same chat, use str_replace to swap the whole content (old_str = entire old content, new_str = entire new content), or delete+create. Do not generate new filenames like 2.txt, 3.txt, etc. just to dodge the "already exists" error.
 
 <u>upload/ and download/ — staging buffers (CRITICAL — do not cd into them)</u>
@@ -1404,7 +1392,7 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 - You MAY read and write files in upload/ and download/ via relative paths from your workdir (e.g. <code>cp out.txt ../upload/out.txt</code>, <code>cat ../download/brief.pdf</code>).
 - You MAY NOT <code>cd</code> into upload/ or download/, and you MAY NOT execute any command while your cwd is inside them. The sandbox will reject the command with an explanation. This is intentional: it prevents <code>pip install</code> / <code>npm install</code> / build tools from polluting the staging area and corrupting outgoing attachments or user-supplied originals.
 - Typical send-a-file flow: produce the file in your workdir → <code>stage_upload paths=["report.pdf"]</code> → <code>present_files paths=["report.pdf"]</code>.
-- Typical receive-a-file flow: <code>list_download</code> → <code>fetch_download filenames=["brief.pdf"]</code> → process <code>brief.pdf</code> in your workdir with text_editor / bash.
+- Typical receive-a-file flow: <code>list_download</code> → <code>fetch_download filenames=["brief.pdf"]</code> → process <code>brief.pdf</code> in your workdir with file_editor / bash.
 
 <tool_description_guide>
 为每个工具调用添加 `_description` 字段（≤60字，纯文本），简述本次操作目的。该字段会显示给用户，帮助他们理解你在做什么。示例见各工具定义的 input_examples。
@@ -1928,8 +1916,8 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
             return short_cmd
         return "Running command"
 
-    # ---------- text_editor ----------
-    if fn_name == "text_editor":
+    # ---------- file_editor ----------
+    if fn_name == "file_editor":
         command = fn_args.get("command", "")
         path = fn_args.get("path", "")
         # 进行时只显示描述，不需要详细路径
@@ -2002,7 +1990,7 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
     if custom_desc:
         return custom_desc
 
-    if fn_name == "text_editor":
+    if fn_name == "file_editor":
         cmd = fn_args.get("command", "")
         return {
             "view": "viewed a file",
@@ -2130,7 +2118,7 @@ async def _run_tool_calls_and_append(
 
     for fn_name, fn_args, tc_id in tool_tasks:
         preview_html = ""
-        if fn_name == "text_editor":
+        if fn_name == "file_editor":
             cmd = fn_args.get("command", "")
             path = fn_args.get("path", "")
             if cmd == "create":
@@ -2205,7 +2193,7 @@ async def _run_tool_calls_and_append(
             # 图像 / 视频工具不设超时（内部已有轮询超时控制）
             # 子 agent 走 310s 超时（内部默认 90s，用户可配到 300s）
             # bash 走 310s（内层沙箱 300s + 10s 外层缓冲）
-            # 网络类工具（web_search / fetch_url / text_editor）走 45s 宽松超时，避免外层 12s 误杀
+            # 网络类工具（web_search / fetch_url / file_editor）走 45s 宽松超时，避免外层 12s 误杀
             # 其他工具保持 12 秒
             if fn_name in MEDIA_GEN_TOOLS:
                 timeout = None
@@ -2478,7 +2466,7 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
     if fn_name == "bash":
         return "Ran a command"
 
-    if fn_name == "text_editor":
+    if fn_name == "file_editor":
         return {
             "view": "Viewed a file",
             "create": "Created a file",
@@ -2628,7 +2616,7 @@ def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, s
             new_summary = _generate_initial_tool_summary(fn_name, fallback_args)
         else:
             new_summary = None
-        if fn_name == "text_editor":
+        if fn_name == "file_editor":
             m = re.search(r'"file_text"\s*:\s*"((?:[^"\\]|\\.)*)(?:$|")', args_str, re.DOTALL)
             if m:
                 raw = m.group(1)
@@ -2646,7 +2634,7 @@ def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, s
     new_summary = _generate_initial_tool_summary(fn_name, args_obj)
     preview_html = ""
 
-    if fn_name == "text_editor":
+    if fn_name == "file_editor":
         cmd = args_obj.get("command", "")
         if cmd == "create":
             file_text = args_obj.get("file_text", "")
@@ -2942,7 +2930,7 @@ class RichMessageBuilder:
                 group["outer_summary"] = short
             else:
                 group["outer_summary"] = "Running command"
-        elif t == "text_editor":
+        elif t == "file_editor":
             command = fn_args.get("command", "")
             # 进行时只显示动作，不显示路径
             mapping = {
@@ -3029,10 +3017,10 @@ class RichMessageBuilder:
     _GROUP_SUMMARY_TEMPLATES = {
         "web_search": ("Searched the web", "Searched the web"),
         "bash": ("Ran a command", "Ran {n} commands"),
-        "text_editor_view": ("Viewed a file", "Viewed {n} files"),
-        "text_editor_edit": ("Edited a file", "Edited {n} files"),
-        "text_editor_create": ("Created a file", "Created {n} files"),
-        "text_editor_delete": ("Deleted a file", "Deleted {n} files"),
+        "file_editor_view": ("Viewed a file", "Viewed {n} files"),
+        "file_editor_edit": ("Edited a file", "Edited {n} files"),
+        "file_editor_create": ("Created a file", "Created {n} files"),
+        "file_editor_delete": ("Deleted a file", "Deleted {n} files"),
         "present_files": ("Presented a file", "Presented {n} files"),
         "fetch_download": ("Fetched a file from download/", "Fetched {n} files from download/"),
         "stage_upload": ("Staged a file to upload/", "Staged {n} files to upload/"),
@@ -3067,15 +3055,15 @@ class RichMessageBuilder:
 
     def _get_group_type_for_item(self, item: dict) -> str:
         t = item.get("type", "unknown")
-        if t == "text_editor":
+        if t == "file_editor":
             command = item.get("fn_args", {}).get("command", "")
             if command == "view":
-                return "text_editor_view"
+                return "file_editor_view"
             if command == "create":
-                return "text_editor_create"
+                return "file_editor_create"
             if command == "delete":
-                return "text_editor_delete"
-            return "text_editor_edit"
+                return "file_editor_delete"
+            return "file_editor_edit"
         return t
 
     def _generate_group_summary(self, group: dict) -> str:

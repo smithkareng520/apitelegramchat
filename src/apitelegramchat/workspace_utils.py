@@ -6,7 +6,6 @@ from pathlib import Path
 import mimetypes
 from apitelegramchat.workspace_paths import (
     workspace_root, workspace_workdir, workspace_namespace,
-    runtime_cache_root,
     workspace_upload_root, workspace_download_root,
 )
 
@@ -237,11 +236,11 @@ async def fetch_from_download(
 ) -> dict:
     """把 download/{filename} 复制到 workspace/{filename}。
 
-    返回 runtime 工作区下的相对路径，bash / text_editor 可以直接使用。
+    返回 runtime 工作区下的相对路径，bash / file_editor 可以直接使用。
     默认不覆盖已存在的文件，避免误覆盖模型已经在编辑的同名文件。
     """
     rel = _safe_relative_name(filename)
-    # ★ init 在 workspace lock 外面执行（同 bash / text_editor）。
+    # ★ init 在 workspace lock 外面执行（同 bash / file_editor）。
     await _ensure_runtime_workspace(chat_id, namespace)
     lock = await _get_workspace_lock(chat_id, namespace)
     async with lock:
@@ -286,7 +285,7 @@ async def stage_to_upload(
     present_files 只从 upload/ 读取，所以模型必须先调用 stage_to_upload。
     """
     rel = _safe_relative_name(rel_path)
-    # ★ init 在 workspace lock 外面执行（同 bash / text_editor）。
+    # ★ init 在 workspace lock 外面执行（同 bash / file_editor）。
     await _ensure_runtime_workspace(chat_id, namespace)
     lock = await _get_workspace_lock(chat_id, namespace)
     async with lock:

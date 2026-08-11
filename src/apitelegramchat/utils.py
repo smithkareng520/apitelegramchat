@@ -5,13 +5,12 @@ import aiohttp
 import asyncio
 import html
 import logging
-import logging.handlers
+from logging import handlers as logging_handlers
 import time
-import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from apitelegramchat.config import BASE_URL, DEEPSEEK_API_KEY, OPENROUTER_API_KEY, LOG_LEVEL
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Union
 from contextlib import asynccontextmanager
 import sys
 from apitelegramchat.config import GROQ_API_KEY
@@ -38,7 +37,7 @@ def setup_logging():
     root_logger.addHandler(console_handler)
 
     try:
-        file_handler = logging.handlers.RotatingFileHandler(
+        file_handler = logging_handlers.RotatingFileHandler(
             "/tmp/app.log", maxBytes=10*1024*1024, backupCount=10, encoding="utf-8"
         )
         file_handler.setFormatter(logging.Formatter(

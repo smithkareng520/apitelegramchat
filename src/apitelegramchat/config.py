@@ -2,8 +2,8 @@
 import os
 import asyncio
 import logging
-from dataclasses import dataclass, field
-from typing import Dict, Optional, List
+from dataclasses import dataclass
+from typing import Dict, Optional
 
 # ---------- 日志 ----------
 logger = logging.getLogger(__name__)

@@ -13,10 +13,9 @@ import ipaddress
 import socket
 import uuid
 import math
-from datetime import datetime
 import shutil
-from urllib.parse import unquote, quote, urljoin, urlparse, urlsplit, urlunsplit, parse_qs
-from typing import Optional, List, Dict, Any
+from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
+from typing import Optional
 try:
     import trafilatura  # type: ignore
     from trafilatura.settings import use_config  # type: ignore
@@ -36,7 +35,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
             return {"entries": []}
     feedparser = _FeedParserStub()  # type: ignore
 from pathlib import Path
-from apitelegramchat.workspace_paths import workspace_root, workspace_workdir, workspace_namespace
+from apitelegramchat.workspace_paths import workspace_workdir
 
 # === [amap_integration patch] 高德地图数据源 ===
 try:
@@ -55,7 +54,7 @@ try:
     from lxml import html as lxml_html  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
     lxml_html = None  # type: ignore
-from apitelegramchat.state import get_editor_file_state, set_editor_file_state, clear_editor_file_state
+from apitelegramchat.state import set_editor_file_state, clear_editor_file_state
 
 def _build_nav_links(
     lat_wgs: float,
@@ -77,34 +76,31 @@ def _build_nav_links(
 
 from apitelegramchat.config import (
     GOOGLE_CSE_KEY, GOOGLE_CSE_ID,
-    BASE_URL, OPENROUTER_API_KEY, MODELSCOPE_API_KEY, IMGBB_KEY,
+    OPENROUTER_API_KEY,
     TOMTOM_API_KEY,
     ORS_API_KEY,
-    GEOAPIFY_KEY,
     SEARCH_CACHE_TTL,
     FETCH_CACHE_TTL,
     SUPPORTED_MODELS,
     DDG_SEARCH_API_URL,
     get_openrouter_provider_preferences,
 )
-from apitelegramchat.utils import retry_async, send_rich_html_message
+from apitelegramchat.utils import retry_async
 
 OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 
 from apitelegramchat.s3_utils import upload_bytes_to_r2
 from apitelegramchat.workspace_utils import (
-    _get_workspace_lock, _ensure_workspace_initialized, _ensure_runtime_workspace,
+    _get_workspace_lock, _ensure_runtime_workspace,
 )
 # 任务工具：定义在 todo_tool.py / memory_tool.py / subagent_tool.py
 # 本文件只做注册与转出
-from apitelegramchat.todo_tool import TODO_TOOL, execute_todo  # noqa: E402
-from apitelegramchat.memory_tool import MEMORY_TOOL, execute_memory  # noqa: E402
+from apitelegramchat.todo_tool import TODO_TOOL  # noqa: E402
+from apitelegramchat.memory_tool import MEMORY_TOOL  # noqa: E402
 try:  # noqa: E402
-    from apitelegramchat.subagent_tool import SUBAGENT_TOOL, execute_subagent  # type: ignore
+    from apitelegramchat.subagent_tool import SUBAGENT_TOOL  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
     SUBAGENT_TOOL = []
-    async def execute_subagent(*args, **kwargs):  # type: ignore
-        return "Error: subagent tool is unavailable in this environment."
 logger = logging.getLogger(__name__)
 
 WIKIPEDIA_USER_AGENTS = [
@@ -174,7 +170,7 @@ def _normalize_fetch_cache_key(url: str) -> str:
 
 # ===================== 显式持久化单个编辑文件 =====================
 async def _persist_edited_file(chat_id: int, rel_path: str, *, delete: bool = False):
-    """Persist only the file explicitly changed through text_editor."""
+    """Persist only the file explicitly changed through file_editor."""
     try:
         result = await persist_workspace_file(chat_id, rel_path, delete=delete)
         logger.debug("显式持久化成功：%s", result.get("key", rel_path))
@@ -218,7 +214,7 @@ def _write_editor_file(local_path: Path, new_content: str) -> None:
 
 
 # ---------- 主函数 ----------
-async def execute_text_editor(
+async def execute_file_editor(
     chat_id: int,
     command: str,
     path: str,
@@ -1052,7 +1048,7 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "text_editor",
+            "name": "file_editor",
             "description": (
                 "View / create / edit / delete / undo text files (and directories). Recommended workflow:\n"
                 "  1. 'view' once to inspect the target area; pass 'search_terms' to jump to keywords.\n"
@@ -1154,7 +1150,7 @@ SEARCH_TOOLS = [
                 "Execute shell commands in the user workspace. The workspace is local-only and is never synchronized wholesale to R2. "
                 "Use for installs, tests, builds, scripts, and system operations. Generated files and dependencies remain local to this workspace. "
                 "Avoid interactive commands (vim, top) and long-running processes. Set 'restart'=true to reset the session. "
-                "When the model chooses to use a skill, it can `cd skills/<skill_id>` and read the skill instructions there. To list files without Bash, use text_editor command='list'.\n"
+                "When the model chooses to use a skill, it can `cd skills/<skill_id>` and read the skill instructions there. To list files without Bash, use file_editor command='list'.\n"
                 "\n"
                 "CRITICAL — upload/ and download/ are staging buffers, not execution roots:\n"
                 "- You MAY read and write files in upload/ and download/ via relative paths from your cwd, "
@@ -1200,7 +1196,7 @@ SEARCH_TOOLS = [
                 "Copy one or more user-uploaded files from download/ into the agent's ephemeral workdir (workspace root/). "
                 "User-uploaded documents land in download/ automatically when the model cannot ingest them natively; bash "
                 "cannot `cd` into download/, so this tool is the canonical way to make a downloaded file available to "
-                "text_editor / bash / other tools. After fetch_download the file lives at the same relative path inside "
+                "file_editor / bash / other tools. After fetch_download the file lives at the same relative path inside "
                 "the workdir.\n"
                 "download/ is a local-only buffer (not mirrored to R2); if it is empty after a process restart, ask the "
                 "user to re-send the document.\n"
@@ -3608,28 +3604,12 @@ async def _run_overpass_poi(overpass_query: str,
     return json.dumps({"status": "success", "results": results}, ensure_ascii=False)
 
 
-# ===================== 文本编辑器工具实现 =====================
-import os
-import re
-import hashlib
-from urllib.parse import quote
-
+# ===================== 文件编辑器工具实现 =====================
 
 
 def _fmt_coord(value: float) -> str:
     """Format coordinates compactly while keeping map precision adequate."""
     return f"{value:.6f}".rstrip("0").rstrip(".")
-try:
-    import aioboto3  # type: ignore
-    from botocore.exceptions import ClientError  # type: ignore
-except Exception:  # pragma: no cover - optional dependency fallback
-    aioboto3 = None  # type: ignore
-    ClientError = Exception
-from apitelegramchat.s3_utils import upload_bytes_to_r2, download_from_r2, file_exists_in_r2
-from apitelegramchat.config import (
-    R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY,
-    R2_BUCKET_NAME, R2_REGION
-)
 
 # 编辑器配置
 MAX_EDITOR_FILE_SIZE = 5 * 1024 * 1024  # 1MB
@@ -3666,7 +3646,7 @@ def _editor_get_backup_key(chat_id: int, path: str) -> str:
 def _list_directory(dir_path: Path, display_path: str) -> str:
     """列出工作区内某个目录的内容。
 
-    用于 text_editor 的 list 命令 / view 命令遇到目录时的兜底返回。
+    用于 file_editor 的 list 命令 / view 命令遇到目录时的兜底返回。
     返回带类型标记的列表（dir/file/size），便于模型快速定位文件。
     """
     if not dir_path.exists():
