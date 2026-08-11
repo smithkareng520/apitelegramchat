@@ -369,13 +369,22 @@ def build_skill_system_message(skill_id: str, *, include_body: bool = True) -> d
     if body:
         content += "\n\nInstructions:\n" + body
         content += (
-            "\n\nIMPORTANT — resolving paths above: any relative path this skill's "
-            "instructions mention (e.g. `scripts/...`, `REFERENCE.md`, `FORMS.md`) has been "
-            f"copied into your workspace under `{assets_relpath}/`. "
-            f"For example `scripts/office/unpack.py` is actually at "
-            f"`{assets_relpath}/scripts/office/unpack.py` — use that full path when running "
-            "bash commands or reading files with the editor tool. Paths written elsewhere in "
-            "this workspace (outside that folder) are your own working files, not skill assets."
+            "\n\nIMPORTANT — how to run the commands above:\n"
+            f"1. bash tool: your shell's working directory is AUTOMATICALLY set to "
+            f"`{assets_relpath}/` (this skill's own folder) for every command you run while "
+            "this skill is active. This means every relative path written in the "
+            "instructions above — `scripts/office/unpack.py`, `REFERENCE.md`, "
+            "`python scripts/accept_changes.py input.docx output.docx`, etc. — already works "
+            "exactly as written. Do NOT prefix them with anything; do NOT `cd` elsewhere "
+            "first. If a command needs to read/write a file the user uploaded or a file "
+            f"you created earlier in this conversation, that file lives one level up, at "
+            f"`../` relative to your current directory (i.e. the workspace root) — use "
+            f"`../document.docx` or an absolute path from the `Cwd:` line in the bash "
+            "tool's output to reach it.\n"
+            f"2. text_editor tool: unlike bash, every path you pass to text_editor is "
+            "resolved relative to the workspace root, NOT this skill's folder. So to open "
+            f"a skill asset with text_editor you must write the full path, e.g. "
+            f"`{assets_relpath}/scripts/office/unpack.py`."
         )
     return {
         "role": "system",

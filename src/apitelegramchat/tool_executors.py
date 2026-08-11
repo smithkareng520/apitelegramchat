@@ -7,6 +7,7 @@ import random
 import aiohttp
 import json
 import hashlib
+import time
 from pathlib import Path
 from apitelegramchat.workspace_paths import workspace_root, workspace_workdir
 import re
@@ -79,6 +80,7 @@ from apitelegramchat.skills import (
     read_skill_text as skill_read_text,
     activate_skill as skill_activate_skill,
     sync_skill_assets_to_workspace as _skill_sync_assets,
+    SKILL_ASSETS_DIRNAME,
 )
 from apitelegramchat.todo_tool import (
     render_todo_card,
@@ -120,6 +122,29 @@ class BashSession:
         self.workspace = workspace_root(chat_id)
         self.workdir = workspace_workdir(chat_id)
         self._watchdog_task: Optional[asyncio.Task] = None
+        # 当前激活的 skill id（如有）。非 None 时，execute() 里每条命令执行前
+        # 会 cd 到该 skill 的资源目录（workspace/.skills/<skill_id>/），而不是
+        # workspace 根 —— 这样 SKILL.md 里写的相对路径（如
+        # `python scripts/office/soffice.py ...`）天然成立，不需要模型自己
+        # 拼接 `.skills/<id>/` 前缀，也不用担心拼接出错。
+        self._active_skill_id: Optional[str] = None
+
+    def set_active_skill(self, skill_id: Optional[str]) -> None:
+        """设置/清除当前激活的 skill，影响下一次 execute() 的 cwd。"""
+        self._active_skill_id = skill_id or None
+
+    def _effective_cwd(self) -> Path:
+        """返回本次命令应该在哪个目录下执行。
+
+        有 active skill 且该 skill 的资源目录确实已经同步到本地时，
+        cwd 切到 skill 目录本身（渐进式披露：模型此时"就在"该 skill 包内，
+        SKILL.md 里的相对路径不需要任何改写）。否则退回 workspace 根。
+        """
+        if self._active_skill_id:
+            skill_dir = self.workdir / SKILL_ASSETS_DIRNAME / self._active_skill_id
+            if skill_dir.is_dir():
+                return skill_dir
+        return self.workdir
 
     async def start(self):
         """启动 bash 进程，套上 Landlock 沙箱 + rlimit + no-new-privs"""
@@ -219,7 +244,8 @@ class BashSession:
                 return f"Error: Command rejected for security reasons: {command}"
 
             marker = f"__END_{random.randint(100000, 999999)}__"
-            workspace_dir = shlex.quote(str(self.workdir.absolute()))
+            effective_cwd = self._effective_cwd()
+            workspace_dir = shlex.quote(str(effective_cwd.absolute()))
             # ★ 关键：在 echo marker 前先输出一个换行，确保 marker 单独占一行。
             #   如果命令输出不以换行结尾（如 cat 无换行文件、printf 无 \n），
             #   echo 的输出会粘在前一行，readline() 永远读不到以 marker 开头的行，
@@ -264,6 +290,7 @@ class BashSession:
                 asyncio.create_task(_async_sync_workspace_to_r2(self.chat_id))
 
                 return (f"Command: {command}\n"
+                        f"Cwd: {effective_cwd.absolute()}\n"
                         f"Exit code: {exit_code}\n"
                         f"Sandbox: landlock\n"
                         f"Output:\n{output}")
@@ -369,7 +396,7 @@ _bash_manager = BashSessionManager()
 # =====================================================================
 # execute_bash —— 工具调用入口（保持原签名，外部无需修改）
 # =====================================================================
-async def execute_bash(chat_id: int, command: str = "", restart: bool = False) -> str:
+async def execute_bash(chat_id: int, command: str = "", restart: bool = False, skill_id: Optional[str] = None) -> str:
     if restart:
         result = await _bash_manager.restart_session(chat_id)
         # 重启后也异步同步一次
@@ -381,6 +408,9 @@ async def execute_bash(chat_id: int, command: str = "", restart: bool = False) -
         session = await _bash_manager.get_session(chat_id)
     except RuntimeError as e:
         return f"Error: {e}"
+    # ★ 每次调用都同步当前 active skill，使 cwd 与最新的 skill 激活状态一致
+    #   （skill 可能在上一轮对话里才切换，session 是跨轮复用的）。
+    session.set_active_skill(skill_id)
     # 执行命令，内部已包含异步同步
     return await session.execute(command)
 
@@ -1583,16 +1613,37 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             skill_id_arg = arguments.get("skill_id", "")
             payload = skill_activate_skill(skill_id_arg, include_body=arguments.get("include_body", True))
             if "error" not in payload:
+                # 用规范化后的真实 skill_id（而非用户可能传入的 name 别名），
+                # 保证和 sync_skill_assets_to_workspace() 落盘的目录名、以及
+                # bash 分支读取 active_skill 后拼接的 .skills/<id>/ 完全一致。
+                resolved_skill_id = str(
+                    (payload.get("activated") or {}).get("skill_id") or skill_id_arg
+                )
                 # ★ 手动激活同样必须同步资源到 workspace/.skills/<id>/，
                 # 否则模型即使读到了 SKILL.md 正文，bash/text_editor 依然
                 # 因为 Landlock 拒绝而访问不到 scripts/、REFERENCE.md 等文件。
                 try:
                     sync_result = await asyncio.to_thread(
-                        _skill_sync_assets, skill_id_arg, workspace_root(chat_id)
+                        _skill_sync_assets, resolved_skill_id, workspace_root(chat_id)
                     )
                     payload["assets_sync"] = sync_result
                 except Exception as e:
                     payload["assets_sync"] = {"synced": False, "error": str(e)}
+                # 同步写入 active_skill 状态，保证与 ai_handlers.py 的自动匹配路径
+                # 语义一致：下一次 bash 调用能读到这次手动激活，cwd 才会切到
+                # 该 skill 目录。不这么做的话，模型手动 skill_activate 之后，
+                # bash 依旧会落在 workspace 根，SKILL.md 的相对路径又对不上。
+                try:
+                    from apitelegramchat import state as _state
+                    ctx = _state.user_contexts.setdefault(chat_id, {})
+                    ctx["active_skill"] = {
+                        "skill_id": resolved_skill_id,
+                        "reason": "手动激活 (skill_activate)",
+                        "score": None,
+                        "updated_at": time.time(),
+                    }
+                except Exception:
+                    pass
             return json.dumps(payload, ensure_ascii=False, indent=2)
         elif name == "wikipedia":
             return await execute_wikipedia(arguments.get("query", ""), arguments.get("lang", "zh"))
@@ -1703,10 +1754,23 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             )
         # ========== Bash 工具分支 ==========
         elif name == "bash":
+            # 读取当前 chat 的 active skill，让沙箱 cwd 与之保持一致
+            # （渐进式披露：有 active skill 时 cwd 直接落在该 skill 的
+            # workspace/.skills/<id>/ 目录下，SKILL.md 的相对路径不需要改写）。
+            active_skill_id = None
+            try:
+                from apitelegramchat import state as _state
+                ctx = _state.user_contexts.get(chat_id, {})
+                active_skill = ctx.get("active_skill")
+                if isinstance(active_skill, dict):
+                    active_skill_id = active_skill.get("skill_id")
+            except Exception:
+                active_skill_id = None
             return await execute_bash(
                 chat_id=chat_id,
                 command=arguments.get("command", ""),
-                restart=arguments.get("restart", False)
+                restart=arguments.get("restart", False),
+                skill_id=active_skill_id,
             )
         # ========== Todo 工具分支 ==========
         # 任务 / 待办清单。返回 JSON 字符串给 AI 上下文；UI 渲染由 format_tool_result 处理。
