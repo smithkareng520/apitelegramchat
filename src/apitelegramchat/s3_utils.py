@@ -30,14 +30,14 @@ logger = logging.getLogger(__name__)
 session = aioboto3.Session() if aioboto3 is not None else None
 _LOCAL_R2_ROOT = data_root() / "r2_cache"
 
-# R2 超时配置：connect 5s，read 10s，不重试（由调用方决定重试策略）。
+# R2 超时配置：connect 3s，read 5s，0 次重试（1 次尝试，失败即放弃）。
 # 默认 botocore 配置是 connect 60s / read 60s / 3 retries，冷启动时一次
-# 挂掉的 R2 调用会卡 60s+60s*3 = 240s，远超工具调用的 45s 超时。
-# 用短超时让 R2 快速失败，上层 init 逻辑会把失败视为"R2 暂不可用"并继续。
+# 挂掉的 R2 调用会卡 60s+60s*3 = 240s。这里把每次调用限制在 3+5=8s 内，
+# 配合 init 的 30s 全局超时，确保 init 最多跑 30s 就放弃。
 _R2_CONFIG = Config(
-    connect_timeout=5,
-    read_timeout=10,
-    retries={"max_attempts": 1, "mode": "standard"},
+    connect_timeout=3,
+    read_timeout=5,
+    retries={"max_attempts": 0, "mode": "standard"},
     max_pool_connections=10,
 ) if Config is not None else None
 
@@ -82,7 +82,7 @@ async def upload_bytes_to_r2(
             logger.exception("Local R2 cache write failed: %s", e)
             return None
 
-    max_attempts = 3
+    max_attempts = 1
     for attempt in range(max_attempts):
         try:
             async with session.client(

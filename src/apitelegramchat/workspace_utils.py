@@ -51,39 +51,47 @@ async def _get_workspace_init_lock(key: str) -> asyncio.Lock:
         return _workspace_init_locks[key]
 
 
-_RUNTIME_MARKER = ".workspace-runtime-ready"
-
-
 def _copy_persistent_tree_to_runtime(chat_id: int, namespace: str | None = None) -> None:
-    """Hydrate the ephemeral shell tree from the persistent files tree once.
+    """Incrementally hydrate the ephemeral shell tree from the persistent files tree.
 
-    This is a one-way bootstrap. Runtime changes are never mirrored back
-    implicitly; that is the core persistence boundary.
+    This is idempotent: it only copies files that don't exist in the target or
+    are newer than the source. No marker file — every call is a cheap stat-check
+    sweep. This ensures files downloaded by a background R2 init (which may
+    complete AFTER the first tool call) eventually appear in runtime/exec/ on
+    the next tool call.
     """
     source = workspace_files_root(chat_id, namespace)
     target = workspace_workdir(chat_id, namespace)
     target.mkdir(parents=True, exist_ok=True)
-    marker = target / _RUNTIME_MARKER
-    if marker.exists():
+
+    if not source.exists():
         return
 
-    # Copy regular files/directories only. Symlinks from legacy workspaces are not
-    # imported into the execution tree, avoiding link-based escapes.
-    for entry in source.iterdir() if source.exists() else ():
-        dst = target / entry.name
-        if entry.is_symlink():
+    # Walk source and copy any file that's missing or outdated in target.
+    for entry in source.rglob("*"):
+        if entry.is_dir() or entry.is_symlink():
             continue
-        if entry.is_dir():
-            shutil.copytree(entry, dst, dirs_exist_ok=True)
-        elif entry.is_file():
+        rel = entry.relative_to(source)
+        dst = target / rel
+        try:
+            src_stat = entry.stat()
+            if dst.exists():
+                dst_stat = dst.stat()
+                # Skip if target is same age or newer (already copied).
+                if dst_stat.st_mtime >= src_stat.st_mtime and dst_stat.st_size == src_stat.st_size:
+                    continue
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(entry, dst)
-
-    marker.write_text("1\n", encoding="utf-8")
+        except OSError:
+            continue
 
 
 async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) -> None:
-    """Ensure Bash/text-editor tools share the same ephemeral working tree."""
+    """Ensure Bash/text-editor tools share the same ephemeral working tree.
+
+    Non-blocking: if init is in progress, this returns immediately and the
+    incremental copy handles whatever local state is available.
+    """
     await _ensure_workspace_initialized(chat_id, namespace)
     await asyncio.to_thread(_copy_persistent_tree_to_runtime, chat_id, namespace)
 
@@ -166,56 +174,81 @@ async def persist_workspace_file(
         )
 
 
+# 跟踪 init 是否正在进行中。工具调用检查这个集合，如果 init 在跑就直接返回，
+# 不等锁。这是解决"工具调用阻塞在 init_lock 上"的关键。
+_workspace_init_in_progress: set[str] = set()
+
+# init 全局超时：即使 R2 上有几百个文件，init 也最多跑这么久。
+# 超时后标记为已完成，后续工具调用使用本地已有的部分状态。
+_INIT_TIMEOUT_SEC = 30.0
+
+
 async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = None) -> None:
-    """首次访问 workspace 时从 R2 初始化一次；之后本地 workspace 即为工作副本。
+    """非阻塞检查：如果 init 已完成或在跑，立即返回。
 
-    会同步两棵持久化子树：
-      - editor/{ns}/   -> files/      (text_editor / workspace_commit 持久化层)
-      - upload/{ns}/   -> upload/     (待发送给用户的产物暂存)
+    工具调用（text_editor / bash 等）调这个函数。它永远不会阻塞——
+    如果 init 还没开始，会 fire-and-forget 启动一个后台 init 任务，
+    然后立即返回。工具使用本地已有的文件状态（可能为空）。
 
-    注意：download/ 不同步到 R2。用户上传的文档由 file_handlers.py 的
-    `telegram/{file_id}` R2 缓存负责跨重启持久化（Telegram 对同一文件给同一
-    file_id，天然去重）。download/ 只是当前会话的本地落地缓冲，进程重启后
-    可以为空——模型需要时用户重发即可，或通过 file_id 重新拉取。
-
-    失败语义（重要）：
-    - 如果 R2 同步抛异常或被取消（asyncio.CancelledError），仍然把 key 加入
-      _workspace_initialized。这避免"超时→重试→再超时"的死循环：第一次 init
-      失败后，后续工具调用直接使用本地已有的文件（可能是空的），模型仍可工作。
-      丢失的只是 R2 上历史持久化的文件，用户重发即可恢复。
-    - 这是显式的可用性优先于一致性取舍：工具调用的 45s 超时不应被 R2 网络问题
-      反复消耗。
+    这解决了一个关键死锁：之前工具调用会等 init_lock，而 init_lock 被后台
+    init 任务持有（可能跑 3+ 分钟）。工具的 45s 超时在等锁阶段就耗尽了，
+    finally 块根本没机会执行。
     """
     key = workspace_namespace(chat_id, namespace)
-    if key in _workspace_initialized:
+    if key in _workspace_initialized or key in _workspace_init_in_progress:
+        return
+    # init 还没开始——fire and forget。工具不等它完成。
+    asyncio.create_task(_do_workspace_init(chat_id, namespace))
+
+
+async def _do_workspace_init(chat_id: int, namespace: str | None = None) -> None:
+    """实际的 R2 同步逻辑，带 30s 全局超时。
+
+    由后台任务调用（app.py 的 init_workspace 或 _ensure_workspace_initialized
+    的 fire-and-forget）。同一个 chat 只会跑一次。
+    """
+    key = workspace_namespace(chat_id, namespace)
+    if key in _workspace_initialized or key in _workspace_init_in_progress:
         return
 
     init_lock = await _get_workspace_init_lock(key)
     async with init_lock:
-        if key in _workspace_initialized:
+        if key in _workspace_initialized or key in _workspace_init_in_progress:
             return
-        try:
-            await _sync_workspace_from_r2(chat_id)
-            await _sync_upload_from_r2(chat_id, namespace)
-            logger.debug("Workspace initialized: chat_id=%s namespace=%s", chat_id, key)
-        except asyncio.CancelledError:
-            # 工具调用超时会 cancel 整个调用链，包括 init。如果不标记，下一次
-            # 工具调用会从头再同步，又超时，形成死循环。标记为已初始化，让后续
-            # 调用继续工作（本地文件可能不全，但至少不卡死）。
-            logger.warning(
-                "Workspace init cancelled for chat_id=%s; marking as initialized "
-                "with partial state to avoid retry loop.", chat_id
-            )
-            raise  # CancelledError 必须向上传播
-        except Exception as e:
-            logger.warning(
-                "Workspace init failed for chat_id=%s (%s); marking as initialized "
-                "with local-only state to avoid retry loop.", chat_id, e
-            )
-        finally:
-            # 无论成功、失败还是取消，都标记为已初始化。
-            # CancelledError 在 finally 中 add 不会阻止传播，但会防止重试。
-            _workspace_initialized.add(key)
+        _workspace_init_in_progress.add(key)
+
+    try:
+        await asyncio.wait_for(
+            _sync_workspace_and_upload(chat_id, namespace),
+            timeout=_INIT_TIMEOUT_SEC,
+        )
+        logger.info("Workspace 初始化完成: chat_id=%s", chat_id)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Workspace init timed out after %ss for chat_id=%s; "
+            "proceeding with partial local state.",
+            _INIT_TIMEOUT_SEC, chat_id,
+        )
+    except asyncio.CancelledError:
+        logger.warning(
+            "Workspace init cancelled for chat_id=%s; "
+            "proceeding with partial local state.", chat_id,
+        )
+        raise
+    except Exception as e:
+        logger.warning(
+            "Workspace init failed for chat_id=%s (%s); "
+            "proceeding with local-only state.", chat_id, e,
+        )
+    finally:
+        _workspace_init_in_progress.discard(key)
+        _workspace_initialized.add(key)
+
+
+async def _sync_workspace_and_upload(chat_id: int, namespace: str | None = None) -> None:
+    """同步 files/ 和 upload/ 两棵子树。"""
+    await _sync_workspace_from_r2(chat_id)
+    await _sync_upload_from_r2(chat_id, namespace)
 
 
 def _mark_workspace_initialized(chat_id: int, namespace: str | None = None) -> None:
@@ -586,9 +619,12 @@ async def list_upload_files(chat_id: int, *, namespace: str | None = None) -> li
 # ========== 可选：初始化工作区（后台执行） ==========
 
 async def init_workspace(chat_id: int):
-    """后台初始化工作区；同一进程内只初始化一次。"""
+    """后台初始化工作区；同一进程内只初始化一次。
+
+    调用 _do_workspace_init（带 30s 超时的实际同步逻辑）。
+    _do_workspace_init 内部有幂等检查，重复调用是 no-op。
+    """
     try:
-        await _ensure_workspace_initialized(chat_id)
-        logger.info(f"Workspace 初始化完成: chat_id={chat_id}")
+        await _do_workspace_init(chat_id)
     except Exception as e:
         logger.error(f"Workspace 初始化失败: {e}")
