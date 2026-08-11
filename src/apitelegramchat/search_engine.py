@@ -1277,7 +1277,7 @@ SEARCH_TOOLS = [
                     },
                     "overwrite": {
                         "type": "boolean",
-                        "default": false,
+                        "default": False,
                         "description": "true 则覆盖工作区已存在的同名文件；默认 false 会跳过并返回 skipped。"
                     }
                 },
@@ -1285,7 +1285,7 @@ SEARCH_TOOLS = [
             },
             "input_examples": [
                 {"filenames": ["brief.pdf"]},
-                {"filenames": ["data.csv", "notes.txt"], "overwrite": true}
+                {"filenames": ["data.csv", "notes.txt"], "overwrite": True}
             ]
         }
     },
