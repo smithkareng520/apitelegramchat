@@ -52,7 +52,6 @@ from apitelegramchat.file_handlers import get_file_path
 from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2
 from apitelegramchat.skills import skill_catalog_brief
 from apitelegramchat.tool_executors import (
-    BashProgressSnapshot,
     dispatch_tool_call,
     format_tool_result,
     _truncate_tool_result,
@@ -2201,19 +2200,27 @@ async def _run_tool_calls_and_append(
                 command_preview = str(fn_args.get("command") or "").strip()
                 short_command = command_preview[:30] + "…" if len(command_preview) > 30 else command_preview
 
-                async def bash_progress_callback(snapshot: BashProgressSnapshot):
+                async def bash_progress_callback(output_text: str):
                     try:
-                        # 执行层提供的是有限状态的 20 行终端视口，而非原始字符尾部。
-                        # 渲染层继续按 HTML 转义后的体积裁剪，双重防护避免任何单行日志
-                        # 或 ANSI/进度条把草稿撑爆；最终 tool result 则完全不受这里影响。
-                        preview = _render_bash_live_preview(command_preview, snapshot)
+                        # 伪刷新式终端预览：每次收到新输出都用“最新 10 行”替换旧内容。
+                        # 这里只影响 Telegram 草稿 UI，不影响发送给模型的原始 tool 输出。
+                        live_tail, first_line = _tail_lines_with_start(output_text, 10)
+                        if live_tail:
+                            preview = (
+                                f"{_format_code_block(command_preview, header='bash · command', show_line_numbers=True, show_size=False, max_lines=10)}"
+                                f"<details open><summary>实时输出 · 最近 10 行（持续刷新）</summary>"
+                                f"{_format_code_block(live_tail, header='', show_line_numbers=True, show_size=False, max_lines=10, line_start=first_line)}"
+                                f"</details>"
+                            )
+                        else:
+                            preview = _format_code_block(command_preview, header="bash · command", show_line_numbers=True, show_size=False, max_lines=10)
                         builder.update_tool_preview(
                             tc_id,
                             preview,
                             summary=f"Running: {short_command}" if short_command else "Running command",
                         )
-                        # 和 output-delta 一样，只替换同一个滚动窗口。builder/传输层负责
-                        # 合并和节流，因此高频 stdout 不会造成草稿 API 高频调用。
+                        # 和 Codex 的 outputDelta 类似：执行层只推送增量，真正的网络刷新由
+                        # builder 自己节流，避免 Python/Node 高频 stdout 把 Telegram API 打爆。
                         builder.request_flush(force=False)
                     except Exception:
                         pass  # UI 推送失败不能影响 Bash 本身执行
@@ -2497,80 +2504,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
 # ========== 流式工具预览辅助 ==========
 _STREAM_PREVIEW_MAX_LINES = 15
 _STREAM_PREVIEW_MAX_LINES_FULL = 200
-_BASH_LIVE_PREVIEW_MAX_LINES = 20
-# 限制的是 HTML 转义后的字符量而非原始长度，避免一行包含大量 <、& 时
-# 经过转义后再次撑大 rich draft。
-_BASH_LIVE_PREVIEW_MAX_ESCAPED_LINE_CHARS = 120
-_BASH_COMMAND_PREVIEW_MAX_ESCAPED_LINE_CHARS = 96
-
-
-def _clip_terminal_line_for_preview(line: str, max_escaped_chars: int) -> str:
-    """Return a safe terminal line whose rendered HTML payload has a hard size cap."""
-    if not line:
-        return ""
-    used = 0
-    clipped: list[str] = []
-    for char in line:
-        escaped_size = len(escape_html(char))
-        if used + escaped_size > max_escaped_chars:
-            return "".join(clipped).rstrip() + "…"
-        clipped.append(char)
-        used += escaped_size
-    return "".join(clipped)
-
-
-def _bounded_terminal_preview(
-    text: str,
-    *,
-    max_lines: int,
-    max_escaped_line_chars: int,
-) -> str:
-    """Defensively bound an output window before it reaches the rich-message renderer."""
-    # `BashPreviewBuffer` already normalizes controls.  Keep this second layer so a
-    # future executor/callback change cannot accidentally reintroduce raw terminal data.
-    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text or "")
-    lines = cleaned.splitlines()[-max(1, max_lines):]
-    return "\n".join(
-        _clip_terminal_line_for_preview(line, max_escaped_line_chars)
-        for line in lines
-    )
-
-
-def _render_bash_live_preview(command: str, snapshot: BashProgressSnapshot) -> str:
-    """Render the bounded Bash viewport in the same card style as other live tools."""
-    command_text = _bounded_terminal_preview(
-        command,
-        max_lines=10,
-        max_escaped_line_chars=_BASH_COMMAND_PREVIEW_MAX_ESCAPED_LINE_CHARS,
-    )
-    output_text = _bounded_terminal_preview(
-        snapshot.text,
-        max_lines=_BASH_LIVE_PREVIEW_MAX_LINES,
-        max_escaped_line_chars=_BASH_LIVE_PREVIEW_MAX_ESCAPED_LINE_CHARS,
-    )
-    visible_lines = len(output_text.splitlines()) or 1
-    if snapshot.hidden_lines:
-        output_title = (
-            f"实时输出 · 最近 {visible_lines} 行（共 {snapshot.total_lines} 行，滚动刷新）"
-        )
-    else:
-        output_title = f"实时输出 · 最近 {visible_lines} 行（滚动刷新）"
-    command_card = _format_code_block(
-        command_text or "(空命令)",
-        header="bash · command",
-        show_line_numbers=True,
-        show_size=False,
-        max_lines=10,
-    )
-    output_card = _format_code_block(
-        output_text or "(等待输出…)",
-        header="",
-        show_line_numbers=True,
-        show_size=False,
-        max_lines=_BASH_LIVE_PREVIEW_MAX_LINES,
-        line_start=snapshot.first_line,
-    )
-    return f"{command_card}<details open><summary>{output_title}</summary>{output_card}</details>"
 
 
 def _format_code_block(content: str, max_lines: int = _STREAM_PREVIEW_MAX_LINES_FULL,
