@@ -1399,7 +1399,8 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 
 <tool_usage_guide>
 - todo：用户说"记一下""提醒我"时优先用。写操作（add/done/undone/delete/edit/clear）后紧跟一次 list，让用户看到最新状态。
-- memory：用户说"记住…"或提到长期偏好/过敏/重要他人/截止日期时写入；回答涉及偏好的问题前先 search。
+- memory：每次任务开始先用 <code>view</code> 查看 <code>/memories</code>，再按需读取相关文件；对可复用的进度、决策或偏好，以文件形式 create/str_replace/insert 维护。所有路径必须在 <code>/memories</code> 内。
+- tool_search：仅核心工具在首轮可用。需要尚未暴露的能力时，先用 <code>tool_search</code> 按任务意图检索；搜索结果会在下一轮自动加载。搜索只发现工具，不会执行任务。
 - skills：技能包存储在当前工作目录下。由你主动判断是否需要某个 skill；需要时先读取对应 SKILL.md，再按其说明调用脚本或参考文件，不会自动替你激活技能。
 - subagent：彼此独立的子任务请在同一轮里一次性并发派多个 subagent 工具调用，不要一个做完再发下一个；简单问题自己答，不要滥用。子 agent 不继承主对话历史，只看到 task + context。
 </tool_usage_guide>
@@ -2371,6 +2372,13 @@ def _tool_result_is_failure(fn_name: str, fn_args: dict, result_content: Any, de
         return True
     text = str(result_content or "").strip()
     lower = text.lower()
+    if fn_name in {"memory", "tool_search"}:
+        try:
+            structured = json.loads(text)
+        except (TypeError, ValueError):
+            structured = None
+        if isinstance(structured, dict):
+            return not bool(structured.get("ok"))
     if fn_name == "bash":
         # bash 的成功/失败以退出码为准；仅在明确看不到退出码时，再回退到错误前缀判断。
         m = re.search(r"Exit code:\s*(\d+)", text)
@@ -3439,9 +3447,15 @@ async def _agentic_loop_openai_compat(
         client: AsyncOpenAI, current_model: str, messages: list, api_label: str,
         builder: "RichMessageBuilder", tools: list = None, supports_tools: bool = True
 ) -> tuple[str | None, object | None, list]:
+    from apitelegramchat.search_engine import TOOL_CATALOG, get_initial_agent_tools, get_tools_for_names
+    from apitelegramchat.tool_search import extract_loaded_tool_names
     if tools is None:
-        from apitelegramchat.search_engine import SEARCH_TOOLS
-        tools = SEARCH_TOOLS
+        tools = get_initial_agent_tools()
+    # Keep the initial set stable for prompt caching.  Definitions returned by
+    # tool_search are validated against the server-side catalog and become
+    # callable only on the next loop turn.
+    eager_tools = list(tools)
+    loaded_tool_names: list[str] = []
     loop_messages = list(messages)
     final_content = None
     final_usage = None
@@ -3454,6 +3468,16 @@ async def _agentic_loop_openai_compat(
     max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
 
     for _round in range(MAX_TOOL_CALLS):
+        active_tools = [*eager_tools, *get_tools_for_names(loaded_tool_names)]
+        # De-duplicate by function name while preserving the eager tool order.
+        seen_tool_names: set[str] = set()
+        active_tools = [
+            tool for tool in active_tools
+            if isinstance(tool, dict)
+            and isinstance(tool.get("function"), dict)
+            and isinstance(tool["function"].get("name"), str)
+            and not (tool["function"]["name"] in seen_tool_names or seen_tool_names.add(tool["function"]["name"]))
+        ]
         added_tool_indices = set()
         last_arg_len = {}
 
@@ -3489,8 +3513,8 @@ async def _agentic_loop_openai_compat(
             if supports_sampling:
                 create_params["temperature"] = 0.6
                 create_params["top_p"] = 0.9
-            if supports_tools and tools:
-                create_params["tools"] = tools
+            if supports_tools and active_tools:
+                create_params["tools"] = active_tools
                 create_params["tool_choice"] = "auto"
                 create_params["parallel_tool_calls"] = parallel_tool_calls
             if api_label == "openrouter":
@@ -3657,8 +3681,8 @@ async def _agentic_loop_openai_compat(
                 if supports_sampling:
                     fallback_params["temperature"] = 0.6
                     fallback_params["top_p"] = 0.9
-                if supports_tools and tools:
-                    fallback_params["tools"] = tools
+                if supports_tools and active_tools:
+                    fallback_params["tools"] = active_tools
                     fallback_params["tool_choice"] = "auto"
                     fallback_params["parallel_tool_calls"] = parallel_tool_calls
                 if api_label == "openrouter":
@@ -3667,7 +3691,7 @@ async def _agentic_loop_openai_compat(
                 resp = await client.chat.completions.create(**fallback_params)
                 msg = resp.choices[0].message
                 content_acc = msg.content or ""
-                if supports_tools and tools and hasattr(msg, "tool_calls") and msg.tool_calls:
+                if supports_tools and active_tools and hasattr(msg, "tool_calls") and msg.tool_calls:
                     for idx, tc in enumerate(msg.tool_calls):
                         tool_calls_acc[idx] = {
                             "id": tc.id,
@@ -3750,8 +3774,21 @@ async def _agentic_loop_openai_compat(
             tool_calls_list, loop_messages, new_history_entries,
             tool_call_count_ref, api_label, builder, chat_id=builder.chat_id
         )
-
+        # Search returns model-visible references, but the orchestrator is the
+        # trust boundary: load only catalog-verified names after this tool round.
+        discovered_names: list[str] = []
+        for message in reversed(loop_messages):
+            if message.get("role") == "assistant":
+                break
+            if message.get("role") == "tool" and message.get("name") == "tool_search":
+                discovered_names.extend(extract_loaded_tool_names(message.get("content", ""), TOOL_CATALOG))
+        for name in reversed(discovered_names):
+            if name not in loaded_tool_names:
+                loaded_tool_names.append(name)
+        if discovered_names:
+            logger.info("[%s] tool_search loaded definitions for next round: %s", api_label, loaded_tool_names)
         # ===== FIX: 只对 over_limit 做强制总结并退出 =====
+
         if status == "over_limit":
             synth_params = {
                 "model": current_model,
@@ -3813,7 +3850,12 @@ async def _agentic_loop_gemini_openai_compat(
             cleaned.append(new_tool)
         return cleaned
 
-    cleaned_tools = _clean_tools_for_gemini(tools) if tools else None
+    from apitelegramchat.search_engine import TOOL_CATALOG, get_initial_agent_tools, get_tools_for_names
+    from apitelegramchat.tool_search import extract_loaded_tool_names
+    if tools is None:
+        tools = get_initial_agent_tools()
+    eager_tools = list(tools)
+    loaded_tool_names: list[str] = []
 
     model_info = SUPPORTED_MODELS.get(current_model)
     supports_sampling = model_info.supports_sampling if model_info else True
@@ -3832,6 +3874,16 @@ async def _agentic_loop_gemini_openai_compat(
     new_history_entries: list = []
 
     for _round in range(MAX_TOOL_CALLS):
+        active_tools = [*eager_tools, *get_tools_for_names(loaded_tool_names)]
+        seen_tool_names: set[str] = set()
+        active_tools = [
+            tool for tool in active_tools
+            if isinstance(tool, dict)
+            and isinstance(tool.get("function"), dict)
+            and isinstance(tool["function"].get("name"), str)
+            and not (tool["function"]["name"] in seen_tool_names or seen_tool_names.add(tool["function"]["name"]))
+        ]
+        cleaned_tools = _clean_tools_for_gemini(active_tools)
         payload: dict = {
             "model": current_model,
             "messages": loop_messages,
@@ -3947,6 +3999,17 @@ async def _agentic_loop_gemini_openai_compat(
             tool_calls_list, loop_messages, new_history_entries,
             tool_call_count_ref, "gemini", builder, chat_id=builder.chat_id
         )
+        discovered_names: list[str] = []
+        for message in reversed(loop_messages):
+            if message.get("role") == "assistant":
+                break
+            if message.get("role") == "tool" and message.get("name") == "tool_search":
+                discovered_names.extend(extract_loaded_tool_names(message.get("content", ""), TOOL_CATALOG))
+        for name in reversed(discovered_names):
+            if name not in loaded_tool_names:
+                loaded_tool_names.append(name)
+        if discovered_names:
+            logger.info("[gemini] tool_search loaded definitions for next round: %s", loaded_tool_names)
 
         if status == "over_limit":
             synth_payload = {
@@ -5141,8 +5204,8 @@ async def _call_api(
         tools: list = None
 ) -> tuple[str | None, object | None, list]:
     if tools is None:
-        from apitelegramchat.search_engine import SEARCH_TOOLS
-        tools = SEARCH_TOOLS
+        from apitelegramchat.search_engine import get_initial_agent_tools
+        tools = get_initial_agent_tools()
 
     api_type = model_info.provider
     supports_tools = model_info.supports_tools

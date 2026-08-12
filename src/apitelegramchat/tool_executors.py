@@ -68,6 +68,7 @@ from apitelegramchat.todo_tool import (
     render_todo_card,
 )
 from apitelegramchat.memory_tool import execute_memory, render_memory_card
+from apitelegramchat.tool_search import execute_tool_search, render_tool_search_card
 from apitelegramchat.subagent_tool import execute_subagent, render_subagent_card
 from apitelegramchat.utils import escape_html
 
@@ -1706,6 +1707,22 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = render_todo_card(payload)
         return summary, details_html
 
+    # ===================== Tool Search 工具格式化 =====================
+    elif fn_name == "tool_search":
+        try:
+            payload = json.loads(result_str)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        if not isinstance(payload, dict):
+            return "工具搜索", escape_text(result_str)
+        if payload.get("ok"):
+            summary = (
+                f"工具搜索：命中 {payload.get('matched', 0)} 个 · "
+                f"已加载 {payload.get('returned', 0)} 个"
+            )
+        else:
+            summary = f"工具搜索失败：{payload.get('code', 'search_error')}"
+        return summary, render_tool_search_card(payload)
     # ===================== Memory 工具格式化 =====================
     # execute_memory 返回 JSON 字符串（给 AI 阅读），这里渲染成富文本卡片。
     elif fn_name == "memory":
@@ -1721,29 +1738,19 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             summary = f"❌ 记忆操作失败：{payload.get('code', '')}"
             details_html = f"<p>{escape_text(payload.get('error', '未知错误'))}</p>"
             return summary, details_html
-        action = payload.get("action", "list")
-        if action == "list":
-            total = payload.get("total", 0)
-            shown = payload.get("shown", 0)
-            summary = f"🧠 记忆库：{total} 条 · 显示 {shown} 条"
-        elif action == "search":
-            summary = f"🔎 记忆搜索：{payload.get('matches', 0)} / {payload.get('total', 0)} 条命中"
-        elif action == "add":
-            m = payload.get("memory", {})
-            summary = f"🧠 保存 #{m.get('id', '?')} {m.get('content', '')[:30]}"
-        elif action == "get":
-            m = payload.get("memory", {})
-            summary = f"🧠 查看 #{m.get('id', '?')} {m.get('content', '')[:30]}"
-        elif action == "update":
-            m = payload.get("memory", {})
-            summary = f"📝 更新 #{m.get('id', '?')} {m.get('content', '')[:30]}"
-        elif action == "delete":
-            m = payload.get("memory", {})
-            summary = f"🗑️ 删除 #{m.get('id', '?')} {m.get('content', '')[:30]}"
-        elif action == "clear":
-            summary = f"🧹 清理 {payload.get('removed', 0)} 条记忆"
-        else:
-            summary = "🧠 记忆操作"
+        command = payload.get("command") or payload.get("action", "view")
+        path = payload.get("path", "")
+        labels = {
+            "view": "🧠 查看记忆",
+            "create": "🧠 创建记忆文件",
+            "str_replace": "📝 编辑记忆文件",
+            "insert": "➕ 插入记忆内容",
+            "delete": "🗑️ 删除记忆项目",
+            "rename": "📁 重命名记忆项目",
+        }
+        summary = labels.get(command, "🧠 记忆操作")
+        if path:
+            summary += f" · {str(path)[:60]}"
         details_html = render_memory_card(payload)
         return summary, details_html
 
@@ -2200,21 +2207,32 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 tag=arguments.get("tag"),
             )
             return result_str
+        # ========== Tool Search 工具分支 ==========
+        # 完整目录仅驻留服务端；结果会由 agent loop 校验并在下一轮加载。
+        elif name == "tool_search":
+            from apitelegramchat.search_engine import TOOL_CATALOG
+            return execute_tool_search(
+                query=arguments.get("query", ""),
+                catalog=TOOL_CATALOG,
+                strategy=arguments.get("strategy", "bm25"),
+                max_results=arguments.get("max_results", 5),
+            )
         # ========== Memory 工具分支 ==========
-        # 长期记忆库。返回 JSON 给 AI；UI 由 format_tool_result 渲染富文本卡片。
+        # 文件化长期记忆库。返回 JSON 给 AI；UI 由 format_tool_result 渲染富文本卡片。
         elif name == "memory":
             return await execute_memory(
                 chat_id=chat_id,
-                action=arguments.get("action", "list"),
-                content=arguments.get("content"),
-                memory_id=arguments.get("memory_id"),
-                category=arguments.get("category"),
-                tags=arguments.get("tags"),
-                importance=arguments.get("importance"),
-                query=arguments.get("query"),
-                scope=arguments.get("scope"),
-                limit=arguments.get("limit", 50),
-                source=arguments.get("source", "agent"),
+                namespace=resolved_namespace,
+                command=arguments.get("command", "view"),
+                path=arguments.get("path", "/memories"),
+                view_range=arguments.get("view_range"),
+                old_str=arguments.get("old_str"),
+                new_str=arguments.get("new_str"),
+                insert_line=arguments.get("insert_line"),
+                insert_text=arguments.get("insert_text"),
+                file_text=arguments.get("file_text"),
+                old_path=arguments.get("old_path"),
+                new_path=arguments.get("new_path"),
             )
         # ========== Subagent 工具分支 ==========
         # 子 agent。返回 JSON（含 answer / rounds / tool_calls）给父 agent 阅读；

@@ -62,6 +62,10 @@ export SERPER_MCP_TOKEN='...'
 
 地图坐标统一为 `longitude,latitude`，例如 `116.397128,39.916527`。
 
+## 文件化记忆与按需工具搜索
+
+长期记忆已升级为隔离的 `/memories` 文件目录，支持按需浏览、创建、唯一精确替换、按行插入、删除及重命名；工具集则通过 `tool_search` 在下一轮按需加载匹配的完整定义。完整协议、迁移策略、安全边界和测试命令请参见 [MEMORY_AND_TOOL_SEARCH_UPGRADE.md](MEMORY_AND_TOOL_SEARCH_UPGRADE.md)。
+
 ## 测试
 
 ```bash

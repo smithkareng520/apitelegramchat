@@ -75,6 +75,7 @@ from apitelegramchat.workspace_utils import (
 # 本文件只做注册与转出
 from apitelegramchat.todo_tool import TODO_TOOL  # noqa: E402
 from apitelegramchat.memory_tool import MEMORY_TOOL  # noqa: E402
+from apitelegramchat.tool_search import TOOL_SEARCH_TOOL, ToolCatalog  # noqa: E402
 try:  # noqa: E402
     from apitelegramchat.subagent_tool import SUBAGENT_TOOL  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
@@ -1151,13 +1152,36 @@ SEARCH_TOOLS = [
     TODO_TOOL,
     # ===================== 长期记忆工具 =====================
     # 跨会话保留的事实/偏好/人物/事件——不同于会自动修剪的对话历史。
-    # 数据落在 ./state/{user_id}/memories.json，随 R2 同步。
+    # 数据以 /memories 虚拟目录映射到私有 state/{user_id}/memories/，并按文件同步到 R2。
     MEMORY_TOOL,
     # ===================== 子 Agent 工具 =====================
     # 派生一个干净上下文的子 agent 处理子任务，自带最小 agentic loop，
     # 工具白名单受控，禁递归调用 subagent/memory。
     SUBAGENT_TOOL,
 ]
+
+# 工具搜索采用客户端按需加载：完整目录只保留在服务端，模型首轮仅看到
+# 高频核心工具与 tool_search。搜索结果经过 ToolCatalog 校验后，由 agent loop
+# 在下一轮把相应完整定义加入可调用集合。
+TOOL_CATALOG = ToolCatalog(SEARCH_TOOLS)
+EAGER_TOOL_NAMES = (
+    "web_search",
+    "fetch_url",
+    "text_editor",
+    "bash",
+    "ask_user",
+    "todo",
+    "memory",
+)
+
+def get_initial_agent_tools() -> list[dict]:
+    """Return the compact tool set exposed before any catalog search."""
+    return [TOOL_SEARCH_TOOL, *TOOL_CATALOG.definitions(EAGER_TOOL_NAMES)]
+
+
+def get_tools_for_names(names) -> list[dict]:
+    """Return catalog-validated definitions in the requested stable order."""
+    return TOOL_CATALOG.definitions(names)
 
 
 # =============================================================================
