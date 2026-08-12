@@ -170,6 +170,20 @@ def _line_range_preview(lines: list[str], start_line: int, end_line: int, highli
     return "\n".join(preview)
 
 
+def _latest_editor_snapshot(content: str, max_lines: int = 10) -> str:
+    """Return the current file tail with absolute line numbers for the chat UI."""
+    lines = _normalize_editor_text(content).splitlines()
+    if not lines:
+        return "(空文件)"
+    start = max(1, len(lines) - max_lines + 1)
+    width = len(str(len(lines)))
+    return "\n".join(_format_editor_line(index, lines[index - 1], width) for index in range(start, len(lines) + 1))
+
+
+def _with_latest_editor_snapshot(message: str, content: str) -> str:
+    return f"{message}\n\nLatest file snapshot (tail 10):\n{_latest_editor_snapshot(content)}"
+
+
 def _write_editor_file(local_path: Path, new_content: str) -> None:
     backup_path = local_path.with_suffix(local_path.suffix + ".backup")
     shutil.copy2(local_path, backup_path)
@@ -308,7 +322,7 @@ async def execute_file_editor(
             mtime = local_path.stat().st_mtime
             set_editor_file_state(chat_id, safe_path, file_text, mtime)
             asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
-            return f"File created successfully: {path}"
+            return _with_latest_editor_snapshot(f"File created successfully: {path}", file_text)
 
         # ----- replace_lines -----
         elif command == "replace_lines":
@@ -338,7 +352,7 @@ async def execute_file_editor(
             asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
             preview_lines = new_full.splitlines()
             preview = _line_range_preview(preview_lines, start_del, min(len(preview_lines), start_del + max(0, len(replacement_text.splitlines()) - 1) if replacement_text else start_del), highlight_line=start_del)
-            return f"Successfully replaced lines {start_del}-{end_del} in {path}.\n\nResult around edit:\n{preview}"
+            return _with_latest_editor_snapshot(f"Successfully replaced lines {start_del}-{end_del} in {path}.\n\nResult around edit:\n{preview}", new_full)
 
         # ----- str_replace (简化版，无前置验证) -----
         elif command == "str_replace":
@@ -435,7 +449,7 @@ async def execute_file_editor(
                 replace_info = f"Replaced all {match_count} matches."
             else:
                 replace_info = f"Replaced occurrence {occurrence} of {match_count} match(es)."
-            return f"Successfully replaced text in {path} (lines {changed_start}-{changed_end}). {replace_info}\nTotal matches found: {match_count}\nResult around edit:\n{preview}"
+            return _with_latest_editor_snapshot(f"Successfully replaced text in {path} (lines {changed_start}-{changed_end}). {replace_info}\nTotal matches found: {match_count}\nResult around edit:\n{preview}", new_full)
 
         # ----- insert -----
         elif command == "insert":
@@ -463,7 +477,7 @@ async def execute_file_editor(
             mtime = local_path.stat().st_mtime
             set_editor_file_state(chat_id, safe_path, new_content, mtime)
             asyncio.create_task(_upload_edited_file(chat_id, safe_path, new_content))
-            return f"Successfully inserted text after line {insert_line}."
+            return _with_latest_editor_snapshot(f"Successfully inserted text after line {insert_line}.", new_content)
 
         # ----- delete -----
         elif command == "delete":
@@ -504,7 +518,7 @@ async def execute_file_editor(
                     mtime = local_path.stat().st_mtime
                     set_editor_file_state(chat_id, safe_path, new_content, mtime)
                     asyncio.create_task(_upload_edited_file(chat_id, safe_path, new_content))
-                    return f"Successfully deleted lines {start_del}-{end_del} from {path}"
+                    return _with_latest_editor_snapshot(f"Successfully deleted lines {start_del}-{end_del} from {path}", new_content)
                 else:
                     if not local_path.exists():
                         return f"Error: File not found: {path}"
@@ -527,7 +541,7 @@ async def execute_file_editor(
             mtime = local_path.stat().st_mtime
             set_editor_file_state(chat_id, safe_path, content, mtime)
             asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
-            return f"Undo successful. Reverted {path} to previous version."
+            return _with_latest_editor_snapshot(f"Undo successful. Reverted {path} to previous version.", content)
 
         else:
             return f"Error: Unknown command: {command}"

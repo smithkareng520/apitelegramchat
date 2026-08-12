@@ -1376,6 +1376,7 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 - Files created or modified by Bash remain in this local workspace. They are not synchronized wholesale to R2.
 - When using a skill, read its <code>skills/&lt;skill_id&gt;/SKILL.md</code> and run its scripts from that local skill directory as needed.
 - <code>file_editor</code> edits are persisted automatically for the specific file being edited.
+- The chat UI automatically shows compiler-style, line-numbered previews: during a file write it rolls the newest ten draft lines, and after a successful edit it shows the current file tail. Do not call an extra <code>view</code> solely to make the user see that preview; call <code>view</code> when you need additional content for reasoning.
 - file_editor "create" will return "Error: File already exists" if a file with the same path exists anywhere in this chat's workspace (cloud storage is shared across the whole session). Do NOT retry create with the same path or a slightly different name hoping for success — that will loop forever.
 - If create fails with "File already exists", do ONE of these on your NEXT call, never retry create:
   1. Use command="str_replace" with old_str/new_str to edit the existing file in place.
@@ -2111,37 +2112,31 @@ async def _run_tool_calls_and_append(
         if fn_name == "file_editor":
             cmd = fn_args.get("command", "")
             path = fn_args.get("path", "")
+            content = ""
+            label = "文件内容"
             if cmd == "create":
-                file_text = fn_args.get("file_text", "")
-                if file_text:
-                    preview_html = _format_code_block(file_text, header=f"{path or 'file'} (create)")
-                else:
-                    preview_html = "<code>创建空文件...</code>"
+                content = str(fn_args.get("file_text", "") or "")
+                label = "新建文件 · 实时草稿"
             elif cmd == "str_replace":
-                old_str = fn_args.get("old_str", "")
-                new_str = fn_args.get("new_str", "")
-                preview_html = (
-                        "替换内容：<br/>"
-                        + _format_code_block(old_str, header="old_str")
-                        + " →<br/>"
-                        + _format_code_block(new_str, header="new_str")
-                )
+                content = str(fn_args.get("new_str", "") or "")
+                label = "替换后片段 · 实时草稿"
             elif cmd == "replace_lines":
-                start = fn_args.get("start_line", 0)
-                end = fn_args.get("end_line", 0)
-                new_content = fn_args.get("new_content", "")
-                preview_html = f"按行替换 {start}-{end}：<br/>" + _format_code_block(new_content, header="new_content")
+                content = str(fn_args.get("new_str") or fn_args.get("insert_text") or "")
+                label = "按行替换 · 实时草稿"
             elif cmd == "insert":
-                insert_text = fn_args.get("insert_text", "")
-                insert_line = fn_args.get("insert_line", 0)
-                preview_html = f"在第{insert_line}行后插入：<br/>" + _format_code_block(insert_text,
-                                                                                       header="insert_text")
-            elif cmd == "delete":
-                # 删除不再显示多余的“准备删除”中间态；最终工具结果直接反馈。
-                preview_html = ""
+                content = str(fn_args.get("insert_text", "") or "")
+                label = "插入内容 · 实时草稿"
+            if content:
+                preview_html = _format_live_file_preview(content, path=path, label=label)
+            elif cmd == "view":
+                preview_html = "<p><i>正在读取文件内容…</i></p>"
+            elif cmd == "create":
+                preview_html = "<p><i>正在创建空文件…</i></p>"
         elif fn_name == "bash":
             command = fn_args.get("command", "")
-            preview_html = _format_code_block(command, header="bash")
+            preview_html = _format_code_block(
+                command, header="bash · command", show_line_numbers=True, show_size=False, max_lines=10
+            )
         elif fn_name == "web_search":
             query = fn_args.get("query", "")
             preview_html = f"搜索：{escape_html(query)}"
@@ -2167,7 +2162,8 @@ async def _run_tool_calls_and_append(
     # 普通 force=False flush 会被 send_rich_message_draft 的“内容未变化”短路，
     # 因此前端看不到持续运行中的 Bash 状态。每 2 秒强制 reassert 一帧，保持
     # 草稿在前端持续活跃；真正有 stdout 增量时仍由 progress_callback 节流刷新。
-    force_tool_refresh = has_image_tool or has_bash_tool or has_ask_user_tool
+    # 所有工具调用都每两秒重申草稿；避免网络类/MCP/文件操作在无文本增量时被客户端暂时挤掉。
+    force_tool_refresh = bool(tool_tasks)
 
     async def refresh_loop():
         await builder.flush(force=force_tool_refresh)
@@ -2218,16 +2214,16 @@ async def _run_tool_calls_and_append(
                     try:
                         # 伪刷新式终端预览：每次收到新输出都用“最新 10 行”替换旧内容。
                         # 这里只影响 Telegram 草稿 UI，不影响发送给模型的原始 tool 输出。
-                        live_tail = _tail_lines(output_text, 10)
+                        live_tail, first_line = _tail_lines_with_start(output_text, 10)
                         if live_tail:
                             preview = (
-                                f"{_format_code_block(command_preview, header='bash')}"
-                                f"<details open><summary>实时输出 · 最新 10 行</summary>"
-                                f"{_format_code_block(live_tail, header='', show_line_numbers=False, show_size=False, max_lines=10)}"
+                                f"{_format_code_block(command_preview, header='bash · command', show_line_numbers=True, show_size=False, max_lines=10)}"
+                                f"<details open><summary>实时输出 · 最近 10 行（持续刷新）</summary>"
+                                f"{_format_code_block(live_tail, header='', show_line_numbers=True, show_size=False, max_lines=10, line_start=first_line)}"
                                 f"</details>"
                             )
                         else:
-                            preview = _format_code_block(command_preview, header="bash")
+                            preview = _format_code_block(command_preview, header="bash · command", show_line_numbers=True, show_size=False, max_lines=10)
                         builder.update_tool_preview(
                             tc_id,
                             preview,
@@ -2273,7 +2269,8 @@ async def _run_tool_calls_and_append(
                 raise
             except asyncio.TimeoutError:
                 logger.error(f"[tool] {fn_name} timed out after {timeout}s ...")
-                result_str = f"Error: tool '{fn_name}' timed out. Please try again or refine the request."
+                # 使用统一标记，让 UI 展示友好状态、模型仍收到可操作的超时说明。
+                result_str = _TOOL_TIMEOUT_MARKER
             except Exception as e:
                 logger.exception(f"[tool] {fn_name} failed: {e}")
                 result_str = f"Exception: tool {fn_name} failed - {str(e)[:200]}"
@@ -2309,13 +2306,13 @@ async def _run_tool_calls_and_append(
             logger.error("工具执行异常: %s", res, exc_info=res)
             continue
         # 元组字段顺序: (fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content)
-        fn_name, tc_id, _, details_html, llm_content, fn_args, safe_content = res
+        fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content = res
 
         # 失败工具不进入工具组成功统计。
         is_error = _tool_result_is_failure(fn_name, fn_args, safe_content, details_html)
         if is_error:
-            # 失败：显示 llm_content（友好错误提示）的截断版本，状态标记为 error
-            final_summary = llm_content[:100] if len(llm_content) > 100 else llm_content
+            # 优先展示格式化器生成的可读标题；模型上下文仍保留完整的可操作错误文本。
+            final_summary = formatted_summary or (llm_content[:100] if len(llm_content) > 100 else llm_content)
             status = "error"
         else:
             # 成功：使用 _generate_tool_summary_done 生成描述
@@ -2523,7 +2520,7 @@ _STREAM_PREVIEW_MAX_LINES_FULL = 200
 
 def _format_code_block(content: str, max_lines: int = _STREAM_PREVIEW_MAX_LINES_FULL,
                        header: str = "", show_line_numbers: bool = False,
-                       show_size: bool = False) -> str:
+                       show_size: bool = False, line_start: int = 1) -> str:
     if not content:
         return ""
     content = content.rstrip()
@@ -2541,11 +2538,12 @@ def _format_code_block(content: str, max_lines: int = _STREAM_PREVIEW_MAX_LINES_
         display_lines = lines
 
     if show_line_numbers:
+        # 使用真实的绝对行号；滚动尾部预览不再每次都从 1 重新编号。
         line_count = len(display_lines)
-        width = len(str(line_count))
+        width = len(str(max(line_start + line_count - 1, line_count)))
         numbered_lines = []
-        for idx, line in enumerate(display_lines, 1):
-            numbered_lines.append(f"❯ {idx:>{width}} │ {line}")
+        for idx, line in enumerate(display_lines, line_start):
+            numbered_lines.append(f"{idx:>{width}} │ {line}")
         display = "\n".join(numbered_lines)
     else:
         display = "\n".join(display_lines)
@@ -2587,6 +2585,31 @@ def _tail_lines(text: str, n: int = 7) -> str:
     return "\n".join(lines[-n:])
 
 
+def _tail_lines_with_start(text: str, n: int = 10) -> tuple[str, int]:
+    """Return a rolling tail and the absolute one-based line number of its first row."""
+    lines = (text or "").splitlines()
+    if not lines:
+        return "", 1
+    first = max(1, len(lines) - n + 1)
+    return "\n".join(lines[-n:]), first
+
+
+def _format_live_file_preview(content: str, *, path: str = "", label: str = "文件草稿") -> str:
+    """Compiler-style file preview: only the current tail, always with stable line numbers."""
+    tail, first_line = _tail_lines_with_start(content, 10)
+    if not tail:
+        return "<p><i>等待文件内容…</i></p>"
+    title = f"{label} · {path}" if path else label
+    return (
+        "<details open><summary>当前内容 · 最近 10 行（持续刷新）</summary>"
+        + _format_code_block(
+            tail, header=title, show_line_numbers=True, show_size=False,
+            max_lines=10, line_start=first_line,
+        )
+        + "</details>"
+    )
+
+
 # ---- 修改点2：_build_streaming_preview 中的进行时摘要（规范第三部分） ----
 def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, str]:
     try:
@@ -2605,8 +2628,7 @@ def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, s
             if m:
                 raw = m.group(1)
                 raw = raw.replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t')
-                tail = _tail_lines(raw, 7)
-                preview_html = _format_code_block(tail, header="", show_line_numbers=False, show_size=False)
+                preview_html = _format_live_file_preview(raw, label="文件草稿")
             else:
                 # 参数尚未完整解析时不显示额外的编辑器中间态噪声。
                 preview_html = ""
@@ -2620,55 +2642,31 @@ def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, s
 
     if fn_name == "file_editor":
         cmd = args_obj.get("command", "")
+        path = str(args_obj.get("path", "") or "")
+        content = ""
+        label = "文件草稿"
         if cmd == "create":
-            file_text = args_obj.get("file_text", "")
-            if file_text:
-                tail = _tail_lines(file_text, 7)
-                preview_html = _format_code_block(tail, header="", show_line_numbers=False, show_size=False)
-            else:
-                preview_html = "<code>创建空文件...</code>"
+            content = str(args_obj.get("file_text", "") or "")
+            label = "新建文件 · 实时草稿"
         elif cmd == "str_replace":
-            old_str = args_obj.get("old_str", "")
-            new_str = args_obj.get("new_str", "")
-            old_tail = _tail_lines(old_str, 7) if old_str else ""
-            new_tail = _tail_lines(new_str, 7) if new_str else ""
-            preview_html = (
-                    "替换内容：<br/>"
-                    + _format_code_block(old_tail, header="旧内容", show_line_numbers=False, show_size=False)
-                    + " →<br/>"
-                    + _format_code_block(new_tail, header="新内容", show_line_numbers=False, show_size=False)
-            )
+            content = str(args_obj.get("new_str", "") or "")
+            label = "替换后片段 · 实时草稿"
         elif cmd == "replace_lines":
-            start = args_obj.get("start_line", 0)
-            end = args_obj.get("end_line", 0)
-            new_content = args_obj.get("new_content", "")
-            if new_content:
-                tail = _tail_lines(new_content, 7)
-                preview_html = f"按行替换 {start}-{end}：<br/>" + _format_code_block(tail, header="",
-                                                                                    show_line_numbers=False,
-                                                                                    show_size=False)
-            else:
-                preview_html = f"按行替换 {start}-{end}（空内容）"
+            content = str(args_obj.get("new_str") or args_obj.get("insert_text") or "")
+            label = "按行替换 · 实时草稿"
         elif cmd == "insert":
-            insert_text = args_obj.get("insert_text", "")
-            insert_line = args_obj.get("insert_line", 0)
-            if insert_text:
-                tail = _tail_lines(insert_text, 7)
-                preview_html = f"在第{insert_line}行后插入：<br/>" + _format_code_block(tail, header="",
-                                                                                       show_line_numbers=False,
-                                                                                       show_size=False)
-            else:
-                preview_html = f"在第{insert_line}行后插入..."
-        elif cmd == "delete":
-            preview_html = ""
+            content = str(args_obj.get("insert_text", "") or "")
+            label = "插入内容 · 实时草稿"
+        if content:
+            preview_html = _format_live_file_preview(content, path=path, label=label)
         elif cmd == "view":
-            preview_html = ""
-        else:
-            preview_html = ""
+            preview_html = "<p><i>正在读取文件内容…</i></p>"
+        elif cmd == "create":
+            preview_html = "<p><i>正在创建空文件…</i></p>"
 
     elif fn_name == "bash":
         command = args_obj.get("command", "")
-        preview_html = _format_code_block(command, header="bash", show_line_numbers=False, show_size=False)
+        preview_html = _format_code_block(command, header="bash · command", show_line_numbers=True, show_size=False, max_lines=10)
 
     elif fn_name == "web_search":
         query = args_obj.get("query", "")
@@ -2714,7 +2712,8 @@ class RichMessageBuilder:
     #
     # 只对 bash 和 file_editor 的详情展示做截断/简化；其他工具（包括
     # web_search）的展示内容保持原样，不受此限制影响。
-    MAX_TOOL_UI_DETAIL_CHARS = 500
+    # 详情本身已被渲染器限制为十行；保留足够空间避免把合法 HTML 卡片截成纯文本。
+    MAX_TOOL_UI_DETAIL_CHARS = 6000
     TRUNCATED_DETAIL_TOOL_TYPES = {"bash", "file_editor"}
 
     def __init__(self, chat_id: int):
@@ -2738,6 +2737,7 @@ class RichMessageBuilder:
         self._pending_reasoning_html: str = ""
         self._flush_lock = asyncio.Lock()
         self._rate_limited_until: float = 0.0
+        self._force_flush_requested: bool = False
 
     def _get_reasoning_summary(self, content: str) -> str:
         """从包含 HTML 标签的思考内容中提取纯文本摘要，长度不超过 30 字符"""
@@ -2751,15 +2751,22 @@ class RichMessageBuilder:
         return plain
 
     def request_flush(self, force: bool = False) -> None:
-        """异步触发一次刷新，避免把流式处理卡在网络发送上。"""
+        """异步触发刷新，并保证后到的强制刷新不会被在途普通刷新吞掉。"""
+        if force:
+            self._force_flush_requested = True
         if self._pending_flush_task and not self._pending_flush_task.done():
             return
 
         async def _runner():
             try:
-                await self.flush(force=force)
+                force_now = self._force_flush_requested
+                self._force_flush_requested = False
+                await self.flush(force=force_now)
             finally:
                 self._pending_flush_task = None
+                # 若网络发送期间又收到保活请求，再补发一帧，防止客户端短暂丢失草稿。
+                if self._force_flush_requested and not self._stop_flush:
+                    self.request_flush(force=True)
 
         try:
             self._pending_flush_task = asyncio.create_task(_runner())
@@ -3343,6 +3350,8 @@ class RichMessageBuilder:
                 msg_id = await send_rich_message_draft(
                     self.chat_id, self.draft_id, html_content, force=force
                 )
+                # 无论 API 是否返回 message_id，已完成的一次发送都会重置保活计时。
+                self._last_flush_time = time.monotonic()
                 if msg_id:
                     self.draft_message_id = msg_id
             except RateLimitError as e:

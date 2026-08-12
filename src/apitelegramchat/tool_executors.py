@@ -83,6 +83,223 @@ def _truncate_tool_result(result: str) -> str:
         return result[:MAX_TOOL_RESPONSE_LEN] + "\n…[内容过长已截断]"
     return result
 
+
+_UI_TAIL_LINES = 10
+_UI_MAX_VALUE_CHARS = 360
+_UI_MAX_FIELDS = 10
+_SENSITIVE_RESULT_KEYS = {
+    "authorization", "token", "access_token", "api_key", "apikey", "secret",
+    "password", "cookie", "signature", "x-amz-signature",
+}
+
+
+def _tail_text_lines(text: str, count: int = _UI_TAIL_LINES) -> tuple[list[str], int, int]:
+    """Return the visible tail together with its one-based first line and total lines."""
+    lines = (text or "").rstrip("\n").splitlines()
+    total = len(lines)
+    if total <= count:
+        return lines, 1, total
+    return lines[-count:], total - count + 1, total
+
+
+def _numbered_text(text: str, *, max_lines: int = _UI_TAIL_LINES) -> str:
+    lines, first_line, total = _tail_text_lines(text, max_lines)
+    if not lines:
+        return "(无输出)"
+    width = len(str(max(total, first_line + len(lines) - 1)))
+    prefix = "…\n" if first_line > 1 else ""
+    body = "\n".join(
+        f"{line_no:>{width}} │ {line}" for line_no, line in enumerate(lines, start=first_line)
+    )
+    return prefix + body
+
+
+def _render_code_panel(
+    title: str,
+    text: str,
+    *,
+    max_lines: int = _UI_TAIL_LINES,
+    add_line_numbers: bool = True,
+) -> str:
+    if add_line_numbers:
+        display = _numbered_text(text, max_lines=max_lines)
+    else:
+        lines, _, _ = _tail_text_lines(text, max_lines)
+        display = "\n".join(lines) if lines else "(无输出)"
+    return (
+        f"<details open><summary>{escape_html(title)}</summary>"
+        "<pre style=\"margin:6px 0 0;padding:10px 12px;background:#111827;color:#e5e7eb;"
+        "border-radius:8px;white-space:pre;overflow:auto;font-family:ui-monospace,SFMono-Regular,"
+        "Menlo,Monaco,Consolas,monospace;font-size:12px;line-height:1.55;\"><code>"
+        f"{escape_html(display)}</code></pre></details>"
+    )
+
+
+def _trim_ui_value(value: object, limit: int = _UI_MAX_VALUE_CHARS) -> str:
+    text = str(value if value is not None else "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _looks_like_http_url(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    parsed = urlparse(value.strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _display_key(key: object) -> str:
+    raw = str(key)
+    labels = {
+        "name": "名称", "title": "标题", "address": "地址", "location": "坐标",
+        "city": "城市", "district": "区域", "type": "类型", "distance": "距离",
+        "duration": "预计时长", "price": "价格", "tel": "电话", "website": "网站",
+        "status": "状态", "message": "说明", "count": "数量", "total": "总数",
+        "id": "ID", "url": "链接", "url_name": "链接名称", "formatted_address": "标准地址",
+    }
+    return labels.get(raw.lower(), raw.replace("_", " "))
+
+
+def _compact_json(value: object, limit: int = _UI_MAX_VALUE_CHARS) -> str:
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        encoded = str(value)
+    return _trim_ui_value(encoded, limit)
+
+
+def _render_structured_value(value: object, *, depth: int = 0) -> str:
+    if value is None:
+        return "<i>—</i>"
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, (int, float)):
+        return escape_html(str(value))
+    if isinstance(value, str):
+        clean = _trim_ui_value(value)
+        if _looks_like_http_url(value):
+            safe_url = escape_html(value.strip())
+            return f'<a href="{safe_url}">打开链接</a>'
+        return escape_html(clean)
+    if depth >= 2:
+        return f"<code>{escape_html(_compact_json(value))}</code>"
+    if isinstance(value, list):
+        if not value:
+            return "<i>无</i>"
+        if all(not isinstance(item, (dict, list)) for item in value):
+            items = "".join(f"<li>{_render_structured_value(item, depth=depth + 1)}</li>" for item in value[:8])
+            suffix = f"<li>…另有 {len(value) - 8} 项</li>" if len(value) > 8 else ""
+            return f"<ul>{items}{suffix}</ul>"
+        cards = []
+        for index, item in enumerate(value[:6], start=1):
+            if isinstance(item, dict):
+                title = next(
+                    (item.get(k) for k in ("name", "title", "address", "id") if item.get(k) not in (None, "")),
+                    f"项目 {index}",
+                )
+                cards.append(
+                    f"<details><summary>{escape_html(_trim_ui_value(title, 80))}</summary>"
+                    f"{_render_structured_value(item, depth=depth + 1)}</details>"
+                )
+            else:
+                cards.append(f"<p>{_render_structured_value(item, depth=depth + 1)}</p>")
+        if len(value) > 6:
+            cards.append(f"<p><i>其余 {len(value) - 6} 项已折叠</i></p>")
+        return "".join(cards)
+    if isinstance(value, dict):
+        rows = []
+        visible_items = [
+            (key, item) for key, item in value.items()
+            if str(key).lower() not in _SENSITIVE_RESULT_KEYS
+        ]
+        for key, item in visible_items[:_UI_MAX_FIELDS]:
+            rows.append(
+                f"<tr><td><b>{escape_html(_display_key(key))}</b></td>"
+                f"<td>{_render_structured_value(item, depth=depth + 1)}</td></tr>"
+            )
+        if len(visible_items) > _UI_MAX_FIELDS:
+            rows.append(f"<tr><td colspan=\"2\"><i>其余 {len(visible_items) - _UI_MAX_FIELDS} 个字段已折叠</i></td></tr>")
+        return "<table bordered striped>" + "".join(rows) + "</table>"
+    return escape_html(_trim_ui_value(value))
+
+
+def _parse_structured_payload(result_str: str) -> object | None:
+    raw = (result_str or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
+        raw = re.sub(r"\s*```$", "", raw)
+    if not raw or raw[0] not in "[{":
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(parsed, (dict, list)):
+        return parsed
+    return None
+
+
+def _render_structured_payload(result_str: str) -> str | None:
+    payload = _parse_structured_payload(result_str)
+    if payload is None:
+        return None
+    if isinstance(payload, dict) and isinstance(payload.get("data"), (dict, list)) and len(payload) <= 3:
+        payload = payload["data"]
+    return (
+        "<p><b>结构化结果</b><br/><i>已将服务返回转换为可阅读字段；详情可展开查看。</i></p>"
+        + _render_structured_value(payload)
+    )
+
+
+def _render_bash_result(result_str: str) -> str:
+    metadata, separator, output = (result_str or "").partition("Output:\n")
+    command = ""
+    cwd = ""
+    exit_code = ""
+    for line in metadata.splitlines():
+        if line.startswith("Command: "):
+            command = line.removeprefix("Command: ")
+        elif line.startswith("Cwd: "):
+            cwd = line.removeprefix("Cwd: ")
+        elif line.startswith("Exit code: "):
+            exit_code = line.removeprefix("Exit code: ")
+    header_parts = []
+    if command:
+        header_parts.append(f"<b>命令</b> <code>{escape_html(_trim_ui_value(command, 180))}</code>")
+    if exit_code:
+        status = "成功" if exit_code == "0" else f"退出码 {escape_html(exit_code)}"
+        header_parts.append(f"<b>状态</b> {status}")
+    if cwd:
+        header_parts.append(f"<b>目录</b> <code>{escape_html(_trim_ui_value(cwd, 120))}</code>")
+    if not separator:
+        return _render_code_panel("Bash 响应", result_str)
+    header = "<br/>".join(header_parts) if header_parts else "<b>Bash 已完成</b>"
+    return f"<p>{header}</p>" + _render_code_panel("输出 · 最近 10 行", output)
+
+
+def _render_editor_result(command: str, path: str, result_str: str) -> str:
+    marker = "Latest file snapshot (tail 10):\n"
+    before, has_snapshot, snapshot = (result_str or "").partition(marker)
+    action_labels = {
+        "view": "文件视图", "create": "创建文件", "str_replace": "替换文本",
+        "replace_lines": "按行编辑", "insert": "插入内容", "delete": "删除操作",
+        "undo_edit": "撤销编辑",
+    }
+    label = action_labels.get(command, "文件操作")
+    heading = f"<p><b>{escape_html(label)}</b>"
+    if path:
+        heading += f" · <code>{escape_html(path)}</code>"
+    heading += "</p>"
+    if has_snapshot:
+        main = _render_code_panel("当前文件 · 最近 10 行", snapshot, add_line_numbers=False)
+        context = before.strip()
+        if context:
+            main += f"<details><summary>操作结果</summary>{_render_code_panel('编辑上下文', context, add_line_numbers=False)}</details>"
+        return heading + main
+    if command == "view":
+        return heading + _render_code_panel("文件内容 · 最近 10 行", result_str, add_line_numbers=False)
+    return heading + _render_code_panel("操作结果 · 最近 10 行", result_str, add_line_numbers=False)
+
 def extract_domain(url: str) -> str:
     if not url:
         return "unknown"
@@ -1031,48 +1248,27 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
         ip = fn_args.get('ip') if fn_name == "ip_geo" else None
         summary = base_label + (f" {ip}" if ip else "")
-        details_html = escape_text(result_str)
+        # 外部 MCP 常返回 JSON 文本。对聊天界面渲染结构化卡片，而向模型仍保留原始结果。
+        details_html = _render_structured_payload(result_str) or _render_code_panel("服务响应 · 最近 10 行", result_str)
         return summary, details_html
 
     elif fn_name == "file_editor":
         command = fn_args.get("command", "")
         path = fn_args.get("path", "")
-
-        def render_editor_block(text: str) -> str:
-            # Keep line breaks and indentation intact for tool output.
-            # Using <pre> makes editor results much easier to read in the foldout.
-            safe = escape_text(text or "")
-            return (
-                "<pre style=\"white-space: pre-wrap; word-break: break-word; "
-                "margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;\">"
-                f"{safe}</pre>"
-            )
-
-        if "Error:" in result_str:
-            summary = "❌ 编辑器操作失败"
-            details_html = render_editor_block(result_str)
+        if any(marker in (result_str or "") for marker in ("Error:", "No match found", "requires ")):
+            summary = "❌ 文件操作未完成"
         elif command == "view":
-            lines = result_str.split("\n")
-            if len(lines) > 20:
-                truncated = "\n".join(lines[:20]) + f"\n... (共 {len(lines)} 行)"
-                summary = f"📄 查看文件（前20行）"
-                details_html = render_editor_block(truncated)
-            else:
-                summary = f"📄 查看文件（{len(lines)} 行）"
-                details_html = render_editor_block(result_str)
-        elif "Successfully" in result_str or "File created" in result_str:
-            if command == "create":
-                summary = f"📄 已创建文件 {path}" if path else "📄 已创建文件"
-            elif command in ("str_replace", "replace_lines", "insert"):
-                summary = f"📝 已编辑文件 {path}" if path else "📝 已编辑文件"
-            elif command == "delete":
-                summary = f"🗑️ 已删除文件 {path}" if path else "🗑️ 已删除文件"
-            else:
-                summary = "✅ 编辑器操作成功"
-            details_html = render_editor_block(result_str)
+            summary = f"📄 查看 {path}" if path else "📄 查看文件"
+        elif command == "create":
+            summary = f"📄 已创建 {path}" if path else "📄 已创建文件"
+        elif command in ("str_replace", "replace_lines", "insert", "undo_edit"):
+            summary = f"📝 已更新 {path}" if path else "📝 已更新文件"
+        elif command == "delete":
+            summary = f"🗑️ 已删除 {path}" if path else "🗑️ 已删除文件"
         else:
-            summary = "📝 编辑器操作"
-            details_html = render_editor_block(result_str)
+            summary = "📝 文件操作"
+        # 每个编辑结果都优先展示写入后文件的最后十行（含绝对行号）。
+        details_html = _render_editor_result(command, path, result_str)
         return summary, details_html
 
     # ===================== Todo 工具格式化 =====================
@@ -1207,9 +1403,10 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         else:
             cmd_line = result_str.split("\n")[0].replace("Command: ", "")
             if len(cmd_line) > 30:
-                cmd_line = cmd_line[:30] + "..."
-            summary = f"🖥 {cmd_line}"
-        details_html = f"<pre><code>{escape_text(result_str)}</code></pre>"
+                cmd_line = cmd_line[:30] + "…"
+            summary = f"🖥 {cmd_line or '命令已完成'}"
+        # 保留命令元信息，并将终端输出固定为带行号的最后十行，避免原始日志撑爆工具卡片。
+        details_html = _render_bash_result(result_str)
         return summary, details_html
 
     elif fn_name == "present_files":
