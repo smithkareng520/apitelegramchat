@@ -75,7 +75,12 @@ async def invoke(function: Callable[..., Any], *args: Any, **kwargs: Any) -> str
 
 async def web_search(_: MCPRequestContext, args: JsonObject) -> str:
     from apitelegramchat.search_engine import execute_web_search
-    return await invoke(execute_web_search, args["query"], args.get("num_results", 5))
+    return await invoke(
+        execute_web_search,
+        args["query"],
+        args.get("num_results"),
+        args.get("offset"),
+    )
 
 
 async def fetch_url(_: MCPRequestContext, args: JsonObject) -> str:
@@ -209,7 +214,20 @@ async def present_files(context: MCPRequestContext, args: JsonObject) -> str:
 
 
 READ_ONLY_SPECS: tuple[ToolSpec, ...] = (
-    ToolSpec("search.web", "Web search", "Search public web information.", object_schema({"query": text_field("Search query.", 1), "num_results": int_field("Maximum result count.", 1, 10)}, ("query",)), web_search),
+    ToolSpec(
+        "search.web",
+        "Web search",
+        "Search public web information.",
+        object_schema(
+            {
+                "query": text_field("Search query.", 1),
+                "num_results": int_field("Optional result count (1-50). If omitted, Bing MCP uses its default of 10.", 1, 50),
+                "offset": int_field("Optional result offset for pagination. If omitted, Bing MCP uses its default of 0.", 0),
+            },
+            ("query",),
+        ),
+        web_search,
+    ),
     ToolSpec("search.fetch", "Fetch URL", "Fetch and extract a public HTTP(S) URL.", object_schema({"url": text_field("HTTP(S) URL.", 8)}, ("url",)), fetch_url),
     ToolSpec("search.wikipedia", "Wikipedia", "Query Wikipedia.", object_schema({"query": text_field("Article query.", 1), "lang": {"type": "string", "enum": ["zh", "en"]}}, ("query",)), wikipedia),
     ToolSpec("search.exchange_rate", "Exchange rate", "Look up an exchange rate.", object_schema({"base": text_field("Base ISO currency.", 3), "target": text_field("Optional target ISO currency.", 3)}, ("base",)), exchange_rate),

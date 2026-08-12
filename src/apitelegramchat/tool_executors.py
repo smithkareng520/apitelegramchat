@@ -2050,7 +2050,11 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
     resolved_namespace = workspace_namespace(chat_id)
     try:
         if name == "web_search":
-            return await execute_web_search(arguments.get("query", ""), arguments.get("num_results", 5))
+            return await execute_web_search(
+                arguments.get("query", ""),
+                arguments.get("num_results"),
+                arguments.get("offset"),
+            )
         elif name == "fetch_url":
             # 增加重试逻辑：如果超时，重试一次
             url = arguments.get("url", "")

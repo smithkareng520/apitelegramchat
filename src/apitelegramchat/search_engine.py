@@ -677,13 +677,15 @@ SEARCH_TOOLS = [
                         "description": "简述本次操作目的（≤60字）。示例：搜索2024年诺贝尔奖"
                     },
                     "query": {"type": "string", "description": "搜索关键词"},
-                    "num_results": {"type": "integer", "description": "返回结果数（1-10）", "default": 10}
+                    "num_results": {"type": "integer", "description": "可选：返回结果数（1-50）；不填写则由 Bing MCP 使用默认值 10", "minimum": 1, "maximum": 50},
+                    "offset": {"type": "integer", "description": "可选：结果偏移量，用于分页，从0开始；不填写则由 Bing MCP 使用默认值 0", "minimum": 0}
                 },
                 "required": ["query"]
             },
             "input_examples": [
                 {"query": "2024 诺贝尔物理学奖 获奖者", "num_results": 5},
-                {"query": "Python 3.13 新特性", "num_results": 3}
+                {"query": "Python 3.13 新特性", "num_results": 3},
+                {"query": "React Hooks 教程", "num_results": 10, "offset": 10}
             ]
         }
     },
@@ -1370,7 +1372,7 @@ class MCPSearchTransientError(Exception):
 
 @retry_async(max_retries=2, delay=1.5, backoff=2.0,
             exceptions=(MCPToolError, MCPSearchTransientError, asyncio.TimeoutError))
-async def _search_via_mcp(query: str, num_results: int) -> list[dict] | None:
+async def _search_via_mcp(query: str, num_results: int, offset: int = 0) -> list[dict] | None:
     """通过外部 MCP 服务（bing-cn-mcp-server 的 bing_search 工具）执行网页搜索。
 
     工具协议：bing_search(query: str, count?: int, offset?: int) -> 纯文本，
@@ -1391,10 +1393,15 @@ async def _search_via_mcp(query: str, num_results: int) -> list[dict] | None:
         return None
 
     try:
+        arguments: dict[str, Any] = {"query": query}
+        if num_results is not None:
+            arguments["count"] = max(1, min(int(num_results), 50))
+        if offset is not None:
+            arguments["offset"] = max(int(offset), 0)
         raw_text = await call_mcp_tool(
             "bing-cn-mcp-server",
             "bing_search",
-            {"query": query, "count": num_results},
+            arguments,
         )
     except MCPToolError as e:
         logger.warning(f"MCP 搜索调用失败: {e}")
@@ -1408,7 +1415,7 @@ async def _search_via_mcp(query: str, num_results: int) -> list[dict] | None:
     raise MCPSearchTransientError("MCP search returned no results")
 
 
-def _parse_bing_mcp_result(raw_text: str, num_results: int) -> list[dict]:
+def _parse_bing_mcp_result(raw_text: str, num_results: int | None = None) -> list[dict]:
     """解析 bing-cn-mcp-server 的 bing_search 返回，提取 title/link/snippet。
 
     当前服务端返回的是 JSON 字符串（见 test_mcp_bing_search.py 实测输出）：
@@ -1439,7 +1446,7 @@ def _parse_bing_mcp_result(raw_text: str, num_results: int) -> list[dict]:
             if not link:
                 continue
             items.append({"title": title, "link": link, "snippet": snippet})
-            if len(items) >= num_results:
+            if num_results is not None and len(items) >= num_results:
                 break
         return items
 
@@ -1459,7 +1466,7 @@ def _parse_bing_mcp_result(raw_text: str, num_results: int) -> list[dict]:
         if not link:
             continue
         items.append({"title": title, "link": link, "snippet": snippet})
-        if len(items) >= num_results:
+        if num_results is not None and len(items) >= num_results:
             break
     return items
 
@@ -1476,19 +1483,24 @@ def _format_search_results(items: list, query: str, engine: str, requested: int 
     return "\n".join(lines)
 
 
-async def execute_web_search(query: str, num_results: int = 5) -> str:
+async def execute_web_search(query: str, num_results: int | None = None, offset: int | None = None) -> str:
     """通过外部 MCP 搜索服务（bing-cn-mcp-server）执行网页搜索。
 
     对外的函数签名 / 返回文本格式保持不变，仅内部实现从
     Google CSE + DuckDuckGo 换成了 MCP 工具调用，调用方无需改动。
     """
     query = (query or "").strip()
-    requested = min(max(int(num_results or 5), 1), 10)
+    requested = None
+    if num_results is not None:
+        requested = min(max(int(num_results), 1), 50)
+    page_offset = None
+    if offset is not None:
+        page_offset = max(int(offset), 0)
     if not query:
         return "❌ 搜索关键词为空。"
 
     try:
-        items = await _search_via_mcp(query, requested)
+        items = await _search_via_mcp(query, requested, page_offset)
     except Exception as e:
         logger.warning(f"MCP 搜索失败: {e}")
         items = None
