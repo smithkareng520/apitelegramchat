@@ -83,7 +83,7 @@ SUBAGENT_TOOL_TIMEOUT = _env_int("SUBAGENT_TOOL_TIMEOUT", 120, min_value=5, max_
 
 # 子 agent 默认可用的工具白名单（如果调用方未指定）
 DEFAULT_ALLOWED_TOOLS = {
-    "web_search", "fetch_url", "wikipedia", "exchange_rate",
+    "google_search", "fetch_url", "wikipedia", "exchange_rate",
     "book_lookup", "weather", "news", "crypto_price", "ip_geo", "qr_code",
     "geocode", "route", "distance", "poi_keyword_search",
     "poi_nearby_search", "poi_details",
@@ -557,7 +557,7 @@ SUBAGENT_TOOL = {
             "required": ["task"]
         },
         "input_examples": [
-            {"task": "调研 2025 年最热门的 3 个开源 LLM 项目，每个给出 stars / license / 一句话特色", "allowed_tools": ["web_search", "fetch_url"]},
+            {"task": "调研 2025 年最热门的 3 个开源 LLM 项目，每个给出 stars / license / 一句话特色", "allowed_tools": ["google_search", "fetch_url"]},
             {"task": "把 workspace/report.md 翻译成英文并保存为 report_en.md", "allowed_tools": ["file_editor", "bash"]},
             {"task": "查北京今天的天气，并给出适合的穿搭建议", "allowed_tools": ["weather"]},
             {"task": "用一句话总结这段文字", "context": "……长文本……", "allowed_tools": []}

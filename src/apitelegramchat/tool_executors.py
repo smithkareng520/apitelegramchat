@@ -42,6 +42,7 @@ _TOOL_TIMEOUT_MARKER = "__TOOL_TIMEOUT__"
 import shutil
 from apitelegramchat.search_engine import (
     execute_web_search,
+    execute_google_search,
     execute_fetch_url,
     execute_wikipedia,
     execute_exchange_rate,
@@ -2049,7 +2050,9 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
     # async tasks/subtasks cannot accidentally resolve a different ContextVar.
     resolved_namespace = workspace_namespace(chat_id)
     try:
-        if name == "web_search":
+        if name == "google_search":
+            return await execute_google_search(arguments)
+        elif name == "web_search":
             return await execute_web_search(
                 arguments.get("query", ""),
                 arguments.get("num_results"),

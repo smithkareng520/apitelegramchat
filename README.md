@@ -54,10 +54,14 @@ export GAODE_MCP_TOKEN='...'
 # 仅在覆盖默认 ModelScope 主机时才需要指定。
 export GAODE_MCP_ALLOWED_HOSTS='mcp.api-inference.modelscope.net'
 
-# ModelScope Serper MCP：google_search 通过环境变量配置；scrape 不注册。
+# ModelScope Serper MCP：google_search / scrape 直接暴露给模型，由模型自行选择工具和参数。
 # 常规部署只需提供 token；如需改用自定义 URL，才须同时覆盖 allowlist。
 export SERPER_MCP_ENABLED=true
 export SERPER_MCP_TOKEN='...'
+# Serper google_search 还要求 gl（地区）和 hl（语言）。
+# 默认：gl=cn, hl=zh；需要英文/美国结果时可改为 us/en。
+export SERPER_MCP_REGION='cn'
+export SERPER_MCP_LANGUAGE='zh'
 
 # 可选：仅在使用自定义 endpoint 时设置。
 # export SERPER_MCP_URL='https://mcp.example.com/mcp'

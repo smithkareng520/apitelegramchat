@@ -51,6 +51,10 @@ services:
         sync: false
       - key: SERPER_MCP_TOKEN
         sync: false
+      - key: SERPER_MCP_REGION
+        value: cn
+      - key: SERPER_MCP_LANGUAGE
+        value: zh
       - key: GAODE_MCP_URL
         sync: false
       - key: GAODE_MCP_TOKEN

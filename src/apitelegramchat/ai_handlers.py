@@ -80,7 +80,7 @@ OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 #
 # file_editor 需要初始化一次隔离 workspace，但不再做工作区级 R2 全量同步。
 # 编辑操作只持久化被编辑的具体文件。
-LONG_RUNNING_TOOLS = {"web_search", "fetch_url", "file_editor"}
+LONG_RUNNING_TOOLS = {"web_search", "google_search", "fetch_url", "file_editor"}
 LONG_TOOL_CALL_TIMEOUT = 45
 # bash 工具单独一档，比 LONG_RUNNING_TOOLS 更宽松：
 #   - 沙箱首次启动要 fork+exec+安装 Landlock 规则；
@@ -2179,7 +2179,7 @@ async def _run_tool_calls_and_append(
             # 图像 / 视频工具不设超时（内部已有轮询超时控制）
             # 子 agent 走 930s 超时（内部默认 900s，用户可配到 1800s）
             # bash 走 310s（内层沙箱 300s + 10s 外层缓冲）
-            # 网络类工具（web_search / fetch_url / file_editor）走 45s 宽松超时，避免外层 12s 误杀
+            # 网络类工具（google_search / scrape / fetch_url / file_editor）走 45s 宽松超时，避免外层 12s 误杀
             # 其他工具保持 12 秒
             if fn_name in MEDIA_GEN_TOOLS:
                 timeout = None

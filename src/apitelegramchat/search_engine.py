@@ -61,6 +61,8 @@ from apitelegramchat.config import (
     FETCH_CACHE_TTL,
     SUPPORTED_MODELS,
     get_openrouter_provider_preferences,
+    SERPER_MCP_REGION,
+    SERPER_MCP_LANGUAGE,
 )
 from apitelegramchat.utils import retry_async
 from apitelegramchat.mcp_client import call_mcp_tool, MCPToolError
@@ -667,25 +669,37 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "web_search",
-            "description": "Search the web for real-time information via the Serper google_search MCP tool. Returns the MCP provider response directly. Use fetch_url separately when full webpage content is needed.",
+            "name": "google_search",
+            "description": "通过已配置的 Serper MCP 执行 Google 搜索。模型可以自己决定地区、语言、分页、时间过滤、位置和高级搜索查询。优先用于获取实时/近期信息；需要阅读具体网页时使用项目自己的 fetch_url。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：搜索2024年诺贝尔奖"
-                    },
-                    "query": {"type": "string", "description": "搜索关键词"},
-                    "num_results": {"type": "integer", "description": "可选：返回结果数（1-50）；不填写则不发送该参数，由 Serper MCP 服务端决定默认值", "minimum": 1, "maximum": 50},
-                    "offset": {"type": "integer", "description": "可选：结果偏移量，用于分页，从0开始；内部转换为 Serper 的 page；不填写则不发送该参数", "minimum": 0}
+                    "q": {"type": "string", "description": "搜索查询。支持 site:, filetype:, inurl:, intitle:, related:, cache:, before:, after:, exact:, exclude:, or: 等高级操作符。"},
+                    "gl": {"type": "string", "description": "国家/地区代码，例如 cn、us、gb、jp。模型根据查询语境自行选择。", "minLength": 2, "maxLength": 2},
+                    "hl": {"type": "string", "description": "搜索结果语言代码，例如 zh、en、ja。模型根据查询语境自行选择。", "minLength": 2, "maxLength": 5},
+                    "location": {"type": "string", "description": "可选的搜索地理位置，例如 'Shanghai, China' 或 'New York, NY'。需要本地化搜索时使用。"},
+                    "num": {"type": "number", "description": "可选：返回结果数量，默认10。", "minimum": 1, "maximum": 100},
+                    "tbs": {"type": "string", "description": "可选：时间过滤，例如 qdr:h（过去1小时）、qdr:d（过去1天）、qdr:w（过去1周）、qdr:m（过去1月）、qdr:y（过去1年）。"},
+                    "page": {"type": "number", "description": "可选：结果页码，从1开始。", "minimum": 1},
+                    "autocorrect": {"type": "boolean", "description": "可选：是否启用 Google 自动纠错。"},
+                    "site": {"type": "string", "description": "可选：限制到指定域名，例如 github.com。"},
+                    "filetype": {"type": "string", "description": "可选：限制文件类型，例如 pdf、doc、xls。"},
+                    "inurl": {"type": "string", "description": "可选：URL 中包含指定词。"},
+                    "intitle": {"type": "string", "description": "可选：标题中包含指定词。"},
+                    "related": {"type": "string", "description": "可选：查找指定网站的相似网站。"},
+                    "cache": {"type": "string", "description": "可选：查看指定 URL 的 Google 缓存版本。"},
+                    "before": {"type": "string", "description": "可选：日期之前，格式 YYYY-MM-DD。"},
+                    "after": {"type": "string", "description": "可选：日期之后，格式 YYYY-MM-DD。"},
+                    "exact": {"type": "string", "description": "可选：精确短语匹配。"},
+                    "exclude": {"type": "string", "description": "可选：从结果中排除的术语，多个术语可用逗号分隔。"},
+                    "or": {"type": "string", "description": "可选：替代术语，多个术语可用逗号分隔。"}
                 },
-                "required": ["query"]
+                "required": ["q", "gl", "hl"]
             },
             "input_examples": [
-                {"query": "2024 诺贝尔物理学奖 获奖者", "num_results": 5},
-                {"query": "Python 3.13 新特性", "num_results": 3},
-                {"query": "React Hooks 教程", "num_results": 10, "offset": 10}
+                {"q": "2026 诺贝尔物理学奖", "gl": "us", "hl": "en", "num": 5},
+                {"q": "上海 人工智能 实习", "gl": "cn", "hl": "zh", "location": "Shanghai, China", "num": 10},
+                {"q": "site:openai.com latest model", "gl": "us", "hl": "en", "autocorrect": True}
             ]
         }
     },
@@ -1371,46 +1385,36 @@ class MCPSearchTransientError(Exception):
 
 @retry_async(max_retries=2, delay=1.5, backoff=2.0,
             exceptions=(MCPToolError, MCPSearchTransientError, asyncio.TimeoutError))
-async def _search_via_mcp(query: str, num_results: int | None = None, offset: int | None = None) -> str | None:
-    """通过 Serper MCP 的 google_search 执行网页搜索，直接返回 MCP 原始结果。"""
-    query = (query or "").strip()
-    if not query:
+async def _google_search_via_mcp(arguments: dict[str, Any]) -> str | None:
+    """直接把模型选择的 google_search 参数转发给 Serper MCP。"""
+    q = str(arguments.get("q", "")).strip()
+    if not q:
         return None
-    arguments: dict[str, Any] = {"q": query}
-    if num_results is not None:
-        arguments["num"] = max(1, min(int(num_results), 50))
-    if offset is not None:
-        page_size = int(num_results) if num_results else 10
-        arguments["page"] = max(1, int(offset) // max(page_size, 1) + 1)
+    payload = {k: v for k, v in arguments.items() if v is not None and k != "_description"}
+    payload["q"] = q
+    payload.setdefault("gl", SERPER_MCP_REGION or "cn")
+    payload.setdefault("hl", SERPER_MCP_LANGUAGE or "zh")
     try:
-        raw_text = await call_mcp_tool("mcp-server-serper", "google_search", arguments)
+        raw_text = await call_mcp_tool("mcp-server-serper", "google_search", payload)
     except MCPToolError:
-        logger.exception("Serper MCP 搜索调用失败")
+        logger.exception("Serper MCP google_search 调用失败")
         raise
     if raw_text:
         return raw_text
-    raise MCPSearchTransientError("Serper MCP search returned no results")
+    raise MCPSearchTransientError("Serper MCP google_search returned no results")
 
 
+@retry_async(max_retries=2, delay=1.5, backoff=2.0,
+            exceptions=(MCPToolError, asyncio.TimeoutError))
 async def execute_web_search(query: str, num_results: int | None = None, offset: int | None = None) -> str:
-    """通过 ModelScope Serper MCP 搜索，并原样返回 google_search 的结果。"""
-    query = (query or "").strip()
-    requested = None
+    """旧 web_search 兼容入口；新模型工具应直接使用 google_search。"""
+    arguments: dict[str, Any] = {"q": (query or "").strip()}
     if num_results is not None:
-        requested = min(max(int(num_results), 1), 50)
-    page_offset = None
+        arguments["num"] = max(1, min(int(num_results), 100))
     if offset is not None:
-        page_offset = max(int(offset), 0)
-    if not query:
-        return "❌ 搜索关键词为空。"
-
-    try:
-        raw_text = await _search_via_mcp(query, requested, page_offset)
-    except Exception as e:
-        logger.warning(f"MCP 搜索失败: {e}")
-        return f"❌ Serper 搜索失败：{e}"
-
-    return raw_text or "❌ Serper 搜索返回空结果。"
+        size = int(num_results) if num_results else 10
+        arguments["page"] = max(1, int(offset) // max(size, 1) + 1)
+    return await execute_google_search(arguments)
 
 # --------------------- fetch_url (增加重试循环) ---------------------
 async def _extract_with_trafilatura(url: str) -> str | None:

@@ -37,6 +37,10 @@ GAODE_MCP_TOKEN = (os.getenv("GAODE_MCP_TOKEN") or "").strip()
 # 网页正文继续由本项目自己的 fetch_url 工具负责。
 SERPER_MCP_URL = (os.getenv("SERPER_MCP_URL") or "").strip()
 SERPER_MCP_TOKEN = (os.getenv("SERPER_MCP_TOKEN") or "").strip()
+# Serper MCP google_search requires gl (region) and hl (language).
+# Defaults target Chinese searches; override via env for another market.
+SERPER_MCP_REGION = (os.getenv("SERPER_MCP_REGION") or "cn").strip().lower()
+SERPER_MCP_LANGUAGE = (os.getenv("SERPER_MCP_LANGUAGE") or "zh").strip().lower()
 
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
