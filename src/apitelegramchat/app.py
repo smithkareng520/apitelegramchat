@@ -10,6 +10,7 @@ import re
 import os
 import mimetypes
 from apitelegramchat.workspace_paths import workspace_download_root
+from apitelegramchat.context_manager import apply_layered_trim
 
 from apitelegramchat.utils import (
     send_rich_html_message,
@@ -358,42 +359,42 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
         if new_input_est < 1:
             new_input_est = 1
 
-        while True:
+        def _is_over_budget() -> bool:
             ledger_total = sum(item["input_tokens"] + item["output_tokens"] for item in ledger)
-            if ledger_total + new_input_est <= safe_limit:
-                return True
+            return ledger_total + new_input_est > safe_limit
 
-            deleted = False
-            for i in range(len(history)):
-                if history[i].get("role") == "user":
-                    end = len(history)
-                    for j in range(i + 1, len(history)):
-                        if history[j].get("role") == "user":
-                            end = j
-                            break
-                    removed_turn = history[i:end]
-                    del history[i:end]
+        def _on_turn_removed() -> None:
+            if ledger:
+                removed = ledger.pop(0)
+                ctx["last_prompt_tokens"] = max(
+                    0,
+                    ctx.get("last_prompt_tokens", 0) - removed["input_tokens"] - removed["output_tokens"],
+                )
+            else:
+                # 没有账目可弹出时，用估算值兜底扣减，行为与原实现一致。
+                ctx["last_prompt_tokens"] = max(0, ctx.get("last_prompt_tokens", 0))
 
-                    if ledger:
-                        removed = ledger.pop(0)
-                        ctx["last_prompt_tokens"] = max(
-                            0,
-                            ctx.get("last_prompt_tokens", 0) - removed["input_tokens"] - removed["output_tokens"],
-                        )
-                    else:
-                        removed_est = sum(_estimate_message_tokens(m) for m in removed_turn)
-                        ctx["last_prompt_tokens"] = max(0, ctx.get("last_prompt_tokens", 0) - removed_est)
-                    deleted = True
-                    break
+        if not _is_over_budget():
+            return True
 
-            if not deleted:
-                ctx["last_prompt_tokens"] = 0
-                ctx["last_completion_tokens"] = 0
-                ctx["token_ledger"] = []
-                ctx["conversation_history"] = [m for m in history if m.get("role") == "system"]
-                if new_input_est > safe_limit:
-                    return False
-                return True
+        stats = apply_layered_trim(
+            history,
+            is_over_budget=_is_over_budget,
+            on_turn_removed=_on_turn_removed,
+        )
+        if stats["hard_reset"]:
+            ctx["last_prompt_tokens"] = 0
+            ctx["last_completion_tokens"] = 0
+            ctx["token_ledger"] = []
+        if stats["compressed_tool_msgs"] or stats["removed_turns"] or stats["hard_reset"]:
+            logger.info(
+                "[ContextTrim] chat_id=%s compressed_tool_msgs=%d removed_turns=%d hard_reset=%s",
+                chat_id, stats["compressed_tool_msgs"], stats["removed_turns"], stats["hard_reset"],
+            )
+
+        if new_input_est > safe_limit:
+            return False
+        return True
 
 async def update_conversation_and_ledger(chat_id: int, user_message: dict, new_msgs: list, usage: dict = None) -> None:
     lock = await get_chat_lock(chat_id)
@@ -428,25 +429,39 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict, new_m
             ctx["last_completion_tokens"] = current_comp
             ledger = ctx.setdefault("token_ledger", [])
             ledger.append({"input_tokens": t_input, "output_tokens": t_output})
-        while len(history) > MAX_HISTORY_MESSAGES:
-            deleted = False
-            for i in range(len(history)):
-                if history[i].get("role") == "user":
-                    end = len(history)
-                    for j in range(i + 1, len(history)):
-                        if history[j].get("role") == "user":
-                            end = j
-                            break
-                    del history[i:end]
-                    ledger = ctx.setdefault("token_ledger", [])
-                    if ledger:
-                        removed = ledger.pop(0)
-                        ctx["last_prompt_tokens"] = max(0, ctx.get("last_prompt_tokens", 0) - removed["input_tokens"] - removed["output_tokens"])
-                    deleted = True
-                    break
-            if not deleted:
-                if history:
-                    history.pop(0)
+
+        def _over_message_cap() -> bool:
+            return len(history) > MAX_HISTORY_MESSAGES
+
+        def _on_turn_removed() -> None:
+            cur_ledger = ctx.setdefault("token_ledger", [])
+            if cur_ledger:
+                removed = cur_ledger.pop(0)
+                ctx["last_prompt_tokens"] = max(
+                    0, ctx.get("last_prompt_tokens", 0) - removed["input_tokens"] - removed["output_tokens"]
+                )
+
+        if _over_message_cap():
+            stats = apply_layered_trim(
+                history,
+                is_over_budget=_over_message_cap,
+                on_turn_removed=_on_turn_removed,
+            )
+            if stats["hard_reset"]:
+                ctx["last_prompt_tokens"] = 0
+                ctx["last_completion_tokens"] = 0
+                ctx["token_ledger"] = []
+            if stats["compressed_tool_msgs"] or stats["removed_turns"] or stats["hard_reset"]:
+                logger.info(
+                    "[ContextTrim] chat_id=%s (post-turn) compressed_tool_msgs=%d removed_turns=%d hard_reset=%s",
+                    chat_id, stats["compressed_tool_msgs"], stats["removed_turns"], stats["hard_reset"],
+                )
+            # 兜底：极端情况下（例如单轮消息数就超过上限，裁剪层无法
+            # 再缩小轮次），退回到原始的"弹出队首一条消息"逻辑，避免死循环。
+            guard = 0
+            while len(history) > MAX_HISTORY_MESSAGES and history and guard < 1000:
+                history.pop(0)
+                guard += 1
 
 # ---------------------------------------------------------------------------
 # 业务处理
