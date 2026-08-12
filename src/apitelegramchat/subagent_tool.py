@@ -154,15 +154,9 @@ def _truncate(s: str, limit: int = MAX_SUBAGENT_RESULT_LEN) -> str:
 
 
 async def _execute_tool_for_subagent(
-    name: str, arguments: dict, chat_id: int, progress_callback=None
+    name: str, arguments: dict, chat_id: int
 ) -> str:
-    """执行单个工具调用，复用主 agent 的 dispatch_tool_call。
-
-    progress_callback: 可选的 async 回调 async (status_text: str) -> None，
-    透传给上层 _report。仅对 bash 生效——把执行中的原始 stdout 折叠成
-    “最近 10 行、持续刷新”的伪滚动预览，而不是把整段原始输出一次性丢给外层，
-    避免子 agent 内部跑 bash 时外层草稿在整个工具调用期间都是静止的。
-    """
+    """执行单个工具调用，复用主 agent 的 dispatch_tool_call。"""
     # 二次防御：禁止递归 / 禁用工具
     if name in FORBIDDEN_TOOLS:
         return f"Error: tool '{name}' is forbidden in subagent context."
@@ -170,27 +164,13 @@ async def _execute_tool_for_subagent(
         from apitelegramchat.tool_executors import dispatch_tool_call, tool_semaphore
     except Exception as e:
         return f"Error: cannot import dispatch_tool_call: {e}"
-
-    bash_progress = None
-    if name == "bash" and progress_callback:
-        command_preview = str(arguments.get("command") or "").strip()
-        short_command = command_preview[:30] + "…" if len(command_preview) > 30 else command_preview
-
-        async def bash_progress(output_text: str):
-            lines = (output_text or "").splitlines()
-            tail = "\n".join(lines[-10:]) if lines else ""
-            status = f"🔧 bash: {short_command}" if short_command else "🔧 bash 运行中"
-            if tail:
-                status += f"\n最近 10 行（持续刷新）：\n{tail}"
-            await progress_callback(status)
-
     try:
         # 复用主 agent 同一个全局信号量：多个子 agent 并行运行时，
         # 各自发起的工具调用（web_search / bash 等）仍受总并发上限约束，
         # 避免 N 个子 agent 同时爆发出 N×M 个不受控的外部请求。
         async with tool_semaphore:
             result = await asyncio.wait_for(
-                dispatch_tool_call(name, arguments or {}, chat_id=chat_id, progress_callback=bash_progress),
+                dispatch_tool_call(name, arguments or {}, chat_id=chat_id),
                 timeout=SUBAGENT_TOOL_TIMEOUT,
             )
         return _truncate(str(result))
@@ -358,7 +338,7 @@ async def _subagent_agentic_loop(
                 fn_args = json.loads(tc_entry["function"]["arguments"] or "{}")
             except json.JSONDecodeError:
                 fn_args = {}
-            result = await _execute_tool_for_subagent(fn_name, fn_args, chat_id, progress_callback=_report)
+            result = await _execute_tool_for_subagent(fn_name, fn_args, chat_id)
             return tc_id, result
 
         results = await asyncio.gather(
