@@ -636,27 +636,47 @@ def _render_bash_result(result_str: str) -> str:
     return f"<p>{header}</p>" + _render_code_panel("输出 · 最近 10 行", output)
 
 
-def _render_editor_result(command: str, path: str, result_str: str) -> str:
-    marker = "Latest file snapshot (tail 10):\n"
-    before, has_snapshot, snapshot = (result_str or "").partition(marker)
-    action_labels = {
-        "view": "文件视图", "create": "创建文件", "str_replace": "替换文本",
-        "insert": "插入内容",
-    }
-    label = action_labels.get(command, "文件操作")
-    heading = f"<p><b>{escape_html(label)}</b>"
-    if path:
-        heading += f" · <code>{escape_html(path)}</code>"
-    heading += "</p>"
-    if has_snapshot:
-        main = _render_code_panel("当前文件 · 最近 10 行", snapshot, add_line_numbers=False)
-        context = before.strip()
-        if context:
-            main += f"<details><summary>操作结果</summary>{_render_code_panel('编辑上下文', context, add_line_numbers=False)}</details>"
-        return heading + main
+def _render_editor_quote(label: str, value: str) -> str:
+    """Render editor input or output as a readable quoted text block."""
+    text = value if isinstance(value, str) else str(value or "")
+    if not text:
+        text = "(empty)"
+    return (
+        f"<p><b>{escape_html(label)}</b></p>"
+        f"<blockquote><pre><code>{escape_html(text)}</code></pre></blockquote>"
+    )
+
+
+def _truncate_editor_view_output(result_str: str, max_lines: int = 20) -> str:
+    """Keep only the first max_lines from the raw, non-JSON view result."""
+    lines = (result_str or "").splitlines()
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    return "\n".join(lines[:max_lines])
+
+
+def _editor_result_summary(result_str: str) -> str:
+    """Discard internal snapshot metadata; front-end Output shows the result text."""
+    message, _marker, _snapshot = (result_str or "").partition("Latest file snapshot (tail 10):\n")
+    return message.strip() or result_str or ""
+
+
+def _render_editor_result(command: str, path: str, result_str: str, arguments: dict | None = None) -> str:
+    """Render text-editor calls as explicit, quote-formatted Input and Output."""
+    arguments = arguments or {}
     if command == "view":
-        return heading + _render_code_panel("文件内容 · 最近 10 行", result_str, add_line_numbers=False)
-    return heading + _render_code_panel("操作结果 · 最近 10 行", result_str, add_line_numbers=False)
+        intent = str(arguments.get("_description") or "View the requested text file.")
+        output = _truncate_editor_view_output(result_str, max_lines=20)
+        return _render_editor_quote("Input", intent) + _render_editor_quote("Output", output)
+
+    input_field = {
+        "str_replace": "new_str",
+        "create": "file_text",
+        "insert": "insert_text",
+    }.get(command)
+    input_value = arguments.get(input_field, "") if input_field else ""
+    output = _editor_result_summary(result_str)
+    return _render_editor_quote("Input", input_value) + _render_editor_quote("Output", output)
 
 def extract_domain(url: str) -> str:
     if not url:
@@ -1626,7 +1646,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         else:
             summary = "📝 文件操作"
         # 每个编辑结果都优先展示写入后文件的最后十行（含绝对行号）。
-        details_html = _render_editor_result(command, path, result_str)
+        details_html = _render_editor_result(command, path, result_str, fn_args)
         return summary, details_html
 
     # ===================== Todo 工具格式化 =====================

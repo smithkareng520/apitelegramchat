@@ -325,7 +325,7 @@ async def execute_text_editor(
                     return "Error: File already exists."
                 set_editor_file_state(chat_id, safe_path, file_text, local_path.stat().st_mtime)
                 asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
-                return _with_latest_editor_snapshot("File created successfully.", file_text)
+                return _with_latest_editor_snapshot(f"Successfully created file in {local_path}", file_text)
 
             if not local_path.exists():
                 return "Error: File not found"
@@ -353,7 +353,7 @@ async def execute_text_editor(
                 _write_text_editor_file(local_path, new_content)
                 set_editor_file_state(chat_id, safe_path, new_content, local_path.stat().st_mtime)
                 asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
-                return _with_latest_editor_snapshot("Successfully replaced text.", new_content)
+                return _with_latest_editor_snapshot(f"Successfully replaced string in {local_path}", new_content)
 
             # command == "insert"
             if not isinstance(insert_line, int) or not isinstance(insert_text, str):
@@ -374,7 +374,7 @@ async def execute_text_editor(
             _write_text_editor_file(local_path, new_content)
             set_editor_file_state(chat_id, safe_path, new_content, local_path.stat().st_mtime)
             asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
-            return _with_latest_editor_snapshot(f"Successfully inserted text after line {insert_line}.", new_content)
+            return _with_latest_editor_snapshot(f"Successfully inserted string in {local_path} after line {insert_line}", new_content)
 
         except FileNotFoundError:
             return "Error: File not found"
