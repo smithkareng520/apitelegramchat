@@ -61,7 +61,7 @@ from apitelegramchat.search_engine import (
     execute_poi_details,
     execute_route,
     execute_distance,
-    execute_file_editor,
+    execute_text_editor,
 )
 from apitelegramchat.todo_tool import (
     execute_todo,
@@ -641,8 +641,7 @@ def _render_editor_result(command: str, path: str, result_str: str) -> str:
     before, has_snapshot, snapshot = (result_str or "").partition(marker)
     action_labels = {
         "view": "文件视图", "create": "创建文件", "str_replace": "替换文本",
-        "replace_lines": "按行编辑", "insert": "插入内容", "delete": "删除操作",
-        "undo_edit": "撤销编辑",
+        "insert": "插入内容",
     }
     label = action_labels.get(command, "文件操作")
     heading = f"<p><b>{escape_html(label)}</b>"
@@ -1216,7 +1215,7 @@ _TOOL_TIMEOUT_LABELS = {
     "poi_keyword_search": "POI keyword search",
     "poi_nearby_search": "Nearby POI search",
     "poi_details": "POI detail lookup",
-    "file_editor": "Editor operation",
+    "text_editor": "Text editor operation",
     "bash": "Bash command",
     "present_files": "File presentation",
     "fetch_download": "Fetch from download/",
@@ -1611,7 +1610,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = _render_structured_payload(result_str, map_tool=fn_name) or _render_code_panel("服务响应 · 最近 10 行", result_str)
         return summary, details_html
 
-    elif fn_name == "file_editor":
+    elif fn_name == "text_editor":
         command = fn_args.get("command", "")
         path = fn_args.get("path", "")
         if any(marker in (result_str or "") for marker in ("Error:", "No match found", "requires ")):
@@ -1620,7 +1619,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             summary = f"📄 查看 {path}" if path else "📄 查看文件"
         elif command == "create":
             summary = f"📄 已创建 {path}" if path else "📄 已创建文件"
-        elif command in ("str_replace", "replace_lines", "insert", "undo_edit"):
+        elif command in ("str_replace", "insert"):
             summary = f"📝 已更新 {path}" if path else "📝 已更新文件"
         elif command == "delete":
             summary = f"🗑️ 已删除 {path}" if path else "🗑️ 已删除文件"
@@ -1905,7 +1904,7 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
             "error": "No paths provided. Files must be staged under upload/ first.",
         })
 
-    # ★ init 在 workspace lock 外面执行（同 bash / file_editor）。
+    # ★ init 在 workspace lock 外面执行（同 bash / text_editor）。
     await _ensure_runtime_workspace(chat_id)
 
     lock = await _get_workspace_lock(chat_id)
@@ -1977,7 +1976,7 @@ async def execute_fetch_download(chat_id: int, filenames: List[str], overwrite: 
     cannot `cd` into download/, and the model is expected to fetch only the
     files it actually needs rather than hydrate the whole tree. After
     fetch_download, the file is available in the workdir under the same
-    relative path and can be opened with file_editor / bash / etc.
+    relative path and can be opened with text_editor / bash / etc.
     """
     if not isinstance(filenames, list) or not filenames:
         return json.dumps({
@@ -2146,8 +2145,8 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             )
         elif name == "poi_details":
             return await execute_poi_details(arguments.get("id", ""))
-        elif name == "file_editor":
-            return await execute_file_editor(
+        elif name == "text_editor":
+            return await execute_text_editor(
                 chat_id=chat_id,
                 namespace=resolved_namespace,
                 command=arguments.get("command", ""),
@@ -2155,16 +2154,9 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 view_range=arguments.get("view_range"),
                 old_str=arguments.get("old_str"),
                 new_str=arguments.get("new_str"),
-                start_line=arguments.get("start_line"),
-                end_line=arguments.get("end_line"),
-                occurrence=arguments.get("occurrence", 1),
-                allow_multi=arguments.get("allow_multi", False),
-                use_regex=arguments.get("use_regex", False),
-                delete_range=arguments.get("delete_range"),
                 insert_line=arguments.get("insert_line"),
                 insert_text=arguments.get("insert_text"),
                 file_text=arguments.get("file_text"),
-                confirm=arguments.get("confirm", False),
             )
         # ========== Bash 工具分支 ==========
         elif name == "bash":

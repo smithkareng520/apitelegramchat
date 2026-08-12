@@ -74,7 +74,7 @@ MAX_ANSWER_LEN = _env_int("SUBAGENT_MAX_ANSWER_LEN", 12000, min_value=1000, max_
 
 # 子 agent 不允许调用的工具（防递归 / 防爆炸 / 防资源滥用）
 FORBIDDEN_TOOLS = {"subagent", "memory", "skill", "ask_user"}
-# 注意：todo / bash / file_editor 仍允许，因为子 agent 可能需要查 / 写工作区文件。
+# 注意：todo / bash / text_editor 仍允许，因为子 agent 可能需要查 / 写工作区文件。
 # ask_user 不允许由子 agent 调用，否则会让父 agent 陷入不可控的嵌套人工等待。
 # 但 memory / skill 跨会话状态复杂，子 agent 不应触碰
 
@@ -87,7 +87,7 @@ DEFAULT_ALLOWED_TOOLS = {
     "book_lookup", "weather", "news", "crypto_price", "ip_geo", "qr_code",
     "geocode", "route", "distance", "poi_keyword_search",
     "poi_nearby_search", "poi_details",
-    "bash", "file_editor", "todo",
+    "bash", "text_editor", "todo",
     # upload/download 显式跨边界工具：子 agent 也允许使用
     "fetch_download", "stage_upload", "list_download", "list_upload",
     "present_files",
@@ -546,7 +546,7 @@ SUBAGENT_TOOL = {
                 "allowed_tools": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "可选的工具白名单。缺省时使用安全默认集（web_search/fetch_url/wikipedia/weather/bash/file_editor/todo 等）。传空数组则禁用所有工具。无论是否指定，subagent/memory/skill/ask_user 始终禁用。"
+                    "description": "可选的工具白名单。缺省时使用安全默认集（web_search/fetch_url/wikipedia/weather/bash/text_editor/todo 等）。传空数组则禁用所有工具。无论是否指定，subagent/memory/skill/ask_user 始终禁用。"
                 },
                 "timeout": {
                     "type": "integer",
@@ -558,7 +558,7 @@ SUBAGENT_TOOL = {
         },
         "input_examples": [
             {"task": "调研 2025 年最热门的 3 个开源 LLM 项目，每个给出 stars / license / 一句话特色", "allowed_tools": ["web_search", "fetch_url"]},
-            {"task": "把 workspace/report.md 翻译成英文并保存为 report_en.md", "allowed_tools": ["file_editor", "bash"]},
+            {"task": "把 workspace/report.md 翻译成英文并保存为 report_en.md", "allowed_tools": ["text_editor", "bash"]},
             {"task": "查北京今天的天气，并给出适合的穿搭建议", "allowed_tools": ["weather"]},
             {"task": "用一句话总结这段文字", "context": "……长文本……", "allowed_tools": []}
         ]

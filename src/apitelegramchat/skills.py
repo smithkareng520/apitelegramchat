@@ -263,7 +263,7 @@ def build_skill_system_message(skill_id: str, *, include_body: bool = True) -> d
             f"explicit path such as `python ../{assets_relpath}/scripts/example.py`. "
             "After changing directory, the persistent bash session keeps that cwd. "
             "User files remain in the workspace and can be reached with `../` as usual.\n"
-            f"3. file_editor paths are resolved from the workspace root, so use "
+            f"3. text_editor paths are resolved from the workspace root, so use "
             f"`{assets_relpath}/...` for skill assets."
         )
     return {

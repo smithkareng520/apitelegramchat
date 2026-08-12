@@ -1,6 +1,5 @@
 # search_engine.py — 完整版（集成搜索缓存 & 抓取缓存）
-# 新增 view 搜索功能：支持 search_terms 列表，返回匹配上下文
-# str_replace 重构：无前置验证，occurrence 可选，默认替换第一个匹配
+# 文本编辑器：仅支持 view、str_replace、create 和 insert 四个命令。
 import asyncio
 import aiohttp
 import re
@@ -14,6 +13,7 @@ import socket
 import uuid
 import math
 import shutil
+import tempfile
 import mimetypes
 from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
 from typing import Any, Optional
@@ -132,7 +132,7 @@ async def _persist_edited_file(
     delete: bool = False,
     namespace: str | None = None,
 ):
-    """Persist only the file explicitly changed through file_editor."""
+    """Persist only the file explicitly changed through text_editor."""
     try:
         result = await persist_workspace_file(
             chat_id, rel_path, delete=delete, namespace=namespace
@@ -184,367 +184,206 @@ def _with_latest_editor_snapshot(message: str, content: str) -> str:
     return f"{message}\n\nLatest file snapshot (tail 10):\n{_latest_editor_snapshot(content)}"
 
 
-def _write_editor_file(local_path: Path, new_content: str) -> None:
-    backup_path = local_path.with_suffix(local_path.suffix + ".backup")
-    shutil.copy2(local_path, backup_path)
-    with open(local_path, "w", encoding="utf-8") as f:
-        f.write(new_content)
+def _format_editor_line(line_no: int, text: str, width: int) -> str:
+    """Format a text-editor view line with an absolute 1-based line number."""
+    return f"{line_no:>{width}}: {text.rstrip(chr(10))}"
+
+
+def _latest_editor_snapshot(content: str, max_lines: int = 10) -> str:
+    """Return the tail of a file with absolute line numbers for the chat UI."""
+    lines = _normalize_editor_text(content).splitlines()
+    if not lines:
+        return "(empty file)"
+    start = max(1, len(lines) - max_lines + 1)
+    width = len(str(len(lines)))
+    return "\n".join(_format_editor_line(index, lines[index - 1], width) for index in range(start, len(lines) + 1))
+
+
+def _with_latest_editor_snapshot(message: str, content: str) -> str:
+    return f"{message}\n\nLatest file snapshot (tail 10):\n{_latest_editor_snapshot(content)}"
+
+
+def _write_text_editor_file(local_path: Path, new_content: str) -> None:
+    """Atomically replace an existing UTF-8 text file while preserving its mode."""
+    mode = local_path.stat().st_mode & 0o777
+    fd, temp_name = tempfile.mkstemp(prefix=f".{local_path.name}.", dir=local_path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with open(fd, "w", encoding="utf-8", closefd=True) as temp_file:
+            temp_file.write(new_content)
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, local_path)
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _permission_error(command: str) -> str:
+    if command == "view":
+        return "Error: Permission denied. Cannot read file."
+    if command == "create":
+        return "Error: Permission denied. Cannot create file."
+    return "Error: Permission denied. Cannot write to file."
 
 
 # ---------- 主函数 ----------
-async def execute_file_editor(
+async def execute_text_editor(
     chat_id: int,
     command: str,
     path: str,
     namespace: str | None = None,
     view_range: list[int] | None = None,
-    search_terms: list[str] | None = None,        # 新增：view 搜索关键词
     old_str: str | None = None,
     new_str: str | None = None,
-    start_line: int | None = None,
-    end_line: int | None = None,
-    occurrence: int | None = None,                # 改为 None，由内部决定默认
-    allow_multi: bool = False,
-    use_regex: bool = False,
-    delete_range: list[int] | None = None,
     insert_line: int | None = None,
     insert_text: str | None = None,
     file_text: str | None = None,
-    confirm: bool = False,
 ) -> str:
-    # list 命令 + view 命令遇到目录时，允许 path 为空 / "." / "./"，对应 workspace 根
-    allow_root_path = command in ("list", "view") and (
-        not path or not isinstance(path, str) or path.strip() in ("", "/", ".", "./")
-    )
-    try:
-        if allow_root_path:
-            safe_path = "."
-        else:
-            safe_path = _editor_safe_path(path)
-    except ValueError as e:
-        return f"Error: {e}"
+    """Safely perform one of four text-file operations inside the workspace.
 
-    # ★ init 在 workspace lock 外面执行：R2 网络同步可能耗时数秒，
-    #   不应阻塞其他工具调用获取 workspace lock。init 只需要 init_lock
-    #   （在 _ensure_workspace_initialized 内部获取），与 workspace lock 独立。
+    ``str_replace`` is intentionally strict: ``old_str`` must occur exactly once
+    in the entire file. This prevents accidental broad edits and tells the model
+    to re-view the relevant text when its context is stale.
+    """
+    allowed_commands = {"view", "str_replace", "create", "insert"}
+    if command not in allowed_commands:
+        return f"Error: Unknown command: {command}. Allowed commands are view, str_replace, create, and insert."
+
+    try:
+        safe_path = _editor_safe_path(path)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
     resolved_namespace = workspace_namespace(chat_id, namespace)
-    await _ensure_runtime_workspace(chat_id, resolved_namespace)
+    try:
+        await _ensure_runtime_workspace(chat_id, resolved_namespace)
+    except PermissionError:
+        return _permission_error(command)
+    except OSError as exc:
+        return f"Error: Cannot access workspace: {exc.strerror or str(exc)}"
 
     lock = await _get_workspace_lock(chat_id, resolved_namespace)
     async with lock:
-        workspace = workspace_workdir(chat_id, resolved_namespace).resolve()
         try:
-            local_path = workspace if allow_root_path else _resolve_editor_path(workspace, safe_path)
-        except ValueError as exc:
-            return f"Error: {exc}"
+            workspace = workspace_workdir(chat_id, resolved_namespace).resolve()
+            local_path = _resolve_editor_path(workspace, safe_path)
 
-        # ----- view (增强：支持搜索关键词) -----
-        if command == "view":
+            if command == "view":
+                if not local_path.exists():
+                    return "Error: File not found"
+                if local_path.is_dir():
+                    return "Error: Path is a directory. view only supports files."
+                try:
+                    content = local_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    return "Error: File is not valid UTF-8 text."
+                lines = content.splitlines()
+                total_lines = len(lines)
+                if view_range is not None:
+                    if (
+                        not isinstance(view_range, list)
+                        or len(view_range) != 2
+                        or not all(isinstance(value, int) for value in view_range)
+                    ):
+                        return "Error: view_range must be [start_line, end_line]."
+                    start, end = view_range
+                    if start < 1:
+                        return "Error: view_range start_line must be at least 1."
+                    if end != -1 and end < start:
+                        return "Error: view_range end_line must be -1 or greater than or equal to start_line."
+                    if start > total_lines:
+                        return f"Error: start_line {start} exceeds total lines {total_lines}"
+                    if end == -1 or end > total_lines:
+                        end = total_lines
+                else:
+                    start, end = 1, total_lines
+
+                set_editor_file_state(chat_id, safe_path, content, local_path.stat().st_mtime)
+                if total_lines == 0:
+                    return "(empty file)"
+                width = len(str(total_lines))
+                return "\n".join(
+                    _format_editor_line(line_number, lines[line_number - 1], width)
+                    for line_number in range(start, end + 1)
+                )
+
+            if command == "create":
+                if not isinstance(file_text, str):
+                    return "Error: Missing file_text for create."
+                if local_path.exists():
+                    if local_path.is_dir():
+                        return "Error: A directory already exists at this path."
+                    return "Error: File already exists."
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with open(local_path, "x", encoding="utf-8") as file:
+                        file.write(file_text)
+                except FileExistsError:
+                    return "Error: File already exists."
+                set_editor_file_state(chat_id, safe_path, file_text, local_path.stat().st_mtime)
+                asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
+                return _with_latest_editor_snapshot("File created successfully.", file_text)
+
             if not local_path.exists():
-                return f"Error: File not found: {path}"
-            # 如果是目录，转走 list 命令的逻辑（向后兼容）
+                return "Error: File not found"
             if local_path.is_dir():
-                return _list_directory(local_path, path)
-            with open(local_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            # 自动更新状态（隐式 view）
-            mtime = local_path.stat().st_mtime
-            set_editor_file_state(chat_id, safe_path, content, mtime)
-            lines = content.splitlines()
-            total_lines = len(lines)
-            width = len(str(total_lines))
+                return "Error: Path is a directory. Text editing only supports files."
+            try:
+                content = local_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                return "Error: File is not valid UTF-8 text."
 
-            # 如果提供了 search_terms，执行搜索并返回上下文
-            if search_terms and isinstance(search_terms, list) and len(search_terms) > 0:
-                # 确保每个词都是字符串
-                terms = [str(t).strip() for t in search_terms if str(t).strip()]
-                if not terms:
-                    # 如果没有有效关键词，回退到普通查看
-                    pass
-                else:
-                    result_parts = []
-                    result_parts.append(f"File: {path}")
-                    for term in terms:
-                        # 搜索 term（区分大小写，可按需添加 flags）
-                        matches = []
-                        for idx, line in enumerate(lines, start=1):
-                            if term in line:
-                                matches.append(idx)
-                        if not matches:
-                            result_parts.append(f"Search term '{term}': No matches found.")
-                            continue
-                        result_parts.append(f"Search term '{term}': Found {len(matches)} match(es):")
-                        # 对于每个匹配，显示前后各2行
-                        for match_line in matches[:10]:  # 最多显示10个匹配，避免过长
-                            start_ctx = max(0, match_line - 3)  # 0-based index
-                            end_ctx = min(total_lines, match_line + 2)
-                            context_lines = lines[start_ctx:end_ctx]
-                            # 加上行号
-                            result_parts.append(f"  At line {match_line}:")
-                            for i, line in enumerate(context_lines, start=start_ctx+1):
-                                result_parts.append("  " + _format_editor_line(i, line, width, highlight=i == match_line))
-                        if len(matches) > 10:
-                            result_parts.append(f"  ... and {len(matches)-10} more match(es).")
-                    return "\n".join(result_parts)
-
-            # 如果没有 search_terms，走原有逻辑
-            if view_range:
-                start, end = view_range
-                if start < 1:
-                    start = 1
-                if end == -1 or end > total_lines:
-                    end = total_lines
-                selected = lines[start-1:end]
-                numbered = [_format_editor_line(idx+1, line, width) for idx, line in enumerate(selected, start=start)]
-                return "\n".join(numbered)
-            else:
-                numbered = [_format_editor_line(idx+1, line, width) for idx, line in enumerate(lines)]
-                return "\n".join(numbered)
-
-        # ----- list (列出目录内容；如果 bash 沙箱不可用，这是模型查看
-        # 工作区文件结构的唯一途径) -----
-        elif command == "list":
-            display = path.strip() if path and path.strip() not in ("", "/", ".", "./") else "./"
-            if not local_path.exists():
-                # 兜底：列出 workspace 根
-                return _list_directory(workspace, "./")
-            return _list_directory(local_path, display)
-
-        # ----- create -----
-        elif command == "create":
-            if file_text is None:
-                return "Error: Missing file_text for create."
-            if local_path.exists():
-                return f"Error: File already exists: {path}. Use str_replace to edit or delete+confirm to remove."
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(local_path, "w", encoding="utf-8") as f:
-                f.write(file_text)
-            mtime = local_path.stat().st_mtime
-            set_editor_file_state(chat_id, safe_path, file_text, mtime)
-            asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
-            return _with_latest_editor_snapshot(f"File created successfully: {path}", file_text)
-
-        # ----- replace_lines -----
-        elif command == "replace_lines":
-            replacement_text = new_str if new_str is not None else insert_text
-            if delete_range is None or replacement_text is None:
-                return "Error: replace_lines requires delete_range and new_str (or insert_text)."
-            if not local_path.exists():
-                return f"Error: File not found: {path}"
-            with open(local_path, "r", encoding="utf-8") as f:
-                full_content = f.read()
-            lines = _split_editor_lines(full_content)
-            total = len(lines)
-            start_del, end_del = delete_range
-            if start_del < 1:
-                start_del = 1
-            if end_del == -1 or end_del > total:
-                end_del = total
-            if start_del > total:
-                return f"Error: start_line {start_del} exceeds total lines {total}"
-            replacement_text = _normalize_editor_text(replacement_text)
-            if replacement_text and not replacement_text.endswith("\n") and end_del < total:
-                replacement_text += "\n"
-            new_full = "".join(lines[:start_del - 1]) + replacement_text + "".join(lines[end_del:])
-            _write_editor_file(local_path, new_full)
-            mtime = local_path.stat().st_mtime
-            set_editor_file_state(chat_id, safe_path, new_full, mtime)
-            asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
-            preview_lines = new_full.splitlines()
-            preview = _line_range_preview(preview_lines, start_del, min(len(preview_lines), start_del + max(0, len(replacement_text.splitlines()) - 1) if replacement_text else start_del), highlight_line=start_del)
-            return _with_latest_editor_snapshot(f"Successfully replaced lines {start_del}-{end_del} in {path}.\n\nResult around edit:\n{preview}", new_full)
-
-        # ----- str_replace (简化版，无前置验证) -----
-        elif command == "str_replace":
-            if old_str is None or new_str is None:
-                return "Error: Missing old_str or new_str for str_replace"
-            # 拒绝空 old_str，否则 str.count("") 返回 len+1，str.replace("",x) 会在每个字符间插入 x
-            if not old_str:
-                return "Error: old_str must be non-empty for str_replace"
-
-            if not local_path.exists():
-                return f"Error: File not found: {path}"
-
-            # 读取文件并自动更新状态
-            with open(local_path, 'r', encoding='utf-8') as f:
-                full_content = f.read()
-            mtime = local_path.stat().st_mtime
-            set_editor_file_state(chat_id, safe_path, full_content, mtime)
-
-            lines = full_content.splitlines(keepends=True)
-            total_lines = len(lines)
-
-            _start = start_line if start_line is not None else 1
-            _end = end_line if end_line is not None else -1
-
-            if _start < 1:
-                _start = 1
-            if _end == -1 or _end > total_lines:
-                _end = total_lines
-            if _start > total_lines:
-                return f"Error: start_line {_start} exceeds total lines {total_lines}"
-
-            slice_content = "".join(lines[_start-1:_end])
-
-            # 计算匹配
-            if use_regex:
-                pattern = re.compile(old_str, re.DOTALL)
-                matches = list(pattern.finditer(slice_content))
-                match_count = len(matches)
-            else:
-                match_count = slice_content.count(old_str)
+            if command == "str_replace":
+                if not isinstance(old_str, str) or not isinstance(new_str, str):
+                    return "Error: Missing old_str or new_str for str_replace."
+                if not old_str:
+                    return "Error: old_str must be non-empty for str_replace."
+                match_count = content.count(old_str)
                 if match_count == 0:
-                    # 尝试 strip 空格再试一次
-                    stripped_old = old_str.strip()
-                    if stripped_old != old_str:
-                        old_str = stripped_old
-                        match_count = slice_content.count(old_str)
+                    return "Error: No match found for replacement. Please check your text and try again."
+                if match_count > 1:
+                    return (
+                        f"Error: Found {match_count} matches for replacement text. "
+                        "Please provide more context to make a unique match."
+                    )
+                new_content = content.replace(old_str, new_str, 1)
+                _write_text_editor_file(local_path, new_content)
+                set_editor_file_state(chat_id, safe_path, new_content, local_path.stat().st_mtime)
+                asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
+                return _with_latest_editor_snapshot("Successfully replaced text.", new_content)
 
-            if match_count == 0:
-                return f"No match found for replacement text in lines {_start}-{_end}. Please adjust old_str or range."
-
-            # 执行替换
-            if use_regex:
-                if allow_multi:
-                    new_slice = pattern.sub(new_str, slice_content)
-                else:
-                    # 确定 occurrence
-                    if occurrence is None:
-                        occurrence = 1
-                    elif occurrence < 1 or occurrence > match_count:
-                        return f"Error: occurrence must be between 1 and {match_count}."
-                    m = matches[occurrence - 1]
-                    new_slice = slice_content[:m.start()] + new_str + slice_content[m.end():]
-            else:
-                if allow_multi:
-                    new_slice = slice_content.replace(old_str, new_str)
-                else:
-                    if occurrence is None:
-                        occurrence = 1
-                    elif occurrence < 1 or occurrence > match_count:
-                        return f"Error: occurrence must be between 1 and {match_count}."
-                    # 分割替换
-                    parts = slice_content.split(old_str)
-                    before = old_str.join(parts[:occurrence])
-                    after = old_str.join(parts[occurrence:])
-                    new_slice = before + new_str + after
-
-            # 写入文件
-            new_full = "".join(lines[:_start - 1]) + new_slice + "".join(lines[_end:])
-            _write_editor_file(local_path, new_full)
-            mtime = local_path.stat().st_mtime
-            set_editor_file_state(chat_id, safe_path, new_full, mtime)
-            asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
-
-            # 生成预览
-            new_lines = new_full.splitlines()
-            # 估算修改的行范围
-            changed_start = _start
-            changed_end = _start + len(new_slice.splitlines()) - 1
-            if changed_end > len(new_lines):
-                changed_end = len(new_lines)
-            preview = _line_range_preview(new_lines, max(1, changed_start-2), min(len(new_lines), changed_end+2), highlight_line=changed_start)
-
-            if allow_multi:
-                replace_info = f"Replaced all {match_count} matches."
-            else:
-                replace_info = f"Replaced occurrence {occurrence} of {match_count} match(es)."
-            return _with_latest_editor_snapshot(f"Successfully replaced text in {path} (lines {changed_start}-{changed_end}). {replace_info}\nTotal matches found: {match_count}\nResult around edit:\n{preview}", new_full)
-
-        # ----- insert -----
-        elif command == "insert":
-            if insert_line is None or insert_text is None:
-                return "Error: Missing insert_line or insert_text"
-            if not local_path.exists():
-                return f"Error: File not found: {path}"
-            with open(local_path, "r", encoding="utf-8") as f:
-                content = f.read()
+            # command == "insert"
+            if not isinstance(insert_line, int) or not isinstance(insert_text, str):
+                return "Error: Missing insert_line or insert_text for insert."
             lines = content.splitlines(keepends=True)
-            total = len(lines)
-            if insert_line < 0:
-                insert_line = 0
-            if insert_line > total:
-                insert_line = total
-            if insert_line == 0:
-                new_content = insert_text + content
-            else:
-                if insert_line == total and content and not content.endswith("\n"):
-                    content += "\n"
-                    # 修复：必须基于更新后的 content 重新计算 lines，否则追加的换行会被丢弃
-                    lines = content.splitlines(keepends=True)
-                new_content = "".join(lines[:insert_line]) + insert_text + "".join(lines[insert_line:])
-            _write_editor_file(local_path, new_content)
-            mtime = local_path.stat().st_mtime
-            set_editor_file_state(chat_id, safe_path, new_content, mtime)
-            asyncio.create_task(_upload_edited_file(chat_id, safe_path, new_content))
+            total_lines = len(lines)
+            if insert_line < 0 or insert_line > total_lines:
+                return f"Error: insert_line must be between 0 and {total_lines}."
+
+            prefix = "".join(lines[:insert_line])
+            suffix = "".join(lines[insert_line:])
+            text_to_insert = insert_text
+            if prefix and not prefix.endswith(("\n", "\r")):
+                prefix += "\n"
+            if suffix and text_to_insert and not text_to_insert.endswith(("\n", "\r")):
+                text_to_insert += "\n"
+            new_content = prefix + text_to_insert + suffix
+            _write_text_editor_file(local_path, new_content)
+            set_editor_file_state(chat_id, safe_path, new_content, local_path.stat().st_mtime)
+            asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
             return _with_latest_editor_snapshot(f"Successfully inserted text after line {insert_line}.", new_content)
 
-        # ----- delete -----
-        elif command == "delete":
-            if local_path.is_dir() or path.endswith("/"):
-                if not confirm:
-                    return "Error: Directory deletion requires confirm=True."
-                if not local_path.exists():
-                    return f"Directory {path} does not exist."
-                # Directory deletion is local to the runtime tree. Persist deletions
-                # for each existing file explicitly; the commit boundary is still file-based.
-                removed = []
-                for child in local_path.rglob("*"):
-                    if child.is_file() and not child.is_symlink():
-                        rel = child.relative_to(workspace).as_posix()
-                        removed.append(rel)
-                shutil.rmtree(local_path)
-                for rel in removed:
-                    await _persist_edited_file(chat_id, rel, delete=True)
-                clear_editor_file_state(chat_id, safe_path)
-                return f"Successfully deleted directory: {path}"
-            else:
-                if delete_range:
-                    if not local_path.exists():
-                        return f"Error: File not found: {path}"
-                    with open(local_path, "r", encoding="utf-8") as f:
-                        lines = f.read().splitlines(keepends=True)
-                    total = len(lines)
-                    start_del, end_del = delete_range
-                    if start_del < 1:
-                        start_del = 1
-                    if end_del == -1 or end_del > total:
-                        end_del = total
-                    if start_del > total:
-                        return f"Error: start_line {start_del} exceeds total lines {total}"
-                    new_lines = lines[:start_del-1] + lines[end_del:]
-                    new_content = "".join(new_lines)
-                    _write_editor_file(local_path, new_content)
-                    mtime = local_path.stat().st_mtime
-                    set_editor_file_state(chat_id, safe_path, new_content, mtime)
-                    asyncio.create_task(_upload_edited_file(chat_id, safe_path, new_content))
-                    return _with_latest_editor_snapshot(f"Successfully deleted lines {start_del}-{end_del} from {path}", new_content)
-                else:
-                    if not local_path.exists():
-                        return f"Error: File not found: {path}"
-                    os.remove(local_path)
-                    clear_editor_file_state(chat_id, safe_path)
-                    await _persist_edited_file(chat_id, safe_path, delete=True)
-                    return f"Successfully deleted file: {path}"
-
-        # ----- undo_edit -----
-        elif command == "undo_edit":
-            if not local_path.exists():
-                return f"Error: File not found: {path}"
-            backup_path = local_path.with_suffix(local_path.suffix + ".backup")
-            if not backup_path.exists():
-                return f"Error: No backup found for {path}. Unable to undo."
-            shutil.copy2(backup_path, local_path)
-            os.remove(backup_path)
-            with open(local_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            mtime = local_path.stat().st_mtime
-            set_editor_file_state(chat_id, safe_path, content, mtime)
-            asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
-            return _with_latest_editor_snapshot(f"Undo successful. Reverted {path} to previous version.", content)
-
-        else:
-            return f"Error: Unknown command: {command}"
+        except FileNotFoundError:
+            return "Error: File not found"
+        except PermissionError:
+            return _permission_error(command)
+        except IsADirectoryError:
+            return "Error: Path is a directory. Text editing only supports files."
+        except OSError as exc:
+            return f"Error: File operation failed: {exc.strerror or str(exc)}"
 
 
 # ========== 缓存函数 ==========
@@ -951,94 +790,57 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "file_editor",
+            "name": "text_editor",
             "description": (
-                "View / create / edit / delete / undo text files (and directories). Recommended workflow:\n"
-                "  1. 'view' once to inspect the target area; pass 'search_terms' to jump to keywords.\n"
-                "  2. For line-accurate edits use command='replace_lines' with 'delete_range' + 'new_str'.\n"
-                "  3. For text matches use command='str_replace' with a narrow start_line/end_line scope.\n"
-                "  4. If a replacement misses, re-view the smallest relevant range instead of retrying blindly.\n"
-                "  5. For repeated structures set 'allow_multi'=True or 'use_regex'=True.\n"
-                "For delete use 'delete_range' (e.g. [10, 20]); for undo use command='undo_edit'."
+                "Safely view or edit UTF-8 text files. Only four commands are available: "
+                "view, str_replace, create, and insert. Always call view before editing. "
+                "str_replace requires old_str to match exactly once in the entire file; "
+                "if it finds zero or multiple matches, call view and provide a more specific old_str. "
+                "view returns 1-based line numbers and accepts view_range=[start_line, end_line], "
+                "where -1 means the end of the file. insert_line is also 1-based; use 0 to insert at the start."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：创建配置文件"
+                        "description": "Briefly describe the operation (60 characters or fewer)."
                     },
                     "command": {
                         "type": "string",
-                        "enum": ["view", "list", "str_replace", "replace_lines", "create", "insert", "delete", "undo_edit"],
-                        "description": "要执行的命令。list 用于列出工作区目录内容（即使 bash 沙箱不可用也能用）。"
+                        "enum": ["view", "str_replace", "create", "insert"],
+                        "description": "The text-editor operation to perform."
                     },
                     "path": {
                         "type": "string",
-                        "description": "文件或目录路径。list 命令时传空串、'.' 或 './' 表示列出 workspace 根。目录可省略尾 / 。"
+                        "description": "Relative path of a text file inside the workspace. Directories are not supported."
                     },
                     "view_range": {
                         "type": "array",
                         "items": {"type": "integer"},
                         "minItems": 2,
                         "maxItems": 2,
-                        "description": "view 命令的 [起始行, 结束行]（1-indexed，-1 表示到末尾）。"
-                    },
-                    "search_terms": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "view 时可选的关键词列表，返回每个匹配的行号与上下文。"
+                        "description": "For view: [start_line, end_line], 1-based; end_line=-1 reads to the end."
                     },
                     "old_str": {
                         "type": "string",
-                        "description": "str_replace 时要替换的文本。use_regex=True 时作为正则。"
+                        "description": "For str_replace: exact existing text. It must have exactly one match."
                     },
                     "new_str": {
                         "type": "string",
-                        "description": "str_replace / replace_lines 的新文本。"
-                    },
-                    "start_line": {
-                        "type": "integer",
-                        "description": "替换/删除范围的起始行（1-indexed，默认 1）。"
-                    },
-                    "end_line": {
-                        "type": "integer",
-                        "description": "范围的结束行（1-indexed，-1 表示到末尾，默认 -1）。"
-                    },
-                    "occurrence": {
-                        "type": "integer",
-                        "description": "仅 allow_multi=False 时有效：替换第 N 次出现（1-indexed）。未提供且多处匹配时替换首个。"
-                    },
-                    "allow_multi": {
-                        "type": "boolean",
-                        "description": "True 则替换范围内的所有匹配。默认 False。"
-                    },
-                    "use_regex": {
-                        "type": "boolean",
-                        "description": "True 则将 old_str 作为正则。默认 False。"
-                    },
-                    "delete_range": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "minItems": 2,
-                        "maxItems": 2,
-                        "description": "delete 命令的 [起始行, 结束行]（1-indexed）。"
-                    },
-                    "insert_line": {
-                        "type": "integer",
-                        "description": "insert 命令插入位置（0 表示文件开头）。"
-                    },
-                    "insert_text": {
-                        "type": "string",
-                        "description": "insert 命令要插入的文本。"
+                        "description": "For str_replace: replacement text; may be an empty string."
                     },
                     "file_text": {
                         "type": "string",
-                        "description": "create 命令的文件内容。"
+                        "description": "For create: complete initial file content; may be empty."
                     },
-                    "confirm": {
-                        "type": "boolean",
-                        "description": "删除目录时必填，必须为 true。"
+                    "insert_line": {
+                        "type": "integer",
+                        "description": "For insert: insert after this 1-based line number; 0 inserts at the beginning."
+                    },
+                    "insert_text": {
+                        "type": "string",
+                        "description": "For insert: text to add after insert_line; may be empty."
                     }
                 },
                 "required": ["command", "path"]
@@ -1053,7 +855,7 @@ SEARCH_TOOLS = [
                 "Execute shell commands in the user workspace. The workspace is local-only and is never synchronized wholesale to R2. "
                 "Use for installs, tests, builds, scripts, and system operations. Generated files and dependencies remain local to this workspace. "
                 "Avoid interactive commands (vim, top) and long-running processes. Set 'restart'=true to reset the session. "
-                "When the model chooses to use a skill, it can `cd skills/<skill_id>` and read the skill instructions there. To list files without Bash, use file_editor command='list'.\n"
+                "When the model chooses to use a skill, it can `cd skills/<skill_id>` and read the skill instructions there. Use Bash to list workspace files when needed.\n"
                 "\n"
                 "CRITICAL — upload/ and download/ are staging buffers, not execution roots:\n"
                 "- You MAY read and write files in upload/ and download/ via relative paths from your cwd, "
@@ -1099,7 +901,7 @@ SEARCH_TOOLS = [
                 "Copy one or more user-uploaded files from download/ into the agent's ephemeral workdir (workspace root/). "
                 "User-uploaded documents land in download/ automatically when the model cannot ingest them natively; bash "
                 "cannot `cd` into download/, so this tool is the canonical way to make a downloaded file available to "
-                "file_editor / bash / other tools. After fetch_download the file lives at the same relative path inside "
+                "text_editor / bash / other tools. After fetch_download the file lives at the same relative path inside "
                 "the workdir.\n"
                 "download/ is a local-only buffer (not mirrored to R2); if it is empty after a process restart, ask the "
                 "user to re-send the document.\n"
@@ -2876,7 +2678,7 @@ async def persist_workspace_file(
     delete: bool = False,
     namespace: str | None = None,
 ) -> dict[str, str | bool]:
-    """Persist exactly one file edited by file_editor.
+    """Persist exactly one file edited by text_editor.
 
     The local workspace is always the source of truth. This helper only mirrors
     the explicitly changed file to the existing R2 editor namespace; it never
@@ -2904,30 +2706,3 @@ async def persist_workspace_file(
     content_type = mimetypes.guess_type(safe)[0] or "application/octet-stream"
     url = await upload_bytes_to_r2(data, key, content_type)
     return {"key": key, "persisted": url is not None}
-
-
-def _list_directory(dir_path: Path, display_path: str) -> str:
-    """List a verified workspace directory without following child symlinks."""
-    if not dir_path.exists():
-        return f"Error: Directory not found: {display_path}"
-    if not dir_path.is_dir():
-        return f"Error: Not a directory: {display_path}"
-    try:
-        entries = sorted(dir_path.iterdir(), key=lambda p: p.name.lower())
-    except PermissionError:
-        return f"Error: Permission denied: {display_path}"
-    if not entries:
-        return f"Directory {display_path} is empty."
-    out = [f"Directory: {display_path} ({len(entries)} entries)"]
-    for entry in entries:
-        try:
-            if entry.is_symlink():
-                out.append(f"  [link]  {entry.name}  (not followed)")
-                continue
-            if entry.is_dir():
-                out.append(f"  [dir ]  {entry.name}/")
-            else:
-                out.append(f"  [file]  {entry.name}  ({entry.stat().st_size} bytes)")
-        except OSError as exc:
-            out.append(f"  [????]  {entry.name}  (stat failed: {exc})")
-    return "\n".join(out)

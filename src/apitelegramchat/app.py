@@ -758,7 +758,7 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
             else:
                 content_text += (
                     "\n\n请根据用户指令处理这些文档。先用 list_download 查看可用文件，"
-                    "再用 fetch_download 把需要的文件取到工作区，然后用 file_editor 或 bash 查看。"
+                    "再用 fetch_download 把需要的文件取到工作区，然后用 text_editor 或 bash 查看。"
                 )
 
         user_message = {"role": "user", "content": content_text, "file_ids": file_ids, "file_names": file_names, "mime_types": mime_types, "type": "document_group", "attachments": [{"kind": "document", "file_id": fid, "file_name": fname, "mime_type": mime} for fid, fname, mime in zip(file_ids, file_names, mime_types)]}
@@ -1192,7 +1192,7 @@ async def webhook() -> tuple:
                             if cap:
                                 content_text += f"\n\n用户指令：{cap}"
                             else:
-                                content_text += "\n\n请根据用户指令处理该文档。取到工作区后可用 file_editor 或 bash 查看。"
+                                content_text += "\n\n请根据用户指令处理该文档。取到工作区后可用 text_editor 或 bash 查看。"
                         else:
                             content_text = f"📎 用户上传了文档「{safe_fname}」，但下载失败，请稍后重试。"
 

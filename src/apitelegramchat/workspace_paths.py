@@ -117,7 +117,7 @@ def workspace_namespace(chat_id: object, namespace: object | None = None) -> str
 def workspace_identity(chat_id: object, namespace: object | None = None) -> tuple[str, Path]:
     """Resolve the stable namespace and root together.
 
-    The tuple is intentionally cheap to pass through tool dispatch so file_editor,
+    The tuple is intentionally cheap to pass through tool dispatch so text_editor,
     bash, skill sync, and persistence all operate on the exact same filesystem tree.
     """
     resolved = workspace_namespace(chat_id, namespace)
