@@ -24,14 +24,13 @@ from typing import Any, Optional
 from urllib.parse import unquote
 
 from apitelegramchat.s3_utils import delete_r2_object, list_r2_objects, upload_bytes_to_r2
-from apitelegramchat.workspace_paths import chat_state_root, memory_state_file, workspace_namespace
-from apitelegramchat.workspace_utils import _get_workspace_lock, _sync_generic_tree_from_r2, _sync_named_file_from_r2
+from apitelegramchat.workspace_paths import chat_state_root, workspace_namespace
+from apitelegramchat.workspace_utils import _get_workspace_lock, _sync_generic_tree_from_r2
 
 logger = logging.getLogger(__name__)
 
 MEMORY_ROOT = "/memories"
 MEMORY_DIR_NAME = "memories"
-LEGACY_FILENAME = "memories.json"
 MAX_VIEW_CHARS = 16_000
 MAX_FILE_CHARS = 1_000_000
 MAX_TOTAL_BYTES = 4 * 1024 * 1024
@@ -426,44 +425,6 @@ def _rename(root: Path, old_path: Any, new_path: Any) -> tuple[str, dict[str, An
     return f"Successfully renamed {old_logical} to {new_logical}", {"old_path": old_logical, "new_path": new_logical}
 
 
-def _migrate_legacy_json(chat_id: int, root: Path, namespace: object | None = None) -> bool:
-    """Preserve old structured records in one readable file during the upgrade."""
-    legacy_path = memory_state_file(chat_id, namespace)
-    destination = root / "legacy-import.md"
-    if destination.exists() or not legacy_path.is_file():
-        return False
-    try:
-        data = json.loads(legacy_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    records = data.get("memories") if isinstance(data, dict) else None
-    if not isinstance(records, list) or not records:
-        return False
-    lines = ["# Imported legacy memories", "", "This file preserves records created before the file-based memory protocol.", ""]
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        content = str(record.get("content", "")).strip()
-        if not content:
-            continue
-        meta: list[str] = []
-        if record.get("category"):
-            meta.append(f"category: {record['category']}")
-        if record.get("importance"):
-            meta.append(f"importance: {record['importance']}")
-        tags = record.get("tags")
-        if isinstance(tags, list) and tags:
-            meta.append("tags: " + ", ".join(str(tag) for tag in tags))
-        lines.append(f"## {record.get('id', 'legacy-memory')}")
-        if meta:
-            lines.append("_" + " · ".join(meta) + "_")
-        lines.extend((content, ""))
-    content = "\n".join(lines).strip() + "\n"
-    _assert_storage_budget(root, len(content.encode("utf-8")))
-    _atomic_write(destination, content)
-    return True
-
-
 async def _sync_from_remote(chat_id: int, root: Path, namespace: object | None = None) -> None:
     try:
         prefix = _remote_prefix(chat_id, namespace)
@@ -475,17 +436,6 @@ async def _sync_from_remote(chat_id: int, root: Path, namespace: object | None =
             await _sync_generic_tree_from_r2(chat_id, root, prefix, namespace=namespace)
     except Exception as exc:
         logger.warning("memory: R2→local directory sync failed (chat=%s): %s", chat_id, exc)
-    # Fetch the legacy JSON only for a clean upgrade.  It is deliberately kept
-    # remote-side for compatibility with older deployments and MCP resources.
-    try:
-        await _sync_named_file_from_r2(chat_id, memory_state_file(chat_id, namespace), LEGACY_FILENAME)
-    except Exception as exc:
-        logger.warning("memory: legacy R2 sync failed (chat=%s): %s", chat_id, exc)
-    try:
-        if _migrate_legacy_json(chat_id, root, namespace):
-            await _sync_to_remote(chat_id, root, namespace)
-    except Exception as exc:
-        logger.warning("memory: legacy migration failed (chat=%s): %s", chat_id, exc)
 
 
 async def _sync_to_remote(chat_id: int, root: Path, namespace: object | None = None) -> None:

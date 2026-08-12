@@ -96,10 +96,6 @@ def state_file(chat_id: object, filename: str, namespace: object | None = None) 
     return chat_state_root(chat_id, namespace) / filename
 
 
-def memory_state_file(chat_id: object, namespace: object | None = None) -> Path:
-    return state_file(chat_id, "memories.json", namespace)
-
-
 def todo_state_file(chat_id: object, namespace: object | None = None) -> Path:
     return state_file(chat_id, "todos.json", namespace)
 
