@@ -22,8 +22,9 @@ from apitelegramchat.search_engine import (
     execute_book_lookup, execute_crypto_price, execute_done, execute_distance,
     execute_exchange_rate, execute_fetch_url, execute_geocode, execute_generate_image,
     execute_generate_video, execute_ip_geo,
-    execute_news, execute_place_details, execute_qr_code, execute_route,
-    execute_search_poi, execute_file_editor, execute_weather, execute_web_search, execute_wikipedia,
+    execute_news, execute_keyword_search, execute_nearby_search, execute_poi_details,
+    execute_qr_code, execute_route, execute_file_editor, execute_weather,
+    execute_web_search, execute_wikipedia,
 )
 from ..core.settings import get_mcp_scope
 
@@ -175,11 +176,12 @@ TOOL_SPECS: list[ToolSpec] = [
     ToolSpec("search.done", "Return a done marker.", lambda **kw: _call(execute_done, **_clean_args(kw)), _schema_for(execute_done, title="search.done")),
     ToolSpec("search.generate_image", "Generate an image.", lambda **kw: _call(execute_generate_image, **_clean_args(kw)), _schema_for(execute_generate_image, title="search.generate_image")),
     ToolSpec("search.generate_video", "Generate a video.", lambda **kw: _call(execute_generate_video, **_clean_args(kw)), _schema_for(execute_generate_video, title="search.generate_video")),
-    ToolSpec("geo.geocode", "Geocode an address.", lambda **kw: _call(execute_geocode, **_clean_args(kw)), _schema_for(execute_geocode, title="geo.geocode")),
-    ToolSpec("geo.search_poi", "Search points of interest.", lambda **kw: _call(execute_search_poi, **_clean_args(kw)), _schema_for(execute_search_poi, title="geo.search_poi")),
-    ToolSpec("geo.route", "Calculate a route.", lambda **kw: _call(execute_route, **_clean_args(kw)), _schema_for(execute_route, title="geo.route")),
-    ToolSpec("geo.distance", "Calculate distance between two points.", lambda **kw: _call(execute_distance, **_clean_args(kw)), _schema_for(execute_distance, title="geo.distance")),
-    ToolSpec("geo.place_details", "Fetch place details.", lambda **kw: _call(execute_place_details, **_clean_args(kw)), _schema_for(execute_place_details, title="geo.place_details")),
+    ToolSpec("geo.geocode", "Convert a structured address to coordinates.", lambda **kw: _call(execute_geocode, **_clean_args(kw)), _schema_for(execute_geocode, title="geo.geocode")),
+    ToolSpec("geo.route", "Plan cycling, walking, driving, or public-transit travel between longitude/latitude coordinates.", lambda **kw: _call(execute_route, **_clean_args(kw)), _schema_for(execute_route, title="geo.route")),
+    ToolSpec("geo.distance", "Measure straight-line distance between two longitude/latitude coordinates.", lambda **kw: _call(execute_distance, **_clean_args(kw)), _schema_for(execute_distance, title="geo.distance")),
+    ToolSpec("geo.poi_keyword_search", "Search POIs by keywords, optionally restricted to a city.", lambda **kw: _call(execute_keyword_search, **_clean_args(kw)), _schema_for(execute_keyword_search, title="geo.poi_keyword_search")),
+    ToolSpec("geo.poi_nearby_search", "Search POIs within a radius around longitude/latitude coordinates.", lambda **kw: _call(execute_nearby_search, **_clean_args(kw)), _schema_for(execute_nearby_search, title="geo.poi_nearby_search")),
+    ToolSpec("geo.poi_details", "Retrieve POI details by an ID returned by a POI search.", lambda **kw: _call(execute_poi_details, **_clean_args(kw)), _schema_for(execute_poi_details, title="geo.poi_details")),
     ToolSpec("workspace.editor", "Edit workspace files with guarded operations.", lambda **kw: _call(execute_file_editor, **_clean_args(kw)), _schema_for(execute_file_editor, title="workspace.editor")),
 ]
 

@@ -85,8 +85,8 @@ SUBAGENT_TOOL_TIMEOUT = _env_int("SUBAGENT_TOOL_TIMEOUT", 120, min_value=5, max_
 DEFAULT_ALLOWED_TOOLS = {
     "web_search", "fetch_url", "wikipedia", "exchange_rate",
     "book_lookup", "weather", "news", "crypto_price", "ip_geo", "qr_code",
-    "geocode", "search_poi", "route", "distance",
-    "place_details",
+    "geocode", "route", "distance", "poi_keyword_search",
+    "poi_nearby_search", "poi_details",
     "bash", "file_editor", "todo",
     # upload/download 显式跨边界工具：子 agent 也允许使用
     "fetch_download", "stage_upload", "list_download", "list_upload",

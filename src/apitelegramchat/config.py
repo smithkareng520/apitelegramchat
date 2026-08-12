@@ -9,9 +9,7 @@ from typing import Dict, Optional
 logger = logging.getLogger(__name__)
 
 # ---------- 环境变量 ----------
-GEOAPIFY_KEY = os.getenv("GEOAPIFY_KEY", "")
 AUTHORIZED_USER = "dearella"
-IMGBB_KEY = os.getenv("IMGBB_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 # OpenRouter 全局路由偏好：默认价格优先、允许自动回退；可用环境变量覆盖。
@@ -21,8 +19,6 @@ OPENROUTER_REQUIRE_PARAMETERS = os.getenv("OPENROUTER_REQUIRE_PARAMETERS", "fals
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 XAI_API_KEY = os.getenv("XAI_API_KEY")
-TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY")
-ORS_API_KEY = os.getenv("ORS_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GLM_API_KEY = os.getenv("GLM_API_KEY", "")
 MODELSCOPE_API_KEY = os.getenv("MODELSCOPE_API_KEY", "")
@@ -589,7 +585,6 @@ _SENSITIVE_EXACT = {
     "XAI_API_KEY", "GROQ_API_KEY", "MODELSCOPE_API_KEY", "AGNES_API_KEY",
     "R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY",
     "R2_BUCKET_NAME", "R2_PUBLIC_URL", "R2_REGION",
-    "GEOAPIFY_KEY", "IMGBB_KEY", "TOMTOM_API_KEY", "ORS_API_KEY",
     "BING_CN_MCP_TOKEN", "GAODE_MCP_TOKEN",
     "WEBHOOK_TOKEN", "WEBHOOK_URL",
 }

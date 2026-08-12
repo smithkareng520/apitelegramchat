@@ -5,7 +5,6 @@ import subprocess
 import random
 import aiohttp
 import json
-import hashlib
 import time
 from pathlib import Path
 from apitelegramchat.workspace_paths import (
@@ -34,16 +33,13 @@ from apitelegramchat.sandbox import (
 )
 
 from apitelegramchat.config import (
-    R2_PUBLIC_URL,
     MAX_CONCURRENT_TOOLS,
     BASE_URL,
-    GEOAPIFY_KEY,
 )
 
 _TOOL_TIMEOUT_MARKER = "__TOOL_TIMEOUT__"
 
 import shutil
-from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2
 from apitelegramchat.search_engine import (
     execute_web_search,
     execute_fetch_url,
@@ -60,10 +56,11 @@ from apitelegramchat.search_engine import (
     execute_generate_video,
     # 地图工具（全部委托给 amap-maps MCP）
     execute_geocode,
-    execute_search_poi,
+    execute_keyword_search,
+    execute_nearby_search,
+    execute_poi_details,
     execute_route,
     execute_distance,
-    execute_place_details,
     execute_file_editor,
 )
 from apitelegramchat.todo_tool import (
@@ -618,86 +615,6 @@ async def execute_bash(
     # 执行命令；workspace 本地文件不会自动同步到 R2。
     return await session.execute(command, progress_callback=progress_callback)
 
-# ---------- 静态地图生成 ----------
-async def _get_static_map_image(
-        lat: float,
-        lon: float,
-        markers: list = None,
-        zoom: int = 15,
-        width: int = 600,
-        height: int = 400
-) -> Optional[str]:
-    cache_key = hashlib.md5(f"{lat}{lon}{zoom}{markers}".encode()).hexdigest()
-    r2_key = f"maps/{cache_key}.png"
-
-    if await file_exists_in_r2(r2_key):
-        if R2_PUBLIC_URL:
-            return f"{R2_PUBLIC_URL.rstrip('/')}/{r2_key}"
-
-    # 静态地图来源：Geoapify（若配置 GEOAPIFY_KEY）或 OSM staticmap。
-    # 原高德静态地图分支（amap_integration.static_map_url_amap）已随
-    # amap_integration.py 一并删除——高德能力统一改由 amap-maps MCP 服务
-    # 提供，仅用于结构化数据查询（geocode/POI/route/distance/ip_geo），
-    # 静态地图预览继续走通用 Geoapify / OSM 渲染管线。
-    marker_str = ""
-    if markers:
-        colors = ['blue', 'green', 'orange', 'purple', 'brown', 'red']
-        for idx, m in enumerate(markers[:10]):
-            color = colors[idx % len(colors)]
-            label = chr(65 + idx)
-            marker_str += f"&markers={color}%7C{m['lat']},{m['lon']}"
-    else:
-        marker_str = f"&markers=red%7C{lat},{lon}"
-
-    geoapify_key = GEOAPIFY_KEY or ""
-    if geoapify_key:
-        url = (
-            f"https://maps.geoapify.com/v1/staticmap"
-            f"?style=osm-carto&width={width}&height={height}"
-            f"&center=lonlat:{lon},{lat}&zoom={zoom}"
-            f"&apiKey={geoapify_key}"
-        )
-        if markers:
-            for idx, m in enumerate(markers[:10]):
-                label = chr(65 + idx)
-                url += f"&marker=lonlat:{m['lon']},{m['lat']};color:%23ff3300;size:medium;text:{label}"
-        else:
-            url += f"&marker=lonlat:{lon},{lat};color:%23ff3300;size:medium"
-        sources = [url]
-    else:
-        sources = [
-            (
-                f"https://staticmap.openstreetmap.de/staticmap.php"
-                f"?center={lat},{lon}&zoom={zoom}&size={width}x{height}{marker_str}"
-            )
-        ]
-
-    for static_url in sources:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                        static_url,
-                        timeout=aiohttp.ClientTimeout(total=12)
-                ) as resp:
-                    if resp.status == 200:
-                        img_bytes = await resp.read()
-                        if len(img_bytes) > 500:  # 排除空响应
-                            uploaded_url = await upload_bytes_to_r2(
-                                img_bytes, r2_key, "image/png"
-                            )
-                            return uploaded_url
-        except Exception as e:
-            # 仅记录主机名和异常，避免泄露包含 apiKey 的完整 URL
-            try:
-                from urllib.parse import urlparse as _up
-                _host = _up(static_url).netloc or "unknown"
-            except Exception:
-                _host = "unknown"
-            logger.warning(f"静态地图源失败 host={_host}: {e}")
-            continue
-
-    return None
-
 # ---------- 工具结果格式化 ----------
 
 # Magic marker emitted by ai_handlers.run_one on asyncio.TimeoutError.
@@ -718,10 +635,11 @@ _TOOL_TIMEOUT_LABELS = {
     "qr_code": "QR code generation",
     "generate_video": "Video generation",
     "geocode": "Geocoding",
-    "search_poi": "POI search",
     "route": "Route planning",
     "distance": "Distance calculation",
-    "place_details": "Place details fetch",
+    "poi_keyword_search": "POI keyword search",
+    "poi_nearby_search": "Nearby POI search",
+    "poi_details": "POI detail lookup",
     "file_editor": "Editor operation",
     "bash": "Bash command",
     "present_files": "File presentation",
@@ -1086,15 +1004,16 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
     # 都已废弃），改为：
     #   - 若解析出 JSON 且含 status=error，则显示为失败
     #   - 否则把原始输出转义后直接展示给用户，让 LLM 在后续轮次里自由解读。
-    elif fn_name in ("geocode", "search_poi", "route", "distance",
-                     "place_details", "ip_geo"):
+    elif fn_name in ("geocode", "route", "distance", "poi_keyword_search",
+                     "poi_nearby_search", "poi_details", "ip_geo"):
         label_map = {
-            "geocode":       "📍 地理编码",
-            "search_poi":    "📍 POI 搜索",
-            "route":         "🚗 路线规划",
-            "distance":      "📏 距离",
-            "place_details": "📍 地点详情",
-            "ip_geo":        "🌍 IP 地理位置",
+            "geocode":            "📍 地理编码",
+            "route":              "🚗 路线规划",
+            "distance":           "📏 距离测量",
+            "poi_keyword_search": "📍 POI 关键词搜索",
+            "poi_nearby_search": "📍 POI 周边搜索",
+            "poi_details":        "📍 POI 详情",
+            "ip_geo":             "🌍 IP 地理位置",
         }
         base_label = label_map.get(fn_name, fn_name)
 
@@ -1641,32 +1560,32 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
         # 地图工具
         elif name == "geocode":
             return await execute_geocode(arguments.get("address", ""))
-        elif name == "search_poi":
-            return await execute_search_poi(
-                arguments.get("lat", 0),
-                arguments.get("lon", 0),
-                arguments.get("query", ""),
-                arguments.get("radius", 1000)
-            )
         elif name == "route":
             return await execute_route(
-                arguments.get("start", ""),
-                arguments.get("end", ""),
-                arguments.get("profile", "driving")
+                arguments.get("origin", ""),
+                arguments.get("destination", ""),
+                arguments.get("mode", "driving"),
+                arguments.get("city"),
+                arguments.get("cityd"),
             )
         elif name == "distance":
             return await execute_distance(
-                arguments.get("from_lat", 0),
-                arguments.get("from_lon", 0),
-                arguments.get("to_lat", 0),
-                arguments.get("to_lon", 0)
+                arguments.get("origin", ""),
+                arguments.get("destination", ""),
             )
-        elif name == "place_details":
-            return await execute_place_details(
-                arguments.get("query", ""),
-                arguments.get("lat"),
-                arguments.get("lon")
+        elif name == "poi_keyword_search":
+            return await execute_keyword_search(
+                arguments.get("keywords", ""),
+                arguments.get("city"),
             )
+        elif name == "poi_nearby_search":
+            return await execute_nearby_search(
+                arguments.get("keywords", ""),
+                arguments.get("location", ""),
+                arguments.get("radius"),
+            )
+        elif name == "poi_details":
+            return await execute_poi_details(arguments.get("id", ""))
         elif name == "file_editor":
             return await execute_file_editor(
                 chat_id=chat_id,

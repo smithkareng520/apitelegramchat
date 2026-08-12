@@ -44,6 +44,25 @@ tools return an MCP-not-configured error. There is no longer any self-hosted
 fallback (Nominatim / Overpass / OSRM / TomTom / ORS / Geoapify static maps
 were removed together with `amap_integration.py`).
 
+### Map tool contract
+
+The project exposes the following map tools through both the agent runtime and
+its MCP registry. All coordinate inputs use the unambiguous AMap order
+`longitude,latitude` (for example, `116.397128,39.916527`).
+
+| Runtime tool | MCP tool | Required input | Notes |
+| --- | --- | --- | --- |
+| `route` | `geo.route` | `origin`, `destination` | Set `mode` to `cycling`, `walking`, `driving`, or `transit`. Cross-city transit must include both `city` and `cityd`. |
+| `distance` | `geo.distance` | `origin`, `destination` | Measures straight-line distance. |
+| `poi_keyword_search` | `geo.poi_keyword_search` | `keywords` | `city` is optional. |
+| `poi_nearby_search` | `geo.poi_nearby_search` | `keywords`, `location` | `radius` is optional and must be 1–50000 metres when supplied. |
+| `poi_details` | `geo.poi_details` | `id` | The ID must come from a keyword or nearby POI search result. |
+
+The cycling adapter first requests `maps_bicycling` and only falls back to
+`maps_direction_bicycling` when the configured upstream MCP server explicitly
+reports that the first tool name is unavailable. This supports both observed
+AMap MCP naming variants without masking normal upstream errors.
+
 ## Security verification
 
 Run this in the deployed Linux container after enabling the shell tool:

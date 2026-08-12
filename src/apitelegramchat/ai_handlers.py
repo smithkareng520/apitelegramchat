@@ -1964,12 +1964,13 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
         "geocode": "Geocoding address",
         "route": "Planning route",
         "distance": "Measuring distance",
-        "place_details": "Fetching place details",
+        "poi_keyword_search": "Searching POI by keyword",
+        "poi_nearby_search": "Searching nearby POI",
+        "poi_details": "Fetching POI details",
         "exchange_rate": "Checking exchange rates",
         "crypto_price": "Fetching crypto prices",
         "weather": "Fetching weather",
         "qr_code": "Generating QR code",
-        "search_poi": "Searching POI",
     }
     return mapping.get(fn_name, "Running...")
 
@@ -2006,10 +2007,11 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
         "qr_code": "generated a QR code",
         "generate_video": "generated a video",
         "geocode": "geocoded an address",
-        "search_poi": "searched for points of interest",
+        "poi_keyword_search": "searched for points of interest by keyword",
+        "poi_nearby_search": "searched for nearby points of interest",
+        "poi_details": "fetched POI details",
         "route": "planned a route",
         "distance": "measured a distance",
-        "place_details": "fetched place details",
         "bash": "ran a command",
         "present_files": "presented files",
         "fetch_download": "fetched files from download/",
@@ -2502,13 +2504,14 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         "nearby_search": "Searched nearby",
         "route": "Planned a route",
         "distance": "Measured a distance",
-        "place_details": "Fetched place details",
+        "poi_keyword_search": "Searched POIs by keyword",
+        "poi_nearby_search": "Searched nearby POIs",
+        "poi_details": "Fetched POI details",
         "exchange_rate": "Checked exchange rates",
         "crypto_price": "Fetched crypto prices",
         "public_holidays": "Looked up holidays",
         "weather": "Fetched weather",
         "convert": "Calculated a result",
-        "search_poi": "Searched for points of interest",
     }
     return mapping.get(fn_name, "Ran an action")
 
@@ -2949,8 +2952,12 @@ class RichMessageBuilder:
             group["outer_summary"] = "Planning route"
         elif t == "distance":
             group["outer_summary"] = "Measuring distance"
-        elif t == "place_details":
-            group["outer_summary"] = "Fetching place details"
+        elif t == "poi_keyword_search":
+            group["outer_summary"] = "Searching POI by keyword"
+        elif t == "poi_nearby_search":
+            group["outer_summary"] = "Searching nearby POI"
+        elif t == "poi_details":
+            group["outer_summary"] = "Fetching POI details"
         elif t == "exchange_rate":
             group["outer_summary"] = "Checking exchange rates"
         elif t == "crypto_price":
@@ -2971,8 +2978,6 @@ class RichMessageBuilder:
                 group["outer_summary"] = "Editing an image"
             else:
                 group["outer_summary"] = f"Editing {num_images} images"
-        elif t == "search_poi":
-            group["outer_summary"] = "Searching POI"
         else:
             action = target.get("action_description") or _generate_action_description(t, fn_args)
             group["outer_summary"] = action.capitalize() + "..." if action else "Running..."
@@ -3004,7 +3009,9 @@ class RichMessageBuilder:
         "nearby_search": ("Searched nearby", "Searched nearby for {n} categories"),
         "route": ("Planned a route", "Planned {n} routes"),
         "distance": ("Measured a distance", "Measured a distance"),
-        "place_details": ("Fetched place details", "Fetched details for {n} places"),
+        "poi_keyword_search": ("Searched POIs by keyword", "Searched POIs by keyword"),
+        "poi_nearby_search": ("Searched nearby POIs", "Searched nearby POIs"),
+        "poi_details": ("Fetched POI details", "Fetched details for {n} POIs"),
         "exchange_rate": ("Checked exchange rates", "Checked exchange rates"),
         "crypto_price": ("Fetched crypto prices", "Fetched price for {n} coins"),
         "public_holidays": ("Looked up holidays", "Looked up holidays for {n} countries"),
@@ -3013,7 +3020,6 @@ class RichMessageBuilder:
         "qr_code": ("Generated a QR code", "Generated {n} QR codes"),
         "generate_image_from_text": ("Generated an image", "Generated {n} images"),
         "edit_image_with_reference": ("Edited an image", "Edited {n} images"),
-        "search_poi": ("Searched for points of interest", "Searched for {n} POIs"),
         "ask_user": ("Asked you a question", "Asked you questions"),
     }
 

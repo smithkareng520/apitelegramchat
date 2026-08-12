@@ -835,11 +835,8 @@ SEARCH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：将北京西站转为坐标"
-                    },
-                    "address": {"type": "string", "description": "地址或地名，如 '北京市海淀区中关村'"}
+                    "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
+                    "address": {"type": "string", "description": "地址或地名，如“北京市海淀区中关村”。"}
                 },
                 "required": ["address"]
             }
@@ -849,23 +846,22 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "route",
-            "description": "规划两点之间的路线（driving / walking / cycling / transit）。委托给 amap-maps MCP 的 maps_direction_* 工具。返回总距离、总时间、分段指引及起终点坐标。",
+            "description": "统一规划骑行、步行、驾车或公交路线。origin 与 destination 必须是高德坐标“经度,纬度”；公交跨城时必须同时提供 city 和 cityd。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：规划从家到公司的驾车路线"
-                    },
-                    "start": {"type": "string", "description": "起点地址或坐标（lat,lon）"},
-                    "end": {"type": "string", "description": "终点地址或坐标"},
-                    "profile": {"type": "string", "enum": ["driving", "walking", "cycling", "transit"], "default": "driving"}
+                    "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
+                    "origin": {"type": "string", "description": "起点经纬度，格式为“经度,纬度”，例如“116.397128,39.916527”。"},
+                    "destination": {"type": "string", "description": "终点经纬度，格式为“经度,纬度”。"},
+                    "mode": {"type": "string", "enum": ["cycling", "walking", "driving", "transit"], "default": "driving", "description": "骑行、步行、驾车或公交。"},
+                    "city": {"type": "string", "description": "公交起点城市；跨城公交时必填。"},
+                    "cityd": {"type": "string", "description": "公交终点城市；跨城公交时必填。"}
                 },
-                "required": ["start", "end"]
+                "required": ["origin", "destination"]
             },
             "input_examples": [
-                {"start": "北京市朝阳区望京", "end": "海淀区中关村", "profile": "driving"},
-                {"start": "39.9,116.3", "end": "40.0,116.4", "profile": "walking"}
+                {"origin": "116.397128,39.916527", "destination": "116.481488,39.990464", "mode": "cycling"},
+                {"origin": "116.397128,39.916527", "destination": "121.473701,31.230416", "mode": "transit", "city": "北京", "cityd": "上海"}
             ]
         }
     },
@@ -873,62 +869,63 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "distance",
-            "description": "计算地球上两点之间的直线距离。委托给 amap-maps MCP 的 maps_distance 工具。",
+            "description": "测量两个高德经纬度坐标之间的直线距离。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：计算北京到上海的直线距离"
-                    },
-                    "from_lat": {"type": "number", "description": "起点纬度"},
-                    "from_lon": {"type": "number", "description": "起点经度"},
-                    "to_lat": {"type": "number", "description": "终点纬度"},
-                    "to_lon": {"type": "number", "description": "终点经度"}
+                    "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
+                    "origin": {"type": "string", "description": "起点经纬度，格式“经度,纬度”。"},
+                    "destination": {"type": "string", "description": "终点经纬度，格式“经度,纬度”。"}
                 },
-                "required": ["from_lat", "from_lon", "to_lat", "to_lon"]
+                "required": ["origin", "destination"]
             }
         }
     },
     {
         "type": "function",
         "function": {
-            "name": "place_details",
-            "description": "获取地点详情：名称、电话、网站、营业时间、菜系、评分、无障碍设施、Wi-Fi 等。委托给 amap-maps MCP 的 maps_text_search 工具。",
+            "name": "poi_keyword_search",
+            "description": "按关键词搜索 POI；有明确城市范围时传 city，不要将 POI ID 传入本工具。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：查询故宫的开放时间"
-                    },
-                    "query": {"type": "string", "description": "地点名称，如 '故宫博物院'"},
-                    "lat": {"type": "number", "description": "可选：已知纬度，提高搜索精度"},
-                    "lon": {"type": "number", "description": "可选：已知经度"}
+                    "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
+                    "keywords": {"type": "string", "description": "搜索关键词，如“故宫博物院”。"},
+                    "city": {"type": "string", "description": "可选的查询城市，如“北京”。"}
                 },
-                "required": ["query"]
+                "required": ["keywords"]
             }
         }
     },
     {
         "type": "function",
         "function": {
-            "name": "search_poi",
-            "description": "以某点为中心、按关键词搜索周边兴趣点（POI）。委托给 amap-maps MCP 的 maps_around_search 工具。返回匹配地点列表及详情。",
+            "name": "poi_nearby_search",
+            "description": "在指定中心点附近搜索 POI。location 必须是“经度,纬度”，radius 单位为米。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：搜索故宫"
-                    },
-                    "lat": {"type": "number", "description": "中心纬度"},
-                    "lon": {"type": "number", "description": "中心经度"},
-                    "query": {"type": "string", "description": "搜索关键词，如 '天安门'"},
-                    "radius": {"type": "number", "description": "半径（米），默认 1000"},
-                    "max_results": {"type": "integer", "description": "最大结果数 (1-30)", "default": 15}
+                    "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
+                    "keywords": {"type": "string", "description": "搜索关键词，如“咖啡馆”。"},
+                    "location": {"type": "string", "description": "中心点经纬度，格式“经度,纬度”。"},
+                    "radius": {"type": "integer", "description": "半径，单位米，范围 1–50000，默认 1000。"}
                 },
-                "required": ["lat", "lon", "query"]
+                "required": ["keywords", "location"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "poi_details",
+            "description": "根据关键词搜索或周边搜索返回的 POI ID 获取地点详情；不要传地点名称。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
+                    "id": {"type": "string", "description": "关键词搜索或周边搜索返回的 POI ID。"}
+                },
+                "required": ["id"]
             }
         }
     },
@@ -2571,6 +2568,61 @@ def _empty_mcp_error(tool_name: str) -> str:
     )
 
 
+def _amap_error(message: str, *, code: str = "invalid_request") -> str:
+    """返回统一、可被 MCP 调用方解析的地图工具错误。"""
+    return json.dumps({"status": "error", "code": code, "message": message}, ensure_ascii=False)
+
+
+def _is_unknown_mcp_tool_error(error: Exception) -> bool:
+    """仅在服务端明确提示工具不存在时启用别名回退，避免吞掉真实业务错误。"""
+    text = str(error).lower()
+    markers = ("unknown tool", "tool not found", "method not found", "不存在", "未找到工具")
+    return any(marker in text for marker in markers)
+
+
+async def _call_amap_mcp_candidates(tool_names: list[str], arguments: dict[str, Any]) -> str:
+    """按优先级调用高德 MCP 工具，并仅对未知工具名启用兼容别名。"""
+    if not tool_names:
+        return _amap_error("未配置高德 MCP 工具名", code="configuration_error")
+    last_error: Exception | None = None
+    for index, tool_name in enumerate(tool_names):
+        try:
+            raw = await call_mcp_tool("amap-maps", tool_name, arguments)
+            if raw:
+                return raw
+            return _empty_mcp_error(tool_name)
+        except MCPToolError as exc:
+            last_error = exc
+            if index < len(tool_names) - 1 and _is_unknown_mcp_tool_error(exc):
+                logger.info("高德 MCP 工具 %s 不可用，尝试兼容别名", tool_name)
+                continue
+            return _amap_error(f"amap-maps MCP 调用失败（{tool_name}）：{exc}", code="upstream_error")
+    return _amap_error(f"amap-maps MCP 调用失败：{last_error}", code="upstream_error")
+
+
+def _normalize_amap_coordinate(value: Any, field_name: str) -> str:
+    """校验并规范化高德坐标为 ``经度,纬度``（WGS/GCJ 坐标系由上游约定）。"""
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        raw_lng, raw_lat = value
+    elif isinstance(value, str):
+        parts = [item.strip() for item in value.split(",")]
+        if len(parts) != 2:
+            raise ValueError(f"{field_name} 必须是“经度,纬度”格式，例如 116.397128,39.916527")
+        raw_lng, raw_lat = parts
+    else:
+        raise ValueError(f"{field_name} 必须是“经度,纬度”字符串")
+    try:
+        lng = float(raw_lng)
+        lat = float(raw_lat)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} 必须包含合法数字经纬度") from exc
+    if not (-180 <= lng <= 180):
+        raise ValueError(f"{field_name} 的经度必须在 -180 到 180 之间")
+    if not (-90 <= lat <= 90):
+        raise ValueError(f"{field_name} 的纬度必须在 -90 到 90 之间")
+    return f"{lng:.6f},{lat:.6f}"
+
+
 # ---------------------------------------------------------------------------
 # 内部辅助：通过 amap-maps MCP 把地址转坐标
 # ---------------------------------------------------------------------------
@@ -2635,111 +2687,141 @@ async def execute_geocode(address: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 2. POI 搜索
+# 2. POI 关键词、周边与详情搜索
 # ---------------------------------------------------------------------------
-async def execute_search_poi(lat: float, lon: float, query: str,
-                              radius: int = 1000, max_results: int = 15) -> str:
-    """周边 POI 搜索。委托给 amap-maps MCP 的 maps_around_search 工具。
-
-    amap 接受 "经度,纬度" 顺序的 location，半径单位米，范围 [100, 50000]。
-    """
-    if not query or not query.strip():
-        return json.dumps({"status": "error", "message": "搜索关键词为空"}, ensure_ascii=False)
-    radius_clamped = min(max(int(radius or 1000), 100), 50000)
-    arguments: dict[str, Any] = {
-        "location": f"{lon},{lat}",
-        "keywords": query.strip(),
-        "radius": str(radius_clamped),
-    }
-    return await _call_amap_mcp("maps_around_search", arguments)
+async def execute_keyword_search(keywords: str, city: str | None = None) -> str:
+    """按关键词搜索 POI；可用 city 将查询限定在指定城市。"""
+    keyword_text = str(keywords or "").strip()
+    if not keyword_text:
+        return _amap_error("keywords 不能为空")
+    arguments: dict[str, Any] = {"keywords": keyword_text}
+    if city is not None:
+        city_text = str(city).strip()
+        if not city_text:
+            return _amap_error("city 如提供则不能为空")
+        arguments["city"] = city_text
+    return await _call_amap_mcp("maps_text_search", arguments)
 
 
-# ---------------------------------------------------------------------------
-# 3. 路线规划
-# ---------------------------------------------------------------------------
-async def execute_route(start: str, end: str, profile: str = "driving") -> str:
-    """路线规划。委托给 amap-maps MCP 的 maps_direction_* 工具。
-
-    起终点支持 "lat,lon" 坐标对或地址文本。地址会先通过 maps_geo 解析为坐标。
-    """
-    profile_to_tool = {
-        "driving":  "maps_direction_driving",
-        "walking":  "maps_direction_walking",
-        "cycling":  "maps_direction_bicycling",
-        "transit":  "maps_direction_transit_integrated",
-    }
-    tool_name = profile_to_tool.get((profile or "driving").strip().lower(), "maps_direction_driving")
-
-    async def _resolve_location(loc: str) -> str | None:
-        """把 "lat,lon" 或地址文本解析为 amap 期望的 "lng,lat" 字符串。"""
-        loc = (loc or "").strip()
-        if not loc:
-            return None
-        m = re.match(r'^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$', loc)
-        if m:
-            lat, lon = float(m.group(1)), float(m.group(2))
-            return f"{lon},{lat}"
-        coords = await _geocode_coords(loc)
-        if coords is None:
-            return None
-        lat, lon, _ = coords
-        return f"{lon},{lat}"
-
+async def execute_nearby_search(
+    keywords: str,
+    location: str,
+    radius: int | None = None,
+) -> str:
+    """在中心点周边检索 POI；location 必须为 ``经度,纬度``。"""
+    keyword_text = str(keywords or "").strip()
+    if not keyword_text:
+        return _amap_error("keywords 不能为空")
     try:
-        origin, destination = await asyncio.gather(
-            _resolve_location(start),
-            _resolve_location(end),
-        )
-    except Exception as e:
-        return json.dumps(
-            {"status": "error", "message": f"解析起终点失败：{str(e)[:120]}"},
-            ensure_ascii=False,
-        )
-    if origin is None:
-        return json.dumps({"status": "error", "message": f"无法解析起点：{start}"}, ensure_ascii=False)
-    if destination is None:
-        return json.dumps({"status": "error", "message": f"无法解析终点：{end}"}, ensure_ascii=False)
+        normalized_location = _normalize_amap_coordinate(location, "location")
+    except ValueError as exc:
+        return _amap_error(str(exc))
+    if radius is None:
+        radius_value = 1000
+    else:
+        if isinstance(radius, bool):
+            return _amap_error("radius 必须是 1 到 50000 之间的整数（米）")
+        try:
+            radius_value = int(radius)
+        except (TypeError, ValueError):
+            return _amap_error("radius 必须是 1 到 50000 之间的整数（米）")
+        if radius_value < 1 or radius_value > 50000:
+            return _amap_error("radius 必须在 1 到 50000 米之间")
+    return await _call_amap_mcp(
+        "maps_around_search",
+        {"keywords": keyword_text, "location": normalized_location, "radius": str(radius_value)},
+    )
 
-    arguments: dict[str, Any] = {"origin": origin, "destination": destination}
-    if tool_name == "maps_direction_transit_integrated":
-        # amap 公交路径要求 city 参数；无法从坐标稳定推断时让服务端兜底。
-        arguments["city"] = "全国"
-    return await _call_amap_mcp(tool_name, arguments)
+
+async def execute_poi_details(id: str) -> str:
+    """按关键词或周边搜索结果中的 POI ID 查询地点详情。"""
+    poi_id = str(id or "").strip()
+    if not poi_id:
+        return _amap_error("id 不能为空；请传入关键词搜索或周边搜索返回的 POI ID")
+    return await _call_amap_mcp_candidates(["maps_search_detail"], {"id": poi_id})
+
+
+# ---------------------------------------------------------------------------
+# 3. 统一路线规划：用 mode 合并骑行、步行、驾车和公交四类能力
+# ---------------------------------------------------------------------------
+_ROUTE_TOOL_CANDIDATES: dict[str, list[str]] = {
+    # 官方不同发布版本对骑行工具名存在差异，未知工具名时才按顺序降级。
+    "cycling": ["maps_bicycling", "maps_direction_bicycling"],
+    "walking": ["maps_direction_walking"],
+    "driving": ["maps_direction_driving"],
+    "transit": ["maps_direction_transit_integrated"],
+}
+
+_ROUTE_MODE_ALIASES = {
+    "bicycle": "cycling",
+    "bicycling": "cycling",
+    "bike": "cycling",
+    "cycling": "cycling",
+    "walk": "walking",
+    "walking": "walking",
+    "drive": "driving",
+    "driving": "driving",
+    "car": "driving",
+    "transit": "transit",
+    "public_transit": "transit",
+    "public-transport": "transit",
+}
+
+
+async def execute_route(
+    origin: str,
+    destination: str,
+    mode: str = "driving",
+    city: str | None = None,
+    cityd: str | None = None,
+) -> str:
+    """规划骑行、步行、驾车或公交路线；坐标统一使用 ``经度,纬度``。"""
+    try:
+        normalized_origin = _normalize_amap_coordinate(origin, "origin")
+        normalized_destination = _normalize_amap_coordinate(destination, "destination")
+    except ValueError as exc:
+        return _amap_error(str(exc))
+
+    mode_key = _ROUTE_MODE_ALIASES.get(str(mode or "").strip().lower())
+    if mode_key is None:
+        return _amap_error("mode 必须是 cycling、walking、driving 或 transit")
+
+    arguments: dict[str, Any] = {
+        "origin": normalized_origin,
+        "destination": normalized_destination,
+    }
+    city_text = str(city).strip() if city is not None else ""
+    cityd_text = str(cityd).strip() if cityd is not None else ""
+    if city is not None and not city_text:
+        return _amap_error("city 如提供则不能为空")
+    if cityd is not None and not cityd_text:
+        return _amap_error("cityd 如提供则不能为空")
+    if mode_key != "transit" and (city_text or cityd_text):
+        return _amap_error("city 和 cityd 仅适用于 transit 公交路径规划")
+    if cityd_text and not city_text:
+        return _amap_error("跨城 transit 路线必须同时提供 city 和 cityd")
+    if city_text:
+        arguments["city"] = city_text
+    if cityd_text:
+        arguments["cityd"] = cityd_text
+
+    return await _call_amap_mcp_candidates(_ROUTE_TOOL_CANDIDATES[mode_key], arguments)
 
 
 # ---------------------------------------------------------------------------
 # 4. 两点距离
 # ---------------------------------------------------------------------------
-async def execute_distance(from_lat: float, from_lon: float,
-                           to_lat: float, to_lon: float) -> str:
-    """两点直线距离。委托给 amap-maps MCP 的 maps_distance 工具。
-
-    amap 接受 "经度,纬度" 顺序，type=1 表示直线距离。
-    """
-    arguments = {
-        "origins": f"{from_lon},{from_lat}",
-        "destination": f"{to_lon},{to_lat}",
-        "type": "1",
-    }
-    return await _call_amap_mcp("maps_distance", arguments)
-
-
-# ---------------------------------------------------------------------------
-# 5. 地点详情
-# ---------------------------------------------------------------------------
-async def execute_place_details(query: str,
-                                lat: float = None,
-                                lon: float = None) -> str:
-    """地点详情。委托给 amap-maps MCP 的 maps_text_search 工具。
-
-    若提供 lat/lon，附加 location 参数以提升搜索精度。
-    """
-    if not query or not query.strip():
-        return json.dumps({"status": "error", "message": "地点名称为空"}, ensure_ascii=False)
-    arguments: dict[str, Any] = {"keywords": query.strip()}
-    if lat is not None and lon is not None:
-        arguments["location"] = f"{lon},{lat}"
-    return await _call_amap_mcp("maps_text_search", arguments)
+async def execute_distance(origin: str, destination: str) -> str:
+    """测量两点直线距离；origin 与 destination 均为 ``经度,纬度``。"""
+    try:
+        normalized_origin = _normalize_amap_coordinate(origin, "origin")
+        normalized_destination = _normalize_amap_coordinate(destination, "destination")
+    except ValueError as exc:
+        return _amap_error(str(exc))
+    return await _call_amap_mcp(
+        "maps_distance",
+        {"origins": normalized_origin, "destination": normalized_destination, "type": "1"},
+    )
 
 
 # ===================== 文件编辑器工具实现 =====================

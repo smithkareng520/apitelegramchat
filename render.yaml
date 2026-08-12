@@ -45,14 +45,6 @@ services:
         sync: false
       - key: R2_REGION
         value: auto
-      - key: GEOAPIFY_KEY
-        sync: false
-      - key: IMGBB_KEY
-        sync: false
-      - key: TOMTOM_API_KEY
-        sync: false
-      - key: ORS_API_KEY
-        sync: false
       - key: WEBHOOK_URL
         sync: false
       - key: BING_CN_MCP_URL
