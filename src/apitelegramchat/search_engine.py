@@ -1360,55 +1360,111 @@ SEARCH_TOOLS = [
 # 工具实现
 # =============================================================================
 
-# 网页搜索统一通过 Bing CN MCP 的 `bing_search` 工具完成；地图能力仍通过 AMap MCP 提供。
+# Google CSE / DuckDuckGo 抓取实现已移除，搜索改为通过外部 MCP 服务
+# （bing-cn-mcp-server，见 mcp_client.py）调用其 bing_search 工具。
 
-def _parse_bing_search_text(raw: str, requested: int) -> list[dict[str, str]]:
-    """解析 Bing CN MCP 的文本返回，同时兼容 JSON 返回。"""
-    text = (raw or "").strip()
-    if not text:
-        return []
+# 专门用于触发 retry_async 重试的临时异常——MCP 搜索服务限流/超时或空结果时抛出
+class MCPSearchTransientError(Exception):
+    """外部 MCP 搜索服务临时不可用 / 空结果，可重试。"""
+
+
+@retry_async(max_retries=2, delay=1.5, backoff=2.0,
+            exceptions=(MCPToolError, MCPSearchTransientError, asyncio.TimeoutError))
+async def _search_via_mcp(query: str, num_results: int) -> list[dict] | None:
+    """通过外部 MCP 服务（bing-cn-mcp-server 的 bing_search 工具）执行网页搜索。
+
+    工具协议：bing_search(query: str, count?: int, offset?: int) -> 纯文本，
+    形如：
+        搜索关键词: ...
+        找到约 N 条结果
+        返回前 M 条结果:
+        ====...====
+        [1] 标题
+            链接: https://...
+            摘要: ...
+        [2] ...
+    这里把该文本解析为统一的 {title, link, snippet} 列表，交给
+    _format_search_results 统一格式化，保持对外的返回格式不变。
+    """
+    query = (query or "").strip()
+    if not query:
+        return None
 
     try:
-        payload = json.loads(text)
-    except (TypeError, json.JSONDecodeError):
-        payload = None
+        raw_text = await call_mcp_tool(
+            "bing-cn-mcp-server",
+            "bing_search",
+            {"query": query, "count": num_results},
+        )
+    except MCPToolError as e:
+        logger.warning(f"MCP 搜索调用失败: {e}")
+        raise
 
-    if isinstance(payload, dict):
-        candidates = payload.get("results") or payload.get("items") or payload.get("data")
-        if isinstance(candidates, dict):
-            candidates = candidates.get("results") or candidates.get("items")
-        if isinstance(candidates, list):
-            items: list[dict[str, str]] = []
-            for item in candidates:
-                if not isinstance(item, dict):
-                    continue
-                title = str(item.get("title") or item.get("name") or "无标题").strip()
-                link = str(item.get("url") or item.get("link") or "").strip()
-                snippet = str(item.get("snippet") or item.get("description") or item.get("summary") or "").strip()
-                if link:
-                    items.append({"title": title or "无标题", "link": link, "snippet": snippet})
-                if len(items) >= requested:
-                    break
-            if items:
-                return items
+    items = _parse_bing_mcp_result(raw_text, num_results)
+    if items:
+        return items
 
-    # Bing CN MCP 当前实现返回类似：
-    # [1] 标题\n    #     链接: https://...\n    #     摘要: ...
-    pattern = re.compile(
-        r"(?ms)^\s*\[(\d+)\]\s+(.+?)\n\s*链接:\s*(https?://\S+)\s*\n\s*摘要:\s*(.*?)(?=\n\s*\[\d+\]\s+|\Z)"
-    )
+    logger.info("MCP 搜索服务返回空结果")
+    raise MCPSearchTransientError("MCP search returned no results")
+
+
+def _parse_bing_mcp_result(raw_text: str, num_results: int) -> list[dict]:
+    """解析 bing-cn-mcp-server 的 bing_search 返回，提取 title/link/snippet。
+
+    当前服务端返回的是 JSON 字符串（见 test_mcp_bing_search.py 实测输出）：
+        {"query": "...", "results": [{"uuid","title","url","snippet","displayUrl"}, ...], "totalResults": N}
+    优先按 JSON 解析；如果服务端将来又切回旧的纯文本格式
+        [1] 标题
+            链接: https://...
+            摘要: ...
+    则回退到原来的正则解析，保证兼容两种返回。
+    """
+    if not raw_text:
+        return []
+
+    # ---- 优先尝试 JSON 格式 ----
+    try:
+        data = json.loads(raw_text)
+    except (json.JSONDecodeError, TypeError):
+        data = None
+
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        items: list[dict] = []
+        for r in data["results"]:
+            if not isinstance(r, dict):
+                continue
+            title = (r.get("title") or "").strip() or "无标题"
+            link = (r.get("url") or r.get("link") or "").strip()
+            snippet = (r.get("snippet") or "").strip()
+            if not link:
+                continue
+            items.append({"title": title, "link": link, "snippet": snippet})
+            if len(items) >= num_results:
+                break
+        return items
+
+    # ---- 回退：旧的纯文本格式 ----
     items = []
-    for match in pattern.finditer(text):
-        title = re.sub(r"\s+", " ", match.group(2)).strip()
-        link = match.group(3).strip()
-        snippet = re.sub(r"\s+", " ", match.group(4)).strip()
-        items.append({"title": title or "无标题", "link": link, "snippet": snippet})
-        if len(items) >= requested:
+    entry_re = re.compile(
+        r'^\s*\[\d+\]\s*(?P<title>.+?)\s*$'
+        r'(?:\n\s*链接[:：]\s*(?P<link>\S+))?'
+        r'(?:\n\s*摘要[:：]\s*(?P<snippet>.*?))?'
+        r'(?=\n\s*\[\d+\]|\Z)',
+        re.MULTILINE | re.DOTALL,
+    )
+    for m in entry_re.finditer(raw_text):
+        title = (m.group("title") or "").strip() or "无标题"
+        link = (m.group("link") or "").strip()
+        snippet = (m.group("snippet") or "").replace("\n", " ").strip()
+        if not link:
+            continue
+        items.append({"title": title, "link": link, "snippet": snippet})
+        if len(items) >= num_results:
             break
     return items
 
 
-def _format_search_results(items: list[dict[str, str]], query: str, engine: str, requested: int | None = None) -> str:
+def _format_search_results(items: list, query: str, engine: str, requested: int | None = None) -> str:
     success_count = len(items)
     requested_count = requested if isinstance(requested, int) and requested > 0 else success_count
     lines = [f"🔍 [成功: {engine}] 搜索「{query}」的结果（{success_count}/{requested_count}）：\n"]
@@ -1421,29 +1477,24 @@ def _format_search_results(items: list[dict[str, str]], query: str, engine: str,
 
 
 async def execute_web_search(query: str, num_results: int = 5) -> str:
-    """通过外部 Bing CN MCP 的 `bing_search` 工具执行网页搜索。"""
+    """通过外部 MCP 搜索服务（bing-cn-mcp-server）执行网页搜索。
+
+    对外的函数签名 / 返回文本格式保持不变，仅内部实现从
+    Google CSE + DuckDuckGo 换成了 MCP 工具调用，调用方无需改动。
+    """
     query = (query or "").strip()
     requested = min(max(int(num_results or 5), 1), 10)
     if not query:
         return "❌ 搜索关键词为空。"
 
     try:
-        raw = await call_mcp_tool(
-            "bing-cn-mcp-server",
-            "bing_search",
-            {"query": query, "count": requested},
-        )
-    except MCPToolError as exc:
-        logger.warning("Bing MCP 搜索失败: %s", exc)
-        return f"❌ Bing MCP 搜索失败：{exc}"
+        items = await _search_via_mcp(query, requested)
+    except Exception as e:
+        logger.warning(f"MCP 搜索失败: {e}")
+        items = None
 
-    items = _parse_bing_search_text(raw, requested)
     if items:
         return _format_search_results(items, query, "Bing", requested=requested)
-
-    if raw.strip():
-        # 上游已提供可读的 MCP 文本时不要丢失内容，即使格式发生变化。
-        return f"🔍 [成功: Bing] 搜索「{query}」：\n\n{raw.strip()}"
 
     return f"❌ 未找到与「{query}」相关的结果。"
 
