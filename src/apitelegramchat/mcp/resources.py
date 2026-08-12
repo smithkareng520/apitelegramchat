@@ -11,7 +11,7 @@ from mcp.server.lowlevel.helper_types import ReadResourceContents
 from apitelegramchat.mcp.context import MCPRequestContext
 from apitelegramchat.skills import get_skill_catalog, load_skill_records, read_skill_text
 from apitelegramchat.workspace_paths import (
-    chat_state_root,
+    memory_state_file,
     todo_state_file,
     workspace_download_root,
     workspace_root,
@@ -57,7 +57,7 @@ class ResourceService:
     async def list_resources(self) -> list[types.Resource]:
         resources = [
             types.Resource(uri="workspace://current/todos", name="todos.json", mimeType="application/json"),
-            types.Resource(uri="workspace://current/memories", name="memories-index.json", mimeType="application/json"),
+            types.Resource(uri="workspace://current/memories", name="memories.json", mimeType="application/json"),
             types.Resource(uri="workspace://current/skills", name="skills.json", mimeType="application/json"),
             types.Resource(uri="workspace://current/files", name="files.json", mimeType="application/json"),
             types.Resource(uri="workspace://current/upload", name="upload.json", mimeType="application/json"),
@@ -85,12 +85,8 @@ class ResourceService:
             path = todo_state_file(self._chat_id, self._namespace)
             return path.read_text(encoding="utf-8") if path.exists() else "{}"
         if uri == "workspace://current/memories":
-            memory_root = chat_state_root(self._chat_id, self._namespace) / "memories"
-            return json.dumps(
-                {"root": "/memories", "files": self._tree(memory_root)},
-                ensure_ascii=False,
-                indent=2,
-            )
+            path = memory_state_file(self._chat_id, self._namespace)
+            return path.read_text(encoding="utf-8") if path.exists() else "{}"
         if uri == "workspace://current/skills":
             return json.dumps(get_skill_catalog(), ensure_ascii=False, indent=2)
         if uri.startswith("workspace://current/skills/"):

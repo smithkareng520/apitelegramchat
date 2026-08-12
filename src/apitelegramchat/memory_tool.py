@@ -1,630 +1,693 @@
-"""Persistent, file-based memory tool.
+# memory_tool.py
+"""
+长期记忆工具。
 
-This module implements the same client-side memory protocol used by Claude's
-memory tool while preserving this project's per-chat isolation and R2-backed
-persistence.  The model sees a virtual ``/memories`` tree.  The application
-maps that tree into a private state directory and performs every operation only
-after canonical-path validation.
+定位
+----
+- 不同于对话历史（短期、会被自动修剪），memory 是用户希望长期保留的事实、
+  偏好、要点——跨会话持久化。
+- 按用户隔离，落在 ./state/{user_id}/memories.json，复用既有 R2 同步链路。
+- 给 AI 一组 CRUD + 检索接口：add / get / list / search / update / delete / clear。
 
-Supported commands are ``view``, ``create``, ``str_replace``, ``insert``,
-``delete`` and ``rename``.  Files are retrieved just in time rather than being
-preloaded into the conversation context.
+数据模型
+--------
+每条 memory：
+  {
+    "id":        8 位短 id
+    "content":   记忆正文（<=2000 字符）
+    "category":  分类标签（fact / preference / person / event / note / custom...）
+    "tags":      [str, ...]   可选标签
+    "importance":low/medium/high
+    "created_at": unix
+    "updated_at": unix
+    "source":    "agent" / "user"   来源（谁写入的）
+  }
+
+检索
+----
+- list 按 category / tag / importance 过滤
+- search 用简单的子串匹配（大小写不敏感）扫 content + tags + category，
+  无外部依赖、零成本、跨语言可用
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
-import shutil
 import time
+import uuid
 from pathlib import Path
+from apitelegramchat.workspace_paths import memory_state_file
 from typing import Any, Optional
-from urllib.parse import unquote
 
-from apitelegramchat.s3_utils import delete_r2_object, list_r2_objects, upload_bytes_to_r2
-from apitelegramchat.workspace_paths import chat_state_root, workspace_namespace
-from apitelegramchat.workspace_utils import _get_workspace_lock, _sync_generic_tree_from_r2
+from apitelegramchat.workspace_utils import (
+    _get_workspace_lock,
+    _sync_named_file_from_r2,
+    _sync_named_file_to_r2,
+)
 
 logger = logging.getLogger(__name__)
 
-MEMORY_ROOT = "/memories"
-MEMORY_DIR_NAME = "memories"
-MAX_VIEW_CHARS = 16_000
-MAX_FILE_CHARS = 1_000_000
-MAX_TOTAL_BYTES = 4 * 1024 * 1024
-MAX_DIRECTORY_DEPTH = 2
-MAX_FILE_LINES = 999_999
-MAX_PATH_LENGTH = 240
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+# ---------- 常量 ----------
+MEMORY_FILENAME = "memories.json"
+VALID_IMPORTANCE = ("low", "medium", "high")
+MAX_CONTENT_LEN = 2000
+MAX_TAG_LEN = 24
+MAX_TAGS = 8
+MAX_MEMORIES = 1000  # 单 chat 上限，防止失控增长
+DEFAULT_CATEGORIES = ("fact", "preference", "person", "event", "note")
+
+IMPORTANCE_META = {
+    "high":   {"emoji": "🔴", "label": "高"},
+    "medium": {"emoji": "🟡", "label": "中"},
+    "low":    {"emoji": "🟢", "label": "低"},
+}
+
+CATEGORY_EMOJI = {
+    "fact":        "📌",
+    "preference":  "⚙️",
+    "person":      "👤",
+    "event":       "📅",
+    "note":        "📝",
+}
 
 
-class MemoryToolError(Exception):
-    """An expected, model-actionable memory operation error."""
+# ---------- 存储层 ----------
+def _memory_path(chat_id: int) -> Path:
+    return memory_state_file(chat_id)
 
-    def __init__(self, message: str, code: str = "memory_error") -> None:
+
+def _new_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def _empty_store() -> dict:
+    return {"memories": [], "updated_at": 0}
+
+
+def _load_local(chat_id: int) -> dict:
+    path = _memory_path(chat_id)
+    if not path.is_file():
+        return _empty_store()
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict) or not isinstance(data.get("memories"), list):
+            return _empty_store()
+        data.setdefault("updated_at", 0)
+        return data
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"memories.json 读取失败 (chat={chat_id}): {e}")
+        return _empty_store()
+
+
+def _save_local(chat_id: int, store: dict) -> None:
+    path = _memory_path(chat_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    store["updated_at"] = int(time.time())
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _find_memory(memories: list, mid: str) -> tuple[int, dict] | None:
+    if not mid:
+        return None
+    target = str(mid).lstrip("#")
+    for i, m in enumerate(memories):
+        if str(m.get("id", "")).lstrip("#") == target:
+            return i, m
+    return None
+
+
+def _normalize_importance(value: Optional[str]) -> str:
+    if not value:
+        return "medium"
+    v = str(value).strip().lower()
+    if v in VALID_IMPORTANCE:
+        return v
+    alias = {"p0": "high", "p1": "high", "p2": "medium", "p3": "low",
+             "高": "high", "中": "medium", "低": "low"}
+    return alias.get(v, "medium")
+
+
+def _normalize_tags(tags: Any) -> list[str]:
+    if tags is None:
+        return []
+    if isinstance(tags, str):
+        parts = [t.strip() for t in tags.replace(",", " ").split() if t.strip()]
+    elif isinstance(tags, list):
+        parts = [str(t).strip() for t in tags if str(t).strip()]
+    else:
+        return []
+    seen = set()
+    out = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            out.append(p[:MAX_TAG_LEN])
+        if len(out) >= MAX_TAGS:
+            break
+    return out
+
+
+def _normalize_category(value: Optional[str]) -> str:
+    if not value:
+        return "note"
+    v = str(value).strip().lower()[:32]
+    return v or "note"
+
+
+# ---------- 业务逻辑 ----------
+class _MemoryError(Exception):
+    def __init__(self, message: str, code: str = "memory_error"):
         super().__init__(message)
         self.message = message
         self.code = code
 
 
-def _memory_root(chat_id: int, namespace: object | None = None) -> Path:
-    """Return the private, non-symlinked backing directory for ``/memories``."""
-    parent = chat_state_root(chat_id, namespace)
-    root = parent / MEMORY_DIR_NAME
-    if root.exists() and root.is_symlink():
-        raise MemoryToolError("Memory storage is unavailable: symlinked memory directory was rejected.", "unsafe_storage")
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        os.chmod(root, 0o700)
-    except OSError:
-        pass
-    resolved = root.resolve()
-    if not resolved.is_dir() or resolved.is_symlink():
-        raise MemoryToolError("Memory storage directory is invalid.", "unsafe_storage")
-    return resolved
-
-
-def _remote_prefix(chat_id: int, namespace: object | None = None) -> str:
-    return f"state/{workspace_namespace(chat_id, namespace)}/{MEMORY_DIR_NAME}/"
-
-
-def _human_size(size: int) -> str:
-    value = float(max(0, size))
-    for unit in ("B", "K", "M", "G"):
-        if value < 1024.0 or unit == "G":
-            if unit == "B":
-                return f"{int(value)}B"
-            return f"{value:.1f}{unit}"
-        value /= 1024.0
-    return f"{int(value)}B"
-
-
-def _logical_path(root: Path, real_path: Path) -> str:
-    relative = real_path.resolve().relative_to(root.resolve())
-    return MEMORY_ROOT if str(relative) == "." else f"{MEMORY_ROOT}/{relative.as_posix()}"
-
-
-def _decoded_path(value: Any) -> str:
-    if not isinstance(value, str):
-        raise MemoryToolError("A memory path must be a string.", "bad_path")
-    candidate = value.strip()
-    # Decode a small, bounded number of times so encoded traversal cannot sneak
-    # through a prefix-only check, without accepting unbounded work from input.
-    for _ in range(3):
-        decoded = unquote(candidate)
-        if decoded == candidate:
-            break
-        candidate = decoded
-    if not candidate:
-        raise MemoryToolError("A memory path is required.", "bad_path")
-    # Treat the conventional root spelling `/memories/` as `/memories` while
-    # retaining rejection of empty components in the middle of a path.
-    if candidate != "/":
-        candidate = candidate.rstrip("/") or "/"
-    if "\x00" in candidate or "\\" in candidate:
-        raise MemoryToolError("Invalid memory path.", "bad_path")
-    if len(candidate) > MAX_PATH_LENGTH:
-        raise MemoryToolError(f"Memory path exceeds the {MAX_PATH_LENGTH}-character limit.", "bad_path")
-    return candidate
-
-
-def _resolve_path(root: Path, logical_path: Any, *, allow_root: bool = True) -> Path:
-    """Safely map a logical ``/memories`` path to an on-disk path.
-
-    Traversal is rejected before and after resolution.  The second check also
-    protects against a malicious symlink that may exist inside the memory tree.
+async def _read_store(chat_id: int, fn) -> dict:
     """
-    candidate = _decoded_path(logical_path)
-    if candidate == MEMORY_ROOT:
-        relative = Path()
+    读取型操作：先从 R2 拉取最新内容到本地，再执行读取，不回写 store。
+    """
+    lock = await _get_workspace_lock(chat_id)
+    async with lock:
+        try:
+            await _sync_named_file_from_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
+        except Exception as e:
+            logger.warning(f"memory: R2→local 同步失败 (chat={chat_id}): {e}")
+        store = _load_local(chat_id)
+        try:
+            _store, payload = fn(store)
+        except _MemoryError as e:
+            return {"ok": False, "error": str(e), "code": e.code}
+        return payload
+
+
+async def _mutate(chat_id: int, fn) -> dict:
+    """
+    写入型操作：R2 → 本地 → 修改 → 保存 → 回传 R2。
+    """
+    lock = await _get_workspace_lock(chat_id)
+    async with lock:
+        try:
+            await _sync_named_file_from_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
+        except Exception as e:
+            logger.warning(f"memory: R2→local 同步失败 (chat={chat_id}): {e}")
+        store = _load_local(chat_id)
+        try:
+            store, payload = fn(store)
+        except _MemoryError as e:
+            return {"ok": False, "error": str(e), "code": e.code}
+        _save_local(chat_id, store)
+        try:
+            await _sync_named_file_to_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
+        except Exception as e:
+            logger.warning(f"memory: local→R2 同步失败 (chat={chat_id}): {e}")
+        return payload
+
+
+def _op_add(store: dict, content: str, category: str, tags: list[str],
+            importance: str, source: str) -> dict:
+    content = (content or "").strip()
+    if not content:
+        raise _MemoryError("content 不能为空", "empty_content")
+    if len(content) > MAX_CONTENT_LEN:
+        content = content[:MAX_CONTENT_LEN]
+    if len(store["memories"]) >= MAX_MEMORIES:
+        raise _MemoryError(f"记忆数量已达上限 {MAX_MEMORIES}，请先清理", "too_many")
+
+    now = int(time.time())
+    mem = {
+        "id": _new_id(),
+        "content": content,
+        "category": _normalize_category(category),
+        "tags": _normalize_tags(tags),
+        "importance": _normalize_importance(importance),
+        "created_at": now,
+        "updated_at": now,
+        "source": (source or "agent").strip().lower()[:16] or "agent",
+    }
+    store["memories"].append(mem)
+    return store, {
+        "ok": True,
+        "action": "add",
+        "memory": _mem_summary(mem),
+        "total": len(store["memories"]),
+    }
+
+
+def _op_get(store: dict, mid: str) -> dict:
+    found = _find_memory(store["memories"], mid)
+    if not found:
+        raise _MemoryError(f"找不到 id 为 {mid} 的记忆", "not_found")
+    _, mem = found
+    return store, {"ok": True, "action": "get", "memory": _mem_summary(mem),
+                   "total": len(store["memories"])}
+
+
+def _op_list(store: dict, category: Optional[str], tag: Any,
+             importance: Optional[str], limit: int) -> dict:
+    memories = store["memories"]
+    # 默认排序：重要性降序，再按创建时间倒序（新的在前）
+    weight = {"high": 3, "medium": 2, "low": 1}
+    memories_sorted = sorted(
+        memories,
+        key=lambda m: (
+            -weight.get(m.get("importance", "medium"), 2),
+            -int(m.get("created_at", 0) or 0),
+            str(m.get("id", "")),
+        ),
+    )
+
+    filtered = []
+    cat_filter = _normalize_category(category) if category else None
+    imp_filter = _normalize_importance(importance) if importance else None
+    tag_filters = _normalize_tags(tag)
+    for m in memories_sorted:
+        if cat_filter and m.get("category") != cat_filter:
+            continue
+        if imp_filter and m.get("importance") != imp_filter:
+            continue
+        if tag_filters and not any(t in m.get("tags", []) for t in tag_filters):
+            continue
+        filtered.append(m)
+        if limit and len(filtered) >= limit:
+            break
+
+    return store, {
+        "ok": True,
+        "action": "list",
+        "category": category,
+        "tag": tag if isinstance(tag, str) else None,
+        "tags": tag_filters or None,
+        "importance": importance,
+        "memories": [_mem_summary(m) for m in filtered],
+        "total": len(memories),
+        "shown": len(filtered),
+    }
+
+
+def _op_search(store: dict, query: str, limit: int) -> dict:
+    q = (query or "").strip().lower()
+    if not q:
+        raise _MemoryError("search query 不能为空", "empty_query")
+    memories = store["memories"]
+    matches = []
+    for m in memories:
+        haystack_parts = [m.get("content", ""),
+                          m.get("category", ""),
+                          " ".join(m.get("tags", []))]
+        haystack = "\n".join(haystack_parts).lower()
+        if q in haystack:
+            matches.append(m)
+    # 同样的排序
+    weight = {"high": 3, "medium": 2, "low": 1}
+    matches.sort(key=lambda m: (
+        -weight.get(m.get("importance", "medium"), 2),
+        -int(m.get("created_at", 0) or 0),
+        str(m.get("id", "")),
+    ))
+    if limit and len(matches) > limit:
+        matches = matches[:limit]
+
+    return store, {
+        "ok": True,
+        "action": "search",
+        "query": query,
+        "matches": len(matches),
+        "total": len(memories),
+        "memories": [_mem_summary(m) for m in matches],
+    }
+
+
+def _op_update(store: dict, mid: str, content: Optional[str],
+               category: Optional[str], tags: Any, importance: Optional[str]) -> dict:
+    found = _find_memory(store["memories"], mid)
+    if not found:
+        raise _MemoryError(f"找不到 id 为 {mid} 的记忆", "not_found")
+    _, mem = found
+    changed = []
+    if content is not None:
+        c = content.strip()
+        if not c:
+            raise _MemoryError("content 不能为空", "empty_content")
+        mem["content"] = c[:MAX_CONTENT_LEN]
+        changed.append("content")
+    if category is not None:
+        mem["category"] = _normalize_category(category)
+        changed.append("category")
+    if tags is not None:
+        mem["tags"] = _normalize_tags(tags)
+        changed.append("tags")
+    if importance is not None:
+        mem["importance"] = _normalize_importance(importance)
+        changed.append("importance")
+    if changed:
+        mem["updated_at"] = int(time.time())
+    return store, {
+        "ok": True,
+        "action": "update",
+        "memory": _mem_summary(mem),
+        "changed": changed,
+        "total": len(store["memories"]),
+    }
+
+
+def _op_delete(store: dict, mid: str) -> dict:
+    found = _find_memory(store["memories"], mid)
+    if not found:
+        raise _MemoryError(f"找不到 id 为 {mid} 的记忆", "not_found")
+    idx, mem = found
+    store["memories"].pop(idx)
+    return store, {
+        "ok": True,
+        "action": "delete",
+        "memory": _mem_summary(mem),
+        "total": len(store["memories"]),
+    }
+
+
+def _op_clear(store: dict, scope: str) -> dict:
+    """scope = all / category:<name> / tag:<name>"""
+    before = len(store["memories"])
+    if scope == "all":
+        store["memories"] = []
+        removed = before
+        msg = f"已清空全部 {removed} 条记忆"
+    elif scope.startswith("category:"):
+        cat = _normalize_category(scope.split(":", 1)[1])
+        before_list = list(store["memories"])
+        store["memories"] = [m for m in before_list if m.get("category") != cat]
+        removed = before - len(store["memories"])
+        msg = f"已清空分类 {cat} 下 {removed} 条记忆"
+    elif scope.startswith("tag:"):
+        tag = scope.split(":", 1)[1].strip()
+        before_list = list(store["memories"])
+        store["memories"] = [m for m in before_list if tag not in m.get("tags", [])]
+        removed = before - len(store["memories"])
+        msg = f"已清空标签 #{tag} 下 {removed} 条记忆"
     else:
-        prefix = MEMORY_ROOT + "/"
-        if not candidate.startswith(prefix):
-            raise MemoryToolError("Memory paths must stay inside /memories.", "path_outside_memory")
-        relative_text = candidate[len(prefix):]
-        if not relative_text:
-            relative = Path()
-        else:
-            raw_parts = relative_text.split("/")
-            if any(part in {"", ".", ".."} for part in raw_parts):
-                raise MemoryToolError("Invalid memory path traversal sequence.", "path_traversal")
-            if any(part.startswith(".") for part in raw_parts):
-                raise MemoryToolError("Hidden memory paths are not allowed.", "bad_path")
-            relative = Path(*raw_parts)
-    if not allow_root and not relative.parts:
-        raise MemoryToolError("The /memories root cannot be modified or deleted.", "root_protected")
-    target = root / relative
-    try:
-        resolved = target.resolve(strict=False)
-        resolved.relative_to(root.resolve())
-    except (OSError, ValueError) as exc:
-        raise MemoryToolError("Memory path resolves outside /memories.", "path_traversal") from exc
-    return resolved
+        raise _MemoryError(f"不支持的 clear scope: {scope}", "bad_scope")
+    return store, {
+        "ok": True,
+        "action": "clear",
+        "scope": scope,
+        "removed": removed,
+        "message": msg,
+        "total": len(store["memories"]),
+    }
 
 
-def _validate_text(value: Any, field_name: str, *, allow_empty: bool = True) -> str:
-    if value is None:
-        return "" if allow_empty else _raise_missing(field_name)
-    if not isinstance(value, str):
-        raise MemoryToolError(f"{field_name} must be text.", "bad_input")
-    if len(value) > MAX_FILE_CHARS:
-        raise MemoryToolError(f"{field_name} exceeds the {MAX_FILE_CHARS}-character limit.", "file_too_large")
-    if not value and not allow_empty:
-        raise MemoryToolError(f"{field_name} cannot be empty.", "bad_input")
-    return value
+def _mem_summary(m: dict) -> dict:
+    return {
+        "id": m.get("id"),
+        "content": m.get("content", ""),
+        "category": m.get("category", "note"),
+        "tags": list(m.get("tags", [])),
+        "importance": m.get("importance", "medium"),
+        "created_at": m.get("created_at"),
+        "updated_at": m.get("updated_at"),
+        "source": m.get("source", "agent"),
+    }
 
 
-def _raise_missing(field_name: str) -> str:
-    raise MemoryToolError(f"{field_name} is required.", "missing_input")
-
-
-def _walk_files(root: Path) -> list[Path]:
-    files: list[Path] = []
-    for path in root.rglob("*"):
-        try:
-            if path.is_symlink():
-                continue
-            if path.is_file():
-                files.append(path)
-        except OSError:
-            continue
-    return files
-
-
-def _total_size(root: Path, *, excluding: Path | None = None) -> int:
-    total = 0
-    excluded = excluding.resolve() if excluding else None
-    for path in _walk_files(root):
-        try:
-            if excluded is not None and path.resolve() == excluded:
-                continue
-            total += path.stat().st_size
-        except OSError:
-            continue
-    return total
-
-
-def _assert_storage_budget(root: Path, additional_bytes: int, *, replacing: Path | None = None) -> None:
-    used = _total_size(root, excluding=replacing)
-    if used + additional_bytes > MAX_TOTAL_BYTES:
-        raise MemoryToolError(
-            f"Memory storage limit exceeded: {used + additional_bytes} bytes requested, maximum is {MAX_TOTAL_BYTES} bytes.",
-            "storage_limit",
-        )
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
-    try:
-        temp.write_text(text, encoding="utf-8")
-        os.replace(temp, path)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-    finally:
-        try:
-            temp.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-
-def _numbered_content(logical_path: str, text: str, view_range: Any = None) -> str:
-    lines = text.splitlines()
-    # Preserve a final empty line when it is meaningful to the model's exact
-    # replacement/insertion logic.
-    if text.endswith("\n"):
-        lines.append("")
-    if len(lines) > MAX_FILE_LINES:
-        raise MemoryToolError(
-            f"File {logical_path} exceeds maximum line limit of {MAX_FILE_LINES:,} lines.",
-            "too_many_lines",
-        )
-    start, end = 1, len(lines)
-    if view_range is not None:
-        if not isinstance(view_range, (list, tuple)) or len(view_range) != 2:
-            raise MemoryToolError("view_range must be [start_line, end_line].", "bad_view_range")
-        try:
-            start, end = int(view_range[0]), int(view_range[1])
-        except (TypeError, ValueError) as exc:
-            raise MemoryToolError("view_range values must be integers.", "bad_view_range") from exc
-        if start < 1 or (end != -1 and end < start):
-            raise MemoryToolError("Invalid view_range. Use [start_line, end_line] or [start_line, -1].", "bad_view_range")
-        if start > len(lines) and lines:
-            raise MemoryToolError(f"view_range starts after the end of {logical_path}.", "bad_view_range")
-        if end == -1:
-            end = len(lines)
-        else:
-            end = min(end, len(lines))
-    selected = lines[start - 1:end] if lines else []
-    body = "\n".join(f"{index:>6}\t{line}" for index, line in enumerate(selected, start=start))
-    result = f"Here's the content of {logical_path} with line numbers:\n{body}"
-    if len(result) > MAX_VIEW_CHARS:
-        available = max(0, MAX_VIEW_CHARS - len(f"Here's the content of {logical_path} with line numbers:\n") - 72)
-        result = result[:available].rsplit("\n", 1)[0]
-        result += "\n…[text view truncated at 16,000 characters; use view_range to continue]"
-    return result
-
-
-def _directory_listing(root: Path, target: Path) -> str:
-    logical_target = _logical_path(root, target)
-    entries: list[tuple[str, Path]] = []
-    try:
-        for path in target.rglob("*"):
-            relative = path.relative_to(target)
-            if len(relative.parts) > MAX_DIRECTORY_DEPTH:
-                continue
-            if any(part.startswith(".") or part == "node_modules" for part in relative.parts):
-                continue
-            if path.is_symlink():
-                continue
-            entries.append((relative.as_posix(), path))
-    except OSError as exc:
-        raise MemoryToolError(f"Unable to list {logical_target}: {exc}", "view_failed") from exc
-
-    lines = [
-        f"Here're the files and directories up to {MAX_DIRECTORY_DEPTH} levels deep in {logical_target}, excluding hidden items and node_modules:"
-    ]
-    root_size = _total_size(target)
-    lines.append(f"{_human_size(root_size)}\t{logical_target}")
-    for _, path in sorted(entries, key=lambda pair: (pair[0].lower(), pair[0])):
-        try:
-            size = _total_size(path) if path.is_dir() else path.stat().st_size
-            lines.append(f"{_human_size(size)}\t{_logical_path(root, path)}")
-        except OSError:
-            continue
-    return "\n".join(lines)
-
-
-def _view(root: Path, path: Any, view_range: Any = None) -> tuple[str, dict[str, Any]]:
-    target = _resolve_path(root, path)
-    logical = _logical_path(root, target)
-    if not target.exists():
-        raise MemoryToolError(f"The path {logical} does not exist. Please provide a valid path.", "not_found")
-    if target.is_dir():
-        return _directory_listing(root, target), {"path": logical, "kind": "directory"}
-    if not target.is_file() or target.is_symlink():
-        raise MemoryToolError(f"The path {logical} does not exist. Please provide a valid path.", "not_found")
-    try:
-        size = target.stat().st_size
-    except OSError as exc:
-        raise MemoryToolError(f"Unable to read {logical}: {exc}", "view_failed") from exc
-    if target.suffix.lower() in IMAGE_SUFFIXES:
-        return f"Image memory file at {logical} ({_human_size(size)}).", {"path": logical, "kind": "image", "size": size}
-    if size > MAX_FILE_CHARS * 4:
-        raise MemoryToolError(f"File {logical} is too large to view safely.", "file_too_large")
-    try:
-        text = target.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        raise MemoryToolError(f"File {logical} is not a UTF-8 text file.", "non_text_file") from exc
-    except OSError as exc:
-        raise MemoryToolError(f"Unable to read {logical}: {exc}", "view_failed") from exc
-    return _numbered_content(logical, text, view_range), {"path": logical, "kind": "file", "size": size}
-
-
-def _create(root: Path, path: Any, file_text: Any) -> tuple[str, dict[str, Any]]:
-    target = _resolve_path(root, path, allow_root=False)
-    logical = _logical_path(root, target)
-    if target.exists():
-        raise MemoryToolError(f"Error: File {logical} already exists", "already_exists")
-    text = _validate_text(file_text, "file_text")
-    encoded = text.encode("utf-8")
-    _assert_storage_budget(root, len(encoded))
-    _atomic_write(target, text)
-    return f"File created successfully at: {logical}", {"path": logical, "bytes": len(encoded)}
-
-
-def _str_replace(root: Path, path: Any, old_str: Any, new_str: Any) -> tuple[str, dict[str, Any]]:
-    target = _resolve_path(root, path, allow_root=False)
-    logical = _logical_path(root, target)
-    if not target.is_file() or target.is_symlink():
-        raise MemoryToolError(f"Error: The path {logical} does not exist. Please provide a valid path.", "not_found")
-    old = _validate_text(old_str, "old_str", allow_empty=False)
-    new = _validate_text(new_str, "new_str")
-    try:
-        text = target.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise MemoryToolError(f"Error: The path {logical} is not an editable UTF-8 text file.", "non_text_file") from exc
-    count = text.count(old)
-    if count == 0:
-        raise MemoryToolError(f"No replacement was performed, old_str `{old}` did not appear verbatim in {logical}.", "no_match")
-    if count > 1:
-        line_numbers: list[str] = []
-        start = 0
-        while True:
-            start = text.find(old, start)
-            if start < 0:
-                break
-            line_numbers.append(str(text.count("\n", 0, start) + 1))
-            start += len(old)
-        raise MemoryToolError(
-            f"No replacement was performed. Multiple occurrences of old_str `{old}` in lines: {', '.join(line_numbers)}. Please ensure it is unique",
-            "multiple_matches",
-        )
-    updated = text.replace(old, new, 1)
-    _assert_storage_budget(root, len(updated.encode("utf-8")), replacing=target)
-    _atomic_write(target, updated)
-    line = text.count("\n", 0, text.find(old)) + 1
-    preview_range = [max(1, line - 2), line + max(3, new.count("\n") + 2)]
-    preview = _numbered_content(logical, updated, preview_range)
-    return f"The memory file has been edited.\n{preview}", {"path": logical, "changed_lines_from": line}
-
-
-def _insert(root: Path, path: Any, insert_line: Any, insert_text: Any) -> tuple[str, dict[str, Any]]:
-    target = _resolve_path(root, path, allow_root=False)
-    logical = _logical_path(root, target)
-    if not target.is_file() or target.is_symlink():
-        raise MemoryToolError(f"Error: The path {logical} does not exist", "not_found")
-    try:
-        position = int(insert_line)
-    except (TypeError, ValueError) as exc:
-        raise MemoryToolError("Error: Invalid `insert_line` parameter.", "bad_insert_line") from exc
-    insertion = _validate_text(insert_text, "insert_text", allow_empty=False)
-    try:
-        text = target.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise MemoryToolError(f"Error: The path {logical} is not an editable UTF-8 text file.", "non_text_file") from exc
-    lines = text.splitlines(keepends=True)
-    n_lines = len(lines)
-    if not 0 <= position <= n_lines:
-        raise MemoryToolError(
-            f"Error: Invalid `insert_line` parameter: {position}. It should be within the range of lines of the file: [0, {n_lines}]",
-            "bad_insert_line",
-        )
-    updated = "".join(lines[:position]) + insertion + "".join(lines[position:])
-    _assert_storage_budget(root, len(updated.encode("utf-8")), replacing=target)
-    _atomic_write(target, updated)
-    return f"The file {logical} has been edited.", {"path": logical, "inserted_after_line": position}
-
-
-def _delete(root: Path, path: Any) -> tuple[str, dict[str, Any]]:
-    target = _resolve_path(root, path, allow_root=False)
-    logical = _logical_path(root, target)
-    if not target.exists() and not target.is_symlink():
-        raise MemoryToolError(f"Error: The path {logical} does not exist", "not_found")
-    try:
-        if target.is_dir() and not target.is_symlink():
-            shutil.rmtree(target)
-        else:
-            target.unlink()
-        parent = target.parent
-        while parent != root and parent.exists():
-            try:
-                parent.rmdir()
-            except OSError:
-                break
-            parent = parent.parent
-    except OSError as exc:
-        raise MemoryToolError(f"Unable to delete {logical}: {exc}", "delete_failed") from exc
-    return f"Successfully deleted {logical}", {"path": logical}
-
-
-def _rename(root: Path, old_path: Any, new_path: Any) -> tuple[str, dict[str, Any]]:
-    source = _resolve_path(root, old_path, allow_root=False)
-    destination = _resolve_path(root, new_path, allow_root=False)
-    old_logical = _logical_path(root, source)
-    new_logical = _logical_path(root, destination)
-    if not source.exists() and not source.is_symlink():
-        raise MemoryToolError(f"Error: The path {old_logical} does not exist", "not_found")
-    if destination.exists() or destination.is_symlink():
-        raise MemoryToolError(f"Error: The destination {new_logical} already exists", "destination_exists")
-    # A directory cannot be moved into itself (``a`` -> ``a/b``).
-    try:
-        destination.relative_to(source.resolve())
-        raise MemoryToolError("Error: A memory directory cannot be moved into itself.", "invalid_rename")
-    except ValueError:
-        pass
-    try:
-        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.replace(source, destination)
-    except OSError as exc:
-        raise MemoryToolError(f"Unable to rename {old_logical}: {exc}", "rename_failed") from exc
-    return f"Successfully renamed {old_logical} to {new_logical}", {"old_path": old_logical, "new_path": new_logical}
-
-
-async def _sync_from_remote(chat_id: int, root: Path, namespace: object | None = None) -> None:
-    try:
-        prefix = _remote_prefix(chat_id, namespace)
-        # Never let an unavailable/empty remote listing erase a local write.  A
-        # non-empty listing is safe to mirror; an empty one is ambiguous during
-        # first use, R2 outages, and immediately after a failed upload.
-        remote_keys = await list_r2_objects(prefix)
-        if remote_keys:
-            await _sync_generic_tree_from_r2(chat_id, root, prefix, namespace=namespace)
-    except Exception as exc:
-        logger.warning("memory: R2→local directory sync failed (chat=%s): %s", chat_id, exc)
-
-
-async def _sync_to_remote(chat_id: int, root: Path, namespace: object | None = None) -> None:
-    prefix = _remote_prefix(chat_id, namespace)
-    try:
-        remote_keys = set(await list_r2_objects(prefix))
-        current_keys: set[str] = set()
-        for local_path in _walk_files(root):
-            try:
-                resolved = local_path.resolve()
-                relative = resolved.relative_to(root.resolve()).as_posix()
-                if not relative or relative.startswith(".") or "/." in relative:
-                    continue
-                key = prefix + relative
-                current_keys.add(key)
-                data = await asyncio.to_thread(resolved.read_bytes)
-                await upload_bytes_to_r2(data, key, "text/plain; charset=utf-8")
-            except (OSError, ValueError) as exc:
-                logger.warning("memory: skipped unsafe local file during sync: %s", exc)
-        for key in remote_keys - current_keys:
-            await delete_r2_object(key)
-    except Exception as exc:
-        logger.warning("memory: local→R2 directory sync failed (chat=%s): %s", chat_id, exc)
-
-
-def _payload(ok: bool, command: str, result: str, *, code: str | None = None, meta: dict[str, Any] | None = None) -> str:
-    data: dict[str, Any] = {"ok": ok, "action": command, "command": command}
-    if ok:
-        data["result"] = result
-    else:
-        data["error"] = result
-        data["code"] = code or "memory_error"
-    if meta:
-        data.update(meta)
-    return json.dumps(data, ensure_ascii=False)
-
-
+# ---------- 工具入口 ----------
 async def execute_memory(
     chat_id: int,
-    command: str = "view",
-    path: str = MEMORY_ROOT,
-    view_range: Any = None,
-    old_str: Optional[str] = None,
-    new_str: Optional[str] = None,
-    insert_line: Optional[int] = None,
-    insert_text: Optional[str] = None,
-    file_text: Optional[str] = None,
-    old_path: Optional[str] = None,
-    new_path: Optional[str] = None,
-    namespace: object | None = None,
-    **legacy: Any,
+    action: str = "list",
+    content: Optional[str] = None,
+    memory_id: Optional[str] = None,
+    category: Optional[str] = None,
+    tags: Any = None,
+    importance: Optional[str] = None,
+    query: Optional[str] = None,
+    scope: Optional[str] = None,
+    limit: int = 50,
+    source: str = "agent",
 ) -> str:
-    """Execute one memory protocol command and return a model-readable payload.
-
-    ``legacy`` is intentionally accepted so older callers fail gracefully with a
-    migration hint instead of producing a Python ``TypeError``.
     """
-    if legacy.get("action") is not None:
-        return _payload(
-            False,
-            "legacy",
-            "The structured memory API has been replaced by the file-based protocol. Use command=view/create/str_replace/insert/delete/rename under /memories.",
-            code="legacy_api_removed",
-        )
-    command = (command or "view").strip().lower()
-    if command not in {"view", "create", "str_replace", "insert", "delete", "rename"}:
-        return _payload(False, command or "unknown", f"Unknown memory command: {command}", code="bad_command")
+    memory 工具主入口。返回 JSON 字符串。
 
+    action: add | get | list | search | update | delete | clear
+    """
+    action = (action or "list").strip().lower()
     try:
-        lock = await _get_workspace_lock(chat_id)
-        async with lock:
-            root = _memory_root(chat_id, namespace)
-            await _sync_from_remote(chat_id, root, namespace)
-            if command == "view":
-                result, meta = _view(root, path, view_range)
-            elif command == "create":
-                result, meta = _create(root, path, file_text)
-                await _sync_to_remote(chat_id, root, namespace)
-            elif command == "str_replace":
-                result, meta = _str_replace(root, path, old_str, new_str)
-                await _sync_to_remote(chat_id, root, namespace)
-            elif command == "insert":
-                result, meta = _insert(root, path, insert_line, insert_text)
-                await _sync_to_remote(chat_id, root, namespace)
-            elif command == "delete":
-                result, meta = _delete(root, path)
-                await _sync_to_remote(chat_id, root, namespace)
-            else:
-                result, meta = _rename(root, old_path, new_path)
-                await _sync_to_remote(chat_id, root, namespace)
-            return _payload(True, command, result, meta=meta)
-    except MemoryToolError as exc:
-        return _payload(False, command, exc.message, code=exc.code)
-    except Exception as exc:  # Do not leak filesystem paths or tracebacks to the model/UI.
-        logger.exception("memory operation failed (chat=%s command=%s)", chat_id, command)
-        return _payload(False, command, "Memory operation could not be completed safely.", code="memory_error")
+        limit_i = max(1, min(int(limit or 50), 500))
+    except (TypeError, ValueError):
+        limit_i = 50
 
-
-def _escape(value: Any) -> str:
-    return str(value if value is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _preview_lines(text: str, max_lines: int = 12, max_chars: int = 1800) -> str:
-    lines = text.splitlines()
-    visible = lines[:max_lines]
-    preview = "\n".join(visible)
-    if len(lines) > max_lines:
-        preview += "\n…"
-    if len(preview) > max_chars:
-        preview = preview[:max_chars] + "…"
-    return _escape(preview)
-
-
-def render_memory_card(payload: dict[str, Any], max_items: int = 30) -> str:
-    """Render clear Telegram HTML without exposing raw JSON to end users."""
-    if not isinstance(payload, dict):
-        return f"<p><b>记忆工具</b></p><blockquote>{_escape(payload)}</blockquote>"
-    if not payload.get("ok"):
-        code = _escape(payload.get("code", "memory_error"))
-        message = _escape(payload.get("error", "未知错误"))
-        return f"<p><b>记忆操作未完成</b> · <code>{code}</code></p><blockquote>{message}</blockquote>"
-
-    command = str(payload.get("command") or payload.get("action") or "view")
-    result = str(payload.get("result", ""))
-    path = _escape(payload.get("path", ""))
-    if command == "view":
-        kind = payload.get("kind")
-        if kind == "directory":
-            title = "记忆目录"
-        elif kind == "image":
-            title = "记忆图像"
-        else:
-            title = "记忆文件"
-        return f"<p><b>{title}</b>{(' · <code>' + path + '</code>') if path else ''}</p><pre>{_preview_lines(result)}</pre>"
-    if command == "create":
-        return f"<p><b>已创建记忆文件</b> · <code>{path}</code></p><blockquote>{_escape(result)}</blockquote>"
-    if command == "str_replace":
-        return f"<p><b>已编辑记忆文件</b> · <code>{path}</code></p><pre>{_preview_lines(result)}</pre>"
-    if command == "insert":
-        return f"<p><b>已插入记忆内容</b> · <code>{path}</code></p><blockquote>{_escape(result)}</blockquote>"
-    if command == "delete":
-        return f"<p><b>已删除记忆项目</b> · <code>{path}</code></p><blockquote>{_escape(result)}</blockquote>"
-    if command == "rename":
-        return (
-            "<p><b>已重命名记忆项目</b></p>"
-            f"<p><code>{_escape(payload.get('old_path', ''))}</code> → <code>{_escape(payload.get('new_path', ''))}</code></p>"
+    if action == "add":
+        return json.dumps(
+            await _mutate(chat_id, lambda s: _op_add(s, content, category or "note", tags,
+                                                      importance or "medium", source)),
+            ensure_ascii=False,
         )
-    return f"<p><b>记忆操作已完成</b></p><pre>{_preview_lines(result)}</pre>"
+    if action == "get":
+        return json.dumps(
+            await _read_store(chat_id, lambda s: _op_get(s, memory_id)),
+            ensure_ascii=False,
+        )
+    if action == "list":
+        return json.dumps(
+            await _read_store(chat_id, lambda s: _op_list(s, category, tags, importance, limit_i)),
+            ensure_ascii=False,
+        )
+    if action == "search":
+        return json.dumps(
+            await _read_store(chat_id, lambda s: _op_search(s, query or "", limit_i)),
+            ensure_ascii=False,
+        )
+    if action == "update":
+        return json.dumps(
+            await _mutate(chat_id, lambda s: _op_update(s, memory_id, content, category, tags, importance)),
+            ensure_ascii=False,
+        )
+    if action == "delete":
+        return json.dumps(
+            await _mutate(chat_id, lambda s: _op_delete(s, memory_id)),
+            ensure_ascii=False,
+        )
+    if action == "clear":
+        s = scope or "all"
+        return json.dumps(
+            await _mutate(chat_id, lambda store: _op_clear(store, s)),
+            ensure_ascii=False,
+        )
+
+    return json.dumps({"ok": False, "error": f"未知 action: {action}", "code": "bad_action"},
+                      ensure_ascii=False)
 
 
-MEMORY_TOOL: dict[str, Any] = {
+# ---------- 富文本渲染 ----------
+def _esc(text: Any) -> str:
+    s = "" if text is None else str(text)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _importance_badge(m: dict) -> str:
+    p = m.get("importance", "medium")
+    meta = IMPORTANCE_META.get(p, IMPORTANCE_META["medium"])
+    return f"<b>{meta['emoji']} {meta['label']}</b>"
+
+
+def _category_badge(m: dict) -> str:
+    c = m.get("category", "note")
+    emoji = CATEGORY_EMOJI.get(c, "🏷️")
+    return f"<code>{emoji} {_esc(c)}</code>"
+
+
+def _tag_chips(m: dict) -> str:
+    tags = m.get("tags", []) or []
+    if not tags:
+        return ""
+    return " ".join(f"<code>#{_esc(t)}</code>" for t in tags[:MAX_TAGS])
+
+
+def render_memory_card(payload: dict, max_items: int = 30) -> str:
+    """将 execute_memory 返回的 payload 渲染成 Telegram 富文本卡片。"""
+    if not isinstance(payload, dict):
+        return f"<p>{_esc(payload)}</p>"
+
+    if not payload.get("ok"):
+        return (f"<p>❌ <b>记忆操作失败</b></p>"
+                f"<p>{_esc(payload.get('error', '未知错误'))}</p>")
+
+    action = payload.get("action", "list")
+
+    if action == "add":
+        m = payload.get("memory", {})
+        return (
+            f"<p>🧠 <b>已保存记忆</b> <code>#{m.get('id', '?')}</code></p>"
+            f"<p>{_importance_badge(m)} {_category_badge(m)} {_tag_chips(m)}</p>"
+            f"<blockquote>{_esc(m.get('content'))}</blockquote>"
+        )
+    if action == "get":
+        m = payload.get("memory", {})
+        return _render_memory_detail(m)
+    if action == "update":
+        m = payload.get("memory", {})
+        return (
+            f"<p>📝 <b>已更新记忆</b> <code>#{m.get('id', '?')}</code></p>"
+            f"<p>{_importance_badge(m)} {_category_badge(m)} {_tag_chips(m)}</p>"
+            f"<blockquote>{_esc(m.get('content'))}</blockquote>"
+            f"<p><i>修改字段：{', '.join(payload.get('changed', [])) or '无'}</i></p>"
+        )
+    if action == "delete":
+        m = payload.get("memory", {})
+        return (
+            f"<p>🗑️ <b>已删除记忆</b> <code>#{m.get('id', '?')}</code></p>"
+            f"<blockquote><s>{_esc(m.get('content'))}</s></blockquote>"
+        )
+    if action == "clear":
+        return (
+            f"<p>🧹 <b>{_esc(payload.get('message', '已清空'))}</b></p>"
+            f"<p><i>剩余 {payload.get('total', 0)} 条</i></p>"
+        )
+    if action == "search":
+        q = payload.get("query", "")
+        matches = payload.get("memories", []) or []
+        header = f"<h3>🔎 记忆搜索：<code>{_esc(q)}</code></h3>"
+        if not matches:
+            return header + "<blockquote>没有匹配的记忆</blockquote>"
+        items = "".join(_render_memory_item(m) for m in matches[:max_items])
+        extra = len(matches) - max_items
+        extra_html = (f"<p><i>… 还有 {extra} 条未显示</i></p>" if extra > 0 else "")
+        return header + f"<p>命中 <b>{payload.get('matches', 0)}</b> / {payload.get('total', 0)} 条</p><hr/><ol>{items}</ol>{extra_html}"
+
+    # ---- list 渲染 ----
+    memories = payload.get("memories", []) or []
+    total = payload.get("total", 0)
+    shown = payload.get("shown", len(memories))
+    header = "<h3>🧠 长期记忆库</h3>"
+    stat = f"共 <b>{total}</b> 条 · 显示 <b>{shown}</b> 条"
+    extra_desc = []
+    if payload.get("category"):
+        extra_desc.append(f"分类=<code>{_esc(payload['category'])}</code>")
+    if payload.get("tags"):
+        tags_value = payload["tags"]
+        if isinstance(tags_value, list):
+            extra_desc.append("标签=" + " ".join(f"<code>#{_esc(t)}</code>" for t in tags_value[:MAX_TAGS]))
+        else:
+            extra_desc.append(f"标签=<code>#{_esc(tags_value)}</code>")
+    elif payload.get("tag"):
+        extra_desc.append(f"标签=<code>#{_esc(payload['tag'])}</code>")
+    if payload.get("importance"):
+        p = payload["importance"]
+        meta = IMPORTANCE_META.get(p, {})
+        extra_desc.append(f"重要性={meta.get('emoji', '⚫')}{_esc(p)}")
+    extra_line = f"筛选：<i>{' · '.join(extra_desc) if extra_desc else '全部'}</i>"
+
+    if not memories:
+        return header + f"<p>{stat}</p><p>{extra_line}</p><blockquote>📭 当前没有任何记忆</blockquote>"
+
+    items = "".join(_render_memory_item(m) for m in memories[:max_items])
+    extra = len(memories) - max_items
+    extra_html = (f"<p><i>… 还有 {extra} 条未显示，可用 search 或更细的过滤查看</i></p>"
+                  if extra > 0 else "")
+    return header + f"<p>{stat}</p><p>{extra_line}</p><hr/><ol>{items}</ol>{extra_html}"
+
+
+def _render_memory_item(m: dict) -> str:
+    badge = _importance_badge(m)
+    cat = _category_badge(m)
+    mid = f"<code>#{_esc(m.get('id', '?'))}</code>"
+    content = _esc(m.get("content", ""))
+    # 内容超过 ~200 字截断
+    if len(content) > 400:
+        content = content[:400] + "…"
+    tags = _tag_chips(m)
+    parts = [f"{badge} {cat} {mid}", f"<blockquote>{content}</blockquote>"]
+    if tags:
+        parts.append(tags)
+    return f"<li>{' '.join(parts[:1])} {' '.join(parts[1:])}</li>"
+
+
+def _render_memory_detail(m: dict) -> str:
+    if not m:
+        return "<p>记忆不存在</p>"
+    parts = [
+        f"<h3>🧠 记忆 #{_esc(m.get('id', '?'))}</h3>",
+        f"<p>{_importance_badge(m)} {_category_badge(m)} {_tag_chips(m)}</p>",
+        f"<blockquote>{_esc(m.get('content'))}</blockquote>",
+    ]
+    if m.get("created_at"):
+        parts.append(f"<p><i>创建于 {m['created_at']} · 更新于 {m.get('updated_at', m['created_at'])} · 来源 {m.get('source', 'agent')}</i></p>")
+    return "".join(parts)
+
+
+# ---------- 工具定义（OpenAI function-calling schema） ----------
+# 注意：description 字段是给 AI 阅读的「工具说明书」，全部用纯文本，
+# 不使用 Markdown 语法，与系统提示词风格保持一致。
+MEMORY_TOOL = {
     "type": "function",
     "function": {
         "name": "memory",
         "description": (
-            "Persistent per-chat file memory. ALWAYS begin a task by calling view on /memories, then read only relevant files. "
-            "Use create, str_replace, insert, delete, or rename to maintain concise, organized long-term memory. "
-            "All paths must be inside /memories. Do not store secrets, credentials, or unnecessary conversation transcripts."
+            "Persistent per-chat long-term memory store. Use to remember facts, preferences, people, events, or any note that should survive across sessions (unlike short-lived conversation history). 7 actions: add / get / list / search / update / delete / clear. Each memory carries category, tags, and importance (low/medium/high). Write when the user mentions something worth remembering; search before answering preference-related questions."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "_description": {"type": "string", "description": "简述本次记忆操作目的（≤60字）。"},
-                "command": {
+                "_description": {
                     "type": "string",
-                    "enum": ["view", "create", "str_replace", "insert", "delete", "rename"],
-                    "description": "记忆文件操作命令。"
+                    "description": "简述本次操作目的（≤60字）。示例：保存用户偏好：喜欢清淡口味"
                 },
-                "path": {"type": "string", "description": "目标路径，必须为 /memories 或其内部路径。"},
-                "view_range": {
-                    "type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2,
-                    "description": "仅 view：行范围 [起始行, 结束行]；结束行 -1 表示到文件末尾。"
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "get", "list", "search", "update", "delete", "clear"],
+                    "description": "要执行的操作。默认 list。"
                 },
-                "file_text": {"type": "string", "description": "仅 create：新文件的完整 UTF-8 文本。"},
-                "old_str": {"type": "string", "description": "仅 str_replace：必须在文件中唯一且完全匹配的旧文本。"},
-                "new_str": {"type": "string", "description": "仅 str_replace：替换文本；省略时删除 old_str。"},
-                "insert_line": {"type": "integer", "description": "仅 insert：在该 1-based 行之后插入；0 表示文件开头。"},
-                "insert_text": {"type": "string", "description": "仅 insert：要插入的文本。"},
-                "old_path": {"type": "string", "description": "仅 rename：原路径，必须在 /memories 内。"},
-                "new_path": {"type": "string", "description": "仅 rename：目标路径，必须在 /memories 内且不存在。"}
+                "content": {
+                    "type": "string",
+                    "description": "记忆内容。add/update 必填。最长 2000 字符。"
+                },
+                "memory_id": {
+                    "type": "string",
+                    "description": "目标记忆 id：8 位 hex。可带 # 前缀。get/update/delete 必填。"
+                },
+                "category": {
+                    "type": "string",
+                    "description": "记忆分类。内置：fact / preference / person / event / note；也可用自定义字符串。"
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "可选标签，最多 8 个，每个 ≤24 字符。也接受逗号/空格分隔的字符串。"
+                },
+                "importance": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "重要程度，默认 medium。"
+                },
+                "query": {
+                    "type": "string",
+                    "description": "搜索查询（仅 search）。对 content+tags+category 做子串匹配。"
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "清除范围。可选：all（默认）、category:<名称>、tag:<名称>。"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "list/search 返回上限。默认 50，最大 500。",
+                    "default": 50
+                },
+                "source": {
+                    "type": "string",
+                    "description": "记忆来源。agent（默认）或 user。"
+                }
             },
-            "required": ["command"]
+            "required": ["action"]
         },
         "input_examples": [
-            {"command": "view", "path": "/memories"},
-            {"command": "create", "path": "/memories/project-status.md", "file_text": "# Project status\n\n- Pending: inspect requirements\n"},
-            {"command": "str_replace", "path": "/memories/project-status.md", "old_str": "Pending: inspect requirements", "new_str": "Done: requirements inspected"},
-            {"command": "insert", "path": "/memories/project-status.md", "insert_line": 3, "insert_text": "- Next: implement changes\n"},
-            {"command": "rename", "old_path": "/memories/draft.md", "new_path": "/memories/final.md"}
+            {"action": "add", "content": "用户对花生过敏", "category": "fact", "importance": "high", "tags": ["健康", "过敏"]},
+            {"action": "search", "query": "过敏"},
+            {"action": "list", "category": "preference"},
+            {"action": "update", "memory_id": "a1b2c3d4", "content": "用户对花生和海鲜过敏", "importance": "high"},
+            {"action": "delete", "memory_id": "a1b2c3d4"},
+            {"action": "clear", "scope": "tag:temp"}
         ]
     }
 }

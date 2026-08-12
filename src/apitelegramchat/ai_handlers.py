@@ -52,6 +52,7 @@ from apitelegramchat.file_handlers import get_file_path
 from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2
 from apitelegramchat.skills import skill_catalog_brief
 from apitelegramchat.tool_executors import (
+    BashProgressSnapshot,
     dispatch_tool_call,
     format_tool_result,
     _truncate_tool_result,
@@ -1399,8 +1400,7 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 
 <tool_usage_guide>
 - todo：用户说"记一下""提醒我"时优先用。写操作（add/done/undone/delete/edit/clear）后紧跟一次 list，让用户看到最新状态。
-- memory：每次任务开始先用 <code>view</code> 查看 <code>/memories</code>，再按需读取相关文件；对可复用的进度、决策或偏好，以文件形式 create/str_replace/insert 维护。所有路径必须在 <code>/memories</code> 内。
-- tool_search：仅核心工具在首轮可用。需要尚未暴露的能力时，先用 <code>tool_search</code> 按任务意图检索；搜索结果会在下一轮自动加载。搜索只发现工具，不会执行任务。
+- memory：用户说"记住…"或提到长期偏好/过敏/重要他人/截止日期时写入；回答涉及偏好的问题前先 search。
 - skills：技能包存储在当前工作目录下。由你主动判断是否需要某个 skill；需要时先读取对应 SKILL.md，再按其说明调用脚本或参考文件，不会自动替你激活技能。
 - subagent：彼此独立的子任务请在同一轮里一次性并发派多个 subagent 工具调用，不要一个做完再发下一个；简单问题自己答，不要滥用。子 agent 不继承主对话历史，只看到 task + context。
 </tool_usage_guide>
@@ -2201,27 +2201,19 @@ async def _run_tool_calls_and_append(
                 command_preview = str(fn_args.get("command") or "").strip()
                 short_command = command_preview[:30] + "…" if len(command_preview) > 30 else command_preview
 
-                async def bash_progress_callback(output_text: str):
+                async def bash_progress_callback(snapshot: BashProgressSnapshot):
                     try:
-                        # 伪刷新式终端预览：每次收到新输出都用“最新 10 行”替换旧内容。
-                        # 这里只影响 Telegram 草稿 UI，不影响发送给模型的原始 tool 输出。
-                        live_tail, first_line = _tail_lines_with_start(output_text, 10)
-                        if live_tail:
-                            preview = (
-                                f"{_format_code_block(command_preview, header='bash · command', show_line_numbers=True, show_size=False, max_lines=10)}"
-                                f"<details open><summary>实时输出 · 最近 10 行（持续刷新）</summary>"
-                                f"{_format_code_block(live_tail, header='', show_line_numbers=True, show_size=False, max_lines=10, line_start=first_line)}"
-                                f"</details>"
-                            )
-                        else:
-                            preview = _format_code_block(command_preview, header="bash · command", show_line_numbers=True, show_size=False, max_lines=10)
+                        # 执行层提供的是有限状态的 20 行终端视口，而非原始字符尾部。
+                        # 渲染层继续按 HTML 转义后的体积裁剪，双重防护避免任何单行日志
+                        # 或 ANSI/进度条把草稿撑爆；最终 tool result 则完全不受这里影响。
+                        preview = _render_bash_live_preview(command_preview, snapshot)
                         builder.update_tool_preview(
                             tc_id,
                             preview,
                             summary=f"Running: {short_command}" if short_command else "Running command",
                         )
-                        # 和 Codex 的 outputDelta 类似：执行层只推送增量，真正的网络刷新由
-                        # builder 自己节流，避免 Python/Node 高频 stdout 把 Telegram API 打爆。
+                        # 和 output-delta 一样，只替换同一个滚动窗口。builder/传输层负责
+                        # 合并和节流，因此高频 stdout 不会造成草稿 API 高频调用。
                         builder.request_flush(force=False)
                     except Exception:
                         pass  # UI 推送失败不能影响 Bash 本身执行
@@ -2372,13 +2364,6 @@ def _tool_result_is_failure(fn_name: str, fn_args: dict, result_content: Any, de
         return True
     text = str(result_content or "").strip()
     lower = text.lower()
-    if fn_name in {"memory", "tool_search"}:
-        try:
-            structured = json.loads(text)
-        except (TypeError, ValueError):
-            structured = None
-        if isinstance(structured, dict):
-            return not bool(structured.get("ok"))
     if fn_name == "bash":
         # bash 的成功/失败以退出码为准；仅在明确看不到退出码时，再回退到错误前缀判断。
         m = re.search(r"Exit code:\s*(\d+)", text)
@@ -2512,6 +2497,80 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
 # ========== 流式工具预览辅助 ==========
 _STREAM_PREVIEW_MAX_LINES = 15
 _STREAM_PREVIEW_MAX_LINES_FULL = 200
+_BASH_LIVE_PREVIEW_MAX_LINES = 20
+# 限制的是 HTML 转义后的字符量而非原始长度，避免一行包含大量 <、& 时
+# 经过转义后再次撑大 rich draft。
+_BASH_LIVE_PREVIEW_MAX_ESCAPED_LINE_CHARS = 120
+_BASH_COMMAND_PREVIEW_MAX_ESCAPED_LINE_CHARS = 96
+
+
+def _clip_terminal_line_for_preview(line: str, max_escaped_chars: int) -> str:
+    """Return a safe terminal line whose rendered HTML payload has a hard size cap."""
+    if not line:
+        return ""
+    used = 0
+    clipped: list[str] = []
+    for char in line:
+        escaped_size = len(escape_html(char))
+        if used + escaped_size > max_escaped_chars:
+            return "".join(clipped).rstrip() + "…"
+        clipped.append(char)
+        used += escaped_size
+    return "".join(clipped)
+
+
+def _bounded_terminal_preview(
+    text: str,
+    *,
+    max_lines: int,
+    max_escaped_line_chars: int,
+) -> str:
+    """Defensively bound an output window before it reaches the rich-message renderer."""
+    # `BashPreviewBuffer` already normalizes controls.  Keep this second layer so a
+    # future executor/callback change cannot accidentally reintroduce raw terminal data.
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text or "")
+    lines = cleaned.splitlines()[-max(1, max_lines):]
+    return "\n".join(
+        _clip_terminal_line_for_preview(line, max_escaped_line_chars)
+        for line in lines
+    )
+
+
+def _render_bash_live_preview(command: str, snapshot: BashProgressSnapshot) -> str:
+    """Render the bounded Bash viewport in the same card style as other live tools."""
+    command_text = _bounded_terminal_preview(
+        command,
+        max_lines=10,
+        max_escaped_line_chars=_BASH_COMMAND_PREVIEW_MAX_ESCAPED_LINE_CHARS,
+    )
+    output_text = _bounded_terminal_preview(
+        snapshot.text,
+        max_lines=_BASH_LIVE_PREVIEW_MAX_LINES,
+        max_escaped_line_chars=_BASH_LIVE_PREVIEW_MAX_ESCAPED_LINE_CHARS,
+    )
+    visible_lines = len(output_text.splitlines()) or 1
+    if snapshot.hidden_lines:
+        output_title = (
+            f"实时输出 · 最近 {visible_lines} 行（共 {snapshot.total_lines} 行，滚动刷新）"
+        )
+    else:
+        output_title = f"实时输出 · 最近 {visible_lines} 行（滚动刷新）"
+    command_card = _format_code_block(
+        command_text or "(空命令)",
+        header="bash · command",
+        show_line_numbers=True,
+        show_size=False,
+        max_lines=10,
+    )
+    output_card = _format_code_block(
+        output_text or "(等待输出…)",
+        header="",
+        show_line_numbers=True,
+        show_size=False,
+        max_lines=_BASH_LIVE_PREVIEW_MAX_LINES,
+        line_start=snapshot.first_line,
+    )
+    return f"{command_card}<details open><summary>{output_title}</summary>{output_card}</details>"
 
 
 def _format_code_block(content: str, max_lines: int = _STREAM_PREVIEW_MAX_LINES_FULL,
@@ -2606,74 +2665,6 @@ def _format_live_file_preview(content: str, *, path: str = "", label: str = "文
     )
 
 
-_BASH_STREAM_PREVIEW_LINES = 20
-_BASH_STREAM_PREVIEW_MAX_LINE_CHARS = 400
-
-
-def _decode_streaming_json_string(raw: str) -> str:
-    """Decode a JSON string fragment without discarding a trailing partial escape."""
-    try:
-        return json.loads(f'"{raw}"')
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    decoded: list[str] = []
-    index = 0
-    escapes = {
-        '"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f',
-        'n': '\n', 'r': '\r', 't': '\t',
-    }
-    while index < len(raw):
-        char = raw[index]
-        if char != '\\' or index + 1 >= len(raw):
-            decoded.append(char)
-            index += 1
-            continue
-        escaped = raw[index + 1]
-        if escaped == 'u':
-            unicode_digits = raw[index + 2:index + 6]
-            if len(unicode_digits) == 4 and all(c in '0123456789abcdefABCDEF' for c in unicode_digits):
-                decoded.append(chr(int(unicode_digits, 16)))
-                index += 6
-                continue
-            decoded.append(raw[index:])
-            break
-        decoded.append(escapes.get(escaped, f'\\{escaped}'))
-        index += 2
-    return ''.join(decoded)
-
-
-def _extract_streaming_json_string(args_str: str, key: str) -> str:
-    """Return a complete or in-progress JSON string field from streamed arguments."""
-    match = re.search(
-        rf'"{re.escape(key)}"\s*:\s*"((?:[^"\\]|\\.)*)(?:$|")',
-        args_str,
-        re.DOTALL,
-    )
-    return _decode_streaming_json_string(match.group(1)) if match else ''
-
-
-def _format_live_bash_preview(command: str) -> str:
-    """Render only the current command tail so streamed Bash drafts remain bounded."""
-    tail, first_line = _tail_lines_with_start(command, _BASH_STREAM_PREVIEW_LINES)
-    if not tail:
-        return "<p><i>正在接收命令…</i></p>"
-    bounded_lines = [
-        line if len(line) <= _BASH_STREAM_PREVIEW_MAX_LINE_CHARS
-        else line[:_BASH_STREAM_PREVIEW_MAX_LINE_CHARS] + " … [此行已截断]"
-        for line in tail.splitlines()
-    ]
-    return (
-        f"<details open><summary>当前命令 · 最近 {_BASH_STREAM_PREVIEW_LINES} 行（持续刷新）</summary>"
-        + _format_code_block(
-            "\n".join(bounded_lines), header="bash · command",
-            show_line_numbers=True, show_size=False,
-            max_lines=_BASH_STREAM_PREVIEW_LINES, line_start=first_line,
-        )
-        + "</details>"
-    )
-
-
 # ---- 修改点2：_build_streaming_preview 中的进行时摘要（规范第三部分） ----
 def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, str]:
     try:
@@ -2696,11 +2687,6 @@ def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, s
             else:
                 # 参数尚未完整解析时不显示额外的编辑器中间态噪声。
                 preview_html = ""
-        elif fn_name == "bash":
-            command = _extract_streaming_json_string(args_str, "command")
-            if command:
-                new_summary = _generate_initial_tool_summary("bash", {"command": command})
-            preview_html = _format_live_bash_preview(command)
         else:
             preview_html = _format_code_block(args_str, header="arguments (streaming)")
         return new_summary, preview_html
@@ -2731,8 +2717,8 @@ def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, s
             preview_html = "<p><i>正在创建空文件…</i></p>"
 
     elif fn_name == "bash":
-        command = str(args_obj.get("command", "") or "")
-        preview_html = _format_live_bash_preview(command)
+        command = args_obj.get("command", "")
+        preview_html = _format_code_block(command, header="bash · command", show_line_numbers=True, show_size=False, max_lines=10)
 
     elif fn_name == "web_search":
         query = args_obj.get("query", "")
@@ -3520,15 +3506,9 @@ async def _agentic_loop_openai_compat(
         client: AsyncOpenAI, current_model: str, messages: list, api_label: str,
         builder: "RichMessageBuilder", tools: list = None, supports_tools: bool = True
 ) -> tuple[str | None, object | None, list]:
-    from apitelegramchat.search_engine import TOOL_CATALOG, get_initial_agent_tools, get_tools_for_names
-    from apitelegramchat.tool_search import extract_loaded_tool_names
     if tools is None:
-        tools = get_initial_agent_tools()
-    # Keep the initial set stable for prompt caching.  Definitions returned by
-    # tool_search are validated against the server-side catalog and become
-    # callable only on the next loop turn.
-    eager_tools = list(tools)
-    loaded_tool_names: list[str] = []
+        from apitelegramchat.search_engine import SEARCH_TOOLS
+        tools = SEARCH_TOOLS
     loop_messages = list(messages)
     final_content = None
     final_usage = None
@@ -3541,16 +3521,6 @@ async def _agentic_loop_openai_compat(
     max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
 
     for _round in range(MAX_TOOL_CALLS):
-        active_tools = [*eager_tools, *get_tools_for_names(loaded_tool_names)]
-        # De-duplicate by function name while preserving the eager tool order.
-        seen_tool_names: set[str] = set()
-        active_tools = [
-            tool for tool in active_tools
-            if isinstance(tool, dict)
-            and isinstance(tool.get("function"), dict)
-            and isinstance(tool["function"].get("name"), str)
-            and not (tool["function"]["name"] in seen_tool_names or seen_tool_names.add(tool["function"]["name"]))
-        ]
         added_tool_indices = set()
         last_arg_len = {}
 
@@ -3586,8 +3556,8 @@ async def _agentic_loop_openai_compat(
             if supports_sampling:
                 create_params["temperature"] = 0.6
                 create_params["top_p"] = 0.9
-            if supports_tools and active_tools:
-                create_params["tools"] = active_tools
+            if supports_tools and tools:
+                create_params["tools"] = tools
                 create_params["tool_choice"] = "auto"
                 create_params["parallel_tool_calls"] = parallel_tool_calls
             if api_label == "openrouter":
@@ -3754,8 +3724,8 @@ async def _agentic_loop_openai_compat(
                 if supports_sampling:
                     fallback_params["temperature"] = 0.6
                     fallback_params["top_p"] = 0.9
-                if supports_tools and active_tools:
-                    fallback_params["tools"] = active_tools
+                if supports_tools and tools:
+                    fallback_params["tools"] = tools
                     fallback_params["tool_choice"] = "auto"
                     fallback_params["parallel_tool_calls"] = parallel_tool_calls
                 if api_label == "openrouter":
@@ -3764,7 +3734,7 @@ async def _agentic_loop_openai_compat(
                 resp = await client.chat.completions.create(**fallback_params)
                 msg = resp.choices[0].message
                 content_acc = msg.content or ""
-                if supports_tools and active_tools and hasattr(msg, "tool_calls") and msg.tool_calls:
+                if supports_tools and tools and hasattr(msg, "tool_calls") and msg.tool_calls:
                     for idx, tc in enumerate(msg.tool_calls):
                         tool_calls_acc[idx] = {
                             "id": tc.id,
@@ -3847,21 +3817,8 @@ async def _agentic_loop_openai_compat(
             tool_calls_list, loop_messages, new_history_entries,
             tool_call_count_ref, api_label, builder, chat_id=builder.chat_id
         )
-        # Search returns model-visible references, but the orchestrator is the
-        # trust boundary: load only catalog-verified names after this tool round.
-        discovered_names: list[str] = []
-        for message in reversed(loop_messages):
-            if message.get("role") == "assistant":
-                break
-            if message.get("role") == "tool" and message.get("name") == "tool_search":
-                discovered_names.extend(extract_loaded_tool_names(message.get("content", ""), TOOL_CATALOG))
-        for name in reversed(discovered_names):
-            if name not in loaded_tool_names:
-                loaded_tool_names.append(name)
-        if discovered_names:
-            logger.info("[%s] tool_search loaded definitions for next round: %s", api_label, loaded_tool_names)
-        # ===== FIX: 只对 over_limit 做强制总结并退出 =====
 
+        # ===== FIX: 只对 over_limit 做强制总结并退出 =====
         if status == "over_limit":
             synth_params = {
                 "model": current_model,
@@ -3923,12 +3880,7 @@ async def _agentic_loop_gemini_openai_compat(
             cleaned.append(new_tool)
         return cleaned
 
-    from apitelegramchat.search_engine import TOOL_CATALOG, get_initial_agent_tools, get_tools_for_names
-    from apitelegramchat.tool_search import extract_loaded_tool_names
-    if tools is None:
-        tools = get_initial_agent_tools()
-    eager_tools = list(tools)
-    loaded_tool_names: list[str] = []
+    cleaned_tools = _clean_tools_for_gemini(tools) if tools else None
 
     model_info = SUPPORTED_MODELS.get(current_model)
     supports_sampling = model_info.supports_sampling if model_info else True
@@ -3947,16 +3899,6 @@ async def _agentic_loop_gemini_openai_compat(
     new_history_entries: list = []
 
     for _round in range(MAX_TOOL_CALLS):
-        active_tools = [*eager_tools, *get_tools_for_names(loaded_tool_names)]
-        seen_tool_names: set[str] = set()
-        active_tools = [
-            tool for tool in active_tools
-            if isinstance(tool, dict)
-            and isinstance(tool.get("function"), dict)
-            and isinstance(tool["function"].get("name"), str)
-            and not (tool["function"]["name"] in seen_tool_names or seen_tool_names.add(tool["function"]["name"]))
-        ]
-        cleaned_tools = _clean_tools_for_gemini(active_tools)
         payload: dict = {
             "model": current_model,
             "messages": loop_messages,
@@ -4072,17 +4014,6 @@ async def _agentic_loop_gemini_openai_compat(
             tool_calls_list, loop_messages, new_history_entries,
             tool_call_count_ref, "gemini", builder, chat_id=builder.chat_id
         )
-        discovered_names: list[str] = []
-        for message in reversed(loop_messages):
-            if message.get("role") == "assistant":
-                break
-            if message.get("role") == "tool" and message.get("name") == "tool_search":
-                discovered_names.extend(extract_loaded_tool_names(message.get("content", ""), TOOL_CATALOG))
-        for name in reversed(discovered_names):
-            if name not in loaded_tool_names:
-                loaded_tool_names.append(name)
-        if discovered_names:
-            logger.info("[gemini] tool_search loaded definitions for next round: %s", loaded_tool_names)
 
         if status == "over_limit":
             synth_payload = {
@@ -5277,8 +5208,8 @@ async def _call_api(
         tools: list = None
 ) -> tuple[str | None, object | None, list]:
     if tools is None:
-        from apitelegramchat.search_engine import get_initial_agent_tools
-        tools = get_initial_agent_tools()
+        from apitelegramchat.search_engine import SEARCH_TOOLS
+        tools = SEARCH_TOOLS
 
     api_type = model_info.provider
     supports_tools = model_info.supports_tools
