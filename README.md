@@ -44,24 +44,18 @@ workspace 编辑器只接收相对路径，并在解析符号链接后再次确�
 
 ## 外部 MCP（地图与搜索）
 
-地图和可选的 Bing 搜索通过 Streamable HTTP 调用外部 MCP server。外部 endpoint 必须使用 HTTPS、主机 allowlist 和固定的上游工具 allowlist；认证令牌不会发往未受信任的 URL。
+地图和 Bing 搜索通过 Streamable HTTP 调用外部 MCP server。
 
 ```bash
 # AMap / ModelScope
 export GAODE_MCP_ENABLED=true
 export GAODE_MCP_URL='https://mcp.api-inference.modelscope.net/<deployment-id>/mcp'
 export GAODE_MCP_TOKEN='...'
-# 仅在覆盖默认 ModelScope 主机时才需要指定。
 export GAODE_MCP_ALLOWED_HOSTS='mcp.api-inference.modelscope.net'
 
-# 官方 Bing MCP：官方 ModelScope endpoint 与其主机默认已配置。
-# 常规部署只需提供 token；如需改用自定义 URL，才须同时覆盖 allowlist。
-export BING_CN_MCP_ENABLED=true
+# Bing CN MCP：URL 与 Bearer token 均从环境变量读取。
+export BING_CN_MCP_URL='https://mcp.api-inference.modelscope.net/<deployment-id>/mcp'
 export BING_CN_MCP_TOKEN='...'
-
-# 可选：仅在使用自定义 endpoint 时设置。
-# export BING_CN_MCP_URL='https://mcp.example.com/mcp'
-# export BING_CN_MCP_ALLOWED_HOSTS='mcp.example.com'
 ```
 
 地图坐标统一为 `longitude,latitude`，例如 `116.397128,39.916527`。

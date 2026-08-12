@@ -32,14 +32,9 @@ GAODE_MCP_ENABLED = os.getenv("GAODE_MCP_ENABLED", "true").strip().lower() in {"
 GAODE_MCP_URL = (os.getenv("GAODE_MCP_URL") or "https://mcp.api-inference.modelscope.net/3331c36972ff42/mcp").strip()
 GAODE_MCP_TOKEN = (os.getenv("GAODE_MCP_TOKEN") or "").strip()
 
-# ---------- 网页搜索：官方 ModelScope Bing MCP 服务 ----------
-# 采用 streamable_http + Bearer token。可通过环境变量覆盖 endpoint，
-# 但自定义 host 仍须在 BING_CN_MCP_ALLOWED_HOSTS 中显式 allowlist。
-BING_CN_MCP_ENABLED = os.getenv("BING_CN_MCP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-BING_CN_MCP_URL = (
-    os.getenv("BING_CN_MCP_URL")
-    or "https://mcp.api-inference.modelscope.net/822d99d32a6946/mcp"
-).strip()
+# ---------- 网页搜索：Bing CN MCP 服务 ----------
+# 使用 streamable_http + Bearer token；URL 和 token 均由运行环境提供。
+BING_CN_MCP_URL = (os.getenv("BING_CN_MCP_URL") or "").strip()
 BING_CN_MCP_TOKEN = (os.getenv("BING_CN_MCP_TOKEN") or "").strip()
 
 

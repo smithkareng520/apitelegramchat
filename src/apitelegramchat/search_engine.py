@@ -1360,46 +1360,55 @@ SEARCH_TOOLS = [
 # 工具实现
 # =============================================================================
 
-# 网页搜索统一通过用户指定的 DuckDuckGo REST API 完成；地图能力仍通过 AMap MCP 提供。
+# 网页搜索统一通过 Bing CN MCP 的 `bing_search` 工具完成；地图能力仍通过 AMap MCP 提供。
 
-@retry_async(max_retries=2, delay=1.5, backoff=2.0,
-            exceptions=(aiohttp.ClientError, asyncio.TimeoutError))
-async def _search_via_ddg_api(query: str, num_results: int) -> list[dict] | None:
-    """通过用户指定的 DuckDuckGo REST API 服务执行网页搜索。"""
-    query = (query or "").strip()
-    if not query:
-        return None
+def _parse_bing_search_text(raw: str, requested: int) -> list[dict[str, str]]:
+    """解析 Bing CN MCP 的文本返回，同时兼容 JSON 返回。"""
+    text = (raw or "").strip()
+    if not text:
+        return []
 
-    api_url = f"https://my-search-api-08cb.onrender.com/duckduckgo/search?text={quote(query)}"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(api_url, timeout=15) as resp:
-                if resp.status != 200:
-                    logger.warning(f"DDG API 状态码非 200: {resp.status}")
-                    return None
-                data = await resp.json()
-                raw_results = data.get("results", [])
-                
-                items = []
-                for r in raw_results:
-                    # 过滤广告
-                    if r.get("type") == "ad":
-                        continue
-                    title = (r.get("title") or "").strip() or "无标题"
-                    link = (r.get("url") or "").strip()
-                    snippet = (r.get("snippet") or "").strip()
-                    if not link:
-                        continue
-                    items.append({"title": title, "link": link, "snippet": snippet})
-                    if len(items) >= num_results:
-                        break
-                return items if items else None
-    except Exception as e:
-        logger.warning(f"DDG API 搜索调用异常: {e}")
-        raise
+        payload = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        payload = None
+
+    if isinstance(payload, dict):
+        candidates = payload.get("results") or payload.get("items") or payload.get("data")
+        if isinstance(candidates, dict):
+            candidates = candidates.get("results") or candidates.get("items")
+        if isinstance(candidates, list):
+            items: list[dict[str, str]] = []
+            for item in candidates:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title") or item.get("name") or "无标题").strip()
+                link = str(item.get("url") or item.get("link") or "").strip()
+                snippet = str(item.get("snippet") or item.get("description") or item.get("summary") or "").strip()
+                if link:
+                    items.append({"title": title or "无标题", "link": link, "snippet": snippet})
+                if len(items) >= requested:
+                    break
+            if items:
+                return items
+
+    # Bing CN MCP 当前实现返回类似：
+    # [1] 标题\n    #     链接: https://...\n    #     摘要: ...
+    pattern = re.compile(
+        r"(?ms)^\s*\[(\d+)\]\s+(.+?)\n\s*链接:\s*(https?://\S+)\s*\n\s*摘要:\s*(.*?)(?=\n\s*\[\d+\]\s+|\Z)"
+    )
+    items = []
+    for match in pattern.finditer(text):
+        title = re.sub(r"\s+", " ", match.group(2)).strip()
+        link = match.group(3).strip()
+        snippet = re.sub(r"\s+", " ", match.group(4)).strip()
+        items.append({"title": title or "无标题", "link": link, "snippet": snippet})
+        if len(items) >= requested:
+            break
+    return items
 
 
-def _format_search_results(items: list, query: str, engine: str, requested: int | None = None) -> str:
+def _format_search_results(items: list[dict[str, str]], query: str, engine: str, requested: int | None = None) -> str:
     success_count = len(items)
     requested_count = requested if isinstance(requested, int) and requested > 0 else success_count
     lines = [f"🔍 [成功: {engine}] 搜索「{query}」的结果（{success_count}/{requested_count}）：\n"]
@@ -1412,20 +1421,29 @@ def _format_search_results(items: list, query: str, engine: str, requested: int 
 
 
 async def execute_web_search(query: str, num_results: int = 5) -> str:
-    """通过专用的 DuckDuckGo REST API 服务执行网页搜索（唯一搜索引擎）。"""
+    """通过外部 Bing CN MCP 的 `bing_search` 工具执行网页搜索。"""
     query = (query or "").strip()
     requested = min(max(int(num_results or 5), 1), 10)
     if not query:
         return "❌ 搜索关键词为空。"
 
     try:
-        items = await _search_via_ddg_api(query, requested)
-    except Exception as e:
-        logger.warning(f"DDG 搜索失败: {e}")
-        items = None
+        raw = await call_mcp_tool(
+            "bing-cn-mcp-server",
+            "bing_search",
+            {"query": query, "count": requested},
+        )
+    except MCPToolError as exc:
+        logger.warning("Bing MCP 搜索失败: %s", exc)
+        return f"❌ Bing MCP 搜索失败：{exc}"
 
+    items = _parse_bing_search_text(raw, requested)
     if items:
-        return _format_search_results(items, query, "DuckDuckGo", requested=requested)
+        return _format_search_results(items, query, "Bing", requested=requested)
+
+    if raw.strip():
+        # 上游已提供可读的 MCP 文本时不要丢失内容，即使格式发生变化。
+        return f"🔍 [成功: Bing] 搜索「{query}」：\n\n{raw.strip()}"
 
     return f"❌ 未找到与「{query}」相关的结果。"
 

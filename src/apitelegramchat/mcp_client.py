@@ -68,14 +68,14 @@ def _build_servers() -> dict[str, MCPServerConfig]:
     from apitelegramchat import config
 
     servers: dict[str, MCPServerConfig] = {}
-    if config.BING_CN_MCP_ENABLED and config.BING_CN_MCP_URL:
+    if config.BING_CN_MCP_URL and config.BING_CN_MCP_TOKEN:
         try:
+            # URL 已由部署环境显式指定；仍强制 HTTPS，并仅允许 Bing 搜索工具。
+            bing_host = (urlparse(config.BING_CN_MCP_URL).hostname or "").lower()
             servers["bing-cn-mcp-server"] = MCPServerConfig(
                 name="bing-cn-mcp-server",
                 url=config.BING_CN_MCP_URL,
-                allowed_hosts=_configured_hosts(
-                    "BING_CN_MCP_ALLOWED_HOSTS", {"mcp.api-inference.modelscope.net"}
-                ),
+                allowed_hosts=frozenset({bing_host}),
                 allowed_tools=frozenset({"bing_search"}),
                 headers=_build_bearer_header(config.BING_CN_MCP_TOKEN),
             )
