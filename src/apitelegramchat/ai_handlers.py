@@ -1376,7 +1376,7 @@ After each search result, append: source emoji [Source Name](URL). Use the sourc
 - Files created or modified by Bash remain in this local workspace. They are not synchronized wholesale to R2.
 - When using a skill, read its <code>skills/&lt;skill_id&gt;/SKILL.md</code> and run its scripts from that local skill directory as needed.
 - <code>text_editor</code> edits are persisted automatically for the specific file being edited.
-- The chat UI renders text-editor tool results as quoted <b>Input</b> and <b>Output</b> blocks. For <code>str_replace</code>, Input is <code>new_str</code> and Output is the absolute-path success message. For <code>view</code>, Input is the call’s <code>_description</code> intent and Output is the raw returned text, limited to its first 20 lines. Use <code>_description</code> to state the view intent clearly.
+- The chat UI renders tool results (both <code>text_editor</code> and <code>bash</code>) as quoted <b>Input</b> and <b>Output</b> blocks, with no live/streaming preview during execution — only the final result is shown once the call completes. For <code>text_editor str_replace</code>, Input is <code>new_str</code> and Output is the absolute-path success message. For <code>text_editor view</code>, Input is the call’s <code>_description</code> intent and Output is the raw returned text. For <code>bash</code>, Input is the executed command and Output is its captured output (prefixed with the exit code). Either Input or Output is truncated to its first 20 lines if longer. Use <code>_description</code> to state the view intent clearly.
 - <code>text_editor</code> has exactly four commands: <code>view</code>, <code>str_replace</code>, <code>create</code>, and <code>insert</code>. It never lists directories, deletes files, uses regular expressions, or replaces by line range.
 - Call <code>view</code> before every edit. Its result is line-numbered; use <code>view_range=[start_line, end_line]</code> for focused inspection and <code>insert_line</code> to insert after an exact line (use 0 for the beginning).
 - <code>str_replace</code> accepts only an exact, non-empty <code>old_str</code> and succeeds only when it has exactly one match in the whole file. Never try to resolve multiple matches with a line range, occurrence selector, regex, or a retry.
@@ -2100,59 +2100,16 @@ async def _run_tool_calls_and_append(
 
     await builder.flush(force=False)
 
-    for fn_name, fn_args, tc_id in tool_tasks:
-        preview_html = ""
-        if fn_name == "text_editor":
-            cmd = fn_args.get("command", "")
-            path = fn_args.get("path", "")
-            content = ""
-            label = "文件内容"
-            if cmd == "create":
-                content = str(fn_args.get("file_text", "") or "")
-                label = "新建文件 · 实时草稿"
-            elif cmd == "str_replace":
-                content = str(fn_args.get("new_str", "") or "")
-                label = "替换后片段 · 实时草稿"
-            elif cmd == "insert":
-                content = str(fn_args.get("insert_text", "") or "")
-                label = "插入内容 · 实时草稿"
-            if content:
-                preview_html = _format_live_file_preview(content, path=path, label=label)
-            elif cmd == "view":
-                preview_html = "<p><i>正在读取文件内容…</i></p>"
-            elif cmd == "create":
-                preview_html = "<p><i>正在创建空文件…</i></p>"
-        elif fn_name == "bash":
-            command = fn_args.get("command", "")
-            preview_html = _format_code_block(
-                command, header="bash · command", show_line_numbers=True, show_size=False, max_lines=10
-            )
-        elif fn_name == "web_search":
-            query = fn_args.get("query", "")
-            preview_html = f"搜索：{escape_html(query)}"
-        elif fn_name == "fetch_url":
-            url = fn_args.get("url", "")
-            preview_html = f"抓取：{escape_html(url)}"
-        elif fn_name == "generate_video":
-            prompt = fn_args.get("prompt", "")
-            duration = fn_args.get("duration", 5)
-            short = prompt[:80] + "…" if len(prompt) > 80 else prompt
-            preview_html = f"生成视频（{duration}s）：{escape_html(short)}"
-
-        if preview_html:
-            builder.update_tool_item(tc_id, initial_summary, preview_html, status="running")
-    await builder.flush(force=False)
-
     stop_refresh = asyncio.Event()
 
     has_image_tool = any(fn_name in MEDIA_GEN_TOOLS for fn_name, _, _ in tool_tasks)
     has_bash_tool = any(fn_name in BASH_TOOLS for fn_name, _, _ in tool_tasks)
     has_ask_user_tool = any(fn_name == "ask_user" for fn_name, _, _ in tool_tasks)
-    # Bash 与子 agent 一样，可能长时间没有新的文本增量。
-    # 普通 force=False flush 会被 send_rich_message_draft 的“内容未变化”短路，
-    # 因此前端看不到持续运行中的 Bash 状态。每 2 秒强制 reassert 一帧，保持
-    # 草稿在前端持续活跃；真正有 stdout 增量时仍由 progress_callback 节流刷新。
-    # 所有工具调用都每两秒重申草稿；避免网络类/MCP/文件操作在无文本增量时被客户端暂时挤掉。
+    # 工具执行期间不再做实时输出预览（bash/text_editor 的结果只在完成后
+    # 展示一次），但工具执行本身可能长时间没有新的文本增量。普通
+    # force=False flush 会被 send_rich_message_draft 的“内容未变化”短路，
+    # 因此前端看不到持续运行中的状态。每 2 秒强制 reassert 一帧，保持
+    # 草稿在前端持续活跃；子 agent 的状态更新仍由 progress_callback 推送。
     force_tool_refresh = bool(tool_tasks)
 
     async def refresh_loop():
@@ -2195,35 +2152,8 @@ async def _run_tool_calls_and_append(
                     except Exception:
                         pass  # 进度推送失败不能影响主流程
 
-            bash_progress_callback = None
-            if fn_name in BASH_TOOLS:
-                command_preview = str(fn_args.get("command") or "").strip()
-                short_command = command_preview[:30] + "…" if len(command_preview) > 30 else command_preview
-
-                async def bash_progress_callback(output_text: str):
-                    try:
-                        # 伪刷新式终端预览：每次收到新输出都用“最新 10 行”替换旧内容。
-                        # 这里只影响 Telegram 草稿 UI，不影响发送给模型的原始 tool 输出。
-                        live_tail, first_line = _tail_lines_with_start(output_text, 10)
-                        if live_tail:
-                            preview = (
-                                f"{_format_code_block(command_preview, header='bash · command', show_line_numbers=True, show_size=False, max_lines=10)}"
-                                f"<details open><summary>实时输出 · 最近 10 行（持续刷新）</summary>"
-                                f"{_format_code_block(live_tail, header='', show_line_numbers=True, show_size=False, max_lines=10, line_start=first_line)}"
-                                f"</details>"
-                            )
-                        else:
-                            preview = _format_code_block(command_preview, header="bash · command", show_line_numbers=True, show_size=False, max_lines=10)
-                        builder.update_tool_preview(
-                            tc_id,
-                            preview,
-                            summary=f"Running: {short_command}" if short_command else "Running command",
-                        )
-                        # 和 Codex 的 outputDelta 类似：执行层只推送增量，真正的网络刷新由
-                        # builder 自己节流，避免 Python/Node 高频 stdout 把 Telegram API 打爆。
-                        builder.request_flush(force=False)
-                    except Exception:
-                        pass  # UI 推送失败不能影响 Bash 本身执行
+            # bash 不再做执行期间的实时预览刷新；结果只在完成后按统一的
+            # Input/Output 格式渲染一次（见 _render_bash_result）。
 
             try:
                 if fn_name == "ask_user":
@@ -2251,7 +2181,7 @@ async def _run_tool_calls_and_append(
                     result_str = await asyncio.wait_for(
                         dispatch_tool_call(
                             fn_name, fn_args, chat_id=builder.chat_id,
-                            progress_callback=(bash_progress_callback or subagent_progress_callback),
+                            progress_callback=subagent_progress_callback,
                         ),
                         timeout=timeout
                     )
@@ -2500,182 +2430,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
     }
     return mapping.get(fn_name, "Ran an action")
 
-
-# ========== 流式工具预览辅助 ==========
-_STREAM_PREVIEW_MAX_LINES = 15
-_STREAM_PREVIEW_MAX_LINES_FULL = 200
-
-
-def _format_code_block(content: str, max_lines: int = _STREAM_PREVIEW_MAX_LINES_FULL,
-                       header: str = "", show_line_numbers: bool = False,
-                       show_size: bool = False, line_start: int = 1) -> str:
-    if not content:
-        return ""
-    content = content.rstrip()
-    lines = content.splitlines()
-    total = len(lines)
-    if total == 0:
-        return "<pre><code></code></pre>"
-
-    if total > max_lines:
-        half = max_lines // 2
-        first = lines[:half]
-        last = lines[-half:]
-        display_lines = first + [f"... (省略 {total - max_lines} 行，共 {total} 行) ..."] + last
-    else:
-        display_lines = lines
-
-    if show_line_numbers:
-        # 使用真实的绝对行号；滚动尾部预览不再每次都从 1 重新编号。
-        line_count = len(display_lines)
-        width = len(str(max(line_start + line_count - 1, line_count)))
-        numbered_lines = []
-        for idx, line in enumerate(display_lines, line_start):
-            numbered_lines.append(f"{idx:>{width}} │ {line}")
-        display = "\n".join(numbered_lines)
-    else:
-        display = "\n".join(display_lines)
-
-    display_escaped = escape_html(display)
-
-    header_html = ""
-    if header:
-        header_html = (
-            f'<div style="background:#2d2d2d;color:#999;padding:4px 12px;'
-            f'font-size:11px;font-family:sans-serif;'
-            f'border-bottom:1px solid #404040;">{escape_html(header)}</div>'
-        )
-
-    size_html = ""
-    if show_size:
-        byte_count = len(content.encode('utf-8'))
-        size_html = f'<div style="color:#888;font-size:11px;padding:2px 12px;border-top:1px solid #333;">大小: {byte_count} 字节</div>'
-
-    return (
-        f'<div style="background:#1e1e1e;border-radius:6px;'
-        f'border:1px solid #333;overflow:hidden;">'
-        f'{header_html}'
-        f'<pre style="margin:0;padding:10px 12px;color:#d4d4d4;'
-        f'font-family:SFMono-Regular,Consolas,\'Liberation Mono\',Menlo,monospace;'
-        f'font-size:12px;max-height:240px;overflow:auto;'
-        f'white-space:pre;line-height:1.5;">{display_escaped}</pre>'
-        f'{size_html}'
-        f'</div>'
-    )
-
-
-def _tail_lines(text: str, n: int = 7) -> str:
-    if not text:
-        return ""
-    lines = text.splitlines()
-    if len(lines) <= n:
-        return text
-    return "\n".join(lines[-n:])
-
-
-def _tail_lines_with_start(text: str, n: int = 10) -> tuple[str, int]:
-    """Return a rolling tail and the absolute one-based line number of its first row."""
-    lines = (text or "").splitlines()
-    if not lines:
-        return "", 1
-    first = max(1, len(lines) - n + 1)
-    return "\n".join(lines[-n:]), first
-
-
-def _format_live_file_preview(content: str, *, path: str = "", label: str = "文件草稿") -> str:
-    """Compiler-style file preview: only the current tail, always with stable line numbers."""
-    tail, first_line = _tail_lines_with_start(content, 10)
-    if not tail:
-        return "<p><i>等待文件内容…</i></p>"
-    title = f"{label} · {path}" if path else label
-    return (
-        "<details open><summary>当前内容 · 最近 10 行（持续刷新）</summary>"
-        + _format_code_block(
-            tail, header=title, show_line_numbers=True, show_size=False,
-            max_lines=10, line_start=first_line,
-        )
-        + "</details>"
-    )
-
-
-# ---- 修改点2：_build_streaming_preview 中的进行时摘要（规范第三部分） ----
-def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, str]:
-    try:
-        args_obj = json.loads(args_str)
-    except (json.JSONDecodeError, ValueError):
-        new_summary = None
-        preview_html = ""
-        fallback_args = _safe_parse_args(args_str)
-        # 使用统一的进行时摘要生成函数
-        if fallback_args:
-            new_summary = _generate_initial_tool_summary(fn_name, fallback_args)
-        else:
-            new_summary = None
-        if fn_name == "text_editor":
-            m = re.search(r'"file_text"\s*:\s*"((?:[^"\\]|\\.)*)(?:$|")', args_str, re.DOTALL)
-            if m:
-                raw = m.group(1)
-                raw = raw.replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t')
-                preview_html = _format_live_file_preview(raw, label="文件草稿")
-            else:
-                # 参数尚未完整解析时不显示额外的编辑器中间态噪声。
-                preview_html = ""
-        else:
-            preview_html = _format_code_block(args_str, header="arguments (streaming)")
-        return new_summary, preview_html
-
-    # 有完整 JSON 时，使用统一的进行时摘要
-    new_summary = _generate_initial_tool_summary(fn_name, args_obj)
-    preview_html = ""
-
-    if fn_name == "text_editor":
-        cmd = args_obj.get("command", "")
-        path = str(args_obj.get("path", "") or "")
-        content = ""
-        label = "文件草稿"
-        if cmd == "create":
-            content = str(args_obj.get("file_text", "") or "")
-            label = "新建文件 · 实时草稿"
-        elif cmd == "str_replace":
-            content = str(args_obj.get("new_str", "") or "")
-            label = "替换后片段 · 实时草稿"
-        elif cmd == "insert":
-            content = str(args_obj.get("insert_text", "") or "")
-            label = "插入内容 · 实时草稿"
-        if content:
-            preview_html = _format_live_file_preview(content, path=path, label=label)
-        elif cmd == "view":
-            preview_html = "<p><i>正在读取文件内容…</i></p>"
-        elif cmd == "create":
-            preview_html = "<p><i>正在创建空文件…</i></p>"
-
-    elif fn_name == "bash":
-        command = args_obj.get("command", "")
-        preview_html = _format_code_block(command, header="bash · command", show_line_numbers=True, show_size=False, max_lines=10)
-
-    elif fn_name == "web_search":
-        query = args_obj.get("query", "")
-        preview_html = f"搜索：{escape_html(query)}"
-
-    elif fn_name == "fetch_url":
-        url = args_obj.get("url", "")
-        preview_html = f"抓取：{escape_html(url)}"
-
-    elif fn_name == "ip_geo":
-        ip = args_obj.get("ip", "")
-        preview_html = f"IP：{escape_html(ip)}"
-
-    if fn_name in ("generate_image_from_text", "edit_image_with_reference"):
-        num_images = args_obj.get("num_images", 1)
-        preview_html = f"生成 {num_images} 张图"
-
-    elif fn_name == "weather":
-        city = args_obj.get("city", "")
-        preview_html = f"天气：{escape_html(city)}"
-
-    # 其他工具没有特殊预览，可以不设置
-
-    return new_summary, preview_html
 
 
 # ========== Flush task 后台兜底 ==========
@@ -3599,10 +3353,6 @@ async def _agentic_loop_openai_compat(
                             args_str = tc.get("function", {}).get("arguments", "")
                             parsed_args = _safe_parse_args(args_str)
                             summary = _generate_initial_tool_summary(tc_name, parsed_args)
-                            if args_str:
-                                new_summary, _ = _build_streaming_preview(tc_name, args_str)
-                                if new_summary:
-                                    summary = new_summary
                             action_desc = _generate_action_description(tc_name, parsed_args)
                             builder.add_tool_item(
                                 tc_id,
@@ -3619,21 +3369,19 @@ async def _agentic_loop_openai_compat(
                         tc_id = tc.get("id")
                         if not tc_id:
                             continue
+                        # 工具调用参数在流式接收过程中不再实时渲染预览；
+                        # 最终结果会在工具执行完成后按统一的 Input/Output 格式一次性展示。
                         current_args = tc.get("function", {}).get("arguments", "")
                         current_len = len(current_args)
                         if current_len - last_arg_len.get(idx, 0) >= 20:
                             last_arg_len[idx] = current_len
                             tc_name = tc.get("function", {}).get("name", "")
                             parsed_args = _safe_parse_args(current_args)
-                            new_summary, preview_html = _build_streaming_preview(tc_name, current_args)
-                            if preview_html:
-                                builder.update_tool_preview(tc_id, preview_html, summary=new_summary)
-                                for group in builder._tool_groups:
-                                    for item in group["items"]:
-                                        if item["id"] == tc_id:
-                                            item["fn_args"] = parsed_args
-                                            break
-                                builder.request_flush(force=False)
+                            for group in builder._tool_groups:
+                                for item in group["items"]:
+                                    if item["id"] == tc_id:
+                                        item["fn_args"] = parsed_args
+                                        break
         except asyncio.CancelledError:
             raise
         except Exception as e:

@@ -610,47 +610,49 @@ def _render_structured_payload(result_str: str, *, map_tool: str | None = None) 
     )
 
 
-def _render_bash_result(result_str: str) -> str:
-    metadata, separator, output = (result_str or "").partition("Output:\n")
-    command = ""
-    cwd = ""
-    exit_code = ""
-    for line in metadata.splitlines():
-        if line.startswith("Command: "):
-            command = line.removeprefix("Command: ")
-        elif line.startswith("Cwd: "):
-            cwd = line.removeprefix("Cwd: ")
-        elif line.startswith("Exit code: "):
-            exit_code = line.removeprefix("Exit code: ")
-    header_parts = []
-    if command:
-        header_parts.append(f"<b>命令</b> <code>{escape_html(_trim_ui_value(command, 180))}</code>")
-    if exit_code:
-        status = "成功" if exit_code == "0" else f"退出码 {escape_html(exit_code)}"
-        header_parts.append(f"<b>状态</b> {status}")
-    if cwd:
-        header_parts.append(f"<b>目录</b> <code>{escape_html(_trim_ui_value(cwd, 120))}</code>")
-    if not separator:
-        return _render_code_panel("Bash 响应", result_str)
-    header = "<br/>".join(header_parts) if header_parts else "<b>Bash 已完成</b>"
-    return f"<p>{header}</p>" + _render_code_panel("输出 · 最近 10 行", output)
+# 所有工具的完成态展示统一走 text_editor 风格的 Input/Output 引用块；
+# Input 或 Output 任一超过这个行数都做截断，避免长内容把消息撑爆。
+_TOOL_UI_MAX_LINES = 20
+
+
+def _truncate_ui_lines(text: str, max_lines: int = _TOOL_UI_MAX_LINES) -> str:
+    """Keep only the first max_lines lines; append a truncation note if cut."""
+    text = text if isinstance(text, str) else str(text or "")
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    kept = "\n".join(lines[:max_lines])
+    return f"{kept}\n…（已截断，共 {len(lines)} 行，仅显示前 {max_lines} 行）"
 
 
 def _render_editor_quote(label: str, value: str) -> str:
-    """Render editor input or output as a plain quoted text block."""
+    """Render a tool's input or output as a plain quoted text block, truncated to _TOOL_UI_MAX_LINES lines."""
     text = value if isinstance(value, str) else str(value or "")
     if not text:
         text = "(empty)"
+    else:
+        text = _truncate_ui_lines(text)
     quoted_text = escape_html(text).replace("\n", "<br/>")
     return f"<p><b>{escape_html(label)}</b></p><blockquote>{quoted_text}</blockquote>"
 
 
-def _truncate_editor_view_output(result_str: str, max_lines: int = 20) -> str:
-    """Keep only the first max_lines from the raw, non-JSON view result."""
-    lines = (result_str or "").splitlines()
-    if len(lines) <= max_lines:
-        return "\n".join(lines)
-    return "\n".join(lines[:max_lines])
+def _render_bash_result(result_str: str) -> str:
+    """Render bash calls the same way as text_editor: quote-formatted Input and Output."""
+    metadata, separator, output = (result_str or "").partition("Output:\n")
+    command = ""
+    exit_code = ""
+    for line in metadata.splitlines():
+        if line.startswith("Command: "):
+            command = line.removeprefix("Command: ")
+        elif line.startswith("Exit code: "):
+            exit_code = line.removeprefix("Exit code: ")
+    if not separator:
+        # 没有标准的 "Output:" 分隔符时，把完整原始返回当作 Output 展示。
+        return _render_editor_quote("Input", command) + _render_editor_quote("Output", result_str)
+    output_text = output
+    if exit_code:
+        output_text = f"[exit code {exit_code}]\n{output}"
+    return _render_editor_quote("Input", command) + _render_editor_quote("Output", output_text)
 
 
 def _editor_result_summary(result_str: str) -> str:
@@ -664,8 +666,7 @@ def _render_editor_result(command: str, path: str, result_str: str, arguments: d
     arguments = arguments or {}
     if command == "view":
         intent = str(arguments.get("_description") or "View the requested text file.")
-        output = _truncate_editor_view_output(result_str, max_lines=20)
-        return _render_editor_quote("Input", intent) + _render_editor_quote("Output", output)
+        return _render_editor_quote("Input", intent) + _render_editor_quote("Output", result_str)
 
     input_field = {
         "str_replace": "new_str",
