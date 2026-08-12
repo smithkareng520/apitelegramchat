@@ -32,15 +32,11 @@ GAODE_MCP_ENABLED = os.getenv("GAODE_MCP_ENABLED", "true").strip().lower() in {"
 GAODE_MCP_URL = (os.getenv("GAODE_MCP_URL") or "https://mcp.api-inference.modelscope.net/3331c36972ff42/mcp").strip()
 GAODE_MCP_TOKEN = (os.getenv("GAODE_MCP_TOKEN") or "").strip()
 
-# ---------- 网页搜索：官方 ModelScope Bing MCP 服务 ----------
-# 采用 streamable_http + Bearer token。可通过环境变量覆盖 endpoint，
-# 但自定义 host 仍须在 BING_CN_MCP_ALLOWED_HOSTS 中显式 allowlist。
-BING_CN_MCP_ENABLED = os.getenv("BING_CN_MCP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-BING_CN_MCP_URL = (
-    os.getenv("BING_CN_MCP_URL")
-    or "https://mcp.api-inference.modelscope.net/822d99d32a6946/mcp"
-).strip()
-BING_CN_MCP_TOKEN = (os.getenv("BING_CN_MCP_TOKEN") or "").strip()
+# ---------- 网页搜索：ModelScope Serper MCP 服务 ----------
+# 采用 streamable_http + Bearer token。只注册 google_search；scrape 不使用，
+# 网页正文继续由本项目自己的 fetch_url 工具负责。
+SERPER_MCP_URL = (os.getenv("SERPER_MCP_URL") or "").strip()
+SERPER_MCP_TOKEN = (os.getenv("SERPER_MCP_TOKEN") or "").strip()
 
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
@@ -587,7 +583,7 @@ _SENSITIVE_EXACT = {
     "XAI_API_KEY", "GROQ_API_KEY", "MODELSCOPE_API_KEY", "AGNES_API_KEY",
     "R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY",
     "R2_BUCKET_NAME", "R2_PUBLIC_URL", "R2_REGION",
-    "BING_CN_MCP_TOKEN", "GAODE_MCP_TOKEN",
+    "SERPER_MCP_TOKEN", "GAODE_MCP_TOKEN",
     "WEBHOOK_TOKEN", "WEBHOOK_URL",
 }
 

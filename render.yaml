@@ -47,9 +47,9 @@ services:
         value: auto
       - key: WEBHOOK_URL
         sync: false
-      - key: BING_CN_MCP_URL
+      - key: SERPER_MCP_URL
         sync: false
-      - key: BING_CN_MCP_TOKEN
+      - key: SERPER_MCP_TOKEN
         sync: false
       - key: GAODE_MCP_URL
         sync: false

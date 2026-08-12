@@ -108,7 +108,7 @@ _search_cache = TTLCache(maxsize=200, ttl=SEARCH_CACHE_TTL)
 _fetch_cache = TTLCache(maxsize=200, ttl=FETCH_CACHE_TTL)
 
 
-def _search_cache_key(query: str, num_results: int | None = None) -> str:
+def _search_cache_key(query: str, num_results: int | None = None, offset: int | None = None) -> str:
     """Search cache key: keep query + result count distinct."""
     if num_results is None:
         return query
@@ -548,12 +548,12 @@ async def execute_file_editor(
 
 
 # ========== 缓存函数 ==========
-def get_search_cache(query: str, num_results: int | None = None):
-    return _search_cache.get(_search_cache_key(query, num_results))
+def get_search_cache(query: str, num_results: int | None = None, offset: int | None = None):
+    return _search_cache.get(_search_cache_key(query, num_results, offset))
 
 
-def set_search_cache(query: str, result: str, num_results: int | None = None):
-    _search_cache[_search_cache_key(query, num_results)] = result
+def set_search_cache(query: str, result: str, num_results: int | None = None, offset: int | None = None):
+    _search_cache[_search_cache_key(query, num_results, offset)] = result
 
 
 def get_fetch_cache(url: str):
@@ -668,7 +668,7 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web for real-time information (titles, snippets, URLs). Multiple independent queries can be issued in one response. To read a result in depth, follow up with fetch_url (one URL per call).",
+            "description": "Search the web for real-time information via the Serper google_search MCP tool. Returns the MCP provider response directly. Use fetch_url separately when full webpage content is needed.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -677,8 +677,8 @@ SEARCH_TOOLS = [
                         "description": "简述本次操作目的（≤60字）。示例：搜索2024年诺贝尔奖"
                     },
                     "query": {"type": "string", "description": "搜索关键词"},
-                    "num_results": {"type": "integer", "description": "可选：返回结果数（1-50）；不填写则由 Bing MCP 使用默认值 10", "minimum": 1, "maximum": 50},
-                    "offset": {"type": "integer", "description": "可选：结果偏移量，用于分页，从0开始；不填写则由 Bing MCP 使用默认值 0", "minimum": 0}
+                    "num_results": {"type": "integer", "description": "可选：返回结果数（1-50）；不填写则不发送该参数，由 Serper MCP 服务端决定默认值", "minimum": 1, "maximum": 50},
+                    "offset": {"type": "integer", "description": "可选：结果偏移量，用于分页，从0开始；内部转换为 Serper 的 page；不填写则不发送该参数", "minimum": 0}
                 },
                 "required": ["query"]
             },
@@ -1362,133 +1362,38 @@ SEARCH_TOOLS = [
 # 工具实现
 # =============================================================================
 
-# Google CSE / DuckDuckGo 抓取实现已移除，搜索改为通过外部 MCP 服务
-# （bing-cn-mcp-server，见 mcp_client.py）调用其 bing_search 工具。
+# 搜索通过外部 ModelScope Serper MCP 服务执行；网页正文继续使用本项目 fetch_url。
 
-# 专门用于触发 retry_async 重试的临时异常——MCP 搜索服务限流/超时或空结果时抛出
+# 专门用于触发 retry_async 重试的临时异常
 class MCPSearchTransientError(Exception):
     """外部 MCP 搜索服务临时不可用 / 空结果，可重试。"""
 
 
 @retry_async(max_retries=2, delay=1.5, backoff=2.0,
             exceptions=(MCPToolError, MCPSearchTransientError, asyncio.TimeoutError))
-async def _search_via_mcp(query: str, num_results: int, offset: int = 0) -> list[dict] | None:
-    """通过外部 MCP 服务（bing-cn-mcp-server 的 bing_search 工具）执行网页搜索。
-
-    工具协议：bing_search(query: str, count?: int, offset?: int) -> 纯文本，
-    形如：
-        搜索关键词: ...
-        找到约 N 条结果
-        返回前 M 条结果:
-        ====...====
-        [1] 标题
-            链接: https://...
-            摘要: ...
-        [2] ...
-    这里把该文本解析为统一的 {title, link, snippet} 列表，交给
-    _format_search_results 统一格式化，保持对外的返回格式不变。
-    """
+async def _search_via_mcp(query: str, num_results: int | None = None, offset: int | None = None) -> str | None:
+    """通过 Serper MCP 的 google_search 执行网页搜索，直接返回 MCP 原始结果。"""
     query = (query or "").strip()
     if not query:
         return None
-
+    arguments: dict[str, Any] = {"q": query}
+    if num_results is not None:
+        arguments["num"] = max(1, min(int(num_results), 50))
+    if offset is not None:
+        page_size = int(num_results) if num_results else 10
+        arguments["page"] = max(1, int(offset) // max(page_size, 1) + 1)
     try:
-        arguments: dict[str, Any] = {"query": query}
-        if num_results is not None:
-            arguments["count"] = max(1, min(int(num_results), 50))
-        if offset is not None:
-            arguments["offset"] = max(int(offset), 0)
-        raw_text = await call_mcp_tool(
-            "bing-cn-mcp-server",
-            "bing_search",
-            arguments,
-        )
-    except MCPToolError as e:
-        logger.warning(f"MCP 搜索调用失败: {e}")
+        raw_text = await call_mcp_tool("mcp-server-serper", "google_search", arguments)
+    except MCPToolError:
+        logger.exception("Serper MCP 搜索调用失败")
         raise
-
-    items = _parse_bing_mcp_result(raw_text, num_results)
-    if items:
-        return items
-
-    logger.info("MCP 搜索服务返回空结果")
-    raise MCPSearchTransientError("MCP search returned no results")
-
-
-def _parse_bing_mcp_result(raw_text: str, num_results: int | None = None) -> list[dict]:
-    """解析 bing-cn-mcp-server 的 bing_search 返回，提取 title/link/snippet。
-
-    当前服务端返回的是 JSON 字符串（见 test_mcp_bing_search.py 实测输出）：
-        {"query": "...", "results": [{"uuid","title","url","snippet","displayUrl"}, ...], "totalResults": N}
-    优先按 JSON 解析；如果服务端将来又切回旧的纯文本格式
-        [1] 标题
-            链接: https://...
-            摘要: ...
-    则回退到原来的正则解析，保证兼容两种返回。
-    """
-    if not raw_text:
-        return []
-
-    # ---- 优先尝试 JSON 格式 ----
-    try:
-        data = json.loads(raw_text)
-    except (json.JSONDecodeError, TypeError):
-        data = None
-
-    if isinstance(data, dict) and isinstance(data.get("results"), list):
-        items: list[dict] = []
-        for r in data["results"]:
-            if not isinstance(r, dict):
-                continue
-            title = (r.get("title") or "").strip() or "无标题"
-            link = (r.get("url") or r.get("link") or "").strip()
-            snippet = (r.get("snippet") or "").strip()
-            if not link:
-                continue
-            items.append({"title": title, "link": link, "snippet": snippet})
-            if num_results is not None and len(items) >= num_results:
-                break
-        return items
-
-    # ---- 回退：旧的纯文本格式 ----
-    items = []
-    entry_re = re.compile(
-        r'^\s*\[\d+\]\s*(?P<title>.+?)\s*$'
-        r'(?:\n\s*链接[:：]\s*(?P<link>\S+))?'
-        r'(?:\n\s*摘要[:：]\s*(?P<snippet>.*?))?'
-        r'(?=\n\s*\[\d+\]|\Z)',
-        re.MULTILINE | re.DOTALL,
-    )
-    for m in entry_re.finditer(raw_text):
-        title = (m.group("title") or "").strip() or "无标题"
-        link = (m.group("link") or "").strip()
-        snippet = (m.group("snippet") or "").replace("\n", " ").strip()
-        if not link:
-            continue
-        items.append({"title": title, "link": link, "snippet": snippet})
-        if num_results is not None and len(items) >= num_results:
-            break
-    return items
-
-
-def _format_search_results(items: list, query: str, engine: str, requested: int | None = None) -> str:
-    success_count = len(items)
-    requested_count = requested if isinstance(requested, int) and requested > 0 else success_count
-    lines = [f"🔍 [成功: {engine}] 搜索「{query}」的结果（{success_count}/{requested_count}）：\n"]
-    for i, item in enumerate(items, 1):
-        title = item.get("title", "无标题")
-        link = item.get("link", "")
-        snippet = item.get("snippet", "")
-        lines.append(f"{i}. 标题：{title}\n   摘要：{snippet}\n   链接：{link}\n")
-    return "\n".join(lines)
+    if raw_text:
+        return raw_text
+    raise MCPSearchTransientError("Serper MCP search returned no results")
 
 
 async def execute_web_search(query: str, num_results: int | None = None, offset: int | None = None) -> str:
-    """通过外部 MCP 搜索服务（bing-cn-mcp-server）执行网页搜索。
-
-    对外的函数签名 / 返回文本格式保持不变，仅内部实现从
-    Google CSE + DuckDuckGo 换成了 MCP 工具调用，调用方无需改动。
-    """
+    """通过 ModelScope Serper MCP 搜索，并原样返回 google_search 的结果。"""
     query = (query or "").strip()
     requested = None
     if num_results is not None:
@@ -1500,16 +1405,12 @@ async def execute_web_search(query: str, num_results: int | None = None, offset:
         return "❌ 搜索关键词为空。"
 
     try:
-        items = await _search_via_mcp(query, requested, page_offset)
+        raw_text = await _search_via_mcp(query, requested, page_offset)
     except Exception as e:
         logger.warning(f"MCP 搜索失败: {e}")
-        items = None
+        return f"❌ Serper 搜索失败：{e}"
 
-    if items:
-        return _format_search_results(items, query, "Bing", requested=requested)
-
-    return f"❌ 未找到与「{query}」相关的结果。"
-
+    return raw_text or "❌ Serper 搜索返回空结果。"
 
 # --------------------- fetch_url (增加重试循环) ---------------------
 async def _extract_with_trafilatura(url: str) -> str | None:

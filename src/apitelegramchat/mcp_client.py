@@ -68,19 +68,19 @@ def _build_servers() -> dict[str, MCPServerConfig]:
     from apitelegramchat import config
 
     servers: dict[str, MCPServerConfig] = {}
-    if config.BING_CN_MCP_ENABLED and config.BING_CN_MCP_URL:
+    if config.SERPER_MCP_URL:
         try:
-            servers["bing-cn-mcp-server"] = MCPServerConfig(
-                name="bing-cn-mcp-server",
-                url=config.BING_CN_MCP_URL,
+            servers["mcp-server-serper"] = MCPServerConfig(
+                name="mcp-server-serper",
+                url=config.SERPER_MCP_URL,
                 allowed_hosts=_configured_hosts(
-                    "BING_CN_MCP_ALLOWED_HOSTS", {"mcp.api-inference.modelscope.net"}
+                    "SERPER_MCP_ALLOWED_HOSTS", {"mcp.api-inference.modelscope.net"}
                 ),
-                allowed_tools=frozenset({"bing_search"}),
-                headers=_build_bearer_header(config.BING_CN_MCP_TOKEN),
+                allowed_tools=frozenset({"google_search"}),
+                headers=_build_bearer_header(config.SERPER_MCP_TOKEN),
             )
         except ValueError as exc:
-            logger.warning("Bing MCP registration rejected: %s", exc)
+            logger.warning("Serper MCP registration rejected: %s", exc)
     if config.GAODE_MCP_ENABLED and config.GAODE_MCP_URL and config.GAODE_MCP_TOKEN:
         try:
             servers["amap-maps"] = MCPServerConfig(
