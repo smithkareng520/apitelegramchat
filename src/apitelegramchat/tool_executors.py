@@ -637,14 +637,12 @@ def _render_bash_result(result_str: str) -> str:
 
 
 def _render_editor_quote(label: str, value: str) -> str:
-    """Render editor input or output as a readable quoted text block."""
+    """Render editor input or output as a plain quoted text block."""
     text = value if isinstance(value, str) else str(value or "")
     if not text:
         text = "(empty)"
-    return (
-        f"<p><b>{escape_html(label)}</b></p>"
-        f"<blockquote><pre><code>{escape_html(text)}</code></pre></blockquote>"
-    )
+    quoted_text = escape_html(text).replace("\n", "<br/>")
+    return f"<p><b>{escape_html(label)}</b></p><blockquote>{quoted_text}</blockquote>"
 
 
 def _truncate_editor_view_output(result_str: str, max_lines: int = 20) -> str:
