@@ -54,11 +54,14 @@ export GAODE_MCP_TOKEN='...'
 # 仅在覆盖默认 ModelScope 主机时才需要指定。
 export GAODE_MCP_ALLOWED_HOSTS='mcp.api-inference.modelscope.net'
 
-# 可选 Bing MCP：必须同时指定 URL 和明确的可信主机。
+# 官方 Bing MCP：官方 ModelScope endpoint 与其主机默认已配置。
+# 常规部署只需提供 token；如需改用自定义 URL，才须同时覆盖 allowlist。
 export BING_CN_MCP_ENABLED=true
-export BING_CN_MCP_URL='https://mcp.example.com/mcp'
 export BING_CN_MCP_TOKEN='...'
-export BING_CN_MCP_ALLOWED_HOSTS='mcp.example.com'
+
+# 可选：仅在使用自定义 endpoint 时设置。
+# export BING_CN_MCP_URL='https://mcp.example.com/mcp'
+# export BING_CN_MCP_ALLOWED_HOSTS='mcp.example.com'
 ```
 
 地图坐标统一为 `longitude,latitude`，例如 `116.397128,39.916527`。

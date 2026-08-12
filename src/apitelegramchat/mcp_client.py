@@ -73,7 +73,9 @@ def _build_servers() -> dict[str, MCPServerConfig]:
             servers["bing-cn-mcp-server"] = MCPServerConfig(
                 name="bing-cn-mcp-server",
                 url=config.BING_CN_MCP_URL,
-                allowed_hosts=_configured_hosts("BING_CN_MCP_ALLOWED_HOSTS", set()),
+                allowed_hosts=_configured_hosts(
+                    "BING_CN_MCP_ALLOWED_HOSTS", {"mcp.api-inference.modelscope.net"}
+                ),
                 allowed_tools=frozenset({"bing_search"}),
                 headers=_build_bearer_header(config.BING_CN_MCP_TOKEN),
             )

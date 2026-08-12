@@ -32,12 +32,14 @@ GAODE_MCP_ENABLED = os.getenv("GAODE_MCP_ENABLED", "true").strip().lower() in {"
 GAODE_MCP_URL = (os.getenv("GAODE_MCP_URL") or "https://mcp.api-inference.modelscope.net/3331c36972ff42/mcp").strip()
 GAODE_MCP_TOKEN = (os.getenv("GAODE_MCP_TOKEN") or "").strip()
 
-# ---------- 网页搜索：外部 MCP 搜索服务（bing-cn-mcp-server）----------
-# Google CSE / DuckDuckGo 已移除，网页搜索改为通过外部 MCP 服务调用。
-# 连接地址与鉴权 Token 完全由环境变量提供，代码中不含任何明文默认值——
-# 未配置时该搜索服务不可用（mcp_client.py 会跳过注册）。
+# ---------- 网页搜索：官方 ModelScope Bing MCP 服务 ----------
+# 采用 streamable_http + Bearer token。可通过环境变量覆盖 endpoint，
+# 但自定义 host 仍须在 BING_CN_MCP_ALLOWED_HOSTS 中显式 allowlist。
 BING_CN_MCP_ENABLED = os.getenv("BING_CN_MCP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-BING_CN_MCP_URL = (os.getenv("BING_CN_MCP_URL") or "").strip()
+BING_CN_MCP_URL = (
+    os.getenv("BING_CN_MCP_URL")
+    or "https://mcp.api-inference.modelscope.net/822d99d32a6946/mcp"
+).strip()
 BING_CN_MCP_TOKEN = (os.getenv("BING_CN_MCP_TOKEN") or "").strip()
 
 
