@@ -80,7 +80,7 @@ OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 #
 # file_editor 需要初始化一次隔离 workspace，但不再做工作区级 R2 全量同步。
 # 编辑操作只持久化被编辑的具体文件。
-LONG_RUNNING_TOOLS = {"web_search", "google_search", "fetch_url", "file_editor"}
+LONG_RUNNING_TOOLS = {"web_search", "fetch_url", "file_editor"}
 LONG_TOOL_CALL_TIMEOUT = 45
 # bash 工具单独一档，比 LONG_RUNNING_TOOLS 更宽松：
 #   - 沙箱首次启动要 fork+exec+安装 Landlock 规则；
@@ -1840,15 +1840,6 @@ def _get_tool_description_from_args(fn_args: dict) -> Optional[str]:
     return None
 
 
-_SEARCH_TOOL_NAMES = ("web_search", "google_search")
-
-
-def _extract_search_query(fn_args: dict) -> str:
-    """兼容旧 web_search（参数名 query）与新 google_search（参数名 q）。"""
-    fn_args = fn_args or {}
-    return (fn_args.get("q") or fn_args.get("query") or "").strip()
-
-
 def _coerce_positive_int(value: Any, default: int = 1) -> int:
     try:
         num = int(value)
@@ -1904,9 +1895,9 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     """
     fn_args = fn_args or {}
 
-    # web_search / google_search 单工具进行态固定显示搜索词。
-    if fn_name in _SEARCH_TOOL_NAMES:
-        query = _extract_search_query(fn_args)
+    # web_search 单工具进行态固定显示搜索词。
+    if fn_name == "web_search":
+        query = (fn_args.get("query") or "").strip()
         return query if query else "Searching the web"
 
     custom_desc = _get_tool_description_from_args(fn_args)
@@ -2006,7 +1997,6 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
 
     mapping = {
         "web_search": "searched the web",
-        "google_search": "searched the web",
         "fetch_url": "fetched a page",
         "wikipedia": "looked up Wikipedia",
         "exchange_rate": "checked exchange rates",
@@ -2095,8 +2085,8 @@ async def _run_tool_calls_and_append(
 
         search_query = None
         domain = None
-        if fn_name in _SEARCH_TOOL_NAMES:
-            search_query = _extract_search_query(fn_args)
+        if fn_name == "web_search":
+            search_query = fn_args.get("query", "")
         elif fn_name == "fetch_url":
             url = fn_args.get('url', '')
             domain = extract_domain(url)
@@ -2147,8 +2137,8 @@ async def _run_tool_calls_and_append(
             preview_html = _format_code_block(
                 command, header="bash · command", show_line_numbers=True, show_size=False, max_lines=10
             )
-        elif fn_name in _SEARCH_TOOL_NAMES:
-            query = _extract_search_query(fn_args)
+        elif fn_name == "web_search":
+            query = fn_args.get("query", "")
             preview_html = f"搜索：{escape_html(query)}"
         elif fn_name == "fetch_url":
             url = fn_args.get("url", "")
@@ -2189,7 +2179,7 @@ async def _run_tool_calls_and_append(
             # 图像 / 视频工具不设超时（内部已有轮询超时控制）
             # 子 agent 走 930s 超时（内部默认 900s，用户可配到 1800s）
             # bash 走 310s（内层沙箱 300s + 10s 外层缓冲）
-            # 网络类工具（google_search / scrape / fetch_url / file_editor）走 45s 宽松超时，避免外层 12s 误杀
+            # 网络类工具（web_search / fetch_url / file_editor）走 45s 宽松超时，避免外层 12s 误杀
             # 其他工具保持 12 秒
             if fn_name in MEDIA_GEN_TOOLS:
                 timeout = None
@@ -2416,8 +2406,8 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
     """生成当前工具完成后的用户可见摘要。"""
     fn_args = fn_args or {}
 
-    if fn_name in _SEARCH_TOOL_NAMES:
-        query = _extract_search_query(fn_args)
+    if fn_name == "web_search":
+        query = (fn_args.get("query") or "").strip()
         count = _extract_web_search_result_count(result_content)
         if query and count is not None:
             return f"{query} {count} result" if count == 1 else f"{query} {count} results"
@@ -2678,8 +2668,8 @@ def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, s
         command = args_obj.get("command", "")
         preview_html = _format_code_block(command, header="bash · command", show_line_numbers=True, show_size=False, max_lines=10)
 
-    elif fn_name in _SEARCH_TOOL_NAMES:
-        query = _extract_search_query(args_obj)
+    elif fn_name == "web_search":
+        query = args_obj.get("query", "")
         preview_html = f"搜索：{escape_html(query)}"
 
     elif fn_name == "fetch_url":
@@ -2907,8 +2897,8 @@ class RichMessageBuilder:
         t = target["type"]
         fn_args = target.get("fn_args", {})
 
-        # web_search / google_search 工具组进行态固定为 Searching the web。
-        if t in _SEARCH_TOOL_NAMES:
+        # web_search 工具组进行态固定为 Searching the web。
+        if t == "web_search":
             group["outer_summary"] = "Searching the web"
             self.request_flush(force=False)
             return
@@ -3007,7 +2997,6 @@ class RichMessageBuilder:
     # 使用 {n} 占位符表示数量
     _GROUP_SUMMARY_TEMPLATES = {
         "web_search": ("Searched the web", "Searched the web"),
-        "google_search": ("Searched the web", "Searched the web"),
         "bash": ("Ran a command", "Ran {n} commands"),
         "file_editor_view": ("Viewed a file", "Viewed {n} files"),
         "file_editor_edit": ("Edited a file", "Edited {n} files"),

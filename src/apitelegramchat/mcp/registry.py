@@ -221,8 +221,8 @@ READ_ONLY_SPECS: tuple[ToolSpec, ...] = (
         object_schema(
             {
                 "query": text_field("Search query.", 1),
-                "num_results": int_field("Optional result count (1-50). If omitted, this parameter is not sent to Serper MCP.", 1, 50),
-                "offset": int_field("Optional result offset for pagination. If omitted, this parameter is not sent to Serper MCP.", 0),
+                "num_results": int_field("Optional result count (1-50). If omitted, Serper returns its default of 10.", 1, 50),
+                "offset": int_field("Optional zero-based result offset for pagination; it is converted to Serper page numbering.", 0),
             },
             ("query",),
         ),

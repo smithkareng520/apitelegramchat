@@ -44,7 +44,7 @@ workspace 编辑器只接收相对路径，并在解析符号链接后再次确�
 
 ## 外部 MCP（地图与搜索）
 
-地图和可选的 Bing 搜索通过 Streamable HTTP 调用外部 MCP server。外部 endpoint 必须使用 HTTPS、主机 allowlist 和固定的上游工具 allowlist；认证令牌不会发往未受信任的 URL。
+地图和可选的 Serper 搜索通过 Streamable HTTP 调用外部 MCP server。外部 endpoint 必须使用 HTTPS、主机 allowlist 和固定的上游工具 allowlist；认证令牌不会发往未受信任的 URL。`web_search` 会把 Serper 的 `organic` 结果转换回既有的成功数统计、标题、摘要和链接格式，因此 Telegram 侧的来源链接展示保持不变。
 
 ```bash
 # AMap / ModelScope
@@ -54,18 +54,10 @@ export GAODE_MCP_TOKEN='...'
 # 仅在覆盖默认 ModelScope 主机时才需要指定。
 export GAODE_MCP_ALLOWED_HOSTS='mcp.api-inference.modelscope.net'
 
-# ModelScope Serper MCP：google_search / scrape 直接暴露给模型，由模型自行选择工具和参数。
-# 常规部署只需提供 token；如需改用自定义 URL，才须同时覆盖 allowlist。
-export SERPER_MCP_ENABLED=true
+# Serper 搜索 MCP：URL 和令牌均由部署环境显式提供。
+# 项目只允许调用 ModelScope MCP 域名下的 google_search 工具。
+export SERPER_MCP_URL='https://mcp.api-inference.modelscope.net/<deployment-id>/mcp'
 export SERPER_MCP_TOKEN='...'
-# Serper google_search 还要求 gl（地区）和 hl（语言）。
-# 默认：gl=cn, hl=zh；需要英文/美国结果时可改为 us/en。
-export SERPER_MCP_REGION='cn'
-export SERPER_MCP_LANGUAGE='zh'
-
-# 可选：仅在使用自定义 endpoint 时设置。
-# export SERPER_MCP_URL='https://mcp.example.com/mcp'
-# export SERPER_MCP_ALLOWED_HOSTS='mcp.example.com'
 ```
 
 地图坐标统一为 `longitude,latitude`，例如 `116.397128,39.916527`。

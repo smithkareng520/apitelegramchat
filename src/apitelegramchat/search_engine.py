@@ -61,8 +61,6 @@ from apitelegramchat.config import (
     FETCH_CACHE_TTL,
     SUPPORTED_MODELS,
     get_openrouter_provider_preferences,
-    SERPER_MCP_REGION,
-    SERPER_MCP_LANGUAGE,
 )
 from apitelegramchat.utils import retry_async
 from apitelegramchat.mcp_client import call_mcp_tool, MCPToolError
@@ -110,7 +108,7 @@ _search_cache = TTLCache(maxsize=200, ttl=SEARCH_CACHE_TTL)
 _fetch_cache = TTLCache(maxsize=200, ttl=FETCH_CACHE_TTL)
 
 
-def _search_cache_key(query: str, num_results: int | None = None, offset: int | None = None) -> str:
+def _search_cache_key(query: str, num_results: int | None = None) -> str:
     """Search cache key: keep query + result count distinct."""
     if num_results is None:
         return query
@@ -550,12 +548,12 @@ async def execute_file_editor(
 
 
 # ========== 缓存函数 ==========
-def get_search_cache(query: str, num_results: int | None = None, offset: int | None = None):
-    return _search_cache.get(_search_cache_key(query, num_results, offset))
+def get_search_cache(query: str, num_results: int | None = None):
+    return _search_cache.get(_search_cache_key(query, num_results))
 
 
-def set_search_cache(query: str, result: str, num_results: int | None = None, offset: int | None = None):
-    _search_cache[_search_cache_key(query, num_results, offset)] = result
+def set_search_cache(query: str, result: str, num_results: int | None = None):
+    _search_cache[_search_cache_key(query, num_results)] = result
 
 
 def get_fetch_cache(url: str):
@@ -669,37 +667,25 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "google_search",
-            "description": "通过已配置的 Serper MCP 执行 Google 搜索。模型可以自己决定地区、语言、分页、时间过滤、位置和高级搜索查询。优先用于获取实时/近期信息；需要阅读具体网页时使用项目自己的 fetch_url。",
+            "name": "web_search",
+            "description": "Search the web for real-time information (titles, snippets, URLs). Multiple independent queries can be issued in one response. To read a result in depth, follow up with fetch_url (one URL per call).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "q": {"type": "string", "description": "搜索查询。支持 site:, filetype:, inurl:, intitle:, related:, cache:, before:, after:, exact:, exclude:, or: 等高级操作符。"},
-                    "gl": {"type": "string", "description": "国家/地区代码，例如 cn、us、gb、jp。模型根据查询语境自行选择。", "minLength": 2, "maxLength": 2},
-                    "hl": {"type": "string", "description": "搜索结果语言代码，例如 zh、en、ja。模型根据查询语境自行选择。", "minLength": 2, "maxLength": 5},
-                    "location": {"type": "string", "description": "可选的搜索地理位置，例如 'Shanghai, China' 或 'New York, NY'。需要本地化搜索时使用。"},
-                    "num": {"type": "number", "description": "可选：返回结果数量，默认10。", "minimum": 1, "maximum": 100},
-                    "tbs": {"type": "string", "description": "可选：时间过滤，例如 qdr:h（过去1小时）、qdr:d（过去1天）、qdr:w（过去1周）、qdr:m（过去1月）、qdr:y（过去1年）。"},
-                    "page": {"type": "number", "description": "可选：结果页码，从1开始。", "minimum": 1},
-                    "autocorrect": {"type": "boolean", "description": "可选：是否启用 Google 自动纠错。"},
-                    "site": {"type": "string", "description": "可选：限制到指定域名，例如 github.com。"},
-                    "filetype": {"type": "string", "description": "可选：限制文件类型，例如 pdf、doc、xls。"},
-                    "inurl": {"type": "string", "description": "可选：URL 中包含指定词。"},
-                    "intitle": {"type": "string", "description": "可选：标题中包含指定词。"},
-                    "related": {"type": "string", "description": "可选：查找指定网站的相似网站。"},
-                    "cache": {"type": "string", "description": "可选：查看指定 URL 的 Google 缓存版本。"},
-                    "before": {"type": "string", "description": "可选：日期之前，格式 YYYY-MM-DD。"},
-                    "after": {"type": "string", "description": "可选：日期之后，格式 YYYY-MM-DD。"},
-                    "exact": {"type": "string", "description": "可选：精确短语匹配。"},
-                    "exclude": {"type": "string", "description": "可选：从结果中排除的术语，多个术语可用逗号分隔。"},
-                    "or": {"type": "string", "description": "可选：替代术语，多个术语可用逗号分隔。"}
+                    "_description": {
+                        "type": "string",
+                        "description": "简述本次操作目的（≤60字）。示例：搜索2024年诺贝尔奖"
+                    },
+                    "query": {"type": "string", "description": "搜索关键词"},
+                    "num_results": {"type": "integer", "description": "可选：返回结果数（1-50）；不填写时 Serper 默认返回 10 条", "minimum": 1, "maximum": 50},
+                    "offset": {"type": "integer", "description": "可选：结果偏移量，用于分页，从 0 开始；内部会换算为 Serper 的页码", "minimum": 0}
                 },
-                "required": ["q", "gl", "hl"]
+                "required": ["query"]
             },
             "input_examples": [
-                {"q": "2026 诺贝尔物理学奖", "gl": "us", "hl": "en", "num": 5},
-                {"q": "上海 人工智能 实习", "gl": "cn", "hl": "zh", "location": "Shanghai, China", "num": 10},
-                {"q": "site:openai.com latest model", "gl": "us", "hl": "en", "autocorrect": True}
+                {"query": "2024 诺贝尔物理学奖 获奖者", "num_results": 5},
+                {"query": "Python 3.13 新特性", "num_results": 3},
+                {"query": "React Hooks 教程", "num_results": 10, "offset": 10}
             ]
         }
     },
@@ -1376,65 +1362,132 @@ SEARCH_TOOLS = [
 # 工具实现
 # =============================================================================
 
-# 搜索通过外部 ModelScope Serper MCP 服务执行；网页正文继续使用本项目 fetch_url。
+# 搜索通过外部 Serper MCP 服务（见 mcp_client.py）调用 google_search 工具。
+# Serper 返回结构化 JSON；这里仅提取 organic 结果，再交给既有格式化层，
+# 从而保留成功数统计及 Telegram 侧的来源链接展示逻辑。
 
-# 专门用于触发 retry_async 重试的临时异常
+
 class MCPSearchTransientError(Exception):
-    """外部 MCP 搜索服务临时不可用 / 空结果，可重试。"""
+    """外部 MCP 搜索服务临时不可用或未返回 organic 结果，可重试。"""
 
 
-@retry_async(max_retries=2, delay=1.5, backoff=2.0,
-            exceptions=(MCPToolError, MCPSearchTransientError, asyncio.TimeoutError))
-async def _google_search_via_mcp(arguments: dict[str, Any]) -> str | None:
-    """直接把模型选择的 google_search 参数转发给 Serper MCP。"""
-    q = str(arguments.get("q", "")).strip()
-    if not q:
-        return None
-    payload = {k: v for k, v in arguments.items() if v is not None and k != "_description"}
-    payload["q"] = q
-    payload.setdefault("gl", SERPER_MCP_REGION or "cn")
-    payload.setdefault("hl", SERPER_MCP_LANGUAGE or "zh")
-    try:
-        raw_text = await call_mcp_tool("mcp-server-serper", "google_search", payload)
-    except MCPToolError:
-        logger.exception("Serper MCP google_search 调用失败")
-        raise
-    if raw_text:
-        return raw_text
-    raise MCPSearchTransientError("Serper MCP google_search returned no results")
+@retry_async(
+    max_retries=2,
+    delay=1.5,
+    backoff=2.0,
+    exceptions=(MCPToolError, MCPSearchTransientError, asyncio.TimeoutError),
+)
+async def _search_via_mcp(
+    query: str,
+    num_results: int | None,
+    offset: int | None = 0,
+) -> list[dict] | None:
+    """通过 Serper MCP 的 google_search 搜索并规范化 organic 结果。
 
-
-async def execute_google_search(arguments: dict[str, Any]) -> str:
-    """公开入口：供 dispatch_tool_call 的 google_search 分支直接调用。
-
-    对模型传入的参数做基本校验，转发给 _google_search_via_mcp（内部已带重试），
-    并把 MCP 层可能抛出的异常收敛为对用户友好的错误文案，避免异常向上抛出
-    中断整轮对话。
+    Serper 工具要求 ``q``、``gl``、``hl``，并返回含 ``organic`` 数组的 JSON，
+    例如 ``{"organic": [{"title", "link", "snippet", "position"}]}``。
+    ``offset`` 仍沿用本项目从 0 开始的契约，内部按实际页大小换算为 Serper 的
+    从 1 开始 ``page`` 参数，以保持调用方分页行为不变。
     """
-    q = str((arguments or {}).get("q", "")).strip()
-    if not q:
-        return "失败：搜索查询不能为空。"
+    query = (query or "").strip()
+    if not query:
+        return None
+
+    requested = max(1, min(int(num_results), 50)) if num_results is not None else None
+    page_size = requested or 10
+    normalized_offset = max(int(offset or 0), 0)
+    arguments: dict[str, Any] = {
+        "q": query,
+        "gl": "cn",
+        "hl": "zh-cn",
+        "page": (normalized_offset // page_size) + 1,
+    }
+    if requested is not None:
+        arguments["num"] = requested
+
     try:
-        result = await _google_search_via_mcp(arguments or {})
-    except (MCPToolError, MCPSearchTransientError, asyncio.TimeoutError):
-        logger.exception(f"google_search 调用失败，query={q!r}")
-        return f"失败：搜索「{q}」时出错，请稍后重试。"
-    if not result:
-        return f"未找到与「{q}」相关的结果。"
-    return result
+        raw_text = await call_mcp_tool(
+            "serper-search",
+            "google_search",
+            arguments,
+        )
+    except MCPToolError as exc:
+        logger.warning("Serper MCP 搜索调用失败: %s", exc)
+        raise
+
+    items = _parse_serper_mcp_result(raw_text, requested)
+    if items:
+        return items
+
+    logger.info("Serper MCP 搜索服务未返回 organic 结果")
+    raise MCPSearchTransientError("Serper MCP search returned no organic results")
 
 
-@retry_async(max_retries=2, delay=1.5, backoff=2.0,
-            exceptions=(MCPToolError, asyncio.TimeoutError))
+def _parse_serper_mcp_result(raw_text: str, num_results: int | None = None) -> list[dict]:
+    """将 Serper ``organic`` JSON 转换为统一的标题、链接和摘要字段。"""
+    if not raw_text:
+        return []
+
+    try:
+        data = json.loads(raw_text)
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("Serper MCP 返回了无法解析的非 JSON 内容")
+        return []
+
+    organic = data.get("organic") if isinstance(data, dict) else None
+    if not isinstance(organic, list):
+        return []
+
+    items: list[dict] = []
+    for result in organic:
+        if not isinstance(result, dict):
+            continue
+        title = str(result.get("title") or "").strip() or "无标题"
+        link = str(result.get("link") or "").strip()
+        snippet = str(result.get("snippet") or "").strip()
+        if not link:
+            continue
+        items.append({"title": title, "link": link, "snippet": snippet})
+        if num_results is not None and len(items) >= num_results:
+            break
+    return items
+
+
+def _format_search_results(items: list, query: str, engine: str, requested: int | None = None) -> str:
+    success_count = len(items)
+    requested_count = requested if isinstance(requested, int) and requested > 0 else success_count
+    lines = [f"🔍 [成功: {engine}] 搜索「{query}」的结果（{success_count}/{requested_count}）：\n"]
+    for i, item in enumerate(items, 1):
+        title = item.get("title", "无标题")
+        link = item.get("link", "")
+        snippet = item.get("snippet", "")
+        lines.append(f"{i}. 标题：{title}\n   摘要：{snippet}\n   链接：{link}\n")
+    return "\n".join(lines)
+
+
 async def execute_web_search(query: str, num_results: int | None = None, offset: int | None = None) -> str:
-    """旧 web_search 兼容入口；新模型工具应直接使用 google_search。"""
-    arguments: dict[str, Any] = {"q": (query or "").strip()}
+    """通过 Serper MCP 搜索网页，并保持既有的结果文本契约。"""
+    query = (query or "").strip()
+    requested = None
     if num_results is not None:
-        arguments["num"] = max(1, min(int(num_results), 100))
+        requested = min(max(int(num_results), 1), 50)
+    page_offset = None
     if offset is not None:
-        size = int(num_results) if num_results else 10
-        arguments["page"] = max(1, int(offset) // max(size, 1) + 1)
-    return await execute_google_search(arguments)
+        page_offset = max(int(offset), 0)
+    if not query:
+        return "❌ 搜索关键词为空。"
+
+    try:
+        items = await _search_via_mcp(query, requested, page_offset)
+    except Exception as e:
+        logger.warning(f"MCP 搜索失败: {e}")
+        items = None
+
+    if items:
+        return _format_search_results(items, query, "Serper / Google", requested=requested)
+
+    return f"❌ 未找到与「{query}」相关的结果。"
+
 
 # --------------------- fetch_url (增加重试循环) ---------------------
 async def _extract_with_trafilatura(url: str) -> str | None:

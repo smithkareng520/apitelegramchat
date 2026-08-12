@@ -32,15 +32,11 @@ GAODE_MCP_ENABLED = os.getenv("GAODE_MCP_ENABLED", "true").strip().lower() in {"
 GAODE_MCP_URL = (os.getenv("GAODE_MCP_URL") or "https://mcp.api-inference.modelscope.net/3331c36972ff42/mcp").strip()
 GAODE_MCP_TOKEN = (os.getenv("GAODE_MCP_TOKEN") or "").strip()
 
-# ---------- 网页搜索：ModelScope Serper MCP 服务 ----------
-# 采用 streamable_http + Bearer token。只注册 google_search；scrape 不使用，
-# 网页正文继续由本项目自己的 fetch_url 工具负责。
+# ---------- 网页搜索：Serper MCP 服务 ----------
+# 采用 streamable_http + Bearer token。部署时必须显式配置 URL 与令牌；
+# 客户端仅信任 ModelScope MCP 域名，并只允许调用 google_search。
 SERPER_MCP_URL = (os.getenv("SERPER_MCP_URL") or "").strip()
 SERPER_MCP_TOKEN = (os.getenv("SERPER_MCP_TOKEN") or "").strip()
-# Serper MCP google_search requires gl (region) and hl (language).
-# Defaults target Chinese searches; override via env for another market.
-SERPER_MCP_REGION = (os.getenv("SERPER_MCP_REGION") or "cn").strip().lower()
-SERPER_MCP_LANGUAGE = (os.getenv("SERPER_MCP_LANGUAGE") or "zh").strip().lower()
 
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
