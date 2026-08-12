@@ -224,25 +224,384 @@ def _render_structured_value(value: object, *, depth: int = 0) -> str:
 
 
 def _parse_structured_payload(result_str: str) -> object | None:
+    """Parse a JSON document *or* a stream of adjacent JSON objects from MCP text."""
     raw = (result_str or "").strip()
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
         raw = re.sub(r"\s*```$", "", raw)
-    if not raw or raw[0] not in "[{":
+    if not raw:
         return None
-    try:
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+
+    # Some MCP adapters concatenate text blocks without delimiters, for example
+    # ``{...POI 1...}{...POI 2...}``. JSONDecoder.raw_decode lets us retain every
+    # object instead of falling back to an unreadable raw transcript.
+    decoder = json.JSONDecoder()
+    values: list[object] = []
+    cursor = 0
+    length = len(raw)
+    while cursor < length:
+        while cursor < length and raw[cursor].isspace():
+            cursor += 1
+        if cursor >= length:
+            break
+        if raw[cursor] not in "[{":
+            next_object = min(
+                [index for index in (raw.find("{", cursor), raw.find("[", cursor)) if index >= 0],
+                default=-1,
+            )
+            if next_object < 0:
+                break
+            cursor = next_object
+        try:
+            value, next_cursor = decoder.raw_decode(raw, cursor)
+        except (json.JSONDecodeError, TypeError):
+            break
+        if isinstance(value, (dict, list)):
+            values.append(value)
+        cursor = next_cursor
+
+    if not values:
         return None
-    if isinstance(parsed, (dict, list)):
-        return parsed
+    return values[0] if len(values) == 1 else values
+
+
+def _find_poi_records(payload: object) -> list[dict] | None:
+    """Find AMap-like POI records in direct, wrapped, or concatenated MCP output."""
+    if isinstance(payload, dict):
+        for key in ("pois", "poi", "results", "items"):
+            candidate = payload.get(key)
+            if isinstance(candidate, list) and candidate and all(isinstance(item, dict) for item in candidate):
+                if any("name" in item or "address" in item for item in candidate):
+                    return candidate
+        for key in ("data", "result", "payload"):
+            nested = payload.get(key)
+            found = _find_poi_records(nested)
+            if found:
+                return found
+        if "name" in payload and ("address" in payload or "typecode" in payload or "location" in payload):
+            return [payload]
+    elif isinstance(payload, list):
+        direct_records = [item for item in payload if isinstance(item, dict)]
+        if direct_records and any("name" in item or "address" in item for item in direct_records):
+            return direct_records
+        for item in direct_records:
+            found = _find_poi_records(item)
+            if found:
+                return found
     return None
 
 
-def _render_structured_payload(result_str: str) -> str | None:
+def _poi_photo_url(poi: dict) -> str:
+    photos = poi.get("photos")
+    if isinstance(photos, dict):
+        candidate = photos.get("url") or photos.get("photo_url")
+        return str(candidate).strip() if _looks_like_http_url(candidate) else ""
+    if isinstance(photos, list):
+        for photo in photos:
+            if isinstance(photo, dict):
+                candidate = photo.get("url") or photo.get("photo_url")
+                if _looks_like_http_url(candidate):
+                    return str(candidate).strip()
+    return ""
+
+
+def _poi_value(poi: dict, *keys: str) -> str:
+    for key in keys:
+        value = poi.get(key)
+        if value not in (None, "", [], {}):
+            return _trim_ui_value(value, 180)
+    return ""
+
+
+def _render_poi_cards(payload: object) -> str | None:
+    pois = _find_poi_records(payload)
+    if not pois:
+        return None
+
+    total = len(pois)
+    visible = pois[:8]
+    cards: list[str] = [
+        f"<p><b>📍 找到 {total} 个地点</b><br/><i>按名称、地址和图片整理；点击地点可展开详情。</i></p>"
+    ]
+    for index, poi in enumerate(visible, start=1):
+        name = _poi_value(poi, "name", "title") or f"地点 {index}"
+        address = _poi_value(poi, "address", "formatted_address")
+        location = _poi_value(poi, "location")
+        distance = _poi_value(poi, "distance")
+        alias = _poi_value(poi, "alias")
+        rating = _poi_value(poi, "rating")
+        level = _poi_value(poi, "level")
+        opening_hours = _poi_value(poi, "opentime2", "open_time")
+        poi_type = _poi_value(poi, "type")
+        typecode = _poi_value(poi, "typecode")
+        poi_id = _poi_value(poi, "id", "poi_id")
+        photo_url = _poi_photo_url(poi)
+        summary = f"📍 {index}. {name}"
+        details_open = " open" if index <= 2 else ""
+        body: list[str] = []
+        if photo_url and index <= 3:
+            safe_photo = escape_html(photo_url)
+            body.append(
+                f'<figure><img src="{safe_photo}"/>'
+                f'<figcaption><a href="{safe_photo}">查看地点图片</a></figcaption></figure>'
+            )
+        if address:
+            body.append(f"<p><b>地址</b><br/>{escape_html(address)}</p>")
+        if distance:
+            body.append(f"<p><b>距离</b> {escape_html(distance)}</p>")
+        if alias:
+            body.append(f"<p><b>别名</b> {escape_html(alias)}</p>")
+        if rating or level:
+            quality = "　".join(part for part in (f"评分 {rating}" if rating else "", f"等级 {level}" if level else "") if part)
+            body.append(f"<p><b>评价</b> {escape_html(quality)}</p>")
+        if opening_hours:
+            body.append(f"<details><summary>开放时间</summary><p>{escape_html(opening_hours)}</p></details>")
+        if location:
+            body.append(f"<p><b>坐标</b> <code>{escape_html(location)}</code></p>")
+        metadata: list[str] = []
+        if poi_type:
+            metadata.append(f"分类：{escape_html(poi_type)}")
+        if typecode:
+            metadata.append(f"分类编码：<code>{escape_html(typecode)}</code>")
+        if poi_id:
+            metadata.append(f"POI ID：<code>{escape_html(poi_id)}</code>")
+        if photo_url and index > 3:
+            safe_photo = escape_html(photo_url)
+            metadata.append(f'<a href="{safe_photo}">查看地点图片</a>')
+        if metadata:
+            body.append("<details><summary>更多信息</summary><p>" + "<br/>".join(metadata) + "</p></details>")
+        cards.append(f"<details{details_open}><summary>{escape_html(summary)}</summary>{''.join(body)}</details>")
+
+    if total > len(visible):
+        cards.append(f"<p><i>其余 {total - len(visible)} 个地点已省略，模型仍可读取完整结果并按你的需求继续筛选。</i></p>")
+    return "".join(cards)
+
+
+def _int_value(value: object) -> int | None:
+    try:
+        return int(float(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_distance(value: object) -> str:
+    meters = _int_value(value)
+    if meters is None:
+        return _trim_ui_value(value, 40) or "—"
+    if meters >= 1000:
+        return f"{meters / 1000:.1f} 公里"
+    return f"{meters} 米"
+
+
+def _format_duration(value: object) -> str:
+    seconds = _int_value(value)
+    if seconds is None:
+        return _trim_ui_value(value, 40) or "—"
+    minutes = max(1, round(seconds / 60))
+    if minutes >= 60:
+        return f"{minutes // 60} 小时 {minutes % 60} 分钟"
+    return f"约 {minutes} 分钟"
+
+
+def _dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _list_of_dicts(value: object) -> list[dict]:
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _render_map_location_card(payload: object, tool_name: str) -> str | None:
+    data = _dict(payload)
+    records = _list_of_dicts(data.get("return"))
+    if tool_name == "geocode" and records:
+        cards: list[str] = [f"<p><b>📍 已解析 {len(records)} 个位置</b></p>"]
+        for index, record in enumerate(records[:5], start=1):
+            location = _poi_value(record, "location")
+            area = " · ".join(
+                part for part in (_poi_value(record, "province", "provice"), _poi_value(record, "city"), _poi_value(record, "district")) if part
+            )
+            level = _poi_value(record, "level")
+            body = []
+            if area:
+                body.append(f"<p><b>区域</b><br/>{escape_html(area)}</p>")
+            if location:
+                body.append(f"<p><b>坐标</b><br/><code>{escape_html(location)}</code></p>")
+            if level:
+                body.append(f"<p><b>匹配级别</b> {escape_html(level)}</p>")
+            cards.append(f"<details{' open' if index == 1 else ''}><summary>位置 {index}{' · ' + escape_html(location) if location else ''}</summary>{''.join(body) or '<p><i>上游未返回可展示字段。</i></p>'}</details>")
+        return "".join(cards)
+
+    if tool_name == "ip_geo":
+        area = " · ".join(
+            part for part in (_poi_value(data, "country"), _poi_value(data, "province", "provice"), _poi_value(data, "city"), _poi_value(data, "district")) if part
+        )
+        if area:
+            return f"<p><b>🌐 IP 地理位置</b><br/>{escape_html(area)}</p>"
+        return "<p><b>🌐 IP 地理位置</b><br/><i>上游未返回可识别的区域信息。</i></p>"
+
+    if tool_name == "regeocode":
+        area = " · ".join(
+            part for part in (_poi_value(data, "province", "provice"), _poi_value(data, "city"), _poi_value(data, "district")) if part
+        )
+        if area:
+            return f"<p><b>📍 坐标所属区域</b><br/>{escape_html(area)}</p>"
+        return "<p><b>📍 坐标所属区域</b><br/><i>上游未返回可识别的地址组件。</i></p>"
+    return None
+
+
+def _collect_route_steps(path: dict, limit: int = 8) -> list[str]:
+    steps = _list_of_dicts(path.get("steps"))
+    rendered = []
+    for step in steps[:limit]:
+        instruction = _poi_value(step, "instruction")
+        if instruction:
+            rendered.append(instruction)
+    return rendered
+
+
+def _render_route_path(path: dict, index: int, *, open_first: bool = False) -> str:
+    distance = _format_distance(path.get("distance"))
+    duration = _format_duration(path.get("duration"))
+    steps = _collect_route_steps(path)
+    body = f"<p><b>路程</b> {escape_html(distance)}　<b>预计</b> {escape_html(duration)}</p>"
+    if steps:
+        items = "".join(f"<li>{escape_html(step)}</li>" for step in steps)
+        total = len(_list_of_dicts(path.get("steps")))
+        suffix = f"<p><i>其余 {total - len(steps)} 步已折叠</i></p>" if total > len(steps) else ""
+        body += f"<details><summary>导航步骤（{total}）</summary><ol>{items}</ol>{suffix}</details>"
+    return f"<details{' open' if open_first else ''}><summary>方案 {index} · {escape_html(distance)} · {escape_html(duration)}</summary>{body}</details>"
+
+
+def _render_transit_plan(transit: dict, index: int) -> str:
+    duration = _format_duration(transit.get("duration"))
+    walking = _format_distance(transit.get("walking_distance"))
+    bus_segments: list[str] = []
+    for segment in _list_of_dicts(transit.get("segments")):
+        bus = _dict(segment.get("bus"))
+        for line in _list_of_dicts(bus.get("buslines")):
+            line_name = _poi_value(line, "name")
+            departure = _poi_value(_dict(line.get("departure_stop")), "name")
+            arrival = _poi_value(_dict(line.get("arrival_stop")), "name")
+            if line_name:
+                route = " → ".join(part for part in (departure, arrival) if part)
+                bus_segments.append(f"{line_name}{'（' + route + '）' if route else ''}")
+    body = f"<p><b>预计</b> {escape_html(duration)}　<b>步行</b> {escape_html(walking)}</p>"
+    if bus_segments:
+        body += "<p><b>乘车</b></p><ol>" + "".join(f"<li>{escape_html(item)}</li>" for item in bus_segments[:5]) + "</ol>"
+        if len(bus_segments) > 5:
+            body += f"<p><i>其余 {len(bus_segments) - 5} 段已折叠</i></p>"
+    else:
+        body += "<p><i>该方案以步行为主。</i></p>"
+    return f"<details{' open' if index == 1 else ''}><summary>方案 {index} · {escape_html(duration)} · 步行 {escape_html(walking)}</summary>{body}</details>"
+
+
+def _render_map_route_card(payload: object) -> str | None:
+    data = _dict(payload)
+    route = _dict(data.get("route"))
+    if not route and isinstance(data.get("data"), dict):
+        route = _dict(data.get("data"))
+    if not route:
+        return None
+    origin = _poi_value(route, "origin")
+    destination = _poi_value(route, "destination")
+    title = "<p><b>🧭 路线规划</b>"
+    if origin and destination:
+        title += f"<br/><code>{escape_html(origin)}</code> → <code>{escape_html(destination)}</code>"
+    title += "</p>"
+    transits = _list_of_dicts(route.get("transits"))
+    if transits:
+        cards = "".join(_render_transit_plan(item, index) for index, item in enumerate(transits[:4], start=1))
+        if len(transits) > 4:
+            cards += f"<p><i>其余 {len(transits) - 4} 个公交方案已折叠</i></p>"
+        return title + cards
+    paths = _list_of_dicts(route.get("paths"))
+    if paths:
+        cards = "".join(_render_route_path(item, index, open_first=index == 1) for index, item in enumerate(paths[:3], start=1))
+        if len(paths) > 3:
+            cards += f"<p><i>其余 {len(paths) - 3} 个路线方案已折叠</i></p>"
+        return title + cards
+    return None
+
+
+def _render_distance_card(payload: object) -> str | None:
+    records = _list_of_dicts(_dict(payload).get("results"))
+    if not records:
+        return None
+    rows = []
+    for record in records[:12]:
+        origin_id = _poi_value(record, "origin_id") or "—"
+        dest_id = _poi_value(record, "dest_id") or "—"
+        rows.append(
+            f"<tr><td>起点 {escape_html(origin_id)} → 终点 {escape_html(dest_id)}</td>"
+            f"<td>{escape_html(_format_distance(record.get('distance')))}</td>"
+            f"<td>{escape_html(_format_duration(record.get('duration')))}</td></tr>"
+        )
+    suffix = f"<p><i>其余 {len(records) - 12} 条结果已折叠</i></p>" if len(records) > 12 else ""
+    return (
+        f"<p><b>📏 距离测量</b><br/><i>共 {len(records)} 条结果</i></p>"
+        "<table bordered striped><tr><th>路线</th><th>距离</th><th>预计</th></tr>"
+        + "".join(rows) + "</table>" + suffix
+    )
+
+
+def _render_weather_card(payload: object) -> str | None:
+    data = _dict(payload)
+    forecasts = _list_of_dicts(data.get("forecasts"))
+    if not forecasts:
+        return None
+    city = _poi_value(data, "city") or "天气预报"
+    rows = []
+    for item in forecasts[:7]:
+        daytime = f"{_poi_value(item, 'dayweather')} {_poi_value(item, 'daytemp')}℃".strip()
+        nighttime = f"{_poi_value(item, 'nightweather')} {_poi_value(item, 'nighttemp')}℃".strip()
+        wind = " ".join(part for part in (_poi_value(item, "daywind"), _poi_value(item, "daypower")) if part)
+        rows.append(
+            f"<tr><td>{escape_html(_poi_value(item, 'date'))}</td><td>{escape_html(daytime)}</td>"
+            f"<td>{escape_html(nighttime)}</td><td>{escape_html(wind)}</td></tr>"
+        )
+    return (
+        f"<p><b>🌤️ {escape_html(city)} 预报</b></p>"
+        "<table bordered striped><tr><th>日期</th><th>白天</th><th>夜间</th><th>风力</th></tr>"
+        + "".join(rows) + "</table>"
+    )
+
+
+def _render_map_payload(payload: object, tool_name: str | None) -> str | None:
+    if not tool_name:
+        return None
+    poi_cards = _render_poi_cards(payload)
+    if poi_cards:
+        return poi_cards
+    if tool_name in {"geocode", "ip_geo", "regeocode"}:
+        card = _render_map_location_card(payload, tool_name)
+        if card:
+            return card
+    if tool_name == "distance":
+        card = _render_distance_card(payload)
+        if card:
+            return card
+    if tool_name == "weather":
+        card = _render_weather_card(payload)
+        if card:
+            return card
+    if tool_name == "route":
+        card = _render_map_route_card(payload)
+        if card:
+            return card
+    return None
+
+
+def _render_structured_payload(result_str: str, *, map_tool: str | None = None) -> str | None:
     payload = _parse_structured_payload(result_str)
     if payload is None:
         return None
+    map_card = _render_map_payload(payload, map_tool)
+    if map_card:
+        return map_card
+    poi_cards = _render_poi_cards(payload)
+    if poi_cards:
+        return poi_cards
     if isinstance(payload, dict) and isinstance(payload.get("data"), (dict, list)) and len(payload) <= 3:
         payload = payload["data"]
     return (
@@ -1249,7 +1608,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         ip = fn_args.get('ip') if fn_name == "ip_geo" else None
         summary = base_label + (f" {ip}" if ip else "")
         # 外部 MCP 常返回 JSON 文本。对聊天界面渲染结构化卡片，而向模型仍保留原始结果。
-        details_html = _render_structured_payload(result_str) or _render_code_panel("服务响应 · 最近 10 行", result_str)
+        details_html = _render_structured_payload(result_str, map_tool=fn_name) or _render_code_panel("服务响应 · 最近 10 行", result_str)
         return summary, details_html
 
     elif fn_name == "file_editor":
