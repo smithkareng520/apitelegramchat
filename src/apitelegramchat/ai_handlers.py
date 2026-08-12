@@ -2606,6 +2606,74 @@ def _format_live_file_preview(content: str, *, path: str = "", label: str = "文
     )
 
 
+_BASH_STREAM_PREVIEW_LINES = 20
+_BASH_STREAM_PREVIEW_MAX_LINE_CHARS = 400
+
+
+def _decode_streaming_json_string(raw: str) -> str:
+    """Decode a JSON string fragment without discarding a trailing partial escape."""
+    try:
+        return json.loads(f'"{raw}"')
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    decoded: list[str] = []
+    index = 0
+    escapes = {
+        '"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f',
+        'n': '\n', 'r': '\r', 't': '\t',
+    }
+    while index < len(raw):
+        char = raw[index]
+        if char != '\\' or index + 1 >= len(raw):
+            decoded.append(char)
+            index += 1
+            continue
+        escaped = raw[index + 1]
+        if escaped == 'u':
+            unicode_digits = raw[index + 2:index + 6]
+            if len(unicode_digits) == 4 and all(c in '0123456789abcdefABCDEF' for c in unicode_digits):
+                decoded.append(chr(int(unicode_digits, 16)))
+                index += 6
+                continue
+            decoded.append(raw[index:])
+            break
+        decoded.append(escapes.get(escaped, f'\\{escaped}'))
+        index += 2
+    return ''.join(decoded)
+
+
+def _extract_streaming_json_string(args_str: str, key: str) -> str:
+    """Return a complete or in-progress JSON string field from streamed arguments."""
+    match = re.search(
+        rf'"{re.escape(key)}"\s*:\s*"((?:[^"\\]|\\.)*)(?:$|")',
+        args_str,
+        re.DOTALL,
+    )
+    return _decode_streaming_json_string(match.group(1)) if match else ''
+
+
+def _format_live_bash_preview(command: str) -> str:
+    """Render only the current command tail so streamed Bash drafts remain bounded."""
+    tail, first_line = _tail_lines_with_start(command, _BASH_STREAM_PREVIEW_LINES)
+    if not tail:
+        return "<p><i>正在接收命令…</i></p>"
+    bounded_lines = [
+        line if len(line) <= _BASH_STREAM_PREVIEW_MAX_LINE_CHARS
+        else line[:_BASH_STREAM_PREVIEW_MAX_LINE_CHARS] + " … [此行已截断]"
+        for line in tail.splitlines()
+    ]
+    return (
+        f"<details open><summary>当前命令 · 最近 {_BASH_STREAM_PREVIEW_LINES} 行（持续刷新）</summary>"
+        + _format_code_block(
+            "\n".join(bounded_lines), header="bash · command",
+            show_line_numbers=True, show_size=False,
+            max_lines=_BASH_STREAM_PREVIEW_LINES, line_start=first_line,
+        )
+        + "</details>"
+    )
+
+
 # ---- 修改点2：_build_streaming_preview 中的进行时摘要（规范第三部分） ----
 def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, str]:
     try:
@@ -2628,6 +2696,11 @@ def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, s
             else:
                 # 参数尚未完整解析时不显示额外的编辑器中间态噪声。
                 preview_html = ""
+        elif fn_name == "bash":
+            command = _extract_streaming_json_string(args_str, "command")
+            if command:
+                new_summary = _generate_initial_tool_summary("bash", {"command": command})
+            preview_html = _format_live_bash_preview(command)
         else:
             preview_html = _format_code_block(args_str, header="arguments (streaming)")
         return new_summary, preview_html
@@ -2658,8 +2731,8 @@ def _build_streaming_preview(fn_name: str, args_str: str) -> tuple[str | None, s
             preview_html = "<p><i>正在创建空文件…</i></p>"
 
     elif fn_name == "bash":
-        command = args_obj.get("command", "")
-        preview_html = _format_code_block(command, header="bash · command", show_line_numbers=True, show_size=False, max_lines=10)
+        command = str(args_obj.get("command", "") or "")
+        preview_html = _format_live_bash_preview(command)
 
     elif fn_name == "web_search":
         query = args_obj.get("query", "")
