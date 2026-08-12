@@ -1404,6 +1404,26 @@ async def _google_search_via_mcp(arguments: dict[str, Any]) -> str | None:
     raise MCPSearchTransientError("Serper MCP google_search returned no results")
 
 
+async def execute_google_search(arguments: dict[str, Any]) -> str:
+    """公开入口：供 dispatch_tool_call 的 google_search 分支直接调用。
+
+    对模型传入的参数做基本校验，转发给 _google_search_via_mcp（内部已带重试），
+    并把 MCP 层可能抛出的异常收敛为对用户友好的错误文案，避免异常向上抛出
+    中断整轮对话。
+    """
+    q = str((arguments or {}).get("q", "")).strip()
+    if not q:
+        return "失败：搜索查询不能为空。"
+    try:
+        result = await _google_search_via_mcp(arguments or {})
+    except (MCPToolError, MCPSearchTransientError, asyncio.TimeoutError):
+        logger.exception(f"google_search 调用失败，query={q!r}")
+        return f"失败：搜索「{q}」时出错，请稍后重试。"
+    if not result:
+        return f"未找到与「{q}」相关的结果。"
+    return result
+
+
 @retry_async(max_retries=2, delay=1.5, backoff=2.0,
             exceptions=(MCPToolError, asyncio.TimeoutError))
 async def execute_web_search(query: str, num_results: int | None = None, offset: int | None = None) -> str:
