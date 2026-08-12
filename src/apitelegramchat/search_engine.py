@@ -218,8 +218,11 @@ async def execute_file_editor(
 
     lock = await _get_workspace_lock(chat_id, resolved_namespace)
     async with lock:
-        workspace = workspace_workdir(chat_id, resolved_namespace)
-        local_path = workspace if allow_root_path else (workspace / safe_path)
+        workspace = workspace_workdir(chat_id, resolved_namespace).resolve()
+        try:
+            local_path = workspace if allow_root_path else _resolve_editor_path(workspace, safe_path)
+        except ValueError as exc:
+            return f"Error: {exc}"
 
         # ----- view (增强：支持搜索关键词) -----
         if command == "view":
@@ -2832,21 +2835,24 @@ MAX_EDITOR_FILE_SIZE = 5 * 1024 * 1024  # 1MB
 EDITOR_PREFIX = "editor"
 
 def _editor_safe_path(path: str) -> str:
-    """规范化并检查路径安全性，防止目录遍历。
-
-    加强点：
-    - 显式拒绝空路径和根路径，避免空字符串导致操作整个 workspace
-    - 使用 resolve() 解析软链接，防止符号链接逃逸
-    """
+    """Return a normalized relative path without traversal segments."""
     if not path or not isinstance(path, str) or path.strip() in ("", "/", "."):
         raise ValueError("Invalid path: empty or root path not allowed")
-    # 拒绝嵌入的 null 字节
     if "\x00" in path:
         raise ValueError("Invalid path: null byte not allowed")
     norm = os.path.normpath(path)
     if norm == "." or norm.startswith("..") or os.path.isabs(norm):
         raise ValueError("Invalid path: directory traversal not allowed")
     return norm
+
+
+def _resolve_editor_path(workspace: Path, safe_path: str) -> Path:
+    """Resolve a path and reject any file or parent symlink escaping workspace."""
+    root = workspace.resolve()
+    resolved = (root / safe_path).resolve(strict=False)
+    if resolved == root or root not in resolved.parents:
+        raise ValueError("Invalid path: symlink escapes workspace")
+    return resolved
 
 def _editor_get_r2_key(chat_id: int, path: str) -> str:
     """生成R2存储的键，按用户隔离。"""
@@ -2897,30 +2903,27 @@ async def persist_workspace_file(
 
 
 def _list_directory(dir_path: Path, display_path: str) -> str:
-    """列出工作区内某个目录的内容。
-
-    用于 file_editor 的 list 命令 / view 命令遇到目录时的兜底返回。
-    返回带类型标记的列表（dir/file/size），便于模型快速定位文件。
-    """
+    """List a verified workspace directory without following child symlinks."""
     if not dir_path.exists():
         return f"Error: Directory not found: {display_path}"
     if not dir_path.is_dir():
         return f"Error: Not a directory: {display_path}"
     try:
-        entries = sorted(dir_path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        entries = sorted(dir_path.iterdir(), key=lambda p: p.name.lower())
     except PermissionError:
         return f"Error: Permission denied: {display_path}"
     if not entries:
         return f"Directory {display_path} is empty."
     out = [f"Directory: {display_path} ({len(entries)} entries)"]
-    for p in entries:
+    for entry in entries:
         try:
-            st = p.stat()
-            if p.is_dir():
-                out.append(f"  [dir ]  {p.name}/")
+            if entry.is_symlink():
+                out.append(f"  [link]  {entry.name}  (not followed)")
+                continue
+            if entry.is_dir():
+                out.append(f"  [dir ]  {entry.name}/")
             else:
-                size = st.st_size
-                out.append(f"  [file]  {p.name}  ({size} bytes)")
-        except OSError as e:
-            out.append(f"  [????]  {p.name}  (stat failed: {e})")
+                out.append(f"  [file]  {entry.name}  ({entry.stat().st_size} bytes)")
+        except OSError as exc:
+            out.append(f"  [????]  {entry.name}  (stat failed: {exc})")
     return "\n".join(out)

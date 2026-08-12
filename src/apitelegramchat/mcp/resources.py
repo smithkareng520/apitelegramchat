@@ -1,100 +1,113 @@
+"""Private, scope-bound MCP resource service."""
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Iterable
 
+import mcp.types as types
+from mcp.server.lowlevel.helper_types import ReadResourceContents
+
+from apitelegramchat.mcp.context import MCPRequestContext
 from apitelegramchat.skills import get_skill_catalog, load_skill_records, read_skill_text
-from .registry import _chat_id
 from apitelegramchat.workspace_paths import (
+    memory_state_file,
+    todo_state_file,
+    workspace_download_root,
     workspace_root,
-    workspace_upload_root, workspace_download_root,
-    memory_state_file, todo_state_file,
+    workspace_upload_root,
 )
 
 
-def _resource_paths(root: Path) -> list[tuple[str, str]]:
-    items: list[tuple[str, str]] = []
-    for uri, path in [
-        ("workspace://current/todos", todo_state_file(_chat_id())),
-        ("workspace://current/memories", memory_state_file(_chat_id())),
-    ]:
-        if path.exists():
-            items.append((uri, path.name))
-
-    # Skill discovery chain
-    items.append(("workspace://current/skills", "skills.json"))
-    for rec in load_skill_records():
-        items.append((f"workspace://current/skills/{rec.skill_id}", f"{rec.skill_id}.json"))
-
-    items.append(("workspace://current/files", "files"))
-    items.append(("workspace://current/upload", "upload"))
-    items.append(("workspace://current/download", "download"))
-    items.append(("workspace://current/manifest", "manifest.json"))
-    return items
+class ResourceNotFoundError(ValueError):
+    """Raised when a client requests a URI outside the advertised resource set."""
 
 
-async def list_resources() -> list[dict[str, Any]]:
-    root = workspace_root(_chat_id())
-    items = []
-    for uri, rel in _resource_paths(root):
-        mime = "application/json" if rel in {"files", "upload", "download", "manifest.json", "skills.json"} or rel.endswith(".json") else "text/plain"
-        items.append({"uri": uri, "name": rel, "mimeType": mime})
-    return items
+class ResourceService:
+    """Expose metadata-only workspace resources for one trusted scope."""
 
+    def __init__(self, context: MCPRequestContext) -> None:
+        self._context = context
 
-def _list_tree(root: Path) -> list[dict[str, Any]]:
-    payload: list[dict[str, Any]] = []
-    if not root.exists():
-        return payload
-    for path in sorted(root.rglob("*")):
-        if path.is_file():
+    @property
+    def _chat_id(self) -> int:
+        return self._context.chat_id
+
+    @property
+    def _namespace(self) -> str:
+        return self._context.scope
+
+    def _workspace(self) -> Path:
+        return workspace_root(self._chat_id, self._namespace)
+
+    @staticmethod
+    def _tree(root: Path) -> list[dict[str, int | str]]:
+        items: list[dict[str, int | str]] = []
+        if not root.exists():
+            return items
+        for path in sorted(root.rglob("*")):
             try:
-                payload.append({"path": str(path.relative_to(root)), "size": path.stat().st_size})
+                if path.is_symlink() or not path.is_file():
+                    continue
+                items.append({"path": path.relative_to(root).as_posix(), "size": path.stat().st_size})
             except OSError:
                 continue
-    return payload
+        return items
 
+    async def list_resources(self) -> list[types.Resource]:
+        resources = [
+            types.Resource(uri="workspace://current/todos", name="todos.json", mimeType="application/json"),
+            types.Resource(uri="workspace://current/memories", name="memories.json", mimeType="application/json"),
+            types.Resource(uri="workspace://current/skills", name="skills.json", mimeType="application/json"),
+            types.Resource(uri="workspace://current/files", name="files.json", mimeType="application/json"),
+            types.Resource(uri="workspace://current/upload", name="upload.json", mimeType="application/json"),
+            types.Resource(uri="workspace://current/download", name="download.json", mimeType="application/json"),
+            types.Resource(uri="workspace://current/manifest", name="manifest.json", mimeType="application/json"),
+        ]
+        for record in load_skill_records():
+            resources.append(
+                types.Resource(
+                    uri=f"workspace://current/skills/{record.skill_id}",
+                    name=f"{record.skill_id}.json",
+                    mimeType="application/json",
+                )
+            )
+        return resources
 
-async def read_resource(uri: str) -> dict[str, Any]:
-    root = workspace_root(_chat_id())
-    if uri == "workspace://current/files":
-        payload = _list_tree(root)
-        return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload, ensure_ascii=False)}]}
+    async def read_resource(self, uri: str) -> Iterable[ReadResourceContents]:
+        with self._context.activate():
+            text = self._read_text(uri)
+        return [ReadResourceContents(content=text, mime_type="application/json")]
 
-    if uri == "workspace://current/upload":
-        payload = _list_tree(workspace_upload_root(_chat_id()))
-        return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload, ensure_ascii=False)}]}
-
-    if uri == "workspace://current/download":
-        payload = _list_tree(workspace_download_root(_chat_id()))
-        return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload, ensure_ascii=False)}]}
-
-    if uri == "workspace://current/manifest":
-        payload = {
-            "workspace": str(root),
-            "files": [str(p.relative_to(root)) for p in sorted(root.rglob("*")) if p.is_file()],
-            "upload": [str(p) for p in sorted(workspace_upload_root(_chat_id()).rglob("*")) if p.is_file()],
-            "download": [str(p) for p in sorted(workspace_download_root(_chat_id()).rglob("*")) if p.is_file()],
-        }
-        return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload, ensure_ascii=False)}]}
-
-    if uri == "workspace://current/skills":
-        return {
-            "contents": [{
-                "uri": uri,
-                "mimeType": "application/json",
-                "text": json.dumps(get_skill_catalog(), ensure_ascii=False, indent=2),
-            }]
-        }
-
-    if uri.startswith("workspace://current/skills/"):
-        skill_id = uri.rsplit("/", 1)[-1]
-        return {"contents": [{"uri": uri, "mimeType": "application/json", "text": read_skill_text(skill_id)}]}
-
-    mapping = {"workspace://current/todos": todo_state_file(_chat_id()), "workspace://current/memories": memory_state_file(_chat_id())}
-    path = mapping.get(uri)
-    if path is None:
-        return {"error": {"code": -32602, "message": f"Unknown resource: {uri}"}}
-    text = path.read_text(encoding="utf-8") if path.exists() else "{}"
-    return {"contents": [{"uri": uri, "mimeType": "application/json", "text": text}]}
+    def _read_text(self, uri: str) -> str:
+        workspace = self._workspace()
+        if uri == "workspace://current/todos":
+            path = todo_state_file(self._chat_id, self._namespace)
+            return path.read_text(encoding="utf-8") if path.exists() else "{}"
+        if uri == "workspace://current/memories":
+            path = memory_state_file(self._chat_id, self._namespace)
+            return path.read_text(encoding="utf-8") if path.exists() else "{}"
+        if uri == "workspace://current/skills":
+            return json.dumps(get_skill_catalog(), ensure_ascii=False, indent=2)
+        if uri.startswith("workspace://current/skills/"):
+            skill_id = uri.rsplit("/", 1)[-1]
+            advertised = {record.skill_id for record in load_skill_records()}
+            if skill_id not in advertised:
+                raise ResourceNotFoundError(f"Unknown skill resource: {skill_id}")
+            return read_skill_text(skill_id)
+        if uri == "workspace://current/files":
+            return json.dumps(self._tree(workspace), ensure_ascii=False)
+        if uri == "workspace://current/upload":
+            return json.dumps(self._tree(workspace_upload_root(self._chat_id, self._namespace)), ensure_ascii=False)
+        if uri == "workspace://current/download":
+            return json.dumps(self._tree(workspace_download_root(self._chat_id, self._namespace)), ensure_ascii=False)
+        if uri == "workspace://current/manifest":
+            return json.dumps(
+                {
+                    "files": self._tree(workspace),
+                    "upload": self._tree(workspace_upload_root(self._chat_id, self._namespace)),
+                    "download": self._tree(workspace_download_root(self._chat_id, self._namespace)),
+                },
+                ensure_ascii=False,
+            )
+        raise ResourceNotFoundError(f"Unknown resource: {uri}")

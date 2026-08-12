@@ -23,6 +23,17 @@ def set_current_user_namespace(namespace: str | int | None) -> None:
     _current_user_namespace.set(value or None)
 
 
+def bind_current_user_namespace(namespace: str | int | None) -> contextvars.Token[str | None]:
+    """Bind a namespace for one request and return its reset token."""
+    value = None if namespace is None else str(namespace).strip() or None
+    return _current_user_namespace.set(value)
+
+
+def reset_current_user_namespace(token: contextvars.Token[str | None]) -> None:
+    """Restore the namespace that was active before a request-scoped binding."""
+    _current_user_namespace.reset(token)
+
+
 def get_current_user_namespace() -> str | None:
     return _current_user_namespace.get()
 

@@ -29,19 +29,27 @@ def _resolved_namespace(chat_id: object, namespace: object | None = None) -> str
     return sanitize_namespace(chat_id)
 
 
+def _secure_directory(path: Path) -> Path:
+    """Create a private runtime directory without accepting a final symlink."""
+    expanded = path.expanduser()
+    if expanded.exists() and expanded.is_symlink():
+        raise RuntimeError(f"Refusing symlinked runtime directory: {expanded}")
+    expanded.mkdir(parents=True, exist_ok=True, mode=0o700)
+    resolved = expanded.resolve()
+    if resolved.is_symlink() or not resolved.is_dir():
+        raise RuntimeError(f"Invalid runtime directory: {expanded}")
+    try:
+        os.chmod(resolved, 0o700)
+    except OSError as exc:
+        raise RuntimeError(f"Unable to protect runtime directory {resolved}: {exc}") from exc
+    return resolved
+
+
 @lru_cache(maxsize=1)
 def data_root() -> Path:
-    # Use a writable location by default. On managed deploys the app directory may
-    # be read-only for the runtime user, so default to /tmp unless explicitly set.
+    """Return the private root for runtime state and workspaces."""
     base = os.getenv("APITELEGRAMCHAT_DATA_DIR", "/tmp/apitelegramchat_data")
-    root = Path(base).expanduser().resolve()
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-    except PermissionError:
-        fallback = Path("/tmp/apitelegramchat_data").resolve()
-        fallback.mkdir(parents=True, exist_ok=True)
-        root = fallback
-    return root
+    return _secure_directory(Path(base))
 
 
 def sanitize_namespace(value: object) -> str:
@@ -53,9 +61,8 @@ def sanitize_namespace(value: object) -> str:
 
 def workspace_root(chat_id: object, namespace: object | None = None) -> Path:
     ns = _resolved_namespace(chat_id, namespace)
-    root = data_root() / "workspaces" / ns
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
+    parent = _secure_directory(data_root() / "workspaces")
+    return _secure_directory(parent / ns)
 
 
 
@@ -77,16 +84,12 @@ def workspace_file(chat_id: object, filename: str, namespace: object | None = No
 
 
 def state_root() -> Path:
-    root = data_root() / _STATE_DIR_NAME
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
+    return _secure_directory(data_root() / _STATE_DIR_NAME)
 
 
 def chat_state_root(chat_id: object, namespace: object | None = None) -> Path:
     ns = _resolved_namespace(chat_id, namespace)
-    root = state_root() / ns
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
+    return _secure_directory(state_root() / ns)
 
 
 def state_file(chat_id: object, filename: str, namespace: object | None = None) -> Path:
@@ -123,15 +126,11 @@ def workspace_identity(chat_id: object, namespace: object | None = None) -> tupl
 
 def runtime_cache_root(chat_id: object, namespace: object | None = None) -> Path:
     """持久化运行时目录，完全独立于用户文件同步层。"""
-    root = workspace_root(chat_id, namespace) / _RUNTIME_DIR_NAME
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
+    return _secure_directory(workspace_root(chat_id, namespace) / _RUNTIME_DIR_NAME)
 
 def workspace_skills_root(chat_id: object, namespace: object | None = None) -> Path:
     """本地 skill 资源层，不参与用户文件同步。"""
-    root = workspace_root(chat_id, namespace) / _SKILLS_DIR_NAME
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
+    return _secure_directory(workspace_root(chat_id, namespace) / _SKILLS_DIR_NAME)
 
 
 def workspace_upload_root(chat_id: object, namespace: object | None = None) -> Path:
@@ -146,9 +145,7 @@ def workspace_upload_root(chat_id: object, namespace: object | None = None) -> P
     or execute any command while the cwd is inside it. This prevents
     package managers / build tools from polluting the staging area.
     """
-    root = workspace_root(chat_id, namespace) / _UPLOAD_DIR_NAME
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
+    return _secure_directory(workspace_root(chat_id, namespace) / _UPLOAD_DIR_NAME)
 
 
 def workspace_download_root(chat_id: object, namespace: object | None = None) -> Path:
@@ -165,9 +162,7 @@ def workspace_download_root(chat_id: object, namespace: object | None = None) ->
     the cwd is inside it. This keeps user-supplied files immutable from
     the model's execution perspective.
     """
-    root = workspace_root(chat_id, namespace) / _DOWNLOAD_DIR_NAME
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
+    return _secure_directory(workspace_root(chat_id, namespace) / _DOWNLOAD_DIR_NAME)
 
 
 def is_inside_upload_or_download(path: object) -> bool:
