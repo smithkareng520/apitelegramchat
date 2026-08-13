@@ -113,6 +113,7 @@ class FakeBuilder:
         self.chat_id = 123
         self.item_status: dict[str, str] = {}
         self.flush_calls = 0
+        self.finished_groups: list[int] = []
 
     def _get_current_group(self) -> int:
         return 0
@@ -125,6 +126,9 @@ class FakeBuilder:
 
     def update_tool_preview(self, *args, **kwargs) -> None:
         pass
+
+    def finish_group(self, group_idx: int) -> None:
+        self.finished_groups.append(group_idx)
 
     async def flush(self, force: bool = False) -> None:
         self.flush_calls += 1

@@ -43,8 +43,8 @@ from apitelegramchat.utils import (
     strip_html_tags,
     escape_html,
     get_logger,
-    get_request_id,
     delete_message,
+    delete_message_fast,
     mark_draft_dead,
     RateLimitError,
     transcribe_audio_with_groq,
@@ -127,7 +127,18 @@ RICH_DRAFT_ROLLOVER_BLOCKS = min(
     RICH_MESSAGE_BLOCKS_MAX - 1,
     _positive_env_int("RICH_DRAFT_ROLLOVER_BLOCKS", 440),
 )
-# 没有遇到完整块时最多等待到这里；随后降级为转义段，绝不把超限内容提交给草稿 API。
+# 容量接近上限时仅进入“本轮结束后滚动”的待切换状态；真正切换必须等模型
+# 返回与该返回声明的全部工具调用完成。软阈值为一个完整工具批次预留空间。
+RICH_DRAFT_ARM_TEXT_CHARS = min(
+    RICH_DRAFT_ROLLOVER_TEXT_CHARS,
+    _positive_env_int("RICH_DRAFT_ARM_TEXT_CHARS", 27000),
+)
+RICH_DRAFT_ARM_BLOCKS = min(
+    RICH_DRAFT_ROLLOVER_BLOCKS,
+    _positive_env_int("RICH_DRAFT_ARM_BLOCKS", 380),
+)
+# 没有遇到完整块时最多等待到这里；随后在回合边界降级为转义段，绝不把超限内容
+# 作为永久消息提交。
 RICH_DRAFT_HARD_GUARD_CHARS = max(
     RICH_DRAFT_ROLLOVER_TEXT_CHARS + 1,
     RICH_MESSAGE_TEXT_CHARS_MAX - 512,
@@ -2194,17 +2205,6 @@ def _safe_parse_args(args_str: str) -> dict:
 
 
 # ========== 工具调用执行 ==========
-def _log_builder_diagnostic(builder, event: str, **fields) -> None:
-    """兼容最小化 builder 替身；诊断能力不能改变工具调用主链路。"""
-    callback = getattr(builder, "log_diagnostic", None)
-    if not callable(callback):
-        return
-    try:
-        callback(event, **fields)
-    except Exception:
-        pass
-
-
 async def _run_tool_calls_and_append(
         tool_calls: list,
         loop_messages: list,
@@ -2236,14 +2236,6 @@ async def _run_tool_calls_and_append(
     tool_call_count_ref[0] += len(valid_tool_calls)
 
     group_idx = builder._get_current_group() if valid_tool_calls else -1
-    _log_builder_diagnostic(
-        builder, "tool_batch_started",
-        api_label=api_label,
-        valid_tool_calls=len(valid_tool_calls),
-        skipped_tool_calls=len(skipped_tool_calls),
-        tool_budget_used=tool_call_count_ref[0],
-        tool_group_index=group_idx,
-    )
 
     tool_tasks = []
     for tc in valid_tool_calls:
@@ -2299,25 +2291,10 @@ async def _run_tool_calls_and_append(
     force_tool_refresh = bool(tool_tasks)
 
     async def refresh_loop():
-        _log_builder_diagnostic(
-            builder, "tool_keepalive_started", api_label=api_label,
-            force=force_tool_refresh, tool_count=len(tool_tasks),
-        )
         await builder.flush(force=force_tool_refresh)
         while not stop_refresh.is_set():
             await asyncio.sleep(2.0)
             if not stop_refresh.is_set():
-                last_flush_at = getattr(builder, "_last_flush_time", time.monotonic())
-                flush_age_ms = round((time.monotonic() - last_flush_at) * 1000, 1)
-                if flush_age_ms >= 6_000:
-                    _log_builder_diagnostic(
-                        builder, "tool_keepalive_overdue", api_label=api_label,
-                        force=force_tool_refresh, flush_age_ms=flush_age_ms,
-                    )
-                _log_builder_diagnostic(
-                    builder, "tool_keepalive_tick", api_label=api_label,
-                    force=force_tool_refresh, flush_age_ms=flush_age_ms,
-                )
                 await builder.flush(force=force_tool_refresh)
 
     refresh_task = asyncio.create_task(refresh_loop())
@@ -2431,17 +2408,9 @@ async def _run_tool_calls_and_append(
                 llm_content = safe_content
             return (fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content)
 
-    tool_batch_started_at = time.monotonic()
     results = await asyncio.gather(
         *[run_one(fn, args, tid) for fn, args, tid in tool_tasks],
         return_exceptions=True
-    )
-    _log_builder_diagnostic(
-        builder, "tool_batch_results_collected",
-        api_label=api_label,
-        tool_count=len(tool_tasks),
-        exception_count=sum(isinstance(result, Exception) for result in results),
-        elapsed_ms=round((time.monotonic() - tool_batch_started_at) * 1000, 1),
     )
 
     stop_refresh.set()
@@ -2450,11 +2419,6 @@ async def _run_tool_calls_and_append(
     except asyncio.CancelledError:
         pass
     await builder.flush(force=False)
-    _log_builder_diagnostic(
-        builder, "tool_batch_refresh_stopped",
-        api_label=api_label,
-        tool_count=len(tool_tasks),
-    )
 
     # ===== 修改：根据结果标记状态 =====
     # tool_tasks 与 results 顺序一一对应（asyncio.gather 保序），用于在
@@ -2540,6 +2504,9 @@ async def _run_tool_calls_and_append(
             "[%s] 工具调用预算已耗尽：已执行=%s，跳过=%s，上限=%s",
             api_label, tool_call_count_ref[0], len(skipped_tool_calls), MAX_TOOL_CALLS,
         )
+    # 一个模型返回中声明的全部工具已得到最终状态；这才是允许草稿切换的原子边界。
+    if group_idx >= 0:
+        builder.finish_group(group_idx)
     await builder.flush()
 
     if tool_call_count_ref[0] >= MAX_TOOL_CALLS:
@@ -2756,70 +2723,24 @@ class RichMessageBuilder:
         self._last_flush_time: float = time.monotonic()
         self._flush_task: Optional[asyncio.Task] = None
         self._pending_flush_task: Optional[asyncio.Task] = None
-        self._rollover_task: Optional[asyncio.Task] = None
         self._stop_flush = False
-        # 与“停止定时刷新”分开：正常收尾时，已启动的滚动仍可完成；
-        # 外部中断时则永久关闭滚动，禁止旧任务在 finally 之后注册或发送新草稿。
-        self._rollover_allowed = True
         self._thinking_removed: bool = False
         self._pending_reasoning_html: str = ""
         self._flush_lock = asyncio.Lock()
         self._rollover_lock = asyncio.Lock()
         self._rate_limited_until: float = 0.0
         self._force_flush_requested: bool = False
+        # 容量预警与实际切换严格分离：flush 只能置位 pending，只有完成一整轮
+        # 模型返回/工具批次后才能 await rollover_at_turn_boundary()。
+        self._rollover_pending = False
+        self._rollover_in_progress = False
+        # 防御性兜底：理论上回合边界期间不再有模型增量；若调用方违约，增量进入
+        # handoff 缓冲，永久化完成后随新草稿写入，绝不能被旧 remainder 快照覆盖。
+        self._handoff_text: list[str] | None = None
         # 每一次滚动均记录旧草稿、新草稿和永久消息 ID，既用于诊断，也确保最终
         # 收尾只处理当前草稿而不会重复发送已完成的段落。
         self._rollover_history: list[dict[str, int | str | None]] = []
         self._rollover_count: int = 0
-
-    @staticmethod
-    def _diagnostic_task_state(task: Optional[asyncio.Task]) -> str:
-        if task is None:
-            return "none"
-        if task.cancelled():
-            return "cancelled"
-        if task.done():
-            return "done"
-        return "running"
-
-    def diagnostic_snapshot(self) -> dict:
-        """返回无正文、可安全输出的草稿运行状态快照。"""
-        now = time.monotonic()
-        open_groups = [group for group in self._tool_groups if not group.get("finished", False)]
-        return {
-            "chat_id": self.chat_id,
-            "draft_id": self.draft_id,
-            "draft_message_id": self.draft_message_id or 0,
-            "block_count": len(self.blocks),
-            "tool_group_count": len(self._tool_groups),
-            "open_tool_groups": len(open_groups),
-            "tool_item_count": sum(len(group.get("items", [])) for group in self._tool_groups),
-            "running_tool_items": sum(
-                1
-                for group in self._tool_groups
-                for item in group.get("items", [])
-                if item.get("status") in {"running", "waiting"}
-            ),
-            "stream_buffer_chars": len(self._stream_buffer),
-            "pending_chars": self._pending_chars,
-            "last_flush_age_ms": round((now - self._last_flush_time) * 1000, 1),
-            "rate_limit_remaining_ms": round(max(0.0, self._rate_limited_until - now) * 1000, 1),
-            "flush_lock_locked": self._flush_lock.locked(),
-            "flush_task": self._diagnostic_task_state(self._flush_task),
-            "pending_flush_task": self._diagnostic_task_state(self._pending_flush_task),
-            "rollover_task": self._diagnostic_task_state(self._rollover_task),
-            "rollover_allowed": self._rollover_allowed,
-            "stop_flush": self._stop_flush,
-            "rollover_count": self._rollover_count,
-        }
-
-    def log_diagnostic(self, event: str, **fields) -> None:
-        """输出单行 JSON 草稿状态日志，不记录用户正文或工具输出。"""
-        payload = {"event": event, "request_id": get_request_id(), **self.diagnostic_snapshot(), **fields}
-        try:
-            logger.info("[draft_state] %s", json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
-        except Exception:
-            logger.info("[draft_state] event=%s chat=%s draft=%s", event, self.chat_id, self.draft_id)
 
     def _get_reasoning_summary(self, content: str) -> str:
         """从包含 HTML 标签的思考内容中提取纯文本摘要，长度不超过 30 字符"""
@@ -2952,6 +2873,9 @@ class RichMessageBuilder:
                     return
 
     def append_to_current_tool_group_text(self, text: str):
+        if self._handoff_text is not None:
+            self._handoff_text.append(text)
+            return
         group_idx = self._get_current_group()
         if group_idx < 0:
             return
@@ -3209,6 +3133,9 @@ class RichMessageBuilder:
     def add_text(self, text: str):
         if not text or not text.strip():
             return
+        if self._handoff_text is not None:
+            self._handoff_text.append(text)
+            return
         self._commit_stream_buffer()
         self.blocks.append(text)
         self.block_types.append("text")
@@ -3264,6 +3191,9 @@ class RichMessageBuilder:
 
     def append_stream_delta(self, delta: str):
         if not delta:
+            return
+        if self._handoff_text is not None:
+            self._handoff_text.append(delta)
             return
         self._stream_buffer += delta
         self._pending_chars += len(delta)
@@ -3451,7 +3381,7 @@ class RichMessageBuilder:
         result = "".join(html_parts)
         return result if result.strip() else " "
 
-    # ---------- 草稿滚动 ----------
+    # ---------- 容量预警与回合边界滚动 ----------
     @staticmethod
     def _sanitize_rich_html(html_content: str) -> str:
         """删除 Telegram 无法拉取的本地图片，保持草稿和永久消息内容一致。"""
@@ -3480,7 +3410,7 @@ class RichMessageBuilder:
         return max([candidate for candidate in candidates if candidate > 0] or [upper])
 
     def _pick_rollover_boundary(self, html_content: str) -> tuple[int | None, int, int]:
-        """选择完整最外层块结束位置；优先主动预算，必要时允许落在真实限制前的安全余量内。"""
+        """选择完整最外层块结束位置；必要时允许在真实限制前的安全余量内提交。"""
         boundaries, visible_chars, block_count = _scan_rich_html_boundaries(html_content)
         preferred = None
         legal_complete_block = None
@@ -3498,91 +3428,75 @@ class RichMessageBuilder:
         selected = preferred or legal_complete_block
         return (selected[0] if selected else None), visible_chars, block_count
 
-    def _replace_with_rollover_remainder(self, remainder: str) -> None:
-        """将未提交部分作为新草稿的唯一内容，并维持当前流式写入通道。"""
+    def _replace_with_rollover_remainder(self, remainder: str, handoff_text: str = "") -> None:
+        """将未提交内容和交接期间的缓冲内容作为新草稿，并维持流式通道。"""
         remainder = remainder.lstrip()
-        # A rollover creates a new client-visible draft.  Seed it with the
-        # same stable status marker as a fresh request so it never appears as
-        # an empty, contextless bubble while the next stream chunk is pending.
         thinking = "<tg-thinking>Thinking...</tg-thinking>"
         self.blocks = [thinking]
         self.block_types = ["html"]
         if remainder:
             self.blocks.append(remainder)
             self.block_types.append("text")
+        if handoff_text:
+            self.blocks.append(handoff_text)
+            self.block_types.append("text")
         self._tool_groups = []
         self._current_group_idx = -1
         self._stream_buffer = ""
-        # agentic loop 可能仍认为 content stream 已开启；这里主动建立一个 text 流，
-        # 使后续 delta 能继续追加到新草稿，而不是写入一个不可见的游离 buffer。
-        self._stream_text_index = 1 if remainder else -1
+        self._stream_text_index = -1
         self._pending_chars = 0
 
     async def _register_active_draft(self, message_id: int = 0) -> None:
         try:
             from apitelegramchat.state import set_active_draft
             await set_active_draft(self.chat_id, self.draft_id, message_id)
-            self.log_diagnostic("active_draft_registered", registered_message_id=message_id)
         except Exception as exc:
             logger.debug("更新活跃草稿状态失败: chat=%s draft=%s err=%s", self.chat_id, self.draft_id, exc)
 
-    async def _rollover_draft_if_needed(self, html_content: str) -> bool:
-        """
-        在达到主动阈值后完成当前段并创建新草稿。
-
-        正常路径仅选最外层结构块的结束位置；details、table、list、pre、blockquote、
-        figure 等不会被截断。若单一未闭合块异常大到接近硬上限，降级为转义纯文本，
-        优先保证不会因超限丢失整个输出。
-
-        ★ 关键（草稿冻结 bug 的修复说明）：这个方法由 _maybe_start_rollover
-        作为独立后台任务调用，flush() 不会 await 它——早期版本 flush() 会直接
-        `await self._rollover_draft_if_needed(...)`，而这里面的网络 I/O
-        （send_rich_html_message 发永久消息、delete_message 删旧草稿预览）此前
-        用的是 aiohttp 默认超时（远比草稿的 5s/2次重试 宽松，还带 3 次退避重试），
-        一旦网络抖动，这段网络 I/O 可能阻塞十几秒到几分钟；而无论是否占用
-        _flush_lock，await 它本身就会让"这一次" flush() 调用原地卡住，导致
-        _stream_flush_loop / refresh_loop 的顺序循环卡在同一处，前端草稿冻结到
-        网络调用结束为止——这就是"草稿卡住一会儿才刷新"的根因。
-
-        现在的分层：
-          1) 判断/切分/内存重建（必须与其他调用互斥，很快）留在
-             self._rollover_lock 临界区内。
-          2) 网络 I/O（send_rich_html_message / delete_message）在该临界区
-             之外执行，且整个方法是从后台任务里调用的，不阻塞任何 flush()。
-          3) 网络 I/O 完成、真正切换 draft_id 后，会自己 `await self.flush
-             (force=True)` 发新草稿首帧——因为调用方不再等待这里完成，不能
-             依赖"调用方会在这之后接着发"。
-        并发安全：网络 I/O 期间另一次 flush() 可能已经因为不同触发路径切换
-        了 draft_id（理论概率极低，仅在极端并发下出现），切换阶段会重新检查
-        self.draft_id 是否仍等于本次调用开始时的 old_draft_id，不一致则跳过
-        重复切换，只是已发的永久消息内容依然正确落地。
-        """
-        # 外部新请求已接管当前 chat 时，旧任务不得继续把尾段注册为新草稿。
-        if not self._rollover_allowed:
+    def _arm_rollover_if_needed(self, html_content: str | None = None) -> bool:
+        """接近容量时只设置待切换标志，绝不在 flush 中创建后台滚动任务。"""
+        if self._stop_flush or self._rollover_pending or self._rollover_in_progress:
+            return self._rollover_pending
+        if html_content is None:
+            html_content = self._sanitize_rich_html(self._build_html_no_thinking())
+        _cut_at, visible_chars, block_count = self._pick_rollover_boundary(html_content)
+        if visible_chars < RICH_DRAFT_ARM_TEXT_CHARS and block_count < RICH_DRAFT_ARM_BLOCKS:
             return False
-
-        cut_at, visible_chars, block_count = self._pick_rollover_boundary(html_content)
-        should_rollover = (
-            visible_chars >= RICH_DRAFT_ROLLOVER_TEXT_CHARS
-            or block_count >= RICH_DRAFT_ROLLOVER_BLOCKS
+        self._rollover_pending = True
+        logger.info(
+            "草稿容量预警，等待本轮完成后滚动: chat=%s draft=%s chars=%s blocks=%s arm_chars=%s arm_blocks=%s",
+            self.chat_id, self.draft_id, visible_chars, block_count,
+            RICH_DRAFT_ARM_TEXT_CHARS, RICH_DRAFT_ARM_BLOCKS,
         )
-        if not should_rollover:
+        return True
+
+    def _restore_handoff_text(self) -> None:
+        """将异常退出的交接缓冲恢复到当前构建器，避免任何流式增量丢失。"""
+        if self._handoff_text is None:
+            return
+        buffered = "".join(self._handoff_text)
+        self._handoff_text = None
+        if buffered:
+            self.blocks.append(buffered)
+            self.block_types.append("text")
+            self._stream_text_index = -1
+            self._pending_chars += len(buffered)
+
+    async def rollover_at_turn_boundary(self) -> bool:
+        """在完整模型返回/完整工具批次后执行一次无损草稿切换。
+
+        调用方必须保证下一次模型请求尚未开始，且本轮并行工具均已得到最终状态。
+        flush 只负责置位容量预警，因此这里的网络 I/O 不会与后续 Agent 轮次交错。
+        """
+        if self._stop_flush or not self._rollover_pending or self._rollover_in_progress:
             return False
 
-        # 锁内只做状态判断 + 内存重建，不做任何网络 I/O。
+        self._commit_stream_buffer()
         async with self._rollover_lock:
-            # 获锁后重新建模，以覆盖等待期间可能到达的流式增量。
-            # 重新检查，覆盖等待锁期间发生的外部中断。
-            if not self._rollover_allowed:
+            if self._stop_flush or not self._rollover_pending or self._rollover_in_progress:
                 return False
             current_html = self._sanitize_rich_html(self._build_html_no_thinking())
             cut_at, visible_chars, block_count = self._pick_rollover_boundary(current_html)
-            should_rollover = (
-                visible_chars >= RICH_DRAFT_ROLLOVER_TEXT_CHARS
-                or block_count >= RICH_DRAFT_ROLLOVER_BLOCKS
-            )
-            if not should_rollover:
-                return False
 
             used_fallback = False
             if cut_at is not None:
@@ -3592,11 +3506,9 @@ class RichMessageBuilder:
                 visible_chars < RICH_DRAFT_HARD_GUARD_CHARS
                 and block_count < RICH_MESSAGE_BLOCKS_MAX - 1
             ):
-                # 尚未遇到任何完整块，继续等待块闭合，而不是把折叠块/表格截断。
+                # 软阈值已到但当前仍无完整边界：保留 pending，等待下一完整回合。
                 return False
             else:
-                # 不合规或极端超长的单一结构块：最后一道防线。格式会在该段被降级，
-                # 但内容仍完整可见且每一段都不超过 API 的真实限制。
                 plain = _rich_visible_text(current_html)
                 text_cut = self._plain_text_cut(plain, RICH_DRAFT_ROLLOVER_TEXT_CHARS)
                 completed_html = f"<p>{escape_html(plain[:text_cut].rstrip())}</p>"
@@ -3608,210 +3520,115 @@ class RichMessageBuilder:
 
             old_draft_id = self.draft_id
             old_draft_message_id = self.draft_message_id
+            self._rollover_in_progress = True
+            self._handoff_text = []
 
-        # ---- 锁外：网络 I/O。self._flush_lock / self._rollover_lock 均已释放，
-        # 其他 flush() 调用不会因为这里的网络延迟被阻塞。----
-        # 已结束的内容必须先永久化。发送失败时不切换，以免丢失未完成草稿；
-        # 失败时把内容留在当前草稿里，下次 flush 会重新尝试判断是否滚动。
-        completed_message_id = await send_rich_html_message(
-            self.chat_id,
-            completed_html,
-            reassert_draft=False,
-        )
-        if not completed_message_id:
-            logger.warning(
-                "草稿滚动永久化失败，保留当前草稿重试: chat=%s draft=%s chars=%s blocks=%s",
-                self.chat_id, old_draft_id, visible_chars, block_count,
+        try:
+            # 此处被调用在回合边界；等待永久消息期间不会启动下一次模型请求。
+            completed_message_id = await send_rich_html_message(
+                self.chat_id,
+                completed_html,
+                reassert_draft=False,
             )
-            return False
-
-        # sendRichMessage 返回与状态切换之间也可能发生外部中断。此时允许已发出的
-        # 永久消息留在会话中，但绝不能再创建新的 draft_id 或发送其首帧。
-        if not self._rollover_allowed:
-            return False
-
-        # 永久消息已创建，旧预览不应再刷新或滞留为重复内容。
-        await mark_draft_dead(old_draft_id)
-        if old_draft_message_id:
-            try:
-                await delete_message(self.chat_id, old_draft_message_id)
-            except Exception as exc:
-                logger.debug(
-                    "滚动后清理旧草稿预览失败: chat=%s draft=%s msg=%s err=%s",
-                    self.chat_id, old_draft_id, old_draft_message_id, exc,
+            if not completed_message_id:
+                self._restore_handoff_text()
+                self._rollover_in_progress = False
+                logger.warning(
+                    "草稿边界滚动永久化失败，保留当前草稿重试: chat=%s draft=%s chars=%s blocks=%s",
+                    self.chat_id, old_draft_id, visible_chars, block_count,
                 )
-
-        # ---- 重新拿锁，完成状态切换。这段仍是纯内存操作，很快。----
-        async with self._rollover_lock:
-            # 等待永久消息时若收到外部中断，禁止旧生成任务接续出新草稿。
-            if not self._rollover_allowed:
                 return False
-            # 极小概率下，另一次并发滚动可能已经把 draft_id 切换走了
-            # （例如两次 flush 几乎同时判定 should_rollover）。此时不再重复
-            # 切换，避免覆盖更新的 draft 状态；已发的永久消息内容依然正确落地。
-            if self.draft_id != old_draft_id:
-                logger.debug(
-                    "草稿在网络 I/O 期间已被并发滚动，跳过重复切换: chat=%s "
-                    "old=%s current=%s", self.chat_id, old_draft_id, self.draft_id,
-                )
-                return True
 
-            # 重新分配草稿 ID 并立即登记 active 状态；新 ID 不能与旧 ID 相同。
-            new_draft_id = int(time.time() * 1000000) + random.randint(0, 999)
-            while new_draft_id == old_draft_id:
-                new_draft_id += 1
-            self.draft_id = new_draft_id
-            self.draft_message_id = None
-            self._rate_limited_until = 0.0
-            self._replace_with_rollover_remainder(remainder)
-            self._rollover_count += 1
-            self._rollover_history.append({
-                "old_draft_id": old_draft_id,
-                "new_draft_id": new_draft_id,
-                "completed_message_id": completed_message_id if isinstance(completed_message_id, int) else None,
-                "visible_chars": len(_rich_visible_text(completed_html)),
-                "blocks": block_count,
-                "mode": "plain_text_fallback" if used_fallback else "complete_block",
-            })
+            if self._stop_flush:
+                self._restore_handoff_text()
+                self._rollover_in_progress = False
+                return False
+
+            # 先停止旧草稿，再立即登记并发送新草稿。删除旧预览是后台清理，绝不阻塞新首帧。
+            await mark_draft_dead(old_draft_id)
+            async with self._rollover_lock:
+                if self._stop_flush or self.draft_id != old_draft_id:
+                    self._restore_handoff_text()
+                    self._rollover_in_progress = False
+                    return False
+
+                handoff_text = "".join(self._handoff_text or [])
+                self._handoff_text = None
+                new_draft_id = int(time.time() * 1000000) + random.randint(0, 999)
+                while new_draft_id == old_draft_id:
+                    new_draft_id += 1
+                self.draft_id = new_draft_id
+                self.draft_message_id = None
+                self._rate_limited_until = 0.0
+                self._replace_with_rollover_remainder(remainder, handoff_text)
+                self._rollover_pending = False
+                self._rollover_in_progress = False
+                self._rollover_count += 1
+                self._rollover_history.append({
+                    "old_draft_id": old_draft_id,
+                    "new_draft_id": new_draft_id,
+                    "completed_message_id": completed_message_id if isinstance(completed_message_id, int) else None,
+                    "visible_chars": len(_rich_visible_text(completed_html)),
+                    "blocks": block_count,
+                    "mode": "plain_text_fallback" if used_fallback else "complete_block",
+                })
+
+            await self._register_active_draft(0)
+            await self.flush(force=True)
             logger.info(
-                "草稿已滚动: chat=%s old=%s new=%s permanent=%s chars=%s blocks=%s mode=%s",
-                self.chat_id, old_draft_id, new_draft_id, completed_message_id,
+                "草稿已在回合边界滚动: chat=%s old=%s new=%s permanent=%s chars=%s blocks=%s mode=%s",
+                self.chat_id, old_draft_id, self.draft_id, completed_message_id,
                 len(_rich_visible_text(completed_html)), block_count,
                 "fallback" if used_fallback else "complete_block",
             )
-            self.log_diagnostic(
-                "rollover_committed", old_draft_id=old_draft_id, new_draft_id=new_draft_id,
-                permanent_message_id=completed_message_id, completed_chars=len(_rich_visible_text(completed_html)),
-                blocks=block_count, mode="plain_text_fallback" if used_fallback else "complete_block",
-            )
 
-        # _register_active_draft 内部只是写内存字典（state.py 的 _active_drafts），
-        # 不发网络请求，锁外调用也是安全的。外部中断后不再允许旧任务登记新草稿。
-        if not self._rollover_allowed:
-            return False
-        await self._register_active_draft(0)
-        # 滚动现在从独立后台任务（_maybe_start_rollover）触发，调用方
-        # （flush()）不会等待这里完成，因此新草稿的首帧必须自己发出，
-        # 不能再假设"调用方会在当前 flush 完成后接着发"。
-        try:
-            await self.flush(force=True)
-        except Exception as exc:
-            logger.warning(
-                "草稿滚动后发送新首帧失败（下一次常规刷新会补上）: chat=%s "
-                "draft=%s err=%s", self.chat_id, self.draft_id, exc,
-            )
-        return True
+            if old_draft_message_id:
+                async def _cleanup_old_preview():
+                    deleted = await delete_message_fast(self.chat_id, old_draft_message_id)
+                    if not deleted:
+                        logger.debug(
+                            "旧草稿预览异步清理未完成: chat=%s msg=%s",
+                            self.chat_id, old_draft_message_id,
+                        )
+                _track_task(_cleanup_old_preview())
+            return True
+        except asyncio.CancelledError:
+            self._restore_handoff_text()
+            self._rollover_in_progress = False
+            raise
+        except Exception:
+            self._restore_handoff_text()
+            self._rollover_in_progress = False
+            raise
 
     # ---------- 刷新与清理 ----------
-    def _maybe_start_rollover(self, html_content: str) -> None:
-        """满足滚动条件时，把滚动作为独立后台任务触发，flush() 本身不等待它。
-
-        ★ 修复"草稿卡住一会儿才刷新"的根因：早期版本里 flush() 会直接
-        `await self._rollover_draft_if_needed(...)`。即使该方法内部已经把
-        网络 I/O（send_rich_html_message 发永久消息）挪到它自己的锁之外，
-        flush() 这次调用本身仍然会在这一行原地阻塞——而 _stream_flush_loop /
-        refresh_loop 都是"等上一次 flush() 完全返回，才发起下一次"的顺序循环，
-        单次 flush() 卡住，等于整条刷新链路卡住，草稿在前端表现为冻结，
-        直到那次永久消息网络调用结束为止（实测可达数分钟）。
-        真正的修复是让"触发滚动"和"这一帧要不要发出去"彻底解耦：滚动放进
-        后台任务异步跑完，flush() 只管尽快把当前已有内容发出去。
-        """
-        if not self._rollover_allowed:
-            return
-        # 绝大多数刷新不需要滚动。先做纯内存阈值判断，避免每帧都创建一个
-        # 立即返回的后台任务，从而干扰诊断日志并制造不必要的调度开销。
-        _cut_at, visible_chars, block_count = self._pick_rollover_boundary(html_content)
-        if (
-            visible_chars < RICH_DRAFT_ROLLOVER_TEXT_CHARS
-            and block_count < RICH_DRAFT_ROLLOVER_BLOCKS
-        ):
-            return
-        if self._rollover_task is not None and not self._rollover_task.done():
-            # 上一次滚动仍在进行（判断阶段很快，这个窗口通常只有并发触发才会
-            # 命中），避免重复创建后台任务；_rollover_draft_if_needed 内部对
-            # 阈值的判断本身也是幂等的，等它跑完下一次 flush 自然会重新判断。
-            return
-
-        async def _runner():
-            try:
-                await self._rollover_draft_if_needed(html_content)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.exception(
-                    "草稿滚动后台任务异常: chat=%s draft=%s err=%s",
-                    self.chat_id, self.draft_id, exc,
-                )
-
-        try:
-            self._rollover_task = asyncio.create_task(_runner())
-            self.log_diagnostic("rollover_task_started", html_chars=len(html_content))
-        except RuntimeError:
-            self._rollover_task = None
-
     async def flush(self, force: bool = False):
         now = time.monotonic()
         if now < self._rate_limited_until:
-            self.log_diagnostic(
-                "flush_skip_rate_limited",
-                force=force,
-                rate_limit_remaining_ms=round((self._rate_limited_until - now) * 1000, 1),
-            )
             return
 
-        # 滚动判断本身（_pick_rollover_boundary，纯字符串扫描）很快，可以直接
-        # 同步调用；只有真正满足阈值、需要发永久消息时才会走到网络 I/O，那部分
-        # 已经被 _maybe_start_rollover 转成不阻塞当前 flush() 的后台任务。
         html_content = self._sanitize_rich_html(self._build_html())
-        self._maybe_start_rollover(html_content)
+        self._arm_rollover_if_needed(html_content)
 
         async with self._flush_lock:
             now = time.monotonic()
             if now < self._rate_limited_until:
                 return
 
-            # 用锁内的最新状态重新生成一次 HTML：这里只做内存重建（读取
-            # self.blocks / self.draft_id 等，不再调用 _rollover_draft_if_needed），
-            # 因此不会有网络 I/O 占锁。它同时覆盖了两种情况——滚动已把
-            # blocks/draft_id 切换到新草稿，以及滚动判断和这里加锁之间的极短
-            # 窗口内可能到达的新流式增量——两者都通过重新读取当前状态自然覆盖。
             html_content = self._sanitize_rich_html(self._build_html())
-
             if not html_content.strip() or html_content.strip() == " ":
-                # 修复 RICH_MESSAGE_CONTENT_REQUIRED：
-                # 空 <details>（只有 summary、没有 body）同样会被 Telegram 拒绝。
-                # 改用 <p> 占位。
                 html_content = "<p>Working...</p>"
 
-            pending_chars_before_flush = self._pending_chars
             self._pending_chars = 0
-
-            should_trace = force or pending_chars_before_flush > 0 or (now - self._last_flush_time) >= 3.0
-            send_started_at = time.monotonic()
-            if should_trace:
-                self.log_diagnostic(
-                    "flush_dispatch", force=force, html_chars=len(html_content),
-                    pending_chars=pending_chars_before_flush,
-                )
             try:
                 msg_id = await send_rich_message_draft(
                     self.chat_id, self.draft_id, html_content, force=force
                 )
-                if should_trace or not msg_id:
-                    self.log_diagnostic(
-                        "flush_result", force=force, html_chars=len(html_content),
-                        pending_chars=pending_chars_before_flush, message_id=msg_id or 0,
-                        elapsed_ms=round((time.monotonic() - send_started_at) * 1000, 1),
-                    )
-                # 无论 API 是否返回 message_id，已完成的一次发送都会重置保活计时。
                 self._last_flush_time = time.monotonic()
                 if msg_id:
                     self.draft_message_id = msg_id
-                    # 初始草稿和每次滚动后的新草稿都在首帧成功后登记真实 message_id，
-                    # 后续永久消息才能与正确的草稿串行化。
                     await self._register_active_draft(msg_id)
             except RateLimitError as e:
-                self.log_diagnostic("flush_rate_limited", force=force, retry_after_s=e.retry_after)
                 retry_after = e.retry_after + 2
                 self._rate_limited_until = time.monotonic() + retry_after
                 logger.warning(
@@ -3819,10 +3636,6 @@ class RichMessageBuilder:
                     f"{self._rate_limited_until:.1f} (retry_after={e.retry_after}s)"
                 )
             except Exception as e:
-                self.log_diagnostic(
-                    "flush_exception", force=force, error=type(e).__name__,
-                    elapsed_ms=round((time.monotonic() - send_started_at) * 1000, 1),
-                )
                 err_msg = str(e)
                 if "429" in err_msg:
                     self._rate_limited_until = time.monotonic() + 10.0
@@ -3865,90 +3678,30 @@ class RichMessageBuilder:
             self._stop_flush = False
             self._flush_task = asyncio.create_task(self._stream_flush_loop())
 
-    async def stop_flush_loop(self, *, cancel_rollover: bool = False):
-        """通知刷新循环停止，并限时等待其真正退出。
-
-        ``cancel_rollover`` 仅用于外部中断。正常收尾时，已经开始永久化的
-        分段仍可完成；外部新请求接管时，必须取消该后台任务并禁止其继续接上
-        一个新的草稿。
-
-        【修复】旧版是"只通知不等"（fire-and-forget）：把取消后的子任务
-        丢给后台 _swallow_flush_task 就立刻返回，完全不保证它已经真正
-        停止。子任务（_flush_task / _pending_flush_task）是独立的
-        asyncio.Task，不会因为外层任务被 cancel() 就自动停止；如果它
-        当时正好已经通过了草稿存活检查、正在发起 sendRichMessageDraft
-        的网络请求，这次"迟到"的刷新就可能在调用方随后发出的新消息
-        （比如 /clear 的确认消息）之后才落地，造成旧草稿的内容在新消息
-        之后重新刷新的显示错乱。
-
-        现在改为：先 cancel()，再限时 await 它真正结束。cancel() 会在
-        该协程当前挂起的 await 点（通常就是那次网络请求）上立即抛出
-        CancelledError，把这次“迟到的刷新”从源头掐断，而不是依赖存活
-        标记这种“先检查、后发送”的竞态防护。超时时间设置得较短
-        （每个子任务 0.5s），绝大多数情况下取消会在毫秒级完成；只有
-        极端情况下仍未如期退出时，才退回到后台清理，避免无限阻塞。
-        """
+    async def stop_flush_loop(self):
+        """停止并限时等待草稿刷新子任务；回合边界滚动不再存在后台任务。"""
         self._stop_flush = True
-        self.log_diagnostic("flush_stop_requested", cancel_rollover=cancel_rollover)
-        if cancel_rollover:
-            # 该标志同时覆盖“任务尚未被调度”和“取消请求未能即时打断底层 I/O”
-            # 两种情况，确保旧任务不会在稍后注册/刷新新的 draft_id。
-            self._rollover_allowed = False
+        self._rollover_pending = False
+        self._restore_handoff_text()
 
         pending: list[tuple[str, asyncio.Task]] = []
         for attr in ("_flush_task", "_pending_flush_task"):
-            t = getattr(self, attr, None)
-            if t is not None and not t.done():
-                t.cancel()
-                pending.append((attr, t))
+            task = getattr(self, attr, None)
+            if task is not None and not task.done():
+                task.cancel()
+                pending.append((attr, task))
             setattr(self, attr, None)
 
-        for attr, t in pending:
+        for attr, task in pending:
             try:
-                await asyncio.wait_for(t, timeout=0.5)
+                await asyncio.wait_for(task, timeout=0.5)
             except asyncio.CancelledError:
                 pass
             except asyncio.TimeoutError:
-                logger.debug(
-                    f"{attr} 未在 0.5s 内停止，转入后台清理: draft_id={self.draft_id}"
-                )
-                try:
-                    asyncio.create_task(_swallow_flush_task(t, attr, self.draft_id))
-                except RuntimeError:
-                    pass
-            except Exception as e:
-                logger.debug(f"{attr} 停止时出现异常（可忽略）: {e}")
-
-        # 正常收尾时，滚动任务承载的是已判定需要永久化的内容，不能贸然取消；
-        # 但外部中断时，继续它会在旧任务退出后另起草稿，必须一并取消。
-        rt = self._rollover_task
-        self._rollover_task = None
-        if rt is not None and not rt.done():
-            if cancel_rollover:
-                rt.cancel()
-                try:
-                    await asyncio.wait_for(rt, timeout=0.5)
-                except asyncio.CancelledError:
-                    pass
-                except asyncio.TimeoutError:
-                    logger.debug(
-                        f"_rollover_task 未在 0.5s 内停止，保持禁用状态并转入后台清理: "
-                        f"draft_id={self.draft_id}"
-                    )
-                    asyncio.create_task(_swallow_flush_task(rt, "_rollover_task", self.draft_id))
-                except Exception as e:
-                    logger.debug(f"_rollover_task 取消时出现异常（可忽略）: {e}")
-            else:
-                try:
-                    await asyncio.wait_for(asyncio.shield(rt), timeout=0.5)
-                except asyncio.TimeoutError:
-                    logger.debug(
-                        f"_rollover_task 未在 0.5s 内完成，转入后台继续执行（不取消，"
-                        f"避免丢失待永久化内容）: draft_id={self.draft_id}"
-                    )
-                    asyncio.create_task(_swallow_flush_task(rt, "_rollover_task", self.draft_id))
-                except Exception as e:
-                    logger.debug(f"_rollover_task 等待时出现异常（可忽略）: {e}")
+                logger.debug("%s 未在 0.5s 内停止，转入后台清理: draft_id=%s", attr, self.draft_id)
+                asyncio.create_task(_swallow_flush_task(task, attr, self.draft_id))
+            except Exception as exc:
+                logger.debug("%s 停止时出现异常（可忽略）: %s", attr, exc)
 
 
 # ========== Agentic 循环 ==========
@@ -4212,15 +3965,6 @@ async def _agentic_loop_openai_compat(
                 f"ids={tool_call_ids}, names={tool_call_names}, content_len={len(content_acc.strip())}, "
                 f"reasoning_len={len(reasoning_acc.strip())}"
             )
-            builder.log_diagnostic(
-                "model_round_received",
-                api_label=api_label,
-                model_round=_round + 1,
-                tool_calls=len(tool_calls_list),
-                tool_names=tool_call_names,
-                content_chars=len(content_acc.strip()),
-                reasoning_chars=len(reasoning_acc.strip()),
-            )
         except Exception:
             logger.exception(f"[{api_label}] 记录 tool_calls 日志失败")
         for idx, tc in enumerate(tool_calls_list):
@@ -4245,12 +3989,6 @@ async def _agentic_loop_openai_compat(
         if reasoning_acc:
             builder.finalize_reasoning_block(has_tool_calls=bool(tool_calls_list))
         await builder.flush()
-        builder.log_diagnostic(
-            "model_round_rendered",
-            api_label=api_label,
-            model_round=_round + 1,
-            tool_calls=len(tool_calls_list),
-        )
 
         assistant_msg: dict = {"role": "assistant", "content": content_acc or None}
         if tool_calls_list:
@@ -4280,6 +4018,8 @@ async def _agentic_loop_openai_compat(
                             "Use the standard tool_calls API only. Do not emit <tool_call> XML as user-visible text."
                         )
                     })
+                    # 这是一次完整但需要纠正的模型返回；在重试下一请求前仍须完成切换。
+                    await builder.rollover_at_turn_boundary()
                     continue
                 final_content = content_acc or (
                     "工具调用格式连续异常，未继续执行额外操作。请重新描述需求或换一个模型后重试。"
@@ -4290,12 +4030,16 @@ async def _agentic_loop_openai_compat(
                 final_content = content_acc
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
+            # 终局模型返回也是完整回合边界；长最终答复可在此分段永久化。
+            await builder.rollover_at_turn_boundary()
             break
 
         status = await _run_tool_calls_and_append(
             tool_calls_list, loop_messages, new_history_entries,
             tool_call_count_ref, api_label, builder, chat_id=builder.chat_id
         )
+        # 工具批次已完整收束；必须在下一次模型请求前同步切换，禁止后台延后。
+        await builder.rollover_at_turn_boundary()
 
         # ===== FIX: 只对 over_limit 做强制总结并退出 =====
         if status == "over_limit":
@@ -4337,6 +4081,7 @@ async def _agentic_loop_openai_compat(
             new_history_entries.append({"role": "assistant", "content": final_content})
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
+            await builder.rollover_at_turn_boundary()
             break
         # 如果 status == "continue"（包括之前熔断返回的），循环自然继续
 
@@ -4348,6 +4093,7 @@ async def _agentic_loop_openai_compat(
         new_history_entries.append({"role": "assistant", "content": final_content})
         if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
             builder.finish_group(len(builder._tool_groups) - 1)
+        await builder.rollover_at_turn_boundary()
 
     return final_content, final_usage, new_history_entries
 
@@ -4509,12 +4255,15 @@ async def _agentic_loop_gemini_openai_compat(
             final_content = content_acc
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
+            await builder.rollover_at_turn_boundary()
             break
 
         status = await _run_tool_calls_and_append(
             tool_calls_list, loop_messages, new_history_entries,
             tool_call_count_ref, "gemini", builder, chat_id=builder.chat_id
         )
+        # Gemini 适配器同样只能在完整工具批次之后切换草稿。
+        await builder.rollover_at_turn_boundary()
 
         if status == "over_limit":
             synth_payload = {
@@ -4554,6 +4303,7 @@ async def _agentic_loop_gemini_openai_compat(
             )
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
+            await builder.rollover_at_turn_boundary()
             break
 
     if final_content is None:
@@ -4562,6 +4312,7 @@ async def _agentic_loop_gemini_openai_compat(
         new_history_entries.append({"role": "assistant", "content": final_content})
         if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
             builder.finish_group(len(builder._tool_groups) - 1)
+        await builder.rollover_at_turn_boundary()
 
     return final_content, final_usage, new_history_entries
 
@@ -5673,7 +5424,7 @@ async def get_ai_response(
         # 若继续运行，会在旧任务已取消后把尾段注册成新的草稿并抢占新请求。
         if builder:
             try:
-                await builder.stop_flush_loop(cancel_rollover=True)
+                await builder.stop_flush_loop()
             except Exception as e:
                 logger.debug(f"取消时停止草稿滚动异常（可忽略）: {e}")
         raise

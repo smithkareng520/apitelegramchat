@@ -21,6 +21,7 @@ class FakeBuilder:
         self.items = []
         self.updated = []
         self.flushes = []
+        self.finished_groups = []
 
     def _get_current_group(self) -> int:
         return 0
@@ -30,6 +31,9 @@ class FakeBuilder:
 
     def update_tool_item(self, *args, **kwargs) -> None:
         self.updated.append((args, kwargs))
+
+    def finish_group(self, group_idx: int) -> None:
+        self.finished_groups.append(group_idx)
 
     async def flush(self, force: bool = False) -> None:
         self.flushes.append(force)
@@ -88,6 +92,7 @@ async def test_batch_respects_remaining_budget() -> None:
     require([message["tool_call_id"] for message in loop_messages] == ["one", "two", "three"], "所有调用 ID 必须获得配对 tool 消息")
     require("Not executed" in loop_messages[-1]["content"], "超出预算的调用必须明确标记为未执行")
     require(dispatch_mock.await_count == 2, "不得执行第 101 次工具调用")
+    require(builder.finished_groups == [0], "完整工具批次结束时必须收束当前工具组")
 
 
 async def test_over_limit_synthesis_never_leaks_tool_xml() -> None:

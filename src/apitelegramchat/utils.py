@@ -273,23 +273,6 @@ _DRAFT_CONNECT_TIMEOUT = 2.5
 _DRAFT_MAX_ATTEMPTS = 2
 _DRAFT_RETRY_DELAY = 0.25
 
-
-def _log_draft_transport(event: str, *, chat_id: int, draft_id: int | None = None, **fields) -> None:
-    """输出单行 JSON 草稿传输诊断，避免长轮次问题只能靠推测排查。"""
-    payload = {
-        "event": event,
-        "request_id": get_request_id(),
-        "chat_id": chat_id,
-        "draft_id": draft_id,
-        **fields,
-    }
-    try:
-        logger.info("[draft_transport] %s", json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
-    except Exception:
-        # 诊断日志不能影响草稿发送主链路。
-        logger.info("[draft_transport] event=%s chat=%s draft=%s", event, chat_id, draft_id)
-
-
 async def _get_draft_send_lock(chat_id: int, draft_id: int) -> asyncio.Lock:
     key = (chat_id, draft_id)
     async with _draft_locks_lock:
@@ -526,52 +509,30 @@ async def send_rich_message_draft(
         logger.error(f"send_rich_message_draft: invalid draft_id={draft_id!r}: {e}")
         return None
 
-    lock_requested_at = time.monotonic()
     lock = await _get_draft_send_lock(chat_id, draft_id_int)
     async with lock:
-        lock_wait_ms = round((time.monotonic() - lock_requested_at) * 1000, 1)
         if await is_draft_dead(draft_id_int):
-            _log_draft_transport(
-                "skip_dead", chat_id=chat_id, draft_id=draft_id_int, force=force,
-                html_chars=len(html_content), lock_wait_ms=lock_wait_ms,
-            )
             return 0
         if not await _is_current_active_draft(chat_id, draft_id_int):
-            _log_draft_transport(
-                "skip_inactive", chat_id=chat_id, draft_id=draft_id_int, force=force,
-                html_chars=len(html_content), lock_wait_ms=lock_wait_ms,
-            )
             return 0
 
         cache_key = (chat_id, draft_id_int)
         last_sent = _last_sent_draft_cache.get(cache_key)
         if not force and last_sent == html_content:
-            _log_draft_transport(
-                "skip_unchanged", chat_id=chat_id, draft_id=draft_id_int, force=force,
-                html_chars=len(html_content), lock_wait_ms=lock_wait_ms,
-            )
             return 0
 
         if not force:
             last_time = _draft_last_send_time.get(cache_key, 0.0)
             wait_for_slot = _DRAFT_MIN_INTERVAL - (time.monotonic() - last_time)
             if wait_for_slot > 0:
-                _log_draft_transport(
-                    "throttle_wait", chat_id=chat_id, draft_id=draft_id_int, force=force,
-                    html_chars=len(html_content), lock_wait_ms=lock_wait_ms,
-                    wait_ms=round(wait_for_slot * 1000, 1),
-                )
                 # 不直接丢弃这次新状态。等待至多 250ms 后发送，避免 builder 把
                 # pending_chars 清零、随后只能等静默保活周期才重新显示更新。
                 await asyncio.sleep(wait_for_slot)
                 if await is_draft_dead(draft_id_int):
-                    _log_draft_transport("skip_dead_after_throttle", chat_id=chat_id, draft_id=draft_id_int, force=force)
                     return 0
                 if not await _is_current_active_draft(chat_id, draft_id_int):
-                    _log_draft_transport("skip_inactive_after_throttle", chat_id=chat_id, draft_id=draft_id_int, force=force)
                     return 0
                 if _last_sent_draft_cache.get(cache_key) == html_content:
-                    _log_draft_transport("skip_unchanged_after_throttle", chat_id=chat_id, draft_id=draft_id_int, force=force)
                     return 0
 
         payload = {
@@ -593,11 +554,6 @@ async def send_rich_message_draft(
         )
 
         for attempt in range(_DRAFT_MAX_ATTEMPTS):
-            attempt_started_at = time.monotonic()
-            _log_draft_transport(
-                "request_start", chat_id=chat_id, draft_id=draft_id_int, force=force,
-                attempt=attempt + 1, html_chars=len(html_content), lock_wait_ms=lock_wait_ms,
-            )
             try:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.post(f"{BASE_URL}/sendRichMessageDraft", json=payload) as resp:
@@ -616,21 +572,11 @@ async def send_rich_message_draft(
                                 _last_sent_draft_cache[cache_key] = html_content
                                 await _reset_draft_failure(chat_id, draft_id_int)
                                 if isinstance(msg_id, int) and msg_id > 0:
-                                    _log_draft_transport(
-                                        "request_ok", chat_id=chat_id, draft_id=draft_id_int, force=force,
-                                        attempt=attempt + 1, message_id=msg_id, html_chars=len(html_content),
-                                        elapsed_ms=round((time.monotonic() - attempt_started_at) * 1000, 1),
-                                    )
                                     return msg_id
                             except Exception:
                                 pass
                             _last_sent_draft_cache[cache_key] = html_content
                             await _reset_draft_failure(chat_id, draft_id_int)
-                            _log_draft_transport(
-                                "request_ok_no_message_id", chat_id=chat_id, draft_id=draft_id_int,
-                                force=force, attempt=attempt + 1, html_chars=len(html_content),
-                                elapsed_ms=round((time.monotonic() - attempt_started_at) * 1000, 1),
-                            )
                             return 0
 
                         if resp.status == 429:
@@ -654,11 +600,6 @@ async def send_rich_message_draft(
                         if not_modified:
                             _last_sent_draft_cache[cache_key] = html_content
                             await _reset_draft_failure(chat_id, draft_id_int)
-                            _log_draft_transport(
-                                "skip_not_modified", chat_id=chat_id, draft_id=draft_id_int,
-                                force=force, attempt=attempt + 1, html_chars=len(html_content),
-                                elapsed_ms=round((time.monotonic() - attempt_started_at) * 1000, 1),
-                            )
                             return 0
 
                         # RICH_MESSAGE_CONTENT_REQUIRED：内容暂时没有块级元素（<details> 里
@@ -669,19 +610,14 @@ async def send_rich_message_draft(
                             resp.status == 400 and "rich_message_content_required" in body_lower
                         )
                         if content_required:
-                            _log_draft_transport(
-                                "skip_content_required", chat_id=chat_id, draft_id=draft_id_int,
-                                force=force, attempt=attempt + 1, html_chars=len(html_content),
-                                elapsed_ms=round((time.monotonic() - attempt_started_at) * 1000, 1),
+                            logger.debug(
+                                f"sendRichMessageDraft skip (RICH_MESSAGE_CONTENT_REQUIRED), "
+                                f"will retry on next flush: chat={chat_id} draft={draft_id_int} "
+                                f"len={len(html_content)}"
                             )
                             return 0
 
                         failures = await _bump_draft_failure(chat_id, draft_id_int)
-                        _log_draft_transport(
-                            "request_http_error", chat_id=chat_id, draft_id=draft_id_int,
-                            force=force, attempt=attempt + 1, status=resp.status, failures=failures,
-                            html_chars=len(html_content), elapsed_ms=round((time.monotonic() - attempt_started_at) * 1000, 1),
-                        )
                         logger.warning(
                             f"sendRichMessageDraft failed (attempt {attempt+1}/3, failures={failures}): "
                             f"{resp.status} {body[:200]}"
@@ -695,11 +631,6 @@ async def send_rich_message_draft(
             except RateLimitError:
                 raise
             except (aiohttp.ClientConnectorError, asyncio.TimeoutError, aiohttp.ServerDisconnectedError, aiohttp.ClientOSError) as e:
-                _log_draft_transport(
-                    "request_transport_error", chat_id=chat_id, draft_id=draft_id_int,
-                    force=force, attempt=attempt + 1, error=type(e).__name__,
-                    html_chars=len(html_content), elapsed_ms=round((time.monotonic() - attempt_started_at) * 1000, 1),
-                )
                 logger.warning(
                     f"send_rich_message_draft transient error "
                     f"(attempt {attempt + 1}/{_DRAFT_MAX_ATTEMPTS}): {e}"
