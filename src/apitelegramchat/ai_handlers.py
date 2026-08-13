@@ -138,6 +138,17 @@ RICH_DRAFT_ARM_BLOCKS = min(
     RICH_DRAFT_ROLLOVER_BLOCKS,
     _positive_env_int("RICH_DRAFT_ARM_BLOCKS", 380),
 )
+# 交互性能阈值远低于 API 容量阈值。长工具链会在每轮重新序列化完整草稿；若等到
+# 27k 才切，客户端往往会在此前数轮就出现重绘迟滞。达到该阈值后，下一完整工具
+# 回合边界即永久化当前段并新开草稿，以保持持续可见的进度更新。
+RICH_DRAFT_INTERACTIVE_TEXT_CHARS = min(
+    RICH_DRAFT_ARM_TEXT_CHARS,
+    _positive_env_int("RICH_DRAFT_INTERACTIVE_TEXT_CHARS", 12000),
+)
+RICH_DRAFT_INTERACTIVE_BLOCKS = min(
+    RICH_DRAFT_ARM_BLOCKS,
+    _positive_env_int("RICH_DRAFT_INTERACTIVE_BLOCKS", 160),
+)
 # 没有遇到完整块时最多等待到这里；随后在回合边界降级为转义段，绝不把超限内容
 # 作为永久消息提交。
 RICH_DRAFT_HARD_GUARD_CHARS = max(
@@ -2774,6 +2785,10 @@ class RichMessageBuilder:
         self._stream_text_index: int = -1
         self._pending_chars: int = 0
         self._last_flush_time: float = time.monotonic()
+        self._flush_sequence: int = 0
+        # 每次内容变更递增。刷新完成时仅在版本未变化的情况下清除 dirty，
+        # 从而既不会漏掉在途更新，也不会重复发送已由显式 flush 覆盖的同一帧。
+        self._flush_revision: int = 0
         self._flush_task: Optional[asyncio.Task] = None
         self._pending_flush_task: Optional[asyncio.Task] = None
         # request_flush 合并高频更新时，若网络发送仍在进行，新内容不能仅靠
@@ -2817,6 +2832,7 @@ class RichMessageBuilder:
         # pending task 存在时直接 return，会把发送期间的新增工具状态/流式文本
         # 合并掉；若之后没有新的 request_flush，用户便会看到草稿长时间不动。
         self._flush_dirty = True
+        self._flush_revision += 1
         if force:
             self._force_flush_requested = True
         if self._pending_flush_task and not self._pending_flush_task.done():
@@ -2827,16 +2843,27 @@ class RichMessageBuilder:
                 while not self._stop_flush:
                     force_now = self._force_flush_requested
                     self._force_flush_requested = False
-                    # 本轮发送开始前消费脏标记；发送过程中新到的变更会再次置位，
-                    # 然后在本轮结束后立刻补发最新草稿帧。
-                    self._flush_dirty = False
+                    # 显式 flush 可能已在当前 task 启动前把该版本发送出去；此时
+                    # 不重复发送，而是只等待下一次真实内容变更。
+                    if not self._flush_dirty and not force_now:
+                        break
+                    revision_before_send = self._flush_revision
                     await self.flush(force=force_now)
-                    if not self._flush_dirty and not self._force_flush_requested:
+                    # 发送过程没有新版本则结束；有新版本则立即补发最新状态。
+                    if (
+                        self._flush_revision <= revision_before_send
+                        or time.monotonic() < self._rate_limited_until
+                    ):
                         break
             finally:
                 self._pending_flush_task = None
-                # 覆盖任务退出边缘时刻的新变更，避免一次 flush 结束后丢失最后一帧。
-                if (self._flush_dirty or self._force_flush_requested) and not self._stop_flush:
+                # 仅在不处于本地限流冷却时补排；冷却期由全局刷新循环等待后续发送，
+                # 防止失败帧触发紧密自旋。
+                if (
+                    (self._flush_dirty or self._force_flush_requested)
+                    and not self._stop_flush
+                    and time.monotonic() >= self._rate_limited_until
+                ):
                     self.request_flush(force=self._force_flush_requested)
 
         try:
@@ -3263,9 +3290,10 @@ class RichMessageBuilder:
             return
         self._stream_buffer += delta
         self._pending_chars += len(delta)
-        # 流式增量未必每片都调用 request_flush；将其标记为脏数据，可确保一旦
+        # 流式增量未必每片都调用 request_flush；将其标记为新版本，可确保一旦
         # 当前发送结束，后台刷新不会把已累积的增量误认为已经展示。
         self._flush_dirty = True
+        self._flush_revision += 1
 
     def _commit_stream_buffer(self):
         if self._stream_buffer and self._stream_text_index >= 0:
@@ -3532,12 +3560,17 @@ class RichMessageBuilder:
         if html_content is None:
             html_content = self._sanitize_rich_html(self._build_html_no_thinking())
         _cut_at, visible_chars, block_count = self._pick_rollover_boundary(html_content)
-        if visible_chars < RICH_DRAFT_ARM_TEXT_CHARS and block_count < RICH_DRAFT_ARM_BLOCKS:
+        if (
+            visible_chars < RICH_DRAFT_INTERACTIVE_TEXT_CHARS
+            and block_count < RICH_DRAFT_INTERACTIVE_BLOCKS
+        ):
             return False
         self._rollover_pending = True
         logger.info(
-            "草稿容量预警，等待本轮完成后滚动: chat=%s draft=%s chars=%s blocks=%s arm_chars=%s arm_blocks=%s",
+            "草稿交互容量预警，下一完整回合边界滚动: chat=%s draft=%s chars=%s blocks=%s "
+            "interactive_chars=%s interactive_blocks=%s api_arm_chars=%s api_arm_blocks=%s",
             self.chat_id, self.draft_id, visible_chars, block_count,
+            RICH_DRAFT_INTERACTIVE_TEXT_CHARS, RICH_DRAFT_INTERACTIVE_BLOCKS,
             RICH_DRAFT_ARM_TEXT_CHARS, RICH_DRAFT_ARM_BLOCKS,
         )
         return True
@@ -3574,15 +3607,15 @@ class RichMessageBuilder:
             current_html = self._sanitize_rich_html(self._build_html_no_thinking())
             cut_at, visible_chars, block_count = self._pick_rollover_boundary(current_html)
             rollover_due = (
-                visible_chars >= RICH_DRAFT_ARM_TEXT_CHARS
-                or block_count >= RICH_DRAFT_ARM_BLOCKS
+                visible_chars >= RICH_DRAFT_INTERACTIVE_TEXT_CHARS
+                or block_count >= RICH_DRAFT_INTERACTIVE_BLOCKS
             )
             if not rollover_due:
                 return False
 
-            # 预警阈值就是下一次完整工具回合边界的实际切换阈值。这样一旦某轮
-            # 流式输出接近容量上限，紧随其后的工具批次收束后便会完成永久化和
-            # 新草稿首帧，再发起下一次模型请求，绝不继续等待 30k/440 或任务终局。
+            # 交互性能预警就是下一次完整工具回合边界的实际切换阈值。这样一旦
+            # 草稿增长到可能拖慢客户端重绘的体量，紧随其后的工具批次收束后便会
+            # 完成永久化和新草稿首帧，再发起下一次模型请求，绝不继续堆积数轮。
             # 即使此前的 flush 未运行或被限流跳过，也必须在本次边界切换。
             self._rollover_pending = True
 
@@ -3689,6 +3722,10 @@ class RichMessageBuilder:
     async def flush(self, force: bool = False):
         now = time.monotonic()
         if now < self._rate_limited_until:
+            logger.debug(
+                "草稿帧跳过（本地限流冷却）: chat=%s draft=%s wait_ms=%s",
+                self.chat_id, self.draft_id, int((self._rate_limited_until - now) * 1000),
+            )
             return
 
         html_content = self._sanitize_rich_html(self._build_html())
@@ -3704,11 +3741,23 @@ class RichMessageBuilder:
                 html_content = "<p>Working...</p>"
 
             self._pending_chars = 0
+            frame_chars = len(_rich_visible_text(html_content))
+            _frame_boundaries, _ignored_chars, frame_blocks = _scan_rich_html_boundaries(html_content)
+            frame_revision = self._flush_revision
+            frame_started = time.monotonic()
             try:
                 msg_id = await send_rich_message_draft(
                     self.chat_id, self.draft_id, html_content, force=force
                 )
                 self._last_flush_time = time.monotonic()
+                if self._flush_revision == frame_revision:
+                    self._flush_dirty = False
+                self._flush_sequence += 1
+                logger.debug(
+                    "草稿帧完成: chat=%s draft=%s seq=%s force=%s result=%s chars=%s blocks=%s elapsed_ms=%s",
+                    self.chat_id, self.draft_id, self._flush_sequence, force, msg_id,
+                    frame_chars, frame_blocks, int((time.monotonic() - frame_started) * 1000),
+                )
                 if msg_id:
                     self.draft_message_id = msg_id
                     await self._register_active_draft(msg_id)

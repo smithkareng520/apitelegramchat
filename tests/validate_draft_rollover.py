@@ -316,6 +316,42 @@ async def test_turn_boundary_rechecks_capacity_after_rate_limited_flush() -> Non
         handlers.mark_draft_dead = original_dead
 
 
+async def test_interactive_capacity_rolls_before_api_arm() -> None:
+    permanent_segments = []
+
+    async def fake_permanent(chat_id, html_content, **kwargs):
+        permanent_segments.append((chat_id, html_content, kwargs))
+        return 7570
+
+    async def fake_draft(chat_id, draft_id, html_content, **kwargs):
+        return 7571
+
+    original_permanent = handlers.send_rich_html_message
+    original_draft = handlers.send_rich_message_draft
+    original_dead = handlers.mark_draft_dead
+    try:
+        handlers.send_rich_html_message = fake_permanent
+        handlers.send_rich_message_draft = fake_draft
+        handlers.mark_draft_dead = AsyncMock()
+        builder = handlers.RichMessageBuilder(chat_id=108)
+        builder._register_active_draft = AsyncMock()
+        builder.blocks = ["<p>" + ("丙" * handlers.RICH_DRAFT_INTERACTIVE_TEXT_CHARS) + "</p>"]
+        builder.block_types = ["text"]
+
+        await builder.flush()
+        require(builder._rollover_pending, "12k 交互性能阈值必须立即预警")
+        require(await builder.rollover_at_turn_boundary(), "12k 后的下一完整回合边界必须分段")
+        require(len(permanent_segments) == 1, "交互性能阈值必须永久化旧段")
+        require(
+            len(handlers._rich_visible_text(permanent_segments[0][1])) == handlers.RICH_DRAFT_INTERACTIVE_TEXT_CHARS,
+            "永久段必须在 12k 处截出，不能继续堆积到 27k",
+        )
+    finally:
+        handlers.send_rich_html_message = original_permanent
+        handlers.send_rich_message_draft = original_draft
+        handlers.mark_draft_dead = original_dead
+
+
 async def test_arm_threshold_rolls_at_next_turn_boundary() -> None:
     permanent_segments = []
     draft_frames = []
@@ -444,6 +480,7 @@ def main() -> None:
     asyncio.run(test_failed_permanent_send_restores_handoff_to_old_draft())
     asyncio.run(test_old_preview_cleanup_does_not_delay_new_draft())
     asyncio.run(test_turn_boundary_rechecks_capacity_after_rate_limited_flush())
+    asyncio.run(test_interactive_capacity_rolls_before_api_arm())
     asyncio.run(test_arm_threshold_rolls_at_next_turn_boundary())
     asyncio.run(test_inflight_flush_replays_latest_draft_frame())
     asyncio.run(test_done_only_batch_finishes_precreated_tool_group())
