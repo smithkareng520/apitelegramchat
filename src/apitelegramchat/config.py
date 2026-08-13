@@ -559,9 +559,27 @@ R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
 R2_REGION = os.getenv("R2_REGION", "auto")
 
 # ---------- 流式刷新阈值 ----------
-STREAM_FLUSH_INTERVAL = 1.0
-STREAM_FLUSH_CHARS = 200
-STREAM_SILENT_FORCE_FLUSH = 4.0
+# 草稿是用户感知 Agent 正在工作的唯一实时界面。默认值优先保证首字与
+# 状态变更的可见性，同时仍低于 Telegram 草稿 API 的常规刷新频率。
+def _positive_float_env(name: str, default: float, minimum: float) -> float:
+    try:
+        return max(minimum, float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _positive_int_env(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+STREAM_FLUSH_INTERVAL = _positive_float_env("STREAM_FLUSH_INTERVAL", 0.65, 0.25)
+STREAM_FLUSH_CHARS = _positive_int_env("STREAM_FLUSH_CHARS", 96, 32)
+STREAM_SILENT_FORCE_FLUSH = _positive_float_env(
+    "STREAM_SILENT_FORCE_FLUSH", 2.0, STREAM_FLUSH_INTERVAL
+)
 
 # ---------- 工具调用并发数 ----------
 MAX_CONCURRENT_TOOLS = int(os.getenv("MAX_CONCURRENT_TOOLS", "16"))

@@ -2668,14 +2668,12 @@ async def _swallow_flush_task(t: "asyncio.Task", name: str, draft_id: int) -> No
 
 # ========== RichMessageBuilder 类 ==========
 class RichMessageBuilder:
-    # 工具结果只用于草稿 UI 展示，不能让一个或多个工具的超长原始输出
-    # 把整个 rich draft 撑爆。这里仅限制“工具详情展示”，不会影响发送给模型的
-    # tool message，也不会截断最终 AI 回复。
-    #
-    # 只对 bash 和 text_editor 的详情展示做截断/简化；其他工具（包括
-    # web_search）的展示内容保持原样，不受此限制影响。
-    # 详情本身已被渲染器限制为十行；保留足够空间避免把合法 HTML 卡片截成纯文本。
+    # 工具结果仅服务于草稿 UI，不能让一个或多个超长原始输出放大每次
+    # sendRichMessageDraft 的序列化、网络传输与 Telegram 客户端重绘成本。
+    # 模型上下文和最终答复仍保留完整工具结果，不受这些展示预算影响。
     MAX_TOOL_UI_DETAIL_CHARS = 6000
+    DEFAULT_TOOL_UI_DETAIL_CHARS = 2400
+    MAX_TOOL_GROUP_UI_DETAIL_CHARS = 12000
     TRUNCATED_DETAIL_TOOL_TYPES = {"bash", "text_editor"}
 
     def __init__(self, chat_id: int):
@@ -3070,12 +3068,24 @@ class RichMessageBuilder:
 
     def add_initial_thinking(self, text: str = "Thinking...") -> int:
         self._commit_stream_buffer()
-        block = f"<tg-thinking>{text}</tg-thinking>"
+        block = f"<tg-thinking>{escape_html(text)}</tg-thinking>"
         self.blocks.append(block)
         self.block_types.append("html")
         # 不在此处调用 request_flush，由 get_ai_response 中显式 await flush() 统一触发，
         # 避免与显式 flush 产生重复的 sendRichMessageDraft API 调用。
         return len(self.blocks) - 1
+
+    def set_thinking_status(self, text: str, *, force: bool = True) -> bool:
+        """更新首个仍存在的思考占位，使准备阶段也有可见进度。"""
+        safe_text = escape_html((text or "Thinking...").strip() or "Thinking...")
+        for index, (block, block_type) in enumerate(zip(self.blocks, self.block_types)):
+            if block_type == "html" and block.startswith("<tg-thinking>"):
+                updated = f"<tg-thinking>{safe_text}</tg-thinking>"
+                if block != updated:
+                    self.blocks[index] = updated
+                    self.request_flush(force=force)
+                return True
+        return False
 
     def add_text(self, text: str):
         if not text or not text.strip():
@@ -3201,19 +3211,19 @@ class RichMessageBuilder:
         if text_content:
             inner_parts.append(f"<p>{text_content}</p>")
 
-        # 仅限制单个工具的 UI 详情长度；工具组不设置总展示上限。
-        # 注意：这只影响草稿 UI，不影响发送给模型的原始 tool message。
-        # 只有 bash / text_editor 的详情会被截断简化；其他工具（如
-        # web_search）按原始内容完整展示。
+        # 限制草稿中单个工具及整个工具组的详情预算。此前 web_search 等
+        # 工具不截断，单次结果可令后续每一帧反复传输几十 KB，造成客户端长时间
+        # 不重绘。这里仅裁剪可折叠的 UI 详情，模型上下文保持完整。
+        remaining_detail_budget = self.MAX_TOOL_GROUP_UI_DETAIL_CHARS
         for item in items:
-            item_limit = (
+            per_item_limit = (
                 self.MAX_TOOL_UI_DETAIL_CHARS
                 if item.get("type") in self.TRUNCATED_DETAIL_TOOL_TYPES
-                else None
+                else self.DEFAULT_TOOL_UI_DETAIL_CHARS
             )
-            inner_parts.append(
-                self._get_inner_content(item, detail_limit=item_limit)
-            )
+            item_limit = max(0, min(per_item_limit, remaining_detail_budget))
+            inner_parts.append(self._get_inner_content(item, detail_limit=item_limit))
+            remaining_detail_budget = max(0, remaining_detail_budget - item_limit)
 
         inner_html = "\n".join(inner_parts)
         return f"<details><summary>{outer_summary}</summary>\n{inner_html}\n</details>"
@@ -5095,6 +5105,27 @@ async def get_ai_response(
     new_msgs = []
     usage = None
     try:
+        # 草稿首帧必须先于系统提示词、历史归档和多模态解析出现。这些准备操作在
+        # 文件、图片或长历史场景下可能耗时数秒；旧顺序会让用户误以为 Agent 卡死。
+        builder = RichMessageBuilder(chat_id)
+        builder.add_initial_thinking("正在准备请求…")
+        # 先登记为当前活跃草稿，让首帧和后续流式刷新都能通过 active 校验。
+        # message_id 先占位为 0，等首帧真正发出后再回填真实 message_id。
+        try:
+            from apitelegramchat.state import set_active_draft
+            await set_active_draft(chat_id, builder.draft_id, 0)
+        except Exception:
+            pass
+        await builder.flush(force=True)
+        # 首帧发出后，用真实 message_id 覆盖占位值。
+        if builder.draft_message_id:
+            try:
+                from apitelegramchat.state import set_active_draft
+                await set_active_draft(chat_id, builder.draft_id, builder.draft_message_id)
+            except Exception:
+                pass
+        builder.start_flush_loop()
+
         lock = await state.get_chat_lock(chat_id)
         async with lock:
             current_model = user_models.get(chat_id, DEFAULT_MODEL)
@@ -5108,6 +5139,8 @@ async def get_ai_response(
             history = list(user_contexts.get(chat_id, {}).get("conversation_history", []))
             supports_tools = model_info.supports_tools
 
+        builder.set_thinking_status("正在整理对话上下文…")
+        await builder.flush(force=False)
         system_prompt = await build_system_prompt(
             chat_id,
             username,
@@ -5119,29 +5152,15 @@ async def get_ai_response(
         if model_info.supports_prompt_cache:
             _apply_cache_control(messages)
         if user_message:
+            builder.set_thinking_status("正在读取你的输入…")
+            await builder.flush(force=False)
             out_msg = {"role": "user"}
             resolved = await _resolve_multimodal_content(user_message, model_info, api_type, chat_id=chat_id)
             out_msg["content"] = resolved
             messages.append(out_msg)
 
-        builder = RichMessageBuilder(chat_id)
-        builder.add_initial_thinking()
-        # 先登记为当前活跃草稿，让首帧和后续流式刷新都能通过 active 校验。
-        # message_id 先占位为 0，等首帧真正发出后再回填真实 message_id。
-        try:
-            from apitelegramchat.state import set_active_draft
-            await set_active_draft(chat_id, builder.draft_id, 0)
-        except Exception:
-            pass
-        await builder.flush()
-        # 首帧发出后，用真实 message_id 覆盖占位值。
-        if builder.draft_message_id:
-            try:
-                from apitelegramchat.state import set_active_draft
-                await set_active_draft(chat_id, builder.draft_id, builder.draft_message_id)
-            except Exception:
-                pass
-        builder.start_flush_loop()
+        builder.set_thinking_status("正在思考…")
+        await builder.flush(force=False)
 
         logger.debug("发送给 %s (api=%s): %s", current_model, api_type,
                      json.dumps(messages, ensure_ascii=False, indent=2)[:1000])

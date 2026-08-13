@@ -266,6 +266,12 @@ _dead_draft_ids_lock = asyncio.Lock()
 _draft_locks_lock = asyncio.Lock()
 _draft_last_send_time: dict = {}
 _DRAFT_MIN_INTERVAL = 0.25
+# 草稿是可被后续完整状态替代的瞬态 UI；不能像永久消息一样在发送锁中
+# 连续执行长超时重试，否则一帧网络抖动会让所有后续 Agent 状态长时间排队。
+_DRAFT_REQUEST_TIMEOUT = 5.0
+_DRAFT_CONNECT_TIMEOUT = 2.5
+_DRAFT_MAX_ATTEMPTS = 2
+_DRAFT_RETRY_DELAY = 0.25
 
 async def _get_draft_send_lock(chat_id: int, draft_id: int) -> asyncio.Lock:
     key = (chat_id, draft_id)
@@ -348,7 +354,8 @@ async def _reassert_active_draft_content(chat_id: int, draft_id: int) -> None:
                 "html": html_content,
             },
         }
-        timeout = aiohttp.ClientTimeout(total=8, connect=4)
+        # reassert 只是视觉保活，失败可由下一次真实 flush 恢复；不应占用草稿锁过久。
+        timeout = aiohttp.ClientTimeout(total=4, connect=2)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(f"{BASE_URL}/sendRichMessageDraft", json=payload) as resp:
                 if resp.status == 200:
@@ -516,9 +523,17 @@ async def send_rich_message_draft(
 
         if not force:
             last_time = _draft_last_send_time.get(cache_key, 0.0)
-            elapsed = time.monotonic() - last_time
-            if elapsed < _DRAFT_MIN_INTERVAL:
-                return 0
+            wait_for_slot = _DRAFT_MIN_INTERVAL - (time.monotonic() - last_time)
+            if wait_for_slot > 0:
+                # 不直接丢弃这次新状态。等待至多 250ms 后发送，避免 builder 把
+                # pending_chars 清零、随后只能等静默保活周期才重新显示更新。
+                await asyncio.sleep(wait_for_slot)
+                if await is_draft_dead(draft_id_int):
+                    return 0
+                if not await _is_current_active_draft(chat_id, draft_id_int):
+                    return 0
+                if _last_sent_draft_cache.get(cache_key) == html_content:
+                    return 0
 
         payload = {
             "chat_id": chat_id,
@@ -531,9 +546,14 @@ async def send_rich_message_draft(
         if message_thread_id:
             payload["message_thread_id"] = message_thread_id
 
-        timeout = aiohttp.ClientTimeout(total=12, connect=5)
+        # 草稿帧可被更晚的完整帧覆盖。把单次等待限制在 5 秒，并至多做一次
+        # 短暂重试，避免网络抖动时 12s × 3 的锁占用造成前端数十秒“卡住”。
+        timeout = aiohttp.ClientTimeout(
+            total=_DRAFT_REQUEST_TIMEOUT,
+            connect=_DRAFT_CONNECT_TIMEOUT,
+        )
 
-        for attempt in range(3):
+        for attempt in range(_DRAFT_MAX_ATTEMPTS):
             try:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.post(f"{BASE_URL}/sendRichMessageDraft", json=payload) as resp:
@@ -611,18 +631,24 @@ async def send_rich_message_draft(
             except RateLimitError:
                 raise
             except (aiohttp.ClientConnectorError, asyncio.TimeoutError, aiohttp.ServerDisconnectedError, aiohttp.ClientOSError) as e:
-                logger.warning(f"send_rich_message_draft transient error (attempt {attempt+1}/3): {e}")
-                if attempt < 2:
-                    await asyncio.sleep(0.8 * (attempt + 1))
+                logger.warning(
+                    f"send_rich_message_draft transient error "
+                    f"(attempt {attempt + 1}/{_DRAFT_MAX_ATTEMPTS}): {e}"
+                )
+                if attempt < _DRAFT_MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(_DRAFT_RETRY_DELAY * (attempt + 1))
                     continue
                 failures = await _bump_draft_failure(chat_id, draft_id_int)
                 if failures >= 6:
                     await mark_draft_dead(draft_id_int)
                 return 0
             except aiohttp.ClientError as e:
-                logger.warning(f"send_rich_message_draft client error (attempt {attempt+1}/3): {e}")
-                if attempt < 2:
-                    await asyncio.sleep(0.6 * (attempt + 1))
+                logger.warning(
+                    f"send_rich_message_draft client error "
+                    f"(attempt {attempt + 1}/{_DRAFT_MAX_ATTEMPTS}): {e}"
+                )
+                if attempt < _DRAFT_MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(_DRAFT_RETRY_DELAY * (attempt + 1))
                     continue
                 failures = await _bump_draft_failure(chat_id, draft_id_int)
                 if failures >= 6:
