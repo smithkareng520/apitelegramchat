@@ -913,14 +913,62 @@ class BashSession:
             return False
         return True
 
+    @staticmethod
+    async def _is_unterminated(command: str) -> bool:
+        """Detect commands bash would keep waiting on (unclosed heredoc,
+        quote, backtick, paren, etc.) using `bash -n` as ground truth.
+
+        A persistent stdin-backed shell deadlocks whenever the model emits
+        any syntactically incomplete command — not just heredocs. An
+        unterminated `"..."` or `'...'` string is just as fatal: the shell
+        keeps reading stdin waiting for the closing quote, and our synthetic
+        end-marker line is silently swallowed as part of that string instead
+        of being executed. `bash -n` performs a pure syntax check (no
+        execution) and reports "unexpected EOF while looking for matching"
+        for exactly this class of problem, so it is a much more reliable
+        signal than trying to enumerate every unterminated-token regex by
+        hand (heredocs, quotes, backticks, `$(`, `((`, `{`, ...).
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "bash", "-n", "-c", command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                # Can't prove it's safe; route to isolated execution to be safe.
+                return True
+            if proc.returncode != 0:
+                msg = (stderr or b"").decode("utf-8", errors="replace")
+                # Only "unexpected EOF" / unterminated-token errors indicate the
+                # persistent shell would hang; other syntax errors (e.g. a typo)
+                # are fine to let the persistent shell report normally, since
+                # they don't consume the end marker.
+                if "unexpected EOF" in msg or "unexpected end of file" in msg:
+                    return True
+            return False
+        except Exception:
+            # If we can't run the syntax check at all, don't block execution —
+            # fall through to the existing heredoc regex as a safety net.
+            return False
+
     async def _execute_heredoc_isolated(self, command: str, timeout: int, progress_callback=None) -> str:
-        """Execute heredoc-heavy commands in a one-shot bash process.
+        """Execute heredoc-heavy (or otherwise syntactically risky) commands
+        in a one-shot bash process.
 
         A persistent stdin-backed shell can deadlock when a model emits an
-        incomplete heredoc: the shell keeps waiting for the terminator, while
-        our synthetic end marker is consumed as heredoc input.  A one-shot
-        `bash -lc` receives an actual EOF at the end of `command`, so malformed
-        heredocs terminate with a shell error instead of hanging the session.
+        incomplete heredoc or unterminated quote: the shell keeps waiting for
+        the terminator, while our synthetic end marker is consumed as input
+        to that still-open construct.  A one-shot `bash -lc` receives an
+        actual EOF at the end of `command`, so malformed input terminates
+        with a shell error instead of hanging the session.
         """
         workspace = self.workspace
         cwd = self._last_cwd or str(self.workdir.absolute())
@@ -1061,10 +1109,16 @@ class BashSession:
                     )
                 return f"Error: Command rejected for security reasons: {command}"
 
-            # Heredoc commands are executed in a one-shot shell. This prevents an
-            # incomplete model-generated `<<EOF` from leaving the persistent shell
-            # blocked on stdin forever and consuming our end marker as heredoc data.
-            if re.search(r"<<-?\s*(?:[\"']?[A-Za-z_][A-Za-z0-9_]*[\"']?)", command):
+            # Any command containing a heredoc, OR any command bash would
+            # consider syntactically unterminated (unclosed quote/backtick/
+            # paren — e.g. a truncated `python3 -c "..."` multi-line string),
+            # is executed in a one-shot shell instead of the persistent one.
+            # A persistent stdin-backed shell blocks forever on unterminated
+            # input and silently consumes our synthetic end marker as part of
+            # it, which is what previously caused ~300s hangs before the
+            # sandbox timeout kicked in and force-restarted the session.
+            has_heredoc = bool(re.search(r"<<-?\s*(?:[\"']?[A-Za-z_][A-Za-z0-9_]*[\"']?)", command))
+            if has_heredoc or await self._is_unterminated(command):
                 return await self._execute_heredoc_isolated(
                     command, timeout=timeout, progress_callback=progress_callback
                 )
