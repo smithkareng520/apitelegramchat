@@ -2708,6 +2708,7 @@ class RichMessageBuilder:
         self._last_flush_time: float = time.monotonic()
         self._flush_task: Optional[asyncio.Task] = None
         self._pending_flush_task: Optional[asyncio.Task] = None
+        self._rollover_task: Optional[asyncio.Task] = None
         self._stop_flush = False
         self._thinking_removed: bool = False
         self._pending_reasoning_html: str = ""
@@ -3429,6 +3430,29 @@ class RichMessageBuilder:
         正常路径仅选最外层结构块的结束位置；details、table、list、pre、blockquote、
         figure 等不会被截断。若单一未闭合块异常大到接近硬上限，降级为转义纯文本，
         优先保证不会因超限丢失整个输出。
+
+        ★ 关键（草稿冻结 bug 的修复说明）：这个方法由 _maybe_start_rollover
+        作为独立后台任务调用，flush() 不会 await 它——早期版本 flush() 会直接
+        `await self._rollover_draft_if_needed(...)`，而这里面的网络 I/O
+        （send_rich_html_message 发永久消息、delete_message 删旧草稿预览）此前
+        用的是 aiohttp 默认超时（远比草稿的 5s/2次重试 宽松，还带 3 次退避重试），
+        一旦网络抖动，这段网络 I/O 可能阻塞十几秒到几分钟；而无论是否占用
+        _flush_lock，await 它本身就会让"这一次" flush() 调用原地卡住，导致
+        _stream_flush_loop / refresh_loop 的顺序循环卡在同一处，前端草稿冻结到
+        网络调用结束为止——这就是"草稿卡住一会儿才刷新"的根因。
+
+        现在的分层：
+          1) 判断/切分/内存重建（必须与其他调用互斥，很快）留在
+             self._rollover_lock 临界区内。
+          2) 网络 I/O（send_rich_html_message / delete_message）在该临界区
+             之外执行，且整个方法是从后台任务里调用的，不阻塞任何 flush()。
+          3) 网络 I/O 完成、真正切换 draft_id 后，会自己 `await self.flush
+             (force=True)` 发新草稿首帧——因为调用方不再等待这里完成，不能
+             依赖"调用方会在这之后接着发"。
+        并发安全：网络 I/O 期间另一次 flush() 可能已经因为不同触发路径切换
+        了 draft_id（理论概率极低，仅在极端并发下出现），切换阶段会重新检查
+        self.draft_id 是否仍等于本次调用开始时的 old_draft_id，不一致则跳过
+        重复切换，只是已发的永久消息内容依然正确落地。
         """
         cut_at, visible_chars, block_count = self._pick_rollover_boundary(html_content)
         should_rollover = (
@@ -3438,8 +3462,9 @@ class RichMessageBuilder:
         if not should_rollover:
             return False
 
+        # 锁内只做状态判断 + 内存重建，不做任何网络 I/O。
         async with self._rollover_lock:
-            # 获锁后重新建模，以覆盖等待永久消息期间可能到达的流式增量。
+            # 获锁后重新建模，以覆盖等待期间可能到达的流式增量。
             current_html = self._sanitize_rich_html(self._build_html_no_thinking())
             cut_at, visible_chars, block_count = self._pick_rollover_boundary(current_html)
             should_rollover = (
@@ -3473,29 +3498,45 @@ class RichMessageBuilder:
 
             old_draft_id = self.draft_id
             old_draft_message_id = self.draft_message_id
-            # 已结束的内容必须先永久化。发送失败时不切换，以免丢失未完成草稿。
-            completed_message_id = await send_rich_html_message(
-                self.chat_id,
-                completed_html,
-                reassert_draft=False,
-            )
-            if not completed_message_id:
-                logger.warning(
-                    "草稿滚动永久化失败，保留当前草稿重试: chat=%s draft=%s chars=%s blocks=%s",
-                    self.chat_id, old_draft_id, visible_chars, block_count,
-                )
-                return False
 
-            # 永久消息已创建，旧预览不应再刷新或滞留为重复内容。
-            await mark_draft_dead(old_draft_id)
-            if old_draft_message_id:
-                try:
-                    await delete_message(self.chat_id, old_draft_message_id)
-                except Exception as exc:
-                    logger.debug(
-                        "滚动后清理旧草稿预览失败: chat=%s draft=%s msg=%s err=%s",
-                        self.chat_id, old_draft_id, old_draft_message_id, exc,
-                    )
+        # ---- 锁外：网络 I/O。self._flush_lock / self._rollover_lock 均已释放，
+        # 其他 flush() 调用不会因为这里的网络延迟被阻塞。----
+        # 已结束的内容必须先永久化。发送失败时不切换，以免丢失未完成草稿；
+        # 失败时把内容留在当前草稿里，下次 flush 会重新尝试判断是否滚动。
+        completed_message_id = await send_rich_html_message(
+            self.chat_id,
+            completed_html,
+            reassert_draft=False,
+        )
+        if not completed_message_id:
+            logger.warning(
+                "草稿滚动永久化失败，保留当前草稿重试: chat=%s draft=%s chars=%s blocks=%s",
+                self.chat_id, old_draft_id, visible_chars, block_count,
+            )
+            return False
+
+        # 永久消息已创建，旧预览不应再刷新或滞留为重复内容。
+        await mark_draft_dead(old_draft_id)
+        if old_draft_message_id:
+            try:
+                await delete_message(self.chat_id, old_draft_message_id)
+            except Exception as exc:
+                logger.debug(
+                    "滚动后清理旧草稿预览失败: chat=%s draft=%s msg=%s err=%s",
+                    self.chat_id, old_draft_id, old_draft_message_id, exc,
+                )
+
+        # ---- 重新拿锁，完成状态切换。这段仍是纯内存操作，很快。----
+        async with self._rollover_lock:
+            # 极小概率下，另一次并发滚动可能已经把 draft_id 切换走了
+            # （例如两次 flush 几乎同时判定 should_rollover）。此时不再重复
+            # 切换，避免覆盖更新的 draft 状态；已发的永久消息内容依然正确落地。
+            if self.draft_id != old_draft_id:
+                logger.debug(
+                    "草稿在网络 I/O 期间已被并发滚动，跳过重复切换: chat=%s "
+                    "old=%s current=%s", self.chat_id, old_draft_id, self.draft_id,
+                )
+                return True
 
             # 重新分配草稿 ID 并立即登记 active 状态；新 ID 不能与旧 ID 相同。
             new_draft_id = int(time.time() * 1000000) + random.randint(0, 999)
@@ -3505,7 +3546,6 @@ class RichMessageBuilder:
             self.draft_message_id = None
             self._rate_limited_until = 0.0
             self._replace_with_rollover_remainder(remainder)
-            await self._register_active_draft(0)
             self._rollover_count += 1
             self._rollover_history.append({
                 "old_draft_id": old_draft_id,
@@ -3521,26 +3561,81 @@ class RichMessageBuilder:
                 len(_rich_visible_text(completed_html)), block_count,
                 "fallback" if used_fallback else "complete_block",
             )
-            # 由调用方在当前 flush 完成后发送新草稿首帧，避免重入 _flush_lock。
-            return True
+
+        # _register_active_draft 内部只是写内存字典（state.py 的 _active_drafts），
+        # 不发网络请求，锁外调用也是安全的。
+        await self._register_active_draft(0)
+        # 滚动现在从独立后台任务（_maybe_start_rollover）触发，调用方
+        # （flush()）不会等待这里完成，因此新草稿的首帧必须自己发出，
+        # 不能再假设"调用方会在当前 flush 完成后接着发"。
+        try:
+            await self.flush(force=True)
+        except Exception as exc:
+            logger.warning(
+                "草稿滚动后发送新首帧失败（下一次常规刷新会补上）: chat=%s "
+                "draft=%s err=%s", self.chat_id, self.draft_id, exc,
+            )
+        return True
 
     # ---------- 刷新与清理 ----------
+    def _maybe_start_rollover(self, html_content: str) -> None:
+        """满足滚动条件时，把滚动作为独立后台任务触发，flush() 本身不等待它。
+
+        ★ 修复"草稿卡住一会儿才刷新"的根因：早期版本里 flush() 会直接
+        `await self._rollover_draft_if_needed(...)`。即使该方法内部已经把
+        网络 I/O（send_rich_html_message 发永久消息）挪到它自己的锁之外，
+        flush() 这次调用本身仍然会在这一行原地阻塞——而 _stream_flush_loop /
+        refresh_loop 都是"等上一次 flush() 完全返回，才发起下一次"的顺序循环，
+        单次 flush() 卡住，等于整条刷新链路卡住，草稿在前端表现为冻结，
+        直到那次永久消息网络调用结束为止（实测可达数分钟）。
+        真正的修复是让"触发滚动"和"这一帧要不要发出去"彻底解耦：滚动放进
+        后台任务异步跑完，flush() 只管尽快把当前已有内容发出去。
+        """
+        if self._rollover_task is not None and not self._rollover_task.done():
+            # 上一次滚动仍在进行（判断阶段很快，这个窗口通常只有并发触发才会
+            # 命中），避免重复创建后台任务；_rollover_draft_if_needed 内部对
+            # 阈值的判断本身也是幂等的，等它跑完下一次 flush 自然会重新判断。
+            return
+
+        async def _runner():
+            try:
+                await self._rollover_draft_if_needed(html_content)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "草稿滚动后台任务异常: chat=%s draft=%s err=%s",
+                    self.chat_id, self.draft_id, exc,
+                )
+
+        try:
+            self._rollover_task = asyncio.create_task(_runner())
+        except RuntimeError:
+            self._rollover_task = None
+
     async def flush(self, force: bool = False):
         now = time.monotonic()
         if now < self._rate_limited_until:
             return
+
+        # 滚动判断本身（_pick_rollover_boundary，纯字符串扫描）很快，可以直接
+        # 同步调用；只有真正满足阈值、需要发永久消息时才会走到网络 I/O，那部分
+        # 已经被 _maybe_start_rollover 转成不阻塞当前 flush() 的后台任务。
+        html_content = self._sanitize_rich_html(self._build_html())
+        self._maybe_start_rollover(html_content)
 
         async with self._flush_lock:
             now = time.monotonic()
             if now < self._rate_limited_until:
                 return
 
+            # 用锁内的最新状态重新生成一次 HTML：这里只做内存重建（读取
+            # self.blocks / self.draft_id 等，不再调用 _rollover_draft_if_needed），
+            # 因此不会有网络 I/O 占锁。它同时覆盖了两种情况——滚动已把
+            # blocks/draft_id 切换到新草稿，以及滚动判断和这里加锁之间的极短
+            # 窗口内可能到达的新流式增量——两者都通过重新读取当前状态自然覆盖。
             html_content = self._sanitize_rich_html(self._build_html())
-            # 到达主动阈值时先将最后一个完整结构块之前的内容永久化，再使用新的
-            # draft_id 继续发送余下内容。滚动后重建 HTML，确保绝不把已提交内容重发。
-            if await self._rollover_draft_if_needed(html_content):
-                html_content = self._sanitize_rich_html(self._build_html())
-                force = True
+
             if not html_content.strip() or html_content.strip() == " ":
                 # 修复 RICH_MESSAGE_CONTENT_REQUIRED：
                 # 空 <details>（只有 summary、没有 body）同样会被 Telegram 拒绝。
@@ -3654,6 +3749,25 @@ class RichMessageBuilder:
                     pass
             except Exception as e:
                 logger.debug(f"{attr} 停止时出现异常（可忽略）: {e}")
+
+        # _rollover_task 语义与上面两个刷新任务不同：它承载的是"已经判定要
+        # 永久化的一段对话内容"（send_rich_html_message 尚未完成），取消它
+        # 会直接丢失这段内容，比多等待几秒更糟。因此这里不 cancel，只是
+        # 限时等待；仍未完成时转入同样的后台清理（continue running），
+        # 而不是掐断它。
+        rt = self._rollover_task
+        self._rollover_task = None
+        if rt is not None and not rt.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(rt), timeout=0.5)
+            except asyncio.TimeoutError:
+                logger.debug(
+                    f"_rollover_task 未在 0.5s 内完成，转入后台继续执行（不取消，"
+                    f"避免丢失待永久化内容）: draft_id={self.draft_id}"
+                )
+                asyncio.create_task(_swallow_flush_task(rt, "_rollover_task", self.draft_id))
+            except Exception as e:
+                logger.debug(f"_rollover_task 等待时出现异常（可忽略）: {e}")
 
 
 # ========== Agentic 循环 ==========

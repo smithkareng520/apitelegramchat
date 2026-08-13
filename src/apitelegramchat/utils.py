@@ -703,10 +703,17 @@ async def send_rich_html_message(
     if message_thread_id:
         payload["message_thread_id"] = message_thread_id
 
+    # 永久消息需要比草稿更强的送达可靠性，因此保留重试；但此前完全没有设置
+    # timeout（aiohttp 默认是几分钟级），一旦网络抖动或 Telegram 侧偶发变慢，
+    # 三次重试 × 每次可能挂到默认超时，会让调用方（草稿滚动）阻塞数分钟。
+    # 给一个不算激进的有界超时：单次总超时 15s、连接超时 5s，三次重试封顶
+    # 约 45~90s（含 1s/4s/7s 退避），比之前的"无上限"收窄了一个数量级，
+    # 同时仍然给网络抖动足够的恢复空间。
     @retry_async(max_retries=3, delay=1, backoff=3, exceptions=(aiohttp.ClientError, asyncio.TimeoutError))
     async def _send_inner():
+        timeout = aiohttp.ClientTimeout(total=15, connect=5)
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(f"{BASE_URL}/sendRichMessage", json=payload) as resp:
                     if resp.status == 200:
                         try:

@@ -57,16 +57,29 @@ def test_character_and_block_budget_boundaries() -> None:
 
 
 async def test_rollover_tracks_drafts_and_keeps_remainder() -> None:
+    """
+    ★ _rollover_draft_if_needed 现在会在状态切换完成后自己
+    `await self.flush(force=True)` 发新草稿首帧（因为调用方 flush() 不再
+    等待滚动，不能假设"调用方会在这之后接着发"，见其 docstring）。因此这里
+    还需要 mock send_rich_message_draft，并且 _register_active_draft 会被
+    调用两次：一次是滚动内部的占位登记（draft_id, 0），一次是
+    flush(force=True) 里首帧发出后的真实 message_id 登记。
+    """
     completed_segments = []
 
     async def fake_send(chat_id, html_content, **kwargs):
         completed_segments.append((chat_id, html_content, kwargs))
         return 4242
 
+    async def fake_draft(chat_id, draft_id, html_content, **kwargs):
+        return 5252
+
     original_send = handlers.send_rich_html_message
+    original_draft = handlers.send_rich_message_draft
     original_dead = handlers.mark_draft_dead
     original_delete = handlers.delete_message
     handlers.send_rich_html_message = fake_send
+    handlers.send_rich_message_draft = fake_draft
     handlers.mark_draft_dead = AsyncMock()
     handlers.delete_message = AsyncMock()
     try:
@@ -92,14 +105,32 @@ async def test_rollover_tracks_drafts_and_keeps_remainder() -> None:
         require("Thinking..." in builder._build_html(), "新草稿首帧必须保留 Thinking 状态")
         handlers.mark_draft_dead.assert_awaited_once_with(old_draft_id)
         handlers.delete_message.assert_awaited_once_with(99, 777)
-        builder._register_active_draft.assert_awaited_once_with(0)
+        require(builder._register_active_draft.await_count == 2, "需先登记新草稿占位，再登记 flush 首帧的真实 message_id")
+        builder._register_active_draft.assert_any_await(0)
+        builder._register_active_draft.assert_any_await(5252)
     finally:
         handlers.send_rich_html_message = original_send
+        handlers.send_rich_message_draft = original_draft
         handlers.mark_draft_dead = original_dead
         handlers.delete_message = original_delete
 
 
 async def test_flush_restarts_preview_with_new_draft_id() -> None:
+    """
+    ★ 行为变更（草稿冻结 bug 修复的一部分）：滚动（含 send_rich_html_message
+    这条网络 I/O）现在由 flush() 内部通过 _maybe_start_rollover 触发为独立
+    后台任务，flush() 本身不再 await 它完成——这是为了避免一次慢速的永久
+    消息发送把 _flush_lock 或整条 flush 调用链卡住，导致草稿在前端冻结
+    数分钟（详见 _rollover_draft_if_needed 的 docstring）。
+    因此：
+      - `await builder.flush()` 返回时，滚动可能还没完成；旧断言"flush 一次
+        性完成滚动 + 发新首帧"不再成立，测试改为显式等待
+        `builder._rollover_task` 完成。
+      - `flush()` 触发滚动的这一次调用，会先用滚动前的旧状态发一帧草稿
+        （锁内快照），滚动任务完成后再自己 `flush(force=True)` 发新草稿
+        首帧——所以 draft_frames 会有 2 帧，不是旧版的 1 帧；测试改为断言
+        "最后一帧"才是滚动后的新草稿首帧。
+    """
     permanent_segments = []
     draft_frames = []
 
@@ -130,16 +161,79 @@ async def test_flush_restarts_preview_with_new_draft_id() -> None:
         ]
         builder.block_types = ["text"]
         await builder.flush()
+        # 滚动此时是后台任务，可能仍在进行；等它跑完再断言最终状态。
+        if builder._rollover_task is not None:
+            await builder._rollover_task
         require(len(permanent_segments) == 1, "flush 必须先永久化完整旧段")
-        require(len(draft_frames) == 1, "flush 必须立即发送新草稿首帧")
-        new_draft_id, tail_html, kwargs = draft_frames[0]
-        require(new_draft_id != old_draft_id, "尾部必须使用新 draft_id 续写")
+        require(len(draft_frames) >= 1, "flush 必须至少发送一帧草稿")
+        new_draft_id, tail_html, kwargs = draft_frames[-1]
+        require(new_draft_id != old_draft_id, "最终帧必须使用新 draft_id 续写")
         require("丙" in tail_html and "甲" not in tail_html, "新草稿首帧只能包含未提交尾部")
         require("Thinking..." in tail_html, "滚动后的首帧必须带 Thinking 状态")
         require(kwargs.get("force") is True, "滚动后的新草稿首帧必须强制发送")
         require(builder._register_active_draft.await_count == 2, "需先登记新草稿占位，再登记首帧 message_id")
         builder._register_active_draft.assert_any_await(0)
         builder._register_active_draft.assert_any_await(7171)
+    finally:
+        handlers.send_rich_html_message = original_permanent
+        handlers.send_rich_message_draft = original_draft
+        handlers.mark_draft_dead = original_dead
+        handlers.delete_message = original_delete
+
+
+async def test_rollover_network_io_does_not_block_flush() -> None:
+    """
+    ★ 新增回归测试：这是本次修复要保证的核心属性——滚动触发的永久消息
+    网络 I/O（此处 mock 为耗时 0.3s）不应阻塞 flush() 调用本身返回，也不
+    应阻塞其他并发的 flush() 调用（模拟 _stream_flush_loop / refresh_loop
+    在滚动期间继续按自己的节奏刷新）。
+    """
+    import time
+
+    async def slow_send(chat_id, html_content, **kwargs):
+        await asyncio.sleep(0.3)
+        return 8181
+
+    async def fake_draft(chat_id, draft_id, html_content, **kwargs):
+        return 9191
+
+    original_permanent = handlers.send_rich_html_message
+    original_draft = handlers.send_rich_message_draft
+    original_dead = handlers.mark_draft_dead
+    original_delete = handlers.delete_message
+    handlers.send_rich_html_message = slow_send
+    handlers.send_rich_message_draft = fake_draft
+    handlers.mark_draft_dead = AsyncMock()
+    handlers.delete_message = AsyncMock()
+    try:
+        builder = handlers.RichMessageBuilder(chat_id=102)
+        builder._register_active_draft = AsyncMock()
+        builder.blocks = [
+            "<p>甲" + "a" * 12000 + "</p>"
+            "<details><summary>乙</summary><p>" + "b" * 12000 + "</p></details>"
+            "<p>丙" + "c" * 10000 + "</p>"
+        ]
+        builder.block_types = ["text"]
+
+        t0 = time.monotonic()
+        await builder.flush()
+        elapsed = time.monotonic() - t0
+        require(
+            elapsed < 0.2,
+            f"flush() 不应等待滚动的网络 I/O 完成，实际耗时 {elapsed:.3f}s（模拟网络延迟 0.3s）",
+        )
+
+        # 触发滚动的同时，另一次独立 flush() 调用（模拟并发的刷新循环）也不应被卡住。
+        t1 = time.monotonic()
+        await builder.flush()
+        elapsed2 = time.monotonic() - t1
+        require(
+            elapsed2 < 0.2,
+            f"滚动进行中时，并发的 flush() 调用不应被阻塞，实际耗时 {elapsed2:.3f}s",
+        )
+
+        if builder._rollover_task is not None:
+            await builder._rollover_task
     finally:
         handlers.send_rich_html_message = original_permanent
         handlers.send_rich_message_draft = original_draft
@@ -154,10 +248,15 @@ async def test_oversized_single_block_falls_back_without_loss() -> None:
         completed_segments.append(html_content)
         return 5252
 
+    async def fake_draft(chat_id, draft_id, html_content, **kwargs):
+        return 6363
+
     original_send = handlers.send_rich_html_message
+    original_draft = handlers.send_rich_message_draft
     original_dead = handlers.mark_draft_dead
     original_delete = handlers.delete_message
     handlers.send_rich_html_message = fake_send
+    handlers.send_rich_message_draft = fake_draft
     handlers.mark_draft_dead = AsyncMock()
     handlers.delete_message = AsyncMock()
     try:
@@ -175,6 +274,7 @@ async def test_oversized_single_block_falls_back_without_loss() -> None:
         require(len(submitted_text) <= handlers.RICH_DRAFT_ROLLOVER_TEXT_CHARS, "兜底永久段仍须低于主动阈值")
     finally:
         handlers.send_rich_html_message = original_send
+        handlers.send_rich_message_draft = original_draft
         handlers.mark_draft_dead = original_dead
         handlers.delete_message = original_delete
 
@@ -185,6 +285,7 @@ def main() -> None:
     test_character_and_block_budget_boundaries()
     asyncio.run(test_rollover_tracks_drafts_and_keeps_remainder())
     asyncio.run(test_flush_restarts_preview_with_new_draft_id())
+    asyncio.run(test_rollover_network_io_does_not_block_flush())
     asyncio.run(test_oversized_single_block_falls_back_without_loss())
     print("draft rollover validation: PASS")
 
