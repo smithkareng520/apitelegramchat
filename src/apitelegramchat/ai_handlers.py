@@ -2776,6 +2776,9 @@ class RichMessageBuilder:
         self._last_flush_time: float = time.monotonic()
         self._flush_task: Optional[asyncio.Task] = None
         self._pending_flush_task: Optional[asyncio.Task] = None
+        # request_flush 合并高频更新时，若网络发送仍在进行，新内容不能仅靠
+        # “已有 pending task”被吞掉；该标记保证当前帧结束后必补发最新状态。
+        self._flush_dirty: bool = False
         self._stop_flush = False
         self._thinking_removed: bool = False
         self._pending_reasoning_html: str = ""
@@ -2807,9 +2810,13 @@ class RichMessageBuilder:
         return plain
 
     def request_flush(self, force: bool = False) -> None:
-        """异步触发刷新，并保证后到的强制刷新不会被在途普通刷新吞掉。"""
+        """异步触发刷新，确保在途发送期间的新内容一定会补发。"""
         if self._stop_flush:
             return
+        # 无论是否已有在途 flush，只要状态发生变化，都记录为脏数据。旧逻辑在
+        # pending task 存在时直接 return，会把发送期间的新增工具状态/流式文本
+        # 合并掉；若之后没有新的 request_flush，用户便会看到草稿长时间不动。
+        self._flush_dirty = True
         if force:
             self._force_flush_requested = True
         if self._pending_flush_task and not self._pending_flush_task.done():
@@ -2817,14 +2824,20 @@ class RichMessageBuilder:
 
         async def _runner():
             try:
-                force_now = self._force_flush_requested
-                self._force_flush_requested = False
-                await self.flush(force=force_now)
+                while not self._stop_flush:
+                    force_now = self._force_flush_requested
+                    self._force_flush_requested = False
+                    # 本轮发送开始前消费脏标记；发送过程中新到的变更会再次置位，
+                    # 然后在本轮结束后立刻补发最新草稿帧。
+                    self._flush_dirty = False
+                    await self.flush(force=force_now)
+                    if not self._flush_dirty and not self._force_flush_requested:
+                        break
             finally:
                 self._pending_flush_task = None
-                # 若网络发送期间又收到保活请求，再补发一帧，防止客户端短暂丢失草稿。
-                if self._force_flush_requested and not self._stop_flush:
-                    self.request_flush(force=True)
+                # 覆盖任务退出边缘时刻的新变更，避免一次 flush 结束后丢失最后一帧。
+                if (self._flush_dirty or self._force_flush_requested) and not self._stop_flush:
+                    self.request_flush(force=self._force_flush_requested)
 
         try:
             self._pending_flush_task = asyncio.create_task(_runner())
@@ -3250,6 +3263,9 @@ class RichMessageBuilder:
             return
         self._stream_buffer += delta
         self._pending_chars += len(delta)
+        # 流式增量未必每片都调用 request_flush；将其标记为脏数据，可确保一旦
+        # 当前发送结束，后台刷新不会把已累积的增量误认为已经展示。
+        self._flush_dirty = True
 
     def _commit_stream_buffer(self):
         if self._stream_buffer and self._stream_text_index >= 0:

@@ -360,6 +360,42 @@ async def test_arm_threshold_rolls_at_next_turn_boundary() -> None:
         handlers.mark_draft_dead = original_dead
 
 
+async def test_inflight_flush_replays_latest_draft_frame() -> None:
+    first_send_started = asyncio.Event()
+    release_first_send = asyncio.Event()
+    sent_frames = []
+
+    async def slow_draft(chat_id, draft_id, html_content, **kwargs):
+        sent_frames.append(html_content)
+        if len(sent_frames) == 1:
+            first_send_started.set()
+            await release_first_send.wait()
+        return 7777
+
+    original_draft = handlers.send_rich_message_draft
+    try:
+        handlers.send_rich_message_draft = slow_draft
+        builder = handlers.RichMessageBuilder(chat_id=107)
+        builder._register_active_draft = AsyncMock()
+
+        builder.add_text("<p>FIRST_FRAME</p>")
+        await asyncio.wait_for(first_send_started.wait(), timeout=1.0)
+
+        # 第一次网络发送仍在锁内时，第二次状态变更不能被 request_flush 合并后丢失。
+        builder.add_text("<p>LATEST_FRAME</p>")
+        release_first_send.set()
+
+        for _ in range(100):
+            if len(sent_frames) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        require(len(sent_frames) >= 2, "在途发送期间的新状态必须触发补发")
+        require("LATEST_FRAME" in sent_frames[-1], "补发帧必须包含发送期间新增的最新内容")
+        require(not builder._flush_dirty, "补发完成后不应遗留未处理的脏状态")
+    finally:
+        handlers.send_rich_message_draft = original_draft
+
+
 async def test_done_only_batch_finishes_precreated_tool_group() -> None:
     async def fake_draft(chat_id, draft_id, html_content, **kwargs):
         return 7676
@@ -409,6 +445,7 @@ def main() -> None:
     asyncio.run(test_old_preview_cleanup_does_not_delay_new_draft())
     asyncio.run(test_turn_boundary_rechecks_capacity_after_rate_limited_flush())
     asyncio.run(test_arm_threshold_rolls_at_next_turn_boundary())
+    asyncio.run(test_inflight_flush_replays_latest_draft_frame())
     asyncio.run(test_done_only_batch_finishes_precreated_tool_group())
     test_no_legacy_background_rollover_fields()
     print("turn-boundary draft rollover validation: PASS")
