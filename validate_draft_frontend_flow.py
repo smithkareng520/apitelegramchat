@@ -18,13 +18,13 @@ def test_thinking_status_is_escaped_and_requests_refresh() -> None:
     builder = handlers.RichMessageBuilder(chat_id=801)
     refresh_requests: list[bool] = []
     builder.request_flush = lambda force=False: refresh_requests.append(force)
-    builder.add_initial_thinking("正在准备")
+    builder.add_initial_thinking("Thinking...")
 
-    changed = builder.set_thinking_status("读取 <附件> & 上下文")
+    changed = builder.set_thinking_status("Thinking <attachment> & context...")
 
     require(changed, "应能更新尚未移除的思考占位")
     require(
-        builder.blocks[0] == "<tg-thinking>读取 &lt;附件&gt; &amp; 上下文</tg-thinking>",
+        builder.blocks[0] == "<tg-thinking>Thinking &lt;attachment&gt; &amp; context...</tg-thinking>",
         "思考状态必须按富消息 HTML 规则转义",
     )
     require(refresh_requests == [True], "状态变更后必须触发一次强制可见刷新请求")
@@ -117,9 +117,8 @@ async def test_initial_draft_precedes_expensive_request_preparation() -> None:
         require(result[0] == "最终答复", "模拟主流程应返回模型最终内容")
         require(events.index("draft") < events.index("prompt"), "首帧必须早于提示词准备")
         require(events.index("prompt") < events.index("resolve"), "准备态应覆盖多模态输入解析前阶段")
-        require("正在准备请求" in frames[0], "首帧应展示明确的准备状态")
-        require(any("正在读取你的输入" in frame for frame in frames), "输入解析阶段应刷新可见状态")
-        require(any("正在思考" in frame for frame in frames), "调用模型前应刷新思考状态")
+        require("Thinking..." in frames[0], "首帧应展示稳定的 Thinking 状态")
+        require(all("正在思考" not in frame for frame in frames), "草稿状态不应回退为中文文案")
     finally:
         handlers.send_rich_message_draft = original_draft
         handlers.build_system_prompt = original_prompt

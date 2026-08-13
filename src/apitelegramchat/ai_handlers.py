@@ -44,7 +44,6 @@ from apitelegramchat.utils import (
     escape_html,
     get_logger,
     delete_message,
-    delete_message_fast,
     mark_draft_dead,
     RateLimitError,
     transcribe_audio_with_groq,
@@ -52,6 +51,7 @@ from apitelegramchat.utils import (
 from apitelegramchat.file_handlers import get_file_path
 from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2
 from apitelegramchat.skills import skill_catalog_brief
+from apitelegramchat.context_manager import select_request_context
 from apitelegramchat.tool_executors import (
     dispatch_tool_call,
     format_tool_result,
@@ -3381,19 +3381,23 @@ class RichMessageBuilder:
         return (selected[0] if selected else None), visible_chars, block_count
 
     def _replace_with_rollover_remainder(self, remainder: str) -> None:
-        """建立带 Thinking 首帧的新草稿，并让后续 delta 继续追加到尾部文本。"""
+        """将未提交部分作为新草稿的唯一内容，并维持当前流式写入通道。"""
         remainder = remainder.lstrip()
-        # draft_id 发生变化后，Telegram 会展示一个新的临时预览，不能延续旧 draft
-        # 的原位动画。新草稿必须先有可见内容，避免在模型尚未产出下一枚 delta 时
-        # 出现空白卡顿；最终收尾仍会通过 remove_thinking() 移除该临时状态。
-        self.blocks = ["<tg-thinking>正在继续生成…</tg-thinking>", remainder]
-        self.block_types = ["html", "text"]
+        # A rollover creates a new client-visible draft.  Seed it with the
+        # same stable status marker as a fresh request so it never appears as
+        # an empty, contextless bubble while the next stream chunk is pending.
+        thinking = "<tg-thinking>Thinking...</tg-thinking>"
+        self.blocks = [thinking]
+        self.block_types = ["html"]
+        if remainder:
+            self.blocks.append(remainder)
+            self.block_types.append("text")
         self._tool_groups = []
         self._current_group_idx = -1
         self._stream_buffer = ""
-        # agentic loop 仍处于同一 content stream。即使 remainder 为空，也要保留
-        # 空文本槽位，以便下一枚 delta 在新草稿中可见，而不是掉进游离 buffer。
-        self._stream_text_index = 1
+        # agentic loop 可能仍认为 content stream 已开启；这里主动建立一个 text 流，
+        # 使后续 delta 能继续追加到新草稿，而不是写入一个不可见的游离 buffer。
+        self._stream_text_index = 1 if remainder else -1
         self._pending_chars = 0
 
     async def _register_active_draft(self, message_id: int = 0) -> None:
@@ -3467,9 +3471,16 @@ class RichMessageBuilder:
                 )
                 return False
 
-            # 永久消息已创建，旧预览不应再刷新。旧预览删除只是清理，不应放在
-            # 新草稿首帧之前：deleteMessage 带网络重试，曾使第二个 draft 迟到数秒。
+            # 永久消息已创建，旧预览不应再刷新或滞留为重复内容。
             await mark_draft_dead(old_draft_id)
+            if old_draft_message_id:
+                try:
+                    await delete_message(self.chat_id, old_draft_message_id)
+                except Exception as exc:
+                    logger.debug(
+                        "滚动后清理旧草稿预览失败: chat=%s draft=%s msg=%s err=%s",
+                        self.chat_id, old_draft_id, old_draft_message_id, exc,
+                    )
 
             # 重新分配草稿 ID 并立即登记 active 状态；新 ID 不能与旧 ID 相同。
             new_draft_id = int(time.time() * 1000000) + random.randint(0, 999)
@@ -3495,16 +3506,6 @@ class RichMessageBuilder:
                 len(_rich_visible_text(completed_html)), block_count,
                 "fallback" if used_fallback else "complete_block",
             )
-            # 旧预览删除在后台进行；新 draft 的 Thinking 首帧由当前 flush 立即、
-            # 强制发送，二者互不阻塞。
-            if old_draft_message_id:
-                try:
-                    _track_task(delete_message_fast(self.chat_id, old_draft_message_id))
-                except Exception as exc:
-                    logger.debug(
-                        "滚动后安排旧草稿预览清理失败: chat=%s draft=%s msg=%s err=%s",
-                        self.chat_id, old_draft_id, old_draft_message_id, exc,
-                    )
             # 由调用方在当前 flush 完成后发送新草稿首帧，避免重入 _flush_lock。
             return True
 
@@ -5115,7 +5116,7 @@ async def get_ai_response(
         # 草稿首帧必须先于系统提示词、历史归档和多模态解析出现。这些准备操作在
         # 文件、图片或长历史场景下可能耗时数秒；旧顺序会让用户误以为 Agent 卡死。
         builder = RichMessageBuilder(chat_id)
-        builder.add_initial_thinking("正在准备请求…")
+        builder.add_initial_thinking("Thinking...")
         # 先登记为当前活跃草稿，让首帧和后续流式刷新都能通过 active 校验。
         # message_id 先占位为 0，等首帧真正发出后再回填真实 message_id。
         try:
@@ -5143,10 +5144,21 @@ async def get_ai_response(
             model_info = SUPPORTED_MODELS[current_model]
             api_type = model_info.api_type
             # 复制历史快照，避免在锁外被并发请求追加导致竞态
-            history = list(user_contexts.get(chat_id, {}).get("conversation_history", []))
+            stored_history = list(user_contexts.get(chat_id, {}).get("conversation_history", []))
+            context_snapshot = select_request_context(stored_history)
+            history = context_snapshot.messages
             supports_tools = model_info.supports_tools
 
-        builder.set_thinking_status("正在整理对话上下文…")
+        if context_snapshot.dropped_messages:
+            logger.info(
+                "Request context bounded: chat=%s kept=%s dropped=%s estimated_chars=%s",
+                chat_id,
+                len(history),
+                context_snapshot.dropped_messages,
+                context_snapshot.estimated_chars,
+            )
+
+        builder.set_thinking_status("Thinking...")
         await builder.flush(force=False)
         system_prompt = await build_system_prompt(
             chat_id,
@@ -5159,14 +5171,14 @@ async def get_ai_response(
         if model_info.supports_prompt_cache:
             _apply_cache_control(messages)
         if user_message:
-            builder.set_thinking_status("正在读取你的输入…")
+            builder.set_thinking_status("Thinking...")
             await builder.flush(force=False)
             out_msg = {"role": "user"}
             resolved = await _resolve_multimodal_content(user_message, model_info, api_type, chat_id=chat_id)
             out_msg["content"] = resolved
             messages.append(out_msg)
 
-        builder.set_thinking_status("正在思考…")
+        builder.set_thinking_status("Thinking...")
         await builder.flush(force=False)
 
         logger.debug("发送给 %s (api=%s): %s", current_model, api_type,
@@ -5453,4 +5465,3 @@ def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict):
 
 def _openrouter_extra_body() -> dict:
     return {"provider": OPENROUTER_PROVIDER_PREFERENCES.copy()}
-
