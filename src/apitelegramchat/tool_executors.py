@@ -1414,6 +1414,70 @@ _TOOL_TIMEOUT_LABELS = {
     "list_upload": "List upload/",
 }
 
+def _render_image_tool_error_card(result_str: str) -> tuple[str, str] | None:
+    """把图片工具的原始失败文本改为用户提示加引用式诊断信息。
+
+    工具执行层返回的是纯文本，若直接 escape 会导致用户看到重复的 Request ID
+    和不友好的 HTTP 字段。此处只在识别到固定的「图片接口 请求失败」格式时介入。
+    """
+    raw = html.unescape(re.sub(r"<[^>]+>", "", result_str or "")).strip()
+    lines = [re.sub(r"\s+", " ", line).strip() for line in raw.splitlines() if line.strip()]
+    if not lines or "请求失败" not in lines[0]:
+        return None
+
+    status_code = 0
+    model = ""
+    request_id = ""
+    detail_lines: list[str] = []
+    for line in lines[1:]:
+        if line.startswith("HTTP 状态："):
+            match = re.search(r"\d{3}", line)
+            status_code = int(match.group(0)) if match else 0
+        elif line.startswith("模型："):
+            model = line.split("：", 1)[1].strip()
+        elif line.lower().startswith("request id：") or line.lower().startswith("request id:"):
+            request_id = re.split(r"[：:]", line, maxsplit=1)[1].strip()
+        elif line.startswith("详情："):
+            detail = line.split("：", 1)[1].strip()
+            # 常见上游响应会在详情中原样再写一次 Request ID；不重复展示。
+            if not (request_id and request_id.lower() in detail.lower() and "request id" in detail.lower()):
+                detail_lines.append(detail)
+        else:
+            detail_lines.append(line)
+
+    if status_code == 429:
+        advice = "当前图片服务请求较多，请稍后再试；无需修改你的描述。"
+        status_text = "服务繁忙"
+    elif status_code in (400, 422):
+        advice = "这次图片描述暂时无法处理。请简化描述或调整表述后重试。"
+        status_text = "请求暂未被处理"
+    elif status_code in (401, 403):
+        advice = "图片服务暂时不可用，请稍后再试。"
+        status_text = "服务访问受限"
+    elif status_code >= 500:
+        advice = "图片服务暂时不可用，请稍后再试。"
+        status_text = "服务异常"
+    else:
+        advice = "图片暂时无法生成，请稍后重试。"
+        status_text = "请求未完成"
+
+    diagnostics: list[str] = []
+    if status_code:
+        diagnostics.append(f"<b>状态：</b>{status_text}（HTTP {status_code}）")
+    if model:
+        diagnostics.append(f"<b>模型：</b>{escape_html(model)}")
+    if request_id:
+        diagnostics.append(f"<b>请求标识：</b>{escape_html(request_id)}")
+    if detail_lines:
+        concise_detail = "<br/>".join(escape_html(line) for line in detail_lines[:3])
+        diagnostics.append(f"<b>服务响应：</b>{concise_detail}")
+
+    details_html = f"<p><b>图片暂时无法生成</b></p><p>{advice}</p>"
+    if diagnostics:
+        details_html += "<blockquote><b>诊断信息</b><br/>" + "<br/>".join(diagnostics) + "</blockquote>"
+    return "🎨 图片生成暂不可用", details_html
+
+
 async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tuple[str, str]:
     def escape_text(text):
         return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -1685,6 +1749,9 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         return summary, details_html
 
     elif fn_name == "generate_image_from_text":
+        error_card = _render_image_tool_error_card(result_str)
+        if error_card:
+            return error_card
         if "✅" in result_str:
             lines = result_str.splitlines()
             urls = [line.strip() for line in lines if line.strip().startswith(("http://", "https://"))]
@@ -1709,6 +1776,9 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         return summary, details_html
 
     elif fn_name == "edit_image_with_reference":
+        error_card = _render_image_tool_error_card(result_str)
+        if error_card:
+            return error_card
         if "✅" in result_str:
             lines = result_str.splitlines()
             urls = [line.strip() for line in lines if line.strip().startswith(("http://", "https://"))]

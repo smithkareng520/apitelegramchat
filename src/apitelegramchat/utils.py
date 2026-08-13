@@ -1,4 +1,5 @@
 # utils.py
+import hashlib
 import json
 import re
 import aiohttp
@@ -138,6 +139,93 @@ def _escape_media_src_urls(html_content: str) -> str:
         return f'src="{escaped}"'
 
     return _SRC_ATTR_RE.sub(_escape_one, html_content)
+
+
+# Rich Message 的 HTML 中，直接写 <video src="https://..."> 虽然是展示语法，
+# 但 Bot API 10.2 允许（也推荐）将实际媒体显式放在 rich_message.media，
+# 并用 tg://video?id=... 在 HTML 中引用。这样 Telegram 不必从 HTML 属性
+# 猜测媒体对象，尤其可避免 RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND。
+_RICH_VIDEO_SRC_RE = re.compile(
+    r'(?P<prefix><video\b[^>]*?\bsrc\s*=\s*)(?P<quote>["\'])'
+    r'(?P<url>.*?)(?P=quote)',
+    re.IGNORECASE | re.DOTALL,
+)
+_RICH_VIDEO_TAG_RE = re.compile(
+    r'<video\b[^>]*?\bsrc\s*=\s*(?P<quote>["\'])(?P<url>.*?)(?P=quote)[^>]*>'
+    r'(?:.*?</video\s*>)?',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _build_rich_message_from_html(
+    html_content: str,
+    *,
+    embed_videos: bool = True,
+) -> Dict:
+    """将富 HTML 转为符合 Bot API 的 ``InputRichMessage``。
+
+    对 HTTP(S) 视频 URL，生成一个稳定、合法的媒体 id，并把 HTML 引用改写为
+    ``tg://video?id=...``。原 URL 仅保存在 ``InputRichMessageMedia.media`` 中，
+    其中 HTML 实体会先还原，避免预签名 URL 的 ``&amp;`` 被当成真实 URL 字符。
+    已经使用 ``tg://`` 的引用及非 HTTP(S) URL 保持不变，交由服务端作最终校验。
+    """
+    rendered_html = html_content or ""
+    media_items = []
+    media_ids_by_url: Dict[str, str] = {}
+
+    if embed_videos:
+        def _replace_video_src(match: re.Match) -> str:
+            raw_url = html.unescape(match.group("url")).strip()
+            lowered = raw_url.lower()
+            if not lowered.startswith(("http://", "https://")):
+                return match.group(0)
+
+            media_id = media_ids_by_url.get(raw_url)
+            if media_id is None:
+                digest = hashlib.sha256(raw_url.encode("utf-8")).hexdigest()[:32]
+                media_id = f"video_{digest}"
+                media_ids_by_url[raw_url] = media_id
+                media_items.append(
+                    {
+                        "id": media_id,
+                        "media": {
+                            "type": "video",
+                            "media": raw_url,
+                            "supports_streaming": True,
+                        },
+                    }
+                )
+            return f'{match.group("prefix")}{match.group("quote")}tg://video?id={media_id}{match.group("quote")}'
+
+        rendered_html = _RICH_VIDEO_SRC_RE.sub(_replace_video_src, rendered_html)
+
+    rich_message: Dict = {"html": rendered_html}
+    if media_items:
+        rich_message["media"] = media_items
+    return rich_message
+
+
+def _rich_message_video_link_fallback(html_content: str) -> str:
+    """将不可拉取的视频降级为带原始 URL 的普通富文本，保证主回复仍可送达。"""
+    urls = []
+
+    def _strip_video(match: re.Match) -> str:
+        raw_url = html.unescape(match.group("url")).strip()
+        if raw_url.lower().startswith(("http://", "https://")):
+            urls.append(raw_url)
+        return ""
+
+    without_video = _RICH_VIDEO_TAG_RE.sub(_strip_video, html_content or "")
+    text_fallback = _rich_message_plain_text_fallback(without_video)
+    seen = set()
+    link_blocks = []
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        safe_url = html.escape(url, quote=True)
+        link_blocks.append(f'<p><a href="{safe_url}">查看视频</a></p>')
+    return "".join(([text_fallback] if text_fallback else []) + link_blocks)
 
 
 async def send_message(chat_id: int, text: str) -> None:
@@ -360,13 +448,15 @@ async def _reassert_active_draft_content(chat_id: int, draft_id: int) -> None:
         if not html_content or not str(html_content).strip():
             return
 
+        # 草稿接口不支持直接上传新媒体；视频块在草稿中降为安全链接，
+        # 仅在最终 sendRichMessage 里通过 rich_message.media 内嵌。
+        draft_html = _rich_message_video_link_fallback(html_content)
         payload = {
             "chat_id": chat_id,
             "draft_id": draft_id,
-            "rich_message": {
-                "content": html_content,
-                "html": html_content,
-            },
+            "rich_message": _build_rich_message_from_html(
+                draft_html, embed_videos=False
+            ),
         }
         # reassert 只是视觉保活，失败可由下一次真实 flush 恢复；不应占用草稿锁过久。
         timeout = aiohttp.ClientTimeout(total=4, connect=2)
@@ -456,6 +546,8 @@ async def send_rich_message_draft_unlocked(
     html_content = html_content.strip()
     # 自动转义 src="..." 中的裸 &（R2 presigned URL 等），防止 Telegram 拉不到媒体
     html_content = _escape_media_src_urls(html_content)
+    # 草稿接口不支持直接上传新媒体，强制草稿同样只保留视频链接。
+    html_content = _rich_message_video_link_fallback(html_content)
 
     try:
         draft_id_int = int(draft_id)
@@ -468,10 +560,9 @@ async def send_rich_message_draft_unlocked(
     payload = {
         "chat_id": chat_id,
         "draft_id": draft_id_int,
-        "rich_message": {
-            "content": html_content,
-            "html": html_content,
-        },
+        "rich_message": _build_rich_message_from_html(
+            html_content, embed_videos=False
+        ),
     }
     if message_thread_id:
         payload["message_thread_id"] = message_thread_id
@@ -515,6 +606,9 @@ async def send_rich_message_draft(
         return 0
     # 自动转义 src="..." 中的裸 &（R2 presigned URL 等），防止 Telegram 拉不到媒体
     html_content = _escape_media_src_urls(html_content)
+    # sendRichMessageDraft 不支持直接上传新文件，不能传 rich_message.media。
+    # 视频预览降级为链接，最终永久消息再以媒体数组内嵌。
+    html_content = _rich_message_video_link_fallback(html_content)
     try:
         draft_id_int = int(draft_id)
         if draft_id_int == 0:
@@ -552,10 +646,9 @@ async def send_rich_message_draft(
         payload = {
             "chat_id": chat_id,
             "draft_id": draft_id_int,
-            "rich_message": {
-                "content": html_content,
-                "html": html_content,
-            },
+            "rich_message": _build_rich_message_from_html(
+                html_content, embed_videos=False
+            ),
         }
         if message_thread_id:
             payload["message_thread_id"] = message_thread_id
@@ -703,10 +796,7 @@ async def send_rich_html_message(
 
     payload = {
         "chat_id": chat_id,
-        "rich_message": {
-            "content": html_content,
-            "html": html_content,
-        },
+        "rich_message": _build_rich_message_from_html(html_content),
         "disable_notification": False,
         "protect_content": False,
     }
@@ -743,18 +833,29 @@ async def send_rich_html_message(
                     content_required = (
                         resp.status == 400 and "rich_message_content_required" in body_lower
                     )
-                    fallback_html = _rich_message_plain_text_fallback(html_content)
-                    if content_required and fallback_html and fallback_html != html_content:
+                    video_media_error = (
+                        resp.status == 400
+                        and (
+                            "rich_message_video_no_media_found" in body_lower
+                            or "rich_message_video_url_invalid" in body_lower
+                        )
+                    )
+                    if video_media_error:
+                        fallback_html = _rich_message_video_link_fallback(html_content)
+                        fallback_reason = "video media could not be fetched"
+                    else:
+                        fallback_html = _rich_message_plain_text_fallback(html_content)
+                        fallback_reason = "RICH_MESSAGE_CONTENT_REQUIRED"
+                    if (content_required or video_media_error) and fallback_html and fallback_html != html_content:
                         fallback_payload = {
                             **payload,
-                            "rich_message": {
-                                "content": fallback_html,
-                                "html": fallback_html,
-                            },
+                            "rich_message": _build_rich_message_from_html(
+                                fallback_html, embed_videos=False
+                            ),
                         }
                         logger.warning(
-                            "sendRichHtmlMessage received RICH_MESSAGE_CONTENT_REQUIRED; "
-                            "retrying once with a safe paragraph fallback"
+                            "sendRichHtmlMessage received %s; retrying once with a safe fallback",
+                            fallback_reason,
                         )
                         async with session.post(f"{BASE_URL}/sendRichMessage", json=fallback_payload) as fallback_resp:
                             if fallback_resp.status == 200:

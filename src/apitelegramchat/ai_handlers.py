@@ -1282,18 +1282,55 @@ def _format_api_error_notice(
         detail: str = "",
         request_id: str = "",
 ) -> str:
-    parts = [f"⚠️ <b>{escape_html(api_name)} 请求失败</b>"]
+    """将图片 API 故障渲染为「用户提示 + 引用式诊断」两层内容。
+
+    面向用户的第一段只说明当前可采取的动作；HTTP 状态、模型与追踪 ID
+    均集中放进 blockquote，避免同一 Request ID 在正文和详情里重复出现。
+    """
+    if error_code == 429:
+        action_text = "当前图片服务请求较多，请稍后再试；无需修改你的描述。"
+        status_text = "服务繁忙"
+    elif error_code in (400, 422):
+        action_text = "这次图片描述暂时无法处理。请简化描述或调整表述后重试。"
+        status_text = "请求暂未被处理"
+    elif error_code in (401, 403):
+        action_text = "图片服务暂时不可用，请稍后再试。"
+        status_text = "服务访问受限"
+    elif error_code >= 500:
+        action_text = "图片服务暂时不可用，请稍后再试。"
+        status_text = "服务异常"
+    else:
+        action_text = "图片暂时无法生成，请稍后重试。"
+        status_text = "请求未完成"
+
+    diagnostic_lines: list[str] = []
     if error_code:
-        parts.append(f"HTTP 状态：{error_code}")
+        diagnostic_lines.append(f"<b>状态：</b>{status_text}（HTTP {error_code}）")
     if model:
-        parts.append(f"模型：{escape_html(model)}")
+        diagnostic_lines.append(f"<b>模型：</b>{escape_html(_short_model_name(model))}")
     if request_id:
-        parts.append(f"Request ID：{escape_html(request_id)}")
+        diagnostic_lines.append(f"<b>请求标识：</b>{escape_html(request_id)}")
     if detail:
         formatted_detail = _format_error_detail_for_display(detail)
         if formatted_detail:
-            parts.append(f"详情：{formatted_detail}")
-    return "<br/>".join(parts)
+            filtered_lines = []
+            for line in formatted_detail.split("<br/>"):
+                visible_line = html.unescape(strip_html_tags(line)).strip()
+                # request_id 已在独立字段展示，避免来源响应又重复一遍。
+                if request_id and visible_line.lower().startswith("request id") and request_id.lower() in visible_line.lower():
+                    continue
+                filtered_lines.append(line)
+            if filtered_lines:
+                diagnostic_lines.append(f"<b>服务响应：</b>{'<br/>'.join(filtered_lines)}")
+
+    diagnostic_html = ""
+    if diagnostic_lines:
+        diagnostic_html = (
+            "<blockquote><b>诊断信息</b><br/>"
+            + "<br/>".join(diagnostic_lines)
+            + "</blockquote>"
+        )
+    return f"<p><b>图片暂时无法生成</b></p><p>{action_text}</p>{diagnostic_html}"
 
 
 # 内容安全/审核相关错误的关键词（不区分大小写）
@@ -1418,8 +1455,9 @@ async def build_system_prompt(
 <p>媒体元素必须作为<b>独立块级元素</b>输出，绝对禁止嵌入表格、段落或行内容器中。</p>
 <ul>
   <li><b>地图：</b> <code>&lt;tg-map lat="41.9" long="12.5" zoom="14"/&gt;</code>（zoom 范围：13-20）。</li>
-  <li><b>单张图片 / 视频 / 音频：</b> <code>&lt;img src="URL"/&gt;</code> / <code>&lt;video src="URL"/&gt;</code> / <code>&lt;audio src="URL"/&gt;</code></li>
-  <li><b>带图注媒体：</b> <code>&lt;figure&gt;&lt;img src="URL"/&gt;&lt;figcaption&gt;图注文本&lt;cite&gt;来源/署名&lt;/cite&gt;&lt;/figcaption&gt;&lt;/figure&gt;</code></li>
+  <li><b>单张图片 / 视频 / 音频：</b> <code>&lt;img src="URL"/&gt;</code> / <code>&lt;video src="URL"&gt;&lt;/video&gt;</code> / <code>&lt;audio src="URL"&gt;&lt;/audio&gt;</code>。</li>
+  <li><b>视频 URL：</b> 必须是可公开访问的 HTTP(S) 直链；发送层会把 <code>&lt;video src="URL"&gt;&lt;/video&gt;</code> 自动转换为 Telegram 所需的媒体引用，严禁自行输出 <code>tg://video?id=...</code>。</li>
+  <li><b>带图注媒体：</b> <code>&lt;figure&gt;&lt;img src="URL"/&gt;&lt;figcaption&gt;图注文本&lt;cite&gt;来源/署名&lt;/cite&gt;&lt;/figcaption&gt;&lt;/figure&gt;</code>；视频同理使用 <code>&lt;figure&gt;&lt;video src="URL"&gt;&lt;/video&gt;&lt;figcaption&gt;视频说明&lt;/figcaption&gt;&lt;/figure&gt;</code>。</li>
   <li><b>多媒体幻灯片（≥2件资源）：</b> <code>&lt;tg-slideshow&gt;&lt;img src="URL1"/&gt;&lt;img src="URL2"/&gt;&lt;figcaption&gt;可选图注&lt;/figcaption&gt;&lt;/tg-slideshow&gt;</code></li>
 </ul>
 

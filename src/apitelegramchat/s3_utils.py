@@ -30,13 +30,12 @@ logger = logging.getLogger(__name__)
 session = aioboto3.Session() if aioboto3 is not None else None
 _LOCAL_R2_ROOT = data_root() / "r2_cache"
 
-# R2 超时配置：connect 3s，read 5s，0 次重试（1 次尝试，失败即放弃）。
-# 默认 botocore 配置是 connect 60s / read 60s / 3 retries，冷启动时一次
-# 挂掉的 R2 调用会卡 60s+60s*3 = 240s。这里把每次调用限制在 3+5=8s 内，
-# 配合 init 的 30s 全局超时，确保 init 最多跑 30s 就放弃。
+# R2 上传对媒体生成是关键路径。保留 botocore 级零重试，由下方的显式循环
+# 控制总尝试次数，避免隐藏重试把请求时间放大；但把读超时提高到 30 秒，
+# 以容忍 R2 冷启动、跨区网络抖动及视频上传的响应延迟。
 _R2_CONFIG = Config(
-    connect_timeout=3,
-    read_timeout=5,
+    connect_timeout=5,
+    read_timeout=30,
     retries={"max_attempts": 0, "mode": "standard"},
     max_pool_connections=10,
 ) if Config is not None else None
@@ -82,7 +81,10 @@ async def upload_bytes_to_r2(
             logger.exception("Local R2 cache write failed: %s", e)
             return None
 
-    max_attempts = 1
+    # put_object 以唯一 key 写入，重试是幂等安全的。3 次尝试的最长网络等待
+    # 约为 35s + 1s + 35s + 2s + 35s，明显优于一次 5 秒超时后直接回退到
+    # 可能不可被 Telegram 拉取的源站 URL。
+    max_attempts = 3
     for attempt in range(max_attempts):
         try:
             async with session.client(
@@ -103,8 +105,14 @@ async def upload_bytes_to_r2(
             if R2_PUBLIC_URL:
                 return f"{R2_PUBLIC_URL.rstrip('/')}/{key}"
             return await generate_presigned_url(key)
-        except Exception:
-            logger.exception("R2 上传失败（第 %d/%d 次）：%s", attempt + 1, max_attempts, key)
+        except Exception as exc:
+            logger.warning(
+                "R2 上传失败（第 %d/%d 次）：%s；%s",
+                attempt + 1,
+                max_attempts,
+                key,
+                str(exc)[:240],
+            )
             if attempt < max_attempts - 1:
                 await asyncio.sleep(2 ** attempt)
 

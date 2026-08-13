@@ -85,10 +85,11 @@ async def test_permanent_send_retries_once_with_safe_paragraph() -> None:
         )
         require(result == 2468, "安全段落回退成功时必须返回新消息 ID")
         require(len(FakeSession.sent_payloads) == 2, "内容错误时必须只额外尝试一次回退发送")
-        first_content = FakeSession.sent_payloads[0]["rich_message"]["content"]
-        second_content = FakeSession.sent_payloads[1]["rich_message"]["content"]
-        require(first_content == "<details><summary>步骤</summary><i>完成</i></details>", "首发必须保留原 HTML")
-        require(second_content == "<p>步骤完成</p>", "回退必须为服务端可接受的安全段落")
+        first_html = FakeSession.sent_payloads[0]["rich_message"]["html"]
+        second_html = FakeSession.sent_payloads[1]["rich_message"]["html"]
+        require(first_html == "<details><summary>步骤</summary><i>完成</i></details>", "首发必须保留原 HTML")
+        require(second_html == "<p>步骤完成</p>", "回退必须为服务端可接受的安全段落")
+        require("content" not in FakeSession.sent_payloads[0]["rich_message"], "InputRichMessage 不得包含未定义 content 字段")
     finally:
         utils.aiohttp.ClientSession = original_session
 
