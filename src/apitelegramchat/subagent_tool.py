@@ -21,7 +21,7 @@
     4. 直到 LLM 不再返回 tool_calls，取最终 content 作为答复
 - 工具白名单：默认允许所有 SEARCH_TOOLS，调用方可限制为子集
 - 安全护栏：
-    - 最大循环轮数：MAX_SUBAGENT_ROUNDS = 32（可通过环境变量 SUBAGENT_MAX_ROUNDS 调整）
+    - token 接近上下文预算时自动创建 checkpoint 并继续；仅保留紧急工具调用熔断
     - 最大单次工具结果长度：MAX_SUBAGENT_RESULT_LEN = 8000（可通过环境变量 SUBAGENT_MAX_RESULT_LEN 调整）
     - 总体超时：DEFAULT_TIMEOUT = 900s（可通过环境变量 SUBAGENT_DEFAULT_TIMEOUT 调整）
     - 禁止子 agent 递归调用 subagent 工具（防爆炸）
@@ -45,6 +45,12 @@ from typing import Any, Optional
 
 from apitelegramchat.api_client import api_client
 from apitelegramchat.config import SUPPORTED_MODELS, DEFAULT_MODEL
+from apitelegramchat.agent_context import (
+    compact_active_agent_context,
+    estimate_messages_tokens,
+    should_checkpoint,
+    token_budget_for_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +70,10 @@ def _env_int(name: str, default: int, *, min_value: int | None = None, max_value
 
 
 # ---------- 安全护栏 ----------
-MAX_SUBAGENT_ROUNDS = _env_int("SUBAGENT_MAX_ROUNDS", 32, min_value=1, max_value=128)
+# 正常停止由 token 预算的 checkpoint 决定；该值只防止模型异常无限调用工具。
+MAX_SUBAGENT_TOOL_CALLS_EMERGENCY = _env_int(
+    "SUBAGENT_MAX_TOOL_CALLS_EMERGENCY", 512, min_value=32, max_value=4096
+)
 MAX_SUBAGENT_RESULT_LEN = _env_int("SUBAGENT_MAX_RESULT_LEN", 8000, min_value=1000, max_value=50000)
 DEFAULT_TIMEOUT = _env_int("SUBAGENT_DEFAULT_TIMEOUT", 900, min_value=60, max_value=1800)  # 秒
 MAX_TASK_LEN = _env_int("SUBAGENT_MAX_TASK_LEN", 8000, min_value=1000, max_value=50000)
@@ -216,10 +225,15 @@ async def _subagent_agentic_loop(
 
     # 用于工具结果回填
     loop_messages = list(messages)
+    segment_no = 1
 
     await _report(f"启动子 agent（模型 {getattr(model_info, 'name', model)}，{len(tools)} 个工具可用）")
 
-    while rounds < MAX_SUBAGENT_ROUNDS:
+    while True:
+        if total_tool_calls >= MAX_SUBAGENT_TOOL_CALLS_EMERGENCY:
+            last_error = f"子 agent 达到紧急工具调用熔断 {MAX_SUBAGENT_TOOL_CALLS_EMERGENCY}"
+            await _report(last_error)
+            break
         rounds += 1
         elapsed = time.monotonic() - start
         if elapsed > timeout_overall:
@@ -232,7 +246,7 @@ async def _subagent_agentic_loop(
                 "elapsed": elapsed,
             }
 
-        await _report(f"第 {rounds}/{MAX_SUBAGENT_ROUNDS} 轮：LLM 思考中…（已耗时 {elapsed:.0f}s）")
+        await _report(f"第 {rounds} 轮：LLM 思考中…（已耗时 {elapsed:.0f}s）")
 
         try:
             create_params = {
@@ -326,7 +340,7 @@ async def _subagent_agentic_loop(
         # 报告即将执行的工具
         tool_names = [tc_entry["function"]["name"] for tc_entry in tc_list if tc_entry.get("function")]
         await _report(
-            f"第 {rounds}/{MAX_SUBAGENT_ROUNDS} 轮：执行工具 {' + '.join(tool_names)}…"
+            f"第 {rounds} 轮：执行工具 {' + '.join(tool_names)}…"
             f"（已耗时 {time.monotonic() - start:.0f}s）"
         )
 
@@ -358,11 +372,26 @@ async def _subagent_agentic_loop(
             })
             total_tool_calls += 1
 
-    # 跑出循环仍未拿到最终答复
-    await _report(f"结束：达到最大轮数或出错（{rounds} 轮，{total_tool_calls} 次工具调用）")
+        if should_checkpoint(loop_messages, model_info):
+            before_tokens = estimate_messages_tokens(loop_messages)
+            loop_messages, checkpoint = compact_active_agent_context(
+                loop_messages,
+                model_info,
+                segment_no=segment_no,
+                reason="token_budget",
+            )
+            segment_no += 1
+            await _report(
+                "已保存子任务检查点，正在以紧凑上下文继续…"
+                f"（{before_tokens}->{estimate_messages_tokens(loop_messages)} tokens，"
+                f"预算 {token_budget_for_model(model_info).input_hard_limit}）"
+            )
+
+    # 仅在超时、LLM 错误或紧急无限循环保护时到达这里。
+    await _report(f"结束：执行未完成（{rounds} 轮，{total_tool_calls} 次工具调用）")
     return {
         "ok": False,
-        "error": last_error or f"子 agent 达到最大轮数 {MAX_SUBAGENT_ROUNDS}",
+        "error": last_error or "子 agent 未能生成最终答复",
         "rounds": rounds,
         "tool_calls": total_tool_calls,
         "elapsed": time.monotonic() - start,

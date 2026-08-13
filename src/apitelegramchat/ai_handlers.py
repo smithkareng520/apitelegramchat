@@ -64,6 +64,12 @@ from apitelegramchat.ask_user_tool import (
     wait_for_answer,
     answer_to_tool_result,
 )
+from apitelegramchat.agent_context import (
+    compact_active_agent_context,
+    estimate_messages_tokens,
+    should_checkpoint,
+    token_budget_for_model,
+)
 import apitelegramchat.state as state
 
 logger = get_logger(__name__)
@@ -71,7 +77,8 @@ logger.setLevel(logging.DEBUG)
 
 # ---------- 常量 ----------
 MAX_TOOL_RESPONSE_LEN = 100000
-MAX_TOOL_CALLS = 40
+# 正常续写由 token 预算触发 checkpoint；该值只是防止模型无限循环的紧急熔断。
+MAX_AGENT_TOOL_CALLS_EMERGENCY = int(os.getenv("AGENT_MAX_TOOL_CALLS_EMERGENCY", "512"))
 TOOL_ERROR_STREAK_LIMIT = 3
 TOOL_CALL_TIMEOUT = 12
 OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
@@ -2277,8 +2284,11 @@ async def _run_tool_calls_and_append(
         new_history_entries.append(tool_msg)
     await builder.flush()
 
-    if tool_call_count_ref[0] >= MAX_TOOL_CALLS:
-        logger.warning(f"[{api_label}] 工具调用超限 ({MAX_TOOL_CALLS})")
+    if tool_call_count_ref[0] >= MAX_AGENT_TOOL_CALLS_EMERGENCY:
+        logger.warning(
+            "[%s] 工具调用达到紧急熔断阈值 (%s)",
+            api_label, MAX_AGENT_TOOL_CALLS_EMERGENCY,
+        )
         return "over_limit"
 
     error_msgs = []
@@ -3224,12 +3234,25 @@ async def _agentic_loop_openai_compat(
     tool_call_count_ref = [0]
     new_history_entries = []
     parallel_tool_calls = True
+    segment_no = 1
+    _round = 0
 
     model_info = SUPPORTED_MODELS.get(current_model)
     supports_sampling = model_info.supports_sampling if model_info else True
     max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
 
-    for _round in range(MAX_TOOL_CALLS):
+    while True:
+        _round += 1
+        # 轮数不再决定任务是否停止；只有 token 接近预算时才会创建
+        # checkpoint 并开启下一执行段。此处只保留紧急无限循环保护。
+        if tool_call_count_ref[0] >= MAX_AGENT_TOOL_CALLS_EMERGENCY:
+            logger.error(
+                "[%s] Agent reached emergency tool-call ceiling=%s",
+                api_label, MAX_AGENT_TOOL_CALLS_EMERGENCY,
+            )
+            final_content = "（任务因异常循环保护而暂停；进度已压缩保存，可在修正目标后继续。）"
+            new_history_entries.append({"role": "assistant", "content": final_content})
+            break
         added_tool_indices = set()
         last_arg_len = {}
 
@@ -3526,7 +3549,7 @@ async def _agentic_loop_openai_compat(
             synth_params = {
                 "model": current_model,
                 "messages": loop_messages + [{"role": "user",
-                                              "content": f"System: Maximum tool calls ({MAX_TOOL_CALLS}) reached for this turn. Tool usage is now DISABLED. Please immediately summarize what you have successfully done so far, explicitly state what failed or what is left to do, and ask the user if they want to continue the operation in the next turn."}],
+                                              "content": f"System: Emergency tool-call ceiling ({MAX_AGENT_TOOL_CALLS_EMERGENCY}) reached. Tool usage is disabled. Summarize completed work, unresolved blockers, and the safest next action."}],
                 "stream": True,
                 "max_tokens": max_tokens,
             }
@@ -3555,7 +3578,31 @@ async def _agentic_loop_openai_compat(
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
             break
-        # 如果 status == "continue"（包括之前熔断返回的），循环自然继续
+
+        # 达到 token 阈值后，立即把当前 segment 的原始 tool 协议压缩为
+        # 结构化 checkpoint，再以干净上下文继续；草稿和任务不停止。
+        if should_checkpoint(loop_messages, model_info):
+            before_tokens = estimate_messages_tokens(loop_messages)
+            loop_messages, checkpoint = compact_active_agent_context(
+                loop_messages,
+                model_info,
+                segment_no=segment_no,
+                reason="token_budget",
+            )
+            segment_no += 1
+            logger.info(
+                "[%s] Agent checkpoint segment=%s tokens=%s->%s limit=%s",
+                api_label,
+                checkpoint.get("segment"),
+                before_tokens,
+                estimate_messages_tokens(loop_messages),
+                token_budget_for_model(model_info).input_hard_limit,
+            )
+            builder.add_text(
+                "<p><i>已保存执行检查点，正在以紧凑上下文继续任务…</i></p>"
+            )
+            await builder.flush(force=True)
+        # status == "continue" 时自然进入下一次模型调用。
 
     return final_content, final_usage, new_history_entries
 
@@ -3600,8 +3647,19 @@ async def _agentic_loop_gemini_openai_compat(
     final_usage = None
     tool_call_count_ref = [0]
     new_history_entries: list = []
+    segment_no = 1
+    _round = 0
 
-    for _round in range(MAX_TOOL_CALLS):
+    while True:
+        _round += 1
+        if tool_call_count_ref[0] >= MAX_AGENT_TOOL_CALLS_EMERGENCY:
+            logger.error(
+                "[gemini] Agent reached emergency tool-call ceiling=%s",
+                MAX_AGENT_TOOL_CALLS_EMERGENCY,
+            )
+            final_content = "（任务因异常循环保护而暂停；进度已压缩保存，可在修正目标后继续。）"
+            new_history_entries.append({"role": "assistant", "content": final_content})
+            break
         payload: dict = {
             "model": current_model,
             "messages": loop_messages,
@@ -3724,7 +3782,7 @@ async def _agentic_loop_gemini_openai_compat(
             }
             synth_payload["messages"] = loop_messages + [
                 {"role": "user",
-                 "content": f"System: Maximum tool calls ({MAX_TOOL_CALLS}) reached for this turn. Tool usage is now DISABLED. Please immediately summarize what you have successfully done so far, explicitly state what failed or what is left to do, and ask the user if they want to continue the operation in the next turn."}
+                 "content": f"System: Emergency tool-call ceiling ({MAX_AGENT_TOOL_CALLS_EMERGENCY}) reached. Tool usage is disabled. Summarize completed work, unresolved blockers, and the safest next action."}
             ]
             synth_payload["max_tokens"] = max_tokens
             if supports_sampling:
@@ -3753,6 +3811,27 @@ async def _agentic_loop_gemini_openai_compat(
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
             break
+
+        if should_checkpoint(loop_messages, model_info):
+            before_tokens = estimate_messages_tokens(loop_messages)
+            loop_messages, checkpoint = compact_active_agent_context(
+                loop_messages,
+                model_info,
+                segment_no=segment_no,
+                reason="token_budget",
+            )
+            segment_no += 1
+            logger.info(
+                "[gemini] Agent checkpoint segment=%s tokens=%s->%s limit=%s",
+                checkpoint.get("segment"),
+                before_tokens,
+                estimate_messages_tokens(loop_messages),
+                token_budget_for_model(model_info).input_hard_limit,
+            )
+            builder.add_text(
+                "<p><i>已保存执行检查点，正在以紧凑上下文继续任务…</i></p>"
+            )
+            await builder.flush(force=True)
 
     return final_content, final_usage, new_history_entries
 

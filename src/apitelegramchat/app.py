@@ -67,6 +67,13 @@ from apitelegramchat.ask_user_tool import (
 )
 from apitelegramchat.file_handlers import download_file
 from apitelegramchat.workspace_utils import _get_workspace_lock, init_workspace
+from apitelegramchat.agent_context import (
+    compact_turn_for_history,
+    estimate_message_tokens as _token_estimate_message,
+    estimate_messages_tokens,
+    token_budget_for_model,
+    trim_completed_history_to_budget,
+)
 
 app = Quart(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
@@ -83,7 +90,7 @@ def _reply_params(message_id: int | None) -> dict | None:
     return {"message_id": mid}
 
 # ---------- 上下文管理常量 ----------
-MAX_HISTORY_MESSAGES = 30
+# 会话历史完全按 token 预算裁剪；不再以固定消息数量删除长任务。
 MEDIA_GROUP_TIMEOUT = 5
 REPLY_MARKER = "💡 引用回复:"
 
@@ -288,126 +295,69 @@ async def set_webhook() -> None:
             else:
                 logger.error(f"[ERROR] Webhook setup failed: {await resp.text()}")
 
-# ---------- Token 估算及上下文修剪 ----------
-_MEDIA_TOKEN_OVERHEAD = 64
-_MESSAGE_WRAPPER_TOKENS = 4
-
-def estimate_tokens(text: str) -> int:
-    if not text:
-        return 0
-    zh_chars = len(re.findall(r'[一-龥]', text))
-    en_text = re.sub(r'[一-龥]', ' ', text)
-    en_words = len(en_text.split())
-    return int((zh_chars * 1.8) + (en_words * 1.3) * 1.2)
-
-def _estimate_content_tokens(content) -> int:
-    if content is None:
-        return 0
-    if isinstance(content, str):
-        return estimate_tokens(content)
-    if isinstance(content, list):
-        total = 0
-        for part in content:
-            total += _estimate_content_tokens(part)
-        return total
-    if isinstance(content, dict):
-        part_type = str(content.get("type", "")).lower()
-        if part_type == "text":
-            return estimate_tokens(str(content.get("text", "")))
-        if part_type in {"image_url", "image", "input_image"}:
-            return _MEDIA_TOKEN_OVERHEAD
-        if part_type in {"file", "input_file", "document"}:
-            filename = ""
-            file_obj = content.get("file")
-            if isinstance(file_obj, dict):
-                filename = str(file_obj.get("filename", ""))
-            return _MEDIA_TOKEN_OVERHEAD * 2 + estimate_tokens(filename)
-
-        total = _MEDIA_TOKEN_OVERHEAD
-        for value in content.values():
-            if isinstance(value, (str, list, dict)):
-                total += _estimate_content_tokens(value)
-        return total
-    return estimate_tokens(str(content))
-
-def _estimate_message_tokens(message: dict) -> int:
-    tokens = _MESSAGE_WRAPPER_TOKENS
-    tokens += _estimate_content_tokens(message.get("content", ""))
-    if message.get("name"):
-        tokens += estimate_tokens(str(message["name"]))
-    tool_calls = message.get("tool_calls") or []
-    if tool_calls:
-        try:
-            tokens += estimate_tokens(json.dumps(tool_calls, ensure_ascii=False))
-        except Exception:
-            tokens += _MEDIA_TOKEN_OVERHEAD * len(tool_calls)
-    return tokens
+# ---------- Token 预算及上下文修剪 ----------
+# 实现在 agent_context.py 中，以确保主 Agent、子 Agent 与聊天历史使用同一套保守估算器。
 
 async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool:
+    """Make room for a new user turn using the active model's token budget.
+
+    This function only prunes completed historical turns. The running Agent turn
+    has not been committed yet, so it can never be deleted by a fixed message
+    count while it is still needed for continuation.
+    """
     lock = await get_chat_lock(chat_id)
     async with lock:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
-        ledger = ctx.setdefault("token_ledger", [])
-        cm = get_user_model(chat_id)
-        model_info = SUPPORTED_MODELS.get(cm)
-        max_context = getattr(model_info, 'max_context', None) or 128000
-        max_output = getattr(model_info, 'max_output_tokens', None) or 8192
-        safe_limit = max_context - max_output
-        new_input_est = _estimate_message_tokens(new_user_message)
-        if new_input_est < 1:
-            new_input_est = 1
+        model_info = SUPPORTED_MODELS.get(get_user_model(chat_id))
+        budget = token_budget_for_model(model_info)
 
-        while True:
-            ledger_total = sum(item["input_tokens"] + item["output_tokens"] for item in ledger)
-            if ledger_total + new_input_est <= safe_limit:
-                return True
+        trim_completed_history_to_budget(
+            history, model_info, protected_from_index=len(history)
+        )
+        projected = estimate_messages_tokens(history) + _token_estimate_message(new_user_message)
+        ctx["context_token_estimate"] = projected
+        # Provider usage is retained as telemetry only. It is model-specific and
+        # must not decide whether history is deleted.
+        ctx["token_ledger"] = []
+        ctx["last_prompt_tokens"] = 0
+        ctx["last_completion_tokens"] = 0
+        if projected > budget.input_hard_limit:
+            logger.warning(
+                "chat=%s input over token budget projected=%s limit=%s",
+                chat_id, projected, budget.input_hard_limit,
+            )
+            return False
+        return True
 
-            deleted = False
-            for i in range(len(history)):
-                if history[i].get("role") == "user":
-                    end = len(history)
-                    for j in range(i + 1, len(history)):
-                        if history[j].get("role") == "user":
-                            end = j
-                            break
-                    removed_turn = history[i:end]
-                    del history[i:end]
-
-                    if ledger:
-                        removed = ledger.pop(0)
-                        ctx["last_prompt_tokens"] = max(
-                            0,
-                            ctx.get("last_prompt_tokens", 0) - removed["input_tokens"] - removed["output_tokens"],
-                        )
-                    else:
-                        removed_est = sum(_estimate_message_tokens(m) for m in removed_turn)
-                        ctx["last_prompt_tokens"] = max(0, ctx.get("last_prompt_tokens", 0) - removed_est)
-                    deleted = True
-                    break
-
-            if not deleted:
-                ctx["last_prompt_tokens"] = 0
-                ctx["last_completion_tokens"] = 0
-                ctx["token_ledger"] = []
-                ctx["conversation_history"] = [m for m in history if m.get("role") == "system"]
-                if new_input_est > safe_limit:
-                    return False
-                return True
 
 async def update_conversation_and_ledger(chat_id: int, user_message: dict, new_msgs: list, usage: dict = None) -> None:
+    """Persist a completed, token-bounded user-visible turn.
+
+    Raw `assistant.tool_calls` and `tool` protocol records are execution trace,
+    not conversation memory. Keeping them out of this history removes the former
+    30-message self-deletion failure mode for long-running Agent tasks.
+    """
     lock = await get_chat_lock(chat_id)
     async with lock:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
-        block_content = user_message.get("content", "")
+        stored_user = dict(user_message)
+        block_content = stored_user.get("content", "")
         if isinstance(block_content, str) and REPLY_MARKER in block_content:
-            user_message["content"] = block_content.split(REPLY_MARKER)[-1].strip()
-        history.append(user_message)
-        for msg in new_msgs:
-            if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
-                msg["content"] = msg["content"].strip()
-            history.append(msg)
+            stored_user["content"] = block_content.split(REPLY_MARKER)[-1].strip()
+
+        committed_turn = compact_turn_for_history(stored_user, new_msgs)
+        protected_from_index = len(history)
+        history.extend(committed_turn)
+
+        model_info = SUPPORTED_MODELS.get(get_user_model(chat_id))
+        final_tokens = trim_completed_history_to_budget(
+            history, model_info, protected_from_index=protected_from_index
+        )
+        ctx["context_token_estimate"] = final_tokens
+        ctx["token_ledger"] = []
+
         if usage:
             if hasattr(usage, "model_dump"):
                 usage_dict = usage.model_dump()
@@ -416,37 +366,15 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict, new_m
             elif isinstance(usage, dict):
                 usage_dict = usage
             else:
-                usage_dict = {"prompt_tokens": getattr(usage, "prompt_tokens", 0),
-                              "completion_tokens": getattr(usage, "completion_tokens", 0)}
-            current_prompt = usage_dict.get("prompt_tokens", 0)
-            current_comp = usage_dict.get("completion_tokens", 0)
-            last_prompt = ctx.get("last_prompt_tokens", 0)
-            last_comp = ctx.get("last_completion_tokens", 0)
-            t_input = max(0, current_prompt - last_prompt - last_comp)
-            t_output = current_comp
-            ctx["last_prompt_tokens"] = current_prompt
-            ctx["last_completion_tokens"] = current_comp
-            ledger = ctx.setdefault("token_ledger", [])
-            ledger.append({"input_tokens": t_input, "output_tokens": t_output})
-        while len(history) > MAX_HISTORY_MESSAGES:
-            deleted = False
-            for i in range(len(history)):
-                if history[i].get("role") == "user":
-                    end = len(history)
-                    for j in range(i + 1, len(history)):
-                        if history[j].get("role") == "user":
-                            end = j
-                            break
-                    del history[i:end]
-                    ledger = ctx.setdefault("token_ledger", [])
-                    if ledger:
-                        removed = ledger.pop(0)
-                        ctx["last_prompt_tokens"] = max(0, ctx.get("last_prompt_tokens", 0) - removed["input_tokens"] - removed["output_tokens"])
-                    deleted = True
-                    break
-            if not deleted:
-                if history:
-                    history.pop(0)
+                usage_dict = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+                    "completion_tokens": getattr(usage, "completion_tokens", 0),
+                }
+            ctx["last_usage"] = usage_dict
+        logger.info(
+            "chat=%s committed compact turn messages=%s tokens=%s",
+            chat_id, len(committed_turn), final_tokens,
+        )
 
 # ---------------------------------------------------------------------------
 # 业务处理
