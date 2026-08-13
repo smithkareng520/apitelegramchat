@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 
@@ -25,6 +26,19 @@ MAX_CHECKPOINT_CHARS = 12_000
 MAX_TOOL_TRACE_ITEMS = 48
 MAX_TOOL_SUMMARY_CHARS = 700
 MAX_PERSISTENT_ASSISTANT_CHARS = 18_000
+MAX_RESTORABLE_REFERENCES = 32
+MAX_FAILURE_EVIDENCE = 12
+MAX_RECITATION_ITEMS = 8
+TASK_RECITATION_MARKER = "[APITELEGRAMCHAT_TASK_RECITATION]"
+TASK_LEDGER_FILENAME = ".agent_context_ledger.json"
+_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+# Bounded, permissive path detector for sandbox/workspace artifacts.
+_PATH_RE = re.compile(r"(?:^|[\s\"'=:(])((?:/|\.\.?/)[A-Za-z0-9_@+.,=~:/-]+)")
+_ERROR_RE = re.compile(
+    r"(?:\berror\b|\bfailed\b|\bfailure\b|\bexception\b|\btimeout\b|"
+    r"\btraceback\b|错误|失败|异常|超时)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -147,20 +161,50 @@ def _latest_human_request(messages: list[dict[str, Any]]) -> str:
         content = message.get("content")
         if not isinstance(content, str):
             continue
-        if content.startswith("System:") or content.startswith(CHECKPOINT_MARKER):
+        if (
+            content.startswith("System:")
+            or content.startswith(CHECKPOINT_MARKER)
+            or content.startswith(TASK_RECITATION_MARKER)
+        ):
             continue
         return _content_preview(content, 2_400)
     return "（未找到原始用户任务；请先依据 checkpoint 的 next_action 恢复。）"
 
 
-def _trace_summary(messages: list[dict[str, Any]]) -> tuple[list[str], list[str], str]:
+def _extract_restorable_references(text: str, source: str) -> list[dict[str, str]]:
+    """Capture URLs and workspace paths that make a compacted observation re-readable."""
+    references: list[dict[str, str]] = []
+    for url in _URL_RE.findall(text or ""):
+        references.append({"kind": "url", "locator": url.rstrip(".,;:)"), "source": source})
+    for path in _PATH_RE.findall(text or ""):
+        clean = path.rstrip(".,;:)")
+        if len(clean) >= 3:
+            references.append({"kind": "path", "locator": clean, "source": source})
+    return references
+
+
+def _append_reference(target: list[dict[str, str]], ref: dict[str, str]) -> None:
+    if len(target) >= MAX_RESTORABLE_REFERENCES:
+        return
+    key = (ref.get("kind"), ref.get("locator"))
+    if not any((item.get("kind"), item.get("locator")) == key for item in target):
+        target.append(ref)
+
+
+def _trace_summary(messages: list[dict[str, Any]]) -> tuple[list[str], list[str], str, list[dict[str, str]], list[str]]:
     completed: list[str] = []
     open_items: list[str] = []
     last_assistant_text = ""
+    restorable_references: list[dict[str, str]] = []
+    failure_evidence: list[str] = []
     tool_entries = 0
 
     for message in messages:
         role = message.get("role")
+        if role == "user" and str(message.get("content", "")).startswith(TASK_RECITATION_MARKER):
+            # Artificial tail recitation is useful to the model but must not be
+            # mistaken for a human request or duplicated inside the next checkpoint.
+            continue
         if role == "assistant":
             text = _content_preview(message.get("content"), 600)
             calls = message.get("tool_calls") or []
@@ -175,18 +219,35 @@ def _trace_summary(messages: list[dict[str, Any]]) -> tuple[list[str], list[str]
                     names.append(str(name))
                 if names:
                     open_items.append("已请求工具：" + "、".join(names[:8]))
+                try:
+                    raw_calls = json.dumps(calls, ensure_ascii=False, default=str)
+                except Exception:
+                    raw_calls = str(calls)
+                for ref in _extract_restorable_references(raw_calls, "tool_arguments"):
+                    _append_reference(restorable_references, ref)
             elif text:
                 last_assistant_text = text
         elif role == "tool":
             tool_entries += 1
             if tool_entries <= MAX_TOOL_TRACE_ITEMS:
                 name = str(message.get("name") or "tool")
-                preview = _content_preview(message.get("content"), MAX_TOOL_SUMMARY_CHARS)
+                raw_content = str(message.get("content") or "")
+                preview = _content_preview(raw_content, MAX_TOOL_SUMMARY_CHARS)
                 completed.append(f"{name}: {preview}")
+                for ref in _extract_restorable_references(raw_content, name):
+                    _append_reference(restorable_references, ref)
+                if _ERROR_RE.search(raw_content):
+                    failure_evidence.append(f"{name}: {preview}")
 
     if tool_entries > MAX_TOOL_TRACE_ITEMS:
         completed.append(f"另有 {tool_entries - MAX_TOOL_TRACE_ITEMS} 条工具结果已归档，未重放到模型上下文。")
-    return completed[-MAX_TOOL_TRACE_ITEMS:], open_items[-12:], last_assistant_text
+    return (
+        completed[-MAX_TOOL_TRACE_ITEMS:],
+        open_items[-12:],
+        last_assistant_text,
+        restorable_references,
+        failure_evidence[-MAX_FAILURE_EVIDENCE:],
+    )
 
 
 def build_runtime_checkpoint(
@@ -197,7 +258,7 @@ def build_runtime_checkpoint(
     reason: str,
 ) -> dict[str, Any]:
     """Create a deterministic, bounded checkpoint for a fresh agent segment."""
-    completed, open_items, last_assistant_text = _trace_summary(messages)
+    completed, open_items, last_assistant_text, references, failures = _trace_summary(messages)
     budget = token_budget_for_model(model_info)
     return {
         "version": CHECKPOINT_VERSION,
@@ -207,10 +268,70 @@ def build_runtime_checkpoint(
         "completed_tool_results": completed,
         "open_tool_intents": open_items,
         "last_assistant_observation": last_assistant_text,
-        "next_action": "先核对已完成事项与工件；只执行尚未完成的下一步，严禁重复已完成工具调用。",
+        "restorable_references": references,
+        "failure_evidence": failures,
+        "next_action": "先读取任务 ledger 和可恢复工件；保留失败证据，只执行尚未完成的下一步，严禁重复已完成工具调用。",
         "context_tokens_before_compaction": estimate_messages_tokens(messages),
         "input_hard_limit": budget.input_hard_limit,
     }
+
+
+def persist_task_ledger(checkpoint: dict[str, Any], chat_id: int) -> str | None:
+    """Persist a recoverable task ledger in the active Agent workspace.
+
+    The ledger is not copied wholesale into the prompt.  Its path is added to the
+    checkpoint so the Agent can re-read the complete task state with existing
+    file tools after a context segment is compacted or a process is restarted.
+    """
+    try:
+        from apitelegramchat.workspace_paths import workspace_workdir
+
+        target = workspace_workdir(chat_id) / TASK_LEDGER_FILENAME
+        payload = {
+            "schema_version": CHECKPOINT_VERSION,
+            "goal": checkpoint.get("goal", ""),
+            "segment": checkpoint.get("segment"),
+            "completed_tool_results": checkpoint.get("completed_tool_results", []),
+            "open_tool_intents": checkpoint.get("open_tool_intents", []),
+            "failure_evidence": checkpoint.get("failure_evidence", []),
+            "restorable_references": checkpoint.get("restorable_references", []),
+            "next_action": checkpoint.get("next_action", ""),
+        }
+        temp = target.with_suffix(".tmp")
+        temp.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
+        temp.replace(target)
+        return str(target)
+    except Exception:
+        # Context compaction must not fail merely because the optional workspace
+        # ledger cannot be written.  The in-context checkpoint remains valid.
+        return None
+
+
+def task_recitation_message(checkpoint: dict[str, Any]) -> dict[str, str]:
+    """Return a compact tail reminder that recites the current task objective.
+
+    Appending this message after observations preserves the existing prefix for
+    cache-friendly agent loops while keeping goal/progress in recent attention.
+    """
+    completed = checkpoint.get("completed_tool_results") or []
+    failures = checkpoint.get("failure_evidence") or []
+    references = checkpoint.get("restorable_references") or []
+    lines = [
+        TASK_RECITATION_MARKER,
+        "系统生成的任务状态复述，不是用户输入；不要直接回答此消息。",
+        f"目标：{checkpoint.get('goal', '')}",
+        "最近完成：" + ("；".join(completed[-MAX_RECITATION_ITEMS:]) or "暂无"),
+    ]
+    if failures:
+        lines.append("近期失败证据：" + "；".join(failures[-3:]))
+    if references:
+        locators = [str(ref.get("locator", "")) for ref in references[-6:]]
+        lines.append("可恢复工件：" + "；".join(locator for locator in locators if locator))
+    lines.append("下一步：" + str(checkpoint.get("next_action", "")))
+    return {"role": "user", "content": "\n".join(lines)}
 
 
 def checkpoint_message(checkpoint: dict[str, Any]) -> dict[str, str]:
@@ -235,6 +356,7 @@ def compact_active_agent_context(
     *,
     segment_no: int,
     reason: str,
+    chat_id: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Replace noisy tool protocol with a short checkpointed agent context.
 
@@ -244,6 +366,13 @@ def compact_active_agent_context(
     checkpoint = build_runtime_checkpoint(
         messages, model_info, segment_no=segment_no, reason=reason
     )
+    if chat_id is not None:
+        ledger_path = persist_task_ledger(checkpoint, chat_id)
+        if ledger_path:
+            _append_reference(
+                checkpoint.setdefault("restorable_references", []),
+                {"kind": "task_ledger", "locator": ledger_path, "source": "runtime"},
+            )
     base_system: dict[str, Any] | None = None
     for message in messages:
         if message.get("role") == "system" and not str(message.get("content", "")).startswith(CHECKPOINT_MARKER):

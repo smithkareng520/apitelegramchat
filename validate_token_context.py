@@ -5,9 +5,14 @@ Run from the repository root with:
 """
 from apitelegramchat.agent_context import (
     CHECKPOINT_MARKER,
+    TASK_LEDGER_FILENAME,
+    TASK_RECITATION_MARKER,
+    build_runtime_checkpoint,
     compact_active_agent_context,
     compact_turn_for_history,
     estimate_messages_tokens,
+    persist_task_ledger,
+    task_recitation_message,
     token_budget_for_model,
     trim_completed_history_to_budget,
 )
@@ -50,6 +55,12 @@ def main() -> None:
     model = SmallModel()
     user = {"role": "user", "content": "请研究资料并写完整报告。"}
     trace = long_tool_trace(24)
+    # Verify that a failed observation retains both evidence and a recoverable
+    # external reference rather than silently disappearing at compaction time.
+    trace[3]["content"] = (
+        "ERROR: fetch failed; retry later. source=https://example.test/report "
+        "artifact=/tmp/apitelegramchat_data/workspaces/demo/report.md"
+    )
 
     # A 24-step trace produces 50 raw protocol messages, but durable chat memory
     # must persist only a user-visible turn rather than delete the task.
@@ -73,6 +84,17 @@ def main() -> None:
     )
     assert checkpoint["goal"] == user["content"]
     assert checkpoint["completed_tool_results"]
+    assert checkpoint["failure_evidence"], checkpoint
+    assert any(ref["kind"] == "url" for ref in checkpoint["restorable_references"])
+    assert any(ref["kind"] == "path" for ref in checkpoint["restorable_references"])
+
+    recitation = task_recitation_message(checkpoint)
+    assert recitation["content"].startswith(TASK_RECITATION_MARKER)
+    assert "近期失败证据" in recitation["content"]
+
+    ledger_checkpoint = build_runtime_checkpoint(active, model, segment_no=2, reason="test_ledger")
+    ledger_path = persist_task_ledger(ledger_checkpoint, chat_id=987654)
+    assert ledger_path and ledger_path.endswith(TASK_LEDGER_FILENAME)
 
     # Older completed turns may be removed to satisfy budget, but the newly
     # committed protected turn must survive even when old history is huge.

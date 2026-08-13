@@ -6,6 +6,7 @@ FILES = [
     Path("src/apitelegramchat/app.py"),
     Path("src/apitelegramchat/ai_handlers.py"),
     Path("src/apitelegramchat/subagent_tool.py"),
+    Path("src/apitelegramchat/utils.py"),
 ]
 
 for path in FILES:

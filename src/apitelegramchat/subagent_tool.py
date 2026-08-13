@@ -46,9 +46,12 @@ from typing import Any, Optional
 from apitelegramchat.api_client import api_client
 from apitelegramchat.config import SUPPORTED_MODELS, DEFAULT_MODEL
 from apitelegramchat.agent_context import (
+    build_runtime_checkpoint,
     compact_active_agent_context,
     estimate_messages_tokens,
+    persist_task_ledger,
     should_checkpoint,
+    task_recitation_message,
     token_budget_for_model,
 )
 
@@ -379,6 +382,7 @@ async def _subagent_agentic_loop(
                 model_info,
                 segment_no=segment_no,
                 reason="token_budget",
+                chat_id=chat_id,
             )
             segment_no += 1
             await _report(
@@ -386,6 +390,16 @@ async def _subagent_agentic_loop(
                 f"（{before_tokens}->{estimate_messages_tokens(loop_messages)} tokens，"
                 f"预算 {token_budget_for_model(model_info).input_hard_limit}）"
             )
+        else:
+            task_state = build_runtime_checkpoint(
+                loop_messages, model_info, segment_no=segment_no, reason="tail_recitation"
+            )
+            ledger_path = persist_task_ledger(task_state, chat_id)
+            if ledger_path:
+                task_state.setdefault("restorable_references", []).append(
+                    {"kind": "task_ledger", "locator": ledger_path, "source": "runtime"}
+                )
+            loop_messages.append(task_recitation_message(task_state))
 
     # 仅在超时、LLM 错误或紧急无限循环保护时到达这里。
     await _report(f"结束：执行未完成（{rounds} 轮，{total_tool_calls} 次工具调用）")

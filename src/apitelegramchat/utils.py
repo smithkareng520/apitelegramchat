@@ -447,10 +447,8 @@ async def send_rich_message_draft_unlocked(
     payload = {
         "chat_id": chat_id,
         "draft_id": draft_id_int,
-        "rich_message": {
-            "content": html_content,
-            "html": html_content,
-        },
+        # InputRichMessage 要求 html / markdown / blocks 三者恰好其一。
+        "rich_message": {"html": html_content},
     }
     if message_thread_id:
         payload["message_thread_id"] = message_thread_id
@@ -523,10 +521,8 @@ async def send_rich_message_draft(
         payload = {
             "chat_id": chat_id,
             "draft_id": draft_id_int,
-            "rich_message": {
-                "content": html_content,
-                "html": html_content,
-            },
+            # InputRichMessage requires exactly one representation.
+            "rich_message": {"html": html_content},
         }
         if message_thread_id:
             payload["message_thread_id"] = message_thread_id
@@ -663,10 +659,8 @@ async def send_rich_html_message(
 
     payload = {
         "chat_id": chat_id,
-        "rich_message": {
-            "content": html_content,
-            "html": html_content,
-        },
+        # InputRichMessage 要求 html / markdown / blocks 三者恰好其一。
+        "rich_message": {"html": html_content},
         "disable_notification": False,
         "protect_content": False,
     }
