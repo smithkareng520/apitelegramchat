@@ -1418,9 +1418,9 @@ async def build_system_prompt(
 <p>媒体元素必须作为<b>独立块级元素</b>输出，绝对禁止嵌入表格、段落或行内容器中。</p>
 <ul>
   <li><b>地图：</b> <code>&lt;tg-map lat="41.9" long="12.5" zoom="14"/&gt;</code>（zoom 范围：13-20）。</li>
-  <li><b>单张图片 / 视频 / 音频：</b> <code>&lt;img src="URL"/&gt;</code> / <code>&lt;video src="URL"&gt;&lt;/video&gt;</code> / <code>&lt;audio src="URL"&gt;&lt;/audio&gt;</code>。</li>
-  <li><b>视频 URL：</b> 必须是可公开访问的 HTTP(S) 直链；发送层会把 <code>&lt;video src="URL"&gt;&lt;/video&gt;</code> 自动转换为 Telegram 所需的媒体引用，严禁自行输出 <code>tg://video?id=...</code>。</li>
-  <li><b>带图注媒体：</b> <code>&lt;figure&gt;&lt;img src="URL"/&gt;&lt;figcaption&gt;图注文本&lt;cite&gt;来源/署名&lt;/cite&gt;&lt;/figcaption&gt;&lt;/figure&gt;</code>；视频同理使用 <code>&lt;figure&gt;&lt;video src="URL"&gt;&lt;/video&gt;&lt;figcaption&gt;视频说明&lt;/figcaption&gt;&lt;/figure&gt;</code>。</li>
+  <li><b>单张图片 / 视频 / 音频：</b> <code>&lt;img src="URL"/&gt;</code> / <code>&lt;video src="URL"/&gt;</code> / <code>&lt;audio src="URL"/&gt;</code></li>
+  <li><b>带图注媒体：</b> <code>&lt;figure&gt;&lt;img src="URL"/&gt;&lt;figcaption&gt;图注文本&lt;cite&gt;来源/署名&lt;/cite&gt;&lt;/figcaption&gt;&lt;/figure&gt;</code>。视频示例：<code>&lt;figure&gt;&lt;video src="URL"&gt;&lt;/video&gt;&lt;figcaption&gt;视频说明&lt;/figcaption&gt;&lt;/figure&gt;</code>。</li>
+  <li><b>视频工具结果处理（强制）：</b> 当 <code>generate_video</code> 成功返回 <code>视频链接：URL</code> 时，必须在工具调用后的最终回复中使用该 URL 作为独立媒体块发送视频：<code>&lt;figure&gt;&lt;video src="URL"&gt;&lt;/video&gt;&lt;figcaption&gt;已生成视频&lt;/figcaption&gt;&lt;/figure&gt;</code>。不得仅输出裸 URL、普通超链接或“视频已生成”文字；不得把 <code>&lt;video&gt;</code> 放入 <code>&lt;p&gt;</code>、列表、表格或其他容器内。仅使用工具返回的 HTTP/HTTPS URL；若 URL 含有 <code>&amp;</code>，写入 HTML 属性前必须转义为 <code>&amp;amp;</code>。</li>
   <li><b>多媒体幻灯片（≥2件资源）：</b> <code>&lt;tg-slideshow&gt;&lt;img src="URL1"/&gt;&lt;img src="URL2"/&gt;&lt;figcaption&gt;可选图注&lt;/figcaption&gt;&lt;/tg-slideshow&gt;</code></li>
 </ul>
 
