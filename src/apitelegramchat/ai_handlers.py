@@ -143,11 +143,11 @@ RICH_DRAFT_ARM_BLOCKS = min(
 # 回合边界即永久化当前段并新开草稿，以保持持续可见的进度更新。
 RICH_DRAFT_INTERACTIVE_TEXT_CHARS = min(
     RICH_DRAFT_ARM_TEXT_CHARS,
-    _positive_env_int("RICH_DRAFT_INTERACTIVE_TEXT_CHARS", 20000),
+    _positive_env_int("RICH_DRAFT_INTERACTIVE_TEXT_CHARS", 15000),
 )
 RICH_DRAFT_INTERACTIVE_BLOCKS = min(
     RICH_DRAFT_ARM_BLOCKS,
-    _positive_env_int("RICH_DRAFT_INTERACTIVE_BLOCKS", 280),
+    _positive_env_int("RICH_DRAFT_INTERACTIVE_BLOCKS", 160),
 )
 # 没有遇到完整块时最多等待到这里；随后在回合边界降级为转义段，绝不把超限内容
 # 作为永久消息提交。
@@ -2385,29 +2385,20 @@ async def _run_tool_calls_and_append(
             tool_progress_callback = None
             if fn_name in SUBAGENT_TOOLS or fn_name in BASH_TOOLS:
                 label = "🤖 子 agent 运行中" if fn_name in SUBAGENT_TOOLS else "🖥️ Bash 运行中"
-                # 进度可能以远快于网络发送和客户端重绘的频率到达。此前每一个
-                # 回调都 await force flush，导致十几 KB 的完整草稿每秒反复重绘多次，
-                # 新进度反而在客户端队列后“卡住”。进度仅更新最新预览，由统一的
-                # 防抖刷新任务合并发送；至少间隔一秒才主动排队一帧。
-                last_progress_flush_at = 0.0
 
                 async def tool_progress_callback(status_text: str, _tc_id=tc_id, _label=label):
-                    nonlocal last_progress_flush_at
                     try:
                         text = status_text or "正在执行…"
                         preview = f"<i>{escape_html(text[-1200:])}</i>"
                         builder.update_tool_preview(_tc_id, preview, summary=_label)
-                        now = time.monotonic()
-                        if now - last_progress_flush_at >= 1.0:
-                            last_progress_flush_at = now
-                            builder.request_flush(force=False)
+                        await builder.flush(force=True)
                     except asyncio.CancelledError:
                         raise
                     except Exception:
                         pass  # 进度推送失败不能影响工具本身
 
-                # 先立即把工具状态从“刚开始”变成“正在执行”。后续普通 flush 会
-                # 合并高频进度，避免长工具阻塞草稿 UI 的真实更新。
+                # 先立即把工具状态从“刚开始”变成“正在执行”，避免长工具在
+                # 第一次真实 stdout/进度出现之前前端没有任何可见变化。
                 await tool_progress_callback("正在执行…")
 
 

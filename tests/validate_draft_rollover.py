@@ -432,46 +432,6 @@ async def test_inflight_flush_replays_latest_draft_frame() -> None:
         handlers.send_rich_message_draft = original_draft
 
 
-async def test_high_frequency_preview_updates_are_coalesced() -> None:
-    first_send_started = asyncio.Event()
-    release_first_send = asyncio.Event()
-    sent_frames = []
-
-    async def slow_draft(chat_id, draft_id, html_content, **kwargs):
-        sent_frames.append(html_content)
-        if len(sent_frames) == 1:
-            first_send_started.set()
-            await release_first_send.wait()
-        return 7878
-
-    original_draft = handlers.send_rich_message_draft
-    try:
-        handlers.send_rich_message_draft = slow_draft
-        builder = handlers.RichMessageBuilder(chat_id=109)
-        builder._register_active_draft = AsyncMock()
-        builder.add_tool_item("progress-1", "bash", "Running command")
-        await asyncio.wait_for(first_send_started.wait(), timeout=1.0)
-
-        # 模拟 Bash 在单个网络发送期间高频报告进度。每次更新都保留最新预览，
-        # 但不能为每条进度排队一帧全量 Rich Message。
-        for index in range(12):
-            builder.update_tool_preview(
-                "progress-1",
-                f"<i>progress-{index}</i>",
-                summary="Running command",
-            )
-        release_first_send.set()
-
-        for _ in range(100):
-            if len(sent_frames) >= 2:
-                break
-            await asyncio.sleep(0.01)
-        require(len(sent_frames) == 2, "高频预览更新必须合并为单个最新补发帧")
-        require("progress-11" in sent_frames[-1], "合并帧必须保留最后一条进度")
-    finally:
-        handlers.send_rich_message_draft = original_draft
-
-
 async def test_done_only_batch_finishes_precreated_tool_group() -> None:
     async def fake_draft(chat_id, draft_id, html_content, **kwargs):
         return 7676
@@ -523,7 +483,6 @@ def main() -> None:
     asyncio.run(test_interactive_capacity_rolls_before_api_arm())
     asyncio.run(test_arm_threshold_rolls_at_next_turn_boundary())
     asyncio.run(test_inflight_flush_replays_latest_draft_frame())
-    asyncio.run(test_high_frequency_preview_updates_are_coalesced())
     asyncio.run(test_done_only_batch_finishes_precreated_tool_group())
     test_no_legacy_background_rollover_fields()
     print("turn-boundary draft rollover validation: PASS")
