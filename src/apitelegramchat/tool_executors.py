@@ -665,8 +665,11 @@ def _render_editor_result(command: str, path: str, result_str: str, arguments: d
     """Render text-editor calls as explicit, quote-formatted Input and Output."""
     arguments = arguments or {}
     if command == "view":
-        intent = str(arguments.get("_description") or "View the requested text file.")
+        intent = str(arguments.get("_description") or "Inspect the requested text file.")
         return _render_editor_quote("Input", intent) + _render_editor_quote("Output", result_str)
+
+    if result_str.startswith("Error:"):
+        return _render_editor_quote("Result", result_str)
 
     input_field = {
         "str_replace": "new_str",

@@ -3,7 +3,7 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from apitelegramchat.context_manager import select_request_context  # noqa: E402
 
 

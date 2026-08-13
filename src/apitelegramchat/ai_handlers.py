@@ -1421,6 +1421,15 @@ async def build_system_prompt(
 
     if supports_tools:
         catalog_text = skill_catalog_text or skill_catalog_brief()
+        base_prompt += """
+<h2>Tool execution discipline</h2>
+<ul>
+  <li><b>Do not narrate your work.</b> Before a tool call, do not send ordinary messages such as “Let me first…”, repeat the user request, or describe a plan. Call the tool directly; its card is the progress UI.</li>
+  <li>After a tool result, do not repeat its raw output, list files again, or restate the same diagnosis. Continue with the next necessary tool call, or give one concise user-facing result when the task is complete.</li>
+  <li>For <code>text_editor</code>, view the target file immediately before every edit. If replacement reports no match or multiple matches, the next action must be one <code>view</code>; then retry once using exact text copied from that latest view with surrounding context.</li>
+  <li>Never guess from old line numbers or truncated output. Never bypass a text-editor failure with <code>bash</code>, <code>sed</code>, <code>perl</code>, or <code>python</code>. After two failures of the same edit, stop and explain the blocker.</li>
+</ul>
+"""
     base_prompt += """
 <h2>智能体搜索与操作工作流</h2>
 

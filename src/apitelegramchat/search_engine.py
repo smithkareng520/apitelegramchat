@@ -343,11 +343,15 @@ async def execute_text_editor(
                     return "Error: old_str must be non-empty for str_replace."
                 match_count = content.count(old_str)
                 if match_count == 0:
-                    return "Error: No match found for replacement. Please check your text and try again."
+                    return (
+                        "Error: No match found for replacement. Recovery: call text_editor "
+                        "view on this file, then retry once with an exact old_str copied from the latest view."
+                    )
                 if match_count > 1:
                     return (
                         f"Error: Found {match_count} matches for replacement text. "
-                        "Please provide more context to make a unique match."
+                        "Recovery: call text_editor view, then retry once with a longer exact old_str "
+                        "that includes surrounding context."
                     )
                 new_content = content.replace(old_str, new_str, 1)
                 _write_text_editor_file(local_path, new_content)

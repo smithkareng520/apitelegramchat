@@ -22,3 +22,11 @@ creates a bounded snapshot before attachment resolution:
 
 This limits prompt growth and prevents old attachments from delaying request preparation, while
 preserving the newest user intent.
+
+## Text-editor workflow
+
+The model is instructed to call tools without narrating its private work plan. Text-editor failures
+now return a single explicit recovery action: re-view the file, copy an exact unique match from the
+latest view, and retry once. The prompt explicitly forbids guessing from line numbers or bypassing
+that guard with `sed`, `python`, or other shell editing commands. Validation scripts are under
+`tests/` rather than the project root.

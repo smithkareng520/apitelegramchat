@@ -29,7 +29,7 @@ import sys
 import types
 import uuid
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 
 def _stub_missing_third_party_modules() -> None:
