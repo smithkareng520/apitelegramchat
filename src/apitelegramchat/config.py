@@ -577,8 +577,10 @@ def _positive_int_env(name: str, default: int, minimum: int) -> int:
 
 STREAM_FLUSH_INTERVAL = _positive_float_env("STREAM_FLUSH_INTERVAL", 0.65, 0.25)
 STREAM_FLUSH_CHARS = _positive_int_env("STREAM_FLUSH_CHARS", 96, 32)
+# 静默重申只用于确认草稿仍活跃；频率过高会在长工具链中反复全量重绘相同富消息，
+# 反而使客户端停止显示真正的新进度。正常内容变化仍由 STREAM_FLUSH_INTERVAL 驱动。
 STREAM_SILENT_FORCE_FLUSH = _positive_float_env(
-    "STREAM_SILENT_FORCE_FLUSH", 2.0, STREAM_FLUSH_INTERVAL
+    "STREAM_SILENT_FORCE_FLUSH", 8.0, STREAM_FLUSH_INTERVAL
 )
 
 # ---------- 工具调用并发数 ----------
