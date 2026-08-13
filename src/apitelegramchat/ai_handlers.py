@@ -2106,7 +2106,12 @@ async def _run_tool_calls_and_append(
 
     tool_call_count_ref[0] += len(valid_tool_calls)
 
-    group_idx = builder._get_current_group()
+    # 每个模型工具批次必须使用独立的草稿组。旧实现始终复用第一个未完成
+    # group，约 15 轮后其详情会触及 UI 截断上限，后续工具虽在执行但永远
+    # 被截断在不可见尾部，表面上就是“草稿仍刷新但没有新日志”。
+    if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
+        builder.finish_group(len(builder._tool_groups) - 1)
+    group_idx = builder.start_new_tool_group()
 
     tool_tasks = []
     for tc in valid_tool_calls:
@@ -2150,6 +2155,7 @@ async def _run_tool_calls_and_append(
     await builder.flush(force=False)
 
     stop_refresh = asyncio.Event()
+    tool_batch_started = time.monotonic()
 
     has_image_tool = any(fn_name in MEDIA_GEN_TOOLS for fn_name, _, _ in tool_tasks)
     has_bash_tool = any(fn_name in BASH_TOOLS for fn_name, _, _ in tool_tasks)
@@ -2162,11 +2168,34 @@ async def _run_tool_calls_and_append(
     force_tool_refresh = bool(tool_tasks)
 
     async def refresh_loop():
+        # 初帧立即显示本批工具；后续帧必须改变可见内容，而非仅用同一 HTML
+        # 保活。否则 Telegram 客户端会持续刷新草稿却不给用户任何进度反馈。
         await builder.flush(force=force_tool_refresh)
+        last_visible_heartbeat = -1
         while not stop_refresh.is_set():
             await asyncio.sleep(2.0)
-            if not stop_refresh.is_set():
-                await builder.flush(force=force_tool_refresh)
+            if stop_refresh.is_set():
+                break
+            elapsed_seconds = int(time.monotonic() - tool_batch_started)
+            heartbeat_slot = elapsed_seconds // 4
+            if heartbeat_slot != last_visible_heartbeat:
+                last_visible_heartbeat = heartbeat_slot
+                for fn_name, _fn_args, tc_id in tool_tasks:
+                    preview = (
+                        f"<p><i>正在执行 {escape_html(fn_name)}，"
+                        f"已运行 {elapsed_seconds} 秒…</i></p>"
+                    )
+                    builder.update_tool_preview(
+                        tc_id,
+                        preview,
+                        summary=f"正在执行 {fn_name}（{elapsed_seconds}s）",
+                    )
+                logger.info(
+                    "[%s] 工具批次仍在运行: group=%s elapsed=%ss tools=%s",
+                    api_label, group_idx, elapsed_seconds,
+                    [name for name, _args, _tid in tool_tasks],
+                )
+            await builder.flush(force=force_tool_refresh)
 
     refresh_task = asyncio.create_task(refresh_loop())
 
@@ -2204,6 +2233,8 @@ async def _run_tool_calls_and_append(
             # bash 不再做执行期间的实时预览刷新；结果只在完成后按统一的
             # Input/Output 格式渲染一次（见 _render_bash_result）。
 
+            tool_started = time.monotonic()
+            logger.info("[%s] 开始工具: %s id=%s timeout=%s", api_label, fn_name, tc_id, timeout)
             try:
                 if fn_name == "ask_user":
                     question = fn_args.get("question", "")
@@ -2243,6 +2274,8 @@ async def _run_tool_calls_and_append(
             except Exception as e:
                 logger.exception(f"[tool] {fn_name} failed: {e}")
                 result_str = f"Exception: tool {fn_name} failed - {str(e)[:200]}"
+            elapsed = time.monotonic() - tool_started
+            logger.info("[%s] 工具完成: %s id=%s elapsed=%.2fs", api_label, fn_name, tc_id, elapsed)
             safe_content = _truncate_tool_result(result_str)
             # 我们不再使用 format_tool_result 的摘要，而是自己生成
             formatted_summary, details_html = await format_tool_result(fn_name, fn_args, safe_content)
@@ -2302,7 +2335,11 @@ async def _run_tool_calls_and_append(
         tool_msg = {"role": "tool", "tool_call_id": tc_id, "name": fn_name, "content": safe_content}
         loop_messages.append(tool_msg)
         new_history_entries.append(tool_msg)
-    await builder.flush()
+    # 本批结果已经写入草稿；立即收尾，以便下一轮工具调用从一个新的可见
+    # group 开始，避免所有轮次累积到同一份可折叠卡片中。
+    if group_idx >= 0:
+        builder.finish_group(group_idx)
+    await builder.flush(force=True)
 
     if tool_call_count_ref[0] >= MAX_AGENT_TOOL_CALLS_EMERGENCY:
         logger.warning(
