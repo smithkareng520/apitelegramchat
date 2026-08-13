@@ -2106,12 +2106,23 @@ async def _run_tool_calls_and_append(
 
     tool_call_count_ref[0] += len(valid_tool_calls)
 
-    # 每个模型工具批次必须使用独立的草稿组。旧实现始终复用第一个未完成
-    # group，约 15 轮后其详情会触及 UI 截断上限，后续工具虽在执行但永远
-    # 被截断在不可见尾部，表面上就是“草稿仍刷新但没有新日志”。
+    # 每个模型工具批次必须使用独立的草稿组。流式解析在收到 tool_call
+    # delta 时可能已创建本批 group；此处复用它而不是关闭后重建，避免一批
+    # 工具出现两份 UI 条目。只有不存在匹配的进行中 group 时才创建新组。
+    requested_ids = {
+        str(tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", ""))
+        for tc in valid_tool_calls
+    }
+    group_idx = -1
     if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-        builder.finish_group(len(builder._tool_groups) - 1)
-    group_idx = builder.start_new_tool_group()
+        candidate = builder._tool_groups[-1]
+        existing_ids = {str(item.get("id", "")) for item in candidate.get("items", [])}
+        if requested_ids and requested_ids.issubset(existing_ids):
+            group_idx = len(builder._tool_groups) - 1
+        else:
+            builder.finish_group(len(builder._tool_groups) - 1)
+    if group_idx < 0:
+        group_idx = builder.start_new_tool_group()
 
     tool_tasks = []
     for tc in valid_tool_calls:
@@ -2943,6 +2954,33 @@ class RichMessageBuilder:
                 del self.block_types[i]
                 break
 
+    def discard_interim_agent_output(self, block_start: int) -> None:
+        """Drop user-visible text/reasoning emitted in a tool-call turn.
+
+        Some providers stream private analysis through ``content`` before their
+        function-call deltas arrive.  That text is not a final answer and must
+        never survive into the rich draft or the final user message.  Tool group
+        placeholders are deliberately retained so execution progress remains
+        visible.
+        """
+        block_start = max(0, min(int(block_start), len(self.blocks)))
+        remove_indexes = [
+            index for index in range(block_start, len(self.blocks))
+            if self.block_types[index] in {"text", "reasoning"}
+        ]
+        for index in reversed(remove_indexes):
+            del self.blocks[index]
+            del self.block_types[index]
+        # content may have arrived after a tool-call delta and been appended to
+        # the current tool group rather than a normal text block. Clear it too.
+        for group in self._tool_groups:
+            if int(group.get("placeholder_idx", -1)) >= block_start:
+                group["text_content"] = ""
+                group["reasoning_html"] = ""
+        if remove_indexes:
+            self._stream_text_index = -1
+            self._stream_buffer = ""
+
     def add_initial_thinking(self, text: str = "Thinking...") -> int:
         self._commit_stream_buffer()
         block = f"<tg-thinking>{text}</tg-thinking>"
@@ -3449,6 +3487,9 @@ async def _agentic_loop_openai_compat(
 
     while True:
         _round += 1
+        # 保留本轮开始前的 UI 边界。若该轮随后出现 tool_calls，任何先流出的
+        # content/reasoning 都只是中间代理文本，必须从草稿中隔离。
+        round_block_start = len(builder.blocks)
         # 轮数不再决定任务是否停止；只有 token 接近预算时才会创建
         # checkpoint 并开启下一执行段。此处只保留紧急无限循环保护。
         if tool_call_count_ref[0] >= MAX_AGENT_TOOL_CALLS_EMERGENCY:
@@ -3706,6 +3747,19 @@ async def _agentic_loop_openai_compat(
 
         if not tool_calls_list and not content_acc.strip():
             content_acc = "（模型未返回任何内容）"
+
+        if tool_calls_list:
+            # 某些 OpenAI 兼容提供商把内部分析或生成中的代码片段放在
+            # content 字段，然后才给出 tool_calls。它不是用户答复；既不展示，
+            # 也不写入 assistant tool-protocol 消息，避免完成后再次被当成答案。
+            if content_acc.strip() or reasoning_acc.strip():
+                logger.info(
+                    "[%s] 丢弃携带工具调用的中间输出: round=%s content_len=%s reasoning_len=%s",
+                    api_label, _round, len(content_acc), len(reasoning_acc),
+                )
+            builder.discard_interim_agent_output(round_block_start)
+            content_acc = ""
+            reasoning_acc = ""
 
         if reasoning_acc:
             builder.finalize_reasoning_block(has_tool_calls=bool(tool_calls_list))
@@ -5007,13 +5061,11 @@ async def get_ai_response(
 
         await builder.stop_flush_loop()
 
-        # 最后一个草稿段也必须遵守富消息安全预算。若触发滚动，旧段已经
-        # 被永久化；下面无需再把同一份过长 HTML 重复发送一次。
+        # 草稿中的工具轨迹和中间状态仅用于临时可视化，不能在任务结束时
+        # 被整体“转正”。否则长任务触发滚动时可能把内部文本永久发送，并且
+        # 错误地跳过真正的最终答复。最终提交只以最终模型 content 为准。
         builder._commit_stream_buffer()
         builder.remove_thinking()
-        terminal_segment_rolled = await builder.rollover_if_needed(
-            builder._build_html_no_thinking()
-        )
 
         # 本轮流式已结束：后续永久消息不再 reassert 草稿，避免最终回复后再弹出预览气泡。
         # 若外部已 interrupt 并 mark_dead，这里再标一次无害。
@@ -5092,11 +5144,10 @@ async def get_ai_response(
 
         builder._commit_stream_buffer()
         builder.remove_thinking()
-        final_html = builder._build_html_no_thinking()
 
-        if not cleaned_content and not final_html.strip():
+        if not cleaned_content:
             logger.warning("AI 返回空内容（model=%s）", current_model)
-            fallback = "⚠️ AI 响应为空。请尝试换一个模型或提供更多上下文。"
+            fallback = "⚠️ <b>任务未返回最终答复</b>\n请根据已完成的工具操作重新请求总结。"
             await send_rich_html_message(chat_id, fallback, reassert_draft=False)
             if builder.draft_message_id:
                 try:
@@ -5107,8 +5158,13 @@ async def get_ai_response(
                     logger.debug(f"空内容路径删除草稿失败: {e}")
             return fallback, "", [], usage
 
-        if not final_html.strip():
-            final_html = f"<p>{html.escape(cleaned_content)}</p>"
+        # 对纯文本答复进行 HTML 转义和段落包装，保证最终消息始终走 Rich
+        # Message，而不是让未格式化的内部文本以视觉上的“普通消息”出现。
+        if re.search(r"<[/!a-zA-Z]", cleaned_content):
+            final_html = cleaned_content
+        else:
+            escaped = html.escape(cleaned_content).replace("\n", "<br/>")
+            final_html = f"<p>{escaped}</p>"
 
         final_html = re.sub(
             r'<img\s+[^>]*src="(?!(http|https):)[^"]*"[^>]*>',
@@ -5118,17 +5174,21 @@ async def get_ai_response(
         )
         final_html = re.sub(r'\n\s*\n', '\n', final_html)
 
-        if terminal_segment_rolled:
-            # rollover_if_needed 已把旧段作为永久消息发出。此时 builder 仅含新的
-            # thinking 占位草稿，不能把它当作最终回答重复发送。
-            success = True
-            logger.info(f"[{chat_id}] 最终草稿段已通过 rollover 永久化")
-        else:
-            success = await send_rich_html_message(chat_id, final_html, reassert_draft=False)
-            if not success:
-                logger.error(f"[{chat_id}] 富文本发送失败，不再降级。内容前200字: {final_html[:200]!r}")
-            else:
-                logger.info(f"[{chat_id}] 富文本发送成功")
+        # A final answer can itself exceed one Rich Message. Split it by the
+        # parsed-text ceiling, but submit each resulting rich segment exactly once.
+        final_segments = builder._split_html_for_rich_messages(final_html)
+        success = True
+        for segment_index, segment_html in enumerate(final_segments, start=1):
+            sent = await send_rich_html_message(chat_id, segment_html, reassert_draft=False)
+            if not sent:
+                success = False
+                logger.error(
+                    f"[{chat_id}] 最终富文本分段发送失败 part={segment_index}/{len(final_segments)} "
+                    f"前200字: {segment_html[:200]!r}"
+                )
+                break
+        if success:
+            logger.info(f"[{chat_id}] 最终富文本发送成功 segments={len(final_segments)}")
 
         # 正常路径下删除草稿气泡。
         # 若外部 interrupt 已 mark_preserved_draft，则保留现场，不要删掉冻结中的草稿。
