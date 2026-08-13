@@ -343,57 +343,163 @@ def _estimate_message_tokens(message: dict) -> int:
             tokens += _MEDIA_TOKEN_OVERHEAD * len(tool_calls)
     return tokens
 
+
+# ---------- 上下文压缩 ----------
+# Assistant tool_calls 与对应 tool messages 必须作为原子组处理。删除其中任意一条会
+# 破坏 OpenAI 兼容接口的消息配对；因此本项目只在完整 user turn 边界上压缩或删除。
+_CONTEXT_SUMMARY_MARKER = "[历史回合压缩摘要]"
+_CONTEXT_SUMMARY_MAX_CHARS = 4800
+_CONTEXT_SUMMARY_USER_CHARS = 420
+_CONTEXT_SUMMARY_ASSISTANT_CHARS = 900
+_CONTEXT_SUMMARY_TOOL_NAMES = 12
+
+
+def _history_turn_ranges(history: list[dict]) -> list[tuple[int, int]]:
+    """以 user message 为起点划分完整回合，回合内保留 assistant/tool 配对。"""
+    starts = [index for index, msg in enumerate(history) if msg.get("role") == "user"]
+    return [
+        (start, starts[index + 1] if index + 1 < len(starts) else len(history))
+        for index, start in enumerate(starts)
+    ]
+
+
+def _short_context_text(value, limit: int) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        try:
+            value = json.dumps(value, ensure_ascii=False)
+        except Exception:
+            value = str(value)
+    text = re.sub(r"\s+", " ", value).strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _summarize_history_turn(turn: list[dict]) -> str:
+    """生成无需额外模型调用的保守摘要，保留目标、结论和已调用工具的可追溯线索。"""
+    user_goal = ""
+    assistant_result = ""
+    tool_names: list[str] = []
+    for msg in turn:
+        role = msg.get("role")
+        if role == "user" and not user_goal:
+            user_goal = _short_context_text(msg.get("content", ""), _CONTEXT_SUMMARY_USER_CHARS)
+        elif role == "assistant":
+            content = _short_context_text(msg.get("content", ""), _CONTEXT_SUMMARY_ASSISTANT_CHARS)
+            if content:
+                assistant_result = content
+            for call in msg.get("tool_calls") or []:
+                name = str((call.get("function") or {}).get("name") or "").strip()
+                if name and name not in tool_names:
+                    tool_names.append(name)
+        elif role == "tool":
+            name = str(msg.get("name") or "").strip()
+            if name and name not in tool_names:
+                tool_names.append(name)
+
+    lines = ["- 用户目标：" + (user_goal or "（未记录文本目标）")]
+    if tool_names:
+        shown = ", ".join(tool_names[:_CONTEXT_SUMMARY_TOOL_NAMES])
+        suffix = " 等" if len(tool_names) > _CONTEXT_SUMMARY_TOOL_NAMES else ""
+        lines.append("- 已调用工具：" + shown + suffix)
+    if assistant_result:
+        lines.append("- 已完成结论：" + assistant_result)
+    else:
+        lines.append("- 执行状态：该回合包含工具或中间步骤；原始细节已压缩。")
+    return "\n".join(lines)
+
+
+def _context_summary_index(history: list[dict]) -> int | None:
+    for index, msg in enumerate(history):
+        if (
+            msg.get("role") == "system"
+            and isinstance(msg.get("content"), str)
+            and msg["content"].startswith(_CONTEXT_SUMMARY_MARKER)
+        ):
+            return index
+    return None
+
+
+def _compact_oldest_history_turn(history: list[dict]) -> bool:
+    """压缩最早完整回合；工具调用及其结果永远一起移出活跃上下文。"""
+    ranges = _history_turn_ranges(history)
+    if not ranges:
+        return False
+    start, end = ranges[0]
+    turn_summary = _summarize_history_turn(history[start:end])
+    summary_index = _context_summary_index(history)
+    if summary_index is None:
+        history[start:end] = [{
+            "role": "system",
+            "content": f"{_CONTEXT_SUMMARY_MARKER}\n{turn_summary}",
+        }]
+    else:
+        existing = str(history[summary_index].get("content") or "")
+        merged = f"{existing}\n{turn_summary}"
+        if len(merged) > _CONTEXT_SUMMARY_MAX_CHARS:
+            retained = existing[:max(0, _CONTEXT_SUMMARY_MAX_CHARS // 2)].rstrip()
+            merged = f"{retained}\n- …更早的压缩回合已归档…\n{turn_summary}"
+            merged = merged[:_CONTEXT_SUMMARY_MAX_CHARS].rstrip()
+        history[summary_index]["content"] = merged
+        del history[start:end]
+    return True
+
+
+def _drop_oldest_history_turn(history: list[dict]) -> bool:
+    """硬上限兜底：只删除完整 user turn，绝不留下孤立的 tool message。"""
+    ranges = _history_turn_ranges(history)
+    if not ranges:
+        return False
+    start, end = ranges[0]
+    del history[start:end]
+    return True
+
+
+def _refresh_context_ledger(ctx: dict, history: list[dict]) -> None:
+    """压缩后重建估算账本，避免旧回合 token 继续触发误删。"""
+    ranges = _history_turn_ranges(history)
+    ctx["token_ledger"] = [
+        {
+            "input_tokens": sum(_estimate_message_tokens(msg) for msg in history[start:end]),
+            "output_tokens": 0,
+        }
+        for start, end in ranges
+    ]
+    ctx["last_prompt_tokens"] = sum(_estimate_message_tokens(msg) for msg in history)
+    ctx["last_completion_tokens"] = 0
+
 async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool:
     lock = await get_chat_lock(chat_id)
     async with lock:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
-        ledger = ctx.setdefault("token_ledger", [])
         cm = get_user_model(chat_id)
         model_info = SUPPORTED_MODELS.get(cm)
-        max_context = getattr(model_info, 'max_context', None) or 128000
-        max_output = getattr(model_info, 'max_output_tokens', None) or 8192
+        max_context = getattr(model_info, "max_context", None) or 128000
+        max_output = getattr(model_info, "max_output_tokens", None) or 8192
         safe_limit = max_context - max_output
-        new_input_est = _estimate_message_tokens(new_user_message)
-        if new_input_est < 1:
-            new_input_est = 1
+        new_input_est = max(1, _estimate_message_tokens(new_user_message))
+        if new_input_est > safe_limit:
+            return False
 
-        while True:
-            ledger_total = sum(item["input_tokens"] + item["output_tokens"] for item in ledger)
-            if ledger_total + new_input_est <= safe_limit:
-                return True
+        compacted = False
+        while sum(_estimate_message_tokens(msg) for msg in history) + new_input_est > safe_limit:
+            # 优先把最旧回合变成摘要而非直接删除。摘要保留用户目标、工具轨迹和
+            # 最终结论，且整个 tool-call 原子组会一起被替换，避免 API 配对错误。
+            if _compact_oldest_history_turn(history):
+                compacted = True
+                continue
+            # 仅在不存在可压缩回合时才启用硬删除兜底。
+            if _drop_oldest_history_turn(history):
+                compacted = True
+                continue
+            logger.warning("上下文无可压缩回合，保留系统提示词后继续: chat_id=%s", chat_id)
+            history[:] = [msg for msg in history if msg.get("role") == "system"]
+            break
 
-            deleted = False
-            for i in range(len(history)):
-                if history[i].get("role") == "user":
-                    end = len(history)
-                    for j in range(i + 1, len(history)):
-                        if history[j].get("role") == "user":
-                            end = j
-                            break
-                    removed_turn = history[i:end]
-                    del history[i:end]
-
-                    if ledger:
-                        removed = ledger.pop(0)
-                        ctx["last_prompt_tokens"] = max(
-                            0,
-                            ctx.get("last_prompt_tokens", 0) - removed["input_tokens"] - removed["output_tokens"],
-                        )
-                    else:
-                        removed_est = sum(_estimate_message_tokens(m) for m in removed_turn)
-                        ctx["last_prompt_tokens"] = max(0, ctx.get("last_prompt_tokens", 0) - removed_est)
-                    deleted = True
-                    break
-
-            if not deleted:
-                ctx["last_prompt_tokens"] = 0
-                ctx["last_completion_tokens"] = 0
-                ctx["token_ledger"] = []
-                ctx["conversation_history"] = [m for m in history if m.get("role") == "system"]
-                if new_input_est > safe_limit:
-                    return False
-                return True
+        if compacted:
+            _refresh_context_ledger(ctx, history)
+        return sum(_estimate_message_tokens(msg) for msg in history) + new_input_est <= safe_limit
 
 async def update_conversation_and_ledger(chat_id: int, user_message: dict, new_msgs: list, usage: dict = None) -> None:
     lock = await get_chat_lock(chat_id)
@@ -428,25 +534,23 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict, new_m
             ctx["last_completion_tokens"] = current_comp
             ledger = ctx.setdefault("token_ledger", [])
             ledger.append({"input_tokens": t_input, "output_tokens": t_output})
+        # 消息数上限同样优先压缩完整回合；单轮中大量 assistant/tool 消息
+        # 不会再因为超过 30 条而被无提示整体丢弃。
+        compacted = False
         while len(history) > MAX_HISTORY_MESSAGES:
-            deleted = False
-            for i in range(len(history)):
-                if history[i].get("role") == "user":
-                    end = len(history)
-                    for j in range(i + 1, len(history)):
-                        if history[j].get("role") == "user":
-                            end = j
-                            break
-                    del history[i:end]
-                    ledger = ctx.setdefault("token_ledger", [])
-                    if ledger:
-                        removed = ledger.pop(0)
-                        ctx["last_prompt_tokens"] = max(0, ctx.get("last_prompt_tokens", 0) - removed["input_tokens"] - removed["output_tokens"])
-                    deleted = True
-                    break
-            if not deleted:
-                if history:
+            previous_len = len(history)
+            if _compact_oldest_history_turn(history):
+                compacted = True
+                if len(history) < previous_len:
+                    continue
+            if not _drop_oldest_history_turn(history):
+                # 理论上仅剩 system 摘要时才会到这里，保留最新摘要优于盲目清空。
+                if len(history) > 1:
                     history.pop(0)
+                else:
+                    break
+        if compacted:
+            _refresh_context_ledger(ctx, history)
 
 # ---------------------------------------------------------------------------
 # 业务处理

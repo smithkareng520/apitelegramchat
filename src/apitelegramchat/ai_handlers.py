@@ -44,6 +44,7 @@ from apitelegramchat.utils import (
     escape_html,
     get_logger,
     delete_message,
+    delete_message_fast,
     mark_draft_dead,
     RateLimitError,
     transcribe_audio_with_groq,
@@ -3380,16 +3381,19 @@ class RichMessageBuilder:
         return (selected[0] if selected else None), visible_chars, block_count
 
     def _replace_with_rollover_remainder(self, remainder: str) -> None:
-        """将未提交部分作为新草稿的唯一内容，并维持当前流式写入通道。"""
+        """建立带 Thinking 首帧的新草稿，并让后续 delta 继续追加到尾部文本。"""
         remainder = remainder.lstrip()
-        self.blocks = [remainder] if remainder else []
-        self.block_types = ["text"] if remainder else []
+        # draft_id 发生变化后，Telegram 会展示一个新的临时预览，不能延续旧 draft
+        # 的原位动画。新草稿必须先有可见内容，避免在模型尚未产出下一枚 delta 时
+        # 出现空白卡顿；最终收尾仍会通过 remove_thinking() 移除该临时状态。
+        self.blocks = ["<tg-thinking>正在继续生成…</tg-thinking>", remainder]
+        self.block_types = ["html", "text"]
         self._tool_groups = []
         self._current_group_idx = -1
         self._stream_buffer = ""
-        # agentic loop 可能仍认为 content stream 已开启；这里主动建立一个 text 流，
-        # 使后续 delta 能继续追加到新草稿，而不是写入一个不可见的游离 buffer。
-        self._stream_text_index = 0 if remainder else -1
+        # agentic loop 仍处于同一 content stream。即使 remainder 为空，也要保留
+        # 空文本槽位，以便下一枚 delta 在新草稿中可见，而不是掉进游离 buffer。
+        self._stream_text_index = 1
         self._pending_chars = 0
 
     async def _register_active_draft(self, message_id: int = 0) -> None:
@@ -3463,16 +3467,9 @@ class RichMessageBuilder:
                 )
                 return False
 
-            # 永久消息已创建，旧预览不应再刷新或滞留为重复内容。
+            # 永久消息已创建，旧预览不应再刷新。旧预览删除只是清理，不应放在
+            # 新草稿首帧之前：deleteMessage 带网络重试，曾使第二个 draft 迟到数秒。
             await mark_draft_dead(old_draft_id)
-            if old_draft_message_id:
-                try:
-                    await delete_message(self.chat_id, old_draft_message_id)
-                except Exception as exc:
-                    logger.debug(
-                        "滚动后清理旧草稿预览失败: chat=%s draft=%s msg=%s err=%s",
-                        self.chat_id, old_draft_id, old_draft_message_id, exc,
-                    )
 
             # 重新分配草稿 ID 并立即登记 active 状态；新 ID 不能与旧 ID 相同。
             new_draft_id = int(time.time() * 1000000) + random.randint(0, 999)
@@ -3498,6 +3495,16 @@ class RichMessageBuilder:
                 len(_rich_visible_text(completed_html)), block_count,
                 "fallback" if used_fallback else "complete_block",
             )
+            # 旧预览删除在后台进行；新 draft 的 Thinking 首帧由当前 flush 立即、
+            # 强制发送，二者互不阻塞。
+            if old_draft_message_id:
+                try:
+                    _track_task(delete_message_fast(self.chat_id, old_draft_message_id))
+                except Exception as exc:
+                    logger.debug(
+                        "滚动后安排旧草稿预览清理失败: chat=%s draft=%s msg=%s err=%s",
+                        self.chat_id, old_draft_id, old_draft_message_id, exc,
+                    )
             # 由调用方在当前 flush 完成后发送新草稿首帧，避免重入 _flush_lock。
             return True
 

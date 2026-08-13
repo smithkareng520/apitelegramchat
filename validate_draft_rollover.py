@@ -65,10 +65,10 @@ async def test_rollover_tracks_drafts_and_keeps_remainder() -> None:
 
     original_send = handlers.send_rich_html_message
     original_dead = handlers.mark_draft_dead
-    original_delete = handlers.delete_message
+    original_delete_fast = handlers.delete_message_fast
     handlers.send_rich_html_message = fake_send
     handlers.mark_draft_dead = AsyncMock()
-    handlers.delete_message = AsyncMock()
+    handlers.delete_message_fast = AsyncMock(return_value=True)
     try:
         builder = handlers.RichMessageBuilder(chat_id=99)
         old_draft_id = builder.draft_id
@@ -88,14 +88,17 @@ async def test_rollover_tracks_drafts_and_keeps_remainder() -> None:
         require("三" not in submitted, "边界后的尾部内容不得被提前永久化")
         require(builder.draft_id != old_draft_id, "滚动后必须生成新的 draft_id")
         require(builder._rollover_count == 1 and len(builder._rollover_history) == 1, "必须记录滚动历史")
-        require("三" in builder._build_html(), "新草稿必须携带未提交的尾部内容")
+        new_draft_html = builder._build_html()
+        require("三" in new_draft_html, "新草稿必须携带未提交的尾部内容")
+        require("正在继续生成" in new_draft_html, "新草稿首帧必须显示继续生成状态")
         handlers.mark_draft_dead.assert_awaited_once_with(old_draft_id)
-        handlers.delete_message.assert_awaited_once_with(99, 777)
+        await asyncio.sleep(0)
+        handlers.delete_message_fast.assert_awaited_once_with(99, 777)
         builder._register_active_draft.assert_awaited_once_with(0)
     finally:
         handlers.send_rich_html_message = original_send
         handlers.mark_draft_dead = original_dead
-        handlers.delete_message = original_delete
+        handlers.delete_message_fast = original_delete_fast
 
 
 async def test_flush_restarts_preview_with_new_draft_id() -> None:
@@ -134,6 +137,7 @@ async def test_flush_restarts_preview_with_new_draft_id() -> None:
         new_draft_id, tail_html, kwargs = draft_frames[0]
         require(new_draft_id != old_draft_id, "尾部必须使用新 draft_id 续写")
         require("丙" in tail_html and "甲" not in tail_html, "新草稿首帧只能包含未提交尾部")
+        require("正在继续生成" in tail_html, "滚动后的新草稿首帧必须包含 Thinking 状态")
         require(kwargs.get("force") is True, "滚动后的新草稿首帧必须强制发送")
         require(builder._register_active_draft.await_count == 2, "需先登记新草稿占位，再登记首帧 message_id")
         builder._register_active_draft.assert_any_await(0)
@@ -169,7 +173,9 @@ async def test_oversized_single_block_falls_back_without_loss() -> None:
         require(builder._rollover_history[-1]["mode"] == "plain_text_fallback", "超长单块应标记为降级模式")
         submitted_text = handlers._rich_visible_text(completed_segments[0])
         remainder_text = handlers._rich_visible_text(builder._build_html())
-        require(submitted_text + remainder_text == payload, "降级分段必须保持全部可见文本，不得丢失")
+        require("正在继续生成" in remainder_text, "fallback 后的新草稿也必须显示 Thinking 状态")
+        remainder_payload = remainder_text.replace("正在继续生成…", "", 1)
+        require(submitted_text + remainder_payload == payload, "降级分段必须保持全部可见文本，不得丢失")
         require(len(submitted_text) <= handlers.RICH_DRAFT_ROLLOVER_TEXT_CHARS, "兜底永久段仍须低于主动阈值")
     finally:
         handlers.send_rich_html_message = original_send
