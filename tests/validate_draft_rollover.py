@@ -32,6 +32,37 @@ def test_visible_count_and_top_level_blocks() -> None:
     require(source[:boundaries[0][0]].endswith("</table>"), "首个边界必须位于完整表格结束处")
 
 
+def test_inline_content_is_wrapped_as_rich_block() -> None:
+    require(
+        handlers._ensure_rich_block_content("仅有普通文本") == "<p>仅有普通文本</p>",
+        "裸文本必须包装为段落，避免 Rich Message 拒绝",
+    )
+    require(
+        handlers._ensure_rich_block_content("<i>仅有内联样式</i>") == "<p><i>仅有内联样式</i></p>",
+        "仅有内联标签时也必须补齐块级容器",
+    )
+    table = "<table><tr><td>结构化内容</td></tr></table>"
+    require(
+        handlers._ensure_rich_block_content(table) == table,
+        "已有 Rich 块的内容不得被重复包装",
+    )
+
+    builder = handlers.RichMessageBuilder(chat_id=88)
+    builder.blocks = ["<tg-thinking>Thinking...</tg-thinking>", "最终回复", "<i>补充说明</i>"]
+    builder.block_types = ["html", "text", "text"]
+    final_html = builder._build_html_no_thinking()
+    require("最终回复" in final_html and "<i>补充说明</i>" in final_html, "顶层文本必须保持原有流式输出格式")
+
+    tool_detail = builder._get_inner_content({
+        "summary": "检查文件",
+        "details_html": "<i>已完成</i>",
+    })
+    require(
+        "<p><i>已完成</i></p>" in tool_detail,
+        "工具详情的内联内容必须成为 details 内的有效 Rich 块",
+    )
+
+
 def test_capacity_warning_is_not_an_immediate_rollover() -> None:
     builder = handlers.RichMessageBuilder(chat_id=1)
     builder.blocks = [make_oversized_blocks()]
@@ -245,6 +276,7 @@ def test_no_legacy_background_rollover_fields() -> None:
 
 def main() -> None:
     test_visible_count_and_top_level_blocks()
+    test_inline_content_is_wrapped_as_rich_block()
     test_capacity_warning_is_not_an_immediate_rollover()
     asyncio.run(test_rollover_occurs_only_at_turn_boundary())
     asyncio.run(test_handoff_delta_is_preserved())

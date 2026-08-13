@@ -159,6 +159,13 @@ _RICH_COUNTED_BLOCK_TAGS = _RICH_BLOCK_TAGS - {"thead", "tbody", "tfoot", "td", 
 _RICH_VOID_TAGS = {"br", "hr", "img", "video", "audio", "tg-map", "source", "meta", "link", "input"}
 _RICH_HTML_TAG_RE = re.compile(r"<!--.*?-->|<[^>]*>", re.DOTALL)
 _RICH_TAG_NAME_RE = re.compile(r"^<\s*(/)?\s*([A-Za-z][\w:-]*)")
+# Rich Message 的 details、列表和表格等容器不能只承载裸文本；服务端会将其
+# 判为没有有效内容并返回 RICH_MESSAGE_CONTENT_REQUIRED。内联样式标签不算块。
+_RICH_BLOCK_OPEN_TAG_RE = re.compile(
+    r"<\s*(?:p|h[1-6]|pre|blockquote|details|ul|ol|li|table|thead|tbody|tfoot|tr|hr|"
+    r"figure|figcaption|tg-slideshow|tg-map|img|video|audio|tg-math-block|aside|footer)\b",
+    re.IGNORECASE,
+)
 
 
 def _rich_visible_text(text: str) -> str:
@@ -166,6 +173,22 @@ def _rich_visible_text(text: str) -> str:
     if not text:
         return ""
     return html.unescape(_RICH_HTML_TAG_RE.sub("", text))
+
+
+def _ensure_rich_block_content(fragment: str) -> str:
+    """为只有裸文本或内联标签的片段补上 Rich Message 所需的块级容器。
+
+    模型的推理、工具详情和最终文本均可能是普通文字或仅含 ``<b>``、``<i>``
+    等内联标签。该形态在浏览器中可显示，但 Telegram Rich Message API 会拒绝
+    嵌入在 ``<details>`` 中的此类内容。已有任意 Rich 块时保持原样，避免破坏
+    表格、列表、媒体等有效结构。
+    """
+    content = (fragment or "").strip()
+    if not content:
+        return ""
+    if _RICH_BLOCK_OPEN_TAG_RE.search(content):
+        return content
+    return f"<p>{content}</p>"
 
 
 def _scan_rich_html_boundaries(html_content: str) -> tuple[list[tuple[int, int, int]], int, int]:
@@ -3280,9 +3303,9 @@ class RichMessageBuilder:
 
         inner_parts = []
         if reasoning_html:
-            inner_parts.append(reasoning_html)
+            inner_parts.append(_ensure_rich_block_content(reasoning_html))
         if text_content:
-            inner_parts.append(f"<p>{text_content}</p>")
+            inner_parts.append(_ensure_rich_block_content(text_content))
 
         # 限制草稿中单个工具及整个工具组的详情预算。此前 web_search 等
         # 工具不截断，单次结果可令后续每一帧反复传输几十 KB，造成客户端长时间
@@ -3307,6 +3330,7 @@ class RichMessageBuilder:
             inner_body = item["details_html"]
             if detail_limit is not None:
                 inner_body = self._truncate_tool_ui_detail(inner_body, detail_limit)
+            inner_body = _ensure_rich_block_content(inner_body)
             return f"<details><summary>{inner_summary}</summary>\n{inner_body}\n</details>"
         else:
             # 修复 RICH_MESSAGE_CONTENT_REQUIRED：
@@ -3331,7 +3355,8 @@ class RichMessageBuilder:
                 i += 1
                 # 不再收集后续 tool_group，只渲染 reasoning 自身
                 summary = self._get_reasoning_summary(reasoning_content)
-                html_parts.append(f"<details><summary>{summary}</summary>\n{reasoning_content}\n</details>")
+                reasoning_body = _ensure_rich_block_content(reasoning_content)
+                html_parts.append(f"<details><summary>{summary}</summary>\n{reasoning_body}\n</details>")
                 continue
 
             elif b_type == "tool_group":
@@ -3377,7 +3402,8 @@ class RichMessageBuilder:
                 i += 1
                 # 不再收集后续 tool_group，只渲染 reasoning 自身
                 summary = self._get_reasoning_summary(reasoning_content)
-                html_parts.append(f"<details><summary>{summary}</summary>\n{reasoning_content}\n</details>")
+                reasoning_body = _ensure_rich_block_content(reasoning_content)
+                html_parts.append(f"<details><summary>{summary}</summary>\n{reasoning_body}\n</details>")
                 continue
 
             elif b_type == "tool_group":
@@ -5387,8 +5413,15 @@ async def get_ai_response(
                         f"[{chat_id}] 草稿 {builder.draft_id} 已保留，跳过删除 "
                         f"draft_message_id={builder.draft_message_id}"
                     )
-                else:
+                elif success:
                     await delete_message(chat_id, builder.draft_message_id)
+                else:
+                    # 最终消息与纯文本回退均未成功时，保留最后一帧草稿作为可见
+                    # 兜底，不能因传输失败再删除用户唯一能够看到的处理结果。
+                    logger.warning(
+                        f"[{chat_id}] 最终消息未送达，保留草稿预览 "
+                        f"draft_message_id={builder.draft_message_id}"
+                    )
             except Exception as e:
                 logger.debug(f"正常路径删除草稿失败: {e}")
 

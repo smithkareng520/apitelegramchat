@@ -149,6 +149,20 @@ def strip_html_tags(text: str) -> str:
     text = text.replace("<br/>", "\n").replace("<br>", "\n")
     return re.sub(r'<[^>]*>', '', text)
 
+
+def _rich_message_plain_text_fallback(html_content: str) -> str:
+    """将被 Rich Message 服务端拒绝的 HTML 降级为一个安全的段落。
+
+    模型或工具输出有时仅包含内联标签，或在 ``details`` 中缺少块级内容。此类
+    HTML 视觉上并非空白，但 Telegram 会返回 ``RICH_MESSAGE_CONTENT_REQUIRED``。
+    这里保留其可见文本并转义为单个 ``<p>``，以保证用户不会因格式问题丢失回复。
+    """
+    visible_text = html.unescape(strip_html_tags(html_content or ""))
+    visible_text = re.sub(r"\s+", " ", visible_text).strip()
+    if not visible_text:
+        return ""
+    return f"<p>{html.escape(visible_text)}</p>"
+
 async def check_deepseek_balance() -> tuple:
     url = "https://api.deepseek.com/user/balance"
     headers = {"Accept": "application/json", "Authorization": f"Bearer {DEEPSEEK_API_KEY}"}
@@ -725,6 +739,40 @@ async def send_rich_html_message(
                             logger.debug(f"sendRichHtmlMessage parse response failed: {e}")
                         return True
                     body = await resp.text()
+                    body_lower = body.lower()
+                    content_required = (
+                        resp.status == 400 and "rich_message_content_required" in body_lower
+                    )
+                    fallback_html = _rich_message_plain_text_fallback(html_content)
+                    if content_required and fallback_html and fallback_html != html_content:
+                        fallback_payload = {
+                            **payload,
+                            "rich_message": {
+                                "content": fallback_html,
+                                "html": fallback_html,
+                            },
+                        }
+                        logger.warning(
+                            "sendRichHtmlMessage received RICH_MESSAGE_CONTENT_REQUIRED; "
+                            "retrying once with a safe paragraph fallback"
+                        )
+                        async with session.post(f"{BASE_URL}/sendRichMessage", json=fallback_payload) as fallback_resp:
+                            if fallback_resp.status == 200:
+                                try:
+                                    fallback_data = await fallback_resp.json()
+                                    fallback_msg_id = fallback_data.get("result", {}).get("message_id")
+                                    if isinstance(fallback_msg_id, int) and fallback_msg_id > 0:
+                                        return fallback_msg_id
+                                except Exception as e:
+                                    logger.debug(f"sendRichHtmlMessage fallback parse failed: {e}")
+                                return True
+                            fallback_body = await fallback_resp.text()
+                            logger.error(
+                                "sendRichHtmlMessage fallback failed: %s %s",
+                                fallback_resp.status,
+                                fallback_body[:200],
+                            )
+                            return False
                     logger.error(f"sendRichHtmlMessage failed: {resp.status} {body[:200]}")
                     return False
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
