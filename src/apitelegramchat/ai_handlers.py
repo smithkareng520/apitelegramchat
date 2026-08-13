@@ -71,7 +71,10 @@ logger.setLevel(logging.DEBUG)
 
 # ---------- 常量 ----------
 MAX_TOOL_RESPONSE_LEN = 100000
-MAX_TOOL_CALLS = 40
+# 每一轮用户请求最多执行 100 次真实工具调用；超过后进入无工具总结路径。
+# 不依赖模型的单轮并发数量，调用预算按实际执行的工具数精确累计。
+MAX_TOOL_CALLS = 100
+MAX_PLAIN_TEXT_TOOL_CALL_RETRIES = 3
 TOOL_ERROR_STREAK_LIMIT = 3
 TOOL_CALL_TIMEOUT = 12
 OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
@@ -2138,6 +2141,30 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
     return mapping.get(fn_name, f"ran {fn_name}")
 
 
+_TEXTUAL_TOOL_CALL_RE = re.compile(
+    r"<(?:longcat_)?tool_call\b[^>]*>.*?(?:</(?:longcat_)?tool_call\s*>|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _contains_textual_tool_call(content: str) -> bool:
+    return bool(content and re.search(r"<(?:longcat_)?tool_call\b", content, re.IGNORECASE))
+
+
+def _strip_textual_tool_calls(content: str) -> str:
+    """移除模型误以纯文本输出的 function-call XML，防止其泄漏到最终用户消息。"""
+    if not content:
+        return ""
+    return _TEXTUAL_TOOL_CALL_RE.sub("", content).strip()
+
+
+def _tool_limit_summary() -> str:
+    return (
+        f"本轮已完成 {MAX_TOOL_CALLS} 次工具调用，已达到单轮安全上限。"
+        "我已保留成功结果；如仍需继续执行剩余步骤，请发送“继续”。"
+    )
+
+
 def _safe_parse_args(args_str: str) -> dict:
     if not args_str:
         return {}
@@ -2166,19 +2193,27 @@ async def _run_tool_calls_and_append(
         chat_id: int = None,
 ) -> str:
     valid_tool_calls = []
+    skipped_tool_calls = []
+    remaining_budget = max(0, MAX_TOOL_CALLS - tool_call_count_ref[0])
     for tc in tool_calls:
         if isinstance(tc, dict):
             fn_name = tc["function"]["name"]
         else:
             fn_name = tc.function.name
-        if fn_name != "done":
+        if fn_name == "done":
+            continue
+        if len(valid_tool_calls) < remaining_budget:
             valid_tool_calls.append(tc)
-    if not valid_tool_calls:
+        else:
+            # 模型可能在同一轮请求多个函数；超出余量的调用绝不能继续执行。
+            # 稍后仍会为这些 ID 补充 tool 消息，避免下一次总结请求出现未配对调用。
+            skipped_tool_calls.append(tc)
+    if not valid_tool_calls and not skipped_tool_calls:
         return "continue"
 
     tool_call_count_ref[0] += len(valid_tool_calls)
 
-    group_idx = builder._get_current_group()
+    group_idx = builder._get_current_group() if valid_tool_calls else -1
 
     tool_tasks = []
     for tc in valid_tool_calls:
@@ -2374,6 +2409,30 @@ async def _run_tool_calls_and_append(
         tool_msg = {"role": "tool", "tool_call_id": tc_id, "name": fn_name, "content": safe_content}
         loop_messages.append(tool_msg)
         new_history_entries.append(tool_msg)
+    # 对本批因预算而跳过的调用补齐标准 tool 消息，保证后续无工具总结请求的
+    # assistant/tool 配对完整，同时向模型明确说明这些调用没有被执行。
+    if skipped_tool_calls:
+        for tc in skipped_tool_calls:
+            if isinstance(tc, dict):
+                skipped_id = tc.get("id") or f"call_skipped_{uuid.uuid4().hex[:8]}"
+                skipped_name = tc.get("function", {}).get("name") or "unknown"
+            else:
+                skipped_id = getattr(tc, "id", "") or f"call_skipped_{uuid.uuid4().hex[:8]}"
+                skipped_name = getattr(getattr(tc, "function", None), "name", "unknown") or "unknown"
+            skipped_content = (
+                f"Not executed: the per-turn tool-call budget of {MAX_TOOL_CALLS} was reached. "
+                "Do not retry this call in this turn; provide a final status summary instead."
+            )
+            tool_msg = {
+                "role": "tool", "tool_call_id": skipped_id,
+                "name": skipped_name, "content": skipped_content,
+            }
+            loop_messages.append(tool_msg)
+            new_history_entries.append(tool_msg)
+        logger.warning(
+            "[%s] 工具调用预算已耗尽：已执行=%s，跳过=%s，上限=%s",
+            api_label, tool_call_count_ref[0], len(skipped_tool_calls), MAX_TOOL_CALLS,
+        )
     await builder.flush()
 
     if tool_call_count_ref[0] >= MAX_TOOL_CALLS:
@@ -2984,6 +3043,38 @@ class RichMessageBuilder:
         self._stream_text_index = -1
         self.request_flush(force=False)
 
+    def replace_trailing_text(self, original: str, replacement: str = "") -> bool:
+        """替换最近一个文本块的尾部，用于从草稿中撤回模型误输出的伪工具调用 XML。"""
+        if not original:
+            return False
+        self._commit_stream_buffer()
+        for idx in range(len(self.blocks) - 1, -1, -1):
+            if self.block_types[idx] != "text":
+                continue
+            block = self.blocks[idx]
+            if not block.endswith(original):
+                continue
+            updated = block[:-len(original)] + replacement
+            if updated.strip():
+                self.blocks[idx] = updated
+            else:
+                del self.blocks[idx]
+                del self.block_types[idx]
+                if self._stream_text_index == idx:
+                    self._stream_text_index = -1
+                elif self._stream_text_index > idx:
+                    self._stream_text_index -= 1
+            self.request_flush(force=False)
+            return True
+        for group in reversed(self._tool_groups):
+            text_content = group.get("text_content", "")
+            if not text_content.endswith(original):
+                continue
+            group["text_content"] = text_content[:-len(original)] + replacement
+            self.request_flush(force=False)
+            return True
+        return False
+
     # ---------- 流式管理 ----------
     def begin_stream(self, stream_type: str = "text"):
         self._commit_stream_buffer()
@@ -3498,6 +3589,7 @@ async def _agentic_loop_openai_compat(
     final_usage = None
     tool_call_count_ref = [0]
     new_history_entries = []
+    plain_text_tool_attempts = 0
     parallel_tool_calls = True
 
     model_info = SUPPORTED_MODELS.get(current_model)
@@ -3753,6 +3845,18 @@ async def _agentic_loop_openai_compat(
         if not tool_calls_list and not content_acc.strip():
             content_acc = "（模型未返回任何内容）"
 
+        # 个别兼容模型会将 function calling XML 错当普通正文输出。该内容已经
+        # 在流式阶段写入草稿，必须先从构建器撤回，避免最终消息泄漏 <tool_call>。
+        textual_tool_call = _contains_textual_tool_call(content_acc)
+        if textual_tool_call:
+            raw_textual_content = content_acc
+            content_acc = _strip_textual_tool_calls(content_acc)
+            if not builder.replace_trailing_text(raw_textual_content, content_acc):
+                logger.warning(
+                    "[%s] 未能在草稿中定位伪工具调用文本，已阻止其进入最终内容",
+                    api_label,
+                )
+
         if reasoning_acc:
             builder.finalize_reasoning_block(has_tool_calls=bool(tool_calls_list))
         await builder.flush()
@@ -3768,25 +3872,31 @@ async def _agentic_loop_openai_compat(
         loop_messages.append(assistant_msg)
         new_history_entries.append(assistant_msg)
 
-        # ========== 修复问题二：检测并纠正伪工具调用 ==========
+        # 文本伪工具调用最多纠正三次；达到次数后直接给出安全状态说明，而不是
+        # 把 XML 原文返回给用户，也避免模型在不可恢复状态下无限循环。
         if not tool_calls_list:
-            if content_acc and ("<longcat_tool_call>" in content_acc or "<tool_call>" in content_acc):
+            if textual_tool_call:
+                plain_text_tool_attempts += 1
                 logger.warning(
-                    f"[{api_label}] 模型输出了文本格式工具调用，未被正常解析。"
-                    f"内容前300字: {content_acc[:300]!r}"
+                    "[%s] 模型输出了文本格式工具调用，已清理并请求标准调用：第 %s/%s 次",
+                    api_label, plain_text_tool_attempts, MAX_PLAIN_TEXT_TOOL_CALL_RETRIES,
                 )
-                loop_messages.append({
-                    "role": "user",
-                    "content": (
-                        "System: Your last response contained tool calls in plain text format "
-                        "instead of the proper tool_calls API format. "
-                        "Please re-issue your tool calls using the standard function calling interface, "
-                        "not as text."
-                    )
-                })
-                continue
-
-            final_content = content_acc
+                if plain_text_tool_attempts < MAX_PLAIN_TEXT_TOOL_CALL_RETRIES:
+                    loop_messages.append({
+                        "role": "user",
+                        "content": (
+                            "System: Your last response attempted a tool call as plain text. "
+                            "Use the standard tool_calls API only. Do not emit <tool_call> XML as user-visible text."
+                        )
+                    })
+                    continue
+                final_content = content_acc or (
+                    "工具调用格式连续异常，未继续执行额外操作。请重新描述需求或换一个模型后重试。"
+                )
+                if not content_acc:
+                    builder.add_text(final_content)
+            else:
+                final_content = content_acc
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
             break
@@ -3817,20 +3927,36 @@ async def _agentic_loop_openai_compat(
                         if c_delta:
                             synth_text += c_delta
                             builder.append_stream_delta(c_delta)
-                final_content = builder.end_stream_text() or synth_text
+                raw_synth_content = builder.end_stream_text() or synth_text
+                final_content = _strip_textual_tool_calls(raw_synth_content)
+                if final_content != raw_synth_content:
+                    builder.replace_trailing_text(raw_synth_content, final_content)
+                if not final_content:
+                    final_content = _tool_limit_summary()
+                    builder.add_text(final_content)
             except Exception as synth_err:
-                # 合成流失败时使用兜底文本，避免丢失整个工具调用历史
+                # 合成流失败时使用兜底文本，避免丢失整个工具调用历史或泄漏工具 XML。
                 logger.warning(f"OpenAI 合成流失败: {synth_err}")
                 try:
                     builder.end_stream_text()
                 except Exception:
                     pass
-                final_content = "（工具调用超限，无法生成最终回答）"
+                final_content = _tool_limit_summary()
+                builder.add_text(final_content)
             new_history_entries.append({"role": "assistant", "content": final_content})
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
             break
         # 如果 status == "continue"（包括之前熔断返回的），循环自然继续
+
+    # 理论上真实工具调用会先触发 over_limit；此处仍为轮次数耗尽或异常模型行为提供
+    # 可见的、无工具调用标记的最终状态，避免 final_content 为 None。
+    if final_content is None:
+        final_content = _tool_limit_summary()
+        builder.add_text(final_content)
+        new_history_entries.append({"role": "assistant", "content": final_content})
+        if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
+            builder.finish_group(len(builder._tool_groups) - 1)
 
     return final_content, final_usage, new_history_entries
 
@@ -3947,6 +4073,12 @@ async def _agentic_loop_gemini_openai_compat(
                 tc_entry["thought_signature"] = thought_signature
             tool_calls_list.append(tc_entry)
 
+        # Gemini/OpenAI 兼容端也可能把函数调用 XML 放在普通 content 中；在写入
+        # 草稿和历史前先清理，避免最终消息暴露内部调用语法。
+        textual_tool_call = not tool_calls_list and _contains_textual_tool_call(content_acc)
+        if textual_tool_call:
+            content_acc = _strip_textual_tool_calls(content_acc)
+
         reasoning_acc: str = raw_msg.get("reasoning_content") or ""
         if reasoning_acc:
             builder.begin_stream_reasoning()
@@ -4014,20 +4146,31 @@ async def _agentic_loop_gemini_openai_compat(
                             synth_data = await resp.json()
                             synth_choices = synth_data.get("choices") or []
                             if synth_choices:
-                                final_content = (
-                                        synth_choices[0].get("message", {}).get("content") or ""
+                                raw_synth_content = (
+                                    synth_choices[0].get("message", {}).get("content") or ""
                                 )
+                                final_content = _strip_textual_tool_calls(raw_synth_content)
                                 if final_content:
                                     builder.add_text(final_content)
             except Exception as e:
                 logger.exception(f"[Gemini] synthesis error: {e}")
-                final_content = "（工具调用超限，无法生成最终回答）"
+                final_content = ""
+            if not final_content:
+                final_content = _tool_limit_summary()
+                builder.add_text(final_content)
             new_history_entries.append(
                 {"role": "assistant", "content": final_content or ""}
             )
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
             break
+
+    if final_content is None:
+        final_content = _tool_limit_summary()
+        builder.add_text(final_content)
+        new_history_entries.append({"role": "assistant", "content": final_content})
+        if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
+            builder.finish_group(len(builder._tool_groups) - 1)
 
     return final_content, final_usage, new_history_entries
 
