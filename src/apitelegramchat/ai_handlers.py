@@ -143,11 +143,11 @@ RICH_DRAFT_ARM_BLOCKS = min(
 # 回合边界即永久化当前段并新开草稿，以保持持续可见的进度更新。
 RICH_DRAFT_INTERACTIVE_TEXT_CHARS = min(
     RICH_DRAFT_ARM_TEXT_CHARS,
-    _positive_env_int("RICH_DRAFT_INTERACTIVE_TEXT_CHARS", 12000),
+    _positive_env_int("RICH_DRAFT_INTERACTIVE_TEXT_CHARS", 20000),
 )
 RICH_DRAFT_INTERACTIVE_BLOCKS = min(
     RICH_DRAFT_ARM_BLOCKS,
-    _positive_env_int("RICH_DRAFT_INTERACTIVE_BLOCKS", 160),
+    _positive_env_int("RICH_DRAFT_INTERACTIVE_BLOCKS", 280),
 )
 # 没有遇到完整块时最多等待到这里；随后在回合边界降级为转义段，绝不把超限内容
 # 作为永久消息提交。
