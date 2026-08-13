@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+import time
 from unittest.mock import AsyncMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -58,6 +59,22 @@ def test_tool_group_details_are_bounded_for_ui() -> None:
         len(visible) < handlers.RichMessageBuilder.MAX_TOOL_GROUP_UI_DETAIL_CHARS + 800,
         "草稿工具详情总量必须受组展示预算约束",
     )
+
+
+async def test_silent_active_draft_is_force_refreshed_globally() -> None:
+    """静默保活应由构建器统一发起，而不是由具体工具轮询代码承担。"""
+    builder = handlers.RichMessageBuilder(chat_id=803)
+    builder._last_flush_time = time.monotonic() - handlers.STREAM_SILENT_FORCE_FLUSH
+    flushes: list[bool] = []
+
+    async def fake_flush(force: bool = False) -> None:
+        flushes.append(force)
+        builder._stop_flush = True
+
+    builder.flush = fake_flush
+    await builder._stream_flush_loop()
+
+    require(flushes == [True], "静默超时后必须对当前活跃草稿执行 force flush")
 
 
 async def test_initial_draft_precedes_expensive_request_preparation() -> None:
@@ -133,6 +150,7 @@ async def test_initial_draft_precedes_expensive_request_preparation() -> None:
 def main() -> None:
     test_thinking_status_is_escaped_and_requests_refresh()
     test_tool_group_details_are_bounded_for_ui()
+    asyncio.run(test_silent_active_draft_is_force_refreshed_globally())
     asyncio.run(test_initial_draft_precedes_expensive_request_preparation())
     print("draft frontend flow validation: PASS")
 

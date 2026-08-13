@@ -247,7 +247,6 @@ async def _request_modelscope_native_image(
         prompt: str,
         image_urls: list[str],
         num_images: int = 1,
-        builder: Optional["RichMessageBuilder"] = None,
         model: str = "",
 ) -> tuple[dict | None, str, str, int, str]:
     """
@@ -490,18 +489,7 @@ async def _request_modelscope_native_image(
             await asyncio.sleep(1.5)
             IN_PROGRESS_STATES = {'PENDING', 'PROCESSING', 'RUNNING', 'QUEUED', 'QUEUING', 'STARTED'}
 
-            last_force_flush = 0.0
-            FORCE_FLUSH_INTERVAL = 10.0
-
             while time.monotonic() < poll_deadline:
-                if builder is not None:
-                    now = time.monotonic()
-                    if now - last_force_flush >= FORCE_FLUSH_INTERVAL:
-                        try:
-                            await builder.flush(force=True)
-                            last_force_flush = now
-                        except Exception as e:
-                            logger.warning(f"[NativeImage] 强制刷新草稿失败: {e}")
                 poll_iter += 1
                 poll_json, poll_status, poll_error, poll_request_id = await _post_or_get_json(
                     session, "GET", poll_url, request_headers=poll_headers, quiet=True
@@ -2327,26 +2315,12 @@ async def _run_tool_calls_and_append(
 
     await builder.flush(force=False)
 
-    stop_refresh = asyncio.Event()
-
     has_image_tool = any(fn_name in MEDIA_GEN_TOOLS for fn_name, _, _ in tool_tasks)
     has_bash_tool = any(fn_name in BASH_TOOLS for fn_name, _, _ in tool_tasks)
     has_ask_user_tool = any(fn_name == "ask_user" for fn_name, _, _ in tool_tasks)
-    # 工具执行期间不再做实时输出预览（bash/text_editor 的结果只在完成后
-    # 展示一次），但工具执行本身可能长时间没有新的文本增量。普通
-    # force=False flush 会被 send_rich_message_draft 的“内容未变化”短路，
-    # 因此前端看不到持续运行中的状态。每 2 秒强制 reassert 一帧，保持
-    # 草稿在前端持续活跃；子 agent 的状态更新仍由 progress_callback 推送。
-    force_tool_refresh = bool(tool_tasks)
-
-    async def refresh_loop():
-        await builder.flush(force=force_tool_refresh)
-        while not stop_refresh.is_set():
-            await asyncio.sleep(2.0)
-            if not stop_refresh.is_set():
-                await builder.flush(force=force_tool_refresh)
-
-    refresh_task = asyncio.create_task(refresh_loop())
+    # 草稿构建器的全局刷新循环会在静默超时后，对当前活跃草稿统一执行
+    # force flush。工具批次无需另建心跳任务；图片、视频和普通工具均复用
+    # 同一机制，状态变更仍由前面的普通 flush 立即推送。
 
     async def run_one(fn_name, fn_args, tc_id):
         async with tool_semaphore:
@@ -2468,11 +2442,6 @@ async def _run_tool_calls_and_append(
         return_exceptions=True
     )
 
-    stop_refresh.set()
-    try:
-        await refresh_task
-    except asyncio.CancelledError:
-        pass
     await builder.flush(force=False)
 
     # ===== 修改：根据结果标记状态 =====
@@ -3716,7 +3685,10 @@ class RichMessageBuilder:
                 continue
 
             time_elapsed = now - self._last_flush_time
-            silent_too_long = time_elapsed >= min(STREAM_SILENT_FORCE_FLUSH, 3.0)
+            # 此循环的 builder 就是当前请求唯一正在刷新的草稿。无论静默来自
+            # 普通模型、工具、图片还是视频，只要内容长时间未变化，都统一强制
+            # 重申这一帧，避免 send_rich_message_draft 因内容相同而短路。
+            silent_too_long = time_elapsed >= STREAM_SILENT_FORCE_FLUSH
             should_flush = (
                     self._pending_chars >= max(1, STREAM_FLUSH_CHARS // 2)
                     or (self._pending_chars > 0 and time_elapsed >= STREAM_FLUSH_INTERVAL)
@@ -3724,7 +3696,7 @@ class RichMessageBuilder:
             )
             if should_flush:
                 self._commit_stream_buffer()
-                await self.flush(force=False)
+                await self.flush(force=silent_too_long)
                 if not silent_too_long:
                     self._last_flush_time = now
 
@@ -4491,7 +4463,6 @@ async def _agentic_loop_native_image(
                 prompt=prompt_text,
                 image_urls=image_urls,
                 num_images=1,
-                builder=builder,
                 model=current_model,  # 传入当前模型 ID
             )
             used_endpoint = f"/v1{endpoint}"
@@ -4692,30 +4663,10 @@ async def _agentic_loop_native_image(
     return final_content, getattr(response, "usage", None), new_entries
 
 
-async def _refresh_thinking_silently(builder: "RichMessageBuilder", last_force_flush: float,
-                                     force_interval: float = 10.0) -> float:
-    """
-    像图片拉取逻辑一样，静默维持草稿活跃，但不改写文案。
-    只做 force flush，避免出现“已等待 xx 秒”这类刷屏提示。
-    """
-    if not builder:
-        return last_force_flush
-    now = time.monotonic()
-    if now - last_force_flush >= force_interval:
-        try:
-            await builder.flush(force=True)
-            return now
-        except Exception as e:
-            logger.warning(f"[Video] 静默刷新草稿失败: {e}")
-            return last_force_flush
-    return last_force_flush
-
-
 async def _request_agnes_video(
         prompt: str,
         duration: int,
         model: str,
-        builder: "RichMessageBuilder",
 ) -> tuple[str | None, str | None, Optional[dict]]:
     """
     提交视频任务到 Agnes 并轮询结果。
@@ -4783,7 +4734,6 @@ async def _request_agnes_video(
     max_wait = 300  # 5分钟
     interval = 3
     start_time = time.monotonic()
-    last_force_flush = 0.0
     poll_iter = 0
 
     logger.debug(
@@ -4875,24 +4825,6 @@ async def _request_agnes_video(
                             str(error_msg)[:300],
                         )
                         return None, f"Agnes 视频生成失败: {error_msg}", None
-
-                    # 处理中：只做日志和静默刷新，不往消息里塞“已等待 xx 秒”
-                    if builder is not None and (time.monotonic() - last_force_flush) >= 10.0:
-                        try:
-                            await builder.flush(force=True)
-                            last_force_flush = time.monotonic()
-                            logger.debug(
-                                "[NativeVideo/Agnes] heartbeat flush ok: iter=%s elapsed=%.1fs",
-                                poll_iter,
-                                elapsed,
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "[NativeVideo/Agnes] heartbeat flush failed: iter=%s elapsed=%.1fs err=%s",
-                                poll_iter,
-                                elapsed,
-                                str(e)[:200],
-                            )
 
                     logger.debug(
                         "[NativeVideo/Agnes] polling iter=%s still running: status=%s elapsed=%.1fs next_poll_in=%ss",
@@ -4997,7 +4929,6 @@ async def _request_openrouter_video(
     max_wait = 300
     interval = 3
     start_time = time.monotonic()
-    last_force_flush = 0.0
     poll_iter = 0
 
     logger.debug(
@@ -5086,24 +5017,6 @@ async def _request_openrouter_video(
                         )
                         return None, f"OpenRouter 视频生成失败: {error_msg}", None
 
-                    # 处理中：只做日志和静默刷新
-                    if builder is not None and (time.monotonic() - last_force_flush) >= 10.0:
-                        try:
-                            await builder.flush(force=True)
-                            last_force_flush = time.monotonic()
-                            logger.debug(
-                                "[NativeVideo/OpenRouter] heartbeat flush ok: iter=%s elapsed=%.1fs",
-                                poll_iter,
-                                elapsed,
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "[NativeVideo/OpenRouter] heartbeat flush failed: iter=%s elapsed=%.1fs err=%s",
-                                poll_iter,
-                                elapsed,
-                                str(e)[:200],
-                            )
-
                     logger.debug(
                         "[NativeVideo/OpenRouter] polling iter=%s still running: status=%s elapsed=%.1fs next_poll_in=%ss",
                         poll_iter,
@@ -5171,9 +5084,9 @@ async def _agentic_loop_native_video(
     video_meta: Optional[dict] = None
 
     if provider == "agnes":
-        video_url, error, video_meta = await _request_agnes_video(prompt, duration, current_model, builder)
+        video_url, error, video_meta = await _request_agnes_video(prompt, duration, current_model)
     elif provider == "openrouter":
-        video_url, error, video_meta = await _request_openrouter_video(prompt, duration, current_model, builder)
+        video_url, error, video_meta = await _request_openrouter_video(prompt, duration, current_model)
     else:
         return f"VIDEO_ERROR:不支持的视频提供商 {provider}", None, []
 
