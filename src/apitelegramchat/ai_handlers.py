@@ -2350,11 +2350,30 @@ async def _run_tool_calls_and_append(
             except Exception as e:
                 logger.exception(f"[tool] {fn_name} failed: {e}")
                 result_str = f"Exception: tool {fn_name} failed - {str(e)[:200]}"
-            safe_content = _truncate_tool_result(result_str)
-            # 我们不再使用 format_tool_result 的摘要，而是自己生成
-            formatted_summary, details_html = await format_tool_result(fn_name, fn_args, safe_content)
-            # 但我们会用自定义生成摘要替换 formatted_summary
-            # 所以这里保留 details_html，但摘要我们后面自己生成
+            # 修复：_truncate_tool_result / format_tool_result 处理的是工具的原始
+            # 输出（可能是任意格式的字符串），二者内部有大量字符串切分/正则/索引
+            # 操作，遇到非预期形状的内容时可能抛出未捕获异常（IndexError /
+            # KeyError / AttributeError 等）。此前这类异常会直接冒泡出
+            # run_one，被外层 asyncio.gather(return_exceptions=True) 捕获成
+            # 一个裸 Exception，导致该 tool_call_id 既没有配对的 tool 消息，
+            # 也没有更新 builder 状态（UI 上表现为该折叠块永远停在"运行中"）。
+            # 这里已经拿到了真实的工具执行结果 result_str，不应该因为格式化
+            # 阶段的 bug 丢掉它——格式化失败就退化为纯文本展示，而不是让整个
+            # 工具调用从模型上下文和 UI 里"消失"。
+            try:
+                safe_content = _truncate_tool_result(result_str)
+            except Exception as e:
+                logger.exception(f"[tool] {fn_name} _truncate_tool_result 失败: {e}")
+                safe_content = str(result_str)[:4000]
+            try:
+                # 我们不再使用 format_tool_result 的摘要，而是自己生成
+                formatted_summary, details_html = await format_tool_result(fn_name, fn_args, safe_content)
+                # 但我们会用自定义生成摘要替换 formatted_summary
+                # 所以这里保留 details_html，但摘要我们后面自己生成
+            except Exception as e:
+                logger.exception(f"[tool] {fn_name} format_tool_result 失败: {e}")
+                formatted_summary = f"{fn_name} completed (formatting failed)"
+                details_html = f"<p>{escape_html(str(safe_content)[:2000])}</p>"
             if safe_content == _TOOL_TIMEOUT_MARKER:
                 llm_content = f"Error: tool {fn_name} timed out. Please try again or refine the request."
             else:
@@ -2374,12 +2393,36 @@ async def _run_tool_calls_and_append(
     await builder.flush(force=False)
 
     # ===== 修改：根据结果标记状态 =====
-    for res in results:
+    # tool_tasks 与 results 顺序一一对应（asyncio.gather 保序），用于在
+    # run_one 抛出未捕获异常时（如 format_tool_result 内部报错）仍能拿到
+    # 原始 tc_id / fn_name，补齐 tool 消息与 builder 状态。
+    # 修复：此前这里对未捕获异常直接 log + continue，导致：
+    #   1) 该 tool_call_id 永远没有配对的 tool 消息 -> 下一轮请求里
+    #      assistant.tool_calls 与 tool 消息数量不一致，多数供应商会
+    #      直接 400，或者模型陷入重试/困惑的死循环；
+    #   2) builder 里对应的工具条目 status 永远停在 "running"，UI 上
+    #      表现为一个折叠块永远转圈、草稿只在无关地方微调 —— 也就是
+    #      "刷新但没有新信息、后端却仍在跑" 的现象。
+    # 现在无论 run_one 是否抛出未捕获异常，都保证每个 tool_call 都会：
+    #   a) 得到一次 builder.update_tool_item(..., status=...) 调用；
+    #   b) 追加一条配对的 role=tool 消息回传给模型。
+    for idx, res in enumerate(results):
         if isinstance(res, asyncio.CancelledError):
             raise res
         if isinstance(res, Exception):
             # 不在 except 块内，使用 exc_info 显式附加 traceback
             logger.error("工具执行异常: %s", res, exc_info=res)
+            try:
+                fn_name, fn_args, tc_id = tool_tasks[idx]
+            except (IndexError, ValueError):
+                fn_name, fn_args, tc_id = "unknown", {}, f"call_error_{uuid.uuid4().hex[:8]}"
+            err_text = f"Exception: tool {fn_name} failed - {str(res)[:200]}"
+            final_summary = f"⚠️ {fn_name} failed"
+            details_html = f"<p>{escape_html(err_text)}</p>"
+            builder.update_tool_item(tc_id, final_summary, details_html, status="error")
+            tool_msg = {"role": "tool", "tool_call_id": tc_id, "name": fn_name, "content": err_text}
+            loop_messages.append(tool_msg)
+            new_history_entries.append(tool_msg)
             continue
         # 元组字段顺序: (fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content)
         fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content = res
@@ -3142,7 +3185,12 @@ class RichMessageBuilder:
 
         outer_summary = (group.get("outer_summary", "") or "").strip()
         if not outer_summary:
-            return ""
+            # 防御性兜底：正常情况下 _refresh_outer_summary / finish_group 总会
+            # 写入一个非空摘要。如果由于某个未预见的路径（例如未来新增的状态值）
+            # 仍然为空，绝不能让整组内容从渲染结果里直接消失——那样用户会看到
+            # 草稿"卡住不动"，而实际上内容其实还在 builder 里，只是没被渲染。
+            # 进行中的组用通用占位符，已结束的组按状态兜底展示。
+            outer_summary = "Working..." if not group.get("finished", False) else "Tool activity"
 
         reasoning_html = group.get("reasoning_html", "")
         text_content = group.get("text_content", "")
