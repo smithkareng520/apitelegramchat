@@ -345,12 +345,63 @@ def _estimate_message_tokens(message: dict) -> int:
             tokens += _MEDIA_TOKEN_OVERHEAD * len(tool_calls)
     return tokens
 
-async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool:
-    """Check the actual request snapshot without destructively dropping turns.
+def _estimate_request_snapshot(history: list[dict]) -> tuple[object, int]:
+    """Select the next API snapshot and estimate its prompt cost."""
+    snapshot = select_request_context(history)
+    return snapshot, sum(_estimate_message_tokens(message) for message in snapshot.messages)
 
-    When a request would exceed the model budget, archive the older half of the
-    supported tool rounds first.  The model receives short pointers and can use
-    ``text_editor view`` to recover each complete call/result from its workspace.
+
+def _drop_oldest_non_system_block(history: list[dict]) -> bool:
+    """Drop one oldest structural block without leaving orphaned tool messages.
+
+    A user message owns every following non-system message up to the next user
+    message.  If history starts with an assistant tool call, that call and its
+    contiguous paired tool results are dropped together.  System messages are
+    never selected for deletion.
+    """
+    start = next((index for index, message in enumerate(history) if message.get("role") != "system"), None)
+    if start is None:
+        return False
+
+    first = history[start]
+    if first.get("role") == "user":
+        end = start + 1
+        while end < len(history):
+            role = history[end].get("role")
+            if role in {"user", "system"}:
+                break
+            end += 1
+        del history[start:end]
+        return True
+
+    if first.get("role") == "assistant":
+        end = start + 1
+        calls = first.get("tool_calls")
+        expected_ids = {
+            call.get("id")
+            for call in calls
+            if isinstance(call, dict) and isinstance(call.get("id"), str)
+        } if isinstance(calls, list) else set()
+        while end < len(history) and history[end].get("role") == "tool":
+            call_id = history[end].get("tool_call_id")
+            if expected_ids and call_id not in expected_ids:
+                break
+            end += 1
+        del history[start:end]
+        return True
+
+    # A stray non-system message is removed only as a last structural unit.
+    del history[start]
+    return True
+
+
+async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool:
+    """Apply two reversible compaction passes, then structural trimming if needed.
+
+    The first pass archives the older half of eligible target-tool rounds.  If
+    still over budget, the second archives half of the remaining complete rounds
+    (about 75% cumulatively for even-sized sets).  Only if both passes fail does
+    the final fallback remove the oldest non-system conversation blocks.
     """
     lock = await get_chat_lock(chat_id)
     async with lock:
@@ -363,24 +414,64 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
         safe_limit = max_context - max_output
         new_input_est = max(1, _estimate_message_tokens(new_user_message))
 
-        snapshot = select_request_context(history)
-        request_estimate = sum(_estimate_message_tokens(message) for message in snapshot.messages)
-        if request_estimate + new_input_est > safe_limit:
-            stats = await compact_older_tool_rounds(chat_id, history)
-            if stats.compacted_calls:
-                snapshot = select_request_context(history)
-                request_estimate = sum(_estimate_message_tokens(message) for message in snapshot.messages)
-                logger.info(
-                    "Pre-flight tool compaction: chat=%s calls=%s archived_bytes=%s request_estimate=%s",
-                    chat_id,
-                    stats.compacted_calls,
-                    stats.archived_bytes,
-                    request_estimate,
-                )
+        _, request_estimate = _estimate_request_snapshot(history)
+        if request_estimate + new_input_est <= safe_limit:
+            return True
 
-        # History is not deleted here.  select_request_context() still bounds the
-        # request window structurally; only a single oversized new message is
-        # rejected because no history compaction can make it fit.
+        first_pass = await compact_older_tool_rounds(chat_id, history)
+        _, request_estimate = _estimate_request_snapshot(history)
+        if first_pass.compacted_calls:
+            logger.info(
+                "Pre-flight tool compaction pass=1 chat=%s calls=%s archived_bytes=%s request_estimate=%s",
+                chat_id,
+                first_pass.compacted_calls,
+                first_pass.archived_bytes,
+                request_estimate,
+            )
+        if request_estimate + new_input_est <= safe_limit:
+            return True
+
+        remaining_rounds = max(0, first_pass.eligible_rounds - first_pass.compacted_rounds)
+        second_pass_count = max(1, remaining_rounds // 2) if remaining_rounds else 0
+        second_pass = await compact_older_tool_rounds(
+            chat_id,
+            history,
+            rounds_to_compact=second_pass_count,
+        )
+        _, request_estimate = _estimate_request_snapshot(history)
+        if second_pass.compacted_calls:
+            logger.info(
+                "Pre-flight tool compaction pass=2 chat=%s calls=%s archived_bytes=%s request_estimate=%s",
+                chat_id,
+                second_pass.compacted_calls,
+                second_pass.archived_bytes,
+                request_estimate,
+            )
+        if request_estimate + new_input_est <= safe_limit:
+            return True
+
+        deleted_blocks = 0
+        while request_estimate + new_input_est > safe_limit:
+            if not _drop_oldest_non_system_block(history):
+                break
+            deleted_blocks += 1
+            _, request_estimate = _estimate_request_snapshot(history)
+
+        if deleted_blocks:
+            # The old ledger no longer maps one-to-one to remaining history.
+            ctx["token_ledger"] = []
+            ctx["last_prompt_tokens"] = 0
+            ctx["last_completion_tokens"] = 0
+            logger.warning(
+                "Pre-flight structural trim: chat=%s deleted_blocks=%s request_estimate=%s safe_limit=%s",
+                chat_id,
+                deleted_blocks,
+                request_estimate,
+                safe_limit,
+            )
+
+        # The only unserviceable case is a new user message that is oversized by
+        # itself, or a system-only snapshot that is already beyond the budget.
         return request_estimate + new_input_est <= safe_limit
 
 async def update_conversation_and_ledger(chat_id: int, user_message: dict, new_msgs: list, usage: dict = None) -> None:

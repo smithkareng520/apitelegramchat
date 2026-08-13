@@ -153,17 +153,26 @@ def _eligible_rounds(history: list[dict[str, Any]]) -> list[tuple[int, list[tupl
     return rounds
 
 
-async def compact_older_tool_rounds(chat_id: int, history: list[dict[str, Any]]) -> ToolCompactionStats:
-    """Archive only the older half of eligible tool-call rounds.
+async def compact_older_tool_rounds(
+    chat_id: int,
+    history: list[dict[str, Any]],
+    *,
+    rounds_to_compact: int | None = None,
+) -> ToolCompactionStats:
+    """Archive a selected prefix of eligible tool-call rounds.
 
-    The newest half remains verbatim to preserve short-term task continuity.  A
-    second pass is idempotent for already archived pairs and will only consider
-    still-unarchived rounds.  Full payloads are written before the in-memory
-    history is changed, so an archive write failure leaves the conversation
-    untouched for that call.
+    With the default, the function archives the older half of still-unarchived
+    target rounds.  Callers may provide ``rounds_to_compact`` for a later
+    compaction pass; this makes it possible to compact half of the remaining
+    rounds without revisiting already archived payloads.  Full payloads are
+    written before the in-memory history is changed, so an archive write failure
+    leaves the conversation untouched for that call.
     """
     rounds = _eligible_rounds(history)
-    compact_round_count = len(rounds) // 2
+    if rounds_to_compact is None:
+        compact_round_count = len(rounds) // 2
+    else:
+        compact_round_count = min(len(rounds), max(0, int(rounds_to_compact)))
     if compact_round_count == 0:
         return ToolCompactionStats(eligible_rounds=len(rounds))
 
