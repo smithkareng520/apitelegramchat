@@ -357,12 +357,12 @@ SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
 
 # ---------- Agnes 免费模型 ----------
 # (duplicate gemma entry removed)
-SUPPORTED_MODELS["agnes-2.0-flash"] = make_model_config(
-    model_id="agnes-2.0-flash",
+SUPPORTED_MODELS["agnes-2.5-flash"] = make_model_config(
+    model_id="agnes-2.5-flash",
     provider="agnes",
-    name="Agnes 2.0 Flash",
-    max_context=256000,
-    max_output_tokens=64000,
+    name="Agnes 2.5 Flash",
+    max_context=512000,
+    max_output_tokens=65500,
     vision=True,
 )
 
@@ -479,7 +479,7 @@ SUPPORTED_MODELS["agnes-video-v2.0"] = make_model_config(
 )
 
 # ========== 默认模型 ==========
-DEFAULT_MODEL = "agnes-2.0-flash"
+DEFAULT_MODEL = "agnes-2.5-flash"
 assert DEFAULT_MODEL in SUPPORTED_MODELS, f"默认模型 {DEFAULT_MODEL} 未定义"
 
 

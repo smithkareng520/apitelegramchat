@@ -2291,6 +2291,12 @@ async def _run_tool_calls_and_append(
             # 稍后仍会为这些 ID 补充 tool 消息，避免下一次总结请求出现未配对调用。
             skipped_tool_calls.append(tc)
     if not valid_tool_calls and not skipped_tool_calls:
+        # 流式接收阶段已经可能为 done 之类的特殊调用创建了工具条目。
+        # 即使没有可执行的调用，也必须在这一轮结束时收束该工具组；否则下一轮
+        # 会复用一个跨回合未完成的组，既影响 UI，也可能推迟富消息滚动边界。
+        if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
+            builder.finish_group(len(builder._tool_groups) - 1)
+        await builder.flush()
         return "continue"
 
     tool_call_count_ref[0] += len(valid_tool_calls)
@@ -3538,27 +3544,39 @@ class RichMessageBuilder:
         调用方必须保证下一次模型请求尚未开始，且本轮并行工具均已得到最终状态。
         flush 只负责置位容量预警，因此这里的网络 I/O 不会与后续 Agent 轮次交错。
         """
-        if self._stop_flush or not self._rollover_pending or self._rollover_in_progress:
+        if self._stop_flush or self._rollover_in_progress:
             return False
 
+        # 回合边界是唯一允许换草稿的时点，因此必须在这里重新统计真实容量。
+        # 不能只依赖 flush 之前留下的 _rollover_pending：draft API 限流冷却、
+        # 刷新短路或未来调用路径遗漏 flush 时，旧实现会让已到 30k 的草稿跨越
+        # 多个工具回合仍不切换。先提交流式缓冲，确保本轮最后一段也参与统计。
         self._commit_stream_buffer()
         async with self._rollover_lock:
-            if self._stop_flush or not self._rollover_pending or self._rollover_in_progress:
+            if self._stop_flush or self._rollover_in_progress:
                 return False
             current_html = self._sanitize_rich_html(self._build_html_no_thinking())
             cut_at, visible_chars, block_count = self._pick_rollover_boundary(current_html)
+            rollover_due = (
+                visible_chars >= RICH_DRAFT_ROLLOVER_TEXT_CHARS
+                or block_count >= RICH_DRAFT_ROLLOVER_BLOCKS
+            )
+            if not rollover_due:
+                # 27k / 380 blocks 仍只承担提前预警职责；到 30k / 440 blocks
+                # 才在完整工具回合结束时实际换草稿。
+                return False
+
+            # 即使此前的 flush 未运行或被限流跳过，达到正式阈值后也要在本次
+            # 回合边界完成切换，保证不等待整个任务或后续工具轮次。
+            self._rollover_pending = True
 
             used_fallback = False
             if cut_at is not None:
                 completed_html = current_html[:cut_at].strip()
                 remainder = current_html[cut_at:]
-            elif (
-                visible_chars < RICH_DRAFT_HARD_GUARD_CHARS
-                and block_count < RICH_MESSAGE_BLOCKS_MAX - 1
-            ):
-                # 软阈值已到但当前仍无完整边界：保留 pending，等待下一完整回合。
-                return False
             else:
+                # 已到正式切换阈值却没有完整 Rich Block 边界时，立即采用安全的
+                # 纯文本分段。不能等到 hard guard，否则新草稿会被继续拖延数轮。
                 plain = _rich_visible_text(current_html)
                 text_cut = self._plain_text_cut(plain, RICH_DRAFT_ROLLOVER_TEXT_CHARS)
                 completed_html = f"<p>{escape_html(plain[:text_cut].rstrip())}</p>"

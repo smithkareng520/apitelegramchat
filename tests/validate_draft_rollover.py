@@ -2,6 +2,7 @@
 import asyncio
 import os
 import sys
+import time
 from unittest.mock import AsyncMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -267,6 +268,109 @@ async def test_old_preview_cleanup_does_not_delay_new_draft() -> None:
         handlers.delete_message_fast = original_delete_fast
 
 
+async def test_turn_boundary_rechecks_capacity_after_rate_limited_flush() -> None:
+    permanent_segments = []
+    draft_frames = []
+
+    async def fake_permanent(chat_id, html_content, **kwargs):
+        permanent_segments.append((chat_id, html_content, kwargs))
+        return 7373
+
+    async def fake_draft(chat_id, draft_id, html_content, **kwargs):
+        draft_frames.append((draft_id, html_content, kwargs))
+        return 7474
+
+    original_permanent = handlers.send_rich_html_message
+    original_draft = handlers.send_rich_message_draft
+    original_dead = handlers.mark_draft_dead
+    try:
+        handlers.send_rich_html_message = fake_permanent
+        handlers.send_rich_message_draft = fake_draft
+        handlers.mark_draft_dead = AsyncMock()
+
+        builder = handlers.RichMessageBuilder(chat_id=104)
+        old_draft_id = builder.draft_id
+        builder._register_active_draft = AsyncMock()
+        builder.blocks = ["<p>" + ("甲" * handlers.RICH_DRAFT_ROLLOVER_TEXT_CHARS) + "</p>"]
+        builder.block_types = ["text"]
+
+        # 模拟 429 冷却：flush 会提前返回，所以此前实现不会设置 pending。
+        builder._rate_limited_until = time.monotonic() + 60
+        await builder.flush()
+        require(not builder._rollover_pending, "冷却期内的 flush 不应伪造 pending")
+
+        # 修复后，完整工具回合边界自行重新统计 30k 容量并立即切换。
+        require(await builder.rollover_at_turn_boundary(), "边界必须独立于 flush/pending 完成滚动")
+        require(builder.draft_id != old_draft_id, "达到正式阈值后必须换用新草稿")
+        require(len(permanent_segments) == 1, "必须永久化一个旧草稿段")
+        require(
+            len(handlers._rich_visible_text(permanent_segments[0][1])) == handlers.RICH_DRAFT_ROLLOVER_TEXT_CHARS,
+            "30k 的完整段必须在本回合边界立即提交",
+        )
+        # 新 draft_id 有独立的节流状态；切换后必须立即发送新草稿首帧，不能继续被旧草稿
+        # 的冷却窗口拖住，否则用户仍会看到“后端运行但草稿不刷新”。
+        require(draft_frames and draft_frames[-1][0] == builder.draft_id, "新草稿首帧必须立即使用新 draft_id 发送")
+    finally:
+        handlers.send_rich_html_message = original_permanent
+        handlers.send_rich_message_draft = original_draft
+        handlers.mark_draft_dead = original_dead
+
+
+async def test_arm_threshold_waits_for_formal_rollover_threshold() -> None:
+    async def fake_draft(chat_id, draft_id, html_content, **kwargs):
+        return 7575
+
+    original_draft = handlers.send_rich_message_draft
+    try:
+        handlers.send_rich_message_draft = fake_draft
+        builder = handlers.RichMessageBuilder(chat_id=105)
+        builder._register_active_draft = AsyncMock()
+        builder.blocks = ["<p>" + ("乙" * handlers.RICH_DRAFT_ARM_TEXT_CHARS) + "</p>"]
+        builder.block_types = ["text"]
+
+        await builder.flush()
+        require(builder._rollover_pending, "27k 应继续作为提前预警")
+        require(
+            not await builder.rollover_at_turn_boundary(),
+            "未到 30k/440 的完整回合边界不得提前换草稿",
+        )
+        require(builder._rollover_count == 0, "仅预警不能永久化或新建草稿")
+    finally:
+        handlers.send_rich_message_draft = original_draft
+
+
+async def test_done_only_batch_finishes_precreated_tool_group() -> None:
+    async def fake_draft(chat_id, draft_id, html_content, **kwargs):
+        return 7676
+
+    original_draft = handlers.send_rich_message_draft
+    try:
+        handlers.send_rich_message_draft = fake_draft
+        builder = handlers.RichMessageBuilder(chat_id=106)
+        builder._register_active_draft = AsyncMock()
+        # 真实流式阶段会先创建该条目，然后 _run_tool_calls_and_append 才会看到 done-only 批次。
+        builder.add_tool_item("done-1", "done", "Done")
+        require(not builder._tool_groups[-1]["finished"], "前置条件：工具组尚未收束")
+
+        status = await handlers._run_tool_calls_and_append(
+            tool_calls=[{
+                "id": "done-1",
+                "type": "function",
+                "function": {"name": "done", "arguments": "{}"},
+            }],
+            loop_messages=[],
+            new_history_entries=[],
+            tool_call_count_ref=[0],
+            api_label="test",
+            builder=builder,
+            chat_id=106,
+        )
+        require(status == "continue", "done-only 批次应正常继续")
+        require(builder._tool_groups[-1]["finished"], "done-only 批次必须收束已有工具组")
+    finally:
+        handlers.send_rich_message_draft = original_draft
+
+
 def test_no_legacy_background_rollover_fields() -> None:
     builder = handlers.RichMessageBuilder(chat_id=103)
     require(not hasattr(builder, "_rollover_task"), "不得残留后台 rollover task")
@@ -282,6 +386,9 @@ def main() -> None:
     asyncio.run(test_handoff_delta_is_preserved())
     asyncio.run(test_failed_permanent_send_restores_handoff_to_old_draft())
     asyncio.run(test_old_preview_cleanup_does_not_delay_new_draft())
+    asyncio.run(test_turn_boundary_rechecks_capacity_after_rate_limited_flush())
+    asyncio.run(test_arm_threshold_waits_for_formal_rollover_threshold())
+    asyncio.run(test_done_only_batch_finishes_precreated_tool_group())
     test_no_legacy_background_rollover_fields()
     print("turn-boundary draft rollover validation: PASS")
 
