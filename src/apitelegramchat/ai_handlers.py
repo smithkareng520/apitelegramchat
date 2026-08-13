@@ -43,6 +43,7 @@ from apitelegramchat.utils import (
     strip_html_tags,
     escape_html,
     get_logger,
+    get_request_id,
     delete_message,
     mark_draft_dead,
     RateLimitError,
@@ -2193,6 +2194,17 @@ def _safe_parse_args(args_str: str) -> dict:
 
 
 # ========== 工具调用执行 ==========
+def _log_builder_diagnostic(builder, event: str, **fields) -> None:
+    """兼容最小化 builder 替身；诊断能力不能改变工具调用主链路。"""
+    callback = getattr(builder, "log_diagnostic", None)
+    if not callable(callback):
+        return
+    try:
+        callback(event, **fields)
+    except Exception:
+        pass
+
+
 async def _run_tool_calls_and_append(
         tool_calls: list,
         loop_messages: list,
@@ -2224,6 +2236,14 @@ async def _run_tool_calls_and_append(
     tool_call_count_ref[0] += len(valid_tool_calls)
 
     group_idx = builder._get_current_group() if valid_tool_calls else -1
+    _log_builder_diagnostic(
+        builder, "tool_batch_started",
+        api_label=api_label,
+        valid_tool_calls=len(valid_tool_calls),
+        skipped_tool_calls=len(skipped_tool_calls),
+        tool_budget_used=tool_call_count_ref[0],
+        tool_group_index=group_idx,
+    )
 
     tool_tasks = []
     for tc in valid_tool_calls:
@@ -2279,10 +2299,25 @@ async def _run_tool_calls_and_append(
     force_tool_refresh = bool(tool_tasks)
 
     async def refresh_loop():
+        _log_builder_diagnostic(
+            builder, "tool_keepalive_started", api_label=api_label,
+            force=force_tool_refresh, tool_count=len(tool_tasks),
+        )
         await builder.flush(force=force_tool_refresh)
         while not stop_refresh.is_set():
             await asyncio.sleep(2.0)
             if not stop_refresh.is_set():
+                last_flush_at = getattr(builder, "_last_flush_time", time.monotonic())
+                flush_age_ms = round((time.monotonic() - last_flush_at) * 1000, 1)
+                if flush_age_ms >= 6_000:
+                    _log_builder_diagnostic(
+                        builder, "tool_keepalive_overdue", api_label=api_label,
+                        force=force_tool_refresh, flush_age_ms=flush_age_ms,
+                    )
+                _log_builder_diagnostic(
+                    builder, "tool_keepalive_tick", api_label=api_label,
+                    force=force_tool_refresh, flush_age_ms=flush_age_ms,
+                )
                 await builder.flush(force=force_tool_refresh)
 
     refresh_task = asyncio.create_task(refresh_loop())
@@ -2396,9 +2431,17 @@ async def _run_tool_calls_and_append(
                 llm_content = safe_content
             return (fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content)
 
+    tool_batch_started_at = time.monotonic()
     results = await asyncio.gather(
         *[run_one(fn, args, tid) for fn, args, tid in tool_tasks],
         return_exceptions=True
+    )
+    _log_builder_diagnostic(
+        builder, "tool_batch_results_collected",
+        api_label=api_label,
+        tool_count=len(tool_tasks),
+        exception_count=sum(isinstance(result, Exception) for result in results),
+        elapsed_ms=round((time.monotonic() - tool_batch_started_at) * 1000, 1),
     )
 
     stop_refresh.set()
@@ -2407,6 +2450,11 @@ async def _run_tool_calls_and_append(
     except asyncio.CancelledError:
         pass
     await builder.flush(force=False)
+    _log_builder_diagnostic(
+        builder, "tool_batch_refresh_stopped",
+        api_label=api_label,
+        tool_count=len(tool_tasks),
+    )
 
     # ===== 修改：根据结果标记状态 =====
     # tool_tasks 与 results 顺序一一对应（asyncio.gather 保序），用于在
@@ -2723,6 +2771,55 @@ class RichMessageBuilder:
         # 收尾只处理当前草稿而不会重复发送已完成的段落。
         self._rollover_history: list[dict[str, int | str | None]] = []
         self._rollover_count: int = 0
+
+    @staticmethod
+    def _diagnostic_task_state(task: Optional[asyncio.Task]) -> str:
+        if task is None:
+            return "none"
+        if task.cancelled():
+            return "cancelled"
+        if task.done():
+            return "done"
+        return "running"
+
+    def diagnostic_snapshot(self) -> dict:
+        """返回无正文、可安全输出的草稿运行状态快照。"""
+        now = time.monotonic()
+        open_groups = [group for group in self._tool_groups if not group.get("finished", False)]
+        return {
+            "chat_id": self.chat_id,
+            "draft_id": self.draft_id,
+            "draft_message_id": self.draft_message_id or 0,
+            "block_count": len(self.blocks),
+            "tool_group_count": len(self._tool_groups),
+            "open_tool_groups": len(open_groups),
+            "tool_item_count": sum(len(group.get("items", [])) for group in self._tool_groups),
+            "running_tool_items": sum(
+                1
+                for group in self._tool_groups
+                for item in group.get("items", [])
+                if item.get("status") in {"running", "waiting"}
+            ),
+            "stream_buffer_chars": len(self._stream_buffer),
+            "pending_chars": self._pending_chars,
+            "last_flush_age_ms": round((now - self._last_flush_time) * 1000, 1),
+            "rate_limit_remaining_ms": round(max(0.0, self._rate_limited_until - now) * 1000, 1),
+            "flush_lock_locked": self._flush_lock.locked(),
+            "flush_task": self._diagnostic_task_state(self._flush_task),
+            "pending_flush_task": self._diagnostic_task_state(self._pending_flush_task),
+            "rollover_task": self._diagnostic_task_state(self._rollover_task),
+            "rollover_allowed": self._rollover_allowed,
+            "stop_flush": self._stop_flush,
+            "rollover_count": self._rollover_count,
+        }
+
+    def log_diagnostic(self, event: str, **fields) -> None:
+        """输出单行 JSON 草稿状态日志，不记录用户正文或工具输出。"""
+        payload = {"event": event, "request_id": get_request_id(), **self.diagnostic_snapshot(), **fields}
+        try:
+            logger.info("[draft_state] %s", json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
+        except Exception:
+            logger.info("[draft_state] event=%s chat=%s draft=%s", event, self.chat_id, self.draft_id)
 
     def _get_reasoning_summary(self, content: str) -> str:
         """从包含 HTML 标签的思考内容中提取纯文本摘要，长度不超过 30 字符"""
@@ -3425,6 +3522,7 @@ class RichMessageBuilder:
         try:
             from apitelegramchat.state import set_active_draft
             await set_active_draft(self.chat_id, self.draft_id, message_id)
+            self.log_diagnostic("active_draft_registered", registered_message_id=message_id)
         except Exception as exc:
             logger.debug("更新活跃草稿状态失败: chat=%s draft=%s err=%s", self.chat_id, self.draft_id, exc)
 
@@ -3581,6 +3679,11 @@ class RichMessageBuilder:
                 len(_rich_visible_text(completed_html)), block_count,
                 "fallback" if used_fallback else "complete_block",
             )
+            self.log_diagnostic(
+                "rollover_committed", old_draft_id=old_draft_id, new_draft_id=new_draft_id,
+                permanent_message_id=completed_message_id, completed_chars=len(_rich_visible_text(completed_html)),
+                blocks=block_count, mode="plain_text_fallback" if used_fallback else "complete_block",
+            )
 
         # _register_active_draft 内部只是写内存字典（state.py 的 _active_drafts），
         # 不发网络请求，锁外调用也是安全的。外部中断后不再允许旧任务登记新草稿。
@@ -3615,6 +3718,14 @@ class RichMessageBuilder:
         """
         if not self._rollover_allowed:
             return
+        # 绝大多数刷新不需要滚动。先做纯内存阈值判断，避免每帧都创建一个
+        # 立即返回的后台任务，从而干扰诊断日志并制造不必要的调度开销。
+        _cut_at, visible_chars, block_count = self._pick_rollover_boundary(html_content)
+        if (
+            visible_chars < RICH_DRAFT_ROLLOVER_TEXT_CHARS
+            and block_count < RICH_DRAFT_ROLLOVER_BLOCKS
+        ):
+            return
         if self._rollover_task is not None and not self._rollover_task.done():
             # 上一次滚动仍在进行（判断阶段很快，这个窗口通常只有并发触发才会
             # 命中），避免重复创建后台任务；_rollover_draft_if_needed 内部对
@@ -3634,12 +3745,18 @@ class RichMessageBuilder:
 
         try:
             self._rollover_task = asyncio.create_task(_runner())
+            self.log_diagnostic("rollover_task_started", html_chars=len(html_content))
         except RuntimeError:
             self._rollover_task = None
 
     async def flush(self, force: bool = False):
         now = time.monotonic()
         if now < self._rate_limited_until:
+            self.log_diagnostic(
+                "flush_skip_rate_limited",
+                force=force,
+                rate_limit_remaining_ms=round((self._rate_limited_until - now) * 1000, 1),
+            )
             return
 
         # 滚动判断本身（_pick_rollover_boundary，纯字符串扫描）很快，可以直接
@@ -3666,12 +3783,26 @@ class RichMessageBuilder:
                 # 改用 <p> 占位。
                 html_content = "<p>Working...</p>"
 
+            pending_chars_before_flush = self._pending_chars
             self._pending_chars = 0
 
+            should_trace = force or pending_chars_before_flush > 0 or (now - self._last_flush_time) >= 3.0
+            send_started_at = time.monotonic()
+            if should_trace:
+                self.log_diagnostic(
+                    "flush_dispatch", force=force, html_chars=len(html_content),
+                    pending_chars=pending_chars_before_flush,
+                )
             try:
                 msg_id = await send_rich_message_draft(
                     self.chat_id, self.draft_id, html_content, force=force
                 )
+                if should_trace or not msg_id:
+                    self.log_diagnostic(
+                        "flush_result", force=force, html_chars=len(html_content),
+                        pending_chars=pending_chars_before_flush, message_id=msg_id or 0,
+                        elapsed_ms=round((time.monotonic() - send_started_at) * 1000, 1),
+                    )
                 # 无论 API 是否返回 message_id，已完成的一次发送都会重置保活计时。
                 self._last_flush_time = time.monotonic()
                 if msg_id:
@@ -3680,6 +3811,7 @@ class RichMessageBuilder:
                     # 后续永久消息才能与正确的草稿串行化。
                     await self._register_active_draft(msg_id)
             except RateLimitError as e:
+                self.log_diagnostic("flush_rate_limited", force=force, retry_after_s=e.retry_after)
                 retry_after = e.retry_after + 2
                 self._rate_limited_until = time.monotonic() + retry_after
                 logger.warning(
@@ -3687,6 +3819,10 @@ class RichMessageBuilder:
                     f"{self._rate_limited_until:.1f} (retry_after={e.retry_after}s)"
                 )
             except Exception as e:
+                self.log_diagnostic(
+                    "flush_exception", force=force, error=type(e).__name__,
+                    elapsed_ms=round((time.monotonic() - send_started_at) * 1000, 1),
+                )
                 err_msg = str(e)
                 if "429" in err_msg:
                     self._rate_limited_until = time.monotonic() + 10.0
@@ -3753,6 +3889,7 @@ class RichMessageBuilder:
         极端情况下仍未如期退出时，才退回到后台清理，避免无限阻塞。
         """
         self._stop_flush = True
+        self.log_diagnostic("flush_stop_requested", cancel_rollover=cancel_rollover)
         if cancel_rollover:
             # 该标志同时覆盖“任务尚未被调度”和“取消请求未能即时打断底层 I/O”
             # 两种情况，确保旧任务不会在稍后注册/刷新新的 draft_id。
@@ -4075,6 +4212,15 @@ async def _agentic_loop_openai_compat(
                 f"ids={tool_call_ids}, names={tool_call_names}, content_len={len(content_acc.strip())}, "
                 f"reasoning_len={len(reasoning_acc.strip())}"
             )
+            builder.log_diagnostic(
+                "model_round_received",
+                api_label=api_label,
+                model_round=_round + 1,
+                tool_calls=len(tool_calls_list),
+                tool_names=tool_call_names,
+                content_chars=len(content_acc.strip()),
+                reasoning_chars=len(reasoning_acc.strip()),
+            )
         except Exception:
             logger.exception(f"[{api_label}] 记录 tool_calls 日志失败")
         for idx, tc in enumerate(tool_calls_list):
@@ -4099,6 +4245,12 @@ async def _agentic_loop_openai_compat(
         if reasoning_acc:
             builder.finalize_reasoning_block(has_tool_calls=bool(tool_calls_list))
         await builder.flush()
+        builder.log_diagnostic(
+            "model_round_rendered",
+            api_label=api_label,
+            model_round=_round + 1,
+            tool_calls=len(tool_calls_list),
+        )
 
         assistant_msg: dict = {"role": "assistant", "content": content_acc or None}
         if tool_calls_list:
