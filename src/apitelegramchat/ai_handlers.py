@@ -3,6 +3,7 @@ import asyncio
 import ast
 import json
 import aiohttp
+import httpx
 import base64
 from PIL import Image
 import io
@@ -3768,138 +3769,152 @@ async def _agentic_loop_openai_compat(
             if api_label == "openrouter":
                 create_params["extra_body"] = _openrouter_extra_body()
 
-            comp_stream = await client.chat.completions.create(**create_params)
-            async for chunk in comp_stream:
-                received_any = True
-                if getattr(chunk, "usage", None):
-                    final_usage = chunk.usage
-                choices = chunk.choices or []
-                if not choices:
-                    continue
-                delta = choices[0].delta
-                c_delta = getattr(delta, "content", None) or ""
-                if isinstance(c_delta, list):
-                    c_delta = "".join(str(item) for item in c_delta)
-
-                r_delta = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None) or ""
-                if isinstance(r_delta, list):
-                    r_delta = "".join(str(item) for item in r_delta)
-                if r_delta:
-                    if round_leading_kind is None:
-                        round_leading_kind = "content"
-                        if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-                            builder.finish_group(len(builder._tool_groups) - 1)
-                            # ★ 强制刷新，确保总结先于思考内容显示 ★
-                            await builder.flush(force=True)
-                    switch_stream("reasoning")
-                    reasoning_acc += r_delta
-                    builder.append_stream_delta(r_delta)
-
-                if c_delta:
-                    content_acc += c_delta
-                    if round_leading_kind is None:
-                        round_leading_kind = "content"
-                        if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-                            builder.finish_group(len(builder._tool_groups) - 1)
-                            # ★ 强制刷新，确保总结先于文本内容显示 ★
-                            await builder.flush(force=True)
-                    if round_leading_kind == "tool" and builder._tool_groups and not builder._tool_groups[-1].get(
-                            "finished", False):
-                        # 本轮先出现了工具调用，这段文字是同一轮里紧跟在工具调用之后的说明文字，
-                        # 归入当前（同一轮新开或合并的）工具块内部。
-                        builder.append_to_current_tool_group_text(c_delta)
-                    else:
-                        if "<think>" in c_delta:
-                            in_reasoning = True
-                            before, _, rest = c_delta.partition("<think>")
-                            if before:
-                                switch_stream("content")
-                                builder.append_stream_delta(before)
-                            switch_stream("reasoning")
-                            if "</think>" in rest:
-                                think_part, _, after = rest.partition("</think>")
-                                reasoning_acc += think_part
-                                builder.append_stream_delta(think_part)
-                                in_reasoning = False
-                                if after:
-                                    switch_stream("content")
-                                    builder.append_stream_delta(after)
-                                else:
-                                    current_stream = None
-                            else:
-                                reasoning_acc += rest
-                                builder.append_stream_delta(rest)
-                        elif in_reasoning:
-                            if "</think>" in c_delta:
-                                think_part, _, after = c_delta.partition("</think>")
-                                reasoning_acc += think_part
-                                builder.append_stream_delta(think_part)
-                                in_reasoning = False
-                                if after:
-                                    switch_stream("content")
-                                    builder.append_stream_delta(after)
-                                else:
-                                    current_stream = None
-                            else:
-                                reasoning_acc += c_delta
-                                builder.append_stream_delta(c_delta)
-                        else:
-                            switch_stream("content")
-                            builder.append_stream_delta(c_delta)
-
-                for tc_delta in (getattr(delta, "tool_calls", None) or []):
-                    idx = getattr(tc_delta, "index", 0)
-                    _merge_tool_call_delta(
-                        tool_calls_acc, idx,
-                        {"id": getattr(tc_delta, "id", "") or "",
-                         "function": {"name": getattr(tc_delta.function, "name", "") or "",
-                                      "arguments": getattr(tc_delta.function, "arguments", "") or ""}}
-                    )
-                    if idx not in added_tool_indices:
-                        tc = tool_calls_acc[idx]
-                        tc_id = tc.get("id")
-                        tc_name = tc.get("function", {}).get("name")
-                        if tc_id and tc_name:
-                            if round_leading_kind is None:
-                                # 本轮第一个出现的就是工具调用：沿用/合并到上一个未闭合的工具块。
-                                round_leading_kind = "tool"
-                            elif round_leading_kind == "content" and builder._tool_groups and not builder._tool_groups[
-                                -1].get("finished", False):
-                                # 本轮先出现了文本/思考才轮到工具调用：这段文本已经在上面把旧工具块
-                                # 关闭掉了，这里创建的会是全新的独立工具块，不需要再次关闭。
-                                pass
-                            args_str = tc.get("function", {}).get("arguments", "")
-                            parsed_args = _safe_parse_args(args_str)
-                            summary = _generate_initial_tool_summary(tc_name, parsed_args)
-                            action_desc = _generate_action_description(tc_name, parsed_args)
-                            builder.add_tool_item(
-                                tc_id,
-                                tc_name,
-                                summary,
-                                action_description=action_desc,
-                                fn_args=parsed_args
-                            )
-                            added_tool_indices.add(idx)
-                            builder.request_flush(force=False)
-
-                    if idx in added_tool_indices:
-                        tc = tool_calls_acc[idx]
-                        tc_id = tc.get("id")
-                        if not tc_id:
+            # 某些聚合网关会在长工具链后的首个 SSE 事件前沉默较久。
+            # 只有尚未收到任何增量时，重试相同请求才是幂等且安全的；一旦已经向
+            # 用户或工具状态写入增量，必须直接抛出，避免重放半个模型回合。
+            for stream_attempt in range(2):
+                try:
+                    comp_stream = await client.chat.completions.create(**create_params)
+                    async for chunk in comp_stream:
+                        received_any = True
+                        if getattr(chunk, "usage", None):
+                            final_usage = chunk.usage
+                        choices = chunk.choices or []
+                        if not choices:
                             continue
-                        # 工具调用参数在流式接收过程中不再实时渲染预览；
-                        # 最终结果会在工具执行完成后按统一的 Input/Output 格式一次性展示。
-                        current_args = tc.get("function", {}).get("arguments", "")
-                        current_len = len(current_args)
-                        if current_len - last_arg_len.get(idx, 0) >= 20:
-                            last_arg_len[idx] = current_len
-                            tc_name = tc.get("function", {}).get("name", "")
-                            parsed_args = _safe_parse_args(current_args)
-                            for group in builder._tool_groups:
-                                for item in group["items"]:
-                                    if item["id"] == tc_id:
-                                        item["fn_args"] = parsed_args
-                                        break
+                        delta = choices[0].delta
+                        c_delta = getattr(delta, "content", None) or ""
+                        if isinstance(c_delta, list):
+                            c_delta = "".join(str(item) for item in c_delta)
+
+                        r_delta = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None) or ""
+                        if isinstance(r_delta, list):
+                            r_delta = "".join(str(item) for item in r_delta)
+                        if r_delta:
+                            if round_leading_kind is None:
+                                round_leading_kind = "content"
+                                if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
+                                    builder.finish_group(len(builder._tool_groups) - 1)
+                                    # ★ 强制刷新，确保总结先于思考内容显示 ★
+                                    await builder.flush(force=True)
+                            switch_stream("reasoning")
+                            reasoning_acc += r_delta
+                            builder.append_stream_delta(r_delta)
+
+                        if c_delta:
+                            content_acc += c_delta
+                            if round_leading_kind is None:
+                                round_leading_kind = "content"
+                                if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
+                                    builder.finish_group(len(builder._tool_groups) - 1)
+                                    # ★ 强制刷新，确保总结先于文本内容显示 ★
+                                    await builder.flush(force=True)
+                            if round_leading_kind == "tool" and builder._tool_groups and not builder._tool_groups[-1].get(
+                                    "finished", False):
+                                # 本轮先出现了工具调用，这段文字是同一轮里紧跟在工具调用之后的说明文字，
+                                # 归入当前（同一轮新开或合并的）工具块内部。
+                                builder.append_to_current_tool_group_text(c_delta)
+                            else:
+                                if "<think>" in c_delta:
+                                    in_reasoning = True
+                                    before, _, rest = c_delta.partition("<think>")
+                                    if before:
+                                        switch_stream("content")
+                                        builder.append_stream_delta(before)
+                                    switch_stream("reasoning")
+                                    if "</think>" in rest:
+                                        think_part, _, after = rest.partition("</think>")
+                                        reasoning_acc += think_part
+                                        builder.append_stream_delta(think_part)
+                                        in_reasoning = False
+                                        if after:
+                                            switch_stream("content")
+                                            builder.append_stream_delta(after)
+                                        else:
+                                            current_stream = None
+                                    else:
+                                        reasoning_acc += rest
+                                        builder.append_stream_delta(rest)
+                                elif in_reasoning:
+                                    if "</think>" in c_delta:
+                                        think_part, _, after = c_delta.partition("</think>")
+                                        reasoning_acc += think_part
+                                        builder.append_stream_delta(think_part)
+                                        in_reasoning = False
+                                        if after:
+                                            switch_stream("content")
+                                            builder.append_stream_delta(after)
+                                        else:
+                                            current_stream = None
+                                    else:
+                                        reasoning_acc += c_delta
+                                        builder.append_stream_delta(c_delta)
+                                else:
+                                    switch_stream("content")
+                                    builder.append_stream_delta(c_delta)
+
+                        for tc_delta in (getattr(delta, "tool_calls", None) or []):
+                            idx = getattr(tc_delta, "index", 0)
+                            _merge_tool_call_delta(
+                                tool_calls_acc, idx,
+                                {"id": getattr(tc_delta, "id", "") or "",
+                                 "function": {"name": getattr(tc_delta.function, "name", "") or "",
+                                              "arguments": getattr(tc_delta.function, "arguments", "") or ""}}
+                            )
+                            if idx not in added_tool_indices:
+                                tc = tool_calls_acc[idx]
+                                tc_id = tc.get("id")
+                                tc_name = tc.get("function", {}).get("name")
+                                if tc_id and tc_name:
+                                    if round_leading_kind is None:
+                                        # 本轮第一个出现的就是工具调用：沿用/合并到上一个未闭合的工具块。
+                                        round_leading_kind = "tool"
+                                    elif round_leading_kind == "content" and builder._tool_groups and not builder._tool_groups[
+                                        -1].get("finished", False):
+                                        # 本轮先出现了文本/思考才轮到工具调用：这段文本已经在上面把旧工具块
+                                        # 关闭掉了，这里创建的会是全新的独立工具块，不需要再次关闭。
+                                        pass
+                                    args_str = tc.get("function", {}).get("arguments", "")
+                                    parsed_args = _safe_parse_args(args_str)
+                                    summary = _generate_initial_tool_summary(tc_name, parsed_args)
+                                    action_desc = _generate_action_description(tc_name, parsed_args)
+                                    builder.add_tool_item(
+                                        tc_id,
+                                        tc_name,
+                                        summary,
+                                        action_description=action_desc,
+                                        fn_args=parsed_args
+                                    )
+                                    added_tool_indices.add(idx)
+                                    builder.request_flush(force=False)
+
+                            if idx in added_tool_indices:
+                                tc = tool_calls_acc[idx]
+                                tc_id = tc.get("id")
+                                if not tc_id:
+                                    continue
+                                # 工具调用参数在流式接收过程中不再实时渲染预览；
+                                # 最终结果会在工具执行完成后按统一的 Input/Output 格式一次性展示。
+                                current_args = tc.get("function", {}).get("arguments", "")
+                                current_len = len(current_args)
+                                if current_len - last_arg_len.get(idx, 0) >= 20:
+                                    last_arg_len[idx] = current_len
+                                    tc_name = tc.get("function", {}).get("name", "")
+                                    parsed_args = _safe_parse_args(current_args)
+                                    for group in builder._tool_groups:
+                                        for item in group["items"]:
+                                            if item["id"] == tc_id:
+                                                item["fn_args"] = parsed_args
+                                            break
+                    break
+                except httpx.ReadTimeout:
+                    if received_any or stream_attempt >= 1:
+                        raise
+                    logger.warning(
+                        "[%s] 第 %s 轮模型流在首个增量前读取超时，等待后重试一次",
+                        api_label, _round + 1,
+                    )
+                    await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             raise
         except Exception as e:

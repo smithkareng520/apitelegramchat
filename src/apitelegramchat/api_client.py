@@ -8,6 +8,7 @@
 """
 
 import logging
+import httpx
 from typing import Dict, Optional
 from openai import AsyncOpenAI
 
@@ -61,7 +62,9 @@ class APIClient:
         return AsyncOpenAI(
             base_url=config.base_url,
             api_key=api_key,
-            timeout=90,  # 可调整
+            # Agent 在多轮工具调用后，下一轮 SSE 的首个事件可能显著晚于普通聊天。
+            # 使用分项超时：连接保持短，流读取允许 300 秒，避免 90 秒默认值中断长任务。
+            timeout=httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=60.0),
             default_headers=headers,
         )
 
