@@ -2070,7 +2070,6 @@ async def execute_generate_image(
             prompt=prompt,
             image_urls=[image_url] if image_url else [],
             num_images=num_images,
-            builder=None,
             model=model,
         )
         if response_json is None:
@@ -2296,11 +2295,11 @@ async def execute_generate_video(
 
     if provider == "agnes":
         video_url, error, video_meta = await _request_agnes_video(
-            prompt=prompt, duration=duration, model=model, builder=None,
+            prompt=prompt, duration=duration, model=model,
         )
     elif provider == "openrouter":
         video_url, error, video_meta = await _request_openrouter_video(
-            prompt=prompt, duration=duration, model=model, builder=None,
+            prompt=prompt, duration=duration, model=model,
         )
     else:
         return f"❌ 暂不支持的视频提供商：{provider}"

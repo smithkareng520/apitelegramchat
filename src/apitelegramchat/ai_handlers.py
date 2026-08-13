@@ -4964,7 +4964,6 @@ async def _request_openrouter_video(
         prompt: str,
         duration: int,
         model: str,
-        builder: "RichMessageBuilder",
 ) -> tuple[str | None, str | None, Optional[dict]]:
     """
     提交视频任务到 OpenRouter 并轮询结果。
