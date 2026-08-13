@@ -67,6 +67,8 @@ from apitelegramchat.ask_user_tool import (
 )
 from apitelegramchat.file_handlers import download_file
 from apitelegramchat.workspace_utils import _get_workspace_lock, init_workspace
+from apitelegramchat.context_manager import select_request_context
+from apitelegramchat.tool_context_compaction import compact_older_tool_rounds
 
 app = Quart(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
@@ -83,7 +85,7 @@ def _reply_params(message_id: int | None) -> dict | None:
     return {"message_id": mid}
 
 # ---------- 上下文管理常量 ----------
-MAX_HISTORY_MESSAGES = 30
+MAX_HISTORY_MESSAGES = 30  # Trigger a tool-payload compaction pass; do not delete turns.
 MEDIA_GROUP_TIMEOUT = 5
 REPLY_MARKER = "💡 引用回复:"
 
@@ -344,56 +346,42 @@ def _estimate_message_tokens(message: dict) -> int:
     return tokens
 
 async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool:
+    """Check the actual request snapshot without destructively dropping turns.
+
+    When a request would exceed the model budget, archive the older half of the
+    supported tool rounds first.  The model receives short pointers and can use
+    ``text_editor view`` to recover each complete call/result from its workspace.
+    """
     lock = await get_chat_lock(chat_id)
     async with lock:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
-        ledger = ctx.setdefault("token_ledger", [])
         cm = get_user_model(chat_id)
         model_info = SUPPORTED_MODELS.get(cm)
-        max_context = getattr(model_info, 'max_context', None) or 128000
-        max_output = getattr(model_info, 'max_output_tokens', None) or 8192
+        max_context = getattr(model_info, "max_context", None) or 128000
+        max_output = getattr(model_info, "max_output_tokens", None) or 8192
         safe_limit = max_context - max_output
-        new_input_est = _estimate_message_tokens(new_user_message)
-        if new_input_est < 1:
-            new_input_est = 1
+        new_input_est = max(1, _estimate_message_tokens(new_user_message))
 
-        while True:
-            ledger_total = sum(item["input_tokens"] + item["output_tokens"] for item in ledger)
-            if ledger_total + new_input_est <= safe_limit:
-                return True
+        snapshot = select_request_context(history)
+        request_estimate = sum(_estimate_message_tokens(message) for message in snapshot.messages)
+        if request_estimate + new_input_est > safe_limit:
+            stats = await compact_older_tool_rounds(chat_id, history)
+            if stats.compacted_calls:
+                snapshot = select_request_context(history)
+                request_estimate = sum(_estimate_message_tokens(message) for message in snapshot.messages)
+                logger.info(
+                    "Pre-flight tool compaction: chat=%s calls=%s archived_bytes=%s request_estimate=%s",
+                    chat_id,
+                    stats.compacted_calls,
+                    stats.archived_bytes,
+                    request_estimate,
+                )
 
-            deleted = False
-            for i in range(len(history)):
-                if history[i].get("role") == "user":
-                    end = len(history)
-                    for j in range(i + 1, len(history)):
-                        if history[j].get("role") == "user":
-                            end = j
-                            break
-                    removed_turn = history[i:end]
-                    del history[i:end]
-
-                    if ledger:
-                        removed = ledger.pop(0)
-                        ctx["last_prompt_tokens"] = max(
-                            0,
-                            ctx.get("last_prompt_tokens", 0) - removed["input_tokens"] - removed["output_tokens"],
-                        )
-                    else:
-                        removed_est = sum(_estimate_message_tokens(m) for m in removed_turn)
-                        ctx["last_prompt_tokens"] = max(0, ctx.get("last_prompt_tokens", 0) - removed_est)
-                    deleted = True
-                    break
-
-            if not deleted:
-                ctx["last_prompt_tokens"] = 0
-                ctx["last_completion_tokens"] = 0
-                ctx["token_ledger"] = []
-                ctx["conversation_history"] = [m for m in history if m.get("role") == "system"]
-                if new_input_est > safe_limit:
-                    return False
-                return True
+        # History is not deleted here.  select_request_context() still bounds the
+        # request window structurally; only a single oversized new message is
+        # rejected because no history compaction can make it fit.
+        return request_estimate + new_input_est <= safe_limit
 
 async def update_conversation_and_ledger(chat_id: int, user_message: dict, new_msgs: list, usage: dict = None) -> None:
     lock = await get_chat_lock(chat_id)
@@ -428,25 +416,15 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict, new_m
             ctx["last_completion_tokens"] = current_comp
             ledger = ctx.setdefault("token_ledger", [])
             ledger.append({"input_tokens": t_input, "output_tokens": t_output})
-        while len(history) > MAX_HISTORY_MESSAGES:
-            deleted = False
-            for i in range(len(history)):
-                if history[i].get("role") == "user":
-                    end = len(history)
-                    for j in range(i + 1, len(history)):
-                        if history[j].get("role") == "user":
-                            end = j
-                            break
-                    del history[i:end]
-                    ledger = ctx.setdefault("token_ledger", [])
-                    if ledger:
-                        removed = ledger.pop(0)
-                        ctx["last_prompt_tokens"] = max(0, ctx.get("last_prompt_tokens", 0) - removed["input_tokens"] - removed["output_tokens"])
-                    deleted = True
-                    break
-            if not deleted:
-                if history:
-                    history.pop(0)
+        if len(history) > MAX_HISTORY_MESSAGES:
+            stats = await compact_older_tool_rounds(chat_id, history)
+            if stats.compacted_calls:
+                logger.info(
+                    "History-size tool compaction: chat=%s calls=%s archived_bytes=%s",
+                    chat_id,
+                    stats.compacted_calls,
+                    stats.archived_bytes,
+                )
 
 # ---------------------------------------------------------------------------
 # 业务处理
