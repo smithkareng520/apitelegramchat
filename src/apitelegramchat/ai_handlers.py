@@ -1282,55 +1282,18 @@ def _format_api_error_notice(
         detail: str = "",
         request_id: str = "",
 ) -> str:
-    """将图片 API 故障渲染为「用户提示 + 引用式诊断」两层内容。
-
-    面向用户的第一段只说明当前可采取的动作；HTTP 状态、模型与追踪 ID
-    均集中放进 blockquote，避免同一 Request ID 在正文和详情里重复出现。
-    """
-    if error_code == 429:
-        action_text = "当前图片服务请求较多，请稍后再试；无需修改你的描述。"
-        status_text = "服务繁忙"
-    elif error_code in (400, 422):
-        action_text = "这次图片描述暂时无法处理。请简化描述或调整表述后重试。"
-        status_text = "请求暂未被处理"
-    elif error_code in (401, 403):
-        action_text = "图片服务暂时不可用，请稍后再试。"
-        status_text = "服务访问受限"
-    elif error_code >= 500:
-        action_text = "图片服务暂时不可用，请稍后再试。"
-        status_text = "服务异常"
-    else:
-        action_text = "图片暂时无法生成，请稍后重试。"
-        status_text = "请求未完成"
-
-    diagnostic_lines: list[str] = []
+    parts = [f"⚠️ <b>{escape_html(api_name)} 请求失败</b>"]
     if error_code:
-        diagnostic_lines.append(f"<b>状态：</b>{status_text}（HTTP {error_code}）")
+        parts.append(f"HTTP 状态：{error_code}")
     if model:
-        diagnostic_lines.append(f"<b>模型：</b>{escape_html(_short_model_name(model))}")
+        parts.append(f"模型：{escape_html(model)}")
     if request_id:
-        diagnostic_lines.append(f"<b>请求标识：</b>{escape_html(request_id)}")
+        parts.append(f"Request ID：{escape_html(request_id)}")
     if detail:
         formatted_detail = _format_error_detail_for_display(detail)
         if formatted_detail:
-            filtered_lines = []
-            for line in formatted_detail.split("<br/>"):
-                visible_line = html.unescape(strip_html_tags(line)).strip()
-                # request_id 已在独立字段展示，避免来源响应又重复一遍。
-                if request_id and visible_line.lower().startswith("request id") and request_id.lower() in visible_line.lower():
-                    continue
-                filtered_lines.append(line)
-            if filtered_lines:
-                diagnostic_lines.append(f"<b>服务响应：</b>{'<br/>'.join(filtered_lines)}")
-
-    diagnostic_html = ""
-    if diagnostic_lines:
-        diagnostic_html = (
-            "<blockquote><b>诊断信息</b><br/>"
-            + "<br/>".join(diagnostic_lines)
-            + "</blockquote>"
-        )
-    return f"<p><b>图片暂时无法生成</b></p><p>{action_text}</p>{diagnostic_html}"
+            parts.append(f"详情：{formatted_detail}")
+    return "<br/>".join(parts)
 
 
 # 内容安全/审核相关错误的关键词（不区分大小写）
