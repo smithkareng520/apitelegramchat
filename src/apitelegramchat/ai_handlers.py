@@ -2307,19 +2307,25 @@ async def _run_tool_calls_and_append(
 
             # 子 agent 专用：每轮 LLM 调用前 / 工具执行前向 builder 推送进度，
             # 实时刷新草稿，避免 90s 黑屏。
-            subagent_progress_callback = None
-            if fn_name in SUBAGENT_TOOLS:
-                async def subagent_progress_callback(status_text: str):
-                    try:
-                        # 用进度文本更新工具气泡的 preview，状态保持 running
-                        preview = f"<i>🤖 {status_text}</i>"
-                        builder.update_tool_preview(tc_id, preview, summary=f"🤖 子 agent 运行中")
-                        await builder.flush(force=True)
-                    except Exception:
-                        pass  # 进度推送失败不能影响主流程
+            tool_progress_callback = None
+            if fn_name in SUBAGENT_TOOLS or fn_name in BASH_TOOLS:
+                label = "🤖 子 agent 运行中" if fn_name in SUBAGENT_TOOLS else "🖥️ Bash 运行中"
 
-            # bash 不再做执行期间的实时预览刷新；结果只在完成后按统一的
-            # Input/Output 格式渲染一次（见 _render_bash_result）。
+                async def tool_progress_callback(status_text: str, _tc_id=tc_id, _label=label):
+                    try:
+                        text = status_text or "正在执行…"
+                        preview = f"<i>{escape_html(text[-1200:])}</i>"
+                        builder.update_tool_preview(_tc_id, preview, summary=_label)
+                        await builder.flush(force=True)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass  # 进度推送失败不能影响工具本身
+
+                # 先立即把工具状态从“刚开始”变成“正在执行”，避免长工具在
+                # 第一次真实 stdout/进度出现之前前端没有任何可见变化。
+                await tool_progress_callback("正在执行…")
+
 
             try:
                 if fn_name == "ask_user":
@@ -2347,7 +2353,7 @@ async def _run_tool_calls_and_append(
                     result_str = await asyncio.wait_for(
                         dispatch_tool_call(
                             fn_name, fn_args, chat_id=builder.chat_id,
-                            progress_callback=subagent_progress_callback,
+                            progress_callback=tool_progress_callback,
                         ),
                         timeout=timeout
                     )

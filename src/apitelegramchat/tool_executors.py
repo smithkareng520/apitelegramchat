@@ -913,6 +913,112 @@ class BashSession:
             return False
         return True
 
+    async def _execute_heredoc_isolated(self, command: str, timeout: int, progress_callback=None) -> str:
+        """Execute heredoc-heavy commands in a one-shot bash process.
+
+        A persistent stdin-backed shell can deadlock when a model emits an
+        incomplete heredoc: the shell keeps waiting for the terminator, while
+        our synthetic end marker is consumed as heredoc input.  A one-shot
+        `bash -lc` receives an actual EOF at the end of `command`, so malformed
+        heredocs terminate with a shell error instead of hanging the session.
+        """
+        workspace = self.workspace
+        cwd = self._last_cwd or str(self.workdir.absolute())
+        env = build_sandbox_env(self.workspace, self.chat_id, self.namespace)
+        import functools
+        preexec = functools.partial(_preexec_sandbox, str(workspace.absolute()))
+
+        marker = f"__ONE_SHOT_END_{random.randint(100000, 999999)}__"
+        full_cmd = command.rstrip() + f"\nprintf '{marker} %s\n' \"$?\"\nprintf '__ONE_SHOT_CWD__ %s\n' \"$PWD\"\n"
+
+        proc = await asyncio.create_subprocess_exec(
+            "bash", "-lc", full_cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            text=False,
+            bufsize=0,
+            env=env,
+            cwd=cwd,
+            start_new_session=True,
+            preexec_fn=preexec,
+        )
+
+        output_parts: list[str] = []
+        last_emit = 0.0
+
+        async def emit_progress(force: bool = False):
+            nonlocal last_emit
+            if progress_callback is None:
+                return
+            now = time.monotonic()
+            if not force and now - last_emit < 1.0:
+                return
+            preview = "".join(output_parts)[-8000:]
+            try:
+                result = progress_callback(preview or "正在执行 Bash 命令…")
+                if asyncio.iscoroutine(result):
+                    await result
+                last_emit = now
+            except asyncio.CancelledError:
+                raise
+            except Exception as cb_error:
+                logger.debug("bash isolated progress callback failed: %s", cb_error)
+
+        try:
+            while True:
+                chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=timeout)
+                if not chunk:
+                    break
+                output_parts.append(chunk.decode("utf-8", errors="replace"))
+                await emit_progress()
+                # Once the first byte arrived, reset the idle read timer to keep
+                # long-running commands alive while still detecting a total hang.
+                timeout = max(timeout, 1)
+        except asyncio.TimeoutError:
+            logger.warning("Bash isolated timeout chat_id=%s cmd=%s", self.chat_id, command[:120])
+            try:
+                os.killpg(os.getpgid(proc.pid), 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                pass
+            return f"Error: Command timed out after {timeout} seconds (isolated bash killed)"
+        except asyncio.CancelledError:
+            try:
+                os.killpg(os.getpgid(proc.pid), 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                pass
+            raise
+
+        await proc.wait()
+        await emit_progress(force=True)
+        output = "".join(output_parts)
+        exit_code = proc.returncode if proc.returncode is not None else "unknown"
+        marker_match = re.search(rf"(?m)^{re.escape(marker)}\s+(-?\d+)\s*$", output)
+        if marker_match:
+            exit_code = marker_match.group(1)
+            output = re.sub(rf"(?m)^{re.escape(marker)}\s+-?\d+\s*$\n?", "", output)
+        cwd_match = re.search(r"(?m)^__ONE_SHOT_CWD__\s+(.+)$", output)
+        actual_cwd = cwd_match.group(1).strip() if cwd_match else cwd
+        output = re.sub(r"(?m)^__ONE_SHOT_CWD__\s+.*$\n?", "", output)
+        self._last_cwd = actual_cwd
+        if len(output) > 20000:
+            output = output[:20000] + "\n... (truncated)"
+        output = re.sub(r'\x1b\[[0-9;]*m', '', output)
+        return (f"Command: {command}\n"
+                f"Cwd: {actual_cwd}\n"
+                f"Exit code: {exit_code}\n"
+                f"Sandbox: landlock\n"
+                f"Execution mode: isolated (heredoc-safe)\n"
+                f"Output:\n{output}")
+
     # ===================== 执行命令 =====================
     async def execute(self, command: str, timeout: int = SANDBOX_TIMEOUT_SEC, progress_callback=None) -> str:
         """在沙箱中执行 bash 命令，超时自动终止"""
@@ -954,6 +1060,14 @@ class BashSession:
                         f"download/ use the fetch_download tool."
                     )
                 return f"Error: Command rejected for security reasons: {command}"
+
+            # Heredoc commands are executed in a one-shot shell. This prevents an
+            # incomplete model-generated `<<EOF` from leaving the persistent shell
+            # blocked on stdin forever and consuming our end marker as heredoc data.
+            if re.search(r"<<-?\s*(?:[\"']?[A-Za-z_][A-Za-z0-9_]*[\"']?)", command):
+                return await self._execute_heredoc_isolated(
+                    command, timeout=timeout, progress_callback=progress_callback
+                )
 
             marker = f"__END_{random.randint(100000, 999999)}__"
             cwd_marker = f"__CWD_{random.randint(100000, 999999)}__"
