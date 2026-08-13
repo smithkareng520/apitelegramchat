@@ -316,27 +316,48 @@ async def test_turn_boundary_rechecks_capacity_after_rate_limited_flush() -> Non
         handlers.mark_draft_dead = original_dead
 
 
-async def test_arm_threshold_waits_for_formal_rollover_threshold() -> None:
+async def test_arm_threshold_rolls_at_next_turn_boundary() -> None:
+    permanent_segments = []
+    draft_frames = []
+
+    async def fake_permanent(chat_id, html_content, **kwargs):
+        permanent_segments.append((chat_id, html_content, kwargs))
+        return 7574
+
     async def fake_draft(chat_id, draft_id, html_content, **kwargs):
+        draft_frames.append((draft_id, html_content, kwargs))
         return 7575
 
+    original_permanent = handlers.send_rich_html_message
     original_draft = handlers.send_rich_message_draft
+    original_dead = handlers.mark_draft_dead
     try:
+        handlers.send_rich_html_message = fake_permanent
         handlers.send_rich_message_draft = fake_draft
+        handlers.mark_draft_dead = AsyncMock()
         builder = handlers.RichMessageBuilder(chat_id=105)
+        old_draft_id = builder.draft_id
         builder._register_active_draft = AsyncMock()
         builder.blocks = ["<p>" + ("乙" * handlers.RICH_DRAFT_ARM_TEXT_CHARS) + "</p>"]
         builder.block_types = ["text"]
 
         await builder.flush()
-        require(builder._rollover_pending, "27k 应继续作为提前预警")
+        require(builder._rollover_pending, "27k 应置位预警")
         require(
-            not await builder.rollover_at_turn_boundary(),
-            "未到 30k/440 的完整回合边界不得提前换草稿",
+            await builder.rollover_at_turn_boundary(),
+            "27k 预警后，下一完整工具回合边界必须立即换草稿",
         )
-        require(builder._rollover_count == 0, "仅预警不能永久化或新建草稿")
+        require(builder.draft_id != old_draft_id, "不得继续复用旧草稿")
+        require(builder._rollover_count == 1 and len(permanent_segments) == 1, "必须永久化旧段一次")
+        require(
+            len(handlers._rich_visible_text(permanent_segments[0][1])) == handlers.RICH_DRAFT_ARM_TEXT_CHARS,
+            "27k 阈值内容必须在下一回合前提交",
+        )
+        require(draft_frames and draft_frames[-1][0] == builder.draft_id, "新草稿首帧必须立即发送")
     finally:
+        handlers.send_rich_html_message = original_permanent
         handlers.send_rich_message_draft = original_draft
+        handlers.mark_draft_dead = original_dead
 
 
 async def test_done_only_batch_finishes_precreated_tool_group() -> None:
@@ -387,7 +408,7 @@ def main() -> None:
     asyncio.run(test_failed_permanent_send_restores_handoff_to_old_draft())
     asyncio.run(test_old_preview_cleanup_does_not_delay_new_draft())
     asyncio.run(test_turn_boundary_rechecks_capacity_after_rate_limited_flush())
-    asyncio.run(test_arm_threshold_waits_for_formal_rollover_threshold())
+    asyncio.run(test_arm_threshold_rolls_at_next_turn_boundary())
     asyncio.run(test_done_only_batch_finishes_precreated_tool_group())
     test_no_legacy_background_rollover_fields()
     print("turn-boundary draft rollover validation: PASS")

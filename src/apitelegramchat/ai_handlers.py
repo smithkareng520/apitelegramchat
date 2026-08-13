@@ -3558,16 +3558,16 @@ class RichMessageBuilder:
             current_html = self._sanitize_rich_html(self._build_html_no_thinking())
             cut_at, visible_chars, block_count = self._pick_rollover_boundary(current_html)
             rollover_due = (
-                visible_chars >= RICH_DRAFT_ROLLOVER_TEXT_CHARS
-                or block_count >= RICH_DRAFT_ROLLOVER_BLOCKS
+                visible_chars >= RICH_DRAFT_ARM_TEXT_CHARS
+                or block_count >= RICH_DRAFT_ARM_BLOCKS
             )
             if not rollover_due:
-                # 27k / 380 blocks 仍只承担提前预警职责；到 30k / 440 blocks
-                # 才在完整工具回合结束时实际换草稿。
                 return False
 
-            # 即使此前的 flush 未运行或被限流跳过，达到正式阈值后也要在本次
-            # 回合边界完成切换，保证不等待整个任务或后续工具轮次。
+            # 预警阈值就是下一次完整工具回合边界的实际切换阈值。这样一旦某轮
+            # 流式输出接近容量上限，紧随其后的工具批次收束后便会完成永久化和
+            # 新草稿首帧，再发起下一次模型请求，绝不继续等待 30k/440 或任务终局。
+            # 即使此前的 flush 未运行或被限流跳过，也必须在本次边界切换。
             self._rollover_pending = True
 
             used_fallback = False
@@ -3575,8 +3575,8 @@ class RichMessageBuilder:
                 completed_html = current_html[:cut_at].strip()
                 remainder = current_html[cut_at:]
             else:
-                # 已到正式切换阈值却没有完整 Rich Block 边界时，立即采用安全的
-                # 纯文本分段。不能等到 hard guard，否则新草稿会被继续拖延数轮。
+                # 已到预警/切换阈值却没有完整 Rich Block 边界时，立即采用安全的
+                # 纯文本分段。不能等待下一轮或 hard guard，否则新草稿会被拖延。
                 plain = _rich_visible_text(current_html)
                 text_cut = self._plain_text_cut(plain, RICH_DRAFT_ROLLOVER_TEXT_CHARS)
                 completed_html = f"<p>{escape_html(plain[:text_cut].rstrip())}</p>"
