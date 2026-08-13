@@ -343,10 +343,7 @@ async def _reassert_active_draft_content(chat_id: int, draft_id: int) -> None:
         payload = {
             "chat_id": chat_id,
             "draft_id": draft_id,
-            "rich_message": {
-                "content": html_content,
-                "html": html_content,
-            },
+            "rich_message": {"html": html_content},
         }
         timeout = aiohttp.ClientTimeout(total=8, connect=4)
         async with aiohttp.ClientSession(timeout=timeout) as session:

@@ -3282,6 +3282,16 @@ class RichMessageBuilder:
                 self._last_flush_time = time.monotonic()
                 if msg_id:
                     self.draft_message_id = msg_id
+                    # rollover 创建的新 draft 先以 message_id=0 注册；若不在
+                    # 首次成功发送后回写这里，/clear 和新消息只能看到 0，因而
+                    # 无法删除真实预览消息，造成草稿残留。
+                    try:
+                        await state.set_active_draft(self.chat_id, self.draft_id, msg_id)
+                    except Exception:
+                        logger.debug(
+                            "unable to update draft message id: chat=%s draft=%s msg=%s",
+                            self.chat_id, self.draft_id, msg_id,
+                        )
             except RateLimitError as e:
                 retry_after = e.retry_after + 2
                 self._rate_limited_until = time.monotonic() + retry_after

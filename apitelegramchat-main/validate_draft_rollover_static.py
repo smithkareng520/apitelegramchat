@@ -65,7 +65,7 @@ assert harness._needs_draft_rollover(block_heavy)
 # InputRichMessage must choose exactly one representation. All rich send payloads
 # now use html alone, rather than the previous content+html pair.
 UTILS = Path("src/apitelegramchat/utils.py").read_text(encoding="utf-8")
-assert UTILS.count('"rich_message": {"html": html_content}') == 3
+assert UTILS.count('"rich_message": {"html": html_content}') == 4
 assert '"content": html_content,\n            "html": html_content' not in UTILS
 assert "async def rollover_if_needed" in SOURCE
 assert "await self._persist_completed_segment(candidate)" in SOURCE
