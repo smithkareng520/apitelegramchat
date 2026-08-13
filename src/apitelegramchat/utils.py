@@ -664,27 +664,21 @@ async def send_rich_message_draft(
     return 0
 
 # ---------- 发送普通富文本消息 ----------
-async def send_rich_html_message(
+async def send_rich_html_message_unserialized(
     chat_id: int,
     html_content: str,
     reply_parameters: Optional[Dict] = None,
     reply_markup: Optional[Dict] = None,
     message_thread_id: Optional[int] = None,
-    reassert_draft: bool = False,
 ) -> int | bool:
-    """
-    发送永久富文本消息。
+    """发送永久富消息，但不获取当前草稿的串行化锁。
 
-    reassert_draft:
-      False — 仅串行发送，不重新挂回草稿。适合绝大多数永久消息，
-              例如停止提示、清空确认、错误提示、最终回复等。
-      True  — 若该 chat 仍有活跃草稿，则在发送后立刻 reassert 草稿，
-              仅在你确实想让草稿继续贴在新消息下方时使用。
+    仅供草稿 rollover 这类生命周期切换使用：rollover 必须先切换到新
+    draft，旧段的永久消息才能独立慢慢发送，不能继续占住旧 draft 的发送锁。
     """
     if not html_content or not html_content.strip():
         return False
     html_content = html_content.strip()
-    # 自动转义 src="..." 中的裸 &（R2 presigned URL 等），防止 Telegram 拉不到媒体
     html_content = _escape_media_src_urls(html_content)
 
     payload = {
@@ -703,15 +697,10 @@ async def send_rich_html_message(
     if message_thread_id:
         payload["message_thread_id"] = message_thread_id
 
-    # 永久消息需要比草稿更强的送达可靠性，因此保留重试；但此前完全没有设置
-    # timeout（aiohttp 默认是几分钟级），一旦网络抖动或 Telegram 侧偶发变慢，
-    # 三次重试 × 每次可能挂到默认超时，会让调用方（草稿滚动）阻塞数分钟。
-    # 给一个不算激进的有界超时：单次总超时 15s、连接超时 5s，三次重试封顶
-    # 约 45~90s（含 1s/4s/7s 退避），比之前的"无上限"收窄了一个数量级，
-    # 同时仍然给网络抖动足够的恢复空间。
-    @retry_async(max_retries=3, delay=1, backoff=3, exceptions=(aiohttp.ClientError, asyncio.TimeoutError))
-    async def _send_inner():
-        timeout = aiohttp.ClientTimeout(total=15, connect=5)
+    # rollover 的旧段持久化是后台任务，不能为了可靠重试再次把新草稿卡住。
+    # 单次最多 5s、最多 2 次；失败不影响新 draft 继续刷新。
+    timeout = aiohttp.ClientTimeout(total=5, connect=2)
+    for attempt in range(2):
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(f"{BASE_URL}/sendRichMessage", json=payload) as resp:
@@ -721,20 +710,53 @@ async def send_rich_html_message(
                             msg_id = data.get("result", {}).get("message_id")
                             if isinstance(msg_id, int) and msg_id > 0:
                                 return msg_id
-                        except Exception as e:
-                            logger.debug(f"sendRichHtmlMessage parse response failed: {e}")
+                        except Exception as exc:
+                            logger.debug("sendRichHtmlMessageUnserialized parse response failed: %s", exc)
                         return True
                     body = await resp.text()
-                    logger.error(f"sendRichHtmlMessage failed: {resp.status} {body[:200]}")
-                    return False
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            raise
-        except Exception as e:
-            logger.exception(f"sendRichHtmlMessage unexpected exception: {e}")
-            return False
+                    logger.warning(
+                        "sendRichHtmlMessageUnserialized failed: chat=%s attempt=%s/2 status=%s body=%s",
+                        chat_id, attempt + 1, resp.status, body[:200],
+                    )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning(
+                "sendRichHtmlMessageUnserialized transient error: chat=%s attempt=%s/2 err=%s",
+                chat_id, attempt + 1, exc,
+            )
+            if attempt == 0:
+                await asyncio.sleep(0.2)
+                continue
+        except Exception as exc:
+            logger.exception(
+                "sendRichHtmlMessageUnserialized unexpected error: chat=%s err=%s",
+                chat_id, exc,
+            )
+        break
+    return False
 
+
+async def send_rich_html_message(
+    chat_id: int,
+    html_content: str,
+    reply_parameters: Optional[Dict] = None,
+    reply_markup: Optional[Dict] = None,
+    message_thread_id: Optional[int] = None,
+    reassert_draft: bool = False,
+) -> int | bool:
+    """发送永久富文本消息。
+
+    reassert_draft:
+      False — 仅串行发送，不重新挂回草稿。
+      True  — 在发送后重新挂回活跃草稿。
+    """
     async with serialize_with_active_draft(chat_id, reassert=reassert_draft):
-        return await _send_inner()
+        return await send_rich_html_message_unserialized(
+            chat_id,
+            html_content,
+            reply_parameters=reply_parameters,
+            reply_markup=reply_markup,
+            message_thread_id=message_thread_id,
+        )
 
 async def send_rich_message(
     chat_id: int,
