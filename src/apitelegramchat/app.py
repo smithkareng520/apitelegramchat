@@ -67,13 +67,6 @@ from apitelegramchat.ask_user_tool import (
 )
 from apitelegramchat.file_handlers import download_file
 from apitelegramchat.workspace_utils import _get_workspace_lock, init_workspace
-from apitelegramchat.agent_context import (
-    compact_turn_for_history,
-    estimate_message_tokens as _token_estimate_message,
-    estimate_messages_tokens,
-    token_budget_for_model,
-    trim_completed_history_to_budget,
-)
 
 app = Quart(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
@@ -90,7 +83,7 @@ def _reply_params(message_id: int | None) -> dict | None:
     return {"message_id": mid}
 
 # ---------- 上下文管理常量 ----------
-# 会话历史完全按 token 预算裁剪；不再以固定消息数量删除长任务。
+MAX_HISTORY_MESSAGES = 30
 MEDIA_GROUP_TIMEOUT = 5
 REPLY_MARKER = "💡 引用回复:"
 
@@ -117,66 +110,90 @@ async def _send_stopped_output_message(chat_id: int) -> bool:
         return False
 
 
-async def _interrupt_active_generation(
-    chat_id: int,
-    *,
-    send_stop_notice: bool = False,
-    delete_preview: bool = True,
-) -> None:
-    """Stop a generation and close its draft before processing new input.
-
-    A draft is an ephemeral preview, not a durable stopped-output record.  The
-    previous implementation intentionally marked it *preserved*, so `/clear` and
-    the next user message could never remove the visible preview.  The only safe
-    ordering is: cancel and await all flush tasks, mark the draft dead, unregister
-    it, delete its preview message, then optionally emit a rich stop notice.
+async def _interrupt_active_generation(chat_id: int) -> None:
     """
+    中断当前正在进行的生成任务。
+
+    【修复】旧实现是先“标记草稿死亡 + 发一条已停止消息”，再去取消后台
+    生成任务。但生成任务的草稿刷新循环（RichMessageBuilder._flush_task /
+    _pending_flush_task）是独立的 asyncio.Task，并不会因为外层任务被
+    cancel() 就立刻停止；而且旧版 stop_flush_loop() 是“只通知不等”，
+    根本不保证它已经真正退出。
+
+    于是会出现这样的时序：
+      1. 标记草稿死亡、发送“⏹️ 已停止输出” / 新指令的确认消息
+      2. 旧任务里恰好已经通过存活检查、正在发起网络请求的那一次草稿刷新
+         才姗姗来迟地送达
+    结果就是：新消息先出现，旧草稿的最后一次刷新反而排在新消息之后，
+    看起来像“草稿位置被新消息占据，随后又在新消息下方重新刷新”。
+
+    修复方式：先彻底取消并等待旧任务（含其草稿刷新循环、所有在途的
+    刷新请求）真正结束，只有在确认没有任何后台刷新还在跑之后，才去
+    标记草稿死亡、发送停止提示 / 新消息。
+    """
+    # 0) 提前记录当前活跃草稿信息，因为取消旧任务后它的 finally 里可能
+    #    会自己清掉这个注册，届时就取不到了。
     try:
         draft_info = await get_active_draft_info(chat_id)
     except Exception:
         draft_info = None
 
-    # Wait for the producer and its flush tasks before touching the preview. This
-    # prevents an in-flight sendRichMessageDraft from resurrecting it afterwards.
+    # 1) 先彻底停掉旧任务（包括其草稿刷新循环），确保没有任何后台刷新
+    #    还在飞行中，再继续后面的步骤。
     await _cancel_old_task(chat_id)
 
     if not draft_info:
         return
 
-    draft_id, message_id = draft_info
+    draft_id, _msg_id = draft_info
+
+    # 2) 旧任务已经完全停止，这里再标记一次死亡只是双重保险。
     try:
         await mark_draft_dead(draft_id)
+        logger.info(f"已标记草稿死亡: chat={chat_id} draft={draft_id}")
     except Exception as e:
         logger.warning(f"mark_draft_dead 异常: {e}")
 
-    # Clear registration before sending any permanent rich message. This makes
-    # serialize_with_active_draft a no-op and blocks reassertion of the old draft.
+    # 3) 落一条普通消息作为最终停止态，避免 draft 消息后续被回收。
+    #    此时旧任务的刷新循环已确认停止，这条消息不会再被旧草稿的
+    #    迟到刷新“追上”。
+    sent = False
     try:
-        await clear_active_draft(chat_id, draft_id)
+        sent = await _send_stopped_output_message(chat_id)
+        if sent:
+            logger.info(f"已发送永久停止消息: chat={chat_id} draft={draft_id}")
+    except Exception as e:
+        logger.warning(f"发送永久停止消息异常: {e}")
+
+    # 4) 如果稳定消息发送成功，旧草稿就可以从活跃注册中移除；
+    #    即使失败，也不要删除旧草稿消息本身。
+    try:
+        if sent:
+            await clear_active_draft(chat_id, draft_id)
+            logger.info(f"已清除活跃草稿注册: chat={chat_id} draft={draft_id}")
     except Exception as e:
         logger.warning(f"clear_active_draft 异常: {e}")
 
-    if delete_preview and isinstance(message_id, int) and message_id > 0:
-        try:
-            await delete_message(chat_id, message_id)
-            logger.info(f"已删除旧草稿预览: chat={chat_id} draft={draft_id} msg={message_id}")
-        except Exception as e:
-            logger.warning(f"删除旧草稿预览失败: chat={chat_id} draft={draft_id} msg={message_id} {e}")
-
-    if send_stop_notice:
-        await _send_stopped_output_message(chat_id)
+    # 5) 仍然标记保留，确保任何“只删除草稿”的清理路径都不会碰它。
+    try:
+        await mark_preserved_draft(draft_id)
+        logger.info(f"已标记草稿保留: chat={chat_id} draft={draft_id}")
+    except Exception as e:
+        logger.warning(f"mark_preserved_draft 异常: {e}")
 # ---------------------------------------------------------------------------
 # 辅助函数（保持不变）
 # ---------------------------------------------------------------------------
 async def _send_temp_message(chat_id: int, text: str) -> int:
-    """Send transient notices as rich messages; never fall back to sendMessage."""
     try:
-        content = text if "<" in text else f"<p>{html.escape(text)}</p>"
-        result = await send_rich_html_message(chat_id, content, reassert_draft=False)
-        return result if isinstance(result, int) and result > 0 else 0
-    except Exception as e:
-        logger.debug(f"发送临时富消息失败: {e}")
-        return 0
+        async with aiohttp.ClientSession() as session:
+            payload = {"chat_id": chat_id, "text": text}
+            async with session.post(f"{BASE_URL}/sendMessage", json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("result", {}).get("message_id")
+    except Exception:
+        pass
+    return None
 
 @app.route('/health', methods=['GET'])
 async def health_check():
@@ -271,69 +288,126 @@ async def set_webhook() -> None:
             else:
                 logger.error(f"[ERROR] Webhook setup failed: {await resp.text()}")
 
-# ---------- Token 预算及上下文修剪 ----------
-# 实现在 agent_context.py 中，以确保主 Agent、子 Agent 与聊天历史使用同一套保守估算器。
+# ---------- Token 估算及上下文修剪 ----------
+_MEDIA_TOKEN_OVERHEAD = 64
+_MESSAGE_WRAPPER_TOKENS = 4
+
+def estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    zh_chars = len(re.findall(r'[一-龥]', text))
+    en_text = re.sub(r'[一-龥]', ' ', text)
+    en_words = len(en_text.split())
+    return int((zh_chars * 1.8) + (en_words * 1.3) * 1.2)
+
+def _estimate_content_tokens(content) -> int:
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        return estimate_tokens(content)
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            total += _estimate_content_tokens(part)
+        return total
+    if isinstance(content, dict):
+        part_type = str(content.get("type", "")).lower()
+        if part_type == "text":
+            return estimate_tokens(str(content.get("text", "")))
+        if part_type in {"image_url", "image", "input_image"}:
+            return _MEDIA_TOKEN_OVERHEAD
+        if part_type in {"file", "input_file", "document"}:
+            filename = ""
+            file_obj = content.get("file")
+            if isinstance(file_obj, dict):
+                filename = str(file_obj.get("filename", ""))
+            return _MEDIA_TOKEN_OVERHEAD * 2 + estimate_tokens(filename)
+
+        total = _MEDIA_TOKEN_OVERHEAD
+        for value in content.values():
+            if isinstance(value, (str, list, dict)):
+                total += _estimate_content_tokens(value)
+        return total
+    return estimate_tokens(str(content))
+
+def _estimate_message_tokens(message: dict) -> int:
+    tokens = _MESSAGE_WRAPPER_TOKENS
+    tokens += _estimate_content_tokens(message.get("content", ""))
+    if message.get("name"):
+        tokens += estimate_tokens(str(message["name"]))
+    tool_calls = message.get("tool_calls") or []
+    if tool_calls:
+        try:
+            tokens += estimate_tokens(json.dumps(tool_calls, ensure_ascii=False))
+        except Exception:
+            tokens += _MEDIA_TOKEN_OVERHEAD * len(tool_calls)
+    return tokens
 
 async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool:
-    """Make room for a new user turn using the active model's token budget.
-
-    This function only prunes completed historical turns. The running Agent turn
-    has not been committed yet, so it can never be deleted by a fixed message
-    count while it is still needed for continuation.
-    """
     lock = await get_chat_lock(chat_id)
     async with lock:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
-        model_info = SUPPORTED_MODELS.get(get_user_model(chat_id))
-        budget = token_budget_for_model(model_info)
+        ledger = ctx.setdefault("token_ledger", [])
+        cm = get_user_model(chat_id)
+        model_info = SUPPORTED_MODELS.get(cm)
+        max_context = getattr(model_info, 'max_context', None) or 128000
+        max_output = getattr(model_info, 'max_output_tokens', None) or 8192
+        safe_limit = max_context - max_output
+        new_input_est = _estimate_message_tokens(new_user_message)
+        if new_input_est < 1:
+            new_input_est = 1
 
-        trim_completed_history_to_budget(
-            history, model_info, protected_from_index=len(history)
-        )
-        projected = estimate_messages_tokens(history) + _token_estimate_message(new_user_message)
-        ctx["context_token_estimate"] = projected
-        # Provider usage is retained as telemetry only. It is model-specific and
-        # must not decide whether history is deleted.
-        ctx["token_ledger"] = []
-        ctx["last_prompt_tokens"] = 0
-        ctx["last_completion_tokens"] = 0
-        if projected > budget.input_hard_limit:
-            logger.warning(
-                "chat=%s input over token budget projected=%s limit=%s",
-                chat_id, projected, budget.input_hard_limit,
-            )
-            return False
-        return True
+        while True:
+            ledger_total = sum(item["input_tokens"] + item["output_tokens"] for item in ledger)
+            if ledger_total + new_input_est <= safe_limit:
+                return True
 
+            deleted = False
+            for i in range(len(history)):
+                if history[i].get("role") == "user":
+                    end = len(history)
+                    for j in range(i + 1, len(history)):
+                        if history[j].get("role") == "user":
+                            end = j
+                            break
+                    removed_turn = history[i:end]
+                    del history[i:end]
+
+                    if ledger:
+                        removed = ledger.pop(0)
+                        ctx["last_prompt_tokens"] = max(
+                            0,
+                            ctx.get("last_prompt_tokens", 0) - removed["input_tokens"] - removed["output_tokens"],
+                        )
+                    else:
+                        removed_est = sum(_estimate_message_tokens(m) for m in removed_turn)
+                        ctx["last_prompt_tokens"] = max(0, ctx.get("last_prompt_tokens", 0) - removed_est)
+                    deleted = True
+                    break
+
+            if not deleted:
+                ctx["last_prompt_tokens"] = 0
+                ctx["last_completion_tokens"] = 0
+                ctx["token_ledger"] = []
+                ctx["conversation_history"] = [m for m in history if m.get("role") == "system"]
+                if new_input_est > safe_limit:
+                    return False
+                return True
 
 async def update_conversation_and_ledger(chat_id: int, user_message: dict, new_msgs: list, usage: dict = None) -> None:
-    """Persist a completed, token-bounded user-visible turn.
-
-    Raw `assistant.tool_calls` and `tool` protocol records are execution trace,
-    not conversation memory. Keeping them out of this history removes the former
-    30-message self-deletion failure mode for long-running Agent tasks.
-    """
     lock = await get_chat_lock(chat_id)
     async with lock:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
-        stored_user = dict(user_message)
-        block_content = stored_user.get("content", "")
+        block_content = user_message.get("content", "")
         if isinstance(block_content, str) and REPLY_MARKER in block_content:
-            stored_user["content"] = block_content.split(REPLY_MARKER)[-1].strip()
-
-        committed_turn = compact_turn_for_history(stored_user, new_msgs)
-        protected_from_index = len(history)
-        history.extend(committed_turn)
-
-        model_info = SUPPORTED_MODELS.get(get_user_model(chat_id))
-        final_tokens = trim_completed_history_to_budget(
-            history, model_info, protected_from_index=protected_from_index
-        )
-        ctx["context_token_estimate"] = final_tokens
-        ctx["token_ledger"] = []
-
+            user_message["content"] = block_content.split(REPLY_MARKER)[-1].strip()
+        history.append(user_message)
+        for msg in new_msgs:
+            if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
+                msg["content"] = msg["content"].strip()
+            history.append(msg)
         if usage:
             if hasattr(usage, "model_dump"):
                 usage_dict = usage.model_dump()
@@ -342,15 +416,37 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict, new_m
             elif isinstance(usage, dict):
                 usage_dict = usage
             else:
-                usage_dict = {
-                    "prompt_tokens": getattr(usage, "prompt_tokens", 0),
-                    "completion_tokens": getattr(usage, "completion_tokens", 0),
-                }
-            ctx["last_usage"] = usage_dict
-        logger.info(
-            "chat=%s committed compact turn messages=%s tokens=%s",
-            chat_id, len(committed_turn), final_tokens,
-        )
+                usage_dict = {"prompt_tokens": getattr(usage, "prompt_tokens", 0),
+                              "completion_tokens": getattr(usage, "completion_tokens", 0)}
+            current_prompt = usage_dict.get("prompt_tokens", 0)
+            current_comp = usage_dict.get("completion_tokens", 0)
+            last_prompt = ctx.get("last_prompt_tokens", 0)
+            last_comp = ctx.get("last_completion_tokens", 0)
+            t_input = max(0, current_prompt - last_prompt - last_comp)
+            t_output = current_comp
+            ctx["last_prompt_tokens"] = current_prompt
+            ctx["last_completion_tokens"] = current_comp
+            ledger = ctx.setdefault("token_ledger", [])
+            ledger.append({"input_tokens": t_input, "output_tokens": t_output})
+        while len(history) > MAX_HISTORY_MESSAGES:
+            deleted = False
+            for i in range(len(history)):
+                if history[i].get("role") == "user":
+                    end = len(history)
+                    for j in range(i + 1, len(history)):
+                        if history[j].get("role") == "user":
+                            end = j
+                            break
+                    del history[i:end]
+                    ledger = ctx.setdefault("token_ledger", [])
+                    if ledger:
+                        removed = ledger.pop(0)
+                        ctx["last_prompt_tokens"] = max(0, ctx.get("last_prompt_tokens", 0) - removed["input_tokens"] - removed["output_tokens"])
+                    deleted = True
+                    break
+            if not deleted:
+                if history:
+                    history.pop(0)
 
 # ---------------------------------------------------------------------------
 # 业务处理
@@ -686,7 +782,7 @@ async def update_role_list(chat_id: int, message_id: int, role_list: list, curre
     keyboard = {"inline_keyboard": [[{"text": t, "callback_data": r}] for t, r in zip(formatted, role_list)]}
     payload = {
         "chat_id": chat_id, "message_id": message_id,
-        "rich_message": {"markdown": "选择角色设定 (再次点击取消):"},
+        "rich_message": {"content": "选择角色设定 (再次点击取消):", "markdown": "选择角色设定 (再次点击取消):"},
         "reply_markup": json.dumps(keyboard),
     }
     async with aiohttp.ClientSession() as s:
@@ -699,45 +795,84 @@ async def _del_after(chat_id, msg_id, delay):
     await delete_message(chat_id, msg_id)
 
 
-async def _send_rich_command_message(
+async def _send_via_send_message(
     chat_id: int,
     html_content: str,
     reply_message_id: int | None = None,
     reply_markup: dict | str | None = None,
     delete_after: float | None = None,
 ) -> int:
-    """Send command/UI output only through sendRichMessage.
+    """
+    使用 sendMessage（而非 sendRichMessage）发送指令响应。
 
-    The caller must close any active draft first.  `reassert_draft=False` is a
-    second guard: a command confirmation must never revive a draft that was
-    intentionally cancelled for `/clear` or a new user request.
+    【修复】在 AI 生成过程中发送 /model、/role、/balance 等指令时，
+    旧实现走 sendRichMessage。Telegram 客户端在收到 sendRichMessage 时
+    会把这条永久消息画在当前 draft 预览的视觉位（草稿被"转正"/挤开），
+    紧接着 serialize_with_active_draft 里的 _reassert_active_draft_content
+    又用同一个 draft_id 推了一帧 sendRichMessageDraft——但旧草稿已被
+    sendRichMessage 消费掉，于是 Telegram 把它当成一个全新的草稿，
+    画在永久消息下方。AI 的 flush 循环随后继续刷新这个新草稿。
+
+    用户看到的错乱就是：
+      1) 列表占了草稿位（列表出现在草稿原来的位置，而不是指令下方）
+      2) 草稿在指令下方重新刷新（reassert + flush 循环创建的新草稿）
+
+    修复思路：Telegram Bot API 文档明确指出"once the output is finalized,
+    you must call sendRichMessage to persist it"——也就是说，只有
+    sendRichMessage 会触发"草稿转正"行为。改用 sendMessage（普通文本
+    消息）发送指令响应，不会消费/挤开活跃草稿，列表自然出现在指令
+    下方，草稿继续在原位生成。
+
+    sendMessage 的 parse_mode=HTML 不支持 <br/>，需要转换为 \n。
+    <b>、<code>、<i>、<u>、<s>、<a>、<blockquote> 等标签均被支持。
     """
     if not html_content or not html_content.strip():
         return 0
-    try:
-        mid = await send_rich_html_message(
-            chat_id,
-            html_content,
-            reply_parameters=_reply_params(reply_message_id),
-            reply_markup=reply_markup,
-            reassert_draft=False,
+    text = (
+        html_content
+        .replace("<br/>", "\n")
+        .replace("<br>", "\n")
+        .replace("</br>", "\n")
+        .replace("<br />", "\n")
+    )
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+    }
+    reply_parameters = _reply_params(reply_message_id)
+    if reply_parameters:
+        payload["reply_parameters"] = reply_parameters
+    if reply_markup is not None:
+        payload["reply_markup"] = (
+            json.dumps(reply_markup) if isinstance(reply_markup, dict) else reply_markup
         )
-        if isinstance(mid, int) and mid > 0:
-            if delete_after is not None:
-                asyncio.create_task(_del_after(chat_id, mid, delete_after))
-            return mid
-        return 0
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{BASE_URL}/sendMessage", json=payload) as resp:
+                if resp.status == 200:
+                    res = await resp.json()
+                    mid = res.get("result", {}).get("message_id")
+                    if isinstance(mid, int) and mid > 0:
+                        if delete_after is not None:
+                            asyncio.create_task(_del_after(chat_id, mid, delete_after))
+                        return mid
+                else:
+                    body = await resp.text()
+                    logger.error(
+                        f"_send_via_send_message failed: {resp.status} {body[:200]}"
+                    )
     except Exception as e:
-        logger.exception(f"_send_rich_command_message exception: {e}")
-        return 0
+        logger.exception(f"_send_via_send_message exception: {e}")
+    return 0
 
 
 async def send_role_list(chat_id: int, role_list: list, current_role: str, reply_message_id: int | None = None) -> int:
     formatted = [f"{r} √" if r == current_role else r for r in role_list]
     keyboard = {"inline_keyboard": [[{"text": t, "callback_data": r}] for t, r in zip(formatted, role_list)]}
     content = "选择角色设定 (再次点击取消):"
-    # 旧草稿已在命令入口关闭；响应统一走富文本接口。
-    return await _send_rich_command_message(
+    # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置
+    return await _send_via_send_message(
         chat_id,
         content,
         reply_message_id=reply_message_id,
@@ -757,8 +892,8 @@ async def send_model_list(
     if banner_html:
         content += banner_html.rstrip() + "\n\n"
     content += "🤖 请选择一个模型:"
-    # 旧草稿已在命令入口关闭；响应统一走富文本接口。
-    return await _send_rich_command_message(
+    # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置
+    return await _send_via_send_message(
         chat_id,
         content,
         reply_message_id=reply_message_id,
@@ -1159,11 +1294,6 @@ async def webhook() -> tuple:
                     if await resolve_ask_user_text(chat_id, user_input):
                         return "OK", 200
 
-                # 每条命令都会替代正在运行的 Agent 任务；先关闭并删除旧草稿，
-                # 再发送富文本命令响应，绝不允许旧草稿被 reassert。
-                if user_input.startswith("/"):
-                    await _interrupt_active_generation(chat_id)
-
                 if user_input.startswith("/role"):
                     cr = await get_user_role(chat_id)
                     prev_mid = role_message_ids.get(chat_id)
@@ -1202,8 +1332,8 @@ async def webhook() -> tuple:
                             msgs.append("⚠️ <b>OpenRouter</b>: 查询失败")
                     else:
                         msgs.append("❌ 无效服务名，可用: <code>deepseek</code>, <code>openrouter</code>, <code>all</code>")
-                    # 旧草稿已在命令入口关闭；响应统一走富文本接口。
-                    await _send_rich_command_message(
+                    # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置
+                    await _send_via_send_message(
                         chat_id,
                         "\n".join(msgs),
                         reply_message_id=msg["message_id"],
@@ -1212,7 +1342,7 @@ async def webhook() -> tuple:
 
                 if user_input.startswith("/model"):
                     if msg["chat"]["type"] != "private":
-                        await _send_rich_command_message(
+                        await _send_via_send_message(
                             chat_id,
                             "❌ <b>操作受限</b>\n模型切换仅限私聊使用。",
                             reply_message_id=msg["message_id"],
@@ -1421,14 +1551,13 @@ async def webhook() -> tuple:
             sel = cb["data"]
 
             if str(uid) != str(chat_id):
-                await _send_rich_command_message(chat_id, "❌ <b>无权限</b>", reply_message_id=mid)
+                await _send_via_send_message(chat_id, "❌ <b>无权限</b>", reply_message_id=mid)
                 async with aiohttp.ClientSession() as s:
                     await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "无权限"})
                 return "OK", 200
 
             try:
                 if sel in SUPPORTED_ROLES:
-                    await _interrupt_active_generation(chat_id)
                     async with global_lock:
                         prev = await get_user_role(chat_id)
                         if prev == sel:
@@ -1447,16 +1576,15 @@ async def webhook() -> tuple:
                             nm = await send_role_list(chat_id, SUPPORTED_ROLES, cr, mid)
                             if nm:
                                 role_message_ids[chat_id] = nm
-                    # 旧草稿已在命令入口关闭；响应统一走富文本接口。
-                    await _send_rich_command_message(chat_id, f"✅ <b>{notice}</b>", reply_message_id=mid)
+                    # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置
+                    await _send_via_send_message(chat_id, f"✅ <b>{notice}</b>", reply_message_id=mid)
                 elif sel in SUPPORTED_MODELS:
-                    await _interrupt_active_generation(chat_id)
                     async with aiohttp.ClientSession() as s:
                         await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "切换中..."})
                     await safe_set_user_model(chat_id, sel)
                     model_name = SUPPORTED_MODELS[sel]["name"]
-                    # 旧草稿已在命令入口关闭；响应统一走富文本接口。
-                    await _send_rich_command_message(
+                    # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置
+                    await _send_via_send_message(
                         chat_id,
                         f"✅ <b>模型切换成功</b>\n已切换到模型：<b>{model_name}</b>\n<i>（对话历史已保留）</i>",
                         reply_message_id=mid,
@@ -1487,7 +1615,7 @@ async def webhook() -> tuple:
                     return "OK", 200
             except Exception as e:
                 logger.exception(f"Callback query error: {e}")
-                await _send_rich_command_message(chat_id, f"❌ <b>操作失败</b>\n<code>{str(e)[:100]}</code>", reply_message_id=mid)
+                await _send_via_send_message(chat_id, f"❌ <b>操作失败</b>\n<code>{str(e)[:100]}</code>", reply_message_id=mid)
                 async with aiohttp.ClientSession() as s:
                     await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "操作失败"})
                 return "OK", 200
