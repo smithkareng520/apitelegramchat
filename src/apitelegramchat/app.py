@@ -655,10 +655,21 @@ async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
             except Exception:
                 pass
 
-def _schedule_media_group(chat_id: int, media_group_id: str) -> None:
-    if media_group_id not in _media_group_tasks:
-        task = asyncio.create_task(_process_media_group_once(chat_id, media_group_id))
-        _media_group_tasks[media_group_id] = task
+async def _schedule_media_group(chat_id: int, media_group_id: str) -> None:
+    """将图片组的等待/处理任务作为当前 chat 的可取消生成任务登记。"""
+    if media_group_id in _media_group_tasks:
+        return
+    task = asyncio.create_task(_process_media_group_once(chat_id, media_group_id))
+    _media_group_tasks[media_group_id] = task
+    async with active_tasks_lock:
+        active_tasks[chat_id] = task
+
+    def _done(done_task: asyncio.Task) -> None:
+        if _media_group_tasks.get(media_group_id) is done_task:
+            _media_group_tasks.pop(media_group_id, None)
+        asyncio.create_task(_cleanup_task(chat_id, done_task))
+
+    task.add_done_callback(_done)
 
 async def _process_document_group_once(chat_id: int, media_group_id: str) -> None:
     await send_chat_action(chat_id, "upload_document")
@@ -769,10 +780,21 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
         ctx["username"] = username or f"User_{chat_id}"
     await _handle_text_message(chat_id, user_message.get("content", ""), username, user_message)
 
-def _schedule_document_group(chat_id: int, media_group_id: str) -> None:
-    if media_group_id not in _document_group_tasks:
-        task = asyncio.create_task(_process_document_group_once(chat_id, media_group_id))
-        _document_group_tasks[media_group_id] = task
+async def _schedule_document_group(chat_id: int, media_group_id: str) -> None:
+    """将文档组的等待/处理任务作为当前 chat 的可取消生成任务登记。"""
+    if media_group_id in _document_group_tasks:
+        return
+    task = asyncio.create_task(_process_document_group_once(chat_id, media_group_id))
+    _document_group_tasks[media_group_id] = task
+    async with active_tasks_lock:
+        active_tasks[chat_id] = task
+
+    def _done(done_task: asyncio.Task) -> None:
+        if _document_group_tasks.get(media_group_id) is done_task:
+            _document_group_tasks.pop(media_group_id, None)
+        asyncio.create_task(_cleanup_task(chat_id, done_task))
+
+    task.add_done_callback(_done)
 
 # ---------------------------------------------------------------------------
 # 角色与模型列表 UI
@@ -1083,14 +1105,21 @@ async def webhook() -> tuple:
             if "media_group_id" in msg and "photo" in msg:
                 mg = msg["media_group_id"]
                 await add_media_group_message(mg, msg)
-                _schedule_media_group(chat_id, mg)
+                # 图片组存在聚合等待期；只在首个分片到达时中断旧草稿并登记任务。
+                # 同一组的后续分片不能取消正在等待自身完整内容的聚合任务。
+                if mg not in _media_group_tasks:
+                    await _interrupt_active_generation(chat_id)
+                    await _schedule_media_group(chat_id, mg)
                 return "OK", 200
 
             # ── 文档组 ─────────────────────────────────────────────────────
             if "media_group_id" in msg and "document" in msg:
                 mg = msg["media_group_id"]
                 await add_media_group_message(mg, msg)
-                _schedule_document_group(chat_id, mg)
+                # 文档组同样只在首个分片时中断旧草稿；同组后续文件继续聚合。
+                if mg not in _document_group_tasks:
+                    await _interrupt_active_generation(chat_id)
+                    await _schedule_document_group(chat_id, mg)
                 return "OK", 200
 
             # ── 单张图片 ──────────────────────────────────────────────────
