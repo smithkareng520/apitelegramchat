@@ -2769,7 +2769,9 @@ class RichMessageBuilder:
     MAX_TOOL_UI_DETAIL_CHARS = 6000
     DEFAULT_TOOL_UI_DETAIL_CHARS = 2400
     MAX_TOOL_GROUP_UI_DETAIL_CHARS = 12000
-    TRUNCATED_DETAIL_TOOL_TYPES = {"bash", "text_editor"}
+    # 子 agent 会先在自身渲染器中按结构限制答复预览；此处给它完整卡片预算，
+    # 避免通用截断把 <blockquote> / 链接等富文本降级成一段纯文本。
+    TRUNCATED_DETAIL_TOOL_TYPES = {"bash", "text_editor", "subagent"}
 
     def __init__(self, chat_id: int):
         self.chat_id = chat_id

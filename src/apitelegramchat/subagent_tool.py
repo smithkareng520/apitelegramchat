@@ -41,6 +41,7 @@ import logging
 import os
 import time
 import traceback
+from html.parser import HTMLParser
 from typing import Any, Optional
 
 from apitelegramchat.api_client import api_client
@@ -70,6 +71,11 @@ DEFAULT_TIMEOUT = _env_int("SUBAGENT_DEFAULT_TIMEOUT", 900, min_value=60, max_va
 MAX_TASK_LEN = _env_int("SUBAGENT_MAX_TASK_LEN", 8000, min_value=1000, max_value=50000)
 MAX_CONTEXT_LEN = _env_int("SUBAGENT_MAX_CONTEXT_LEN", 16000, min_value=1000, max_value=100000)
 MAX_ANSWER_LEN = _env_int("SUBAGENT_MAX_ANSWER_LEN", 12000, min_value=1000, max_value=100000)
+# 子 agent 的完整答复仍会交给父 agent；此处仅限制 Telegram 工具卡片的预览，
+# 防止一张卡片吞掉整个富消息草稿的交互预算。
+MAX_CARD_ANSWER_HTML_LEN = _env_int(
+    "SUBAGENT_CARD_ANSWER_HTML_LEN", 4200, min_value=1000, max_value=5000
+)
 
 
 # 子 agent 不允许调用的工具（防递归 / 防爆炸 / 防资源滥用）
@@ -479,6 +485,110 @@ def _esc(text: Any) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+_HTML_VOID_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+    "meta", "param", "source", "track", "wbr",
+}
+
+
+class _HTMLPreviewTruncator(HTMLParser):
+    """按 HTML 结构截取预览，并在截断处补齐已打开的标签。"""
+
+    def __init__(self, limit: int):
+        super().__init__(convert_charrefs=False)
+        self.limit = max(1, int(limit))
+        self.parts: list[str] = []
+        self.open_tags: list[str] = []
+        self.open_close_chars = 0
+        self.truncated = False
+
+    def _remaining(self) -> int:
+        return self.limit - len("".join(self.parts)) - self.open_close_chars
+
+    def _append(self, text: str) -> bool:
+        if self.truncated:
+            return False
+        if len(text) > self._remaining():
+            self.truncated = True
+            return False
+        self.parts.append(text)
+        return True
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        raw = self.get_starttag_text() or f"<{tag}>"
+        tag = tag.lower()
+        reserved = 0 if tag in _HTML_VOID_TAGS else len(tag) + 3  # </tag>
+        if len(raw) + reserved > self._remaining():
+            self.truncated = True
+            return
+        self.parts.append(raw)
+        if reserved:
+            self.open_tags.append(tag)
+            self.open_close_chars += reserved
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._append(self.get_starttag_text() or f"<{tag}/>")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        close_index = next((
+            i for i in range(len(self.open_tags) - 1, -1, -1)
+            if self.open_tags[i] == tag
+        ), None)
+        if close_index is None:
+            # 忽略孤立闭合标签，避免模型的局部不规范 HTML 破坏整个工具卡片。
+            return
+        closing_tags = list(reversed(self.open_tags[close_index:]))
+        closing_html = "".join(f"</{open_tag}>" for open_tag in closing_tags)
+        released = sum(len(open_tag) + 3 for open_tag in self.open_tags[close_index:])
+        if self.truncated or len(closing_html) > self._remaining() + released:
+            self.truncated = True
+            return
+        self.parts.append(closing_html)
+        del self.open_tags[close_index:]
+        self.open_close_chars -= released
+
+    def handle_data(self, data: str) -> None:
+        if self.truncated or not data:
+            return
+        remaining = self._remaining()
+        if len(data) <= remaining:
+            self.parts.append(data)
+            return
+        if remaining > 0:
+            self.parts.append(data[:remaining])
+        self.truncated = True
+
+    def handle_entityref(self, name: str) -> None:
+        self._append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        self._append(f"&#{name};")
+
+    def render(self) -> tuple[str, bool]:
+        suffix = "".join(f"</{tag}>" for tag in reversed(self.open_tags))
+        return "".join(self.parts) + suffix, self.truncated
+
+
+def _truncate_html_preview(fragment: str, limit: int = MAX_CARD_ANSWER_HTML_LEN) -> tuple[str, bool]:
+    """截取富文本源码预算内的预览，绝不在标签或实体中间切断。"""
+    text = fragment or ""
+    if len(text) <= limit:
+        return text, False
+    parser = _HTMLPreviewTruncator(limit)
+    try:
+        parser.feed(text)
+        parser.close()
+        preview, _ = parser.render()
+        # 对于只含超长的注释、声明等极端输入，仍提供可展示的安全文本兜底。
+        if not preview:
+            return _esc(text[:limit]), True
+        return preview, True
+    except Exception:
+        # 模型输出不应因预览格式化失败而令整个工具卡片消失。
+        return _esc(text[:limit]), True
+
+
 def render_subagent_card(payload: dict) -> str:
     """把 execute_subagent 的返回渲染成父 agent 看到的工具结果卡片。"""
     if not isinstance(payload, dict):
@@ -497,20 +607,26 @@ def render_subagent_card(payload: dict) -> str:
             f"<p><i>模型：</i><code>{_esc(model_name)}</code> · "
             f"<i>轮数：</i>{rounds} · <i>工具调用：</i>{tool_calls} · "
             f"<i>耗时：</i>{elapsed:.1f}s</p>"
-            f"<p>任务：<blockquote>{_esc(task_preview)}</blockquote></p>"
+            f"<p>任务：</p><blockquote>{_esc(task_preview)}</blockquote>"
             f"<blockquote>⚠️ {_esc(error)}</blockquote>"
         )
 
     answer = payload.get("answer", "") or ""
+    preview, truncated = _truncate_html_preview(str(answer))
+    truncation_note = (
+        "<p><i>…答复较长，卡片仅展示前半部分；完整结果仍已提供给父 agent。</i></p>"
+        if truncated else ""
+    )
     return (
         f"<p>🤖 <b>子 agent 已完成</b></p>"
         f"<p><i>模型：</i><code>{_esc(model_name)}</code> · "
         f"<i>轮数：</i>{rounds} · <i>工具调用：</i>{tool_calls} · "
         f"<i>耗时：</i>{elapsed:.1f}s</p>"
-        f"<p>任务：<blockquote>{_esc(task_preview)}</blockquote></p>"
+        f"<p>任务：</p><blockquote>{_esc(task_preview)}</blockquote>"
         f"<hr/>"
         f"<p><b>子 agent 答复：</b></p>"
-        f"<blockquote>{answer}</blockquote>"
+        f"<blockquote>{preview}</blockquote>"
+        f"{truncation_note}"
     )
 
 

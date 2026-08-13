@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import apitelegramchat.ai_handlers as handlers  # noqa: E402
+import apitelegramchat.subagent_tool as subagent_tool  # noqa: E402
 
 
 def require(condition: bool, message: str) -> None:
@@ -29,6 +30,40 @@ def test_thinking_status_is_escaped_and_requests_refresh() -> None:
         "思考状态必须按富消息 HTML 规则转义",
     )
     require(refresh_requests == [True], "状态变更后必须触发一次强制可见刷新请求")
+
+
+def test_long_subagent_card_preserves_rich_structure() -> None:
+    """长子 agent 答复必须保留卡片、引用块和已展示部分的来源链接。"""
+    answer = (
+        '<p>结论：详见 <a href="https://example.com/source">来源</a>。</p>'
+        + "<p>" + ("长内容 " * 2500) + "</p>"
+    )
+    card = subagent_tool.render_subagent_card({
+        "ok": True,
+        "model": "test-model",
+        "rounds": 2,
+        "tool_calls": 1,
+        "elapsed": 1.2,
+        "task_preview": "验证长卡片",
+        "answer": answer,
+    })
+
+    require("答复较长，卡片仅展示前半部分" in card, "长答复必须明确提示卡片预览已截断")
+    require('<a href="https://example.com/source">来源</a>' in card, "截断前的来源链接必须保留")
+    require(card.count("<blockquote>") == card.count("</blockquote>"), "卡片中的引用块必须完整闭合")
+    require("<p>任务：</p><blockquote>验证长卡片</blockquote>" in card, "任务引用块不得嵌套在段落内")
+
+    builder = handlers.RichMessageBuilder(chat_id=804)
+    builder.request_flush = lambda force=False: None
+    builder.start_new_tool_group()
+    builder.add_tool_item("subagent-1", "subagent", "子 agent 完成", fn_args={})
+    builder.update_tool_item("subagent-1", "子 agent 完成", card)
+    builder.finish_group()
+    rendered = builder._build_html()
+
+    require("子 agent 已完成" in rendered, "长答复不得导致子 agent 卡片消失")
+    require('<a href="https://example.com/source">来源</a>' in rendered, "专用详情预算不得扁平化来源链接")
+    require("答复较长，卡片仅展示前半部分" in rendered, "卡片截断提示必须持续可见")
 
 
 def test_tool_group_details_are_bounded_for_ui() -> None:
@@ -149,6 +184,7 @@ async def test_initial_draft_precedes_expensive_request_preparation() -> None:
 
 def main() -> None:
     test_thinking_status_is_escaped_and_requests_refresh()
+    test_long_subagent_card_preserves_rich_structure()
     test_tool_group_details_are_bounded_for_ui()
     asyncio.run(test_silent_active_draft_is_force_refreshed_globally())
     asyncio.run(test_initial_draft_precedes_expensive_request_preparation())
