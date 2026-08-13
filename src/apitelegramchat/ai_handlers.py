@@ -2205,6 +2205,54 @@ def _safe_parse_args(args_str: str) -> dict:
     return {}
 
 
+# 兼容网关会严格校验 assistant.tool_calls[*].function.arguments 必须是 JSON object。
+# 流式调用偶发截断/拼接异常时，不能把原始坏字符串写回下一轮请求，否则网关会在
+# 模型开始生成前直接 400。此标记本身是合法 JSON，并让执行层返回可恢复错误。
+_INVALID_TOOL_ARGUMENTS_KEY = "__apitelegram_invalid_tool_arguments__"
+_INVALID_TOOL_ARGUMENTS_RAW_KEY = "raw_arguments_excerpt"
+
+
+def _normalize_tool_arguments(arguments: Any) -> tuple[str, bool]:
+    """返回可安全回传给 provider 的 JSON object 字符串及是否发生规范化。"""
+    raw = arguments if isinstance(arguments, str) else str(arguments or "")
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            # 重新序列化同时移除无意义空白，确保所有兼容端收到相同的合法 JSON。
+            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":")), False
+        reason = "arguments must be a JSON object"
+    except (json.JSONDecodeError, TypeError, ValueError):
+        reason = "arguments were not valid JSON"
+
+    safe_excerpt = raw[:2000]
+    normalized = {
+        _INVALID_TOOL_ARGUMENTS_KEY: reason,
+        _INVALID_TOOL_ARGUMENTS_RAW_KEY: safe_excerpt,
+    }
+    return json.dumps(normalized, ensure_ascii=False, separators=(",", ":")), True
+
+
+def _normalize_tool_call_arguments(tool_calls: list[dict], api_label: str, round_number: int) -> int:
+    """就地规范化一个模型返回中的所有工具参数，并返回修复数量。"""
+    corrected = 0
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        function = tc.setdefault("function", {})
+        if not isinstance(function, dict):
+            tc["function"] = function = {}
+        normalized, was_corrected = _normalize_tool_arguments(function.get("arguments", ""))
+        function["arguments"] = normalized
+        if was_corrected:
+            corrected += 1
+    if corrected:
+        logger.warning(
+            "[%s] 第 %s 轮检测到 %s 个非法工具参数 JSON，已写入可恢复错误并阻止其污染下一轮请求",
+            api_label, round_number, corrected,
+        )
+    return corrected
+
+
 # ========== 工具调用执行 ==========
 async def _run_tool_calls_and_append(
         tool_calls: list,
@@ -2341,7 +2389,13 @@ async def _run_tool_calls_and_append(
 
 
             try:
-                if fn_name == "ask_user":
+                invalid_arguments = fn_args.get(_INVALID_TOOL_ARGUMENTS_KEY)
+                if invalid_arguments:
+                    result_str = (
+                        f"Error: tool {fn_name} was not executed because the model returned malformed JSON "
+                        f"arguments ({invalid_arguments}). Reissue the same tool call with a valid JSON object."
+                    )
+                elif fn_name == "ask_user":
                     question = fn_args.get("question", "")
                     options = fn_args.get("options", [])
                     multiple = bool(fn_args.get("multiple", False))
@@ -3985,6 +4039,7 @@ async def _agentic_loop_openai_compat(
         for idx, tc in enumerate(tool_calls_list):
             if not tc.get("id"):
                 tc["id"] = f"call_{_round}_{idx}_{uuid.uuid4().hex[:8]}"
+        _normalize_tool_call_arguments(tool_calls_list, api_label, _round + 1)
 
         if not tool_calls_list and not content_acc.strip():
             content_acc = "（模型未返回任何内容）"
@@ -4224,6 +4279,7 @@ async def _agentic_loop_gemini_openai_compat(
                 # Keep the legacy field too for maximum compatibility.
                 tc_entry["thought_signature"] = thought_signature
             tool_calls_list.append(tc_entry)
+        _normalize_tool_call_arguments(tool_calls_list, "gemini", _round + 1)
 
         # Gemini/OpenAI 兼容端也可能把函数调用 XML 放在普通 content 中；在写入
         # 草稿和历史前先清理，避免最终消息暴露内部调用语法。
