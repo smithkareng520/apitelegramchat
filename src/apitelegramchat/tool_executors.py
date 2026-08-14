@@ -69,7 +69,7 @@ from apitelegramchat.todo_tool import (
 )
 from apitelegramchat.memory_tool import execute_memory, render_memory_card
 from apitelegramchat.subagent_tool import execute_subagent, render_subagent_card
-from apitelegramchat.utils import escape_html
+from apitelegramchat.utils import escape_html, escape_rich_href_url
 
 logger = logging.getLogger(__name__)
 
@@ -667,7 +667,7 @@ def _format_image_generation_result(
             summary = f"🎨 {operation_en} {count} image" + ("" if count == 1 else "s")
             img_tags = "".join(f'<img src="{escape_html(url)}"/>' for url in urls)
             link_items = "".join(
-                f'<li><a href="{url}">图片 {index + 1}</a></li>'
+                f'<li><a href="{escape_rich_href_url(url)}">图片 {index + 1}</a></li>'
                 for index, url in enumerate(urls)
             )
             caption = f"{operation_zh} {count} 张图片：<ul>{link_items}</ul>"
@@ -1722,7 +1722,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                     f'<img src="{safe_url}"/><br/>'
                     f'<b>✅ 二维码生成成功</b><br/>'
                     f'<b>内容：</b>{escape_text(content_text)}<br/>'
-                    f'<b>链接：</b><a href="{safe_url}">📷 点击查看 / 下载二维码</a>'
+                    f'<b>链接：</b><a href="{escape_rich_href_url(img_url)}">📷 点击查看 / 下载二维码</a>'
                 )
                 return summary, details_html
         summary = "📱 二维码"
@@ -1770,7 +1770,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 # 附带简短文本链接 caption，避免裸 R2 presigned URL 刷屏
                 details_html = (
                     f'<figure><video src="{escape_html(video_url)}"></video>'
-                    f'<figcaption><a href="{video_url}">下载 / 查看视频</a></figcaption>'
+                    f'<figcaption><a href="{escape_rich_href_url(video_url)}">下载 / 查看视频</a></figcaption>'
                     f'</figure>'
                 )
                 return summary, details_html
