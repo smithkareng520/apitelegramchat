@@ -4199,10 +4199,9 @@ async def _agentic_loop_openai_compat(
                 final_content = content_acc
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
-            # 终局模型返回也是完整回合边界；长最终答复可在此分段永久化。
-            await builder.rollover_at_turn_boundary()
+            # 本轮没有标准 tool_calls，Agent 循环将在此结束。即使容量达到阈值，
+            # 也不能创建新的草稿：最终发送路径会直接提交当前尾段。
             break
-
         status = await _run_tool_calls_and_append(
             tool_calls_list, loop_messages, new_history_entries,
             tool_call_count_ref, api_label, builder, chat_id=builder.chat_id
@@ -4250,7 +4249,8 @@ async def _agentic_loop_openai_compat(
             new_history_entries.append({"role": "assistant", "content": final_content})
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
-            await builder.rollover_at_turn_boundary()
+            # 工具上限总结是终局回复，不会再发起下一次模型请求；保留当前草稿
+            # 供统一最终发送路径提交，避免无内容的新草稿闪现。
             break
         # 如果 status == "continue"（包括之前熔断返回的），循环自然继续
 
@@ -4262,12 +4262,10 @@ async def _agentic_loop_openai_compat(
         new_history_entries.append({"role": "assistant", "content": final_content})
         if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
             builder.finish_group(len(builder._tool_groups) - 1)
-        await builder.rollover_at_turn_boundary()
-
+        # 轮次数耗尽后的兜底文本同样是终局内容，不创建下一段草稿。
     return final_content, final_usage, new_history_entries
-
-
 # ---------- Gemini 非流式 ----------
+
 async def _agentic_loop_gemini_openai_compat(
         current_model: str,
         messages: list,
@@ -4425,9 +4423,8 @@ async def _agentic_loop_gemini_openai_compat(
             final_content = content_acc
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
-            await builder.rollover_at_turn_boundary()
+            # 无工具调用即为终局响应；统一收尾会发送当前草稿内容，不能额外开新草稿。
             break
-
         status = await _run_tool_calls_and_append(
             tool_calls_list, loop_messages, new_history_entries,
             tool_call_count_ref, "gemini", builder, chat_id=builder.chat_id
@@ -4473,20 +4470,17 @@ async def _agentic_loop_gemini_openai_compat(
             )
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
-            await builder.rollover_at_turn_boundary()
+            # 工具上限总结后没有后续模型轮次，禁止创建空的新草稿。
             break
-
     if final_content is None:
         final_content = _tool_limit_summary()
+
         builder.add_text(final_content)
         new_history_entries.append({"role": "assistant", "content": final_content})
         if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
             builder.finish_group(len(builder._tool_groups) - 1)
-        await builder.rollover_at_turn_boundary()
-
+        # 轮次数耗尽后的兜底文本没有后续轮次，不应切换草稿。
     return final_content, final_usage, new_history_entries
-
-
 async def _response_items_to_bytes(response_json: dict) -> list[bytes]:
     image_bytes_list: list[bytes] = []
     items = _extract_image_items(response_json)
