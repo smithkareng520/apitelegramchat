@@ -126,11 +126,29 @@ _RICH_URL_ATTR_RE = re.compile(
 )
 
 
+def _normalize_rich_url_attr(url: str) -> str:
+    """将 URL 规范为可放入 HTML 属性值的形式，且只编码一次。
+
+    上游工具、模型输出与卡片模板可能分别把查询串的 ``&`` 写成 ``&amp;``。
+    若先前已经发生多次 HTML 编码，Telegram 在解析属性时只会解码一层，
+    最终请求 URL 便会残留字面量 ``amp;``。这里仅折叠 ``&amp;`` 的重复层级，
+    再按属性值语义统一转义一次；浏览器/Telegram 解析后将恢复为原始 ``&``。
+    """
+    normalized = str(url or "")
+    # 限制循环次数，既覆盖常见的多次编码，也避免异常输入造成无界处理。
+    for _ in range(4):
+        decoded = normalized.replace("&amp;", "&")
+        if decoded == normalized:
+            break
+        normalized = decoded
+    return html.escape(normalized, quote=True)
+
+
 def _escape_media_src_urls(html_content: str) -> str:
     """
-    转义富文本 URL 属性中的裸 &。
-    覆盖所有媒体 src 属性，以及图注、下载链接等 href 属性；单双引号形式都支持。
-    幂等：已经转义成 &amp; 的不会被二次转义。
+    规范化富文本 ``src`` 与 ``href`` 属性中的 URL。
+    覆盖图片、视频、音频及下载链接；不论上游传入裸 ``&``、``&amp;`` 或
+    意外的 ``&amp;amp;``，发送给 Telegram 的 HTML 都只保留一层 ``&amp;``。
     """
     if not html_content:
         return html_content
@@ -139,7 +157,7 @@ def _escape_media_src_urls(html_content: str) -> str:
         attribute = match.group("attribute").lower()
         quote = match.group("quote")
         url = match.group("url")
-        escaped = _BARE_AMP_RE.sub('&amp;', url)
+        escaped = _normalize_rich_url_attr(url)
         return f"{attribute}={quote}{escaped}{quote}"
 
     return _RICH_URL_ATTR_RE.sub(_escape_one, html_content)
