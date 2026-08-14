@@ -114,54 +114,46 @@ def escape_html(text: str) -> str:
 # R2 presigned URL 含大量 & 查询参数（X-Amz-Algorithm、X-Amz-Credential、X-Amz-Signature 等）。
 # 在 HTML 属性值 src="..." 中，未转义的 & 会被 Telegram HTML 解析器当作实体名起点，
 # 导致 URL 被截断 → RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND / RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND。
-# 此 sanitizer 在发送前自动转义所有媒体 src 与链接 href 属性中的裸 &，幂等（不重复转义已转义的实体）。
+# 此 sanitizer 在发送前仅转义媒体 src 属性中的裸 &，幂等（不重复转义已转义的实体）。
 _VALID_HTML_ENTITIES = (
     r'amp;|lt;|gt;|quot;|apos;|nbsp;|hellip;|mdash;|ndash;|lsquo;|rsquo;|ldquo;|rdquo;'
     r'|#\d+;|#x[0-9a-fA-F]+;'
 )
 _BARE_AMP_RE = re.compile(rf'&(?!{_VALID_HTML_ENTITIES})')
-_RICH_URL_ATTR_RE = re.compile(
-    r'''\b(?P<attribute>src|href)\s*=\s*(?P<quote>["'])(?P<url>.*?)(?P=quote)''',
+_RICH_SRC_ATTR_RE = re.compile(
+    r'''\bsrc\s*=\s*(?P<quote>["'])(?P<url>.*?)(?P=quote)''',
     re.IGNORECASE,
 )
 
 
-def escape_rich_href_url(url: str) -> str:
-    """Escape a URL for a rich-message ``href`` without HTML-encoding ``&``.
+def escape_html_href_url(url: object) -> str:
+    """Build an href attribute value without rewriting URL query separators.
 
-    R2/S3 presigned URLs require the query parameters to remain separated by the
-    literal ``&`` when a user agent follows the link.  The rich-message media
-    parser can decode ``&amp;`` in ``src``, but the current clickable-link path
-    may expose the attribute value verbatim, producing ``&amp;X-Amz-*`` at the
-    storage endpoint and an invalid signature.  Quotes/angle brackets are still
-    escaped so the URL cannot break the attribute.
+    ``&`` is intentionally preserved. Media ``src`` values are escaped separately
+    for Telegram's rich-message parser, but a clickable ``href`` must keep the
+    original URL string so clients that read the raw message model do not receive
+    ``&amp;`` as part of the URL.
     """
-    raw = html.unescape(str(url or ""))
-    return html.escape(raw, quote=True).replace("&amp;", "&")
+    value = str(url or "").strip()
+    return value.replace('"', '&quot;')
 
 
 def _escape_media_src_urls(html_content: str) -> str:
     """
-    Normalize rich-message URL attributes at the final send boundary.
-
-    ``src`` keeps HTML entity escaping for parser correctness. ``href`` is
-    deliberately emitted with literal ``&`` so clicking/downloading a presigned
-    URL sends the real SigV4 query string to the origin.
+    仅转义富文本媒体 src 属性中的裸 &。
+    href 不在这里处理：下载/查看链接需要保留原始 URL 查询串，避免前端把
+    &amp; 当作 URL 数据。单双引号形式都支持；已经转义成实体的 src 不重复转义。
     """
     if not html_content:
         return html_content
 
     def _escape_one(match: re.Match) -> str:
-        attribute = match.group("attribute").lower()
         quote = match.group("quote")
         url = match.group("url")
-        if attribute == "href":
-            escaped = escape_rich_href_url(url)
-        else:
-            escaped = _BARE_AMP_RE.sub('&amp;', html.unescape(url))
-        return f"{attribute}={quote}{escaped}{quote}"
+        escaped = _BARE_AMP_RE.sub('&amp;', url)
+        return f"src={quote}{escaped}{quote}"
 
-    return _RICH_URL_ATTR_RE.sub(_escape_one, html_content)
+    return _RICH_SRC_ATTR_RE.sub(_escape_one, html_content)
 
 
 async def send_message(chat_id: int, text: str) -> None:

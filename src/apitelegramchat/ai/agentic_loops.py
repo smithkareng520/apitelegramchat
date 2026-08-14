@@ -13,7 +13,7 @@ from typing import Optional
 from openai import AsyncOpenAI
 
 from apitelegramchat.config import GEMINI_API_KEY, SUPPORTED_MODELS
-from apitelegramchat.utils import get_logger, escape_html, send_rich_html_message
+from apitelegramchat.utils import get_logger, escape_html, escape_html_href_url, send_rich_html_message
 from apitelegramchat.s3_utils import upload_bytes_to_r2
 import apitelegramchat.state as state
 
