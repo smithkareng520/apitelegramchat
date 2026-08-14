@@ -110,32 +110,18 @@ def escape_html(text: str) -> str:
     return html.escape(text)
 
 
-def raw_media_url(url: str) -> str:
-    """返回用于 HTTP、模型上下文和 URL 按钮的原始媒体 URL。
-
-    富文本属性源码中的 ``&amp;`` 不是可直接请求的 URL。任何非 HTML
-    场景均应调用本函数，确保 R2 的 ``X-Amz-*`` 查询参数保持原始名称。
-    """
-    return html.unescape(str(url or "").strip())
-
-
-def media_url_html_attr(url: str) -> str:
-    """返回仅可嵌入 HTML ``src``/``href`` 属性的媒体 URL。"""
-    return html.escape(raw_media_url(url), quote=True)
-
-
 # ---------- 媒体 URL 转义 sanitizer ----------
 # R2 presigned URL 含大量 & 查询参数（X-Amz-Algorithm、X-Amz-Credential、X-Amz-Signature 等）。
 # 在 HTML 属性值 src="..." 中，未转义的 & 会被 Telegram HTML 解析器当作实体名起点，
 # 导致 URL 被截断 → RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND / RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND。
-# 此 sanitizer 在发送前自动转义所有媒体 src 与链接 href 属性中的裸 &，幂等（不重复转义已转义的实体）。
+# 此 sanitizer 仅在发送前转义媒体 src 属性中的裸 &；工具卡片的 href 必须保留原始 URL，供前端点击。
 _VALID_HTML_ENTITIES = (
     r'amp;|lt;|gt;|quot;|apos;|nbsp;|hellip;|mdash;|ndash;|lsquo;|rsquo;|ldquo;|rdquo;'
     r'|#\d+;|#x[0-9a-fA-F]+;'
 )
 _BARE_AMP_RE = re.compile(rf'&(?!{_VALID_HTML_ENTITIES})')
 _RICH_URL_ATTR_RE = re.compile(
-    r'''\b(?P<attribute>src|href)\s*=\s*(?P<quote>["'])(?P<url>.*?)(?P=quote)''',
+    r'''\b(?P<attribute>src)\s*=\s*(?P<quote>["'])(?P<url>.*?)(?P=quote)''',
     re.IGNORECASE,
 )
 
@@ -143,7 +129,7 @@ _RICH_URL_ATTR_RE = re.compile(
 def _escape_media_src_urls(html_content: str) -> str:
     """
     转义富文本 URL 属性中的裸 &。
-    覆盖所有媒体 src 属性，以及图注、下载链接等 href 属性；单双引号形式都支持。
+    仅覆盖媒体 src 属性；工具卡片的 href 保留原始 URL，以便前端点击。
     幂等：已经转义成 &amp; 的不会被二次转义。
     """
     if not html_content:
@@ -152,7 +138,7 @@ def _escape_media_src_urls(html_content: str) -> str:
     def _escape_one(match: re.Match) -> str:
         attribute = match.group("attribute").lower()
         quote = match.group("quote")
-        url = raw_media_url(match.group("url"))
+        url = match.group("url")
         escaped = _BARE_AMP_RE.sub('&amp;', url)
         return f"{attribute}={quote}{escaped}{quote}"
 

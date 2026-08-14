@@ -13,13 +13,7 @@ from typing import Optional
 from openai import AsyncOpenAI
 
 from apitelegramchat.config import GEMINI_API_KEY, SUPPORTED_MODELS
-from apitelegramchat.utils import (
-    get_logger,
-    escape_html,
-    media_url_html_attr,
-    raw_media_url,
-    send_rich_html_message,
-)
+from apitelegramchat.utils import get_logger, escape_html, send_rich_html_message
 from apitelegramchat.s3_utils import upload_bytes_to_r2
 import apitelegramchat.state as state
 
@@ -60,24 +54,6 @@ from apitelegramchat.ai.tool_summary import (
 from apitelegramchat.ai.tool_call_loop import _run_tool_calls_and_append
 
 logger = get_logger(__name__)
-
-
-def _media_open_keyboard(urls: list[str], media_label: str) -> dict | None:
-    """构造使用原始 URL 的点击按钮，不复用富文本属性中的 ``&amp;``。"""
-    rows: list[list[dict[str, str]]] = []
-    for index, url in enumerate(urls, start=1):
-        raw_url = raw_media_url(url)
-        if not raw_url.startswith(("https://", "http://")):
-            continue
-        suffix = f" {index}" if len(urls) > 1 else ""
-        rows.append([{"text": f"打开原{media_label}{suffix}", "url": raw_url}])
-    return {"inline_keyboard": rows} if rows else None
-
-
-def _raw_media_urls_for_history(urls: list[str]) -> str:
-    """供模型后续引用的原始 HTTP URL，绝不记录 HTML 属性编码值。"""
-    return "\n".join(raw_media_url(url) for url in urls if raw_media_url(url))
-
 
 def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict):
     if index not in accumulator:
@@ -837,7 +813,7 @@ async def _agentic_loop_native_image(
                     uploaded_urls.append(url)
 
             if uploaded_urls:
-                img_tags = "".join(f'<img src="{media_url_html_attr(u)}"/>' for u in uploaded_urls)
+                img_tags = "".join(f'<img src="{escape_html(u)}"/>' for u in uploaded_urls)
                 caption_text = _format_image_metadata_caption(image_bytes_list[0],
                                                               current_model) if image_bytes_list else "Generated image"
                 # 单图用 <figure>，多图用 <tg-slideshow> 轮播
@@ -845,11 +821,7 @@ async def _agentic_loop_native_image(
                     rich_html = f'<figure>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></figure>'
                 else:
                     rich_html = f'<tg-slideshow>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></tg-slideshow>'
-                await send_rich_html_message(
-                    chat_id,
-                    rich_html,
-                    reply_markup=_media_open_keyboard(uploaded_urls, "图"),
-                )
+                await send_rich_html_message(chat_id, rich_html)
                 final_notice = caption_text
             else:
                 error_notice = _format_api_error_notice(
@@ -862,10 +834,7 @@ async def _agentic_loop_native_image(
                 return f"IMAGE_ERROR:{error_notice}", None, []
 
             final_content = f"IMAGE_SENT:{final_notice}" if final_notice else "IMAGE_SENT"
-            history_content = (
-                f"[图片已生成] 指令: {clean_prompt or prompt_text or '(无)'} | {caption_text}"
-                f"\n原始媒体 URL（仅供后续模型请求使用）：\n{_raw_media_urls_for_history(uploaded_urls)}"
-            )
+            history_content = f"[图片已生成] 指令: {clean_prompt or prompt_text or '(无)'} | {caption_text}"
             new_entries = [{"role": "assistant", "content": history_content}]
             return final_content, getattr(response, "usage", None), new_entries
 
@@ -963,7 +932,7 @@ async def _agentic_loop_native_image(
             uploaded_urls.append(url)
 
     if uploaded_urls:
-        img_tags = "".join(f'<img src="{media_url_html_attr(u)}"/>' for u in uploaded_urls)
+        img_tags = "".join(f'<img src="{escape_html(u)}"/>' for u in uploaded_urls)
         caption_text = _format_image_metadata_caption(image_bytes_list[0],
                                                       current_model) if image_bytes_list else "Generated image"
         # 单图用 <figure>，多图用 <tg-slideshow> 轮播
@@ -971,11 +940,7 @@ async def _agentic_loop_native_image(
             rich_html = f'<figure>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></figure>'
         else:
             rich_html = f'<tg-slideshow>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></tg-slideshow>'
-        await send_rich_html_message(
-            chat_id,
-            rich_html,
-            reply_markup=_media_open_keyboard(uploaded_urls, "图"),
-        )
+        await send_rich_html_message(chat_id, rich_html)
         final_notice = caption_text
     else:
         final_notice = _format_native_image_notice(
@@ -988,10 +953,7 @@ async def _agentic_loop_native_image(
 
     final_content = f"IMAGE_SENT:{final_notice}" if final_notice else "IMAGE_SENT"
     if uploaded_urls:
-        history_content = (
-            f"[图片已生成] {content[:200] if content else ''} | {caption_text}".strip(' |')
-            + f"\n原始媒体 URL（仅供后续模型请求使用）：\n{_raw_media_urls_for_history(uploaded_urls)}"
-        )
+        history_content = f"[图片已生成] {content[:200] if content else ''} | {caption_text}".strip(' |')
     else:
         history_content = final_notice or "（已生成图片）"
     new_entries = [{"role": "assistant", "content": history_content}]
@@ -1099,14 +1061,10 @@ async def _agentic_loop_native_video(
         meta=video_meta if isinstance(video_meta, dict) else None,
     )
     video_html = (
-        f'<figure><video src="{media_url_html_attr(final_video_url)}"></video>'
+        f'<figure><video src="{escape_html(final_video_url)}"></video>'
         f'<figcaption>{escape_html(caption_text)}</figcaption></figure>'
     )
-    send_ok = await send_rich_html_message(
-        chat_id,
-        video_html,
-        reply_markup=_media_open_keyboard([final_video_url], "视频"),
-    )
+    send_ok = await send_rich_html_message(chat_id, video_html)
     if not send_ok:
         logger.error(
             "视频已生成，但 sendRichMessage 发送失败 final_video_url=%s",
@@ -1115,9 +1073,7 @@ async def _agentic_loop_native_video(
         return "VIDEO_ERROR:视频发送失败", None, []
 
     # 生成历史记录
-    history_content = (
-        f"[视频已生成] 提示词: {prompt[:200]}" if prompt else "[视频已生成]"
-    ) + f"\n原始媒体 URL（仅供后续模型请求使用）：\n{_raw_media_urls_for_history([final_video_url])}"
+    history_content = f"[视频已生成] 提示词: {prompt[:200]}" if prompt else "[视频已生成]"
     new_entries = [{"role": "assistant", "content": history_content}]
 
     final_content = f"VIDEO_SENT:{prompt[:100]}"  # 用于上游判断
