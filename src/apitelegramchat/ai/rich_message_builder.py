@@ -101,6 +101,15 @@ _RICH_BLOCK_OPEN_TAG_RE = re.compile(
     r"figure|figcaption|tg-slideshow|tg-map|img|video|audio|tg-math-block|aside|footer)\b",
     re.IGNORECASE,
 )
+# 工具 UI 详情截断时必须原样保留的标签：图片/视频/音频（自闭合或成对）以及
+# 完整的 <a href="URL">文本</a>（下载/查看链接）。这些标签内的 URL 一旦被
+# 通用的“剥标签 + 转义纯文本”截断逻辑处理，就会从可点击链接/可渲染媒体
+# 退化成一段转义后的 URL 文本，导致用户实际访问的不是原始 URL。
+_MEDIA_OR_LINK_TAG_RE = re.compile(
+    r'<(?:img|video|audio)\b[^>]*/?>(?:</(?:video|audio)\s*>)?|'
+    r'<a\b[^>]*href\s*=\s*(?:"[^"]*"|\'[^\']*\')[^>]*>.*?</a\s*>',
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _rich_visible_text(text: str) -> str:
@@ -743,19 +752,73 @@ class RichMessageBuilder:
         self._commit_stream_buffer()
 
     def _truncate_tool_ui_detail(self, html_content: str, limit: int) -> str:
-        """仅截断工具结果的 UI 展示内容，并尽量避免破坏 HTML。"""
+        """仅截断工具结果的 UI 展示内容，并尽量避免破坏 HTML。
+
+        图片/视频类工具卡片里的 <img>、<video>、<audio> 以及作为下载链接的
+        <a href> 都承载着真实媒体 URL：一旦被当作普通文字一起字符裁剪、
+        标签剥离、再整体 escape_html，这些标签会被拆散——内联媒体不再显示，
+        "下载" 链接也不再是可点击的 <a href>，而是退化成一段被转义过的 URL
+        纯文本（用户点开实际访问的是转义后的字符串，而不是原始 URL）。
+        因此这里先把这些媒体/链接标签原样摘出保留，只裁剪它们之外的描述性
+        文字，再把媒体标签拼回结果——保证无论是否触发截断，媒体和下载链接
+        用的都是同一份未被二次转义的 URL。
+        """
         if not html_content:
             return ""
         if len(html_content) <= limit:
             return html_content
-        # 长工具输出的详情重点是给用户查看概览；截断部分改成纯文本，
-        # 避免直接按字符切 HTML 标签造成整块 rich message 解析失败。
-        plain = re.sub(r"<[^>]*>", " ", html_content)
-        plain = html.unescape(plain)
-        plain = re.sub(r"\s+", " ", plain).strip()
-        if len(plain) > max(0, limit - 24):
-            plain = plain[:max(0, limit - 24)].rstrip()
-        return f"{escape_html(plain)}\n<i>…工具输出已截断</i>"
+
+        # 摘出必须保持原样的媒体/链接标签：图片、视频、音频，以及一个
+        # <a href>…</a> 整体（下载/查看链接）。用占位符替换，避免它们参与
+        # 后续的标签剥离与转义。
+        preserved: list[str] = []
+
+        def _stash(match: "re.Match") -> str:
+            preserved.append(match.group(0))
+            return f"\x00PRESERVED{len(preserved) - 1}\x00"
+
+        stashed = _MEDIA_OR_LINK_TAG_RE.sub(_stash, html_content)
+
+        # 长工具输出的详情重点是给用户查看概览；剩余的纯描述性文字才按字符
+        # 裁剪。占位符必须整段保留、不可被字符预算切碎——否则会截断到占位符
+        # 内部，导致后面按 marker 换回原始标签时匹配不到，媒体/链接标签就
+        # 从结果里彻底消失。做法：先按占位符切分成"文字/占位符"交替的片段，
+        # 只对文字片段计入并裁剪字符预算，占位符片段整段跳过、原样保留。
+        plain_with_markers = re.sub(r"<[^>]*>", " ", stashed)
+        plain_with_markers = html.unescape(plain_with_markers)
+        plain_with_markers = re.sub(r"\s+", " ", plain_with_markers).strip()
+
+        segments = re.split(r"(\x00PRESERVED\d+\x00)", plain_with_markers)
+        reserved_for_media = sum(len(p) for p in preserved)
+        text_budget = max(0, limit - 24 - reserved_for_media)
+
+        used = 0
+        kept_segments: list[str] = []
+        text_truncated = False
+        for seg in segments:
+            if re.fullmatch(r"\x00PRESERVED\d+\x00", seg or ""):
+                kept_segments.append(seg)
+                continue
+            if used >= text_budget:
+                if seg:
+                    text_truncated = True
+                continue
+            remaining = text_budget - used
+            if len(seg) > remaining:
+                seg = seg[:remaining]
+                text_truncated = True
+            used += len(seg)
+            kept_segments.append(seg)
+
+        truncated_text = escape_html("".join(kept_segments).rstrip())
+
+        # 把占位符换回原始媒体/链接标签（未被转义、未被裁剪）——escape_html
+        # 不会触碰 \x00 控制字符，marker 在转义后依旧可以原样匹配替换。
+        for idx, original in enumerate(preserved):
+            truncated_text = truncated_text.replace(f"\x00PRESERVED{idx}\x00", original)
+
+        suffix = "\n<i>…工具输出已截断</i>" if text_truncated else ""
+        return f"{truncated_text}{suffix}"
 
     def _build_tool_group_html(self, group: dict) -> str:
         items = group.get("items", [])
