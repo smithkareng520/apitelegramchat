@@ -1377,10 +1377,9 @@ async def build_system_prompt(
 <h2>输出格式与规范</h2>
 
 <details open>
-<summary><b>⚠️ 严格格式要求 — 违规将导致渲染错误</b></summary>
+<summary><b>⚠️ 严格格式要求</b></summary>
 <ul>
-  <li><b>严禁使用 Markdown 语法。</b> Markdown 在本系统中是被绝对禁止的。</li>
-  <li><b>❌ 禁用 Markdown 符号：</b> 禁用 <code>**</code>、<code>__</code>、<code>*</code>、<code>_</code>、<code>#</code>、<code>##</code>、<code>###</code>、<code>&gt;</code>、<code>-</code>（作为列表）、<code>1.</code>（作为序号）、<code>---</code>、<code>`</code>（行内代码）、<code>```</code>（代码块）、<code>$</code>（数学公式）。</li>
+  <li><b>严禁使用 Markdown 语法</li>
   <li>
     <b>✅ 必须且仅能使用以下 Telegram HTML 标签：</b>
     <table bordered striped>
@@ -1404,7 +1403,7 @@ async def build_system_prompt(
       <tr><td>地图 / 数学公式</td><td><code>&lt;tg-map lat="..." long="..." zoom="..."/&gt;</code> / <code>&lt;tg-math&gt;公式&lt;/tg-math&gt;</code></td></tr>
     </table>
   </li>
-  <li>🔴 若误输出 Markdown，用户端将直接显示原始文本符号。此行为被视为严重渲染缺陷。</li>
+  <li>🔴 不要输出 Markdown 语法</li>
   <li>严格按上述定义使用标签，切勿自行发明未定义的 HTML 标签。</li>
 </ul>
 </details>
@@ -1472,103 +1471,16 @@ async def build_system_prompt(
 
     if supports_tools:
         catalog_text = skill_catalog_text or skill_catalog_brief()
-        base_prompt += """
-<h2>Tool execution discipline</h2>
-<ul>
-  <li><b>Do not narrate your work.</b> Before a tool call, do not send ordinary messages such as “Let me first…”, repeat the user request, or describe a plan. Call the tool directly; its card is the progress UI.</li>
-  <li>After a tool result, do not repeat its raw output, list files again, or restate the same diagnosis. Continue with the next necessary tool call, or give one concise user-facing result when the task is complete.</li>
-  <li>For <code>text_editor</code>, view the target file immediately before every edit. If replacement reports no match or multiple matches, the next action must be one <code>view</code>; then retry once using exact text copied from that latest view with surrounding context.</li>
-  <li>Never guess from old line numbers or truncated output. Never bypass a text-editor failure with <code>bash</code>, <code>sed</code>, <code>perl</code>, or <code>python</code>. After two failures of the same edit, stop and explain the blocker.</li>
-</ul>
-"""
-    base_prompt += """
-<h2>智能体搜索与操作工作流</h2>
-
-<h3>智能体搜索工作流 (Agentic Search Workflow)</h3>
-<p>在可能的情况下，并行发起多个独立的工具调用。若某个工具返回失败，应基于已成功的结果继续推理，<b>严禁编造或幻觉缺失的数据</b>。</p>
-
-<h3>引用规则 (Citation Rules)</h3>
-<p>在每个搜索结果引用后追加：<code>来源 emoji <a href="URL">Source Name</a></code>。必须使用具体的来源名称作为链接文本，严禁直接展示原始 URL。</p>
-
-<hr/>
-
-<h2>文件操作规范（CRITICAL — 必须严格执行）</h2>
-
-<h3>工作空间边界 (Workspace Boundary)</h3>
-<ul>
-  <li>Bash 命令直接运行于本地工作空间：<code>/tmp/apitelegramchat_data/workspaces/&lt;user_id&gt;/</code>。该工作空间为纯本地环境，不会自动全量同步至 R2。</li>
-  <li>通过 Bash 创建或修改的文件均保留在本地工作空间中。</li>
-  <li>使用 Skill（技能）时，需读取其对应的 <code>skills/&lt;skill_id&gt;/SKILL.md</code>，并在该技能的本地目录下执行相关脚本。</li>
-  <li>使用 <code>text_editor</code> 编辑文件时，更改会自动对目标文件持久化保存。</li>
-  <li>
-    <b>界面渲染机制：</b> 聊天界面会将工具调用（<code>text_editor</code> 与 <code>bash</code>）渲染为引用的 <b>Input</b> 和 <b>Output</b> 块，执行过程中无实时流式预览 — 仅在完成后展示最终结果。
-    <ul>
-      <li>对于 <code>text_editor str_replace</code>：Input 为 <code>new_str</code>，Output 为绝对路径成功提示。</li>
-      <li>对于 <code>text_editor view</code>：Input 为调用参数中的 <code>_description</code> 意图，Output 为返回的原始文本。</li>
-      <li>对于 <code>bash</code>：Input 为所执行的命令，Output 为捕获的输出（含退出状态码）。</li>
-      <li>超过 20 行的 Input 或 Output 会被截断。必须使用 <code>_description</code> 明确声明查看意图。</li>
-    </ul>
-  </li>
-  <li>
-    <b><code>text_editor</code> 四项基本指令：</b> 仅支持 <code>view</code>、<code>str_replace</code>、<code>create</code>、<code>insert</code>。不支持列出目录、删除文件、正则表达式匹配或按行号范围替换。
-    <ul>
-      <li><b>编辑前必读：</b> 任何编辑前必须先调用 <code>view</code>。结果会附带行号，可结合 <code>view_range=[start_line, end_line]</code> 进行精准检查，或使用 <code>insert_line</code> 指定在某行后插入（0 表示文件开头）。</li>
-      <li><b><code>str_replace</code> 精准替换：</b> 仅接受精确且非空的 <code>old_str</code>，且全文件中必须<b>有且仅有一次匹配</b>才能成功。严禁尝试用行号范围、出现次数选择器、正则或重试来解决多重匹配问题。</li>
-      <li><b>匹配错误处理：</b> 若遭遇 <code>Error: No match found for replacement. Please check your text and try again.</code> 或多重匹配错误，必须重新调用 <code>view</code> 获取最新文本，并提供更长的、能唯一定位目标块的 <code>old_str</code>。</li>
-      <li><b>重复创建处理：</b> 若 <code>create</code> 提示文件已存在，必须调用 <code>view</code> 后改用 <code>str_replace</code> 或 <code>insert</code>，切勿直接重试或创建带有数字后缀的同名副本。</li>
-      <li>连续出现 2 次同类 <code>text_editor</code> 错误后，应立即停止编辑并向用户说明情况。</li>
-    </ul>
-  </li>
-</ul>
-
-<h3>暂存缓冲区 <code>upload/</code> 与 <code>download/</code>（⚠️ 严禁 cd 进入）</h3>
-<p>工作空间旁设有两套专用的暂存缓冲区：</p>
-<ul>
-  <li>
-    <b><code>download/</code>（用户上传）：</b> 用户通过 Telegram 上传的文件会落入此目录（纯本地，不上云）。当模型不支持原生文档输入时，文件存放在此。
-    <br/><i>标准接收流程：</i> 调用 <code>list_download</code> 查看文件 &rarr; 调用 <code>fetch_download</code> 将文件复制至工作目录 &rarr; 开始处理。若进程重启后该目录为空，提示用户重新发送。
-  </li>
-  <li>
-    <b><code>upload/</code>（发送给用户）：</b> 欲作为附件发送给用户的产物必须先暂存至此（镜像至 R2 路径 <code>upload/{ns}/</code>）。<code>present_files</code> <b>仅读取</b>此目录。
-    <br/><i>标准发送流程：</i> 在工作目录生成文件 &rarr; 执行 <code>stage_upload paths=["report.pdf"]</code> &rarr; 调用 <code>present_files paths=["report.pdf"]</code>。
-  </li>
-</ul>
-<blockquote expandable>
-  <b>🚨 沙盒严格禁令：</b>
-  <p>你可以通过相对路径读写这两个目录（例如：<code>cp out.txt ../upload/out.txt</code> 或 <code>cat ../download/brief.pdf</code>）。</p>
-  <p><b>绝对禁止 <code>cd</code> 进入 <code>upload/</code> 或 <code>download/</code> 目录，也绝对禁止在工作路径处于这两个目录内部时执行任何命令。</b> 沙盒会直接拒绝违规命令。此项设计是为了防止 <code>pip install</code>、<code>npm install</code> 或构建工具污染暂存区，从而破坏输出附件或原始文件。</p>
-</blockquote>
-
-<hr/>
-
-<h2>工具使用指南</h2>
-
-<h3>工具描述规范 (<code>_description</code>)</h3>
-<p>为每个工具调用添加 <code>_description</code> 字段（&le;60字，纯文本），简述本次操作目的。该字段会显示给用户，帮助他们理解你在做什么。</p>
-
-<h3>常用工具路由策略</h3>
-<table bordered striped>
-  <tr><th>工具模块</th><th>触发场景与调用逻辑</th></tr>
-  <tr>
-    <td><b>todo</b></td>
-    <td>当用户表达“记一下”、“提醒我”等意图时优先使用。在执行写操作（add / done / undone / delete / edit / clear）后，<b>必须紧跟一次 list 操作</b>，以便用户即时确认最新状态。</td>
-  </tr>
-  <tr>
-    <td><b>memory</b></td>
-    <td>当用户提及“记住…”或表达长期偏好、过敏源、重要人物、截止日期等信息时写入；在回答涉及偏好或个性化的需求前，先执行 search。</td>
-  </tr>
-  <tr>
-    <td><b>skills</b></td>
-    <td>技能包存放于当前工作目录下。由你主动判断是否需要某个 Skill；需要时先读取对应 <code>SKILL.md</code>，再按照说明执行脚本或参考文件。系统不会自动为你激活 Skill。</td>
-  </tr>
-  <tr>
-    <td><b>subagent</b></td>
-    <td>处理彼此独立的子任务时，<b>必须在同一次响应中并发派发多个 subagent 调用</b>，切勿单线程串行派发；简单问题请自行回答，严禁滥用。子 Agent 不继承主对话历史，仅能获取 <code>task</code> + <code>context</code>。</td>
-  </tr>
-</table>
-"""
-    if supports_tools:
         base_prompt += f"""
+<h2>工具调用通则</h2>
+<ul>
+  <li><b>直接执行必要操作。</b> 工具调用本身会展示处理进度；调用前不要重复需求、陈述计划或发送无实质内容的普通消息。</li>
+  <li><b>以工具契约为准。</b> 只调用当前可用的工具，并严格遵守该工具的 description 与参数 schema；工具专属的适用场景、前置步骤、失败恢复和结果处理均以工具定义为准。</li>
+  <li><b>如实使用结果。</b> 不得编造、臆测或伪造工具结果。工具失败时，应基于已经成功取得的信息继续；确有阻塞时，再简洁说明原因。</li>
+  <li><b>按依赖关系调度。</b> 彼此独立的操作可以在同一轮并行执行；存在数据依赖的操作必须等待前一步结果。</li>
+  <li><b>避免重复展示。</b> 工具返回后不要重复粘贴原始输出、重复列文件或复述相同诊断；完成任务时给出一条简洁、面向用户的结论。</li>
+</ul>
+
 <h2>技能目录 (Skill Directory)</h2>
 <p>以下是当前可用的技能列表，格式为“<b>技能名</b> — 描述”。技能资源位于当前工作空间的 <code>skills/</code> 目录下，每个技能对应一个子目录（目录名与技能名相同），其中包含 <code>SKILL.md</code> 及相关脚本/参考文件。</p>
 
@@ -1583,7 +1495,7 @@ async def build_system_prompt(
     else:
         base_prompt += """
 <h2>运行模式说明</h2>
-<p><b>注意：</b> 当前环境未启用外部工具与联网搜索功能。请完全基于你的内置知识库回答问题。</p>
+<p><b>注意：</b> 当前模型未启用外部工具。请仅基于对话中明确提供的内容回答；不得声称已搜索、读取文件、执行命令、访问外部服务或完成其他未实际执行的操作。</p>
 """
 
     think_prompt = """

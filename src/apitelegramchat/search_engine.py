@@ -797,9 +797,11 @@ SEARCH_TOOLS = [
             "name": "text_editor",
             "description": (
                 "Safely view or edit UTF-8 text files. Only four commands are available: "
-                "view, str_replace, create, and insert. Always call view before editing. "
-                "str_replace requires old_str to match exactly once in the entire file; "
-                "if it finds zero or multiple matches, call view and provide a more specific old_str. "
+                "view, str_replace, create, and insert. Always call view immediately before editing. "
+                "str_replace requires old_str to match exactly once in the entire file. If it finds zero or multiple matches, "
+                "the next action must be view; then retry once with exact text copied from that latest view and enough surrounding context "
+                "to identify a unique match. Never infer from stale line numbers or truncated output, and never bypass a text_editor failure "
+                "with bash, sed, perl, or python. After two failures of the same edit, stop and explain the blocker. "
                 "view returns 1-based line numbers and accepts view_range=[start_line, end_line], "
                 "where -1 means the end of the file. insert_line is also 1-based; use 0 to insert at the start."
             ),
