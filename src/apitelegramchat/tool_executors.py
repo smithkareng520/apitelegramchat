@@ -650,28 +650,6 @@ def _render_media_failure_result(result_str: str, fallback: str) -> str:
     return _render_editor_quote("Result", message)
 
 
-_MEDIA_RESULT_URL_RE = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
-
-
-def _extract_media_result_urls(result_str: str) -> list[str]:
-    """从任意图片工具回包中提取 HTTP(S) URL，并先还原 HTML 实体。
-
-    上游有时返回独占 URL 行，有时返回 ``图片 1 (URL)``，且对象存储的预签名
-    查询串可能已经是 ``&amp;``。不能只检查行首，也不能将该实体形式继续向下游
-    传递；先还原为真实 URL，随后由 HTML 属性构造层根据 ``src`` / ``href`` 的
-    不同规则处理。
-    """
-    raw = str(result_str or "")
-    found: list[str] = []
-    seen: set[str] = set()
-    for match in _MEDIA_RESULT_URL_RE.finditer(raw):
-        url = html.unescape(match.group(0)).rstrip(".,;:!?")
-        if url and url not in seen:
-            found.append(url)
-            seen.add(url)
-    return found
-
-
 def _format_image_generation_result(
     result_str: str,
     *,
@@ -681,24 +659,23 @@ def _format_image_generation_result(
     failure_fallback: str,
 ) -> tuple[str, str]:
     """Render image generation and image editing results with one stable template."""
-    success = "✅" in result_str or bool(re.search(r"已(?:生成|编辑)\s*\d+\s*张图片", result_str))
-    urls = _extract_media_result_urls(result_str) if success else []
-    if urls:
-        count = len(urls)
-        summary = f"🎨 {operation_en} {count} image" + ("" if count == 1 else "s")
-        # 此处 URL 已反解为原始 ``&``。escape_html 仅用于构建初始 HTML；最终发送
-        # 时会按属性分流：src 采用单层实体转义，href 保留原始查询分隔符。
-        img_tags = "".join(f'<img src="{escape_html(url)}"/>' for url in urls)
-        link_items = "".join(
-            f'<li><a href="{escape_html(url)}">图片 {index + 1}</a></li>'
-            for index, url in enumerate(urls)
-        )
-        caption = f"{operation_zh} {count} 张图片：<ul>{link_items}</ul>"
-        if count == 1:
-            details_html = f"<figure>{img_tags}<figcaption>{caption}</figcaption></figure>"
-        else:
-            details_html = f"<tg-slideshow>{img_tags}<figcaption>{caption}</figcaption></tg-slideshow>"
-        return summary, details_html
+    if "✅" in result_str:
+        lines = result_str.splitlines()
+        urls = [line.strip() for line in lines if line.strip().startswith(("http://", "https://"))]
+        if urls:
+            count = len(urls)
+            summary = f"🎨 {operation_en} {count} image" + ("" if count == 1 else "s")
+            img_tags = "".join(f'<img src="{escape_html(url)}"/>' for url in urls)
+            link_items = "".join(
+                f'<li><a href="{escape_html(url)}">图片 {index + 1}</a></li>'
+                for index, url in enumerate(urls)
+            )
+            caption = f"{operation_zh} {count} 张图片：<ul>{link_items}</ul>"
+            if count == 1:
+                details_html = f"<figure>{img_tags}<figcaption>{caption}</figcaption></figure>"
+            else:
+                details_html = f"<tg-slideshow>{img_tags}<figcaption>{caption}</figcaption></tg-slideshow>"
+            return summary, details_html
     return failure_summary, _render_media_failure_result(result_str, failure_fallback)
 
 

@@ -126,37 +126,11 @@ _RICH_URL_ATTR_RE = re.compile(
 )
 
 
-def _decode_rich_url_entities(url: str) -> str:
-    """折叠 URL 查询串中意外累积的 ``&amp;`` 编码层级。"""
-    normalized = str(url or "")
-    # 上游工具、模型输出和模板都可能曾处理过实体。限制循环次数，避免异常输入
-    # 造成无界处理，同时覆盖常见的 ``&amp;amp;`` 等重复编码。
-    for _ in range(4):
-        decoded = normalized.replace("&amp;", "&")
-        if decoded == normalized:
-            break
-        normalized = decoded
-    return normalized
-
-
-def _sanitize_raw_href_url(url: str, quote: str) -> str:
-    """为 Telegram Rich HTML 的 ``href`` 保留原始查询分隔符 ``&``。
-
-    用户点击的下载链接由 Telegram 直接使用 ``href`` 的字符串值。实际验证表明，
-    对该属性传入 ``&amp;`` 会令客户端把 ``amp;`` 作为 URL 的一部分；因此仅处理会
-    破坏属性边界的字符，绝不把查询参数分隔符 ``&`` 编码为 HTML 实体。
-    """
-    value = _decode_rich_url_entities(url)
-    replacement = "%22" if quote == '"' else "%27"
-    return value.replace(quote, replacement).replace("<", "%3C").replace(">", "%3E")
-
-
 def _escape_media_src_urls(html_content: str) -> str:
-    """按 Telegram Rich HTML 的属性语义分别规范化 ``src`` 与 ``href``。
-
-    媒体 ``src`` 保持一层 HTML 属性转义，以兼容预签名 URL；下载/外链 ``href``
-    则保留原始 ``&`` 查询参数分隔符，避免客户端跳转到含字面量 ``amp;`` 的地址。
-    两者均先折叠已有的 ``&amp;`` / ``&amp;amp;``，防止二次编码。
+    """
+    转义富文本 URL 属性中的裸 &。
+    覆盖所有媒体 src 属性，以及图注、下载链接等 href 属性；单双引号形式都支持。
+    幂等：已经转义成 &amp; 的不会被二次转义。
     """
     if not html_content:
         return html_content
@@ -165,12 +139,8 @@ def _escape_media_src_urls(html_content: str) -> str:
         attribute = match.group("attribute").lower()
         quote = match.group("quote")
         url = match.group("url")
-        raw_url = _decode_rich_url_entities(url)
-        if attribute == "href":
-            normalized = _sanitize_raw_href_url(raw_url, quote)
-        else:
-            normalized = html.escape(raw_url, quote=True)
-        return f"{attribute}={quote}{normalized}{quote}"
+        escaped = _BARE_AMP_RE.sub('&amp;', url)
+        return f"{attribute}={quote}{escaped}{quote}"
 
     return _RICH_URL_ATTR_RE.sub(_escape_one, html_content)
 
