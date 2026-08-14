@@ -69,7 +69,7 @@ from apitelegramchat.todo_tool import (
 )
 from apitelegramchat.memory_tool import execute_memory, render_memory_card
 from apitelegramchat.subagent_tool import execute_subagent, render_subagent_card
-from apitelegramchat.utils import escape_html, escape_url_for_href
+from apitelegramchat.utils import escape_html
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +178,7 @@ def _render_structured_value(value: object, *, depth: int = 0) -> str:
     if isinstance(value, str):
         clean = _trim_ui_value(value)
         if _looks_like_http_url(value):
-            safe_url = escape_url_for_href(value.strip())
+            safe_url = escape_html(value.strip())
             return f'<a href="{safe_url}">打开链接</a>'
         return escape_html(clean)
     if depth >= 2:
@@ -340,13 +340,10 @@ def _render_poi_cards(payload: object) -> str | None:
         details_open = " open" if index <= 2 else ""
         body: list[str] = []
         if photo_url and index <= 3:
-            # src 仍需 escape_html 转义 &（防止 Telegram 解析媒体 URL 时被 & 截断）
-            safe_photo_src = escape_html(photo_url)
-            # href 不能转义 &（Telegram 对 href 使用字面值，&amp; 会导致跳转 URL 错误）
-            safe_photo_href = escape_url_for_href(photo_url)
+            safe_photo = escape_html(photo_url)
             body.append(
-                f'<figure><img src="{safe_photo_src}"/>'
-                f'<figcaption><a href="{safe_photo_href}">查看地点图片</a></figcaption></figure>'
+                f'<figure><img src="{safe_photo}"/>'
+                f'<figcaption><a href="{safe_photo}">查看地点图片</a></figcaption></figure>'
             )
         if address:
             body.append(f"<p><b>地址</b><br/>{escape_html(address)}</p>")
@@ -369,8 +366,8 @@ def _render_poi_cards(payload: object) -> str | None:
         if poi_id:
             metadata.append(f"POI ID：<code>{escape_html(poi_id)}</code>")
         if photo_url and index > 3:
-            safe_photo_href = escape_url_for_href(photo_url)
-            metadata.append(f'<a href="{safe_photo_href}">查看地点图片</a>')
+            safe_photo = escape_html(photo_url)
+            metadata.append(f'<a href="{safe_photo}">查看地点图片</a>')
         if metadata:
             body.append("<details><summary>更多信息</summary><p>" + "<br/>".join(metadata) + "</p></details>")
         cards.append(f"<details{details_open}><summary>{escape_html(summary)}</summary>{''.join(body)}</details>")
@@ -668,11 +665,9 @@ def _format_image_generation_result(
         if urls:
             count = len(urls)
             summary = f"🎨 {operation_en} {count} image" + ("" if count == 1 else "s")
-            # src 仍用 escape_html（& 必须转义为 &amp;，否则 Telegram 拉取媒体时 URL 会被截断）
             img_tags = "".join(f'<img src="{escape_html(url)}"/>' for url in urls)
-            # href 不能转义 &（Telegram 对 href 使用字面值，&amp; 会破坏 R2 预签名等链接）
             link_items = "".join(
-                f'<li><a href="{escape_url_for_href(url)}">图片 {index + 1}</a></li>'
+                f'<li><a href="{escape_html(url)}">图片 {index + 1}</a></li>'
                 for index, url in enumerate(urls)
             )
             caption = f"{operation_zh} {count} 张图片：<ul>{link_items}</ul>"
@@ -1508,9 +1503,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                     if current_title and current_link:
                         if current_link.startswith("http"):
                             domain = current_link.split('/')[2] if '//' in current_link else current_link
-                            # href 不能转义 &（Telegram 对 href 使用字面值，&amp; 会破坏带查询参数的链接）
-                            safe_link = escape_url_for_href(current_link)
-                            items_html += f"<li><a href=\"{safe_link}\">{current_title}</a> <code>{domain}</code></li>"
+                            items_html += f"<li><a href=\"{current_link}\">{current_title}</a> <code>{domain}</code></li>"
                         else:
                             items_html += f"<li>{current_title} <code>{current_link}</code></li>"
                         current_title = ""
@@ -1537,8 +1530,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 if match:
                     title = match.group(1).strip()
             summary = f"🌐 Fetched: {title}"
-            # href 不能转义 &（Telegram 对 href 使用字面值，&amp; 会破坏带查询参数的链接）
-            safe_url = escape_url_for_href(url)
+            safe_url = html.escape(url)
             safe_domain = html.escape(domain)
             safe_title = html.escape(title)
             details_html = f"{safe_title} <a href=\"{safe_url}\">{safe_domain}</a>"
@@ -1689,9 +1681,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         encoded_query = urllib.parse.quote(query)
         wiki_url = f"https://{lang}.wikipedia.org/wiki/{encoded_query}"
         summary = f"📚 {query}"
-        # href 不能转义 &（Telegram 对 href 使用字面值）
-        safe_wiki_url = escape_url_for_href(wiki_url)
-        details_html = f'<a href="{safe_wiki_url}">{query}</a>'
+        details_html = f'<a href="{wiki_url}">{query}</a>'
         return summary, details_html
 
     elif fn_name == "exchange_rate":
@@ -1726,15 +1716,13 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 img_url = img_match.group(1)
                 content_text = content_match.group(1) if content_match else "已编码内容"
                 summary = "📱 二维码已生成"
-                # src 仍需 escape_html（& 必须转义为 &amp;，否则 Telegram 拉取媒体时 URL 被截断）
-                safe_url_src = escape_html(img_url)
-                # href 不能转义 &（Telegram 对 href 使用字面值，&amp; 会破坏 R2 预签名等链接）
-                safe_url_href = escape_url_for_href(img_url)
+                # 转义 URL（R2 presigned URL 含大量 & 需转义为 &amp;）
+                safe_url = escape_html(img_url)
                 details_html = (
-                    f'<img src="{safe_url_src}"/><br/>'
+                    f'<img src="{safe_url}"/><br/>'
                     f'<b>✅ 二维码生成成功</b><br/>'
                     f'<b>内容：</b>{escape_text(content_text)}<br/>'
-                    f'<b>链接：</b><a href="{safe_url_href}">📷 点击查看 / 下载二维码</a>'
+                    f'<b>链接：</b><a href="{safe_url}">📷 点击查看 / 下载二维码</a>'
                 )
                 return summary, details_html
         summary = "📱 二维码"
@@ -1768,14 +1756,10 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         if "✅" in result_str:
             url_match = re.search(r'视频链接：(https?://[^\s]+)', result_str)
             if url_match:
-                # ⚠️ src 属性：R2 presigned URL 含大量 & 查询参数（X-Amz-Algorithm、
-                # X-Amz-Credential、X-Amz-Signature 等），HTML 属性值中未转义的 & 会被
-                # Telegram HTML 解析器当作实体名起点，导致 URL 被截断 →
-                # RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND。必须用 escape_html 转义 src。
-                #
-                # 但 href 属性不能同样处理：Telegram Rich Message 渲染 <a href> 时
-                # 使用字面属性值，不会对 HTML 实体做反解码。把 href 里的 & 转义成 &amp;
-                # 会导致点击跳转使用的 URL 字面包含 &amp;，破坏 R2 预签名等链接。
+                # ⚠️ R2 presigned URL 含大量 & 查询参数（X-Amz-Algorithm、X-Amz-Credential、
+                # X-Amz-Signature 等），HTML 属性值中未转义的 & 会被 Telegram HTML
+                # 解析器当作实体名起点，导致 URL 被截断 → RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND。
+                # 必须用 escape_html 转义（与 _agentic_loop_native_video 老路径一致）。
                 video_url = url_match.group(1).strip()
                 duration_str = ""
                 m = re.search(r'(\d+)\s*秒', fn_args.get("prompt", "") or "")
@@ -1784,11 +1768,9 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 summary = f"🎬 Video generated{duration_str}"
                 # <figure><video> 是一个独立 media block，可以与其他 block 同消息发送；
                 # 附带简短文本链接 caption，避免裸 R2 presigned URL 刷屏
-                safe_video_src = escape_html(video_url)
-                safe_video_href = escape_url_for_href(video_url)
                 details_html = (
-                    f'<figure><video src="{safe_video_src}"></video>'
-                    f'<figcaption><a href="{safe_video_href}">下载 / 查看视频</a></figcaption>'
+                    f'<figure><video src="{escape_html(video_url)}"></video>'
+                    f'<figcaption><a href="{escape_html(video_url)}">下载 / 查看视频</a></figcaption>'
                     f'</figure>'
                 )
                 return summary, details_html

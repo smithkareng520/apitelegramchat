@@ -62,7 +62,7 @@ from apitelegramchat.config import (
     SUPPORTED_MODELS,
     get_openrouter_provider_preferences,
 )
-from apitelegramchat.utils import retry_async, escape_url_for_href
+from apitelegramchat.utils import retry_async
 from apitelegramchat.mcp_client import call_mcp_tool, MCPToolError
 
 OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
@@ -1740,9 +1740,7 @@ async def execute_news(source: str = "bbc", limit: int = 5) -> str:
             return "失败：无法获取任何新闻源。"
         lines = ["<ul>"]
         for src, title, link in all_items[:limit*2]:
-            # href 不能转义 &（Telegram 对 href 使用字面值，&amp; 会破坏带查询参数的链接）
-            safe_link = escape_url_for_href(link)
-            lines.append(f'<li><b>{html.escape(title)}</b> (<i>{src.upper()}</i>) <a href="{safe_link}">🔗 阅读原文</a></li>')
+            lines.append(f'<li><b>{html.escape(title)}</b> (<i>{src.upper()}</i>) <a href="{html.escape(link)}">🔗 阅读原文</a></li>')
         lines.append("</ul>")
         return "\n".join(lines)
     url = NEWS_FEEDS.get(source_key)
@@ -1757,9 +1755,7 @@ async def execute_news(source: str = "bbc", limit: int = 5) -> str:
             return f"失败：未找到 {source} 的新闻。"
         lines = ["<ul>"]
         for item in items:
-            # href 不能转义 &（Telegram 对 href 使用字面值，&amp; 会破坏带查询参数的链接）
-            safe_link = escape_url_for_href(item.link)
-            lines.append(f'<li><b>{html.escape(item.title)}</b> <a href="{safe_link}">🔗 阅读原文</a></li>')
+            lines.append(f'<li><b>{html.escape(item.title)}</b> <a href="{html.escape(item.link)}">🔗 阅读原文</a></li>')
         lines.append("</ul>")
         return "\n".join(lines)
     except Exception as e:

@@ -110,73 +110,37 @@ def escape_html(text: str) -> str:
     return html.escape(text)
 
 
-def escape_url_for_href(url: str) -> str:
-    """对要放入 ``<a href="...">`` 属性的 URL 做最小化转义。
-
-    关键差异：**不转义 ``&``**。原因：
-    Telegram Rich Message 渲染 ``<a href>`` 时使用的是属性值的字面字符串，
-    不会对 HTML 实体做反解码。若把 R2 预签名 URL 中的 ``&`` 转义成 ``&amp;``，
-    最终点击跳转使用的是 ``...&amp;...`` 字面值，导致 X-Amz-* 等参数被解析失败、
-    链接无法访问。
-
-    而 ``src`` 属性的 ``&`` 必须转义（见 ``_escape_media_src_urls``），
-    因为 Telegram 拉取媒体时确实会做实体解码，未转义的 ``&`` 会被当作
-    实体名起点导致 URL 被截断。
-
-    为防止 URL 中混入特殊字符破坏 HTML 结构（极少数情况下 URL 含 ``"`` ``'`` ``<`` ``>``），
-    这里仍对这些字符做转义，但保留 ``&`` 原样。
-    """
-    if not url:
-        return ""
-    return (
-        url.replace('"', '&quot;')
-           .replace("'", '&#x27;')
-           .replace('<', '&lt;')
-           .replace('>', '&gt;')
-    )
-
-
-# ---------- 媒体 src URL 转义 sanitizer ----------
+# ---------- 媒体 URL 转义 sanitizer ----------
 # R2 presigned URL 含大量 & 查询参数（X-Amz-Algorithm、X-Amz-Credential、X-Amz-Signature 等）。
 # 在 HTML 属性值 src="..." 中，未转义的 & 会被 Telegram HTML 解析器当作实体名起点，
 # 导致 URL 被截断 → RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND / RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND。
-# 此 sanitizer 在发送前自动转义所有媒体 src 属性中的裸 &，幂等（不重复转义已转义的实体）。
-#
-# 注意：**不再处理 href 属性**。Telegram Rich Message 对 <a href> 的渲染使用字面属性值，
-# 不对 HTML 实体做反解码。把 href 里的 & 转义成 &amp; 会导致点击跳转的 URL
-# 字面包含 &amp;，从而破坏 R2 预签名等含 & 查询参数的链接。
-# href 的 URL 安全转义请使用 escape_url_for_href()。
+# 此 sanitizer 在发送前自动转义所有媒体 src 与链接 href 属性中的裸 &，幂等（不重复转义已转义的实体）。
 _VALID_HTML_ENTITIES = (
     r'amp;|lt;|gt;|quot;|apos;|nbsp;|hellip;|mdash;|ndash;|lsquo;|rsquo;|ldquo;|rdquo;'
     r'|#\d+;|#x[0-9a-fA-F]+;'
 )
 _BARE_AMP_RE = re.compile(rf'&(?!{_VALID_HTML_ENTITIES})')
-# 仅匹配 src 属性；href 由 escape_url_for_href() 在构建时单独处理
 _RICH_URL_ATTR_RE = re.compile(
-    r'''\bsrc\s*=\s*(?P<quote>["'])(?P<url>.*?)(?P=quote)''',
+    r'''\b(?P<attribute>src|href)\s*=\s*(?P<quote>["'])(?P<url>.*?)(?P=quote)''',
     re.IGNORECASE,
 )
 
 
 def _escape_media_src_urls(html_content: str) -> str:
     """
-    转义富文本媒体 src 属性中的裸 &。
-    仅覆盖 src 属性（图片、视频等媒体资源），不处理 href 属性。
+    转义富文本 URL 属性中的裸 &。
+    覆盖所有媒体 src 属性，以及图注、下载链接等 href 属性；单双引号形式都支持。
     幂等：已经转义成 &amp; 的不会被二次转义。
-
-    href 属性的 URL 不在此处统一转义。原因：Telegram Rich Message 渲染
-    <a href> 时使用字面属性值，不对 HTML 实体做反解码；把 & 转义成 &amp;
-    会导致最终跳转使用的 URL 字面包含 &amp;，破坏 R2 预签名等含 & 查询
-    参数的链接。构建 href 时请使用 escape_url_for_href()。
     """
     if not html_content:
         return html_content
 
     def _escape_one(match: re.Match) -> str:
+        attribute = match.group("attribute").lower()
         quote = match.group("quote")
         url = match.group("url")
         escaped = _BARE_AMP_RE.sub('&amp;', url)
-        return f"src={quote}{escaped}{quote}"
+        return f"{attribute}={quote}{escaped}{quote}"
 
     return _RICH_URL_ATTR_RE.sub(_escape_one, html_content)
 
