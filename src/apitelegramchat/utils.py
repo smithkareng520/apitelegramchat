@@ -110,40 +110,63 @@ def escape_html(text: str) -> str:
     return html.escape(text)
 
 
+def escape_html_attr_keep_amp(text: str) -> str:
+    """
+    转义 HTML 属性值，但保留裸 & 不转义。
+
+    用于 <a href="..."> 下载链接：R2 预签名 URL 含大量 & 查询参数，
+    若转义为 &amp;，Telegram 对 <a href> 的实体解码与媒体 src 不一致，
+    会导致点击跳转时访问含 &amp; 的错误 URL。
+    仅转义会破坏 HTML 结构的 <、>、"、'，保留 & 原样。
+    """
+    if not text:
+        return ""
+    return (
+        text.replace("&", "\x00AMP\x00")  # 临时占位，避免被后续替换影响
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#x27;")
+        .replace("\x00AMP\x00", "&")  # 还原 &
+    )
+
+
 # ---------- 媒体 URL 转义 sanitizer ----------
 # R2 presigned URL 含大量 & 查询参数（X-Amz-Algorithm、X-Amz-Credential、X-Amz-Signature 等）。
 # 在 HTML 属性值 src="..." 中，未转义的 & 会被 Telegram HTML 解析器当作实体名起点，
 # 导致 URL 被截断 → RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND / RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND。
-#
-# 注意：下载文字链接的 href 必须保留工具返回的原始 URL。前端会从该属性取值并
-# 发起跳转；若将 & 写成 &amp;，某些渲染路径会把实体字符串当作 URL 的实际内容，
-# 导致预签名查询参数失效。因此这里只处理媒体 src，绝不改写 href。
+# 此 sanitizer 在发送前自动转义所有媒体 src 属性中的裸 &，幂等（不重复转义已转义的实体）。
+# 注意：不再处理 href 属性——<a href> 中的 &amp; 在 Telegram 端无法被正确还原为 &，
+# 会导致下载链接跳转错误。下载链接应使用 escape_html_attr_keep_amp() 构建。
 _VALID_HTML_ENTITIES = (
     r'amp;|lt;|gt;|quot;|apos;|nbsp;|hellip;|mdash;|ndash;|lsquo;|rsquo;|ldquo;|rdquo;'
     r'|#\d+;|#x[0-9a-fA-F]+;'
 )
 _BARE_AMP_RE = re.compile(rf'&(?!{_VALID_HTML_ENTITIES})')
-_RICH_MEDIA_SRC_ATTR_RE = re.compile(
-    r'''\bsrc\s*=\s*(?P<quote>["'])(?P<url>.*?)(?P=quote)''',
+_RICH_URL_ATTR_RE = re.compile(
+    r'''\b(?P<attribute>src)\s*=\s*(?P<quote>["'])(?P<url>.*?)(?P=quote)''',
     re.IGNORECASE,
 )
 
 
 def _escape_media_src_urls(html_content: str) -> str:
-    """仅转义媒体 ``src`` 属性中的裸 ``&``，不修改下载链接 ``href``。
-
-    保持幂等：已转义成 ``&amp;`` 的查询参数不会被二次转义。单双引号属性值均支持。
+    """
+    转义富文本媒体 src 属性中的裸 &。
+    仅覆盖 img/video 等媒体 src 属性；<a href> 下载链接不在此处理，
+    应由 escape_html_attr_keep_amp() 在构建时保证 & 不被转义。
+    幂等：已经转义成 &amp; 的不会被二次转义。
     """
     if not html_content:
         return html_content
 
     def _escape_one(match: re.Match) -> str:
+        attribute = match.group("attribute").lower()
         quote = match.group("quote")
         url = match.group("url")
         escaped = _BARE_AMP_RE.sub('&amp;', url)
-        return f"src={quote}{escaped}{quote}"
+        return f"{attribute}={quote}{escaped}{quote}"
 
-    return _RICH_MEDIA_SRC_ATTR_RE.sub(_escape_one, html_content)
+    return _RICH_URL_ATTR_RE.sub(_escape_one, html_content)
 
 
 async def send_message(chat_id: int, text: str) -> None:
