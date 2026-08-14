@@ -8,7 +8,6 @@ loop continues.
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import logging
 import time
@@ -137,13 +136,13 @@ def _build_keyboard(interaction: AskUserInteraction) -> dict:
 
 
 def _question_html(interaction: AskUserInteraction) -> str:
-    question = html.escape(interaction.question)
+    question = interaction.question
     lines = [f"<p>🤔 <b>需要你的确认</b></p><p>{question}</p>"]
     if interaction.options:
         lines.append("<ul>")
         for option in interaction.options:
-            label = html.escape(option["label"])
-            desc = html.escape(option.get("description") or "")
+            label = option["label"]
+            desc = option.get("description") or ""
             if desc:
                 lines.append(f"<li><b>{label}</b>：{desc}</li>")
             else:
@@ -267,15 +266,15 @@ async def _edit_question_message(interaction: AskUserInteraction, body_html: str
 
 
 def _answered_html(interaction: AskUserInteraction, answer: dict[str, Any]) -> str:
-    q = html.escape(interaction.question)
+    q = interaction.question
     kind = answer.get("type")
     if kind == "choice":
         selected = answer.get("selected") or []
-        labels = [html.escape(str(item.get("label", ""))) for item in selected if isinstance(item, dict)]
+        labels = [str(item.get("label", "")) for item in selected if isinstance(item, dict)]
         chosen = "、".join(x for x in labels if x) or "已选择"
         return f"<p>✅ <b>已收到你的选择</b></p><p>{q}</p><p><b>{chosen}</b></p>"
     if kind == "custom":
-        value = html.escape(str(answer.get("value", "")))[:4000]
+        value = str(answer.get("value", ""))[:4000]
         return f"<p>✅ <b>已收到你的回答</b></p><p>{q}</p><p><blockquote>{value}</blockquote></p>"
     if kind == "cancelled":
         return f"<p>✖️ <b>已取消</b></p><p>{q}</p>"

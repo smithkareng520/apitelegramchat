@@ -1527,8 +1527,8 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 if match:
                     title = match.group(1).strip()
             summary = f"🌐 Fetched: {title}"
-            safe_domain = html.escape(domain)
-            safe_title = html.escape(title)
+            safe_domain = domain
+            safe_title = title
             details_html = f"{safe_title} <a href=\"{url}\">{safe_domain}</a>"
         return summary, details_html
 

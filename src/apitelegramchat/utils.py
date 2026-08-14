@@ -107,11 +107,11 @@ def smart_escape_text(text: str) -> str:
     return text
 
 def escape_html(text: str) -> str:
-    return html.escape(text)
+    return text
 
 
 async def send_message(chat_id: int, text: str) -> None:
-    await send_rich_html_message(chat_id, f"<p>{html.escape(text)}</p>")
+    await send_rich_html_message(chat_id, f"<p>{text}</p>")
 
 def strip_html_tags(text: str) -> str:
     if not text:
@@ -131,7 +131,7 @@ def _rich_message_plain_text_fallback(html_content: str) -> str:
     visible_text = re.sub(r"\s+", " ", visible_text).strip()
     if not visible_text:
         return ""
-    return f"<p>{html.escape(visible_text)}</p>"
+    return f"<p>{visible_text}</p>"
 
 async def check_deepseek_balance() -> tuple:
     url = "https://api.deepseek.com/user/balance"

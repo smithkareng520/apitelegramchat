@@ -4,7 +4,6 @@ import asyncio
 import aiohttp
 import json
 import logging
-import html
 import uuid
 import re
 import os
@@ -1080,7 +1079,7 @@ async def webhook() -> tuple:
                             return "OK", 200
                         WHITELIST_USERS.add(target)
                         save_whitelist()
-                        await send_rich_html_message(chat_id, f"✅ <b>添加成功</b>\n已添加 <code>{html.escape(target)}</code> 到白名单。", reply_parameters=_reply_params(msg["message_id"]))
+                        await send_rich_html_message(chat_id, f"✅ <b>添加成功</b>\n已添加 <code>{target}</code> 到白名单。", reply_parameters=_reply_params(msg["message_id"]))
                         return "OK", 200
                     elif _cmd_match(text, "/deluser"):
                         parts = text.split()
@@ -1092,17 +1091,17 @@ async def webhook() -> tuple:
                             await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
                             return "OK", 200
                         if target not in WHITELIST_USERS:
-                            await send_rich_html_message(chat_id, f"❌ <b>用户不存在</b>\n<code>{html.escape(target)}</code> 不在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
+                            await send_rich_html_message(chat_id, f"❌ <b>用户不存在</b>\n<code>{target}</code> 不在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
                             return "OK", 200
                         WHITELIST_USERS.remove(target)
                         save_whitelist()
-                        await send_rich_html_message(chat_id, f"✅ <b>移除成功</b>\n已移除 <code>{html.escape(target)}</code>。", reply_parameters=_reply_params(msg["message_id"]))
+                        await send_rich_html_message(chat_id, f"✅ <b>移除成功</b>\n已移除 <code>{target}</code>。", reply_parameters=_reply_params(msg["message_id"]))
                         return "OK", 200
                     elif _cmd_match(text, "/listusers"):
                         if not WHITELIST_USERS:
                             await send_rich_html_message(chat_id, "📋 <b>白名单为空</b>", reply_parameters=_reply_params(msg["message_id"]))
                         else:
-                            users_list = "".join(f"<li><code>{html.escape(str(u))}</code></li>" for u in sorted(WHITELIST_USERS))
+                            users_list = "".join(f"<li><code>{str(u)}</code></li>" for u in sorted(WHITELIST_USERS))
                             await send_rich_html_message(chat_id, f"📋 <b>当前白名单用户：</b>\n<ul>{users_list}</ul>", reply_parameters=_reply_params(msg["message_id"]))
                         return "OK", 200
 

@@ -47,7 +47,6 @@ try:
 except Exception:  # pragma: no cover - optional dependency fallback
     qrcode = None  # type: ignore
 from io import BytesIO
-import html
 from cachetools import TTLCache
 try:
     from lxml import html as lxml_html  # type: ignore
@@ -1740,7 +1739,7 @@ async def execute_news(source: str = "bbc", limit: int = 5) -> str:
             return "失败：无法获取任何新闻源。"
         lines = ["<ul>"]
         for src, title, link in all_items[:limit*2]:
-            lines.append(f'<li><b>{html.escape(title)}</b> (<i>{src.upper()}</i>) <a href="{link}">🔗 阅读原文</a></li>')
+            lines.append(f'<li><b>{title}</b> (<i>{src.upper()}</i>) <a href="{link}">🔗 阅读原文</a></li>')
         lines.append("</ul>")
         return "\n".join(lines)
     url = NEWS_FEEDS.get(source_key)
@@ -1755,7 +1754,7 @@ async def execute_news(source: str = "bbc", limit: int = 5) -> str:
             return f"失败：未找到 {source} 的新闻。"
         lines = ["<ul>"]
         for item in items:
-            lines.append(f'<li><b>{html.escape(item.title)}</b> <a href="{item.link}">🔗 阅读原文</a></li>')
+            lines.append(f'<li><b>{item.title}</b> <a href="{item.link}">🔗 阅读原文</a></li>')
         lines.append("</ul>")
         return "\n".join(lines)
     except Exception as e:
@@ -1827,7 +1826,7 @@ async def execute_qr_code(text: str) -> str:
     key = f"qr/{hashlib.md5(text.encode()).hexdigest()}.png"
     url = await upload_bytes_to_r2(img_bytes, key, "image/png")
     if url:
-        return f"✅ 二维码生成成功\n内容：{html.escape(text[:200])}\n图片链接：{url}"
+        return f"✅ 二维码生成成功\n内容：{text[:200]}\n图片链接：{url}"
     else:
         return "失败：R2 上传失败，请检查配置。"
 
@@ -1995,17 +1994,17 @@ async def _images_response_to_bytes(data: dict) -> list[bytes]:
 
 
 def _format_image_api_error(api_name: str, status_code: int, detail: str = "", request_id: str = "", endpoint: str = "", model: str = "") -> str:
-    parts = [f"❌ {html.escape(api_name)} 请求失败"]
+    parts = [f"❌ {api_name} 请求失败"]
     if status_code:
         parts.append(f"HTTP 状态：{status_code}")
     if model:
-        parts.append(f"模型：{html.escape(model)}")
+        parts.append(f"模型：{model}")
     if request_id:
-        parts.append(f"Request ID：{html.escape(request_id)}")
+        parts.append(f"Request ID：{request_id}")
     if detail:
         clean = detail.strip().replace("\r\n", "\n").replace("\r", "\n")
         lines = [line.strip() for line in clean.split("\n") if line.strip()]
-        clean = "<br/>".join(html.escape(line) for line in lines)
+        clean = "<br/>".join(line for line in lines)
         if len(clean) > 800:
             clean = clean[:800] + "…"
         parts.append(f"详情：{clean}")

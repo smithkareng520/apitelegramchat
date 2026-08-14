@@ -20,7 +20,6 @@ search_engine.py 等）无需修改任何 import 语句。
 import asyncio
 import json
 import re
-import html
 import logging
 from typing import Optional
 
@@ -483,7 +482,7 @@ async def get_ai_response(
         # 使用 raw_content 回退，否则会把整段输出再发送一次。
         final_tail_empty_after_rollover = builder._rollover_count > 0 and not final_html.strip()
         if not final_html.strip() and not final_tail_empty_after_rollover:
-            final_html = f"<p>{html.escape(cleaned_content)}</p>"
+            final_html = f"<p>{cleaned_content}</p>"
 
         final_html = re.sub(r'\n\s*\n', '\n', final_html)
 
