@@ -1,0 +1,3 @@
+PASS image tool card: src escaped; href has 5 raw query separators
+PASS video tool card: src escaped; href has 5 raw query separators
+PASS markdown link fallback: href equals raw presigned URL

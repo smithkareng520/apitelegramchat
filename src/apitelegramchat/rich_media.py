@@ -47,7 +47,7 @@ def _normalize_markdown_media_links(html_content: str) -> str:
         if is_image:
             return f'<img src="{clean_url}"/>'
         text = (match.group("text") or "").strip() or "链接"
-        return f'<a href="{clean_url}">{html.escape(text)}</a>'
+        return f'<a href="{raw_url}">{html.escape(text)}</a>'
 
     return _MD_LINK_RE.sub(_rewrite, html_content)
 
