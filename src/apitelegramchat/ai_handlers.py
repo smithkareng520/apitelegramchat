@@ -3605,11 +3605,13 @@ class RichMessageBuilder:
             self._stream_text_index = -1
             self._pending_chars += len(buffered)
 
-    async def rollover_at_turn_boundary(self) -> bool:
-        """在完整模型返回/完整工具批次后执行一次无损草稿切换。
+    async def rollover_at_turn_boundary(self, *, start_next_draft: bool = True) -> bool:
+        """在完整模型返回/完整工具批次后，按回合去向完成草稿分段。
 
         调用方必须保证下一次模型请求尚未开始，且本轮并行工具均已得到最终状态。
-        flush 只负责置位容量预警，因此这里的网络 I/O 不会与后续 Agent 轮次交错。
+        到达容量阈值后，本函数总会先永久化已完成的旧段；只有 ``start_next_draft``
+        为真（即工具批次或纠错路径还会继续请求模型）时，才生成并刷新新草稿。
+        对终局文本传入假值时，函数只结束旧草稿，保留尾段给统一最终发送路径提交。
         """
         if self._stop_flush or self._rollover_in_progress:
             return False
@@ -3689,33 +3691,49 @@ class RichMessageBuilder:
 
                 handoff_text = "".join(self._handoff_text or [])
                 self._handoff_text = None
-                new_draft_id = int(time.time() * 1000000) + random.randint(0, 999)
-                while new_draft_id == old_draft_id:
-                    new_draft_id += 1
-                self.draft_id = new_draft_id
                 self.draft_message_id = None
                 self._rate_limited_until = 0.0
                 self._replace_with_rollover_remainder(remainder, handoff_text)
                 self._rollover_pending = False
                 self._rollover_in_progress = False
                 self._rollover_count += 1
+
+                if start_next_draft:
+                    new_draft_id = int(time.time() * 1000000) + random.randint(0, 999)
+                    while new_draft_id == old_draft_id:
+                        new_draft_id += 1
+                    self.draft_id = new_draft_id
+                    rollover_mode = "plain_text_fallback" if used_fallback else "complete_block"
+                else:
+                    # 终局分支没有下一次模型请求：旧草稿已结束，不能创建空的新草稿。
+                    new_draft_id = None
+                    rollover_mode = "terminal_plain_text_fallback" if used_fallback else "terminal_complete_block"
+
                 self._rollover_history.append({
                     "old_draft_id": old_draft_id,
                     "new_draft_id": new_draft_id,
                     "completed_message_id": completed_message_id if isinstance(completed_message_id, int) else None,
                     "visible_chars": len(_rich_visible_text(completed_html)),
                     "blocks": block_count,
-                    "mode": "plain_text_fallback" if used_fallback else "complete_block",
+                    "mode": rollover_mode,
                 })
 
-            await self._register_active_draft(0)
-            await self.flush(force=True)
-            logger.info(
-                "草稿已在回合边界滚动: chat=%s old=%s new=%s permanent=%s chars=%s blocks=%s mode=%s",
-                self.chat_id, old_draft_id, self.draft_id, completed_message_id,
-                len(_rich_visible_text(completed_html)), block_count,
-                "fallback" if used_fallback else "complete_block",
-            )
+            if start_next_draft:
+                await self._register_active_draft(0)
+                await self.flush(force=True)
+                logger.info(
+                    "草稿已在回合边界滚动: chat=%s old=%s new=%s permanent=%s chars=%s blocks=%s mode=%s",
+                    self.chat_id, old_draft_id, self.draft_id, completed_message_id,
+                    len(_rich_visible_text(completed_html)), block_count,
+                    rollover_mode,
+                )
+            else:
+                logger.info(
+                    "草稿已在终局边界结束，不创建新草稿: chat=%s draft=%s permanent=%s chars=%s blocks=%s mode=%s",
+                    self.chat_id, old_draft_id, completed_message_id,
+                    len(_rich_visible_text(completed_html)), block_count,
+                    rollover_mode,
+                )
 
             if old_draft_message_id:
                 async def _cleanup_old_preview():
@@ -4187,8 +4205,8 @@ async def _agentic_loop_openai_compat(
                             "Use the standard tool_calls API only. Do not emit <tool_call> XML as user-visible text."
                         )
                     })
-                    # 这是一次完整但需要纠正的模型返回；在重试下一请求前仍须完成切换。
-                    await builder.rollover_at_turn_boundary()
+                    # 这是一次完整但需要纠正的模型返回；还会重试下一请求，因此创建新草稿。
+                    await builder.rollover_at_turn_boundary(start_next_draft=True)
                     continue
                 final_content = content_acc or (
                     "工具调用格式连续异常，未继续执行额外操作。请重新描述需求或换一个模型后重试。"
@@ -4199,15 +4217,15 @@ async def _agentic_loop_openai_compat(
                 final_content = content_acc
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
-            # 本轮没有标准 tool_calls，Agent 循环将在此结束。即使容量达到阈值，
-            # 也不能创建新的草稿：最终发送路径会直接提交当前尾段。
+            # 终局也统一进入滚动函数；函数只永久化旧段，不创建新草稿。
+            await builder.rollover_at_turn_boundary(start_next_draft=False)
             break
         status = await _run_tool_calls_and_append(
             tool_calls_list, loop_messages, new_history_entries,
             tool_call_count_ref, api_label, builder, chat_id=builder.chat_id
         )
-        # 工具批次已完整收束；必须在下一次模型请求前同步切换，禁止后台延后。
-        await builder.rollover_at_turn_boundary()
+        # 工具批次已完整收束；后续仍会请求模型，因此在函数内创建新草稿。
+        await builder.rollover_at_turn_boundary(start_next_draft=True)
 
         # ===== FIX: 只对 over_limit 做强制总结并退出 =====
         if status == "over_limit":
@@ -4249,8 +4267,8 @@ async def _agentic_loop_openai_compat(
             new_history_entries.append({"role": "assistant", "content": final_content})
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
-            # 工具上限总结是终局回复，不会再发起下一次模型请求；保留当前草稿
-            # 供统一最终发送路径提交，避免无内容的新草稿闪现。
+            # 工具上限总结是终局回复；统一结束旧草稿，但不创建新草稿。
+            await builder.rollover_at_turn_boundary(start_next_draft=False)
             break
         # 如果 status == "continue"（包括之前熔断返回的），循环自然继续
 
@@ -4262,7 +4280,8 @@ async def _agentic_loop_openai_compat(
         new_history_entries.append({"role": "assistant", "content": final_content})
         if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
             builder.finish_group(len(builder._tool_groups) - 1)
-        # 轮次数耗尽后的兜底文本同样是终局内容，不创建下一段草稿。
+        # 轮次数耗尽后的兜底文本同样是终局内容：结束旧草稿，不创建下一段。
+        await builder.rollover_at_turn_boundary(start_next_draft=False)
     return final_content, final_usage, new_history_entries
 # ---------- Gemini 非流式 ----------
 
@@ -4423,14 +4442,15 @@ async def _agentic_loop_gemini_openai_compat(
             final_content = content_acc
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
-            # 无工具调用即为终局响应；统一收尾会发送当前草稿内容，不能额外开新草稿。
+            # 无工具调用即为终局响应；统一结束旧草稿，不额外开新草稿。
+            await builder.rollover_at_turn_boundary(start_next_draft=False)
             break
         status = await _run_tool_calls_and_append(
             tool_calls_list, loop_messages, new_history_entries,
             tool_call_count_ref, "gemini", builder, chat_id=builder.chat_id
         )
-        # Gemini 适配器同样只能在完整工具批次之后切换草稿。
-        await builder.rollover_at_turn_boundary()
+        # Gemini 工具批次后仍会继续请求模型，因此在函数内创建新草稿。
+        await builder.rollover_at_turn_boundary(start_next_draft=True)
 
         if status == "over_limit":
             synth_payload = {
@@ -4470,7 +4490,8 @@ async def _agentic_loop_gemini_openai_compat(
             )
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
-            # 工具上限总结后没有后续模型轮次，禁止创建空的新草稿。
+            # 工具上限总结后没有后续模型轮次：结束旧草稿，禁止创建空新草稿。
+            await builder.rollover_at_turn_boundary(start_next_draft=False)
             break
     if final_content is None:
         final_content = _tool_limit_summary()
@@ -4479,7 +4500,8 @@ async def _agentic_loop_gemini_openai_compat(
         new_history_entries.append({"role": "assistant", "content": final_content})
         if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
             builder.finish_group(len(builder._tool_groups) - 1)
-        # 轮次数耗尽后的兜底文本没有后续轮次，不应切换草稿。
+        # 轮次数耗尽后的兜底文本没有后续轮次：结束旧草稿，但不创建新草稿。
+        await builder.rollover_at_turn_boundary(start_next_draft=False)
     return final_content, final_usage, new_history_entries
 async def _response_items_to_bytes(response_json: dict) -> list[bytes]:
     image_bytes_list: list[bytes] = []
