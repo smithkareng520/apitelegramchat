@@ -110,6 +110,25 @@ def escape_html(text: str) -> str:
     return html.escape(text)
 
 
+def raw_media_url(url: str) -> str:
+    """返回用于 HTTP、模型上下文和 URL 按钮的原始媒体 URL。
+
+    富文本源码中的属性值会把查询参数分隔符写成 ``&amp;``；这不是可直接
+    请求的 URL。所有非 HTML 场景必须先还原实体，避免将 ``amp;X-Amz-*``
+    误作为 R2 预签名参数名。
+    """
+    return html.unescape(str(url or "").strip())
+
+
+def media_url_html_attr(url: str) -> str:
+    """返回仅可嵌入 HTML ``src`` / ``href`` 属性的媒体 URL。
+
+    调用方不得把返回值用于 HTTP 请求、JSON API 字段、模型上下文或 URL
+    按钮；这些场景应始终使用 :func:`raw_media_url` 返回的原始 URL。
+    """
+    return html.escape(raw_media_url(url), quote=True)
+
+
 # ---------- 媒体 URL 转义 sanitizer ----------
 # R2 presigned URL 含大量 & 查询参数（X-Amz-Algorithm、X-Amz-Credential、X-Amz-Signature 等）。
 # 在 HTML 属性值 src="..." 中，未转义的 & 会被 Telegram HTML 解析器当作实体名起点，
@@ -138,7 +157,7 @@ def _escape_media_src_urls(html_content: str) -> str:
     def _escape_one(match: re.Match) -> str:
         attribute = match.group("attribute").lower()
         quote = match.group("quote")
-        url = match.group("url")
+        url = raw_media_url(match.group("url"))
         escaped = _BARE_AMP_RE.sub('&amp;', url)
         return f"{attribute}={quote}{escaped}{quote}"
 
