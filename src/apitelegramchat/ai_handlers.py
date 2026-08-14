@@ -62,6 +62,7 @@ from apitelegramchat.tool_executors import (
     _TOOL_TIMEOUT_MARKER,
 )
 from apitelegramchat.api_client import api_client
+from apitelegramchat.rich_media import normalize_rich_media_html
 from apitelegramchat.ask_user_tool import (
     create_ask_user_interaction,
     wait_for_answer,
@@ -1434,6 +1435,7 @@ async def build_system_prompt(
   <li><b>地图：</b> <code>&lt;tg-map lat="41.9" long="12.5" zoom="14"/&gt;</code>（zoom 范围：13-20）。</li>
   <li><b>单张图片 / 视频 / 音频：</b> <code>&lt;img src="URL"/&gt;</code> / <code>&lt;video src="URL"/&gt;</code> / <code>&lt;audio src="URL"/&gt;</code></li>
   <li><b>带图注媒体：</b> <code>&lt;figure&gt;&lt;img src="URL"/&gt;&lt;figcaption&gt;图注文本&lt;cite&gt;来源/署名&lt;/cite&gt;&lt;/figcaption&gt;&lt;/figure&gt;</code>。视频示例：<code>&lt;figure&gt;&lt;video src="URL"&gt;&lt;/video&gt;&lt;figcaption&gt;视频说明&lt;/figcaption&gt;&lt;/figure&gt;</code>。</li>
+  <li><b>GIF 规则：</b>GIF 是图片资源。URL 路径以 <code>.gif</code> 结尾时，必须使用 <code>&lt;img src="URL"/&gt;</code>；需要图注时使用 <code>&lt;figure&gt;&lt;img src="URL"/&gt;&lt;figcaption&gt;…&lt;/figcaption&gt;&lt;/figure&gt;</code>。严禁使用 <code>&lt;video&gt;</code> 包裹 GIF。</li>
   <li><b>视频工具结果处理（强制）：</b> 当 <code>generate_video</code> 成功返回 <code>视频链接：URL</code> 时，必须在工具调用后的最终回复中使用该 URL 作为独立媒体块发送视频：<code>&lt;figure&gt;&lt;video src="URL"&gt;&lt;/video&gt;&lt;figcaption&gt;已生成视频&lt;/figcaption&gt;&lt;/figure&gt;</code>。不得仅输出裸 URL、普通超链接或“视频已生成”文字；不得把 <code>&lt;video&gt;</code> 放入 <code>&lt;p&gt;</code>、列表、表格或其他容器内。仅使用工具返回的 HTTP/HTTPS URL；若 URL 含有 <code>&amp;</code>，写入 HTML 属性前必须转义为 <code>&amp;amp;</code>。</li>
   <li><b>多媒体幻灯片（≥2件资源）：</b> <code>&lt;tg-slideshow&gt;&lt;img src="URL1"/&gt;&lt;img src="URL2"/&gt;&lt;figcaption&gt;可选图注&lt;/figcaption&gt;&lt;/tg-slideshow&gt;</code></li>
 </ul>
@@ -3414,13 +3416,8 @@ class RichMessageBuilder:
     # ---------- 容量预警与回合边界滚动 ----------
     @staticmethod
     def _sanitize_rich_html(html_content: str) -> str:
-        """删除 Telegram 无法拉取的本地图片，保持草稿和永久消息内容一致。"""
-        return re.sub(
-            r'<img\s+[^>]*src="(?!(http|https):)[^"]*"[^>]*>',
-            '',
-            html_content or '',
-            flags=re.IGNORECASE,
-        )
+        """规范化富媒体，确保草稿、滚动段和最终消息使用完全相同的内容。"""
+        return normalize_rich_media_html(html_content)
 
     @staticmethod
     def _plain_text_cut(text: str, limit: int) -> int:
@@ -5414,12 +5411,7 @@ async def get_ai_response(
         if not final_html.strip() and not final_tail_empty_after_rollover:
             final_html = f"<p>{html.escape(cleaned_content)}</p>"
 
-        final_html = re.sub(
-            r'<img\s+[^>]*src="(?!(http|https):)[^"]*"[^>]*>',
-            '',
-            final_html,
-            flags=re.IGNORECASE
-        )
+        final_html = RichMessageBuilder._sanitize_rich_html(final_html)
         final_html = re.sub(r'\n\s*\n', '\n', final_html)
 
         if final_tail_empty_after_rollover:
