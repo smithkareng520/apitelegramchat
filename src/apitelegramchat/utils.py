@@ -114,30 +114,35 @@ def escape_html(text: str) -> str:
 # R2 presigned URL 含大量 & 查询参数（X-Amz-Algorithm、X-Amz-Credential、X-Amz-Signature 等）。
 # 在 HTML 属性值 src="..." 中，未转义的 & 会被 Telegram HTML 解析器当作实体名起点，
 # 导致 URL 被截断 → RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND / RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND。
-# 此 sanitizer 在发送前自动转义所有 src="..." 中的裸 &，幂等（不重复转义已转义的实体）。
+# 此 sanitizer 在发送前自动转义所有媒体 src 与链接 href 属性中的裸 &，幂等（不重复转义已转义的实体）。
 _VALID_HTML_ENTITIES = (
     r'amp;|lt;|gt;|quot;|apos;|nbsp;|hellip;|mdash;|ndash;|lsquo;|rsquo;|ldquo;|rdquo;'
     r'|#\d+;|#x[0-9a-fA-F]+;'
 )
 _BARE_AMP_RE = re.compile(rf'&(?!{_VALID_HTML_ENTITIES})')
-_SRC_ATTR_RE = re.compile(r'src="([^"]*)"', re.IGNORECASE)
+_RICH_URL_ATTR_RE = re.compile(
+    r'''\b(?P<attribute>src|href)\s*=\s*(?P<quote>["'])(?P<url>.*?)(?P=quote)''',
+    re.IGNORECASE,
+)
 
 
 def _escape_media_src_urls(html_content: str) -> str:
     """
-    转义 HTML 中所有 src="..." 属性值里的裸 &。
-    覆盖 <video>、<img>、<audio>、<source>、<tg-map> 等所有媒体标签。
+    转义富文本 URL 属性中的裸 &。
+    覆盖所有媒体 src 属性，以及图注、下载链接等 href 属性；单双引号形式都支持。
     幂等：已经转义成 &amp; 的不会被二次转义。
     """
     if not html_content:
         return html_content
 
     def _escape_one(match: re.Match) -> str:
-        url = match.group(1)
+        attribute = match.group("attribute").lower()
+        quote = match.group("quote")
+        url = match.group("url")
         escaped = _BARE_AMP_RE.sub('&amp;', url)
-        return f'src="{escaped}"'
+        return f"{attribute}={quote}{escaped}{quote}"
 
-    return _SRC_ATTR_RE.sub(_escape_one, html_content)
+    return _RICH_URL_ATTR_RE.sub(_escape_one, html_content)
 
 
 async def send_message(chat_id: int, text: str) -> None:
@@ -454,7 +459,7 @@ async def send_rich_message_draft_unlocked(
     if not html_content or not html_content.strip():
         html_content = "<i>⏹️ 已停止输出</i>"
     html_content = html_content.strip()
-    # 自动转义 src="..." 中的裸 &（R2 presigned URL 等），防止 Telegram 拉不到媒体
+    # 自动转义富文本 src/href 属性中的裸 &（R2 预签名 URL 等），防止 Telegram 误解析媒体或链接
     html_content = _escape_media_src_urls(html_content)
 
     try:
@@ -513,7 +518,7 @@ async def send_rich_message_draft(
     if not _visible_text:
         logger.debug(f"send_rich_message_draft: skip empty-after-strip content (len={len(html_content)})")
         return 0
-    # 自动转义 src="..." 中的裸 &（R2 presigned URL 等），防止 Telegram 拉不到媒体
+    # 自动转义富文本 src/href 属性中的裸 &（R2 预签名 URL 等），防止 Telegram 误解析媒体或链接
     html_content = _escape_media_src_urls(html_content)
     try:
         draft_id_int = int(draft_id)
@@ -698,7 +703,7 @@ async def send_rich_html_message(
     if not html_content or not html_content.strip():
         return False
     html_content = html_content.strip()
-    # 自动转义 src="..." 中的裸 &（R2 presigned URL 等），防止 Telegram 拉不到媒体
+    # 自动转义富文本 src/href 属性中的裸 &（R2 预签名 URL 等），防止 Telegram 误解析媒体或链接
     html_content = _escape_media_src_urls(html_content)
 
     payload = {
