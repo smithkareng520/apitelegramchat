@@ -1347,6 +1347,21 @@ def _format_image_safety_notice(detail: str = "", model: str = "") -> str:
     return "<br/>".join(parts)
 
 
+def _render_media_failure_quote(error_notice: str) -> str:
+    """把原生媒体模型的失败通知渲染成与 text_editor 相同的引用结果块。"""
+    raw = html.unescape(str(error_notice or ""))
+    visible_text = strip_html_tags(raw).strip()
+    if not visible_text:
+        visible_text = "媒体生成未完成，请稍后重试。"
+    lines = visible_text.splitlines()
+    if len(lines) > 20:
+        visible_text = "\n".join(lines[:20]) + f"\n…（已截断，共 {len(lines)} 行，仅显示前 20 行）"
+    return (
+        "<p><b>Result</b></p>"
+        f"<blockquote>{escape_html(visible_text).replace(chr(10), '<br/>')}</blockquote>"
+    )
+
+
 # ========== 系统提示 ==========
 async def build_system_prompt(
     chat_id: int = None,
@@ -5379,7 +5394,8 @@ async def get_ai_response(
             pass
 
         if raw_content and isinstance(raw_content, str) and raw_content.startswith("IMAGE_ERROR:"):
-            error_html = raw_content.split(":", 1)[1].strip()
+            error_notice = raw_content.split(":", 1)[1].strip()
+            error_html = _render_media_failure_quote(error_notice)
             await send_rich_html_message(chat_id, error_html, reassert_draft=False)
             if builder.draft_message_id:
                 try:
@@ -5412,7 +5428,8 @@ async def get_ai_response(
         # _agentic_loop_native_video 用 "VIDEO_ERROR:..." 和 "VIDEO_SENT[:摘要]" 作为内部信号，
         # 必须在这里消费掉，否则会被当成普通文本再发一条 <p>VIDEO_SENT:...</p> 消息。
         if raw_content and isinstance(raw_content, str) and raw_content.startswith("VIDEO_ERROR:"):
-            error_html = raw_content.split(":", 1)[1].strip()
+            error_notice = raw_content.split(":", 1)[1].strip()
+            error_html = _render_media_failure_quote(error_notice)
             # 失败提示单独发一条永久消息（与 IMAGE_ERROR 一致）
             await send_rich_html_message(chat_id, error_html, reassert_draft=False)
             if builder.draft_message_id:

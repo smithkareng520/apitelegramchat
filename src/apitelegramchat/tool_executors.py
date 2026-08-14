@@ -636,6 +636,20 @@ def _render_editor_quote(label: str, value: str) -> str:
     return f"<p><b>{escape_html(label)}</b></p><blockquote>{quoted_text}</blockquote>"
 
 
+def _render_media_failure_result(result_str: str, fallback: str) -> str:
+    """Render media-generation failures in the same quote format as text_editor.
+
+    Some providers return HTML fragments in their error payloads. Convert those fragments
+    to readable plain text before quoting so the user sees a clean, non-nested error block.
+    """
+    raw = result_str if isinstance(result_str, str) else str(result_str or "")
+    raw = html.unescape(raw)
+    raw = re.sub(r"<br\\s*/?\\s*>", "\n", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"<[^>]+>", "", raw)
+    message = html.unescape(raw).strip() or fallback
+    return _render_editor_quote("Result", message)
+
+
 def _render_bash_result(result_str: str) -> str:
     """Render bash calls the same way as text_editor: quote-formatted Input and Output."""
     metadata, separator, output = (result_str or "").partition("Output:\n")
@@ -1424,7 +1438,11 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
     if result_str == _TOOL_TIMEOUT_MARKER:
         label = _TOOL_TIMEOUT_LABELS.get(fn_name, fn_name)
         summary = f"⏱️ {label} timed out"
-        details_html = "Execution exceeded the timeout limit. Please refine your request or try again later."
+        timeout_message = "Execution exceeded the timeout limit. Please refine your request or try again later."
+        if fn_name in {"generate_image_from_text", "edit_image_with_reference", "generate_video"}:
+            details_html = _render_media_failure_result(timeout_message, timeout_message)
+        else:
+            details_html = timeout_message
         return summary, details_html
 
     if fn_name == "web_search":
@@ -1704,8 +1722,8 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 else:
                     details_html = f'<tg-slideshow>{img_tags}<figcaption>{caption}</figcaption></tg-slideshow>'
                 return summary, details_html
-        summary = "🎨 Image generation"
-        details_html = escape_text(result_str)
+        summary = "🎨 图片生成失败"
+        details_html = _render_media_failure_result(result_str, "图片生成未完成，请稍后重试。")
         return summary, details_html
 
     elif fn_name == "edit_image_with_reference":
@@ -1727,8 +1745,8 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 else:
                     details_html = f'<tg-slideshow>{img_tags}<figcaption>{caption}</figcaption></tg-slideshow>'
                 return summary, details_html
-        summary = "🎨 Image editing"
-        details_html = escape_text(result_str)
+        summary = "🎨 图片编辑失败"
+        details_html = _render_media_failure_result(result_str, "图片编辑未完成，请稍后重试。")
         return summary, details_html
 
     elif fn_name == "generate_video":
@@ -1758,8 +1776,8 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                     f'</figure>'
                 )
                 return summary, details_html
-        summary = "🎬 Video generation"
-        details_html = escape_text(result_str)
+        summary = "🎬 视频生成失败"
+        details_html = _render_media_failure_result(result_str, "视频生成未完成，请稍后重试。")
         return summary, details_html
 
     # ===================== 地图工具（amap-maps MCP 直通） =====================
