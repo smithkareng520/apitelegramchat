@@ -7,7 +7,12 @@ import json
 import re
 import uuid
 
-from apitelegramchat.utils import get_logger, escape_html
+from apitelegramchat.utils import (
+    get_logger,
+    escape_html,
+    raw_media_url,
+    send_rich_html_message,
+)
 from apitelegramchat.tool_executors import (
     dispatch_tool_call,
     format_tool_result,
@@ -42,6 +47,68 @@ from apitelegramchat.ai.tool_summary import (
 )
 
 logger = get_logger(__name__)
+
+
+_MEDIA_RESULT_TOOL_NAMES = {"generate_image_from_text", "edit_image_with_reference", "generate_video", "qr_code"}
+
+
+def _extract_raw_media_urls(fn_name: str, result_str: str) -> list[str]:
+    """从工具原始结果提取可直接访问的 URL；绝不复用富文本里的 ``&amp;`` 值。"""
+    if fn_name not in _MEDIA_RESULT_TOOL_NAMES:
+        return []
+    content = str(result_str or "")
+    if "✅" not in content:
+        return []
+
+    if fn_name in {"generate_image_from_text", "edit_image_with_reference"}:
+        candidates = [line.strip() for line in content.splitlines() if line.strip().startswith(("https://", "http://"))]
+    elif fn_name == "generate_video":
+        candidates = re.findall(r"视频链接：(https?://[^\s]+)", content)
+    else:  # qr_code
+        candidates = re.findall(r"图片链接：(https?://[^\s]+)", content)
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        url = raw_media_url(candidate)
+        if url.startswith(("https://", "http://")) and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+async def _send_media_open_buttons(chat_id: int | None, fn_name: str, result_str: str) -> None:
+    """以 JSON URL 按钮发送原始链接，避免客户端把 HTML 源码中的 ``&amp;`` 当作 URL。"""
+    if chat_id is None:
+        return
+    urls = _extract_raw_media_urls(fn_name, result_str)
+    if not urls:
+        return
+
+    if fn_name == "generate_video":
+        label = "打开原视频"
+        notice = "视频已生成。请使用下方按钮打开原始文件。"
+    elif fn_name == "qr_code":
+        label = "打开二维码"
+        notice = "二维码已生成。请使用下方按钮打开原始图片。"
+    else:
+        label = "打开原图"
+        notice = "图片已生成。请使用下方按钮打开原始文件。"
+
+    rows = []
+    for index, url in enumerate(urls, start=1):
+        suffix = f" {index}" if len(urls) > 1 else ""
+        rows.append([{"text": f"{label}{suffix}", "url": url}])
+    try:
+        await send_rich_html_message(
+            chat_id,
+            f"<p>{notice}</p>",
+            reply_markup={"inline_keyboard": rows},
+            reassert_draft=True,
+        )
+    except Exception:
+        logger.exception("媒体原始链接按钮发送失败: tool=%s", fn_name)
+
 
 async def _run_tool_calls_and_append(
         tool_calls: list,
@@ -298,6 +365,11 @@ async def _run_tool_calls_and_append(
             status = "done"
 
         builder.update_tool_item(tc_id, final_summary, details_html, status=status)
+
+        # 工具卡片中的 src 必须是 HTML 属性编码；可点击下载则通过独立按钮
+        # 传递原始 URL，避免把字面量 &amp; 暴露给客户端或用户复制路径。
+        if not is_error:
+            await _send_media_open_buttons(chat_id, fn_name, safe_content)
 
         # ========== bash 退出码告警（仅用于日志，不影响最终成功判断） ==========
         if fn_name == "bash":

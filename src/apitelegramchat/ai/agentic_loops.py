@@ -63,7 +63,7 @@ logger = get_logger(__name__)
 
 
 def _media_open_keyboard(urls: list[str], media_label: str) -> dict | None:
-    """构造原始 URL 的点击按钮，绝不复用 HTML 属性中的 ``&amp;`` 字符串。"""
+    """构造使用原始 URL 的点击按钮，不复用富文本属性中的 ``&amp;``。"""
     rows: list[list[dict[str, str]]] = []
     for index, url in enumerate(urls, start=1):
         raw_url = raw_media_url(url)
@@ -74,8 +74,8 @@ def _media_open_keyboard(urls: list[str], media_label: str) -> dict | None:
     return {"inline_keyboard": rows} if rows else None
 
 
-def _media_urls_for_history(urls: list[str]) -> str:
-    """将未 HTML 转义的媒体 URL 保留给模型上下文。"""
+def _raw_media_urls_for_history(urls: list[str]) -> str:
+    """供模型后续引用的原始 HTTP URL，绝不记录 HTML 属性编码值。"""
     return "\n".join(raw_media_url(url) for url in urls if raw_media_url(url))
 
 
@@ -864,7 +864,7 @@ async def _agentic_loop_native_image(
             final_content = f"IMAGE_SENT:{final_notice}" if final_notice else "IMAGE_SENT"
             history_content = (
                 f"[图片已生成] 指令: {clean_prompt or prompt_text or '(无)'} | {caption_text}"
-                f"\n原始媒体 URL（供后续请求使用，未 HTML 转义）：\n{_media_urls_for_history(uploaded_urls)}"
+                f"\n原始媒体 URL（仅供后续模型请求使用）：\n{_raw_media_urls_for_history(uploaded_urls)}"
             )
             new_entries = [{"role": "assistant", "content": history_content}]
             return final_content, getattr(response, "usage", None), new_entries
@@ -990,7 +990,7 @@ async def _agentic_loop_native_image(
     if uploaded_urls:
         history_content = (
             f"[图片已生成] {content[:200] if content else ''} | {caption_text}".strip(' |')
-            + f"\n原始媒体 URL（供后续请求使用，未 HTML 转义）：\n{_media_urls_for_history(uploaded_urls)}"
+            + f"\n原始媒体 URL（仅供后续模型请求使用）：\n{_raw_media_urls_for_history(uploaded_urls)}"
         )
     else:
         history_content = final_notice or "（已生成图片）"
@@ -1117,7 +1117,7 @@ async def _agentic_loop_native_video(
     # 生成历史记录
     history_content = (
         f"[视频已生成] 提示词: {prompt[:200]}" if prompt else "[视频已生成]"
-    ) + f"\n原始媒体 URL（供后续请求使用，未 HTML 转义）：\n{_media_urls_for_history([final_video_url])}"
+    ) + f"\n原始媒体 URL（仅供后续模型请求使用）：\n{_raw_media_urls_for_history([final_video_url])}"
     new_entries = [{"role": "assistant", "content": history_content}]
 
     final_content = f"VIDEO_SENT:{prompt[:100]}"  # 用于上游判断

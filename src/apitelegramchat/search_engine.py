@@ -1087,7 +1087,7 @@ SEARCH_TOOLS = [
             "function": {
                 "name": "generate_video",
                 "description": (
-                    "Generate a short video from a text prompt. Use when the user explicitly asks to create / generate / make a video. Do NOT use for animated images or GIFs (use generate_image_from_text instead). Generation is async and may take 1-5 minutes. On success, the application automatically renders the returned HTTPS URL as a rich-media card. Do not repeat the raw URL, an HTML-escaped URL, a separate media block, or an ordinary hyperlink in your final reply; provide only a brief completion message if needed. "
+                    "Generate a short video from a text prompt. Use when the user explicitly asks to create / generate / make a video. Do NOT use for animated images or GIFs (use generate_image_from_text instead). Generation is async and may take 1-5 minutes. On success, it returns a stable HTTPS URL in the exact form `视频链接：https://...`, just like image-generation tools return image URLs. In your next final response, embed that exact URL as a separate rich-media block: <figure><video src=\"URL\"></video><figcaption>已生成视频</figcaption></figure>; never send only a bare URL or ordinary hyperlink. "
                     f"Available models: {', '.join(VIDEO_MODELS) if VIDEO_MODELS else '(none configured)'}"
                 ),
                 "parameters": {
