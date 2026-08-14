@@ -136,7 +136,7 @@ async def build_system_prompt(
   <li><b>单张图片 / 视频 / 音频：</b> <code>&lt;img src="URL"/&gt;</code> / <code>&lt;video src="URL"/&gt;</code> / <code>&lt;audio src="URL"/&gt;</code></li>
   <li><b>带图注媒体：</b> <code>&lt;figure&gt;&lt;img src="URL"/&gt;&lt;figcaption&gt;图注文本&lt;cite&gt;来源/署名&lt;/cite&gt;&lt;/figcaption&gt;&lt;/figure&gt;</code>。视频示例：<code>&lt;figure&gt;&lt;video src="URL"&gt;&lt;/video&gt;&lt;figcaption&gt;视频说明&lt;/figcaption&gt;&lt;/figure&gt;</code>。</li>
   <li><b>GIF 规则：</b>GIF 是图片资源。URL 路径以 <code>.gif</code> 结尾时，必须使用 <code>&lt;img src="URL"/&gt;</code>；需要图注时使用 <code>&lt;figure&gt;&lt;img src="URL"/&gt;&lt;figcaption&gt;…&lt;/figcaption&gt;&lt;/figure&gt;</code>。严禁使用 <code>&lt;video&gt;</code> 包裹 GIF。</li>
-  <li><b>视频工具结果处理（强制）：</b> 当 <code>generate_video</code> 成功返回 <code>视频链接：URL</code> 时，必须在工具调用后的最终回复中使用该 URL 作为独立媒体块发送视频：<code>&lt;figure&gt;&lt;video src="URL"&gt;&lt;/video&gt;&lt;figcaption&gt;已生成视频&lt;/figcaption&gt;&lt;/figure&gt;</code>。不得仅输出裸 URL、普通超链接或“视频已生成”文字；不得把 <code>&lt;video&gt;</code> 放入 <code>&lt;p&gt;</code>、列表、表格或其他容器内。仅使用工具返回的 HTTP/HTTPS URL；若 URL 含有 <code>&amp;</code>，写入 HTML 属性前必须转义为 <code>&amp;amp;</code>。</li>
+  <li><b>图片/视频工具结果处理（强制）：</b> 工具成功后，用户界面已经通过独立媒体块展示图片或视频。最终回复不得重复输出工具返回的裸 URL、<code>&amp;amp;</code> 字面量、普通 <code>&lt;a href&gt;</code> 链接或“图片 N 链接”等文本。若确需渲染媒体，只能使用独立的 <code>&lt;figure&gt;&lt;img src="URL"/&gt;&lt;/figure&gt;</code> 或 <code>&lt;figure&gt;&lt;video src="URL"&gt;&lt;/video&gt;&lt;/figure&gt;</code> 块；URL 含 <code>&amp;</code> 时，仅可在 HTML 属性中转义为 <code>&amp;amp;</code>，不得将此编码后的字符串作为普通 URL 展示或访问。</li>
   <li><b>多媒体幻灯片（≥2件资源）：</b> <code>&lt;tg-slideshow&gt;&lt;img src="URL1"/&gt;&lt;img src="URL2"/&gt;&lt;figcaption&gt;可选图注&lt;/figcaption&gt;&lt;/tg-slideshow&gt;</code></li>
 </ul>
 

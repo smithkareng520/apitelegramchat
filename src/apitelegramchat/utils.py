@@ -111,21 +111,16 @@ def escape_html(text: str) -> str:
 
 
 def raw_media_url(url: str) -> str:
-    """返回用于 HTTP、模型上下文和 URL 按钮的原始媒体 URL。
+    """返回可用于 HTTP、模型上下文和 URL 按钮的原始媒体 URL。
 
-    富文本源码中的属性值会把查询参数分隔符写成 ``&amp;``；这不是可直接
-    请求的 URL。所有非 HTML 场景必须先还原实体，避免将 ``amp;X-Amz-*``
-    误作为 R2 预签名参数名。
+    ``&amp;`` 仅适用于 HTML 源码属性；若把它当作普通 HTTP URL 使用，R2 会把
+    ``amp;X-Amz-*`` 当作参数名，从而拒绝预签名授权。
     """
     return html.unescape(str(url or "").strip())
 
 
 def media_url_html_attr(url: str) -> str:
-    """返回仅可嵌入 HTML ``src`` / ``href`` 属性的媒体 URL。
-
-    调用方不得把返回值用于 HTTP 请求、JSON API 字段、模型上下文或 URL
-    按钮；这些场景应始终使用 :func:`raw_media_url` 返回的原始 URL。
-    """
+    """返回仅用于 HTML ``src`` / ``href`` 属性的媒体 URL。"""
     return html.escape(raw_media_url(url), quote=True)
 
 

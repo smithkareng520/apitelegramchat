@@ -63,7 +63,7 @@ logger = get_logger(__name__)
 
 
 def _media_open_keyboard(urls: list[str], media_label: str) -> dict | None:
-    """构造原始 URL 的点击按钮，不复用富文本属性中的 ``&amp;`` 字符串。"""
+    """构造原始 URL 的点击按钮，绝不复用 HTML 属性中的 ``&amp;`` 字符串。"""
     rows: list[list[dict[str, str]]] = []
     for index, url in enumerate(urls, start=1):
         raw_url = raw_media_url(url)
@@ -75,9 +75,8 @@ def _media_open_keyboard(urls: list[str], media_label: str) -> dict | None:
 
 
 def _media_urls_for_history(urls: list[str]) -> str:
-    """把原始 URL 写入模型历史，绝不写入 HTML 属性编码后的 URL。"""
-    raw_urls = [raw_media_url(url) for url in urls]
-    return "\n".join(url for url in raw_urls if url)
+    """将未 HTML 转义的媒体 URL 保留给模型上下文。"""
+    return "\n".join(raw_media_url(url) for url in urls if raw_media_url(url))
 
 
 def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict):

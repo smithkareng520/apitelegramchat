@@ -69,7 +69,7 @@ from apitelegramchat.todo_tool import (
 )
 from apitelegramchat.memory_tool import execute_memory, render_memory_card
 from apitelegramchat.subagent_tool import execute_subagent, render_subagent_card
-from apitelegramchat.utils import escape_html
+from apitelegramchat.utils import escape_html, media_url_html_attr
 
 logger = logging.getLogger(__name__)
 
@@ -665,12 +665,14 @@ def _format_image_generation_result(
         if urls:
             count = len(urls)
             summary = f"🎨 {operation_en} {count} image" + ("" if count == 1 else "s")
-            img_tags = "".join(f'<img src="{escape_html(url)}"/>' for url in urls)
-            link_items = "".join(
-                f'<li><a href="{escape_html(url)}">图片 {index + 1}</a></li>'
-                for index, url in enumerate(urls)
+            # 预签名 URL 的 ``&amp;`` 只适用于 src 属性，不能作为文字链接展示；
+            # 否则某些客户端会将字面量 ``&amp;`` 原样请求给 R2 并得到 Authorization 错误。
+            img_tags = "".join(f'<img src="{media_url_html_attr(url)}"/>' for url in urls)
+            image_items = "".join(
+                f'<li>图片 {index + 1}（直接点击媒体预览）</li>'
+                for index, _url in enumerate(urls)
             )
-            caption = f"{operation_zh} {count} 张图片：<ul>{link_items}</ul>"
+            caption = f"{operation_zh} {count} 张图片：<ul>{image_items}</ul>"
             if count == 1:
                 details_html = f"<figure>{img_tags}<figcaption>{caption}</figcaption></figure>"
             else:
@@ -1716,13 +1718,13 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 img_url = img_match.group(1)
                 content_text = content_match.group(1) if content_match else "已编码内容"
                 summary = "📱 二维码已生成"
-                # 转义 URL（R2 presigned URL 含大量 & 需转义为 &amp;）
-                safe_url = escape_html(img_url)
+                # 仅在媒体 src 属性中编码预签名 URL，避免把 ``&amp;`` 泄露为文字外链。
+                safe_url = media_url_html_attr(img_url)
                 details_html = (
                     f'<img src="{safe_url}"/><br/>'
                     f'<b>✅ 二维码生成成功</b><br/>'
                     f'<b>内容：</b>{escape_text(content_text)}<br/>'
-                    f'<b>链接：</b><a href="{safe_url}">📷 点击查看 / 下载二维码</a>'
+                    '<i>请直接点击图片预览。</i>'
                 )
                 return summary, details_html
         summary = "📱 二维码"
@@ -1766,12 +1768,13 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 if m:
                     duration_str = f" · {m.group(1)}s"
                 summary = f"🎬 Video generated{duration_str}"
-                # <figure><video> 是一个独立 media block，可以与其他 block 同消息发送；
-                # 附带简短文本链接 caption，避免裸 R2 presigned URL 刷屏
+                # 不把预签名 URL 作为 <a> 文本链接展示。某些客户端会把属性源码里的
+                # ``&amp;`` 直接作为 HTTP 查询串发送，造成 R2 InvalidArgument/Authorization。
+                # 用户可直接播放或点击此媒体预览；原始 URL 仅保留在模型的工具结果中。
                 details_html = (
-                    f'<figure><video src="{escape_html(video_url)}"></video>'
-                    f'<figcaption><a href="{escape_html(video_url)}">下载 / 查看视频</a></figcaption>'
-                    f'</figure>'
+                    f'<figure><video src="{media_url_html_attr(video_url)}"></video>'
+                    '<figcaption>视频已生成（直接播放或点击媒体预览）</figcaption>'
+                    '</figure>'
                 )
                 return summary, details_html
         summary = "🎬 视频生成失败"
