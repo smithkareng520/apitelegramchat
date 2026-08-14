@@ -3,6 +3,7 @@
 从 ai_handlers.py 拆分而来，逻辑未做改动。
 """
 import asyncio
+import html
 import json
 import re
 import uuid
@@ -42,6 +43,25 @@ from apitelegramchat.ai.tool_summary import (
 )
 
 logger = get_logger(__name__)
+
+
+_MEDIA_RESULT_URL_RE = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
+
+
+def _normalize_media_tool_result_urls(result: object) -> str:
+    """将媒体工具原始回包中的 URL 实体恢复为原始 URL。
+
+    富消息卡片中的 HTML 属性会在稍后按 ``src`` / ``href`` 分别编码；但工具
+    回包本身会被前端展示并传给模型，不能在这个纯文本层保留 ``&amp;``，否则
+    用户复制、点击或模型复用 URL 时都会把字面量 ``amp;`` 当作查询参数的一部分。
+    """
+    text = str(result or "")
+
+    def _decode_url(match: re.Match) -> str:
+        return html.unescape(match.group(0))
+
+    return _MEDIA_RESULT_URL_RE.sub(_decode_url, text)
+
 
 async def _run_tool_calls_and_append(
         tool_calls: list,
@@ -229,6 +249,11 @@ async def _run_tool_calls_and_append(
             except Exception as e:
                 logger.exception(f"[tool] {fn_name} _truncate_tool_result 失败: {e}")
                 safe_content = str(result_str)[:4000]
+
+            # 媒体工具的回包既进入前端工具日志，也进入 LLM 上下文。该层必须持有
+            # 原始 URL；HTML 实体转义仅可发生在后续构造富消息属性时。
+            if fn_name in MEDIA_GEN_TOOLS:
+                safe_content = _normalize_media_tool_result_urls(safe_content)
             try:
                 # 我们不再使用 format_tool_result 的摘要，而是自己生成
                 formatted_summary, details_html = await format_tool_result(fn_name, fn_args, safe_content)
