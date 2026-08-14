@@ -650,6 +650,35 @@ def _render_media_failure_result(result_str: str, fallback: str) -> str:
     return _render_editor_quote("Result", message)
 
 
+def _format_image_generation_result(
+    result_str: str,
+    *,
+    operation_en: str,
+    operation_zh: str,
+    failure_summary: str,
+    failure_fallback: str,
+) -> tuple[str, str]:
+    """Render image generation and image editing results with one stable template."""
+    if "✅" in result_str:
+        lines = result_str.splitlines()
+        urls = [line.strip() for line in lines if line.strip().startswith(("http://", "https://"))]
+        if urls:
+            count = len(urls)
+            summary = f"🎨 {operation_en} {count} image" + ("" if count == 1 else "s")
+            img_tags = "".join(f'<img src="{escape_html(url)}"/>' for url in urls)
+            link_items = "".join(
+                f'<li><a href="{escape_html(url)}">图片 {index + 1}</a></li>'
+                for index, url in enumerate(urls)
+            )
+            caption = f"{operation_zh} {count} 张图片：<ul>{link_items}</ul>"
+            if count == 1:
+                details_html = f"<figure>{img_tags}<figcaption>{caption}</figcaption></figure>"
+            else:
+                details_html = f"<tg-slideshow>{img_tags}<figcaption>{caption}</figcaption></tg-slideshow>"
+            return summary, details_html
+    return failure_summary, _render_media_failure_result(result_str, failure_fallback)
+
+
 def _render_bash_result(result_str: str) -> str:
     """Render bash calls the same way as text_editor: quote-formatted Input and Output."""
     metadata, separator, output = (result_str or "").partition("Output:\n")
@@ -1660,8 +1689,6 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         summary = f"💱 {base} 汇率"
         details_html = result_str
         return summary, details_html
-        details_html = result_str
-        return summary, details_html
 
     elif fn_name == "book_lookup":
         query = fn_args.get('query', '')
@@ -1703,51 +1730,22 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         return summary, details_html
 
     elif fn_name == "generate_image_from_text":
-        if "✅" in result_str:
-            lines = result_str.splitlines()
-            urls = [line.strip() for line in lines if line.strip().startswith(("http://", "https://"))]
-            if urls:
-                count = len(urls)
-                summary = f"🎨 Generated {count} image" + ("" if count == 1 else "s")
-                img_tags = "".join(f'<img src="{escape_html(u)}"/>' for u in urls)
-                # 用简短的"图片 1 / 图片 2"文本链接替代裸 URL，避免长 R2 presigned URL 刷屏
-                link_items = "".join(
-                    f'<li><a href="{escape_html(u)}">图片 {i + 1}</a></li>'
-                    for i, u in enumerate(urls)
-                )
-                caption = f"已生成 {count} 张图片：<ul>{link_items}</ul>"
-                # 单图用 <figure>，多图用 <tg-slideshow> 轮播
-                if count == 1:
-                    details_html = f'<figure>{img_tags}<figcaption>{caption}</figcaption></figure>'
-                else:
-                    details_html = f'<tg-slideshow>{img_tags}<figcaption>{caption}</figcaption></tg-slideshow>'
-                return summary, details_html
-        summary = "🎨 图片生成失败"
-        details_html = _render_media_failure_result(result_str, "图片生成未完成，请稍后重试。")
-        return summary, details_html
+        return _format_image_generation_result(
+            result_str,
+            operation_en="Generated",
+            operation_zh="已生成",
+            failure_summary="🎨 图片生成失败",
+            failure_fallback="图片生成未完成，请稍后重试。",
+        )
 
     elif fn_name == "edit_image_with_reference":
-        if "✅" in result_str:
-            lines = result_str.splitlines()
-            urls = [line.strip() for line in lines if line.strip().startswith(("http://", "https://"))]
-            if urls:
-                count = len(urls)
-                summary = f"🎨 Edited {count} image" + ("" if count == 1 else "s")
-                img_tags = "".join(f'<img src="{escape_html(u)}"/>' for u in urls)
-                link_items = "".join(
-                    f'<li><a href="{escape_html(u)}">图片 {i + 1}</a></li>'
-                    for i, u in enumerate(urls)
-                )
-                caption = f"已编辑 {count} 张图片：<ul>{link_items}</ul>"
-                # 单图用 <figure>，多图用 <tg-slideshow> 轮播
-                if count == 1:
-                    details_html = f'<figure>{img_tags}<figcaption>{caption}</figcaption></figure>'
-                else:
-                    details_html = f'<tg-slideshow>{img_tags}<figcaption>{caption}</figcaption></tg-slideshow>'
-                return summary, details_html
-        summary = "🎨 图片编辑失败"
-        details_html = _render_media_failure_result(result_str, "图片编辑未完成，请稍后重试。")
-        return summary, details_html
+        return _format_image_generation_result(
+            result_str,
+            operation_en="Edited",
+            operation_zh="已编辑",
+            failure_summary="🎨 图片编辑失败",
+            failure_fallback="图片编辑未完成，请稍后重试。",
+        )
 
     elif fn_name == "generate_video":
         # 视频通过 <figure><video> 内嵌在工具结果卡片里渲染（Telegram Rich Message

@@ -152,38 +152,6 @@ def _split_editor_lines(text: str) -> list[str]:
     return _normalize_editor_text(text).splitlines(keepends=True)
 
 
-def _format_editor_line(line_no: int, text: str, width: int, highlight: bool = False) -> str:
-    mark = "❯" if highlight else " "
-    clean_text = text.rstrip("\n")
-    return f"{mark} {line_no:>{width}} │ {clean_text}"
-
-
-def _line_range_preview(lines: list[str], start_line: int, end_line: int, highlight_line: int | None = None, radius: int = 2) -> str:
-    if not lines:
-        return ""
-    start = max(1, start_line - radius)
-    end = min(len(lines), end_line + radius)
-    width = len(str(len(lines)))
-    preview = []
-    for i in range(start, end + 1):
-        preview.append(_format_editor_line(i, lines[i - 1], width, highlight=highlight_line and i == highlight_line))
-    return "\n".join(preview)
-
-
-def _latest_editor_snapshot(content: str, max_lines: int = 10) -> str:
-    """Return the current file tail with absolute line numbers for the chat UI."""
-    lines = _normalize_editor_text(content).splitlines()
-    if not lines:
-        return "(空文件)"
-    start = max(1, len(lines) - max_lines + 1)
-    width = len(str(len(lines)))
-    return "\n".join(_format_editor_line(index, lines[index - 1], width) for index in range(start, len(lines) + 1))
-
-
-def _with_latest_editor_snapshot(message: str, content: str) -> str:
-    return f"{message}\n\nLatest file snapshot (tail 10):\n{_latest_editor_snapshot(content)}"
-
-
 def _format_editor_line(line_no: int, text: str, width: int) -> str:
     """Format a text-editor view line with an absolute 1-based line number."""
     return f"{line_no:>{width}}: {text.rstrip(chr(10))}"
