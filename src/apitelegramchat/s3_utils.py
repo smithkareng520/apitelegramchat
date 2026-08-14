@@ -4,6 +4,7 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import List
+from urllib.parse import urlparse
 
 try:
     import aioboto3  # type: ignore
@@ -54,8 +55,35 @@ def _safe_local_key_path(key: str) -> Path:
     return _LOCAL_R2_ROOT.joinpath(*parts)
 
 
+def _public_delivery_base_url() -> str | None:
+    """返回可由 Telegram 等外部抓取器访问的公开媒体基地址。
+
+    ``<account>.r2.cloudflarestorage.com`` 是 R2 的 S3 API 端点，不是公开
+    下载域名；不带签名直接拼接对象 key 会得到 AccessDenied，继而导致 Telegram
+    返回 RICH_MESSAGE_VIDEO_INVALID 或 RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND。
+    遇到该端点（或无效 URL）时应使用预签名 URL。真正可公开访问的 r2.dev
+    域名和自定义域名则保留为无查询参数的稳定媒体 URL。
+    """
+    base = (R2_PUBLIC_URL or "").strip().rstrip("/")
+    if not base:
+        return None
+
+    parsed = urlparse(base)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or not host or parsed.query or parsed.fragment:
+        logger.warning("忽略无效 R2_PUBLIC_URL，改用预签名 URL: %r", base[:160])
+        return None
+    if host.endswith(".r2.cloudflarestorage.com"):
+        logger.warning(
+            "R2_PUBLIC_URL 指向私有 S3 API 端点（%s），改用预签名 URL 供 Telegram 抓取",
+            host,
+        )
+        return None
+    return base
+
+
 def _local_public_url(key: str) -> str:
-    base = (R2_PUBLIC_URL or "").rstrip("/")
+    base = _public_delivery_base_url()
     if base:
         return f"{base}/{key}"
     return f"file://{_safe_local_key_path(key).resolve()}"
@@ -100,8 +128,12 @@ async def upload_bytes_to_r2(
                     ContentType=content_type,
                 )
             logger.info("R2 上传成功：%s", key)
-            if R2_PUBLIC_URL:
-                return f"{R2_PUBLIC_URL.rstrip('/')}/{key}"
+            public_base = _public_delivery_base_url()
+            if public_base:
+                return f"{public_base}/{key}"
+            # R2 S3 API endpoint 并非公开 URL。使用预签名 URL，使 Telegram 的
+            # 媒体抓取器无需 R2 凭据也能读取刚上传的视频；调用方会在 HTML 属性
+            # 中将查询参数的 & 幂等转义为 &amp;。
             return await generate_presigned_url(key)
         except Exception:
             logger.exception("R2 上传失败（第 %d/%d 次）：%s", attempt + 1, max_attempts, key)
