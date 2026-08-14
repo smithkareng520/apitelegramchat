@@ -114,35 +114,36 @@ def escape_html(text: str) -> str:
 # R2 presigned URL 含大量 & 查询参数（X-Amz-Algorithm、X-Amz-Credential、X-Amz-Signature 等）。
 # 在 HTML 属性值 src="..." 中，未转义的 & 会被 Telegram HTML 解析器当作实体名起点，
 # 导致 URL 被截断 → RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND / RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND。
-# 此 sanitizer 在发送前自动转义所有媒体 src 与链接 href 属性中的裸 &，幂等（不重复转义已转义的实体）。
+#
+# 注意：下载文字链接的 href 必须保留工具返回的原始 URL。前端会从该属性取值并
+# 发起跳转；若将 & 写成 &amp;，某些渲染路径会把实体字符串当作 URL 的实际内容，
+# 导致预签名查询参数失效。因此这里只处理媒体 src，绝不改写 href。
 _VALID_HTML_ENTITIES = (
     r'amp;|lt;|gt;|quot;|apos;|nbsp;|hellip;|mdash;|ndash;|lsquo;|rsquo;|ldquo;|rdquo;'
     r'|#\d+;|#x[0-9a-fA-F]+;'
 )
 _BARE_AMP_RE = re.compile(rf'&(?!{_VALID_HTML_ENTITIES})')
-_RICH_URL_ATTR_RE = re.compile(
-    r'''\b(?P<attribute>src|href)\s*=\s*(?P<quote>["'])(?P<url>.*?)(?P=quote)''',
+_RICH_MEDIA_SRC_ATTR_RE = re.compile(
+    r'''\bsrc\s*=\s*(?P<quote>["'])(?P<url>.*?)(?P=quote)''',
     re.IGNORECASE,
 )
 
 
 def _escape_media_src_urls(html_content: str) -> str:
-    """
-    转义富文本 URL 属性中的裸 &。
-    覆盖所有媒体 src 属性，以及图注、下载链接等 href 属性；单双引号形式都支持。
-    幂等：已经转义成 &amp; 的不会被二次转义。
+    """仅转义媒体 ``src`` 属性中的裸 ``&``，不修改下载链接 ``href``。
+
+    保持幂等：已转义成 ``&amp;`` 的查询参数不会被二次转义。单双引号属性值均支持。
     """
     if not html_content:
         return html_content
 
     def _escape_one(match: re.Match) -> str:
-        attribute = match.group("attribute").lower()
         quote = match.group("quote")
         url = match.group("url")
         escaped = _BARE_AMP_RE.sub('&amp;', url)
-        return f"{attribute}={quote}{escaped}{quote}"
+        return f"src={quote}{escaped}{quote}"
 
-    return _RICH_URL_ATTR_RE.sub(_escape_one, html_content)
+    return _RICH_MEDIA_SRC_ATTR_RE.sub(_escape_one, html_content)
 
 
 async def send_message(chat_id: int, text: str) -> None:
