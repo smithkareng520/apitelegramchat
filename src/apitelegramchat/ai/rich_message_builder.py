@@ -20,7 +20,6 @@ from apitelegramchat.utils import (
     RateLimitError,
     escape_html,
 )
-from apitelegramchat.rich_media import normalize_rich_media_html
 from apitelegramchat.ai.error_formatting import extract_domain
 from apitelegramchat.ai.attachment_content import _track_task
 from apitelegramchat.ai.tool_summary import (
@@ -969,11 +968,6 @@ class RichMessageBuilder:
 
     # ---------- 容量预警与回合边界滚动 ----------
     @staticmethod
-    def _sanitize_rich_html(html_content: str) -> str:
-        """规范化富媒体，确保草稿、滚动段和最终消息使用完全相同的内容。"""
-        return normalize_rich_media_html(html_content)
-
-    @staticmethod
     def _plain_text_cut(text: str, limit: int) -> int:
         """在不超过 limit 的前提下尽量停在空白或句末，作为异常兜底的文本边界。"""
         if len(text) <= limit:
@@ -1039,7 +1033,7 @@ class RichMessageBuilder:
         if self._stop_flush or self._rollover_pending or self._rollover_in_progress:
             return self._rollover_pending
         if html_content is None:
-            html_content = self._sanitize_rich_html(self._build_html_no_thinking())
+            html_content = self._build_html_no_thinking()
         _cut_at, visible_chars, block_count = self._pick_rollover_boundary(html_content)
         if (
             visible_chars < RICH_DRAFT_INTERACTIVE_TEXT_CHARS
@@ -1087,7 +1081,7 @@ class RichMessageBuilder:
         async with self._rollover_lock:
             if self._stop_flush or self._rollover_in_progress:
                 return False
-            current_html = self._sanitize_rich_html(self._build_html_no_thinking())
+            current_html = self._build_html_no_thinking()
             cut_at, visible_chars, block_count = self._pick_rollover_boundary(current_html)
             rollover_due = (
                 visible_chars >= RICH_DRAFT_INTERACTIVE_TEXT_CHARS
@@ -1227,7 +1221,7 @@ class RichMessageBuilder:
             )
             return
 
-        html_content = self._sanitize_rich_html(self._build_html())
+        html_content = self._build_html()
         self._arm_rollover_if_needed(html_content)
 
         async with self._flush_lock:
@@ -1235,7 +1229,7 @@ class RichMessageBuilder:
             if now < self._rate_limited_until:
                 return
 
-            html_content = self._sanitize_rich_html(self._build_html())
+            html_content = self._build_html()
             if not html_content.strip() or html_content.strip() == " ":
                 html_content = "<p>Working...</p>"
 

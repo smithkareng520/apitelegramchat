@@ -136,9 +136,8 @@ async def build_system_prompt(
   <li><b>单张图片 / 视频 / 音频：</b> <code><img src="URL"/></code> / <code><video src="URL"/></code> / <code><audio src="URL"/></code></li>
   <li><b>带图注媒体：</b> <code><figure><img src="URL"/><figcaption>图注文本<cite>来源/署名</cite></figcaption></figure></code>。视频示例：<code><figure><video src="URL"></video><figcaption>视频说明</figcaption></figure></code>。</li>
   <li><b>GIF 规则：</b>GIF 是图片资源。URL 路径以 <code>.gif</code> 结尾时，必须使用 <code><img src="URL"/></code>；需要图注时使用 <code><figure><img src="URL"/><figcaption>…</figcaption></figure></code>。严禁使用 <code><video></code> 包裹 GIF。</li>
-  <li><b>视频工具结果处理（强制）：</b> 当 <code>generate_video</code> 成功返回 <code>视频链接：URL</code> 时，必须在工具调用后的最终回复中使用该 URL 作为独立媒体块发送视频：<code><figure><video src="URL"></video><figcaption>已生成视频</figcaption></figure></code>。不得仅输出裸 URL、普通超链接或“视频已生成”文字；不得把 <code><video></code> 放入 <code><p></code>、列表、表格或其他容器内。仅使用工具返回的 HTTP/HTTPS URL；若 URL 本身含有 <code>&</code> 查询参数分隔符，写入 <code>src</code> / <code>href</code> 属性前必须将其转义为 <code>&amp;</code>（这是 HTML 属性值里唯一需要转义的字符，标签本身 <code><</code> <code>></code> 不转义）。同一 URL 若同时出现在下载/查看用的 <code><a href="URL">下载 / 查看视频</a></code> 文本链接中，必须使用与 <code>video</code>/<code>img</code> 的 <code>src</code> 完全相同的转义结果，不得只转义其中一处。</li>
-  <li><b>图片工具结果处理（强制）：</b> 当 <code>generate_image_from_text</code> / <code>edit_image_with_reference</code> 成功返回 <code>图片链接：URL</code>（可能多行、每行一个 URL）时，必须在最终回复中把每个 URL 作为独立媒体块发送：单张用 <code><img src="URL"/></code>，多张（≥2）用 <code><tg-slideshow><img src="URL1"/><img src="URL2"/></tg-slideshow></code>。<b>绝对禁止使用 Markdown 图片/链接语法</b>（<code>![...](URL)</code> 或 <code>[...](URL)</code>），也不得只输出裸 URL 或普通文字描述。仅使用工具返回的原始 HTTP/HTTPS URL，不要自行拼接、截断或修改；若该 URL 本身含有 <code>&</code>，规则与上一条视频一致——写入 <code>src</code>（以及需要时的下载 <code>href</code>）前统一转义为 <code>&amp;</code>，且只转义这一处，不要对同一 URL 做二次转义或对非 HTML 属性上下文（如 Markdown、纯文本）做转义。</li>
-  <li><b>URL 转义的适用范围（重要）：</b> 上面两条“转义为 <code>&amp;</code>”的规则，仅适用于把 URL 写进 HTML 属性（<code>src="..."</code> / <code>href="..."</code>）这一种场景。工具返回给你的原始文本（如 <code>图片链接：https://...&X-Amz-...</code>）里的 <code>&</code> 是未转义的原始字符，这是正常的，不需要你先"预处理"或"纠正"。你要做的只是：把这个原始 URL 原样复制进 <code>src="..."</code> 属性时，把其中每个裸 <code>&</code> 换成 <code>&amp;</code>；除此之外（包括你在普通文字里提到这个链接时）都不要对它做任何转义。</li>
+  <li><b>视频工具结果处理（强制）：</b> 当 <code>generate_video</code> 成功返回 <code>视频链接：URL</code> 时，必须在工具调用后的最终回复中使用该 URL 作为独立媒体块发送视频：<code><figure><video src="URL"></video><figcaption>已生成视频</figcaption></figure></code>。不得仅输出裸 URL、普通超链接或“视频已生成”文字；不得把 <code><video></code> 放入 <code><p></code>、列表、表格或其他容器内。仅使用工具返回的 HTTP/HTTPS URL，并将 URL 原样写入 <code>src</code> 或下载链接 <code>href</code>，不得转义、解码、重写、拼接或截断。</li>
+  <li><b>图片工具结果处理（强制）：</b> 当 <code>generate_image_from_text</code> / <code>edit_image_with_reference</code> 成功返回 <code>图片链接：URL</code>（可能多行、每行一个 URL）时，必须在最终回复中把每个 URL 作为独立媒体块发送：单张用 <code><img src="URL"/></code>，多张（≥2）用 <code><tg-slideshow><img src="URL1"/><img src="URL2"/></tg-slideshow></code>。<b>绝对禁止使用 Markdown 图片/链接语法</b>（<code>![...](URL)</code> 或 <code>[...](URL)</code>），也不得只输出裸 URL 或普通文字描述。仅使用工具返回的原始 HTTP/HTTPS URL，并将 URL 原样写入 <code>src</code> 和需要时的下载 <code>href</code>；不得转义、解码、重写、拼接或截断。</li>
   <li><b>多媒体幻灯片（≥2件资源）：</b> <code><tg-slideshow><img src="URL1"/><img src="URL2"/><figcaption>可选图注</figcaption></tg-slideshow></code></li>
 </ul>
 
@@ -149,7 +148,7 @@ async def build_system_prompt(
 </ul>
 
 <h3>字符转义规则</h3>
-<p>本提示词中出现的所有尖括号标签（如上文表格里的 <code><b></code>、<code><img src="URL"/></code> 等）均为你应直接输出的字面 HTML 标签，<b>不要</b>把它们当成需要保留转义形式的文本。只有当你要展示的是真实内容里出现的字面 <code><</code>、<code>></code>、<code>&</code> 字符本身（例如引用一段包含尖括号的代码片段、或 URL 查询参数中的 <code>&</code>）时，才需要转义：用 <code>&lt;</code> 表示 <code><</code>，用 <code>&gt;</code> 表示 <code>></code>，用 <code>&amp;</code> 表示 <code>&</code>。换言之：先判断这段内容是"你要输出的结构标签"还是"用户可见文本里的字面符号"——前者直接写标签本身，后者才需要转义。</p>
+<p>本提示词中出现的所有尖括号标签（如上文表格里的 <code><b></code>、<code><img src="URL"/></code> 等）均为你应直接输出的字面 HTML 标签，<b>不要</b>把它们当成需要保留转义形式的文本。工具、媒体和普通链接中的 URL 必须原样输出；尤其是 URL 查询参数分隔符 <code>&</code> 必须保持为原始字符，不得转换成实体或作任何其他处理。</p>
 
 <h3>超长输出的结构化收尾规则</h3>
 <p>回答可能很长时，应主动将内容组织为多个独立、完整的兄弟块。每个 <code><details></code>、<code><table></code>、<code><ul></code>、<code><ol></code>、<code><pre></code>、<code><blockquote></code>、<code><figure></code> 或其他块级元素都必须在开始后的合理篇幅内闭合，再开始下一个块。表格请按主题拆成多张表，长列表请拆成多个列表，长代码请拆成多个独立代码块。不要把一个结构块持续扩展到极长；系统仅会在完整块结束后安全地分段并继续输出。</p>
@@ -486,7 +485,6 @@ async def get_ai_response(
         if not final_html.strip() and not final_tail_empty_after_rollover:
             final_html = f"<p>{html.escape(cleaned_content)}</p>"
 
-        final_html = RichMessageBuilder._sanitize_rich_html(final_html)
         final_html = re.sub(r'\n\s*\n', '\n', final_html)
 
         if final_tail_empty_after_rollover:

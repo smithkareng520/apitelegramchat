@@ -178,8 +178,7 @@ def _render_structured_value(value: object, *, depth: int = 0) -> str:
     if isinstance(value, str):
         clean = _trim_ui_value(value)
         if _looks_like_http_url(value):
-            safe_url = escape_html(value.strip())
-            return f'<a href="{safe_url}">打开链接</a>'
+            return f'<a href="{value.strip()}">打开链接</a>'
         return escape_html(clean)
     if depth >= 2:
         return f"<code>{escape_html(_compact_json(value))}</code>"
@@ -340,10 +339,9 @@ def _render_poi_cards(payload: object) -> str | None:
         details_open = " open" if index <= 2 else ""
         body: list[str] = []
         if photo_url and index <= 3:
-            safe_photo = escape_html(photo_url)
             body.append(
-                f'<figure><img src="{safe_photo}"/>'
-                f'<figcaption><a href="{safe_photo}">查看地点图片</a></figcaption></figure>'
+                f'<figure><img src="{photo_url}"/>'
+                f'<figcaption><a href="{photo_url}">查看地点图片</a></figcaption></figure>'
             )
         if address:
             body.append(f"<p><b>地址</b><br/>{escape_html(address)}</p>")
@@ -366,8 +364,7 @@ def _render_poi_cards(payload: object) -> str | None:
         if poi_id:
             metadata.append(f"POI ID：<code>{escape_html(poi_id)}</code>")
         if photo_url and index > 3:
-            safe_photo = escape_html(photo_url)
-            metadata.append(f'<a href="{safe_photo}">查看地点图片</a>')
+            metadata.append(f'<a href="{photo_url}">查看地点图片</a>')
         if metadata:
             body.append("<details><summary>更多信息</summary><p>" + "<br/>".join(metadata) + "</p></details>")
         cards.append(f"<details{details_open}><summary>{escape_html(summary)}</summary>{''.join(body)}</details>")
@@ -665,7 +662,7 @@ def _format_image_generation_result(
         if urls:
             count = len(urls)
             summary = f"🎨 {operation_en} {count} image" + ("" if count == 1 else "s")
-            img_tags = "".join(f'<img src="{escape_html(url)}"/>' for url in urls)
+            img_tags = "".join(f'<img src="{url}"/>' for url in urls)
             link_items = "".join(
                 f'<li><a href="{url}">图片 {index + 1}</a></li>'
                 for index, url in enumerate(urls)
@@ -1530,10 +1527,9 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 if match:
                     title = match.group(1).strip()
             summary = f"🌐 Fetched: {title}"
-            safe_url = html.escape(url)
             safe_domain = html.escape(domain)
             safe_title = html.escape(title)
-            details_html = f"{safe_title} <a href=\"{safe_url}\">{safe_domain}</a>"
+            details_html = f"{safe_title} <a href=\"{url}\">{safe_domain}</a>"
         return summary, details_html
 
     elif fn_name == "weather":
@@ -1716,9 +1712,8 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 img_url = img_match.group(1)
                 content_text = content_match.group(1) if content_match else "已编码内容"
                 summary = "📱 二维码已生成"
-                safe_src_url = escape_html(img_url)
                 details_html = (
-                    f'<img src="{safe_src_url}"/><br/>'
+                    f'<img src="{img_url}"/><br/>'
                     f'<b>✅ 二维码生成成功</b><br/>'
                     f'<b>内容：</b>{escape_text(content_text)}<br/>'
                     f'<b>链接：</b><a href="{img_url}">📷 点击查看 / 下载二维码</a>'
@@ -1768,7 +1763,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 # <figure><video> 是一个独立 media block，可以与其他 block 同消息发送；
                 # 附带简短文本链接 caption，避免裸 R2 presigned URL 刷屏
                 details_html = (
-                    f'<figure><video src="{escape_html(video_url)}"></video>'
+                    f'<figure><video src="{video_url}"></video>'
                     f'<figcaption><a href="{video_url}">下载 / 查看视频</a></figcaption>'
                     f'</figure>'
                 )

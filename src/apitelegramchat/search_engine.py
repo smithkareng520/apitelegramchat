@@ -1740,7 +1740,7 @@ async def execute_news(source: str = "bbc", limit: int = 5) -> str:
             return "失败：无法获取任何新闻源。"
         lines = ["<ul>"]
         for src, title, link in all_items[:limit*2]:
-            lines.append(f'<li><b>{html.escape(title)}</b> (<i>{src.upper()}</i>) <a href="{html.escape(link)}">🔗 阅读原文</a></li>')
+            lines.append(f'<li><b>{html.escape(title)}</b> (<i>{src.upper()}</i>) <a href="{link}">🔗 阅读原文</a></li>')
         lines.append("</ul>")
         return "\n".join(lines)
     url = NEWS_FEEDS.get(source_key)
@@ -1755,7 +1755,7 @@ async def execute_news(source: str = "bbc", limit: int = 5) -> str:
             return f"失败：未找到 {source} 的新闻。"
         lines = ["<ul>"]
         for item in items:
-            lines.append(f'<li><b>{html.escape(item.title)}</b> <a href="{html.escape(item.link)}">🔗 阅读原文</a></li>')
+            lines.append(f'<li><b>{html.escape(item.title)}</b> <a href="{item.link}">🔗 阅读原文</a></li>')
         lines.append("</ul>")
         return "\n".join(lines)
     except Exception as e:

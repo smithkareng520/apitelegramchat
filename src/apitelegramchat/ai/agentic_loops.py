@@ -813,7 +813,7 @@ async def _agentic_loop_native_image(
                     uploaded_urls.append(url)
 
             if uploaded_urls:
-                img_tags = "".join(f'<img src="{escape_html(u)}"/>' for u in uploaded_urls)
+                img_tags = "".join(f'<img src="{u}"/>' for u in uploaded_urls)
                 caption_text = _format_image_metadata_caption(image_bytes_list[0],
                                                               current_model) if image_bytes_list else "Generated image"
                 # 单图用 <figure>，多图用 <tg-slideshow> 轮播
@@ -932,7 +932,7 @@ async def _agentic_loop_native_image(
             uploaded_urls.append(url)
 
     if uploaded_urls:
-        img_tags = "".join(f'<img src="{escape_html(u)}"/>' for u in uploaded_urls)
+        img_tags = "".join(f'<img src="{u}"/>' for u in uploaded_urls)
         caption_text = _format_image_metadata_caption(image_bytes_list[0],
                                                       current_model) if image_bytes_list else "Generated image"
         # 单图用 <figure>，多图用 <tg-slideshow> 轮播
@@ -1061,7 +1061,7 @@ async def _agentic_loop_native_video(
         meta=video_meta if isinstance(video_meta, dict) else None,
     )
     video_html = (
-        f'<figure><video src="{escape_html(final_video_url)}"></video>'
+        f'<figure><video src="{final_video_url}"></video>'
         f'<figcaption>{escape_html(caption_text)}</figcaption></figure>'
     )
     send_ok = await send_rich_html_message(chat_id, video_html)
