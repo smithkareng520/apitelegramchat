@@ -663,6 +663,16 @@ async def send_rich_html_message(
     """
     if not html_content or not html_content.strip():
         return False
+
+    # 记录调用方交付给 Telegram 的原始富文本，不对内容做压缩、截断或预览。
+    # 保留 strip 之前的版本，便于排查空白、换行和富媒体 URL 在发送前后的差异。
+    raw_html_content = html_content
+    logger.info(
+        "[%s] Telegram sendRichMessage 原始内容（未压缩、未截断；长度=%s）：\n%s",
+        chat_id,
+        len(raw_html_content),
+        raw_html_content,
+    )
     html_content = html_content.strip()
 
     payload = {

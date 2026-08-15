@@ -410,8 +410,8 @@ async def get_ai_response(
             else:
                 actual_content = "（已生成图片）"
             if new_msgs and new_msgs[-1].get("role") == "assistant":
-                history_summary = str(new_msgs[-1].get("content") or "")[:120]
-                logger.debug("[NativeImage] 保存到对话历史的 assistant 消息: %s", history_summary)
+                history_summary = str(new_msgs[-1].get("content") or "")
+                logger.debug("[NativeImage] 保存到对话历史的完整 assistant 消息:\n%s", history_summary)
             # 图片路径通常已发过永久消息；仍尝试清理草稿气泡
             if builder.draft_message_id:
                 try:
@@ -447,8 +447,8 @@ async def get_ai_response(
             else:
                 actual_content = "（已生成视频）"
             if new_msgs and new_msgs[-1].get("role") == "assistant":
-                history_summary = str(new_msgs[-1].get("content") or "")[:120]
-                logger.debug("[NativeVideo] 保存到对话历史的 assistant 消息: %s", history_summary)
+                history_summary = str(new_msgs[-1].get("content") or "")
+                logger.debug("[NativeVideo] 保存到对话历史的完整 assistant 消息:\n%s", history_summary)
             if builder.draft_message_id:
                 try:
                     from apitelegramchat.state import is_preserved_draft
@@ -492,7 +492,11 @@ async def get_ai_response(
         else:
             success = await send_rich_html_message(chat_id, final_html, reassert_draft=False)
             if not success:
-                logger.error(f"[{chat_id}] 富文本发送失败，不再降级。内容前200字: {final_html[:200]!r}")
+                logger.error(
+                    "[%s] 富文本发送失败，不再降级。完整待发送 HTML（未压缩、未截断）：\n%s",
+                    chat_id,
+                    final_html,
+                )
             else:
                 logger.info(f"[{chat_id}] 富文本发送成功")
 
@@ -522,12 +526,20 @@ async def get_ai_response(
         if new_msgs and new_msgs[-1].get("role") == "assistant" and not new_msgs[-1].get("tool_calls"):
             new_msgs[-1]["content"] = cleaned_content
 
-        # ======== 添加以下日志 ========
-        logger.info(f"[{chat_id}] 最终内容长度: {len(cleaned_content)} 字符, 前200字符: {cleaned_content[:200]!r}")
-        logger.info(f"[{chat_id}] 最终HTML长度: {len(final_html)} 字符, 前200: {final_html[:200]!r}")
-        # ==============================
-
-        logger.debug("最终输出 (前500字符): %s", cleaned_content[:500])
+        # 保留模型返回的原文和本轮实际提交给 Telegram 的最终 HTML；两者均不得截断。
+        logger.info(
+            "[%s] 原始 AI 回复（未清洗、未压缩、未截断；长度=%s）：\n%s",
+            chat_id,
+            len(content_str),
+            content_str,
+        )
+        logger.info(
+            "[%s] 最终 Telegram 富文本（未压缩、未截断；长度=%s）：\n%s",
+            chat_id,
+            len(final_html),
+            final_html,
+        )
+        logger.debug("最终清洗后输出（未截断）：\n%s", cleaned_content)
         return cleaned_content, "", new_msgs, usage
 
     except asyncio.CancelledError:
