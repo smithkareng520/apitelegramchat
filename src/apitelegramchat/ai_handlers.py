@@ -147,7 +147,7 @@ async def build_system_prompt(
 </ul>
 
 <h3>字符转义规则</h3>
-<p>本提示词中出现的所有尖括号标签（如上文表格里的 <code><b></code>、<code><img src="URL"/></code> 等）均为你应直接输出的字面 HTML 标签，<b>不要</b>把它们当成需要保留转义形式的文本。工具、媒体和普通链接中的 URL 必须原样输出；尤其是 URL 查询参数分隔符 <code>&</code> 必须保持为原始字符，不得转换成实体或作任何其他处理。</p>
+<p>本提示词中出现的所有尖括号标签（如上文表格里的 <code><b></code>、<code><img src="URL"/></code> 等）均为你应直接输出的字面 HTML 标签，<b>不要</b>把它们当成需要保留转义形式的文本。工具、媒体和普通链接中的 URL 必须逐字符原样输出；不得在裸 <code>&</code> 与字面 <code>&amp;</code> 之间转换、解码或规范化。若工具、用户或上文给出的 URL 包含字面 <code>&amp;</code>，必须在 <code>href</code>/<code>src</code> 中原样保留；若包含裸 <code>&</code>，也必须原样保留。</p>
 
 <h3>超长输出的结构化收尾规则</h3>
 <p>回答可能很长时，应主动将内容组织为多个独立、完整的兄弟块。每个 <code><details></code>、<code><table></code>、<code><ul></code>、<code><ol></code>、<code><pre></code>、<code><blockquote></code>、<code><figure></code> 或其他块级元素都必须在开始后的合理篇幅内闭合，再开始下一个块。表格请按主题拆成多张表，长列表请拆成多个列表，长代码请拆成多个独立代码块。不要把一个结构块持续扩展到极长；系统仅会在完整块结束后安全地分段并继续输出。</p>
