@@ -872,7 +872,7 @@ async def update_role_list(chat_id: int, message_id: int, role_list: list, curre
     keyboard = {"inline_keyboard": [[{"text": t, "callback_data": r}] for t, r in zip(formatted, role_list)]}
     payload = {
         "chat_id": chat_id, "message_id": message_id,
-        "rich_message": {"content": "选择角色设定 (再次点击取消):", "markdown": "选择角色设定 (再次点击取消):"},
+        "rich_message": {"markdown": "选择角色设定 (再次点击取消):", "skip_entity_detection": True},
         "reply_markup": json.dumps(keyboard),
     }
     async with aiohttp.ClientSession() as s:

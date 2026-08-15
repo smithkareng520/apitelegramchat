@@ -110,6 +110,19 @@ def escape_html(text: str) -> str:
     return text
 
 
+def _rich_message_html_payload(html_content: str) -> dict:
+    """构造符合 InputRichMessage 规范的 HTML 富消息。
+
+    HTML 富消息必须只提供 ``html``、``markdown``、``blocks`` 三者之一。
+    ``content`` 不是 InputRichMessage 字段；同时关闭自动实体识别，避免服务端
+    再次从已显式标记的 <a href="..."> 中提取 URL 并改写查询参数。
+    """
+    return {
+        "html": html_content,
+        "skip_entity_detection": True,
+    }
+
+
 async def send_message(chat_id: int, text: str) -> None:
     await send_rich_html_message(chat_id, f"<p>{text}</p>")
 
@@ -333,10 +346,7 @@ async def _reassert_active_draft_content(chat_id: int, draft_id: int) -> None:
         payload = {
             "chat_id": chat_id,
             "draft_id": draft_id,
-            "rich_message": {
-                "content": html_content,
-                "html": html_content,
-            },
+            "rich_message": _rich_message_html_payload(html_content),
         }
         # reassert 只是视觉保活，失败可由下一次真实 flush 恢复；不应占用草稿锁过久。
         timeout = aiohttp.ClientTimeout(total=4, connect=2)
@@ -436,10 +446,7 @@ async def send_rich_message_draft_unlocked(
     payload = {
         "chat_id": chat_id,
         "draft_id": draft_id_int,
-        "rich_message": {
-            "content": html_content,
-            "html": html_content,
-        },
+        "rich_message": _rich_message_html_payload(html_content),
     }
     if message_thread_id:
         payload["message_thread_id"] = message_thread_id
@@ -518,10 +525,7 @@ async def send_rich_message_draft(
         payload = {
             "chat_id": chat_id,
             "draft_id": draft_id_int,
-            "rich_message": {
-                "content": html_content,
-                "html": html_content,
-            },
+            "rich_message": _rich_message_html_payload(html_content),
         }
         if message_thread_id:
             payload["message_thread_id"] = message_thread_id
@@ -677,10 +681,7 @@ async def send_rich_html_message(
 
     payload = {
         "chat_id": chat_id,
-        "rich_message": {
-            "content": html_content,
-            "html": html_content,
-        },
+        "rich_message": _rich_message_html_payload(html_content),
         "disable_notification": False,
         "protect_content": False,
     }
@@ -721,10 +722,7 @@ async def send_rich_html_message(
                     if content_required and fallback_html and fallback_html != html_content:
                         fallback_payload = {
                             **payload,
-                            "rich_message": {
-                                "content": fallback_html,
-                                "html": fallback_html,
-                            },
+                            "rich_message": _rich_message_html_payload(fallback_html),
                         }
                         logger.warning(
                             "sendRichHtmlMessage received RICH_MESSAGE_CONTENT_REQUIRED; "
