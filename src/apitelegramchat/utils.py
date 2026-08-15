@@ -110,39 +110,10 @@ def escape_html(text: str) -> str:
     return text
 
 
-_URL_ATTRIBUTE_RE = re.compile(
-    r"(?P<prefix>\b(?:href|src)\s*=\s*)(?P<quote>[\"'])(?P<value>.*?)(?P=quote)",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _preserve_literal_amp_entities_in_url_attributes(html_content: str) -> str:
-    """使 href/src 中 AI 明确写出的字面 ``&amp;`` 经 HTML 解析后仍为 ``&amp;``。
-
-    Telegram 会把 HTML 属性中的 ``&amp;`` 按实体解码为 ``&``。本项目的约定是：
-    AI 在 ``href`` / ``src`` 中写出的 ``&amp;`` 表示 URL 里应存在字面量
-    ``&amp;``，因此在真正发送前仅对该实体额外编码一次为 ``&amp;amp;``。
-    裸 ``&`` 不匹配也不改写，仍作为裸查询参数分隔符发送。普通正文和标签文本
-    不在此函数的处理范围内。
-    """
-    if not html_content or "&amp;" not in html_content:
-        return html_content
-
-    def _replace_attribute(match: re.Match) -> str:
-        value = match.group("value")
-        if "&amp;" not in value:
-            return match.group(0)
-        protected_value = value.replace("&amp;", "&amp;amp;")
-        return f'{match.group("prefix")}{match.group("quote")}{protected_value}{match.group("quote")}'
-
-    return _URL_ATTRIBUTE_RE.sub(_replace_attribute, html_content)
-
-
 def _rich_message_html_payload(html_content: str) -> dict:
-    """构造符合 InputRichMessage 规范的 HTML 富消息。"""
-    prepared_html = _preserve_literal_amp_entities_in_url_attributes(html_content)
+    """构造符合 InputRichMessage 规范的 HTML 富消息，不改写调用方 HTML。"""
     return {
-        "html": prepared_html,
+        "html": html_content,
         "skip_entity_detection": True,
     }
 
@@ -709,13 +680,13 @@ async def send_rich_html_message(
         "disable_notification": False,
         "protect_content": False,
     }
-    # 记录实际 HTTP payload 中的完整 HTML，包含仅作用于 href/src 的字面 &amp; 保护。
-    prepared_html_content = payload["rich_message"]["html"]
+    # 记录实际 HTTP payload 中的完整 HTML；该内容与上方原始 HTML 一致（仅去首尾空白）。
+    payload_html_content = payload["rich_message"]["html"]
     logger.info(
         "[%s] Telegram sendRichMessage 实际 payload HTML（未截断；长度=%s）：\n%s",
         chat_id,
-        len(prepared_html_content),
-        prepared_html_content,
+        len(payload_html_content),
+        payload_html_content,
     )
     if reply_parameters:
         payload["reply_parameters"] = reply_parameters
