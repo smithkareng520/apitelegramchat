@@ -384,13 +384,21 @@ SUPPORTED_MODELS["ZhipuAI/GLM-5.2"] = make_model_config(
 )
 
 # ---------- Gemini 系列 ----------
-SUPPORTED_MODELS["gemini-3.6-flash"] = make_model_config(
-    model_id="gemini-3.6-flash",
+SUPPORTED_MODELS["gemini-3.7-flash"] = make_model_config(
+    model_id="gemini-3.7-flash",
     provider="gemini",
-    name="Gemini 3.6 Flash",
+    name="Gemini 3.7 Flash",
     vision=True,
     max_context=1000000,
-    max_output_tokens=65535,
+    max_output_tokens=64000,
+)
+SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
+    model_id="gemini-3.5-flash-lite",
+    provider="gemini",
+    name="Gemini 3.5 Flash-Lite",
+    vision=True,
+    max_context=1000000,
+    max_output_tokens=64000,
 )
 # ---------- GLM 系列 ----------
 # (Removed duplicate google/gemma-4-31b-it:free entry that overwrote the earlier one)
