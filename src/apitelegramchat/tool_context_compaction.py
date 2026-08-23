@@ -29,8 +29,8 @@ _POINTER_PREFIX = "Tool result archived at "
 class ToolCompactionStats:
     """Counts produced by one idempotent history compaction pass."""
 
-    eligible_rounds: int = 0
-    compacted_rounds: int = 0
+    eligible_calls: int = 0
+    compacted_calls_count: int = 0
     compacted_calls: int = 0
     archived_bytes: int = 0
 
@@ -149,7 +149,7 @@ def _eligible_calls(history: list[dict[str, Any]]) -> list[tuple[int, dict[str, 
     return calls
 
 
-async def compact_older_tool_rounds(
+async def compact_older_tool_calls(
     chat_id: int,
     history: list[dict[str, Any]],
     *,
@@ -158,7 +158,7 @@ async def compact_older_tool_rounds(
     """Archive a selected prefix of eligible tool-call rounds.
 
     With the default, the function archives the older half of still-unarchived
-    target rounds.  Callers may provide ``rounds_to_compact`` for a later
+    target tool calls.  Callers may provide ``calls_to_compact`` for a later
     compaction pass; this makes it possible to compact half of the remaining
     rounds without revisiting already archived payloads.  Full payloads are
     written before the in-memory history is changed, so an archive write failure
@@ -170,7 +170,7 @@ async def compact_older_tool_rounds(
     else:
         compact_call_count = min(len(calls), max(0, int(calls_to_compact)))
     if compact_call_count == 0:
-        return ToolCompactionStats(eligible_rounds=len(calls))
+        return ToolCompactionStats(eligible_calls=len(calls))
 
     await _ensure_runtime_workspace(chat_id)
     workspace_lock = await _get_workspace_lock(chat_id)
@@ -204,16 +204,16 @@ async def compact_older_tool_rounds(
                 archived_bytes += len(payload)
 
     stats = ToolCompactionStats(
-        eligible_rounds=len(calls),
-        compacted_rounds=0,
+        eligible_calls=len(calls),
+        compacted_calls_count=compacted_calls,
         compacted_calls=compacted_calls,
         archived_bytes=archived_bytes,
     )
     logger.info(
-        "Tool context compacted: chat=%s eligible_rounds=%s compacted_rounds=%s compacted_calls=%s archived_bytes=%s",
+        "Tool context compacted: chat=%s eligible_calls=%s compacted_calls_count=%s compacted_calls=%s archived_bytes=%s",
         chat_id,
-        stats.eligible_rounds,
-        stats.compacted_rounds,
+        stats.eligible_calls,
+        stats.compacted_calls_count,
         stats.compacted_calls,
         stats.archived_bytes,
     )

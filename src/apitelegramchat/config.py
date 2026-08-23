@@ -241,7 +241,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "max_output_tokens": 8192,
-        "max_context": 64000,
+        "max_context": 128000,
     },
     "glm": {
         "vision": False,
@@ -253,7 +253,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "max_output_tokens": 8192,
-        "max_context": 64000,
+        "max_context": 128000,
     },
     "agnes": {
         "vision": False,
@@ -266,7 +266,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "max_output_tokens": 8192,
-        "max_context": 64000,
+        "max_context": 128000,
     },
 }
 

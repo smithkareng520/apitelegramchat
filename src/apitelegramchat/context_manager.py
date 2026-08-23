@@ -38,16 +38,11 @@ def _is_supported(message: object) -> bool:
 
 def select_request_context(
     history: list[dict[str, Any]],
-    *,
-    max_messages: int = DEFAULT_MAX_MESSAGES,
-    max_chars: int = DEFAULT_MAX_CHARS,
 ) -> ContextSnapshot:
-    """Return the newest bounded history, without dangling tool messages.
+    """Return the complete valid history without artificial size/message caps.
 
-    Selection is performed before any multimodal work.  The newest item is
-    always retained when valid; older entries are included only while both
-    budgets permit.  A leading tool result is discarded because its matching
-    assistant tool-call is outside the selected window.
+    A leading tool result is discarded because its matching assistant tool-call
+    is outside the selected window.
     """
     selected_reversed: list[dict[str, Any]] = []
     used = 0
@@ -55,10 +50,6 @@ def select_request_context(
         if not _is_supported(message):
             continue
         size = _message_size(message)
-        if selected_reversed and max_messages is not None and len(selected_reversed) >= max_messages:
-            break
-        if selected_reversed and max_chars is not None and used + size > max_chars:
-            break
         selected_reversed.append(message.copy())
         used += size
 

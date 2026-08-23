@@ -67,7 +67,7 @@ from apitelegramchat.ask_user_tool import (
 from apitelegramchat.file_handlers import download_file
 from apitelegramchat.workspace_utils import _get_workspace_lock, init_workspace
 from apitelegramchat.context_manager import select_request_context
-from apitelegramchat.tool_context_compaction import compact_older_tool_rounds
+from apitelegramchat.tool_context_compaction import compact_older_tool_calls
 
 app = Quart(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
@@ -397,8 +397,8 @@ def _drop_oldest_non_system_block(history: list[dict]) -> bool:
 async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool:
     """Apply two reversible compaction passes, then structural trimming if needed.
 
-    The first pass archives the older half of eligible target-tool rounds.  If
-    still over budget, the second archives half of the remaining complete rounds
+    The first pass archives the older half of eligible target-tool calls.  If
+    still over budget, the second archives half of the remaining complete tool calls
     (about 75% cumulatively for even-sized sets).  Only if both passes fail does
     the final fallback remove the oldest non-system conversation blocks.
     """
@@ -417,7 +417,7 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
         if request_estimate + new_input_est <= safe_limit:
             return True
 
-        first_pass = await compact_older_tool_rounds(chat_id, history)
+        first_pass = await compact_older_tool_calls(chat_id, history)
         _, request_estimate = _estimate_request_snapshot(history)
         if first_pass.compacted_calls:
             logger.info(
@@ -430,12 +430,12 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
         if request_estimate + new_input_est <= safe_limit:
             return True
 
-        remaining_rounds = max(0, first_pass.eligible_rounds - first_pass.compacted_rounds)
-        second_pass_count = max(1, remaining_rounds // 2) if remaining_rounds else 0
-        second_pass = await compact_older_tool_rounds(
+        remaining_calls = max(0, first_pass.eligible_calls - first_pass.compacted_calls_count)
+        second_pass_count = max(1, remaining_calls // 2) if remaining_calls else 0
+        second_pass = await compact_older_tool_calls(
             chat_id,
             history,
-            rounds_to_compact=second_pass_count,
+            calls_to_compact=second_pass_count,
         )
         _, request_estimate = _estimate_request_snapshot(history)
         if second_pass.compacted_calls:
@@ -507,7 +507,7 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict, new_m
             ledger = ctx.setdefault("token_ledger", [])
             ledger.append({"input_tokens": t_input, "output_tokens": t_output})
         if len(history) > MAX_HISTORY_MESSAGES:
-            stats = await compact_older_tool_rounds(chat_id, history)
+            stats = await compact_older_tool_calls(chat_id, history)
             if stats.compacted_calls:
                 logger.info(
                     "History-size tool compaction: chat=%s calls=%s archived_bytes=%s",
