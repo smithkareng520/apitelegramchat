@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from typing import Any
 
 
-DEFAULT_MAX_MESSAGES = 32
-DEFAULT_MAX_CHARS = 48_000
+DEFAULT_MAX_MESSAGES = None
+DEFAULT_MAX_CHARS = None
 
 
 @dataclass(frozen=True)
@@ -55,9 +55,9 @@ def select_request_context(
         if not _is_supported(message):
             continue
         size = _message_size(message)
-        if selected_reversed and (
-            len(selected_reversed) >= max_messages or used + size > max_chars
-        ):
+        if selected_reversed and max_messages is not None and len(selected_reversed) >= max_messages:
+            break
+        if selected_reversed and max_chars is not None and used + size > max_chars:
             break
         selected_reversed.append(message.copy())
         used += size

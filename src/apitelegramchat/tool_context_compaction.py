@@ -122,8 +122,8 @@ def _archive_payload(
     return (json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n").encode("utf-8")
 
 
-def _eligible_rounds(history: list[dict[str, Any]]) -> list[tuple[int, list[tuple[dict[str, Any], dict[str, Any]]]]]:
-    """Return unarchived target tool-call/result pairs, grouped by assistant round."""
+def _eligible_calls(history: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any], dict[str, Any]]]:
+    """Return unarchived target tool-call/result pairs in chronological order."""
     results_by_id: dict[str, dict[str, Any]] = {}
     for message in history:
         if message.get("role") != "tool":
@@ -132,32 +132,28 @@ def _eligible_rounds(history: list[dict[str, Any]]) -> list[tuple[int, list[tupl
         if isinstance(call_id, str) and call_id and not _is_archived_pointer(message.get("content")):
             results_by_id[call_id] = message
 
-    rounds: list[tuple[int, list[tuple[dict[str, Any], dict[str, Any]]]]] = []
+    calls: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
     for index, message in enumerate(history):
         if message.get("role") != "assistant":
             continue
-        calls = message.get("tool_calls")
-        if not isinstance(calls, list):
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
             continue
-        pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
-        for tool_call in calls:
+        for tool_call in tool_calls:
             if not isinstance(tool_call, dict):
                 continue
             name = _tool_name(tool_call)
-            call_id = _tool_call_id(tool_call)
-            result = results_by_id.get(call_id)
+            result = results_by_id.get(_tool_call_id(tool_call))
             if name in TARGET_TOOLS and result is not None:
-                pairs.append((tool_call, result))
-        if pairs:
-            rounds.append((index, pairs))
-    return rounds
+                calls.append((index, tool_call, result))
+    return calls
 
 
 async def compact_older_tool_rounds(
     chat_id: int,
     history: list[dict[str, Any]],
     *,
-    rounds_to_compact: int | None = None,
+    calls_to_compact: int | None = None,
 ) -> ToolCompactionStats:
     """Archive a selected prefix of eligible tool-call rounds.
 
@@ -168,13 +164,13 @@ async def compact_older_tool_rounds(
     written before the in-memory history is changed, so an archive write failure
     leaves the conversation untouched for that call.
     """
-    rounds = _eligible_rounds(history)
-    if rounds_to_compact is None:
-        compact_round_count = len(rounds) // 2
+    calls = _eligible_calls(history)
+    if calls_to_compact is None:
+        compact_call_count = len(calls) // 2
     else:
-        compact_round_count = min(len(rounds), max(0, int(rounds_to_compact)))
-    if compact_round_count == 0:
-        return ToolCompactionStats(eligible_rounds=len(rounds))
+        compact_call_count = min(len(calls), max(0, int(calls_to_compact)))
+    if compact_call_count == 0:
+        return ToolCompactionStats(eligible_rounds=len(calls))
 
     await _ensure_runtime_workspace(chat_id)
     workspace_lock = await _get_workspace_lock(chat_id)
@@ -183,8 +179,7 @@ async def compact_older_tool_rounds(
 
     async with workspace_lock:
         workspace = workspace_workdir(chat_id)
-        for round_index, pairs in rounds[:compact_round_count]:
-            for tool_call, tool_result in pairs:
+        for round_index, tool_call, tool_result in calls[:compact_call_count]:
                 name = _tool_name(tool_call)
                 call_id = _tool_call_id(tool_call)
                 relative_path = _archive_relative_path(round_index, call_id)
@@ -209,8 +204,8 @@ async def compact_older_tool_rounds(
                 archived_bytes += len(payload)
 
     stats = ToolCompactionStats(
-        eligible_rounds=len(rounds),
-        compacted_rounds=compact_round_count,
+        eligible_rounds=len(calls),
+        compacted_rounds=0,
         compacted_calls=compacted_calls,
         archived_bytes=archived_bytes,
     )
