@@ -1225,12 +1225,7 @@ async def _search_via_mcp(
 
 
 def _parse_serper_mcp_result(raw_text: str, num_results: int | None = None) -> list[dict]:
-    """解析 Serper MCP 返回结果。
-
-    Serper 除 organic 外还可能返回 knowledgeGraph、peopleAlsoAsk、
-    relatedSearches。当前搜索结果契约仍以 organic 为主，但保留这些
-    字段用于后续 Agent 增强（例如问题扩展、搜索改写）。
-    """
+    """将 Serper ``organic`` JSON 转换为统一的标题、链接和摘要字段。"""
     if not raw_text:
         return []
 
@@ -1240,24 +1235,9 @@ def _parse_serper_mcp_result(raw_text: str, num_results: int | None = None) -> l
         logger.warning("Serper MCP 返回了无法解析的非 JSON 内容")
         return []
 
-    if not isinstance(data, dict):
-        return []
-
-    organic = data.get("organic")
+    organic = data.get("organic") if isinstance(data, dict) else None
     if not isinstance(organic, list):
         return []
-
-    # 记录 Serper 的扩展结果能力，方便后续接入 Agent 上下文。
-    people_also_ask = data.get("peopleAlsoAsk") or []
-    related_searches = data.get("relatedSearches") or []
-    knowledge_graph = data.get("knowledgeGraph") or {}
-    if people_also_ask or related_searches or knowledge_graph:
-        logger.debug(
-            "Serper extras: knowledgeGraph=%s peopleAlsoAsk=%s relatedSearches=%s",
-            bool(knowledge_graph),
-            len(people_also_ask) if isinstance(people_also_ask, list) else 0,
-            len(related_searches) if isinstance(related_searches, list) else 0,
-        )
 
     items: list[dict] = []
     for result in organic:

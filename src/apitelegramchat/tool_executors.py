@@ -1500,15 +1500,18 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                     if current_title and current_link:
                         if current_link.startswith("http"):
                             domain = current_link.split('/')[2] if '//' in current_link else current_link
-                            items_html += f"<li><a href=\"{current_link}\">{current_title}</a> <code>{domain}</code></li>"
+                            items_html += (
+                                f"<li><b><a href=\"{current_link}\">{escape_text(current_title)}</a></b> "
+                                f"<code>{escape_text(domain)}</code></li>"
+                            )
                         else:
-                            items_html += f"<li>{current_title} <code>{current_link}</code></li>"
+                            items_html += f"<li><b>{escape_text(current_title)}</b> <code>{escape_text(current_link)}</code></li>"
                         current_title = ""
                         current_link = ""
             if items_html:
                 details_html = f"<ol>{items_html}</ol>"
             else:
-                details_html = escape_text(result_str[:60000])
+                details_html = escape_text(result_str)
         else:
             details_html = escape_text(result_str[:60000])
         return summary, details_html
