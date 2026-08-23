@@ -475,26 +475,64 @@ def _track_task(coro):
     return t
 
 
+def _mark_last_content_block_cacheable(msg: dict) -> bool:
+    """
+    在 OpenAI 兼容协议（OpenRouter 等网关）下，cache_control 必须挂在
+    content 数组里"某一个具体 content block"上，而不是消息对象本身；
+    网关会忽略挂在消息顶层的 cache_control 字段，导致标记静默失效。
+
+    若 content 是字符串，先转成单元素的 text block 数组再打标记；
+    若已经是数组（多模态消息），直接给最后一个 block 打标记。
+    返回是否成功打上标记。
+    """
+    content = msg.get("content")
+    if content is None:
+        return False
+    if isinstance(content, str):
+        if not content:
+            return False
+        msg["content"] = [
+            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+        ]
+        return True
+    if isinstance(content, list) and content:
+        last_block = content[-1]
+        if isinstance(last_block, dict):
+            last_block["cache_control"] = {"type": "ephemeral"}
+            return True
+    return False
+
+
 def _apply_cache_control(messages: list) -> None:
     """
     为系统消息和最后一条用户/助手消息添加 cache_control 标记。
     固定最多添加两个标记，无需 token 计数。
+
+    注意：cache_control 必须打在 content block 上（见
+    _mark_last_content_block_cacheable），打在消息顶层对 OpenRouter/
+    OpenAI 兼容网关无效，会被静默忽略。
     """
     if not messages:
         return
     # 为系统消息添加标记
+    markers_added = 0
     if messages[0].get("role") == "system":
-        messages[0]["cache_control"] = {"type": "ephemeral"}
-        markers_added = 1
-    else:
-        markers_added = 0
+        if _mark_last_content_block_cacheable(messages[0]):
+            markers_added = 1
     # 如果还有余量，从后往前找一条 user/assistant 消息添加标记
     if markers_added < 2 and len(messages) >= 4:
         for i in range(len(messages) - 2, 0, -1):
             msg = messages[i]
             role = msg.get("role")
-            if role in ("user", "assistant") and "cache_control" not in msg:
-                msg["cache_control"] = {"type": "ephemeral"}
-                break
+            if role in ("user", "assistant"):
+                content = msg.get("content")
+                already_marked = (
+                    isinstance(content, list)
+                    and content
+                    and isinstance(content[-1], dict)
+                    and "cache_control" in content[-1]
+                )
+                if not already_marked and _mark_last_content_block_cacheable(msg):
+                    break
 
 
