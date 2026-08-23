@@ -1146,6 +1146,9 @@ class MCPSearchTransientError(Exception):
     """外部 MCP 搜索服务临时不可用或未返回 organic 结果，可重试。"""
 
 
+SERPER_PAGE_SIZE = 10
+
+
 @retry_async(
     max_retries=2,
     delay=1.5,
@@ -1157,42 +1160,65 @@ async def _search_via_mcp(
     num_results: int | None,
     offset: int | None = 0,
 ) -> list[dict] | None:
-    """通过 Serper MCP 的 google_search 搜索并规范化 organic 结果。
+    """通过 Serper MCP 搜索并自动分页聚合。
 
-    Serper 工具要求 ``q``、``gl``、``hl``，并返回含 ``organic`` 数组的 JSON，
-    例如 ``{"organic": [{"title", "link", "snippet", "position"}]}``。
-    ``offset`` 仍沿用本项目从 0 开始的契约，内部按实际页大小换算为 Serper 的
-    从 1 开始 ``page`` 参数，以保持调用方分页行为不变。
+    Serper/Google organic 单页实际最多约 10 条。这里固定每页 10 条，
+    当调用方需要超过 10 条时并发请求多个 page，然后合并结果。
     """
     query = (query or "").strip()
     if not query:
         return None
 
-    requested = max(1, min(int(num_results), 50)) if num_results is not None else None
-    page_size = requested or 10
+    requested = max(1, min(int(num_results), 50)) if num_results is not None else 10
     normalized_offset = max(int(offset or 0), 0)
-    arguments: dict[str, Any] = {
-        "q": query,
-        "gl": "cn",
-        "hl": "zh-cn",
-        "page": (normalized_offset // page_size) + 1,
-    }
-    if requested is not None:
-        arguments["num"] = requested
 
-    try:
-        raw_text = await call_mcp_tool(
-            "serper-search",
-            "google_search",
-            arguments,
+    # MCP/Serper 的 page 从 1 开始，固定按照真实单页大小计算。
+    first_page = normalized_offset // SERPER_PAGE_SIZE + 1
+    last_needed_index = normalized_offset + requested - 1
+    last_page = last_needed_index // SERPER_PAGE_SIZE + 1
+
+    pages = range(first_page, last_page + 1)
+
+    async def fetch_page(page: int) -> list[dict]:
+        arguments: dict[str, Any] = {
+            "q": query,
+            "gl": "cn",
+            "hl": "zh-cn",
+            "page": page,
+            "num": SERPER_PAGE_SIZE,
+        }
+
+        try:
+            raw_text = await call_mcp_tool(
+                "serper-search",
+                "google_search",
+                arguments,
+            )
+        except MCPToolError as exc:
+            logger.warning("Serper MCP page=%s 搜索失败: %s", page, exc)
+            raise
+
+        return _parse_serper_mcp_result(raw_text, None)
+
+    page_results = await asyncio.gather(*(fetch_page(p) for p in pages))
+
+    items: list[dict] = []
+    for page_items in page_results:
+        items.extend(page_items)
+
+    # 去掉前面的 offset，再限制最终数量。
+    start = normalized_offset % SERPER_PAGE_SIZE
+    result = items[start:start + requested]
+
+    if result:
+        logger.info(
+            "Serper MCP query=%s pages=%s returned=%s requested=%s",
+            query,
+            list(pages),
+            len(result),
+            requested,
         )
-    except MCPToolError as exc:
-        logger.warning("Serper MCP 搜索调用失败: %s", exc)
-        raise
-
-    items = _parse_serper_mcp_result(raw_text, requested)
-    if items:
-        return items
+        return result
 
     logger.info("Serper MCP 搜索服务未返回 organic 结果")
     raise MCPSearchTransientError("Serper MCP search returned no organic results")
