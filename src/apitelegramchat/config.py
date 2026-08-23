@@ -27,9 +27,15 @@ AGNES_API_KEY = os.getenv("AGNES_API_KEY", "")
 # ---------- 高德地图 MCP 服务（@amap/amap-maps on ModelScope）----------
 # 通过 streamable_http 调用，使用 Bearer token 鉴权。
 # 替代了原先的 amap_integration.py 直接调用高德 Web 服务 API 的方式。
-# 未配置 GAODE_MCP_TOKEN 时该 MCP 服务不可用（mcp_client.py 会跳过注册）。
+# 未配置 GAODE_MCP_TOKEN 或 GAODE_MCP_URL 时该 MCP 服务不可用（mcp_client.py 会跳过注册）。
+#
+# 注意：GAODE_MCP_URL 不设默认值——之前的默认值硬编码了一个具体的
+# ModelScope MCP 实例路径（.../3331c36972ff42/mcp），这类路径段通常绑定
+# 到某个具体账号的私有实例。一旦部署方忘记覆盖该环境变量，就会在不知情
+# 的情况下把请求发往别人的实例（可能是私有、限流或按量计费的），且大概率
+# 连不通或返回权限错误。与下方 SERPER_MCP_URL 保持一致，改为必须显式配置。
 GAODE_MCP_ENABLED = os.getenv("GAODE_MCP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-GAODE_MCP_URL = (os.getenv("GAODE_MCP_URL") or "https://mcp.api-inference.modelscope.net/3331c36972ff42/mcp").strip()
+GAODE_MCP_URL = (os.getenv("GAODE_MCP_URL") or "").strip()
 GAODE_MCP_TOKEN = (os.getenv("GAODE_MCP_TOKEN") or "").strip()
 
 # ---------- 网页搜索：Serper MCP 服务 ----------
