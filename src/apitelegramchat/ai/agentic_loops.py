@@ -52,13 +52,6 @@ from apitelegramchat.ai.tool_summary import (
     _tool_limit_summary,
 )
 from apitelegramchat.ai.tool_call_loop import _run_tool_calls_and_append
-from apitelegramchat.ai.gemini_native_protocol import (
-    _GEMINI_THOUGHT_SIGNATURES_KEY,
-    build_assistant_msg_from_gemini_state,
-    merge_gemini_part_into_state,
-    openai_messages_to_gemini_contents,
-    openai_tools_to_gemini_function_declarations,
-)
 
 logger = get_logger(__name__)
 
@@ -486,26 +479,13 @@ async def _agentic_loop_openai_compat(
     return final_content, final_usage, new_history_entries
 
 
-async def _agentic_loop_gemini_native(
+async def _agentic_loop_gemini_openai_compat(
         current_model: str,
         messages: list,
         builder: "RichMessageBuilder",
         tools: list = None,
         supports_tools: bool = True,
 ) -> tuple[str | None, object | None, list]:
-    """Gemini 原生 :streamGenerateContent?alt=sse 流式循环。
-
-    与 OpenAI 兼容端点不同，原生端点保留完整的 parts/thought/thoughtSignature
-    结构，因此可以做到：
-      1. 思考增量推送（reasoning_content 逐 token 显示，不等整段返回）；
-      2. thought_signature 链跨轮保存（避免多轮推理质量退化）；
-      3. thought 布尔位（区分"思考"与"可见文本"）。
-
-    loop_messages 在内部仍以 OpenAI 兼容格式维护，便于与 _run_tool_calls_and_append
-    共享。每轮请求前通过 openai_messages_to_gemini_contents 转换；流式响应通过
-    merge_gemini_part_into_state 累积到 state，最后用 build_assistant_msg_from_gemini_state
-    构造下一轮请求所需的 assistant_msg。
-    """
     def _clean_tools_for_gemini(tools: list) -> list:
         if not tools:
             return tools
@@ -522,22 +502,15 @@ async def _agentic_loop_gemini_native(
         return cleaned
 
     cleaned_tools = _clean_tools_for_gemini(tools) if tools else None
-    gemini_tools = openai_tools_to_gemini_function_declarations(cleaned_tools) if cleaned_tools else None
 
     model_info = SUPPORTED_MODELS.get(current_model)
     supports_sampling = model_info.supports_sampling if model_info else True
     max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
 
-    # 原生端点 URL；alt=sse 让响应变成标准 Server-Sent Events 流。
-    # 鉴权仍是同一个 GEMINI_API_KEY 的 Bearer token，不需要任何新密钥。
-    GEMINI_NATIVE_URL = (
-        f"https://generativelanguage.googleapis.com/v1beta/"
-        f"models/{current_model}:streamGenerateContent?alt=sse"
-    )
+    GEMINI_OPENAI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
     req_headers = {
         "Authorization": f"Bearer {GEMINI_API_KEY}",
         "Content-Type": "application/json",
-        "Accept": "text/event-stream",
     }
 
     loop_messages = list(messages)
@@ -547,54 +520,23 @@ async def _agentic_loop_gemini_native(
     new_history_entries: list = []
 
     for _round in range(MAX_TOOL_CALLS):
-        # 每轮把 OpenAI 兼容 loop_messages 转成原生 contents。转换是幂等的，
-        # 上一轮写入的 _gemini_thought_signatures 会自动还原成 thoughtSignature。
-        system_instruction, contents = openai_messages_to_gemini_contents(loop_messages)
         payload: dict = {
-            "contents": contents,
-            "generationConfig": {
-                "maxOutputTokens": max_tokens,
-            },
-            # 让 Gemini 把思考过程作为独立 thought part 返回，而非塞进 content。
-            "thinkingConfig": {"includeThoughts": True},
+            "model": current_model,
+            "messages": loop_messages,
+            "max_tokens": max_tokens,
+            "stream": False,
         }
-        if system_instruction:
-            payload["systemInstruction"] = system_instruction
         if supports_sampling:
-            payload["generationConfig"]["temperature"] = 0.6
-            payload["generationConfig"]["topP"] = 0.9
-        if supports_tools and gemini_tools:
-            payload["tools"] = gemini_tools
-            payload["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
+            payload["temperature"] = 0.6
+            payload["top_p"] = 0.9
+        if supports_tools and cleaned_tools:
+            payload["tools"] = cleaned_tools
+            payload["tool_choice"] = "auto"
 
-        # 流式状态
-        gemini_state = {
-            "reasoning_acc": "",
-            "content_acc": "",
-            "tool_calls": [],
-            "thought_signatures": [],
-            "finish_reason": None,
-            "_round": _round,
-        }
-        current_stream = None  # "reasoning" / "content"
-        round_leading_kind = None  # 与 OpenAI-compat 路径保持一致的语义
-
-        def switch_stream(target: str):
-            nonlocal current_stream
-            if current_stream == target:
-                return
-            builder.end_stream()
-            if target == "reasoning":
-                builder.begin_stream_reasoning()
-            elif target == "content":
-                builder.begin_stream_text()
-            current_stream = target
-
-        received_any = False
         try:
             async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
                 async with session.post(
-                        GEMINI_NATIVE_URL, headers=req_headers, json=payload
+                        GEMINI_OPENAI_URL, headers=req_headers, json=payload
                 ) as resp:
                     if resp.status not in (200, 201):
                         err_text = await resp.text()
@@ -602,190 +544,91 @@ async def _agentic_loop_gemini_native(
                             resp.request_info, resp.history,
                             status=resp.status, message=err_text,
                         )
-                    # 原生 SSE 流：每行 "data: {json}\n\n"，结尾可能没有 [DONE]。
-                    async for raw_line in resp.content:
-                        line = raw_line.decode("utf-8", errors="replace").rstrip("\n").rstrip("\r")
-                        if not line:
-                            continue
-                        if not line.startswith("data:"):
-                            continue
-                        data_str = line[len("data:"):].lstrip()
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            logger.debug("[Gemini/native] 不可解析的 SSE 行: %r", data_str[:200])
-                            continue
-
-                        # 中流错误：把异常透出去，避免静默丢失工具调用配对
-                        err = chunk.get("error")
-                        if err:
-                            raise RuntimeError(f"Gemini native stream error: {err}")
-
-                        received_any = True
-                        if chunk.get("usageMetadata"):
-                            final_usage = chunk["usageMetadata"]
-
-                        # prompt 级阻断（罕见）
-                        pf = chunk.get("promptFeedback") or {}
-                        if pf.get("blockReason"):
-                            final_content = f"（Gemini 拒绝：{pf['blockReason']}）"
-                            new_history_entries.append({"role": "assistant", "content": final_content})
-                            break
-
-                        cands = chunk.get("candidates") or []
-                        if not cands:
-                            continue
-                        cand = cands[0]
-                        if cand.get("finishReason"):
-                            gemini_state["finish_reason"] = cand["finishReason"]
-                        if cand.get("safetyRatings"):
-                            # 不阻断；让用户看到带 safety 标签的内容
-                            pass
-
-                        content = cand.get("content") or {}
-                        parts = content.get("parts") or []
-
-                        # 跟踪本轮是否已声明工具调用，用于工具组合并/新建决策
-                        tool_calls_before = len(gemini_state["tool_calls"])
-
-                        for part in parts:
-                            # 先把 part 合并到 state，再决定怎么喂 builder。
-                            # 注意：functionCall part 不立刻调用 add_tool_item，
-                            # 因为合并完才知道本轮工具总数与 id 顺序；统一在批
-                            # 量处理时再 add_tool_item，避免按 part 顺序错位。
-                            old_tool_count = len(gemini_state["tool_calls"])
-                            merge_gemini_part_into_state(part, gemini_state)
-                            new_tool_count = len(gemini_state["tool_calls"])
-
-                            if part.get("thought") is True:
-                                text = part.get("text") or ""
-                                if text:
-                                    if round_leading_kind is None:
-                                        round_leading_kind = "content"
-                                        if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-                                            builder.finish_group(len(builder._tool_groups) - 1)
-                                            await builder.flush(force=True)
-                                    switch_stream("reasoning")
-                                    builder.append_stream_delta(text)
-                            elif "text" in part:
-                                text = part.get("text") or ""
-                                if text:
-                                    if round_leading_kind is None:
-                                        round_leading_kind = "content"
-                                        if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-                                            builder.finish_group(len(builder._tool_groups) - 1)
-                                            await builder.flush(force=True)
-                                    if round_leading_kind == "tool" and builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-                                        builder.append_to_current_tool_group_text(text)
-                                    else:
-                                        switch_stream("content")
-                                        builder.append_stream_delta(text)
-                            elif "functionCall" in part and new_tool_count > old_tool_count:
-                                # 新出现的工具调用：与 OpenAI-compat 流式路径一致的
-                                # 时机——立刻 add_tool_item + request_flush，不等本轮结束。
-                                if round_leading_kind is None:
-                                    round_leading_kind = "tool"
-                                elif round_leading_kind == "content" and builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-                                    builder.finish_group(len(builder._tool_groups) - 1)
-                                tc = gemini_state["tool_calls"][-1]
-                                tc_id = tc["id"]
-                                tc_name = tc["function"]["name"]
-                                parsed_args = _safe_parse_args(tc["function"]["arguments"])
-                                summary = _generate_initial_tool_summary(tc_name, parsed_args)
-                                action_desc = _generate_action_description(tc_name, parsed_args)
-                                builder.add_tool_item(
-                                    tc_id,
-                                    tc_name,
-                                    summary,
-                                    action_description=action_desc,
-                                    fn_args=parsed_args,
-                                )
-                                builder.request_flush(force=False)
-                            # thoughtSignature 单独 part / executableCode 等已由
-                            # merge_gemini_part_into_state 处理；不需要再喂 builder。
-
+                    data = await resp.json()
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.exception(f"[Gemini/native] round {_round} error: {e}")
+            logger.exception(f"[Gemini/aiohttp] round {_round} error: {e}")
             raise
 
-        builder.end_stream()
-        while builder.blocks and not builder.blocks[-1].strip() and builder.block_types[-1] in ("text", "reasoning"):
-            builder.blocks.pop()
-            builder.block_types.pop()
+        choices = data.get("choices") or []
+        if not choices:
+            final_content = "（Gemini 未返回内容）"
+            new_history_entries.append({"role": "assistant", "content": final_content})
+            break
 
-        if not received_any or (not gemini_state["content_acc"] and not gemini_state["tool_calls"] and not gemini_state["reasoning_acc"]):
-            logger.warning(f"[gemini] 第 {_round + 1} 轮原生流式无有效内容，回退到非流式请求")
-            try:
-                non_stream_url = (
-                    f"https://generativelanguage.googleapis.com/v1beta/"
-                    f"models/{current_model}:generateContent"
+        raw_msg = choices[0].get("message", {})
+        content_acc: str = raw_msg.get("content") or ""
+        final_usage = data.get("usage")
+
+        tool_calls_list: list[dict] = []
+        for tc in (raw_msg.get("tool_calls") or []):
+            tc_entry: dict = {
+                "id": tc.get("id", ""),
+                "type": "function",
+                "function": {
+                    "name": tc.get("function", {}).get("name", ""),
+                    "arguments": tc.get("function", {}).get("arguments", ""),
+                },
+            }
+            # Gemini OpenAI-compat expects the signature to be returned in the
+            # original part structure. The compat format mirrors this via
+            # extra_content.google.thought_signature.
+            thought_signature = tc.get("thought_signature")
+            if thought_signature is None:
+                extra_content = tc.get("extra_content") or {}
+                thought_signature = (
+                    extra_content.get("google", {}).get("thought_signature")
                 )
-                non_stream_payload = dict(payload)
-                non_stream_payload.pop("thinkingConfig", None)
-                non_stream_payload["thinkingConfig"] = {"includeThoughts": True}
-                async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
-                    async with session.post(
-                            non_stream_url, headers=req_headers, json=non_stream_payload
-                    ) as resp:
-                        if resp.status not in (200, 201):
-                            err_text = await resp.text()
-                            raise aiohttp.ClientResponseError(
-                                resp.request_info, resp.history,
-                                status=resp.status, message=err_text,
-                            )
-                        data = await resp.json()
-                cands = data.get("candidates") or []
-                if cands:
-                    parts = (cands[0].get("content") or {}).get("parts") or []
-                    for part in parts:
-                        merge_gemini_part_into_state(part, gemini_state)
-                if data.get("usageMetadata"):
-                    final_usage = data["usageMetadata"]
-            except Exception as e:
-                logger.exception(f"[Gemini/native] 非流式回退失败: {e}")
-                gemini_state["content_acc"] = "请求失败，请稍后重试。"
-
-        tool_calls_list = gemini_state["tool_calls"]
-        content_acc = gemini_state["content_acc"]
-        reasoning_acc = gemini_state["reasoning_acc"]
-        thought_signatures = gemini_state["thought_signatures"]
-
-        try:
-            logger.info(
-                f"[gemini] 第 {_round + 1} 轮原生返回: tool_calls={len(tool_calls_list)}, "
-                f"content_len={len(content_acc.strip())}, reasoning_len={len(reasoning_acc.strip())}, "
-                f"signatures={len(thought_signatures)}, finish={gemini_state['finish_reason']}"
-            )
-        except Exception:
-            logger.exception("[gemini] 记录原生返回日志失败")
-
-        for idx, tc in enumerate(tool_calls_list):
-            if not tc.get("id"):
-                tc["id"] = f"callgemini_{_round}_{idx}_{uuid.uuid4().hex[:8]}"
+            if thought_signature is not None:
+                tc_entry["extra_content"] = {
+                    "google": {
+                        "thought_signature": thought_signature,
+                    }
+                }
+                # Keep the legacy field too for maximum compatibility.
+                tc_entry["thought_signature"] = thought_signature
+            tool_calls_list.append(tc_entry)
         _normalize_tool_call_arguments(tool_calls_list, "gemini", _round + 1)
 
-        if not tool_calls_list and not content_acc.strip():
-            content_acc = "（模型未返回任何内容）"
-            gemini_state["content_acc"] = content_acc
-
-        # 兼容部分 Gemini 模型把 function calling XML 写成普通文本的情况
-        textual_tool_call = _contains_textual_tool_call(content_acc)
+        # Gemini/OpenAI 兼容端也可能把函数调用 XML 放在普通 content 中；在写入
+        # 草稿和历史前先清理，避免最终消息暴露内部调用语法。
+        textual_tool_call = not tool_calls_list and _contains_textual_tool_call(content_acc)
         if textual_tool_call:
-            raw_textual_content = content_acc
             content_acc = _strip_textual_tool_calls(content_acc)
-            gemini_state["content_acc"] = content_acc
-            if not builder.replace_trailing_text(raw_textual_content, content_acc):
-                logger.warning("[gemini] 未能在草稿中定位伪工具调用文本，已阻止其进入最终内容")
 
+        reasoning_acc: str = raw_msg.get("reasoning_content") or ""
         if reasoning_acc:
+            builder.begin_stream_reasoning()
+            builder.append_stream_delta(reasoning_acc)
+            builder.end_stream()
             builder.finalize_reasoning_block(has_tool_calls=bool(tool_calls_list))
+
+        if tool_calls_list and content_acc:
+            # ===== 规范第一部分第4点：文本+工具组合需要新开一个独立的工具折叠块，
+            # 因此要先把上一个尚未总结的工具块（可能来自连续的纯工具轮次）总结掉。=====
+            if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
+                builder.finish_group(len(builder._tool_groups) - 1)
+            builder.start_new_tool_group()
+            builder.append_to_current_tool_group_text(content_acc)
+
+        if not tool_calls_list and content_acc:
+            builder.add_text(content_acc)
+
         await builder.flush()
 
-        assistant_msg = build_assistant_msg_from_gemini_state(gemini_state)
+        assistant_msg: dict = dict(raw_msg)
+        assistant_msg["role"] = "assistant"
+        assistant_msg["content"] = content_acc or None
+        if tool_calls_list:
+            assistant_msg["tool_calls"] = tool_calls_list
+        else:
+            assistant_msg.pop("tool_calls", None)
+        if reasoning_acc:
+            assistant_msg["reasoning_content"] = reasoning_acc
+        elif "reasoning_content" in assistant_msg:
+            assistant_msg.pop("reasoning_content", None)
+
         loop_messages.append(assistant_msg)
         new_history_entries.append(assistant_msg)
 
@@ -793,103 +636,67 @@ async def _agentic_loop_gemini_native(
             final_content = content_acc
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
+            # 无工具调用即为终局响应；统一结束旧草稿，不额外开新草稿。
             await builder.rollover_at_turn_boundary(start_next_draft=False)
             break
         status = await _run_tool_calls_and_append(
             tool_calls_list, loop_messages, new_history_entries,
             tool_call_count_ref, "gemini", builder, chat_id=builder.chat_id
         )
+        # Gemini 工具批次后仍会继续请求模型，因此在函数内创建新草稿。
         await builder.rollover_at_turn_boundary(start_next_draft=True)
 
         if status == "over_limit":
-            synth_system_text = (
-                f"System: Maximum tool calls ({MAX_TOOL_CALLS}) reached for this turn. "
-                "Tool usage is now DISABLED. Please immediately summarize what you have "
-                "successfully done so far, explicitly state what failed or what is left "
-                "to do, and ask the user if they want to continue the operation in the next turn."
-            )
-            synth_messages = loop_messages + [{"role": "user", "content": synth_system_text}]
-            synth_system_instruction, synth_contents = openai_messages_to_gemini_contents(synth_messages)
-            synth_payload: dict = {
-                "contents": synth_contents,
-                "generationConfig": {"maxOutputTokens": max_tokens},
-                "thinkingConfig": {"includeThoughts": True},
+            synth_payload = {
+                k: v for k, v in payload.items() if k not in ("tools", "tool_choice")
             }
-            if synth_system_instruction:
-                synth_payload["systemInstruction"] = synth_system_instruction
+            synth_payload["messages"] = loop_messages + [
+                {"role": "user",
+                 "content": f"System: Maximum tool calls ({MAX_TOOL_CALLS}) reached for this turn. Tool usage is now DISABLED. Please immediately summarize what you have successfully done so far, explicitly state what failed or what is left to do, and ask the user if they want to continue the operation in the next turn."}
+            ]
+            synth_payload["max_tokens"] = max_tokens
             if supports_sampling:
-                synth_payload["generationConfig"]["temperature"] = 0.6
-                synth_payload["generationConfig"]["topP"] = 0.9
+                synth_payload["temperature"] = 0.6
+                synth_payload["top_p"] = 0.9
             try:
-                builder.begin_stream_text()
-                synth_text = ""
                 async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
                     async with session.post(
-                            GEMINI_NATIVE_URL, headers=req_headers, json=synth_payload
+                            GEMINI_OPENAI_URL, headers=req_headers, json=synth_payload
                     ) as resp:
-                        if resp.status not in (200, 201):
-                            raise RuntimeError(await resp.text())
-                        async for raw_line in resp.content:
-                            line = raw_line.decode("utf-8", errors="replace").rstrip("\n").rstrip("\r")
-                            if not line.startswith("data:"):
-                                continue
-                            data_str = line[len("data:"):].lstrip()
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(data_str)
-                            except json.JSONDecodeError:
-                                continue
-                            if chunk.get("error"):
-                                raise RuntimeError(chunk["error"])
-                            if chunk.get("usageMetadata"):
-                                final_usage = chunk["usageMetadata"]
-                            cands = chunk.get("candidates") or []
-                            if not cands:
-                                continue
-                            parts = (cands[0].get("content") or {}).get("parts") or []
-                            for part in parts:
-                                if part.get("thought") is True:
-                                    continue  # 终局总结不再渲染思考块
-                                if "text" in part:
-                                    text = part.get("text") or ""
-                                    if text:
-                                        synth_text += text
-                                        builder.append_stream_delta(text)
-                raw_synth_content = builder.end_stream_text() or synth_text
-                final_content = _strip_textual_tool_calls(raw_synth_content)
-                if final_content != raw_synth_content:
-                    builder.replace_trailing_text(raw_synth_content, final_content)
-                if not final_content:
-                    final_content = _tool_limit_summary()
-                    builder.add_text(final_content)
-            except Exception as synth_err:
-                logger.warning(f"Gemini 原生合成流失败: {synth_err}")
-                try:
-                    builder.end_stream_text()
-                except Exception:
-                    pass
+                        if resp.status == 200:
+                            synth_data = await resp.json()
+                            synth_choices = synth_data.get("choices") or []
+                            if synth_choices:
+                                raw_synth_content = (
+                                    synth_choices[0].get("message", {}).get("content") or ""
+                                )
+                                final_content = _strip_textual_tool_calls(raw_synth_content)
+                                if final_content:
+                                    builder.add_text(final_content)
+            except Exception as e:
+                logger.exception(f"[Gemini] synthesis error: {e}")
+                final_content = ""
+            if not final_content:
                 final_content = _tool_limit_summary()
                 builder.add_text(final_content)
-            new_history_entries.append({"role": "assistant", "content": final_content or ""})
+            new_history_entries.append(
+                {"role": "assistant", "content": final_content or ""}
+            )
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
+            # 工具上限总结后没有后续模型轮次：结束旧草稿，禁止创建空新草稿。
             await builder.rollover_at_turn_boundary(start_next_draft=False)
             break
-
     if final_content is None:
         final_content = _tool_limit_summary()
+
         builder.add_text(final_content)
         new_history_entries.append({"role": "assistant", "content": final_content})
         if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
             builder.finish_group(len(builder._tool_groups) - 1)
+        # 轮次数耗尽后的兜底文本没有后续轮次：结束旧草稿，但不创建新草稿。
         await builder.rollover_at_turn_boundary(start_next_draft=False)
     return final_content, final_usage, new_history_entries
-
-
-# 旧名兼容：保留 _agentic_loop_gemini_openai_compat 作为别名，避免外部引用方
-# （如 ai_handlers 旧 import）出现 AttributeError。新代码应使用新名。
-_agentic_loop_gemini_openai_compat = _agentic_loop_gemini_native
 
 
 async def _agentic_loop_native_image(

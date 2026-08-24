@@ -96,8 +96,7 @@ class ProviderConfig:
     base_url: str
     api_key_env: str
     default_headers: Optional[Dict[str, str]] = None
-    # 是否使用专用循环（如 Gemini 原生 :streamGenerateContent?alt=sse 流式，
-    # 保留 thought_signature 链与思考增量推送）
+    # 是否使用专用循环（如 Gemini 非流式特殊处理）
     use_dedicated_loop: bool = False
     # 是否支持 Prompt Caching（仅部分厂商需要显式标记）
     supports_prompt_cache: bool = False
@@ -158,9 +157,9 @@ PROVIDERS: Dict[str, ProviderConfig] = {
     ),
     "gemini": ProviderConfig(
         name="Gemini",
-        base_url="https://generativelanguage.googleapis.com/v1beta/",  # 原生端点，:streamGenerateContent 由 agentic_loops 直接拼路径
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         api_key_env="GEMINI_API_KEY",
-        use_dedicated_loop=True,      # Gemini 走原生 SSE 流式专用循环
+        use_dedicated_loop=True,      # Gemini 使用非流式专用循环
         supports_prompt_cache=False,  # Gemini 隐式缓存，无需标记
     ),
     "grok": ProviderConfig(

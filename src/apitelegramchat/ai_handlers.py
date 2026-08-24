@@ -54,7 +54,7 @@ from apitelegramchat.ai.attachment_content import (
 )
 from apitelegramchat.ai.rich_message_builder import RichMessageBuilder
 from apitelegramchat.ai.agentic_loops import (
-    _agentic_loop_gemini_native,
+    _agentic_loop_gemini_openai_compat,
     _agentic_loop_native_image,
     _agentic_loop_native_video,
     _agentic_loop_openai_compat,
@@ -675,7 +675,7 @@ async def _call_api(
     use_dedicated_loop = provider_config.use_dedicated_loop if provider_config else False
 
     if use_dedicated_loop:
-        return await _agentic_loop_gemini_native(
+        return await _agentic_loop_gemini_openai_compat(
             current_model, messages, builder,
             tools=tools_to_pass, supports_tools=supports_tools
         )
