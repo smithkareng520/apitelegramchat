@@ -497,8 +497,8 @@ SEARCH_TOOLS = [
                         "description": "简述本次操作目的（≤60字）。示例：搜索2024年诺贝尔奖"
                     },
                     "query": {"type": "string", "description": "搜索关键词"},
-                    "num_results": {"type": "integer", "description": "可选：返回结果数（1-50）；不填写时 Serper 默认返回 10 条", "minimum": 1, "maximum": 50},
-                    "offset": {"type": "integer", "description": "可选：结果偏移量，用于分页，从 0 开始；内部会换算为 Serper 的页码", "minimum": 0}
+                    "num_results": {"type": "integer", "description": "可选：返回结果数（1-50）；不填写时默认返回 10 条", "minimum": 1, "maximum": 50},
+                    "offset": {"type": "integer", "description": "可选：结果偏移量，用于分页，从 0 开始", "minimum": 0}
                 },
                 "required": ["query"]
             },
@@ -580,28 +580,11 @@ SEARCH_TOOLS = [
         "function": {
             "name": "weather",
             "description": (
-                "Get weather conditions and forecasts for a city (data source: wttr.in). "
-                "Returns a JSON object with three blocks.\n"
-                "\n"
-                "current — the most recent station OBSERVATION, not a live reading:\n"
-                "  temp, feels_like, humidity, wind (km/h), wind_gust, wind_dir/wind_deg, pressure (mb), "
-                "visibility (km), cloudcover (%), uvIndex, precip (mm), condition (text), weather_code, and "
-                "obs_time — the LOCAL timestamp at which the upstream weather station actually recorded "
-                "this reading (e.g. '2024-08-24 14:30'). obs_time is NOT the moment this tool was invoked; "
-                "the value can lag real-time by 15-60 minutes. When the user asks 'now' or 'right now', "
-                "always quote obs_time rather than inferring freshness from the call time, and tell the "
-                "user the data is an observation rather than a live measurement.\n"
-                "\n"
-                "hourly — up to 24 hourly forecasts starting at the current hour; each entry has time "
-                "(HH:00), temp, condition, precip, humidity, wind_speed, wind_dir, uvIndex, cloudcover, "
-                "visibility, and chance_of_rain/snow/thunder/fog/frost/overcast/sunshine/windy/hightemp/remdry.\n"
-                "\n"
-                "daily — up to 5 days of daily forecast (day 0 is today); includes max/min/avg temp, "
-                "condition, sunrise/sunset, moon_phase, and precipitation probabilities.\n"
-                "\n"
-                "The `hours` parameter only limits how many hourly entries are SUMMARIZED in the returned "
-                "text; the full 24-hour array is always present in the JSON payload. "
-                "unit='c' (default) returns Celsius, 'f' returns Fahrenheit."
+                "Get weather conditions and forecasts for a city. Returns current conditions, "
+                "up to 24 hours of hourly forecast, and up to 5 days of daily forecast. "
+                "Use for any weather-related question. unit='c' (default) returns Celsius, "
+                "'f' returns Fahrenheit. The `hours` parameter controls how many hourly entries "
+                "are summarized in the returned text."
             ),
             "parameters": {
                 "type": "object",
@@ -659,7 +642,7 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "ip_geo",
-            "description": "Get geolocation info (country, region, city, ISP, ASN) for an IPv4 address via the amap-maps MCP `maps_ip_location` tool. If ip omitted, queries the server's own IP.",
+            "description": "Get geolocation info (country, region, city, ISP, ASN) for an IPv4 address. If ip omitted, queries the server's own IP.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -672,7 +655,7 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "qr_code",
-            "description": "Generate a QR code image from text or URL and return its R2 URL.",
+            "description": "Generate a QR code image from text or URL and return its public URL.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -687,7 +670,7 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "geocode",
-            "description": "将地址或地名转换为经纬度坐标（地理编码）。委托给 amap-maps MCP 的 maps_geo 工具。",
+            "description": "将地址或地名转换为经纬度坐标（地理编码）。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -854,30 +837,25 @@ SEARCH_TOOLS = [
             "description": (
                 "Execute bash commands inside the user's per-session workspace. Use this tool for "
                 "installs, tests, builds, running scripts, git operations, and inspecting workspace "
-                "files. The workspace is ephemeral: files you create exist only for the lifetime of "
-                "this session and are NOT persisted across process restarts.\n"
+                "files.\n"
                 "\n"
                 "Avoid interactive or long-running programs (vim, top, less, watch, -it shells, "
-                "daemons). They will block the session. If a command appears stuck, set restart=true "
-                "to reset the bash session (clears cwd, env vars, and shell state) and retry with a "
-                "non-interactive variant.\n"
+                "daemons); they will block the session. If a command appears stuck, set restart=true "
+                "to reset the session and retry with a non-interactive variant.\n"
                 "\n"
                 "STAGING BUFFER RULES (enforced by the sandbox):\n"
-                "- upload/ holds outgoing files staged for the user and is mirrored to R2 (survives "
-                "restarts). download/ holds files the user has sent that the model could not ingest "
-                "natively; it is local-only and may be empty after a restart.\n"
+                "- upload/ holds outgoing files staged for the user. download/ holds files the user "
+                "has sent that the model could not ingest natively.\n"
                 "- You MAY read and write files inside upload/ and download/ via relative paths from "
                 "your cwd, e.g. `cp out.txt ../upload/out.txt` or `cat ../download/brief.pdf`.\n"
                 "- You MAY NOT `cd` into upload/ or download/, and you MAY NOT execute any command "
                 "while your cwd is inside either of them. The sandbox rejects `cd ../upload/...` and "
-                "any subsequent command; this prevents dependency installs and build tools from "
-                "polluting the staging area.\n"
+                "any subsequent command.\n"
                 "- To move files INTO upload/ prefer `stage_upload`. To move files OUT OF download/ "
                 "into your cwd prefer `fetch_download`. Use `list_upload` / `list_download` to "
                 "inspect their contents.\n"
                 "\n"
-                "To read a skill's instructions, run `cd skills/<skill_id>` from your cwd and read "
-                "the SKILL.md there."
+                "To read a skill's instructions, `cd skills/<skill_id>` from your cwd."
             ),
             "parameters": {
                 "type": "object",
@@ -910,14 +888,10 @@ SEARCH_TOOLS = [
         "function": {
             "name": "fetch_download",
             "description": (
-                "Copy one or more user-uploaded files from download/ into the agent's ephemeral workdir (workspace root/). "
-                "User-uploaded documents land in download/ automatically when the model cannot ingest them natively; bash "
-                "cannot `cd` into download/, so this tool is the canonical way to make a downloaded file available to "
-                "text_editor / bash / other tools. After fetch_download the file lives at the same relative path inside "
-                "the workdir.\n"
-                "download/ is a local-only buffer (not mirrored to R2); if it is empty after a process restart, ask the "
-                "user to re-send the document.\n"
-                "Call list_download first when you do not know the exact filenames."
+                "Copy one or more user-uploaded files from download/ into the agent workdir so other "
+                "tools (text_editor, bash, etc.) can read them. After fetch_download the file lives at "
+                "the same relative path inside the workdir. Call list_download first when you do not "
+                "know the exact filenames."
             ),
             "parameters": {
                 "type": "object",
@@ -951,11 +925,10 @@ SEARCH_TOOLS = [
         "function": {
             "name": "stage_upload",
             "description": (
-                "Copy one or more files from the agent workspace (workspace root/) into upload/, the staging "
-                "area for outgoing attachments. present_files ONLY reads from upload/, so you must call stage_upload "
-                "before present_files can send a file to the user. The staged file is also mirrored to R2 so it "
-                "survives process restarts.\n"
-                "Pass exact file paths relative to the workdir root; directories and wildcards are not accepted."
+                "Copy one or more files from the agent workdir into upload/, the staging area for outgoing "
+                "attachments. present_files ONLY reads from upload/, so you must call stage_upload before "
+                "present_files can send a file to the user. Pass exact file paths relative to the "
+                "workdir root; directories and wildcards are not accepted."
             ),
             "parameters": {
                 "type": "object",
@@ -984,8 +957,7 @@ SEARCH_TOOLS = [
         "function": {
             "name": "list_download",
             "description": (
-                "List all files currently in download/ (user-upplied documents that have not been fetched into the "
-                "workdir yet). Returns JSON: {\"files\": [{\"path\": ..., \"size\": ...}], \"count\": N}."
+                "List all files currently in download/ that have not been fetched into the workdir yet."
             ),
             "parameters": {
                 "type": "object",
@@ -998,8 +970,7 @@ SEARCH_TOOLS = [
         "function": {
             "name": "list_upload",
             "description": (
-                "List all files currently staged in upload/ (waiting to be sent to the user via present_files). "
-                "Returns JSON: {\"files\": [{\"path\": ..., \"size\": ...}], \"count\": N}."
+                "List all files currently staged in upload/ waiting to be sent to the user via present_files."
             ),
             "parameters": {
                 "type": "object",
@@ -1012,11 +983,10 @@ SEARCH_TOOLS = [
         "function": {
             "name": "present_files",
             "description": (
-                "Send one or more files from the upload/ staging tree to the chat as attachments. "
-                "Files MUST already be staged under upload/ — either via the stage_upload tool or via bash "
-                "(e.g. `cp out.txt ../upload/out.txt`). Files left in the ephemeral workdir are NOT directly "
-                "sendable; this is the execution/persistence boundary.\n"
-                "Pass exact paths relative to upload/; wildcards are not supported."
+                "Send one or more files from upload/ to the chat as attachments. Files MUST already be "
+                "staged under upload/ — via the stage_upload tool or via bash "
+                "(e.g. `cp out.txt ../upload/out.txt`). Files left in the workdir are NOT directly "
+                "sendable. Pass exact paths relative to upload/; wildcards are not supported."
             ),
             "parameters": {
                 "type": "object",
