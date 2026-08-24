@@ -41,6 +41,7 @@ import logging
 import os
 import time
 import traceback
+import uuid
 from html.parser import HTMLParser
 from typing import Any, Optional
 
@@ -87,8 +88,11 @@ FORBIDDEN_TOOLS = {"subagent", "memory", "skill", "ask_user"}
 SUBAGENT_LLM_TIMEOUT = _env_int("SUBAGENT_LLM_TIMEOUT", 180, min_value=30, max_value=900)
 SUBAGENT_TOOL_TIMEOUT = _env_int("SUBAGENT_TOOL_TIMEOUT", 120, min_value=5, max_value=900)
 
-# 子 agent 默认可用的工具白名单（如果调用方未指定）
-DEFAULT_ALLOWED_TOOLS = {
+# 子 agent 默认可用的工具白名单（如果调用方未指定）。
+# 使用 list 并按字母序排序：set 的迭代顺序在 CPython 上由 hash 决定，
+# 不同进程可能顺序不同，传给 LLM 的 tool schema 顺序也会变，导致
+# prompt cache 失效。用 list + sort 保证稳定顺序。
+DEFAULT_ALLOWED_TOOLS = sorted([
     "web_search", "fetch_url", "wikipedia", "exchange_rate",
     "book_lookup", "weather", "news", "crypto_price", "ip_geo", "qr_code",
     "geocode", "route", "distance", "poi_keyword_search",
@@ -100,7 +104,7 @@ DEFAULT_ALLOWED_TOOLS = {
     # 不含 generate_image / video / subagent / memory / skill
     # 注：elevation / traffic / isochrone 工具已随 amap_integration.py 迁移到
     # amap-maps MCP 而移除（MCP 不提供等价能力）。
-}
+])
 
 SUBAGENT_SYSTEM_PROMPT_TEMPLATE = """\
 你是一个被父 agent 派生出来的子 agent，负责独立完成一个子任务。
@@ -463,12 +467,17 @@ async def execute_subagent(
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        logger.exception(f"subagent: unexpected error: {e}")
+        # 安全修复：traceback 里可能包含文件路径、env var 名、甚至 URL
+        # 形态的 secret（如 API key 拼在 endpoint URL 里）。把它原样返回
+        # 给 LLM 等于把这些信息泄露给模型 API。改成只返回一个本进程内
+        # 生成的短 error_id，把完整 traceback 留在后端 logger 里供运维查。
+        error_id = uuid.uuid4().hex[:12]
+        logger.exception(f"subagent: unexpected error (error_id={error_id}): {e}")
         return json.dumps({
             "ok": False,
-            "error": f"子 agent 异常: {str(e)[:200]}",
+            "error": f"子 agent 异常 (error_id={error_id})：{str(e)[:200]}",
             "code": "exception",
-            "traceback": traceback.format_exc()[:500],
+            "error_id": error_id,
             "model": chosen_model,
         }, ensure_ascii=False)
 

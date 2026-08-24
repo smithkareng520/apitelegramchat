@@ -6,13 +6,12 @@ import re
 import logging
 import json
 import os
+import time
 import base64
 import hashlib
 import ipaddress
 import socket
 import uuid
-import math
-import shutil
 import tempfile
 import mimetypes
 from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
@@ -52,7 +51,7 @@ try:
     from lxml import html as lxml_html  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
     lxml_html = None  # type: ignore
-from apitelegramchat.state import set_editor_file_state, clear_editor_file_state
+from apitelegramchat.state import set_editor_file_state  # noqa: F401  (clear_editor_file_state 历史上被引用，现已移除以避免未使用 import 警告)
 
 from apitelegramchat.config import (
     OPENROUTER_API_KEY,
@@ -371,6 +370,17 @@ def get_fetch_cache(url: str):
 
 
 def set_fetch_cache(url: str, content: str):
+    """写入 fetch 缓存。
+
+    重要安全修复：此前所有失败结果（以 ``失败：`` 开头的字符串）也被写
+    入缓存。这意味着任何一次网络抖动导致的失败都会让该 URL 在
+    ``FETCH_CACHE_TTL``（默认 1 小时）内对所有后续调用直接返回缓存的
+    失败字符串，即使网络已恢复也不会重试。现在改为只缓存成功结果，
+    失败结果仍然返回给调用方但不写入缓存，让下一次调用有机会重试。
+    """
+    if isinstance(content, str) and content.startswith("失败："):
+        # 失败结果不缓存，避免短暂网络抖动把 URL "中毒" 一整个 TTL 周期。
+        return
     _fetch_cache[_normalize_fetch_cache_key(url)] = content
 
 
@@ -1393,9 +1403,12 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
         return cached
 
     if start_time is None:
-        start_time = asyncio.get_event_loop().time()
+        # 使用 time.monotonic 而非 asyncio.get_event_loop().time()：
+        # 后者在 Python 3.10+ 没有运行 loop 时会发出 DeprecationWarning，
+        # 且与 time.monotonic 不是同一个时钟。
+        start_time = time.monotonic()
     # 总超时 30 秒
-    if asyncio.get_event_loop().time() - start_time > 30:
+    if time.monotonic() - start_time > 30:
         result = f"失败：抓取超时（总时间 >30s）：{url}"
         set_fetch_cache(url, result)
         return result
@@ -1563,7 +1576,13 @@ async def execute_exchange_rate(base: str, target: str = None) -> str:
         lines = [f"<b>{base} 汇率</b><br/>更新时间：{update_time}<br/>"]
         for cur in major:
             if cur in rates and cur != base:
-                lines.append(f"1 {base} = {rates[cur]:.4f} {cur}")
+                # 强制 float 转换：上游 API 偶尔返回字符串（如 "0.1234"），
+                # 直接 :.4f 会抛 ValueError 被 outer except 吞成"汇率查询出错"。
+                try:
+                    rate_val = float(rates[cur])
+                except (TypeError, ValueError):
+                    continue
+                lines.append(f"1 {base} = {rate_val:.4f} {cur}")
         return "<br/>".join(lines)
     except Exception as e:
         return f"失败：汇率查询出错：{str(e)[:100]}"
@@ -1796,8 +1815,20 @@ COIN_MAP = {
 }
 
 async def execute_crypto_price(coin: str, currency: str = "usd") -> str:
-    coin_id = COIN_MAP.get(coin.lower(), coin.lower())
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={currency}"
+    # 安全修复：coin / currency 直接来自 LLM 工具调用参数，若不 quote
+    # 就拼到 URL，LLM 可能传 "btc&ids=ethereum" 之类的字符串做参数注入。
+    # 这里强制白名单（coin_id 只允许字母数字和连字符），currency 同理。
+    coin_raw = (coin or "").lower().strip()
+    currency_raw = (currency or "usd").lower().strip() or "usd"
+    if not re.match(r'^[a-z0-9-]+$', coin_raw):
+        return f"失败：币种标识 {coin!r} 包含非法字符。"
+    if not re.match(r'^[a-z]{3}$', currency_raw):
+        return f"失败：货币代码 {currency!r} 必须是 3 个小写字母。"
+    coin_id = COIN_MAP.get(coin_raw, coin_raw)
+    url = (
+        "https://api.coingecko.com/api/v3/simple/price"
+        f"?ids={quote(coin_id, safe='')}&vs_currencies={quote(currency_raw, safe='')}"
+    )
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=HTTP_TIMEOUT_SHORT) as resp:
@@ -2635,7 +2666,7 @@ async def execute_distance(origin: str, destination: str) -> str:
 
 
 # 编辑器配置
-MAX_EDITOR_FILE_SIZE = 5 * 1024 * 1024  # 1MB
+MAX_EDITOR_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 EDITOR_PREFIX = "editor"
 
 def _editor_safe_path(path: str) -> str:

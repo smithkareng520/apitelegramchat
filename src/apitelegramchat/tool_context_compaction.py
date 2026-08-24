@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -83,8 +84,18 @@ def _minimal_arguments(name: str, raw: object) -> str:
 
 
 def _archive_relative_path(round_index: int, call_id: str) -> str:
-    digest = hashlib.sha256(f"{round_index}:{call_id}".encode("utf-8")).hexdigest()[:16]
-    return f"{ARCHIVE_DIR}/round-{round_index + 1:04d}-{digest}.json"
+    """生成归档文件的相对路径。
+
+    修复：原 digest 包含 round_index（history 数组下标），一旦之前的
+    消息被裁剪或压缩（例如 select_request_context 截尾之后），同一
+    次 tool_call 的 round_index 就变了，重新归档会生成不同的 digest，
+    让旧的 archive 文件成为孤儿（无法被引用、永远占据 workspace）。
+    改用 call_id 一个稳定标识：call_id 由 LLM 在生成 tool_call 时给出，
+    在整个会话内不变。
+    """
+    safe_call_id = re.sub(r'[^A-Za-z0-9_-]', '_', str(call_id or ""))[:32] or "anon"
+    digest = hashlib.sha256(f"{call_id}".encode("utf-8")).hexdigest()[:16]
+    return f"{ARCHIVE_DIR}/call-{safe_call_id}-{digest}.json"
 
 
 def _pointer_text(name: str, relative_path: str) -> str:
@@ -193,6 +204,18 @@ async def compact_older_tool_calls(
                     name=name,
                     relative_path=relative_path,
                 )
+                # 体积上限：fetch_url 等工具可能返回 10MB+ 的 payload，
+                # 每次压缩都生成一份归档会让 workspace 持续膨胀。
+                # 超过 1MB 的 payload 跳过归档，仅保留 in-memory 历史。
+                _MAX_ARCHIVE_PAYLOAD = 1 * 1024 * 1024
+                if len(payload) > _MAX_ARCHIVE_PAYLOAD:
+                    logger.info(
+                        "skip archiving tool payload (size=%s, max=%s) for call_id=%s",
+                        len(payload), _MAX_ARCHIVE_PAYLOAD, str(call_id)[:32],
+                    )
+                    # 不写盘，也不替换 content 为 pointer —— 保留原 result，
+                    # 让 select_request_context 的截尾处理自然把它推出去。
+                    continue
                 await asyncio.to_thread(archive_path.write_bytes, payload)
 
                 function = tool_call.get("function")

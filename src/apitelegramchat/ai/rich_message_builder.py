@@ -81,16 +81,16 @@ RICH_DRAFT_HARD_GUARD_CHARS = max(
 
 # 这些标签被视为富消息中的结构块。只有在最外层结构块完全闭合后，才允许正常滚动，
 # 从而不会在 details/table/list/pre 等结构的中间截断。
-_RICH_BLOCK_TAGS = {
+_RICH_BLOCK_TAGS = frozenset({
     "p", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "blockquote", "details",
     "ul", "ol", "li", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "hr",
     "figure", "figcaption", "tg-slideshow", "tg-map", "img", "video", "audio",
     "tg-math-block", "aside", "footer",
-}
+})
 # API 将嵌套富消息块、列表项和表格行计入 500 块上限；table cell 只承载 RichText，
 # 因此不将 td/th 等单元格标签虚增为独立块。
-_RICH_COUNTED_BLOCK_TAGS = _RICH_BLOCK_TAGS - {"thead", "tbody", "tfoot", "td", "th", "figcaption"}
-_RICH_VOID_TAGS = {"br", "hr", "img", "video", "audio", "tg-map", "source", "meta", "link", "input"}
+_RICH_COUNTED_BLOCK_TAGS = _RICH_BLOCK_TAGS - frozenset({"thead", "tbody", "tfoot", "td", "th", "figcaption"})
+_RICH_VOID_TAGS = frozenset({"br", "hr", "img", "video", "audio", "tg-map", "source", "meta", "link", "input"})
 _RICH_HTML_TAG_RE = re.compile(r"<!--.*?-->|<[^>]*>", re.DOTALL)
 _RICH_TAG_NAME_RE = re.compile(r"^<\s*(/)?\s*([A-Za-z][\w:-]*)")
 # Rich Message 的 details、列表和表格等容器不能只承载裸文本；服务端会将其
@@ -1076,6 +1076,9 @@ class RichMessageBuilder:
                     new_draft_id = None
                     rollover_mode = "terminal_plain_text_fallback" if used_fallback else "terminal_complete_block"
 
+                # 限制 _rollover_history 长度：此前每次 rollover 都 append 一条，
+                # 没有上限，长时间运行的会话会让该 list 无限增长。保留最近 50 条
+                # 用于诊断即可。
                 self._rollover_history.append({
                     "old_draft_id": old_draft_id,
                     "new_draft_id": new_draft_id,
@@ -1084,6 +1087,9 @@ class RichMessageBuilder:
                     "blocks": block_count,
                     "mode": rollover_mode,
                 })
+                if len(self._rollover_history) > 50:
+                    # 删除最早的元素，保留最近 50 条。
+                    del self._rollover_history[: len(self._rollover_history) - 50]
 
             if start_next_draft:
                 await self._register_active_draft(0)
@@ -1172,10 +1178,17 @@ class RichMessageBuilder:
                     f"{self._rate_limited_until:.1f} (retry_after={e.retry_after}s)"
                 )
             except Exception as e:
+                # 修复：原代码用 "429" 子串判断 HTTP 429，对任何巧合
+                # 含 "429" 字符串的异常（如 request_id）会误报为 rate limit。
+                # 优先看异常的 status_code 属性，再回退到子串匹配。
+                status_code = getattr(e, "status_code", None) or getattr(e, "status", None)
                 err_msg = str(e)
-                if "429" in err_msg:
+                if status_code == 429 or "429" in err_msg:
                     self._rate_limited_until = time.monotonic() + 10.0
-                    logger.warning(f"Flush hit 429 (fallback), cooling until {self._rate_limited_until:.1f}")
+                    logger.warning(
+                        f"Flush hit 429 (fallback, status={status_code}), "
+                        f"cooling until {self._rate_limited_until:.1f}"
+                    )
                 else:
                     logger.warning(f"Flush failed: {e}")
 

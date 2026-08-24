@@ -48,7 +48,7 @@ def _get_r2_key(file_id: str) -> str:
     return f"telegram/{file_id}"
 
 
-async def get_cached_image_data(chat_id: int, file_id: str) -> Optional[bytes]:
+async def get_cached_image_data(chat_id: int | None, file_id: str) -> Optional[bytes]:
     """Resolve image bytes for a Telegram file_id.
 
     Resolution order:
@@ -56,15 +56,21 @@ async def get_cached_image_data(chat_id: int, file_id: str) -> Optional[bytes]:
       2. Permanent-failure marker (`state.is_r2_attempted`) — if set, bail out
          early because we've already determined that neither R2 nor Telegram
          can serve this file. (NOTE: this marker must ONLY be set on actual
-         failures; see `_upload_and_mark`.)
+         *hard* failures — see below.)
       3. R2 / local cache — if the file has been previously uploaded, download
          it and re-populate the in-memory cache. This is the recovery path
          that keeps historical images visible after the TTLCache expires.
       4. Telegram — first-time fetch; on success, kick off a background R2
          upload so the next cache miss can be served from R2 alone.
 
-    If all paths fail, mark the file as permanently failed so we don't keep
-    retrying expensive network calls on every subsequent turn.
+    IMPORTANT: `state.mark_r2_attempted` is a *permanent* failure marker that
+    short-circuits all future resolution attempts for that file_id. It must
+    therefore be set ONLY on hard, non-transient failures (404/403/410 from
+    Telegram, or R2 reporting that the object is unreadable). Setting it on
+    transient errors (429 rate-limit, 5xx, network blip, or any ``Exception``)
+    permanently blacklists the file across ALL future turns — even after the
+    transient condition clears — causing historical images to silently
+    disappear from the conversation. We now only mark on hard status codes.
     """
     cache_key = file_id
     if cache_key in _image_cache:
@@ -87,6 +93,8 @@ async def get_cached_image_data(chat_id: int, file_id: str) -> Optional[bytes]:
 
     tg_path = await get_file_path(file_id)
     if not tg_path:
+        # Telegram reports the file_path itself is missing — this is a hard
+        # failure (file deleted on Telegram's side). Safe to mark permanently.
         await state.mark_r2_attempted(file_id)
         return None
     url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{tg_path}"
@@ -98,11 +106,30 @@ async def get_cached_image_data(chat_id: int, file_id: str) -> Optional[bytes]:
                     _image_cache[cache_key] = data
                     _track_task(_upload_and_mark(file_id, data, r2_key))
                     return data
-                else:
+                elif resp.status in (404, 403, 410):
+                    # Hard failure — file is gone or access permanently denied.
+                    # Safe to mark permanently so future turns skip the round-trip.
+                    logger.warning(
+                        f"图片下载永久失败 {file_id}: HTTP {resp.status}"
+                    )
                     await state.mark_r2_attempted(file_id)
+                else:
+                    # Transient (429/5xx/etc.) — DO NOT mark. Next turn may succeed.
+                    logger.warning(
+                        f"图片下载临时失败 {file_id}: HTTP {resp.status} (will retry next turn)"
+                    )
+    except asyncio.TimeoutError as e:
+        # Network blip — do not permanently blacklist the file.
+        logger.warning(f"图片下载超时 {file_id}: {e} (will retry next turn)")
+    except aiohttp.ClientError as e:
+        # Network / connection-level error — also transient.
+        logger.warning(f"图片下载网络异常 {file_id}: {e} (will retry next turn)")
     except Exception as e:
-        logger.exception(f"图片下载失败 {file_id}: {e}")
-        await state.mark_r2_attempted(file_id)
+        # Unknown error — log full traceback but DO NOT permanently mark.
+        # Earlier code did `mark_r2_attempted` here, which permanently
+        # blacklisted files on any unexpected exception (e.g. a brief DNS
+        # hiccup), causing silent image loss across turns.
+        logger.exception(f"图片下载未分类异常 {file_id}: {e} (will retry next turn)")
     return None
 
 
@@ -139,7 +166,7 @@ async def _upload_and_mark(file_id: str, data: bytes, r2_key: str):
         await state.mark_r2_attempted(file_id)
 
 
-async def _get_cached_audio_data(chat_id: int, file_id: str) -> Optional[bytes]:
+async def _get_cached_audio_data(chat_id: int | None, file_id: str) -> Optional[bytes]:
     """仅在内存中缓存音频字节，不做磁盘或 R2 持久化。"""
     cache_key = file_id
     if cache_key in _audio_cache:
@@ -161,7 +188,7 @@ async def _get_cached_audio_data(chat_id: int, file_id: str) -> Optional[bytes]:
     return None
 
 
-async def _get_cached_document_data(chat_id: int, file_id: str) -> Optional[bytes]:
+async def _get_cached_document_data(chat_id: int | None, file_id: str) -> Optional[bytes]:
     cache_key = file_id
     if cache_key in _document_cache:
         return _document_cache[cache_key]
@@ -193,7 +220,7 @@ def _guess_document_mime_type(file_name: str = "", explicit_mime: str = "") -> s
 
 
 async def _build_native_document_part(
-        chat_id: int,
+        chat_id: int | None,
         file_id: str,
         file_name: str = "",
         mime_type: str = "",
@@ -219,19 +246,20 @@ def _attachment_label(kind: str) -> str:
 
 
 async def _resolve_public_attachment_url(file_id: str) -> str:
-    """把 Telegram file_id 解析成一个可供模型/工具继续引用的公开 URL。"""
+    """把 Telegram file_id 解析成一个可供模型/工具继续引用的公开 URL。
+
+    安全约束：此函数的返回值会被嵌入到发送给 LLM 的 fallback 文本里
+    （见 ``_build_attachment_fallback_text``），因此**绝对不能**返回
+    Telegram 直链 —— 那会暴露 ``bot{TELEGRAM_BOT_TOKEN}/`` 给第三方模型
+    API。优先返回 R2 公开 URL；若 R2 未配置则返回空串，由调用方降级为
+    file_id 文本。
+    """
     fid = str(file_id or "").strip()
     if not fid:
         return ""
 
-    try:
-        if TELEGRAM_BOT_TOKEN:
-            tg_path = await get_file_path(fid)
-            if tg_path:
-                return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{tg_path}"
-    except Exception as e:
-        logger.debug(f"解析 Telegram 文件 URL 失败 {fid[:12]}: {e}")
-
+    # 不再返回 Telegram 直链（避免把 bot token 暴露给第三方模型 API）。
+    # 仅 R2 公开 URL 是安全的：它要么是自定义域，要么是 r2.dev。
     try:
         r2_key = _get_r2_key(fid)
         if await file_exists_in_r2(r2_key) and R2_PUBLIC_URL:
@@ -375,7 +403,10 @@ async def _build_audio_fallback_text(
             ext = Path(safe_name).suffix or ".ogg"
             transcript = await transcribe_audio_with_groq(audio_bytes, ext) or ""
         except Exception as e:
-            logger.debug(f"[AudioFallback] 转录失败 {file_id[:12]}: {e}")
+            # 提升到 warning：转录失败对用户可见（用户会拿到空文本占位），
+            # debug 级别在实际生产环境几乎不会被打开，会让问题被静默吞掉。
+            logger.warning(f"[AudioFallback] 转录失败 {file_id[:12]}: {e}")
+            transcript = "[转录失败，请稍后重试或检查 Groq 配置]"
 
     parts: list[str] = []
     if user_text:
@@ -385,7 +416,7 @@ async def _build_audio_fallback_text(
     return "\n\n".join(parts) if parts else (user_text or "请分析这段音频")
 
 
-async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_type: str, chat_id: int = None):
+async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_type: str, chat_id: int | None = None):
     supports_vision = model_info.vision
     supports_audio = model_info.audio
     supports_native_documents = bool(getattr(model_info, "native_document", False))
@@ -420,24 +451,26 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_ty
                 if not img_bytes:
                     return None
                 try:
-                    img = Image.open(io.BytesIO(img_bytes))
-                    fmt = img.format.lower() if img.format else "jpeg"
-                    if fmt not in ("jpeg", "png"):
-                        fmt = "jpeg"
-                    if fmt == "png" and img.mode == "RGBA":
-                        buf = io.BytesIO()
-                        img.save(buf, format="PNG")
-                        b64 = base64.b64encode(buf.getvalue()).decode()
-                    else:
-                        img_rgb = img.convert("RGB")
-                        buf = io.BytesIO()
-                        img_rgb.save(buf, format=fmt.upper())
-                        b64 = base64.b64encode(buf.getvalue()).decode()
-                    img.close()
-                    return {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/{fmt};base64,{b64}", "detail": "high"}
-                    }
+                    # 用 with 语句确保 PIL Image 在异常路径上也会被 close，
+                    # 避免大量并发图片处理时文件描述符泄露。
+                    with Image.open(io.BytesIO(img_bytes)) as img:
+                        fmt = img.format.lower() if img.format else "jpeg"
+                        if fmt not in ("jpeg", "png"):
+                            fmt = "jpeg"
+                        if fmt == "png" and img.mode == "RGBA":
+                            buf = io.BytesIO()
+                            img.save(buf, format="PNG")
+                            b64 = base64.b64encode(buf.getvalue()).decode()
+                        else:
+                            # convert() 返回的是新 Image 对象，同样需要 close。
+                            with img.convert("RGB") as img_rgb:
+                                buf = io.BytesIO()
+                                img_rgb.save(buf, format=fmt.upper())
+                                b64 = base64.b64encode(buf.getvalue()).decode()
+                        return {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/{fmt};base64,{b64}", "detail": "high"}
+                        }
                 except Exception as e:
                     logger.exception(f"处理图片 {fid} 失败: {e}")
                     return None
@@ -566,15 +599,25 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_ty
 
 
 async def _append_history_async(messages: list, history: list, api_type: str, model_info: ModelConfig, chat_id: int | None = None) -> None:
+    """把历史消息格式化后追加到 ``messages``。
+
+    重要：发给模型 API 的消息体只允许包含 OpenAI 兼容协议认可的字段
+    （``role``、``content``、``tool_calls``、``tool_call_id``、``name``、
+    ``reasoning_content``）。Telegram 侧的附件元数据（``file_id``、
+    ``file_ids``、``file_name`` 等）属于内部存储字段，**不能**写到
+    出站消息里——否则部分网关（OpenAI / Anthropic / Gemini）会因未声
+    明字段直接 400。此前版本在这里把附件元数据一起拷进了 out_msg，
+    是一个静默导致请求失败的 BUG。
+    """
     for msg in history:
         if msg.get("role") in ("user", "assistant", "tool", "system"):
             out_msg = {"role": msg["role"]}
             if msg.get("role") == "user":
                 resolved = await _resolve_multimodal_content(dict(msg), model_info, api_type, chat_id=chat_id)
                 out_msg["content"] = resolved
-                for key in ("file_id", "file_ids", "file_name", "file_names", "mime_type", "mime_types", "type", "attachments"):
-                    if key in msg:
-                        out_msg[key] = msg[key]
+                # 注意：不要把 file_id / file_ids / file_name / mime_type /
+                # type / attachments 等附件元数据写到出站消息里，部分
+                # 模型 API 会因此返回 400。
             else:
                 if "content" in msg:
                     content = msg["content"]

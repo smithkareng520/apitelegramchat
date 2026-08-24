@@ -9,7 +9,9 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
-logger = logging.getLogger("apitelegramchat.mcp_client")
+# 与项目其它模块保持一致：使用 __name__ 而非硬编码字符串，
+# 这样 reload / 重命名模块时 logger 命名空间会自动跟随。
+logger = logging.getLogger(__name__)
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 try:

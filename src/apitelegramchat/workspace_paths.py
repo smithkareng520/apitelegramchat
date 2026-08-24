@@ -173,18 +173,24 @@ def is_inside_upload_or_download(path: object) -> bool:
     it walks the parent chain looking for a directory whose name matches
     the upload/download dir name AND whose parent looks like a workspace
     root (i.e. lives under data_root()/workspaces).
+
+    失败方向：FAIL CLOSED。任何路径解析异常都返回 True（视为"在
+    staging 内"），让 bash sandbox 拒绝执行——此前是 fail-open
+    返回 False，会让 cwd 解析失败时仍允许执行 staging 内的命令，
+    绕过安全边界。
     """
     try:
         resolved = Path(path).expanduser().resolve() if path is not None else None
     except Exception:
-        return False
+        # 解析失败：保守地视为"在 staging 内"，让 sandbox 拒绝执行。
+        return True
     if resolved is None:
-        return False
+        return True
     try:
         ws_root = data_root() / "workspaces"
         ws_resolved = ws_root.resolve()
     except Exception:
-        return False
+        return True
     # Walk up: if any ancestor is named upload/ or download/ AND that
     # ancestor's parent is itself under workspaces/, we're inside.
     target_names = {_UPLOAD_DIR_NAME, _DOWNLOAD_DIR_NAME}

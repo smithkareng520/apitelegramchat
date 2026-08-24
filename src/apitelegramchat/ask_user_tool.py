@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -18,7 +19,7 @@ from typing import Any
 import aiohttp
 
 from apitelegramchat.config import BASE_URL
-from apitelegramchat.utils import send_rich_html_message
+from apitelegramchat.utils import send_rich_html_message, escape_html
 
 logger = logging.getLogger("apitelegramchat.ask_user")
 
@@ -26,7 +27,11 @@ MAX_QUESTION_CHARS = 1200
 MAX_OPTIONS = 8
 MAX_LABEL_CHARS = 48
 MAX_OPTION_DESC_CHARS = 180
-INTERACTION_TIMEOUT = 24 * 60 * 60
+# 修复：24h 超时太长——一个未回答的 ask_user 会把 agent 循环挂起整整一天，
+# 中间所有事件循环资源（chat lock、内存里的消息、模型 prompt cache 等）都
+# 不能释放。改成默认 10 分钟，足够用户做选择又不至于让会话僵死。
+# 如需更长等待可通过环境变量 ASK_USER_TIMEOUT 覆盖。
+INTERACTION_TIMEOUT = int(os.getenv("ASK_USER_TIMEOUT", str(10 * 60)))
 
 
 @dataclass
@@ -136,15 +141,22 @@ def _build_keyboard(interaction: AskUserInteraction) -> dict:
 
 
 def _question_html(interaction: AskUserInteraction) -> str:
-    question = interaction.question
+    """构造 ask_user 问题卡片 HTML。
+
+    安全修复：question / label / description 均来自 LLM 工具调用参数，
+    若不转义，LLM 一旦输出含 ``<script>`` 或 ``<img onerror=...>`` 的
+    文本，就会作为原始 HTML 渲染在用户的客户端。所有插值必须经
+    escape_html 转义。
+    """
+    question = escape_html(interaction.question)
     lines = [f"<p>🤔 <b>需要你的确认</b></p><p>{question}</p>"]
     if interaction.options:
         lines.append("<ul>")
         for option in interaction.options:
-            label = option["label"]
+            label = escape_html(option.get("label", ""))
             desc = option.get("description") or ""
             if desc:
-                lines.append(f"<li><b>{label}</b>：{desc}</li>")
+                lines.append(f"<li><b>{label}</b>：{escape_html(desc)}</li>")
             else:
                 lines.append(f"<li><b>{label}</b></li>")
         lines.append("</ul>")
@@ -266,16 +278,23 @@ async def _edit_question_message(interaction: AskUserInteraction, body_html: str
 
 
 def _answered_html(interaction: AskUserInteraction, answer: dict[str, Any]) -> str:
-    q = interaction.question
+    """构造回答后的问题卡片 HTML。
+
+    安全修复：q 来自 LLM 工具参数，selected 选项的 label 同样来自 LLM，
+    custom 的 value 是用户自由文本——都必须 escape，否则任意一方包含
+    HTML 字符都会注入到用户客户端的渲染上下文。
+    """
+    q = escape_html(interaction.question)
     kind = answer.get("type")
     if kind == "choice":
         selected = answer.get("selected") or []
         labels = [str(item.get("label", "")) for item in selected if isinstance(item, dict)]
-        chosen = "、".join(x for x in labels if x) or "已选择"
+        chosen_raw = "、".join(x for x in labels if x) or "已选择"
+        chosen = escape_html(chosen_raw)
         return f"<p>✅ <b>已收到你的选择</b></p><p>{q}</p><p><b>{chosen}</b></p>"
     if kind == "custom":
         value = str(answer.get("value", ""))[:4000]
-        return f"<p>✅ <b>已收到你的回答</b></p><p>{q}</p><p><blockquote>{value}</blockquote></p>"
+        return f"<p>✅ <b>已收到你的回答</b></p><p>{q}</p><p><blockquote>{escape_html(value)}</blockquote></p>"
     if kind == "cancelled":
         return f"<p>✖️ <b>已取消</b></p><p>{q}</p>"
     if kind == "expired":
@@ -288,7 +307,16 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
         interaction = _pending.get(interaction_id)
         if interaction is None:
             return False, "这个问题已经结束或失效了"
-        if int(interaction.chat_id) != int(chat_id) or int(callback_from_id) != int(chat_id):
+        # 类型校验：Telegram 偶发会传非数值 chat_id（如 channel post），
+        # 此前直接 int() 会抛 ValueError 让整个 callback 500。先校验。
+        try:
+            chat_id_int = int(chat_id) if chat_id is not None else None
+            from_id_int = int(callback_from_id) if callback_from_id is not None else None
+        except (TypeError, ValueError):
+            return False, "无效的 chat_id 或 callback_from_id"
+        if chat_id_int is None or from_id_int is None:
+            return False, "无效的 chat_id 或 callback_from_id"
+        if int(interaction.chat_id) != chat_id_int or from_id_int != chat_id_int:
             return False, "无权限"
         if interaction.status != "waiting":
             return False, "这个问题已经处理过了"

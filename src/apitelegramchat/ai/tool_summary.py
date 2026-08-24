@@ -245,8 +245,16 @@ def _safe_parse_args(args_str: str) -> dict:
     # 流式不完整时，用正则兜底提取 _description
     desc_match = re.search(r'"_description"\s*:\s*"((?:[^"\\]|\\.)*)"', args_str)
     if desc_match:
-        desc = desc_match.group(1).replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t')
-        return {"_description": desc}
+        # 修复：原代码用三个 .replace() 手工反转义，遗漏 \\u、\\r、\\\\、\\/ 等，
+        # 对 `C:\\path` 这样的输入会丢一个反斜杠。改成把正则捕获的字符串
+        # 当作 JSON 字符串字面量解析，让 json 模块处理全部转义序列。
+        try:
+            desc = json.loads(f'"{desc_match.group(1)}"')
+            return {"_description": desc}
+        except (json.JSONDecodeError, ValueError):
+            # 兜底：如果 json.loads 失败，退回到旧的简单反转义。
+            desc = desc_match.group(1).replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t')
+            return {"_description": desc}
     return {}
 
 

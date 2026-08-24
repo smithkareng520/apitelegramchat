@@ -3,6 +3,7 @@
 从 ai_handlers.py 拆分而来，逻辑未做改动。
 """
 import ast
+import io
 import json
 import re
 import html
@@ -14,7 +15,10 @@ from apitelegramchat.utils import strip_html_tags, escape_html, get_logger
 
 logger = get_logger(__name__)
 
-_CONTENT_SAFETY_KEYWORDS = [
+# 改为 frozenset：避免误操作修改；查询性能更好（O(1) 包含判定）。
+# 同时预计算 lower-case 版本（中文无需小写，但英文要），避免在热路径
+# 上反复 .lower()。
+_CONTENT_SAFETY_KEYWORDS_RAW = (
     'inappropriate content',
     'content filter',
     'safety filter',
@@ -28,7 +32,11 @@ _CONTENT_SAFETY_KEYWORDS = [
     '违规内容',
     '安全限制',
     '内容审核',
-]
+)
+_CONTENT_SAFETY_KEYWORDS = frozenset(
+    kw if any('\u4e00' <= ch <= '\u9fff' for ch in kw) else kw.lower()
+    for kw in _CONTENT_SAFETY_KEYWORDS_RAW
+)
 
 def _strip_prefix_error_message(text: str) -> str:
     if not text:
@@ -288,7 +296,9 @@ def _is_content_safety_error(detail: str) -> bool:
     if not detail:
         return False
     text = detail.lower()
-    return any(kw.lower() in text for kw in _CONTENT_SAFETY_KEYWORDS)
+    # _CONTENT_SAFETY_KEYWORDS 已在模块级预计算成小写 frozenset，
+    # 此处无需在每个调用上再对每个 kw 调 .lower()。
+    return any(kw in text for kw in _CONTENT_SAFETY_KEYWORDS)
 
 
 def _format_image_safety_notice(detail: str = "", model: str = "") -> str:
@@ -363,19 +373,22 @@ def _format_image_metadata_caption(img_bytes: bytes, model: str) -> str:
     parts: list[str] = []
     fmt = ''
     try:
-        from io import BytesIO
-        img = Image.open(BytesIO(img_bytes))
-        fmt = (img.format or '').upper() or 'IMG'
-        w, h = img.size
-        mode = img.mode or ''
-        # RGB / RGBA / L / P 等，只取常见模式的简写
-        mode_display = mode if mode in ('RGB', 'RGBA', 'L', 'LA', 'P') else ''
-        parts.append(fmt)
-        parts.append(f"{w}×{h}")
-        if mode_display:
-            parts.append(mode_display)
+        # io.BytesIO 已在模块顶部 import；PIL Image 必须用 with 关闭，
+        # 否则反复打开会泄露文件描述符。
+        with Image.open(io.BytesIO(img_bytes)) as img:
+            fmt = (img.format or '').upper() or 'IMG'
+            w, h = img.size
+            mode = img.mode or ''
+            # RGB / RGBA / L / P 等，只取常见模式的简写
+            mode_display = mode if mode in ('RGB', 'RGBA', 'L', 'LA', 'P') else ''
+            parts.append(fmt)
+            parts.append(f"{w}×{h}")
+            if mode_display:
+                parts.append(mode_display)
     except Exception as e:
-        logger.debug(f"[NativeImage] PIL 解析图片元数据失败，退化展示: {e}")
+        # 提升到 warning：图片元数据解析失败会让 caption 缺字段，但
+        # debug 级别在生产环境几乎不会被打开，问题会被静默吞掉。
+        logger.warning(f"[NativeImage] PIL 解析图片元数据失败，退化展示: {e}")
         parts.append('IMG')
 
     parts.append(size_str)

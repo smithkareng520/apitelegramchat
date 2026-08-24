@@ -8,11 +8,15 @@
 # =====================================================================
 
 import asyncio
+import logging
 import os
 import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 PASS = "\033[32m[PASS]\033[0m"
 FAIL = "\033[31m[FAIL]\033[0m"
@@ -60,7 +64,13 @@ def check_no_sudo():
 # 2. 敏感环境变量检查
 # ----------------------------------------------------------------------
 def check_env_scrubbed():
-    """检查 os.environ 中是否还有敏感变量"""
+    """检查 os.environ 中是否还有敏感变量。
+
+    安全修复：此前直接把残留变量名打印到 stdout / 日志，这本身
+    是一种信息泄露（虽然只打印名字不打印值，但泄露"我们用了
+    STRIPE_SECRET_KEY"等本身也是 leak）。改成只打印数量，名字
+    仅在 DEBUG 级别输出。
+    """
     sensitive_patterns = ("TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL")
     leaked = []
     for k in os.environ:
@@ -72,8 +82,11 @@ def check_env_scrubbed():
     # HOME/USER 等白名单不算
     safe_whitelist = {"USER", "HOME", "PATH", "LANG", "LC_ALL", "TERM", "SHELL", "PWD"}
     leaked = [k for k in leaked if k not in safe_whitelist]
+    if leaked:
+        # 只在 DEBUG 级别打印变量名，stdout / 日志里只显示数量。
+        logger.debug("leaked sensitive env var names: %s", leaked)
     report("2.1 敏感环境变量已清洗", not leaked,
-           f"残留: {leaked}" if leaked else "无敏感变量泄漏")
+           f"残留 {len(leaked)} 个敏感变量（详见 DEBUG 日志）" if leaked else "无敏感变量泄漏")
 
 
 # ----------------------------------------------------------------------
@@ -99,10 +112,18 @@ async def check_sandbox_isolation(landlock_ok: bool):
     import functools
     from apitelegramchat.sandbox import build_sandbox_argv, build_sandbox_env, _preexec_sandbox
 
-    workspace = Path("/tmp/verify_workspace").absolute()
+    # 修复 symlink 攻击：原代码用固定路径 /tmp/verify_workspace，
+    # 本地攻击者可以提前创建该路径并指向 /etc，让 verify_security 写
+    # 测试文件到 /etc。改用 mkdtemp 在私有 data_root 下创建唯一目录。
+    from apitelegramchat.workspace_paths import data_root
+    try:
+        base = data_root()
+    except Exception:
+        base = Path("/tmp")
+    base.mkdir(parents=True, exist_ok=True)
+    workspace = Path(tempfile.mkdtemp(prefix="verify_workspace_", dir=str(base)))
     parent_probe = workspace.parent / "landlock-parent-probe.txt"
     outside_target = workspace.parent / "landlock-outside-target.txt"
-    workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "secret.txt").write_text("THIS_IS_SECRET_12345")
     parent_probe.unlink(missing_ok=True)
     outside_target.write_text("OUTSIDE_SECRET_98765")
@@ -124,7 +145,9 @@ async def check_sandbox_isolation(landlock_ok: bool):
             preexec_fn=preexec,
         )
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(cmd.encode()), timeout=5)
+            # 提升到 15s：Landlock + rlimit + bash 启动在冷容器里
+            # 经常超过 5s，旧值会产生假阴性 FAIL。
+            out, _ = await asyncio.wait_for(proc.communicate(cmd.encode()), timeout=15)
             return proc.returncode or 0, out.decode("utf-8", errors="replace")
         finally:
             if proc.returncode is None:

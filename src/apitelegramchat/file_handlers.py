@@ -34,7 +34,10 @@ async def get_file_path(file_id: str) -> str:
     try:
         # 对 file_id 进行 URL 编码，防止异常字符破坏 URL
         encoded_fid = quote(file_id, safe="")
-        async with aiohttp.ClientSession() as session:
+        # 必须设置超时：此前没有 timeout，Telegram API stall 时会
+        # 无限期挂起，间接阻塞所有等待该 file_id 的协程。
+        timeout = aiohttp.ClientTimeout(total=15, connect=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(f"{BASE_URL}/getFile?file_id={encoded_fid}") as response:
                 if response.status == 200:
                     data = await response.json()
@@ -47,7 +50,12 @@ async def get_file_path(file_id: str) -> str:
                     logger.error(f"获取文件路径失败: {await response.text()}")
                     return None
     except Exception as e:
-        logger.error(f"获取文件路径失败: {str(e)}")
+        # 脱敏：str(e) 可能含 BASE_URL（带 bot token），不要原样打日志
+        # 到 ERROR 级别（容易被采集到外部日志系统）。但保留诊断价值。
+        safe_msg = str(e)
+        if BASE_URL and BASE_URL in safe_msg:
+            safe_msg = "[redacted url]"
+        logger.error(f"获取文件路径失败: {safe_msg}")
         return None
 
 # ---------- R2 键生成 ----------
@@ -60,17 +68,21 @@ async def _telegram_download(file_id: str, file_path: str) -> bool:
         file_real_path = await get_file_path(file_id)
         if not file_real_path:
             return False
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=60, connect=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_real_path}") as response:
                 if response.status == 200:
                     with open(file_path, "wb") as f:
                         f.write(await response.read())
                     return True
                 else:
-                    logger.error(f"文件下载失败: {await response.text()}")
+                    logger.error(f"文件下载失败: HTTP {response.status}")
                     return False
     except Exception as e:
-        logger.error(f"文件下载失败: {str(e)}")
+        safe_msg = str(e)
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN in safe_msg:
+            safe_msg = "[redacted token]"
+        logger.error(f"文件下载失败: {safe_msg}")
         return False
 
 # ---------- 主下载函数（含 R2 缓存） ----------

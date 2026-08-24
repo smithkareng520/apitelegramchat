@@ -77,11 +77,16 @@ def _load_local(chat_id: int) -> dict:
 
 
 def _save_local(chat_id: int, store: dict) -> None:
-    """写入本地，并保证目录存在。"""
+    """以原子方式写入本地，并保证目录存在。
+
+    修复：之前所有并发 writer 共用 ``todos.json.tmp`` 这一个 tmp 名，
+    后写的覆盖先写的，导致并发 todo 操作丢数据。现在 tmp 名加 PID + 随机后缀。
+    """
     path = _todo_path(chat_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     store["updated_at"] = int(time.time())
-    tmp = path.with_suffix(".json.tmp")
+    import uuid as _uuid
+    tmp = path.with_suffix(f".json.tmp.{os.getpid()}.{_uuid.uuid4().hex[:8]}")
     tmp.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
 
@@ -225,7 +230,12 @@ def _op_list(store: dict, filter_: str, tag: Optional[str], priority: Optional[s
     def sort_key(t: dict):
         return (
             1 if t.get("done") else 0,
-            -PRIORITY_META.get(t.get("priority", "medium"), {})["weight"],
+            # 安全修复：PRIORITY_META.get(...) 默认 {} 在 store 含有
+            # 未经验证的 priority 字段（旧数据 / LLM typo / 手改 JSON）
+            # 时会触发 KeyError，让整个 execute_todo 工具直接抛异常。
+            # 改为 .get("weight", 2) 链式兜底，确保任何 priority 值都
+            # 能落到一个稳定排序权重上。
+            -PRIORITY_META.get(t.get("priority", "medium"), {}).get("weight", 2),
             t.get("created_at", 0),
             t.get("id", ""),
         )

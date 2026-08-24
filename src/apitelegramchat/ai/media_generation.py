@@ -132,6 +132,16 @@ async def _request_modelscope_native_image(
         try:
             parsed = json.loads(body_text)
             return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError as e:
+            # 仅在 debug 级别输出，避免噪声；但留下诊断痕迹，
+            # 此前是完全静默（except Exception: return None），
+            # 导致 200 响应体不是合法 JSON 时排查非常困难。
+            logger.debug(
+                "[NativeImage/ModelScope] JSON parse failed: %s; body_preview=%r",
+                e,
+                (body_text or "")[:200],
+            )
+            return None
         except Exception:
             return None
 
@@ -146,37 +156,47 @@ async def _request_modelscope_native_image(
             quiet: bool = False,
     ) -> tuple[dict | None, int, str, str]:
         effective_headers = request_headers if request_headers is not None else headers
-        async with session.request(method, url, headers=effective_headers, data=data, json=json_payload) as resp:
-            body_text = await resp.text()
+        # aiohttp 不允许同时给 data 与 json：两者行为未定义，且若 json_payload
+        # 不为 None，data 通常会被忽略。这里显式二选一，避免歧义。
+        if json_payload is not None:
+            async with session.request(method, url, headers=effective_headers, json=json_payload) as resp:
+                return await _finalize_response(resp, method, url, quiet)
+        else:
+            async with session.request(method, url, headers=effective_headers, data=data) as resp:
+                return await _finalize_response(resp, method, url, quiet)
+
+    async def _finalize_response(resp, method: str, url: str, quiet: bool) -> tuple[dict | None, int, str, str]:
+        """Common response handling extracted from _post_or_get_json for clarity."""
+        body_text = await resp.text()
+        if not quiet:
+            logger.debug(
+                "[NativeImage/ModelScope] %s %s response: status=%s content_type=%s body_preview=%r",
+                method,
+                url.replace(base_url, ''),
+                resp.status,
+                resp.headers.get("Content-Type", ""),
+                _body_preview(body_text),
+            )
+        request_id = ''
+        parsed = _safe_json_parse(body_text)
+        if parsed and isinstance(parsed, dict):
+            request_id = str(parsed.get('request_id') or parsed.get('requestId') or '').strip()
+        if resp.status != 200:
+            detail, req_id = _extract_error_details(body_text)
+            return None, resp.status, detail or body_text, req_id or request_id
+        if parsed is not None:
             if not quiet:
                 logger.debug(
-                    "[NativeImage/ModelScope] %s %s response: status=%s content_type=%s body_preview=%r",
-                    method,
-                    url.replace(base_url, ''),
-                    resp.status,
-                    resp.headers.get("Content-Type", ""),
-                    _body_preview(body_text),
+                    "[NativeImage/ModelScope] parsed JSON keys=%s",
+                    list(parsed.keys())[:40],
                 )
-            request_id = ''
-            parsed = _safe_json_parse(body_text)
-            if parsed and isinstance(parsed, dict):
-                request_id = str(parsed.get('request_id') or parsed.get('requestId') or '').strip()
-            if resp.status != 200:
-                detail, req_id = _extract_error_details(body_text)
-                return None, resp.status, detail or body_text, req_id or request_id
-            if parsed is not None:
-                if not quiet:
-                    logger.debug(
-                        "[NativeImage/ModelScope] parsed JSON keys=%s",
-                        list(parsed.keys())[:40],
-                    )
-                return parsed, resp.status, '', request_id
-            if not quiet:
-                logger.debug(
-                    "[NativeImage/ModelScope] JSON parse failed; body_preview=%r",
-                    _body_preview(body_text),
-                )
-            return None, resp.status, body_text[:500], request_id
+            return parsed, resp.status, '', request_id
+        if not quiet:
+            logger.debug(
+                "[NativeImage/ModelScope] JSON parse failed; body_preview=%r",
+                _body_preview(body_text),
+            )
+        return None, resp.status, body_text[:500], request_id
 
     def _extract_request_meta(payload: dict | None) -> tuple[str, str]:
         if not isinstance(payload, dict):
@@ -268,6 +288,17 @@ async def _request_modelscope_native_image(
                 task_status or 'UNKNOWN',
                 task_id,
             )
+            # SSRF 防御：task_id 来自上游 API 响应，必须严格白名单后再拼到 URL。
+            # 此前是直接 `f"{base_url}/tasks/{task_id}"`，若上游被攻陷或返回
+            # 包含 `../` / `?` / host 注入字符串的 task_id，会改写最终的
+            # poll_url，把 bot 引导到任意主机。这里要求 task_id 仅包含
+            # `[A-Za-z0-9_-]`，长度 1-128，其他一律拒绝并直接返回失败。
+            if not re.match(r'^[A-Za-z0-9_-]{1,128}$', task_id):
+                logger.warning(
+                    "[NativeImage/ModelScope] rejected suspicious task_id=%r",
+                    task_id[:32],
+                )
+                return None, endpoint, "上游返回了非法的 task_id", 200, request_id
             poll_url = f"{base_url}/tasks/{task_id}"
             poll_deadline = time.monotonic() + 240
             poll_interval = 3.0
@@ -556,6 +587,9 @@ async def _response_items_to_bytes(response_json: dict) -> list[bytes]:
     image_bytes_list: list[bytes] = []
     items = _extract_image_items(response_json)
     logger.debug("[NativeImage/ModelScope] extracted image item count=%s", len(items))
+    # 防止恶意/失控的上游用超大 base64 串触发 OOM：
+    # 单张图片的 base64 串超过 25 MB 时直接拒绝解码。
+    _MAX_B64_LEN = 25 * 1024 * 1024
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
         for img_data in items:
             img_url = ''
@@ -567,6 +601,12 @@ async def _response_items_to_bytes(response_json: dict) -> list[bytes]:
             b64_json = str(img_data.get('b64_json') or img_data.get('base64') or '').strip()
 
             if b64_json:
+                if len(b64_json) > _MAX_B64_LEN:
+                    logger.warning(
+                        "[NativeImage] 跳过超大 base64 图片 (len=%s, 上限=%s)",
+                        len(b64_json), _MAX_B64_LEN,
+                    )
+                    continue
                 try:
                     image_bytes_list.append(base64.b64decode(b64_json))
                     continue
@@ -576,6 +616,12 @@ async def _response_items_to_bytes(response_json: dict) -> list[bytes]:
             if img_url.startswith('data:image'):
                 try:
                     _, base64_data = img_url.split(',', 1)
+                    if len(base64_data) > _MAX_B64_LEN:
+                        logger.warning(
+                            "[NativeImage] 跳过超大 data URL 图片 (len=%s, 上限=%s)",
+                            len(base64_data), _MAX_B64_LEN,
+                        )
+                        continue
                     image_bytes_list.append(base64.b64decode(base64_data))
                     continue
                 except Exception as e:
@@ -585,7 +631,17 @@ async def _response_items_to_bytes(response_json: dict) -> list[bytes]:
                 try:
                     async with session.get(img_url, timeout=30) as resp:
                         if resp.status == 200:
-                            image_bytes_list.append(await resp.read())
+                            # 同样限制远端下载体积，避免恶意 upstream 用
+                            # 一个 100 MB 的"图片"把进程拖垮。
+                            max_remote = 25 * 1024 * 1024
+                            image_bytes = await resp.content.read(max_remote + 1)
+                            if len(image_bytes) > max_remote:
+                                logger.warning(
+                                    "[NativeImage] 远端图片体积超限 (>%s)，跳过: %s",
+                                    max_remote, img_url[:120],
+                                )
+                                continue
+                            image_bytes_list.append(image_bytes)
                         else:
                             logger.warning(f"[NativeImage] 下载生成图片失败 {resp.status}: {img_url[:120]}")
                 except Exception as e:
@@ -842,6 +898,26 @@ async def _request_openrouter_video(
                         list(data.keys())[:40],
                     )
                     return None, "OpenRouter 响应缺少 job_id 或 polling_url", None
+
+                # SSRF 防御：polling_url 由上游 API 返回，恶意/被攻陷的
+                # 上游可让 bot 去访问内网（如 169.254.169.254 metadata
+                # endpoint 或 127.0.0.1）。这里强制白名单只允许
+                # openrouter.ai 主机，其它一律拒绝。
+                try:
+                    from urllib.parse import urlparse
+                    _parsed_poll = urlparse(str(polling_url))
+                except Exception:
+                    _parsed_poll = None
+                if (
+                    not _parsed_poll
+                    or _parsed_poll.scheme not in ("http", "https")
+                    or _parsed_poll.netloc.lower() not in {"openrouter.ai", "api.openrouter.ai"}
+                ):
+                    logger.warning(
+                        "[NativeVideo/OpenRouter] rejected polling_url outside allowlist: %r",
+                        str(polling_url)[:200],
+                    )
+                    return None, "OpenRouter 返回了不在白名单内的轮询 URL", None
 
                 logger.debug(
                     "[NativeVideo/OpenRouter] submit ok: job_id=%s polling_url=%s keys=%s",

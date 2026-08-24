@@ -1,8 +1,10 @@
 # utils.py
 import json
+import os
 import re
 import aiohttp
 import asyncio
+import functools
 import html
 import logging
 from logging import handlers as logging_handlers
@@ -16,17 +18,32 @@ import sys
 from apitelegramchat.config import GROQ_API_KEY
 
 # ---------- 配置日志 ----------
-def setup_logging():
+# 日志文件路径可由环境变量 LOG_FILE 覆盖；默认 /tmp/app.log 仅在可写时启用。
+LOG_FILE = os.getenv("LOG_FILE", "/tmp/app.log")
+
+def setup_logging() -> bool:
+    """配置 root logger。返回 True 表示完成了配置，False 表示跳过。
+
+    通过环境变量 APITELEGRAMCHAT_REQUIRE_LOGGING=1 可强制在导入时配置；
+    默认情况下，若 root logger 已有 handler 则不再覆盖，便于宿主程序
+    （如 unit tests、MCP server）自定义 logging config。
+    """
     root_logger = logging.getLogger()
     # 应用 LOG_LEVEL 环境变量（默认 INFO）
     try:
         level = getattr(logging, LOG_LEVEL, logging.INFO)
     except Exception:
         level = logging.INFO
-    root_logger.setLevel(level)
+    if root_logger.level == logging.NOTSET or root_logger.level > level:
+        root_logger.setLevel(level)
     logging.getLogger('botocore').setLevel(logging.WARNING)
     logging.getLogger('aiobotocore').setLevel(logging.WARNING)
     logging.getLogger('urllib3').setLevel(logging.WARNING)
+
+    # 仅在没有任何 handler 时才安装 console/file handler，
+    # 避免重复 import（例如 utils 被 reload）造成 handler 累积和日志重复输出。
+    if root_logger.handlers:
+        return False
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
 
@@ -38,16 +55,22 @@ def setup_logging():
 
     try:
         file_handler = logging_handlers.RotatingFileHandler(
-            "/tmp/app.log", maxBytes=10*1024*1024, backupCount=10, encoding="utf-8"
+            LOG_FILE, maxBytes=10*1024*1024, backupCount=10, encoding="utf-8"
         )
         file_handler.setFormatter(logging.Formatter(
             '{"time": "%(asctime)s", "level": "%(levelname)s", "name": "%(name)s", "message": "%(message)s"}'
         ))
         root_logger.addHandler(file_handler)
     except Exception as e:
-        print(f"Warning: 无法创建文件日志: {e}")
+        print(f"Warning: 无法创建文件日志 {LOG_FILE}: {e}")
 
-setup_logging()
+    return True
+
+# 仅在显式开启或 root logger 还没有 handler 时执行初始化。
+# 此前是 import-time 无条件覆盖 root logger，会让 MCP server、tests 等宿主
+# 失去对自己 logging 配置的控制。
+if os.getenv("APITELEGRAMCHAT_REQUIRE_LOGGING", "0") in {"1", "true", "yes", "on"} or not logging.getLogger().handlers:
+    setup_logging()
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +98,7 @@ _SMART_AMP_PATTERN = re.compile(r'&(?![a-zA-Z0-9#]+;)')
 
 def retry_async(max_retries: int = 3, delay: float = 1.0, backoff: float = 3.0, exceptions: tuple = (Exception,)):
     def decorator(func):
+        @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             current_delay = delay
             for attempt in range(max_retries):
@@ -106,7 +130,23 @@ def smart_escape_text(text: str) -> str:
     text = text.replace('<', '&lt;').replace('>', '&gt;')
     return text
 
-def escape_html(text: str) -> str:
+def escape_html(text) -> str:
+    """转义 HTML 特殊字符（<、>、&）。
+
+    历史 BUG：此函数曾是一个 no-op（`return text`），导致 60+ 处调用点
+    实际上未做任何转义，存在 HTML 注入风险。现统一走 smart_escape_text
+    的转义逻辑（智能 ampersand 处理避免对已有的 &amp;/&#39; 实体二次转义）。
+    非字符串输入会被先转换为 str。
+    """
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    if not text:
+        return ""
+    # 复用 smart_escape_text 的逻辑：保留已存在的 HTML 实体，仅转义裸 & 与 <、>。
+    text = _SMART_AMP_PATTERN.sub('&amp;', text)
+    text = text.replace('<', '&lt;').replace('>', '&gt;')
     return text
 
 
@@ -134,11 +174,18 @@ def _rich_message_plain_text_fallback(html_content: str) -> str:
     模型或工具输出有时仅包含内联标签，或在 ``details`` 中缺少块级内容。此类
     HTML 视觉上并非空白，但 Telegram 会返回 ``RICH_MESSAGE_CONTENT_REQUIRED``。
     这里保留其可见文本并转义为单个 ``<p>``，以保证用户不会因格式问题丢失回复。
+
+    顺序很重要：先 strip 标签，再 unescape 实体，最后**重新转义**输出，避免
+    上游 HTML 中的 ``&lt;script&gt;`` 被 unescape 后再次注入回最终 HTML。
     """
-    visible_text = html.unescape(strip_html_tags(html_content or ""))
+    visible_text = strip_html_tags(html_content or "")
+    visible_text = html.unescape(visible_text)
     visible_text = re.sub(r"\s+", " ", visible_text).strip()
     if not visible_text:
         return ""
+    # 重新转义，确保 unescape 出来的 <、>、& 不会被当作 HTML。
+    visible_text = _SMART_AMP_PATTERN.sub('&amp;', visible_text)
+    visible_text = visible_text.replace('<', '&lt;').replace('>', '&gt;')
     return f"<p>{visible_text}</p>"
 
 async def check_deepseek_balance() -> tuple:
@@ -275,12 +322,31 @@ async def _get_draft_send_lock(chat_id: int, draft_id: int) -> asyncio.Lock:
         return lock
 
 async def _reset_draft_failure(chat_id: int, draft_id: int) -> None:
-    _draft_failure_counts.pop((chat_id, draft_id), None)
+    async with _draft_locks_lock:
+        _draft_failure_counts.pop((chat_id, draft_id), None)
 
 async def _bump_draft_failure(chat_id: int, draft_id: int) -> int:
     key = (chat_id, draft_id)
-    _draft_failure_counts[key] = _draft_failure_counts.get(key, 0) + 1
-    return _draft_failure_counts[key]
+    async with _draft_locks_lock:
+        _draft_failure_counts[key] = _draft_failure_counts.get(key, 0) + 1
+        return _draft_failure_counts[key]
+
+async def _cleanup_dead_draft_state(chat_id: int, draft_id: int) -> None:
+    """草稿生命周期结束后，主动清理所有相关缓存项。
+
+    此前 _last_sent_draft_cache / _draft_send_locks / _draft_failure_counts /
+    _draft_last_send_time 这 4 个 module-level dict 没有清理路径，长时间运行
+    会让每个草稿的元数据永久驻留，造成内存泄漏。这里在 mark_draft_dead 之后
+    统一回收。
+    """
+    if not isinstance(chat_id, int) or not isinstance(draft_id, int):
+        return
+    key = (chat_id, draft_id)
+    async with _draft_locks_lock:
+        _last_sent_draft_cache.pop(key, None)
+        _draft_send_locks.pop(key, None)
+        _draft_failure_counts.pop(key, None)
+        _draft_last_send_time.pop(key, None)
 
 async def mark_draft_dead(draft_id) -> None:
     try:
@@ -290,6 +356,12 @@ async def mark_draft_dead(draft_id) -> None:
     async with _dead_draft_ids_lock:
         _dead_draft_ids.add(draft_id_int)
     logger.info(f"Draft {draft_id_int} marked as dead")
+    # 顺手清理可能仍持有的草稿状态。chat_id 在 mark 阶段无法可靠得到，
+    # 我们只能扫描所有 (chat_id, draft_id_int) 键，但数量通常很小。
+    async with _draft_locks_lock:
+        stale_keys = [k for k in _last_sent_draft_cache if isinstance(k, tuple) and len(k) == 2 and k[1] == draft_id_int]
+    for key in stale_keys:
+        await _cleanup_dead_draft_state(key[0], draft_id_int)
 
 async def is_draft_dead(draft_id) -> bool:
     try:
@@ -772,8 +844,11 @@ async def send_rich_message(
 # ==================== 发送 Chat Action ====================
 async def send_chat_action(chat_id: int, action: str) -> None:
     payload = {"chat_id": chat_id, "action": action}
+    # 必须设置超时：此前完全没设 timeout，Telegram API 偶尔 stall 时
+    # 会无限期挂起协程，间接阻塞整个 chat 的活跃任务。
+    timeout = aiohttp.ClientTimeout(total=5, connect=3)
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(f"{BASE_URL}/sendChatAction", json=payload) as resp:
                 if resp.status != 200:
                     logger.warning(f"sendChatAction failed: {await resp.text()}")

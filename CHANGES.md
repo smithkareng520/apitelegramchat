@@ -1,0 +1,418 @@
+# 代码优化与脏代码清理 — 变更清单
+
+本次代码审计与优化覆盖了 `apitelegramchat` 全部核心模块。下文按
+"安全 / 逻辑 / 健壮性 / 脏代码"四类列出实际改动。所有变更均保持
+向后兼容（未变更任何公开 API 签名），可以直接覆盖原代码运行。
+
+## 1. 安全（HIGH 严重度）
+
+### 1.1 修复 `escape_html` 长期为 no-op 的 HTML 注入漏洞
+- 文件：`src/apitelegramchat/utils.py`
+- 问题：`escape_html()` 实现是 `return text`（完全不做转义），
+  但项目里有 60+ 处调用点依赖它防御 HTML 注入。这意味着过去
+  每一处把 LLM/上游 API 数据通过 `escape_html` 拼进 Telegram
+  HTML 的代码实际都没生效，存在被动 HTML 注入风险。
+- 修复：`escape_html` 现在真正做转义（智能 ampersand 处理 +
+  `<` / `>`），并接受任意非字符串输入。同时移除 `ai_handlers.py`
+  里 `logger.setLevel(DEBUG)` 的覆盖（它会让本模块无视 LOG_LEVEL
+  把所有日志以 DEBUG 透传）。
+
+### 1.2 阻止 Telegram bot token 泄露给 LLM API
+- 文件：`src/apitelegramchat/ai/attachment_content.py`
+- 问题：`_resolve_public_attachment_url()` 会返回
+  `https://api.telegram.org/file/bot{TOKEN}/{path}`，该返回值
+  被拼进 `_build_attachment_fallback_text()` 写入发送给 LLM 的
+  prompt 文本——直接把 bot token 暴露给第三方模型 API。
+- 修复：`_resolve_public_attachment_url()` 不再返回 Telegram
+  直链，只返回 R2 公开 URL；R2 不可用时返回空串，让调用方降级
+  为 file_id 文本。
+
+### 1.3 阻止 token 经 `failed` 列表回传 LLM
+- 文件：`src/apitelegramchat/tool_executors.py`
+- 问题：`execute_present_files` 在异常路径上把 `str(e)` 直接
+  塞进 `failed` 列表。`aiohttp.ClientError` 的 str 形式经常
+  把请求 URL（含 `bot{TOKEN}`）一起打印出来，这个 list 又会
+  被作为 tool_result 返回给 LLM。
+- 修复：异常分支显式检测 `BASE_URL in str(e)`，命中则替换为
+  `[redacted url]`，避免 token 泄露。
+
+### 1.4 `execute_fetch_url` SSRF / DNS-rebinding 加固
+- 文件：`src/apitelegramchat/ai/media_generation.py`
+- 问题：`poll_url` 和 `polling_url` 都直接来自上游 API 响应，
+  原代码把它们原样拿来做 HTTP GET——恶意/被攻陷的上游可让 bot
+  去访问内网 metadata endpoint（169.254.169.254）或本地端口。
+- 修复：`task_id` 强制白名单 `^[A-Za-z0-9_-]{1,128}$`；OpenRouter
+  的 `polling_url` 强制只允许 `openrouter.ai` / `api.openrouter.ai`
+  主机，其它一律拒绝。
+
+### 1.5 `ask_user_tool` HTML 注入
+- 文件：`src/apitelegramchat/ask_user_tool.py`
+- 问题：`_question_html` / `_answered_html` 把 LLM 给的
+  `question` / `label` / `description` 与用户自由文本 `value`
+  原样插入 Telegram HTML，攻击者只要让 LLM 输出
+  `<img onerror=...>` 就能在用户客户端执行任意 HTML。
+- 修复：所有插值统一走 `escape_html`（已修正后的真转义版）。
+
+### 1.6 `is_inside_upload_or_download` 改为 fail-closed
+- 文件：`src/apitelegramchat/workspace_paths.py`
+- 问题：该函数被 bash sandbox 用来拒绝在 staging 目录中执行
+  命令。原代码在路径解析异常时返回 `False`（fail-open），意味着
+  任何解析失败都会让 sandbox 误以为 cwd 不在 staging 中并允许
+  执行——绕过安全边界。
+- 修复：所有异常分支返回 `True`（视为在 staging 内），让 sandbox
+  拒绝执行。
+
+### 1.7 `verify_security.py` symlink 竞争 + env 变量名泄露
+- 文件：`src/apitelegramchat/verify_security.py`
+- 问题：
+  - 测试 workspace 用固定路径 `/tmp/verify_workspace`，本地攻击者
+    可以提前创建该路径并指向 `/etc`，让安全自检把测试文件写进 `/etc`。
+  - `check_env_scrubbed` 把残留 env 变量名（如 `STRIPE_SECRET_KEY`）
+    直接 print 到 stdout，本身就是一种信息泄露。
+- 修复：使用 `tempfile.mkdtemp` 在私有 `data_root()` 下创建唯一
+  目录；env 变量名只在 DEBUG 级别记录到 logger，stdout 只显示数量。
+  同时把 landlock 测试超时从 5s 提到 15s（冷容器里常超 5s）。
+
+## 2. 逻辑 bug
+
+### 2.1 `<br>` 标签替换的正则从未生效
+- 文件：`src/apitelegramchat/tool_executors.py` L644
+- 问题：写的是 `r"<br\\s*/?\\s*>"` —— 在 raw string 里 `\\s`
+  是字面量 `\s` 而非正则空白匹配，导致 `<br>` 永远不会被替换
+  成换行。结果：含 `<br>` 的错误响应在 UI 上展示成"未剥离的
+  HTML 片段"。
+- 修复：改为 `r"<br\s*/?\s*>"`。
+
+### 2.2 `bash -n` 在非英文 locale 下完全失效
+- 文件：`src/apitelegramchat/tool_executors.py`
+- 问题：持久 bash shell 防卡死检测靠 `bash -n -c <cmd>` 的
+  `"unexpected EOF"` 错误信息识别未闭合 heredoc / 引号。但
+  原代码不设 `LC_ALL`，在 `zh_CN.UTF-8` / `ja_JP.UTF-8` 环境
+  下 bash 输出本地化错误信息（"未预期的文件结束符"），英文
+  子串匹配失效——本应被路由到隔离执行的危险命令直接进入持久
+  shell，触发 300s 卡死。
+- 修复：在 `create_subprocess_exec` 时显式设置
+  `LC_ALL=C.UTF-8` / `LANG=C.UTF-8`，保证错误信息为英文。
+
+### 2.3 fetch_url 缓存"中毒"
+- 文件：`src/apitelegramchat/search_engine.py`
+- 问题：`set_fetch_cache` 把所有结果（包括 `失败：...` 开头的
+  失败字符串）都写入缓存。一次网络抖动失败会让该 URL 在整个
+  `FETCH_CACHE_TTL`（默认 1 小时）内对所有后续调用直接返回
+  缓存的失败字符串，即使网络已恢复也不会重试。
+- 修复：`set_fetch_cache` 现在拒绝缓存 `失败：` 开头的结果，
+  失败结果仍返回给本次调用方，但不写入缓存。
+
+### 2.4 `_format_image_generation_result` 用 ✅ 子串判断成功
+- 文件：`src/apitelegramchat/tool_executors.py` L659
+- 问题：判断逻辑是 `if "✅" in result_str`——任何错误信息
+  中只要含 ✅ 字符（例如 LLM 把工具描述里 emoji 复制到失败
+  文本中）都会被误判为成功。
+- 修复：（审计标记后，配合 `escape_html` 的修复，至少避免
+  显示层注入；建议后续把工具执行结果改成结构化
+  `{"ok": bool, "data": ...}` 而不是字符串前缀判断。这条
+  在本次优化里保留原行为，避免破坏 UI 协议——但加注释提示。）
+
+### 2.5 `escape_text` 本地副本与全局 `escape_html` 行为不一致
+- 文件：`src/apitelegramchat/tool_executors.py`
+- 问题：`format_tool_result` 内部本地定义了 `escape_text`，
+  它与模块顶部 import 的 `escape_html` 行为略有不同（本地版
+  会重复转义已合法的实体）。两套实现容易飘移。
+- 修复：删除本地 `escape_text` 定义，所有调用点统一改用
+  `escape_html`（现在做了智能 ampersand 处理）。
+
+### 2.6 `execute_crypto_price` URL 参数注入
+- 文件：`src/apitelegramchat/search_engine.py`
+- 问题：`coin_id` 直接来自 LLM 工具参数，未做白名单就拼到
+  CoinGecko URL。LLM 传 `coin="btc&ids=ethereum"` 即可
+  做查询参数注入。
+- 修复：强制白名单 `^[a-z0-9-]+$`；currency 同理要求 3 字母。
+  拼接时再 `quote(..., safe='')`。
+
+### 2.7 汇率 `:.4f` 对字符串值抛 ValueError
+- 文件：`src/apitelegramchat/search_engine.py` L1579
+- 问题：上游 API 偶尔返回字符串形式的汇率（如 "0.1234"），
+  直接 `f"{rates[cur]:.4f}"` 会触发 ValueError，被 outer
+  except 吞成"汇率查询出错"。
+- 修复：显式 `float(...)` 转换 + try/except。
+
+### 2.8 `todo_tool._op_list` 在异常 priority 上抛 KeyError
+- 文件：`src/apitelegramchat/todo_tool.py`
+- 问题：`PRIORITY_META.get(t.get("priority", "medium"), {})["weight"]`
+  在 store 含有未经验证 priority（旧数据 / LLM typo / 手改 JSON）
+  时会触发 `KeyError`，让整个 `execute_todo` 直接异常退出。
+- 修复：改用 `.get("weight", 2)` 链式兜底。
+
+### 2.9 `memory_tool._op_clear` 空 tag 静默不删除
+- 文件：`src/apitelegramchat/memory_tool.py`
+- 问题：scope 是 `tag:`（空 tag）时，
+  `[m for m in before_list if "" not in m.get("tags", [])]`
+  对所有记忆都返回 True（空串不在任何 tag list 里），导致 clear
+  不删除任何条目，却返回 `removed=0` 的成功响应——LLM 容易误以为
+  已清空。
+- 修复：显式拒绝空 tag。
+
+### 2.10 `ai_handlers.py` 硬覆盖 logger 级别
+- 文件：`src/apitelegramchat/ai_handlers.py` L64
+- 问题：`logger.setLevel(logging.DEBUG)` 强制本模块无视
+  `config.LOG_LEVEL`，在生产环境输出大量 debug 噪声。
+- 修复：删除该行。
+
+### 2.11 `clean_prompt` 计算了却不传入图像模型
+- 文件：`src/apitelegramchat/ai/agentic_loops.py` L760
+- 问题：`clean_prompt = _clean_prompt_for_image_model(prompt_text)`
+  算出来了，但调 `_request_modelscope_native_image` 时传的还是
+  `prompt_text`——`_clean_prompt_for_image_model` 想剥离的
+  UI 元数据 / reasoning marker 全部原样泄漏到图像生成模型。
+- 修复：改为传 `clean_prompt`。
+
+### 2.12 `tool_summary._parse_tool_arguments` 手工反转义丢反斜杠
+- 文件：`src/apitelegramchat/ai/tool_summary.py`
+- 问题：兜底分支用 `.replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t')`
+  手工反转义 JSON 字符串，遗漏 `\\u`、`\\r`、`\\\\`、`\\/` 等。
+  对 `C:\\path` 输入会丢一个反斜杠。
+- 修复：把正则捕获的字符串当作 JSON 字符串字面量
+  （`json.loads(f'"{match.group(1)}"')`）解析，让 json 模块
+  处理全部转义；解析失败时退回旧的简单反转义。
+
+### 2.13 `_agentic_loop_native_video` 视频时长只认中文"秒"
+- 文件：`src/apitelegramchat/ai/agentic_loops.py`
+- 问题：`re.search(r'(\d+)\s*秒', prompt)` 只识别中文"秒"，
+  英文 "5 seconds" / "5s" 静默落到默认 5s。
+- 修复：扩展正则到中英文，删除冗余的本地 `import re`。
+
+### 2.14 `_agentic_loop_native_video` `logger.exception` 丢异常对象
+- 文件：`src/apitelegramchat/ai/agentic_loops.py` L1054
+- 问题：原写法 `logger.exception("...: %s", str(video_url)[:200])`
+  把 `%s` 占位符只填了 URL 字符串，e 本身没被传给 logger——异常
+  栈被丢弃，只能看到 "视频下载/上传异常" 而不知道为什么异常。
+- 修复：把 `e` 也作为参数传入。
+
+### 2.15 `INTERACTION_TIMEOUT` 24 小时太长
+- 文件：`src/apitelegramchat/ask_user_tool.py`
+- 问题：一个未回答的 `ask_user` 会把 agent 循环挂起整整一天，
+  期间 chat lock / 内存里的 prompt / 模型 cache 都不能释放。
+- 修复：默认 10 分钟，可通过 `ASK_USER_TIMEOUT` 环境变量覆盖。
+
+### 2.16 `resolve_callback` 在非数值 chat_id 上抛 500
+- 文件：`src/apitelegramchat/ask_user_tool.py`
+- 问题：`int(chat_id)` 在 Telegram 偶发传非数值 chat_id
+  （channel post）时会抛 ValueError，整个 callback 500。
+- 修复：先 try/except 校验类型，无效值返回友好错误。
+
+### 2.17 `context_manager` 没有实际上限
+- 文件：`src/apitelegramchat/context_manager.py`
+- 问题：`DEFAULT_MAX_MESSAGES = None` / `DEFAULT_MAX_CHARS = None`
+  让 `select_request_context` 把整段 history 原样塞进 prompt。长
+  会话能轻易达到 100k+ tokens 请求体，触发 413 / 上下文超限 /
+  费用失控。
+- 修复：默认最近 50 条 / 200k 字符（约 50k tokens），均可通过
+  `CONTEXT_MAX_MESSAGES` / `CONTEXT_MAX_CHARS` 覆盖。
+
+### 2.18 `tool_context_compaction._archive_relative_path` 用 round_index 做 digest
+- 文件：`src/apitelegramchat/tool_context_compaction.py`
+- 问题：归档文件路径的 digest 用 `f"{round_index}:{call_id}"`
+  生成。一旦前面的消息被 select_request_context 截尾，同一
+  次 tool_call 的 round_index 就变了，重新归档会生成不同 digest，
+  让旧 archive 文件永远孤儿化（无法被引用、占据 workspace）。
+- 修复：只用 `call_id` 作为 digest 输入。
+
+## 3. 健壮性 / 资源泄漏
+
+### 3.1 `get_cached_image_data` 一次性失败永久标记 R2 attempted
+- 文件：`src/apitelegramchat/ai/attachment_content.py`
+- 问题：原代码在 *任何* 非 200 响应、任何 `Exception` 上都调用
+  `state.mark_r2_attempted(file_id)`。这个标记是永久的，会让该
+  file_id 在所有后续 turn 中直接短路返回 None——意味着一次
+  Telegram 429 / 一次 DNS 抖动会让该图片永久从对话历史中
+  消失（用户报告 "Gemini 只能看到最新图片"的根因之一）。
+- 修复：仅 hard status（404/403/410）和 file_path 缺失才 mark；
+  429/5xx/网络异常/未知异常都跳过 mark，让下次 turn 重试。
+
+### 3.2 `attachment_content._append_history_async` 把附件元数据发给模型 API
+- 文件：`src/apitelegramchat/ai/attachment_content.py`
+- 问题：把 `file_id` / `file_ids` / `file_name` / `mime_type` /
+  `type` / `attachments` 等内部字段拷到出站消息体——OpenAI /
+  Anthropic / Gemini 等网关对未声明字段会直接返回 400。
+- 修复：只拷 OpenAI 兼容协议认可的字段
+  （`role` / `content` / `tool_calls` / `tool_call_id` /
+  `name` / `reasoning_content`）。
+
+### 3.3 `s3_utils.upload_bytes_to_r2` 重试循环是死代码
+- 文件：`src/apitelegramchat/s3_utils.py` L113
+- 问题：`max_attempts = 1` 让 `for attempt in range(1)` 只跑一次，
+  下面的 `if attempt < max_attempts - 1` 永远进不去。
+- 修复：改成 `max_attempts = 3` + 指数退避。
+
+### 3.4 PIL Image 未 close + `img.convert("RGB")` 也未 close
+- 文件：`src/apitelegramchat/ai/attachment_content.py` L423
+  + `src/apitelegramchat/ai/error_formatting.py` L375
+- 问题：在异常路径上 PIL Image 不会 close，反复处理大量图片
+  会泄露文件描述符。`img.convert("RGB")` 返回新对象，也未被 close。
+- 修复：都用 `with Image.open(...) as img:` + `with img.convert(...) as ...`。
+
+### 3.5 `media_generation` 大 base64 / 远端图片无大小限制
+- 文件：`src/apitelegramchat/ai/media_generation.py`
+- 问题：`base64.b64decode(b64_json)` 直接对上游返回的 base64
+  串做解码，恶意/失控的上游可返回多 GB 字符串触发 OOM；
+  `await resp.read()` 同样把整个"图片"读进内存。
+- 修复：base64 串超过 25MB 直接拒绝解码；远端图片同样用
+  `resp.content.read(max+1)` + 大小检查。
+
+### 3.6 `_agentic_loop_native_video` 视频下载无大小上限
+- 文件：`src/apitelegramchat/ai/agentic_loops.py`
+- 问题：`await dl_resp.read()` 把整个视频字节读进内存，
+  无上限。一个失控上游返回 1GB+ 视频会把进程拖垮。
+- 修复：限制 200MB，超限拒绝并回退到原始 URL。
+
+### 3.7 `_safe_json_parse` 完全静默吞异常
+- 文件：`src/apitelegramchat/ai/media_generation.py`
+- 问题：所有 JSON parse 失败都 `except Exception: return None`，
+  没有任何诊断痕迹。200 响应体不是合法 JSON 时排查非常困难。
+- 修复：`JSONDecodeError` 在 debug 级别输出诊断信息。
+
+### 3.8 `_post_or_get_json` 同时传 `data=` 和 `json=`
+- 文件：`src/apitelegramchat/ai/media_generation.py`
+- 问题：aiohttp 在两者都非 None 时行为未定义。原代码总是
+  一起传，实际只有 `json=` 生效，但代码意图不清。
+- 修复：显式二选一分支，提取 `_finalize_response` 复用。
+
+### 3.9 `_rollover_history` 无上限
+- 文件：`src/apitelegramchat/ai/rich_message_builder.py`
+- 问题：每次 rollover 都 append 一条，没有上限，长会话会让
+  该 list 无限增长。
+- 修复：限制最近 50 条，老的 `del` 掉。
+
+### 3.10 429 检测靠 `"429" in str(e)`
+- 文件：`src/apitelegramchat/ai/rich_message_builder.py` L1182
+- 问题：子串匹配，任何巧合含 "429" 字符串的异常（如 request_id）
+  都会被误判为 rate limit。
+- 修复：优先看异常的 `status_code` 属性，再回退到子串。
+
+### 3.11 `_RICH_BLOCK_TAGS` / `_RICH_VOID_TAGS` 是可变 set
+- 文件：`src/apitelegramchat/ai/rich_message_builder.py`
+- 问题：模块级 mutable set，任何误操作会污染所有 builder。
+- 修复：改为 `frozenset`。
+
+### 3.12 `_draft_*` 全局 dict 永不清理
+- 文件：`src/apitelegramchat/utils.py`
+- 问题：`_last_sent_draft_cache` / `_draft_send_locks` /
+  `_draft_failure_counts` / `_draft_last_send_time` 这 4 个
+  module-level dict 在草稿生命周期结束后没有清理路径，长时间
+  运行会让每个草稿的元数据永久驻留（内存泄漏）。
+- 修复：`mark_draft_dead` 之后主动扫描并清理匹配的缓存项；
+  失败计数加锁。
+
+### 3.13 `retry_async` 不用 `functools.wraps`
+- 文件：`src/apitelegramchat/utils.py`
+- 问题：被装饰的协程失去 `__name__` / `__doc__`，影响
+  introspection / help() / 日志可读性。
+- 修复：加 `@functools.wraps`。
+
+### 3.14 `setup_logging` 在 import 时无条件覆盖 root logger
+- 文件：`src/apitelegramchat/utils.py`
+- 问题：任何 import 都会触发 root logger 重置 + 安装
+  console/file handler，让 MCP server / unit tests 等宿主
+  失去对自己 logging 配置的控制；同时日志文件路径硬编码
+  `/tmp/app.log`，只读 FS 上会失败。
+- 修复：仅在 root logger 还没有 handler 或显式通过
+  `APITELEGRAMCHAT_REQUIRE_LOGGING=1` 要求时才初始化；
+  日志路径可通过 `LOG_FILE` 覆盖。
+
+### 3.15 `_rich_message_plain_text_fallback` 重新注入风险
+- 文件：`src/apitelegramchat/utils.py`
+- 问题：`html.unescape(strip_html_tags(html))` 后直接拼回
+  `<p>...</p>`，如果原 HTML 里含 `&lt;script&gt;`，
+  unescape 出来的 `<script>` 会被当作 HTML 渲染。
+- 修复：unescape 之后**再次转义**，避免重新注入。
+
+### 3.16 `send_chat_action` 没设超时
+- 文件：`src/apitelegramchat/utils.py`
+- 问题：Telegram API stall 时会无限期挂起协程，间接阻塞
+  整个 chat 的活跃任务。
+- 修复：设 `total=5, connect=3`。
+
+### 3.17 `file_handlers.get_file_path` 没设超时
+- 文件：`src/apitelegramchat/file_handlers.py`
+- 问题：同上。
+- 修复：设 `total=15, connect=5`；下载用 `total=60, connect=10`；
+  异常路径上脱敏 token（避免 `str(e)` 含 token 进 ERROR 日志）。
+
+### 3.18 `todo_tool` / `memory_tool` 共用 tmp 文件名导致并发丢数据
+- 文件：`src/apitelegramchat/todo_tool.py` / `memory_tool.py`
+- 问题：原子写入用的 tmp 文件名固定为
+  `<name>.json.tmp`，两个并发 writer 共用同一个 tmp 路径，
+  后写的覆盖先写的。
+- 修复：tmp 名加 PID + 8 字节随机后缀，确保唯一。
+
+### 3.19 `subagent_tool` 把 traceback 直接返回给 LLM
+- 文件：`src/apitelegramchat/subagent_tool.py` L474
+- 问题：`"traceback": traceback.format_exc()[:500]` 直接放进
+  tool_result JSON 返回给 LLM。traceback 里可能含文件路径、
+  env var 名、甚至 URL 形态的 secret（如 API key 拼在 endpoint URL 里）。
+- 修复：改成只返回 `error_id`（uuid 前 12 字节），完整 traceback
+  留在后端 logger 里供运维查。
+
+### 3.20 `DEFAULT_ALLOWED_TOOLS` 用 set 让 prompt cache 失效
+- 文件：`src/apitelegramchat/subagent_tool.py`
+- 问题：set 迭代顺序在 CPython 上由 hash 决定，不同进程可能
+  顺序不同，传给 LLM 的 tool schema 顺序也会变，导致 prompt
+  cache 命中率掉到 0。
+- 修复：改用 `sorted(list)`，保证稳定顺序。
+
+## 4. 脏代码 / 可维护性
+
+- `search_engine.py`：删除未使用的 `import math` / `import shutil`
+  / `clear_editor_file_state`；修正 `MAX_EDITOR_FILE_SIZE` 注释
+  （原写"# 1MB"，值实际是 5MB）。
+- `search_engine.py`：把 `asyncio.get_event_loop().time()` 换成
+  `time.monotonic()`——前者在 Python 3.10+ 没有运行 loop 时
+  会发 DeprecationWarning，且与 `time.monotonic` 不是同一个时钟。
+- `tool_executors.py`：删除 `format_tool_result` 内的本地
+  `escape_text` 定义，全部用 `escape_html`。
+- `tool_executors.py`：把 `execute_present_files` 的
+  `aiohttp.ClientSession` 提到循环外层，避免每个文件都做一次
+  TLS 握手。
+- `error_formatting.py`：`_CONTENT_SAFETY_KEYWORDS` 改为
+  `frozenset` 并预计算 lower-case 版本，省去每次调用的 `.lower()`
+  开销；`from io import BytesIO` 提到模块顶部。
+- `verify_security.py`：补 `import logging`、`import tempfile`，
+  与项目其它模块保持一致的 logger 命名。
+- `mcp_client.py`：logger 名从硬编码字符串改成 `__name__`。
+- `attachment_content.py`：`_get_cached_audio_data` /
+  `_get_cached_document_data` / `_build_native_document_part` /
+  `_resolve_multimodal_content` 的 `chat_id` 类型注解从 `int`
+  改成 `int | None`，与实际调用一致（多处传 `None`）。
+- `tool_context_compaction.py`：archive payload 加 1MB 上限，
+  避免大 `fetch_url` 结果反复归档撑爆 workspace。
+- `tool_summary.py`：补 `json.loads` 解析失败时记录 debug 痕迹
+  （此前完全静默 `except Exception: pass`）。
+
+## 5. 已知遗留项（建议后续单独处理）
+
+以下问题影响较大但本次未改，因为修复方式会破坏现有协议或
+需要重构：
+
+- `tool_executors.format_tool_result` 是 600 行 if/elif 级联，
+  按工具名分派。建议改成 `TOOL_FORMATTERS: dict[str, ToolFormatter]`
+  注册表，每个工具一个 formatter 类，避免新增工具时改到全文件。
+- `tool_executors.py` ↔ `search_engine.py` ↔ `subagent_tool.py`
+  存在循环依赖（`subagent_tool` 内部 import `tool_executors`）。
+  建议把 `dispatch_tool_call` / `tool_semaphore` /
+  `_TOOL_TIMEOUT_MARKER` 拆到独立的 `tool_dispatch.py`。
+- `_request_agnes_video` 与 `_request_openrouter_video` 是
+  两个 180 行几乎重复的函数，建议提取
+  `_submit_and_poll_video(submit_fn, poll_fn, status_extractor)`。
+- `RichMessageBuilder` 是 god-object，`agentic_loops` /
+  `tool_call_loop` 大量直接访问其 `_tool_groups` 私有属性。
+  建议暴露 `is_current_group_finished()` /
+  `finish_current_group()` 等公开 API。
+- `sandbox._preexec_sandbox` 使用 `preexec_fn=`，在多线程程序
+  上有 Python 文档明示的死锁风险。建议改用 `unshare` /
+  `setpriv` 或父进程预置 `setrlimit`。
+- `sandbox.watchdog` 每秒 walk 整个 `/proc` 找子进程，O(N×M)。
+  建议用 cgroup 跟踪 descendant。
+- 工具结果统一信封：不同工具的失败返回有的是 `"❌ ..."`，
+  有的是 `"失败：..."`，有的是 `{"status":"error"}`。建议
+  统一为 `{"ok": bool, "error": {"code","message"}}` 并让
+  formatter 信任结构化字段而非字符串前缀。

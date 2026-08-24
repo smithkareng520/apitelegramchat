@@ -61,10 +61,13 @@ from apitelegramchat.ai.agentic_loops import (
 )
 
 logger = get_logger(__name__)
-logger.setLevel(logging.DEBUG)
+# 修复 BUG：此前这里硬性 setLevel(DEBUG)，无论 config.LOG_LEVEL 是 INFO
+# 还是 WARNING，本模块的所有日志都会以 DEBUG 级别透传到 root，从而
+# 在生产环境输出大量 debug 噪声。删除该行，让模块日志遵循 root logger
+# 的级别（由 utils.setup_logging 应用 LOG_LEVEL）。
 
 async def build_system_prompt(
-    chat_id: int = None,
+    chat_id: int | None = None,
     username: str = "用户",
     supports_tools: bool = True,
     skill_catalog_text: str | None = None,

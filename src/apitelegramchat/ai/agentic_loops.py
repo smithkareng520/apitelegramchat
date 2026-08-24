@@ -757,7 +757,11 @@ async def _agentic_loop_native_image(
 
         if provider == "modelscope":
             response_json, endpoint, error_detail, status_code, request_id = await _request_modelscope_native_image(
-                prompt=prompt_text,
+                # 修复 BUG：clean_prompt 已计算但未传入 _request_modelscope_native_image，
+                # 后者实际收到的是原始 prompt_text。结果是 _clean_prompt_for_image_model
+                # 想要剥离的 UI 元数据（chat history 标记、reasoning marker 等）会
+                # 原样泄漏到图像生成模型，可能被当作 prompt 的一部分影响生成结果。
+                prompt=clean_prompt,
                 image_urls=image_urls,
                 num_images=1,
                 model=current_model,  # 传入当前模型 ID
@@ -986,12 +990,16 @@ async def _agentic_loop_native_video(
         return "VIDEO_ERROR:未提供提示词", None, []
 
     # 可选：解析时长
-    import re
+    # re 已在文件顶部 import，删除本地的 `import re`（之前是冗余 import）。
     duration = 5
-    match = re.search(r'(\d+)\s*秒', prompt)
+    # 时长解析：兼容中英文（"5秒" 与 "5 seconds" / "5s"）
+    match = re.search(r'(\d+)\s*(?:秒|seconds?|secs?|s)\b', prompt, re.IGNORECASE)
     if match:
-        duration = int(match.group(1))
-        duration = max(3, min(duration, 30))
+        try:
+            duration = int(match.group(1))
+            duration = max(3, min(duration, 30))
+        except ValueError:
+            duration = 5
 
     # 获取模型信息，确定 provider
     model_info = SUPPORTED_MODELS.get(current_model)
@@ -1029,25 +1037,43 @@ async def _agentic_loop_native_video(
         async with aiohttp.ClientSession(timeout=timeout) as dl_session:
             async with dl_session.get(video_url) as dl_resp:
                 if dl_resp.status == 200:
-                    video_bytes = await dl_resp.read()
-                    video_bytes_len = len(video_bytes)
-                    logger.debug(
-                        "[NativeVideo] video downloaded: %d bytes from %s",
-                        video_bytes_len, str(video_url)[:200],
-                    )
-                    r2_key = f"generated/{uuid.uuid4().hex}.mp4"
-                    r2_url = await upload_bytes_to_r2(video_bytes, r2_key, "video/mp4")
-                    if r2_url:
-                        final_video_url = r2_url
+                    # 修复 OOM 风险：此前直接 await dl_resp.read() 把整个视频字节读进
+                    # 内存，没有大小上限。一个失控/恶意的上游返回 1GB+ 的"视频"会把
+                    # 进程拖垮。这里限制为 200MB（足够任何合理的 720p 视频片段），
+                    # 超限则拒绝并回退到原始 URL。
+                    _MAX_VIDEO_BYTES = 200 * 1024 * 1024
+                    video_bytes = await dl_resp.content.read(_MAX_VIDEO_BYTES + 1)
+                    if len(video_bytes) > _MAX_VIDEO_BYTES:
+                        logger.warning(
+                            "[NativeVideo] 视频体积超限 (>%s)，跳过 R2 上传，回退原始 URL: %s",
+                            _MAX_VIDEO_BYTES, str(video_url)[:200],
+                        )
+                        video_bytes = b""
+                        video_bytes_len = 0
                     else:
-                        logger.warning("[NativeVideo] R2 上传失败，回退使用原始视频 URL")
+                        video_bytes_len = len(video_bytes)
+                        logger.debug(
+                            "[NativeVideo] video downloaded: %d bytes from %s",
+                            video_bytes_len, str(video_url)[:200],
+                        )
+                        r2_key = f"generated/{uuid.uuid4().hex}.mp4"
+                        r2_url = await upload_bytes_to_r2(video_bytes, r2_key, "video/mp4")
+                        if r2_url:
+                            final_video_url = r2_url
+                        else:
+                            logger.warning("[NativeVideo] R2 上传失败，回退使用原始视频 URL")
                 else:
                     logger.warning(
                         "[NativeVideo] 视频下载非 200: status=%s url=%s，回退使用原始 URL",
                         dl_resp.status, str(video_url)[:200],
                     )
     except Exception as e:
-        logger.exception("[NativeVideo] 视频下载/上传异常，回退使用原始 URL: %s", str(video_url)[:200])
+        # 修复：原 logger.exception 把 %s 视频字符串作为参数但 %s 占位符只有
+        # 一个，导致 e 本身被 logger 内部忽略。改为把 e 也传入。
+        logger.exception(
+            "[NativeVideo] 视频下载/上传异常，回退使用原始 URL: url=%s err=%s",
+            str(video_url)[:200], e,
+        )
 
     # 构造富文本：用 <figure>+<video>+<figcaption> 的文档推荐写法（视频只能作为独立 media block）
     # caption 走与图片一致的“元数据”风格（分辨率/帧率/帧数/大小/模型），不再附提示词。

@@ -641,7 +641,10 @@ def _render_media_failure_result(result_str: str, fallback: str) -> str:
     """
     raw = result_str if isinstance(result_str, str) else str(result_str or "")
     raw = html.unescape(raw)
-    raw = re.sub(r"<br\\s*/?\\s*>", "\n", raw, flags=re.IGNORECASE)
+    # 修复 BUG：原先写的是 r"<br\\s*/?\\s*>" —— 在 raw-string 里 \\s 是字面量 "\s"
+    # 而非正则的空白匹配，导致这个 <br> 替换实际上从未生效。
+    # 改成 r"<br\s*/?\s*>" 后才会正确匹配 <br>、<br/>、<br />。
+    raw = re.sub(r"<br\s*/?\s*>", "\n", raw, flags=re.IGNORECASE)
     raw = re.sub(r"<[^>]+>", "", raw)
     message = html.unescape(raw).strip() or fallback
     return _render_editor_quote("Result", message)
@@ -970,11 +973,22 @@ class BashSession:
         hand (heredocs, quotes, backticks, `$(`, `((`, `{`, ...).
         """
         try:
+            # 强制使用 C locale：bash 在 zh_CN.UTF-8 / ja_JP.UTF-8 等环境下
+            # 会输出本地化错误信息（"未预期的文件结束符"），从而让下面
+            # 的英文子串匹配（"unexpected EOF"）彻底失效，导致本应被路由
+            # 到隔离执行的危险命令直接进入持久 shell，触发 300s 卡死。
+            import os as _os
+            env = {
+                "LC_ALL": "C.UTF-8",
+                "LANG": "C.UTF-8",
+                "PATH": _os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+            }
             proc = await asyncio.create_subprocess_exec(
                 "bash", "-n", "-c", command,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
             try:
                 _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
@@ -987,10 +1001,9 @@ class BashSession:
                 return True
             if proc.returncode != 0:
                 msg = (stderr or b"").decode("utf-8", errors="replace")
-                # Only "unexpected EOF" / unterminated-token errors indicate the
-                # persistent shell would hang; other syntax errors (e.g. a typo)
-                # are fine to let the persistent shell report normally, since
-                # they don't consume the end marker.
+                # 仅 "unexpected EOF" / 未终止 token 错误才说明持久 shell 会
+                # 卡住；其他语法错误（如拼写错误）可以由持久 shell 正常报错，
+                # 因为它们不会吞掉 end marker。
                 if "unexpected EOF" in msg or "unexpected end of file" in msg:
                     return True
             return False
@@ -1455,9 +1468,10 @@ _TOOL_TIMEOUT_LABELS = {
 }
 
 async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tuple[str, str]:
-    def escape_text(text):
-        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
+    # 历史上这里曾重复定义一个本地 escape_text（与 import 的 escape_html
+    # 行为不完全一致：本地版会对已经合法的实体再做一次 `&` -> `&amp;` 转换，
+    # 导致双重转义），是容易飘移的脏代码。现已删除本地定义，全部走
+    # utils.escape_html（它做了智能 ampersand 处理，不会重复转义）。
     # ---- Intercept timeout magic marker BEFORE any other branch ----
     # The raw exception (with TOOL_CALL_TIMEOUT seconds) is kept in
     # logger.error on the backend; the UI only sees the friendly version.
@@ -1501,19 +1515,19 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                         if current_link.startswith("http"):
                             domain = current_link.split('/')[2] if '//' in current_link else current_link
                             items_html += (
-                                f"<li><b><a href=\"{current_link}\">{escape_text(current_title)}</a></b> "
-                                f"<code>{escape_text(domain)}</code></li>"
+                                f"<li><b><a href=\"{current_link}\">{escape_html(current_title)}</a></b> "
+                                f"<code>{escape_html(domain)}</code></li>"
                             )
                         else:
-                            items_html += f"<li><b>{escape_text(current_title)}</b> <code>{escape_text(current_link)}</code></li>"
+                            items_html += f"<li><b>{escape_html(current_title)}</b> <code>{escape_html(current_link)}</code></li>"
                         current_title = ""
                         current_link = ""
             if items_html:
                 details_html = f"<ol>{items_html}</ol>"
             else:
-                details_html = escape_text(result_str)
+                details_html = escape_html(result_str)
         else:
-            details_html = escape_text(result_str[:60000])
+            details_html = escape_html(result_str[:60000])
         return summary, details_html
 
     elif fn_name == "fetch_url":
@@ -1668,7 +1682,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             return summary, details_html
 
         except json.JSONDecodeError:
-            safe_log = escape_text(result_str[:60000])
+            safe_log = escape_html(result_str[:60000])
             summary = "🌤️ 天气数据"
             details_html = f"<pre><code>{safe_log}</code></pre>"
             return summary, details_html
@@ -1718,12 +1732,12 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 details_html = (
                     f'<img src="{img_url}"/><br/>'
                     f'<b>✅ 二维码生成成功</b><br/>'
-                    f'<b>内容：</b>{escape_text(content_text)}<br/>'
+                    f'<b>内容：</b>{escape_html(content_text)}<br/>'
                     f'<b>链接：</b><a href="{img_url}">📷 点击查看 / 下载二维码</a>'
                 )
                 return summary, details_html
         summary = "📱 二维码"
-        details_html = escape_text(result_str)
+        details_html = escape_html(result_str)
         return summary, details_html
 
     elif fn_name == "generate_image_from_text":
@@ -1804,7 +1818,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         if isinstance(data, dict) and data.get("status") == "error":
             message = data.get("message") or result_str
             summary = f"❌ {base_label}失败"
-            details_html = escape_text(str(message))
+            details_html = escape_html(str(message))
             return summary, details_html
 
         ip = fn_args.get('ip') if fn_name == "ip_geo" else None
@@ -1846,12 +1860,12 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             payload = None
         if not isinstance(payload, dict):
             summary = "📋 待办操作"
-            details_html = escape_text(result_str)
+            details_html = escape_html(result_str)
             return summary, details_html
 
         if not payload.get("ok"):
             summary = f"❌ 待办操作失败：{payload.get('code', '')}"
-            details_html = f"<p>{escape_text(payload.get('error', '未知错误'))}</p>"
+            details_html = f"<p>{escape_html(payload.get('error', '未知错误'))}</p>"
             return summary, details_html
 
         action = payload.get("action", "list")
@@ -1900,11 +1914,11 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             payload = None
         if not isinstance(payload, dict):
             summary = "🧠 记忆操作"
-            details_html = escape_text(result_str)
+            details_html = escape_html(result_str)
             return summary, details_html
         if not payload.get("ok"):
             summary = f"❌ 记忆操作失败：{payload.get('code', '')}"
-            details_html = f"<p>{escape_text(payload.get('error', '未知错误'))}</p>"
+            details_html = f"<p>{escape_html(payload.get('error', '未知错误'))}</p>"
             return summary, details_html
         action = payload.get("action", "list")
         if action == "list":
@@ -1942,7 +1956,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             payload = None
         if not isinstance(payload, dict):
             summary = "🤖 子 agent"
-            details_html = escape_text(result_str)
+            details_html = escape_html(result_str)
             return summary, details_html
         ok = payload.get("ok", False)
         model_name = payload.get("model_name") or payload.get("model") or "?"
@@ -1987,7 +2001,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             # from dispatch_tool_call's top-level exception handler). Render
             # it as escaped plain text so we never break the UI.
             summary = "📂 Presenting files"
-            details_html = escape_text(result_str) or "<i>No files were processed.</i>"
+            details_html = escape_html(result_str) or "<i>No files were processed.</i>"
             return summary, details_html
 
         sent = data.get("sent") or []
@@ -2015,15 +2029,15 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         # ---- Details: HTML list of successes and failures ----
         details_parts: List[str] = []
         if sent:
-            items = "".join(f"<li>{escape_text(str(f))}</li>" for f in sent)
+            items = "".join(f"<li>{escape_html(str(f))}</li>" for f in sent)
             label = "file" if sent_count == 1 else "files"
             details_parts.append(f"<b>✅ Sent ({sent_count} {label})</b><ul>{items}</ul>")
         if failed:
-            items = "".join(f"<li>{escape_text(str(f))}</li>" for f in failed)
+            items = "".join(f"<li>{escape_html(str(f))}</li>" for f in failed)
             label = "file" if failed_count == 1 else "files"
             details_parts.append(f"<b>❌ Failed ({failed_count} {label})</b><ul>{items}</ul>")
         if error:
-            details_parts.append(f"<i>{escape_text(str(error))}</i>")
+            details_parts.append(f"<i>{escape_html(str(error))}</i>")
 
         if not details_parts:
             details_parts.append("<i>No files were processed.</i>")
@@ -2037,7 +2051,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         except (json.JSONDecodeError, TypeError):
             data = None
         if not isinstance(data, dict):
-            return f"📦 {fn_name}", f"<pre><code>{escape_text(result_str)}</code></pre>"
+            return f"📦 {fn_name}", f"<pre><code>{escape_html(result_str)}</code></pre>"
         ok_key = "fetched" if fn_name == "fetch_download" else "staged"
         ok_items = data.get(ok_key) or []
         failed_items = data.get("failed") or []
@@ -2053,13 +2067,13 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_parts: List[str] = []
         if ok_items:
             items = "".join(
-                f"<li>{escape_text(str(it.get('path')))}</li>"
+                f"<li>{escape_html(str(it.get('path')))}</li>"
                 for it in ok_items if isinstance(it, dict)
             )
             label = "file" if len(ok_items) == 1 else "files"
             details_parts.append(f"<b>✅ {verb} ({len(ok_items)} {label})</b><ul>{items}</ul>")
         if failed_items:
-            items = "".join(f"<li>{escape_text(str(x))}</li>" for x in failed_items)
+            items = "".join(f"<li>{escape_html(str(x))}</li>" for x in failed_items)
             label = "file" if len(failed_items) == 1 else "files"
             details_parts.append(f"<b>❌ Failed ({len(failed_items)} {label})</b><ul>{items}</ul>")
         if not details_parts:
@@ -2071,7 +2085,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         except (json.JSONDecodeError, TypeError):
             data = None
         if not isinstance(data, dict):
-            return f"📋 {fn_name}", f"<pre><code>{escape_text(result_str)}</code></pre>"
+            return f"📋 {fn_name}", f"<pre><code>{escape_html(result_str)}</code></pre>"
         files = data.get("files") or []
         count = data.get("count", len(files))
         label = "download/" if fn_name == "list_download" else "upload/"
@@ -2080,14 +2094,14 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             details_html = f"<i>{label} is empty.</i>"
         else:
             items = "".join(
-                f"<li>{escape_text(str(f.get('path')))} <i>({f.get('size')} bytes)</i></li>"
+                f"<li>{escape_html(str(f.get('path')))} <i>({f.get('size')} bytes)</i></li>"
                 for f in files if isinstance(f, dict)
             )
             details_html = f"<b>{label}</b><ul>{items}</ul>"
         return summary, details_html
     else:
         summary = f"🔧 {fn_name}"
-        details_html = escape_text(result_str)
+        details_html = escape_html(result_str)
         return summary, details_html
 
 
@@ -2117,48 +2131,51 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
         failed = []
         # 文件大小上限：50MB，防止 OOM
         _MAX_PRESENT_FILE_SIZE = 50 * 1024 * 1024
-        for path in paths:
-            if not isinstance(path, str) or not path:
-                failed.append(f"{path} (invalid path)")
-                continue
-            # 拒绝嵌入的 null 字节
-            if "\x00" in path:
-                failed.append(f"{path} (invalid path)")
-                continue
-            safe_path = os.path.normpath(path)
-            if safe_path == "." or safe_path.startswith("..") or os.path.isabs(safe_path):
-                failed.append(f"{path} (invalid path)")
-                continue
-            local_path = upload_root / safe_path
-            # 关键：使用 resolve() 跟随符号链接，再校验最终路径仍在 upload/ 之下
-            try:
-                resolved = local_path.resolve()
-            except Exception:
-                failed.append(f"{path} (invalid path)")
-                continue
-            try:
-                upload_resolved = upload_root.resolve()
-            except Exception:
-                upload_resolved = upload_root
-            if resolved != upload_resolved and upload_resolved not in resolved.parents:
-                failed.append(f"{path} (invalid path)")
-                continue
-            if not resolved.is_file():
-                failed.append(
-                    f"{path} (file not found in upload/ — use stage_upload to copy "
-                    f"it from your workdir first)"
-                )
-                continue
-            try:
-                file_size = resolved.stat().st_size
-                if file_size > _MAX_PRESENT_FILE_SIZE:
-                    failed.append(f"{path} (file too large: {file_size} bytes)")
+        # 提升：把 aiohttp session 提升到循环外层，避免每个文件都做一次
+        # TLS 握手。同时若异常 str(e) 里包含了带 TELEGRAM_BOT_TOKEN 的 URL
+        # （BASE_URL 里嵌了 bot token），截断 + 脱敏后再写入 failed 列表，
+        # 否则这个 list 会被 LLM 看到从而泄露 token。
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for path in paths:
+                if not isinstance(path, str) or not path:
+                    failed.append(f"{path} (invalid path)")
                     continue
-                # 使用 asyncio.to_thread 包装同步 read，避免阻塞事件循环
-                file_data = await asyncio.to_thread(resolved.read_bytes)
-                # 显式超时，防止 hang 死
-                timeout = aiohttp.ClientTimeout(total=60)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
+                # 拒绝嵌入的 null 字节
+                if "\x00" in path:
+                    failed.append(f"{path} (invalid path)")
+                    continue
+                safe_path = os.path.normpath(path)
+                if safe_path == "." or safe_path.startswith("..") or os.path.isabs(safe_path):
+                    failed.append(f"{path} (invalid path)")
+                    continue
+                local_path = upload_root / safe_path
+                # 关键：使用 resolve() 跟随符号链接，再校验最终路径仍在 upload/ 之下
+                try:
+                    resolved = local_path.resolve()
+                except Exception:
+                    failed.append(f"{path} (invalid path)")
+                    continue
+                try:
+                    upload_resolved = upload_root.resolve()
+                except Exception:
+                    upload_resolved = upload_root
+                if resolved != upload_resolved and upload_resolved not in resolved.parents:
+                    failed.append(f"{path} (invalid path)")
+                    continue
+                if not resolved.is_file():
+                    failed.append(
+                        f"{path} (file not found in upload/ — use stage_upload to copy "
+                        f"it from your workdir first)"
+                    )
+                    continue
+                try:
+                    file_size = resolved.stat().st_size
+                    if file_size > _MAX_PRESENT_FILE_SIZE:
+                        failed.append(f"{path} (file too large: {file_size} bytes)")
+                        continue
+                    # 使用 asyncio.to_thread 包装同步 read，避免阻塞事件循环
+                    file_data = await asyncio.to_thread(resolved.read_bytes)
                     form = aiohttp.FormData()
                     form.add_field("chat_id", str(chat_id))
                     form.add_field("document", file_data, filename=resolved.name)
@@ -2166,9 +2183,19 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
                         if resp.status == 200:
                             sent.append(resolved.name)
                         else:
-                            failed.append(f"{path} (send failed: {resp.status})")
-            except Exception as e:
-                failed.append(f"{path} (error: {str(e)[:50]})")
+                            failed.append(f"{path} (send failed: HTTP {resp.status})")
+                except aiohttp.ClientError as e:
+                    # 网络层错误：str(e) 可能含 URL（带 bot token），脱敏后再写。
+                    safe_msg = str(e)
+                    if BASE_URL and BASE_URL in safe_msg:
+                        safe_msg = "[redacted url]"
+                    failed.append(f"{path} (network error: {safe_msg[:80]})")
+                except Exception as e:
+                    # 通用兜底：同样脱敏 URL，避免 token 泄露给 LLM 上下文。
+                    safe_msg = str(e)
+                    if BASE_URL and BASE_URL in safe_msg:
+                        safe_msg = "[redacted url]"
+                    failed.append(f"{path} (error: {safe_msg[:50]})")
         return json.dumps({"sent": sent, "failed": failed, "error": None})
 
 

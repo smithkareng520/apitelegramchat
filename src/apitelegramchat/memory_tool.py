@@ -103,10 +103,18 @@ def _load_local(chat_id: int) -> dict:
 
 
 def _save_local(chat_id: int, store: dict) -> None:
+    """以原子方式把 store 写到 memories.json。
+
+    修复：之前 tmp 文件名固定为 ``memories.json.tmp``，两个并发 writer
+    会复用同一个 tmp 路径，后写的覆盖先写的，导致数据丢失。现在在
+    tmp 名中加入 PID + 随机后缀，确保唯一。
+    """
     path = _memory_path(chat_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     store["updated_at"] = int(time.time())
-    tmp = path.with_suffix(".json.tmp")
+    # 唯一 tmp 名：进程内 PID + 8 字节随机，避免并发写碰撞。
+    import uuid as _uuid
+    tmp = path.with_suffix(f".json.tmp.{os.getpid()}.{_uuid.uuid4().hex[:8]}")
     tmp.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
 
@@ -384,6 +392,12 @@ def _op_clear(store: dict, scope: str) -> dict:
         msg = f"已清空分类 {cat} 下 {removed} 条记忆"
     elif scope.startswith("tag:"):
         tag = scope.split(":", 1)[1].strip()
+        # 修复 BUG：此前 tag 为空时 ``[m for m in before_list if "" not in m.get("tags", [])]``
+        # 对所有记忆都返回 True（因为空串不在任何 tag list 里），导致 clear
+        # 静默不删除任何条目，却返回 removed=0 的成功响应——非常容易让 LLM
+        # 误以为已经清空。这里显式拒绝空 tag。
+        if not tag:
+            raise _MemoryError("clear tag 不能为空", "bad_scope")
         before_list = list(store["memories"])
         store["memories"] = [m for m in before_list if tag not in m.get("tags", [])]
         removed = before - len(store["memories"])

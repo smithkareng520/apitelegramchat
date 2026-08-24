@@ -110,7 +110,11 @@ async def upload_bytes_to_r2(
             logger.exception("Local R2 cache write failed: %s", e)
             return None
 
-    max_attempts = 1
+    # 修复 BUG：max_attempts=1 让 for 循环只跑一次，下面的重试分支
+    # （if attempt < max_attempts - 1）永远进不去。要么改成 >1 的实际重试
+    # 次数，要么删掉循环结构。这里改成 3 次重试 + 指数退避，让短暂
+    # 网络/服务端抖动有自愈机会。
+    max_attempts = 3
     for attempt in range(max_attempts):
         try:
             async with session.client(
