@@ -344,12 +344,13 @@ def make_model_config(
 SUPPORTED_MODELS: Dict[str, ModelConfig] = {}
 
 # ---------- OpenRouter 模型 ----------
-SUPPORTED_MODELS["openai/gpt-oss-20b:free"] = make_model_config(
-    model_id="openai/gpt-oss-20b:free",
+SUPPORTED_MODELS["stealth/ox-alpha"] = make_model_config(
+    model_id="stealth/ox-alpha",
     provider="openrouter",
-    name="GPT OSS 20b Free",
-    max_context=131000,
-    max_output_tokens=33000,
+    name="Ox Alpha",
+    vision=True,
+    max_context=1050000,
+    max_output_tokens=131000,
 )
 SUPPORTED_MODELS["poolside/laguna-s-2.1:free"] = make_model_config(
     model_id="poolside/laguna-s-2.1:free",
