@@ -11,10 +11,15 @@ from PIL import Image
 from typing import Optional
 import aiohttp
 
-from apitelegramchat.config import ModelConfig, TELEGRAM_BOT_TOKEN, R2_PUBLIC_URL
+from apitelegramchat.config import ModelConfig, TELEGRAM_BOT_TOKEN, R2_PUBLIC_URL, PROVIDERS
 from apitelegramchat.utils import get_logger, transcribe_audio_with_groq
 from apitelegramchat.file_handlers import get_file_path
-from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2
+from apitelegramchat.s3_utils import (
+    upload_bytes_to_r2,
+    file_exists_in_r2,
+    download_from_r2,
+    public_url_for_existing_key,
+)
 import apitelegramchat.state as state
 
 logger = get_logger(__name__)
@@ -44,11 +49,29 @@ def _get_r2_key(file_id: str) -> str:
 
 
 async def get_cached_image_data(chat_id: int, file_id: str) -> Optional[bytes]:
+    """Resolve image bytes for a Telegram file_id.
+
+    Resolution order:
+      1. In-memory TTLCache (~5 min) — hot path for repeat requests within a turn.
+      2. Permanent-failure marker (`state.is_r2_attempted`) — if set, bail out
+         early because we've already determined that neither R2 nor Telegram
+         can serve this file. (NOTE: this marker must ONLY be set on actual
+         failures; see `_upload_and_mark`.)
+      3. R2 / local cache — if the file has been previously uploaded, download
+         it and re-populate the in-memory cache. This is the recovery path
+         that keeps historical images visible after the TTLCache expires.
+      4. Telegram — first-time fetch; on success, kick off a background R2
+         upload so the next cache miss can be served from R2 alone.
+
+    If all paths fail, mark the file as permanently failed so we don't keep
+    retrying expensive network calls on every subsequent turn.
+    """
     cache_key = file_id
     if cache_key in _image_cache:
         return _image_cache[cache_key]
 
     if await state.is_r2_attempted(file_id):
+        # Permanent failure — neither R2 nor Telegram can serve this file.
         return None
 
     r2_key = _get_r2_key(file_id)
@@ -58,6 +81,8 @@ async def get_cached_image_data(chat_id: int, file_id: str) -> Optional[bytes]:
             _image_cache[cache_key] = data
             return data
         else:
+            # R2 reports the object exists but the body is unreadable; treat
+            # as a permanent failure so we don't loop on every request.
             await state.mark_r2_attempted(file_id)
 
     tg_path = await get_file_path(file_id)
@@ -82,11 +107,35 @@ async def get_cached_image_data(chat_id: int, file_id: str) -> Optional[bytes]:
 
 
 async def _upload_and_mark(file_id: str, data: bytes, r2_key: str):
+    """Upload image bytes to R2 / local cache in the background.
+
+    IMPORTANT: `state.mark_r2_attempted` is a *permanent failure* marker used by
+    `get_cached_image_data` to short-circuit retries once we've determined that
+    a file is unrecoverable from both R2 and Telegram. It must therefore be set
+    ONLY on upload failure. If we mark it after a SUCCESSFUL upload, then once
+    the in-memory TTLCache entry expires (~5 min later), every subsequent
+    request will:
+
+        1. miss the cache
+        2. see is_r2_attempted == True and return None immediately
+        3. never re-fetch the bytes from R2 (where they now live)
+
+    The result is that historical images silently vanish from the conversation
+    history — only the most recently uploaded image (whose TTLCache entry is
+    still warm) remains visible to the model. This is exactly the symptom
+    "after a couple of turns, Gemini can only see the latest image".
+
+    Setting the flag only on failure fixes this: after the TTLCache entry
+    expires, `get_cached_image_data` will fall through to `file_exists_in_r2`,
+    find the previously-uploaded object, and re-populate the cache.
+    """
     try:
-        await upload_bytes_to_r2(data, r2_key, "image/jpeg")
+        result = await upload_bytes_to_r2(data, r2_key, "image/jpeg")
+        if result is None:
+            # upload_bytes_to_r2 returns None on failure (it already logged)
+            await state.mark_r2_attempted(file_id)
     except Exception as e:
         logger.warning(f"R2后台上传失败 {file_id}: {e}")
-    finally:
         await state.mark_r2_attempted(file_id)
 
 
@@ -193,6 +242,66 @@ async def _resolve_public_attachment_url(file_id: str) -> str:
     return ""
 
 
+async def _resolve_r2_public_url_for_vision(file_id: str) -> str:
+    """Resolve a publicly-accessible HTTP URL for an image, suitable for
+    OpenAI-compatible vision APIs that reject data: base64 URLs (e.g. Agnes
+    2.5 Flash — per its docs: "Image inputs must use publicly accessible
+    image_url values").
+
+    Returns the R2 public URL **or** an R2 presigned URL — NEVER the
+    Telegram direct URL (which would leak the bot token to third-party APIs).
+
+    The function ensures the file is uploaded to R2 first (synchronously),
+    so the returned URL is immediately usable. Three failure modes return
+    "" so the caller can fall back to base64:
+      - R2 is not configured at all (local-cache fallback: file:// is not
+        publicly fetchable).
+      - The image bytes can't be retrieved from cache / Telegram.
+      - The R2 upload itself fails.
+
+    Note: presigned URLs expire (default 1h). For multi-turn sessions the
+    same file_id will be re-resolved on each turn, so a fresh presigned URL
+    is issued when needed — historical URLs in already-stored messages are
+    re-built every turn via ``_append_history_async``.
+    """
+    fid = str(file_id or "").strip()
+    if not fid:
+        return ""
+
+    r2_key = _get_r2_key(fid)
+    try:
+        if await file_exists_in_r2(r2_key):
+            # Already in R2 — return whatever public URL form is available
+            # (custom domain, r2.dev, or presigned). Returns None if R2
+            # isn't configured remotely.
+            url = await public_url_for_existing_key(r2_key)
+            if url:
+                return url
+            # Fall through to attempt a synchronous upload — covers the
+            # edge case where file_exists_in_r2 returned True for the
+            # local-cache path but we still can't serve a public URL.
+            return ""
+
+        # Not in R2 yet — synchronously fetch from Telegram and upload so
+        # that we have a public URL for THIS turn's request.
+        img_bytes = await get_cached_image_data(None, fid)
+        if not img_bytes:
+            return ""
+        # upload_bytes_to_r2 returns the public URL (custom domain, r2.dev,
+        # or presigned) on success, or None on failure.
+        result = await upload_bytes_to_r2(img_bytes, r2_key, "image/jpeg")
+        if result is None:
+            return ""
+        # If upload_bytes_to_r2 fell back to a local file:// URL, that's not
+        # publicly fetchable — signal the caller to use base64 instead.
+        if result.startswith("file://"):
+            return ""
+        return result
+    except Exception as e:
+        logger.debug(f"为 vision 解析 R2 公开 URL 失败 {fid[:12]}: {e}")
+        return ""
+
+
 async def _build_attachment_fallback_text(
     *,
     kind: str,
@@ -280,6 +389,10 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_ty
     supports_vision = model_info.vision
     supports_audio = model_info.audio
     supports_native_documents = bool(getattr(model_info, "native_document", False))
+    # 部分网关（Agnes）只接受 image_url 里的公开 HTTP URL，不接受 data: base64。
+    # 命中时优先用 R2 公开 URL；R2 不可用时回退 base64。
+    provider_cfg = PROVIDERS.get(model_info.provider)
+    vision_prefer_url = bool(getattr(provider_cfg, "vision_prefer_url", False)) if provider_cfg else False
     user_text = msg.get("content", "")
     if isinstance(user_text, str):
         user_text = _strip_reply_prefix(user_text)
@@ -289,6 +402,20 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_ty
         file_ids = list(msg.get("file_ids") or [])
         if supports_vision:
             async def process_one(fid):
+                # 优先用公开 HTTP URL（Agnes 等只接受公开 URL 的网关）。
+                # 失败回退到 base64 data URL（OpenAI 等多数网关都支持）。
+                if vision_prefer_url:
+                    public_url = await _resolve_r2_public_url_for_vision(fid)
+                    if public_url:
+                        return {
+                            "type": "image_url",
+                            "image_url": {"url": public_url, "detail": "high"},
+                        }
+                    # R2 不可用，回退到 base64（仍然好过完全没图）。
+                    logger.debug(
+                        f"vision_prefer_url=True 但 R2 URL 不可用，回退 base64: {fid[:12]}"
+                    )
+
                 img_bytes = await get_cached_image_data(chat_id, fid) if chat_id else None
                 if not img_bytes:
                     return None

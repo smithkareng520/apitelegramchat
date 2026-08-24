@@ -100,6 +100,11 @@ class ProviderConfig:
     use_dedicated_loop: bool = False
     # 是否支持 Prompt Caching（仅部分厂商需要显式标记）
     supports_prompt_cache: bool = False
+    # 视觉输入是否需要"公开可访问 HTTP URL"而非 data:image/...;base64,... 内联格式。
+    # 部分 OpenAI 兼容网关（如 Agnes）官方文档明确只接受 image_url 中的公开 URL，
+    # 内联 base64 会被静默忽略甚至报 4xx。开启后，会在 _resolve_multimodal_content
+    # 里优先用 R2 公开 URL（不泄露 Telegram bot token），R2 不可用时回退 base64。
+    vision_prefer_url: bool = False
 
 
 @dataclass
@@ -180,6 +185,9 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         base_url="https://apihub.agnes-ai.com/v1",
         api_key_env="AGNES_API_KEY",
         supports_prompt_cache=False,
+        # Agnes 官方文档明确只接受 image_url 中的公开 URL（不接受 data: base64），
+        # 因此 _resolve_multimodal_content 会优先用 R2 公开 URL，R2 不可用时回退 base64。
+        vision_prefer_url=True,
     ),
 }
 

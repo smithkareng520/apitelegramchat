@@ -166,6 +166,39 @@ async def generate_presigned_url(
         )
 
 
+async def public_url_for_existing_key(key: str) -> str | None:
+    """Return a publicly-accessible URL for an object that's already in R2.
+
+    Used by vision flows (e.g. Agnes, which rejects base64 image_url) to
+    satisfy the "publicly accessible image_url" requirement without
+    re-uploading the same bytes every turn.
+
+    Resolution order:
+      1. If R2_PUBLIC_URL is configured (custom domain or r2.dev):
+         return ``{R2_PUBLIC_URL}/{key}`` — no signature, no expiry.
+      2. Otherwise, if R2 is configured remotely: return a presigned URL
+         (default 1h expiry). The URL is publicly fetchable but expires;
+         long-running sessions will re-issue a fresh one on the next turn.
+      3. R2 is not configured at all (local-cache fallback): return None.
+         ``file://`` URLs aren't publicly reachable, so the vision caller
+         must fall back to base64 (or skip the image entirely).
+    """
+    if not _use_remote_r2():
+        # Local cache: file:// URLs aren't publicly accessible, so signal
+        # the caller to fall back to base64.
+        return None
+
+    base = _public_delivery_base_url()
+    if base:
+        return f"{base}/{key}"
+    # No public delivery URL — issue a presigned URL instead.
+    try:
+        return await generate_presigned_url(key)
+    except Exception as e:
+        logger.warning("public_url_for_existing_key presign 失败 %s: %s", key, e)
+        return None
+
+
 async def file_exists_in_r2(key: str) -> bool:
     if not _use_remote_r2():
         return _safe_local_key_path(key).exists()
