@@ -89,7 +89,13 @@ def _local_public_url(key: str) -> str:
     return f"file://{_safe_local_key_path(key).resolve()}"
 
 
-def _use_remote_r2() -> bool:
+def is_r2_configured() -> bool:
+    """是否配置了远程 R2（含 endpoint / access key / secret / bucket）。
+
+    公开化：附件层需要据此决定走 R2 公开 URL 路径还是降级 base64，
+    并据此早退避免"拉字节→写本地 file://→发现不可公开访问→降级"的
+    无谓链路。
+    """
     return bool(aioboto3 and R2_ENDPOINT and R2_ACCESS_KEY and R2_SECRET_KEY and R2_BUCKET_NAME)
 
 
@@ -99,7 +105,7 @@ async def upload_bytes_to_r2(
     content_type: str = "application/octet-stream",
 ) -> str | None:
     """Upload bytes to R2, or fall back to a local cache when R2 is unavailable."""
-    if not _use_remote_r2():
+    if not is_r2_configured():
         try:
             path = _safe_local_key_path(key)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -152,7 +158,7 @@ async def generate_presigned_url(
     key: str,
     expires_in: int = 3600,
 ) -> str:
-    if not _use_remote_r2():
+    if not is_r2_configured():
         return _local_public_url(key)
 
     async with session.client(
@@ -187,7 +193,7 @@ async def public_url_for_existing_key(key: str) -> str | None:
          ``file://`` URLs aren't publicly reachable, so the vision caller
          must fall back to base64 (or skip the image entirely).
     """
-    if not _use_remote_r2():
+    if not is_r2_configured():
         # Local cache: file:// URLs aren't publicly accessible, so signal
         # the caller to fall back to base64.
         return None
@@ -204,7 +210,7 @@ async def public_url_for_existing_key(key: str) -> str | None:
 
 
 async def file_exists_in_r2(key: str) -> bool:
-    if not _use_remote_r2():
+    if not is_r2_configured():
         return _safe_local_key_path(key).exists()
 
     try:
@@ -230,7 +236,7 @@ async def file_exists_in_r2(key: str) -> bool:
 
 
 async def download_from_r2(key: str) -> bytes | None:
-    if not _use_remote_r2():
+    if not is_r2_configured():
         path = _safe_local_key_path(key)
         if path.exists() and path.is_file():
             try:
@@ -256,7 +262,7 @@ async def download_from_r2(key: str) -> bytes | None:
 
 
 async def list_r2_objects(prefix: str) -> List[str]:
-    if not _use_remote_r2():
+    if not is_r2_configured():
         root = _LOCAL_R2_ROOT / prefix
         if not root.exists():
             return []
@@ -291,7 +297,7 @@ async def list_r2_objects(prefix: str) -> List[str]:
 
 
 async def delete_r2_object(key: str) -> bool:
-    if not _use_remote_r2():
+    if not is_r2_configured():
         path = _safe_local_key_path(key)
         try:
             if path.exists():

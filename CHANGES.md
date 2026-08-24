@@ -475,3 +475,86 @@
 - `scripts/test_e2e_log_scenario.py` 端到端：模拟日志中的
   完整 HTML，验证清理后伪 URL 被剥离、正文全部保留，
   不再触发 `RICH_MESSAGE_PHOTO_URL_INVALID`。
+
+---
+
+# 补丁 3 — 附件多模态路径开销优化（2026-08-24）
+
+## 背景
+用户追问："Agnes 用 URL、Gemini 用 base64，切换模型不失效的机制下
+有没有不必要的开销？"审计后发现确实存在 3 个浪费点，本次彻底重构。
+
+## 浪费点 1：Agnes 首访路径重复 HEAD 检查
+- 位置：`_resolve_r2_public_url_for_vision` → `get_cached_image_data`
+- 问题：外层已 `file_exists_in_r2(r2_key)=False`，紧接着调
+  `get_cached_image_data` 内部又会做一次同样的 HEAD 检查。
+  每次 Agnes 首访多一次 R2 HEAD 请求。
+- 修复：`_resolve_r2_public_url_for_vision` 路径 3（R2 未有）
+  改为直接调 `_fetch_from_telegram_and_cache`，绕过
+  `get_cached_image_data` 的 HEAD 检查。
+
+## 浪费点 2：Agnes 首访路径同一张图被 put_object 两次
+- 位置：`get_cached_image_data` 末尾的 `_track_task(_upload_and_mark())`
+- 问题：旧版 `get_cached_image_data` 在 Telegram getFile 成功后
+  fire-and-forget 后台上传 R2。Agnes 路径紧接着又同步上传 R2。
+  两个 PUT 写同一个 key，第二次纯浪费（带宽 + R2 API 配额）。
+- 修复：把"后台上传"职责从 `get_cached_image_data` 剥离：
+  * `get_cached_image_data` 现在职责单一，只取字节，不触发上传
+  * Gemini 路径在 `process_one` 内**显式**调
+    `_track_task(_upload_and_mark(...))` 触发预防性后台上传
+  * Agnes 路径不经过 `process_one` 的 base64 分支（vision_prefer_url=True
+    时早已 return），不会触发后台上传，由 `_resolve_r2_public_url_for_vision`
+    自己负责唯一的同步上传
+
+## 浪费点 3：R2 未配置时 Agnes 仍写本地 file:// 然后降级
+- 位置：`_resolve_r2_public_url_for_vision`
+- 问题：R2 未配置时，`upload_bytes_to_r2` 走本地兜底返回
+  `file://` URL，本函数检测到 `file://` 又返回空串让调用方降级 base64。
+  这次本地磁盘写入是纯浪费。
+- 修复：`_resolve_r2_public_url_for_vision` 路径 1 早退检测
+  `is_r2_configured()`，未配置直接返回空串，避免任何下游调用。
+
+## 重构 — 函数职责单一化
+
+### `get_cached_image_data(chat_id, file_id)`
+- 旧版职责：取字节 + 后台上传 R2（耦合）
+- 新版职责：只取字节
+- 解析顺序：内存 TTLCache → 永久失败标记 → R2 download →
+  Telegram getFile（拉到后只填内存缓存，不触发上传）
+
+### `_fetch_from_telegram_and_cache(file_id)` （新增）
+- 从 `get_cached_image_data` 拆出，作为两条路径共用的 Telegram getFile
+  拉字节函数。临时失败不永久标记，hard failure (404/403/410) 才标记。
+
+### `_resolve_r2_public_url_for_vision(file_id)`
+- 旧版：3 个失败模式统一返回空串，但中间链路有重复 HEAD + 重复 PUT
+- 新版：3 条清晰路径按开销从低到高
+  1. R2 未配置 → 立即返回空串（0 下游调用）
+  2. R2 已有 → 直接拿公开 URL（0 上传、0 拉字节）
+  3. R2 未有 → 同步拉字节 + 同步上传（1 次拉、1 次传，唯一）
+
+### `s3_utils._use_remote_r2` → `is_r2_configured`
+- 公开化（去下划线前缀），让附件层据此早退。
+- 同步修改 `s3_utils.py` 内部 7 处 `if not _use_remote_r2():` 引用。
+
+## 验证
+- `scripts/test_attachment_refactor.py` 覆盖 5 个场景全部通过：
+  A. Agnes + R2 已有 key → 0 拉字节、0 上传
+  B. Agnes + R2 没该 key → 1 拉字节、1 上传（旧版 2 次 PUT）
+  C. Agnes + R2 未配置 → 0 下游调用（旧版会写本地再降级）
+  D. Gemini 路径 _track_task + _upload_and_mark 契约正常
+  E. Agnes 首访不触发 _track_task（旧版会，导致重复 PUT）
+- 之前的两个回归测试仍然通过：
+  - `test_strip_media.py`：4 场景全过
+  - `test_e2e_log_scenario.py`：日志场景端到端 OK
+
+## 收益
+| 场景 | 旧版开销 | 新版开销 | 节省 |
+|---|---|---|---|
+| Agnes 首访 + R2 已有 | 1 HEAD + 0 PUT | 1 HEAD + 0 PUT | — |
+| Agnes 首访 + R2 没该 key | 2 HEAD + 2 PUT | 1 HEAD + 1 PUT | 1 HEAD + 1 PUT |
+| Agnes 首访 + R2 未配置 | 1 HEAD + 1 本地写 | 0 下游调用 | 1 HEAD + 1 本地写 |
+| Gemini 首访 | 1 HEAD + 1 后台 PUT | 1 HEAD + 1 后台 PUT | — |
+
+切换模型时的零延迟收益**保留**：Gemini 那轮的后台上传让 Agnes 那轮
+直接命中 R2 已有路径。

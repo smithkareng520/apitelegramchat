@@ -19,6 +19,7 @@ from apitelegramchat.s3_utils import (
     file_exists_in_r2,
     download_from_r2,
     public_url_for_existing_key,
+    is_r2_configured,
 )
 import apitelegramchat.state as state
 
@@ -49,35 +50,37 @@ def _get_r2_key(file_id: str) -> str:
 
 
 async def get_cached_image_data(chat_id: int | None, file_id: str) -> Optional[bytes]:
-    """Resolve image bytes for a Telegram file_id.
+    """取图片字节，不触发任何 R2 上传。
 
-    Resolution order:
-      1. In-memory TTLCache (~5 min) — hot path for repeat requests within a turn.
-      2. Permanent-failure marker (`state.is_r2_attempted`) — if set, bail out
-         early because we've already determined that neither R2 nor Telegram
-         can serve this file. (NOTE: this marker must ONLY be set on actual
-         *hard* failures — see below.)
-      3. R2 / local cache — if the file has been previously uploaded, download
-         it and re-populate the in-memory cache. This is the recovery path
-         that keeps historical images visible after the TTLCache expires.
-      4. Telegram — first-time fetch; on success, kick off a background R2
-         upload so the next cache miss can be served from R2 alone.
+    解析顺序：
+      1. In-memory TTLCache (~5 min) —— 同轮内重复访问的热路径。
+      2. Permanent-failure marker (``state.is_r2_attempted``) —— 若已标记，
+         直接返回 None，避免对已知无法恢复的 file_id 反复重试。
+      3. R2 / local cache —— 之前上传过的对象，下载并重新填充内存缓存。
+         这是 TTLCache 过期后的恢复路径，让历史图片不依赖 Telegram API。
+      4. Telegram getFile —— 首次拉取；拉到后只填内存缓存，**不**触发
+         R2 上传。上传由调用方按需显式触发（见 ``_upload_and_mark`` 与
+         ``_resolve_r2_public_url_for_vision``）。
 
-    IMPORTANT: `state.mark_r2_attempted` is a *permanent* failure marker that
-    short-circuits all future resolution attempts for that file_id. It must
-    therefore be set ONLY on hard, non-transient failures (404/403/410 from
-    Telegram, or R2 reporting that the object is unreadable). Setting it on
-    transient errors (429 rate-limit, 5xx, network blip, or any ``Exception``)
-    permanently blacklists the file across ALL future turns — even after the
-    transient condition clears — causing historical images to silently
-    disappear from the conversation. We now only mark on hard status codes.
+    IMPORTANT: ``state.mark_r2_attempted`` 是**永久失败标记**，必须在
+    ``get_cached_image_data`` 看到 hard failure（404/403/410 from Telegram，
+    或 R2 报告对象存在但 body 不可读）时才设置。设置在临时错误
+    (429 rate-limit / 5xx / 网络抖动 / 任何 Exception) 上会永久拉黑该
+    file_id，即使临时条件消除后下一轮也无法恢复，导致历史图片"静默
+    消失"。
+
+    设计取舍：旧版本在此函数末尾调用 ``_track_task(_upload_and_mark(...))``
+    做后台上传。这把"取字节"和"预防性 R2 上传"两个职责耦合在一起，导致
+    Agnes 路径（``_resolve_r2_public_url_for_vision``）首次访问时
+    同一张图被 ``put_object`` 两次（一次后台 + 一次同步）。重构后此函数
+    职责单一，Agnes 路径自己负责唯一的同步上传，Gemini 路径在
+    ``process_one`` 内显式触发后台上传。
     """
     cache_key = file_id
     if cache_key in _image_cache:
         return _image_cache[cache_key]
 
     if await state.is_r2_attempted(file_id):
-        # Permanent failure — neither R2 nor Telegram can serve this file.
         return None
 
     r2_key = _get_r2_key(file_id)
@@ -86,49 +89,55 @@ async def get_cached_image_data(chat_id: int | None, file_id: str) -> Optional[b
         if data:
             _image_cache[cache_key] = data
             return data
-        else:
-            # R2 reports the object exists but the body is unreadable; treat
-            # as a permanent failure so we don't loop on every request.
-            await state.mark_r2_attempted(file_id)
-
-    tg_path = await get_file_path(file_id)
-    if not tg_path:
-        # Telegram reports the file_path itself is missing — this is a hard
-        # failure (file deleted on Telegram's side). Safe to mark permanently.
+        # R2 报告对象存在但 body 不可读：永久失败，避免每轮重复 download
         await state.mark_r2_attempted(file_id)
         return None
+
+    # R2 没该 key → 从 Telegram getFile 拉
+    return await _fetch_from_telegram_and_cache(file_id)
+
+
+async def _fetch_from_telegram_and_cache(file_id: str) -> Optional[bytes]:
+    """从 Telegram getFile API 拉图片字节并缓存到内存。不触发 R2 上传。
+
+    供两条路径共用：
+      * ``get_cached_image_data`` —— 内存缓存 + R2 download miss 后的兜底
+      * ``_resolve_r2_public_url_for_vision`` —— R2 已知 miss 时直接调本
+        函数拉字节，避免重复 HEAD 检查
+
+    临时失败（429/5xx/网络抖动）只 WARNING 日志，**不**永久标记，
+    下一轮可重试；hard failure（404/403/410）才永久标记。
+    """
+    tg_path = await get_file_path(file_id)
+    if not tg_path:
+        # Telegram 报告 file_path 本身丢失 —— 永久失败
+        await state.mark_r2_attempted(file_id)
+        return None
+
     url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{tg_path}"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.read()
-                    _image_cache[cache_key] = data
-                    _track_task(_upload_and_mark(file_id, data, r2_key))
+                    _image_cache[file_id] = data
                     return data
-                elif resp.status in (404, 403, 410):
-                    # Hard failure — file is gone or access permanently denied.
-                    # Safe to mark permanently so future turns skip the round-trip.
+                if resp.status in (404, 403, 410):
                     logger.warning(
                         f"图片下载永久失败 {file_id}: HTTP {resp.status}"
                     )
                     await state.mark_r2_attempted(file_id)
                 else:
-                    # Transient (429/5xx/etc.) — DO NOT mark. Next turn may succeed.
+                    # 临时失败（429/5xx/etc.）—— 不标记，下一轮可重试
                     logger.warning(
                         f"图片下载临时失败 {file_id}: HTTP {resp.status} (will retry next turn)"
                     )
     except asyncio.TimeoutError as e:
-        # Network blip — do not permanently blacklist the file.
         logger.warning(f"图片下载超时 {file_id}: {e} (will retry next turn)")
     except aiohttp.ClientError as e:
-        # Network / connection-level error — also transient.
         logger.warning(f"图片下载网络异常 {file_id}: {e} (will retry next turn)")
     except Exception as e:
-        # Unknown error — log full traceback but DO NOT permanently mark.
-        # Earlier code did `mark_r2_attempted` here, which permanently
-        # blacklisted files on any unexpected exception (e.g. a brief DNS
-        # hiccup), causing silent image loss across turns.
+        # 未分类异常 —— 完整 traceback 但不永久标记，避免误拉黑
         logger.exception(f"图片下载未分类异常 {file_id}: {e} (will retry next turn)")
     return None
 
@@ -271,63 +280,57 @@ async def _resolve_public_attachment_url(file_id: str) -> str:
 
 
 async def _resolve_r2_public_url_for_vision(file_id: str) -> str:
-    """Resolve a publicly-accessible HTTP URL for an image, suitable for
-    OpenAI-compatible vision APIs that reject data: base64 URLs (e.g. Agnes
-    2.5 Flash — per its docs: "Image inputs must use publicly accessible
-    image_url values").
+    """为 vision API 解析公开可访问的 HTTP URL（Agnes 等只接受公开 URL 的网关）。
 
-    Returns the R2 public URL **or** an R2 presigned URL — NEVER the
-    Telegram direct URL (which would leak the bot token to third-party APIs).
+    三条路径，按开销从低到高：
 
-    The function ensures the file is uploaded to R2 first (synchronously),
-    so the returned URL is immediately usable. Three failure modes return
-    "" so the caller can fall back to base64:
-      - R2 is not configured at all (local-cache fallback: file:// is not
-        publicly fetchable).
-      - The image bytes can't be retrieved from cache / Telegram.
-      - The R2 upload itself fails.
+      1. **R2 未配置 → 立即返回空串**。让调用方降级 base64，避免"拉字节
+         → 上传本地 file:// → 检测不可公开访问 → 降级 base64"的无谓链路
+         （浪费一次本地磁盘 IO 和一次 download_from_r2 调用）。
+      2. **R2 已有该对象 → 直接拿公开 URL**。无上传开销，无 Telegram API
+         调用。这是切换模型场景下的热路径（Gemini 那轮已上传过）。
+      3. **R2 有配置但对象不存在 → 同步从 Telegram 拉字节 → 同步上传到
+         R2 → 返回 URL**。这是首次访问 Agnes 的冷路径。
 
-    Note: presigned URLs expire (default 1h). For multi-turn sessions the
-    same file_id will be re-resolved on each turn, so a fresh presigned URL
-    is issued when needed — historical URLs in already-stored messages are
-    re-built every turn via ``_append_history_async``.
+    关键设计：本函数负责**唯一的** R2 上传调用，不通过
+    ``get_cached_image_data`` 触发后台上传。旧版本调 ``get_cached_image_data``
+    导致同一张图被 ``put_object`` 两次（后台 fire-and-forget + 本函数同步），
+    浪费一次 R2 PUT 和一次同图上行带宽。
+
+    返回值绝不包含 bot token：Telegram 直链会泄露 token 给第三方 API。
     """
     fid = str(file_id or "").strip()
     if not fid:
         return ""
 
-    r2_key = _get_r2_key(fid)
-    try:
-        if await file_exists_in_r2(r2_key):
-            # Already in R2 — return whatever public URL form is available
-            # (custom domain, r2.dev, or presigned). Returns None if R2
-            # isn't configured remotely.
-            url = await public_url_for_existing_key(r2_key)
-            if url:
-                return url
-            # Fall through to attempt a synchronous upload — covers the
-            # edge case where file_exists_in_r2 returned True for the
-            # local-cache path but we still can't serve a public URL.
-            return ""
-
-        # Not in R2 yet — synchronously fetch from Telegram and upload so
-        # that we have a public URL for THIS turn's request.
-        img_bytes = await get_cached_image_data(None, fid)
-        if not img_bytes:
-            return ""
-        # upload_bytes_to_r2 returns the public URL (custom domain, r2.dev,
-        # or presigned) on success, or None on failure.
-        result = await upload_bytes_to_r2(img_bytes, r2_key, "image/jpeg")
-        if result is None:
-            return ""
-        # If upload_bytes_to_r2 fell back to a local file:// URL, that's not
-        # publicly fetchable — signal the caller to use base64 instead.
-        if result.startswith("file://"):
-            return ""
-        return result
-    except Exception as e:
-        logger.debug(f"为 vision 解析 R2 公开 URL 失败 {fid[:12]}: {e}")
+    # 路径 1：R2 完全没配置 → 立即降级，避免无谓的本地文件写入
+    if not is_r2_configured():
         return ""
+
+    r2_key = _get_r2_key(fid)
+
+    # 路径 2：R2 已有 → 直接拿公开 URL（custom domain / r2.dev / presigned）
+    if await file_exists_in_r2(r2_key):
+        url = await public_url_for_existing_key(r2_key)
+        if url:
+            return url
+        # R2 已有对象但拿不到公开 URL（罕见：custom domain 未配 + presign 失败）
+        # → 让调用方降级 base64
+        return ""
+
+    # 路径 3：R2 未有 → 同步从 Telegram 拉字节 + 同步上传
+    # 不调 get_cached_image_data：它会再做一次 file_exists_in_r2（外层刚做过）
+    # 是纯浪费 HEAD 请求。
+    img_bytes = await _fetch_from_telegram_and_cache(fid)
+    if not img_bytes:
+        return ""
+
+    result = await upload_bytes_to_r2(img_bytes, r2_key, "image/jpeg")
+    if result is None or result.startswith("file://"):
+        # upload_bytes_to_r2 返回 file:// 说明 is_r2_configured() 其实是 False，
+        # 但路径 1 已早退，这里理论上不该走到；保险起见仍降级。
+        return ""
+    return result
 
 
 async def _build_attachment_fallback_text(
@@ -446,8 +449,8 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_ty
         file_ids = list(msg.get("file_ids") or [])
         if supports_vision:
             async def process_one(fid):
-                # 优先用公开 HTTP URL（Agnes 等只接受公开 URL 的网关）。
-                # 失败回退到 base64 data URL（OpenAI 等多数网关都支持）。
+                # Agnes 等 vision_prefer_url 网关：走公开 URL 路径。
+                # 失败回退到 base64（OpenAI 等多数网关都支持）。
                 if vision_prefer_url:
                     public_url = await _resolve_r2_public_url_for_vision(fid)
                     if public_url:
@@ -463,6 +466,18 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_ty
                 img_bytes = await get_cached_image_data(chat_id, fid) if chat_id else None
                 if not img_bytes:
                     return None
+
+                # 预防性后台上传到 R2：fire-and-forget，不阻塞 base64 编码。
+                # 目的：
+                #   1. 让内存 TTLCache (~5min) 过期后能从 R2 拉取，避免再调
+                #      Telegram getFile API（Telegram bot getFile 有 rate limit）。
+                #   2. 让未来切换到 Agnes (vision_prefer_url=True) 的轮次能
+                #      零延迟拿 R2 公开 URL，不必再走同步上传路径。
+                # Agnes 路径不经过这里（vision_prefer_url=True 时早已 return），
+                # 所以同一张图不会被 put_object 两次。
+                r2_key = _get_r2_key(fid)
+                _track_task(_upload_and_mark(fid, img_bytes, r2_key))
+
                 try:
                     # 用 with 语句确保 PIL Image 在异常路径上也会被 close，
                     # 避免大量并发图片处理时文件描述符泄露。
