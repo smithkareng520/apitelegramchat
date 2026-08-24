@@ -692,6 +692,22 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_ty
             results = await asyncio.gather(*[process_one(fid) for fid in file_ids])
             content_parts = [r for r in results if r is not None]
             if content_parts:
+                # 即使当前模型支持视觉输入，也额外注入附件临时 URL。
+                # 该 URL 与非多模态 fallback 使用同一套解析逻辑，
+                # 便于图片编辑工具调用，以及后续模型切换后继续复用。
+                url_lines = []
+                for fid in file_ids:
+                    try:
+                        temp_url = await _resolve_public_attachment_url(fid)
+                    except Exception:
+                        temp_url = ""
+                    if temp_url:
+                        url_lines.append(f"原始图片 URL: {temp_url}")
+                if url_lines:
+                    content_parts.append({
+                        "type": "text",
+                        "text": "\n".join(url_lines),
+                    })
                 content_parts.append({"type": "text", "text": user_text})
                 return content_parts
             return user_text
