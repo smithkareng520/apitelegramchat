@@ -19,6 +19,7 @@ from apitelegramchat.s3_utils import (
     file_exists_in_r2,
     download_from_r2,
     public_url_for_existing_key,
+    generate_presigned_url,
     is_r2_configured,
 )
 import apitelegramchat.state as state
@@ -451,8 +452,10 @@ async def _resolve_public_attachment_url(file_id: str) -> str:
     # 仅 R2 公开 URL 是安全的：它要么是自定义域，要么是 r2.dev。
     try:
         r2_key = _get_r2_key(fid)
-        if await file_exists_in_r2(r2_key) and R2_PUBLIC_URL:
-            return f"{R2_PUBLIC_URL.rstrip('/')}/{r2_key}"
+        if await file_exists_in_r2(r2_key):
+            # fallback 与多模态注入统一使用上传后的临时访问 URL。
+            # 不依赖永久公开域名，避免切换模型时丢失可访问地址。
+            return await generate_presigned_url(r2_key)
     except Exception as e:
         logger.debug(f"解析 R2 文件 URL 失败 {fid[:12]}: {e}")
 
