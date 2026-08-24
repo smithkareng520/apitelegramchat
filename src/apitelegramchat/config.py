@@ -118,6 +118,13 @@ class ModelConfig:
     name: str                   # 显示名称
     vision: Optional[bool] = None
     audio: Optional[bool] = None
+    # 视频输入（video understanding）能力：模型能否直接“看”视频内容。
+    # 注意与 native_video（视频生成输出）区分：前者是输入模态，后者是
+    # 生成模态。视频输入通过 OpenAI 兼容协议的 video_url content part
+    # 传递（OpenRouter / vLLM / LiteLLM 等均为该事实标准），且由于视频
+    # 体积远大于图片，base64 内联容易触发网关请求体上限，因此统一优先
+    # 走 R2 公开 URL（见 attachment_content._resolve_r2_public_url_for_video）。
+    video: Optional[bool] = None
     supports_tools: Optional[bool] = None
     native_image: Optional[bool] = None
     native_document: Optional[bool] = None
@@ -199,6 +206,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "openrouter": {
         "vision": False,
         "audio": False,
+        "video": False,
         "supports_tools": True,
         "native_image": False,
         "native_document": False,
@@ -212,6 +220,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "modelscope": {
         "vision": False,
         "audio": False,
+        "video": False,
         "supports_tools": True,
         "native_image": False,
         "native_document": False,
@@ -224,6 +233,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "gemini": {
         "vision": True,
         "audio": False,
+        "video": False,
         "supports_tools": True,
         "native_image": False,
         "native_document": False,
@@ -236,6 +246,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "grok": {
         "vision": False,
         "audio": False,
+        "video": False,
         "supports_tools": True,
         "native_image": False,
         "native_document": False,
@@ -248,6 +259,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "deepseek": {
         "vision": False,
         "audio": False,
+        "video": False,
         "supports_tools": True,
         "native_image": False,
         "native_document": False,
@@ -260,6 +272,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "glm": {
         "vision": False,
         "audio": False,
+        "video": False,
         "supports_tools": True,
         "native_image": False,
         "native_document": False,
@@ -272,6 +285,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "agnes": {
         "vision": False,
         "audio": False,
+        "video": False,
         "supports_tools": True,
         "native_image": False,
         "native_document": False,
@@ -326,6 +340,7 @@ def make_model_config(
         name=name,
         vision=merged.get("vision"),
         audio=merged.get("audio"),
+        video=merged.get("video"),
         supports_tools=merged.get("supports_tools"),
         native_image=merged.get("native_image"),
         native_document=merged.get("native_document"),
@@ -349,6 +364,9 @@ SUPPORTED_MODELS["stealth/ox-alpha"] = make_model_config(
     provider="openrouter",
     name="Ox Alpha",
     vision=True,
+    # OpenRouter 官方模型元数据 input_modalities = [text, image, video]：
+    # 支持通过 video_url content part 直接传入视频进行理解。
+    video=True,
     max_context=1050000,
     max_output_tokens=131000,
 )
@@ -404,6 +422,10 @@ SUPPORTED_MODELS["gemini-3.7-flash"] = make_model_config(
     provider="gemini",
     name="Gemini 3.7 Flash",
     vision=True,
+    # Gemini 3.x 系列支持视频理解（OpenRouter 元数据 input_modalities
+    # 含 video；Google 官方也支持通过原生 API 传视频）。OpenAI 兼容
+    # 协议下用 video_url content part 传递。
+    video=True,
     max_context=1000000,
     max_output_tokens=64000,
 )
@@ -412,6 +434,7 @@ SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
     provider="gemini",
     name="Gemini 3.5 Flash-Lite",
     vision=True,
+    video=True,
     max_context=1000000,
     max_output_tokens=64000,
 )
@@ -523,6 +546,7 @@ def discover_model(model_id: str) -> Optional[ModelConfig]:
                 name=name,
                 vision=defaults.get("vision"),
                 audio=defaults.get("audio"),
+                video=defaults.get("video"),
                 supports_tools=defaults.get("supports_tools"),
                 native_image=defaults.get("native_image"),
                 native_document=defaults.get("native_document"),

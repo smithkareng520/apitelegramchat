@@ -278,7 +278,20 @@ def _get_reply_media(msg: dict) -> dict:
         return {"type": "voice", "file_id": voice["file_id"], "file_name": voice.get("file_name", "voice.ogg")}
     if "video" in reply:
         video = reply["video"]
-        return {"type": "video", "file_id": video["file_id"], "file_name": video.get("file_name", "video")}
+        return {
+            "type": "video",
+            "file_id": video["file_id"],
+            "file_name": video.get("file_name", "video.mp4"),
+            "mime_type": video.get("mime_type", "video/mp4"),
+        }
+    if "video_note" in reply:
+        vn = reply["video_note"]
+        return {
+            "type": "video",
+            "file_id": vn["file_id"],
+            "file_name": "video_note.mp4",
+            "mime_type": "video/mp4",
+        }
     return {}
 
 async def set_webhook() -> None:
@@ -635,11 +648,41 @@ async def _handle_audio_message(chat_id: int, user_message: dict, username: str)
         logger.exception(f"_handle_audio_message 异常: {e}")
         await send_rich_html_message(chat_id, f"❌ <b>处理音频时出错</b>\n<code>{str(e)[:100]}</code>")
 
+async def _handle_video_message(chat_id: int, user_message: dict, username: str):
+    """处理直接上传的视频 / 圆形视频消息（video_note）。
+
+    与图片消息对称：user_message 携带 file_id / mime_type 等元数据存入
+    对话历史，每轮由 _resolve_multimodal_content 按当前模型能力重新解析
+    ——支持视频输入的模型（stealth/ox-alpha、Gemini 系列等）收到
+    video_url content part，不支持的模型收到文本占位；切换模型不丢信息。
+    """
+    await send_chat_action(chat_id, "upload_video")
+    asyncio.create_task(init_workspace(chat_id))
+    try:
+        is_safe = await pre_flight_context_check(chat_id, user_message)
+        if not is_safe:
+            await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的视频附加内容过长，已超过模型单次处理极限，请精简发送。")
+            return
+        full, clean, new_msgs, usage = await get_ai_response(
+            chat_id, user_models, user_contexts, username,
+            user_message=user_message,
+        )
+        if full and not full.startswith(("IMAGE_SENT", "VIDEO_SENT", "⚠️", "❌")):
+            await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"_handle_video_message 异常: {e}")
+        await send_rich_html_message(chat_id, f"❌ <b>处理视频时出错</b>\n<code>{str(e)[:100]}</code>")
+
 # ---------------------------------------------------------------------------
 # 媒体组和文档组处理（保持不变）
 # ---------------------------------------------------------------------------
 _media_group_tasks: dict[str, asyncio.Task] = {}
 _document_group_tasks: dict[str, asyncio.Task] = {}
+# 视频组任务表：key 为 f"{media_group_id}:video"（与图片组 :photo 后缀分流，
+# 避免混合相册里两类分片互相争抢聚合存储 / 互相取消任务）。
+_video_group_tasks: dict[str, asyncio.Task] = {}
 
 async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
     temp_msg_id = await _send_temp_message(chat_id, "📷 正在处理您发送的图片组，请稍候…")
@@ -735,6 +778,116 @@ async def _schedule_media_group(chat_id: int, media_group_id: str) -> None:
     def _done(done_task: asyncio.Task) -> None:
         if _media_group_tasks.get(media_group_id) is done_task:
             _media_group_tasks.pop(media_group_id, None)
+        asyncio.create_task(_cleanup_task(chat_id, done_task))
+
+    task.add_done_callback(_done)
+
+async def _process_video_group_once(chat_id: int, group_key: str) -> None:
+    """聚合处理视频相册（对称 _process_media_group_once）。
+
+    group_key 为 f"{media_group_id}:video"。等待聚合期结束后弹出全部分片，
+    组装 type="video_group" 的 user_message（file_ids / file_names /
+    mime_types 数组），由 _resolve_multimodal_content 按当前模型能力解析：
+    支持视频的模型收到多个 video_url content part，不支持的模型收到文本
+    占位——与单视频、图片组行为完全一致，切换模型不丢信息。
+    """
+    temp_msg_id = await _send_temp_message(chat_id, "🎬 正在处理您发送的视频组，请稍候…")
+    try:
+        await send_chat_action(chat_id, "upload_video")
+        await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
+        messages = await pop_media_group(group_key)
+        _video_group_tasks.pop(group_key, None)
+        if not messages:
+            return
+
+        first_msg = messages[0]
+        username, user_id = get_user_info(first_msg)
+        set_current_user_namespace(user_id or str(chat_id))
+        if not is_authorized(username, user_id):
+            await reply_unauthorized(chat_id, first_msg.get("message_id"))
+            return
+
+        video_items = []
+        captions = []
+        for gmsg in messages:
+            media = gmsg.get("video") or gmsg.get("video_note")
+            if media and media.get("file_id"):
+                fid = media["file_id"]
+                video_items.append({
+                    "file_id": fid,
+                    "file_name": media.get("file_name") or f"video_{fid[:8]}.mp4",
+                    "mime_type": media.get("mime_type") or "video/mp4",
+                })
+            if gmsg.get("caption"):
+                captions.append(gmsg["caption"].strip())
+        if not video_items:
+            return
+
+        combined_caption = " ".join(c for c in captions if c)
+        context_prefix = _get_reply_context(first_msg)
+        if context_prefix:
+            combined_caption = context_prefix + combined_caption
+
+        content_text = f"📎 用户上传了视频组（共 {len(video_items)} 个）"
+        if combined_caption:
+            content_text += f"\n\n{combined_caption}"
+        else:
+            content_text += "\n\n请分析这组视频的内容"
+
+        user_message = {
+            "role": "user",
+            "content": content_text,
+            "file_ids": [v["file_id"] for v in video_items],
+            "file_names": [v["file_name"] for v in video_items],
+            "mime_types": [v["mime_type"] for v in video_items],
+            "type": "video_group",
+            "attachments": [
+                {
+                    "kind": "video",
+                    "file_id": v["file_id"],
+                    "file_name": v["file_name"],
+                    "mime_type": v["mime_type"],
+                }
+                for v in video_items
+            ],
+        }
+
+        is_safe = await pre_flight_context_check(chat_id, user_message)
+        if not is_safe:
+            await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的视频组附加内容过长，已超过模型单次处理极限，请精简发送。")
+            return
+
+        full, clean, new_msgs, usage = await get_ai_response(
+            chat_id, user_models, user_contexts, username,
+            user_message=user_message,
+        )
+        if full and not full.startswith(("IMAGE_SENT", "VIDEO_SENT", "⚠️", "❌")):
+            await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"_process_video_group_once 异常: {e}")
+        await send_rich_html_message(chat_id, f"❌ <b>处理视频组时出错</b>\n<code>{str(e)[:100]}</code>")
+    finally:
+        if temp_msg_id:
+            try:
+                await delete_message(chat_id, temp_msg_id)
+            except Exception:
+                pass
+
+async def _schedule_video_group(chat_id: int, group_key: str) -> None:
+    """将视频组的等待/处理任务作为当前 chat 的可取消生成任务登记（对称 _schedule_media_group）。"""
+    if group_key in _video_group_tasks:
+        return
+    task = asyncio.create_task(_process_video_group_once(chat_id, group_key))
+    _video_group_tasks[group_key] = task
+    async with active_tasks_lock:
+        active_tasks[chat_id] = task
+
+    def _done(done_task: asyncio.Task) -> None:
+        if _video_group_tasks.get(group_key) is done_task:
+            _video_group_tasks.pop(group_key, None)
         asyncio.create_task(_cleanup_task(chat_id, done_task))
 
     task.add_done_callback(_done)
@@ -1169,15 +1322,34 @@ async def webhook() -> tuple:
                 task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
                 return "OK", 200
 
-            # ── 媒体组（图片） ─────────────────────────────────────────────
+            # ── 媒体组（图片） ─────────────────────────────────
+            # 存储与任务 key 加 ":photo" 后缀：混合相册（photo+video 同
+            # media_group_id）里两类分片各占一个子组，互不争抢聚合存储。
             if "media_group_id" in msg and "photo" in msg:
                 mg = msg["media_group_id"]
-                await add_media_group_message(mg, msg)
+                group_key = f"{mg}:photo"
+                await add_media_group_message(group_key, msg)
                 # 图片组存在聚合等待期；只在首个分片到达时中断旧草稿并登记任务。
                 # 同一组的后续分片不能取消正在等待自身完整内容的聚合任务。
-                if mg not in _media_group_tasks:
-                    await _interrupt_active_generation(chat_id)
-                    await _schedule_media_group(chat_id, mg)
+                # 混合相册：同组视频任务已在等待时不中断它，让两组各自完成。
+                if group_key not in _media_group_tasks:
+                    if f"{mg}:video" not in _video_group_tasks:
+                        await _interrupt_active_generation(chat_id)
+                    await _schedule_media_group(chat_id, group_key)
+                return "OK", 200
+
+            # ── 视频相册（聚合，对称图片组） ─────────────────────
+            # Telegram 相册可含多个视频分片（或 photo+video 混合）。聚合
+            # 等待期后合并为一条 type="video_group" 消息触发一轮 AI。
+            if "media_group_id" in msg and ("video" in msg or "video_note" in msg):
+                mg = msg["media_group_id"]
+                group_key = f"{mg}:video"
+                await add_media_group_message(group_key, msg)
+                if group_key not in _video_group_tasks:
+                    # 同一相册的图片组任务已在等待时不中断它（混合相册）
+                    if f"{mg}:photo" not in _media_group_tasks:
+                        await _interrupt_active_generation(chat_id)
+                    await _schedule_video_group(chat_id, group_key)
                 return "OK", 200
 
             # ── 文档组 ─────────────────────────────────────────────────────
@@ -1380,6 +1552,55 @@ async def webhook() -> tuple:
                         active_tasks[chat_id] = task
                     task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
                     return "OK", 200
+            # ── 视频 / 圆形视频（单发，无 media_group_id） ─────
+            # 相册里的视频分片已在上方"视频相册"分支聚合处理；到达这里的
+            # 一定是单独发送的视频。video_note（圆形视频）无 file_name /
+            # mime_type，给默认值。
+            if "video" in msg or "video_note" in msg:
+                is_video_note = "video_note" in msg and "video" not in msg
+                media = msg.get("video") or msg.get("video_note") or {}
+                fid = media.get("file_id", "")
+                if fid:
+                    mime_type = media.get("mime_type") or "video/mp4"
+                    if is_video_note:
+                        fname = f"video_note_{fid[:8]}.mp4"
+                    else:
+                        fname = media.get("file_name") or f"video_{fid[:8]}.mp4"
+                    cap = msg.get("caption", "").strip()
+                    context_prefix = _get_reply_context(msg)
+                    if context_prefix:
+                        cap = context_prefix + cap
+
+                    content_text = f"📎 用户上传了视频「{fname}」"
+                    if cap:
+                        content_text += f"\n\n{cap}"
+                    else:
+                        content_text += "\n\n请分析这段视频。"
+
+                    user_message = {
+                        "role": "user",
+                        "content": content_text,
+                        "file_id": fid,
+                        "file_name": fname,
+                        "mime_type": mime_type,
+                        "type": "video",
+                        "attachments": [
+                            {
+                                "kind": "video",
+                                "file_id": fid,
+                                "file_name": fname,
+                                "mime_type": mime_type,
+                            }
+                        ],
+                    }
+
+                    await _interrupt_active_generation(chat_id)
+                    task = asyncio.create_task(_handle_video_message(chat_id, user_message, username))
+                    async with active_tasks_lock:
+                        active_tasks[chat_id] = task
+                    task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
+                    return "OK", 200
+
             # ── 文本消息 ──────────────────────────────────────────────────
             if "text" in msg:
                 user_input = msg["text"]
@@ -1615,12 +1836,14 @@ async def webhook() -> tuple:
                             "content": content_text,
                             "file_id": reply_media["file_id"],
                             "file_name": file_name,
+                            "mime_type": reply_media.get("mime_type", "video/mp4"),
                             "type": "video",
                             "attachments": [
                                 {
                                     "kind": "video",
                                     "file_id": reply_media["file_id"],
                                     "file_name": file_name,
+                                    "mime_type": reply_media.get("mime_type", "video/mp4"),
                                 }
                             ],
                         }

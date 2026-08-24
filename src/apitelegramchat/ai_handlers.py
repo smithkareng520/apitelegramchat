@@ -696,4 +696,9 @@ from apitelegramchat.ai.media_generation import (  # noqa: E402,F401
     _request_agnes_video,
     _request_openrouter_video,
 )
-from apitelegramchat.ai.attachment_content import _get_cached_audio_data  # noqa: E402,F401
+from apitelegramchat.ai.attachment_content import (  # noqa: E402,F401
+    _get_cached_audio_data,
+    get_cached_video_data,
+    _resolve_r2_public_url_for_video,
+    _ensure_video_persisted,
+)

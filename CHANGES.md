@@ -558,3 +558,121 @@
 
 切换模型时的零延迟收益**保留**：Gemini 那轮的后台上传让 Agnes 那轮
 直接命中 R2 已有路径。
+
+
+---
+
+# 视频输入模态（video understanding）— 变更清单
+
+本次变更为 Telegram AI 助手加入**视频输入**能力，与既有的图片输入
+（vision）实现完全对称：用户可直接发送视频 / 圆形视频 / 视频相册给
+bot，支持视频理解的模型（`stealth/ox-alpha`、Gemini 系列等）会收到
+OpenAI 兼容协议的 `video_url` content part；不支持的模型收到保留
+元数据的文本占位。切换模型时历史消息按新模型能力**重新解析**，
+信息不丢失。
+
+## 1. API 格式调研结论（实现依据）
+
+- **OpenRouter 官方文档**（/docs/guides/overview/multimodal/videos）：
+  视频输入通过 `/api/v1/chat/completions` 的 `video_url` content type
+  传递，`url` 可以是公开 URL 或 base64 data URL；支持容器为
+  video/mp4、video/mpeg、video/mov、video/webm；大文件建议用 URL。
+- **OpenRouter 模型元数据实测**：`stealth/ox-alpha` 与
+  `google/gemini-3.7-flash` 的 `architecture.input_modalities` 均含
+  `video`；`anthropic/claude-sonnet-5` 不含（[text, image, file]）。
+- **事实标准**：vLLM / LiteLLM / Envoy AI Gateway / Venice / Grok
+  等兼容生态均采用 `{"type": "video_url", "video_url": {"url": ...}}`。
+- **设计取舍**：视频统一走 **R2 公开 URL（自定义域 / r2.dev / 预签名）**，
+  不做 base64 内联 —— Telegram bot 视频上限 20MB，base64 膨胀 ~33%
+  极易触发网关请求体上限。R2 不可用时降级为文本占位（信息不丢）。
+
+## 2. `config.py`：新增 `video` 输入模态参数
+
+- `ModelConfig` 新增 `video: Optional[bool]` 字段（视频输入理解能力）。
+  与 `native_video`（视频**生成**输出）语义区分、互不影响。
+- `_PROVIDER_DEFAULTS` 七个厂商均补 `"video": False` 默认值；
+  `make_model_config` / `discover_model` 透传该字段。
+- 标记支持视频输入的模型（依据 OpenRouter input_modalities 实测）：
+  - `stealth/ox-alpha` → `video=True`
+  - `gemini-3.7-flash`、`gemini-3.5-flash-lite` → `video=True`
+
+## 3. `ai/attachment_content.py`：视频解析管线（对称图片实现）
+
+新增函数（与图片路径一一对应）：
+
+| 视频函数 | 对称的图片函数 | 职责 |
+|---|---|---|
+| `_video_cache` (TTLCache 50) | `_image_cache` | 内存缓存（条数少，防大文件占内存） |
+| `get_cached_video_data` | `get_cached_image_data` | 内存 → 永久失败标记 → R2 → Telegram |
+| `_fetch_video_from_telegram_and_cache` | `_fetch_from_telegram_and_cache` | 拉字节（超时 120s，仅 hard failure 永久标记） |
+| `_upload_video_and_mark` | `_upload_and_mark` | 后台上传（用真实 mime，仅失败时标记） |
+| `_resolve_r2_public_url_for_video` | `_resolve_r2_public_url_for_vision` | R2 有→URL；无→拉+同步上传→URL |
+| `_ensure_video_persisted` | （图片无对应） | **视频专属**：降级路径也后台持久化 |
+| `_normalize_video_mime_type` | （无） | quicktime→mov，未知→mp4 |
+
+`_resolve_multimodal_content` 新增两个分支：
+
+- **单视频**（`type == "video"`，`file_id` 单数）：`model_info.video`
+  为真且 URL 可解析 → `[{"type": "video_url", ...}, {"type": "text"}]`；
+  否则文本降级。降级时（无论模型是否支持视频）都 fire-and-forget 触发
+  `_ensure_video_persisted` —— Telegram getFile 直链约 1 小时过期，
+  必须先把字节落到 R2，之后切换到支持视频的模型才能恢复原生解析。
+- **视频组**（`type == "video_group"`，`file_ids` 数组，对称
+  `photo_group`）：并发解析多个 `video_url` part；部分失败时成功的
+  照常发送、失败的触发后台持久化。
+
+## 4. `app.py`：消息入口与视频相册聚合
+
+- **新增直接上传视频入口**（此前完全没有：视频消息会被静默忽略）：
+  - 单视频 / 圆形视频（`video` / `video_note`）→ `_handle_video_message`
+    （对称 `_handle_audio_message`，upload_video chat action）。
+  - **视频相册**：新增 `_video_group_tasks` / `_process_video_group_once` /
+    `_schedule_video_group`（对称图片组聚合），等待 `MEDIA_GROUP_TIMEOUT`
+    后合并为一条 `type="video_group"` 消息触发一轮 AI。
+  - **混合相册（photo+video 同 media_group_id）**：图片组与视频组改用
+    复合 key（`{mg}:photo` / `{mg}:video`）分流存储；互斥的 interrupt
+    条件保证两组聚合任务不会互相取消，各自独立完成。
+- **回复视频路径增强**：`_get_reply_media` 与 reply 分支补传
+  `mime_type`（并支持回复 `video_note`）。
+
+## 5. 切换模型不丢信息（核心诉求的机制保障）
+
+沿用图片的"**历史存元数据、每轮按当前模型重解析**"架构：
+
+1. 视频消息以 `{content, file_id, file_name, mime_type, type,
+   attachments}` 形式存入 `conversation_history`（出站消息体只含
+   OpenAI 协议字段，元数据不泄露）。
+2. 每轮请求 `_append_history_async` → `_resolve_multimodal_content`
+   按当前模型能力重新构造 content：支持视频 → `video_url` 数组；
+   不支持 → 文本占位（含 R2 链接 / file_id / mime 元数据）。
+3. 字节持久化到 R2 保证跨轮可恢复：
+   - 支持视频的模型首访 → 同步上传（对称图片 Agnes 路径）；
+   - 不支持视频的模型首访 → 后台上传（`_ensure_video_persisted`，
+     图片没有这一步 —— 视频 Telegram 直链过期更紧迫）。
+   - TTLCache 过期后从 R2 回填；预签名 URL（1h）每轮重解析时重新签发。
+
+场景矩阵：
+- 发视频时模型支持 → 原生 video_url；之后切到不支持 → 文本占位
+  （链接仍在）；再切回支持的模型 → 恢复原生 video_url。
+- 发视频时模型不支持 → 文本占位 + 后台已持久化；切到支持的模型
+  → 直接恢复原生 video_url（R2 已有对象，零上传延迟）。
+
+## 6. 验证
+
+- `scripts/test_video_modality.py`：6 项断言通过 —— 配置标志、mime
+  归一化、单视频三种解析路径、切换模型重解析端到端。
+- `scripts/test_video_group.py`：3 项断言通过 —— 视频组原生解析 /
+  文本降级 + 双持久化 / 部分失败补救。
+- 出站消息体验证：`video_url` part 结构与 OpenRouter 官方文档一致；
+  附件元数据（file_id 等）不泄露进出站消息体；JSON 可序列化。
+- 全部改动文件 `py_compile` 语法通过；AST 结构分析确认 webhook
+  分支顺序：图片组 → 视频组 → 文档组 → 单图 → 单文档 → 音频 →
+  单视频 → 文本。
+
+## 7. 部署提示
+
+- **必须配置 R2**（`R2_ENDPOINT` / `R2_ACCESS_KEY` / `R2_SECRET_KEY` /
+  `R2_BUCKET_NAME`，公开域名 `R2_PUBLIC_URL` 或预签名）才能走原生
+  视频输入；未配置时视频自动降级为文本占位，消息不会失败。
+- Telegram bot API 下载上限 20MB，超过上限的视频无法被 bot 下载
+  （Telegram 平台限制，与本项目无关）。

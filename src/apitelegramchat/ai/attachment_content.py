@@ -31,6 +31,9 @@ from apitelegramchat.config import CACHE_TTL
 _image_cache = TTLCache(maxsize=1000, ttl=CACHE_TTL)
 _audio_cache = TTLCache(maxsize=500, ttl=CACHE_TTL)
 _document_cache = TTLCache(maxsize=300, ttl=CACHE_TTL)
+# 视频体积大（Telegram bot 下载上限 20MB），缓存条数比图片少，
+# 避免内存被少数大文件占满。
+_video_cache = TTLCache(maxsize=50, ttl=CACHE_TTL)
 
 # ---------- 后台任务引用集合（防止 asyncio.create_task 创建的任务被 GC 提前回收）----------
 _background_tasks: set = set()
@@ -173,6 +176,183 @@ async def _upload_and_mark(file_id: str, data: bytes, r2_key: str):
     except Exception as e:
         logger.warning(f"R2后台上传失败 {file_id}: {e}")
         await state.mark_r2_attempted(file_id)
+
+
+# =====================================================================
+# 视频输入模态：缓存获取 / R2 持久化 / 公开 URL 解析
+# 与图片路径（get_cached_image_data / _upload_and_mark /
+# _resolve_r2_public_url_for_vision）完全对称，但有两个关键差异：
+#
+#   1. **只走 URL，不走 base64**。视频体积远大于图片（Telegram bot
+#      下载上限 20MB），base64 后请求体会膨胀 ~33%，极易触发网关的
+#      请求体上限；且 OpenRouter 官方文档也建议大文件优先用 URL。
+#      因此 video_url 解析失败（R2 不可用）时直接降级为文本占位，
+#      不做 base64 内联。
+#
+#   2. **持久化时机更早**。Telegram getFile 直链约 1 小时过期；为了让
+#      "先发给不支持视频的模型，再切换到支持视频的模型"这条路径不丢
+#      信息，视频在首次进入 fallback（模型不支持视频）路径时也会
+#      fire-and-forget 地后台上传 R2（图片的 fallback 路径不做上传，
+#      因为图片场景下 supports_vision 的模型占比高，且图片字节便宜）。
+# =====================================================================
+
+
+def _normalize_video_mime_type(mime_type: str = "") -> str:
+    """归一化视频 mime type，只保留 OpenRouter 官方支持的四种容器。
+
+    OpenRouter video_url 支持的格式：video/mp4、video/mpeg、video/mov、
+    video/webm。未知/缺失的 mime 一律归为 video/mp4（Telegram 发送的
+    视频绝大多是 H.264/mp4，video_note 也是 mp4）。
+    """
+    mime = (mime_type or "").strip().lower()
+    if mime in ("video/mp4", "video/mpeg", "video/quicktime", "video/mov", "video/webm"):
+        # OpenRouter 用 video/mov 表示 mov 容器（标准 MIME 是 video/quicktime）
+        if mime == "video/quicktime":
+            return "video/mov"
+        return mime
+    return "video/mp4"
+
+
+async def get_cached_video_data(chat_id: int | None, file_id: str) -> Optional[bytes]:
+    """取视频字节，不触发任何 R2 上传（与 get_cached_image_data 对称）。
+
+    解析顺序：内存 TTLCache → 永久失败标记 → R2 下载 → Telegram getFile。
+    上传由调用方按需触发（``_resolve_r2_public_url_for_video`` 同步上传，
+    ``_ensure_video_persisted`` 后台上传）。
+    """
+    cache_key = file_id
+    if cache_key in _video_cache:
+        return _video_cache[cache_key]
+
+    if await state.is_r2_attempted(file_id):
+        return None
+
+    r2_key = _get_r2_key(file_id)
+    if await file_exists_in_r2(r2_key):
+        data = await download_from_r2(r2_key)
+        if data:
+            _video_cache[cache_key] = data
+            return data
+        await state.mark_r2_attempted(file_id)
+        return None
+
+    return await _fetch_video_from_telegram_and_cache(file_id)
+
+
+async def _fetch_video_from_telegram_and_cache(file_id: str) -> Optional[bytes]:
+    """从 Telegram getFile API 拉视频字节并缓存到内存。不触发 R2 上传。
+
+    与图片版的差异：视频体积大，超时给到 120s（图片用默认值）；
+    hard failure（404/403/410）才永久标记，临时失败可重试。
+    """
+    tg_path = await get_file_path(file_id)
+    if not tg_path:
+        await state.mark_r2_attempted(file_id)
+        return None
+
+    url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{tg_path}"
+    try:
+        timeout = aiohttp.ClientTimeout(total=120, connect=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    _video_cache[file_id] = data
+                    return data
+                if resp.status in (404, 403, 410):
+                    logger.warning(f"视频下载永久失败 {file_id}: HTTP {resp.status}")
+                    await state.mark_r2_attempted(file_id)
+                else:
+                    logger.warning(
+                        f"视频下载临时失败 {file_id}: HTTP {resp.status} (will retry next turn)"
+                    )
+    except asyncio.TimeoutError as e:
+        logger.warning(f"视频下载超时 {file_id}: {e} (will retry next turn)")
+    except aiohttp.ClientError as e:
+        logger.warning(f"视频下载网络异常 {file_id}: {e} (will retry next turn)")
+    except Exception as e:
+        logger.exception(f"视频下载未分类异常 {file_id}: {e} (will retry next turn)")
+    return None
+
+
+async def _upload_video_and_mark(file_id: str, data: bytes, r2_key: str, mime_type: str = "video/mp4"):
+    """后台上传视频字节到 R2（与 _upload_and_mark 对称，但用真实 mime）。
+
+    同样遵守"只在失败时 mark_r2_attempted"的约束，防止上传成功后
+    TTLCache 过期导致历史视频被永久拉黑静默消失。
+    """
+    try:
+        result = await upload_bytes_to_r2(data, r2_key, _normalize_video_mime_type(mime_type))
+        if result is None:
+            await state.mark_r2_attempted(file_id)
+    except Exception as e:
+        logger.warning(f"视频 R2 后台上传失败 {file_id}: {e}")
+        await state.mark_r2_attempted(file_id)
+
+
+async def _resolve_r2_public_url_for_video(file_id: str, mime_type: str = "video/mp4") -> str:
+    """为视频输入模态解析公开可访问的 HTTP URL（对称图片版 _resolve_r2_public_url_for_vision）。
+
+    video_url content part（OpenRouter / vLLM / LiteLLM 等的事实标准）只
+    接受可公开抓取的 URL 或 data: URL；这里统一走 URL：
+
+      1. R2 未配置 → 空串，调用方降级为文本占位（视频不走 base64，
+         避免请求体膨胀触发网关上限）。
+      2. R2 已有对象 → 直接返回公开 URL（自定义域 / r2.dev）或预签名
+         URL（1h 有效，每轮重解析时重新签发，与图片 Agnes 路径一致）。
+      3. R2 未有对象 → 同步从 Telegram 拉字节 → 同步上传 R2 → 返回 URL。
+
+    返回值绝不包含 bot token：Telegram 直链会泄露 token 给第三方 API。
+    """
+    fid = str(file_id or "").strip()
+    if not fid:
+        return ""
+
+    if not is_r2_configured():
+        return ""
+
+    r2_key = _get_r2_key(fid)
+
+    if await file_exists_in_r2(r2_key):
+        url = await public_url_for_existing_key(r2_key)
+        if url:
+            return url
+        return ""
+
+    # 冷路径：同步拉取 + 同步上传（首次访问支持视频的模型时触发一次，
+    # 之后切换模型直接命中路径 2）。
+    video_bytes = await _fetch_video_from_telegram_and_cache(fid)
+    if not video_bytes:
+        return ""
+
+    result = await upload_bytes_to_r2(video_bytes, r2_key, _normalize_video_mime_type(mime_type))
+    if result is None or result.startswith("file://"):
+        return ""
+    return result
+
+
+async def _ensure_video_persisted(file_id: str, mime_type: str = "video/mp4"):
+    """后台把视频持久化到 R2（fire-and-forget，不阻塞响应）。
+
+    使用场景：当前模型不支持视频输入，走了文本降级路径。此时仍要把
+    字节存到 R2，因为 Telegram getFile 直链约 1 小时过期——若不持久化，
+    之后切换到支持视频的模型（如 stealth/ox-alpha / Gemini）时，历史里
+    这条视频消息将既拿不到 URL 也拉不到字节，信息就此丢失。
+    """
+    fid = str(file_id or "").strip()
+    if not fid or not is_r2_configured():
+        return
+
+    r2_key = _get_r2_key(fid)
+    if await file_exists_in_r2(r2_key):
+        return
+
+    video_bytes = await get_cached_video_data(None, fid)
+    if not video_bytes:
+        logger.warning(f"[VideoPersist] 无法获取视频字节，放弃后台上传: {fid[:12]}")
+        return
+
+    await _upload_video_and_mark(fid, video_bytes, r2_key, mime_type)
 
 
 async def _get_cached_audio_data(chat_id: int | None, file_id: str) -> Optional[bytes]:
@@ -435,6 +615,10 @@ async def _build_audio_fallback_text(
 async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_type: str, chat_id: int | None = None):
     supports_vision = model_info.vision
     supports_audio = model_info.audio
+    # 视频输入模态：模型能直接理解视频内容（如 stealth/ox-alpha、
+    # Gemini 系列）。用 getattr 容错，避免旧代码路径构造的 ModelConfig
+    # 缺字段时报错。
+    supports_video = bool(getattr(model_info, "video", False))
     supports_native_documents = bool(getattr(model_info, "native_document", False))
     # 部分网关（Agnes）只接受 image_url 里的公开 HTTP URL，不接受 data: base64。
     # 命中时优先用 R2 公开 URL；R2 不可用时回退 base64。
@@ -521,6 +705,52 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_ty
             mime_types=mime_types,
         )
 
+    # ---------- 视频组（video_group，对称 photo_group） ----------
+    if "file_ids" in msg and msg.get("type") == "video_group":
+        vg_file_ids = list(msg.get("file_ids") or [])
+        vg_file_names = list(msg.get("file_names") or [])
+        vg_mime_types = list(msg.get("mime_types") or [])
+        if vg_file_ids and supports_video:
+            async def process_video_one(idx: int, fid: str):
+                mime = ""
+                if idx < len(vg_mime_types):
+                    mime = str(vg_mime_types[idx] or "").strip()
+                public_url = await _resolve_r2_public_url_for_video(fid, mime or "video/mp4")
+                if public_url:
+                    return {
+                        "type": "video_url",
+                        "video_url": {"url": public_url},
+                    }
+                return None
+
+            results = await asyncio.gather(
+                *[process_video_one(i, fid) for i, fid in enumerate(vg_file_ids)]
+            )
+            content_parts = [r for r in results if r is not None]
+            # 无论整体走原生还是降级，解析失败的视频都触发后台持久化，
+            # 保证之后切换模型/下一轮重试时仍有机会恢复。
+            failed_indices = [i for i, r in enumerate(results) if r is None]
+            for i in failed_indices:
+                mime = vg_mime_types[i] if i < len(vg_mime_types) else ""
+                _track_task(_ensure_video_persisted(vg_file_ids[i], mime or "video/mp4"))
+            if content_parts:
+                content_parts.append({"type": "text", "text": user_text})
+                return content_parts
+        elif vg_file_ids:
+            # 模型不支持视频输入：后台持久化全部，保证切换模型不丢信息
+            for i, fid in enumerate(vg_file_ids):
+                mime = vg_mime_types[i] if i < len(vg_mime_types) else ""
+                _track_task(_ensure_video_persisted(fid, mime or "video/mp4"))
+
+        return await _build_attachment_fallback_text(
+            kind="video",
+            file_ids=vg_file_ids,
+            user_text=user_text,
+            chat_id=chat_id,
+            file_names=vg_file_names,
+            mime_types=vg_mime_types,
+        )
+
     # ---------- 原生文档 / 文档组 ----------
     doc_file_ids = []
     doc_file_names = []
@@ -592,18 +822,54 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_ty
         if file_type == "video":
             file_name = msg.get("file_name", f"{file_type}_{fid[:8]}")
             mime_type = msg.get("mime_type", "")
+
+            # ---------- 视频输入模态（与图片 supports_vision 路径对称） ----------
+            # OpenRouter / vLLM / LiteLLM 等的事实标准：
+            #   {"type": "video_url", "video_url": {"url": "<公开 URL>"}}
+            # 视频统一走 URL（R2 公开域名 / 预签名），不走 base64 内联。
+            if supports_video:
+                public_url = await _resolve_r2_public_url_for_video(fid, mime_type or "video/mp4")
+                if public_url:
+                    return [
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": public_url},
+                        },
+                        {"type": "text", "text": user_text or "请分析这段视频。"},
+                    ]
+                # URL 不可用（R2 未配置 / 上传失败）：降级为文本占位。
+                # 同时后台尝试持久化，万一 R2 稍后恢复/配置上，下一轮可
+                # 重新解析为原生视频。
+                _track_task(_ensure_video_persisted(fid, mime_type or "video/mp4"))
+                logger.warning(
+                    f"模型 {getattr(model_info, 'model_id', '?')} 支持视频但无法解析公开 URL，"
+                    f"降级为文本占位: {fid[:12]}（检查 R2 配置）"
+                )
+            else:
+                # 当前模型不支持视频输入：后台把字节持久化到 R2，
+                # 保证后续切换到支持视频的模型时不丢信息。
+                _track_task(_ensure_video_persisted(fid, mime_type or "video/mp4"))
+
             url = await _resolve_public_attachment_url(fid)
             lines = [f"📎 用户上传了{_attachment_label(file_type)}「{file_name}」"]
             if url:
                 lines.append(f"链接：{url}")
             if mime_type:
                 lines.append(f"mime_type：{mime_type}")
+            if fid:
+                lines.append(f"file_id：{fid}")
             if user_text:
                 lines.append("")
                 lines.append(f"用户原始指令：{user_text}")
             else:
                 lines.append("")
                 lines.append("用户未附加文字，请根据附件内容和上下文处理。")
+            if supports_video:
+                lines.append("")
+                lines.append(
+                    "说明：当前模型支持视频输入，但视频 URL 不可用（R2 未配置或上传失败），"
+                    "已降级为文本占位；配置 R2 后新上传的视频可直接解析。"
+                )
             return "\n".join(lines)
 
         if file_type in ("document", "document_group"):
