@@ -175,6 +175,22 @@ async def build_system_prompt(
   <li>即使当前上下文回退到了纯文本状态，也不可假定原始附件已被删除。</li>
 </ul>
 
+<h3>媒体 URL 严格规则（强制，违反将导致整条回复发送失败）</h3>
+<p>用户上传的附件占位符（形如 <code>📎 用户上传了图片「photo_AbCdEf12.jpg」</code>）中的<b>「...」内文本仅是文件名，不是合法 URL</b>。同理，<code>file_id：...</code> 后跟的字符串是 Telegram 内部 ID，也不是 URL。绝对禁止把这两种字符串写入 <code>&lt;img src="..."/&gt;</code>、<code>&lt;video src="..."/&gt;</code>、<code>&lt;audio src="..."/&gt;</code>、<code>&lt;a href="..."&gt;</code> 等任何 URL 属性中。</p>
+<ul>
+  <li><b>用户已上传的图片/视频/音频：</b>无需在回复中回显原始附件。直接用文字描述或回答即可；用户已在客户端看到过原件，回显属于冗余。</li>
+  <li><b>唯一允许写入 <code>src</code>/<code>href</code> 的 URL 来源：</b>
+    <ol>
+      <li>工具 <code>generate_image_from_text</code> / <code>edit_image_with_reference</code> 返回的 <code>图片链接：https://...</code>；</li>
+      <li>工具 <code>generate_video</code> 返回的 <code>视频链接：https://...</code>；</li>
+      <li>Web 检索 / Wikipedia / 二维码等工具明确返回的 <code>https://</code> 开头的 URL；</li>
+      <li>用户消息中明示给出的 <code>https://</code> 或 <code>http://</code> 开头的 URL。</li>
+    </ol>
+  </li>
+  <li><b>绝对禁止：</b>从附件占位符中提取 file_name / file_id 拼成看似 URL 的字符串（如 <code>photo_AbCdEf12.jpg</code>、<code>document_xxx.pdf</code>）；也禁止编造任何 <code>https://</code> 开头但实际不存在的 URL。</li>
+  <li>若回答需要展示原图但无合法 URL，请直接用文字描述；宁可不放图也不要放伪 URL。</li>
+</ul>
+
 <footer>环境信息：当前时间见本提示词末尾。</footer>
 """
 

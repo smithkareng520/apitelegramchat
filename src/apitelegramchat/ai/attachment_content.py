@@ -381,7 +381,20 @@ async def _build_attachment_fallback_text(
 
     if chat_id is not None:
         lines.append("")
-        lines.append("说明：原始附件已保留；若当前模型不支持直接读取该类型内容，请基于上述链接调用工具或进行文本降级处理。")
+        lines.append(
+            "说明：原始附件已保留；若当前模型不支持直接读取该类型内容，"
+            "请基于上述链接调用工具或进行文本降级处理。"
+        )
+        # 显式提醒模型：file_name / file_id 都不是 URL，禁止拼到 <img src> 里。
+        # 这条提示针对「链接」字段为空（R2 未配置）时的降级路径，避免 LLM
+        # 自行编造伪 URL 写入 <img src>，导致 Telegram 返回
+        # RICH_MESSAGE_PHOTO_URL_INVALID 整条消息发送失败。
+        if not url:
+            lines.append(
+                "⚠️ 上面的「文件名」和「file_id」仅是元数据，不是合法 URL，"
+                "禁止把它们写入 <img src>/<video src>/<a href>；"
+                "若需展示图片，请直接用文字描述。"
+            )
 
     return "\n".join(lines)
 

@@ -151,11 +151,127 @@ def escape_html(text) -> str:
 
 
 def _rich_message_html_payload(html_content: str) -> dict:
-    """构造符合 InputRichMessage 规范的 HTML 富消息，不改写调用方 HTML。"""
+    """构造符合 InputRichMessage 规范的 HTML 富消息。
+
+    在交付给 Telegram 前，先调用 ``_strip_invalid_media_urls`` 做一次兜底
+    清理：当 LLM 把附件 file_name（如 ``photo_AgACAgUA.jpg``）或 file_id
+    误当成 URL 写入 ``<img src>``/``<video src>``/``<audio src>`` 时，
+    Telegram 会以 ``RICH_MESSAGE_PHOTO_URL_INVALID`` 拒绝**整条消息**，
+    导致用户连文字描述都看不到。这里在发送前把这类伪 URL 的媒体块剥离，
+    保证剩余的文字内容仍然能正常送达。
+    """
+    cleaned = _strip_invalid_media_urls(html_content)
+    if cleaned != html_content:
+        logger.warning(
+            "sendRichMessage 兜底清理：检测到伪 URL 媒体块，已剥离以保证消息送达。"
+            "原始长度=%s，清理后长度=%s",
+            len(html_content),
+            len(cleaned),
+        )
     return {
-        "html": html_content,
+        "html": cleaned,
         "skip_entity_detection": True,
     }
+
+
+# 匹配完整的 <img ...> 标签（含可选自闭合斜杠），直到第一个 >。
+# 不处理 <a href>，因为锚点的非法 href 不会让 Telegram 整条拒绝，
+# 且剥离锚点会丢失链接文本。
+_MEDIA_SRC_RE = re.compile(
+    r'<img\b[^>]*?/?>',
+    re.IGNORECASE,
+)
+
+
+def _strip_invalid_media_urls(html_content: str) -> str:
+    """剥离 src 不是合法 http(s) URL 的 <img>/<video>/<audio> 标签。
+
+    Telegram Rich Message 要求 ``<img src>`` 必须是公开可访问的 http(s)
+    URL；LLM 偶尔会把附件 file_name（如 ``photo_AgACAgUA.jpg``）或 file_id
+    当作 URL 写入，会被服务端以 ``RICH_MESSAGE_PHOTO_URL_INVALID`` 拒绝。
+
+    本函数逐个扫描 ``<img>``/``<video>``/``<audio>`` 标签的 ``src`` 属性，
+    若不以 ``http://`` 或 ``https://`` 开头，则：
+
+      * 对 ``<img .../>`` 自闭合形式：直接删除整个标签；
+      * 对 ``<video>...</video>`` / ``<audio>...</audio>`` 容器形式：
+        删除整个开闭标签对（包含内部内容），避免出现孤立结束标签；
+      * 若外层是 ``<figure>`` 且剥离后 figure 内既无 ``<img>``/``<video>``
+        也无 ``<figcaption>``，则一并删除该空 figure。
+
+    仅做"剥离非法块"这一件事，不动其它合法标签，避免误伤。
+    """
+    if not html_content:
+        return ""
+
+    def _extract_src(tag_text: str) -> str:
+        m = re.search(r'\bsrc\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))',
+                      tag_text, re.IGNORECASE)
+        if not m:
+            return ""
+        return (m.group(2) or m.group(3) or m.group(4) or "").strip()
+
+    def _is_valid_url(url: str) -> bool:
+        u = (url or "").strip().lower()
+        return bool(u) and (u.startswith("http://") or u.startswith("https://"))
+
+    # 先处理容器型 <video>...</video> / <audio>...</audio>：
+    # 起始标签 src 非法时，连同内部内容一起删掉。
+    def _strip_container(text: str, tag: str) -> str:
+        pattern = re.compile(
+            rf'<{tag}\b[^>]*>.*?</{tag}\s*>|<{tag}\b[^>]*/>',
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        def _check(m: re.Match) -> str:
+            block = m.group(0)
+            src = _extract_src(block)
+            if _is_valid_url(src):
+                return block  # 合法 URL，保留
+            return ""  # 非法 URL，整块删除
+
+        return pattern.sub(_check, text)
+
+    result = html_content
+    for tag in ("video", "audio"):
+        result = _strip_container(result, tag)
+
+    # 再处理 <img .../> 自闭合形式
+    def _strip_img(text: str) -> str:
+        def _check(m: re.Match) -> str:
+            block = m.group(0)
+            src = _extract_src(block)
+            if _is_valid_url(src):
+                return block
+            return ""
+        # <img ...> 不一定有自闭合斜杠，统一处理
+        return _MEDIA_SRC_RE.sub(_check, text)
+
+    result = _strip_img(result)
+
+    # 清理空的 <figure>...</figure>（剥离后只剩空白）
+    figure_pattern = re.compile(
+        r'<figure\b[^>]*>(.*?)</figure\s*>',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def _clean_empty_figure(m: re.Match) -> str:
+        inner = m.group(1) or ""
+        # 仍然有 img/video/audio/figcaption 就保留
+        has_media = re.search(
+            r'<(img|video|audio|figcaption)\b',
+            inner,
+            re.IGNORECASE,
+        )
+        if has_media:
+            return m.group(0)
+        # 全空白：直接删
+        if not inner.strip():
+            return ""
+        return m.group(0)
+
+    result = figure_pattern.sub(_clean_empty_figure, result)
+    return result
 
 
 async def send_message(chat_id: int, text: str) -> None:

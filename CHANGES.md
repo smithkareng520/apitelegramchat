@@ -416,3 +416,62 @@
   有的是 `"失败：..."`，有的是 `{"status":"error"}`。建议
   统一为 `{"ok": bool, "error": {"code","message"}}` 并让
   formatter 信任结构化字段而非字符串前缀。
+
+---
+
+# 补丁 2 — RICH_MESSAGE_PHOTO_URL_INVALID 修复（2026-08-24）
+
+## 问题
+用户上传图片后 AI 回复发送失败，Telegram 返回 400
+`Bad Request: RICH_MESSAGE_PHOTO_URL_INVALID`，**整条**回复
+（包括图片描述正文）都丢失。
+
+## 根因
+1. `app.py:1206` 把图片附件的 `file_name` 设为
+   `photo_{file_id[:8]}.jpg`（如 `photo_AgACAgUA.jpg`），
+   并写入 user_message 的 content 文本
+   `📎 用户上传了图片「photo_AgACAgUA.jpg」`。
+2. 走 vision 路径时图片字节通过 `image_url` 发给模型，
+   但 user_text 仍带着这段含 `.jpg` 后缀的字符串。
+3. 模型在回复时把它误当成 URL，输出
+   `<figure><img src="photo_AgACAgUA.jpg"/></figure>`。
+4. `photo_AgACAgUA.jpg` 不是合法 http(s) URL，Telegram
+   拒绝整条消息。
+
+## 三重防御修复
+
+### 修复 A — system prompt 加约束
+- 文件：`src/apitelegramchat/ai_handlers.py`
+- 在「附件处理」段后新增「媒体 URL 严格规则」段，明确：
+  - 附件占位符中的 `「...」` 文本只是文件名，不是 URL
+  - `file_id：...` 后的字符串是 Telegram 内部 ID，不是 URL
+  - 禁止把这两种字符串写入 `src` / `href`
+  - 列出唯一允许写入 URL 的 4 种来源
+  - 用户已上传附件无需在回复中回显
+
+### 修复 B — 发送前兜底清理（最终防线）
+- 文件：`src/apitelegramchat/utils.py`
+- 新增 `_strip_invalid_media_urls(html)`：扫描
+  `<img>/<video>/<audio>` 标签的 `src`，若不以
+  `http(s)://` 开头则剥离整个标签；并清理剥离后留下的
+  空 `<figure>`。
+- `_rich_message_html_payload()` 改为先调用此函数清理，
+  再交给 Telegram。剥离发生时打 WARNING 日志。
+- 即使 AI 偶尔违反 system prompt 输出伪 URL，消息也
+  能正常送达（只是少了那张图），避免整条回复丢失。
+
+### 修复 C — fallback text 显式警告
+- 文件：`src/apitelegramchat/ai/attachment_content.py`
+- `_build_attachment_fallback_text()` 在「链接」字段为空
+  （R2 未配置）时追加一条提示，明确告诉 LLM file_name /
+  file_id 不是合法 URL，禁止写入 `<img src>`。
+- 这一路径只在模型不支持原生 vision 时命中，作为
+  A + B 之外的补充防御。
+
+## 验证
+- `scripts/test_strip_media.py` 单元测试：4 个场景全部通过
+  （日志场景 / 合法 URL 保留 / 非法 video 整块删除 /
+  全伪 URL 返回空）
+- `scripts/test_e2e_log_scenario.py` 端到端：模拟日志中的
+  完整 HTML，验证清理后伪 URL 被剥离、正文全部保留，
+  不再触发 `RICH_MESSAGE_PHOTO_URL_INVALID`。
