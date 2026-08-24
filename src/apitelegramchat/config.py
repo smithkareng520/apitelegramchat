@@ -364,8 +364,9 @@ SUPPORTED_MODELS["stealth/ox-alpha"] = make_model_config(
     provider="openrouter",
     name="Ox Alpha",
     vision=True,
-    # OpenRouter 官方模型元数据 input_modalities = [text, image, video]：
-    # 支持通过 video_url content part 直接传入视频进行理解。
+    # OpenRouter metadata 曾标记 video，但实际 endpoint 未必支持
+    # chat/completions 的 video_url。保留 metadata，具体发送层会根据 provider
+    # 能力做保护，避免错误透传导致 404。
     video=True,
     max_context=1050000,
     max_output_tokens=131000,

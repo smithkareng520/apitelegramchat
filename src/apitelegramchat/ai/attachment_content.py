@@ -618,7 +618,15 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_ty
     # 视频输入模态：模型能直接理解视频内容（如 stealth/ox-alpha、
     # Gemini 系列）。用 getattr 容错，避免旧代码路径构造的 ModelConfig
     # 缺字段时报错。
+    # video=True 只代表模型元数据声明支持视频。
+    # OpenRouter 是聚合网关，实际 endpoint 能力可能与 metadata 不一致。
+    # 目前 OpenRouter chat/completions 对 video_url 需要 endpoint 显式支持，
+    # 否则会返回：No endpoints found that support video URLs。
+    # 因此先阻断 OpenRouter 的 video_url 透传，走附件降级逻辑，避免整次请求失败。
     supports_video = bool(getattr(model_info, "video", False))
+    if getattr(model_info, "provider", "") == "openrouter":
+        supports_video = False
+
     supports_native_documents = bool(getattr(model_info, "native_document", False))
     # 部分网关（Agnes）只接受 image_url 里的公开 HTTP URL，不接受 data: base64。
     # 命中时优先用 R2 公开 URL；R2 不可用时回退 base64。
