@@ -74,6 +74,29 @@ if os.getenv("APITELEGRAMCHAT_REQUIRE_LOGGING", "0") in {"1", "true", "yes", "on
 
 logger = logging.getLogger(__name__)
 
+# ---------- HTTP session 复用 ----------
+# Rich draft 更新是高频短请求，不能每次 flush 创建新的 ClientSession。
+# 使用懒加载单例，复用 TCP/TLS keep-alive 连接。
+_http_session: Optional[aiohttp.ClientSession] = None
+_http_session_lock = asyncio.Lock()
+
+async def get_http_session(timeout: Optional[aiohttp.ClientTimeout] = None) -> aiohttp.ClientSession:
+    """获取全局 aiohttp session（用于高频内部 API 请求）。"""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        async with _http_session_lock:
+            if _http_session is None or _http_session.closed:
+                connector = aiohttp.TCPConnector(
+                    limit=100,
+                    limit_per_host=50,
+                    keepalive_timeout=60,
+                )
+                _http_session = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=timeout or aiohttp.ClientTimeout(total=30),
+                )
+    return _http_session
+
 # ---------- 请求ID上下文 ----------
 # 使用 contextvars 替代全局 dict，避免并发协程间 request_id 互相覆盖
 import contextvars
@@ -533,8 +556,8 @@ async def _reassert_active_draft_content(chat_id: int, draft_id: int) -> None:
         }
         # reassert 只是视觉保活，失败可由下一次真实 flush 恢复；不应占用草稿锁过久。
         timeout = aiohttp.ClientTimeout(total=4, connect=2)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{BASE_URL}/sendRichMessageDraft", json=payload) as resp:
+        session = await get_http_session(timeout)
+        async with session.post(f"{BASE_URL}/sendRichMessageDraft", json=payload) as resp:
                 if resp.status == 200:
                     _draft_last_send_time[cache_key] = time.monotonic()
                     try:
@@ -636,8 +659,8 @@ async def send_rich_message_draft_unlocked(
 
     timeout = aiohttp.ClientTimeout(total=5, connect=3)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{BASE_URL}/sendRichMessageDraft", json=payload) as resp:
+        session = await get_http_session(timeout)
+        async with session.post(f"{BASE_URL}/sendRichMessageDraft", json=payload) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     msg_id = data.get("result", {}).get("message_id")
@@ -722,8 +745,8 @@ async def send_rich_message_draft(
 
         for attempt in range(_DRAFT_MAX_ATTEMPTS):
             try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(f"{BASE_URL}/sendRichMessageDraft", json=payload) as resp:
+                session = await get_http_session(timeout)
+                async with session.post(f"{BASE_URL}/sendRichMessageDraft", json=payload) as resp:
                         body = ""
                         if resp.status != 200:
                             try:
