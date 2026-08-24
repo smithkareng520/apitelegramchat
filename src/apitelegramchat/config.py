@@ -422,10 +422,6 @@ SUPPORTED_MODELS["gemini-3.7-flash"] = make_model_config(
     provider="gemini",
     name="Gemini 3.7 Flash",
     vision=True,
-    # Gemini 3.x 系列支持视频理解（OpenRouter 元数据 input_modalities
-    # 含 video；Google 官方也支持通过原生 API 传视频）。OpenAI 兼容
-    # 协议下用 video_url content part 传递。
-    video=True,
     max_context=1000000,
     max_output_tokens=64000,
 )
@@ -434,7 +430,6 @@ SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
     provider="gemini",
     name="Gemini 3.5 Flash-Lite",
     vision=True,
-    video=True,
     max_context=1000000,
     max_output_tokens=64000,
 )
