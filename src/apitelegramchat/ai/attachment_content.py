@@ -615,17 +615,11 @@ async def _build_audio_fallback_text(
 async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_type: str, chat_id: int | None = None):
     supports_vision = model_info.vision
     supports_audio = model_info.audio
-    # 视频输入模态：模型能直接理解视频内容（如 stealth/ox-alpha、
-    # Gemini 系列）。用 getattr 容错，避免旧代码路径构造的 ModelConfig
-    # 缺字段时报错。
-    # video=True 只代表模型元数据声明支持视频。
-    # OpenRouter 是聚合网关，实际 endpoint 能力可能与 metadata 不一致。
-    # 目前 OpenRouter chat/completions 对 video_url 需要 endpoint 显式支持，
-    # 否则会返回：No endpoints found that support video URLs。
-    # 因此先阻断 OpenRouter 的 video_url 透传，走附件降级逻辑，避免整次请求失败。
+    # 视频输入模态：默认由 provider 能力决定，模型必须显式设置 video=True 才开启。
+    # 与 vision/audio 等参数保持一致：provider 只提供默认能力，模型配置负责覆盖。
+    # 例如 OpenRouter 默认 video=False，但某个模型经过验证支持后可以手动 video=True。
+    # 这样不会因为免费模型 metadata 声明支持视频而误发送 video_url。
     supports_video = bool(getattr(model_info, "video", False))
-    if getattr(model_info, "provider", "") == "openrouter":
-        supports_video = False
 
     supports_native_documents = bool(getattr(model_info, "native_document", False))
     # 部分网关（Agnes）只接受 image_url 里的公开 HTTP URL，不接受 data: base64。
