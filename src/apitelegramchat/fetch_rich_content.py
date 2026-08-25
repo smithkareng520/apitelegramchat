@@ -46,14 +46,14 @@ logger = logging.getLogger(__name__)
 
 # fetch 结果的 HTML 总预算。必须小于 tool_executors.MAX_TOOL_RESPONSE_LEN(16000)，
 # 这样 _truncate_tool_result 的朴素切片永远不会作用在 fetch_url 的 HTML 上。
-FETCH_RICH_MAX_LEN = 14000
+FETCH_RICH_MAX_LEN = 20000
 # 正文（含原位插入的媒体）占用的预算。页头（<h3> 标题 + 来源链接，最长约
 # 330）+ 截断提示（约 30）后仍低于 FETCH_RICH_MAX_LEN，且留有充足余量
 # 低于 MAX_TOOL_RESPONSE_LEN(16000)。
 # 历史教训：曾设为 11000，内容丰富的页面（如维基百科条目）会把靠后的
 # 表格（各话列表等）整块截掉——预算压缩（见 _demote_same_origin_links）
 # 与本预算必须协同工作。
-FETCH_BODY_MAX_LEN = 13400
+FETCH_BODY_MAX_LEN = 19400
 
 # 媒体数量上限：防止图库/相册类页面把工具结果塞满 <img>。
 MAX_IMAGES = 8
