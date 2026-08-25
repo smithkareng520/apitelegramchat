@@ -618,7 +618,6 @@ def _positive_int_env(name: str, default: int, minimum: int) -> int:
 
 
 STREAM_FLUSH_INTERVAL = _positive_float_env("STREAM_FLUSH_INTERVAL", 0.65, 0.25)
-STREAM_FLUSH_CHARS = _positive_int_env("STREAM_FLUSH_CHARS", 96, 32)
 STREAM_SILENT_FORCE_FLUSH = _positive_float_env(
     "STREAM_SILENT_FORCE_FLUSH", 2.0, STREAM_FLUSH_INTERVAL
 )

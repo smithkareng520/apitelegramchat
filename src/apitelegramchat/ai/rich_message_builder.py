@@ -10,7 +10,7 @@ import os
 import time
 from typing import List, Optional
 
-from apitelegramchat.config import STREAM_FLUSH_INTERVAL, STREAM_SILENT_FORCE_FLUSH, STREAM_FLUSH_CHARS
+from apitelegramchat.config import STREAM_FLUSH_INTERVAL, STREAM_SILENT_FORCE_FLUSH
 from apitelegramchat.utils import (
     send_rich_message_draft,
     send_rich_html_message,
@@ -204,7 +204,6 @@ class RichMessageBuilder:
         self._current_group_idx = -1
         self._stream_buffer: str = ""
         self._stream_text_index: int = -1
-        self._pending_chars: int = 0
         self._last_flush_time: float = time.monotonic()
         self._flush_sequence: int = 0
         # 每次内容变更递增。刷新完成时仅在版本未变化的情况下清除 dirty，
@@ -710,7 +709,6 @@ class RichMessageBuilder:
             self._handoff_text.append(delta)
             return
         self._stream_buffer += delta
-        self._pending_chars += len(delta)
         # 流式增量未必每片都调用 request_flush；将其标记为新版本，可确保一旦
         # 当前发送结束，后台刷新不会把已累积的增量误认为已经展示。
         self._flush_dirty = True
@@ -929,7 +927,6 @@ class RichMessageBuilder:
         self._current_group_idx = -1
         self._stream_buffer = ""
         self._stream_text_index = -1
-        self._pending_chars = 0
 
     async def _register_active_draft(self, message_id: int = 0) -> None:
         try:
@@ -970,7 +967,6 @@ class RichMessageBuilder:
             self.blocks.append(buffered)
             self.block_types.append("text")
             self._stream_text_index = -1
-            self._pending_chars += len(buffered)
 
     async def rollover_at_turn_boundary(self, *, start_next_draft: bool = True) -> bool:
         """在完整模型返回/完整工具批次后，按回合去向完成草稿分段。
@@ -1149,8 +1145,7 @@ class RichMessageBuilder:
             if not html_content.strip() or html_content.strip() == " ":
                 html_content = "<p>Working...</p>"
 
-            self._pending_chars = 0
-            frame_chars = len(_rich_visible_text(html_content))
+                frame_chars = len(_rich_visible_text(html_content))
             _frame_boundaries, _ignored_chars, frame_blocks = _scan_rich_html_boundaries(html_content)
             frame_revision = self._flush_revision
             frame_started = time.monotonic()
@@ -1215,8 +1210,7 @@ class RichMessageBuilder:
             # 重申这一帧，避免 send_rich_message_draft 因内容相同而短路。
             silent_too_long = time_elapsed >= STREAM_SILENT_FORCE_FLUSH
             should_flush = (
-                    self._pending_chars >= max(1, STREAM_FLUSH_CHARS // 2)
-                    or (self._pending_chars > 0 and time_elapsed >= STREAM_FLUSH_INTERVAL)
+                    (self._flush_dirty and time_elapsed >= STREAM_FLUSH_INTERVAL)
                     or silent_too_long
             )
             if should_flush:
