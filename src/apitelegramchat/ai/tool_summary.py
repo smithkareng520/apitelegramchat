@@ -313,7 +313,7 @@ def _tool_result_is_failure(fn_name: str, fn_args: dict, result_content: Any, de
         if lower.startswith(("error:", "exception:", "failed:", "timeout:", "❌")):
             return True
         return False
-    if lower.startswith(("error:", "exception:", "failed:", "timeout:", "❌")):
+    if lower.startswith(("error:", "exception:", "failed:", "timeout:", "❌", "失败：", "失败:")):
         return True
     if text.startswith("{"):
         try:
@@ -347,14 +347,20 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         if _tool_result_is_failure(fn_name, fn_args, result_content):
             return f"Failed to fetch {domain}" if domain else "Failed to fetch page"
         title = None
-        m = re.search(r'🏷️\s+([^\n]+)', text)
+        # 新版 fetch_url 结果为 Telegram Rich HTML，标题在 <h3>…</h3>。
+        m = re.search(r"<h3[^>]*>(.*?)</h3>", text, re.S | re.I)
         if m:
-            title = m.group(1).strip()
+            title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1))).strip()
         if not title:
-            m = re.search(r'<title>(.*?)</title>', text, re.I | re.S)
+            # 旧格式兼容：🏷️ 标记行。
+            m = re.search(r"🏷️\s+([^\n]+)", text)
             if m:
-                title = re.sub(r'<[^>]+>', '', m.group(1)).strip()
-                title = re.sub(r'\s+', ' ', title)
+                title = m.group(1).strip()
+        if not title:
+            m = re.search(r"<title>(.*?)</title>", text, re.I | re.S)
+            if m:
+                title = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+                title = re.sub(r"\s+", " ", title)
         return f"Fetched: {title}" if title else (f"Fetched: {domain}" if domain else "Fetched a page")
 
     if fn_name == "ask_user":

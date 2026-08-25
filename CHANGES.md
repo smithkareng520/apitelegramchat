@@ -676,3 +676,103 @@ OpenAI 兼容协议的 `video_url` content part；不支持的模型收到保留
   视频输入；未配置时视频自动降级为文本占位，消息不会失败。
 - Telegram bot API 下载上限 20MB，超过上限的视频无法被 bot 下载
   （Telegram 平台限制，与本项目无关）。
+
+---
+
+# fetch_url 富媒体提取改造 — 变更清单
+
+## 背景
+
+`fetch_url` 此前用 trafilatura 的 `txt` 输出（纯文本，所有格式丢失），
+返回形如 `✅ [成功] 🏷️ 标题\n🔗 URL\n📄 内容：…` 的纯文本结果。该格式
+既不是系统提示词规定的 Telegram HTML 子集，也提取不到页面上的图片、
+内嵌视频、iframe 播放器（YouTube/Bilibili 等）与音频，模型只能把链接
+当纯文本转述。
+
+## 改动总览
+
+新增 `src/apitelegramchat/fetch_rich_content.py`（提取引擎，约 1000 行），
+重写 `execute_fetch_url` 成功路径，并同步更新全部下游消费方。
+
+### 新文件：`fetch_rich_content.py`
+
+1. **trafilatura XML → Telegram Rich HTML 转换器**
+   - `output_format='xml'`（`include_links/images/formatting/tables` 全开）
+     保留全部结构；`<hi rend="#b">` → `<b>`、`<ref target>` → `<a href>`、
+     `<list>` → `<ul>/<ol>`、`<table>` → `<table bordered striped>`（含
+     `colspan/rowspan` 与表头加粗）、`<quote>` → `<blockquote>`、块级
+     `<code>` → `<pre><code>`。
+   - **中文页面退化检测**：中文等无空格语言会击穿 trafilatura 基于词数
+     的启发式，走 justext 回退把多段合并成单段并丢失全部行内格式。
+     `extract_body_blocks()` 在"结果块数 ≤1 而原始 HTML 明明有 ≥3 个块
+     级元素"时用 `favor_precision=True` 重试，取结构更完整的一份。
+   - **容器行内合并**：维基百科 `favor_precision` 输出会把 `<ref>` 直接
+     挂在 `<main>` 下、尾巴文本散落成 `：`/`、` 碎片；`_render_container`
+     将容器层连续行内子元素与尾巴合并成完整段落，并过滤纯标点碎片段落
+     与空表格。
+   - **媒体提升**：段落/列表项内的 `<graphic>` 一律提升为兄弟块级
+     `<img/>`/`<figure>`，符合"媒体必须是独立块级元素、严禁嵌入行内
+     容器"的 Rich Message 约束。
+
+2. **嵌入媒体提取 `extract_embedded_media()`**（trafilatura 全部丢失的部分）
+   - `<video>/<source>`（含 poster 封面）→ `<video src>`；
+   - `<iframe>/<embed>` 播放器 → 规范化观看链接列表（YouTube/YouTube-
+     nocookie/Vimeo/Dailymotion/Bilibili（bvid/aid）/优酷，其余站点按
+     域名标注 X/Facebook/Instagram/TikTok/Spotify/网易云等）；
+   - `<audio>/<source>` → `<audio src>`；
+   - `<img>` 懒加载属性（data-src/data-original/data-actualsrc 等 9 种）
+     与 `srcset`（取最大尺寸候选）；
+   - Open Graph（og:video/og:audio/og:image/og:title/og:description）；
+   - JSON-LD `VideoObject/AudioObject/ImageObject`（递归 @graph/hasPart）；
+   - 安全与降噪：URL 仅允许 http/https（拒绝 javascript:/data:/blob:
+     等），基于 base_url 补全相对路径并去 fragment；过滤装饰图（sprite/
+     spacer/icon/logo/avatar/1x1 等文件名特征）；全类型去重；数量上限
+     （图 8 / 视频 4 / 播放器 5 / 音频 2）。
+
+3. **结果组装 `build_fetch_rich_result()`**
+   - 结构：`<h3>` 标题（og:title 优先）→ `🔗 来源链接` → 正文块 →
+     `🎬 视频` / `📺 内嵌播放器` / `🎵 音频` / `🖼️ 图片`（≥2 张用
+     `<tg-slideshow>`，内部只放裸 `<img>`）媒体区；
+   - **整块截断**：14000 字符总预算（低于 `MAX_TOOL_RESPONSE_LEN=16000`，
+     朴素切片永远不会作用在 HTML 上），只会在完整块边界截断并追加
+     "（正文过长，已截断）"，绝不产生未闭合标签；
+   - 正文里已内联出现的媒体自动从媒体区去重；首个正文标题与页面标题
+     重复时自动去重。
+
+### `search_engine.py`：`execute_fetch_url` 重写
+
+- 成功路径改为 `_build_rich_fetch_payload()`（CPU 密集，经
+  `asyncio.to_thread` 调度）：标题 + 正文块 + 嵌入媒体 → 最终 HTML；
+- `curl_cffi` 失败时不再直接走 trafilatura 纯文本提取，而是用
+  trafilatura 下载器拿到原始 HTML 后仍走富 HTML 提取
+  （`_download_html_with_trafilatura`）；
+- SSRF 校验、缓存策略（失败结果不缓存）、JS/Meta-Refresh 重定向跟随、
+  重试循环等行为全部保持不变；
+- `fetch_url` 工具描述更新：明确告知模型结果为 Telegram Rich HTML、
+  其中的媒体/链接 URL 可直接复用。
+
+### 下游消费方同步更新
+
+- `tool_executors.py / format_tool_result`：fetch_url 详情不再降级为
+  "标题 + 域名链接"，而是原样透传富 HTML——用户在 Telegram 折叠面板里
+  可直接预览网页正文、图片、视频与播放器链接；失败判断改为前缀匹配
+  （避免把谈论"失败"的新闻正文误判为抓取失败）；标题解析优先 `<h3>`
+  并保留旧 `🏷️` 格式兼容。
+- `ai/tool_summary.py`：`_generate_tool_summary_done` 标题解析同步支持
+  `<h3>`（旧格式兼容）；`_tool_result_is_failure` 补充中文"失败："前缀。
+- `ai_handlers.py / build_system_prompt`：媒体 URL 白名单条款明确加入
+  `fetch_url`，说明其返回的 `<img>/<video>/<a>` 标签中的 URL 均为
+  合法来源，可直接复用。
+
+## 验证
+
+- 新增 `tests/test_fetch_rich_content.py`：47 项离线单测全绿，覆盖 URL
+  安全过滤、播放器规范化、OG/JSON-LD/懒加载提取、装饰图过滤、去重与
+  上限、XML→HTML 全元素转换、容器行内合并、碎片段落/空表格过滤、
+  整块截断闭合性、execute_fetch_url 集成（成功/失败/SSRF/缓存）。
+- `tests/test_consumers.py`：下游链路验证（format_tool_result /
+  摘要 / 失败判定 / 旧格式兼容）全绿。
+- 真实网页抽查（BBC / 中文维基百科 / GitHub）均产出合法 Telegram
+  HTML：标题、来源链接、加粗/斜体、超链接、图片（含懒加载）、
+  slideshow、表格、代码块齐全；中文维基百科触发 favor_precision
+  回退并正确合并信息框碎片。

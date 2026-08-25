@@ -1533,20 +1533,36 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
     elif fn_name == "fetch_url":
         url = fn_args.get('url', '')
         domain = extract_domain(url)
-        if "失败" in result_str or "超时" in result_str or "Failed" in result_str or "Error" in result_str:
-            logger.error(f"[fetch_url] Failed to fetch {url}: {result_str[:500]}")
+        text = str(result_str or "")
+        stripped = text.lstrip()
+        # 新版 fetch_url 成功结果本身就是 Telegram Rich HTML（可能包含
+        # <h3>/<img>/<video>/<a> 等标签），正文文本里也可能出现"失败"字样；
+        # 因此失败判断只看前缀，避免把谈论"失败"的新闻正文误判为抓取失败。
+        if (stripped.startswith(("失败", "❌"))
+                or stripped.lower().startswith(("error", "failed", "timeout", "exception"))
+                or "超时" in stripped[:30]):
+            logger.error(f"[fetch_url] Failed to fetch {url}: {text[:500]}")
             summary = f"🌐 Failed to fetch {domain}"
             details_html = "Unable to retrieve content. Check the URL or try again later."
         else:
-            title = domain
-            if "🏷️" in result_str:
-                match = re.search(r'🏷️\s+([^\n]+)', result_str)
-                if match:
-                    title = match.group(1).strip()
-            summary = f"🌐 Fetched: {title}"
-            safe_domain = domain
-            safe_title = title
-            details_html = f"{safe_title} <a href=\"{url}\">{safe_domain}</a>"
+            title = None
+            # 新格式：<h3>标题</h3> 开头
+            m = re.search(r'<h3[^>]*>(.*?)</h3>', text, re.S | re.I)
+            if m:
+                title = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', m.group(1))).strip()
+            if not title:
+                # 旧格式兼容：🏷️ 标题
+                m = re.search(r'🏷️\s+([^\n]+)', text)
+                if m:
+                    title = m.group(1).strip()
+            if not title:
+                m = re.search(r'<title>(.*?)</title>', text, re.I | re.S)
+                if m:
+                    title = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', m.group(1))).strip()
+            summary = f"🌐 Fetched: {title}" if title else f"🌐 Fetched: {domain}"
+            # 工具结果已是合法的 Telegram Rich HTML：直接作为详情渲染，用户
+            # 可在折叠面板中预览网页正文、图片、内嵌视频与播放器链接。
+            details_html = text.strip() if text.strip() else escape_html(url)
         return summary, details_html
 
     elif fn_name == "weather":

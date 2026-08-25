@@ -513,7 +513,13 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "fetch_url",
-            "description": "Fetch and read full content of a specific URL. Use when a search result needs deeper reading or the user gave you a link. One URL per call.",
+            "description": (
+                "Fetch and read the full content of a specific URL. Returns the page as Telegram Rich Message HTML "
+                "(<h3> title, source link, body paragraphs/lists/tables, plus sections for embedded videos, "
+                "iframe players like YouTube/Bilibili, audio and images with their original URLs). "
+                "You may quote or reuse the relevant HTML fragments (including <img>/<video>/<a> tags) directly in your reply. "
+                "Use when a search result needs deeper reading or the user gave you a link. One URL per call."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1299,25 +1305,7 @@ async def execute_web_search(query: str, num_results: int | None = None, offset:
     return f"❌ 未找到与「{query}」相关的结果。"
 
 
-# --------------------- fetch_url (增加重试循环) ---------------------
-async def _extract_with_trafilatura(url: str) -> str | None:
-    try:
-        downloaded = await asyncio.to_thread(trafilatura.fetch_url, url)
-        if downloaded:
-            extracted = await asyncio.to_thread(
-                trafilatura.extract,
-                downloaded,
-                output_format='txt',
-                include_comments=False,
-                include_tables=True,
-            )
-            if extracted:
-                return re.sub(r'\s+', ' ', extracted).strip()
-    except Exception as e:
-        logger.error(f"trafilatura extract error for {url}: {e}")
-    return None
-
-
+# --------------------- fetch_url (Telegram Rich HTML 输出) ---------------------
 async def _fetch_html_with_curl(url: str) -> str | None:
     try:
         async with AsyncSession() as session:
@@ -1331,23 +1319,74 @@ async def _fetch_html_with_curl(url: str) -> str | None:
         return None
 
 
-def _extract_text_from_html(html: str) -> str | None:
+async def _download_html_with_trafilatura(url: str) -> str | None:
+    """curl_cffi 失败时用 trafilatura 自带下载器兜底获取原始 HTML。"""
+    if trafilatura is None:
+        return None
+    try:
+        downloaded = await asyncio.to_thread(trafilatura.fetch_url, url)
+        return downloaded or None
+    except Exception as e:
+        logger.debug(f"trafilatura 下载失败: {url}: {e}")
+        return None
+
+
+def _build_rich_fetch_payload(url: str, html: str) -> str | None:
+    """把原始 HTML 转换为 Telegram Rich Message HTML 工具结果（同步、CPU 密集）。
+
+    提取链路：
+      1. trafilatura XML（保留链接/图片/格式/表格）→ Telegram HTML 块；
+      2. 原始 HTML → 内嵌视频 / iframe 播放器 / 音频 / 懒加载图片 / OG / JSON-LD；
+      3. 组装：标题 + 来源链接 + 正文 + 媒体区，预算内整块截断。
+    返回 None 表示完全提不出内容（调用方继续走重定向检测/失败路径）。
+    """
     if not html:
         return None
     try:
-        extracted = trafilatura.extract(
-            html,
-            output_format='txt',
-            include_comments=False,
-            include_tables=True,
-            no_fallback=False,
-            with_metadata=False,
+        from apitelegramchat.fetch_rich_content import (
+            build_fetch_rich_result,
+            build_fallback_text_from_html,
+            extract_body_blocks,
+            extract_embedded_media,
+            extract_title_from_html,
         )
-        if extracted:
-            return re.sub(r'\s+', ' ', extracted).strip()
-    except Exception:
-        pass
-    return None
+    except Exception as e:
+        logger.error(f"[fetch_url] fetch_rich_content 导入失败: {e}")
+        return None
+
+    title = extract_title_from_html(html)
+    media = extract_embedded_media(html, url)
+    if media.og_title and not title:
+        title = media.og_title
+
+    # 正文提取：trafilatura XML → Telegram HTML 块（含中文页面退化检测与
+    # favor_precision/favor_recall 回退），链接/图片/格式/表格全保留。
+    body_blocks = extract_body_blocks(html, url)
+
+    # 正文太薄时补充 og:description 开头段（正文块仍可能为空 → fallback）。
+    body_len = sum(len(b) for b in body_blocks)
+    if body_len < 200 and media.og_description:
+        body_blocks.insert(0, f"<p>{_escape_plain(media.og_description[:500])}</p>")
+        body_len = sum(len(b) for b in body_blocks)
+
+    fallback_text = ""
+    if body_len < 200:
+        # 结构化提取失败：用纯文本兜底（meta 描述 + 段落），同时保住媒体区。
+        fallback_text = build_fallback_text_from_html(html)
+
+    if body_len < 200 and not fallback_text.strip() and not media.has_any():
+        return None
+
+    result = build_fetch_rich_result(url, title, body_blocks, media, fallback_text)
+    # 最终防御：结果可见文本过短视为提取失败。
+    visible = re.sub(r'<[^>]+>', '', result)
+    if len(re.sub(r'\s+', '', visible)) < 60 and not media.has_any():
+        return None
+    return result
+
+
+def _escape_plain(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # --------------------- SSRF 防护 ---------------------
@@ -1425,15 +1464,9 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
             # 先用 curl_cffi 获取 HTML
             html = await _fetch_html_with_curl(url)
             if not html:
-                # 如果 curl 失败，尝试 trafilatura 直接提取
-                try:
-                    content = await _extract_with_trafilatura(url)
-                    if content:
-                        result = f"✅ [成功] 🏷️ {urlparse(url).netloc}\n🔗 {url}\n📄 内容：\n\n{_truncate(content)}"
-                        set_fetch_cache(url, result)
-                        return result
-                except Exception:
-                    pass
+                # curl 失败：trafilatura 自带下载器兜底（拿到 HTML 后仍走富 HTML 提取）
+                html = await _download_html_with_trafilatura(url)
+            if not html:
                 # 第一次尝试失败，等待后重试
                 if attempt == 0:
                     logger.warning(f"fetch_url attempt {attempt+1} failed for {url}, retrying...")
@@ -1444,15 +1477,15 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
                     set_fetch_cache(url, result)
                     return result
 
-            # 获取标题（用于后续展示）
+            # 获取标题（用于失败提示与展示兜底）
             title = _get_title_from_html(html)
 
-            # 尝试用 trafilatura 提取正文
-            content = _extract_text_from_html(html)
-            if content and len(content) > 200:
-                result = f"✅ [成功] 🏷️ {title}\n🔗 {url}\n📄 内容：\n\n{_truncate(content)}"
-                set_fetch_cache(url, result)
-                return result
+            # 转 Telegram Rich HTML（CPU 密集，放线程池避免阻塞事件循环）。
+            # 内容 + 内嵌视频/播放器/音频/图片 都在这一步提取。
+            payload = await asyncio.to_thread(_build_rich_fetch_payload, url, html)
+            if payload:
+                set_fetch_cache(url, payload)
+                return payload
 
             # ---- 检测 JavaScript 重定向 ----
             js_pattern = re.compile(r'window\.location\.href\s*=\s*[\'"]([^\'"]+)[\'"]', re.IGNORECASE)
