@@ -924,10 +924,10 @@ async def send_rich_html_message(
                             return False
                     logger.error(f"sendRichHtmlMessage failed: {resp.status} {body[:200]}")
                     return False
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             raise
-        except Exception as e:
-            logger.exception(f"sendRichHtmlMessage unexpected exception: {e}")
+        except Exception:
+            logger.exception("sendRichHtmlMessage unexpected exception")
             return False
 
     async with serialize_with_active_draft(chat_id, reassert=reassert_draft):

@@ -2001,6 +2001,12 @@ async def execute_qr_code(text: str) -> str:
         return "失败：R2 上传失败，请检查配置。"
 
 
+# --------------------- done ---------------------
+async def execute_done() -> str:
+    """Sentinel result for the `done` tool, signalling end of the tool round."""
+    return "Tool round completed."
+
+
 # --------------------- image API helpers ---------------------
 def _extract_modelscope_error_detail(body_text: str) -> tuple[str, str]:
     detail = body_text[:500] if body_text else ""

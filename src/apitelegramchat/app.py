@@ -5,7 +5,6 @@ import aiohttp
 import json
 import logging
 import uuid
-import re
 import os
 import time
 import hmac
@@ -44,7 +43,6 @@ from apitelegramchat.config import (
 from apitelegramchat.state import (
     user_contexts,
     user_models,
-    processed_updates,
     role_message_ids,
     get_or_init_context,
     get_user_model,
@@ -1957,7 +1955,7 @@ async def webhook() -> tuple:
         logger.exception(f"Webhook 顶层异常: {e}")
         return "OK", 200
     finally:
-        _elapsed = _time.monotonic() - _t0
+        _elapsed = time.monotonic() - _t0
         if _elapsed > 1.0:
             logger.warning(f"⚠️ Webhook 处理耗时 {_elapsed:.2f}s, 超过 1s 阈值（应当 < 500ms）")
         else:

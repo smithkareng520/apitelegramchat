@@ -2,7 +2,6 @@
 import asyncio
 import os
 import subprocess
-import random
 import uuid
 import aiohttp
 import json
@@ -1908,7 +1907,6 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
         action = payload.get("action", "list")
         if action == "list":
-            todos = payload.get("todos", []) or []
             total = payload.get("total", 0)
             pending = payload.get("pending", 0)
             summary = f"📋 共 {total} 项 · 待办 {pending} 项"
@@ -2002,10 +2000,10 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         tool_calls = payload.get("tool_calls", 0)
         elapsed = payload.get("elapsed", 0)
         if ok:
-            summary = f"🤖 子 agent 完成 · {rounds} 轮 · {tool_calls} 工具 · {elapsed:.1f}s"
+            summary = f"🤖 {model_name} · {rounds} 轮 · {tool_calls} 工具 · {elapsed:.1f}s"
         else:
             err = payload.get("error", "未知错误")
-            summary = f"❌ 子 agent 失败 · {rounds} 轮 · {err[:40]}"
+            summary = f"❌ {model_name} 失败 · {rounds} 轮 · {err[:40]}"
         details_html = render_subagent_card(payload)
         return summary, details_html
 
