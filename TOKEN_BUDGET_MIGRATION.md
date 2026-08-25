@@ -51,3 +51,11 @@ PYTHONPATH=src python3 -m unittest -v tests.test_token_budget
 部署日志显示草稿刷新阶段出现 `ValueError: too many values to unpack (expected 3)`。根因是富消息边界扫描器在 token 迁移后新增了“可见 Unicode 单位”这一第四返回值，而 `RichMessageBuilder.flush()` 仍按旧的三项结构解包。
 
 现已将 `flush()` 更新为接收四项返回值，并使用其中的 `frame_tokens` 记录帧级日志。新增回归测试会实际调用 `RichMessageBuilder.flush()`，以模拟草稿发送并验证四项返回值不会再触发解包异常。
+
+## 后续修复：结构化表格保真
+
+针对萌娘百科“可塑性记忆”页面的实测表明，原始 DOM 的各话表包含 `#01` 至 `#13`，而 Trafilatura XML 只保留了表头和 `#01`。最终结果仅 5,370 tokens，远低于现有 fetch token 预算，因此问题发生在正文提取而不是截断。
+
+现有 Trafilatura 主链路保持不变。新增的回填机制只在转换结果已经包含同一张表、原始 DOM 与转换表具有相同的前三个表头和首个数据键、且原始表至少多出 3 行并达到转换表行数两倍时才会替换该表。回填输出只包含 HTML 转义后的可见文本及受限的跨行属性；没有转换表锚点、匹配不唯一、行数差不足或任何解析失败时均保留原结果。无表格页面会快速返回，不额外解析原始 DOM。
+
+真实页面复测显示，最终模型结果已完整保留 `#01` 至 `#13`，总计 5,370 tokens，仍低于 20,000-token 总预算。详细安全规则见 `DOM_TABLE_FALLBACK_DESIGN.md`。

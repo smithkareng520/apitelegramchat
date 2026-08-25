@@ -830,6 +830,187 @@ def trafilatura_xml_to_rich_html(xml_text: str, base_url: str = "") -> list[str]
 _XML_BLOCK_RE = re.compile(r"<(?:p|head|list|table|quote|code|graphic|media)\b")
 _RAW_HTML_BLOCK_RE = re.compile(r"<(?:p|h[1-6]|li|blockquote|pre|table)\b", re.IGNORECASE)
 
+# DOM 表格回填仅用于已验证的“同表严重丢行”场景。它不替换正文提取器，也不
+# 新增没有转换表锚点的原始表格；详见 DOM_TABLE_FALLBACK_DESIGN.md。
+_DOM_TABLE_MIN_DATA_ROWS = 3
+_DOM_TABLE_MIN_ROW_DELTA = 3
+
+
+def _collapse_table_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _table_cell_text(cell) -> str:
+    """Extract only visible text from one DOM cell; never retain source HTML."""
+    texts: list[str] = []
+    try:
+        for node in cell.xpath(
+            ".//text()[not(ancestor::script or ancestor::style or ancestor::noscript or ancestor::template)]"
+        ):
+            texts.append(str(node))
+    except Exception:
+        try:
+            texts.append("".join(cell.itertext()))
+        except Exception:
+            return ""
+    return _collapse_table_text(" ".join(texts))
+
+
+def _table_rows_from_dom(table) -> list[list[dict[str, object]]]:
+    """Read direct rows/cells from one table, excluding rows of nested tables."""
+    rows: list[list[dict[str, object]]] = []
+    try:
+        row_nodes = table.xpath(".//tr")
+    except Exception:
+        return rows
+    for row in row_nodes:
+        owner = None
+        try:
+            for ancestor in row.iterancestors():
+                if _local_name(ancestor) == "table":
+                    owner = ancestor
+                    break
+        except Exception:
+            continue
+        if owner is not table:
+            continue
+        cells: list[dict[str, object]] = []
+        for cell in row:
+            tag = _local_name(cell)
+            if tag not in {"th", "td"}:
+                continue
+            text = _table_cell_text(cell)
+            attrs: dict[str, int] = {}
+            for attr in ("colspan", "rowspan"):
+                raw = (cell.get(attr) or "").strip()
+                if raw.isdigit() and 2 <= int(raw) <= 20:
+                    attrs[attr] = int(raw)
+            cells.append({"text": text, "header": tag == "th", "attrs": attrs})
+        if cells:
+            rows.append(cells)
+    return rows
+
+
+def _table_signature(rows: list[list[dict[str, object]]]) -> tuple[tuple[str, ...], str] | None:
+    """Return a conservative identity key: first headers plus first data key."""
+    if len(rows) < 2:
+        return None
+    header = tuple(
+        _collapse_table_text(str(cell["text"])).lower()
+        for cell in rows[0]
+        if str(cell["text"])
+    )[:3]
+    first_data = next(
+        (
+            _collapse_table_text(str(cell["text"])).lower()
+            for row in rows[1:]
+            for cell in row
+            if str(cell["text"])
+        ),
+        "",
+    )
+    if len(header) < 3 or not first_data:
+        return None
+    return header, first_data
+
+
+def _is_raw_table_fallback_candidate(rows: list[list[dict[str, object]]]) -> bool:
+    if len(rows) < _DOM_TABLE_MIN_DATA_ROWS + 1:
+        return False
+    if sum(1 for cell in rows[0] if str(cell["text"])) < 3:
+        return False
+    return _table_signature(rows) is not None
+
+
+def _render_safe_dom_table(rows: list[list[dict[str, object]]]) -> str:
+    """Render validated raw DOM table data using only escaped text and safe spans."""
+    output_rows: list[str] = []
+    for row_index, row in enumerate(rows):
+        cells: list[str] = []
+        for cell in row:
+            attrs = cell["attrs"] if isinstance(cell.get("attrs"), dict) else {}
+            attr_text = "".join(
+                f' {name}="{int(value)}"'
+                for name, value in attrs.items()
+                if name in {"colspan", "rowspan"} and isinstance(value, int) and 2 <= value <= 20
+            )
+            value = esc(str(cell["text"]))
+            if row_index == 0 or bool(cell.get("header")):
+                value = f"<b>{value}</b>"
+            cells.append(f"<td{attr_text}>{value}</td>")
+        if cells:
+            output_rows.append("<tr>" + "".join(cells) + "</tr>")
+    return '<table bordered striped>' + "".join(output_rows) + "</table>" if output_rows else ""
+
+
+def _rich_table_rows(block: str) -> list[list[dict[str, object]]]:
+    """Parse one converter-produced Rich HTML table back into normalized rows."""
+    if _lxml_html is None or not block or not block.lstrip().startswith("<table"):
+        return []
+    try:
+        root = _lxml_html.fragment_fromstring(block, create_parent="div")
+        table = root.find(".//table")
+    except Exception:
+        return []
+    return _table_rows_from_dom(table) if table is not None else []
+
+
+def _restore_severely_truncated_dom_tables(body_blocks: list[str], html_text: str) -> list[str]:
+    """Replace only a uniquely matched Rich table proven to have lost many rows.
+
+    Failure is deliberately inert: parse, matching, or safety ambiguity returns
+    the original body blocks unchanged.  The returned replacement remains a
+    normal body block and therefore continues through existing token budgets.
+    """
+    if _lxml_html is None or not body_blocks or not html_text:
+        return body_blocks
+    # 普通文章没有转换表格时完全跳过 DOM 解析，保持既有路径和性能特征。
+    if not any(block.lstrip().startswith("<table") for block in body_blocks):
+        return body_blocks
+    try:
+        parser = _lxml_html.HTMLParser(recover=True, encoding="utf-8", huge_tree=True)
+        tree = _lxml_html.fromstring(html_text, parser=parser)
+        raw_tables = []
+        for table in tree.xpath("//table"):
+            rows = _table_rows_from_dom(table)
+            if _is_raw_table_fallback_candidate(rows):
+                signature = _table_signature(rows)
+                if signature is not None:
+                    raw_tables.append((signature, rows))
+    except Exception as exc:
+        logger.debug("[fetch_rich] 原始 DOM 表格回填解析失败: %s", exc)
+        return body_blocks
+
+    by_signature: dict[tuple[tuple[str, ...], str], list[list[list[dict[str, object]]]]] = {}
+    for signature, rows in raw_tables:
+        by_signature.setdefault(signature, []).append(rows)
+
+    restored = list(body_blocks)
+    replaced = 0
+    for index, block in enumerate(body_blocks):
+        converted_rows = _rich_table_rows(block)
+        converted_signature = _table_signature(converted_rows)
+        if converted_signature is None:
+            continue
+        matches = by_signature.get(converted_signature, [])
+        # Any ambiguity must preserve the existing conversion unchanged.
+        if len(matches) != 1:
+            continue
+        raw_rows = matches[0]
+        if not (
+            len(raw_rows) >= len(converted_rows) + _DOM_TABLE_MIN_ROW_DELTA
+            and len(raw_rows) >= len(converted_rows) * 2
+        ):
+            continue
+        safe_table = _render_safe_dom_table(raw_rows)
+        if safe_table:
+            restored[index] = safe_table
+            replaced += 1
+
+    if replaced:
+        logger.info("[fetch_rich] 已回填 %s 张经验证丢行的原始 DOM 表格", replaced)
+    return restored
+
 
 def _xml_block_count(xml_text: str) -> int:
     return len(_XML_BLOCK_RE.findall(xml_text or ""))
@@ -886,7 +1067,8 @@ def extract_body_blocks(html_text: str, base_url: str = "") -> list[str]:
             xml_text = alt
     if not xml_text:
         return []
-    return trafilatura_xml_to_rich_html(xml_text, base_url)
+    converted_blocks = trafilatura_xml_to_rich_html(xml_text, base_url)
+    return _restore_severely_truncated_dom_tables(converted_blocks, html_text)
 
 
 # ---------------------------------------------------------------------------
