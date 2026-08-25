@@ -6,6 +6,10 @@ import asyncio
 import json
 import re
 import uuid
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from apitelegramchat.ai.rich_message_builder import RichMessageBuilder
 
 from apitelegramchat.utils import get_logger, escape_html
 from apitelegramchat.token_budget import truncate_to_token_budget
@@ -123,9 +127,6 @@ async def _run_tool_calls_and_append(
 
     await builder.flush(force=False)
 
-    has_image_tool = any(fn_name in MEDIA_GEN_TOOLS for fn_name, _, _ in tool_tasks)
-    has_bash_tool = any(fn_name in BASH_TOOLS for fn_name, _, _ in tool_tasks)
-    has_ask_user_tool = any(fn_name == "ask_user" for fn_name, _, _ in tool_tasks)
     # 草稿构建器的全局刷新循环会在静默超时后，对当前活跃草稿统一执行
     # force flush。工具批次无需另建心跳任务；图片、视频和普通工具均复用
     # 同一机制，状态变更仍由前面的普通 flush 立即推送。

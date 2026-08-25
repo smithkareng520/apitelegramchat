@@ -412,7 +412,6 @@ async def resolve_text(chat_id: int, text: str) -> bool:
         answer = {"type": "custom", "value": truncate_to_token_budget(text, ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET, suffix="…")}
         if interaction.future and not interaction.future.done():
             interaction.future.set_result(answer)
-        message_id = interaction.message_id
         await _clear_pending_unlocked(interaction)
     asyncio.create_task(_edit_question_message(interaction, _answered_html(interaction, answer)))
     return True

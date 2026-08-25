@@ -116,7 +116,7 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     # ---------- text_editor ----------
     if fn_name == "text_editor":
         command = fn_args.get("command", "")
-        path = fn_args.get("path", "")
+        fn_args.get("path", "")
         # 进行时只显示描述，不需要详细路径
         return custom_desc or {
             "view": "Viewing file",

@@ -4,6 +4,7 @@ import os
 import re
 import aiohttp
 import asyncio
+import contextvars
 import functools
 import html
 import logging
@@ -99,7 +100,6 @@ async def get_http_session(timeout: Optional[aiohttp.ClientTimeout] = None) -> a
 
 # ---------- 请求ID上下文 ----------
 # 使用 contextvars 替代全局 dict，避免并发协程间 request_id 互相覆盖
-import contextvars
 _request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="unknown")
 
 def set_request_id(request_id: str):
@@ -363,7 +363,7 @@ class RateLimitError(Exception):
 
 @retry_async(max_retries=5, delay=0.5, backoff=3.0, exceptions=(aiohttp.ClientError, asyncio.TimeoutError, RateLimitError))
 async def delete_message(chat_id: int, message_id: int) -> None:
-    from apitelegramchat.state import deleted_message_ids, deleted_messages_lock, is_protected_message
+    from apitelegramchat.state import deleted_message_ids, deleted_messages_lock, is_protected_message, mark_deleted_message
     if await is_protected_message(message_id):
         logger.info(f"deleteMessage 跳过受保护消息: chat={chat_id} msg={message_id}")
         return
@@ -377,8 +377,7 @@ async def delete_message(chat_id: int, message_id: int) -> None:
                 json={"chat_id": chat_id, "message_id": message_id},
             ) as r:
                 if r.status == 200:
-                    async with deleted_messages_lock:
-                        deleted_message_ids.add(message_id)
+                    await mark_deleted_message(message_id)
                     logger.debug(f"deleteMessage 成功: chat={chat_id} msg={message_id}")
                     return
                 elif r.status == 429:
@@ -412,9 +411,8 @@ async def delete_message_fast(chat_id: int, message_id: int) -> bool:
             ) as r:
                 if r.status == 200:
                     try:
-                        from apitelegramchat.state import deleted_message_ids, deleted_messages_lock
-                        async with deleted_messages_lock:
-                            deleted_message_ids.add(message_id)
+                        from apitelegramchat.state import mark_deleted_message
+                        await mark_deleted_message(message_id)
                     except Exception:
                         pass
                     return True
@@ -961,7 +959,7 @@ async def send_rich_html_message(
                             return False
                     logger.error(f"sendRichHtmlMessage failed: {resp.status} {body[:200]}")
                     return False
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             raise
         except Exception as e:
             logger.exception(f"sendRichHtmlMessage unexpected exception: {e}")

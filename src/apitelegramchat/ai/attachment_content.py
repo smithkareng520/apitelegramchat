@@ -10,8 +10,9 @@ from pathlib import Path
 from PIL import Image
 from typing import Optional
 import aiohttp
+from cachetools import TTLCache
 
-from apitelegramchat.config import ModelConfig, TELEGRAM_BOT_TOKEN, R2_PUBLIC_URL, PROVIDERS
+from apitelegramchat.config import CACHE_TTL, ModelConfig, TELEGRAM_BOT_TOKEN, PROVIDERS
 from apitelegramchat.utils import get_logger, transcribe_audio_with_groq
 from apitelegramchat.file_handlers import get_file_path
 from apitelegramchat.s3_utils import (
@@ -25,9 +26,6 @@ from apitelegramchat.s3_utils import (
 import apitelegramchat.state as state
 
 logger = get_logger(__name__)
-
-from cachetools import TTLCache
-from apitelegramchat.config import CACHE_TTL
 
 _image_cache = TTLCache(maxsize=1000, ttl=CACHE_TTL)
 _audio_cache = TTLCache(maxsize=500, ttl=CACHE_TTL)

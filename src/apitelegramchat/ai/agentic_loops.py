@@ -9,13 +9,15 @@ import httpx
 import base64
 import re
 import uuid
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from openai import AsyncOpenAI
+
+if TYPE_CHECKING:
+    from apitelegramchat.ai.rich_message_builder import RichMessageBuilder
 
 from apitelegramchat.config import GEMINI_API_KEY, SUPPORTED_MODELS
 from apitelegramchat.utils import get_logger, escape_html, send_rich_html_message
 from apitelegramchat.s3_utils import upload_bytes_to_r2
-import apitelegramchat.state as state
 
 from apitelegramchat.ai._constants import (
     MAX_TOOL_CALLS,

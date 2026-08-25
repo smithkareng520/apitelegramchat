@@ -28,7 +28,6 @@ from apitelegramchat.ai.tool_summary import (
     _generate_action_description,
     _get_tool_description_from_args,
 )
-import apitelegramchat.state as state
 
 logger = get_logger(__name__)
 
