@@ -364,11 +364,11 @@ async def get_ai_response(
 
         if context_snapshot.dropped_messages:
             logger.info(
-                "Request context bounded: chat=%s kept=%s dropped=%s estimated_chars=%s",
+                "Request context bounded: chat=%s kept=%s dropped=%s estimated_tokens=%s",
                 chat_id,
                 len(history),
                 context_snapshot.dropped_messages,
-                context_snapshot.estimated_chars,
+                context_snapshot.estimated_tokens,
             )
 
         builder.set_thinking_status("Thinking...")
