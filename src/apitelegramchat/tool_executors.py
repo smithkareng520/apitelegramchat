@@ -15,7 +15,6 @@ from apitelegramchat.workspace_paths import (
 import re
 import html
 import logging
-import shutil
 from typing import Optional, List
 from urllib.parse import urlparse
 from apitelegramchat.workspace_utils import (
@@ -38,6 +37,9 @@ from apitelegramchat.config import (
     BASE_URL,
 )
 
+_TOOL_TIMEOUT_MARKER = "__TOOL_TIMEOUT__"
+
+import shutil
 from apitelegramchat.search_engine import (
     execute_web_search,
     execute_fetch_url,
@@ -70,23 +72,12 @@ from apitelegramchat.subagent_tool import execute_subagent, render_subagent_card
 from apitelegramchat.utils import escape_html
 from apitelegramchat.token_budget import truncate_to_token_budget
 
-_TOOL_TIMEOUT_MARKER = "__TOOL_TIMEOUT__"
 logger = logging.getLogger(__name__)
 
 # ---------- 信号量控制并发工具调用 ----------
 tool_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TOOLS)
 
-
-def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-    return min(maximum, max(minimum, value))
-
-
-TOOL_RESPONSE_TOKEN_BUDGET = _bounded_int_env("TOOL_RESPONSE_TOKEN_BUDGET", 20_000, 256, 100_000)
-BASH_SESSION_IDLE_SECONDS = _bounded_int_env("BASH_SESSION_IDLE_SECONDS", 1_800, 60, 86_400)
+TOOL_RESPONSE_TOKEN_BUDGET = int(os.getenv("TOOL_RESPONSE_TOKEN_BUDGET", "20000"))
 
 
 def _truncate_tool_result(result: str) -> str:
@@ -162,16 +153,6 @@ def _looks_like_http_url(value: object) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
-def _safe_html_url(value: object) -> str:
-    """Return a protocol-checked, attribute-escaped URL or an empty string."""
-    if not _looks_like_http_url(value):
-        return ""
-    raw = str(value).strip()
-    if len(raw) > 2048 or any(char.isspace() for char in raw):
-        return ""
-    return html.escape(raw, quote=True)
-
-
 def _display_key(key: object) -> str:
     raw = str(key)
     labels = {
@@ -201,9 +182,8 @@ def _render_structured_value(value: object, *, depth: int = 0) -> str:
         return escape_html(str(value))
     if isinstance(value, str):
         clean = _trim_ui_value(value)
-        safe_url = _safe_html_url(value)
-        if safe_url:
-            return f'<a href="{safe_url}">打开链接</a>'
+        if _looks_like_http_url(value):
+            return f'<a href="{value.strip()}">打开链接</a>'
         return escape_html(clean)
     if depth >= 2:
         return f"<code>{escape_html(_compact_json(value))}</code>"
@@ -360,14 +340,13 @@ def _render_poi_cards(payload: object) -> str | None:
         typecode = _poi_value(poi, "typecode")
         poi_id = _poi_value(poi, "id", "poi_id")
         photo_url = _poi_photo_url(poi)
-        safe_photo_url = _safe_html_url(photo_url)
         summary = f"📍 {index}. {name}"
         details_open = " open" if index <= 2 else ""
         body: list[str] = []
-        if safe_photo_url and index <= 3:
+        if photo_url and index <= 3:
             body.append(
-                f'<figure><img src="{safe_photo_url}"/>'
-                f'<figcaption><a href="{safe_photo_url}">查看地点图片</a></figcaption></figure>'
+                f'<figure><img src="{photo_url}"/>'
+                f'<figcaption><a href="{photo_url}">查看地点图片</a></figcaption></figure>'
             )
         if address:
             body.append(f"<p><b>地址</b><br/>{escape_html(address)}</p>")
@@ -389,8 +368,8 @@ def _render_poi_cards(payload: object) -> str | None:
             metadata.append(f"分类编码：<code>{escape_html(typecode)}</code>")
         if poi_id:
             metadata.append(f"POI ID：<code>{escape_html(poi_id)}</code>")
-        if safe_photo_url and index > 3:
-            metadata.append(f'<a href="{safe_photo_url}">查看地点图片</a>')
+        if photo_url and index > 3:
+            metadata.append(f'<a href="{photo_url}">查看地点图片</a>')
         if metadata:
             body.append("<details><summary>更多信息</summary><p>" + "<br/>".join(metadata) + "</p></details>")
         cards.append(f"<details{details_open}><summary>{escape_html(summary)}</summary>{''.join(body)}</details>")
@@ -689,15 +668,12 @@ def _format_image_generation_result(
         lines = result_str.splitlines()
         urls = [line.strip() for line in lines if line.strip().startswith(("http://", "https://"))]
         if urls:
-            safe_urls = [safe for url in urls if (safe := _safe_html_url(url))]
-            if not safe_urls:
-                return failure_summary, _render_media_failure_result(result_str, failure_fallback)
-            count = len(safe_urls)
+            count = len(urls)
             summary = f"🎨 {operation_en} {count} image" + ("" if count == 1 else "s")
-            img_tags = "".join(f'<img src="{url}"/>' for url in safe_urls)
+            img_tags = "".join(f'<img src="{url}"/>' for url in urls)
             link_items = "".join(
                 f'<li><a href="{url}">图片 {index + 1}</a></li>'
-                for index, url in enumerate(safe_urls)
+                for index, url in enumerate(urls)
             )
             caption = f"{operation_zh} {count} 张图片：<ul>{link_items}</ul>"
             if count == 1:
@@ -1181,13 +1157,13 @@ class BashSession:
                     )
                 if self._UPLOAD_DOWNLOAD_CD_PATTERN.search(command):
                     return (
-                        "Error: Command rejected — `cd` into upload/ or download/ is "
-                        "not allowed. These directories are staging buffers: read and "
-                        "write files in them via relative paths (e.g. "
-                        "`cp out.txt ../upload/out.txt`, `cat ../download/doc.pdf`), "
-                        "but never execute commands from inside them. To move a file "
-                        "into upload/ use the stage_upload tool; to pull a file from "
-                        "download/ use the fetch_download tool."
+                        f"Error: Command rejected — `cd` into upload/ or download/ is "
+                        f"not allowed. These directories are staging buffers: read and "
+                        f"write files in them via relative paths (e.g. "
+                        f"`cp out.txt ../upload/out.txt`, `cat ../download/doc.pdf`), "
+                        f"but never execute commands from inside them. To move a file "
+                        f"into upload/ use the stage_upload tool; to pull a file from "
+                        f"download/ use the fetch_download tool."
                     )
                 return f"Error: Command rejected for security reasons: {command}"
 
@@ -1296,10 +1272,10 @@ class BashSession:
 
                 # 提取命令结束后的真实 PWD，同时把内部 marker 从用户输出中移除。
                 actual_cwd = str(self.workdir.absolute())
-                cwd_match = re.search(r'(?m)^' + re.escape(cwd_marker) + r' (.+)$', output)
+                cwd_match = re.search(rf'(?m)^' + re.escape(cwd_marker) + r' (.+)$', output)
                 if cwd_match:
                     actual_cwd = cwd_match.group(1).strip()
-                    output = re.sub(r'(?m)^' + re.escape(cwd_marker) + r' .*$\n?', '', output)
+                    output = re.sub(rf'(?m)^' + re.escape(cwd_marker) + r' .*$\n?', '', output)
 
                 # 记录最新 cwd，下一次 _is_safe 会据此拒绝在 upload/ 或 download/
                 # 子树内继续执行命令。即便 cd 进入被拒，模型也可能通过 pushd /
@@ -1396,27 +1372,10 @@ class BashSession:
 # =====================================================================
 class BashSessionManager:
     def __init__(self):
-        self._sessions: dict[tuple[int, str], BashSession] = {}
-        self._last_used: dict[tuple[int, str], float] = {}
+        self._sessions: dict = {}
         self._lock = asyncio.Lock()
 
-    async def cleanup_idle(self) -> int:
-        """Close idle persistent shells without holding the registry lock while waiting."""
-        cutoff = time.monotonic() - BASH_SESSION_IDLE_SECONDS
-        async with self._lock:
-            stale = [key for key, used_at in self._last_used.items() if used_at < cutoff]
-            sessions = [self._sessions.pop(key) for key in stale if key in self._sessions]
-            for key in stale:
-                self._last_used.pop(key, None)
-        for session in sessions:
-            try:
-                await session.close()
-            except Exception:
-                logger.exception("关闭空闲 Bash 会话失败 chat_id=%s", session.chat_id)
-        return len(sessions)
-
     async def get_session(self, chat_id: int, namespace: str | None = None) -> BashSession:
-        await self.cleanup_idle()
         resolved_namespace = workspace_namespace(chat_id, namespace)
         key = (chat_id, resolved_namespace)
         async with self._lock:
@@ -1426,10 +1385,9 @@ class BashSessionManager:
                 self._sessions[key] = session
             else:
                 # 进程已死则重建
-                session = self._sessions[key]
-                if session.proc is None or session.proc.returncode is not None:
-                    await session.start()
-            self._last_used[key] = time.monotonic()
+                s = self._sessions[key]
+                if s.proc is None or s.proc.returncode is not None:
+                    await s.start()
             return self._sessions[key]
 
     async def restart_session(self, chat_id: int, namespace: str | None = None) -> str:
@@ -1443,8 +1401,7 @@ class BashSessionManager:
             new_session = BashSession(chat_id, resolved_namespace)
             await new_session.start()
             self._sessions[key] = new_session
-            self._last_used[key] = time.monotonic()
-            return "Bash session restarted (sandbox=landlock)"
+            return f"Bash session restarted (sandbox=landlock)"
 
     async def cleanup_all(self):
         """优雅关闭所有会话（应用退出时调用）"""
@@ -1455,7 +1412,6 @@ class BashSessionManager:
                 except Exception:
                     pass
             self._sessions.clear()
-            self._last_used.clear()
 
 _bash_manager = BashSessionManager()
 
@@ -1949,7 +1905,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
         action = payload.get("action", "list")
         if action == "list":
-            payload.get("todos", []) or []
+            todos = payload.get("todos", []) or []
             total = payload.get("total", 0)
             pending = payload.get("pending", 0)
             summary = f"📋 共 {total} 项 · 待办 {pending} 项"
@@ -2038,7 +1994,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             details_html = escape_html(result_str)
             return summary, details_html
         ok = payload.get("ok", False)
-        payload.get("model_name") or payload.get("model") or "?"
+        model_name = payload.get("model_name") or payload.get("model") or "?"
         rounds = payload.get("rounds", 0)
         tool_calls = payload.get("tool_calls", 0)
         elapsed = payload.get("elapsed", 0)

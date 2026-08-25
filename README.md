@@ -8,15 +8,10 @@
 python -m venv .venv
 .venv/bin/pip install -e .
 export TELEGRAM_BOT_TOKEN=...
-# 用于 Telegram X-Telegram-Bot-Api-Secret-Token 请求头校验；不写入 URL。
-export TELEGRAM_WEBHOOK_SECRET_TOKEN='a-long-random-secret'
+export WEBHOOK_TOKEN=...
 export WEBHOOK_URL=https://example.com/webhook
 export OPENROUTER_API_KEY=...
-# 持久保存授权白名单；应为应用用户专属且可备份的目录。
-export APITELEGRAMCHAT_DATA_DIR=/var/lib/apitelegramchat
 python -m quart --app apitelegramchat.app:app run --host 0.0.0.0 --port 5000
-# 应用启动后显式注册 webhook；默认不会丢弃积压 update。
-apitelegramchat-register-webhook
 ```
 
 ## MCP server
@@ -29,7 +24,7 @@ export APITELEGRAMCHAT_DATA_DIR='/var/lib/apitelegramchat'
 apitelegramchat-mcp
 ```
 
-缺少或不符合格式的 `APITELEGRAMCHAT_MCP_SCOPE` 会使 server 拒绝启动，避免默认共享 workspace。运行时目录、workspace 和 state 目录均以 `0700` 创建。请将 `APITELEGRAMCHAT_DATA_DIR` 设为应用用户私有、持久化的目录；Telegram 白名单将原子写入该目录的 `authorized_users.json`，文件权限为 `0600`。
+缺少或不符合格式的 `APITELEGRAMCHAT_MCP_SCOPE` 会使 server 拒绝启动，避免默认共享 workspace。运行时目录、workspace 和 state 目录均以 `0700` 创建。请将 `APITELEGRAMCHAT_DATA_DIR` 设为应用用户私有、持久化的目录。
 
 ### 默认工具面
 
@@ -73,7 +68,7 @@ export SERPER_MCP_TOKEN='...'
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-测试覆盖：强制 scope、私有目录权限、默认最小权限工具表、编辑器符号链接拒绝、资源不泄露绝对 workspace 路径、外部 endpoint allowlist、SDK 请求处理器注册，以及授权白名单持久化、状态 TTL 回收和输出 URL 安全回归。
+测试覆盖：强制 scope、私有目录权限、默认最小权限工具表、编辑器符号链接拒绝、资源不泄露绝对 workspace 路径、外部 endpoint allowlist 以及 SDK 请求处理器注册。
 
 ## Docker
 

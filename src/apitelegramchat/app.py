@@ -5,6 +5,7 @@ import aiohttp
 import json
 import logging
 import uuid
+import re
 import os
 import mimetypes
 from apitelegramchat.workspace_paths import workspace_download_root
@@ -26,10 +27,9 @@ from apitelegramchat.ai_handlers import get_ai_response, _get_cached_audio_data
 from apitelegramchat.config import (
     BASE_URL,
     WEBHOOK_URL,
-    WEBHOOK_SECRET_TOKEN,
     SUPPORTED_MODELS,
     SUPPORTED_ROLES,
-    load_whitelist,
+    WEBHOOK_TOKEN,
     DEFAULT_MODEL,
     WHITELIST_USERS,
     ADMIN_USERS,
@@ -42,9 +42,8 @@ from apitelegramchat.config import (
 from apitelegramchat.state import (
     user_contexts,
     user_models,
+    processed_updates,
     role_message_ids,
-    remember_update,
-    cleanup_expired_runtime_state,
     get_or_init_context,
     get_user_model,
     safe_clear_history,
@@ -198,20 +197,14 @@ async def _send_temp_message(chat_id: int, text: str) -> int:
         pass
     return None
 
-@app.before_serving
-async def _load_persistent_runtime_state() -> None:
-    """Load durable settings once; never silently ignore a storage error."""
-    try:
-        await asyncio.to_thread(load_whitelist)
-        logger.info("已加载授权白名单，数量=%s", len(WHITELIST_USERS))
-    except Exception as exc:
-        logger.error("授权白名单加载失败，服务将仅允许管理员访问: %s", exc)
-
-
 @app.route('/health', methods=['GET'])
 async def health_check():
-    # 不暴露授权用户数或任务数量等内部运行状态。
-    return {"status": "ok", "version": "2.1"}, 200
+    return {
+        "status": "ok",
+        "version": "2.0",
+        "whitelist_count": len(WHITELIST_USERS),
+        "active_tasks": len(active_tasks),
+    }, 200
 
 # ---------- 权限辅助 ----------
 def get_user_info(msg: dict) -> tuple[str, str]:
@@ -235,16 +228,6 @@ def is_authorized(username: str, user_id: str) -> bool:
     if user_id and user_id in WHITELIST_USERS:
         return True
     return False
-
-
-def _cmd_match(text: str, name: str) -> bool:
-    """Match a Telegram command token, including an optional @bot suffix."""
-    raw = str(text or "").strip()
-    if not raw.startswith("/"):
-        return False
-    command = raw.split(maxsplit=1)[0]
-    return command == name or command.startswith(name + "@")
-
 
 async def reply_unauthorized(chat_id: int, reply_message_id: int | None = None):
     await send_rich_html_message(
@@ -312,22 +295,13 @@ def _get_reply_media(msg: dict) -> dict:
         }
     return {}
 
-async def set_webhook(*, drop_pending_updates: bool = False) -> None:
-    """Register the Telegram webhook with header-based secret verification."""
-    if not BASE_URL or not WEBHOOK_URL or not WEBHOOK_SECRET_TOKEN:
-        raise RuntimeError("配置 webhook 前必须设置 TELEGRAM_BOT_TOKEN、WEBHOOK_URL 与密钥")
-    payload = {
-        "url": WEBHOOK_URL,
-        "secret_token": WEBHOOK_SECRET_TOKEN,
-        "drop_pending_updates": bool(drop_pending_updates),
-    }
+async def set_webhook() -> None:
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{BASE_URL}/setWebhook", json=payload) as resp:
-            body = await resp.text()
+        async with session.post(f"{BASE_URL}/setWebhook?drop_pending_updates=true", json={"url": WEBHOOK_URL}) as resp:
             if resp.status == 200:
-                logger.info("Webhook 已使用 secret_token 注册")
-                return
-            raise RuntimeError(f"Webhook 注册失败: HTTP {resp.status}: {body[:300]}")
+                logger.info("[INIT] Webhook configured")
+            else:
+                logger.error(f"[ERROR] Webhook setup failed: {await resp.text()}")
 
 # ---------- Token 估算及上下文修剪 ----------
 _MEDIA_TOKEN_OVERHEAD = 64
@@ -589,56 +563,114 @@ async def _cleanup_task(chat_id: int, task: asyncio.Task):
             del active_tasks[chat_id]
 
 # -------------------- 各类型消息处理 --------------------
-async def _handle_ai_message(
-    chat_id: int,
-    user_message: dict,
-    username: str,
-    *,
-    chat_action: str,
-    label: str,
-    too_large_notice: str,
-    success_markers: tuple[str, ...] = ("IMAGE_SENT", "⚠️", "❌"),
-) -> None:
-    """Run the shared preflight → generation → history-update lifecycle once."""
-    await send_chat_action(chat_id, chat_action)
-    # 初始化失败已在 init_workspace 内部记录，不应使用户主请求失败。
-    asyncio.create_task(init_workspace(chat_id), name=f"workspace-init-{chat_id}")
+async def _handle_text_message(chat_id: int, user_input: str, username: str, user_message: dict):
+    await send_chat_action(chat_id, "typing")
+    # 后台预初始化 workspace：与模型生成响应并行，避免第一个工具调用
+    # 是 no-op。
+    asyncio.create_task(init_workspace(chat_id))
     try:
-        if not await pre_flight_context_check(chat_id, user_message):
-            await send_rich_html_message(chat_id, too_large_notice)
+        is_safe = await pre_flight_context_check(chat_id, user_message)
+        if not is_safe:
+            await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的内容过长，已超过模型单次处理极限，请分批或精简发送。")
             return
-        full, _clean, new_msgs, usage = await get_ai_response(
-            chat_id, user_models, user_contexts, username, user_message=user_message
+        full, clean, new_msgs, usage = await get_ai_response(
+            chat_id, user_models, user_contexts, username,
+            user_message=user_message,
         )
-        if full and not full.startswith(success_markers):
+        if full and not full.startswith(("IMAGE_SENT", "⚠️", "❌")):
             await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
     except asyncio.CancelledError:
         raise
-    except Exception as exc:
-        logger.exception("%s 异常: %s", label, exc)
-        await send_rich_html_message(
-            chat_id, f"❌ <b>处理{label}时出错</b>\n<code>{str(exc)[:100]}</code>"
+    except Exception as e:
+        logger.exception(f"_handle_text_message 异常: {e}")
+        await send_rich_html_message(chat_id, f"❌ <b>处理消息时出错</b>\n<code>{str(e)[:100]}</code>")
+
+async def _handle_photo_message(chat_id: int, user_message: dict, username: str):
+    await send_chat_action(chat_id, "upload_photo")
+    asyncio.create_task(init_workspace(chat_id))
+    try:
+        is_safe = await pre_flight_context_check(chat_id, user_message)
+        if not is_safe:
+            await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的图片附加内容过长，已超过模型单次处理极限，请精简发送。")
+            return
+        full, clean, new_msgs, usage = await get_ai_response(
+            chat_id, user_models, user_contexts, username,
+            user_message=user_message,
         )
+        if full and not full.startswith(("IMAGE_SENT", "⚠️", "❌")):
+            await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"_handle_photo_message 异常: {e}")
+        await send_rich_html_message(chat_id, f"❌ <b>处理图片时出错</b>\n<code>{str(e)[:100]}</code>")
 
+async def _handle_document_message(chat_id: int, user_message: dict, username: str):
+    await send_chat_action(chat_id, "upload_document")
+    asyncio.create_task(init_workspace(chat_id))
+    try:
+        is_safe = await pre_flight_context_check(chat_id, user_message)
+        if not is_safe:
+            await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的文档内容过长，已超过模型单次处理极限，请精简发送。")
+            return
+        full, clean, new_msgs, usage = await get_ai_response(
+            chat_id, user_models, user_contexts, username,
+            user_message=user_message,
+        )
+        if full and not full.startswith(("IMAGE_SENT", "⚠️", "❌")):
+            await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"_handle_document_message 异常: {e}")
+        await send_rich_html_message(chat_id, f"❌ <b>处理文档时出错</b>\n<code>{str(e)[:100]}</code>")
 
-async def _handle_text_message(chat_id: int, _user_input: str, username: str, user_message: dict) -> None:
-    await _handle_ai_message(chat_id, user_message, username, chat_action="typing", label="消息", too_large_notice="⚠️ <b>发送失败</b><br/>您当前发送的内容过长，已超过模型单次处理极限，请分批或精简发送。")
+async def _handle_audio_message(chat_id: int, user_message: dict, username: str):
+    await send_chat_action(chat_id, "upload_voice")
+    asyncio.create_task(init_workspace(chat_id))
+    try:
+        is_safe = await pre_flight_context_check(chat_id, user_message)
+        if not is_safe:
+            await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的音频转录文本过长，已超过模型单次处理极限，请精简发送。")
+            return
+        full, clean, new_msgs, usage = await get_ai_response(
+            chat_id, user_models, user_contexts, username,
+            user_message=user_message,
+        )
+        if full and not full.startswith(("IMAGE_SENT", "⚠️", "❌")):
+            await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"_handle_audio_message 异常: {e}")
+        await send_rich_html_message(chat_id, f"❌ <b>处理音频时出错</b>\n<code>{str(e)[:100]}</code>")
 
+async def _handle_video_message(chat_id: int, user_message: dict, username: str):
+    """处理直接上传的视频 / 圆形视频消息（video_note）。
 
-async def _handle_photo_message(chat_id: int, user_message: dict, username: str) -> None:
-    await _handle_ai_message(chat_id, user_message, username, chat_action="upload_photo", label="图片", too_large_notice="⚠️ <b>发送失败</b><br/>您当前发送的图片附加内容过长，已超过模型单次处理极限，请精简发送。")
-
-
-async def _handle_document_message(chat_id: int, user_message: dict, username: str) -> None:
-    await _handle_ai_message(chat_id, user_message, username, chat_action="upload_document", label="文档", too_large_notice="⚠️ <b>发送失败</b><br/>您当前发送的文档内容过长，已超过模型单次处理极限，请精简发送。")
-
-
-async def _handle_audio_message(chat_id: int, user_message: dict, username: str) -> None:
-    await _handle_ai_message(chat_id, user_message, username, chat_action="upload_voice", label="音频", too_large_notice="⚠️ <b>发送失败</b><br/>您当前发送的音频转录文本过长，已超过模型单次处理极限，请精简发送。")
-
-
-async def _handle_video_message(chat_id: int, user_message: dict, username: str) -> None:
-    await _handle_ai_message(chat_id, user_message, username, chat_action="upload_video", label="视频", too_large_notice="⚠️ <b>发送失败</b><br/>您当前发送的视频附加内容过长，已超过模型单次处理极限，请精简发送。", success_markers=("IMAGE_SENT", "VIDEO_SENT", "⚠️", "❌"))
+    与图片消息对称：user_message 携带 file_id / mime_type 等元数据存入
+    对话历史，每轮由 _resolve_multimodal_content 按当前模型能力重新解析
+    ——支持视频输入的模型（stealth/ox-alpha、Gemini 系列等）收到
+    video_url content part，不支持的模型收到文本占位；切换模型不丢信息。
+    """
+    await send_chat_action(chat_id, "upload_video")
+    asyncio.create_task(init_workspace(chat_id))
+    try:
+        is_safe = await pre_flight_context_check(chat_id, user_message)
+        if not is_safe:
+            await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的视频附加内容过长，已超过模型单次处理极限，请精简发送。")
+            return
+        full, clean, new_msgs, usage = await get_ai_response(
+            chat_id, user_models, user_contexts, username,
+            user_message=user_message,
+        )
+        if full and not full.startswith(("IMAGE_SENT", "VIDEO_SENT", "⚠️", "❌")):
+            await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"_handle_video_message 异常: {e}")
+        await send_rich_html_message(chat_id, f"❌ <b>处理视频时出错</b>\n<code>{str(e)[:100]}</code>")
 
 # ---------------------------------------------------------------------------
 # 媒体组和文档组处理（保持不变）
@@ -669,7 +701,8 @@ async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
         lock = await get_chat_lock(chat_id)
         async with lock:
             current_model = get_user_model(chat_id)
-        SUPPORTED_MODELS.get(current_model)
+        model_info = SUPPORTED_MODELS.get(current_model)
+        supports_vision = model_info.vision if model_info else False
 
         file_ids = []
         captions = []
@@ -1120,18 +1153,15 @@ async def webhook() -> tuple:
         set_request_id(request_id)
         logger.info(f"Received webhook request {request_id}")
 
-        # Telegram 将注册时声明的 secret_token 放在每个 webhook 请求头中。
-        # 不再接受 URL 查询参数，避免密钥进入访问日志或代理日志。
-        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        token = (request.args or {}).get("token")
+        # 使用 hmac.compare_digest 进行恒定时间比较，防止时序攻击
         import hmac as _hmac
-        if not WEBHOOK_SECRET_TOKEN or not _hmac.compare_digest(token, WEBHOOK_SECRET_TOKEN):
+        if not token or not WEBHOOK_TOKEN or not _hmac.compare_digest(str(token), str(WEBHOOK_TOKEN)):
             return "Forbidden", 403
         if request.method in ('GET', 'HEAD'):
             return "OK - Webhook is alive", 200
 
         data = await request.json
-        if not isinstance(data, dict):
-            return "Bad Request", 400
         uid = data.get('update_id')
         # 缺少 update_id 的非法 payload 直接拒绝，避免污染去重集合
         if uid is None:
@@ -1151,10 +1181,16 @@ async def webhook() -> tuple:
                     msg_debug = msg_debug[:LOG_TRUNCATE_LIMIT] + "... (truncated)"
                 logger.debug(f"截断的 Webhook 数据: {msg_debug}")
 
-        if not await remember_update(uid):
-            return "OK", 200
-        # 低成本的惰性回收：每次真实 update 都有机会清理长期闲置状态。
-        await cleanup_expired_runtime_state()
+        async with _dedup_lock:
+            if uid in processed_updates:
+                return "OK", 200
+            # 容量限制：超过 10000 条时只清理旧的一半，避免清空后导致刚加入的 uid 被重放
+            if len(processed_updates) > 10_000:
+                # 转为有序结构，丢弃最早的 5000 条
+                _old = list(processed_updates)[:-5000]
+                for _oid in _old:
+                    processed_updates.discard(_oid)
+            processed_updates.add(uid)
 
         # ── 消息处理 ──────────────────────────────────────────────────────
         if "message" in data and isinstance(data["message"], dict):
@@ -1168,6 +1204,13 @@ async def webhook() -> tuple:
             set_current_user_namespace(user_id or str(chat_id))
 
             text = msg.get("text", "") or ""
+            # 使用更严格的命令匹配：以 / 开头并按空格/ @ 切分首段
+            def _cmd_match(t: str, name: str) -> bool:
+                if not t.startswith("/"):
+                    return False
+                first = t.split(None, 1)[0] if t.strip() else t
+                # 兼容 /cmd@botname 形式
+                return first == name or first.startswith(name + "@")
             is_admin_cmd = (_cmd_match(text, "/adduser") or _cmd_match(text, "/deluser")
                             or _cmd_match(text, "/listusers"))
             if is_admin_cmd:
@@ -1185,13 +1228,7 @@ async def webhook() -> tuple:
                             await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
                             return "OK", 200
                         WHITELIST_USERS.add(target)
-                        try:
-                            save_whitelist()
-                        except Exception as exc:
-                            WHITELIST_USERS.discard(target)
-                            logger.exception("白名单写入失败: %s", exc)
-                            await send_rich_html_message(chat_id, "❌ <b>保存失败</b>\n授权白名单未变更，请检查数据目录权限。", reply_parameters=_reply_params(msg["message_id"]))
-                            return "OK", 200
+                        save_whitelist()
                         await send_rich_html_message(chat_id, f"✅ <b>添加成功</b>\n已添加 <code>{target}</code> 到白名单。", reply_parameters=_reply_params(msg["message_id"]))
                         return "OK", 200
                     elif _cmd_match(text, "/deluser"):
@@ -1207,13 +1244,7 @@ async def webhook() -> tuple:
                             await send_rich_html_message(chat_id, f"❌ <b>用户不存在</b>\n<code>{target}</code> 不在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
                             return "OK", 200
                         WHITELIST_USERS.remove(target)
-                        try:
-                            save_whitelist()
-                        except Exception as exc:
-                            WHITELIST_USERS.add(target)
-                            logger.exception("白名单写入失败: %s", exc)
-                            await send_rich_html_message(chat_id, "❌ <b>保存失败</b>\n授权白名单未变更，请检查数据目录权限。", reply_parameters=_reply_params(msg["message_id"]))
-                            return "OK", 200
+                        save_whitelist()
                         await send_rich_html_message(chat_id, f"✅ <b>移除成功</b>\n已移除 <code>{target}</code>。", reply_parameters=_reply_params(msg["message_id"]))
                         return "OK", 200
                     elif _cmd_match(text, "/listusers"):
@@ -1224,7 +1255,7 @@ async def webhook() -> tuple:
                             await send_rich_html_message(chat_id, f"📋 <b>当前白名单用户：</b>\n<ul>{users_list}</ul>", reply_parameters=_reply_params(msg["message_id"]))
                         return "OK", 200
 
-            if _cmd_match(text, "/start"):
+            if text.startswith("/start"):
                 authorized = is_authorized(username, user_id)
                 if authorized:
                     welcome_msg = """
@@ -1333,6 +1364,7 @@ async def webhook() -> tuple:
                 async with lock:
                     cm = get_user_model(chat_id)
                     model_info = SUPPORTED_MODELS.get(cm)
+                    supports_vision = model_info.vision if model_info else False
 
                 fid = msg["photo"][-1]["file_id"]
                 cap = msg.get("caption", "").strip()
@@ -1577,7 +1609,7 @@ async def webhook() -> tuple:
                     if await resolve_ask_user_text(chat_id, user_input):
                         return "OK", 200
 
-                if _cmd_match(user_input, "/role"):
+                if user_input.startswith("/role"):
                     cr = await get_user_role(chat_id)
                     prev_mid = role_message_ids.get(chat_id)
                     if not prev_mid or not await update_role_list(chat_id, prev_mid, SUPPORTED_ROLES, cr):
@@ -1586,7 +1618,7 @@ async def webhook() -> tuple:
                             role_message_ids[chat_id] = mid
                     return "OK", 200
 
-                if _cmd_match(user_input, "/balance"):
+                if user_input.startswith("/balance"):
                     parts = user_input.split(maxsplit=1)
                     svc = parts[1].lower() if len(parts) > 1 else None
                     msgs = []
@@ -1623,7 +1655,7 @@ async def webhook() -> tuple:
                     )
                     return "OK", 200
 
-                if _cmd_match(user_input, "/model"):
+                if user_input.startswith("/model"):
                     if msg["chat"]["type"] != "private":
                         await _send_via_send_message(
                             chat_id,
@@ -1644,7 +1676,7 @@ async def webhook() -> tuple:
                     )
                     return "OK", 200
 
-                if _cmd_match(user_input, "/clear"):
+                if user_input.startswith("/clear"):
                     await _interrupt_active_generation(chat_id)
                     await safe_clear_history(chat_id)
                     await safe_clear_active_skill(chat_id)
@@ -1668,6 +1700,7 @@ async def webhook() -> tuple:
                 async with lock:
                     cm = get_user_model(chat_id)
                     model_info = SUPPORTED_MODELS.get(cm)
+                    supports_vision = model_info.vision if model_info else False
                     supports_audio = model_info.audio if model_info else False
                     supports_native_document = bool(model_info.native_document) if model_info else False
 

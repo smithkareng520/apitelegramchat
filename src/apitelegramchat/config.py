@@ -47,29 +47,12 @@ SERPER_MCP_TOKEN = (os.getenv("SERPER_MCP_TOKEN") or "").strip()
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
 _RAW_WEBHOOK_URL = os.getenv("WEBHOOK_URL") or ""
-# 不再将密钥放入 URL 查询参数；Telegram 使用请求头 secret_token 校验。
-WEBHOOK_URL = _RAW_WEBHOOK_URL.strip()
-WEBHOOK_SECRET_TOKEN = (
-    os.getenv("TELEGRAM_WEBHOOK_SECRET_TOKEN") or WEBHOOK_TOKEN or ""
-).strip()
+WEBHOOK_URL = f"{_RAW_WEBHOOK_URL}?token={WEBHOOK_TOKEN}" if _RAW_WEBHOOK_URL else ""
 
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 
-
-def _int_env(name: str, default: int, minimum: int = 0, maximum: int | None = None) -> int:
-    """安全解析整数配置，避免错误部署变量使模块导入失败。"""
-    raw = os.getenv(name, str(default))
-    try:
-        value = int(str(raw).strip())
-    except (TypeError, ValueError):
-        logger.warning("环境变量 %s=%r 非法，使用默认值 %s", name, raw, default)
-        return default
-    value = max(minimum, value)
-    return min(value, maximum) if maximum is not None else value
-
-
 # ---------- 日志截断配置 ----------
-LOG_TRUNCATE_LIMIT = _int_env("LOG_TRUNCATE_LIMIT", 5000, 0, 100_000)
+LOG_TRUNCATE_LIMIT = int(os.getenv("LOG_TRUNCATE_LIMIT", "5000"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # ---------- 必需环境变量检查 ----------
@@ -576,30 +559,22 @@ def get_model_config(model_id: str) -> ModelConfig:
 # =============================================================================
 # 白名单管理
 # =============================================================================
-# 授权数据写入 APITELEGRAMCHAT_DATA_DIR，避免容器代码目录不可写或重建后丢失。
-# 保留可变 set 以兼容既有调用方，不通过重新绑定破坏其引用。
+WHITELIST_FILE = "whitelist.txt"
 ADMIN_USERS = ["dearella"]
-WHITELIST_USERS: set[str] = set()
+WHITELIST_USERS = set()
 
+def load_whitelist():
+    global WHITELIST_USERS
+    try:
+        with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
+            WHITELIST_USERS = {line.strip() for line in f if line.strip()}
+    except FileNotFoundError:
+        WHITELIST_USERS = set()  # 修复了原代码中的拼写错误 WHILIST_USERS
 
-def load_whitelist() -> set[str]:
-    """加载授权数据到进程内兼容集合。"""
-    from apitelegramchat.authorization import authorization_store
-
-    users = authorization_store.load_sync()
-    WHITELIST_USERS.clear()
-    WHITELIST_USERS.update(users)
-    return WHITELIST_USERS
-
-
-def save_whitelist() -> set[str]:
-    """原子写入授权数据并规范化进程内集合。"""
-    from apitelegramchat.authorization import authorization_store
-
-    users = authorization_store.save_sync(WHITELIST_USERS)
-    WHITELIST_USERS.clear()
-    WHITELIST_USERS.update(users)
-    return WHITELIST_USERS
+def save_whitelist():
+    with open(WHITELIST_FILE, "w", encoding="utf-8") as f:
+        for user in sorted(WHITELIST_USERS):
+            f.write(user + "\n")
 
 # ---------- 缓存 TTL ----------
 CACHE_TTL = 300
@@ -637,11 +612,43 @@ STREAM_SILENT_FORCE_FLUSH = _positive_float_env(
 )
 
 # ---------- 工具调用并发数 ----------
-MAX_CONCURRENT_TOOLS = _int_env("MAX_CONCURRENT_TOOLS", 16, 1, 64)
+MAX_CONCURRENT_TOOLS = int(os.getenv("MAX_CONCURRENT_TOOLS", "16"))
 
 # ---------- 文件解析配置 ----------
-PARSE_CONCURRENCY_LIMIT = _int_env("PARSE_CONCURRENCY_LIMIT", 5, 1, 32)
-PARSE_TIMEOUT = _int_env("PARSE_TIMEOUT", 60, 1, 3600)
+PARSE_CONCURRENCY_LIMIT = int(os.getenv("PARSE_CONCURRENCY_LIMIT", "5"))
+PARSE_TIMEOUT = int(os.getenv("PARSE_TIMEOUT", "60"))
 
-# 敏感变量仅由显式配置读取；子进程使用 sandbox.build_sandbox_env()
-# 提供的最小环境，应用导入过程不会再修改宿主 os.environ。
+# =============================================================================
+# 安全补丁：读取后立即清洗敏感环境变量
+# =============================================================================
+_SENSITIVE_PATTERNS = (
+    "TOKEN", "KEY", "SECRET", "PASSWORD", "PASSWD",
+    "CREDENTIAL", "PRIVATE", "ACCESS", "WEBHOOK_TOKEN",
+)
+_SENSITIVE_EXACT = {
+    "TELEGRAM_BOT_TOKEN",
+    "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY",
+    "XAI_API_KEY", "GROQ_API_KEY", "MODELSCOPE_API_KEY", "AGNES_API_KEY",
+    "R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY",
+    "R2_BUCKET_NAME", "R2_PUBLIC_URL", "R2_REGION",
+    "SERPER_MCP_TOKEN", "GAODE_MCP_TOKEN",
+    "WEBHOOK_TOKEN", "WEBHOOK_URL",
+}
+
+def scrub_environment() -> None:
+    removed = []
+    for key in list(os.environ.keys()):
+        key_upper = key.upper()
+        if key_upper in _SENSITIVE_EXACT:
+            os.environ.pop(key, None)
+            removed.append(key)
+            continue
+        for pattern in _SENSITIVE_PATTERNS:
+            if pattern in key_upper:
+                os.environ.pop(key, None)
+                removed.append(key)
+                break
+    if removed:
+        logger.info(f"🔒 Scrubbed {len(removed)} sensitive env vars: {', '.join(removed)}")
+
+scrub_environment()

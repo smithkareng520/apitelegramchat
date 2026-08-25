@@ -14,7 +14,7 @@ import socket
 import uuid
 import tempfile
 import mimetypes
-from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
 from typing import Any, Optional
 try:
     import trafilatura  # type: ignore
@@ -36,8 +36,6 @@ except Exception:  # pragma: no cover - optional dependency fallback
     feedparser = _FeedParserStub()  # type: ignore
 from pathlib import Path
 from apitelegramchat.workspace_paths import workspace_workdir, workspace_namespace
-from apitelegramchat.s3_utils import upload_bytes_to_r2, delete_r2_object
-from apitelegramchat.workspace_utils import _get_workspace_lock, _ensure_runtime_workspace
 
 # 高德地图能力现已迁移到外部 MCP 服务 `amap-maps`（@amap/amap-maps on
 # ModelScope）。所有地理编码 / POI / 路径 / 距离 / IP 定位工具都通过
@@ -68,6 +66,10 @@ from apitelegramchat.mcp_client import call_mcp_tool, MCPToolError
 
 OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 
+from apitelegramchat.s3_utils import upload_bytes_to_r2, delete_r2_object
+from apitelegramchat.workspace_utils import (
+    _get_workspace_lock, _ensure_runtime_workspace,
+)
 # 任务工具：定义在 todo_tool.py / memory_tool.py / subagent_tool.py
 # 本文件只做注册与转出
 from apitelegramchat.todo_tool import TODO_TOOL  # noqa: E402
@@ -1571,11 +1573,11 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
         logger.error(f"[wikipedia] fetch_rich_content 导入失败: {e}")
         build_model_facing_html = None
 
-    for language_code in [lang, "en"]:
+    for l in [lang, "en"]:
         try:
             async with AsyncSession() as session:
                 search_resp = await session.get(
-                    f"https://{language_code}.wikipedia.org/w/api.php",
+                    f"https://{l}.wikipedia.org/w/api.php",
                     params={"action": "query", "list": "search", "srsearch": query, "srlimit": 3, "format": "json", "utf8": 1},
                     headers={"Accept": "application/json", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
                     impersonate="chrome120", timeout=CURL_TIMEOUT
@@ -1592,7 +1594,7 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
                 if build_model_facing_html is not None:
                     try:
                         parse_resp = await session.get(
-                            f"https://{language_code}.wikipedia.org/w/api.php",
+                            f"https://{l}.wikipedia.org/w/api.php",
                             params={
                                 "action": "parse", "pageid": page_id, "prop": "text|displaytitle",
                                 "redirects": 1, "disablelimitreport": 1, "disableeditsection": 1,
@@ -1606,7 +1608,7 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
                             page_html = ((parse_data.get("text") or {}).get("*") or "").strip()
                             title = (parse_data.get("title") or results[0].get("title") or query).strip()
                             if page_html:
-                                page_url = f"https://{language_code}.wikipedia.org/wiki/{quote(title)}"
+                                page_url = f"https://{l}.wikipedia.org/wiki/{quote(title)}"
                                 # CPU 密集转换放到线程池，不阻塞事件循环
                                 # （与 _build_rich_fetch_payload 同一调度方式）。
                                 rich = await asyncio.to_thread(
@@ -1619,7 +1621,7 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
 
                 # ---- 退化路径：纯文本摘要（历史行为）----
                 page_resp = await session.get(
-                    f"https://{language_code}.wikipedia.org/w/api.php",
+                    f"https://{l}.wikipedia.org/w/api.php",
                     params={"action": "query", "pageids": page_id, "prop": "extracts|info", "explaintext": True, "inprop": "url", "format": "json", "utf8": 1},
                     headers={"Accept": "application/json", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
                     impersonate="chrome120", timeout=CURL_TIMEOUT
@@ -1634,7 +1636,7 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
                 if not extract:
                     continue
                 extract = _truncate(extract)
-                page_url = page.get("fullurl", f"https://{language_code}.wikipedia.org/wiki/{quote(title)}")
+                page_url = page.get("fullurl", f"https://{l}.wikipedia.org/wiki/{quote(title)}")
                 return f"<b>Wikipedia — {title}</b><br/><br/>{extract}<br/><br/>链接：{page_url}"
         except Exception:
             continue

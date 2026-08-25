@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import time
+import traceback
 import uuid
 from html.parser import HTMLParser
 from typing import Any, Optional
