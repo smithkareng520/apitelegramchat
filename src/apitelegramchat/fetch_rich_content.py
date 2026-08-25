@@ -456,11 +456,16 @@ def _in_boilerplate(el) -> bool:
 # ---------------------------------------------------------------------------
 
 # trafilatura <hi rend="#b #i"> → Telegram 标签映射。
+# rend token 全集来自 trafilatura 1.12.2 htmlprocessing.REND_TAG_MAPPING 实测：
+#   #b(b/strong) #i(i/em) #u(u) #t(kbd/samp/tt/var 等宽) #sub(sub) #sup(sup)；
+# 删除线走独立的 <del> 元素（见 _convert_inline_element），rend="overstrike"
+# 在多数版本的输出中已被清理，此处仅作防御性兜底。
 _REND_MAP = {
     "#b": "b", "b": "b", "bold": "b",
     "#i": "i", "i": "i", "italic": "i", "em": "i",
     "#u": "u", "u": "u", "underline": "u",
-    "#s": "s", "s": "s", "strike": "s", "del": "s",
+    "#s": "s", "s": "s", "strike": "s", "del": "s", "overstrike": "s",
+    "#t": "code", "t": "code",
     "#sup": "sup", "sup": "sup",
     "#sub": "sub", "sub": "sub",
     "#code": "code", "code": "code",
@@ -514,6 +519,11 @@ def _convert_inline_element(el, ctx: "_ConvertContext") -> tuple[str, list[str]]
 
     if tag == "code":
         return f"<code>{inner}</code>", media_blocks
+
+    if tag == "del":
+        # trafilatura 把 <s>/<del>/<strike> 统一转成 <del>（删除线），
+        # 映射为 Telegram 的 <s>；空内容时不输出空标签。
+        return (f"<s>{inner}</s>" if inner.strip() else inner), media_blocks
 
     if tag == "lb":
         return "<br/>", media_blocks

@@ -849,3 +849,58 @@ OpenAI 兼容协议的 `video_url` content part；不支持的模型收到保留
   富 HTML 不出现在展示中；其余（失败识别/摘要/旧格式兼容）保持全绿。
 - 真实网页抽查（BBC / 中文维基百科 / GitHub）：媒体全部在原位、图文顺序
   忠实、页脚/导航媒体被排除、无聚合区。
+
+---
+
+# fetch_url 标签映射审计（v3）— 对照系统提示词全量核查 + 两处缺口修复
+
+## 背景
+
+对照 `ai_handlers.build_system_prompt` 声明的 Telegram Rich HTML 标签子集，
+逐标签核查 `fetch_rich_content.py` 转换器的全部产出。并以 trafilatura 1.12.2
+真实 XML 输出（`htmlprocessing.REND_TAG_MAPPING` 源码 + 合成/真实页面实测）
+作为 ground truth，验证映射无遗漏。
+
+## 核查结论（全部对齐）
+
+- **标题级别 1:1 保真**：trafilatura 以 `<head rend="h1">`…`<head rend="h6">`
+  输出标题级别（本管线自始用 `output_format='xml'`，不存在 Markdown `#`
+  形态）；转换器 `rend="hN"` → `<hN>`（clamp 1-6，无 rend 默认 `<h2>`），
+  `<h1>`-`<h6>` 在系统提示词格式表中明确允许（"标题 (Headings)"行），
+  且属 `rich_message_builder` 的块级边界标签集合。
+- 其余映射全部合法：`#b/#i/#u/#sub/#sup` → `<b>/<i>/<u>/<sub>/<sup>`、
+  行内 `<code>` → `<code>`、`<ref target>` → `<a href>`（相对路径补全、
+  实体转义）、`<lb/>` → `<br/>`（`rich_message_builder._RICH_VOID_TAGS`
+  与 tool_executors 既有大量使用均证明受支持）、块级 `<code>` →
+  `<pre><code>`、`<quote>` → `<blockquote>`、`<list rend="ul|ol|dl">` →
+  `<ul>/<ol>`、`<cell role="head">` → `<td><b>`、`<table bordered striped>`
+  与 `colspan/rowspan`、`<graphic>/<media>` → `<img>/<video>/<audio>`/
+  `<figure><figcaption>`、轮播 → `<tg-slideshow>`、页眉 `<h3>` +
+  `<p>🔗 <a>`。端到端扫描输出标签全集，无一超出允许集合。
+
+## 修复的两处真实缺口（实测发现）
+
+1. **删除线丢失**：trafilatura 把 `<s>/<del>/<strike>` 统一转为 `<del>`
+   元素（非 `<hi rend>`），此前未处理 → 文本保留但删除线丢失。
+   修复：`_convert_inline_element` 新增 `del` 分支 → `<s>…</s>`；
+   `_REND_MAP` 防御性补 `"overstrike": "s"`。
+2. **等宽丢失**：`<kbd>/<samp>/<tt>/<var>` → `<hi rend="#t">`，`#t` 此前
+   不在 `_REND_MAP` → 格式丢失。修复：补 `"#t"/"t": "code"` 映射。
+
+## 已知上游限制（不修，记录在案）
+
+- `<mark>` 高亮：trafilatura 在 XML 输出中整体剥离（文本保留、标记丢失），
+  转换器 `#mark` 映射为防御性死代码；
+- 单元格 `colspan/rowspan`：trafilatura 提取阶段即丢弃（`<row span>` 是
+  表宽元数据而非单元格跨度），转换器的 colspan/rowspan 透传为防御性代码；
+- 嵌套行内格式（`<b><i>`）被 trafilatura 扁平化为单一 rend；
+  `<hr>` 与 `<br>` 同被转为 `<lb/>`（无法区分，统一按换行处理）。
+
+## 验证
+
+- 新增 3 项单测：h1-h6 六级逐一保真（含无 rend 默认二级）、`<del>` →
+  `<s>`（含 `rend="overstrike"` 防御路径）、`#t` → `<code>`；
+  `tests/test_fetch_rich_content.py` 共 60 项全绿，`test_consumers.py` 全绿。
+- 端到端审计脚本：完整管线输出的标签全集 100% 落在系统提示词允许集合内；
+  真实网页回归（BBC / GitHub）通过，含标题内嵌链接（`<h2><a>`）场景。
+
