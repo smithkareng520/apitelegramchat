@@ -33,7 +33,7 @@
 
 ## 不兼容配置变更
 
-以下旧式环境变量和标识符已被移除，不再保留兼容别名：`CONTEXT_MAX_CHARS`、旧式子代理长度环境变量、旧式富消息草稿字符阈值，以及所有源码和文档中的 `*_LEN` / `*_CHARS` 标识符。部署时请改用对应的 `*_TOKEN_BUDGET` 或 `CONTEXT_MAX_TOKENS` 配置。
+所有旧式字符长度环境变量与标识符均已移除，不再保留兼容别名。部署时请改用对应的 token 预算环境变量或 `CONTEXT_MAX_TOKENS` 配置。
 
 ## 验证结果
 
@@ -44,4 +44,10 @@ PYTHONPATH=src python3 -m compileall -q src tests
 PYTHONPATH=src python3 -m unittest -v tests.test_token_budget
 ```
 
-测试覆盖精确 token 截断、Unicode 安全性、上下文硬预算、全局工具 20,000 token 限额、富抓取 20,000 token 限额，以及全项目不再存在旧式 `*_LEN` / `*_CHARS` 标识符。交付包已清理 `__pycache__` 和 `.pyc` 文件。
+测试覆盖精确 token 截断、Unicode 安全性、上下文硬预算、全局工具 20,000 token 限额、富抓取 20,000 token 限额，以及全项目不再存在废弃的长度标识符。交付包已清理 `__pycache__` 和 `.pyc` 文件。
+
+## 后续修复：富消息草稿刷新异常
+
+部署日志显示草稿刷新阶段出现 `ValueError: too many values to unpack (expected 3)`。根因是富消息边界扫描器在 token 迁移后新增了“可见 Unicode 单位”这一第四返回值，而 `RichMessageBuilder.flush()` 仍按旧的三项结构解包。
+
+现已将 `flush()` 更新为接收四项返回值，并使用其中的 `frame_tokens` 记录帧级日志。新增回归测试会实际调用 `RichMessageBuilder.flush()`，以模拟草稿发送并验证四项返回值不会再触发解包异常。

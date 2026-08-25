@@ -1149,10 +1149,9 @@ class RichMessageBuilder:
             if not html_content.strip() or html_content.strip() == " ":
                 html_content = "<p>Working...</p>"
 
-            # flush 已不再依赖字符阈值，frame_chars 仅用于日志统计。
-            # 无论进入哪条执行路径都必须初始化，避免 UnboundLocalError。
-            frame_chars = len(_rich_visible_text(html_content))
-            _frame_boundaries, _ignored_chars, frame_blocks = _scan_rich_html_boundaries(html_content)
+            # 统一使用边界扫描器的 token 统计；无论进入哪条执行路径都必须
+            # 初始化，避免 UnboundLocalError。
+            _frame_boundaries, frame_tokens, frame_blocks, _frame_visible_units = _scan_rich_html_boundaries(html_content)
             frame_revision = self._flush_revision
             frame_started = time.monotonic()
             try:
@@ -1164,9 +1163,9 @@ class RichMessageBuilder:
                     self._flush_dirty = False
                 self._flush_sequence += 1
                 logger.debug(
-                    "草稿帧完成: chat=%s draft=%s seq=%s force=%s result=%s chars=%s blocks=%s elapsed_ms=%s",
+                    "草稿帧完成: chat=%s draft=%s seq=%s force=%s result=%s tokens=%s blocks=%s elapsed_ms=%s",
                     self.chat_id, self.draft_id, self._flush_sequence, force, msg_id,
-                    frame_chars, frame_blocks, int((time.monotonic() - frame_started) * 1000),
+                    frame_tokens, frame_blocks, int((time.monotonic() - frame_started) * 1000),
                 )
                 if msg_id:
                     self.draft_message_id = msg_id

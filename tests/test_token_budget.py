@@ -3,8 +3,10 @@ from __future__ import annotations
 import re
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from apitelegramchat.context_manager import select_request_context
+from apitelegramchat.ai.rich_message_builder import RichMessageBuilder, _scan_rich_html_boundaries
 from apitelegramchat.fetch_rich_content import FETCH_RESPONSE_TOKEN_BUDGET, build_model_facing_html
 from apitelegramchat.token_budget import count_tokens, truncate_to_token_budget
 from apitelegramchat.tool_executors import TOOL_RESPONSE_TOKEN_BUDGET, _truncate_tool_result
@@ -48,6 +50,30 @@ class TokenBudgetTests(unittest.TestCase):
         )
         self.assertIsNotNone(fetch_result)
         self.assertLessEqual(count_tokens(fetch_result), FETCH_RESPONSE_TOKEN_BUDGET)
+
+    def test_rich_boundary_scan_returns_token_metadata(self) -> None:
+        boundaries, visible_tokens, block_count, visible_units = _scan_rich_html_boundaries(
+            "<p>中文 English</p><p>下一段</p>"
+        )
+        self.assertEqual(len(boundaries[-1]), 4)
+        self.assertGreater(visible_tokens, 0)
+        self.assertEqual(block_count, 2)
+        self.assertGreater(visible_units, 0)
+
+    def test_rich_builder_flush_accepts_four_value_scan_result(self) -> None:
+        async def run_flush() -> None:
+            builder = RichMessageBuilder(chat_id=1)
+            builder.blocks = ["<p>flush regression check</p>"]
+            builder.block_types = ["html"]
+            with patch(
+                "apitelegramchat.ai.rich_message_builder.send_rich_message_draft",
+                new=AsyncMock(return_value=None),
+            ) as send_draft:
+                await builder.flush(force=True)
+                send_draft.assert_awaited_once()
+
+        import asyncio
+        asyncio.run(run_flush())
 
     def test_no_legacy_length_identifiers_remain(self) -> None:
         legacy = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:LEN|CHARS)\b")
