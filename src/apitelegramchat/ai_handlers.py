@@ -617,7 +617,7 @@ async def get_ai_response(
                         elif isinstance(err, str):
                             error_msg_for_user = err
                 except Exception:
-                    error_msg_for_user = f"{error_msg_for_user} | Response: {truncate_to_tokens(body, 150, suffix="…")}"
+                    error_msg_for_user = f"{error_msg_for_user} | Response: {truncate_to_tokens(body, 150, suffix='…')}"
             except Exception:
                 pass
 
