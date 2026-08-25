@@ -1906,7 +1906,7 @@ async def webhook() -> tuple:
                     async with aiohttp.ClientSession() as s:
                         await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "切换中..."})
                     await safe_set_user_model(chat_id, sel)
-                    model_name = SUPPORTED_MODELS[sel]["name"]
+                    model_name = SUPPORTED_MODELS[sel].name
                     # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置
                     await _send_via_send_message(
                         chat_id,
