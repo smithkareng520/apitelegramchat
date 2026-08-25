@@ -417,14 +417,6 @@ SUPPORTED_MODELS["ZhipuAI/GLM-5.2"] = make_model_config(
 )
 
 # ---------- Gemini 系列 ----------
-SUPPORTED_MODELS["gemini-3.7-flash"] = make_model_config(
-    model_id="gemini-3.7-flash",
-    provider="gemini",
-    name="Gemini 3.7 Flash",
-    vision=True,
-    max_context=1000000,
-    max_output_tokens=64000,
-)
 SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
     model_id="gemini-3.5-flash-lite",
     provider="gemini",
@@ -434,14 +426,20 @@ SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
     max_output_tokens=64000,
 )
 # ---------- GLM 系列 ----------
-# (Removed duplicate google/gemma-4-31b-it:free entry that overwrote the earlier one)
-SUPPORTED_MODELS["glm-4.6v"] = make_model_config(
-    model_id="glm-4.6v",
+SUPPORTED_MODELS["GLM-4.6V-Flash"] = make_model_config(
+    model_id="GLM-4.6V-Flash",
     provider="glm",
-    name="GLM 4.6V",
+    name="GLM 4.6V Flash",
     vision=True,
     max_context=128000,
     max_output_tokens=32000,
+)
+SUPPORTED_MODELS["GLM-4.7-Flash"] = make_model_config(
+    model_id="GLM-4.7-Flash",
+    provider="glm",
+    name="GLM 4.7 Flash",
+    max_context=200000,
+    max_output_tokens=128000,
 )
 
 # ---------- 图像生成模型 ----------
@@ -458,15 +456,6 @@ SUPPORTED_MODELS["agnes-image-2.1-flash"] = make_model_config(
     model_id="agnes-image-2.1-flash",
     provider="agnes",
     name="Agnes Image 2.1 Flash",
-    max_context=32768,
-    max_output_tokens=4000,
-)
-SUPPORTED_MODELS["Qwen/Qwen-Image-Edit-2511"] = make_model_config(
-    model_id="Qwen/Qwen-Image-Edit-2511",
-    provider="modelscope",
-    name="Qwen Image Edit 2511",
-    vision=True,
-    native_image=True,
     max_context=32768,
     max_output_tokens=4000,
 )
