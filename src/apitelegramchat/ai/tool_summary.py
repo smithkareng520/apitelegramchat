@@ -11,6 +11,8 @@ from apitelegramchat.tool_executors import _TOOL_TIMEOUT_MARKER
 from apitelegramchat.ai._constants import MAX_TOOL_CALLS
 from apitelegramchat.ai.error_formatting import extract_domain
 
+from apitelegramchat.token_utils import truncate_to_tokens
+
 logger = get_logger(__name__)
 
 # 流式调用偶发截断/拼接异常时，不能把原始坏字符串写回下一轮请求，否则网关会在
@@ -30,8 +32,7 @@ def _get_tool_description_from_args(fn_args: dict) -> Optional[str]:
     desc = fn_args.get("_description") or fn_args.get("_summary")
     if desc and isinstance(desc, str):
         desc = desc.strip()
-        if len(desc) > 80:
-            desc = desc[:80] + "..."
+        desc = truncate_to_tokens(desc, 40, suffix="...")
         return desc
     return None
 
@@ -109,7 +110,7 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     if fn_name == "bash":
         cmd = (fn_args.get("command") or "").strip()
         if cmd:
-            short_cmd = cmd[:30] + "..." if len(cmd) > 30 else cmd
+            short_cmd = truncate_to_tokens(cmd, 15, suffix="...")
             return short_cmd
         return "Running command"
 
@@ -270,7 +271,7 @@ def _normalize_tool_arguments(arguments: Any) -> tuple[str, bool]:
     except (json.JSONDecodeError, TypeError, ValueError):
         reason = "arguments were not valid JSON"
 
-    safe_excerpt = raw[:2000]
+    safe_excerpt = truncate_to_tokens(raw, 1000, suffix="…")
     normalized = {
         _INVALID_TOOL_ARGUMENTS_KEY: reason,
         _INVALID_TOOL_ARGUMENTS_RAW_KEY: safe_excerpt,

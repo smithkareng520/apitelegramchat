@@ -41,6 +41,8 @@ from apitelegramchat.ai.tool_summary import (
     _INVALID_TOOL_ARGUMENTS_KEY,
 )
 
+from apitelegramchat.token_utils import truncate_to_tokens
+
 logger = get_logger(__name__)
 
 async def _run_tool_calls_and_append(
@@ -290,7 +292,7 @@ async def _run_tool_calls_and_append(
         is_error = _tool_result_is_failure(fn_name, fn_args, safe_content, details_html)
         if is_error:
             # 优先展示格式化器生成的可读标题；模型上下文仍保留完整的可操作错误文本。
-            final_summary = formatted_summary or (llm_content[:100] if len(llm_content) > 100 else llm_content)
+            final_summary = formatted_summary or (truncate_to_tokens(llm_content, 50, suffix="…"))
             status = "error"
         else:
             # 成功：使用 _generate_tool_summary_done 生成描述
@@ -304,7 +306,7 @@ async def _run_tool_calls_and_append(
             exit_match = re.search(r"Exit code:\s*(\d+)", str(safe_content or ""))
             if exit_match and exit_match.group(1) != "0":
                 logger.warning(
-                    f"[bash] 非零退出码，命令可能失败: {safe_content[:300]!r}"
+                    f"[bash] 非零退出码，命令可能失败: {truncate_to_tokens(safe_content, 150, suffix="…")!r}"
                 )
 
         # 向 LLM 发送实际工具输出（safe_content），以便 LLM 准确推理
@@ -351,7 +353,7 @@ async def _run_tool_calls_and_append(
             if isinstance(llm_content, str) and (
                     llm_content.startswith("Error:") or llm_content.startswith("Exception:")
             ):
-                error_msgs.append(llm_content[:80])
+                error_msgs.append(truncate_to_tokens(llm_content, 40, suffix="…"))
     if error_msgs and len(set(error_msgs)) == 1 and len(error_msgs) == len(results):
         key = f"_streak:{error_msgs[0]}"
         prev = getattr(builder, key, 0)

@@ -20,6 +20,8 @@ from apitelegramchat.utils import get_logger, strip_html_tags
 from apitelegramchat.ai._constants import OPENROUTER_PROVIDER_PREFERENCES
 from apitelegramchat.ai.error_formatting import _extract_error_details
 
+from apitelegramchat.token_utils import truncate_to_tokens
+
 logger = get_logger(__name__)
 
 def _clean_prompt_for_image_model(prompt: str) -> str:
@@ -196,7 +198,7 @@ async def _request_modelscope_native_image(
                 "[NativeImage/ModelScope] JSON parse failed; body_preview=%r",
                 _body_preview(body_text),
             )
-        return None, resp.status, body_text[:500], request_id
+        return None, resp.status, truncate_to_tokens(body_text, 250, suffix="…"), request_id
 
     def _extract_request_meta(payload: dict | None) -> tuple[str, str]:
         if not isinstance(payload, dict):
@@ -569,16 +571,16 @@ def _format_native_image_notice(
 
     if reason in {"content_filter", "safety", "blocked", "moderation"}:
         if refusal_text:
-            return f"⚠️ 这张图触发了安全限制：{refusal_text[:600]}"
+            return f"⚠️ 这张图触发了安全限制：{truncate_to_tokens(refusal_text, 300, suffix="…")}"
         if content_text:
-            return f"⚠️ 这张图触发了安全限制：{content_text[:600]}"
+            return f"⚠️ 这张图触发了安全限制：{truncate_to_tokens(content_text, 300, suffix="…")}"
         return "⚠️ 这张图触发了安全限制，请修改描述后重试。"
 
     if refusal_text:
-        return f"⚠️ {refusal_text[:600]}"
+        return f"⚠️ {truncate_to_tokens(refusal_text, 300, suffix="…")}"
 
     if content_text:
-        return content_text[:1200]
+        return truncate_to_tokens(content_text, 600, suffix="…")
 
     return "⚠️ 图片生成失败，请稍后重试。"
 
@@ -589,7 +591,7 @@ async def _response_items_to_bytes(response_json: dict) -> list[bytes]:
     logger.debug("[NativeImage/ModelScope] extracted image item count=%s", len(items))
     # 防止恶意/失控的上游用超大 base64 串触发 OOM：
     # 单张图片的 base64 串超过 25 MB 时直接拒绝解码。
-    _MAX_B64_LEN = 25 * 1024 * 1024
+    _MAX_B64_ENCODED_BYTES = 25 * 1024 * 1024
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
         for img_data in items:
             img_url = ''
@@ -601,10 +603,10 @@ async def _response_items_to_bytes(response_json: dict) -> list[bytes]:
             b64_json = str(img_data.get('b64_json') or img_data.get('base64') or '').strip()
 
             if b64_json:
-                if len(b64_json) > _MAX_B64_LEN:
+                if len(b64_json) > _MAX_B64_ENCODED_BYTES:
                     logger.warning(
                         "[NativeImage] 跳过超大 base64 图片 (len=%s, 上限=%s)",
-                        len(b64_json), _MAX_B64_LEN,
+                        len(b64_json), _MAX_B64_ENCODED_BYTES,
                     )
                     continue
                 try:
@@ -616,10 +618,10 @@ async def _response_items_to_bytes(response_json: dict) -> list[bytes]:
             if img_url.startswith('data:image'):
                 try:
                     _, base64_data = img_url.split(',', 1)
-                    if len(base64_data) > _MAX_B64_LEN:
+                    if len(base64_data) > _MAX_B64_ENCODED_BYTES:
                         logger.warning(
                             "[NativeImage] 跳过超大 data URL 图片 (len=%s, 上限=%s)",
-                            len(base64_data), _MAX_B64_LEN,
+                            len(base64_data), _MAX_B64_ENCODED_BYTES,
                         )
                         continue
                     image_bytes_list.append(base64.b64decode(base64_data))
@@ -670,7 +672,7 @@ async def _request_agnes_video(
         model,
         duration,
         len(clean_prompt),
-        clean_prompt[:240],
+        truncate_to_tokens(clean_prompt, 120, suffix="…"),
     )
 
     # 提交任务
@@ -689,15 +691,15 @@ async def _request_agnes_video(
                     "[NativeVideo/Agnes] submit response: status=%s content_type=%s body_preview=%r",
                     resp.status,
                     resp.headers.get("Content-Type", ""),
-                    resp_text[:500],
+                    truncate_to_tokens(resp_text, 250, suffix="…"),
                 )
                 if resp.status != 200:
-                    return None, f"Agnes 提交失败 (HTTP {resp.status}): {resp_text[:200]}", None
+                    return None, f"Agnes 提交失败 (HTTP {resp.status}): {truncate_to_tokens(resp_text, 100, suffix="…")}", None
 
                 try:
                     data = json.loads(resp_text)
                 except Exception:
-                    return None, f"Agnes 提交返回非 JSON: {resp_text[:200]}", None
+                    return None, f"Agnes 提交返回非 JSON: {truncate_to_tokens(resp_text, 100, suffix="…")}", None
 
                 video_id = data.get("video_id") or data.get("id")
                 if not video_id:
@@ -743,7 +745,7 @@ async def _request_agnes_video(
                         "[NativeVideo/Agnes] polling iter=%s response: status=%s body_preview=%r",
                         poll_iter,
                         resp.status,
-                        body_text[:500],
+                        truncate_to_tokens(body_text, 250, suffix="…"),
                     )
 
                     if resp.status != 200:
@@ -763,7 +765,7 @@ async def _request_agnes_video(
                             "[NativeVideo/Agnes] polling iter=%s JSON parse failed elapsed=%.1fs body_preview=%r",
                             poll_iter,
                             elapsed,
-                            body_text[:300],
+                            truncate_to_tokens(body_text, 150, suffix="…"),
                         )
                         await asyncio.sleep(interval)
                         continue
@@ -856,7 +858,7 @@ async def _request_openrouter_video(
         model,
         duration,
         len(clean_prompt),
-        clean_prompt[:240],
+        truncate_to_tokens(clean_prompt, 120, suffix="…"),
     )
 
     # 提交任务
@@ -878,16 +880,16 @@ async def _request_openrouter_video(
                     "[NativeVideo/OpenRouter] submit response: status=%s content_type=%s body_preview=%r",
                     resp.status,
                     resp.headers.get("Content-Type", ""),
-                    resp_text[:500],
+                    truncate_to_tokens(resp_text, 250, suffix="…"),
                 )
 
                 if resp.status != 202:
-                    return None, f"OpenRouter 提交失败 (HTTP {resp.status}): {resp_text[:200]}", None
+                    return None, f"OpenRouter 提交失败 (HTTP {resp.status}): {truncate_to_tokens(resp_text, 100, suffix="…")}", None
 
                 try:
                     data = json.loads(resp_text)
                 except Exception:
-                    return None, f"OpenRouter 提交返回非 JSON: {resp_text[:200]}", None
+                    return None, f"OpenRouter 提交返回非 JSON: {truncate_to_tokens(resp_text, 100, suffix="…")}", None
 
                 job_id = data.get("id")
                 polling_url = data.get("polling_url") or data.get("status_url")
@@ -956,7 +958,7 @@ async def _request_openrouter_video(
                         "[NativeVideo/OpenRouter] polling iter=%s response: status=%s body_preview=%r",
                         poll_iter,
                         resp.status,
-                        body_text[:500],
+                        truncate_to_tokens(body_text, 250, suffix="…"),
                     )
 
                     if resp.status != 200:
@@ -976,7 +978,7 @@ async def _request_openrouter_video(
                             "[NativeVideo/OpenRouter] polling iter=%s JSON parse failed elapsed=%.1fs body_preview=%r",
                             poll_iter,
                             elapsed,
-                            body_text[:300],
+                            truncate_to_tokens(body_text, 150, suffix="…"),
                         )
                         await asyncio.sleep(interval)
                         continue

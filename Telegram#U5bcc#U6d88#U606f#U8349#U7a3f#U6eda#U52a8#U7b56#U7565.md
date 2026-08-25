@@ -12,10 +12,10 @@
 
 | 维度 | 容量预警阈值 | 常规滚动阈值 | 富消息上限 |
 |---|---:|---:|---:|
-| 解析后可见文本 | 27,000 字符 | 30,000 字符 | 32,768 字符 |
+| 项目内部文本预算 | 5,000 token | 6,800 token | 7,500 token |
 | 富消息结构块 | 380 块 | 440 块 | 500 块 |
 
-容量预警阈值通过 `RICH_DRAFT_ARM_TEXT_CHARS` 和 `RICH_DRAFT_ARM_BLOCKS` 配置。预警并不立即切换草稿，而是为当前完整模型/工具批次留出容量。`RICH_DRAFT_ROLLOVER_TEXT_CHARS` 与 `RICH_DRAFT_ROLLOVER_BLOCKS` 是正常分段使用的安全预算；若单一未闭合结构逼近真实上限，则使用纯文本降级路径作为硬保护。
+容量预警阈值通过 `RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET` 和 `RICH_DRAFT_INTERACTIVE_BLOCKS` 配置；正常分段预算通过 `RICH_DRAFT_ROLLOVER_TOKEN_BUDGET` 配置，硬保护通过 `RICH_DRAFT_HARD_GUARD_TOKEN_BUDGET` 配置。Telegram 服务端仍有 32,768 个解析后 Unicode 字符的外部协议硬限制，因此实现同时保留字符安全阈值，但项目内部预算统一按 token 计算。
 
 ## 状态机
 
@@ -66,15 +66,16 @@
 ## 配置
 
 ```bash
-RICH_MESSAGE_TEXT_CHARS_MAX=32768
-RICH_DRAFT_ARM_TEXT_CHARS=27000
-RICH_DRAFT_ROLLOVER_TEXT_CHARS=30000
-RICH_MESSAGE_BLOCKS_MAX=500
-RICH_DRAFT_ARM_BLOCKS=380
-RICH_DRAFT_ROLLOVER_BLOCKS=440
+RICH_MESSAGE_TOKEN_BUDGET=7500
+RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET=5000
+RICH_DRAFT_ROLLOVER_TOKEN_BUDGET=6800
+RICH_DRAFT_HARD_GUARD_TOKEN_BUDGET=7372
+RICH_MESSAGE_BLOCKS_MAX=80
+RICH_DRAFT_INTERACTIVE_BLOCKS=45
+RICH_DRAFT_ROLLOVER_BLOCKS=70
 ```
 
-一般不应将预警阈值与真实富消息上限设置得过近。预警值需覆盖当前工具批次收尾、永久消息处理和新草稿首帧的安全余量；真实限制仍由常规滚动阈值和硬保护共同兜底。
+一般不应将 token 预警阈值与硬预算设置得过近。当前 5,000 / 6,800 / 7,500 token 分层为工具批次收尾、永久消息处理和新草稿首帧预留了余量；另外保留 32,768 Unicode 字符的协议安全阈值，避免低 token 密度的英文文本触发 Telegram 服务端限制。
 
 ## 回归验证
 

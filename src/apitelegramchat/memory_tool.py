@@ -39,6 +39,7 @@ import time
 import uuid
 from pathlib import Path
 from apitelegramchat.workspace_paths import memory_state_file
+from apitelegramchat.token_utils import truncate_to_tokens
 from typing import Any, Optional
 
 from apitelegramchat.workspace_utils import (
@@ -52,8 +53,8 @@ logger = logging.getLogger(__name__)
 # ---------- 常量 ----------
 MEMORY_FILENAME = "memories.json"
 VALID_IMPORTANCE = ("low", "medium", "high")
-MAX_CONTENT_LEN = 2000
-MAX_TAG_LEN = 24
+MAX_CONTENT_TOKENS = 2000
+MAX_TAG_TOKENS = 24
 MAX_TAGS = 8
 MAX_MEMORIES = 1000  # 单 chat 上限，防止失控增长
 DEFAULT_CATEGORIES = ("fact", "preference", "person", "event", "note")
@@ -154,7 +155,7 @@ def _normalize_tags(tags: Any) -> list[str]:
     for p in parts:
         if p not in seen:
             seen.add(p)
-            out.append(p[:MAX_TAG_LEN])
+            out.append(truncate_to_tokens(p, MAX_TAG_TOKENS, suffix=""))
         if len(out) >= MAX_TAGS:
             break
     return out
@@ -221,8 +222,7 @@ def _op_add(store: dict, content: str, category: str, tags: list[str],
     content = (content or "").strip()
     if not content:
         raise _MemoryError("content 不能为空", "empty_content")
-    if len(content) > MAX_CONTENT_LEN:
-        content = content[:MAX_CONTENT_LEN]
+    content = truncate_to_tokens(content, MAX_CONTENT_TOKENS, suffix="")
     if len(store["memories"]) >= MAX_MEMORIES:
         raise _MemoryError(f"记忆数量已达上限 {MAX_MEMORIES}，请先清理", "too_many")
 
@@ -341,7 +341,7 @@ def _op_update(store: dict, mid: str, content: Optional[str],
         c = content.strip()
         if not c:
             raise _MemoryError("content 不能为空", "empty_content")
-        mem["content"] = c[:MAX_CONTENT_LEN]
+        mem["content"] = truncate_to_tokens(c, MAX_CONTENT_TOKENS, suffix="")
         changed.append("content")
     if category is not None:
         mem["category"] = _normalize_category(category)
@@ -608,9 +608,7 @@ def _render_memory_item(m: dict) -> str:
     cat = _category_badge(m)
     mid = f"<code>#{_esc(m.get('id', '?'))}</code>"
     content = _esc(m.get("content", ""))
-    # 内容超过 ~200 字截断
-    if len(content) > 400:
-        content = content[:400] + "…"
+    content = truncate_to_tokens(content, 200, suffix="…")
     tags = _tag_chips(m)
     parts = [f"{badge} {cat} {mid}", f"<blockquote>{content}</blockquote>"]
     if tags:

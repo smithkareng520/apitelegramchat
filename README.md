@@ -78,3 +78,23 @@ docker run --env-file .env -p 5000:5000 apitelegramchat
 ```
 
 容器启动 MCP 子进程时仍须为每个受信任会话单独传入 `APITELEGRAMCHAT_MCP_SCOPE`。不要把 stdio MCP 直接暴露到网络；如需远程接入，应通过单独的认证网关、TLS、会话隔离、限流和审计层实现。
+
+
+## Token budget
+
+项目内部的文本预算统一按 **token** 计算，不再把 Python `len(str)` 当作
+工具结果、上下文、fetch 内容、subagent 输入/输出等预算单位。依赖
+`tiktoken`，默认使用 `cl100k_base`；如果模型名能被 tiktoken 识别则优先使用
+对应编码，也可以通过 `TOKEN_ENCODING` 指定编码。
+
+主要环境变量也统一以 token 为单位，例如：
+
+- `CONTEXT_MAX_TOKENS`：请求上下文 token 上限
+- `SUBAGENT_MAX_RESULT_TOKENS`：子 agent 单次工具结果 token 上限
+- `SUBAGENT_MAX_TASK_TOKENS` / `SUBAGENT_MAX_CONTEXT_TOKENS` /
+  `SUBAGENT_MAX_ANSWER_TOKENS`：子 agent 输入输出 token 上限
+- `TOKEN_ENCODING`：显式指定 tiktoken encoding
+
+不再保留旧的长度/字符预算环境变量或常量名称；所有项目内部文本预算均使用
+明确的 `*_TOKENS` 命名。Telegram/HTTP 等外部协议本身要求的字节数、字符数、
+行数或文件大小限制仍按协议单位执行，不作为模型文本预算。

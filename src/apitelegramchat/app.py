@@ -67,6 +67,7 @@ from apitelegramchat.ask_user_tool import (
 from apitelegramchat.file_handlers import download_file
 from apitelegramchat.workspace_utils import _get_workspace_lock, init_workspace
 from apitelegramchat.context_manager import select_request_context
+from apitelegramchat.token_utils import truncate_to_tokens
 from apitelegramchat.tool_context_compaction import compact_older_tool_calls
 
 app = Quart(__name__)
@@ -255,8 +256,7 @@ def _get_reply_context(msg: dict) -> str:
             quote = "[该消息无文字内容]"
     if REPLY_MARKER in quote:
         quote = quote.split(REPLY_MARKER)[-1].strip()
-    if len(quote) > 800:
-        quote = quote[:800] + "...(truncated)"
+    quote = truncate_to_tokens(quote, 200, suffix="...(truncated)")
     return f"{REPLY_MARKER}\n> {quote}\n\n"
 
 def _get_reply_media(msg: dict) -> dict:

@@ -20,6 +20,7 @@ import time
 import uuid
 from pathlib import Path
 from apitelegramchat.workspace_paths import todo_state_file
+from apitelegramchat.token_utils import truncate_to_tokens
 from typing import Any, Optional
 
 
@@ -35,7 +36,7 @@ logger = logging.getLogger(__name__)
 TODO_FILENAME = "todos.json"
 VALID_PRIORITIES = ("low", "medium", "high")
 VALID_FILTERS = ("all", "pending", "done")
-MAX_TITLE_LEN = 200
+MAX_TITLE_TOKENS = 200
 MAX_TODOS = 500  # 单 chat 上限，防止失控增长
 MAX_TAGS = 8
 
@@ -197,8 +198,7 @@ def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optio
     title = (title or "").strip()
     if not title:
         raise _TodoError("title 不能为空", "empty_title")
-    if len(title) > MAX_TITLE_LEN:
-        title = title[:MAX_TITLE_LEN]
+    title = truncate_to_tokens(title, MAX_TITLE_TOKENS, suffix="")
     if len(store["todos"]) >= MAX_TODOS:
         raise _TodoError(f"待办数量已达上限 {MAX_TODOS}，请先清理", "too_many")
 
@@ -208,7 +208,7 @@ def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optio
         "done": False,
         "priority": _normalize_priority(priority),
         "tags": _normalize_tags(tags),
-        "note": (note or "").strip()[:500] if note else "",
+        "note": truncate_to_tokens((note or "").strip(), 500, suffix="") if note else "",
         "created_at": int(time.time()),
         "completed_at": None,
     }
@@ -345,7 +345,7 @@ def _op_edit(store: dict, todo_id: str, title: Optional[str],
         t = title.strip()
         if not t:
             raise _TodoError("title 不能为空", "empty_title")
-        todo["title"] = t[:MAX_TITLE_LEN]
+        todo["title"] = truncate_to_tokens(t, MAX_TITLE_TOKENS, suffix="")
         changed.append("title")
     if priority is not None:
         todo["priority"] = _normalize_priority(priority)
@@ -354,7 +354,7 @@ def _op_edit(store: dict, todo_id: str, title: Optional[str],
         todo["tags"] = _normalize_tags(tags)
         changed.append("tags")
     if note is not None:
-        todo["note"] = (note or "").strip()[:500]
+        todo["note"] = truncate_to_tokens((note or "").strip(), 500, suffix="")
         changed.append("note")
     return store, {
         "ok": True,

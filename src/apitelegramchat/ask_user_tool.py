@@ -20,13 +20,14 @@ import aiohttp
 
 from apitelegramchat.config import BASE_URL
 from apitelegramchat.utils import send_rich_html_message, escape_html
+from apitelegramchat.token_utils import truncate_to_tokens
 
 logger = logging.getLogger("apitelegramchat.ask_user")
 
-MAX_QUESTION_CHARS = 1200
+MAX_QUESTION_TOKENS = 1200
 MAX_OPTIONS = 8
-MAX_LABEL_CHARS = 48
-MAX_OPTION_DESC_CHARS = 180
+MAX_LABEL_TOKENS = 48
+MAX_OPTION_DESC_TOKENS = 180
 # 修复：24h 超时太长——一个未回答的 ask_user 会把 agent 循环挂起整整一天，
 # 中间所有事件循环资源（chat lock、内存里的消息、模型 prompt cache 等）都
 # 不能释放。改成默认 10 分钟，足够用户做选择又不至于让会话僵死。
@@ -65,7 +66,7 @@ def _new_id() -> str:
 def _option_text(option: dict[str, Any]) -> tuple[str, str]:
     label = str(option.get("label") or option.get("title") or option.get("id") or "选项").strip()
     desc = str(option.get("description") or "").strip()
-    return label[:MAX_LABEL_CHARS], desc[:MAX_OPTION_DESC_CHARS]
+    return truncate_to_tokens(label, MAX_LABEL_TOKENS, suffix=""), truncate_to_tokens(desc, MAX_OPTION_DESC_TOKENS, suffix="")
 
 
 def _normalized_options(options: Any) -> list[dict[str, str]]:
@@ -74,7 +75,7 @@ def _normalized_options(options: Any) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     for idx, raw in enumerate(options[:MAX_OPTIONS]):
         if isinstance(raw, str):
-            label = raw.strip()[:MAX_LABEL_CHARS]
+            label = truncate_to_tokens(raw.strip(), MAX_LABEL_TOKENS, suffix="")
             oid = f"option_{idx + 1}"
             desc = ""
         elif isinstance(raw, dict):
@@ -179,7 +180,7 @@ async def create_ask_user_interaction(
     multiple: bool = False,
     allow_custom: bool = True,
 ) -> AskUserInteraction:
-    question = str(question or "").strip()[:MAX_QUESTION_CHARS]
+    question = truncate_to_tokens(str(question or "").strip(), MAX_QUESTION_TOKENS, suffix="")
     normalized = _normalized_options(options)
     if not question:
         raise ValueError("ask_user.question 不能为空")
@@ -403,7 +404,7 @@ async def resolve_text(chat_id: int, text: str) -> bool:
         if not interaction or interaction.status != "waiting" or not interaction.awaiting_text:
             return False
         interaction.status = "answered"
-        answer = {"type": "custom", "value": text[:4000]}
+        answer = {"type": "custom", "value": truncate_to_tokens(text, 2000, suffix="…[回答过长已截断]")}
         if interaction.future and not interaction.future.done():
             interaction.future.set_result(answer)
         message_id = interaction.message_id

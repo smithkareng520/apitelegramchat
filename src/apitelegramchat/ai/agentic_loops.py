@@ -53,6 +53,8 @@ from apitelegramchat.ai.tool_summary import (
 )
 from apitelegramchat.ai.tool_call_loop import _run_tool_calls_and_append
 
+from apitelegramchat.token_utils import truncate_to_tokens
+
 logger = get_logger(__name__)
 
 def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict):
@@ -769,7 +771,7 @@ async def _agentic_loop_native_image(
             used_endpoint = f"/v1{endpoint}"
             if response_json is None:
                 if _is_content_safety_error(error_detail):
-                    logger.info("[NativeImage] 请求被内容安全策略拦截: %s", error_detail[:200])
+                    logger.info("[NativeImage] 请求被内容安全策略拦截: %s", truncate_to_tokens(error_detail, 100, suffix="…"))
                     error_notice = _format_image_safety_notice(detail=error_detail, model=current_model)
                 else:
                     error_notice = _format_api_error_notice(
@@ -957,7 +959,7 @@ async def _agentic_loop_native_image(
 
     final_content = f"IMAGE_SENT:{final_notice}" if final_notice else "IMAGE_SENT"
     if uploaded_urls:
-        history_content = f"[图片已生成] {content[:200] if content else ''} | {caption_text}".strip(' |')
+        history_content = f"[图片已生成] {truncate_to_tokens(content, 100, suffix="…") if content else ''} | {caption_text}".strip(' |')
     else:
         history_content = final_notice or "（已生成图片）"
     new_entries = [{"role": "assistant", "content": history_content}]
@@ -1099,10 +1101,10 @@ async def _agentic_loop_native_video(
         return "VIDEO_ERROR:视频发送失败", None, []
 
     # 生成历史记录
-    history_content = f"[视频已生成] 提示词: {prompt[:200]}" if prompt else "[视频已生成]"
+    history_content = f"[视频已生成] 提示词: {truncate_to_tokens(prompt, 100, suffix="…")}" if prompt else "[视频已生成]"
     new_entries = [{"role": "assistant", "content": history_content}]
 
-    final_content = f"VIDEO_SENT:{prompt[:100]}"  # 用于上游判断
+    final_content = f"VIDEO_SENT:{truncate_to_tokens(prompt, 50, suffix="…")}"  # 用于上游判断
     return final_content, None, new_entries
 
 

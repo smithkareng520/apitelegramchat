@@ -22,7 +22,7 @@
 - 工具白名单：默认允许所有 SEARCH_TOOLS，调用方可限制为子集
 - 安全护栏：
     - 最大循环轮数：MAX_SUBAGENT_ROUNDS = 32（可通过环境变量 SUBAGENT_MAX_ROUNDS 调整）
-    - 最大单次工具结果长度：MAX_SUBAGENT_RESULT_LEN = 8000（可通过环境变量 SUBAGENT_MAX_RESULT_LEN 调整）
+    - 最大单次工具结果预算：MAX_SUBAGENT_RESULT_TOKENS = 8000（可通过环境变量 SUBAGENT_MAX_RESULT_TOKENS 调整）
     - 总体超时：DEFAULT_TIMEOUT = 900s（可通过环境变量 SUBAGENT_DEFAULT_TIMEOUT 调整）
     - 禁止子 agent 递归调用 subagent 工具（防爆炸）
 - 不带流式输出（子 agent 是后台任务，用户不需要看 token 流），用普通 chat.completions.create
@@ -47,6 +47,7 @@ from typing import Any, Optional
 
 from apitelegramchat.api_client import api_client
 from apitelegramchat.config import SUPPORTED_MODELS, DEFAULT_MODEL
+from apitelegramchat.token_utils import count_tokens, truncate_to_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -67,15 +68,18 @@ def _env_int(name: str, default: int, *, min_value: int | None = None, max_value
 
 # ---------- 安全护栏 ----------
 MAX_SUBAGENT_ROUNDS = _env_int("SUBAGENT_MAX_ROUNDS", 32, min_value=1, max_value=128)
-MAX_SUBAGENT_RESULT_LEN = _env_int("SUBAGENT_MAX_RESULT_LEN", 8000, min_value=1000, max_value=50000)
+MAX_SUBAGENT_RESULT_TOKENS = _env_int("SUBAGENT_MAX_RESULT_TOKENS", 8000, min_value=1000, max_value=50000)
 DEFAULT_TIMEOUT = _env_int("SUBAGENT_DEFAULT_TIMEOUT", 900, min_value=60, max_value=1800)  # 秒
-MAX_TASK_LEN = _env_int("SUBAGENT_MAX_TASK_LEN", 8000, min_value=1000, max_value=50000)
-MAX_CONTEXT_LEN = _env_int("SUBAGENT_MAX_CONTEXT_LEN", 16000, min_value=1000, max_value=100000)
-MAX_ANSWER_LEN = _env_int("SUBAGENT_MAX_ANSWER_LEN", 12000, min_value=1000, max_value=100000)
+MAX_TASK_TOKENS = _env_int("SUBAGENT_MAX_TASK_TOKENS", 8000, min_value=1000, max_value=50000)
+MAX_CONTEXT_TOKENS = _env_int("SUBAGENT_MAX_CONTEXT_TOKENS", 16000, min_value=1000, max_value=100000)
+MAX_ANSWER_TOKENS = _env_int("SUBAGENT_MAX_ANSWER_TOKENS", 12000, min_value=1000, max_value=100000)
 # 子 agent 的完整答复仍会交给父 agent；此处仅限制 Telegram 工具卡片的预览，
 # 防止一张卡片吞掉整个富消息草稿的交互预算。
-MAX_CARD_ANSWER_HTML_LEN = _env_int(
-    "SUBAGENT_CARD_ANSWER_HTML_LEN", 4200, min_value=1000, max_value=5000
+MAX_CARD_ANSWER_HTML_TOKENS = _env_int(
+    "SUBAGENT_CARD_ANSWER_HTML_TOKENS",
+    4200,
+    min_value=1000,
+    max_value=5000,
 )
 
 
@@ -155,12 +159,8 @@ def _filter_tools(allowed: Optional[list[str]]) -> list[dict]:
     return out
 
 
-def _truncate(s: str, limit: int = MAX_SUBAGENT_RESULT_LEN) -> str:
-    if not s:
-        return ""
-    if len(s) <= limit:
-        return s
-    return s[:limit] + "\n…[子 agent 视野已截断]"
+def _truncate(s: str, limit: int = MAX_SUBAGENT_RESULT_TOKENS) -> str:
+    return truncate_to_tokens(s or "", limit, suffix="\n…[子 agent 视野已截断]")
 
 
 async def _execute_tool_for_subagent(
@@ -189,7 +189,7 @@ async def _execute_tool_for_subagent(
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        return f"Error: tool '{name}' failed: {str(e)[:200]}"
+        return f"Error: tool '{name}' failed: {truncate_to_tokens(str(e), 100, suffix="…")}"
 
 
 async def _subagent_agentic_loop(
@@ -268,7 +268,7 @@ async def _subagent_agentic_loop(
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            last_error = f"LLM 调用失败: {str(e)[:200]}"
+            last_error = f"LLM 调用失败: {truncate_to_tokens(str(e), 100, suffix="…")}"
             logger.exception(f"subagent: LLM call failed (round {rounds}): {e}")
             await _report(f"第 {rounds} 轮 LLM 调用失败")
             break
@@ -300,8 +300,8 @@ async def _subagent_agentic_loop(
         # 没有 tool_calls → 任务结束
         if not tool_calls:
             answer = (content or "").strip()
-            if len(answer) > MAX_ANSWER_LEN:
-                answer = answer[:MAX_ANSWER_LEN] + "\n…[子 agent 答复已截断]"
+            if truncate_to_tokens(answer, MAX_ANSWER_TOKENS) != answer:
+                answer = truncate_to_tokens(answer, MAX_ANSWER_TOKENS, suffix="\n…[子 agent 答复已截断]")
             await _report(f"完成：{rounds} 轮，{total_tool_calls} 次工具调用，{time.monotonic() - start:.0f}s")
             return {
                 "ok": True,
@@ -406,10 +406,9 @@ async def execute_subagent(
     if not task:
         return json.dumps({"ok": False, "error": "task 不能为空", "code": "empty_task"},
                           ensure_ascii=False)
-    if len(task) > MAX_TASK_LEN:
-        task = task[:MAX_TASK_LEN]
-    if context and len(context) > MAX_CONTEXT_LEN:
-        context = context[:MAX_CONTEXT_LEN]
+    task = truncate_to_tokens(task, MAX_TASK_TOKENS, suffix="")
+    if context:
+        context = truncate_to_tokens(context, MAX_CONTEXT_TOKENS, suffix="")
 
     # 选模型
     chosen_model = (model or DEFAULT_MODEL).strip()
@@ -475,7 +474,7 @@ async def execute_subagent(
         logger.exception(f"subagent: unexpected error (error_id={error_id}): {e}")
         return json.dumps({
             "ok": False,
-            "error": f"子 agent 异常 (error_id={error_id})：{str(e)[:200]}",
+            "error": f"子 agent 异常 (error_id={error_id})：{truncate_to_tokens(str(e), 100, suffix="…")}",
             "code": "exception",
             "error_id": error_id,
             "model": chosen_model,
@@ -484,7 +483,7 @@ async def execute_subagent(
     # 加上模型信息再返回
     result["model"] = chosen_model
     result["model_name"] = getattr(model_info, "name", chosen_model)
-    result["task_preview"] = task[:80]
+    result["task_preview"] = truncate_to_tokens(task, 40, suffix="…")
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -579,23 +578,39 @@ class _HTMLPreviewTruncator(HTMLParser):
         return "".join(self.parts) + suffix, self.truncated
 
 
-def _truncate_html_preview(fragment: str, limit: int = MAX_CARD_ANSWER_HTML_LEN) -> tuple[str, bool]:
-    """截取富文本源码预算内的预览，绝不在标签或实体中间切断。"""
+def _truncate_html_preview(fragment: str, limit: int = MAX_CARD_ANSWER_HTML_TOKENS) -> tuple[str, bool]:
+    """按 token 预算截取富文本，同时保证 HTML 标签结构完整。
+
+    ``_HTMLPreviewTruncator`` 本身按字符安全截断；这里对其安全输出做
+    token-budget 二分搜索，因此外部预算始终是 token，而不是字符。
+    """
     text = fragment or ""
-    if len(text) <= limit:
+    if not text or len(text) <= 0:
         return text, False
-    parser = _HTMLPreviewTruncator(limit)
-    try:
+    if count_tokens(text) <= limit:
+        return text, False
+
+    def render_with_char_budget(char_budget: int) -> str:
+        parser = _HTMLPreviewTruncator(max(1, char_budget))
         parser.feed(text)
         parser.close()
         preview, _ = parser.render()
-        # 对于只含超长的注释、声明等极端输入，仍提供可展示的安全文本兜底。
-        if not preview:
-            return _esc(text[:limit]), True
-        return preview, True
+        return preview or _esc(text[:max(1, char_budget)])
+
+    try:
+        lo, hi = 1, len(text)
+        best = ""
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            preview = render_with_char_budget(mid)
+            if count_tokens(preview) <= limit:
+                best = preview
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best or _esc(truncate_to_tokens(text, limit, suffix="")), True
     except Exception:
-        # 模型输出不应因预览格式化失败而令整个工具卡片消失。
-        return _esc(text[:limit]), True
+        return _esc(truncate_to_tokens(text, limit, suffix="")), True
 
 
 def render_subagent_card(payload: dict) -> str:

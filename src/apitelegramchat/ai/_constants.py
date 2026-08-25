@@ -17,7 +17,7 @@ def _positive_env_int(name: str, default: int, *, minimum: int = 1) -> int:
 
 
 # ---------- 工具调用相关 ----------
-MAX_TOOL_RESPONSE_LEN = 100000
+MAX_TOOL_RESPONSE_TOKENS = 16000
 # 每一轮用户请求最多执行 100 次真实工具调用；超过后进入无工具总结路径。
 # 不依赖模型的单轮并发数量，调用预算按实际执行的工具数精确累计。
 MAX_TOOL_CALLS = 100
