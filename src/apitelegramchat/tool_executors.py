@@ -51,7 +51,6 @@ from apitelegramchat.search_engine import (
     execute_crypto_price,
     execute_ip_geo,
     execute_qr_code,
-    execute_done,
     execute_generate_image,
     execute_generate_video,
     # 地图工具（全部委托给 amap-maps MCP）
@@ -2355,8 +2354,6 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             return await execute_ip_geo(arguments.get("ip"))
         elif name == "qr_code":
             return await execute_qr_code(arguments.get("text", ""))
-        elif name == "done":
-            return await execute_done()
         elif name == "generate_image_from_text":
             return await execute_generate_image(
                 prompt=arguments.get("prompt"),

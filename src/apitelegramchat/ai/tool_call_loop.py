@@ -57,12 +57,6 @@ async def _run_tool_calls_and_append(
     skipped_tool_calls = []
     remaining_budget = max(0, MAX_TOOL_CALLS - tool_call_count_ref[0])
     for tc in tool_calls:
-        if isinstance(tc, dict):
-            fn_name = tc["function"]["name"]
-        else:
-            fn_name = tc.function.name
-        if fn_name == "done":
-            continue
         if len(valid_tool_calls) < remaining_budget:
             valid_tool_calls.append(tc)
         else:
@@ -70,9 +64,8 @@ async def _run_tool_calls_and_append(
             # 稍后仍会为这些 ID 补充 tool 消息，避免下一次总结请求出现未配对调用。
             skipped_tool_calls.append(tc)
     if not valid_tool_calls and not skipped_tool_calls:
-        # 流式接收阶段已经可能为 done 之类的特殊调用创建了工具条目。
-        # 即使没有可执行的调用，也必须在这一轮结束时收束该工具组；否则下一轮
-        # 会复用一个跨回合未完成的组，既影响 UI，也可能推迟富消息滚动边界。
+        # 收到空 tool_calls 批次：仍需收束当前未完成工具组，避免下一轮复用跨回合的组
+        # 影响 UI 草稿滚动边界。
         if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
             builder.finish_group(len(builder._tool_groups) - 1)
         await builder.flush()
