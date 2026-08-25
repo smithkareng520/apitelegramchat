@@ -514,10 +514,12 @@ SEARCH_TOOLS = [
         "function": {
             "name": "fetch_url",
             "description": (
-                "Fetch and read the full content of a specific URL. Returns the page as Telegram Rich Message HTML "
-                "(<h3> title, source link, body paragraphs/lists/tables, plus sections for embedded videos, "
-                "iframe players like YouTube/Bilibili, audio and images with their original URLs). "
-                "You may quote or reuse the relevant HTML fragments (including <img>/<video>/<a> tags) directly in your reply. "
+                "Fetch and read the full content of a specific URL. Returns the page rendered as Telegram Rich Message HTML "
+                "that mirrors the original page structure and order: headings, paragraphs, lists, tables, quotes, "
+                "code blocks, links and media (images, embedded videos, iframe players such as YouTube/Bilibili, "
+                "audio) all appear at their original positions; image carousels are grouped into <tg-slideshow>. "
+                "You may quote or reuse the relevant HTML fragments (including <img>/<video>/<a> tags with their "
+                "original URLs) directly in your reply. "
                 "Use when a search result needs deeper reading or the user gave you a link. One URL per call."
             ),
             "parameters": {
@@ -1332,22 +1334,23 @@ async def _download_html_with_trafilatura(url: str) -> str | None:
 
 
 def _build_rich_fetch_payload(url: str, html: str) -> str | None:
-    """把原始 HTML 转换为 Telegram Rich Message HTML 工具结果（同步、CPU 密集）。
+    """把原始 HTML 转换为【返回给模型】的 Telegram Rich HTML（同步、CPU 密集）。
 
-    提取链路：
-      1. trafilatura XML（保留链接/图片/格式/表格）→ Telegram HTML 块；
-      2. 原始 HTML → 内嵌视频 / iframe 播放器 / 音频 / 懒加载图片 / OG / JSON-LD；
-      3. 组装：标题 + 来源链接 + 正文 + 媒体区，预算内整块截断。
+    提取链路（结果忠实于原页面文档顺序，媒体原位呈现，无聚合媒体区）：
+      1. trafilatura XML（保留链接/图片/格式/表格及其顺序）→ Telegram HTML 块；
+      2. DOM 文档序收集内嵌视频/iframe 播放器/音频/懒加载图片（带位置）；
+      3. 锚定 + 原位插回正文流；轮播图 → <tg-slideshow>；预算内整块截断。
+    注意：本函数的返回值只进入模型上下文；Telegram 工具 UI 的展示由
+    tool_executors.format_tool_result 单独负责（保持历史简单样式）。
     返回 None 表示完全提不出内容（调用方继续走重定向检测/失败路径）。
     """
     if not html:
         return None
     try:
         from apitelegramchat.fetch_rich_content import (
-            build_fetch_rich_result,
+            build_model_facing_html,
             build_fallback_text_from_html,
             extract_body_blocks,
-            extract_embedded_media,
             extract_title_from_html,
         )
     except Exception as e:
@@ -1355,38 +1358,34 @@ def _build_rich_fetch_payload(url: str, html: str) -> str | None:
         return None
 
     title = extract_title_from_html(html)
-    media = extract_embedded_media(html, url)
-    if media.og_title and not title:
-        title = media.og_title
 
     # 正文提取：trafilatura XML → Telegram HTML 块（含中文页面退化检测与
     # favor_precision/favor_recall 回退），链接/图片/格式/表格全保留。
     body_blocks = extract_body_blocks(html, url)
-
-    # 正文太薄时补充 og:description 开头段（正文块仍可能为空 → fallback）。
     body_len = sum(len(b) for b in body_blocks)
-    if body_len < 200 and media.og_description:
-        body_blocks.insert(0, f"<p>{_escape_plain(media.og_description[:500])}</p>")
-        body_len = sum(len(b) for b in body_blocks)
 
     fallback_text = ""
     if body_len < 200:
-        # 结构化提取失败：用纯文本兜底（meta 描述 + 段落），同时保住媒体区。
+        # 结构化提取失败：纯文本兜底（meta 描述 + 段落），媒体仍会原位插入。
         fallback_text = build_fallback_text_from_html(html)
+        if not fallback_text.strip():
+            # 连兜底文本都没有：若 DOM 也完全没有媒体则直接失败；
+            # 有媒体时仍交给 build_model_facing_html 产出媒体型结果。
+            probe = build_model_facing_html(url, html, body_blocks=[], title=title)
+            if not probe:
+                return None
 
-    if body_len < 200 and not fallback_text.strip() and not media.has_any():
+    result = build_model_facing_html(
+        url, html, body_blocks=body_blocks, title=title, fallback_text=fallback_text,
+    )
+    if not result:
         return None
-
-    result = build_fetch_rich_result(url, title, body_blocks, media, fallback_text)
-    # 最终防御：结果可见文本过短视为提取失败。
+    # 最终防御：结果可见文本过短且无任何媒体时视为提取失败。
     visible = re.sub(r'<[^>]+>', '', result)
-    if len(re.sub(r'\s+', '', visible)) < 60 and not media.has_any():
+    has_media = bool(re.search(r'<(img|video|audio|tg-slideshow)\b', result))
+    if len(re.sub(r'\s+', '', visible)) < 60 and not has_media:
         return None
     return result
-
-
-def _escape_plain(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # --------------------- SSRF 防护 ---------------------

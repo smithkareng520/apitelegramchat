@@ -776,3 +776,76 @@ OpenAI 兼容协议的 `video_url` content part；不支持的模型收到保留
   HTML：标题、来源链接、加粗/斜体、超链接、图片（含懒加载）、
   slideshow、表格、代码块齐全；中文维基百科触发 favor_precision
   回退并正确合并信息框碎片。
+
+---
+
+# fetch_url 面向模型重构（v2）— 展示与模型上下文分离 + 文档顺序忠实
+
+## 背景
+
+第一版富媒体改造把两类受众混在一起了：(a) Telegram 工具折叠面板的 UI 展示
+直接透传了完整富 HTML（消息过长且与模型回复重复）；(b) 媒体被集中堆到结果
+末尾的"🎬 视频 / 📺 内嵌播放器 / 🎵 音频 / 🖼️ 图片"聚合区，违背了页面
+原始结构。本次按正确需求重构：
+
+- **工具返回的 UI 展示保持原样不变**（标题 + 域名链接）；
+- **模型看到的是忠实于原网页文档顺序的 Telegram HTML**：链接、图片、视频、
+  播放器在它们的原始位置；轮播图识别为 `<tg-slideshow>`；绝不集中到一处。
+
+## 改动明细
+
+### fetch_rich_content.py（重写组装层）
+
+- **删除聚合媒体区**：`build_fetch_rich_result`（含 PageMedia/MediaAsset/
+  extract_embedded_media/OG/JSON-LD 元数据媒体注入）整体移除。
+- **新增 `build_model_facing_html`**：
+  - `_collect_dom_media`：DOM 单次文档序遍历，收集带 `order_idx`/`path`/
+    `carousel` 位置的媒体（video/source、audio、iframe/embed 播放器、懒加载
+    图片 data-*/srcset、figure figcaption 图注、隐藏元素过滤、装饰图过滤、
+    去重与数量上限）；
+  - `_anchor_entries`：把每个正文块锚定到 DOM 元素——文本前向贪心匹配
+    （支持相等/前缀/包含，覆盖中文短标题与 trafilatura 合并段落场景），
+    纯图片块用 src 反查 DOM 位置（精确原位锚定）；
+  - `_sort_entries_by_anchor`：按锚点稳定排序正文块，修正 trafilatura 把
+    `<graphic>` 挪到 XML 末尾导致的顺序偏移；
+  - `_interleave`：dropped 媒体（trafilatura 丢弃的视频/音频/播放器/懒图）
+    按文档位置插回正文流；
+  - 轮播：`_find_carousel_ancestor`（取 body 以下最外层 swiper/carousel/
+    gallery/slick/... 特征容器）+ `_group_carousel_runs`（连续同轮播图片块
+    → `<tg-slideshow>`，保持原位置）+ 全懒加载轮播在原位置插入完整
+    slideshow；无轮播特征的相邻图片保持独立 `<img>`（忠实原结构）；
+  - **样板区域排除**：nav/footer/aside 祖先内的媒体不插入（替代路径前缀
+    方案——公共 XPath 前缀在"正文只提取到单个小节"的新闻首页会过窄）；
+  - OG/JSON-LD 元数据媒体不再进入结果（不在文档流中，无法原位呈现；标题
+    仍用 og:title）。
+
+### search_engine.py
+
+- `_build_rich_fetch_payload` 改用 `build_model_facing_html`；注释明确
+  "返回值只进入模型上下文，UI 展示由 format_tool_result 单独负责"。
+- `fetch_url` 工具描述更新：说明结果镜像原页面结构与顺序、媒体在原始
+  位置、轮播为 slideshow、HTML 片段可直接复用。
+
+### tool_executors.py（UI 展示还原）
+
+- `format_tool_result` 的 fetch_url 分支恢复历史展示样式：
+  `details_html = f"{title} <a href=\"{url}\">{domain}</a>"`，不再透传富
+  HTML；标题解析优先 `<h3>`（新格式）并保留 `🏷️`（旧格式）兼容；失败
+  前缀判定与"超时"字样检查保留（正文谈论"失败"不误判）。
+
+### ai_handlers.py
+
+- 系统提示词 URL 白名单条款更新：fetch_url 结果为"按原页面文档顺序组织的
+  Telegram Rich Message HTML"，媒体与链接可直接复用且保持原始位置。
+
+## 验证
+
+- `tests/test_fetch_rich_content.py`：57 项离线单测全绿，新增覆盖——
+  DOM 媒体位置信息、轮播容器共享判定（swiper 外层容器而非 slide 项）、
+  媒体原位插入顺序（第一段 < 视频 < 第二段）、embed 原位、懒图原位、
+  已保留图片块按 DOM 重锚定、轮 slideshow 原位、全懒轮播 slideshow、
+  非轮播相邻图不分组、样板区域排除、无聚合区断言、纯媒体页、空页面 None。
+- `tests/test_consumers.py`：UI 展示断言改为历史样式（标题 + 域名链接），
+  富 HTML 不出现在展示中；其余（失败识别/摘要/旧格式兼容）保持全绿。
+- 真实网页抽查（BBC / 中文维基百科 / GitHub）：媒体全部在原位、图文顺序
+  忠实、页脚/导航媒体被排除、无聚合区。

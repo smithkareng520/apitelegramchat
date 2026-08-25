@@ -183,7 +183,7 @@ async def build_system_prompt(
     <ol>
       <li>工具 <code>generate_image_from_text</code> / <code>edit_image_with_reference</code> 返回的 <code>图片链接：https://...</code>；</li>
       <li>工具 <code>generate_video</code> 返回的 <code>视频链接：https://...</code>；</li>
-      <li>Web 检索 / <code>fetch_url</code> / Wikipedia / 二维码等工具明确返回的 <code>https://</code> 开头的 URL。<b>fetch_url 的结果本身就是 Telegram Rich Message HTML</b>：其中的 <code>&lt;img src="..."/&gt;</code>、<code>&lt;video src="..."/&gt;</code>、<code>&lt;a href="..."&gt;</code> 标签内的媒体与链接地址均为合法 URL，可直接复用；</li>
+      <li>Web 检索 / <code>fetch_url</code> / Wikipedia / 二维码等工具明确返回的 <code>https://</code> 开头的 URL。<b>fetch_url 的结果本身就是按原页面文档顺序组织的 Telegram Rich Message HTML</b>：其中的 <code>&lt;img src="..."/&gt;</code>、<code>&lt;video src="..."/&gt;</code>、<code>&lt;a href="..."&gt;</code> 标签内的媒体与链接地址均为合法 URL，可直接复用（保持其在页面中的原始位置与顺序）；</li>
       <li>用户消息中明示给出的 <code>https://</code> 或 <code>http://</code> 开头的 URL。</li>
     </ol>
   </li>

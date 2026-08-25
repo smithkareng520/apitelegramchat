@@ -1,13 +1,22 @@
-# fetch_rich_content.py — fetch_url 结果的 Telegram Rich Message HTML 提取引擎
+# fetch_rich_content.py — fetch_url 的面向模型 Telegram Rich HTML 提取引擎
 #
-# 职责：
-#   1. 将 trafilatura 的 XML 输出（含 <ref>/<graphic>/<list>/<table>/<hi> 等结构）
-#      转换为项目系统提示词中定义的 Telegram HTML 子集；
-#   2. 从原始 HTML 中提取 trafilatura 会丢失的媒体资源：内嵌 <video>/<audio>、
-#      <iframe>/<embed> 播放器（YouTube/Bilibili/Vimeo 等，规范化为可读链接）、
-#      懒加载图片（data-src/srcset）、Open Graph 视频与图片、JSON-LD VideoObject；
-#   3. 组装最终 fetch_url 工具结果：标题 + 来源链接 + 正文富 HTML + 媒体区块，
-#      并在固定字符预算内做"整块截断"（绝不截断在标签中间）。
+# 目标（两类受众严格分离）：
+#   - 【模型上下文】execute_fetch_url 的返回值：忠实于原网页文档顺序的
+#     Telegram HTML——标题/段落/列表/表格/链接/图片/视频/播放器都出现在它们
+#     在原页面上的原始位置；轮播图（swiper/carousel/gallery 等容器）识别为
+#     <tg-slideshow>。绝不把媒体集中堆到末尾"媒体区"。
+#   - 【Telegram 工具 UI】由 tool_executors.format_tool_result 单独生成，
+#     保持与历史版本相同的简单展示（标题 + 来源域名链接），本模块不管 UI。
+#
+# 实现链路：
+#   1. trafilatura XML（保留链接/图片/格式/表格及其相对顺序）→ Telegram HTML 块；
+#   2. 原始 HTML DOM 单次文档序遍历，收集带"文档位置"（order_idx/path）的媒体：
+#      内嵌 <video>/<audio>、<iframe>/<embed> 播放器（规范化为观看链接）、
+#      懒加载图片（data-src/srcset）；
+#   3. 把每个正文块锚定到 DOM 元素（文本前向贪心匹配 / 图片 URL 匹配），
+#      将 trafilatura 丢弃的媒体按原始位置插回正文流；
+#   4. 轮播图检测：同容器内 >=2 张图片 → <tg-slideshow>（保持原位置）；
+#   5. 固定字符预算内"整块截断"（绝不截断在标签中间）。
 #
 # 设计约束（对齐系统提示词与 rich_message_builder 的解析规则）：
 #   - 媒体（<img>/<video>/<audio>/<figure>）必须作为独立块级元素，严禁出现在
@@ -20,10 +29,9 @@
 from __future__ import annotations
 
 import html as _html
-import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import parse_qs, urljoin, urlparse, urlsplit, urlunsplit
 
@@ -39,7 +47,7 @@ logger = logging.getLogger(__name__)
 # fetch 结果的 HTML 总预算。必须小于 tool_executors.MAX_TOOL_RESPONSE_LEN(16000)，
 # 这样 _truncate_tool_result 的朴素切片永远不会作用在 fetch_url 的 HTML 上。
 FETCH_RICH_MAX_LEN = 14000
-# 正文（不含媒体区）占用的预算，给标题/链接/媒体区留余量。
+# 正文（含原位插入的媒体）占用的预算，给标题/来源链接留余量。
 FETCH_BODY_MAX_LEN = 11000
 
 # 媒体数量上限：防止图库/相册类页面把工具结果塞满 <img>。
@@ -199,29 +207,45 @@ def _is_probably_decorative(url: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 1) 媒体提取（原始 HTML / OG / JSON-LD）
+# 1) DOM 媒体收集（带文档顺序位置，供"原位插入"使用）
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class MediaAsset:
+class DomMedia:
+    """DOM 中的单个媒体资源，携带文档位置信息。
+
+    order_idx: 在 tree.iter() 文档序遍历中的序号（决定插入位置）。
+    path:      lxml getpath() 的规范 XPath（用于内容容器边界与轮播分组）。
+    kind:      video / audio / embed / image。
+    carousel:  所属轮播容器的 path（无则 None）。
+    skip:      轮播归并处理后置 True（不再单独插入正文流）。
+    """
+
+    order_idx: int
+    path: str
+    kind: str
     url: str
     label: str = ""
-    source: str = ""   # video / embed / audio / image
-    provider: str = ""  # embed 专用：提供方标签
+    provider: str = ""
+    carousel: Optional[str] = None
+    skip: bool = False
+    boilerplate: bool = False  # 位于 nav/footer/aside 等样板区域内
 
 
-@dataclass
-class PageMedia:
-    videos: list[MediaAsset] = field(default_factory=list)   # 可直接播放的视频文件
-    embeds: list[MediaAsset] = field(default_factory=list)   # iframe/嵌入播放器 → 观看链接
-    audios: list[MediaAsset] = field(default_factory=list)   # 可直接播放的音频文件
-    images: list[MediaAsset] = field(default_factory=list)   # 页面图片（含懒加载/OG）
-    og_title: str = ""
-    og_description: str = ""
-
-    def has_any(self) -> bool:
-        return bool(self.videos or self.embeds or self.audios or self.images)
+def _parse_dom(html_text: str):
+    """解析原始 HTML 为 lxml 树（容错：utf-8 recover → 裸 fromstring → None）。"""
+    if _lxml_html is None or not html_text:
+        return None
+    try:
+        parser = _lxml_html.HTMLParser(recover=True, encoding="utf-8", huge_tree=True)
+        return _lxml_html.fromstring(html_text, parser=parser)
+    except Exception:
+        try:
+            return _lxml_html.fromstring(html_text)
+        except Exception as e:
+            logger.debug(f"[fetch_rich] DOM 解析失败: {e}")
+            return None
 
 
 def _meta_content(tree, names: set[str]) -> str:
@@ -267,44 +291,50 @@ def _canonicalize_embed(raw_url: str, base_url: str) -> Optional[tuple[str, str]
     return url, "嵌入内容"
 
 
-def _walk_jsonld(node, media: PageMedia, base_url: str, depth: int = 0):
-    """递归遍历 JSON-LD（含 @graph / 数组），收集 VideoObject/AudioObject/ImageObject。"""
-    if depth > 6 or node is None:
-        return
-    if isinstance(node, list):
-        for item in node:
-            _walk_jsonld(item, media, base_url, depth + 1)
-        return
-    if not isinstance(node, dict):
-        return
-    node_type = node.get("@type")
-    types = node_type if isinstance(node_type, list) else [node_type]
-    types = {str(t).lower() for t in types if t}
-    name = str(node.get("name") or node.get("headline") or "").strip()
-    if "videoobject" in types:
-        for key in ("contentUrl", "embedUrl"):
-            raw = node.get(key)
-            if isinstance(raw, str) and raw:
-                url = _sanitize_url(raw, base_url)
-                if url:
-                    media.videos.append(MediaAsset(url=url, label=name, source="video"))
+# 轮播/画廊容器特征（class/id/role/data-component 文本）。
+_CAROUSEL_HINT_RE = re.compile(
+    r"(swiper|carousel|slider|slideshow|gallery|slick|splide|glide|flickity|owl|slides)",
+    re.IGNORECASE,
+)
+
+
+def _is_hidden_element(el) -> bool:
+    """过滤隐藏 / 零尺寸的跟踪型媒体元素。"""
+    style = (el.get("style") or "").replace(" ", "").lower()
+    if "display:none" in style or "visibility:hidden" in style:
+        return True
+    if (el.get("aria-hidden") or "").strip().lower() == "true":
+        return True
+    if "hidden" in (el.get("class") or "").lower():
+        return True
+    if el.get("width") == "0" or el.get("height") == "0":
+        return True
+    return False
+
+
+def _find_carousel_ancestor(el) -> Optional[str]:
+    """返回轮播容器的 XPath。
+
+    取 body 以下【最外层】的轮播特征祖先：swiper 结构中每个 .swiper-slide
+    项自身也匹配特征，但各项 path 不同无法分组；只有共享的外层容器
+    （.swiper / .gallery 等）才能把同轮播的图片归到同一组。
+    """
+    outermost: Optional[str] = None
+    try:
+        for anc in el.iterancestors():
+            if _local_name(anc) in ("body", "html"):
+                break
+            hint = " ".join(filter(None, (
+                anc.get("class"), anc.get("id"), anc.get("role"), anc.get("data-component"),
+            )))
+            if hint and _CAROUSEL_HINT_RE.search(hint):
+                try:
+                    outermost = anc.getroottree().getpath(anc)
+                except Exception:
                     break
-    if "audioobject" in types:
-        raw = node.get("contentUrl")
-        if isinstance(raw, str) and raw:
-            url = _sanitize_url(raw, base_url)
-            if url:
-                media.audios.append(MediaAsset(url=url, label=name, source="audio"))
-    if "imageobject" in types:
-        raw = node.get("contentUrl") or node.get("url")
-        if isinstance(raw, str) and raw:
-            url = _sanitize_url(raw, base_url)
-            if url and not _is_probably_decorative(url):
-                media.images.append(MediaAsset(url=url, label=name, source="image"))
-    for key in ("@graph", "hasPart", "mainEntity", "subjectOf", "associatedMedia"):
-        child = node.get(key)
-        if child:
-            _walk_jsonld(child, media, base_url, depth + 1)
+    except Exception:
+        return outermost
+    return outermost
 
 
 _IMG_LAZY_ATTRS = (
@@ -312,148 +342,113 @@ _IMG_LAZY_ATTRS = (
     "data-echo", "data-url", "data-image", "data-original-src",
 )
 
+_MEDIA_KIND_CAPS = {"video": MAX_VIDEOS, "audio": MAX_AUDIOS, "embed": MAX_EMBEDS, "image": MAX_IMAGES}
 
-def extract_embedded_media(html_text: str, base_url: str) -> PageMedia:
-    """从原始 HTML 提取内嵌视频 / 播放器 / 音频 / 图片（含 OG 与 JSON-LD）。"""
-    media = PageMedia()
-    if _lxml_html is None or not html_text:
-        return media
-    try:
-        parser = _lxml_html.HTMLParser(recover=True, encoding="utf-8", huge_tree=True)
-        tree = _lxml_html.fromstring(html_text, parser=parser)
-    except Exception:
-        try:
-            tree = _lxml_html.fromstring(html_text)
-        except Exception as e:
-            logger.debug(f"[fetch_rich] 媒体提取解析失败: {e}")
-            return media
 
-    media.og_title = _meta_content(tree, {"og:title", "twitter:title"})
-    media.og_description = _meta_content(
-        tree, {"og:description", "twitter:description", "description"}
-    )
+def _collect_dom_media(tree, base_url: str) -> list[DomMedia]:
+    """单次文档序遍历收集全部媒体，携带 order_idx/path/carousel 位置信息。
 
+    覆盖：内嵌 <video>/<source>、<audio>/<source>、<iframe>/<embed> 播放器
+    （规范化为观看链接）、<img>（懒加载 data-* 属性与 srcset）。
+    不收集 OG/JSON-LD 元数据媒体——它们不在页面文档流中，无法"原位"呈现；
+    标题等元数据仍通过 extract_title_from_html 单独使用。
+    """
+    media: list[DomMedia] = []
     seen: set[str] = set()
+    counts = {"video": 0, "audio": 0, "embed": 0, "image": 0}
+    try:
+        root_tree = tree.getroottree()
+    except Exception:
+        root_tree = None
 
-    def _seen(url: str) -> bool:
-        if url in seen:
-            return True
-        seen.add(url)
-        return False
+    for order_idx, el in enumerate(tree.iter()):
+        tag = _local_name(el)
+        kind: Optional[str] = None
+        url: Optional[str] = None
+        label = ""
+        provider = ""
 
-    # ---- <video> / <source> ----
-    for video_el in tree.iter("video"):
-        candidates: list[str] = []
-        if video_el.get("src"):
-            candidates.append(video_el.get("src"))
-        for source_el in video_el.iter("source"):
-            if source_el.get("src"):
-                candidates.append(source_el.get("src"))
-        poster = _sanitize_url(video_el.get("poster"), base_url)
-        if poster and not _is_probably_decorative(poster) and not _seen(poster):
-            media.images.append(MediaAsset(url=poster, label="视频封面", source="image"))
-        for raw in candidates:
-            url = _sanitize_url(raw, base_url)
-            if not url or _seen(url):
-                continue
-            media.videos.append(MediaAsset(url=url, label="", source="video"))
-            if len(media.videos) >= MAX_VIDEOS:
-                break
-
-    # ---- <audio> / <source> ----
-    for audio_el in tree.iter("audio"):
-        candidates = []
-        if audio_el.get("src"):
-            candidates.append(audio_el.get("src"))
-        for source_el in audio_el.iter("source"):
-            if source_el.get("src"):
-                candidates.append(source_el.get("src"))
-        for raw in candidates:
-            url = _sanitize_url(raw, base_url)
-            if url and not _seen(url):
-                media.audios.append(MediaAsset(url=url, label="", source="audio"))
-                if len(media.audios) >= MAX_AUDIOS:
-                    break
-
-    # ---- <iframe> / <embed> 播放器 ----
-    for tag in ("iframe", "embed"):
-        for el in tree.iter(tag):
-            raw = el.get("src") or el.get("data-src")
+        if tag in ("video", "audio"):
+            kind = tag
+            raw = el.get("src")
             if not raw:
-                continue
-            resolved = _canonicalize_embed(raw, base_url)
-            if not resolved:
-                continue
-            url, provider = resolved
-            if _seen(url):
-                continue
-            title = (el.get("title") or el.get("aria-label") or "").strip()
-            media.embeds.append(
-                MediaAsset(url=url, label=title[:MAX_LINK_TEXT_LEN], source="embed", provider=provider)
-            )
-            if len(media.embeds) >= MAX_EMBEDS:
-                break
+                raw = next((s.get("src") for s in el.iter("source") if s.get("src")), None)
+            url = _sanitize_url(raw, base_url)
+        elif tag in ("iframe", "embed"):
+            raw = el.get("src") or el.get("data-src")
+            if raw:
+                resolved = _canonicalize_embed(raw, base_url)
+                if resolved:
+                    url, provider = resolved
+                    label = (el.get("title") or el.get("aria-label") or "").strip()[:MAX_LINK_TEXT_LEN]
+                    kind = "embed"
+        elif tag == "img":
+            raw = None
+            for attr in _IMG_LAZY_ATTRS:
+                val = el.get(attr)
+                if val and not val.strip().startswith("data:"):
+                    raw = val
+                    break
+            if raw is None:
+                best = _pick_srcset_best(el.get("srcset") or el.get("data-srcset"))
+                if best:
+                    raw = best
+            url = _sanitize_url(raw, base_url)
+            if url and not _is_probably_decorative(url):
+                kind = "image"
+                label = (el.get("alt") or "").strip()[:MAX_CAPTION_LEN]
+                # 父级 <figure> 的 <figcaption> 作为图注。
+                try:
+                    parent = el.getparent()
+                    if parent is not None and _local_name(parent) == "figure":
+                        for sib in parent:
+                            if _local_name(sib) == "figcaption":
+                                cap = "".join(sib.itertext()).strip()[:MAX_CAPTION_LEN]
+                                if cap:
+                                    label = label or cap
+                                break
+                except Exception:
+                    pass
 
-    # ---- Open Graph 视频 / 音频 ----
-    og_video = _sanitize_url(
-        _meta_content(tree, {"og:video", "og:video:secure_url", "og:video:url", "twitter:player:stream"}),
-        base_url,
-    )
-    if og_video and not _seen(og_video):
-        media.videos.append(MediaAsset(url=og_video, label="", source="video"))
-
-    og_audio = _sanitize_url(_meta_content(tree, {"og:audio", "og:audio:secure_url"}), base_url)
-    if og_audio and not _seen(og_audio):
-        media.audios.append(MediaAsset(url=og_audio, label="", source="audio"))
-
-    # ---- JSON-LD ----
-    for script in tree.iter("script"):
-        if (script.get("type") or "").strip().lower() != "application/ld+json":
+        if not kind or not url or url in seen:
             continue
-        payload = (script.text or "").strip()
-        if not payload:
+        if _is_hidden_element(el):
             continue
+        if counts[kind] >= _MEDIA_KIND_CAPS[kind]:
+            continue
+        seen.add(url)
+        counts[kind] += 1
         try:
-            _walk_jsonld(json.loads(payload), media, base_url)
+            path = root_tree.getpath(el) if root_tree is not None else ""
         except Exception:
-            continue
-
-    # ---- <img>（含懒加载属性与 srcset）----
-    for img_el in tree.iter("img"):
-        raw = None
-        for attr in _IMG_LAZY_ATTRS:
-            val = img_el.get(attr)
-            if val and not val.strip().startswith("data:"):
-                raw = val
-                break
-        if raw is None:
-            best = _pick_srcset_best(img_el.get("srcset") or img_el.get("data-srcset"))
-            if best:
-                raw = best
-        if raw is None:
-            continue
-        url = _sanitize_url(raw, base_url)
-        if not url or _is_probably_decorative(url) or _seen(url):
-            continue
-        alt = (img_el.get("alt") or "").strip()
-        media.images.append(MediaAsset(url=url, label=alt[:MAX_CAPTION_LEN], source="image"))
-        if len(media.images) >= MAX_IMAGES:
-            break
-
-    # ---- Open Graph 图片（放最后，作为兜底）----
-    og_image = _sanitize_url(
-        _meta_content(tree, {"og:image", "og:image:secure_url", "twitter:image", "twitter:image:src"}),
-        base_url,
-    )
-    if og_image and not _is_probably_decorative(og_image) and not _seen(og_image):
-        media.images.append(MediaAsset(url=og_image, label="页面主图", source="image"))
-
-    # ---- 数量上限裁剪 ----
-    media.videos = media.videos[:MAX_VIDEOS]
-    media.embeds = media.embeds[:MAX_EMBEDS]
-    media.audios = media.audios[:MAX_AUDIOS]
-    media.images = media.images[:MAX_IMAGES]
+            path = ""
+        media.append(DomMedia(
+            order_idx=order_idx, path=path, kind=kind, url=url,
+            label=label, provider=provider, carousel=_find_carousel_ancestor(el),
+            boilerplate=_in_boilerplate(el),
+        ))
     return media
+
+
+# 样板区域标签：这些容器内的媒体（导航图、页脚 widget 等）不属于正文内容。
+_BOILERPLATE_TAGS = frozenset({"nav", "footer", "aside"})
+
+
+def _in_boilerplate(el) -> bool:
+    """媒体元素是否位于 nav/footer/aside 样板容器内。
+
+    注意 header 不算样板：文章内的 <header> 常包含标题与题图，
+    属于正文内容；页面级 header 的 logo 等由装饰图过滤兜底。
+    """
+    try:
+        for anc in el.iterancestors():
+            if _local_name(anc) in _BOILERPLATE_TAGS:
+                return True
+    except Exception:
+        return False
+    return False
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -879,34 +874,20 @@ def extract_body_blocks(html_text: str, base_url: str = "") -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# 3) 结果组装（标题 + 来源 + 正文 + 媒体区，预算内整块截断）
+# 3) 结果组装（文档顺序原位插入媒体 + 轮播分组 + 预算内整块截断）
 # ---------------------------------------------------------------------------
 
-
-def _dedupe_keep_order(items: list[MediaAsset]) -> list[MediaAsset]:
-    seen: set[str] = set()
-    result: list[MediaAsset] = []
-    for item in items:
-        if item.url in seen:
-            continue
-        seen.add(item.url)
-        result.append(item)
-    return result
-
-
-_SRC_ATTR_RE = re.compile(r'\b(?:src|href)\s*=\s*"([^"]+)"', re.IGNORECASE)
-
-
-def _urls_embedded_in_blocks(blocks: list[str]) -> set[str]:
-    """收集正文块里已经出现过的 src/href URL（用于媒体区去重）。"""
-    urls: set[str] = set()
-    for block in blocks:
-        for raw in _SRC_ATTR_RE.findall(block):
-            urls.add(_html.unescape(raw))
-    return urls
-
-
 _TAG_TEXT_RE = re.compile(r"<[^>]+>")
+
+# 正文块内媒体 src 提取（仅 src，不含 href——文本链接不算媒体已存在）。
+_BLOCK_MEDIA_SRC_RE = re.compile(
+    r'<(?:img|video|audio)\b[^>]*?\bsrc\s*=\s*"([^"]+)"', re.IGNORECASE
+)
+
+
+def _block_media_srcs(block: str) -> list[str]:
+    """提取块内 <img>/<video>/<audio> 的 src 属性（已反转义）。"""
+    return [_html.unescape(u) for u in _BLOCK_MEDIA_SRC_RE.findall(block or "")]
 
 
 def _normalize_heading_text(text: str) -> str:
@@ -926,28 +907,237 @@ def _truncate_blocks(blocks: list[str], max_len: int) -> tuple[list[str], bool]:
     return kept, len(kept) < len(blocks)
 
 
-def build_fetch_rich_result(
-    url: str,
-    title: str,
-    body_blocks: list[str],
-    media: PageMedia,
-    fallback_text: str = "",
-) -> str:
-    """组装 fetch_url 的最终 Telegram HTML 工具结果。
+def _norm_text(text: str) -> str:
+    """归一化文本用于锚点匹配：去全部空白（含全角空格）。"""
+    return re.sub(r"[\s\u3000]+", "", text or "")
 
-    结构（全部为系统提示词允许的 Telegram HTML 子集）：
-      <h3>标题</h3>
-      <p>🔗 <a href=...>domain</a></p>
-      正文块……（预算内整块截断）
-      <h4>🎬 视频</h4> + <figure><video …/>
-      <h4>📺 内嵌播放器</h4> + <ul>观看链接
-      <h4>🎵 音频</h4> + <figure><audio …/>
-      <h4>🖼️ 图片</h4> + <tg-slideshow>/<img/>
+
+# 可作为锚点候选的 DOM 块级标签（不含 div/body 等容器，避免锚点过度前移）。
+_ANCHOR_CANDIDATE_TAGS = frozenset({
+    "p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "pre",
+    "td", "th", "figcaption",
+})
+
+
+def _anchor_text_match(block_text: str, cand_text: str) -> bool:
+    """块文本与 DOM 候选文本的匹配判定。
+
+    - 完全相等：直接匹配（覆盖短标题，如 4 字中文 h1）。
+    - 候选文本是块文本的前缀 / 被包含：覆盖 trafilatura 合并段落场景。
+    - 块文本是候选文本的前缀：覆盖 trafilatura 截断段落场景。
     """
-    media.videos = _dedupe_keep_order(media.videos)
-    media.embeds = _dedupe_keep_order(media.embeds)
-    media.audios = _dedupe_keep_order(media.audios)
-    media.images = _dedupe_keep_order(media.images)
+    if not block_text or not cand_text:
+        return False
+    if block_text == cand_text:
+        return True
+    if len(cand_text) >= 8 and (block_text.startswith(cand_text) or cand_text in block_text):
+        return True
+    if len(block_text) >= 8 and cand_text.startswith(block_text):
+        return True
+    return False
+
+
+def _anchor_entries(entries: list[dict], tree, media: list[DomMedia]) -> list[dict]:
+    """为每个正文块确定 DOM 锚点（order/path）。
+
+    策略：
+      1. 文本匹配：DOM 文档序候选元素（p/h*/li/…）文本 vs 块可见文本，
+         前向贪心（指针只前进，块本身按文档顺序产出）。
+      2. 媒体 URL 匹配：纯图片/视频块（无文本）用其 src 在 DOM 媒体表中
+         的位置作为锚点——图片块因此获得精确的原位锚定。
+      3. 都失败：锚点为 None（交错时沿用上一个块的锚点）。
+    """
+    url_pos: dict[str, tuple[int, str]] = {}
+    for m in media:
+        url_pos.setdefault(m.url, (m.order_idx, m.path))
+
+    cands: list[tuple[int, str, str]] = []
+    try:
+        root_tree = tree.getroottree()
+    except Exception:
+        root_tree = None
+    if root_tree is not None:
+        for order_idx, el in enumerate(tree.iter()):
+            if _local_name(el) in _ANCHOR_CANDIDATE_TAGS:
+                txt = _norm_text(_html.unescape("".join(el.itertext())))
+                if len(txt) >= 4:
+                    try:
+                        cands.append((order_idx, root_tree.getpath(el), txt))
+                    except Exception:
+                        continue
+
+    ptr = 0
+    for entry in entries:
+        block_text = _norm_text(_html.unescape(_TAG_TEXT_RE.sub("", entry["html"])))
+        anchor: Optional[tuple[int, str]] = None
+        if block_text:
+            for j in range(ptr, len(cands)):
+                cand_order, cand_path, cand_text = cands[j]
+                if _anchor_text_match(block_text, cand_text):
+                    anchor = (cand_order, cand_path)
+                    ptr = j + 1
+                    break
+        if anchor is None:
+            for src in _block_media_srcs(entry["html"]):
+                if src in url_pos:
+                    anchor = url_pos[src]
+                    break
+        if anchor is not None:
+            entry["order"], entry["path"] = anchor
+    return entries
+
+
+def _is_standalone_img_block(block: str) -> bool:
+    """块是否为单个图片块（<img/> 或 <figure><img/>…</figure>）。"""
+    if not block:
+        return False
+    if len(re.findall(r"<img\b", block, re.IGNORECASE)) != 1:
+        return False
+    return bool(re.match(r"^<(img|figure)\b", block.strip(), re.IGNORECASE))
+
+
+def _group_carousel_runs(entries: list[dict], url_to_carousel: dict[str, str]) -> list[dict]:
+    """把"连续的、同轮播容器"的图片块合并成一个 <tg-slideshow> 条目。"""
+    out: list[dict] = []
+    run: list[dict] = []
+
+    def _flush():
+        nonlocal run
+        if len(run) >= 2:
+            imgs = []
+            for e in run:
+                srcs = _block_media_srcs(e["html"])
+                if srcs:
+                    imgs.append(f'<img src="{esc_attr(srcs[0])}"/>')
+            if len(imgs) >= 2:
+                out.append({
+                    "html": "<tg-slideshow>" + "".join(imgs) + "</tg-slideshow>",
+                    "order": run[0]["order"],
+                    "path": run[0]["path"],
+                })
+                run = []
+                return
+        out.extend(run)
+        run = []
+
+    for entry in entries:
+        srcs = _block_media_srcs(entry["html"])
+        carousel_key = url_to_carousel.get(srcs[0]) if srcs else None
+        if carousel_key and _is_standalone_img_block(entry["html"]):
+            if run and run[-1].get("carousel") == carousel_key:
+                run.append({**entry, "carousel": carousel_key})
+                continue
+            _flush()
+            run = [{**entry, "carousel": carousel_key}]
+            continue
+        _flush()
+        out.append(entry)
+    _flush()
+    return out
+
+
+def _render_dom_media_block(m: DomMedia) -> str:
+    """把 DOM 收集的媒体渲染为块级 Telegram HTML（在原位插入）。"""
+    if m.kind == "video":
+        cap = esc((m.label or "").strip()[:MAX_CAPTION_LEN])
+        if cap:
+            return f'<figure><video src="{esc_attr(m.url)}"/><figcaption>{cap}</figcaption></figure>'
+        return f'<video src="{esc_attr(m.url)}"/>'
+    if m.kind == "audio":
+        cap = esc((m.label or "").strip()[:MAX_CAPTION_LEN])
+        if cap:
+            return f'<figure><audio src="{esc_attr(m.url)}"/><figcaption>{cap}</figcaption></figure>'
+        return f'<audio src="{esc_attr(m.url)}"/>'
+    if m.kind == "embed":
+        provider = m.provider or "嵌入内容"
+        label = (m.label or "").strip()
+        link_text = f"{provider} · {label}" if label else provider
+        link_text = link_text[:MAX_LINK_TEXT_LEN]
+        return f'<p>▶ <a href="{esc_attr(m.url)}">{esc(link_text)}</a></p>'
+    # image
+    cap = esc((m.label or "").strip()[:MAX_CAPTION_LEN])
+    if cap:
+        return f'<figure><img src="{esc_attr(m.url)}"/><figcaption>{cap}</figcaption></figure>'
+    return f'<img src="{esc_attr(m.url)}"/>'
+
+
+def _sort_entries_by_anchor(entries: list[dict]) -> list[dict]:
+    """按锚点 order 稳定排序正文块，使块本身回到 DOM 文档顺序。
+
+    trafilatura 有时会把 <graphic> 等元素挪到 XML 末尾（例如段落之后的
+    收尾位置），导致块顺序偏离原始页面。锚点排序后正文块与其 DOM 位置
+    一致。无锚点块沿用前一个块的 order（稳定排序保持其相对位置）。
+    """
+    keyed: list[tuple[int, int, dict]] = []
+    last: Optional[int] = None
+    for idx, entry in enumerate(entries):
+        order = entry.get("order")
+        if order is None:
+            order = last if last is not None else -1
+        else:
+            last = order
+        keyed.append((order, idx, entry))
+    keyed.sort(key=lambda t: (t[0], t[1]))
+    return [t[2] for t in keyed]
+
+
+def _interleave(entries: list[dict], dropped: list[tuple[int, str]]) -> list[str]:
+    """按锚点顺序把 dropped 媒体块插入正文块流。"""
+    result: list[str] = []
+    pending = sorted(dropped, key=lambda t: t[0])
+    pi = 0
+    last_order: Optional[int] = None
+    for entry in entries:
+        order = entry.get("order")
+        cur = order if order is not None else last_order
+        if order is not None:
+            last_order = order
+        if cur is not None:
+            while pi < len(pending) and pending[pi][0] < cur:
+                result.append(pending[pi][1])
+                pi += 1
+        result.append(entry["html"])
+    while pi < len(pending):
+        result.append(pending[pi][1])
+        pi += 1
+    return result
+
+
+def _fallback_paragraph_blocks(fallback_text: str) -> list[str]:
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", fallback_text or "") if p.strip()]
+    if not paragraphs and fallback_text:
+        paragraphs = [fallback_text.strip()]
+    return [f"<p>{esc(p[:2000])}</p>" for p in paragraphs[:40]]
+
+
+def build_model_facing_html(
+    url: str,
+    html_text: str,
+    body_blocks: Optional[list[str]] = None,
+    title: str = "",
+    fallback_text: str = "",
+) -> Optional[str]:
+    """组装 fetch_url 返回给模型的 Telegram HTML（忠实于原页面文档顺序）。
+
+    结构：
+      <h3>标题</h3>
+      <p>🔗 来源链接</p>
+      正文块……（图片/视频/播放器/音频在它们的原始位置；轮播图为 slideshow）
+    不存在任何"集中的媒体区"。
+
+    参数：
+      body_blocks: 已转换的正文块（None 时内部用 trafilatura 提取）。
+      title: 页面标题（og:title 优先，调用方提取）。
+      fallback_text: trafilatura 提取失败时的纯文本兜底。
+    """
+    if _lxml_html is None or not html_text:
+        return None
+
+    if body_blocks is None:
+        body_blocks = extract_body_blocks(html_text, url)
+    blocks = [b for b in body_blocks if b and b.strip()]
+    if not blocks and fallback_text:
+        blocks = _fallback_paragraph_blocks(fallback_text)
 
     domain = urlparse(url).netloc or url
     header_parts: list[str] = []
@@ -956,85 +1146,119 @@ def build_fetch_rich_result(
         header_parts.append(f"<h3>{clean_title}</h3>")
     header_parts.append(f'<p>🔗 <a href="{esc_attr(url)}">{esc(domain)}</a></p>')
 
-    # ---- 正文区准备 ----
-    body_blocks = [b for b in body_blocks if b and b.strip()]
-    if not body_blocks and fallback_text:
-        # trafilatura 失败时的兜底：纯文本分段。
-        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", fallback_text) if p.strip()]
-        if not paragraphs:
-            paragraphs = [fallback_text.strip()]
-        body_blocks = [f"<p>{esc(p[:2000])}</p>" for p in paragraphs[:40]]
-
-    # 正文里已经内联出现的媒体不再重复进媒体区（图片/视频/音频均如此）。
-    embedded_urls = _urls_embedded_in_blocks(body_blocks)
-    if embedded_urls:
-        media.images = [m for m in media.images if m.url not in embedded_urls]
-        media.videos = [m for m in media.videos if m.url not in embedded_urls]
-        media.audios = [m for m in media.audios if m.url not in embedded_urls]
-
     # 首个正文标题与页面标题重复时去掉，避免连续两个相同标题。
-    if body_blocks and clean_title:
-        first = body_blocks[0]
-        m = re.match(r"^<h([1-6])>(.*?)</h\1>$", first.strip(), re.DOTALL)
+    if blocks and clean_title:
+        m = re.match(r"^<h([1-6])>(.*?)</h\1>$", blocks[0].strip(), re.DOTALL)
         if m and _normalize_heading_text(m.group(2)) == _normalize_heading_text(title):
-            body_blocks = body_blocks[1:]
+            blocks = blocks[1:]
 
-    # ---- 媒体区（优先保证完整进入结果）----
-    media_parts: list[str] = []
-    if media.videos:
-        media_parts.append("<h4>🎬 视频</h4>")
-        for v in media.videos:
-            cap = esc((v.label or "").strip()[:MAX_CAPTION_LEN])
-            if cap:
-                media_parts.append(
-                    f'<figure><video src="{esc_attr(v.url)}"/><figcaption>{cap}</figcaption></figure>'
-                )
-            else:
-                media_parts.append(f'<video src="{esc_attr(v.url)}"/>')
-    if media.embeds:
-        media_parts.append("<h4>📺 内嵌播放器</h4><ul>")
-        for embed in media.embeds:
-            provider = embed.provider or "嵌入内容"
-            label = (embed.label or "").strip()
-            link_text = f"{provider} · {label}" if label else provider
-            link_text = link_text[:MAX_LINK_TEXT_LEN]
-            media_parts.append(f'<li>▶ <a href="{esc_attr(embed.url)}">{esc(link_text)}</a></li>')
-        media_parts.append("</ul>")
-    if media.audios:
-        media_parts.append("<h4>🎵 音频</h4>")
-        for a in media.audios:
-            cap = esc((a.label or "").strip()[:MAX_CAPTION_LEN])
-            if cap:
-                media_parts.append(
-                    f'<figure><audio src="{esc_attr(a.url)}"/><figcaption>{cap}</figcaption></figure>'
-                )
-            else:
-                media_parts.append(f'<audio src="{esc_attr(a.url)}"/>')
-    if media.images:
-        # <tg-slideshow> 内只放裸 <img>（不带 figure/figcaption）。
-        bare_imgs = [f'<img src="{esc_attr(img.url)}"/>' for img in media.images]
-        if len(bare_imgs) >= 2:
-            media_parts.append("<h4>🖼️ 图片</h4><tg-slideshow>" + "".join(bare_imgs) + "</tg-slideshow>")
-        elif bare_imgs:
-            media_parts.append("<h4>🖼️ 图片</h4>" + bare_imgs[0])
+    entries: list[dict] = [{"html": b, "order": None, "path": None} for b in blocks]
+    dropped: list[tuple[int, str]] = []
 
-    media_len = sum(len(p) + 1 for p in media_parts)
-    header_len = sum(len(p) + 1 for p in header_parts)
-    body_budget = max(1000, FETCH_BODY_MAX_LEN - media_len - header_len)
-    kept_blocks, was_truncated = _truncate_blocks(body_blocks, body_budget)
+    tree = _parse_dom(html_text)
+    if tree is not None:
+        try:
+            media = _collect_dom_media(tree, url)
+            # 1) 锚定正文块位置，并按锚点恢复 DOM 文档顺序。
+            entries = _anchor_entries(entries, tree, media)
+            entries = _sort_entries_by_anchor(entries)
+            # 2) 轮播处理。
+            entries, dropped = _apply_carousels(entries, media)
+        except Exception as e:
+            logger.debug(f"[fetch_rich] 媒体原位插入失败（退化为纯正文块）: {e}")
+            entries = [{"html": b, "order": None, "path": None} for b in blocks]
+            dropped = []
 
-    parts = header_parts + kept_blocks + media_parts
+    final_blocks = _interleave(entries, dropped)
+    if not final_blocks:
+        return None
+
+    kept_blocks, was_truncated = _truncate_blocks(final_blocks, FETCH_BODY_MAX_LEN)
+    parts = header_parts + kept_blocks
     if was_truncated:
         parts.append("<p>…（正文过长，已截断）</p>")
 
     result = "\n".join(parts)
     if len(result) > FETCH_RICH_MAX_LEN:
-        # 兜底：极端情况下（媒体区超预算）再按块裁剪一次。
         parts2, trunc2 = _truncate_blocks(parts, FETCH_RICH_MAX_LEN - 60)
         if trunc2:
             parts2.append("<p>…（内容过长，已截断）</p>")
         result = "\n".join(parts2)
     return result
+
+
+def _apply_carousels(entries: list[dict], media: list[DomMedia]) -> tuple[list[dict], list[tuple[int, str]]]:
+    """轮播归并 + 收集需要原位插入的 dropped 媒体。
+
+    返回 (新 entries, dropped 媒体块列表[(order_idx, html)])。
+
+    规则：
+      - 同一轮播容器内 >=2 张图：
+        * >=2 张已出现在正文块 → 连续图片块由 _group_carousel_runs 合并为
+          slideshow（保持原位置）；未出现的图片跳过（同轮播不重复）。
+        * <2 张出现在正文块（如全部懒加载被 trafilatura 丢弃）→ 在轮播首图
+          位置插入完整 <tg-slideshow>，并从正文块中移除已计入的单图块。
+      - dropped 媒体（trafilatura 丢弃的视频/音频/播放器/图片）限制在
+        "内容容器"（锚点元素的公共 XPath 前缀）内，页面导航/页脚等区域
+        的媒体不插入。
+    """
+    kept_urls: set[str] = set()
+    for entry in entries:
+        kept_urls.update(_block_media_srcs(entry["html"]))
+
+    url_to_carousel: dict[str, str] = {}
+    by_carousel: dict[str, list[DomMedia]] = {}
+    for m in media:
+        if m.kind == "image" and m.carousel:
+            url_to_carousel.setdefault(m.url, m.carousel)
+            by_carousel.setdefault(m.carousel, []).append(m)
+
+    # ---- 轮播归并决策 ----
+    extra_slideshows: list[tuple[int, str, str]] = []  # (order, path, html)
+    remove_urls: set[str] = set()
+    for carousel_path, imgs in by_carousel.items():
+        if len(imgs) < 2:
+            continue
+        kept = [i for i in imgs if i.url in kept_urls]
+        if len(kept) >= 2:
+            # run-grouping 会合并连续图片块；轮播内未出现的图不再单独插入。
+            for i in imgs:
+                if i.url not in kept_urls:
+                    i.skip = True
+        else:
+            # 全量 slideshow 插入轮播首图位置；已计入的单图块从正文移除。
+            for i in imgs:
+                i.skip = True
+            first = min(imgs, key=lambda i: i.order_idx)
+            ordered = sorted(imgs, key=lambda i: i.order_idx)
+            slide = "<tg-slideshow>" + "".join(
+                f'<img src="{esc_attr(i.url)}"/>' for i in ordered
+            ) + "</tg-slideshow>"
+            extra_slideshows.append((first.order_idx, first.path, slide))
+            remove_urls.update(i.url for i in kept)
+
+    if remove_urls:
+        kept_entries: list[dict] = []
+        for entry in entries:
+            srcs = _block_media_srcs(entry["html"])
+            if srcs and all(s in remove_urls for s in srcs):
+                continue
+            kept_entries.append(entry)
+        entries = kept_entries
+
+    # ---- 连续同轮播图片块 → slideshow ----
+    entries = _group_carousel_runs(entries, url_to_carousel)
+
+    # ---- dropped 媒体（原位插入；nav/footer/aside 样板区域内的不插入）----
+    dropped: list[tuple[int, str]] = []
+    for m in media:
+        if m.skip or m.url in kept_urls or m.boilerplate:
+            continue
+        dropped.append((m.order_idx, _render_dom_media_block(m)))
+    for order, _path, slide_html in extra_slideshows:
+        dropped.append((order, slide_html))
+    return entries, dropped
+
 
 
 def extract_title_from_html(html_text: str) -> str:

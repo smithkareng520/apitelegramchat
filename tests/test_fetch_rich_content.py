@@ -1,12 +1,15 @@
-# tests/test_fetch_rich_content.py — fetch_url Telegram Rich HTML 提取引擎测试
+# tests/test_fetch_rich_content.py — fetch_url 面向模型的 Telegram HTML 提取引擎测试
 #
 # 运行：PYTHONPATH=src python -m unittest discover -s tests -v
 # 全部为离线测试（不访问网络），覆盖：
-#   1. trafilatura XML → Telegram HTML 转换（段落/格式/链接/列表/引用/代码/表格/媒体提升）
-#   2. 嵌入媒体提取（<video>/<source>、iframe 播放器规范化、懒加载图片、OG、JSON-LD、
-#      危险协议过滤、装饰图过滤、去重、数量上限）
-#   3. 结果组装（预算截断闭合标签、正文内媒体去重、重复标题去除、纯文本兜底）
-#   4. search_engine.execute_fetch_url 集成（monkeypatch 网络，验证输出格式与失败路径）
+#   1. URL 安全过滤与 srcset 解析
+#   2. iframe/embed 播放器规范化（YouTube/Vimeo/Bilibili 等）
+#   3. DOM 媒体收集（带文档位置：video/audio/iframe/懒加载图、隐藏过滤、
+#      装饰图过滤、去重、上限、轮播容器识别）
+#   4. trafilatura XML → Telegram HTML 转换（全元素 + 容器行内合并 + 碎片过滤）
+#   5. 面向模型的结果组装（媒体原位插入、轮播 slideshow、无聚合媒体区、
+#      内容容器边界、整块截断闭合、重复标题去除、纯文本兜底）
+#   6. search_engine.execute_fetch_url 集成（monkeypatch 网络）
 import asyncio
 import sys
 import unittest
@@ -16,22 +19,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from apitelegramchat.fetch_rich_content import (
     FETCH_RICH_MAX_LEN,
-    MediaAsset,
-    PageMedia,
+    _collect_dom_media,
+    _parse_dom,
+    _truncate_blocks,
+    build_fallback_text_from_html,
+    build_model_facing_html,
+    extract_title_from_html,
+    trafilatura_xml_to_rich_html,
     _canonicalize_embed,
     _pick_srcset_best,
     _sanitize_url,
-    _truncate_blocks,
-    build_fetch_rich_result,
-    build_fallback_text_from_html,
-    extract_embedded_media,
-    extract_title_from_html,
-    trafilatura_xml_to_rich_html,
 )
 
 
 def run_async(coro):
     return asyncio.run(coro)
+
+
+def collect(html, base="https://example.com/page"):
+    tree = _parse_dom(html)
+    assert tree is not None, "DOM 解析失败"
+    return _collect_dom_media(tree, base)
 
 
 class TestUrlHelpers(unittest.TestCase):
@@ -102,58 +110,34 @@ class TestEmbedCanonicalization(unittest.TestCase):
         self.assertIsNone(_canonicalize_embed("javascript:alert(1)", ""))
 
 
-class TestMediaExtraction(unittest.TestCase):
-    def test_video_and_source(self):
+class TestDomMediaCollection(unittest.TestCase):
+    def test_video_and_source_with_position(self):
         html = """
-        <html><body>
-        <video controls poster="https://cdn.example.com/poster.jpg">
-            <source src="https://cdn.example.com/clip.mp4" type="video/mp4"/>
-        </video>
-        </body></html>
+        <html><body><p>段落文本足够长。</p>
+        <video controls><source src="https://cdn.example.com/clip.mp4" type="video/mp4"/></video>
+        <p>之后的段落文本。</p></body></html>
         """
-        media = extract_embedded_media(html, "https://example.com/watch")
-        self.assertEqual([v.url for v in media.videos], ["https://cdn.example.com/clip.mp4"])
-        self.assertIn("https://cdn.example.com/poster.jpg", [i.url for i in media.images])
+        media = collect(html)
+        videos = [m for m in media if m.kind == "video"]
+        self.assertEqual([v.url for v in videos], ["https://cdn.example.com/clip.mp4"])
+        # 位置信息存在且在两个段落之间（用图片/视频 order 与段落对比由组装层保证）。
+        self.assertGreater(videos[0].order_idx, 0)
+        self.assertTrue(videos[0].path)
 
     def test_audio_extraction(self):
         html = '<html><body><audio><source src="/a/podcast.mp3" type="audio/mpeg"/></audio></body></html>'
-        media = extract_embedded_media(html, "https://example.com/page")
-        self.assertEqual([a.url for a in media.audios], ["https://example.com/a/podcast.mp3"])
+        media = collect(html)
+        audios = [m for m in media if m.kind == "audio"]
+        self.assertEqual([a.url for a in audios], ["https://example.com/a/podcast.mp3"])
 
-    def test_iframe_extraction(self):
+    def test_iframe_canonicalized_with_provider(self):
         html = '<html><body><iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ" title="Rick Astley"></iframe></body></html>'
-        media = extract_embedded_media(html, "https://example.com")
-        self.assertEqual(len(media.embeds), 1)
-        self.assertEqual(media.embeds[0].url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-        self.assertEqual(media.embeds[0].provider, "YouTube")
-        self.assertEqual(media.embeds[0].label, "Rick Astley")
-
-    def test_og_media(self):
-        html = """
-        <html><head>
-        <meta property="og:video" content="https://media.example.com/v.mp4"/>
-        <meta property="og:image" content="https://media.example.com/cover.jpg"/>
-        <meta property="og:title" content="OG 标题"/>
-        <meta property="og:description" content="OG 描述"/>
-        </head><body></body></html>
-        """
-        media = extract_embedded_media(html, "https://example.com")
-        self.assertEqual([v.url for v in media.videos], ["https://media.example.com/v.mp4"])
-        self.assertIn("https://media.example.com/cover.jpg", [i.url for i in media.images])
-        self.assertEqual(media.og_title, "OG 标题")
-        self.assertEqual(media.og_description, "OG 描述")
-
-    def test_jsonld_video_object(self):
-        html = """
-        <html><head><script type="application/ld+json">
-        {"@type": "VideoObject", "name": "新闻回顾",
-         "contentUrl": "https://cdn.example.com/news.mp4",
-         "thumbnailUrl": "https://cdn.example.com/thumb.jpg"}
-        </script></head><body></body></html>
-        """
-        media = extract_embedded_media(html, "https://example.com")
-        self.assertEqual([v.url for v in media.videos], ["https://cdn.example.com/news.mp4"])
-        self.assertEqual(media.videos[0].label, "新闻回顾")
+        media = collect(html, "https://example.com")
+        embeds = [m for m in media if m.kind == "embed"]
+        self.assertEqual(len(embeds), 1)
+        self.assertEqual(embeds[0].url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(embeds[0].provider, "YouTube")
+        self.assertEqual(embeds[0].label, "Rick Astley")
 
     def test_lazy_image_attrs_and_srcset(self):
         html = """
@@ -162,11 +146,17 @@ class TestMediaExtraction(unittest.TestCase):
         <img srcset="https://cdn.example.com/s.jpg 480w, https://cdn.example.com/l.jpg 1200w"/>
         </body></html>
         """
-        media = extract_embedded_media(html, "https://example.com")
-        urls = [i.url for i in media.images]
+        media = collect(html, "https://example.com")
+        urls = [m.url for m in media if m.kind == "image"]
         self.assertIn("https://cdn.example.com/lazy.jpg", urls)
         self.assertIn("https://cdn.example.com/l.jpg", urls)
         self.assertNotIn("https://cdn.example.com/s.jpg", urls)
+
+    def test_figcaption_as_label(self):
+        html = '<html><body><figure><img src="https://cdn.example.com/p.jpg"/><figcaption>图片说明文字</figcaption></figure></body></html>'
+        media = collect(html)
+        imgs = [m for m in media if m.kind == "image"]
+        self.assertEqual(imgs[0].label, "图片说明文字")
 
     def test_decorative_images_filtered(self):
         html = """
@@ -176,22 +166,57 @@ class TestMediaExtraction(unittest.TestCase):
         <img src="https://cdn.example.com/real-photo.jpg"/>
         </body></html>
         """
-        media = extract_embedded_media(html, "https://example.com")
-        urls = [i.url for i in media.images]
+        media = collect(html)
+        urls = [m.url for m in media if m.kind == "image"]
         self.assertEqual(urls, ["https://cdn.example.com/real-photo.jpg"])
 
+    def test_hidden_media_skipped(self):
+        html = """
+        <html><body>
+        <iframe src="https://ads.example.com/tracker" style="display:none"></iframe>
+        <img src="https://cdn.example.com/pixel.jpg" width="0" height="0"/>
+        <video src="https://cdn.example.com/v.mp4"></video>
+        </body></html>
+        """
+        media = collect(html)
+        urls = [m.url for m in media]
+        self.assertEqual(urls, ["https://cdn.example.com/v.mp4"])
+
     def test_dedupe_and_limits(self):
-        imgs = "".join(
-            f'<img src="https://cdn.example.com/p{i}.jpg"/>' for i in range(20)
-        )
+        imgs = "".join(f'<img src="https://cdn.example.com/p{i}.jpg"/>' for i in range(20))
         html = f"<html><body>{imgs}</body></html>"
-        media = extract_embedded_media(html, "https://example.com")
-        self.assertEqual(len(media.images), 8)  # MAX_IMAGES
+        media = collect(html)
+        self.assertEqual(len([m for m in media if m.kind == "image"]), 8)  # MAX_IMAGES
 
     def test_relative_urls_resolved(self):
         html = '<html><body><img src="img/photo.png"/></body></html>'
-        media = extract_embedded_media(html, "https://example.com/articles/2024/x.html")
-        self.assertEqual([i.url for i in media.images], ["https://example.com/articles/2024/img/photo.png"])
+        media = collect(html, "https://example.com/articles/2024/x.html")
+        self.assertEqual([m.url for m in media], ["https://example.com/articles/2024/img/photo.png"])
+
+    def test_carousel_detection_shared_container(self):
+        # swiper 结构：每张图共享外层 .swiper 容器（不是各自的 .swiper-slide）。
+        html = """
+        <html><body><article>
+        <div class="swiper"><div class="swiper-slide"><img src="https://cdn.example.com/a.jpg"/></div>
+        <div class="swiper-slide"><img src="https://cdn.example.com/b.jpg"/></div>
+        <div class="swiper-slide"><img src="https://cdn.example.com/c.jpg"/></div></div>
+        <img src="https://cdn.example.com/plain.jpg"/>
+        </article></body></html>
+        """
+        media = collect(html)
+        carousel_paths = {m.url.rsplit("/", 1)[-1]: m.carousel for m in media if m.kind == "image"}
+        self.assertIsNotNone(carousel_paths["a.jpg"])
+        self.assertEqual(carousel_paths["a.jpg"], carousel_paths["b.jpg"])
+        self.assertEqual(carousel_paths["b.jpg"], carousel_paths["c.jpg"])
+        self.assertIsNone(carousel_paths["plain.jpg"])
+
+    def test_og_meta_not_collected_as_media(self):
+        # og:image 是元数据而非文档流元素 → 不收集（忠实文档顺序原则）。
+        html = ('<html><head><meta property="og:image" content="https://cdn.example.com/og.jpg"/>'
+                '<meta property="og:video" content="https://cdn.example.com/ogv.mp4"/></head>'
+                '<body><p>正文段落。</p></body></html>')
+        media = collect(html)
+        self.assertEqual(media, [])
 
 
 class TestXmlToRichHtml(unittest.TestCase):
@@ -271,18 +296,13 @@ class TestXmlToRichHtml(unittest.TestCase):
             '</main></doc>'
         )
         blocks = trafilatura_xml_to_rich_html(xml, "https://zh.wikipedia.org/wiki/X")
-        # 碎片段落被合并：不再出现单独的 <p>：</p>。
         self.assertNotIn("<p>：</p>", blocks)
         self.assertNotIn("<p>、</p>", blocks)
-        # 合并后的段落包含完整的行内序列。
         merged = next(b for b in blocks if "多范型" in b)
         self.assertIn('<a href="https://zh.wikipedia.org/wiki/multi">多范型</a>', merged)
         self.assertIn('<a href="https://zh.wikipedia.org/wiki/proc">过程式</a>', merged)
         self.assertIn("：", merged)
         self.assertIn("、", merged)
-        # 两个主题段分开。
-        lic = next(b for b in blocks if "许可证" in b and "软件基金会" in b)
-        self.assertIn('<a href="https://zh.wikipedia.org/wiki/psf">Python软件基金会许可证</a>', lic)
 
     def test_punct_only_paragraphs_dropped(self):
         xml = '<doc><main><p>：</p><p>、</p><p>正文段落保留</p></main></doc>'
@@ -307,7 +327,6 @@ class TestTruncateBlocks(unittest.TestCase):
         self.assertTrue(truncated)
         total = sum(len(b) + 1 for b in kept)
         self.assertLessEqual(total, 350)
-        # 每个保留块都是完整闭合的。
         for b in kept:
             self.assertTrue(b.startswith("<p>") and b.endswith("</p>"))
 
@@ -318,79 +337,202 @@ class TestTruncateBlocks(unittest.TestCase):
         self.assertFalse(truncated)
 
 
-class TestBuildResult(unittest.TestCase):
-    def _make_media(self):
-        return PageMedia(
-            videos=[MediaAsset(url="https://cdn.example.com/v.mp4", label="宣传片")],
-            embeds=[MediaAsset(
-                url="https://www.youtube.com/watch?v=abc",
-                label="Demo", source="embed", provider="YouTube",
-            )],
-            audios=[],
-            images=[
-                MediaAsset(url="https://cdn.example.com/a.jpg"),
-                MediaAsset(url="https://cdn.example.com/b.jpg"),
-            ],
-        )
+class TestModelFacingHtml(unittest.TestCase):
+    """面向模型的结果组装：媒体原位、轮播 slideshow、无聚合媒体区。"""
 
-    def test_structure(self):
-        media = self._make_media()
-        result = build_fetch_rich_result(
-            "https://example.com/post", "示例页面", ["<p>正文内容</p>"], media
+    def test_header_and_basic_structure(self):
+        html = "<html><head><title>T</title></head><body><article><p>唯一正文段落内容。</p></article></body></html>"
+        result = build_model_facing_html(
+            "https://example.com/post", html, body_blocks=["<p>唯一正文段落内容。</p>"], title="页面标题"
         )
-        self.assertIn("<h3>示例页面</h3>", result)
+        self.assertIn("<h3>页面标题</h3>", result)
         self.assertIn('<p>🔗 <a href="https://example.com/post">example.com</a></p>', result)
-        self.assertIn("<p>正文内容</p>", result)
-        self.assertIn('<figure><video src="https://cdn.example.com/v.mp4"/><figcaption>宣传片</figcaption></figure>', result)
-        self.assertIn('<a href="https://www.youtube.com/watch?v=abc">YouTube · Demo</a>', result)
+        self.assertIn("<p>唯一正文段落内容。</p>", result)
+        # 无聚合媒体区标题。
+        for marker in ("🎬", "📺", "🎵", "🖼️"):
+            self.assertNotIn(marker, result)
+
+    def test_media_at_original_positions(self):
+        html = """<html><head><title>T</title></head><body><article>
+        <p>这是第一段正文内容足够长。</p>
+        <video><source src="/media/clip.mp4" type="video/mp4"/></video>
+        <p>这是第二段正文内容也是足够长的。</p>
+        </article></body></html>"""
+        blocks = [
+            "<p>这是第一段正文内容足够长。</p>",
+            "<p>这是第二段正文内容也是足够长的。</p>",
+        ]
+        result = build_model_facing_html("https://example.com/p", html, body_blocks=blocks, title="T")
+        self.assertIn('<video src="https://example.com/media/clip.mp4"/>', result)
+        # 顺序：第一段 < 视频 < 第二段。
+        self.assertLess(result.index("第一段"), result.index("clip.mp4"))
+        self.assertLess(result.index("clip.mp4"), result.index("第二段"))
+
+    def test_embed_link_at_original_position(self):
+        html = """<html><head><title>T</title></head><body><article>
+        <p>第一段落正文内容足够长了。</p>
+        <iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ" title="Demo"></iframe>
+        <p>第二段落正文内容足够长了。</p>
+        </article></body></html>"""
+        blocks = ["<p>第一段落正文内容足够长了。</p>", "<p>第二段落正文内容足够长了。</p>"]
+        result = build_model_facing_html("https://example.com/p", html, body_blocks=blocks, title="T")
+        self.assertIn('<a href="https://www.youtube.com/watch?v=dQw4w9WgXcQ">YouTube · Demo</a>', result)
+        self.assertLess(result.index("第一段落"), result.index("YouTube"))
+        self.assertLess(result.index("YouTube"), result.index("第二段落"))
+
+    def test_dropped_lazy_image_inserted_at_position(self):
+        html = """<html><head><title>T</title></head><body><article>
+        <p>第一段落正文内容足够长了。</p>
+        <img data-src="https://cdn.example.com/lazy.png" alt="懒图"/>
+        <p>第二段落正文内容足够长了。</p>
+        </article></body></html>"""
+        blocks = ["<p>第一段落正文内容足够长了。</p>", "<p>第二段落正文内容足够长了。</p>"]
+        result = build_model_facing_html("https://example.com/p", html, body_blocks=blocks, title="T")
+        self.assertIn('<figure><img src="https://cdn.example.com/lazy.png"/><figcaption>懒图</figcaption></figure>', result)
+        self.assertLess(result.index("第一段落"), result.index("lazy.png"))
+        self.assertLess(result.index("lazy.png"), result.index("第二段落"))
+
+    def test_kept_image_block_reanchored_to_dom_position(self):
+        # trafilatura 把 graphic 放在段落后的 XML 末尾，但 DOM 中图片位于
+        # 两段之间 → 通过 URL 锚定回到原始位置。
+        html = """<html><head><title>T</title></head><body><article>
+        <p>第一段落正文内容足够长了。</p>
+        <img src="https://cdn.example.com/mid.png"/>
+        <p>第二段落正文内容足够长了。</p>
+        </article></body></html>"""
+        blocks = [
+            "<p>第一段落正文内容足够长了。</p>",
+            "<p>第二段落正文内容足够长了。</p>",
+            '<img src="https://cdn.example.com/mid.png"/>',
+        ]
+        result = build_model_facing_html("https://example.com/p", html, body_blocks=blocks, title="T")
+        self.assertLess(result.index("第一段落"), result.index("mid.png"))
+        self.assertLess(result.index("mid.png"), result.index("第二段落"))
+
+    def test_carousel_run_grouping_in_place(self):
+        # trafilatura 保留了轮播三图（连续 img 块）→ 合并为 slideshow，位置不变。
+        html = """<html><head><title>T</title></head><body><article>
+        <p>intro paragraph text long enough here.</p>
+        <div class="swiper"><div class="swiper-slide"><img src="https://cdn.example.com/a.jpg"/></div>
+        <div class="swiper-slide"><img src="https://cdn.example.com/b.jpg"/></div>
+        <div class="swiper-slide"><img src="https://cdn.example.com/c.jpg"/></div></div>
+        <p>outro paragraph text long enough here too.</p>
+        </article></body></html>"""
+        blocks = [
+            "<p>intro paragraph text long enough here.</p>",
+            '<img src="https://cdn.example.com/a.jpg"/>',
+            '<img src="https://cdn.example.com/b.jpg"/>',
+            '<img src="https://cdn.example.com/c.jpg"/>',
+            "<p>outro paragraph text long enough here too.</p>",
+        ]
+        result = build_model_facing_html("https://example.com/p", html, body_blocks=blocks, title="T")
         self.assertIn("<tg-slideshow>", result)
+        self.assertEqual(result.count("<img"), 3)
+        self.assertLess(result.index("intro"), result.index("<tg-slideshow>"))
+        self.assertLess(result.index("<tg-slideshow>"), result.index("outro"))
 
-    def test_slideshow_contains_bare_imgs_only(self):
-        media = self._make_media()
-        result = build_fetch_rich_result("https://example.com/p", "t", [], media)
-        slide = result[result.index("<tg-slideshow>"):result.index("</tg-slideshow>")]
-        self.assertNotIn("<figure", slide)
-        self.assertEqual(slide.count("<img"), 2)
+    def test_all_lazy_carousel_slideshow_at_position(self):
+        # 轮播图全部懒加载（trafilatura 全丢）→ 在轮播位置插入完整 slideshow。
+        html = """<html><head><title>T</title></head><body><article>
+        <p>第一段落正文内容足够长了。</p>
+        <div class="product-gallery">
+        <img data-src="https://cdn.example.com/g1.jpg"/>
+        <img data-src="https://cdn.example.com/g2.jpg"/>
+        <img data-src="https://cdn.example.com/g3.jpg"/>
+        </div>
+        <p>第二段落正文内容足够长了。</p>
+        </article></body></html>"""
+        blocks = ["<p>第一段落正文内容足够长了。</p>", "<p>第二段落正文内容足够长了。</p>"]
+        result = build_model_facing_html("https://example.com/p", html, body_blocks=blocks, title="T")
+        self.assertIn("<tg-slideshow>", result)
+        self.assertEqual(result.count("<img"), 3)
+        self.assertLess(result.index("第一段落"), result.index("<tg-slideshow>"))
+        self.assertLess(result.index("<tg-slideshow>"), result.index("第二段落"))
 
-    def test_inline_media_deduped_from_media_section(self):
-        media = self._make_media()
-        body = ['<img src="https://cdn.example.com/a.jpg"/>', "<p>文本</p>"]
-        result = build_fetch_rich_result("https://example.com/p", "t", body, media)
-        # a.jpg 已内联出现 → 幻灯片里只应剩下 b.jpg（单张 → 不用 slideshow）。
+    def test_adjacent_images_without_carousel_not_grouped(self):
+        # 无轮播容器特征的相邻图片保持独立 <img>（忠实原结构）。
+        html = """<html><head><title>T</title></head><body><article>
+        <p>第一段落正文内容足够长了。</p>
+        <div><img src="https://cdn.example.com/x1.jpg"/><img src="https://cdn.example.com/x2.jpg"/></div>
+        <p>第二段落正文内容足够长了。</p>
+        </article></body></html>"""
+        blocks = [
+            "<p>第一段落正文内容足够长了。</p>",
+            '<img src="https://cdn.example.com/x1.jpg"/>',
+            '<img src="https://cdn.example.com/x2.jpg"/>',
+            "<p>第二段落正文内容足够长了。</p>",
+        ]
+        result = build_model_facing_html("https://example.com/p", html, body_blocks=blocks, title="T")
         self.assertNotIn("<tg-slideshow>", result)
-        self.assertIn('<img src="https://cdn.example.com/b.jpg"/>', result)
-        self.assertEqual(result.count('src="https://cdn.example.com/a.jpg"'), 1)
+        self.assertEqual(result.count("<img"), 2)
 
-    def test_duplicate_heading_removed(self):
-        media = PageMedia()
-        result = build_fetch_rich_result(
-            "https://example.com/p", "Same Title", ["<h1>Same Title</h1>", "<p>正文</p>"], media
+    def test_footer_media_excluded_by_content_boundary(self):
+        # 页脚的 iframe/widget 不属于正文内容 → 不进入结果。
+        html = """<html><head><title>T</title></head><body>
+        <article><p>正文段落内容足够长了。</p></article>
+        <footer><iframe src="https://social.example.com/widget"></iframe>
+        <img src="https://cdn.example.com/footer-logo.png"/></footer>
+        </body></html>"""
+        blocks = ["<p>正文段落内容足够长了。</p>"]
+        result = build_model_facing_html("https://example.com/p", html, body_blocks=blocks, title="T")
+        self.assertNotIn("social.example.com", result)
+        self.assertNotIn("footer-logo", result)
+
+    def test_no_aggregated_media_sections(self):
+        html = """<html><head><title>T</title></head><body><article>
+        <p>第一段落正文内容足够长了。</p>
+        <video src="https://cdn.example.com/v.mp4"></video>
+        <audio src="https://cdn.example.com/a.mp3"></audio>
+        <iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ"></iframe>
+        <img src="https://cdn.example.com/i.jpg"/>
+        <p>第二段落正文内容足够长了。</p>
+        </article></body></html>"""
+        blocks = ["<p>第一段落正文内容足够长了。</p>", "<p>第二段落正文内容足够长了。</p>"]
+        result = build_model_facing_html("https://example.com/p", html, body_blocks=blocks, title="T")
+        for marker in ("🎬 视频", "📺 内嵌播放器", "🎵 音频", "🖼️ 图片"):
+            self.assertNotIn(marker, result)
+        # 媒体全部存在且在两段之间（原位）。
+        self.assertIn('<video src="https://cdn.example.com/v.mp4"/>', result)
+        self.assertIn('<audio src="https://cdn.example.com/a.mp3"/>', result)
+        self.assertIn("YouTube", result)
+        self.assertIn('src="https://cdn.example.com/i.jpg"', result)
+
+    def test_duplicate_first_heading_removed(self):
+        html = "<html><head><title>Same Title</title></head><body><article><h1>Same Title</h1><p>正文段落。</p></article></body></html>"
+        result = build_model_facing_html(
+            "https://example.com/p", html, body_blocks=["<h1>Same Title</h1>", "<p>正文段落。</p>"], title="Same Title"
         )
         self.assertNotIn("<h1>Same Title</h1>", result)
         self.assertIn("<h3>Same Title</h3>", result)
 
     def test_fallback_text_used_when_no_blocks(self):
-        media = PageMedia()
-        result = build_fetch_rich_result(
-            "https://example.com/p", "标题", [], media, fallback_text="第一段。\n\n第二段。"
+        html = "<html><head><title>T</title></head><body><p>纯文本段落。</p></body></html>"
+        result = build_model_facing_html(
+            "https://example.com/p", html, body_blocks=[], title="标题", fallback_text="第一段。\n\n第二段。"
         )
         self.assertIn("<p>第一段。</p>", result)
         self.assertIn("<p>第二段。</p>", result)
 
     def test_long_content_truncated_at_block_boundary(self):
-        media = PageMedia()
+        html = "<html><head><title>T</title></head><body><article><p>正文段落。</p></article></body></html>"
         blocks = [f"<p>{'内容' * 900}</p>" for _ in range(30)]
-        result = build_fetch_rich_result("https://example.com/p", "标题", blocks, media)
+        result = build_model_facing_html("https://example.com/p", html, body_blocks=blocks, title="标题")
         self.assertLessEqual(len(result), FETCH_RICH_MAX_LEN)
         self.assertIn("正文过长，已截断", result)
-        # 截断后每个 <p> 都应当闭合。
         self.assertEqual(result.count("<p>"), result.count("</p>"))
 
-    def test_single_image_no_slideshow(self):
-        media = PageMedia(images=[MediaAsset(url="https://cdn.example.com/only.jpg")])
-        result = build_fetch_rich_result("https://example.com/p", "t", ["<p>x</p>"], media)
-        self.assertNotIn("<tg-slideshow>", result)
-        self.assertIn('<img src="https://cdn.example.com/only.jpg"/>', result)
+    def test_media_only_page(self):
+        # 无正文、无兜底文本，但 DOM 有视频 → 仍产出结果（媒体型）。
+        html = ('<html><head><title>Video</title></head><body>'
+                '<video src="https://cdn.example.com/only.mp4"></video></body></html>')
+        result = build_model_facing_html("https://example.com/v", html, body_blocks=[], title="Video")
+        self.assertIsNotNone(result)
+        self.assertIn('<video src="https://cdn.example.com/only.mp4"/>', result)
+
+    def test_returns_none_when_nothing(self):
+        html = "<html><head><title>T</title></head><body><div></div></body></html>"
+        result = build_model_facing_html("https://example.com/e", html, body_blocks=[], title="")
+        self.assertIsNone(result)
 
 
 class TestTitleAndFallback(unittest.TestCase):
@@ -449,26 +591,32 @@ class TestExecuteFetchUrlIntegration(unittest.TestCase):
         self.addCleanup(restore)
         return se
 
-    def test_success_returns_telegram_html(self):
+    def test_success_returns_telegram_html_in_document_order(self):
         se = self._patch_fetch(self.PAGE_HTML)
         result = run_async(se.execute_fetch_url("https://example.com/integration-test"))
         self.assertFalse(result.startswith("失败"))
         self.assertIn("<h3>集成测试页面</h3>", result)
         self.assertIn('<p>🔗 <a href="https://example.com/integration-test">example.com</a></p>', result)
-        self.assertIn('<a href="https://example.com/more">更多阅读</a>', result)
         self.assertIn("<b>加粗</b>", result)
+        self.assertIn('<a href="https://example.com/more">更多阅读</a>', result)
+        # 媒体在原始位置：正文 → YouTube 链接 → 图片（DOM 顺序）。
         self.assertIn('<a href="https://www.youtube.com/watch?v=dQw4w9WgXcQ">YouTube</a>', result)
-        # 正文里的 photo.jpg 由 trafilatura 内联提取为 figure；去重后媒体区
-        # 只剩 og:cover.jpg 一张 → 单张不使用 slideshow，直接 <img>。
-        self.assertIn('<figure><img src="https://cdn.example.com/photo.jpg"/><figcaption>新闻配图</figcaption></figure>', result)
-        self.assertIn('<h4>🖼️ 图片</h4><img src="https://cdn.example.com/cover.jpg"/>', result)
-        self.assertEqual(result.count('src="https://cdn.example.com/photo.jpg"'), 1)
+        self.assertIn('src="https://cdn.example.com/photo.jpg"', result)
+        body_pos = result.index("足够长的正文内容")
+        yt_pos = result.index("YouTube")
+        img_pos = result.index("photo.jpg")
+        self.assertLess(body_pos, yt_pos)
+        self.assertLess(yt_pos, img_pos)
+        # 无聚合媒体区。
+        for marker in ("🎬 视频", "📺 内嵌播放器", "🖼️ 图片", "🎵 音频"):
+            self.assertNotIn(marker, result)
+        # og:image 元数据不进入文档流。
+        self.assertNotIn("cover.jpg", result)
 
     def test_failure_not_cached_and_prefix_preserved(self):
         se = self._patch_fetch(None, download=None)
         result = run_async(se.execute_fetch_url("https://example.com/empty-page"))
         self.assertTrue(result.startswith("失败："))
-        # 失败结果不写入缓存。
         self.assertIsNone(se.get_fetch_cache("https://example.com/empty-page"))
 
     def test_ssrf_rejected(self):

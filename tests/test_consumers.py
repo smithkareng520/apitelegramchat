@@ -1,4 +1,9 @@
 # test_consumers.py — 验证 fetch_url 新格式在下游（format_tool_result / 摘要）的表现
+#
+# 关键点：
+#   - 工具 UI 展示（details_html）保持历史样式：标题 + 域名链接（不透传富 HTML）；
+#   - 模型上下文（result_str）为忠实文档顺序的 Telegram HTML；
+#   - 失败判定基于前缀，正文含"失败"字样不误判。
 import asyncio
 import sys
 from pathlib import Path
@@ -32,17 +37,22 @@ def main():
     se._fetch_cache.clear()
     result = run_async(se.execute_fetch_url("https://example.com/consumer-test"))
     assert "<h3>" in result, "应为新格式（含 <h3> 标题）"
-    print("[1] execute_fetch_url 输出格式 OK")
+    # 媒体原位（iframe 在正文之后、图片之前）。
+    assert result.index("足够长的正文内容") < result.index("YouTube") < result.index("photo.jpg")
+    print("[1] execute_fetch_url 输出为忠实文档顺序的 Telegram HTML OK")
 
-    # 2) format_tool_result 的 fetch_url 分支
+    # 2) format_tool_result 的 fetch_url 分支：UI 展示为历史样式
     from apitelegramchat.tool_executors import format_tool_result
 
     summary, details_html = run_async(
         format_tool_result("fetch_url", {"url": "https://example.com/consumer-test"}, result)
     )
     assert summary == "🌐 Fetched: 消费端测试页面", f"summary 异常: {summary!r}"
-    assert details_html == result.strip(), "详情应原样透传富 HTML"
-    print(f"[2] format_tool_result summary OK → {summary!r}")
+    expected_details = '消费端测试页面 <a href="https://example.com/consumer-test">example.com</a>'
+    assert details_html == expected_details, f"details 应为历史样式:\n  期望: {expected_details!r}\n  实际: {details_html!r}"
+    # 富 HTML 绝不出现在 UI 展示中。
+    assert "<video" not in details_html and "photo.jpg" not in details_html
+    print(f"[2] UI 展示保持原样 OK → {details_html!r}")
 
     # 3) 失败结果仍被正确识别
     fail_summary, fail_details = run_async(
