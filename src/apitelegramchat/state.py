@@ -2,6 +2,7 @@
 import asyncio
 import contextvars
 import time
+from collections import OrderedDict
 from typing import Optional
 from apitelegramchat.config import DEFAULT_MODEL
 
@@ -49,9 +50,25 @@ async def get_chat_lock(chat_id: int) -> asyncio.Lock:
 
 # ---------- 媒体组 ----------
 media_groups: dict = {}
+# 给 media_groups 单独加锁，避免和 get_chat_lock 抢同一把全局锁造成阻塞。
+media_groups_lock = asyncio.Lock()
+
+async def add_media_group_message(media_group_id: str, msg: dict):
+    async with media_groups_lock:
+        if media_group_id not in media_groups:
+            media_groups[media_group_id] = []
+        media_groups[media_group_id].append(msg)
+
+async def pop_media_group(media_group_id: str) -> list:
+    async with media_groups_lock:
+        return media_groups.pop(media_group_id, [])
 
 # ---------- 消息去重 ----------
-processed_updates: set = set()
+# 用 OrderedDict 保留插入顺序，淘汰时按"最早插入"的 5000 条淘汰，避免
+# 之前 set 无序时把刚加入的 update_id 随机淘汰导致重复处理。
+# 同时记录插入时间，便于将来按时间窗口做 GC。
+processed_updates: OrderedDict = OrderedDict()
+_dedup_lock = asyncio.Lock()
 
 # ---------- 角色菜单消息ID ----------
 role_message_ids: dict = {}
@@ -97,10 +114,7 @@ def get_or_init_context(chat_id: int) -> dict:
     if chat_id not in user_contexts:
         user_contexts[chat_id] = {
             "conversation_history": [],
-            "search_mode": False,
             "username": f"User_{chat_id}",
-            "total_prompt_tokens": 0,
-            "last_usage": None,
             "active_skill": None,
         }
     return user_contexts[chat_id]
@@ -176,17 +190,6 @@ async def safe_get_history_length(chat_id: int) -> int:
     async with lock:
         return get_history_length(chat_id)
 
-# ---------- 媒体组操作 ----------
-async def add_media_group_message(media_group_id: str, msg: dict):
-    async with _chat_locks_lock:
-        if media_group_id not in media_groups:
-            media_groups[media_group_id] = []
-        media_groups[media_group_id].append(msg)
-
-async def pop_media_group(media_group_id: str) -> list:
-    async with _chat_locks_lock:
-        return media_groups.pop(media_group_id, [])
-
 # ---------- 角色选择管理 ----------
 _role_selections: dict = {}
 _role_lock = asyncio.Lock()
@@ -218,23 +221,6 @@ def set_editor_file_state(chat_id: int, path: str, content: str, mtime: float) -
         return
     _editor_file_state[key] = {"content": content, "mtime": mtime}
 
-def clear_editor_file_state(chat_id: int, path: str) -> None:
-    key = (chat_id, path)
-    _editor_file_state.pop(key, None)
-
-def update_editor_file_state(chat_id: int, path: str, content: str = None, mtime: float = None) -> None:
-    key = (chat_id, path)
-    if content is None and mtime is None:
-        _editor_file_state.pop(key, None)
-        return
-    if content is None and mtime is not None:
-        if key in _editor_file_state:
-            _editor_file_state[key]["mtime"] = mtime
-        return
-    if mtime is None:
-        mtime = time.time()
-    _editor_file_state[key] = {"content": content, "mtime": mtime}
-
 # ========== 最近生成的图片 URL 缓存 ==========
 _last_generated_image: dict = {}
 _last_generated_image_lock = asyncio.Lock()
@@ -252,7 +238,7 @@ async def get_last_generated_image_url(chat_id: int) -> Optional[str]:
 _active_drafts: dict = {}
 _active_drafts_lock = asyncio.Lock()
 
-# 被明确“冻结”为停止输出的草稿，会被保留在状态里，避免后续清理误删/误收回。
+# 被明确"冻结"为停止输出的草稿，会被保留在状态里，避免后续清理误删/误收回。
 _preserved_draft_ids: set[int] = set()
 _preserved_draft_ids_lock = asyncio.Lock()
 
@@ -292,3 +278,26 @@ async def is_preserved_draft(draft_id: int) -> bool:
         return False
     async with _preserved_draft_ids_lock:
         return draft_id_int in _preserved_draft_ids
+
+
+# ---------- 消息去重辅助函数 ----------
+async def mark_update_processed(uid: object) -> None:
+    """把 update_id 标记为已处理；超过上限时按插入顺序淘汰最早的一批。"""
+    async with _dedup_lock:
+        if uid in processed_updates:
+            # 已存在则先 pop，再 set 到末尾，保持"最近访问"在尾部。
+            processed_updates.move_to_end(uid)
+        else:
+            processed_updates[uid] = time.time()
+        # 上限 10000，超过则淘汰最早的 5000 条（按插入顺序，确定性）。
+        if len(processed_updates) > 10000:
+            for _ in range(5000):
+                try:
+                    processed_updates.popitem(last=False)
+                except KeyError:
+                    break
+
+
+async def is_update_processed(uid: object) -> bool:
+    async with _dedup_lock:
+        return uid in processed_updates

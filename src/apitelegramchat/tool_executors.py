@@ -3,6 +3,7 @@ import asyncio
 import os
 import subprocess
 import random
+import uuid
 import aiohttp
 import json
 import time
@@ -1034,7 +1035,7 @@ class BashSession:
         import functools
         preexec = functools.partial(_preexec_sandbox, str(workspace.absolute()))
 
-        marker = f"__ONE_SHOT_END_{random.randint(100000, 999999)}__"
+        marker = f"__ONE_SHOT_END_{uuid.uuid4().hex[:8]}__"
         full_cmd = command.rstrip() + f"\nprintf '{marker} %s\n' \"$?\"\nprintf '__ONE_SHOT_CWD__ %s\n' \"$PWD\"\n"
 
         proc = await asyncio.create_subprocess_exec(
@@ -1181,8 +1182,8 @@ class BashSession:
                     command, timeout=timeout, progress_callback=progress_callback
                 )
 
-            marker = f"__END_{random.randint(100000, 999999)}__"
-            cwd_marker = f"__CWD_{random.randint(100000, 999999)}__"
+            marker = f"__END_{uuid.uuid4().hex[:8]}__"
+            cwd_marker = f"__CWD_{uuid.uuid4().hex[:8]}__"
             # 默认 shell 启动目录为 workspace/workspace root。模型决定使用 skill 后，
             # 可自行 `cd skills/<skill_id>`；persistent bash 会保留该 cwd。
             # ★ 关键：在 echo marker 前先输出一个换行，确保 marker 单独占一行。
@@ -1734,26 +1735,28 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
     elif fn_name == "exchange_rate":
         base = fn_args.get('base', 'USD')
-        summary = f"💱 {base} 汇率"
-        details_html = result_str
+        summary = f"💱 {escape_html(base)} 汇率"
+        # result_str 可能是成功 HTML，也可能是以 "失败：" 开头的错误文本。
+        # 后者含上游错误消息，需要 escape 以免打坏 Telegram 渲染。
+        details_html = result_str if not result_str.startswith("失败：") else escape_html(result_str)
         return summary, details_html
 
     elif fn_name == "book_lookup":
         query = fn_args.get('query', '')
-        summary = f"📖 {query}"
-        details_html = result_str
+        summary = f"📖 {escape_html(query)}"
+        details_html = result_str if not result_str.startswith("失败：") else escape_html(result_str)
         return summary, details_html
 
     elif fn_name == "news":
         source = fn_args.get('source', 'news')
-        summary = f"📰 {source.upper()} 新闻"
-        details_html = result_str
+        summary = f"📰 {escape_html(source.upper())} 新闻"
+        details_html = result_str if not result_str.startswith("失败：") else escape_html(result_str)
         return summary, details_html
 
     elif fn_name == "crypto_price":
         coin = fn_args.get('coin', '')
-        summary = f"💰 {coin.upper()} 价格"
-        details_html = result_str
+        summary = f"💰 {escape_html(coin.upper())} 价格"
+        details_html = result_str if not result_str.startswith("失败：") else escape_html(result_str)
         return summary, details_html
 
     elif fn_name == "qr_code":

@@ -435,7 +435,15 @@ def _count_descendants(root_pid: int) -> int:
 async def watchdog(proc: asyncio.subprocess.Process,
                    max_procs: int = SANDBOX_MAX_PROCS,
                    interval: float = 1.0) -> None:
-    """周期性检查子进程树，超过 max_procs 立即 kill"""
+    """周期性检查子进程树，超过 max_procs 立即 kill。
+
+    注意：proc 必须以 `start_new_session=True` 启动（见 verify_security.py），
+    这样 proc.pid 才是它自己的 PGID，killpg 才会杀掉"这个子进程及其子孙"
+    而不是误杀父进程组。如果 caller 没用 start_new_session=True，
+    `os.getpgid(proc.pid)` 会返回父进程的 PGID，killpg 会误杀整个父进程组
+    （包括 bot 自身）。为此本函数对 fallback 路径仅做 proc.kill()，
+    不用 killpg，避免灾难性误杀。
+    """
     if proc.returncode is not None:
         return
     while proc.returncode is None:
@@ -445,10 +453,17 @@ async def watchdog(proc: asyncio.subprocess.Process,
                 logger.warning(
                     f"🚨 Watchdog: sandbox pid={proc.pid} spawned {n} > {max_procs} procs, killing"
                 )
+                # 仅当 proc.pid 自身就是 PGID（即 start_new_session=True）时
+                # 才 killpg；否则只杀 proc.pid 本身，不波及父进程组。
                 try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    proc_pgid = os.getpgid(proc.pid)
                 except ProcessLookupError:
-                    pass
+                    proc_pgid = None
+                if proc_pgid is not None and proc_pgid == proc.pid:
+                    try:
+                        os.killpg(proc_pgid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                 try:
                     proc.kill()
                 except ProcessLookupError:

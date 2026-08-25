@@ -7,6 +7,8 @@ import logging
 import uuid
 import re
 import os
+import time
+import hmac
 import mimetypes
 from apitelegramchat.workspace_paths import workspace_download_root
 from apitelegramchat.token_budget import count_tokens
@@ -59,6 +61,8 @@ from apitelegramchat.state import (
     mark_preserved_draft,
     mark_protected_message,
     set_current_user_namespace,
+    mark_update_processed,
+    is_update_processed,
 )
 from apitelegramchat.ask_user_tool import (
     get_pending_for_chat,
@@ -74,6 +78,16 @@ app = Quart(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
 
 logger = get_logger(__name__)
+
+
+@app.before_serving
+async def _startup_load_whitelist() -> None:
+    """启动时加载白名单。之前没人调过 load_whitelist，导致默认是空 set。"""
+    try:
+        from apitelegramchat.config import load_whitelist
+        await load_whitelist()
+    except Exception:
+        logger.warning("startup load_whitelist failed", exc_info=True)
 
 def _reply_params(message_id: int | None) -> dict | None:
     try:
@@ -91,7 +105,8 @@ REPLY_MARKER = "💡 引用回复:"
 
 active_tasks: dict[int, asyncio.Task] = {}
 active_tasks_lock = asyncio.Lock()
-_dedup_lock = asyncio.Lock()
+# 消息去重的锁已下沉到 state.mark_update_processed / is_update_processed，
+# 这里不再需要 app 级别的 _dedup_lock。
 
 # ==================== 停止旧草稿（冻结当前流，并落一条永久结束消息） ====================
 
@@ -192,18 +207,19 @@ async def _send_temp_message(chat_id: int, text: str) -> int:
             async with session.post(f"{BASE_URL}/sendMessage", json=payload) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data.get("result", {}).get("message_id")
-    except Exception:
-        pass
+                    # `data.get("result", {})` 在 result 为 None 时返回 None，
+                    # 再 `.get` 会 AttributeError。用 `or {}` 兜底。
+                    return (data.get("result") or {}).get("message_id")
+    except Exception as e:
+        logger.warning(f"_send_temp_message failed (chat_id={chat_id}): {e}")
     return None
 
 @app.route('/health', methods=['GET'])
 async def health_check():
+    # 健康检查端点对外可访问，不应暴露内部统计信息（白名单数量、活跃任务数）。
+    # 这些信息可能被探测方用于侧信道推断。
     return {
         "status": "ok",
-        "version": "2.0",
-        "whitelist_count": len(WHITELIST_USERS),
-        "active_tasks": len(active_tasks),
     }, 200
 
 # ---------- 权限辅助 ----------
@@ -913,7 +929,7 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
         if "document" in msg:
             doc = msg["document"]
             file_ids.append(doc["file_id"])
-            fname = doc.get("file_name", f"document_{doc['file_id'][:8]}.bin")
+            fname = doc.get("file_name") or f"document_{doc['file_id'][:8]}.bin"
             file_names.append(fname)
             mime_types.append(doc.get("mime_type", mimetypes.guess_type(fname)[0] or "application/pdf"))
             if msg.get("caption"):
@@ -1146,17 +1162,15 @@ async def send_model_list(
 # ---------------------------------------------------------------------------
 @app.route('/webhook', methods=['GET', 'POST', 'HEAD'])
 async def webhook() -> tuple:
-    import time as _time
-    _t0 = _time.monotonic()
+    _t0 = time.monotonic()
     try:
         request_id = str(uuid.uuid4())[:8]
         set_request_id(request_id)
         logger.info(f"Received webhook request {request_id}")
 
-        token = (request.args or {}).get("token")
+        token = request.args.get("token")
         # 使用 hmac.compare_digest 进行恒定时间比较，防止时序攻击
-        import hmac as _hmac
-        if not token or not WEBHOOK_TOKEN or not _hmac.compare_digest(str(token), str(WEBHOOK_TOKEN)):
+        if not token or not WEBHOOK_TOKEN or not hmac.compare_digest(str(token), str(WEBHOOK_TOKEN)):
             return "Forbidden", 403
         if request.method in ('GET', 'HEAD'):
             return "OK - Webhook is alive", 200
@@ -1181,16 +1195,11 @@ async def webhook() -> tuple:
                     msg_debug = msg_debug[:LOG_TRUNCATE_LIMIT] + "... (truncated)"
                 logger.debug(f"截断的 Webhook 数据: {msg_debug}")
 
-        async with _dedup_lock:
-            if uid in processed_updates:
-                return "OK", 200
-            # 容量限制：超过 10000 条时只清理旧的一半，避免清空后导致刚加入的 uid 被重放
-            if len(processed_updates) > 10_000:
-                # 转为有序结构，丢弃最早的 5000 条
-                _old = list(processed_updates)[:-5000]
-                for _oid in _old:
-                    processed_updates.discard(_oid)
-            processed_updates.add(uid)
+        # 使用 OrderedDict 保留插入顺序，超过 10000 条时按插入顺序淘汰最早的 5000 条。
+        # 之前用 set + list 刉片是随机淘汰，可能把刚加入的 uid 误伤。
+        if await is_update_processed(uid):
+            return "OK", 200
+        await mark_update_processed(uid)
 
         # ── 消息处理 ──────────────────────────────────────────────────────
         if "message" in data and isinstance(data["message"], dict):
@@ -1228,7 +1237,7 @@ async def webhook() -> tuple:
                             await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
                             return "OK", 200
                         WHITELIST_USERS.add(target)
-                        save_whitelist()
+                        await save_whitelist()
                         await send_rich_html_message(chat_id, f"✅ <b>添加成功</b>\n已添加 <code>{target}</code> 到白名单。", reply_parameters=_reply_params(msg["message_id"]))
                         return "OK", 200
                     elif _cmd_match(text, "/deluser"):
@@ -1244,7 +1253,7 @@ async def webhook() -> tuple:
                             await send_rich_html_message(chat_id, f"❌ <b>用户不存在</b>\n<code>{target}</code> 不在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
                             return "OK", 200
                         WHITELIST_USERS.remove(target)
-                        save_whitelist()
+                        await save_whitelist()
                         await send_rich_html_message(chat_id, f"✅ <b>移除成功</b>\n已移除 <code>{target}</code>。", reply_parameters=_reply_params(msg["message_id"]))
                         return "OK", 200
                     elif _cmd_match(text, "/listusers"):
@@ -1308,7 +1317,7 @@ async def webhook() -> tuple:
                     f"如果用户问起『附近』『周边』等，请直接以此坐标作为中心点，"
                     f"调用 search_poi / route / distance 等工具，无需再调用 geocode。"
                     f"如需反查中文地址，请调用 amap-maps MCP 的 maps_regeocode 工具。"
-                ).replace("\\n", "\n")
+                )
                 user_message = {"role": "user", "content": content_text}
                 await _interrupt_active_generation(chat_id)
                 task = asyncio.create_task(
@@ -1445,8 +1454,8 @@ async def webhook() -> tuple:
                     safe_fname = os.path.basename(fname)
                     target_path = workspace / safe_fname
 
-                    lock = await _get_workspace_lock(chat_id)
-                    async with lock:
+                    workspace_lock = await _get_workspace_lock(chat_id)
+                    async with workspace_lock:
                         # download_file 内部已经把字节缓存到 R2 的 telegram/{file_id} 前缀，
                         # download/ 只是本地落地缓冲，不需要再往 R2 镜像一份。
                         success = await download_file(fid, str(target_path))
@@ -1656,7 +1665,7 @@ async def webhook() -> tuple:
                     return "OK", 200
 
                 if user_input.startswith("/model"):
-                    if msg["chat"]["type"] != "private":
+                    if (msg.get("chat") or {}).get("type") != "private":
                         await _send_via_send_message(
                             chat_id,
                             "❌ <b>操作受限</b>\n模型切换仅限私聊使用。",
@@ -1752,8 +1761,8 @@ async def webhook() -> tuple:
                             workspace = workspace_download_root(chat_id)
                             workspace.mkdir(parents=True, exist_ok=True)
                             target_path = workspace / safe_fname
-                            lock = await _get_workspace_lock(chat_id)
-                            async with lock:
+                            workspace_lock = await _get_workspace_lock(chat_id)
+                            async with workspace_lock:
                                 # download_file 内部已经把字节缓存到 R2 的 telegram/{file_id} 前缀，
                                 # download/ 只是本地落地缓冲，不需要再往 R2 镜像一份。
                                 success = await download_file(reply_media["file_id"], str(target_path))

@@ -53,13 +53,6 @@ class MCPRequestContext:
             reset_current_user_namespace(token)
 
 
-def shell_is_explicitly_enabled() -> bool:
-    """Return whether the deployment explicitly opted in to command execution."""
-    return os.getenv("APITELEGRAMCHAT_MCP_ENABLE_SHELL", "false").strip().lower() in {
-        "1", "true", "yes", "on"
-    }
-
-
 def mutations_are_explicitly_enabled() -> bool:
     """Return whether write/cost-incurring MCP tools are intentionally exposed."""
     return os.getenv("APITELEGRAMCHAT_MCP_ENABLE_MUTATIONS", "false").strip().lower() in {

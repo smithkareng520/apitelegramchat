@@ -297,9 +297,6 @@ def _strip_invalid_media_urls(html_content: str) -> str:
     return result
 
 
-async def send_message(chat_id: int, text: str) -> None:
-    await send_rich_html_message(chat_id, f"<p>{text}</p>")
-
 def strip_html_tags(text: str) -> str:
     if not text:
         return ""
@@ -562,7 +559,7 @@ async def _reassert_active_draft_content(chat_id: int, draft_id: int) -> None:
                     _draft_last_send_time[cache_key] = time.monotonic()
                     try:
                         data = await resp.json()
-                        msg_id = data.get("result", {}).get("message_id")
+                        msg_id = (data.get("result") or {}).get("message_id")
                         if isinstance(msg_id, int) and msg_id > 0:
                             logger.debug(
                                 f"reassert draft ok: chat={chat_id} draft={draft_id} msg_id={msg_id}"
@@ -624,55 +621,6 @@ async def serialize_with_active_draft(chat_id: int, *, reassert: bool = True):
                 pass
             await _reassert_active_draft_content(chat_id, draft_id)
 
-
-# ---------- 不加锁的强制发送函数 ----------
-async def send_rich_message_draft_unlocked(
-    chat_id: int,
-    draft_id,
-    html_content: str,
-    message_thread_id: Optional[int] = None,
-) -> Optional[int]:
-    """
-    强制发送草稿更新，不做任何锁检查、死亡检查、缓存或速率限制。
-    用于强制更新停止状态，仅发送一次，不重试。
-    如果内容为空，自动填充占位符。
-    """
-    if not html_content or not html_content.strip():
-        html_content = "<i>⏹️ 已停止输出</i>"
-    html_content = html_content.strip()
-
-    try:
-        draft_id_int = int(draft_id)
-        if draft_id_int == 0:
-            raise ValueError("draft_id must be non-zero")
-    except (ValueError, TypeError) as e:
-        logger.error(f"send_rich_message_draft_unlocked: invalid draft_id={draft_id!r}: {e}")
-        return None
-
-    payload = {
-        "chat_id": chat_id,
-        "draft_id": draft_id_int,
-        "rich_message": _rich_message_html_payload(html_content),
-    }
-    if message_thread_id:
-        payload["message_thread_id"] = message_thread_id
-
-    timeout = aiohttp.ClientTimeout(total=5, connect=3)
-    try:
-        session = await get_http_session(timeout)
-        async with session.post(f"{BASE_URL}/sendRichMessageDraft", json=payload) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    msg_id = data.get("result", {}).get("message_id")
-                    logger.info(f"强制发送停止状态成功: chat={chat_id} draft={draft_id} msg_id={msg_id}")
-                    return msg_id if isinstance(msg_id, int) and msg_id > 0 else 0
-                else:
-                    body = await resp.text()
-                    logger.warning(f"强制发送停止状态失败: {resp.status} {body[:200]}")
-                    return 0
-    except Exception as e:
-        logger.warning(f"强制发送停止状态异常: {e}")
-        return 0
 
 # ---------- 常规草稿发送（带锁） ----------
 async def send_rich_message_draft(
@@ -758,7 +706,7 @@ async def send_rich_message_draft(
                             _draft_last_send_time[cache_key] = time.monotonic()
                             try:
                                 data = await resp.json()
-                                msg_id = data.get("result", {}).get("message_id")
+                                msg_id = (data.get("result") or {}).get("message_id")
                                 _last_sent_draft_cache[cache_key] = html_content
                                 await _reset_draft_failure(chat_id, draft_id_int)
                                 if isinstance(msg_id, int) and msg_id > 0:
@@ -809,7 +757,7 @@ async def send_rich_message_draft(
 
                         failures = await _bump_draft_failure(chat_id, draft_id_int)
                         logger.warning(
-                            f"sendRichMessageDraft failed (attempt {attempt+1}/3, failures={failures}): "
+                            f"sendRichMessageDraft failed (attempt {attempt+1}/{_DRAFT_MAX_ATTEMPTS}, failures={failures}): "
                             f"{resp.status} {body[:200]}"
                         )
                         if hard_not_found and failures >= 5:
@@ -877,12 +825,20 @@ async def send_rich_html_message(
     # 记录调用方交付给 Telegram 的原始富文本，不对内容做压缩、截断或预览。
     # 保留 strip 之前的版本，便于排查空白、换行和富媒体 URL 在发送前后的差异。
     raw_html_content = html_content
+    # INFO 只输出长度与前 200 字符，避免大消息打爆日志。
     logger.info(
-        "[%s] Telegram sendRichMessage 原始内容（未压缩、未截断；长度=%s）：\n%s",
+        "[%s] Telegram sendRichMessage 原始内容（长度=%s）：%s",
         chat_id,
         len(raw_html_content),
-        raw_html_content,
+        raw_html_content[:200],
     )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "[%s] Telegram sendRichMessage 完整原始内容（未截断；长度=%s）：\n%s",
+            chat_id,
+            len(raw_html_content),
+            raw_html_content,
+        )
     html_content = html_content.strip()
 
     payload = {
@@ -894,11 +850,18 @@ async def send_rich_html_message(
     # 记录实际 HTTP payload 中的完整 HTML；该内容与上方原始 HTML 一致（仅去首尾空白）。
     payload_html_content = payload["rich_message"]["html"]
     logger.info(
-        "[%s] Telegram sendRichMessage 实际 payload HTML（未截断；长度=%s）：\n%s",
+        "[%s] Telegram sendRichMessage payload HTML（长度=%s）：%s",
         chat_id,
         len(payload_html_content),
-        payload_html_content,
+        payload_html_content[:200],
     )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "[%s] Telegram sendRichMessage 完整 payload HTML（未截断；长度=%s）：\n%s",
+            chat_id,
+            len(payload_html_content),
+            payload_html_content,
+        )
     if reply_parameters:
         payload["reply_parameters"] = reply_parameters
     if reply_markup:
@@ -921,7 +884,7 @@ async def send_rich_html_message(
                     if resp.status == 200:
                         try:
                             data = await resp.json()
-                            msg_id = data.get("result", {}).get("message_id")
+                            msg_id = (data.get("result") or {}).get("message_id")
                             if isinstance(msg_id, int) and msg_id > 0:
                                 return msg_id
                         except Exception as e:
@@ -946,7 +909,7 @@ async def send_rich_html_message(
                             if fallback_resp.status == 200:
                                 try:
                                     fallback_data = await fallback_resp.json()
-                                    fallback_msg_id = fallback_data.get("result", {}).get("message_id")
+                                    fallback_msg_id = (fallback_data.get("result") or {}).get("message_id")
                                     if isinstance(fallback_msg_id, int) and fallback_msg_id > 0:
                                         return fallback_msg_id
                                 except Exception as e:
@@ -969,16 +932,6 @@ async def send_rich_html_message(
 
     async with serialize_with_active_draft(chat_id, reassert=reassert_draft):
         return await _send_inner()
-
-async def send_rich_message(
-    chat_id: int,
-    text: str,
-    parse_mode: str = "html",
-    reply_parameters: dict = None,
-) -> bool:
-    if not text or not text.strip():
-        text = "⚠️ No content to send"
-    return await send_rich_html_message(chat_id, text, reply_parameters, reassert_draft=False)
 
 # ==================== 发送 Chat Action ====================
 async def send_chat_action(chat_id: int, action: str) -> None:

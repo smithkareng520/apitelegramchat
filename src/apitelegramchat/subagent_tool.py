@@ -40,7 +40,6 @@ import json
 import logging
 import os
 import time
-import traceback
 import uuid
 from html.parser import HTMLParser
 from typing import Any, Optional
@@ -368,6 +367,10 @@ async def _subagent_agentic_loop(
             return_exceptions=True,
         )
         for r in results:
+            # CancelledError 是 BaseException 而非 Exception，需要单独检查并重新抛出，
+            # 否则会导致 loop_messages 缺少 role:"tool" 消息，下一轮 LLM 调用 400。
+            if isinstance(r, asyncio.CancelledError):
+                raise r
             if isinstance(r, Exception):
                 # 不应该发生，_exec_one 已吞掉异常；防御性记录
                 logger.error(f"subagent: tool exec returned exception: {r}")

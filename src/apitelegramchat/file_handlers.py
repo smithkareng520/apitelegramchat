@@ -4,6 +4,7 @@ import aiohttp
 import asyncio
 import logging
 from urllib.parse import quote
+from cachetools import LRUCache
 
 from apitelegramchat.config import (
     TELEGRAM_BOT_TOKEN,
@@ -16,7 +17,9 @@ from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, down
 logger = logging.getLogger(__name__)
 
 # ---------- 文件下载锁 ----------
-_download_locks = {}
+# 用 LRUCache 避免 dict 无界增长（每个 file_id 一把锁，长期运行会累积）。
+_DOWNLOAD_LOCKS_MAX = 256
+_download_locks: LRUCache = LRUCache(maxsize=_DOWNLOAD_LOCKS_MAX)
 _download_locks_lock = asyncio.Lock()
 
 # 后台任务引用集合（防止 GC 提前取消）

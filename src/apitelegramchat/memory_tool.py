@@ -115,8 +115,7 @@ def _save_local(chat_id: int, store: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     store["updated_at"] = int(time.time())
     # 唯一 tmp 名：进程内 PID + 8 字节随机，避免并发写碰撞。
-    import uuid as _uuid
-    tmp = path.with_suffix(f".json.tmp.{os.getpid()}.{_uuid.uuid4().hex[:8]}")
+    tmp = path.with_suffix(f".json.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
     tmp.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
 

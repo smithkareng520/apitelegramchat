@@ -7,6 +7,7 @@ unless the deployment explicitly opts in.
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
@@ -70,6 +71,12 @@ async def invoke(function: Callable[..., Any], *args: Any, **kwargs: Any) -> str
     result = function(*args, **kwargs)
     if inspect.isawaitable(result):
         result = await result
+    # 对 dict/list 用 JSON 序列化（避免 str() 用单引号产生非合法 JSON 串），
+    # 其它类型仍用 str() 兜底。
+    if isinstance(result, str):
+        return result
+    if isinstance(result, (dict, list)):
+        return json.dumps(result, ensure_ascii=False)
     return str(result)
 
 
@@ -279,9 +286,11 @@ class ToolRegistry:
             with self._context.activate():
                 text = await spec.handler(self._context, arguments)
             return types.CallToolResult(content=[types.TextContent(type="text", text=text)], isError=False)
-        except Exception:
+        except Exception as exc:
             logger.exception("MCP tool execution failed: %s", name)
-            return self._error("Tool execution failed. Check the arguments and retry.")
+            # 把异常类型 + 简短 message 放进 error text，便于调用方定位。
+            # 不放完整 traceback（含敏感字段）。
+            return self._error(f"Tool execution failed: {type(exc).__name__}: {exc}")
 
     @staticmethod
     def _error(message: str) -> types.CallToolResult:

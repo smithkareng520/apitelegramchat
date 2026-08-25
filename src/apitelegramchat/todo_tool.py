@@ -88,8 +88,7 @@ def _save_local(chat_id: int, store: dict) -> None:
     path = _todo_path(chat_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     store["updated_at"] = int(time.time())
-    import uuid as _uuid
-    tmp = path.with_suffix(f".json.tmp.{os.getpid()}.{_uuid.uuid4().hex[:8]}")
+    tmp = path.with_suffix(f".json.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
     tmp.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
 

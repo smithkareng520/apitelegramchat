@@ -14,7 +14,7 @@ import socket
 import uuid
 import tempfile
 import mimetypes
-from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from typing import Any, Optional
 try:
     import trafilatura  # type: ignore
@@ -51,7 +51,7 @@ try:
     from lxml import html as lxml_html  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
     lxml_html = None  # type: ignore
-from apitelegramchat.state import set_editor_file_state  # noqa: F401  (clear_editor_file_state 历史上被引用，现已移除以避免未使用 import 警告)
+from apitelegramchat.state import set_editor_file_state  # noqa: F401  (保留 set_editor_file_state 用于编辑器状态追踪)
 
 from apitelegramchat.config import (
     OPENROUTER_API_KEY,
@@ -60,7 +60,7 @@ from apitelegramchat.config import (
     SUPPORTED_MODELS,
     get_openrouter_provider_preferences,
 )
-from apitelegramchat.utils import retry_async
+from apitelegramchat.utils import retry_async, escape_html
 from apitelegramchat.token_budget import truncate_to_token_budget
 from apitelegramchat.mcp_client import call_mcp_tool, MCPToolError
 
@@ -80,21 +80,11 @@ except Exception:  # pragma: no cover - optional dependency fallback
     SUBAGENT_TOOL = []
 logger = logging.getLogger(__name__)
 
-WIKIPEDIA_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/121.0",
-]
-
 FETCH_CONTENT_TOKEN_BUDGET = 20_000
 FETCH_TITLE_TOKEN_BUDGET = 64
 TRAFILATURA_TIMEOUT = 10
 HTTP_TIMEOUT_SHORT = 10
-HTTP_TIMEOUT_FETCH = 15
 CURL_TIMEOUT = 20
-
-BACKUP_TIMEOUT = 10
 
 _TRAFILATURA_CONFIG = use_config()
 if _TRAFILATURA_CONFIG is not None:
@@ -1400,10 +1390,10 @@ def _build_rich_fetch_payload(url: str, html: str) -> str | None:
 _ALLOWED_FETCH_SCHEMES = {"http", "https"}
 
 
-def _is_safe_url_to_fetch(url: str) -> tuple[bool, str]:
+def _is_safe_url_to_fetch_sync(url: str) -> tuple[bool, str]:
     """
-    SSRF 防护：只允许 http/https 协议；拒绝解析到私网/回环/链路本地/保留 IP 的主机。
-    返回 (是否安全, 失败原因)。
+    SSRF 防护（同步部分）：URL 协议/格式校验 + IP 字面量校验。
+    不做 DNS 解析。需要 DNS 解析的部分由 `_is_safe_url_to_fetch` 的 async 包装完成。
     """
     if not url or not isinstance(url, str):
         return False, "URL 为空"
@@ -1416,36 +1406,78 @@ def _is_safe_url_to_fetch(url: str) -> tuple[bool, str]:
     host = parts.hostname or ""
     if not host:
         return False, "URL 缺少主机名"
-    # 先处理 IPv6/IPv4 字面量与域名
+    # 如果 host 本身就是 IP 字面量，直接校验，无需 DNS 解析
     try:
-        # getaddrinfo 同步可能阻塞，但仅查一次；为了安全可接受
-        infos = socket.getaddrinfo(host, parts.port or 443, type=socket.SOCK_STREAM)
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        # 不是 IP 字面量，是域名，DNS 解析交由 async 部分处理
+        return True, ""
+    if (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+        return False, f"目标地址 {ip} 属于禁止访问的范围（私网/回环/链路本地等）"
+    return True, ""
+
+
+def _check_ip_safe(ip_str: str) -> tuple[bool, str]:
+    """单个 IP 字符串的 SSRF 校验。"""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True, ""  # 不是 IP，跳过
+    if (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+        return False, f"目标地址 {ip} 属于禁止访问的范围（私网/回环/链路本地等）"
+    return True, ""
+
+
+async def _is_safe_url_to_fetch(url: str) -> tuple[bool, str]:
+    """
+    SSRF 防护：先做同步部分（URL 协议/IP 字面量校验），再做异步 DNS 解析。
+    注意：DNS 解析必须用 asyncio 的非阻塞版本，不能用同步 socket.getaddrinfo，
+    否则恶意 LLM 高频调用 fetch_url 即可拖垮整个事件循环。
+    """
+    ok, reason = _is_safe_url_to_fetch_sync(url)
+    if not ok:
+        return False, reason
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if not host:
+        return False, "URL 缺少主机名"
+    # 如果是 IP 字面量，同步部分已校验，无需 DNS
+    try:
+        ipaddress.ip_address(host)
+        return True, ""
+    except ValueError:
+        pass
+    # 异步 DNS 解析，避免阻塞事件循环
+    try:
+        loop = asyncio.get_event_loop()
+        infos = await loop.getaddrinfo(
+            host, parts.port or 443, type=socket.SOCK_STREAM
+        )
     except socket.gaierror as e:
         return False, f"DNS 解析失败: {e}"
-    for family, _stype, _proto, _canon, sockaddr in infos:
+    except Exception as e:
+        return False, f"DNS 解析异常: {e}"
+    for _family, _stype, _proto, _canon, sockaddr in infos:
         ip_str = sockaddr[0]
-        try:
-            ip = ipaddress.ip_address(ip_str)
-        except ValueError:
-            continue
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
-            return False, f"目标地址 {ip} 属于禁止访问的范围（私网/回环/链路本地等）"
+        ok, reason = _check_ip_safe(ip_str)
+        if not ok:
+            return False, reason
     return True, ""
 
 
 async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float = None) -> str:
-    # SSRF 防护：先校验 URL
-    ok, reason = _is_safe_url_to_fetch(url)
-    if not ok:
-        logger.warning(f"fetch_url 拒绝不安全 URL: {url} ({reason})")
-        return f"失败：拒绝抓取不安全的 URL：{reason}"
-
-    # 检查缓存
+    # 先检查缓存（避免 SSRF 校验浪费），再做 SSRF 校验
     cached = get_fetch_cache(url)
     if cached is not None:
         logger.debug(f"Fetch cache hit for {url}")
         return cached
+    # SSRF 防护：先校验 URL（含异步 DNS 解析）
+    ok, reason = await _is_safe_url_to_fetch(url)
+    if not ok:
+        logger.warning(f"fetch_url 拒绝不安全 URL: {url} ({reason})")
+        return f"失败：拒绝抓取不安全的 URL：{reason}"
 
     if start_time is None:
         # 使用 time.monotonic 而非 asyncio.get_event_loop().time()：
@@ -1455,12 +1487,10 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
     # 总超时 30 秒
     if time.monotonic() - start_time > 30:
         result = f"失败：抓取超时（总时间 >30s）：{url}"
-        set_fetch_cache(url, result)
         return result
 
     if redirect_depth > 3:
         result = f"失败：重定向层次过深 (>{3})，已放弃：{url}"
-        set_fetch_cache(url, result)
         return result
 
     original_url = url
@@ -1481,7 +1511,6 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
                     continue
                 else:
                     result = f"失败：无法获取页面内容：{url}"
-                    set_fetch_cache(url, result)
                     return result
 
             # 获取标题（用于失败提示与展示兜底）
@@ -1501,7 +1530,6 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
                 new_url = urljoin(url, match.group(1))
                 if new_url == url:
                     result = f"失败：页面重定向到自身，无法抓取：{url}"
-                    set_fetch_cache(url, result)
                     return result
                 logger.info(f"[fetch_url] 跟随 JS 跳转: {original_url} -> {new_url}")
                 result = await execute_fetch_url(new_url, redirect_depth + 1, start_time)
@@ -1515,7 +1543,6 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
                 new_url = urljoin(url, match.group(1))
                 if new_url == url:
                     result = f"失败：页面重定向到自身，无法抓取：{url}"
-                    set_fetch_cache(url, result)
                     return result
                 logger.info(f"[fetch_url] 跟随 Meta Refresh: {original_url} -> {new_url}")
                 result = await execute_fetch_url(new_url, redirect_depth + 1, start_time)
@@ -1524,7 +1551,6 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
 
             # 未提取到有效正文
             result = f"失败：无法提取有效正文（标题：{title}）\n🔗 {url}"
-            set_fetch_cache(url, result)
             return result
 
         except asyncio.TimeoutError:
@@ -1534,7 +1560,6 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
                 continue
             else:
                 result = f"失败：抓取超时，请稍后重试：{url}"
-                set_fetch_cache(url, result)
                 return result
         except Exception as e:
             logger.error(f"fetch_url unexpected error (attempt {attempt+1}): {e}")
@@ -1543,12 +1568,10 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
                 continue
             else:
                 result = f"失败：抓取异常，请稍后重试：{url}"
-                set_fetch_cache(url, result)
                 return result
 
     # 如果循环结束仍未返回（理论上不会）
     result = f"失败：多次尝试均失败：{url}"
-    set_fetch_cache(url, result)
     return result
 
 
@@ -1630,7 +1653,7 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
                     continue
                 page_data = page_resp.json()
                 pages = page_data.get("query", {}).get("pages", {})
-                page = next(iter(pages.values()))
+                page = next(iter(pages.values()), {})
                 title = page.get("title", results[0].get("title", query))
                 extract = page.get("extract", "").strip()
                 if not extract:
@@ -1689,15 +1712,16 @@ async def execute_book_lookup(query: str) -> str:
         docs = data.get("docs", [])
         if not docs:
             return f"失败：未找到与「{query}」相关的书籍"
-        lines = [f"<b>书籍查询结果：「{query}」</b><br/>"]
+        lines = [f"<b>书籍查询结果：「{escape_html(query)}」</b><br/>"]
         for i, doc in enumerate(docs[:5], 1):
-            title = doc.get("title", "无标题")
-            authors = "、".join(doc.get("author_name", ["未知作者"])[:3])
-            year = doc.get("first_publish_year", "未知")
-            subjects = "、".join(doc.get("subject", [])[:3])
+            title = escape_html(doc.get("title", "无标题"))
+            authors = escape_html("、".join(doc.get("author_name", ["未知作者"])[:3]))
+            year = escape_html(str(doc.get("first_publish_year", "未知")))
+            subjects = escape_html("、".join(doc.get("subject", [])[:3]))
             key = doc.get("key", "")
             ol_url = f"https://openlibrary.org{key}" if key else ""
-            lines.append(f"{i}. 《{title}》<br/>   作者：{authors}<br/>   首次出版：{year} 年<br/>" + (f"   主题：{subjects}<br/>" if subjects else "") + (f"   详情：{ol_url}<br/>" if ol_url else ""))
+            ol_url_html = escape_html(ol_url) if ol_url else ""
+            lines.append(f"{i}. 《{title}》<br/>   作者：{authors}<br/>   首次出版：{year} 年<br/>" + (f"   主题：{subjects}<br/>" if subjects else "") + (f"   详情：{ol_url_html}<br/>" if ol_url_html else ""))
         return "<br/>".join(lines)
     except Exception as e:
         return f"失败：书籍查询出错：{str(e)[:100]}"
@@ -1719,7 +1743,7 @@ async def execute_weather(city: str, unit: str = "c", hours: int = 6) -> str:
                     error_msg = data.get("error", {}).get("message", text)
                     return json.dumps({"error": f"天气查询失败（HTTP {resp.status}）：{error_msg[:200]}"}, ensure_ascii=False)
 
-                current = data.get("current_condition", [{}])[0]
+                current = (data.get("current_condition") or [{}])[0]
                 current_data = {
                     "temp": current.get(f"temp_{unit.upper()}", "N/A"),
                     "feels_like": current.get(f"FeelsLike{unit.upper()}", "N/A"),
@@ -1738,7 +1762,7 @@ async def execute_weather(city: str, unit: str = "c", hours: int = 6) -> str:
                     "obs_time": current.get("localObsDateTime") or current.get("observation_time", ""),
                 }
 
-                first_day = data.get("weather", [{}])[0]
+                first_day = (data.get("weather") or [{}])[0]
                 hourly_list = first_day.get("hourly", [])
                 hourly_data = []
                 for h in hourly_list[:24]:
@@ -1873,7 +1897,7 @@ async def execute_news(source: str = "bbc", limit: int = 5) -> str:
             return "失败：无法获取任何新闻源。"
         lines = ["<ul>"]
         for src, title, link in all_items[:limit*2]:
-            lines.append(f'<li><b>{title}</b> (<i>{src.upper()}</i>) <a href="{link}">🔗 阅读原文</a></li>')
+            lines.append(f'<li><b>{escape_html(title)}</b> (<i>{escape_html(src.upper())}</i>) <a href="{escape_html(link)}">🔗 阅读原文</a></li>')
         lines.append("</ul>")
         return "\n".join(lines)
     url = NEWS_FEEDS.get(source_key)
@@ -1888,7 +1912,7 @@ async def execute_news(source: str = "bbc", limit: int = 5) -> str:
             return f"失败：未找到 {source} 的新闻。"
         lines = ["<ul>"]
         for item in items:
-            lines.append(f'<li><b>{item.title}</b> <a href="{item.link}">🔗 阅读原文</a></li>')
+            lines.append(f'<li><b>{escape_html(item.title)}</b> <a href="{escape_html(item.link)}">🔗 阅读原文</a></li>')
         lines.append("</ul>")
         return "\n".join(lines)
     except Exception as e:
@@ -1975,11 +1999,6 @@ async def execute_qr_code(text: str) -> str:
         return f"✅ 二维码生成成功\n内容：{text[:200]}\n图片链接：{url}"
     else:
         return "失败：R2 上传失败，请检查配置。"
-
-
-# --------------------- done ---------------------
-async def execute_done() -> str:
-    return "Tool round completed."
 
 
 # --------------------- image API helpers ---------------------
@@ -2755,7 +2774,6 @@ async def execute_distance(origin: str, destination: str) -> str:
 
 
 # 编辑器配置
-MAX_EDITOR_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 EDITOR_PREFIX = "editor"
 
 def _editor_safe_path(path: str) -> str:
@@ -2782,12 +2800,6 @@ def _editor_get_r2_key(chat_id: int, path: str) -> str:
     """生成R2存储的键，按用户隔离。"""
     safe = _editor_safe_path(path)
     return f"{EDITOR_PREFIX}/{chat_id}/{safe}"
-
-def _editor_get_backup_key(chat_id: int, path: str) -> str:
-    """生成备份文件的R2键。"""
-    safe = _editor_safe_path(path)
-    return f"{EDITOR_PREFIX}/{chat_id}/{safe}.backup"
-
 
 async def persist_workspace_file(
     chat_id: int,

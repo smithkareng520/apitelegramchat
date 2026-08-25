@@ -991,9 +991,13 @@ async def _request_openrouter_video(
                     )
 
                     if status == "completed":
+                        # unsigned_urls 可能是空列表 []（任务完成但 URL 列表为空）。
+                        # 用 next(iter(...), None) 安全取首个元素，避免 IndexError。
+                        unsigned = data.get("unsigned_urls")
                         video_url = data.get("content") or (
-                            data.get("unsigned_urls", [None])[0] if isinstance(data.get("unsigned_urls"),
-                                                                               list) else None
+                            next(iter(unsigned), None)
+                            if isinstance(unsigned, list) and unsigned
+                            else None
                         )
                         if video_url:
                             logger.info(

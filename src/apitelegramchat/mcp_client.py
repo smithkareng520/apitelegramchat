@@ -127,6 +127,9 @@ async def call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, A
         result = await asyncio.wait_for(run_call(), timeout=server.timeout)
     except asyncio.TimeoutError as exc:
         raise MCPToolError(f"External MCP tool timed out: {server_name}.{tool_name}") from exc
+    except MCPToolError:
+        # 已经是 MCPToolError，避免再包一层导致 chain 不清晰。
+        raise
     except Exception as exc:
         raise MCPToolError(f"External MCP tool failed: {server_name}.{tool_name}") from exc
 

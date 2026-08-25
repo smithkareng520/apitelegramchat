@@ -42,7 +42,7 @@ BASH_TOOL_CALL_TIMEOUT = 310
 # 子 agent 工具：内部跑自己的多轮 agentic loop（每轮一次 LLM 调用 + 可能的工具调用）。
 # 默认 900s，用户可配到 1800s。外层必须给足够长的超时，否则主工具层会提前杀掉它。
 SUBAGENT_TOOLS = {"subagent"}
-SUBAGENT_OUTER_TIMEOUT = int(os.getenv("SUBAGENT_OUTER_TIMEOUT", "930"))  # 900s 子 agent 上限 + 30s 缓冲
+SUBAGENT_OUTER_TIMEOUT = _positive_env_int("SUBAGENT_OUTER_TIMEOUT", 930, minimum=1)  # 900s 子 agent 上限 + 30s 缓冲
 IMAGE_GEN_TOOLS = {"generate_image_from_text", "edit_image_with_reference"}
 # 视频生成工具：内部已有 5 分钟轮询超时，外层 wait_for 必须不设超时，
 # 否则会被 TOOL_CALL_TIMEOUT=10 秒杀掉（与 IMAGE_GEN_TOOLS 同样的处理）。

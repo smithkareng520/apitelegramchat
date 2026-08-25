@@ -231,49 +231,6 @@ def skill_catalog_brief() -> str:
     return _cached_skill_catalog_text()
 
 
-def build_skill_system_message(skill_id: str, *, include_body: bool = True) -> dict[str, Any]:
-    data = read_skill(skill_id)
-    if "error" in data:
-        return {"error": data["error"]}
-
-    skill = data["skill"]
-    frontmatter = skill.get("frontmatter") or {}
-    assets_relpath = skill_assets_workspace_relpath(skill.get("skill_id", skill_id))
-    header_lines = [
-        f"Active skill: {skill.get('skill_id')}",
-        f"Name: {skill.get('name')}",
-        f"Description: {skill.get('description')}",
-        f"Skill assets path (in this workspace): {assets_relpath}/",
-    ]
-    if frontmatter.get("allowed_tools"):
-        header_lines.append("Allowed tools: " + ", ".join(map(str, frontmatter.get("allowed_tools", []))))
-    if frontmatter.get("priority"):
-        header_lines.append(f"Priority: {frontmatter.get('priority')}")
-    body = data.get("body", "") if include_body else ""
-    content = "\n".join(header_lines)
-    if body:
-        content += "\n\nInstructions:\n" + body
-        content += (
-            "\n\nIMPORTANT — explicit skill usage:\n"
-            f"1. The complete skill package is available at `{assets_relpath}/`. "
-            "Read its `SKILL.md` first, then follow the instructions only when you "
-            "have explicitly decided this skill is useful for the current task.\n"
-            f"2. bash starts in the workspace execution directory. To run commands from "
-            f"this skill, use `cd ../{assets_relpath}` first, or invoke scripts with an "
-            f"explicit path such as `python ../{assets_relpath}/scripts/example.py`. "
-            "After changing directory, the persistent bash session keeps that cwd. "
-            "User files remain in the workspace and can be reached with `../` as usual.\n"
-            f"3. text_editor paths are resolved from the workspace root, so use "
-            f"`{assets_relpath}/...` for skill assets."
-        )
-    return {
-        "role": "system",
-        "name": f"skill:{skill.get('skill_id')}",
-        "content": content,
-        "skill": skill,
-    }
-
-
 def get_skill_catalog() -> dict[str, Any]:
     records = load_skill_records()
     featured = next((rec.skill_id for rec in records if rec.priority > 0), None)

@@ -22,7 +22,7 @@ from apitelegramchat.config import BASE_URL
 from apitelegramchat.utils import send_rich_html_message, escape_html
 from apitelegramchat.token_budget import truncate_to_token_budget
 
-logger = logging.getLogger("apitelegramchat.ask_user")
+logger = logging.getLogger(__name__)
 
 ASK_USER_QUESTION_TOKEN_BUDGET = 300
 ASK_USER_LABEL_TOKEN_BUDGET = 32
@@ -101,7 +101,6 @@ def _build_keyboard(interaction: AskUserInteraction) -> dict:
             "inline_keyboard": [[
                 {
                     "text": "取消自定义回答",
-                    "style": "danger",
                     "callback_data": f"ask:{interaction.id}:cancel",
                 }
             ]]
@@ -113,7 +112,6 @@ def _build_keyboard(interaction: AskUserInteraction) -> dict:
         prefix = "✅ " if idx in interaction.selected_indices else ""
         option_buttons.append({
             "text": f"{prefix}{option['label']}",
-            "style": "primary",
             "callback_data": f"ask:{interaction.id}:o:{idx}",
         })
 
@@ -128,7 +126,6 @@ def _build_keyboard(interaction: AskUserInteraction) -> dict:
     if interaction.multiple:
         rows.append([{
             "text": "✅ 提交选择",
-            "style": "success",
             "callback_data": f"ask:{interaction.id}:submit",
         }])
 
@@ -140,7 +137,6 @@ def _build_keyboard(interaction: AskUserInteraction) -> dict:
 
     rows.append([{
         "text": "取消",
-        "style": "danger",
         "callback_data": f"ask:{interaction.id}:cancel",
     }])
     return {"inline_keyboard": rows}

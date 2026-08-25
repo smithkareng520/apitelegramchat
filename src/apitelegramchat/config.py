@@ -1,5 +1,6 @@
 # config.py
 import os
+import sys
 import asyncio
 import logging
 from dataclasses import dataclass
@@ -47,12 +48,34 @@ SERPER_MCP_TOKEN = (os.getenv("SERPER_MCP_TOKEN") or "").strip()
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
 _RAW_WEBHOOK_URL = os.getenv("WEBHOOK_URL") or ""
-WEBHOOK_URL = f"{_RAW_WEBHOOK_URL}?token={WEBHOOK_TOKEN}" if _RAW_WEBHOOK_URL else ""
+# 当 WEBHOOK_URL 已配但 WEBHOOK_TOKEN 缺失时，不再生成 `?token=None`，
+# 避免被 Telegram 当作合法 webhook 注册却失去鉴权。
+WEBHOOK_URL = (
+    f"{_RAW_WEBHOOK_URL}?token={WEBHOOK_TOKEN}"
+    if _RAW_WEBHOOK_URL and WEBHOOK_TOKEN
+    else _RAW_WEBHOOK_URL
+)
 
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 
+# ---------- 公共：环境变量安全解析工具 ----------
+# 必须在使用前定义（LOG_TRUNCATE_LIMIT / MAX_CONCURRENT_TOOLS 等都依赖）。
+def _positive_float_env(name: str, default: float, minimum: float) -> float:
+    try:
+        return max(minimum, float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _positive_int_env(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------- 日志截断配置 ----------
-LOG_TRUNCATE_LIMIT = int(os.getenv("LOG_TRUNCATE_LIMIT", "5000"))
+LOG_TRUNCATE_LIMIT = _positive_int_env("LOG_TRUNCATE_LIMIT", 5000, 1)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # ---------- 必需环境变量检查 ----------
@@ -75,14 +98,17 @@ def validate_runtime_config(*, strict: bool = False) -> None:
         raise RuntimeError(f"缺少必需的环境变量: {', '.join(missing)}")
 
 if os.getenv("APITELEGRAMCHAT_REQUIRE_STRICT_CONFIG", "0") in {"1", "true", "yes", "on"}:
-    validate_runtime_config(strict=True)
+    try:
+        validate_runtime_config(strict=True)
+    except RuntimeError as exc:
+        # 导入期 logger 还没配置 basicConfig，print 到 stderr 兜底。
+        print(f"[apitelegramchat.config] {exc}", file=sys.stderr)
+        raise
 
-# ---------- 全局锁（保留兼容） ----------
 # ---------- 全局锁 ----------
 global_lock = asyncio.Lock()
 
 # ---------- 角色相关 ----------
-user_role_selections = {}
 SUPPORTED_ROLES = ["china", "think", "neko_catgirl", "succubus", "isla"]
 
 # =============================================================================
@@ -141,9 +167,6 @@ class ModelConfig:
 
     def get(self, key, default=None):
         return getattr(self, key, default)
-
-    def __getitem__(self, key):
-        return getattr(self, key)
 
 
 # =============================================================================
@@ -559,27 +582,45 @@ def get_model_config(model_id: str) -> ModelConfig:
 # =============================================================================
 # 白名单管理
 # =============================================================================
-WHITELIST_FILE = "whitelist.txt"
+WHITELIST_FILE = os.getenv("APITELEGRAMCHAT_WHITELIST_FILE") or "whitelist.txt"
 ADMIN_USERS = ["dearella"]
 WHITELIST_USERS = set()
+_whitelist_lock = asyncio.Lock()
 
-def load_whitelist():
-    global WHITELIST_USERS
+def _resolve_whitelist_path() -> str:
+    """返回白名单文件路径，优先使用绝对路径，否则挂到 data_root 下。"""
+    if os.path.isabs(WHITELIST_FILE):
+        return WHITELIST_FILE
     try:
-        with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
-            WHITELIST_USERS = {line.strip() for line in f if line.strip()}
-    except FileNotFoundError:
-        WHITELIST_USERS = set()  # 修复了原代码中的拼写错误 WHILIST_USERS
+        from apitelegramchat.workspace_paths import data_root
+        return str(data_root() / WHITELIST_FILE)
+    except Exception:
+        return WHITELIST_FILE
 
-def save_whitelist():
-    with open(WHITELIST_FILE, "w", encoding="utf-8") as f:
-        for user in sorted(WHITELIST_USERS):
-            f.write(user + "\n")
+async def load_whitelist():
+    global WHITELIST_USERS
+    async with _whitelist_lock:
+        try:
+            with open(_resolve_whitelist_path(), "r", encoding="utf-8") as f:
+                WHITELIST_USERS = {line.strip() for line in f if line.strip()}
+        except FileNotFoundError:
+            WHITELIST_USERS = set()
+        except OSError:
+            logger.warning("load_whitelist failed: %s", _resolve_whitelist_path(), exc_info=True)
+
+async def save_whitelist():
+    async with _whitelist_lock:
+        try:
+            with open(_resolve_whitelist_path(), "w", encoding="utf-8") as f:
+                for user in sorted(WHITELIST_USERS):
+                    f.write(user + "\n")
+        except OSError:
+            logger.warning("save_whitelist failed: %s", _resolve_whitelist_path(), exc_info=True)
 
 # ---------- 缓存 TTL ----------
-CACHE_TTL = 300
-SEARCH_CACHE_TTL = 300
-FETCH_CACHE_TTL = 3600
+CACHE_TTL = _positive_int_env("CACHE_TTL", 300, 10)
+SEARCH_CACHE_TTL = _positive_int_env("SEARCH_CACHE_TTL", 300, 10)
+FETCH_CACHE_TTL = _positive_int_env("FETCH_CACHE_TTL", 3600, 10)
 
 # ---------- S3 / R2 配置 ----------
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
@@ -592,31 +633,17 @@ R2_REGION = os.getenv("R2_REGION", "auto")
 # ---------- 流式刷新阈值 ----------
 # 草稿是用户感知 Agent 正在工作的唯一实时界面。默认值优先保证首字与
 # 状态变更的可见性，同时仍低于 Telegram 草稿 API 的常规刷新频率。
-def _positive_float_env(name: str, default: float, minimum: float) -> float:
-    try:
-        return max(minimum, float(os.getenv(name, str(default))))
-    except (TypeError, ValueError):
-        return default
-
-
-def _positive_int_env(name: str, default: int, minimum: int) -> int:
-    try:
-        return max(minimum, int(os.getenv(name, str(default))))
-    except (TypeError, ValueError):
-        return default
-
-
 STREAM_FLUSH_INTERVAL = _positive_float_env("STREAM_FLUSH_INTERVAL", 0.65, 0.25)
 STREAM_SILENT_FORCE_FLUSH = _positive_float_env(
     "STREAM_SILENT_FORCE_FLUSH", 2.0, STREAM_FLUSH_INTERVAL
 )
 
 # ---------- 工具调用并发数 ----------
-MAX_CONCURRENT_TOOLS = int(os.getenv("MAX_CONCURRENT_TOOLS", "16"))
+MAX_CONCURRENT_TOOLS = _positive_int_env("MAX_CONCURRENT_TOOLS", 16, 1)
 
 # ---------- 文件解析配置 ----------
-PARSE_CONCURRENCY_LIMIT = int(os.getenv("PARSE_CONCURRENCY_LIMIT", "5"))
-PARSE_TIMEOUT = int(os.getenv("PARSE_TIMEOUT", "60"))
+PARSE_CONCURRENCY_LIMIT = _positive_int_env("PARSE_CONCURRENCY_LIMIT", 5, 1)
+PARSE_TIMEOUT = _positive_int_env("PARSE_TIMEOUT", 60, 1)
 
 # =============================================================================
 # 安全补丁：读取后立即清洗敏感环境变量

@@ -20,7 +20,6 @@ search_engine.py 等）无需修改任何 import 语句。
 import asyncio
 import json
 import re
-import logging
 from typing import Optional
 
 from apitelegramchat.config import (
@@ -312,7 +311,7 @@ def clean_ai_content(content: str) -> str:
     return content.strip() if content else ""
 
 
-def _build_initial_messages(api_type: str, system_prompt: str) -> list:
+def _build_initial_messages(system_prompt: str) -> list:
     return [{"role": "system", "content": system_prompt}]
 
 
@@ -321,7 +320,6 @@ async def get_ai_response(
         user_models: dict,
         user_contexts: dict,
         username: str,
-        is_search: bool = False,
         user_message: dict = None,
 ) -> tuple[str, str, list, Optional[dict]]:
     builder = None
@@ -381,7 +379,7 @@ async def get_ai_response(
             supports_tools=supports_tools,
             skill_catalog_text=skill_catalog_brief(),
         )
-        messages = _build_initial_messages(api_type, system_prompt)
+        messages = _build_initial_messages(system_prompt)
         await _append_history_async(messages, history, api_type, model_info, chat_id=chat_id)
         if model_info.supports_prompt_cache:
             _apply_cache_control(messages)
@@ -584,7 +582,11 @@ async def get_ai_response(
         raise
 
     except Exception as e:
-        logger.exception(f"get_ai_response 顶层异常: {e}")
+        # 用 error_id 关联日志与用户消息，避免把 str(e) 直接回传
+        # （可能含 request URL、Authorization、内部 trace 等敏感字段）。
+        import uuid as _uuid
+        error_id = _uuid.uuid4().hex[:12]
+        logger.exception(f"get_ai_response 顶层异常 (error_id={error_id}): {e}")
         # 异常处理：构造错误消息并发送
         try:
             current_model = user_models.get(chat_id, DEFAULT_MODEL)
@@ -601,7 +603,10 @@ async def get_ai_response(
             is_native_image = False
 
         code = getattr(e, "status_code", getattr(e, "status", 500))
-        error_msg_for_user = str(e)
+        # 给用户/LLM 的错误消息必须避免泄漏上游 SDK 的内部信息
+        # （request URL、Authorization、内部 trace 等）。
+        # 外部只看到简短原因 + error_id。
+        error_msg_for_user = f"内部错误 (error_id={error_id})"
         if hasattr(e, "response") and hasattr(e.response, "text"):
             try:
                 body = await e.response.text()
@@ -611,11 +616,19 @@ async def get_ai_response(
                         # error 字段可能是 dict（OpenAI 风格）或字符串
                         err = body_json.get("error")
                         if isinstance(err, dict):
-                            error_msg_for_user = err.get("message") or error_msg_for_user
-                        elif isinstance(err, str):
-                            error_msg_for_user = err
+                            err_msg = err.get("message")
+                            if isinstance(err_msg, str) and err_msg:
+                                # 上游错误消息可能含敏感字段，只保留前 200 字符
+                                error_msg_for_user = f"{err_msg[:200]} (error_id={error_id})"
+                        elif isinstance(err, str) and err:
+                            error_msg_for_user = f"{err[:200]} (error_id={error_id})"
                 except Exception:
-                    error_msg_for_user = f"{error_msg_for_user} | Response: {body[:300]}"
+                    # body 非 JSON：不直接把原始 body 回传给用户，
+                    # 上游 body 可能含 request_id、API key（如果网关回显）等。
+                    # 只在日志里保留，对用户只暴露 error_id。
+                    logger.warning(
+                        f"get_ai_response 上游错误 body 非 JSON (error_id={error_id}, status={code}): {body[:300]}"
+                    )
             except Exception:
                 pass
 
@@ -698,7 +711,4 @@ from apitelegramchat.ai.media_generation import (  # noqa: E402,F401
 )
 from apitelegramchat.ai.attachment_content import (  # noqa: E402,F401
     _get_cached_audio_data,
-    get_cached_video_data,
-    _resolve_r2_public_url_for_video,
-    _ensure_video_persisted,
 )

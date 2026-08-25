@@ -85,9 +85,11 @@ def select_request_context(
         if not _is_supported(message):
             continue
         message_tokens = _message_token_count(message)
-        if max_messages and len(selected_reversed) >= max_messages:
+        # 用 `is not None` 而非 falsy 检查，避免 max_messages=0/max_tokens=0
+        # 被当作"无限制"而非"零消息/零 token"——语义颠倒。
+        if max_messages is not None and len(selected_reversed) >= max_messages:
             break
-        if max_tokens and used_tokens + message_tokens > max_tokens:
+        if max_tokens is not None and used_tokens + message_tokens > max_tokens:
             if selected_reversed:
                 break
             fitted = _fit_message_to_token_budget(message, max_tokens)

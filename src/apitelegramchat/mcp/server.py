@@ -13,9 +13,10 @@ from apitelegramchat.mcp.registry import ToolRegistry
 from apitelegramchat.mcp.resources import ResourceService
 from apitelegramchat.workspace_paths import data_root
 
-logger = logging.getLogger("apitelegramchat.mcp")
+logger = logging.getLogger(__name__)
 SERVER_NAME = "apitelegramchat"
-SERVER_VERSION = "2.2.0"
+# 引用包 __version__ 作为唯一来源，避免与 __init__.py 不同步。
+from apitelegramchat import __version__ as SERVER_VERSION  # noqa: E402
 
 
 def create_server(context: MCPRequestContext) -> Server:

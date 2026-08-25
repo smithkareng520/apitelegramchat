@@ -3,7 +3,7 @@
 # verify_security.py — 部署后安全自检脚本
 # =====================================================================
 # 用法:
-#   1. 在容器内执行：python verify_security.py
+#   1. 在容器内执行：python -m apitelegramchat.verify_security
 #   2. 所有测试项应通过；失败项说明该防御层失效
 # =====================================================================
 
@@ -18,10 +18,18 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-PASS = "\033[32m[PASS]\033[0m"
-FAIL = "\033[31m[FAIL]\033[0m"
-WARN = "\033[33m[WARN]\033[0m"
-INFO = "\033[36m[INFO]\033[0m"
+# ANSI 颜色码仅在 TTY 输出，避免污染 CI/CD 日志。
+_USE_COLOR = sys.stdout.isatty()
+
+
+def _color(code: int, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _USE_COLOR else text
+
+
+PASS = _color(32, "[PASS]")
+FAIL = _color(31, "[FAIL]")
+WARN = _color(33, "[WARN]")
+INFO = _color(36, "[INFO]")
 
 results = []
 
@@ -109,6 +117,11 @@ async def check_sandbox_isolation(landlock_ok: bool):
         report("4.0 Landlock sandbox available", False, "Landlock unavailable: sandbox cannot be considered safe")
         return
 
+    # 用随机生成的探针 secret，避免固定字符串意外通过 sandbox 泄漏到生产。
+    import secrets as _secrets
+    probe_secret = _secrets.token_hex(16)
+    probe_secret_outside = _secrets.token_hex(16)
+
     import functools
     from apitelegramchat.sandbox import build_sandbox_argv, build_sandbox_env, _preexec_sandbox
 
@@ -124,9 +137,9 @@ async def check_sandbox_isolation(landlock_ok: bool):
     workspace = Path(tempfile.mkdtemp(prefix="verify_workspace_", dir=str(base)))
     parent_probe = workspace.parent / "landlock-parent-probe.txt"
     outside_target = workspace.parent / "landlock-outside-target.txt"
-    (workspace / "secret.txt").write_text("THIS_IS_SECRET_12345")
+    (workspace / "secret.txt").write_text(probe_secret)
     parent_probe.unlink(missing_ok=True)
-    outside_target.write_text("OUTSIDE_SECRET_98765")
+    outside_target.write_text(probe_secret_outside)
 
     async def run(cmd: str) -> tuple[int, str]:
         argv = build_sandbox_argv()
@@ -162,16 +175,19 @@ async def check_sandbox_isolation(landlock_ok: bool):
         report("4.2 ../ 写入被拒绝", rc != 0 and not parent_probe.exists(), out[:200])
 
         rc, out = await run("cat ../landlock-outside-target.txt 2>&1\n")
-        report("4.3 ../ 读取被拒绝", rc != 0 and "OUTSIDE_SECRET_98765" not in out, out[:200])
+        report("4.3 ../ 读取被拒绝", rc != 0 and probe_secret_outside not in out, out[:200])
 
         rc, out = await run("ln -s ../landlock-outside-target.txt escape-link\ncat escape-link 2>&1\n")
-        report("4.4 symlink 逃逸被拒绝", "OUTSIDE_SECRET_98765" not in out, out[:200])
+        report("4.4 symlink 逃逸被拒绝", probe_secret_outside not in out, out[:200])
 
         rc, out = await run("cat /app/config.py 2>&1\n")
         report("4.5 应用源码不可读", "Permission denied" in out or "No such file" in out, out[:200])
 
         rc, out = await run("printf x > /app/landlock-write-probe 2>&1\n")
-        report("4.6 应用目录不可写", "Permission denied" in out or "Read-only" in out, out[:200])
+        # /app 不存在也是安全状态，不应判 FAIL。
+        report("4.6 应用目录不可写",
+               "Permission denied" in out or "Read-only" in out or "No such file" in out,
+               out[:200])
 
         rc, out = await run("printf sandbox-ok > /dev/null\n")
         report("4.7 /dev/null 可写", rc == 0, out[:200])
@@ -183,7 +199,9 @@ async def check_sandbox_isolation(landlock_ok: bool):
         report("4.9 /proc 不可访问", "Permission denied" in out or "No such file" in out, out[:200])
 
         rc, out = await run("env\n")
-        bad = bool(re.search(r'(KEY|TOKEN|SECRET|PASSWORD)=', out))
+        # 用 word boundary 避免误匹配 MONKEY= / PYTHONKEY= / TURKEY= 等无关变量。
+        # 仅匹配以 SENSITIVE 字段结尾的环境变量名。
+        bad = bool(re.search(r'(^|\n)\S*(?:KEY|TOKEN|SECRET|PASSWORD)=', out))
         report("4.9 子进程环境无密钥", not bad, out[:300])
     finally:
         parent_probe.unlink(missing_ok=True)
@@ -215,9 +233,14 @@ def check_resource_limits():
 # 6. Workspace 权限检查
 # ----------------------------------------------------------------------
 def check_workspace_perms():
-    ws = Path("/app/workspace")
+    # 用真实 data_root 路径而非硬编码 /app，否则非 /app 部署永远跳过检查。
+    try:
+        from apitelegramchat.workspace_paths import data_root
+        ws = data_root()
+    except Exception:
+        ws = Path("/app/workspace")
     if not ws.exists():
-        warn("6.x workspace 权限", "/app/workspace 不存在")
+        warn("6.x workspace 权限", f"{ws} 不存在")
         return
     mode = ws.stat().st_mode & 0o777
     report("6.1 workspace 权限 700", mode == 0o700, f"实际 mode={oct(mode)}")

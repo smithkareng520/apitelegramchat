@@ -112,8 +112,9 @@ async def upload_bytes_to_r2(
             path.write_bytes(data)
             logger.info("Local R2 cache saved: %s", key)
             return _local_public_url(key)
-        except Exception as e:
-            logger.exception("Local R2 cache write failed: %s", e)
+        except Exception:
+            # logger.exception 自带 traceback，不必再传 e。
+            logger.exception("Local R2 cache write failed")
             return None
 
     # 修复 BUG：max_attempts=1 让 for 循环只跑一次，下面的重试分支

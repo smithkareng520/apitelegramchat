@@ -76,14 +76,6 @@ class APIClient:
             self._clients[api_type] = self._build_client(api_type)
         return self._clients[api_type]
 
-    # -------------------- 向后兼容的旧方法 --------------------
-    # 以下方法保留以兼容现有代码，但内部统一使用 get_client
-
-    # -------------------- 可选：获取所有已配置厂商 --------------------
-    def list_providers(self) -> list:
-        """返回所有已配置的厂商名称列表"""
-        return list(self._providers.keys())
-
 
 # 全局单例
 api_client = APIClient()
