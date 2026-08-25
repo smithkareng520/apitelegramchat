@@ -47,8 +47,13 @@ logger = logging.getLogger(__name__)
 # fetch 结果的 HTML 总预算。必须小于 tool_executors.MAX_TOOL_RESPONSE_LEN(16000)，
 # 这样 _truncate_tool_result 的朴素切片永远不会作用在 fetch_url 的 HTML 上。
 FETCH_RICH_MAX_LEN = 14000
-# 正文（含原位插入的媒体）占用的预算，给标题/来源链接留余量。
-FETCH_BODY_MAX_LEN = 11000
+# 正文（含原位插入的媒体）占用的预算。页头（<h3> 标题 + 来源链接，最长约
+# 330）+ 截断提示（约 30）后仍低于 FETCH_RICH_MAX_LEN，且留有充足余量
+# 低于 MAX_TOOL_RESPONSE_LEN(16000)。
+# 历史教训：曾设为 11000，内容丰富的页面（如维基百科条目）会把靠后的
+# 表格（各话列表等）整块截掉——预算压缩（见 _demote_same_origin_links）
+# 与本预算必须协同工作。
+FETCH_BODY_MAX_LEN = 13400
 
 # 媒体数量上限：防止图库/相册类页面把工具结果塞满 <img>。
 MAX_IMAGES = 8
@@ -1120,6 +1125,36 @@ def _fallback_paragraph_blocks(fallback_text: str) -> list[str]:
     return [f"<p>{esc(p[:2000])}</p>" for p in paragraphs[:40]]
 
 
+_SAME_ORIGIN_LINK_RE = re.compile(r'<a href="([^"]*)">(.*?)</a>', re.DOTALL)
+
+
+def _demote_same_origin_links(blocks: list[str], base_url: str) -> list[str]:
+    """把指向同源（同 host）的 <a> 链接降级为纯锚文本，跨域链接保留。
+
+    使用场景：正文超出字符预算时的无损压缩。维基百科等站点的内链 URL
+    是百分号编码（一个 CJK 字符展开为 9 个 ASCII 字符），单条链接即可
+    占用上百字符，数百条内链常常吃掉 40% 以上的预算，导致靠后的表格
+    被整块截断。内链的导航价值远低于其体积成本——降级只去掉 href，
+    锚文本（含行内格式标签）原样保留，信息几乎无损。
+
+    匹配范围限定为本转换器产出的规整形态 `<a href="...">…</a>`（无
+    其他属性），跨域链接、页头来源链接（不在正文块中）均不受影响。
+    """
+    origin = (urlparse(base_url).netloc or "").lower()
+    if not origin:
+        return blocks
+
+    def _demote(m: "re.Match") -> str:
+        href = m.group(1)
+        host = (urlparse(href).netloc or "").lower()
+        # netloc 不受 HTML 实体转义影响（&amp; 只出现在 query 里）。
+        if host == origin:
+            return m.group(2)
+        return m.group(0)
+
+    return [_SAME_ORIGIN_LINK_RE.sub(_demote, b) for b in blocks]
+
+
 def build_model_facing_html(
     url: str,
     html_text: str,
@@ -1182,6 +1217,13 @@ def build_model_facing_html(
     final_blocks = _interleave(entries, dropped)
     if not final_blocks:
         return None
+
+    # 预算感知压缩：正文超出预算时，先把同源链接降级为纯文本（保留锚
+    # 文本与行内格式，仅去掉冗长的 href）。维基百科类页面的内链 URL 是
+    # 百分号编码，单条即可达百字符，常常吃掉 40% 以上的预算——降级后
+    # 信息几乎无损，而靠后的表格（如各话列表）得以保留在预算内。
+    if sum(len(b) + 1 for b in final_blocks) > FETCH_BODY_MAX_LEN:
+        final_blocks = _demote_same_origin_links(final_blocks, url)
 
     kept_blocks, was_truncated = _truncate_blocks(final_blocks, FETCH_BODY_MAX_LEN)
     parts = header_parts + kept_blocks
