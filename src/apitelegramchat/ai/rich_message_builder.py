@@ -1145,7 +1145,9 @@ class RichMessageBuilder:
             if not html_content.strip() or html_content.strip() == " ":
                 html_content = "<p>Working...</p>"
 
-                frame_chars = len(_rich_visible_text(html_content))
+            # flush 已不再依赖字符阈值，frame_chars 仅用于日志统计。
+            # 无论进入哪条执行路径都必须初始化，避免 UnboundLocalError。
+            frame_chars = len(_rich_visible_text(html_content))
             _frame_boundaries, _ignored_chars, frame_blocks = _scan_rich_html_boundaries(html_content)
             frame_revision = self._flush_revision
             frame_started = time.monotonic()
