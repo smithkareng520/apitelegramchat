@@ -143,7 +143,7 @@ def _render_code_panel(
 def _trim_ui_value(value: object, limit: int = _UI_MAX_VALUE_TOKENS) -> str:
     text = str(value if value is not None else "")
     text = re.sub(r"\s+", " ", text).strip()
-    return truncate_to_tokens(text, limit, suffix="…")
+    return truncate_to_tokens(text, limit, suffix=chr(0x2026))
 
 
 def _looks_like_http_url(value: object) -> bool:
@@ -1060,7 +1060,7 @@ class BashSession:
             now = time.monotonic()
             if not force and now - last_emit < 1.0:
                 return
-            preview = truncate_to_tokens("".join(output_parts), 2000, suffix="…")
+            preview = truncate_to_tokens("".join(output_parts), 2000, suffix=chr(0x2026))
             try:
                 result = progress_callback(preview or "正在执行 Bash 命令…")
                 if asyncio.iscoroutine(result):
@@ -1216,7 +1216,7 @@ class BashSession:
                     if not force and grew < progress_min_chars and (now - progress_last_emit) < progress_min_interval:
                         return
                     # 前端草稿只需要最近一段日志；完整输出仍由最终结果保留。
-                    preview_text = truncate_to_tokens(output_text, 2000, suffix="…")
+                    preview_text = truncate_to_tokens(output_text, 2000, suffix=chr(0x2026))
                     try:
                         result = progress_callback(preview_text)
                         if asyncio.iscoroutine(result):

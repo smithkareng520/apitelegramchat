@@ -1116,7 +1116,7 @@ def _fallback_paragraph_blocks(fallback_text: str) -> list[str]:
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", fallback_text or "") if p.strip()]
     if not paragraphs and fallback_text:
         paragraphs = [fallback_text.strip()]
-    return [f'<p>{esc(truncate_to_tokens(p, 1000, suffix="…"))}</p>' for p in paragraphs[:40]]
+    return [f'<p>{esc(truncate_to_tokens(p, 1000, suffix=chr(0x2026)))}</p>' for p in paragraphs[:40]]
 
 
 _SAME_ORIGIN_LINK_RE = re.compile(r'<a href="([^"]*)">(.*?)</a>', re.DOTALL)

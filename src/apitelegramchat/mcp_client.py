@@ -134,7 +134,7 @@ async def call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, A
 
     text = _extract_text(result)
     if getattr(result, "isError", False):
-        raise MCPToolError(f"External MCP tool returned an error: {server_name}.{tool_name}: {truncate_to_tokens(text, 250, suffix="…")}")
+        raise MCPToolError(f"External MCP tool returned an error: {server_name}.{tool_name}: {truncate_to_tokens(text, 250, suffix=chr(0x2026))}")
     return text
 
 

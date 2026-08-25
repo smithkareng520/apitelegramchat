@@ -2152,7 +2152,7 @@ def _format_image_api_error(api_name: str, status_code: int, detail: str = "", r
         clean = detail.strip().replace("\r\n", "\n").replace("\r", "\n")
         lines = [line.strip() for line in clean.split("\n") if line.strip()]
         clean = "<br/>".join(line for line in lines)
-        clean = truncate_to_tokens(clean, 200, suffix="…")
+        clean = truncate_to_tokens(clean, 200, suffix=chr(0x2026))
         parts.append(f"详情：{clean}")
     return "<br/>".join(parts)
 

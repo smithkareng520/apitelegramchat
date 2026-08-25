@@ -198,7 +198,7 @@ async def _request_modelscope_native_image(
                 "[NativeImage/ModelScope] JSON parse failed; body_preview=%r",
                 _body_preview(body_text),
             )
-        return None, resp.status, truncate_to_tokens(body_text, 250, suffix="…"), request_id
+        return None, resp.status, truncate_to_tokens(body_text, 250, suffix=chr(0x2026)), request_id
 
     def _extract_request_meta(payload: dict | None) -> tuple[str, str]:
         if not isinstance(payload, dict):
@@ -571,16 +571,16 @@ def _format_native_image_notice(
 
     if reason in {"content_filter", "safety", "blocked", "moderation"}:
         if refusal_text:
-            return f"⚠️ 这张图触发了安全限制：{truncate_to_tokens(refusal_text, 300, suffix="…")}"
+            return f"⚠️ 这张图触发了安全限制：{truncate_to_tokens(refusal_text, 300, suffix=chr(0x2026))}"
         if content_text:
-            return f"⚠️ 这张图触发了安全限制：{truncate_to_tokens(content_text, 300, suffix="…")}"
+            return f"⚠️ 这张图触发了安全限制：{truncate_to_tokens(content_text, 300, suffix=chr(0x2026))}"
         return "⚠️ 这张图触发了安全限制，请修改描述后重试。"
 
     if refusal_text:
-        return f"⚠️ {truncate_to_tokens(refusal_text, 300, suffix="…")}"
+        return f"⚠️ {truncate_to_tokens(refusal_text, 300, suffix=chr(0x2026))}"
 
     if content_text:
-        return truncate_to_tokens(content_text, 600, suffix="…")
+        return truncate_to_tokens(content_text, 600, suffix=chr(0x2026))
 
     return "⚠️ 图片生成失败，请稍后重试。"
 
@@ -672,7 +672,7 @@ async def _request_agnes_video(
         model,
         duration,
         len(clean_prompt),
-        truncate_to_tokens(clean_prompt, 120, suffix="…"),
+        truncate_to_tokens(clean_prompt, 120, suffix=chr(0x2026)),
     )
 
     # 提交任务
@@ -691,15 +691,15 @@ async def _request_agnes_video(
                     "[NativeVideo/Agnes] submit response: status=%s content_type=%s body_preview=%r",
                     resp.status,
                     resp.headers.get("Content-Type", ""),
-                    truncate_to_tokens(resp_text, 250, suffix="…"),
+                    truncate_to_tokens(resp_text, 250, suffix=chr(0x2026)),
                 )
                 if resp.status != 200:
-                    return None, f"Agnes 提交失败 (HTTP {resp.status}): {truncate_to_tokens(resp_text, 100, suffix="…")}", None
+                    return None, f"Agnes 提交失败 (HTTP {resp.status}): {truncate_to_tokens(resp_text, 100, suffix=chr(0x2026))}", None
 
                 try:
                     data = json.loads(resp_text)
                 except Exception:
-                    return None, f"Agnes 提交返回非 JSON: {truncate_to_tokens(resp_text, 100, suffix="…")}", None
+                    return None, f"Agnes 提交返回非 JSON: {truncate_to_tokens(resp_text, 100, suffix=chr(0x2026))}", None
 
                 video_id = data.get("video_id") or data.get("id")
                 if not video_id:
@@ -745,7 +745,7 @@ async def _request_agnes_video(
                         "[NativeVideo/Agnes] polling iter=%s response: status=%s body_preview=%r",
                         poll_iter,
                         resp.status,
-                        truncate_to_tokens(body_text, 250, suffix="…"),
+                        truncate_to_tokens(body_text, 250, suffix=chr(0x2026)),
                     )
 
                     if resp.status != 200:
@@ -765,7 +765,7 @@ async def _request_agnes_video(
                             "[NativeVideo/Agnes] polling iter=%s JSON parse failed elapsed=%.1fs body_preview=%r",
                             poll_iter,
                             elapsed,
-                            truncate_to_tokens(body_text, 150, suffix="…"),
+                            truncate_to_tokens(body_text, 150, suffix=chr(0x2026)),
                         )
                         await asyncio.sleep(interval)
                         continue
@@ -858,7 +858,7 @@ async def _request_openrouter_video(
         model,
         duration,
         len(clean_prompt),
-        truncate_to_tokens(clean_prompt, 120, suffix="…"),
+        truncate_to_tokens(clean_prompt, 120, suffix=chr(0x2026)),
     )
 
     # 提交任务
@@ -880,16 +880,16 @@ async def _request_openrouter_video(
                     "[NativeVideo/OpenRouter] submit response: status=%s content_type=%s body_preview=%r",
                     resp.status,
                     resp.headers.get("Content-Type", ""),
-                    truncate_to_tokens(resp_text, 250, suffix="…"),
+                    truncate_to_tokens(resp_text, 250, suffix=chr(0x2026)),
                 )
 
                 if resp.status != 202:
-                    return None, f"OpenRouter 提交失败 (HTTP {resp.status}): {truncate_to_tokens(resp_text, 100, suffix="…")}", None
+                    return None, f"OpenRouter 提交失败 (HTTP {resp.status}): {truncate_to_tokens(resp_text, 100, suffix=chr(0x2026))}", None
 
                 try:
                     data = json.loads(resp_text)
                 except Exception:
-                    return None, f"OpenRouter 提交返回非 JSON: {truncate_to_tokens(resp_text, 100, suffix="…")}", None
+                    return None, f"OpenRouter 提交返回非 JSON: {truncate_to_tokens(resp_text, 100, suffix=chr(0x2026))}", None
 
                 job_id = data.get("id")
                 polling_url = data.get("polling_url") or data.get("status_url")
@@ -958,7 +958,7 @@ async def _request_openrouter_video(
                         "[NativeVideo/OpenRouter] polling iter=%s response: status=%s body_preview=%r",
                         poll_iter,
                         resp.status,
-                        truncate_to_tokens(body_text, 250, suffix="…"),
+                        truncate_to_tokens(body_text, 250, suffix=chr(0x2026)),
                     )
 
                     if resp.status != 200:
@@ -978,7 +978,7 @@ async def _request_openrouter_video(
                             "[NativeVideo/OpenRouter] polling iter=%s JSON parse failed elapsed=%.1fs body_preview=%r",
                             poll_iter,
                             elapsed,
-                            truncate_to_tokens(body_text, 150, suffix="…"),
+                            truncate_to_tokens(body_text, 150, suffix=chr(0x2026)),
                         )
                         await asyncio.sleep(interval)
                         continue

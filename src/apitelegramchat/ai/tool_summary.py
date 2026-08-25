@@ -32,7 +32,7 @@ def _get_tool_description_from_args(fn_args: dict) -> Optional[str]:
     desc = fn_args.get("_description") or fn_args.get("_summary")
     if desc and isinstance(desc, str):
         desc = desc.strip()
-        desc = truncate_to_tokens(desc, 40, suffix="...")
+        desc = truncate_to_tokens(desc, 40, suffix=chr(0x2e) * 3)
         return desc
     return None
 
@@ -110,7 +110,7 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     if fn_name == "bash":
         cmd = (fn_args.get("command") or "").strip()
         if cmd:
-            short_cmd = truncate_to_tokens(cmd, 15, suffix="...")
+            short_cmd = truncate_to_tokens(cmd, 15, suffix=chr(0x2e) * 3)
             return short_cmd
         return "Running command"
 
@@ -271,7 +271,7 @@ def _normalize_tool_arguments(arguments: Any) -> tuple[str, bool]:
     except (json.JSONDecodeError, TypeError, ValueError):
         reason = "arguments were not valid JSON"
 
-    safe_excerpt = truncate_to_tokens(raw, 1000, suffix="…")
+    safe_excerpt = truncate_to_tokens(raw, 1000, suffix=chr(0x2026))
     normalized = {
         _INVALID_TOOL_ARGUMENTS_KEY: reason,
         _INVALID_TOOL_ARGUMENTS_RAW_KEY: safe_excerpt,

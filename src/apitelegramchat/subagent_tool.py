@@ -189,7 +189,7 @@ async def _execute_tool_for_subagent(
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        return f"Error: tool '{name}' failed: {truncate_to_tokens(str(e), 100, suffix="…")}"
+        return f"Error: tool '{name}' failed: {truncate_to_tokens(str(e), 100, suffix=chr(0x2026))}"
 
 
 async def _subagent_agentic_loop(
@@ -268,7 +268,7 @@ async def _subagent_agentic_loop(
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            last_error = f"LLM 调用失败: {truncate_to_tokens(str(e), 100, suffix="…")}"
+            last_error = f"LLM 调用失败: {truncate_to_tokens(str(e), 100, suffix=chr(0x2026))}"
             logger.exception(f"subagent: LLM call failed (round {rounds}): {e}")
             await _report(f"第 {rounds} 轮 LLM 调用失败")
             break
@@ -474,7 +474,7 @@ async def execute_subagent(
         logger.exception(f"subagent: unexpected error (error_id={error_id}): {e}")
         return json.dumps({
             "ok": False,
-            "error": f"子 agent 异常 (error_id={error_id})：{truncate_to_tokens(str(e), 100, suffix="…")}",
+            "error": f"子 agent 异常 (error_id={error_id})：{truncate_to_tokens(str(e), 100, suffix=chr(0x2026))}",
             "code": "exception",
             "error_id": error_id,
             "model": chosen_model,
@@ -483,7 +483,7 @@ async def execute_subagent(
     # 加上模型信息再返回
     result["model"] = chosen_model
     result["model_name"] = getattr(model_info, "name", chosen_model)
-    result["task_preview"] = truncate_to_tokens(task, 40, suffix="…")
+    result["task_preview"] = truncate_to_tokens(task, 40, suffix=chr(0x2026))
     return json.dumps(result, ensure_ascii=False)
 
 

@@ -608,7 +608,7 @@ def _render_memory_item(m: dict) -> str:
     cat = _category_badge(m)
     mid = f"<code>#{_esc(m.get('id', '?'))}</code>"
     content = _esc(m.get("content", ""))
-    content = truncate_to_tokens(content, 200, suffix="…")
+    content = truncate_to_tokens(content, 200, suffix=chr(0x2026))
     tags = _tag_chips(m)
     parts = [f"{badge} {cat} {mid}", f"<blockquote>{content}</blockquote>"]
     if tags:
