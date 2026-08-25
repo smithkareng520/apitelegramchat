@@ -1702,10 +1702,29 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         query = fn_args.get('query', '')
         lang = fn_args.get('lang', 'zh')
         import urllib.parse
-        encoded_query = urllib.parse.quote(query)
-        wiki_url = f"https://{lang}.wikipedia.org/wiki/{encoded_query}"
-        summary = f"📚 {query}"
-        details_html = f'<a href="{wiki_url}">{query}</a>'
+        text = result_str.strip()
+        # 标题：富 HTML 结果取首个 <h3>；退化（纯文本摘要）取 <b>Wikipedia — 标题</b>。
+        title = None
+        m = re.search(r"<h3[^>]*>(.*?)</h3>", text, re.S | re.I)
+        if m:
+            title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1))).strip()
+        if not title:
+            m = re.search(r"<b>Wikipedia\s*[—-]\s*(.+?)</b>", text, re.S)
+            if m:
+                title = re.sub(r"\s+", " ", m.group(1)).strip()
+        if not title:
+            title = query
+        # 来源链接：优先结果中的真实 URL——关键词解析出的页面标题
+        # 可能与 query 不同（如搜"可塑性记忆"命中"可塑性記憶"），
+        # 猜测 URL 会 404。富 HTML 里是 <a href>；退化格式里是纯文本。
+        m = re.search(r'<a href="(https://[^"]*wikipedia\.org[^"]*)"', text)
+        if m:
+            wiki_url = m.group(1)
+        else:
+            m = re.search(r"https://[^\s<>\"']+wikipedia\.org[^\s<>\"']*", text)
+            wiki_url = m.group(0) if m else f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(query)}"
+        summary = f"📚 {escape_html(title)}"
+        details_html = f'<a href="{wiki_url}">{escape_html(title)}</a>'
         return summary, details_html
 
     elif fn_name == "exchange_rate":

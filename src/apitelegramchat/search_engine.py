@@ -535,7 +535,15 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "wikipedia",
-            "description": "Look up a topic on Wikipedia and return an encyclopedic summary. Prefer for factual / definitional queries.",
+            "description": (
+                "Look up a topic on Wikipedia by keyword and return the full article rendered as "
+                "Telegram Rich Message HTML mirroring the original page structure: headings, "
+                "paragraphs, lists, tables (episode lists, statistics), images and links all appear "
+                "at their original positions. The keyword is resolved to the best-matching page in "
+                "one step (no separate search needed). You may quote or reuse the relevant HTML "
+                "fragments (including <table>, <img>, <a> tags) directly in your reply. "
+                "Prefer for encyclopedic / factual / definitional queries."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1546,6 +1554,25 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
 
 # --------------------- wikipedia ---------------------
 async def execute_wikipedia(query: str, lang: str = "zh") -> str:
+    """Wikipedia 关键词查询 → 忠实原文结构的 Telegram Rich HTML。
+
+    链路：
+      1. list=search 把关键词解析为最匹配的页面（web_search+fetch_url 需要
+         两轮才能做到，且不保证维基百科排第一）；
+      2. action=parse 获取该页面的完整解析后 HTML（MediaWiki API 并非只有
+         纯文本：prop=extracts&explaintext 才是纯文本摘要；action=parse 的
+         prop=text 返回含表格/列表/图片的完整 HTML，比抓取网页更稳定）；
+      3. 复用 fetch_url 的富提取管线（trafilatura 结构化提取 + 媒体原位 +
+         预算感知压缩），结果格式与 fetch_url 完全一致，模型可同样复用其中
+         的 <img>/<a> 等片段；
+      4. parse 失败或富转换提不出内容时，退化为旧的纯文本摘要路径。
+    """
+    try:
+        from apitelegramchat.fetch_rich_content import build_model_facing_html
+    except Exception as e:
+        logger.error(f"[wikipedia] fetch_rich_content 导入失败: {e}")
+        build_model_facing_html = None
+
     for l in [lang, "en"]:
         try:
             async with AsyncSession() as session:
@@ -1562,6 +1589,37 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
                 if not results:
                     continue
                 page_id = results[0]["pageid"]
+
+                # ---- 主路径：action=parse 完整 HTML → 富管线 ----
+                if build_model_facing_html is not None:
+                    try:
+                        parse_resp = await session.get(
+                            f"https://{l}.wikipedia.org/w/api.php",
+                            params={
+                                "action": "parse", "pageid": page_id, "prop": "text|displaytitle",
+                                "redirects": 1, "disablelimitreport": 1, "disableeditsection": 1,
+                                "disabletoc": 1, "format": "json", "utf8": 1,
+                            },
+                            headers={"Accept": "application/json", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+                            impersonate="chrome120", timeout=CURL_TIMEOUT
+                        )
+                        if parse_resp.status_code == 200:
+                            parse_data = (parse_resp.json() or {}).get("parse", {}) or {}
+                            page_html = ((parse_data.get("text") or {}).get("*") or "").strip()
+                            title = (parse_data.get("title") or results[0].get("title") or query).strip()
+                            if page_html:
+                                page_url = f"https://{l}.wikipedia.org/wiki/{quote(title)}"
+                                # CPU 密集转换放到线程池，不阻塞事件循环
+                                # （与 _build_rich_fetch_payload 同一调度方式）。
+                                rich = await asyncio.to_thread(
+                                    build_model_facing_html, page_url, page_html, None, title
+                                )
+                                if rich:
+                                    return rich
+                    except Exception as e:
+                        logger.debug(f"[wikipedia] 富 HTML 路径失败（回退纯文本摘要）: {e}")
+
+                # ---- 退化路径：纯文本摘要（历史行为）----
                 page_resp = await session.get(
                     f"https://{l}.wikipedia.org/w/api.php",
                     params={"action": "query", "pageids": page_id, "prop": "extracts|info", "explaintext": True, "inprop": "url", "format": "json", "utf8": 1},

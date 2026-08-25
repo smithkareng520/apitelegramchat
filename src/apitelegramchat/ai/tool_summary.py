@@ -363,6 +363,25 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
                 title = re.sub(r"\s+", " ", title)
         return f"Fetched: {title}" if title else (f"Fetched: {domain}" if domain else "Fetched a page")
 
+    if fn_name == "wikipedia":
+        query = (fn_args.get("query") or "").strip()
+        text = str(result_content or "").strip()
+        if _tool_result_is_failure(fn_name, fn_args, result_content):
+            return f"Failed to look up {query}" if query else "Failed to look up on Wikipedia"
+        # 新版结果为 Telegram Rich HTML，标题在 <h3>…</h3>；
+        # 退化路径（纯文本摘要）为 <b>Wikipedia — 标题</b>。
+        title = None
+        m = re.search(r"<h3[^>]*>(.*?)</h3>", text, re.S | re.I)
+        if m:
+            title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1))).strip()
+        if not title:
+            m = re.search(r"<b>Wikipedia\s*[—-]\s*(.+?)</b>", text, re.S)
+            if m:
+                title = re.sub(r"\s+", " ", m.group(1)).strip()
+        if not title:
+            title = query
+        return f"Looked up: {title}" if title else "Looked up on Wikipedia"
+
     if fn_name == "ask_user":
         try:
             payload = json.loads(str(result_content or "{}"))

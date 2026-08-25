@@ -955,3 +955,66 @@ OpenAI 兼容协议的 `video_url` content part；不支持的模型收到保留
   查每集列表等结构化内容应使用 `fetch_url`。
 
 # fetch_url 标签映射审计（v3）内容见上一章节。
+
+---
+
+# wikipedia 工具富 HTML 升级（v5）
+
+## 背景
+
+用户询问 MediaWiki API 是否只能返回纯文本、能否输出 Telegram 支持的
+HTML；若升级不必要则删除该工具。调研结论：**纯文本是旧实现的主动选择**
+（`prop=extracts&explaintext=True`），API 本身有三种模式：
+
+| API 模式 | 返回 | 表格/图片 |
+|---|---|---|
+| `prop=extracts&explaintext=1`（旧实现） | 纯文本摘要 | ✗ |
+| `prop=extracts`（无 explaintext） | 受限 HTML（仅段落+标题） | ✗（API 层剥除） |
+| `action=parse&prop=text` | **完整解析后 HTML** | ✓ |
+
+决策：**升级而非删除**。理由：① 该工具的独特价值是"关键词 → 最匹配
+页面"一步解析（web_search + fetch_url 需两轮且不保证维基排第一）；
+② API 抓取比页面抓取更可靠（本机实测页面抓取被 403 限流，API 稳定）；
+③ 升级成本极低——action=parse 的 HTML 直接复用 fetch_url 的整套富管线。
+
+## 改动明细
+
+### search_engine.py
+
+- `execute_wikipedia` 重写：list=search 解析关键词 → `action=parse`
+  （`disableeditsection/disabletoc/disablelimitreport/redirects=1` 去噪）→
+  `build_model_facing_html`（`asyncio.to_thread` 调度，与 fetch_url 一致）；
+- parse 失败 / 空 HTML / 富转换提不出内容 → 退化为旧纯文本摘要路径
+  （`<b>Wikipedia — 标题</b>` 格式，历史行为不变）；
+- 工具描述更新：结果为镜像原页面结构的 Telegram Rich HTML，表格
+  （各话列表/统计）、图片、链接在原始位置，片段可直接复用。
+
+### tool_executors.py（UI 展示）
+
+- wikipedia 分支：标题从结果 `<h3>` 解析（退化格式取
+  `<b>Wikipedia — 标题</b>`）；来源链接优先取结果中的真实 URL——关键词
+  解析出的页面标题可能与 query 不同（"可塑性记忆"命中"可塑性記憶"），
+  按 query 猜测的 URL 会 404。
+
+### ai/tool_summary.py
+
+- `_generate_tool_summary_done` 新增 wikipedia 分支：`Looked up: 标题`
+  （<h3> 解析 + 旧格式兼容 + 失败前缀识别）。
+
+### ai_handlers.py
+
+- 系统提示词媒体 URL 白名单条款：fetch_url 与 Wikipedia 查询并列声明
+  为"按原页面文档顺序组织的 Telegram Rich Message HTML"。
+
+## 验证
+
+- 新增 `tests/test_wikipedia_tool.py`（12 项，全离线 mock MediaWiki API）：
+  富路径（表格/页头/退化格式排除）、parse 参数去噪断言、parse 失败/
+  空 HTML/异常三条退化路径、zh→en 语言回退、彻底失败前缀、UI 展示
+  （解析后标题 + 真实 URL + 富 HTML 不进折叠面板）、完成摘要（新旧
+  格式）、失败判定（正文含"失敗"不误判）。
+- 全套 76 项测试通过。
+- 真实 API 端到端：execute_wikipedia("可塑性记忆") 返回 9133 字符富
+  HTML——页头 + 题图 + h2/h3 结构 + 每话表格（14 行含日文标题）+
+  角色列表，标签全集合法。附带发现：API 按 Accept-Language 自动做
+  简繁变体转换（話→话），内容自动适配用户语言。
