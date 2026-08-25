@@ -11,8 +11,6 @@ from urllib.parse import urlparse
 
 # 与项目其它模块保持一致：使用 __name__ 而非硬编码字符串，
 # 这样 reload / 重命名模块时 logger 命名空间会自动跟随。
-from apitelegramchat.token_utils import truncate_to_tokens
-
 logger = logging.getLogger(__name__)
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
@@ -134,7 +132,7 @@ async def call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, A
 
     text = _extract_text(result)
     if getattr(result, "isError", False):
-        raise MCPToolError(f"External MCP tool returned an error: {server_name}.{tool_name}: {truncate_to_tokens(text, 250, suffix=chr(0x2026))}")
+        raise MCPToolError(f"External MCP tool returned an error: {server_name}.{tool_name}: {text[:500]}")
     return text
 
 

@@ -9,6 +9,7 @@ import re
 import os
 import mimetypes
 from apitelegramchat.workspace_paths import workspace_download_root
+from apitelegramchat.token_budget import count_tokens
 
 from apitelegramchat.utils import (
     send_rich_html_message,
@@ -67,7 +68,6 @@ from apitelegramchat.ask_user_tool import (
 from apitelegramchat.file_handlers import download_file
 from apitelegramchat.workspace_utils import _get_workspace_lock, init_workspace
 from apitelegramchat.context_manager import select_request_context
-from apitelegramchat.token_utils import truncate_to_tokens
 from apitelegramchat.tool_context_compaction import compact_older_tool_calls
 
 app = Quart(__name__)
@@ -256,7 +256,8 @@ def _get_reply_context(msg: dict) -> str:
             quote = "[该消息无文字内容]"
     if REPLY_MARKER in quote:
         quote = quote.split(REPLY_MARKER)[-1].strip()
-    quote = truncate_to_tokens(quote, 200, suffix="...(truncated)")
+    if len(quote) > 800:
+        quote = quote[:800] + "...(truncated)"
     return f"{REPLY_MARKER}\n> {quote}\n\n"
 
 def _get_reply_media(msg: dict) -> dict:
@@ -307,12 +308,8 @@ _MEDIA_TOKEN_OVERHEAD = 64
 _MESSAGE_WRAPPER_TOKENS = 4
 
 def estimate_tokens(text: str) -> int:
-    if not text:
-        return 0
-    zh_chars = len(re.findall(r'[一-龥]', text))
-    en_text = re.sub(r'[一-龥]', ' ', text)
-    en_words = len(en_text.split())
-    return int((zh_chars * 1.8) + (en_words * 1.3) * 1.2)
+    """Return the exact tokenizer count for model-facing text."""
+    return count_tokens(text)
 
 def _estimate_content_tokens(content) -> int:
     if content is None:

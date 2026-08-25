@@ -61,8 +61,8 @@ from apitelegramchat.config import (
     get_openrouter_provider_preferences,
 )
 from apitelegramchat.utils import retry_async
+from apitelegramchat.token_budget import truncate_to_token_budget
 from apitelegramchat.mcp_client import call_mcp_tool, MCPToolError
-from apitelegramchat.token_utils import truncate_to_tokens
 
 OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 
@@ -78,8 +78,6 @@ try:  # noqa: E402
     from apitelegramchat.subagent_tool import SUBAGENT_TOOL  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
     SUBAGENT_TOOL = []
-from apitelegramchat.token_utils import count_tokens, truncate_to_tokens
-
 logger = logging.getLogger(__name__)
 
 WIKIPEDIA_USER_AGENTS = [
@@ -89,7 +87,8 @@ WIKIPEDIA_USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/121.0",
 ]
 
-FETCH_CONTENT_MAX_TOKENS = 15000
+FETCH_CONTENT_TOKEN_BUDGET = 20_000
+FETCH_TITLE_TOKEN_BUDGET = 64
 TRAFILATURA_TIMEOUT = 10
 HTTP_TIMEOUT_SHORT = 10
 HTTP_TIMEOUT_FETCH = 15
@@ -388,8 +387,8 @@ def set_fetch_cache(url: str, content: str):
 
 
 # ---------- 工具函数 ----------
-def _truncate(text: str, max_tokens: int = FETCH_CONTENT_MAX_TOKENS, suffix: str = "…（内容已截断）") -> str:
-    return truncate_to_tokens(text or "", max_tokens, suffix=suffix)
+def _truncate(text: str, token_budget: int = FETCH_CONTENT_TOKEN_BUDGET, suffix: str = "…（内容已按 token 预算截断）") -> str:
+    return truncate_to_token_budget(text, token_budget, suffix=suffix)
 
 
 def _get_title_from_html(html_content: str) -> str:
@@ -400,7 +399,7 @@ def _get_title_from_html(html_content: str) -> str:
         title_elem = tree.find('.//title')
         if title_elem is not None and title_elem.text:
             title = title_elem.text.strip()
-            return truncate_to_tokens(title, 100, suffix="") if title else "无标题"
+            return truncate_to_token_budget(title, FETCH_TITLE_TOKEN_BUDGET, suffix="…") if title else "无标题"
     except Exception:
         pass
     return "无标题"
@@ -2152,7 +2151,8 @@ def _format_image_api_error(api_name: str, status_code: int, detail: str = "", r
         clean = detail.strip().replace("\r\n", "\n").replace("\r", "\n")
         lines = [line.strip() for line in clean.split("\n") if line.strip()]
         clean = "<br/>".join(line for line in lines)
-        clean = truncate_to_tokens(clean, 200, suffix=chr(0x2026))
+        if len(clean) > 800:
+            clean = clean[:800] + "…"
         parts.append(f"详情：{clean}")
     return "<br/>".join(parts)
 

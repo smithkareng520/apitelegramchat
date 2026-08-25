@@ -11,7 +11,6 @@ import time
 from typing import List, Optional
 
 from apitelegramchat.config import STREAM_FLUSH_INTERVAL, STREAM_SILENT_FORCE_FLUSH
-from apitelegramchat.token_utils import count_tokens, truncate_to_tokens
 from apitelegramchat.utils import (
     send_rich_message_draft,
     send_rich_html_message,
@@ -23,6 +22,7 @@ from apitelegramchat.utils import (
 )
 from apitelegramchat.ai.error_formatting import extract_domain
 from apitelegramchat.ai.attachment_content import _track_task
+from apitelegramchat.token_budget import count_tokens, truncate_to_token_budget
 from apitelegramchat.ai.tool_summary import (
     _coerce_positive_int,
     _generate_action_description,
@@ -33,48 +33,55 @@ import apitelegramchat.state as state
 logger = get_logger(__name__)
 
 # ---------- Telegram Rich Message 草稿滚动 ----------
-# Telegram Rich Message 的服务端硬限制仍以解析后的 Unicode 字符计量；这是
-# 外部协议约束而非项目预算。项目内部的滚动/交互预算统一以 token 计量，
-# 同时保留一个略低于协议上限的字符安全阈值，防止英文等低 token 密度文本超限。
-TELEGRAM_RICH_VISIBLE_CHAR_LIMIT = 32768
-
+# 内部内容预算一律按 tiktoken 计算。Telegram 仍有 32,768 个解析后 Unicode
+# 字符的协议上限；该值仅作为最终的传输安全边界，并非内容预算。
 def _positive_env_int(name: str, default: int, *, minimum: int = 1) -> int:
     try:
         return max(minimum, int(os.getenv(name, str(default))))
     except (TypeError, ValueError):
         return default
 
-RICH_MESSAGE_TOKEN_BUDGET = _positive_env_int("RICH_MESSAGE_TOKEN_BUDGET", 7500)
-RICH_DRAFT_ROLLOVER_TOKEN_BUDGET = max(1, min(
-    RICH_MESSAGE_TOKEN_BUDGET - 64,
-    _positive_env_int("RICH_DRAFT_ROLLOVER_TOKEN_BUDGET", 6800),
-))
-RICH_DRAFT_ARM_TOKEN_BUDGET = min(
-    RICH_DRAFT_ROLLOVER_TOKEN_BUDGET,
-    _positive_env_int("RICH_DRAFT_ARM_TOKEN_BUDGET", 6200),
+
+RICH_MESSAGE_TEXT_PROTOCOL_LIMIT = _positive_env_int("RICH_MESSAGE_TEXT_PROTOCOL_LIMIT", 32768)
+RICH_DRAFT_ROLLOVER_TOKEN_BUDGET = _positive_env_int(
+    "RICH_DRAFT_ROLLOVER_TOKEN_BUDGET", 6_000
 )
-RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET = min(
-    RICH_DRAFT_ARM_TOKEN_BUDGET,
-    _positive_env_int("RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET", 5000),
-)
-RICH_DRAFT_HARD_GUARD_TOKEN_BUDGET = max(
-    RICH_DRAFT_ROLLOVER_TOKEN_BUDGET + 1,
-    RICH_MESSAGE_TOKEN_BUDGET - 128,
-)
-RICH_MESSAGE_BLOCKS_MAX = _positive_env_int("RICH_MESSAGE_BLOCKS_MAX", 80)
+RICH_MESSAGE_BLOCKS_MAX = _positive_env_int("RICH_MESSAGE_BLOCKS_MAX", 500)
 RICH_DRAFT_ROLLOVER_BLOCKS = min(
     RICH_MESSAGE_BLOCKS_MAX - 1,
-    _positive_env_int("RICH_DRAFT_ROLLOVER_BLOCKS", 70),
+    _positive_env_int("RICH_DRAFT_ROLLOVER_BLOCKS", 440),
+)
+# 接近上限时仅进入“本轮结束后滚动”状态；真正切换仍在完整工具批次结束后进行。
+RICH_DRAFT_ARM_TOKEN_BUDGET = min(
+    RICH_DRAFT_ROLLOVER_TOKEN_BUDGET,
+    _positive_env_int("RICH_DRAFT_ARM_TOKEN_BUDGET", 5_400),
 )
 RICH_DRAFT_ARM_BLOCKS = min(
     RICH_DRAFT_ROLLOVER_BLOCKS,
-    _positive_env_int("RICH_DRAFT_ARM_BLOCKS", 60),
+    _positive_env_int("RICH_DRAFT_ARM_BLOCKS", 380),
+)
+# 交互阈值较低，以避免客户端在长工具链中反复重绘过大的草稿。
+RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET = min(
+    RICH_DRAFT_ARM_TOKEN_BUDGET,
+    _positive_env_int("RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET", 3_000),
 )
 RICH_DRAFT_INTERACTIVE_BLOCKS = min(
     RICH_DRAFT_ARM_BLOCKS,
-    _positive_env_int("RICH_DRAFT_INTERACTIVE_BLOCKS", 45),
+    _positive_env_int("RICH_DRAFT_INTERACTIVE_BLOCKS", 160),
 )
 
+# 这些标签被视为富消息中的结构块。只有在最外层结构块完全闭合后，才允许正常滚动，
+# 从而不会在 details/table/list/pre 等结构的中间截断。
+_RICH_BLOCK_TAGS = frozenset({
+    "p", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "blockquote", "details",
+    "ul", "ol", "li", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "hr",
+    "figure", "figcaption", "tg-slideshow", "tg-map", "img", "video", "audio",
+    "tg-math-block", "aside", "footer",
+})
+# API 将嵌套富消息块、列表项和表格行计入 500 块上限；table cell 只承载 RichText，
+# 因此不将 td/th 等单元格标签虚增为独立块。
+_RICH_COUNTED_BLOCK_TAGS = _RICH_BLOCK_TAGS - frozenset({"thead", "tbody", "tfoot", "td", "th", "figcaption"})
+_RICH_VOID_TAGS = frozenset({"br", "hr", "img", "video", "audio", "tg-map", "source", "meta", "link", "input"})
 _RICH_HTML_TAG_RE = re.compile(r"<!--.*?-->|<[^>]*>", re.DOTALL)
 _RICH_TAG_NAME_RE = re.compile(r"^<\s*(/)?\s*([A-Za-z][\w:-]*)")
 # Rich Message 的 details、列表和表格等容器不能只承载裸文本；服务端会将其
@@ -96,7 +103,7 @@ _MEDIA_OR_LINK_TAG_RE = re.compile(
 
 
 def _rich_visible_text(text: str) -> str:
-    """按 Rich Message 的近似语义计算解析后的可见文本，不计 HTML 标签和属性。"""
+    """按 Rich Message 的近似语义计算解析后的可见字符，不计 HTML 标签和属性。"""
     if not text:
         return ""
     return html.unescape(_RICH_HTML_TAG_RE.sub("", text))
@@ -118,24 +125,32 @@ def _ensure_rich_block_content(fragment: str) -> str:
     return f"<p>{content}</p>"
 
 
-def _scan_rich_html_boundaries(html_content: str) -> tuple[list[tuple[int, int, int, int]], int, int, int]:
-    """返回完整最外层块边界：(源码位置、token 数、可见字符数、结构块数)。"""
+def _scan_rich_html_boundaries(
+    html_content: str,
+) -> tuple[list[tuple[int, int, int, int]], int, int, int]:
+    """Return complete outer-block boundaries with exact visible-text tokens.
+
+    Each boundary is ``(source_end, visible_tokens, block_count, visible_units)``.
+    ``visible_units`` is retained only to enforce Telegram's protocol cap; all
+    draft rollover choices use ``visible_tokens``.
+    """
     content = html_content or ""
     boundaries: list[tuple[int, int, int, int]] = []
     open_tags: list[str] = []
-    visible_text_parts: list[str] = []
-    visible_chars = 0
+    visible_parts: list[str] = []
     block_count = 0
     cursor = 0
 
-    def snapshot(position: int) -> None:
-        visible_text = html.unescape("".join(visible_text_parts))
-        boundaries.append((position, count_tokens(visible_text), len(visible_text), block_count))
+    def add_visible(fragment: str) -> None:
+        if fragment:
+            visible_parts.append(html.unescape(fragment))
+
+    def append_boundary(source_end: int) -> None:
+        visible_text = "".join(visible_parts)
+        boundaries.append((source_end, count_tokens(visible_text), block_count, len(visible_text)))
 
     for match in _RICH_HTML_TAG_RE.finditer(content):
-        text_part = html.unescape(content[cursor:match.start()])
-        visible_text_parts.append(text_part)
-        visible_chars += len(text_part)
+        add_visible(content[cursor:match.start()])
         token = match.group(0)
         cursor = match.end()
         if token.startswith("<!--"):
@@ -155,21 +170,20 @@ def _scan_rich_html_boundaries(html_content: str) -> tuple[list[tuple[int, int, 
             if tag in _RICH_COUNTED_BLOCK_TAGS:
                 block_count += 1
             if not open_tags:
-                snapshot(match.end())
+                append_boundary(match.end())
         elif is_self_closing:
             if tag in _RICH_COUNTED_BLOCK_TAGS:
                 block_count += 1
             if not open_tags:
-                snapshot(match.end())
+                append_boundary(match.end())
         else:
             open_tags.append(tag)
 
-    tail = html.unescape(content[cursor:])
-    visible_text_parts.append(tail)
-    visible_chars += len(tail)
+    add_visible(content[cursor:])
+    visible_text = "".join(visible_parts)
     if not open_tags and content.strip() and (not boundaries or boundaries[-1][0] != len(content)):
-        snapshot(len(content))
-    return boundaries, count_tokens("".join(visible_text_parts)), visible_tokens, block_count
+        boundaries.append((len(content), count_tokens(visible_text), max(1, block_count), len(visible_text)))
+    return boundaries, count_tokens(visible_text), block_count, len(visible_text)
 
 
 async def _swallow_flush_task(t: "asyncio.Task", name: str, draft_id: int) -> None:
@@ -867,11 +881,12 @@ class RichMessageBuilder:
 
     # ---------- 容量预警与回合边界滚动 ----------
     @staticmethod
-    def _plain_text_cut(text: str, limit_tokens: int) -> int:
-        """在不超过 token 预算的前提下尽量停在空白或句末。"""
-        if count_tokens(text) <= limit_tokens:
+    def _plain_text_cut(text: str, token_budget: int) -> int:
+        """Pick a sentence-friendly plain-text cut that fits a token budget."""
+        if count_tokens(text) <= token_budget:
             return len(text)
-        upper = len(truncate_to_tokens(text, limit_tokens, suffix=""))
+        prefix = truncate_to_token_budget(text, token_budget, suffix="")
+        upper = max(1, len(prefix))
         lower = max(1, int(upper * 0.80))
         candidates = [
             text.rfind('\n', lower, upper + 1),
@@ -881,25 +896,23 @@ class RichMessageBuilder:
             text.rfind('. ', lower, upper + 1),
             text.rfind(' ', lower, upper + 1),
         ]
-        return max([candidate for candidate in candidates if candidate > 0] or [upper])
+        for candidate in sorted((c for c in candidates if c > 0), reverse=True):
+            if count_tokens(text[:candidate]) <= token_budget:
+                return candidate
+        return upper
 
     def _pick_rollover_boundary(self, html_content: str) -> tuple[int | None, int, int]:
-        """选择完整最外层块结束位置；必要时允许在真实限制前的安全余量内提交。"""
-        boundaries, visible_tokens, _visible_chars, block_count = _scan_rich_html_boundaries(html_content)
-        preferred = None
-        legal_complete_block = None
-        legal_tokens = RICH_DRAFT_HARD_GUARD_TOKEN_BUDGET
-        legal_chars = TELEGRAM_RICH_VISIBLE_CHAR_LIMIT - 512
-        legal_blocks = max(RICH_DRAFT_ROLLOVER_BLOCKS, RICH_MESSAGE_BLOCKS_MAX - 1)
+        """Choose a complete outer-block boundary within the token budget."""
+        boundaries, visible_tokens, block_count, _visible_units = _scan_rich_html_boundaries(html_content)
+        selected = None
         for boundary in boundaries:
-            _, tokens_at_boundary, chars_at_boundary, blocks_at_boundary = boundary
-            if (tokens_at_boundary <= legal_tokens and chars_at_boundary <= legal_chars
-                    and blocks_at_boundary <= legal_blocks):
-                legal_complete_block = boundary
-                if (tokens_at_boundary <= RICH_DRAFT_ROLLOVER_TOKEN_BUDGET
-                        and blocks_at_boundary <= RICH_DRAFT_ROLLOVER_BLOCKS):
-                    preferred = boundary
-        selected = preferred or legal_complete_block
+            _, tokens_at_boundary, blocks_at_boundary, units_at_boundary = boundary
+            if (
+                tokens_at_boundary <= RICH_DRAFT_ROLLOVER_TOKEN_BUDGET
+                and blocks_at_boundary <= RICH_DRAFT_ROLLOVER_BLOCKS
+                and units_at_boundary <= RICH_MESSAGE_TEXT_PROTOCOL_LIMIT - 256
+            ):
+                selected = boundary
         return (selected[0] if selected else None), visible_tokens, block_count
 
     def _replace_with_rollover_remainder(self, remainder: str, handoff_text: str = "") -> None:
@@ -941,7 +954,7 @@ class RichMessageBuilder:
         self._rollover_pending = True
         logger.info(
             "草稿交互容量预警，下一完整回合边界滚动: chat=%s draft=%s tokens=%s blocks=%s "
-            "interactive_tokens=%s interactive_blocks=%s api_arm_tokens=%s api_arm_blocks=%s",
+            "interactive_tokens=%s interactive_blocks=%s arm_tokens=%s arm_blocks=%s",
             self.chat_id, self.draft_id, visible_tokens, block_count,
             RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET, RICH_DRAFT_INTERACTIVE_BLOCKS,
             RICH_DRAFT_ARM_TOKEN_BUDGET, RICH_DRAFT_ARM_BLOCKS,
@@ -1082,16 +1095,16 @@ class RichMessageBuilder:
                 await self._register_active_draft(0)
                 await self.flush(force=True)
                 logger.info(
-                    "草稿已在回合边界滚动: chat=%s old=%s new=%s permanent=%s tokens=%s blocks=%s mode=%s",
+                    "草稿已在回合边界滚动: chat=%s old=%s new=%s permanent=%s chars=%s blocks=%s mode=%s",
                     self.chat_id, old_draft_id, self.draft_id, completed_message_id,
-                    count_tokens(_rich_visible_text(completed_html)), block_count,
+                    len(_rich_visible_text(completed_html)), block_count,
                     rollover_mode,
                 )
             else:
                 logger.info(
-                    "草稿已在终局边界结束，不创建新草稿: chat=%s draft=%s permanent=%s tokens=%s blocks=%s mode=%s",
+                    "草稿已在终局边界结束，不创建新草稿: chat=%s draft=%s permanent=%s chars=%s blocks=%s mode=%s",
                     self.chat_id, old_draft_id, completed_message_id,
-                    count_tokens(_rich_visible_text(completed_html)), block_count,
+                    len(_rich_visible_text(completed_html)), block_count,
                     rollover_mode,
                 )
 
@@ -1151,7 +1164,7 @@ class RichMessageBuilder:
                     self._flush_dirty = False
                 self._flush_sequence += 1
                 logger.debug(
-                    "草稿帧完成: chat=%s draft=%s seq=%s force=%s result=%s tokens=%s blocks=%s elapsed_ms=%s",
+                    "草稿帧完成: chat=%s draft=%s seq=%s force=%s result=%s chars=%s blocks=%s elapsed_ms=%s",
                     self.chat_id, self.draft_id, self._flush_sequence, force, msg_id,
                     frame_chars, frame_blocks, int((time.monotonic() - frame_started) * 1000),
                 )

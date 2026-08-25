@@ -13,8 +13,6 @@ from PIL import Image
 
 from apitelegramchat.utils import strip_html_tags, escape_html, get_logger
 
-from apitelegramchat.token_utils import count_tokens, truncate_to_tokens
-
 logger = get_logger(__name__)
 
 # 改为 frozenset：避免误操作修改；查询性能更好（O(1) 包含判定）。
@@ -319,7 +317,7 @@ def _format_image_safety_notice(detail: str = "", model: str = "") -> str:
         parts.append(f"模型：{escape_html(_short_model_name(model))}")
     if detail:
         clean_detail = strip_html_tags(detail).strip()
-        if clean_detail and count_tokens(clean_detail) < 125:
+        if clean_detail and len(clean_detail) < 500:
             parts.append(f"<i>详情：{escape_html(clean_detail)}</i>")
     return "<br/>".join(parts)
 

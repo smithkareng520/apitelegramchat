@@ -20,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 from apitelegramchat.workspace_paths import todo_state_file
-from apitelegramchat.token_utils import truncate_to_tokens
+from apitelegramchat.token_budget import truncate_to_token_budget
 from typing import Any, Optional
 
 
@@ -36,7 +36,9 @@ logger = logging.getLogger(__name__)
 TODO_FILENAME = "todos.json"
 VALID_PRIORITIES = ("low", "medium", "high")
 VALID_FILTERS = ("all", "pending", "done")
-MAX_TITLE_TOKENS = 200
+TODO_TITLE_TOKEN_BUDGET = 200
+TODO_TAG_TOKEN_BUDGET = 24
+TODO_NOTE_TOKEN_BUDGET = 500
 MAX_TODOS = 500  # 单 chat 上限，防止失控增长
 MAX_TAGS = 8
 
@@ -125,13 +127,13 @@ def _normalize_tags(tags: Any) -> list[str]:
         parts = [str(t).strip() for t in tags if str(t).strip()]
     else:
         return []
-    # 去重 + 限长
+    # 去重 + token 预算
     seen = set()
     out = []
     for p in parts:
         if p not in seen:
             seen.add(p)
-            out.append(p[:24])
+            out.append(truncate_to_token_budget(p, TODO_TAG_TOKEN_BUDGET, suffix="…"))
         if len(out) >= MAX_TAGS:
             break
     return out
@@ -198,7 +200,7 @@ def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optio
     title = (title or "").strip()
     if not title:
         raise _TodoError("title 不能为空", "empty_title")
-    title = truncate_to_tokens(title, MAX_TITLE_TOKENS, suffix="")
+    title = truncate_to_token_budget(title, TODO_TITLE_TOKEN_BUDGET, suffix="…")
     if len(store["todos"]) >= MAX_TODOS:
         raise _TodoError(f"待办数量已达上限 {MAX_TODOS}，请先清理", "too_many")
 
@@ -208,7 +210,7 @@ def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optio
         "done": False,
         "priority": _normalize_priority(priority),
         "tags": _normalize_tags(tags),
-        "note": truncate_to_tokens((note or "").strip(), 500, suffix="") if note else "",
+        "note": truncate_to_token_budget((note or "").strip(), TODO_NOTE_TOKEN_BUDGET, suffix="…") if note else "",
         "created_at": int(time.time()),
         "completed_at": None,
     }
@@ -345,7 +347,7 @@ def _op_edit(store: dict, todo_id: str, title: Optional[str],
         t = title.strip()
         if not t:
             raise _TodoError("title 不能为空", "empty_title")
-        todo["title"] = truncate_to_tokens(t, MAX_TITLE_TOKENS, suffix="")
+        todo["title"] = truncate_to_token_budget(t, TODO_TITLE_TOKEN_BUDGET, suffix="…")
         changed.append("title")
     if priority is not None:
         todo["priority"] = _normalize_priority(priority)
@@ -354,7 +356,7 @@ def _op_edit(store: dict, todo_id: str, title: Optional[str],
         todo["tags"] = _normalize_tags(tags)
         changed.append("tags")
     if note is not None:
-        todo["note"] = truncate_to_tokens((note or "").strip(), 500, suffix="")
+        todo["note"] = truncate_to_token_budget((note or "").strip(), TODO_NOTE_TOKEN_BUDGET, suffix="…")
         changed.append("note")
     return store, {
         "ok": True,
@@ -628,7 +630,7 @@ TODO_TOOL = {
                 },
                 "title": {
                     "type": "string",
-                    "description": "待办标题。add 必填，edit 可选。最长 200 字符。"
+                    "description": "待办标题。add 必填，edit 可选。最多 200 tokens。"
                 },
                 "todo_id": {
                     "type": "string",
@@ -642,11 +644,11 @@ TODO_TOOL = {
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "可选标签，最多 8 个，每个 ≤24 字符。也接受逗号/空格分隔的字符串。"
+                    "description": "可选标签，最多 8 个，每个最多 24 tokens。也接受逗号/空格分隔的字符串。"
                 },
                 "note": {
                     "type": "string",
-                    "description": "可选的较长备注（≤500 字符）。add/edit 使用。"
+                    "description": "可选的较长备注（最多 500 tokens）。add/edit 使用。"
                 },
                 "filter": {
                     "type": "string",

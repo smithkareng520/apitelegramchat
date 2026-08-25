@@ -12,17 +12,18 @@
 
 | 维度 | 容量预警阈值 | 常规滚动阈值 | 富消息上限 |
 |---|---:|---:|---:|
-| 项目内部文本预算 | 5,000 token | 6,800 token | 7,500 token |
+| 可见文本 token 预算 | 3,000 tokens | 6,000 tokens | 不适用 |
+| Telegram 协议文本安全边界 | 不适用 | 不适用 | 32,768 个解析后 Unicode 单位 |
 | 富消息结构块 | 380 块 | 440 块 | 500 块 |
 
-容量预警阈值通过 `RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET` 和 `RICH_DRAFT_INTERACTIVE_BLOCKS` 配置；正常分段预算通过 `RICH_DRAFT_ROLLOVER_TOKEN_BUDGET` 配置，硬保护通过 `RICH_DRAFT_HARD_GUARD_TOKEN_BUDGET` 配置。Telegram 服务端仍有 32,768 个解析后 Unicode 字符的外部协议硬限制，因此实现同时保留字符安全阈值，但项目内部预算统一按 token 计算。
+容量预警阈值通过 `RICH_DRAFT_ARM_TOKEN_BUDGET` 和 `RICH_DRAFT_ARM_BLOCKS` 配置。预警并不立即切换草稿，而是为当前完整模型/工具批次留出容量。`RICH_DRAFT_ROLLOVER_TOKEN_BUDGET` 与 `RICH_DRAFT_ROLLOVER_BLOCKS` 是正常分段使用的安全预算。Telegram 的协议文本限制仅作为最终传输安全检查；若单一未闭合结构没有合法边界，系统会使用纯文本 token 分段路径。
 
 ## 状态机
 
 | 状态 | 触发条件 | 行为 |
 |---|---|---|
 | 正常写入 | 未接近容量预警 | 流式内容继续写入当前 `draft_id`。|
-| 待滚动 | 可见文本或结构块达到容量预警 | 设置 `_rollover_pending=True`；`flush()` 仍只刷新当前草稿。|
+| 待滚动 | 可见文本 token 或结构块达到容量预警 | 设置 `_rollover_pending=True`；`flush()` 仍只刷新当前草稿。|
 | 回合收束 | 模型返回结束，且所有同批工具均有终态 | 关闭工具组、刷新最终状态，并在下一模型请求前调用 `rollover_at_turn_boundary()`。|
 | 交接 | 旧段永久消息正在发送 | 不启动下一次模型请求；防御性 `handoff` 缓冲接收任何迟到增量。|
 | 新草稿 | 旧段永久化成功 | 标死旧 draft，立即登记新的 `draft_id` 并强制发送新草稿首帧；旧预览在后台快速清理。|
@@ -66,16 +67,16 @@
 ## 配置
 
 ```bash
-RICH_MESSAGE_TOKEN_BUDGET=7500
-RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET=5000
-RICH_DRAFT_ROLLOVER_TOKEN_BUDGET=6800
-RICH_DRAFT_HARD_GUARD_TOKEN_BUDGET=7372
-RICH_MESSAGE_BLOCKS_MAX=80
-RICH_DRAFT_INTERACTIVE_BLOCKS=45
-RICH_DRAFT_ROLLOVER_BLOCKS=70
+RICH_MESSAGE_TEXT_PROTOCOL_LIMIT=32768
+RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET=3000
+RICH_DRAFT_ARM_TOKEN_BUDGET=5400
+RICH_DRAFT_ROLLOVER_TOKEN_BUDGET=6000
+RICH_MESSAGE_BLOCKS_MAX=500
+RICH_DRAFT_ARM_BLOCKS=380
+RICH_DRAFT_ROLLOVER_BLOCKS=440
 ```
 
-一般不应将 token 预警阈值与硬预算设置得过近。当前 5,000 / 6,800 / 7,500 token 分层为工具批次收尾、永久消息处理和新草稿首帧预留了余量；另外保留 32,768 Unicode 字符的协议安全阈值，避免低 token 密度的英文文本触发 Telegram 服务端限制。
+一般不应将预警阈值与真实富消息上限设置得过近。预警值需覆盖当前工具批次收尾、永久消息处理和新草稿首帧的安全余量；真实限制仍由常规滚动阈值和硬保护共同兜底。
 
 ## 回归验证
 

@@ -20,14 +20,16 @@ import aiohttp
 
 from apitelegramchat.config import BASE_URL
 from apitelegramchat.utils import send_rich_html_message, escape_html
-from apitelegramchat.token_utils import truncate_to_tokens
+from apitelegramchat.token_budget import truncate_to_token_budget
 
 logger = logging.getLogger("apitelegramchat.ask_user")
 
-MAX_QUESTION_TOKENS = 1200
+ASK_USER_QUESTION_TOKEN_BUDGET = 300
+ASK_USER_LABEL_TOKEN_BUDGET = 32
+ASK_USER_OPTION_DESCRIPTION_TOKEN_BUDGET = 64
+ASK_USER_ID_TOKEN_BUDGET = 32
+ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET = 1_000
 MAX_OPTIONS = 8
-MAX_LABEL_TOKENS = 48
-MAX_OPTION_DESC_TOKENS = 180
 # 修复：24h 超时太长——一个未回答的 ask_user 会把 agent 循环挂起整整一天，
 # 中间所有事件循环资源（chat lock、内存里的消息、模型 prompt cache 等）都
 # 不能释放。改成默认 10 分钟，足够用户做选择又不至于让会话僵死。
@@ -66,7 +68,10 @@ def _new_id() -> str:
 def _option_text(option: dict[str, Any]) -> tuple[str, str]:
     label = str(option.get("label") or option.get("title") or option.get("id") or "选项").strip()
     desc = str(option.get("description") or "").strip()
-    return truncate_to_tokens(label, MAX_LABEL_TOKENS, suffix=""), truncate_to_tokens(desc, MAX_OPTION_DESC_TOKENS, suffix="")
+    return (
+        truncate_to_token_budget(label, ASK_USER_LABEL_TOKEN_BUDGET, suffix="…"),
+        truncate_to_token_budget(desc, ASK_USER_OPTION_DESCRIPTION_TOKEN_BUDGET, suffix="…"),
+    )
 
 
 def _normalized_options(options: Any) -> list[dict[str, str]]:
@@ -75,12 +80,12 @@ def _normalized_options(options: Any) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     for idx, raw in enumerate(options[:MAX_OPTIONS]):
         if isinstance(raw, str):
-            label = truncate_to_tokens(raw.strip(), MAX_LABEL_TOKENS, suffix="")
+            label = truncate_to_token_budget(raw.strip(), ASK_USER_LABEL_TOKEN_BUDGET, suffix="…")
             oid = f"option_{idx + 1}"
             desc = ""
         elif isinstance(raw, dict):
             label, desc = _option_text(raw)
-            oid = str(raw.get("id") or f"option_{idx + 1}").strip()[:80]
+            oid = truncate_to_token_budget(str(raw.get("id") or f"option_{idx + 1}").strip(), ASK_USER_ID_TOKEN_BUDGET, suffix="…")
         else:
             continue
         if not label:
@@ -180,7 +185,7 @@ async def create_ask_user_interaction(
     multiple: bool = False,
     allow_custom: bool = True,
 ) -> AskUserInteraction:
-    question = truncate_to_tokens(str(question or "").strip(), MAX_QUESTION_TOKENS, suffix="")
+    question = truncate_to_token_budget(str(question or "").strip(), ASK_USER_QUESTION_TOKEN_BUDGET, suffix="…")
     normalized = _normalized_options(options)
     if not question:
         raise ValueError("ask_user.question 不能为空")
@@ -294,7 +299,7 @@ def _answered_html(interaction: AskUserInteraction, answer: dict[str, Any]) -> s
         chosen = escape_html(chosen_raw)
         return f"<p>✅ <b>已收到你的选择</b></p><p>{q}</p><p><b>{chosen}</b></p>"
     if kind == "custom":
-        value = str(answer.get("value", ""))[:4000]
+        value = truncate_to_token_budget(str(answer.get("value", "")), ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET, suffix="…")
         return f"<p>✅ <b>已收到你的回答</b></p><p>{q}</p><p><blockquote>{escape_html(value)}</blockquote></p>"
     if kind == "cancelled":
         return f"<p>✖️ <b>已取消</b></p><p>{q}</p>"
@@ -404,7 +409,7 @@ async def resolve_text(chat_id: int, text: str) -> bool:
         if not interaction or interaction.status != "waiting" or not interaction.awaiting_text:
             return False
         interaction.status = "answered"
-        answer = {"type": "custom", "value": truncate_to_tokens(text, 2000, suffix="…[回答过长已截断]")}
+        answer = {"type": "custom", "value": truncate_to_token_budget(text, ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET, suffix="…")}
         if interaction.future and not interaction.future.done():
             interaction.future.set_result(answer)
         message_id = interaction.message_id

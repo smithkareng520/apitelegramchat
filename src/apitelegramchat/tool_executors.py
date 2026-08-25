@@ -70,27 +70,27 @@ from apitelegramchat.todo_tool import (
 from apitelegramchat.memory_tool import execute_memory, render_memory_card
 from apitelegramchat.subagent_tool import execute_subagent, render_subagent_card
 from apitelegramchat.utils import escape_html
-from apitelegramchat.token_utils import count_tokens, truncate_to_tokens
+from apitelegramchat.token_budget import truncate_to_token_budget
 
 logger = logging.getLogger(__name__)
 
 # ---------- 信号量控制并发工具调用 ----------
 tool_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TOOLS)
 
-# Internal tool-result budget: the value is TOKENS, not characters.
-MAX_TOOL_RESPONSE_TOKENS = 16000
-# Backward-compatible alias for callers that imported the old constant. Its
-# numeric value now explicitly represents tokens.
+TOOL_RESPONSE_TOKEN_BUDGET = int(os.getenv("TOOL_RESPONSE_TOKEN_BUDGET", "20000"))
+
+
 def _truncate_tool_result(result: str) -> str:
-    return truncate_to_tokens(
+    """Bound every model-facing tool result by an exact 20k-token budget."""
+    return truncate_to_token_budget(
         result,
-        MAX_TOOL_RESPONSE_TOKENS,
-        suffix="\n…[内容过长已截断]",
+        TOOL_RESPONSE_TOKEN_BUDGET,
+        suffix="\n…[内容过长，已按 token 预算截断]",
     )
 
 
 _UI_TAIL_LINES = 10
-_UI_MAX_VALUE_TOKENS = 360
+_UI_VALUE_TOKEN_BUDGET = 120
 _UI_MAX_FIELDS = 10
 _SENSITIVE_RESULT_KEYS = {
     "authorization", "token", "access_token", "api_key", "apikey", "secret",
@@ -140,10 +140,10 @@ def _render_code_panel(
     )
 
 
-def _trim_ui_value(value: object, limit: int = _UI_MAX_VALUE_TOKENS) -> str:
+def _trim_ui_value(value: object, token_budget: int = _UI_VALUE_TOKEN_BUDGET) -> str:
     text = str(value if value is not None else "")
     text = re.sub(r"\s+", " ", text).strip()
-    return truncate_to_tokens(text, limit, suffix=chr(0x2026))
+    return truncate_to_token_budget(text, token_budget, suffix="…")
 
 
 def _looks_like_http_url(value: object) -> bool:
@@ -165,12 +165,12 @@ def _display_key(key: object) -> str:
     return labels.get(raw.lower(), raw.replace("_", " "))
 
 
-def _compact_json(value: object, limit: int = _UI_MAX_VALUE_TOKENS) -> str:
+def _compact_json(value: object, token_budget: int = _UI_VALUE_TOKEN_BUDGET) -> str:
     try:
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
         encoded = str(value)
-    return _trim_ui_value(encoded, limit)
+    return _trim_ui_value(encoded, token_budget)
 
 
 def _render_structured_value(value: object, *, depth: int = 0) -> str:
@@ -1060,7 +1060,7 @@ class BashSession:
             now = time.monotonic()
             if not force and now - last_emit < 1.0:
                 return
-            preview = truncate_to_tokens("".join(output_parts), 2000, suffix=chr(0x2026))
+            preview = "".join(output_parts)[-8000:]
             try:
                 result = progress_callback(preview or "正在执行 Bash 命令…")
                 if asyncio.iscoroutine(result):
@@ -1115,8 +1115,8 @@ class BashSession:
         actual_cwd = cwd_match.group(1).strip() if cwd_match else cwd
         output = re.sub(r"(?m)^__ONE_SHOT_CWD__\s+.*$\n?", "", output)
         self._last_cwd = actual_cwd
-        if count_tokens(output) > 14000:
-            output = truncate_to_tokens(output, 14000, suffix="\n... (truncated)")
+        if len(output) > 20000:
+            output = output[:20000] + "\n... (truncated)"
         output = re.sub(r'\x1b\[[0-9;]*m', '', output)
         return (f"Command: {command}\n"
                 f"Cwd: {actual_cwd}\n"
@@ -1216,7 +1216,7 @@ class BashSession:
                     if not force and grew < progress_min_chars and (now - progress_last_emit) < progress_min_interval:
                         return
                     # 前端草稿只需要最近一段日志；完整输出仍由最终结果保留。
-                    preview_text = truncate_to_tokens(output_text, 2000, suffix=chr(0x2026))
+                    preview_text = output_text[-8000:]
                     try:
                         result = progress_callback(preview_text)
                         if asyncio.iscoroutine(result):
@@ -1266,8 +1266,8 @@ class BashSession:
                 await asyncio.wait_for(read_until_marker(), timeout=timeout)
 
                 output = "".join(output_parts)
-                if count_tokens(output) > 14000:
-                    output = truncate_to_tokens(output, 14000, suffix="\n... (truncated)")
+                if len(output) > 20000:
+                    output = output[:20000] + "\n... (truncated)"
                 output = re.sub(r'\x1b\[[0-9;]*m', '', output)
 
                 # 提取命令结束后的真实 PWD，同时把内部 marker 从用户输出中移除。
@@ -1532,7 +1532,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             else:
                 details_html = escape_html(result_str)
         else:
-            details_html = escape_html(truncate_to_tokens(result_str, 12000, suffix="…[内容过长已截断]"))
+            details_html = escape_html(result_str[:60000])
         return summary, details_html
 
     elif fn_name == "fetch_url":
@@ -1698,7 +1698,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             return summary, details_html
 
         except json.JSONDecodeError:
-            safe_log = escape_html(truncate_to_tokens(result_str, 12000, suffix="…[内容过长已截断]"))
+            safe_log = escape_html(result_str[:60000])
             summary = "🌤️ 天气数据"
             details_html = f"<pre><code>{safe_log}</code></pre>"
             return summary, details_html

@@ -14,7 +14,7 @@
 每条 memory：
   {
     "id":        8 位短 id
-    "content":   记忆正文（<=2000 字符）
+    "content":   记忆正文（最多 2,000 tokens）
     "category":  分类标签（fact / preference / person / event / note / custom...）
     "tags":      [str, ...]   可选标签
     "importance":low/medium/high
@@ -39,7 +39,7 @@ import time
 import uuid
 from pathlib import Path
 from apitelegramchat.workspace_paths import memory_state_file
-from apitelegramchat.token_utils import truncate_to_tokens
+from apitelegramchat.token_budget import truncate_to_token_budget
 from typing import Any, Optional
 
 from apitelegramchat.workspace_utils import (
@@ -53,8 +53,9 @@ logger = logging.getLogger(__name__)
 # ---------- 常量 ----------
 MEMORY_FILENAME = "memories.json"
 VALID_IMPORTANCE = ("low", "medium", "high")
-MAX_CONTENT_TOKENS = 2000
-MAX_TAG_TOKENS = 24
+MEMORY_CONTENT_TOKEN_BUDGET = 2_000
+MEMORY_TAG_TOKEN_BUDGET = 24
+MEMORY_CARD_CONTENT_TOKEN_BUDGET = 200
 MAX_TAGS = 8
 MAX_MEMORIES = 1000  # 单 chat 上限，防止失控增长
 DEFAULT_CATEGORIES = ("fact", "preference", "person", "event", "note")
@@ -155,7 +156,7 @@ def _normalize_tags(tags: Any) -> list[str]:
     for p in parts:
         if p not in seen:
             seen.add(p)
-            out.append(truncate_to_tokens(p, MAX_TAG_TOKENS, suffix=""))
+            out.append(truncate_to_token_budget(p, MEMORY_TAG_TOKEN_BUDGET, suffix="…"))
         if len(out) >= MAX_TAGS:
             break
     return out
@@ -164,7 +165,7 @@ def _normalize_tags(tags: Any) -> list[str]:
 def _normalize_category(value: Optional[str]) -> str:
     if not value:
         return "note"
-    v = str(value).strip().lower()[:32]
+    v = truncate_to_token_budget(str(value).strip().lower(), 32, suffix="…")
     return v or "note"
 
 
@@ -222,7 +223,7 @@ def _op_add(store: dict, content: str, category: str, tags: list[str],
     content = (content or "").strip()
     if not content:
         raise _MemoryError("content 不能为空", "empty_content")
-    content = truncate_to_tokens(content, MAX_CONTENT_TOKENS, suffix="")
+    content = truncate_to_token_budget(content, MEMORY_CONTENT_TOKEN_BUDGET, suffix="…")
     if len(store["memories"]) >= MAX_MEMORIES:
         raise _MemoryError(f"记忆数量已达上限 {MAX_MEMORIES}，请先清理", "too_many")
 
@@ -235,7 +236,7 @@ def _op_add(store: dict, content: str, category: str, tags: list[str],
         "importance": _normalize_importance(importance),
         "created_at": now,
         "updated_at": now,
-        "source": (source or "agent").strip().lower()[:16] or "agent",
+        "source": truncate_to_token_budget((source or "agent").strip().lower(), 16, suffix="…") or "agent",
     }
     store["memories"].append(mem)
     return store, {
@@ -341,7 +342,7 @@ def _op_update(store: dict, mid: str, content: Optional[str],
         c = content.strip()
         if not c:
             raise _MemoryError("content 不能为空", "empty_content")
-        mem["content"] = truncate_to_tokens(c, MAX_CONTENT_TOKENS, suffix="")
+        mem["content"] = truncate_to_token_budget(c, MEMORY_CONTENT_TOKEN_BUDGET, suffix="…")
         changed.append("content")
     if category is not None:
         mem["category"] = _normalize_category(category)
@@ -608,7 +609,7 @@ def _render_memory_item(m: dict) -> str:
     cat = _category_badge(m)
     mid = f"<code>#{_esc(m.get('id', '?'))}</code>"
     content = _esc(m.get("content", ""))
-    content = truncate_to_tokens(content, 200, suffix=chr(0x2026))
+    content = truncate_to_token_budget(content, MEMORY_CARD_CONTENT_TOKEN_BUDGET, suffix="…")
     tags = _tag_chips(m)
     parts = [f"{badge} {cat} {mid}", f"<blockquote>{content}</blockquote>"]
     if tags:
@@ -653,7 +654,7 @@ MEMORY_TOOL = {
                 },
                 "content": {
                     "type": "string",
-                    "description": "记忆内容。add/update 必填。最长 2000 字符。"
+                    "description": "记忆内容。add/update 必填。最多 2,000 tokens。"
                 },
                 "memory_id": {
                     "type": "string",
@@ -666,7 +667,7 @@ MEMORY_TOOL = {
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "可选标签，最多 8 个，每个 ≤24 字符。也接受逗号/空格分隔的字符串。"
+                    "description": "可选标签，最多 8 个，每个最多 24 tokens。也接受逗号/空格分隔的字符串。"
                 },
                 "importance": {
                     "type": "string",

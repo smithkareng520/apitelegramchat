@@ -202,12 +202,11 @@
 
 ### 2.17 `context_manager` 没有实际上限
 - 文件：`src/apitelegramchat/context_manager.py`
-- 问题：`DEFAULT_MAX_MESSAGES = None` / `旧字符上下文上限 = None`
-  让 `select_request_context` 把整段 history 原样塞进 prompt。长
+- 问题：旧实现允许 `select_request_context` 将整段 history 原样塞进 prompt。长
   会话能轻易达到 100k+ tokens 请求体，触发 413 / 上下文超限 /
   费用失控。
-- 修复：默认最近 50 条 / 200k 字符（约 50k tokens），均可通过
-  `CONTEXT_MAX_MESSAGES` / “旧字符上下文环境变量” 覆盖。
+- 修复：默认保留最近 50 条消息和 50,000 tokens；可通过
+  `CONTEXT_MAX_MESSAGES` / `CONTEXT_MAX_TOKENS` 覆盖。
 
 ### 2.18 `tool_context_compaction._archive_relative_path` 用 round_index 做 digest
 - 文件：`src/apitelegramchat/tool_context_compaction.py`
@@ -733,9 +732,8 @@ OpenAI 兼容协议的 `video_url` content part；不支持的模型收到保留
    - 结构：`<h3>` 标题（og:title 优先）→ `🔗 来源链接` → 正文块 →
      `🎬 视频` / `📺 内嵌播放器` / `🎵 音频` / `🖼️ 图片`（≥2 张用
      `<tg-slideshow>`，内部只放裸 `<img>`）媒体区；
-   - **整块截断**：14000 字符总预算（低于 `旧工具结果长度常量=16000`，
-     朴素切片永远不会作用在 HTML 上），只会在完整块边界截断并追加
-     "（正文过长，已截断）"，绝不产生未闭合标签；
+   - **整块截断**：当前统一使用 20,000 token 总预算；只会在完整块边界截断并追加
+     token 预算提示，绝不产生未闭合标签；
    - 正文里已内联出现的媒体自动从媒体区去重；首个正文标题与页面标题
      重复时自动去重。
 
@@ -917,9 +915,8 @@ OpenAI 兼容协议的 `video_url` content part；不支持的模型收到保留
 
 - `extract_body_blocks` 层表格提取正常（114 块，每话表完整，第 82 块）；
 - 组装链（锚定/排序/轮播/interleave）全部无损（117 块）；
-- **丢失发生在 `_truncate_blocks`**：正文共 25290 字符，而
-  `旧 fetch 正文长度常量=11000`，截断只保留前 69 块——每话表在 13806 偏移
-  处，被整块丢弃。
+- **丢失发生在 `_truncate_blocks`**：旧版正文预算过小，截断只保留前 69 块，
+  使每话表在靠后的结构边界被整块丢弃。
 
 为什么"以前可以"：旧版 trafilatura 纯文本输出没有 URL 膨胀，同样页面
 只有约 7K 字符，全部装得下；富 HTML 版本里维基百科内链 URL 是百分号
@@ -928,9 +925,8 @@ OpenAI 兼容协议的 `video_url` content part；不支持的模型收到保留
 
 ## 修复（两管齐下）
 
-1. **正文预算 11000 → 13400**：用满 旧 fetch 总长度常量=14000 窗口
-   （页头最长 ~330 + 截断提示 ~30），仍留 2000+ 余量低于
-   旧工具结果长度常量=16000。
+1. **正文预算迁移为 token 计数**：当前为正文预留 19,000 tokens，并将总工具
+   输出硬性限制为 20,000 tokens，给页头和截断提示保留余量。
 2. **`_demote_same_origin_links`（预算感知压缩，新增）**：仅当正文超出
    预算时，把指向同源（同 host）的 `<a>` 链接降级为纯锚文本（保留行内
    格式标签），跨域链接原样保留。降级只去掉冗长 href，可见文本逐字符
@@ -946,8 +942,8 @@ OpenAI 兼容协议的 `video_url` content part；不支持的模型收到保留
   - 同源降级/跨域保留/嵌套格式保真/可见文本无损；
   - 预算内不降级（保真优先）；
   - 回归复现：链接膨胀 + 每话表在预算之外 → 表格存活、跨域链接保留、
-    页头来源链接不受影响（monkeypatch 旧 fetch 正文长度常量）；
-  - 旧 fetch 总长度常量 > 旧 fetch 正文长度常量 + 400 不变式。
+    页头来源链接不受影响（monkeypatch 正文 token 预算）；
+  - 总 token 预算大于正文 token 预算并为页头保留余量的不变式。
 - 全套 64 项单测 + `test_consumers.py` 全绿；真实页面走
   `execute_fetch_url` 真实入口（`_build_rich_fetch_payload`）验证
   13 集完整提取。

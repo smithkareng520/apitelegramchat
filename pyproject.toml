@@ -29,7 +29,7 @@ dependencies = [
   "pdf2image==1.17.0",
   "pytesseract==0.3.13",
   "pandas==2.2.3",
-  "tiktoken>=0.9,<1",
+  "tiktoken==0.11.0",
 ]
 
 [project.scripts]

@@ -8,6 +8,7 @@ import re
 import uuid
 
 from apitelegramchat.utils import get_logger, escape_html
+from apitelegramchat.token_budget import truncate_to_token_budget
 from apitelegramchat.tool_executors import (
     dispatch_tool_call,
     format_tool_result,
@@ -40,8 +41,6 @@ from apitelegramchat.ai.tool_summary import (
     _tool_result_is_failure,
     _INVALID_TOOL_ARGUMENTS_KEY,
 )
-
-from apitelegramchat.token_utils import truncate_to_tokens
 
 logger = get_logger(__name__)
 
@@ -158,7 +157,7 @@ async def _run_tool_calls_and_append(
                 async def tool_progress_callback(status_text: str, _tc_id=tc_id, _label=label):
                     try:
                         text = status_text or "正在执行…"
-                        preview = f"<i>{escape_html(text[-1200:])}</i>"
+                        preview = f"<i>{escape_html(truncate_to_token_budget(text, 300, suffix='…'))}</i>"
                         builder.update_tool_preview(_tc_id, preview, summary=_label)
                         await builder.flush(force=True)
                     except asyncio.CancelledError:
@@ -193,7 +192,7 @@ async def _run_tool_calls_and_append(
                     builder.update_tool_item(
                         tc_id,
                         "Waiting for your answer",
-                        f"<p>{escape_html(str(question)[:200])}</p>",
+                        f"<p>{escape_html(truncate_to_token_budget(str(question), 64, suffix='…'))}</p>",
                         status="waiting",
                     )
                     await builder.flush(force=True)
@@ -215,7 +214,7 @@ async def _run_tool_calls_and_append(
                 result_str = _TOOL_TIMEOUT_MARKER
             except Exception as e:
                 logger.exception(f"[tool] {fn_name} failed: {e}")
-                result_str = f"Exception: tool {fn_name} failed - {str(e)[:200]}"
+                result_str = f"Exception: tool {fn_name} failed - {truncate_to_token_budget(str(e), 64, suffix='…')}"
             # 修复：_truncate_tool_result / format_tool_result 处理的是工具的原始
             # 输出（可能是任意格式的字符串），二者内部有大量字符串切分/正则/索引
             # 操作，遇到非预期形状的内容时可能抛出未捕获异常（IndexError /
@@ -230,7 +229,7 @@ async def _run_tool_calls_and_append(
                 safe_content = _truncate_tool_result(result_str)
             except Exception as e:
                 logger.exception(f"[tool] {fn_name} _truncate_tool_result 失败: {e}")
-                safe_content = str(result_str)[:4000]
+                safe_content = "Error: tool output could not be safely constrained to its token budget."
             try:
                 # 我们不再使用 format_tool_result 的摘要，而是自己生成
                 formatted_summary, details_html = await format_tool_result(fn_name, fn_args, safe_content)
@@ -239,7 +238,7 @@ async def _run_tool_calls_and_append(
             except Exception as e:
                 logger.exception(f"[tool] {fn_name} format_tool_result 失败: {e}")
                 formatted_summary = f"{fn_name} completed (formatting failed)"
-                details_html = f"<p>{escape_html(str(safe_content)[:2000])}</p>"
+                details_html = f"<p>{escape_html(truncate_to_token_budget(str(safe_content), 256, suffix='…'))}</p>"
             if safe_content == _TOOL_TIMEOUT_MARKER:
                 llm_content = f"Error: tool {fn_name} timed out. Please try again or refine the request."
             else:
@@ -292,7 +291,7 @@ async def _run_tool_calls_and_append(
         is_error = _tool_result_is_failure(fn_name, fn_args, safe_content, details_html)
         if is_error:
             # 优先展示格式化器生成的可读标题；模型上下文仍保留完整的可操作错误文本。
-            final_summary = formatted_summary or (truncate_to_tokens(llm_content, 50, suffix=chr(0x2026)))
+            final_summary = formatted_summary or (llm_content[:100] if len(llm_content) > 100 else llm_content)
             status = "error"
         else:
             # 成功：使用 _generate_tool_summary_done 生成描述
@@ -306,7 +305,7 @@ async def _run_tool_calls_and_append(
             exit_match = re.search(r"Exit code:\s*(\d+)", str(safe_content or ""))
             if exit_match and exit_match.group(1) != "0":
                 logger.warning(
-                    f"[bash] 非零退出码，命令可能失败: {truncate_to_tokens(safe_content, 150, suffix=chr(0x2026))!r}"
+                    f"[bash] 非零退出码，命令可能失败: {safe_content[:300]!r}"
                 )
 
         # 向 LLM 发送实际工具输出（safe_content），以便 LLM 准确推理
@@ -353,7 +352,7 @@ async def _run_tool_calls_and_append(
             if isinstance(llm_content, str) and (
                     llm_content.startswith("Error:") or llm_content.startswith("Exception:")
             ):
-                error_msgs.append(truncate_to_tokens(llm_content, 40, suffix=chr(0x2026)))
+                error_msgs.append(llm_content[:80])
     if error_msgs and len(set(error_msgs)) == 1 and len(error_msgs) == len(results):
         key = f"_streak:{error_msgs[0]}"
         prev = getattr(builder, key, 0)

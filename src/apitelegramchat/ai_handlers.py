@@ -60,8 +60,6 @@ from apitelegramchat.ai.agentic_loops import (
     _agentic_loop_openai_compat,
 )
 
-from apitelegramchat.token_utils import truncate_to_tokens
-
 logger = get_logger(__name__)
 # 修复 BUG：此前这里硬性 setLevel(DEBUG)，无论 config.LOG_LEVEL 是 INFO
 # 还是 WARNING，本模块的所有日志都会以 DEBUG 级别透传到 root，从而
@@ -368,11 +366,11 @@ async def get_ai_response(
 
         if context_snapshot.dropped_messages:
             logger.info(
-                "Request context bounded: chat=%s kept=%s dropped=%s estimated_tokens=%s",
+                "Request context bounded: chat=%s kept=%s dropped=%s estimated_chars=%s",
                 chat_id,
                 len(history),
                 context_snapshot.dropped_messages,
-                context_snapshot.estimated_tokens,
+                context_snapshot.estimated_chars,
             )
 
         builder.set_thinking_status("Thinking...")
@@ -617,7 +615,7 @@ async def get_ai_response(
                         elif isinstance(err, str):
                             error_msg_for_user = err
                 except Exception:
-                    error_msg_for_user = f"{error_msg_for_user} | Response: {truncate_to_tokens(body, 150, suffix='…')}"
+                    error_msg_for_user = f"{error_msg_for_user} | Response: {body[:300]}"
             except Exception:
                 pass
 

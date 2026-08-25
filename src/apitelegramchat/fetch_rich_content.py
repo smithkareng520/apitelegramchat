@@ -16,7 +16,7 @@
 #   3. 把每个正文块锚定到 DOM 元素（文本前向贪心匹配 / 图片 URL 匹配），
 #      将 trafilatura 丢弃的媒体按原始位置插回正文流；
 #   4. 轮播图检测：同容器内 >=2 张图片 → <tg-slideshow>（保持原位置）；
-#   5. 固定 token 预算内"整块截断"（绝不截断在标签中间）。
+#   5. 固定字符预算内"整块截断"（绝不截断在标签中间）。
 #
 # 设计约束（对齐系统提示词与 rich_message_builder 的解析规则）：
 #   - 媒体（<img>/<video>/<audio>/<figure>）必须作为独立块级元素，严禁出现在
@@ -24,8 +24,8 @@
 #   - <li> 与表格单元格内仅允许行内格式元素 → 嵌套列表/媒体一律提升到列表之后；
 #   - <tg-slideshow> 内只放裸 <img src="..."/>，不放 <figure>；
 #   - 失败结果（"失败：xxx"）仍由 search_engine 以纯文本生成，本模块只负责成功路径；
-#   - 输出总长度受 FETCH_RICH_MAX_TOKENS 约束，保证低于 tool_executors 的
-#     MAX_TOOL_RESPONSE_TOKENS（16000），避免朴素切片截断破坏 HTML 结构。
+#   - 输出总量受 20,000 token 预算约束，并按完整 HTML 块裁剪，避免截断
+#     到标签中间。
 from __future__ import annotations
 
 import html as _html
@@ -34,6 +34,8 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import parse_qs, urljoin, urlparse, urlsplit, urlunsplit
+
+from apitelegramchat.token_budget import count_tokens, truncate_to_token_budget
 
 try:
     from lxml import etree as _etree
@@ -44,26 +46,23 @@ except Exception:  # pragma: no cover - lxml 为硬依赖，仅防御性兜底
 
 logger = logging.getLogger(__name__)
 
-from apitelegramchat.token_utils import count_tokens, truncate_to_tokens, truncate_blocks_to_tokens
-
-# fetch 结果的 HTML 总预算。必须小于 tool_executors.MAX_TOOL_RESPONSE_TOKENS(16000)，
-# 这样 _truncate_tool_result 的朴素切片永远不会作用在 fetch_url 的 HTML 上。
-FETCH_RICH_MAX_TOKENS = 15000
-# 正文（含原位插入的媒体）占用的预算。页头（<h3> 标题 + 来源链接，最长约
-# 330）+ 截断提示（约 30）后仍低于 FETCH_RICH_MAX_TOKENS，且留有充足余量
-# 低于 MAX_TOOL_RESPONSE_TOKENS(16000)。
-# 历史教训：曾设为 11000，内容丰富的页面（如维基百科条目）会把靠后的
-# 表格（各话列表等）整块截掉——预算压缩（见 _demote_same_origin_links）
-# 与本预算必须协同工作。
-FETCH_BODY_MAX_TOKENS = 14400
+# fetch_url 返回给模型的总预算。与全局工具结果预算保持一致，均以
+# tiktoken 计数；结构化 HTML 始终按完整块裁剪，避免在标签中间截断。
+FETCH_RESPONSE_TOKEN_BUDGET = 20_000
+# 为页头、来源链接及截断提示预留 1,000 tokens，正文可用 19,000 tokens。
+FETCH_BODY_TOKEN_BUDGET = 19_000
+FETCH_TRUNCATION_NOTICE = "<p>…（内容过长，已按 token 预算截断）</p>"
 
 # 媒体数量上限：防止图库/相册类页面把工具结果塞满 <img>。
 MAX_IMAGES = 8
 MAX_VIDEOS = 4
 MAX_EMBEDS = 5
 MAX_AUDIOS = 2
-MAX_LINK_TEXT_TOKENS = 120
-MAX_CAPTION_TOKENS = 200
+LINK_TEXT_TOKEN_BUDGET = 48
+CAPTION_TOKEN_BUDGET = 80
+TITLE_TOKEN_BUDGET = 64
+FALLBACK_BLOCK_TOKEN_BUDGET = 512
+FALLBACK_TOTAL_TOKEN_BUDGET = 1_500
 
 # 被判定为装饰性/跟踪用途的图片文件名特征。
 _ICONISH_NAME_RE = re.compile(
@@ -387,7 +386,7 @@ def _collect_dom_media(tree, base_url: str) -> list[DomMedia]:
                 resolved = _canonicalize_embed(raw, base_url)
                 if resolved:
                     url, provider = resolved
-                    label = truncate_to_tokens((el.get("title") or el.get("aria-label") or "").strip(), MAX_LINK_TEXT_TOKENS)
+                    label = truncate_to_token_budget((el.get("title") or el.get("aria-label") or "").strip(), LINK_TEXT_TOKEN_BUDGET, suffix="…")
                     kind = "embed"
         elif tag == "img":
             raw = None
@@ -403,14 +402,14 @@ def _collect_dom_media(tree, base_url: str) -> list[DomMedia]:
             url = _sanitize_url(raw, base_url)
             if url and not _is_probably_decorative(url):
                 kind = "image"
-                label = truncate_to_tokens((el.get("alt") or "").strip(), MAX_CAPTION_TOKENS)
+                label = truncate_to_token_budget((el.get("alt") or "").strip(), CAPTION_TOKEN_BUDGET, suffix="…")
                 # 父级 <figure> 的 <figcaption> 作为图注。
                 try:
                     parent = el.getparent()
                     if parent is not None and _local_name(parent) == "figure":
                         for sib in parent:
                             if _local_name(sib) == "figcaption":
-                                cap = truncate_to_tokens("".join(sib.itertext()).strip(), MAX_CAPTION_TOKENS)
+                                cap = truncate_to_token_budget("".join(sib.itertext()).strip(), CAPTION_TOKEN_BUDGET, suffix="…")
                                 if cap:
                                     label = label or cap
                                 break
@@ -520,7 +519,7 @@ def _convert_inline_element(el, ctx: "_ConvertContext") -> tuple[str, list[str]]
     if tag == "ref":
         target = _sanitize_url(el.get("target"), ctx.base_url)
         if target:
-            text = inner.strip() or esc(truncate_to_tokens(target, MAX_LINK_TEXT_TOKENS))
+            text = inner.strip() or esc(truncate_to_token_budget(target, LINK_TEXT_TOKEN_BUDGET, suffix="…"))
             return f'<a href="{esc_attr(target)}">{text}</a>', media_blocks
         return inner, media_blocks
 
@@ -572,7 +571,7 @@ def _render_media_element(el, ctx: "_ConvertContext") -> Optional[str]:
         if _is_probably_decorative(url):
             return None
         alt = (el.get("alt") or "").strip()
-        caption = truncate_to_tokens((el.get("title") or alt), MAX_CAPTION_TOKENS)
+        caption = truncate_to_token_budget(el.get("title") or alt, CAPTION_TOKEN_BUDGET, suffix="…")
         if caption:
             return (
                 f'<figure><img src="{esc_attr(url)}"/>'
@@ -777,7 +776,7 @@ def _render_block(el, ctx: "_ConvertContext") -> list[str]:
                 if child_tag in ("graphic", "media"):
                     media_el = child
                 elif child_tag == "caption":
-                    caption = truncate_to_tokens("".join(child.itertext()).strip(), MAX_CAPTION_TOKENS)
+                    caption = truncate_to_token_budget("".join(child.itertext()).strip(), CAPTION_TOKEN_BUDGET, suffix="…")
             if media_el is not None:
                 block = _render_media_element(media_el, ctx)
                 if block and caption and block.startswith("<img"):
@@ -911,9 +910,18 @@ def _normalize_heading_text(text: str) -> str:
     return re.sub(r"\s+", "", _TAG_TEXT_RE.sub("", text or "")).lower()
 
 
-def _truncate_blocks(blocks: list[str], max_tokens: int) -> tuple[list[str], bool]:
-    """按最外层块截断到 token budget 内；绝不截断在标签中间。"""
-    return truncate_blocks_to_tokens(blocks, max_tokens)
+def _truncate_blocks(blocks: list[str], token_budget: int) -> tuple[list[str], bool]:
+    """Keep complete top-level HTML blocks within an exact token budget."""
+    kept: list[str] = []
+    used_tokens = 0
+    for block in blocks:
+        block_tokens = count_tokens(block) + 1  # Separator between top-level blocks.
+        if used_tokens + block_tokens <= token_budget:
+            kept.append(block)
+            used_tokens += block_tokens
+        else:
+            break
+    return kept, len(kept) < len(blocks)
 
 
 def _norm_text(text: str) -> str:
@@ -1048,12 +1056,12 @@ def _group_carousel_runs(entries: list[dict], url_to_carousel: dict[str, str]) -
 def _render_dom_media_block(m: DomMedia) -> str:
     """把 DOM 收集的媒体渲染为块级 Telegram HTML（在原位插入）。"""
     if m.kind == "video":
-        cap = esc(truncate_to_tokens((m.label or "").strip(), MAX_CAPTION_TOKENS))
+        cap = esc(truncate_to_token_budget((m.label or "").strip(), CAPTION_TOKEN_BUDGET, suffix="…"))
         if cap:
             return f'<figure><video src="{esc_attr(m.url)}"/><figcaption>{cap}</figcaption></figure>'
         return f'<video src="{esc_attr(m.url)}"/>'
     if m.kind == "audio":
-        cap = esc(truncate_to_tokens((m.label or "").strip(), MAX_CAPTION_TOKENS))
+        cap = esc(truncate_to_token_budget((m.label or "").strip(), CAPTION_TOKEN_BUDGET, suffix="…"))
         if cap:
             return f'<figure><audio src="{esc_attr(m.url)}"/><figcaption>{cap}</figcaption></figure>'
         return f'<audio src="{esc_attr(m.url)}"/>'
@@ -1061,10 +1069,10 @@ def _render_dom_media_block(m: DomMedia) -> str:
         provider = m.provider or "嵌入内容"
         label = (m.label or "").strip()
         link_text = f"{provider} · {label}" if label else provider
-        link_text = truncate_to_tokens(link_text, MAX_LINK_TEXT_TOKENS)
+        link_text = truncate_to_token_budget(link_text, LINK_TEXT_TOKEN_BUDGET, suffix="…")
         return f'<p>▶ <a href="{esc_attr(m.url)}">{esc(link_text)}</a></p>'
     # image
-    cap = esc(truncate_to_tokens((m.label or "").strip(), MAX_CAPTION_TOKENS))
+    cap = esc(truncate_to_token_budget((m.label or "").strip(), CAPTION_TOKEN_BUDGET, suffix="…"))
     if cap:
         return f'<figure><img src="{esc_attr(m.url)}"/><figcaption>{cap}</figcaption></figure>'
     return f'<img src="{esc_attr(m.url)}"/>'
@@ -1116,7 +1124,10 @@ def _fallback_paragraph_blocks(fallback_text: str) -> list[str]:
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", fallback_text or "") if p.strip()]
     if not paragraphs and fallback_text:
         paragraphs = [fallback_text.strip()]
-    return [f'<p>{esc(truncate_to_tokens(p, 1000, suffix=chr(0x2026)))}</p>' for p in paragraphs[:40]]
+    return [
+        f"<p>{esc(truncate_to_token_budget(p, FALLBACK_BLOCK_TOKEN_BUDGET, suffix='…'))}</p>"
+        for p in paragraphs[:40]
+    ]
 
 
 _SAME_ORIGIN_LINK_RE = re.compile(r'<a href="([^"]*)">(.*?)</a>', re.DOTALL)
@@ -1125,7 +1136,7 @@ _SAME_ORIGIN_LINK_RE = re.compile(r'<a href="([^"]*)">(.*?)</a>', re.DOTALL)
 def _demote_same_origin_links(blocks: list[str], base_url: str) -> list[str]:
     """把指向同源（同 host）的 <a> 链接降级为纯锚文本，跨域链接保留。
 
-    使用场景：正文超出token 预算时的无损压缩。维基百科等站点的内链 URL
+    使用场景：正文超出字符预算时的无损压缩。维基百科等站点的内链 URL
     是百分号编码（一个 CJK 字符展开为 9 个 ASCII 字符），单条链接即可
     占用上百字符，数百条内链常常吃掉 40% 以上的预算，导致靠后的表格
     被整块截断。内链的导航价值远低于其体积成本——降级只去掉 href，
@@ -1180,7 +1191,7 @@ def build_model_facing_html(
 
     domain = urlparse(url).netloc or url
     header_parts: list[str] = []
-    clean_title = esc((title or "").strip()[:200])
+    clean_title = esc(truncate_to_token_budget((title or "").strip(), TITLE_TOKEN_BUDGET, suffix="…"))
     if clean_title:
         header_parts.append(f"<h3>{clean_title}</h3>")
     header_parts.append(f'<p>🔗 <a href="{esc_attr(url)}">{esc(domain)}</a></p>')
@@ -1216,21 +1227,27 @@ def build_model_facing_html(
     # 文本与行内格式，仅去掉冗长的 href）。维基百科类页面的内链 URL 是
     # 百分号编码，单条即可达百字符，常常吃掉 40% 以上的预算——降级后
     # 信息几乎无损，而靠后的表格（如各话列表）得以保留在预算内。
-    if count_tokens("\n".join(final_blocks)) > FETCH_BODY_MAX_TOKENS:
+    if count_tokens("\n".join(final_blocks)) > FETCH_BODY_TOKEN_BUDGET:
         final_blocks = _demote_same_origin_links(final_blocks, url)
 
-    kept_blocks, was_truncated = _truncate_blocks(final_blocks, FETCH_BODY_MAX_TOKENS)
+    kept_blocks, was_truncated = _truncate_blocks(final_blocks, FETCH_BODY_TOKEN_BUDGET)
     parts = header_parts + kept_blocks
     if was_truncated:
-        parts.append("<p>…（正文过长，已截断）</p>")
+        parts.append(FETCH_TRUNCATION_NOTICE)
 
     result = "\n".join(parts)
-    if count_tokens(result) > FETCH_RICH_MAX_TOKENS:
-        parts2, trunc2 = _truncate_blocks(parts, FETCH_RICH_MAX_TOKENS - count_tokens("<p>…（内容过长，已截断）</p>"))
+    if count_tokens(result) > FETCH_RESPONSE_TOKEN_BUDGET:
+        reserve = count_tokens(FETCH_TRUNCATION_NOTICE) + 1
+        parts2, trunc2 = _truncate_blocks(parts, FETCH_RESPONSE_TOKEN_BUDGET - reserve)
         if trunc2:
-            parts2.append("<p>…（内容过长，已截断）</p>")
+            parts2.append(FETCH_TRUNCATION_NOTICE)
         result = "\n".join(parts2)
-    return result
+    # Defensive final guard for an unusually long source URL or malformed block.
+    return truncate_to_token_budget(
+        result,
+        FETCH_RESPONSE_TOKEN_BUDGET,
+        suffix="…[内容已按 token 预算截断]",
+    )
 
 
 def _apply_carousels(entries: list[dict], media: list[DomMedia]) -> tuple[list[dict], list[tuple[int, str]]]:
@@ -1318,17 +1335,17 @@ def extract_title_from_html(html_text: str) -> str:
         return ""
     og = _meta_content(tree, {"og:title", "twitter:title"})
     if og:
-        return og.strip()[:200]
+        return truncate_to_token_budget(og.strip(), TITLE_TOKEN_BUDGET, suffix="…")
     try:
         title_el = tree.find(".//title")
         if title_el is not None and title_el.text:
-            return re.sub(r"\s+", " ", title_el.text).strip()[:200]
+            return truncate_to_token_budget(re.sub(r"\s+", " ", title_el.text).strip(), TITLE_TOKEN_BUDGET, suffix="…")
     except Exception:
         pass
     return ""
 
 
-def build_fallback_text_from_html(html_text: str, limit: int = 6000) -> str:
+def build_fallback_text_from_html(html_text: str, token_budget: int = FALLBACK_TOTAL_TOKEN_BUDGET) -> str:
     """提取不到结构化正文时的纯文本兜底（meta description + 段落文本）。"""
     if _lxml_html is None or not html_text:
         return ""
@@ -1347,6 +1364,6 @@ def build_fallback_text_from_html(html_text: str, limit: int = 6000) -> str:
         # 按 20 英文词校准的阈值会把中文正文全部过滤掉。
         if len(text) >= 10:
             chunks.append(text)
-        if sum(len(c) for c in chunks) >= limit:
+        if count_tokens("\n\n".join(chunks)) >= token_budget:
             break
-    return "\n\n".join(chunks)[:limit]
+    return truncate_to_token_budget("\n\n".join(chunks), token_budget, suffix="…")

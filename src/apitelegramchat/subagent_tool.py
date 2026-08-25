@@ -22,7 +22,7 @@
 - 工具白名单：默认允许所有 SEARCH_TOOLS，调用方可限制为子集
 - 安全护栏：
     - 最大循环轮数：MAX_SUBAGENT_ROUNDS = 32（可通过环境变量 SUBAGENT_MAX_ROUNDS 调整）
-    - 最大单次工具结果预算：MAX_SUBAGENT_RESULT_TOKENS = 8000（可通过环境变量 SUBAGENT_MAX_RESULT_TOKENS 调整）
+    - 最大单次工具结果预算：20,000 tokens（可通过环境变量 SUBAGENT_TOOL_RESULT_TOKEN_BUDGET 调整）
     - 总体超时：DEFAULT_TIMEOUT = 900s（可通过环境变量 SUBAGENT_DEFAULT_TIMEOUT 调整）
     - 禁止子 agent 递归调用 subagent 工具（防爆炸）
 - 不带流式输出（子 agent 是后台任务，用户不需要看 token 流），用普通 chat.completions.create
@@ -47,7 +47,7 @@ from typing import Any, Optional
 
 from apitelegramchat.api_client import api_client
 from apitelegramchat.config import SUPPORTED_MODELS, DEFAULT_MODEL
-from apitelegramchat.token_utils import count_tokens, truncate_to_tokens
+from apitelegramchat.token_budget import count_tokens, truncate_to_token_budget
 
 logger = logging.getLogger(__name__)
 
@@ -68,18 +68,23 @@ def _env_int(name: str, default: int, *, min_value: int | None = None, max_value
 
 # ---------- 安全护栏 ----------
 MAX_SUBAGENT_ROUNDS = _env_int("SUBAGENT_MAX_ROUNDS", 32, min_value=1, max_value=128)
-MAX_SUBAGENT_RESULT_TOKENS = _env_int("SUBAGENT_MAX_RESULT_TOKENS", 8000, min_value=1000, max_value=50000)
+SUBAGENT_TOOL_RESULT_TOKEN_BUDGET = _env_int(
+    "SUBAGENT_TOOL_RESULT_TOKEN_BUDGET", 20_000, min_value=256, max_value=20_000
+)
 DEFAULT_TIMEOUT = _env_int("SUBAGENT_DEFAULT_TIMEOUT", 900, min_value=60, max_value=1800)  # 秒
-MAX_TASK_TOKENS = _env_int("SUBAGENT_MAX_TASK_TOKENS", 8000, min_value=1000, max_value=50000)
-MAX_CONTEXT_TOKENS = _env_int("SUBAGENT_MAX_CONTEXT_TOKENS", 16000, min_value=1000, max_value=100000)
-MAX_ANSWER_TOKENS = _env_int("SUBAGENT_MAX_ANSWER_TOKENS", 12000, min_value=1000, max_value=100000)
-# 子 agent 的完整答复仍会交给父 agent；此处仅限制 Telegram 工具卡片的预览，
-# 防止一张卡片吞掉整个富消息草稿的交互预算。
-MAX_CARD_ANSWER_HTML_TOKENS = _env_int(
-    "SUBAGENT_CARD_ANSWER_HTML_TOKENS",
-    4200,
-    min_value=1000,
-    max_value=5000,
+SUBAGENT_TASK_TOKEN_BUDGET = _env_int(
+    "SUBAGENT_TASK_TOKEN_BUDGET", 2_000, min_value=128, max_value=20_000
+)
+SUBAGENT_CONTEXT_TOKEN_BUDGET = _env_int(
+    "SUBAGENT_CONTEXT_TOKEN_BUDGET", 4_000, min_value=256, max_value=20_000
+)
+SUBAGENT_ANSWER_TOKEN_BUDGET = _env_int(
+    "SUBAGENT_ANSWER_TOKEN_BUDGET", 4_000, min_value=256, max_value=20_000
+)
+# 完整答复仍会交给父 agent；这里只限制 Telegram 工具卡片的预览，避免一张卡片
+# 吞掉整个富消息草稿的交互预算。
+SUBAGENT_CARD_PREVIEW_TOKEN_BUDGET = _env_int(
+    "SUBAGENT_CARD_PREVIEW_TOKEN_BUDGET", 1_000, min_value=128, max_value=4_000
 )
 
 
@@ -159,8 +164,12 @@ def _filter_tools(allowed: Optional[list[str]]) -> list[dict]:
     return out
 
 
-def _truncate(s: str, limit: int = MAX_SUBAGENT_RESULT_TOKENS) -> str:
-    return truncate_to_tokens(s or "", limit, suffix="\n…[子 agent 视野已截断]")
+def _truncate(s: str, token_budget: int = SUBAGENT_TOOL_RESULT_TOKEN_BUDGET) -> str:
+    return truncate_to_token_budget(
+        s,
+        token_budget,
+        suffix="\n…[子 agent 视野已按 token 预算截断]",
+    )
 
 
 async def _execute_tool_for_subagent(
@@ -189,7 +198,7 @@ async def _execute_tool_for_subagent(
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        return f"Error: tool '{name}' failed: {truncate_to_tokens(str(e), 100, suffix=chr(0x2026))}"
+        return f"Error: tool '{name}' failed: {str(e)[:200]}"
 
 
 async def _subagent_agentic_loop(
@@ -268,7 +277,7 @@ async def _subagent_agentic_loop(
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            last_error = f"LLM 调用失败: {truncate_to_tokens(str(e), 100, suffix=chr(0x2026))}"
+            last_error = f"LLM 调用失败: {str(e)[:200]}"
             logger.exception(f"subagent: LLM call failed (round {rounds}): {e}")
             await _report(f"第 {rounds} 轮 LLM 调用失败")
             break
@@ -292,7 +301,7 @@ async def _subagent_agentic_loop(
             tool_call_ids = [getattr(tc, "id", "") or "" for tc in tool_calls]
             logger.info(
                 f"subagent: round={rounds}, raw_tool_calls={len(tool_calls)}, ids={tool_call_ids}, "
-                f"names={tool_call_names}, content_len={len(content.strip())}"
+                f"names={tool_call_names}, content_tokens={count_tokens(content.strip())}"
             )
         except Exception:
             logger.exception("subagent: tool_calls 日志记录失败")
@@ -300,8 +309,11 @@ async def _subagent_agentic_loop(
         # 没有 tool_calls → 任务结束
         if not tool_calls:
             answer = (content or "").strip()
-            if truncate_to_tokens(answer, MAX_ANSWER_TOKENS) != answer:
-                answer = truncate_to_tokens(answer, MAX_ANSWER_TOKENS, suffix="\n…[子 agent 答复已截断]")
+            answer = truncate_to_token_budget(
+                answer,
+                SUBAGENT_ANSWER_TOKEN_BUDGET,
+                suffix="\n…[子 agent 答复已按 token 预算截断]",
+            )
             await _report(f"完成：{rounds} 轮，{total_tool_calls} 次工具调用，{time.monotonic() - start:.0f}s")
             return {
                 "ok": True,
@@ -406,9 +418,9 @@ async def execute_subagent(
     if not task:
         return json.dumps({"ok": False, "error": "task 不能为空", "code": "empty_task"},
                           ensure_ascii=False)
-    task = truncate_to_tokens(task, MAX_TASK_TOKENS, suffix="")
+    task = truncate_to_token_budget(task, SUBAGENT_TASK_TOKEN_BUDGET, suffix="…")
     if context:
-        context = truncate_to_tokens(context, MAX_CONTEXT_TOKENS, suffix="")
+        context = truncate_to_token_budget(context, SUBAGENT_CONTEXT_TOKEN_BUDGET, suffix="…")
 
     # 选模型
     chosen_model = (model or DEFAULT_MODEL).strip()
@@ -474,7 +486,7 @@ async def execute_subagent(
         logger.exception(f"subagent: unexpected error (error_id={error_id}): {e}")
         return json.dumps({
             "ok": False,
-            "error": f"子 agent 异常 (error_id={error_id})：{truncate_to_tokens(str(e), 100, suffix=chr(0x2026))}",
+            "error": f"子 agent 异常 (error_id={error_id})：{str(e)[:200]}",
             "code": "exception",
             "error_id": error_id,
             "model": chosen_model,
@@ -483,7 +495,7 @@ async def execute_subagent(
     # 加上模型信息再返回
     result["model"] = chosen_model
     result["model_name"] = getattr(model_info, "name", chosen_model)
-    result["task_preview"] = truncate_to_tokens(task, 40, suffix=chr(0x2026))
+    result["task_preview"] = task[:80]
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -500,44 +512,50 @@ _HTML_VOID_TAGS = {
 
 
 class _HTMLPreviewTruncator(HTMLParser):
-    """按 HTML 结构截取预览，并在截断处补齐已打开的标签。"""
+    """Keep a structurally valid HTML preview within an exact token budget."""
 
-    def __init__(self, limit: int):
+    def __init__(self, token_budget: int):
         super().__init__(convert_charrefs=False)
-        self.limit = max(1, int(limit))
+        self.token_budget = max(1, int(token_budget))
         self.parts: list[str] = []
         self.open_tags: list[str] = []
-        self.open_close_chars = 0
         self.truncated = False
 
-    def _remaining(self) -> int:
-        return self.limit - len("".join(self.parts)) - self.open_close_chars
+    def _closing_html(self, tags: Optional[list[str]] = None) -> str:
+        return "".join(f"</{tag}>" for tag in reversed(tags if tags is not None else self.open_tags))
 
-    def _append(self, text: str) -> bool:
+    def _fits(self, extra: str = "", future_open_tags: Optional[list[str]] = None) -> bool:
+        tags = self.open_tags if future_open_tags is None else future_open_tags
+        return count_tokens("".join(self.parts) + extra + self._closing_html(tags)) <= self.token_budget
+
+    def _append_complete(self, text: str) -> bool:
         if self.truncated:
             return False
-        if len(text) > self._remaining():
+        if not self._fits(text):
             self.truncated = True
             return False
         self.parts.append(text)
         return True
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.truncated:
+            return
         raw = self.get_starttag_text() or f"<{tag}>"
         tag = tag.lower()
-        reserved = 0 if tag in _HTML_VOID_TAGS else len(tag) + 3  # </tag>
-        if len(raw) + reserved > self._remaining():
+        future_open_tags = self.open_tags if tag in _HTML_VOID_TAGS else self.open_tags + [tag]
+        if not self._fits(raw, future_open_tags):
             self.truncated = True
             return
         self.parts.append(raw)
-        if reserved:
+        if tag not in _HTML_VOID_TAGS:
             self.open_tags.append(tag)
-            self.open_close_chars += reserved
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self._append(self.get_starttag_text() or f"<{tag}/>")
+        self._append_complete(self.get_starttag_text() or f"<{tag}/>")
 
     def handle_endtag(self, tag: str) -> None:
+        if self.truncated:
+            return
         tag = tag.lower()
         close_index = next((
             i for i in range(len(self.open_tags) - 1, -1, -1)
@@ -548,69 +566,61 @@ class _HTMLPreviewTruncator(HTMLParser):
             return
         closing_tags = list(reversed(self.open_tags[close_index:]))
         closing_html = "".join(f"</{open_tag}>" for open_tag in closing_tags)
-        released = sum(len(open_tag) + 3 for open_tag in self.open_tags[close_index:])
-        if self.truncated or len(closing_html) > self._remaining() + released:
+        future_open_tags = self.open_tags[:close_index]
+        if not self._fits(closing_html, future_open_tags):
             self.truncated = True
             return
         self.parts.append(closing_html)
         del self.open_tags[close_index:]
-        self.open_close_chars -= released
 
     def handle_data(self, data: str) -> None:
         if self.truncated or not data:
             return
-        remaining = self._remaining()
-        if len(data) <= remaining:
+        if self._fits(data):
             self.parts.append(data)
             return
-        if remaining > 0:
-            self.parts.append(data[:remaining])
+        # Binary-search the largest Unicode-safe prefix that still leaves room
+        # for every required closing tag.
+        low, high, best = 0, len(data), 0
+        while low <= high:
+            middle = (low + high) // 2
+            if self._fits(data[:middle]):
+                best = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+        if best:
+            self.parts.append(data[:best])
         self.truncated = True
 
     def handle_entityref(self, name: str) -> None:
-        self._append(f"&{name};")
+        self._append_complete(f"&{name};")
 
     def handle_charref(self, name: str) -> None:
-        self._append(f"&#{name};")
+        self._append_complete(f"&#{name};")
 
     def render(self) -> tuple[str, bool]:
-        suffix = "".join(f"</{tag}>" for tag in reversed(self.open_tags))
-        return "".join(self.parts) + suffix, self.truncated
+        return "".join(self.parts) + self._closing_html(), self.truncated
 
 
-def _truncate_html_preview(fragment: str, limit: int = MAX_CARD_ANSWER_HTML_TOKENS) -> tuple[str, bool]:
-    """按 token 预算截取富文本，同时保证 HTML 标签结构完整。
-
-    ``_HTMLPreviewTruncator`` 本身按字符安全截断；这里对其安全输出做
-    token-budget 二分搜索，因此外部预算始终是 token，而不是字符。
-    """
+def _truncate_html_preview(fragment: str, token_budget: int = SUBAGENT_CARD_PREVIEW_TOKEN_BUDGET) -> tuple[str, bool]:
+    """截取富文本 token 预算内的预览，绝不在标签或实体中间切断。"""
     text = fragment or ""
-    if not text or len(text) <= 0:
+    if count_tokens(text) <= token_budget:
         return text, False
-    if count_tokens(text) <= limit:
-        return text, False
-
-    def render_with_char_budget(char_budget: int) -> str:
-        parser = _HTMLPreviewTruncator(max(1, char_budget))
+    parser = _HTMLPreviewTruncator(token_budget)
+    try:
         parser.feed(text)
         parser.close()
         preview, _ = parser.render()
-        return preview or _esc(text[:max(1, char_budget)])
-
-    try:
-        lo, hi = 1, len(text)
-        best = ""
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            preview = render_with_char_budget(mid)
-            if count_tokens(preview) <= limit:
-                best = preview
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        return best or _esc(truncate_to_tokens(text, limit, suffix="")), True
+        # 对于只含超长注释、声明等极端输入，仍提供可展示的安全文本兜底。
+        if preview:
+            return preview, True
     except Exception:
-        return _esc(truncate_to_tokens(text, limit, suffix="")), True
+        # 模型输出不应因预览格式化失败而令整个工具卡片消失。
+        pass
+    safe_text = truncate_to_token_budget(text, token_budget, suffix="…")
+    return truncate_to_token_budget(_esc(safe_text), token_budget, suffix="…"), True
 
 
 def render_subagent_card(payload: dict) -> str:
@@ -673,11 +683,11 @@ SUBAGENT_TOOL = {
                 },
                 "task": {
                     "type": "string",
-                    "description": "子任务描述。明确说明要让子 agent 产出什么。最长 8000 字符。"
+                    "description": "子任务描述。明确说明要让子 agent 产出什么。最多 2,000 tokens。"
                 },
                 "context": {
                     "type": "string",
-                    "description": "可选的背景上下文。最长 16000 字符。可用来传递父对话中的相关信息。"
+                    "description": "可选的背景上下文。最多 4,000 tokens。可用来传递父对话中的相关信息。"
                 },
                 "model": {
                     "type": "string",
