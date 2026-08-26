@@ -81,6 +81,7 @@ export SERPER_MCP_TOKEN='...'
 | `HTTP 429` 或错误文本含 `quota`、`rate limit`、`throttled` | 上游限流或调用额度限制。此类请求不会在短时间内自动重试，避免额外消耗调用次数。 | 在 ModelScope MCP 部署的用量、调用日志或配额页面确认限制，稍后再试。 |
 | `HTTP 502`、`503`、`504` | 上游网关或服务临时不可用，**不能据此确认额度已用完**；项目会保留短时自动重试。 | 稍后重试，并检查 MCP 部署状态和调用日志。 |
 | `HTTP 401`、`403` | 访问令牌、部署地址或授权配置有误。 | 核对 `SERPER_MCP_URL`、`SERPER_MCP_TOKEN` 及部署授权。 |
+| `HTTP 404` | MCP 部署地址不存在、已失效，或不是可用的 Streamable HTTP MCP 端点；**不是额度耗尽**。 | 从 ModelScope 部署页面重新复制 MCP URL，确认部署状态仍为可用。 |
 | 其他 `4xx` | 请求参数或上游工具配置被拒绝。 | 查看日志中的 `status`、`category` 和脱敏 `detail` 字段。 |
 
 ### 根路径首页回退

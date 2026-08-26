@@ -17,10 +17,12 @@ _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 try:
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
+    from mcp.shared._httpx_utils import create_mcp_http_client
     _MCP_SDK_AVAILABLE = True
 except Exception as exc:  # pragma: no cover - optional deployment dependency
     ClientSession = None  # type: ignore[assignment]
     streamablehttp_client = None  # type: ignore[assignment]
+    create_mcp_http_client = None  # type: ignore[assignment]
     _MCP_SDK_AVAILABLE = False
     logger.warning("MCP SDK unavailable; external MCP calls are disabled: %s", exc)
 
@@ -58,6 +60,11 @@ class MCPToolError(RuntimeError):
             return (
                 f"❌ {feature_name}的上游网关暂时不可用{suffix}。"
                 "该状态不能证明调用额度已用完；请稍后重试，并检查 ModelScope MCP 部署状态及调用日志。"
+            )
+        if self.category == "endpoint":
+            return (
+                f"❌ {feature_name}的 MCP 部署地址不存在或不是可用的 Streamable HTTP 端点{suffix}。"
+                "这不是额度耗尽；请从 ModelScope 部署页面重新复制 MCP URL，并确认部署仍处于可用状态。"
             )
         if self.category == "request":
             return f"❌ {feature_name}的上游请求被拒绝{suffix}。请检查搜索参数和 MCP 服务配置。"
@@ -142,15 +149,50 @@ def _build_servers() -> dict[str, MCPServerConfig]:
 EXTERNAL_MCP_SERVERS = _build_servers()
 
 
+@dataclass
+class _MCPHTTPTrace:
+    """记录 MCP SDK 自行吞掉前的最后一个 HTTP 响应状态。"""
+
+    status_code: int | None = None
+
+    def observe_response(self, response: Any) -> None:
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int):
+            self.status_code = status_code
+
+
+def _tracing_http_client_factory(trace: _MCPHTTPTrace):
+    """在保留 SDK 推荐 HTTP 客户端配置的前提下附加响应观察钩子。"""
+    def factory(*args: Any, **kwargs: Any) -> Any:
+        if create_mcp_http_client is None:  # pragma: no cover - SDK 可用时必然存在
+            raise RuntimeError("MCP HTTP client factory is unavailable")
+        client = create_mcp_http_client(*args, **kwargs)
+        hooks = getattr(client, "event_hooks", None)
+        if isinstance(hooks, dict):
+            hooks.setdefault("response", []).append(trace.observe_response)
+        return client
+
+    return factory
+
+
 def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
-    """按因果链收集异常，避免 SDK 包装后丢失 HTTP 响应。"""
+    """递归展开因果链和 ExceptionGroup，寻找 SDK 包装前的 HTTP 异常。"""
     chain: list[BaseException] = []
     seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen and len(chain) < 8:
-        chain.append(current)
+    pending: list[BaseException] = [exc]
+    while pending and len(chain) < 32:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
         seen.add(id(current))
-        current = current.__cause__ or current.__context__
+        chain.append(current)
+
+        cause = current.__cause__ or current.__context__
+        if cause is not None:
+            pending.append(cause)
+        nested = getattr(current, "exceptions", None)
+        if isinstance(nested, (tuple, list)):
+            pending.extend(item for item in nested if isinstance(item, BaseException))
     return tuple(chain)
 
 
@@ -171,6 +213,8 @@ def _classify_failure(status_code: int | None, detail: str) -> tuple[str, bool]:
         return "rate_limited", False
     if status_code in {401, 403}:
         return "authentication", False
+    if status_code == 404:
+        return "endpoint", False
     if status_code is not None and 500 <= status_code <= 599:
         return "gateway", True
     if status_code is not None and 400 <= status_code <= 499:
@@ -178,10 +222,14 @@ def _classify_failure(status_code: int | None, detail: str) -> tuple[str, bool]:
     return "unknown", True
 
 
-def _diagnose_mcp_exception(exc: BaseException) -> tuple[int | None, str, str, bool]:
-    """从 SDK 包装异常中提取 HTTP 状态和简短响应摘要。"""
-    status_code: int | None = None
-    details: list[str] = []
+def _diagnose_mcp_exception(
+    exc: BaseException,
+    observed_status_code: int | None = None,
+) -> tuple[int | None, str, str, bool]:
+    """从 SDK 包装异常和 HTTP 观察器中提取状态与简短响应摘要。"""
+    status_code: int | None = observed_status_code
+    response_details: list[str] = []
+    exception_details: list[str] = []
     for current in _exception_chain(exc):
         response = getattr(current, "response", None)
         raw_status = getattr(response, "status_code", None)
@@ -196,12 +244,15 @@ def _diagnose_mcp_exception(exc: BaseException) -> tuple[int | None, str, str, b
             except Exception:
                 response_text = ""
             if response_text:
-                details.append(_truncate_safe_detail(response_text))
+                response_details.append(_truncate_safe_detail(response_text))
         text = _truncate_safe_detail(current)
         if text:
-            details.append(text)
+            exception_details.append(text)
 
-    detail = next((item for item in details if item), "")
+    # HTTP 响应体比 ExceptionGroup 的包装文字更接近根因；无响应体时再退回异常文本。
+    detail = next((item for item in response_details if item), "")
+    if not detail:
+        detail = next((item for item in exception_details if item), "")
     category, retryable = _classify_failure(status_code, detail)
     return status_code, category, detail, retryable
 
@@ -218,8 +269,14 @@ async def call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, A
     if not _TOOL_NAME_RE.fullmatch(tool_name) or tool_name not in server.allowed_tools:
         raise MCPToolError(f"External MCP tool is not allowed: {server_name}.{tool_name}")
 
+    http_trace = _MCPHTTPTrace()
+
     async def run_call() -> Any:
-        async with streamablehttp_client(server.url, headers=server.headers) as (read_stream, write_stream, _):
+        async with streamablehttp_client(
+            server.url,
+            headers=server.headers,
+            httpx_client_factory=_tracing_http_client_factory(http_trace),
+        ) as (read_stream, write_stream, _):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
                 return await session.call_tool(tool_name, arguments)
@@ -236,7 +293,10 @@ async def call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, A
         # 已经是 MCPToolError，避免再包一层导致 chain 不清晰。
         raise
     except Exception as exc:
-        status_code, category, detail, retryable = _diagnose_mcp_exception(exc)
+        status_code, category, detail, retryable = _diagnose_mcp_exception(
+            exc,
+            observed_status_code=http_trace.status_code,
+        )
         logger.warning(
             "External MCP call failed server=%s tool=%s status=%s category=%s retryable=%s detail=%s",
             server_name,

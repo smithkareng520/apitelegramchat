@@ -45,6 +45,26 @@ class MCPErrorDiagnosticsTests(unittest.TestCase):
         self.assertEqual(category, "rate_limited")
         self.assertFalse(retryable)
 
+    def test_exception_group_is_recursively_unwrapped(self) -> None:
+        grouped = ExceptionGroup(
+            "task group failure",
+            [_FakeHttpError(404, "Not Found")],
+        )
+        status, category, detail, retryable = _diagnose_mcp_exception(grouped)
+        self.assertEqual(status, 404)
+        self.assertEqual(category, "endpoint")
+        self.assertFalse(retryable)
+        self.assertIn("Not Found", detail)
+
+    def test_observed_status_recovers_sdk_swallowed_404(self) -> None:
+        status, category, _, retryable = _diagnose_mcp_exception(
+            RuntimeError("Session terminated"),
+            observed_status_code=404,
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(category, "endpoint")
+        self.assertFalse(retryable)
+
     def test_sensitive_values_are_redacted_from_diagnostics(self) -> None:
         detail = _truncate_safe_detail(
             "Authorization: Bearer secret-token api_key=also-secret"
@@ -58,8 +78,12 @@ class MCPErrorDiagnosticsTests(unittest.TestCase):
         quota = MCPToolError(
             "limited", category="rate_limited", status_code=429, retryable=False
         )
+        endpoint = MCPToolError(
+            "missing", category="endpoint", status_code=404, retryable=False
+        )
         self.assertIn("不能证明调用额度已用完", gateway.user_message("网页搜索服务"))
         self.assertIn("限流或调用额度限制", quota.user_message("网页搜索服务"))
+        self.assertIn("部署地址不存在", endpoint.user_message("网页搜索服务"))
 
 
 if __name__ == "__main__":
