@@ -388,14 +388,12 @@ SUPPORTED_MODELS["dots-studio/dots-3-note-preview:free"] = make_model_config(
     name="Dots-3-Note Preview Free",
     vision=True,
     max_context=512000,
-    max_output_tokens=131000,
 )
 SUPPORTED_MODELS["poolside/laguna-s-2.1:free"] = make_model_config(
     model_id="poolside/laguna-s-2.1:free",
     provider="openrouter",
     name="Laguna S 2.1 Free",
     max_context=262000,
-    max_output_tokens=64000,
 )
 SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
     model_id="anthropic/claude-sonnet-5",
@@ -405,7 +403,6 @@ SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
     native_document=True,
     supports_prompt_cache=True,
     max_context=1000000,
-    max_output_tokens=128000,
 )
 
 # ---------- Agnes 免费模型 ----------
@@ -415,7 +412,6 @@ SUPPORTED_MODELS["agnes-2.5-flash"] = make_model_config(
     provider="agnes",
     name="Agnes 2.5 Flash",
     max_context=512000,
-    max_output_tokens=65500,
     vision=True,
 )
 
@@ -425,7 +421,6 @@ SUPPORTED_MODELS["deepseek-ai/DeepSeek-V4-Flash-0731"] = make_model_config(
     provider="modelscope",
     name="Deepseek V4 Flash",
     max_context=1000000,
-    max_output_tokens=65536,
 )
 
 SUPPORTED_MODELS["ZhipuAI/GLM-5.2"] = make_model_config(
@@ -433,7 +428,6 @@ SUPPORTED_MODELS["ZhipuAI/GLM-5.2"] = make_model_config(
     provider="modelscope",
     name="GLM 5.2",
     max_context=1000000,
-    max_output_tokens=65536,
 )
 
 # ---------- Gemini 系列 ----------
@@ -443,7 +437,6 @@ SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
     name="Gemini 3.5 Flash-Lite",
     vision=True,
     max_context=1000000,
-    max_output_tokens=64000,
 )
 # ---------- GLM 系列 ----------
 SUPPORTED_MODELS["GLM-4.6V-Flash"] = make_model_config(
@@ -452,14 +445,12 @@ SUPPORTED_MODELS["GLM-4.6V-Flash"] = make_model_config(
     name="GLM 4.6V Flash",
     vision=True,
     max_context=128000,
-    max_output_tokens=32000,
 )
 SUPPORTED_MODELS["GLM-4.7-Flash"] = make_model_config(
     model_id="GLM-4.7-Flash",
     provider="glm",
     name="GLM 4.7 Flash",
     max_context=200000,
-    max_output_tokens=128000,
 )
 
 # ---------- 图像生成模型 ----------
@@ -495,7 +486,6 @@ SUPPORTED_MODELS["google/gemini-3.1-flash-lite-image"] = make_model_config(
     vision=True,
     supports_tools=False,
     max_context=131000,
-    max_output_tokens=33000,
 )
 SUPPORTED_MODELS["google/gemini-3-pro-image-preview"] = make_model_config(
     model_id="google/gemini-3-pro-image-preview",
@@ -505,7 +495,6 @@ SUPPORTED_MODELS["google/gemini-3-pro-image-preview"] = make_model_config(
     vision=True,
     supports_tools=False,
     max_context=66000,
-    max_output_tokens=33000,
 )
 SUPPORTED_MODELS["bytedance-seed/seedream-4.5"] = make_model_config(
     model_id="bytedance-seed/seedream-4.5",
