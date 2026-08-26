@@ -125,6 +125,38 @@ def _ensure_rich_block_content(fragment: str) -> str:
     return f"<p>{content}</p>"
 
 
+def _escape_reasoning_text(text: str) -> str:
+    """严格转义思考原文中的 HTML 特殊字符（&、<、> 一律转义）。
+
+    与 utils.escape_html 的“智能 amp”策略不同：reasoning 字段是模型的原始
+    独白，模型没有意识（也不被要求）自行转义。若沿用智能策略保留
+    ``&amp;``/``&lt;`` 等既有实体不转义，模型在思考中提及这些字面量时会被
+    Telegram 解析回字符，用户看到的就不是模型真实写下的内容；因此这里对
+    ``&`` 无条件转义，保证思考内容逐字可见。
+    """
+    if not text:
+        return ""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _render_reasoning_html(content: str) -> str:
+    """把思考原文渲染为可安全嵌入 ``<details>`` 的块级 HTML 片段。
+
+    思考内容一律按纯文本处理：先整体严格转义——模型思考中出现的加粗、
+    标签或任何 HTML 片段都只会按字面显示，不会再被 Telegram 当作富文本
+    解析，也不会破坏外层折叠块的结构；随后把换行转换为 ``<br/>``，保留
+    思考本身的分行排版。
+    """
+    text = (content or "").strip()
+    if not text:
+        # <details> 必须承载块级内容，否则 Telegram 会以
+        # RICH_MESSAGE_CONTENT_REQUIRED 拒绝整帧草稿；流式刚开始、首个
+        # 增量尚未到达时用占位段落兜底。
+        return "<p>思考中…</p>"
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return f"<p>{_escape_reasoning_text(text).replace(chr(10), '<br/>')}</p>"
+
+
 def _scan_rich_html_boundaries(
     html_content: str,
 ) -> tuple[list[tuple[int, int, int, int]], int, int, int]:
@@ -239,15 +271,22 @@ class RichMessageBuilder:
         self._rollover_count: int = 0
 
     def _get_reasoning_summary(self, content: str) -> str:
-        """从包含 HTML 标签的思考内容中提取纯文本摘要，长度不超过 30 字符"""
+        """从思考原文中提取单行纯文本摘要（长度不超过 30 字符）并严格转义。
+
+        摘要与折叠块正文一样按纯文本对待：正文已整体转义、标签只会按字面
+        展示，因此这里不再剥除标签（也避免了旧正则会把 “x < 5, y > 3” 中
+        的 ``< 5, y >`` 误当成标签剥掉的问题），只折叠空白、截断长度，最后
+        严格转义，确保 ``<summary>`` 不会被思考中出现的 ``<``、``>``、``&``
+        破坏。
+        """
         if not content:
             return "思考中…"
-        plain = re.sub(r'<[^>]+>', '', content).strip()
+        plain = re.sub(r"\s+", " ", content).strip()
         if not plain:
             return "思考中…"
         if len(plain) > 30:
-            return plain[:30] + "…"
-        return plain
+            plain = plain[:30].rstrip() + "…"
+        return _escape_reasoning_text(plain)
 
     def request_flush(self, force: bool = False) -> None:
         """异步触发刷新，确保在途发送期间的新内容一定会补发。"""
@@ -762,7 +801,9 @@ class RichMessageBuilder:
 
         inner_parts = []
         if reasoning_html:
-            inner_parts.append(_ensure_rich_block_content(reasoning_html))
+            # 工具组内的思考片段同样按纯文本严格转义后渲染，防止其中的标签
+            # 破坏外层 <details> 结构（与独立思考块的转义策略保持一致）。
+            inner_parts.append(_render_reasoning_html(reasoning_html))
         if text_content:
             inner_parts.append(_ensure_rich_block_content(text_content))
 
@@ -803,7 +844,9 @@ class RichMessageBuilder:
                 i += 1
                 # 不再收集后续 tool_group，只渲染 reasoning 自身
                 summary = self._get_reasoning_summary(reasoning_content)
-                reasoning_body = _ensure_rich_block_content(reasoning_content)
+                # 思考原文必须先严格转义再嵌入，否则其中的标签会被 Telegram
+                # 解析成真实格式，甚至破坏外层 <details> 折叠结构。
+                reasoning_body = _render_reasoning_html(reasoning_content)
                 html_parts.append(f"<details><summary>{summary}</summary>\n{reasoning_body}\n</details>")
                 continue
 
@@ -850,7 +893,9 @@ class RichMessageBuilder:
                 i += 1
                 # 不再收集后续 tool_group，只渲染 reasoning 自身
                 summary = self._get_reasoning_summary(reasoning_content)
-                reasoning_body = _ensure_rich_block_content(reasoning_content)
+                # 与 _build_html 保持一致：思考原文先严格转义再嵌入，
+                # 防止标签被解析或破坏折叠结构。
+                reasoning_body = _render_reasoning_html(reasoning_content)
                 html_parts.append(f"<details><summary>{summary}</summary>\n{reasoning_body}\n</details>")
                 continue
 
