@@ -94,7 +94,11 @@ def _reply_params(message_id: int | None) -> dict | None:
         return None
     if mid <= 0:
         return None
-    return {"message_id": mid}
+    # 被回复的消息可能已被删除（例如模型/角色列表已到 delete_after 定时
+    # 清理时间，而客户端仍显示旧按钮，用户点击后回调才到达）。
+    # allow_sending_without_reply 让反馈消息在引用目标丢失时降级为普通
+    # 消息继续送达，避免"操作已生效但用户看不到任何反馈"。
+    return {"message_id": mid, "allow_sending_without_reply": True}
 
 # ---------- 上下文管理常量 ----------
 MAX_HISTORY_MESSAGES = 30  # Trigger a tool-payload compaction pass; do not delete turns.
@@ -1044,6 +1048,55 @@ async def update_role_list(chat_id: int, message_id: int, role_list: list, curre
             return resp.status == 200
 
 
+async def update_model_list(
+    chat_id: int,
+    message_id: int,
+    model_list: list,
+    current_model: str,
+    banner_html: str = "",
+) -> bool:
+    """就地更新模型列表：给当前模型按钮打 √，其余保持原样。
+
+    仿照 /role 列表的交互模式：点击模型后不再立即删除列表，而是更新按钮
+    标记当前选择；列表仍由 send_model_list 发送时安排的 delete_after
+    定时清理。这样在列表尚未消失的窗口内再次点击其他模型，用户同样
+    能看到 "按钮 √ 变化 + ✅ 切换消息" 的双重反馈，明确知道切换是否
+    生效。
+
+    列表可能已被定时清理或并发删除，此时 editMessageText 会失败；该
+    失败属于预期内的竞态，仅记录日志并返回 False，绝不能让调用方
+    误以为切换失败。重复点击同一模型时 Telegram 会返回 400 "message
+    is not modified"，同样按可忽略处理。
+    """
+    formatted = [f"{m} √" if m == current_model else m for m in model_list]
+    keyboard = {"inline_keyboard": [[{"text": t, "callback_data": m}] for t, m in zip(formatted, model_list)]}
+    content = ""
+    if banner_html:
+        content += banner_html.rstrip() + "\n\n"
+    content += "🤖 请选择一个模型:"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": content,
+        "parse_mode": "HTML",
+        "reply_markup": json.dumps(keyboard),
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=5, connect=2)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.post(f"{BASE_URL}/editMessageText", json=payload) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.info(
+                        f"update_model_list 未生效(列表可能已清理): chat={chat_id} "
+                        f"msg={message_id} status={resp.status} body={body[:120]}"
+                    )
+                return resp.status == 200
+    except Exception as e:
+        logger.warning(f"update_model_list 异常(可忽略): chat={chat_id} msg={message_id} {e}")
+        return False
+
+
 async def _del_after(chat_id, msg_id, delay):
     await asyncio.sleep(delay)
     await delete_message(chat_id, msg_id)
@@ -1141,7 +1194,12 @@ async def send_model_list(
     reply_message_id: int | None = None,
     banner_html: str = "",
 ) -> int:
-    keyboard = {"inline_keyboard": [[{"text": model, "callback_data": model}] for model in model_list]}
+    # 与 /role 列表一致：当前模型打 √，让用户在切换前就能看到当前选择；
+    # 点击后由 update_model_list 就地移动 √（不删除列表），列表在
+    # delete_after 到期前持续可点，期间每次点击均有反馈。
+    current_model = get_user_model(chat_id)
+    formatted = [f"{m} √" if m == current_model else m for m in model_list]
+    keyboard = {"inline_keyboard": [[{"text": t, "callback_data": m}] for t, m in zip(formatted, model_list)]}
     content = ""
     if banner_html:
         content += banner_html.rstrip() + "\n\n"
@@ -1904,16 +1962,40 @@ async def webhook() -> tuple:
                     await _send_via_send_message(chat_id, f"✅ <b>{notice}</b>", reply_message_id=mid)
                 elif sel in SUPPORTED_MODELS:
                     async with aiohttp.ClientSession() as s:
-                        await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "切换中..."})
+                        await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": f"切换到 {SUPPORTED_MODELS[sel].name}..."})
                     await safe_set_user_model(chat_id, sel)
                     model_name = SUPPORTED_MODELS[sel].name
-                    # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置
-                    await _send_via_send_message(
-                        chat_id,
-                        f"✅ <b>模型切换成功</b>\n已切换到模型：<b>{model_name}</b>\n<i>（对话历史已保留）</i>",
-                        reply_message_id=mid,
+                    confirmation = (
+                        f"✅ <b>模型切换成功</b>\n已切换到模型：<b>{model_name}</b>\n<i>（对话历史已保留）</i>"
                     )
-                    await delete_message(chat_id, mid)
+                    # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置。
+                    # 【修复】快速连点时，本次点击的列表消息可能已被 delete_after
+                    # 定时清理删除；reply 到已不存在的消息会被 Telegram 以 400
+                    # 拒绝，旧实现静默吞错，导致"模型已切换却没有任何反馈"。
+                    # 这里失败后去掉 reply 补发一次，确保切换结果总能送达。
+                    sent_mid = await _send_via_send_message(chat_id, confirmation, reply_message_id=mid)
+                    if not sent_mid:
+                        await _send_via_send_message(chat_id, confirmation)
+                    # 【修复】仿照 /role：点击后不删除列表，而是就地给当前模型
+                    # 打 √，列表仍由发送时的 delete_after 定时清理。列表消失前
+                    # 的每一次点击都会得到 "√ 移动 + ✅ 消息" 双重反馈。
+                    try:
+                        async with global_lock:
+                            current_role = await get_user_role(chat_id)
+                        banner_html = ""
+                        if current_role:
+                            banner_html = f"⚠️ <b>兼容性提示</b>\n当前角色「<b>{current_role}</b>」可能与新模型不兼容，请留意。"
+                        # 读取当前模型与就地更新必须在同一把 chat 锁内完成：
+                        # 快速连点时多个回调并发执行，若读与编辑分离，后完成的
+                        # 编辑可能携带旧值，使列表上的 √ 停留在已被覆盖的模型上。
+                        lock = await get_chat_lock(chat_id)
+                        async with lock:
+                            await update_model_list(
+                                chat_id, mid, list(SUPPORTED_MODELS.keys()),
+                                get_user_model(chat_id), banner_html,
+                            )
+                    except Exception as list_err:
+                        logger.warning(f"模型列表就地更新失败(可忽略): chat={chat_id} msg={mid} {list_err}")
                     return "OK", 200
                 elif isinstance(sel, str) and sel.startswith("ask:"):
                     parts = sel.split(":", 3)
