@@ -382,15 +382,12 @@ def make_model_config(
 SUPPORTED_MODELS: Dict[str, ModelConfig] = {}
 
 # ---------- OpenRouter 模型 ----------
-SUPPORTED_MODELS["stealth/ox-alpha"] = make_model_config(
-    model_id="stealth/ox-alpha",
+SUPPORTED_MODELS["dots-studio/dots-3-note-preview:free"] = make_model_config(
+    model_id="dots-studio/dots-3-note-preview:free",
     provider="openrouter",
-    name="Ox Alpha",
+    name="Dots-3-Note Preview Free",
     vision=True,
-    # 默认关闭视频输入。只有确认该模型当前 endpoint 支持 video_url 时手动开启。
-    # OpenRouter 免费模型 metadata 可能标记支持视频，但实际供应商 endpoint 未必开放。
-    video=False,
-    max_context=1050000,
+    max_context=512000,
     max_output_tokens=131000,
 )
 SUPPORTED_MODELS["poolside/laguna-s-2.1:free"] = make_model_config(
