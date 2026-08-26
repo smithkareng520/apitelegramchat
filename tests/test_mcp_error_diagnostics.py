@@ -1,9 +1,11 @@
 """外部 MCP 失败分类与用户提示的回归测试。"""
 
+import asyncio
 import unittest
 
 from apitelegramchat.mcp_client import (
     MCPToolError,
+    _MCPHTTPTrace,
     _classify_failure,
     _diagnose_mcp_exception,
     _truncate_safe_detail,
@@ -64,6 +66,11 @@ class MCPErrorDiagnosticsTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(category, "endpoint")
         self.assertFalse(retryable)
+
+    def test_response_observer_is_awaitable_and_records_status(self) -> None:
+        trace = _MCPHTTPTrace()
+        asyncio.run(trace.observe_response(_FakeResponse(200, "OK")))
+        self.assertEqual(trace.status_code, 200)
 
     def test_sensitive_values_are_redacted_from_diagnostics(self) -> None:
         detail = _truncate_safe_detail(

@@ -155,7 +155,8 @@ class _MCPHTTPTrace:
 
     status_code: int | None = None
 
-    def observe_response(self, response: Any) -> None:
+    async def observe_response(self, response: Any) -> None:
+        """httpx 事件钩子：当前运行时会 await 该回调，因此必须是协程函数。"""
         status_code = getattr(response, "status_code", None)
         if isinstance(status_code, int):
             self.status_code = status_code
