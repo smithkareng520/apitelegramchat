@@ -990,12 +990,20 @@ def _mark_last_content_block_cacheable(msg: dict) -> bool:
 
 def _apply_cache_control(messages: list) -> None:
     """
-    为系统消息和最后一条用户/助手消息添加 cache_control 标记。
+    为系统消息和最后一条 user/assistant 消息添加 cache_control 标记。
     固定最多添加两个标记，无需 token 计数。
 
     注意：cache_control 必须打在 content block 上（见
     _mark_last_content_block_cacheable），打在消息顶层对 OpenRouter/
     OpenAI 兼容网关无效，会被静默忽略。
+
+    断点策略（Anthropic 前缀缓存最佳实践）：
+      1. system 消息末尾打一个断点 —— 稳定不变的系统提示在每一轮都能命中；
+      2. 从最后一条消息（通常是本轮新 user 消息）往前找第一条
+         user/assistant 消息打断点 —— 断点越靠后，缓存覆盖的前缀越长。
+    本函数必须在"全部消息（含本轮新 user 消息）就位之后"调用，
+    供 agentic loop 的每一轮请求复用：loop 内追加的 tool 消息位于
+    断点之后，不影响断点之前的前缀命中。
     """
     if not messages:
         return
@@ -1004,9 +1012,12 @@ def _apply_cache_control(messages: list) -> None:
     if messages[0].get("role") == "system":
         if _mark_last_content_block_cacheable(messages[0]):
             markers_added = 1
-    # 如果还有余量，从后往前找一条 user/assistant 消息添加标记
-    if markers_added < 2 and len(messages) >= 4:
-        for i in range(len(messages) - 2, 0, -1):
+    # 如果还有余量，从最后一条消息（含本轮新 user 消息）往前找一条
+    # user/assistant 消息添加标记。此前 range 从 len-2 起步且调用时机
+    # 早于新 user 消息 append，导致断点落在倒数第二条历史消息上，
+    # 缓存覆盖范围无谓缩小。
+    if markers_added < 2 and len(messages) >= 2:
+        for i in range(len(messages) - 1, 0, -1):
             msg = messages[i]
             role = msg.get("role")
             if role in ("user", "assistant"):

@@ -12,7 +12,12 @@ import uuid
 from typing import Optional
 from openai import AsyncOpenAI
 
-from apitelegramchat.config import GEMINI_API_KEY, SUPPORTED_MODELS
+from apitelegramchat.config import (
+    GEMINI_API_KEY,
+    SUPPORTED_MODELS,
+    get_sampling_params,
+    get_reasoning_request_fields,
+)
 from apitelegramchat.utils import get_logger, escape_html, send_rich_html_message
 from apitelegramchat.s3_utils import upload_bytes_to_r2
 import apitelegramchat.state as state
@@ -72,6 +77,25 @@ def _openrouter_extra_body() -> dict:
     return {"provider": OPENROUTER_PROVIDER_PREFERENCES.copy()}
 
 
+def _merged_extra_body(api_label: str, reasoning_extra: Optional[dict]) -> Optional[dict]:
+    """
+    合并 OpenRouter 路由偏好与推理控制字段，返回应传给 create() 的
+    extra_body；两个来源都为空时返回 None（不发送 extra_body）。
+
+    reasoning_extra 来自 config.get_reasoning_request_fields()，例如：
+      openrouter  -> {"reasoning": {"enabled": True, "effort": "high"}}
+      glm         -> {"thinking": {"type": "enabled"}}
+      modelscope  -> {"enable_thinking": True}
+    这些字段均不会与 provider 键冲突，直接字典合并即可。
+    """
+    body = None
+    if api_label == "openrouter":
+        body = _openrouter_extra_body()
+    if reasoning_extra:
+        body = {**(body or {}), **reasoning_extra}
+    return body
+
+
 async def _agentic_loop_openai_compat(
         client: AsyncOpenAI, current_model: str, messages: list, api_label: str,
         builder: "RichMessageBuilder", tools: list = None, supports_tools: bool = True
@@ -88,8 +112,10 @@ async def _agentic_loop_openai_compat(
     parallel_tool_calls = True
 
     model_info = SUPPORTED_MODELS.get(current_model)
-    supports_sampling = model_info.supports_sampling if model_info else True
     max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
+    # 采样与推理控制统一来自 config.py（含 per-model 覆盖），禁止在此硬编码。
+    sampling_params = get_sampling_params(model_info)
+    reasoning_top, reasoning_extra = get_reasoning_request_fields(model_info, api_label)
 
     for _round in range(MAX_TOOL_CALLS):
         added_tool_indices = set()
@@ -124,15 +150,15 @@ async def _agentic_loop_openai_compat(
                 "max_tokens": max_tokens,
                 "stream_options": {"include_usage": True},
             }
-            if supports_sampling:
-                create_params["temperature"] = 0.6
-                create_params["top_p"] = 0.9
+            create_params.update(sampling_params)
+            create_params.update(reasoning_top)
             if supports_tools and tools:
                 create_params["tools"] = tools
                 create_params["tool_choice"] = "auto"
                 create_params["parallel_tool_calls"] = parallel_tool_calls
-            if api_label == "openrouter":
-                create_params["extra_body"] = _openrouter_extra_body()
+            extra_body = _merged_extra_body(api_label, reasoning_extra)
+            if extra_body is not None:
+                create_params["extra_body"] = extra_body
 
             # 某些聚合网关会在长工具链后的首个 SSE 事件前沉默较久。
             # 只有尚未收到任何增量时，重试相同请求才是幂等且安全的；一旦已经向
@@ -300,15 +326,15 @@ async def _agentic_loop_openai_compat(
                     "stream": False,
                     "max_tokens": max_tokens,
                 }
-                if supports_sampling:
-                    fallback_params["temperature"] = 0.6
-                    fallback_params["top_p"] = 0.9
+                fallback_params.update(sampling_params)
+                fallback_params.update(reasoning_top)
                 if supports_tools and tools:
                     fallback_params["tools"] = tools
                     fallback_params["tool_choice"] = "auto"
                     fallback_params["parallel_tool_calls"] = parallel_tool_calls
-                if api_label == "openrouter":
-                    fallback_params["extra_body"] = _openrouter_extra_body()
+                fallback_extra_body = _merged_extra_body(api_label, reasoning_extra)
+                if fallback_extra_body is not None:
+                    fallback_params["extra_body"] = fallback_extra_body
 
                 resp = await client.chat.completions.create(**fallback_params)
                 msg = resp.choices[0].message
@@ -430,8 +456,11 @@ async def _agentic_loop_openai_compat(
                 "stream": True,
                 "max_tokens": max_tokens,
             }
-            if supports_sampling:
-                synth_params["temperature"] = 0.6
+            synth_params.update(sampling_params)
+            synth_params.update(reasoning_top)
+            synth_extra_body = _merged_extra_body(api_label, reasoning_extra)
+            if synth_extra_body is not None:
+                synth_params["extra_body"] = synth_extra_body
             try:
                 synth_stream = await client.chat.completions.create(**synth_params)
                 builder.begin_stream_text()
@@ -504,8 +533,12 @@ async def _agentic_loop_gemini_openai_compat(
     cleaned_tools = _clean_tools_for_gemini(tools) if tools else None
 
     model_info = SUPPORTED_MODELS.get(current_model)
-    supports_sampling = model_info.supports_sampling if model_info else True
     max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
+    # 采样与推理控制统一来自 config.py。Gemini 官方 OpenAI 兼容层：
+    # reasoning_effort 为顶层字段；google.thinking_config.thinkingBudget
+    # 通过 extra_body 下发（本循环用原始 JSON payload，等价于顶层 google 键）。
+    sampling_params = get_sampling_params(model_info)
+    reasoning_top, reasoning_extra = get_reasoning_request_fields(model_info, "gemini")
 
     GEMINI_OPENAI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
     req_headers = {
@@ -526,9 +559,10 @@ async def _agentic_loop_gemini_openai_compat(
             "max_tokens": max_tokens,
             "stream": False,
         }
-        if supports_sampling:
-            payload["temperature"] = 0.6
-            payload["top_p"] = 0.9
+        payload.update(sampling_params)
+        payload.update(reasoning_top)
+        if reasoning_extra:
+            payload.update(reasoning_extra)
         if supports_tools and cleaned_tools:
             payload["tools"] = cleaned_tools
             payload["tool_choice"] = "auto"
@@ -650,14 +684,12 @@ async def _agentic_loop_gemini_openai_compat(
             synth_payload = {
                 k: v for k, v in payload.items() if k not in ("tools", "tool_choice")
             }
+            # 采样/推理参数已随 payload 拷贝带入，无需重复覆盖。
             synth_payload["messages"] = loop_messages + [
                 {"role": "user",
                  "content": f"System: Maximum tool calls ({MAX_TOOL_CALLS}) reached for this turn. Tool usage is now DISABLED. Please immediately summarize what you have successfully done so far, explicitly state what failed or what is left to do, and ask the user if they want to continue the operation in the next turn."}
             ]
             synth_payload["max_tokens"] = max_tokens
-            if supports_sampling:
-                synth_payload["temperature"] = 0.6
-                synth_payload["top_p"] = 0.9
             try:
                 async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
                     async with session.post(
@@ -747,6 +779,9 @@ async def _agentic_loop_native_image(
         return prompt, image_urls
 
     max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
+    # 图像模型采样参数同样从 config 读取（默认不发送、走供应商默认）；
+    # 推理控制不适用于图像生成端点，不发送。
+    sampling_params = get_sampling_params(model_info)
     prompt_text, image_urls = _extract_prompt_and_image_urls_from_messages(messages)
 
     clean_prompt = _clean_prompt_for_image_model(prompt_text)
@@ -847,10 +882,10 @@ async def _agentic_loop_native_image(
             response = await client.chat.completions.create(
                 model=current_model,
                 messages=messages,
-                temperature=0.6,
                 max_tokens=max_tokens,
                 extra_body={"modalities": ["image", "text"], "provider": OPENROUTER_PROVIDER_PREFERENCES},
                 stream=False,
+                **sampling_params,
             )
         except Exception as e:
             err_text = str(e)
@@ -860,10 +895,10 @@ async def _agentic_loop_native_image(
             response = await client.chat.completions.create(
                 model=current_model,
                 messages=messages,
-                temperature=0.6,
                 max_tokens=max_tokens,
                 extra_body={"modalities": ["image"], "provider": OPENROUTER_PROVIDER_PREFERENCES},
                 stream=False,
+                **sampling_params,
             )
     except Exception as e:
         logger.exception(f"Native image model request failed: {e}")

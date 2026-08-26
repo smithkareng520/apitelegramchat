@@ -60,6 +60,10 @@ BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_T
 
 # ---------- 公共：环境变量安全解析工具 ----------
 # 必须在使用前定义（LOG_TRUNCATE_LIMIT / MAX_CONCURRENT_TOOLS 等都依赖）。
+# 合法推理努力档位（OpenAI gpt-5 / Gemini 3 / Claude / OpenRouter 通用口径）
+VALID_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "none"}
+
+
 def _positive_float_env(name: str, default: float, minimum: float) -> float:
     try:
         return max(minimum, float(os.getenv(name, str(default))))
@@ -161,6 +165,25 @@ class ModelConfig:
     max_output_tokens: Optional[int] = None
     max_context: Optional[int] = None  # <=== 【新增】最大上下文窗口
 
+    # ===================== 推理控制（思考开关 / 努力档位 / token 上限）=====
+    # 三者均可独立配置；None = 不向 API 发送任何推理控制参数（跟随模型默认）。
+    # reasoning_enabled:  显式开/关思考（GLM thinking.type / ModelScope
+    #                     enable_thinking / OpenRouter reasoning.enabled /
+    #                     Gemini thinkingBudget=0 关闭）
+    # reasoning_effort:   努力档位 "minimal"/"low"/"medium"/"high"（"none" 仅
+    #                     部分模型支持，会透传）
+    # reasoning_max_tokens: 推理 token 预算（OpenRouter reasoning.max_tokens /
+    #                     Gemini thinkingBudget / ModelScope thinking_budget）
+    reasoning_enabled: Optional[bool] = None
+    reasoning_effort: Optional[str] = None
+    reasoning_max_tokens: Optional[int] = None
+
+    # ===================== 采样参数 =====================
+    # None = 不发送该字段，走供应商默认（供应商默认采样已按模型调优）；
+    # 数值 = 按模型覆盖。某模型完全不支持采样时用 supports_sampling=False。
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+
     @property
     def api_type(self) -> str:
         return self.provider
@@ -237,6 +260,11 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_search": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
+        "temperature": None,          # None -> 不发送，走供应商默认
+        "top_p": None,                # None -> 不发送，走供应商默认
+        "reasoning_enabled": None,    # None -> 不发送推理控制参数
+        "reasoning_effort": None,
+        "reasoning_max_tokens": None,
         "max_output_tokens": 8192,
         "max_context": 128000,
     },
@@ -250,6 +278,11 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_search": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
+        "temperature": None,          # None -> 不发送，走供应商默认
+        "top_p": None,                # None -> 不发送，走供应商默认
+        "reasoning_enabled": None,    # None -> 不发送推理控制参数
+        "reasoning_effort": None,
+        "reasoning_max_tokens": None,
         "max_output_tokens": 8192,
         "max_context": 128000,
     },
@@ -263,6 +296,11 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_search": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
+        "temperature": None,          # None -> 不发送，走供应商默认
+        "top_p": None,                # None -> 不发送，走供应商默认
+        "reasoning_enabled": None,    # None -> 不发送推理控制参数
+        "reasoning_effort": None,
+        "reasoning_max_tokens": None,
         "max_output_tokens": 8192,
         "max_context": 1000000,
     },
@@ -276,6 +314,11 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_search": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
+        "temperature": None,          # None -> 不发送，走供应商默认
+        "top_p": None,                # None -> 不发送，走供应商默认
+        "reasoning_enabled": None,    # None -> 不发送推理控制参数
+        "reasoning_effort": None,
+        "reasoning_max_tokens": None,
         "max_output_tokens": 8192,
         "max_context": 128000,
     },
@@ -289,6 +332,11 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_search": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
+        "temperature": None,          # None -> 不发送，走供应商默认
+        "top_p": None,                # None -> 不发送，走供应商默认
+        "reasoning_enabled": None,    # None -> 不发送推理控制参数
+        "reasoning_effort": None,
+        "reasoning_max_tokens": None,
         "max_output_tokens": 8192,
         "max_context": 128000,
     },
@@ -302,6 +350,11 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_search": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
+        "temperature": None,          # None -> 不发送，走供应商默认
+        "top_p": None,                # None -> 不发送，走供应商默认
+        "reasoning_enabled": None,    # None -> 不发送推理控制参数
+        "reasoning_effort": None,
+        "reasoning_max_tokens": None,
         "max_output_tokens": 8192,
         "max_context": 128000,
     },
@@ -316,6 +369,11 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_search": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
+        "temperature": None,          # None -> 不发送，走供应商默认
+        "top_p": None,                # None -> 不发送，走供应商默认
+        "reasoning_enabled": None,    # None -> 不发送推理控制参数
+        "reasoning_effort": None,
+        "reasoning_max_tokens": None,
         "max_output_tokens": 8192,
         "max_context": 128000,
     },
@@ -352,6 +410,22 @@ def make_model_config(
     """工厂函数：根据 provider 和覆盖项创建 ModelConfig"""
     merged = _merge_with_defaults(provider, kwargs)
 
+    # 推理努力档位校验：拼错会在运行期被网关 400，尽早暴露。
+    effort = merged.get("reasoning_effort")
+    if effort is not None:
+        effort = str(effort).strip().lower()
+        if effort not in VALID_REASONING_EFFORTS:
+            raise ValueError(
+                f"模型 {model_id} 的 reasoning_effort={effort!r} 无效，"
+                f"合法值: {sorted(VALID_REASONING_EFFORTS)}"
+            )
+        merged["reasoning_effort"] = effort
+
+    # 推理预算下限：负数/0 没有意义。
+    budget = merged.get("reasoning_max_tokens")
+    if budget is not None and int(budget) < 1:
+        raise ValueError(f"模型 {model_id} 的 reasoning_max_tokens={budget!r} 必须 >= 1")
+
     # OpenRouter 的模型 ID 需要完整的 openrouter/<author>/<slug> 形式。
     normalized_model_id = model_id
     if provider == "openrouter" and not model_id.startswith("openrouter/"):
@@ -373,7 +447,118 @@ def make_model_config(
         supports_prompt_cache=merged.get("supports_prompt_cache"),
         max_output_tokens=merged.get("max_output_tokens", 8192),
         max_context=merged.get("max_context", 128000),
+        reasoning_enabled=merged.get("reasoning_enabled"),
+        reasoning_effort=merged.get("reasoning_effort"),
+        reasoning_max_tokens=(int(budget) if budget is not None else None),
+        temperature=merged.get("temperature"),
+        top_p=merged.get("top_p"),
     )
+
+
+# =============================================================================
+# 统一参数出口：所有 agentic 循环（主循环 / subagent / 回退 / 总结请求）
+# 一律通过这两个函数获取采样与推理参数，禁止在循环内硬编码。
+# =============================================================================
+def get_sampling_params(model_info) -> dict:
+    """
+    返回应并入 chat.completions.create 的采样参数（temperature / top_p）。
+
+    规则：
+      - model_info 为 None 或 supports_sampling=False -> 返回 {}（不发送采样参数）
+      - 字段为 None -> 不发送该字段，走供应商默认；
+      - 字段为数值 -> 按模型覆盖。
+    """
+    if not model_info:
+        return {}
+    if not getattr(model_info, "supports_sampling", True):
+        return {}
+    params: Dict[str, float] = {}
+    if model_info.temperature is not None:
+        params["temperature"] = model_info.temperature
+    if model_info.top_p is not None:
+        params["top_p"] = model_info.top_p
+    return params
+
+
+_REASONING_NOOP = ({}, {})
+
+
+def get_reasoning_request_fields(model_info, api_label: str = "") -> tuple:
+    """
+    根据模型配置与厂商，返回推理控制（思考开关/努力档位/推理预算）参数。
+
+    返回 (top_level_params, extra_body_fields)：
+      - top_level_params: 直接并入 create()/payload 顶层的字段
+        （如 reasoning_effort）
+      - extra_body_fields: 需并入 extra_body（OpenAI SDK）或原始 JSON body
+        顶层的字段（如 reasoning/thinking/enable_thinking/google）
+
+    未配置任何推理控制时返回 ({}, {})。厂商映射：
+      openrouter  -> extra_body.reasoning = {enabled?, effort?, max_tokens?}
+                     （OpenRouter 统一推理接口，会自动转换到具体后端）
+      gemini      -> 顶层 reasoning_effort + extra_body.google.thinking_config
+                     .thinkingBudget（官方 OpenAI 兼容层；enabled=False 映射
+                     thinkingBudget=0 关闭思考）
+      glm         -> extra_body.thinking = {"type": "enabled"/"disabled"}
+                     （智谱官方 v4 接口；预算暂不支持，静默忽略）
+      modelscope  -> extra_body.enable_thinking / thinking_budget
+                     （DashScope 风格，Qwen/GLM/DeepSeek 混合思考模型通用）
+      其他        -> 顶层 reasoning_effort（OpenAI gpt-5 / xAI 等兼容网关
+                     的事实标准；仅当显式配置 effort 时发送）
+    """
+    if not model_info:
+        return _REASONING_NOOP
+    enabled = getattr(model_info, "reasoning_enabled", None)
+    effort = getattr(model_info, "reasoning_effort", None)
+    budget = getattr(model_info, "reasoning_max_tokens", None)
+    if enabled is None and effort is None and budget is None:
+        return _REASONING_NOOP
+
+    provider = (api_label or getattr(model_info, "provider", "") or "").strip().lower()
+
+    if provider == "openrouter":
+        reasoning: Dict[str, object] = {}
+        if enabled is not None:
+            reasoning["enabled"] = bool(enabled)
+        if effort is not None:
+            reasoning["effort"] = effort
+        if budget is not None:
+            reasoning["max_tokens"] = int(budget)
+        return ({}, {"reasoning": reasoning})
+
+    if provider == "gemini":
+        top_level: Dict[str, object] = {}
+        google_cfg: Dict[str, object] = {}
+        if effort is not None:
+            top_level["reasoning_effort"] = effort
+        if enabled is False:
+            google_cfg["thinkingBudget"] = 0
+        elif budget is not None:
+            google_cfg["thinkingBudget"] = int(budget)
+        if google_cfg:
+            return (top_level, {"google": {"thinking_config": google_cfg}})
+        return (top_level, {})
+
+    if provider == "glm":
+        thinking_type = "enabled" if enabled in (None, True) else "disabled"
+        thinking: Dict[str, object] = {"type": thinking_type}
+        # GLM 官方接口对未知字段宽容，但为稳妥起见仅在显式配置时携带预算。
+        if budget is not None:
+            thinking["max_reasoning_tokens"] = int(budget)
+        return ({}, {"thinking": thinking})
+
+    if provider == "modelscope":
+        extra: Dict[str, object] = {}
+        if enabled is not None:
+            extra["enable_thinking"] = bool(enabled)
+        if budget is not None:
+            extra["thinking_budget"] = int(budget)
+        return ({}, extra)
+
+    # 其他 OpenAI 兼容厂商：只透传 effort（能力不明的网关不发未知字段）。
+    if effort is not None:
+        return ({"reasoning_effort": effort}, {})
+    return _REASONING_NOOP
 
 
 # =============================================================================
@@ -388,12 +573,14 @@ SUPPORTED_MODELS["dots-studio/dots-3-note-preview:free"] = make_model_config(
     name="Dots-3-Note Preview Free",
     vision=True,
     max_context=512000,
+    # 笔记型预览模型：不发送推理控制（预览期能力未知），采样不发送、走供应商默认。
 )
 SUPPORTED_MODELS["poolside/laguna-s-2.1:free"] = make_model_config(
     model_id="poolside/laguna-s-2.1:free",
     provider="openrouter",
     name="Laguna S 2.1 Free",
     max_context=262000,
+    # 代码模型，免费档：不发送推理控制与采样参数，走供应商默认。
 )
 SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
     model_id="anthropic/claude-sonnet-5",
@@ -403,6 +590,12 @@ SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
     native_document=True,
     supports_prompt_cache=True,
     max_context=1000000,
+    # 扩展思考：高努力档位，经 OpenRouter 统一 reasoning 接口下发。
+    reasoning_enabled=True,
+    reasoning_effort="high",
+    # Anthropic 思考模式官方要求 temperature=1.0，且不建议调整 top_p；
+    # top_p 不配置即不发送，走供应商默认。
+    temperature=1.0,
 )
 
 # ---------- Agnes 免费模型 ----------
@@ -413,6 +606,8 @@ SUPPORTED_MODELS["agnes-2.5-flash"] = make_model_config(
     name="Agnes 2.5 Flash",
     max_context=512000,
     vision=True,
+    # 默认主力模型：网关对推理/采样参数的支持未公开，保守起见两者都不发送，
+    # 完全走供应商默认。确认网关支持后可在此显式开启。
 )
 
 # ---------- ModelScope 免费模型 ----------
@@ -421,6 +616,11 @@ SUPPORTED_MODELS["deepseek-ai/DeepSeek-V4-Flash-0731"] = make_model_config(
     provider="modelscope",
     name="Deepseek V4 Flash",
     max_context=1000000,
+    # 混合推理模型：开启思考（DashScope 风格 enable_thinking）。
+    # DeepSeek 思考模式建议 temperature 0.5-0.7，取 0.6；官方文档指出思考
+    # 模式下 top_p 影响很小，不发送 top_p 走供应商默认。
+    reasoning_enabled=True,
+    temperature=0.6,
 )
 
 SUPPORTED_MODELS["ZhipuAI/GLM-5.2"] = make_model_config(
@@ -428,6 +628,10 @@ SUPPORTED_MODELS["ZhipuAI/GLM-5.2"] = make_model_config(
     provider="modelscope",
     name="GLM 5.2",
     max_context=1000000,
+    # GLM 混合思考：ModelScope 通道开启思考，智谱官方建议思考模式
+    # temperature=0.6；如需关闭改 reasoning_enabled=False。
+    reasoning_enabled=True,
+    temperature=0.6,
 )
 
 # ---------- Gemini 系列 ----------
@@ -437,6 +641,11 @@ SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
     name="Gemini 3.5 Flash-Lite",
     vision=True,
     max_context=1000000,
+    # Flash-Lite 定位轻快：思考限制在低档，避免响应变慢。
+    # Google 建议不调整 temperature（默认 1.0）；top_p 不配置即不发送。
+    # 如需精确控制可改用 reasoning_max_tokens（映射 thinkingBudget）。
+    reasoning_effort="low",
+    temperature=1.0,
 )
 # ---------- GLM 系列 ----------
 SUPPORTED_MODELS["GLM-4.6V-Flash"] = make_model_config(
@@ -445,12 +654,21 @@ SUPPORTED_MODELS["GLM-4.6V-Flash"] = make_model_config(
     name="GLM 4.6V Flash",
     vision=True,
     max_context=128000,
+    # 智谱官方 v4 接口：thinking.type=enabled。视觉 Flash 免费档，
+    # 思考默认开启可提升图表/文档理解准确率。
+    # 智谱建议思考模式 temperature 0.5-0.7，取 0.6；top_p 不发送走默认。
+    reasoning_enabled=True,
+    temperature=0.6,
 )
 SUPPORTED_MODELS["GLM-4.7-Flash"] = make_model_config(
     model_id="GLM-4.7-Flash",
     provider="glm",
     name="GLM 4.7 Flash",
     max_context=200000,
+    # 同上：思考开启，智谱思考模式建议 temperature=0.6。
+    # 需要更快响应时改 reasoning_enabled=False。
+    reasoning_enabled=True,
+    temperature=0.6,
 )
 
 # ---------- 图像生成模型 ----------
@@ -549,6 +767,11 @@ def discover_model(model_id: str) -> Optional[ModelConfig]:
                 supports_prompt_cache=defaults.get("supports_prompt_cache"),
                 max_output_tokens=defaults.get("max_output_tokens", 8192),
                 max_context=defaults.get("max_context", 128000),
+                reasoning_enabled=defaults.get("reasoning_enabled"),
+                reasoning_effort=defaults.get("reasoning_effort"),
+                reasoning_max_tokens=defaults.get("reasoning_max_tokens"),
+                temperature=defaults.get("temperature"),
+                top_p=defaults.get("top_p"),
             )
     return None
 

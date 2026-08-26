@@ -381,8 +381,6 @@ async def get_ai_response(
         )
         messages = _build_initial_messages(system_prompt)
         await _append_history_async(messages, history, api_type, model_info, chat_id=chat_id)
-        if model_info.supports_prompt_cache:
-            _apply_cache_control(messages)
         if user_message:
             builder.set_thinking_status("Thinking...")
             await builder.flush(force=False)
@@ -390,6 +388,13 @@ async def get_ai_response(
             resolved = await _resolve_multimodal_content(user_message, model_info, api_type, chat_id=chat_id)
             out_msg["content"] = resolved
             messages.append(out_msg)
+
+        # 缓存标记必须在所有消息（含本轮新 user 消息）就位之后再打：
+        # Anthropic 前缀缓存断点越靠后，能复用的前缀越长。此前在 user
+        # 消息 append 之前打标记，断点落在历史消息上，本轮新输入
+        # 无法进入缓存覆盖范围，多轮对话缓存命中率偏低。
+        if model_info.supports_prompt_cache:
+            _apply_cache_control(messages)
 
         builder.set_thinking_status("Thinking...")
         await builder.flush(force=False)

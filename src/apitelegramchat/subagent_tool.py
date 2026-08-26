@@ -45,7 +45,12 @@ from html.parser import HTMLParser
 from typing import Any, Optional
 
 from apitelegramchat.api_client import api_client
-from apitelegramchat.config import SUPPORTED_MODELS, DEFAULT_MODEL
+from apitelegramchat.config import (
+    SUPPORTED_MODELS,
+    DEFAULT_MODEL,
+    get_sampling_params,
+    get_reasoning_request_fields,
+)
 from apitelegramchat.token_budget import count_tokens, truncate_to_token_budget
 
 logger = logging.getLogger(__name__)
@@ -259,6 +264,18 @@ async def _subagent_agentic_loop(
                 "stream": False,
                 "max_tokens": (model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192),
             }
+            # 采样与推理控制与主 agent 同源（config.py per-model 配置），
+            # 确保子 agent 与主循环行为一致。
+            create_params.update(get_sampling_params(model_info))
+            reasoning_top, reasoning_extra = get_reasoning_request_fields(
+                model_info, model_info.provider if model_info else ""
+            )
+            if reasoning_top:
+                create_params.update(reasoning_top)
+            if reasoning_extra:
+                existing_extra = dict(create_params.get("extra_body") or {})
+                existing_extra.update(reasoning_extra)
+                create_params["extra_body"] = existing_extra
             if supports_tools:
                 create_params["tools"] = tools
                 create_params["tool_choice"] = "auto"
