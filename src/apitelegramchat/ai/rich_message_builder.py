@@ -848,18 +848,29 @@ class RichMessageBuilder:
 
     def _get_inner_content(self, item: dict) -> str:
         inner_summary = item["summary"]
-        if item["details_html"].strip():
-            inner_body = item["details_html"]
-            inner_body = _ensure_rich_block_content(inner_body)
+        details_html = (item.get("details_html") or "").strip()
+        if details_html:
+            inner_body = _ensure_rich_block_content(details_html)
             return f"<details><summary>{inner_summary}</summary>\n{inner_body}\n</details>"
+        # details_html 为空：工具声明后仍在执行（web_search 搜索中、
+        # text_editor 编辑中、图片生成中……这些阶段尚无可展示的输出），
+        # 或极少数终态确实无输出的路径。此时一律渲染为折叠块而非裸文本，
+        # 保证同一工具组内所有条目形态一致，避免"执行中是裸文本、
+        # 结束后才突然变成折叠块"的跳变。
+        # 注意：Rich Message 的 <details> 不能只承载裸文本——正文必须是
+        # 块级内容，否则 Telegram sendRichMessageDraft 会返回 400
+        # RICH_MESSAGE_CONTENT_REQUIRED，因此占位正文用 <p> 包一层。
+        status = item.get("status")
+        if status == "waiting":
+            placeholder = "Waiting..."
+        elif status == "done":
+            placeholder = "Done"
+        elif status == "error":
+            placeholder = "Failed"
         else:
-            # 修复 RICH_MESSAGE_CONTENT_REQUIRED：
-            # details_html 为空时（工具刚被 LLM 声明、args 还没流到），
-            # 不能只返回裸 inner_summary 纯文本——外层 <details> 会变成
-            # "只有纯文本、无块级子元素" 的结构，Telegram sendRichMessageDraft
-            # 会返回 400 RICH_MESSAGE_CONTENT_REQUIRED。
-            # 用 <p> 包一层保证块级内容。
-            return f"<p>{inner_summary}</p>"
+            # running 及未知状态
+            placeholder = "Running..."
+        return f"<details><summary>{inner_summary}</summary>\n<p>{placeholder}</p>\n</details>"
 
     # ========== 关键修改：_build_html 不再将 tool_group 合并到 reasoning 中 ==========
     def _build_html(self) -> str:
