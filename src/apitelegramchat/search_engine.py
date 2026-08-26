@@ -1318,9 +1318,21 @@ async def execute_web_search(query: str, num_results: int | None = None, offset:
     try:
         candidate_count = _candidate_result_count(requested)
         items = await _search_via_mcp(query, candidate_count, page_offset)
-    except Exception as e:
-        logger.warning(f"MCP 搜索失败: {e}")
-        items = None
+    except MCPToolError as exc:
+        logger.warning(
+            "MCP 搜索失败 category=%s status=%s retryable=%s: %s",
+            exc.category,
+            exc.status_code if exc.status_code is not None else "unknown",
+            exc.retryable,
+            exc,
+        )
+        return exc.user_message("网页搜索服务")
+    except MCPSearchTransientError as exc:
+        logger.warning("MCP 搜索未返回有效 organic 结果: %s", exc)
+        return "❌ 网页搜索服务暂未返回有效结果；请稍后重试。"
+    except Exception as exc:
+        logger.exception("MCP 搜索发生未分类异常")
+        return "❌ 网页搜索服务发生未分类异常；请稍后重试，并检查 MCP 部署调用日志。"
 
     if items:
         items, filtered_count = _filter_blacklisted_search_results(items)

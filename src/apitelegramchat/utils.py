@@ -130,7 +130,9 @@ def retry_async(max_retries: int = 3, delay: float = 1.0, backoff: float = 3.0, 
                 except asyncio.CancelledError:
                     raise
                 except exceptions as e:
-                    if attempt == max_retries - 1:
+                    # 某些异常（如 MCP 的额度、鉴权和参数错误）已明确标记为不可重试，
+                    # 不应为了固定重试次数而额外消耗调用配额或掩盖根因。
+                    if attempt == max_retries - 1 or not getattr(e, "retryable", True):
                         raise
                     logger.warning(f"Retry {attempt+1}/{max_retries} for {func.__name__} due to {e}")
                     await asyncio.sleep(current_delay)

@@ -72,6 +72,17 @@ export SERPER_MCP_TOKEN='...'
 
 该文件还集中提供 `WEB_SEARCH_DOMAIN_FILTER_ENABLED`（启停本地最终过滤）、`WEB_SEARCH_UPSTREAM_DOMAIN_EXCLUDE_ENABLED`（启停上游预筛选）、`WEB_SEARCH_DEFAULT_RESULTS`、`WEB_SEARCH_MAX_RESULTS`、`WEB_SEARCH_CANDIDATE_MULTIPLIER`、`WEB_SEARCH_MAX_CANDIDATES`、`WEB_SEARCH_REGION` 与 `WEB_SEARCH_LANGUAGE`。当连接的是 [marcopesani/mcp-server-serper](https://github.com/marcopesani/mcp-server-serper) 时，只有 `[*.]example.com` 这类“根域名加全部子域名”规则会安全转换为 `exclude` 参数中的 `site:<域名>`，从而生成 Google 的 `-site:<域名>` 查询条件；精确规则和仅子域名规则不会发送可能扩大范围的 `-site:` 条件。本地 URL 主机名过滤始终在返回前执行，因此是最终保证。若改用不支持 `exclude` 参数的搜索 MCP，请将 `WEB_SEARCH_UPSTREAM_DOMAIN_EXCLUDE_ENABLED` 设为 `False`。修改后重启应用即可生效。不要填写协议、端口、路径、查询参数或其他通配符。
 
+### MCP 搜索失败诊断
+
+`web_search` 会保留外部 MCP 响应中的 HTTP 状态码，记录经过脱敏和长度限制的上游错误摘要，并将失败明确返回给调用方；它不再把服务故障误显示为“未找到结果”。
+
+| 可见状态 | 含义 | 应采取的动作 |
+|---|---|---|
+| `HTTP 429` 或错误文本含 `quota`、`rate limit`、`throttled` | 上游限流或调用额度限制。此类请求不会在短时间内自动重试，避免额外消耗调用次数。 | 在 ModelScope MCP 部署的用量、调用日志或配额页面确认限制，稍后再试。 |
+| `HTTP 502`、`503`、`504` | 上游网关或服务临时不可用，**不能据此确认额度已用完**；项目会保留短时自动重试。 | 稍后重试，并检查 MCP 部署状态和调用日志。 |
+| `HTTP 401`、`403` | 访问令牌、部署地址或授权配置有误。 | 核对 `SERPER_MCP_URL`、`SERPER_MCP_TOKEN` 及部署授权。 |
+| 其他 `4xx` | 请求参数或上游工具配置被拒绝。 | 查看日志中的 `status`、`category` 和脱敏 `detail` 字段。 |
+
 ### 根路径首页回退
 
 部分网站的根路径（例如 `https://www.battleofballs.com/`）不能被静态抓取器可靠读取，但同一站点的 `https://www.battleofballs.com/index/` 可正常读取。为处理这一情况，`fetch_url` 在根路径的常规请求和正文提取均失败后，可按 `src/apitelegramchat/web_search_settings.py` 中的 `FETCH_URL_ROOT_FALLBACK_PATHS` 依次尝试同站点首页路径。默认启用的路径为 `/index/`。

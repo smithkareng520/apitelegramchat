@@ -26,7 +26,44 @@ except Exception as exc:  # pragma: no cover - optional deployment dependency
 
 
 class MCPToolError(RuntimeError):
-    """A controlled external MCP connection or execution failure."""
+    """外部 MCP 连接或工具调用失败，并保留可安全展示的诊断信息。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "unknown",
+        status_code: int | None = None,
+        retryable: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.status_code = status_code
+        self.retryable = retryable
+
+    def user_message(self, feature_name: str = "外部服务") -> str:
+        """返回可安全传递给用户/模型的说明，不暴露令牌或上游内部异常。"""
+        suffix = f"（HTTP {self.status_code}）" if self.status_code is not None else ""
+        if self.category == "rate_limited":
+            return (
+                f"❌ {feature_name}受到上游限流或调用额度限制{suffix}。"
+                "这不是“未找到结果”；请稍后重试，并在 ModelScope MCP 部署的用量、调用日志或配额页面核对限制。"
+            )
+        if self.category == "authentication":
+            return (
+                f"❌ {feature_name}的上游鉴权失败{suffix}。"
+                "请检查 MCP 部署地址、访问令牌和授权状态。"
+            )
+        if self.category == "gateway":
+            return (
+                f"❌ {feature_name}的上游网关暂时不可用{suffix}。"
+                "该状态不能证明调用额度已用完；请稍后重试，并检查 ModelScope MCP 部署状态及调用日志。"
+            )
+        if self.category == "request":
+            return f"❌ {feature_name}的上游请求被拒绝{suffix}。请检查搜索参数和 MCP 服务配置。"
+        if self.category == "timeout":
+            return f"❌ {feature_name}请求超时。请稍后重试。"
+        return f"❌ {feature_name}暂时不可用{suffix}。请稍后重试，并检查 MCP 部署调用日志。"
 
 
 @dataclass(frozen=True)
@@ -105,6 +142,70 @@ def _build_servers() -> dict[str, MCPServerConfig]:
 EXTERNAL_MCP_SERVERS = _build_servers()
 
 
+def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
+    """按因果链收集异常，避免 SDK 包装后丢失 HTTP 响应。"""
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(chain) < 8:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return tuple(chain)
+
+
+def _truncate_safe_detail(value: Any, limit: int = 500) -> str:
+    """清理上游错误摘要，避免日志中意外留下授权头或过长响应体。"""
+    text = str(value or "").strip().replace("\n", " ")
+    text = re.sub(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+", r"\1***", text)
+    text = re.sub(r"(?i)(api[_-]?key\s*[:=]\s*)[^\s,;]+", r"\1***", text)
+    return text[:limit]
+
+
+def _classify_failure(status_code: int | None, detail: str) -> tuple[str, bool]:
+    """将 HTTP/MCP 失败归类，并返回是否值得短时间内自动重试。"""
+    normalized = detail.lower()
+    if status_code == 429 or any(token in normalized for token in (
+        "rate limit", "request limit", "quota", "throttl", "too many requests",
+    )):
+        return "rate_limited", False
+    if status_code in {401, 403}:
+        return "authentication", False
+    if status_code is not None and 500 <= status_code <= 599:
+        return "gateway", True
+    if status_code is not None and 400 <= status_code <= 499:
+        return "request", False
+    return "unknown", True
+
+
+def _diagnose_mcp_exception(exc: BaseException) -> tuple[int | None, str, str, bool]:
+    """从 SDK 包装异常中提取 HTTP 状态和简短响应摘要。"""
+    status_code: int | None = None
+    details: list[str] = []
+    for current in _exception_chain(exc):
+        response = getattr(current, "response", None)
+        raw_status = getattr(response, "status_code", None)
+        if raw_status is None:
+            raw_status = getattr(current, "status_code", None)
+        if status_code is None and isinstance(raw_status, int):
+            status_code = raw_status
+
+        if response is not None:
+            try:
+                response_text = getattr(response, "text", "")
+            except Exception:
+                response_text = ""
+            if response_text:
+                details.append(_truncate_safe_detail(response_text))
+        text = _truncate_safe_detail(current)
+        if text:
+            details.append(text)
+
+    detail = next((item for item in details if item), "")
+    category, retryable = _classify_failure(status_code, detail)
+    return status_code, category, detail, retryable
+
+
 async def call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, Any]) -> str:
     """Call one allowlisted tool on one configured, trusted endpoint."""
     if not _MCP_SDK_AVAILABLE:
@@ -126,16 +227,42 @@ async def call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, A
     try:
         result = await asyncio.wait_for(run_call(), timeout=server.timeout)
     except asyncio.TimeoutError as exc:
-        raise MCPToolError(f"External MCP tool timed out: {server_name}.{tool_name}") from exc
+        raise MCPToolError(
+            f"External MCP tool timed out: {server_name}.{tool_name}",
+            category="timeout",
+            retryable=True,
+        ) from exc
     except MCPToolError:
         # 已经是 MCPToolError，避免再包一层导致 chain 不清晰。
         raise
     except Exception as exc:
-        raise MCPToolError(f"External MCP tool failed: {server_name}.{tool_name}") from exc
+        status_code, category, detail, retryable = _diagnose_mcp_exception(exc)
+        logger.warning(
+            "External MCP call failed server=%s tool=%s status=%s category=%s retryable=%s detail=%s",
+            server_name,
+            tool_name,
+            status_code if status_code is not None else "unknown",
+            category,
+            retryable,
+            detail or "<empty>",
+            exc_info=True,
+        )
+        status_fragment = f" HTTP {status_code}" if status_code is not None else ""
+        raise MCPToolError(
+            f"External MCP tool failed:{status_fragment} {server_name}.{tool_name}",
+            category=category,
+            status_code=status_code,
+            retryable=retryable,
+        ) from exc
 
     text = _extract_text(result)
     if getattr(result, "isError", False):
-        raise MCPToolError(f"External MCP tool returned an error: {server_name}.{tool_name}: {text[:500]}")
+        category, retryable = _classify_failure(None, text)
+        raise MCPToolError(
+            f"External MCP tool returned an error: {server_name}.{tool_name}: {text[:500]}",
+            category=category,
+            retryable=retryable,
+        )
     return text
 
 
