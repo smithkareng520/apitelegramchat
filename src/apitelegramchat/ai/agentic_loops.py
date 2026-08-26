@@ -286,17 +286,15 @@ async def _agentic_loop_openai_compat(
                                     continue
                                 # 工具调用参数在流式接收过程中不再实时渲染预览；
                                 # 最终结果会在工具执行完成后按统一的 Input/Output 格式一次性展示。
+                                # 但参数中一旦解析出模型提交的简短描述（_description/_summary），
+                                # 或完整 JSON 解析出 query/command/url 等字段，就立即更新摘要上屏，
+                                # 不再等到整段参数流结束后才由工具批次补写。
                                 current_args = tc.get("function", {}).get("arguments", "")
                                 current_len = len(current_args)
                                 if current_len - last_arg_len.get(idx, 0) >= 20:
                                     last_arg_len[idx] = current_len
-                                    tc_name = tc.get("function", {}).get("name", "")
                                     parsed_args = _safe_parse_args(current_args)
-                                    for group in builder._tool_groups:
-                                        for item in group["items"]:
-                                            if item["id"] == tc_id:
-                                                item["fn_args"] = parsed_args
-                                            break
+                                    builder.update_tool_args(tc_id, parsed_args)
                     break
                 except httpx.ReadTimeout:
                     if received_any or stream_attempt >= 1:

@@ -26,6 +26,7 @@ from apitelegramchat.token_budget import count_tokens, truncate_to_token_budget
 from apitelegramchat.ai.tool_summary import (
     _coerce_positive_int,
     _generate_action_description,
+    _generate_initial_tool_summary,
     _get_tool_description_from_args,
 )
 import apitelegramchat.state as state
@@ -145,14 +146,13 @@ def _render_reasoning_html(content: str) -> str:
     思考内容一律按纯文本处理：先整体严格转义——模型思考中出现的加粗、
     标签或任何 HTML 片段都只会按字面显示，不会再被 Telegram 当作富文本
     解析，也不会破坏外层折叠块的结构；随后把换行转换为 ``<br/>``，保留
-    思考本身的分行排版。
+    思考本身的分行排版。空内容返回空串：调用方（``_build_html*``）对
+    空思考块整块跳过，等首个字符到达后再渲染折叠块，不再输出
+    “思考中…”占位。
     """
     text = (content or "").strip()
     if not text:
-        # <details> 必须承载块级内容，否则 Telegram 会以
-        # RICH_MESSAGE_CONTENT_REQUIRED 拒绝整帧草稿；流式刚开始、首个
-        # 增量尚未到达时用占位段落兜底。
-        return "<p>思考中…</p>"
+        return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     return f"<p>{_escape_reasoning_text(text).replace(chr(10), '<br/>')}</p>"
 
@@ -277,13 +277,14 @@ class RichMessageBuilder:
         展示，因此这里不再剥除标签（也避免了旧正则会把 “x < 5, y > 3” 中
         的 ``< 5, y >`` 误当成标签剥掉的问题），只折叠空白、截断长度，最后
         严格转义，确保 ``<summary>`` 不会被思考中出现的 ``<``、``>``、``&``
-        破坏。
+        破坏。空内容返回空串；空思考块由调用方整块跳过，不会出现空
+        ``<summary>``。
         """
         if not content:
-            return "思考中…"
+            return ""
         plain = re.sub(r"\s+", " ", content).strip()
         if not plain:
-            return "思考中…"
+            return ""
         if len(plain) > 30:
             plain = plain[:30].rstrip() + "…"
         return _escape_reasoning_text(plain)
@@ -428,6 +429,28 @@ class RichMessageBuilder:
                     item["details_html"] = preview_html
                     self.request_flush(force=False)
                     return
+
+    def update_tool_args(self, tool_id: str, fn_args: dict):
+        """流式接收工具参数期间更新条目参数，并即时刷新可见摘要。
+
+        模型提交的简短描述（``_description``/``_summary``）一旦能从（可能
+        还不完整的）参数中解析出来，就直接作为条目摘要与工具组外部摘要
+        上屏，而不是先停留在通用进行态文本、等整段参数流结束后才更新；
+        完整 JSON 中途解析成功时，query/command/url 等字段同样按进行态
+        规范立即生效。已进入终态（done/error）的条目不会被覆盖。
+        """
+        args = fn_args or {}
+        for group in self._tool_groups:
+            for item in group["items"]:
+                if item["id"] != tool_id:
+                    continue
+                item["fn_args"] = args
+                if item.get("status") in ("running", "waiting"):
+                    new_summary = _generate_initial_tool_summary(item.get("type", ""), args)
+                    if new_summary and new_summary != item["summary"]:
+                        item["summary"] = new_summary
+                    self._refresh_outer_summary(group)
+                return
 
     def append_to_current_tool_group_text(self, text: str):
         if self._handoff_text is not None:
@@ -607,7 +630,11 @@ class RichMessageBuilder:
         return t
 
     def _generate_group_summary(self, group: dict) -> str:
-        """完成态工具组摘要：只统计成功工具；同类工具只展示一次，顺序按首次成功调用。"""
+        """完成态工具组摘要：只统计成功工具；同类工具只展示一次，顺序按首次成功调用。
+
+        按规范只有第一个描述的首字母大写，后续描述保持小写，例如
+        ``Searched the web, fetched news, fetched hacker news``。
+        """
         done_items = [it for it in group.get("items", []) if it.get("status") == "done"]
         if not done_items:
             return ""
@@ -623,8 +650,12 @@ class RichMessageBuilder:
         for gtype in type_order:
             count = type_counts[gtype]
             singular, plural = self._GROUP_SUMMARY_TEMPLATES.get(gtype, ("Ran an action", "Ran {n} actions"))
-            desc = singular if count == 1 else plural.format(n=count)
-            descs.append(desc[:1].upper() + desc[1:] if desc else desc)
+            descs.append(singular if count == 1 else plural.format(n=count))
+        if descs and descs[0]:
+            descs[0] = descs[0][:1].upper() + descs[0][1:]
+        for j in range(1, len(descs)):
+            if descs[j]:
+                descs[j] = descs[j][:1].lower() + descs[j][1:]
         return ", ".join(descs)
 
     # ---- 修改点5：finish_group 增加默认标题 ----
@@ -842,6 +873,10 @@ class RichMessageBuilder:
             if b_type == "reasoning":
                 reasoning_content = block
                 i += 1
+                # 思考字段刚开始、首个字符尚未到达（或只收到空白）时整块跳过，
+                # 不渲染任何“思考中…”占位；真实内容到达后折叠块自然出现。
+                if not reasoning_content.strip():
+                    continue
                 # 不再收集后续 tool_group，只渲染 reasoning 自身
                 summary = self._get_reasoning_summary(reasoning_content)
                 # 思考原文必须先严格转义再嵌入，否则其中的标签会被 Telegram
@@ -891,6 +926,9 @@ class RichMessageBuilder:
             if b_type == "reasoning":
                 reasoning_content = block
                 i += 1
+                # 与 _build_html 一致：空思考块不渲染占位，内容到达后再出现。
+                if not reasoning_content.strip():
+                    continue
                 # 不再收集后续 tool_group，只渲染 reasoning 自身
                 summary = self._get_reasoning_summary(reasoning_content)
                 # 与 _build_html 保持一致：思考原文先严格转义再嵌入，
