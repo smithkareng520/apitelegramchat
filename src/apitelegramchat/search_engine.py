@@ -60,6 +60,20 @@ from apitelegramchat.config import (
     SUPPORTED_MODELS,
     get_openrouter_provider_preferences,
 )
+from apitelegramchat.web_search_settings import (
+    WEB_SEARCH_LANGUAGE,
+    WEB_SEARCH_REGION,
+)
+from apitelegramchat.web_search_filter import (
+    BLACKLISTED_SEARCH_DOMAINS as _BLACKLISTED_SEARCH_DOMAINS,
+    SEARCH_CANDIDATE_MULTIPLIER as _SEARCH_CANDIDATE_MULTIPLIER,
+    SEARCH_DEFAULT_RESULTS as _SEARCH_DEFAULT_RESULTS,
+    SEARCH_MAX_CANDIDATES as _SEARCH_MAX_CANDIDATES,
+    SEARCH_MAX_RESULTS as _SEARCH_MAX_RESULTS,
+    candidate_result_count as _candidate_result_count,
+    filter_blacklisted_search_results as _filter_blacklisted_search_results,
+    upstream_domain_exclude_terms as _upstream_domain_exclude_terms,
+)
 from apitelegramchat.utils import retry_async, escape_html
 from apitelegramchat.token_budget import truncate_to_token_budget
 from apitelegramchat.mcp_client import call_mcp_tool, MCPToolError
@@ -487,7 +501,7 @@ SEARCH_TOOLS = [
                         "description": "简述本次操作目的（≤60字）。示例：搜索2024年诺贝尔奖"
                     },
                     "query": {"type": "string", "description": "搜索关键词"},
-                    "num_results": {"type": "integer", "description": "可选：返回结果数（1-50）；不填写时默认返回 10 条", "minimum": 1, "maximum": 50},
+                    "num_results": {"type": "integer", "description": f"可选：返回结果数（1-{_SEARCH_MAX_RESULTS}）；不填写时默认返回 {_SEARCH_DEFAULT_RESULTS} 条", "minimum": 1, "maximum": _SEARCH_MAX_RESULTS},
                     "offset": {"type": "integer", "description": "可选：结果偏移量，用于分页，从 0 开始", "minimum": 0}
                 },
                 "required": ["query"]
@@ -1184,7 +1198,11 @@ async def _search_via_mcp(
     if not query:
         return None
 
-    requested = max(1, min(int(num_results), 50)) if num_results is not None else 10
+    requested = (
+        max(1, min(int(num_results), _SEARCH_MAX_CANDIDATES))
+        if num_results is not None
+        else _SEARCH_DEFAULT_RESULTS
+    )
     normalized_offset = max(int(offset or 0), 0)
 
     # MCP/Serper 的 page 从 1 开始，固定按照真实单页大小计算。
@@ -1197,11 +1215,14 @@ async def _search_via_mcp(
     async def fetch_page(page: int) -> list[dict]:
         arguments: dict[str, Any] = {
             "q": query,
-            "gl": "cn",
-            "hl": "zh-cn",
+            "gl": WEB_SEARCH_REGION,
+            "hl": WEB_SEARCH_LANGUAGE,
             "page": page,
             "num": SERPER_PAGE_SIZE,
         }
+        upstream_exclude = _upstream_domain_exclude_terms()
+        if upstream_exclude:
+            arguments["exclude"] = upstream_exclude
 
         try:
             raw_text = await call_mcp_tool(
@@ -1282,11 +1303,11 @@ def _format_search_results(items: list, query: str, engine: str, requested: int 
 
 
 async def execute_web_search(query: str, num_results: int | None = None, offset: int | None = None) -> str:
-    """通过 Serper MCP 搜索网页，并保持既有的结果文本契约。"""
+    """通过 Serper MCP 搜索网页，并在展示前过滤黑名单域名。"""
     query = (query or "").strip()
-    requested = None
+    requested = _SEARCH_DEFAULT_RESULTS
     if num_results is not None:
-        requested = min(max(int(num_results), 1), 50)
+        requested = min(max(int(num_results), 1), _SEARCH_MAX_RESULTS)
     page_offset = None
     if offset is not None:
         page_offset = max(int(offset), 0)
@@ -1294,13 +1315,23 @@ async def execute_web_search(query: str, num_results: int | None = None, offset:
         return "❌ 搜索关键词为空。"
 
     try:
-        items = await _search_via_mcp(query, requested, page_offset)
+        candidate_count = _candidate_result_count(requested)
+        items = await _search_via_mcp(query, candidate_count, page_offset)
     except Exception as e:
         logger.warning(f"MCP 搜索失败: {e}")
         items = None
 
     if items:
-        return _format_search_results(items, query, "Serper / Google", requested=requested)
+        items, filtered_count = _filter_blacklisted_search_results(items)
+        items = items[:requested]
+        if filtered_count:
+            logger.info(
+                "web_search 已过滤 %s 条黑名单域名结果，domains=%s",
+                filtered_count,
+                ", ".join(_BLACKLISTED_SEARCH_DOMAINS),
+            )
+        if items:
+            return _format_search_results(items, query, "Serper / Google", requested=requested)
 
     return f"❌ 未找到与「{query}」相关的结果。"
 

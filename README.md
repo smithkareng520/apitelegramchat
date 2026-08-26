@@ -60,6 +60,18 @@ export SERPER_MCP_URL='https://mcp.api-inference.modelscope.net/<deployment-id>/
 export SERPER_MCP_TOKEN='...'
 ```
 
+### 网页搜索域名黑名单
+
+`web_search` 会在展示 Serper 返回结果前，按照 `src/apitelegramchat/web_search_settings.py` 过滤不可抓取或不希望使用的网站。部署者只需编辑该文件中的 `BLACKLIST_DOMAINS`；**每一条规则都独立定义自己的匹配范围**，无需也不提供全局模式开关。
+
+| 写入的规则 | 匹配范围 | 示例 |
+|---|---|---|
+| `example.com` | 仅精确主机名。 | 只过滤 `example.com`，不影响 `www.example.com`。 |
+| `[*.]example.com` | 根域名及全部子域名。 | 过滤 `example.com`、`www.example.com`、`a.b.example.com`。 |
+| `*.example.com` | 仅子域名，不含根域名。 | 过滤 `www.example.com`、`a.b.example.com`，不影响 `example.com`。 |
+
+该文件还集中提供 `WEB_SEARCH_DOMAIN_FILTER_ENABLED`（启停本地最终过滤）、`WEB_SEARCH_UPSTREAM_DOMAIN_EXCLUDE_ENABLED`（启停上游预筛选）、`WEB_SEARCH_DEFAULT_RESULTS`、`WEB_SEARCH_MAX_RESULTS`、`WEB_SEARCH_CANDIDATE_MULTIPLIER`、`WEB_SEARCH_MAX_CANDIDATES`、`WEB_SEARCH_REGION` 与 `WEB_SEARCH_LANGUAGE`。当连接的是 [marcopesani/mcp-server-serper](https://github.com/marcopesani/mcp-server-serper) 时，只有 `[*.]example.com` 这类“根域名加全部子域名”规则会安全转换为 `exclude` 参数中的 `site:<域名>`，从而生成 Google 的 `-site:<域名>` 查询条件；精确规则和仅子域名规则不会发送可能扩大范围的 `-site:` 条件。本地 URL 主机名过滤始终在返回前执行，因此是最终保证。若改用不支持 `exclude` 参数的搜索 MCP，请将 `WEB_SEARCH_UPSTREAM_DOMAIN_EXCLUDE_ENABLED` 设为 `False`。修改后重启应用即可生效。不要填写协议、端口、路径、查询参数或其他通配符。
+
 地图坐标统一为 `longitude,latitude`，例如 `116.397128,39.916527`。
 
 ## 测试
@@ -68,7 +80,7 @@ export SERPER_MCP_TOKEN='...'
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-测试覆盖：强制 scope、私有目录权限、默认最小权限工具表、编辑器符号链接拒绝、资源不泄露绝对 workspace 路径、外部 endpoint allowlist 以及 SDK 请求处理器注册。
+测试覆盖：强制 scope、私有目录权限、默认最小权限工具表、编辑器符号链接拒绝、资源不泄露绝对 workspace 路径、外部 endpoint allowlist、SDK 请求处理器注册，以及网页搜索的黑名单域名匹配与过滤。
 
 ## Docker
 
