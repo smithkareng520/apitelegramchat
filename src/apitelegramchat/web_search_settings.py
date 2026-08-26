@@ -34,9 +34,6 @@ BLACKLIST_DOMAINS = (
     "baijiahao.baidu.com",
     "zhidao.baidu.com",
 
-    # 游戏官网
-    "www.battleofballs.com",
-
     # 示例：只屏蔽 example.com 的子域名，不屏蔽根域名。
     # "*.example.com",
 )
@@ -47,6 +44,15 @@ BLACKLIST_DOMAINS = (
 # 过度过滤；它们由本地 URL 主机名匹配作为最终保证。
 # 如果实际连接的 google_search MCP 不接受 exclude 参数，请改为 False。
 WEB_SEARCH_UPSTREAM_DOMAIN_EXCLUDE_ENABLED = True
+
+# fetch_url 的根路径首页回退。仅当请求 URL 没有查询参数或片段且路径为 `/` 时，
+# 在常规抓取与正文提取均失败后，按顺序尝试下列同站点路径。
+# 例如 https://www.battleofballs.com/ 失败时，会尝试
+# https://www.battleofballs.com/index/。每项必须是以 `/` 开头的站内路径。
+FETCH_URL_ROOT_FALLBACK_ENABLED = True
+FETCH_URL_ROOT_FALLBACK_PATHS = (
+    "/index/",
+)
 
 # web_search 未传 num_results 时返回的默认结果条数。
 WEB_SEARCH_DEFAULT_RESULTS = 10

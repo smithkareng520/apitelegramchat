@@ -74,6 +74,7 @@ from apitelegramchat.web_search_filter import (
     filter_blacklisted_search_results as _filter_blacklisted_search_results,
     upstream_domain_exclude_terms as _upstream_domain_exclude_terms,
 )
+from apitelegramchat.fetch_url_fallback import root_fallback_urls
 from apitelegramchat.utils import retry_async, escape_html
 from apitelegramchat.token_budget import truncate_to_token_budget
 from apitelegramchat.mcp_client import call_mcp_tool, MCPToolError
@@ -1498,6 +1499,31 @@ async def _is_safe_url_to_fetch(url: str) -> tuple[bool, str]:
     return True, ""
 
 
+async def _try_root_url_fallback(
+    url: str,
+    redirect_depth: int,
+    start_time: float,
+) -> str | None:
+    """在根路径抓取失败后尝试配置的同站点首页路径。"""
+    candidates = root_fallback_urls(url)
+    for fallback_url in candidates:
+        if time.monotonic() - start_time > 30:
+            logger.warning("[fetch_url] 首页回退超出总超时：%s", url)
+            break
+        logger.info("[fetch_url] 根路径回退：%s -> %s", url, fallback_url)
+        result = await execute_fetch_url(
+            fallback_url,
+            redirect_depth=redirect_depth + 1,
+            start_time=start_time,
+        )
+        if not result.startswith("失败："):
+            # 同时缓存原始根路径，后续相同请求不再重复经历失败链路。
+            set_fetch_cache(url, result)
+            return result
+        logger.info("[fetch_url] 首页回退失败：%s", fallback_url)
+    return None
+
+
 async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float = None) -> str:
     # 先检查缓存（避免 SSRF 校验浪费），再做 SSRF 校验
     cached = get_fetch_cache(url)
@@ -1541,6 +1567,11 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
                     await asyncio.sleep(1)
                     continue
                 else:
+                    fallback_result = await _try_root_url_fallback(
+                        url, redirect_depth, start_time,
+                    )
+                    if fallback_result is not None:
+                        return fallback_result
                     result = f"失败：无法获取页面内容：{url}"
                     return result
 
@@ -1580,7 +1611,12 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
                 set_fetch_cache(url, result)
                 return result
 
-            # 未提取到有效正文
+            # 未提取到有效正文：仅根路径可继续尝试配置的同站点首页路径。
+            fallback_result = await _try_root_url_fallback(
+                url, redirect_depth, start_time,
+            )
+            if fallback_result is not None:
+                return fallback_result
             result = f"失败：无法提取有效正文（标题：{title}）\n🔗 {url}"
             return result
 

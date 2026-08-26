@@ -72,6 +72,12 @@ export SERPER_MCP_TOKEN='...'
 
 该文件还集中提供 `WEB_SEARCH_DOMAIN_FILTER_ENABLED`（启停本地最终过滤）、`WEB_SEARCH_UPSTREAM_DOMAIN_EXCLUDE_ENABLED`（启停上游预筛选）、`WEB_SEARCH_DEFAULT_RESULTS`、`WEB_SEARCH_MAX_RESULTS`、`WEB_SEARCH_CANDIDATE_MULTIPLIER`、`WEB_SEARCH_MAX_CANDIDATES`、`WEB_SEARCH_REGION` 与 `WEB_SEARCH_LANGUAGE`。当连接的是 [marcopesani/mcp-server-serper](https://github.com/marcopesani/mcp-server-serper) 时，只有 `[*.]example.com` 这类“根域名加全部子域名”规则会安全转换为 `exclude` 参数中的 `site:<域名>`，从而生成 Google 的 `-site:<域名>` 查询条件；精确规则和仅子域名规则不会发送可能扩大范围的 `-site:` 条件。本地 URL 主机名过滤始终在返回前执行，因此是最终保证。若改用不支持 `exclude` 参数的搜索 MCP，请将 `WEB_SEARCH_UPSTREAM_DOMAIN_EXCLUDE_ENABLED` 设为 `False`。修改后重启应用即可生效。不要填写协议、端口、路径、查询参数或其他通配符。
 
+### 根路径首页回退
+
+部分网站的根路径（例如 `https://www.battleofballs.com/`）不能被静态抓取器可靠读取，但同一站点的 `https://www.battleofballs.com/index/` 可正常读取。为处理这一情况，`fetch_url` 在根路径的常规请求和正文提取均失败后，可按 `src/apitelegramchat/web_search_settings.py` 中的 `FETCH_URL_ROOT_FALLBACK_PATHS` 依次尝试同站点首页路径。默认启用的路径为 `/index/`。
+
+回退仅对不带查询参数或片段的 HTTP(S) 根路径生效，并保持原 URL 的协议、主机和端口；深层路径、带参数链接、片段链接和跨站地址不会被改写。若不需要该行为，可将 `FETCH_URL_ROOT_FALLBACK_ENABLED` 设为 `False`。每个候选项必须是以 `/` 开头的纯站内路径，例如 `/index/` 或 `/home/`。
+
 地图坐标统一为 `longitude,latitude`，例如 `116.397128,39.916527`。
 
 ## 测试
