@@ -1656,6 +1656,15 @@ _TOOL_TIMEOUT_LABELS = {
     "list_upload": "List upload/",
 }
 
+# ---------- web_search 结果解析与渲染 ----------
+# 实现拆到 apitelegramchat.ai.web_search_render，避免在 tool_executors
+# 里维护大段正则与渲染函数；这里只暴露 _format_web_search_result 给
+# format_tool_result 调用，保持调用点零改动。
+from apitelegramchat.ai.web_search_render import (
+    format_web_search_result as _format_web_search_result,
+)
+
+
 async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tuple[str, str]:
     # 历史上这里曾重复定义一个本地 escape_text（与 import 的 escape_html
     # 行为不完全一致：本地版会对已经合法的实体再做一次 `&` -> `&amp;` 转换，
@@ -1675,49 +1684,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         return summary, details_html
 
     if fn_name == "web_search":
-        query = fn_args.get('query', '')
-        # execute_web_search 返回固定 envelope：成功数/请求数；只在旧格式下
-        # 才回退到标题计数，避免把失败误报成 0 results。
-        count_match = re.search(r'\[成功:[^\]]+\].*?[（(]\s*(\d+)\s*/\s*(\d+)\s*[）)]', result_str or "", re.S)
-        if count_match:
-            num_results = int(count_match.group(1))
-        else:
-            num_results = result_str.count("标题：") if "标题：" in result_str else 0
-        if result_str.lstrip().startswith("❌"):
-            summary = "Search failed"
-        elif query and num_results == 1:
-            summary = f"{query} 1 result"
-        elif query:
-            summary = f"{query} {num_results} results"
-        else:
-            summary = "Searched the web"
-        if "标题：" in result_str and "链接：" in result_str:
-            items_html = ""
-            current_title = ""
-            current_link = ""
-            for line in result_str.split('\n'):
-                if "标题：" in line:
-                    current_title = line.split("标题：")[-1].strip()
-                elif "链接：" in line:
-                    current_link = line.split("链接：")[-1].strip()
-                    if current_title and current_link:
-                        if current_link.startswith("http"):
-                            domain = current_link.split('/')[2] if '//' in current_link else current_link
-                            items_html += (
-                                f"<li><b><a href=\"{current_link}\">{escape_html(current_title)}</a></b> "
-                                f"<code>{escape_html(domain)}</code></li>"
-                            )
-                        else:
-                            items_html += f"<li><b>{escape_html(current_title)}</b> <code>{escape_html(current_link)}</code></li>"
-                        current_title = ""
-                        current_link = ""
-            if items_html:
-                details_html = f"<ol>{items_html}</ol>"
-            else:
-                details_html = escape_html(result_str)
-        else:
-            details_html = escape_html(result_str[:60000])
-        return summary, details_html
+        return _format_web_search_result(fn_args, result_str)
 
     elif fn_name == "fetch_url":
         url = fn_args.get('url', '')
