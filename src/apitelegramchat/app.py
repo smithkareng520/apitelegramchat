@@ -87,6 +87,16 @@ async def _startup_load_whitelist() -> None:
     except Exception:
         logger.warning("startup load_whitelist failed", exc_info=True)
 
+
+@app.after_serving
+async def _shutdown_close_http_session() -> None:
+    """关闭全局 aiohttp session，消除 "Unclosed client session" 告警。"""
+    try:
+        from apitelegramchat.utils import close_http_session
+        await close_http_session()
+    except Exception:
+        logger.warning("shutdown close_http_session failed", exc_info=True)
+
 def _reply_params(message_id: int | None) -> dict | None:
     try:
         mid = int(message_id)

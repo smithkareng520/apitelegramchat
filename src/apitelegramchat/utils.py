@@ -39,6 +39,11 @@ def setup_logging() -> bool:
     logging.getLogger('botocore').setLevel(logging.WARNING)
     logging.getLogger('aiobotocore').setLevel(logging.WARNING)
     logging.getLogger('urllib3').setLevel(logging.WARNING)
+    # ModelScope MCP 网关会立即关闭 SSE GET 流，导致 SDK 客户端不停
+    # 重连并每次打印一条 INFO（"GET stream disconnected, reconnecting
+    # in 1000ms..."），大量冲刷日志。重连本身无害且自动进行，调高该
+    # logger 级别降噪；ERROR（如响应体截断）仍会正常输出。
+    logging.getLogger('mcp.client.streamable_http').setLevel(logging.WARNING)
 
     # 仅在没有任何 handler 时才安装 console/file handler，
     # 避免重复 import（例如 utils 被 reload）造成 handler 累积和日志重复输出。
@@ -96,6 +101,26 @@ async def get_http_session(timeout: Optional[aiohttp.ClientTimeout] = None) -> a
                     timeout=timeout or aiohttp.ClientTimeout(total=30),
                 )
     return _http_session
+
+
+async def close_http_session() -> None:
+    """应用关闭时显式关闭全局 aiohttp session。
+
+    修复日志中的：
+      ERROR asyncio: Unclosed client session
+        client_session: <aiohttp.client.ClientSession object at 0x...>
+    原因：全局单例只在首次使用时创建，但进程退出前没有任何关闭路径，
+    session 只能靠 GC 回收并触发 asyncio 告警。由 app.after_serving
+    钩子调用。
+    """
+    global _http_session
+    async with _http_session_lock:
+        if _http_session is not None and not _http_session.closed:
+            try:
+                await _http_session.close()
+            except Exception:
+                pass
+        _http_session = None
 
 # ---------- 请求ID上下文 ----------
 # 使用 contextvars 替代全局 dict，避免并发协程间 request_id 互相覆盖

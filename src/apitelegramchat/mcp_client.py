@@ -104,6 +104,43 @@ def _configured_hosts(variable: str, defaults: set[str]) -> frozenset[str]:
     return frozenset(item.strip().lower() for item in raw.split(",") if item.strip())
 
 
+def _env_timeout(variable: str) -> float:
+    """读取每个外部 MCP 服务独立的调用超时（秒）。
+
+    默认 12s：外层 web_search 工具超时是 45s（LONG_TOOL_CALL_TIMEOUT），
+    而 _search_via_mcp 最多重试 2 次。旧默认 30s 时：
+    30s(首次) + 1s(退避) + 30s(重试) = 61s > 45s，重试永远跑不完就会被
+    外层 wait_for 杀掉 —— 即日志里 "web_search timed out after 45s" 的
+    直接原因之一。12s 预算下：12 + 1 + 12 = 25s，留出充足余量。
+    """
+    raw = (os.getenv(variable) or "").strip()
+    if not raw:
+        return 12.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 12.0
+
+
+# 同一时刻允许并发打开的外部 MCP 会话总数（跨全部服务器）。
+#
+# ModelScope 的 streamable HTTP 网关在并发会话数升高时表现不稳定：
+# 响应体中途被截断（RemoteProtocolError: peer closed connection without
+# sending complete message body）以及 SSE GET 流被立即关闭。原实现里
+# 两个并行 web_search × 各 2 页 = 4 个并发会话同时打向同一端点，正好
+# 触发该问题。限流到 2 后，把上游抖动概率降到单会话水平，同时保留
+# 一定的并行度（一次搜索的 2 页仍可并发）。
+def _max_concurrency() -> int:
+    raw = (os.getenv("EXTERNAL_MCP_MAX_CONCURRENCY") or "").strip()
+    try:
+        return max(1, min(int(raw), 8))
+    except (TypeError, ValueError):
+        return 2
+
+
+_MCP_CALL_SEMAPHORE = asyncio.Semaphore(_max_concurrency())
+
+
 def _build_bearer_header(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
@@ -122,6 +159,7 @@ def _build_servers() -> dict[str, MCPServerConfig]:
                 allowed_hosts=frozenset({"mcp.api-inference.modelscope.net"}),
                 allowed_tools=frozenset({"google_search"}),
                 headers=_build_bearer_header(config.SERPER_MCP_TOKEN),
+                timeout=_env_timeout("SERPER_MCP_TIMEOUT"),
             )
         except ValueError as exc:
             logger.warning("Serper MCP registration rejected: %s", exc)
@@ -140,6 +178,7 @@ def _build_servers() -> dict[str, MCPServerConfig]:
                     "maps_direction_transit_integrated", "maps_distance",
                 }),
                 headers=_build_bearer_header(config.GAODE_MCP_TOKEN),
+                timeout=_env_timeout("GAODE_MCP_TIMEOUT"),
             )
         except ValueError as exc:
             logger.warning("AMap MCP registration rejected: %s", exc)
@@ -273,14 +312,18 @@ async def call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, A
     http_trace = _MCPHTTPTrace()
 
     async def run_call() -> Any:
-        async with streamablehttp_client(
-            server.url,
-            headers=server.headers,
-            httpx_client_factory=_tracing_http_client_factory(http_trace),
-        ) as (read_stream, write_stream, _):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                return await session.call_tool(tool_name, arguments)
+        # 信号量等待时间也计入 server.timeout 预算：排队过久时快速超时，
+        # 避免静默排队把外层（如 web_search 的 45s）预算耗尽后变成
+        # "外层超时 + 会话未清理" 的双重问题。
+        async with _MCP_CALL_SEMAPHORE:
+            async with streamablehttp_client(
+                server.url,
+                headers=server.headers,
+                httpx_client_factory=_tracing_http_client_factory(http_trace),
+            ) as (read_stream, write_stream, _):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    return await session.call_tool(tool_name, arguments)
 
     try:
         result = await asyncio.wait_for(run_call(), timeout=server.timeout)

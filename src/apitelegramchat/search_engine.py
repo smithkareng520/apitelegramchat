@@ -1181,8 +1181,8 @@ SERPER_PAGE_SIZE = 10
 
 @retry_async(
     max_retries=2,
-    delay=1.5,
-    backoff=2.0,
+    delay=1.0,
+    backoff=1.5,
     exceptions=(MCPToolError, MCPSearchTransientError, asyncio.TimeoutError),
 )
 async def _search_via_mcp(
@@ -1194,6 +1194,11 @@ async def _search_via_mcp(
 
     Serper/Google organic 单页实际最多约 10 条。这里固定每页 10 条，
     当调用方需要超过 10 条时并发请求多个 page，然后合并结果。
+
+    重试预算说明：外层 web_search 工具超时为 45s，单次 MCP 调用默认
+    12s（SERPER_MCP_TIMEOUT 可调），两次尝试 + 退避共约 25s，
+    保证重试能在外层超时前完成。旧参数（delay=1.5/backoff=2.0 +
+    单次 30s）总预算 61.5s，重试必被外层杀掉。
     """
     query = (query or "").strip()
     if not query:
@@ -1237,11 +1242,43 @@ async def _search_via_mcp(
 
         return _parse_serper_mcp_result(raw_text, None)
 
-    page_results = await asyncio.gather(*(fetch_page(p) for p in pages))
+    # return_exceptions=True：单个 page 失败（上游网关抖动、响应体被截断、
+    # 单页超时）不应丢弃其他 page 已成功的结果。全部 page 失败或聚合后
+    # 仍为空时才抛错，交给 retry_async 重试。
+    page_outcomes = await asyncio.gather(
+        *(fetch_page(p) for p in pages), return_exceptions=True
+    )
 
     items: list[dict] = []
-    for page_items in page_results:
-        items.extend(page_items)
+    failed_pages: list[int] = []
+    first_error: Exception | None = None
+    for page, outcome in zip(pages, page_outcomes):
+        if isinstance(outcome, BaseException):
+            if isinstance(outcome, asyncio.CancelledError):
+                raise outcome
+            failed_pages.append(page)
+            if first_error is None:
+                first_error = outcome
+            continue
+        items.extend(outcome)
+
+    if failed_pages and items:
+        # 部分降级：拿到的结果仍够用（黑名单过滤前先给足候选），
+        # 比整次搜索直接报错对用户更友好。
+        logger.warning(
+            "Serper MCP 部分分页失败，降级返回已获取结果: query=%s failed_pages=%s ok_items=%s first_error=%s",
+            query,
+            failed_pages,
+            len(items),
+            first_error,
+        )
+    elif failed_pages and first_error is not None:
+        # 全部 page 都失败：拋第一个错误进入外层重试。
+        if isinstance(first_error, (MCPToolError, MCPSearchTransientError, asyncio.TimeoutError)):
+            raise first_error
+        raise MCPToolError(
+            f"External MCP tool failed: serper-search.google_search: {first_error}"
+        )
 
     # 去掉前面的 offset，再限制最终数量。
     start = normalized_offset % SERPER_PAGE_SIZE
