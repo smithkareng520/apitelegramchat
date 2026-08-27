@@ -972,8 +972,10 @@ SEARCH_TOOLS = [
             "description": (
                 "Send one or more files from upload/ to the chat as attachments. Files MUST already be "
                 "staged under upload/ via bash (e.g. `cp out.txt upload/out.txt`); files left "
-                "elsewhere in the workdir are NOT directly sendable. Pass exact paths relative to "
-                "upload/; wildcards are not supported."
+                "elsewhere in the workdir are NOT directly sendable. Pass paths relative to "
+                "upload/ (e.g. `hello.py` or `out/report.pdf`). A single leading `upload/` "
+                "prefix and a leading `./` are tolerated; absolute paths inside the per-chat "
+                "upload/ root are also accepted. Wildcards are not supported."
             ),
             "parameters": {
                 "type": "object",

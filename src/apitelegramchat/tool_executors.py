@@ -11,6 +11,7 @@ from apitelegramchat.workspace_paths import (
     workspace_root, workspace_workdir, runtime_cache_root, workspace_namespace,
     workspace_upload_root,
     is_inside_upload_or_download,
+    _UPLOAD_DIR_NAME,
 )
 import re
 import html
@@ -2246,6 +2247,14 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
     bash using a relative path such as `cp out.txt upload/out.txt`.
     Files left in workspace root/ are not directly sendable; this is the
     persistence/execution boundary.
+
+    Path handling is intentionally lenient to accommodate common model
+    patterns: leading `./` is stripped, a single leading `upload/` segment
+    is stripped (so `present_files(["upload/hello.py"])` and
+    `present_files(["hello.py"])` are equivalent), and absolute paths that
+    resolve inside the per-chat upload/ root are accepted and converted to
+    their upload-relative form. Any path that escapes upload/ after
+    normalization is rejected.
     """
     if not paths:
         return json.dumps({
@@ -2269,6 +2278,11 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
         # （BASE_URL 里嵌了 bot token），截断 + 脱敏后再写入 failed 列表，
         # 否则这个 list 会被 LLM 看到从而泄露 token。
         timeout = aiohttp.ClientTimeout(total=60)
+        # 在循环外解析一次 upload_root，避免每个文件都重新 resolve。
+        try:
+            upload_resolved = upload_root.resolve()
+        except Exception:
+            upload_resolved = upload_root
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for path in paths:
                 if not isinstance(path, str) or not path:
@@ -2278,28 +2292,80 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
                 if "\x00" in path:
                     failed.append(f"{path} (invalid path)")
                     continue
-                safe_path = os.path.normpath(path)
-                if safe_path == "." or safe_path.startswith("..") or os.path.isabs(safe_path):
-                    failed.append(f"{path} (invalid path)")
-                    continue
-                local_path = upload_root / safe_path
-                # 关键：使用 resolve() 跟随符号链接，再校验最终路径仍在 upload/ 之下
-                try:
-                    resolved = local_path.resolve()
-                except Exception:
-                    failed.append(f"{path} (invalid path)")
-                    continue
-                try:
-                    upload_resolved = upload_root.resolve()
-                except Exception:
-                    upload_resolved = upload_root
-                if resolved != upload_resolved and upload_resolved not in resolved.parents:
-                    failed.append(f"{path} (invalid path)")
-                    continue
+
+                # ----- 路径归一化 -----
+                # 模型经常按照 bash 示例 `cp out.txt upload/out.txt` 的写法
+                # 把 `upload/` 前缀也带上调用 present_files，这会导致
+                # upload_root/upload/<file> 这种"双重 upload"路径，文件找不到。
+                # 还有些模型会传 upload_root 的绝对路径。两种情况都要兼容，
+                # 否则会出现"明明文件就在 upload/，工具却报 not found"的
+                # 反直觉循环（历史上发生过：模型尝试 7 轮后放弃）。
+                raw_path = path.strip()
+                # 去掉前导 "./"
+                while raw_path.startswith("./"):
+                    raw_path = raw_path[2:]
+                # 处理绝对路径：若它落在 upload_root 子树内，提取其相对部分。
+                if os.path.isabs(raw_path):
+                    try:
+                        abs_resolved = Path(raw_path).expanduser().resolve()
+                    except Exception:
+                        failed.append(f"{path} (invalid path)")
+                        continue
+                    # 必须严格落在 upload_resolved 之内（包含 upload_resolved 本身，
+                    # 但 upload_resolved 本身是目录不是文件，后面 is_file 会拦）。
+                    if abs_resolved != upload_resolved and upload_resolved not in abs_resolved.parents:
+                        failed.append(f"{path} (invalid path)")
+                        continue
+                    resolved = abs_resolved
+                    try:
+                        safe_rel = abs_resolved.relative_to(upload_resolved)
+                    except ValueError:
+                        safe_rel = Path(raw_path).name
+                    display_path = str(safe_rel)
+                else:
+                    # relative path: normpath first, then strip the leading
+                    # "<UPLOAD_DIR_NAME>/" segment if the model included it.
+                    norm = os.path.normpath(raw_path)
+                    if norm == "." or norm.startswith(".."):
+                        failed.append(f"{path} (invalid path)")
+                        continue
+                    parts = norm.split(os.sep)
+                    # 只要开头第一段是 upload dir 名，就剥掉它一次（且只剥一次，
+                    # 保留后续目录里同名子目录的可能性）。
+                    if parts and parts[0] == _UPLOAD_DIR_NAME:
+                        parts = parts[1:]
+                    if not parts or (len(parts) == 1 and parts[0] in ("", ".")):
+                        failed.append(f"{path} (invalid path)")
+                        continue
+                    # 重组剥掉 upload/ 后的相对路径；若剩下还以 .. 开头，则拒绝。
+                    rel = os.path.join(*parts) if not (len(parts) == 1 and parts[0] == ".") else ""
+                    if not rel or rel == "." or rel.startswith(".."):
+                        failed.append(f"{path} (invalid path)")
+                        continue
+                    display_path = rel
+                    local_path = upload_root / rel
+                    # 关键：使用 resolve() 跟随符号链接，再校验最终路径仍在 upload/ 之下
+                    try:
+                        resolved = local_path.resolve()
+                    except Exception:
+                        failed.append(f"{path} (invalid path)")
+                        continue
+                    if resolved != upload_resolved and upload_resolved not in resolved.parents:
+                        failed.append(f"{path} (invalid path)")
+                        continue
+
                 if not resolved.is_file():
+                    # 错误信息要把"模型实际该用的路径"说清楚：建议从 workdir 根
+                    # cp 到 upload/<basename>，并告诉模型下次直接传 upload 相对
+                    # 路径（不带 upload/ 前缀）。历史上这里曾用 `cp {path}
+                    # upload/{path}` —— 当 path 形如 "upload/hello.py" 时会被
+                    # 展开成 `cp upload/hello.py upload/upload/hello.py`，造成
+                    # 误导模型去创建 upload/upload/ 子目录。
                     failed.append(
-                        f"{path} (file not found in upload/ — copy it from your "
-                        f"workdir first, e.g. `cp {path} upload/{path}`)"
+                        f"{path} (file not found under upload/ — stage it first via "
+                        f"`cp {display_path} upload/{display_path}` from workdir root, "
+                        f"then call present_files with the upload-relative path "
+                        f"'{display_path}', not the full '{path}')"
                     )
                     continue
                 try:
