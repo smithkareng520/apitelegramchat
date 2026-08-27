@@ -33,14 +33,29 @@ _WEB_SEARCH_SECTION_HEADER_RE = re.compile(
     r'(?m)^(🔍|🖼️|🎬|🔎)\s+\[成功:\s*([^\]]+)\]\s*(.*)$'
 )
 _WEB_SEARCH_ITEM_START_RE = re.compile(r'(?m)^(\d+)\.\s+')
+# 字段 → 正则映射。命名约定（让 AI 不再混淆 URL 类型）：
+#   链接  → 网页 URL（search 模式：结果本身就是页面）
+#   页面  → 来源页面 URL（images/videos/lens：独立于媒体 URL）
+#   图片  → 图片直链（images/lens）
+#   封面  → 视频封面图直链（videos）
+#   视频  → 视频媒体直链（videos，可塞进 <video src>）
+#   时长  → 视频时长（videos，如 20:40）
+#   频道  → 视频发布频道（videos）
+#   时间  → 发布时间（search/videos）
+#   评分  → 评分（search，如 4.3 ⭐ (30740 评价)）
 _WEB_SEARCH_FIELD_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("title",     re.compile(r'^标题：\s*(.*)$')),
-    ("snippet",   re.compile(r'^摘要：\s*(.*)$')),
-    ("link",      re.compile(r'^链接：\s*(.*)$')),
-    ("image_url", re.compile(r'^图片：\s*(.*)$')),
-    ("source",    re.compile(r'^来源：\s*(.*)$')),
-    ("page_link", re.compile(r'^页面：\s*(.*)$')),
-    ("cover",     re.compile(r'^封面：\s*(.*)$')),
+    ("title",       re.compile(r'^标题：\s*(.*)$')),
+    ("snippet",     re.compile(r'^摘要：\s*(.*)$')),
+    ("link",        re.compile(r'^链接：\s*(.*)$')),
+    ("page_link",   re.compile(r'^页面：\s*(.*)$')),
+    ("image_url",   re.compile(r'^图片：\s*(.*)$')),
+    ("cover",       re.compile(r'^封面：\s*(.*)$')),
+    ("video_url",   re.compile(r'^视频：\s*(.*)$')),
+    ("source",      re.compile(r'^来源：\s*(.*)$')),
+    ("channel",     re.compile(r'^频道：\s*(.*)$')),
+    ("duration",    re.compile(r'^时长：\s*(.*)$')),
+    ("date",        re.compile(r'^时间：\s*(.*)$')),
+    ("rating",      re.compile(r'^评分：\s*(.*)$')),
 )
 _WEB_SEARCH_MODE_BY_EMOJI = {
     "🔍": "search",
@@ -195,19 +210,31 @@ def _section_header(section: dict) -> str:
 
 # ---------- 各 mode 渲染 ----------
 def _render_search_items(items: list[dict]) -> str:
+    """search 模式：ol 卡片，标题链接 + 域名徽标 + 时间/评分徽标 + 斜体摘要。"""
     parts: list[str] = ["<ol>"]
     for it in items:
         title = escape_html(it.get("title") or "无标题")
         link = it.get("link") or ""
         snippet = escape_html(it.get("snippet") or "")
         domain = _domain_of(link)
+        date = it.get("date") or ""
+        rating = it.get("rating") or ""
+        # rating 行原始文本形如 `4.3 ⭐ (30740 评价)`，直接转义即可保留装饰
+        rating_disp = escape_html(rating) if rating else ""
         card = "<li>"
         if link:
             card += f'<b><a href="{_href(link)}">{title}</a></b>'
         else:
             card += f"<b>{title}</b>"
+        meta_bits: list[str] = []
         if domain:
-            card += f" <code>{escape_html(domain)}</code>"
+            meta_bits.append(escape_html(domain))
+        if date:
+            meta_bits.append(escape_html(date))
+        if rating_disp:
+            meta_bits.append(rating_disp)
+        if meta_bits:
+            card += f" <code>{' · '.join(meta_bits)}</code>"
         card += "<br/>"
         card += f"<i>{snippet}</i>" if snippet else "<i>(无摘要)</i>"
         card += "</li>"
@@ -244,30 +271,58 @@ def _render_images_items(items: list[dict]) -> str:
 
 
 def _render_videos_items(items: list[dict]) -> str:
+    """videos 模式：ol 卡片。
+
+    展示元素：标题(链接到观看页) + 来源/频道/时长/时间/域名徽标 + 斜体摘要
+              + 🎬 封面链接 + ▶️ 视频媒体链接。
+    ▶️ 视频链接只在 video_url 字段非空时出现，且是唯一可安全嵌入
+    <video src> 的 URL——明确与观看页 link 区分，避免 AI 误用。
+    """
     parts: list[str] = ["<ol>"]
     for it in items:
         title = escape_html(it.get("title") or "无标题")
-        link = it.get("link") or ""
+        # 新格式用 page_link；旧日志/缓存可能仍用 link，向后兼容
+        page = it.get("page_link") or it.get("link") or ""
         snippet = escape_html(it.get("snippet") or "")
         source = escape_html(it.get("source") or "")
+        channel = escape_html(it.get("channel") or "")
+        duration = escape_html(it.get("duration") or "")
         date = escape_html(it.get("date") or "")
         cover = it.get("cover") or it.get("image_url") or ""
-        domain = _domain_of(link)
+        video_url = it.get("video_url") or ""
+        domain = _domain_of(page)
         card = "<li>"
-        if link:
-            card += f'<b><a href="{_href(link)}">{title}</a></b>'
+        if page:
+            card += f'<b><a href="{_href(page)}">{title}</a></b>'
         else:
             card += f"<b>{title}</b>"
-        meta_bits = [x for x in (source, date, domain) if x]
+        # 徽标顺序：时长 > 来源 > 频道 > 时间 > 域名
+        meta_bits: list[str] = []
+        if duration:
+            meta_bits.append(duration)
+        if source:
+            meta_bits.append(source)
+        if channel:
+            meta_bits.append(channel)
+        if date:
+            meta_bits.append(date)
+        if domain:
+            meta_bits.append(escape_html(domain))
         if meta_bits:
-            card += f" <code>{escape_html(' · '.join(meta_bits))}</code>"
+            card += f" <code>{' · '.join(meta_bits)}</code>"
         card += "<br/>"
         if snippet:
             card += f"<i>{snippet}</i>"
-            if cover:
-                card += "<br/>"
+        # 行尾链接组：封面 + 视频媒体。空隙用 · 分隔。
+        links: list[str] = []
         if cover:
-            card += f'<a href="{_href(cover)}">🎬 封面</a>'
+            links.append(f'<a href="{_href(cover)}">🎬 封面</a>')
+        if video_url:
+            links.append(f'<a href="{_href(video_url)}">▶️ 视频</a>')
+        if links:
+            if snippet:
+                card += "<br/>"
+            card += " · ".join(links)
         card += "</li>"
         parts.append(card)
     parts.append("</ol>")

@@ -233,23 +233,31 @@ def escape_html(text) -> str:
 def _rich_message_html_payload(html_content: str) -> dict:
     """构造符合 InputRichMessage 规范的 HTML 富消息。
 
-    在交付给 Telegram 前，先调用 ``_strip_invalid_media_urls`` 做一次兜底
-    清理：当 LLM 把附件 file_name（如 ``photo_AgACAgUA.jpg``）或 file_id
-    误当成 URL 写入 ``<img src>``/``<video src>``/``<audio src>`` 时，
-    Telegram 会以 ``RICH_MESSAGE_PHOTO_URL_INVALID`` 拒绝**整条消息**，
-    导致用户连文字描述都看不到。这里在发送前把这类伪 URL 的媒体块剥离，
-    保证剩余的文字内容仍然能正常送达。
+    在交付给 Telegram 前，依次跑两道兜底清理：
+
+    1. ``_strip_invalid_media_urls``：剥离 ``src`` 不是合法 http(s) URL
+       的 ``<img>``/``<video>``/``<audio>`` 标签。处理 LLM 把附件
+       file_name（如 ``photo_AgACAgUA.jpg``）或 file_id 误当成 URL 的情况，
+       Telegram 会以 ``RICH_MESSAGE_PHOTO_URL_INVALID`` 拒绝整条消息。
+
+    2. ``_demote_watch_page_videos``：把 ``<video src="WATCH_PAGE_URL">``
+       块降级为 ``<a href>`` 链接。处理 LLM 把 YouTube / Bilibili 等
+       观看页 URL 误当直链视频嵌入 ``<video src>`` 的情况——这种 URL
+       看着合法（``http(s)://`` 开头），但 Telegram 去抓会拿到 HTML
+       页面，以 ``RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND`` 拒绝整条消息。
+       降级后保留模型生成的 figcaption 文本，让用户仍可点击跳转观看页。
     """
     cleaned = _strip_invalid_media_urls(html_content)
-    if cleaned != html_content:
+    demoted = _demote_watch_page_videos(cleaned)
+    if demoted != html_content:
         logger.warning(
-            "sendRichMessage 兜底清理：检测到伪 URL 媒体块，已剥离以保证消息送达。"
-            "原始长度=%s，清理后长度=%s",
+            "sendRichMessage 兜底清理：检测到伪 URL 或观看页 URL 媒体块，"
+            "已剥离/降级以保证消息送达。原始长度=%s，清理后长度=%s",
             len(html_content),
-            len(cleaned),
+            len(demoted),
         )
     return {
-        "html": cleaned,
+        "html": demoted,
         "skip_entity_detection": True,
     }
 
@@ -261,6 +269,66 @@ _MEDIA_SRC_RE = re.compile(
     r'<img\b[^>]*?/?>',
     re.IGNORECASE,
 )
+
+# 已知的"观看页"URL 模式——这些 URL 永远不可能是直链视频文件，
+# 但模型有时会把它们误嵌入 <video src>。命中后整块降级为 <a> 链接，
+# 而不是直接删除，避免丢失模型给的视频标题/figcaption 文本。
+#
+# 直链视频文件的特征是：URL 末尾通常是 .mp4/.webm/.mov/.m3u8/.ts 等
+# 视频扩展名，或者来自已知视频 CDN（googlevideo.com、bilivideo.com、
+# akamaized.net 等）。这里走"否定式"判定——只要 URL 命中观看页模式，
+# 就一定不是直链。
+#
+# 顺序无所谓，命中任一即认定为观看页。
+_WATCH_PAGE_URL_PATTERNS = (
+    # YouTube watch / embed / shorts —— 注意 watch 后面通常跟 ? 而不是 /
+    re.compile(r'youtube\.com/watch\b', re.IGNORECASE),
+    re.compile(r'youtube\.com/embed/', re.IGNORECASE),
+    re.compile(r'youtube\.com/shorts/', re.IGNORECASE),
+    re.compile(r'youtube\.com/live/', re.IGNORECASE),
+    re.compile(r'youtu\.be/', re.IGNORECASE),
+    # Bilibili 观看页
+    re.compile(r'bilibili\.com/video/', re.IGNORECASE),
+    re.compile(r'bilibili\.com/bangumi/play/', re.IGNORECASE),
+    re.compile(r'b23\.tv/', re.IGNORECASE),
+    # Vimeo / Dailymotion / Twitch / TikTok / Facebook / X / Nico
+    re.compile(r'vimeo\.com/\d', re.IGNORECASE),
+    re.compile(r'dailymotion\.com/video/', re.IGNORECASE),
+    re.compile(r'twitch\.tv/videos/', re.IGNORECASE),
+    re.compile(r'tiktok\.com/@', re.IGNORECASE),
+    re.compile(r'facebook\.com/(?:watch|reel)/', re.IGNORECASE),
+    re.compile(r'fb\.watch/', re.IGNORECASE),
+    re.compile(r'(?:twitter|x)\.com/[^/]+/status/', re.IGNORECASE),
+    re.compile(r'nico(?:video)?\.[a-z]+/watch/', re.IGNORECASE),
+)
+
+# 直链视频文件的扩展名（用于"非观看页 URL"再做一次正向确认）。
+# 走 query/path 末尾段判断，匹配大小写不敏感。
+_DIRECT_VIDEO_EXT_RE = re.compile(
+    r'\.(?:mp4|webm|mov|m4v|m3u8|ts|ogg|ogv)(?:$|\?)',
+    re.IGNORECASE,
+)
+
+
+def _looks_like_watch_page(url: str) -> bool:
+    """判定 URL 是否为视频观看页（不可作为 <video src> 直链）。"""
+    if not url:
+        return False
+    u = url.strip()
+    if not (u.lower().startswith("http://") or u.lower().startswith("https://")):
+        return False
+    # 命中观看页模式即认定非直链
+    for pat in _WATCH_PAGE_URL_PATTERNS:
+        if pat.search(u):
+            return True
+    return False
+
+
+def _looks_like_direct_video(url: str) -> bool:
+    """判定 URL 是否为直链视频文件（保守判定：必须命中扩展名）。"""
+    if not url:
+        return False
+    return bool(_DIRECT_VIDEO_EXT_RE.search(url))
 
 
 def _strip_invalid_media_urls(html_content: str) -> str:
@@ -279,7 +347,12 @@ def _strip_invalid_media_urls(html_content: str) -> str:
       * 若外层是 ``<figure>`` 且剥离后 figure 内既无 ``<img>``/``<video>``
         也无 ``<figcaption>``，则一并删除该空 figure。
 
-    仅做"剥离非法块"这一件事，不动其它合法标签，避免误伤。
+    另外，对 ``<video src="WATCH_PAGE_URL">`` 还会做"观看页降级"：
+    若 URL 命中 YouTube / Bilibili / Vimeo / 抖音 / Twitter / Facebook
+    等观看页模式（即非直链视频文件），把整个 ``<figure>`` 块降级为
+    ``<a href="URL">CAPTION</a>``，避免 Telegram 以
+    ``RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND`` 拒绝整条消息——同时保留模型
+    生成的视频标题/figcaption 文本，让用户仍可点击跳转观看页。
     """
     if not html_content:
         return ""
@@ -294,6 +367,26 @@ def _strip_invalid_media_urls(html_content: str) -> str:
     def _is_valid_url(url: str) -> bool:
         u = (url or "").strip().lower()
         return bool(u) and (u.startswith("http://") or u.startswith("https://"))
+
+    def _domain_of(url: str) -> str:
+        m = re.match(r'https?://([^/\s]+)', url or "")
+        return m.group(1) if m else ""
+
+    def _extract_caption(text: str) -> str:
+        """从 <figcaption>...</figcaption> 或裸文本里提取 caption。"""
+        # 优先取 <figcaption>
+        m = re.search(r'<figcaption\b[^>]*>(.*?)</figcaption\s*>', text, re.IGNORECASE | re.DOTALL)
+        if m:
+            inner = m.group(1).strip()
+            if inner:
+                # 去掉内嵌标签，只留纯文本，便于做链接 anchor 文本
+                inner = re.sub(r'<[^>]+>', '', inner).strip()
+                if inner:
+                    return inner
+        # 退化：去掉所有标签后的纯文本
+        bare = re.sub(r'<[^>]+>', ' ', text)
+        bare = re.sub(r'\s+', ' ', bare).strip()
+        return bare[:80] if bare else ""
 
     # 先处理容器型 <video>...</video> / <audio>...</audio>：
     # 起始标签 src 非法时，连同内部内容一起删掉。
@@ -351,6 +444,131 @@ def _strip_invalid_media_urls(html_content: str) -> str:
         return m.group(0)
 
     result = figure_pattern.sub(_clean_empty_figure, result)
+    return result
+
+
+def _demote_watch_page_videos(html_content: str) -> str:
+    """把 ``<video src="WATCH_PAGE_URL">`` 块降级为 ``<a href>`` 链接。
+
+    在 ``_strip_invalid_media_urls`` 之后跑——前者只检查 URL 是否
+    以 ``http(s)://`` 开头，无法识别"看着合法但其实是 HTML 观看页"的
+    URL（如 ``https://www.bilibili.com/video/BVxxx``）。Telegram 收到
+    这种 ``<video>`` 后会去抓 URL 当视频文件，拿到 HTML 页面，以
+    ``RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND`` 拒绝整条消息。
+
+    本函数扫描所有 ``<video src="...">`` 标签，若 URL 命中观看页模式，
+    把整个 ``<figure><video src="URL"></video><figcaption>CAPTION</figcaption></figure>``
+    降级为 ``<a href="URL">🎬 CAPTION</a>``。若没有外层 ``<figure>``，
+    则把 ``<video>...</video>`` 单独替换为 ``<a>`` 链接。
+
+    URL 看起来是直链（命中 .mp4/.webm/.mov/.m3u8/.ts/.ogg 等）时，
+    保留原 ``<video>`` 不动——这种情况 Telegram 通常能正常播放。
+    """
+    if not html_content:
+        return ""
+
+    # 先匹配 <figure><video ...>...</video><figcaption>...</figcaption></figure>
+    # 也兼容 <figure><video .../></figure>（自闭合）与 figcaption 在 video 之前。
+    figure_video_re = re.compile(
+        r'<figure\b[^>]*>(.*?)</figure\s*>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    video_in_figure_re = re.compile(
+        r'<video\b[^>]*>.*?</video\s*>|<video\b[^>]*/>',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def _replace_figure(m: re.Match) -> str:
+        inner = m.group(1) or ""
+        # 找到第一个 <video> 块
+        vm = video_in_figure_re.search(inner)
+        if not vm:
+            return m.group(0)  # 没有 video，原样返回
+
+        video_block = vm.group(0)
+        src = _extract_attr(video_block, "src")
+        if not src:
+            return m.group(0)  # 无 src，保留给 _strip_invalid_media_urls 处理
+
+        # 只有命中观看页模式才降级；否则保留原 <video>，
+        # 让 Telegram 自行处理（直链成功就播，失败由后续兜底）。
+        if not _looks_like_watch_page(src):
+            return m.group(0)
+
+        # 命中观看页模式 → 降级为 <a> 链接。
+        # caption 优先取 <figcaption> 文本，退化到 domain。
+        figcaption_re = re.compile(
+            r'<figcaption\b[^>]*>(.*?)</figcaption\s*>',
+            re.IGNORECASE | re.DOTALL,
+        )
+        figcaption_text = ""
+        figm = figcaption_re.search(inner)
+        if figm:
+            figcaption_text = re.sub(r'<[^>]+>', '', figm.group(1)).strip()
+
+        if not figcaption_text:
+            domain = _domain_of(src)
+            figcaption_text = "🎬 观看视频" + (f" · {domain}" if domain else "")
+
+        # 把 video 块和 figcaption 都从 inner 里去掉，剩余内容（少见）追加在链接后
+        rest = video_in_figure_re.sub("", inner)
+        rest = figcaption_re.sub("", rest).strip()
+
+        anchor = f'<a href="{src}"><b>{figcaption_text}</b></a>'
+        if not rest:
+            return anchor
+        return f"{anchor} {rest}"
+
+    def _extract_attr(tag_text: str, attr: str) -> str:
+        m = re.search(
+            rf'\b{attr}\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))',
+            tag_text, re.IGNORECASE,
+        )
+        if not m:
+            return ""
+        return (m.group(2) or m.group(3) or m.group(4) or "").strip()
+
+    def _extract_caption_from_inner(inner: str) -> str:
+        m = re.search(
+            r'<figcaption\b[^>]*>(.*?)</figcaption\s*>',
+            inner, re.IGNORECASE | re.DOTALL,
+        )
+        if m:
+            text = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+            if text:
+                return text
+        bare = re.sub(r'<[^>]+>', ' ', inner)
+        bare = re.sub(r'\s+', ' ', bare).strip()
+        return bare[:80] if bare else ""
+
+    def _domain_of(url: str) -> str:
+        m = re.match(r'https?://([^/\s]+)', url or "")
+        return m.group(1) if m else ""
+
+    result = figure_video_re.sub(_replace_figure, html_content)
+
+    # 再处理"裸" video（不在 <figure> 里的，或 figure 已经被上面处理过
+    # 但 video 漏在 figure 外的零散情况）。
+    bare_video_re = re.compile(
+        r'<video\b[^>]*>.*?</video\s*>|<video\b[^>]*/>',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def _replace_bare_video(m: re.Match) -> str:
+        block = m.group(0)
+        src = _extract_attr(block, "src")
+        if not src:
+            return block  # 留给 _strip_invalid_media_urls 删除
+        if not _looks_like_watch_page(src):
+            return block  # 不是观看页，保留
+        # 退化 caption：取 video 块内文本，再不行就用 domain
+        caption = _extract_caption_from_inner(block)
+        if not caption:
+            domain = _domain_of(src)
+            caption = "🎬 观看视频" + (f" · {domain}" if domain else "")
+        return f'<a href="{src}"><b>{caption}</b></a>'
+
+    result = bare_video_re.sub(_replace_bare_video, result)
     return result
 
 

@@ -1266,7 +1266,14 @@ def _serper_api_timeout() -> float:
 
 
 def _parse_serper_search_result(data: dict[str, Any] | None) -> list[dict]:
-    """从 serper.dev /search 响应中提取 organic 列表为统一字段。"""
+    """从 serper.dev /search 响应中提取 organic 列表为统一字段。
+
+    Serper /search 的 organic item 字段（实测）:
+      title, link, snippet, date(可选), rating(可选), ratingCount(可选), position
+    本函数保留前 5 个有用字段；position 已被列表顺序编码，无需重复存储。
+    rating 为浮点（如 4.3），ratingCount 为整数（如 30740），两者通常同时出现
+    但偶有单独出现的情况，统一存为字符串便于下游条件性渲染。
+    """
     if not isinstance(data, dict):
         return []
     organic = data.get("organic")
@@ -1281,7 +1288,25 @@ def _parse_serper_search_result(data: dict[str, Any] | None) -> list[dict]:
         snippet = str(result.get("snippet") or "").strip()
         if not link:
             continue
-        items.append({"title": title, "link": link, "snippet": snippet})
+        # rating 可能是 float 或字符串；统一规范化成可读字符串
+        rating_raw = result.get("rating")
+        rating = ""
+        if isinstance(rating_raw, (int, float)) and rating_raw > 0:
+            rating = f"{float(rating_raw):.1f}"
+        elif isinstance(rating_raw, str) and rating_raw.strip():
+            rating = rating_raw.strip()
+        rating_count_raw = result.get("ratingCount")
+        rating_count = ""
+        if isinstance(rating_count_raw, int) and rating_count_raw > 0:
+            rating_count = str(rating_count_raw)
+        items.append({
+            "title": title,
+            "link": link,
+            "snippet": snippet,
+            "date": str(result.get("date") or "").strip(),
+            "rating": rating,
+            "rating_count": rating_count,
+        })
     return items
 
 
@@ -1314,7 +1339,20 @@ def _parse_serper_images_result(data: dict[str, Any] | None) -> list[dict]:
 
 
 def _parse_serper_videos_result(data: dict[str, Any] | None) -> list[dict]:
-    """从 serper.dev /videos 响应中提取视频列表为统一字段。"""
+    """从 serper.dev /videos 响应中提取视频列表为统一字段。
+
+    Serper /videos 的 item 字段（实测）:
+      title, link(观看页 URL), snippet, imageUrl(封面图直链),
+      videoUrl(可选，视频媒体直链), duration(可选), source, channel(可选), date, position
+
+    ⚠️ 区分两类 URL:
+      - link   = YouTube / Bilibili / Facebook 等观看页 HTML URL —— 给 <a href> 用，
+                 不能塞进 <video src>，否则 Telegram 会报 RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND。
+      - videoUrl = Google CDN 上的视频媒体直链 (encrypted-vtbn0.gstatic.com/video?q=...)，
+                 是真正能塞进 <video src> 的 URL；不是每个 item 都有，缺失时留空。
+    本函数把两者分别保存为 link / video_url，避免下游 AI 把它们搞混。
+    duration 形如 "20:40" 或 "0:54"；channel 是发布者名（YouTube 频道、FB 主页等）。
+    """
     if not isinstance(data, dict):
         return []
     videos = data.get("videos")
@@ -1333,7 +1371,10 @@ def _parse_serper_videos_result(data: dict[str, Any] | None) -> list[dict]:
             "link": link,
             "snippet": str(result.get("snippet") or "").strip(),
             "image_url": str(result.get("imageUrl") or "").strip(),
+            "video_url": str(result.get("videoUrl") or "").strip(),
+            "duration": str(result.get("duration") or "").strip(),
             "source": str(result.get("source") or "").strip(),
+            "channel": str(result.get("channel") or "").strip(),
             "date": str(result.get("date") or "").strip(),
         })
     return items
@@ -1458,14 +1499,33 @@ async def _serper_search_one_mode(
 
 
 def _format_search_results(items: list, query: str, engine: str, requested: int | None = None) -> str:
+    """渲染 search 模式的 envelope section。
+
+    字段顺序固定为：标题 → 摘要 → 时间(可选) → 链接 → 评分(可选)。
+    时间/评分行仅在对应字段非空时才出现，避免给 AI 灌空行。
+    评分行格式：`评分：4.3 ⭐ (30740 评价)`，无评价数则只输出星标。
+    """
     success_count = len(items)
     requested_count = requested if isinstance(requested, int) and requested > 0 else success_count
     lines = [f"🔍 [成功: {engine}] 搜索「{query}」的结果（{success_count}/{requested_count}）：\n"]
     for i, item in enumerate(items, 1):
         title = item.get("title", "无标题")
-        link = item.get("link", "")
         snippet = item.get("snippet", "")
-        lines.append(f"{i}. 标题：{title}\n   摘要：{snippet}\n   链接：{link}\n")
+        date = item.get("date", "")
+        link = item.get("link", "")
+        rating = item.get("rating", "")
+        rating_count = item.get("rating_count", "")
+        block = f"{i}. 标题：{title}\n   摘要：{snippet}\n"
+        if date:
+            block += f"   时间：{date}\n"
+        block += f"   链接：{link}\n"
+        if rating:
+            rating_line = f"   评分：{rating} ⭐"
+            if rating_count:
+                rating_line += f" ({rating_count} 评价)"
+            rating_line += "\n"
+            block += rating_line
+        lines.append(block)
     return "\n".join(lines)
 
 
@@ -1488,23 +1548,43 @@ def _format_image_results(items: list, query: str, requested: int | None = None)
 
 
 def _format_video_results(items: list, query: str, requested: int | None = None) -> str:
+    """渲染 videos 模式的 envelope section。
+
+    字段命名上做了关键区分，避免 AI 把观看页 URL 误当视频媒体 URL：
+      页面 = link 字段，YouTube/Bilibili 等观看页 HTML URL —— 给 <a href> 用
+      封面 = image_url 字段，封面图直链 —— 给 <img src> 用
+      视频 = video_url 字段，Google CDN 视频媒体直链 —— 给 <video src> 用
+    视频行只在 video_url 非空时才出现（不是每个 item 都有 videoUrl）。
+    时长/频道/时间 同样条件性输出。
+    """
     success_count = len(items)
     requested_count = requested if isinstance(requested, int) and requested > 0 else success_count
     lines = [f"🎬 [成功: Serper Videos] 搜视频「{query}」的结果（{success_count}/{requested_count}）：\n"]
     for i, item in enumerate(items, 1):
         title = item.get("title", "无标题")
-        link = item.get("link", "")
         snippet = item.get("snippet", "")
+        duration = item.get("duration", "")
         source = item.get("source", "")
+        channel = item.get("channel", "")
         date = item.get("date", "")
+        link = item.get("link", "")
         image_url = item.get("image_url", "")
-        lines.append(
-            f"{i}. 标题：{title}\n"
-            f"   摘要：{snippet}\n"
-            f"   来源：{source} {date}\n"
-            f"   链接：{link}\n"
-            f"   封面：{image_url}\n"
-        )
+        video_url = item.get("video_url", "")
+        block = f"{i}. 标题：{title}\n   摘要：{snippet}\n"
+        if duration:
+            block += f"   时长：{duration}\n"
+        if source:
+            block += f"   来源：{source}\n"
+        if channel:
+            block += f"   频道：{channel}\n"
+        if date:
+            block += f"   时间：{date}\n"
+        block += f"   页面：{link}\n"
+        if image_url:
+            block += f"   封面：{image_url}\n"
+        if video_url:
+            block += f"   视频：{video_url}\n"
+        lines.append(block)
     return "\n".join(lines)
 
 
