@@ -32,6 +32,7 @@ from apitelegramchat.ai._constants import (
     SUBAGENT_OUTER_TIMEOUT,
     MEDIA_GEN_TOOLS,
     TOOL_ERROR_STREAK_LIMIT,
+    CONSUMER_TOOLS,
 )
 from apitelegramchat.ai.error_formatting import extract_domain
 from apitelegramchat.ai.tool_summary import (
@@ -240,10 +241,43 @@ async def _run_tool_calls_and_append(
                 llm_content = safe_content
             return (fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content)
 
-    results = await asyncio.gather(
-        *[run_one(fn, args, tid) for fn, args, tid in tool_tasks],
-        return_exceptions=True
-    )
+    # ====== 串行化"消费者"工具：同批既含 producer（如 bash cp）又含
+    # consumer（如 present_files）时，consumer 必须在 producer 落盘后才能
+    # 正确读取 upload/。如果让它们一起进 asyncio.gather，consumer 会在
+    # producer 完成前看到空目录并报"file not found"——这是 2026-08-27
+    # 生产事故的直接原因（模型需要多花 2 轮补救）。
+    # 修复策略：把 tool_tasks 拆成 [producers..., consumers...] 两批，
+    # 顺序 gather。仅在两批都非空时启用串行化，否则走原来的单批并行路径，
+    # 不影响纯查询类多工具并发（如 多个 web_search）的性能。
+    producer_indices = [
+        i for i, (fn_name, _, _) in enumerate(tool_tasks) if fn_name not in CONSUMER_TOOLS
+    ]
+    consumer_indices = [
+        i for i, (fn_name, _, _) in enumerate(tool_tasks) if fn_name in CONSUMER_TOOLS
+    ]
+    if producer_indices and consumer_indices:
+        # Phase 1: 并行执行所有 producer（如 bash 复制文件到 upload/）
+        phase1_results = await asyncio.gather(
+            *[run_one(*tool_tasks[i]) for i in producer_indices],
+            return_exceptions=True,
+        )
+        # Phase 2: producer 全部完成后，并行执行所有 consumer（如 present_files）
+        phase2_results = await asyncio.gather(
+            *[run_one(*tool_tasks[i]) for i in consumer_indices],
+            return_exceptions=True,
+        )
+        # 按 tool_tasks 的原始位置重组 results，后续的状态写入和
+        # tool_msg 配对逻辑都基于原始顺序，不需要改动。
+        results = [None] * len(tool_tasks)
+        for i, r in zip(producer_indices, phase1_results):
+            results[i] = r
+        for i, r in zip(consumer_indices, phase2_results):
+            results[i] = r
+    else:
+        results = await asyncio.gather(
+            *[run_one(fn, args, tid) for fn, args, tid in tool_tasks],
+            return_exceptions=True
+        )
 
     await builder.flush(force=False)
 

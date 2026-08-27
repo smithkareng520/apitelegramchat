@@ -39,6 +39,14 @@ LONG_TOOL_CALL_TIMEOUT = 45
 #     确保不会出现外层先杀掉仍在正常运行的沙箱进程。
 BASH_TOOLS = {"bash"}
 BASH_TOOL_CALL_TIMEOUT = 310
+# "消费者"工具：依赖同批其他工具（bash/text_editor 等）已经先把文件 staged
+# 到 upload/ 后才能正确工作。如果让它们和 bash 在同一批 asyncio.gather 里
+# 并行执行，bash 的 cp/write 还没落盘时 present_files 就会读到空目录，
+# 触发"file not found in upload/"的误导性错误（历史上发生过：模型需要
+# 多花 2 轮才能补救）。tool_call_loop 在检测到同批同时存在 producer 和
+# consumer 时，会显式串行化执行：先 gather 所有 producer，再 gather
+# 所有 consumer。仅对"显式声明"的消费者生效，不影响其他工具对的并行性。
+CONSUMER_TOOLS = {"present_files"}
 # 子 agent 工具：内部跑自己的多轮 agentic loop（每轮一次 LLM 调用 + 可能的工具调用）。
 # 默认 900s，用户可配到 1800s。外层必须给足够长的超时，否则主工具层会提前杀掉它。
 SUBAGENT_TOOLS = {"subagent"}
