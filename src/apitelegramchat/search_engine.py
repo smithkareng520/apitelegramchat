@@ -1196,9 +1196,10 @@ async def _search_via_mcp(
     当调用方需要超过 10 条时并发请求多个 page，然后合并结果。
 
     重试预算说明：外层 web_search 工具超时为 45s，单次 MCP 调用默认
-    12s（SERPER_MCP_TIMEOUT 可调），两次尝试 + 退避共约 25s，
-    保证重试能在外层超时前完成。旧参数（delay=1.5/backoff=2.0 +
-    单次 30s）总预算 61.5s，重试必被外层杀掉。
+    12s（SERPER_MCP_TIMEOUT 可调）。部分分页失败时先做一次定向重试
+    （首轮 12s + 重试 12s ≈ 24s），全部失败时交给外层 retry_async
+    （12s + 1s 退避 + 12s ≈ 25s），均在 45s 预算内。旧参数
+    （delay=1.5/backoff=2.0 + 单次 30s）总预算 61.5s，重试必被外层杀掉。
     """
     query = (query or "").strip()
     if not query:
@@ -1243,15 +1244,14 @@ async def _search_via_mcp(
         return _parse_serper_mcp_result(raw_text, None)
 
     # return_exceptions=True：单个 page 失败（上游网关抖动、响应体被截断、
-    # 单页超时）不应丢弃其他 page 已成功的结果。全部 page 失败或聚合后
-    # 仍为空时才抛错，交给 retry_async 重试。
+    # 单页超时）不应丢弃其他 page 已成功的结果。
     page_outcomes = await asyncio.gather(
         *(fetch_page(p) for p in pages), return_exceptions=True
     )
 
-    items: list[dict] = []
+    ok_items: dict[int, list[dict]] = {}
     failed_pages: list[int] = []
-    first_error: Exception | None = None
+    first_error: BaseException | None = None
     for page, outcome in zip(pages, page_outcomes):
         if isinstance(outcome, BaseException):
             if isinstance(outcome, asyncio.CancelledError):
@@ -1259,26 +1259,56 @@ async def _search_via_mcp(
             failed_pages.append(page)
             if first_error is None:
                 first_error = outcome
-            continue
-        items.extend(outcome)
+        else:
+            ok_items[page] = outcome
 
-    if failed_pages and items:
-        # 部分降级：拿到的结果仍够用（黑名单过滤前先给足候选），
-        # 比整次搜索直接报错对用户更友好。
-        logger.warning(
-            "Serper MCP 部分分页失败，降级返回已获取结果: query=%s failed_pages=%s ok_items=%s first_error=%s",
-            query,
-            failed_pages,
-            len(items),
-            first_error,
+    # 部分失败时对失败分页做一次定向快速重试：实测 ModelScope 网关的
+    # 截断/挂死是随机抖动，同一 page 重试一次大多能恢复。时间预算
+    # = 首轮 12s（失败页超时）+ 重试 ~12s ≈ 24s，仍在外层 45s 内。
+    # 全部失败的情况不在这里重试，交给外层 retry_async 统一处理，
+    # 避免两层重试叠加超出外层预算。
+    if failed_pages and ok_items:
+        retry_outcomes = await asyncio.gather(
+            *(fetch_page(p) for p in failed_pages), return_exceptions=True
         )
-    elif failed_pages and first_error is not None:
-        # 全部 page 都失败：拋第一个错误进入外层重试。
+        still_failed: list[int] = []
+        for page, outcome in zip(failed_pages, retry_outcomes):
+            if isinstance(outcome, BaseException):
+                if isinstance(outcome, asyncio.CancelledError):
+                    raise outcome
+                still_failed.append(page)
+                if first_error is None:
+                    first_error = outcome
+            else:
+                ok_items[page] = outcome
+        if still_failed:
+            logger.warning(
+                "Serper MCP 定向重试后仍有分页失败，降级返回已获取结果: query=%s failed_pages=%s ok_pages=%s first_error=%s",
+                query,
+                still_failed,
+                sorted(ok_items),
+                first_error,
+            )
+        else:
+            logger.info(
+                "Serper MCP 分页定向重试成功: query=%s retried_pages=%s",
+                query,
+                failed_pages,
+            )
+        failed_pages = still_failed
+
+    if not ok_items and first_error is not None:
+        # 全部 page 都失败：抛第一个错误进入外层重试。
         if isinstance(first_error, (MCPToolError, MCPSearchTransientError, asyncio.TimeoutError)):
             raise first_error
         raise MCPToolError(
             f"External MCP tool failed: serper-search.google_search: {first_error}"
         )
+
+    # 按页序聚合（不按完成先后），保证 offset 切片语义稳定。
+    items: list[dict] = []
+    for page in pages:
+        items.extend(ok_items.get(page, []))
 
     # 去掉前面的 offset，再限制最终数量。
     start = normalized_offset % SERPER_PAGE_SIZE

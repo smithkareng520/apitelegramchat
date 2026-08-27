@@ -312,21 +312,24 @@ async def call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, A
     http_trace = _MCPHTTPTrace()
 
     async def run_call() -> Any:
-        # 信号量等待时间也计入 server.timeout 预算：排队过久时快速超时，
-        # 避免静默排队把外层（如 web_search 的 45s）预算耗尽后变成
-        # "外层超时 + 会话未清理" 的双重问题。
-        async with _MCP_CALL_SEMAPHORE:
-            async with streamablehttp_client(
-                server.url,
-                headers=server.headers,
-                httpx_client_factory=_tracing_http_client_factory(http_trace),
-            ) as (read_stream, write_stream, _):
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    return await session.call_tool(tool_name, arguments)
+        async with streamablehttp_client(
+            server.url,
+            headers=server.headers,
+            httpx_client_factory=_tracing_http_client_factory(http_trace),
+        ) as (read_stream, write_stream, _):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                return await session.call_tool(tool_name, arguments)
 
     try:
-        result = await asyncio.wait_for(run_call(), timeout=server.timeout)
+        # 信号量在超时预算之外获取：排队等待不应消耗单次调用的超时预算。
+        # 否则当模型并行发起两个 web_search（2×2=4 个会话、信号量=2）时，
+        # 后到的调用排队 ~8s 后只剩 ~4s 预算，必然假超时。排队产生的
+        # 额外总时长由外层工具超时（web_search 45s）兜底。wait_for 超时
+        # 后会等待 run_call 的取消清理（含 DELETE 会话）完成才释放信号量，
+        # 因此拆除连接阶段的并发也不会超标。
+        async with _MCP_CALL_SEMAPHORE:
+            result = await asyncio.wait_for(run_call(), timeout=server.timeout)
     except asyncio.TimeoutError as exc:
         raise MCPToolError(
             f"External MCP tool timed out: {server_name}.{tool_name}",

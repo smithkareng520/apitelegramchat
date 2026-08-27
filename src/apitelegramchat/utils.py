@@ -21,6 +21,31 @@ from apitelegramchat.config import GROQ_API_KEY
 # 日志文件路径可由环境变量 LOG_FILE 覆盖；默认 /tmp/app.log 仅在可写时启用。
 LOG_FILE = os.getenv("LOG_FILE", "/tmp/app.log")
 
+
+class _MCPStreamableHTTPNoiseFilter(logging.Filter):
+    """将 MCP SDK 的原始 ERROR traceback 降为一行 WARNING。
+
+    ModelScope 网关偶发截断 JSON 响应体时，SDK 会以 ERROR + 完整
+    traceback（40+ 行 httpx/httpcore 堆栈）记录 "Error parsing JSON
+    response"。该异常客户端已通过「单次超时 → 分页定向重试 → 部分
+    降级」处理，无需整页堆栈刷屏；降级为一行 WARNING 保留根因痕迹
+    （字节计数等信息已由 search_engine 的降级日志补足）。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        if record.levelno >= logging.ERROR and "Error parsing JSON response" in message:
+            record.msg = message + "（上游网关截断响应体；已由超时+定向重试+降级处理）"
+            record.args = None
+            record.exc_info = None
+            record.exc_text = None
+            record.levelno = logging.WARNING
+            record.levelname = "WARNING"
+        return True
+
 def setup_logging() -> bool:
     """配置 root logger。返回 True 表示完成了配置，False 表示跳过。
 
@@ -42,8 +67,13 @@ def setup_logging() -> bool:
     # ModelScope MCP 网关会立即关闭 SSE GET 流，导致 SDK 客户端不停
     # 重连并每次打印一条 INFO（"GET stream disconnected, reconnecting
     # in 1000ms..."），大量冲刷日志。重连本身无害且自动进行，调高该
-    # logger 级别降噪；ERROR（如响应体截断）仍会正常输出。
-    logging.getLogger('mcp.client.streamable_http').setLevel(logging.WARNING)
+    # logger 级别降噪；响应体截断的原始 ERROR 则由
+    # _MCPStreamableHTTPNoiseFilter 降级为一行 WARNING。
+    sdk_logger = logging.getLogger('mcp.client.streamable_http')
+    sdk_logger.setLevel(logging.WARNING)
+    # 幂等安装：重复调用 setup_logging 不叠加 filter。
+    if not any(isinstance(f, _MCPStreamableHTTPNoiseFilter) for f in sdk_logger.filters):
+        sdk_logger.addFilter(_MCPStreamableHTTPNoiseFilter())
 
     # 仅在没有任何 handler 时才安装 console/file handler，
     # 避免重复 import（例如 utils 被 reload）造成 handler 累积和日志重复输出。
