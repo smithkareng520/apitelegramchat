@@ -108,9 +108,9 @@ def _env_timeout(variable: str) -> float:
     """读取每个外部 MCP 服务独立的调用超时（秒）。
 
     默认 12s：外层 web_search 工具超时是 45s（LONG_TOOL_CALL_TIMEOUT），
-    而 _search_via_mcp 最多重试 2 次。旧默认 30s 时：
+    外部 MCP 调用（高德）也走这条路径。旧默认 30s 时：
     30s(首次) + 1s(退避) + 30s(重试) = 61s > 45s，重试永远跑不完就会被
-    外层 wait_for 杀掉 —— 即日志里 "web_search timed out after 45s" 的
+    外层 wait_for 杀掉 —— 即日志里 "tool timed out after 45s" 的
     直接原因之一。12s 预算下：12 + 1 + 12 = 25s，留出充足余量。
     """
     raw = (os.getenv(variable) or "").strip()
@@ -127,9 +127,8 @@ def _env_timeout(variable: str) -> float:
 # ModelScope 的 streamable HTTP 网关在并发会话数升高时表现不稳定：
 # 响应体中途被截断（RemoteProtocolError: peer closed connection without
 # sending complete message body）以及 SSE GET 流被立即关闭。原实现里
-# 两个并行 web_search × 各 2 页 = 4 个并发会话同时打向同一端点，正好
-# 触发该问题。限流到 2 后，把上游抖动概率降到单会话水平，同时保留
-# 一定的并行度（一次搜索的 2 页仍可并发）。
+# 多个并行 amap-maps 调用会触发该问题。限流到 2 后，把上游抖动概率降到
+# 单会话水平，同时保留一定的并行度。
 def _max_concurrency() -> int:
     raw = (os.getenv("EXTERNAL_MCP_MAX_CONCURRENCY") or "").strip()
     try:
@@ -151,18 +150,9 @@ def _build_servers() -> dict[str, MCPServerConfig]:
     from apitelegramchat import config
 
     servers: dict[str, MCPServerConfig] = {}
-    if config.SERPER_MCP_URL and config.SERPER_MCP_TOKEN:
-        try:
-            servers["serper-search"] = MCPServerConfig(
-                name="serper-search",
-                url=config.SERPER_MCP_URL,
-                allowed_hosts=frozenset({"mcp.api-inference.modelscope.net"}),
-                allowed_tools=frozenset({"google_search"}),
-                headers=_build_bearer_header(config.SERPER_MCP_TOKEN),
-                timeout=_env_timeout("SERPER_MCP_TIMEOUT"),
-            )
-        except ValueError as exc:
-            logger.warning("Serper MCP registration rejected: %s", exc)
+    # Serper 搜索现已迁移到直连 google.serper.dev REST API（见
+    # serper_api.py / search_engine.execute_web_search），不再通过第三方
+    # MCP 中转，故不再注册 serper-search MCP server。
     if config.GAODE_MCP_ENABLED and config.GAODE_MCP_URL and config.GAODE_MCP_TOKEN:
         try:
             servers["amap-maps"] = MCPServerConfig(
@@ -323,9 +313,9 @@ async def call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, A
 
     try:
         # 信号量在超时预算之外获取：排队等待不应消耗单次调用的超时预算。
-        # 否则当模型并行发起两个 web_search（2×2=4 个会话、信号量=2）时，
+        # 否则当模型并行发起多个 amap-maps 调用（信号量=2）时，
         # 后到的调用排队 ~8s 后只剩 ~4s 预算，必然假超时。排队产生的
-        # 额外总时长由外层工具超时（web_search 45s）兜底。wait_for 超时
+        # 额外总时长由外层工具超时（45s）兜底。wait_for 超时
         # 后会等待 run_call 的取消清理（含 DELETE 会话）完成才释放信号量，
         # 因此拆除连接阶段的并发也不会超标。
         async with _MCP_CALL_SEMAPHORE:

@@ -2509,9 +2509,14 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
     try:
         if name == "web_search":
             return await execute_web_search(
-                arguments.get("query", ""),
+                arguments.get("query"),
                 arguments.get("num_results"),
                 arguments.get("offset"),
+                mode=arguments.get("mode", "search"),
+                image_url=arguments.get("image_url"),
+                gl=arguments.get("gl"),
+                hl=arguments.get("hl"),
+                tbs=arguments.get("tbs"),
             )
         elif name == "fetch_url":
             # 增加重试逻辑：如果超时，重试一次

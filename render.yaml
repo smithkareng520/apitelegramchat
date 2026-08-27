@@ -47,9 +47,7 @@ services:
         value: auto
       - key: WEBHOOK_URL
         sync: false
-      - key: SERPER_MCP_URL
-        sync: false
-      - key: SERPER_MCP_TOKEN
+      - key: SERPER_API_KEY
         sync: false
       - key: GAODE_MCP_URL
         sync: false

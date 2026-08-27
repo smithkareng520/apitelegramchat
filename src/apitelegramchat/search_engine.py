@@ -493,7 +493,14 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web for real-time information (titles, snippets, URLs). Multiple independent queries can be issued in one response. To read a result in depth, follow up with fetch_url (one URL per call).",
+            "description": (
+                "Search Google via Serper. One tool, four modes (controlled by `mode`): "
+                "search (default, web pages), images (text-to-image), videos (text-to-video), "
+                "lens (reverse image search — pass `image_url`). "
+                "`mode` accepts a single value or an array of values to run multiple modes "
+                "in one call (e.g. [\"search\",\"images\"]). "
+                "For in-depth reading of a result, follow up with fetch_url (one URL per call)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -501,17 +508,65 @@ SEARCH_TOOLS = [
                         "type": "string",
                         "description": "简述本次操作目的（≤60字）。示例：搜索2024年诺贝尔奖"
                     },
-                    "query": {"type": "string", "description": "搜索关键词"},
-                    "num_results": {"type": "integer", "description": f"可选：返回结果数（1-{_SEARCH_MAX_RESULTS}）；不填写时默认返回 {_SEARCH_DEFAULT_RESULTS} 条", "minimum": 1, "maximum": _SEARCH_MAX_RESULTS},
-                    "offset": {"type": "integer", "description": "可选：结果偏移量，用于分页，从 0 开始", "minimum": 0}
+                    "query": {
+                        "type": "string",
+                        "description": "搜索关键词。search/images/videos 模式必填；lens 模式可选（用作文字约束）。",
+                    },
+                    "mode": {
+                        "type": ["string", "array"],
+                        "items": {"type": "string", "enum": ["search", "images", "videos", "lens"]},
+                        "description": "搜索模式：search（默认，网页）/ images（搜图）/ videos（搜视频）/ lens（以图搜图）。可传数组以一次性执行多个模式。",
+                        "default": "search",
+                    },
+                    "image_url": {
+                        "type": "string",
+                        "description": "lens 模式必填：要反向搜索的图片 URL。其他模式忽略。",
+                    },
+                    "num_results": {
+                        "type": "integer",
+                        "description": (
+                            f"可选：单个 mode 的结果数上限。search: 1-{_SEARCH_MAX_RESULTS}（多页聚合）；"
+                            f"images/videos/lens: 1-100。不填时默认 {_SEARCH_DEFAULT_RESULTS} 条。"
+                        ),
+                        "minimum": 1,
+                        "maximum": 100,
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "可选：search 模式下的结果偏移量（向后翻页），从 0 开始；其他模式忽略。",
+                        "minimum": 0,
+                    },
+                    "gl": {
+                        "type": "string",
+                        "description": "可选：地区码（如 us / cn / al）。不填取默认 cn。",
+                    },
+                    "hl": {
+                        "type": "string",
+                        "description": "可选：界面语言（如 en / zh-cn / ar）。不填取默认 zh-cn。",
+                    },
+                    "tbs": {
+                        "type": "string",
+                        "description": (
+                            "可选：时间筛选。常用值：qdr:h（过去1小时）/ qdr:d（过去24小时）/ "
+                            "qdr:w（过去一周）/ qdr:m（过去一月）/ qdr:y（过去一年）。不填不限时间。"
+                        ),
+                    },
                 },
-                "required": ["query"]
+                "required": [],
+                "anyOf": [
+                    {"required": ["query"]},
+                    {"required": ["image_url"]}
+                ],
             },
             "input_examples": [
                 {"query": "2024 诺贝尔物理学奖 获奖者", "num_results": 5},
                 {"query": "Python 3.13 新特性", "num_results": 3},
-                {"query": "React Hooks 教程", "num_results": 10, "offset": 10}
-            ]
+                {"query": "React Hooks 教程", "num_results": 10, "offset": 10},
+                {"query": "球球大作战 官网", "mode": "images", "num_results": 8},
+                {"query": "苹果发布会", "mode": "videos", "num_results": 5, "tbs": "qdr:w"},
+                {"image_url": "https://example.com/photo.jpg", "mode": "lens", "num_results": 10},
+                {"query": "特斯拉 model y", "mode": ["search", "images", "videos"], "num_results": 5},
+            ],
         }
     },
     {
@@ -1181,182 +1236,42 @@ SEARCH_TOOLS = [
 # 工具实现
 # =============================================================================
 
-# 搜索通过外部 Serper MCP 服务（见 mcp_client.py）调用 google_search 工具。
-# Serper 返回结构化 JSON；这里仅提取 organic 结果，再交给既有格式化层，
-# 从而保留成功数统计及 Telegram 侧的来源链接展示逻辑。
+# 搜索通过直连 Serper 官方 REST API（见 serper_api.py）实现。一个工具支持
+# 4 种 mode：search / images / videos / lens（以图搜图）。每 mode 的请求与
+# 响应字段均严格遵循 https://serper.dev 的官方文档。
 
-
-class MCPSearchTransientError(Exception):
-    """外部 MCP 搜索服务临时不可用或未返回 organic 结果，可重试。"""
-
-
-SERPER_PAGE_SIZE = 10
-
-
-@retry_async(
-    max_retries=2,
-    delay=1.0,
-    backoff=1.5,
-    exceptions=(MCPToolError, MCPSearchTransientError, asyncio.TimeoutError),
+from apitelegramchat.serper_api import (
+    SerperError,
+    SerperUnavailableError,
+    SERPER_DEFAULT_TIMEOUT as _SERPER_DEFAULT_TIMEOUT,
 )
-async def _search_via_mcp(
-    query: str,
-    num_results: int | None,
-    offset: int | None = 0,
-) -> list[dict] | None:
-    """通过 Serper MCP 搜索并自动分页聚合。
-
-    Serper/Google organic 单页实际最多约 10 条。这里固定每页 10 条，
-    当调用方需要超过 10 条时并发请求多个 page，然后合并结果。
-
-    重试预算说明：外层 web_search 工具超时为 45s，单次 MCP 调用默认
-    12s（SERPER_MCP_TIMEOUT 可调）。部分分页失败时先做一次定向重试
-    （首轮 12s + 重试 12s ≈ 24s），全部失败时交给外层 retry_async
-    （12s + 1s 退避 + 12s ≈ 25s），均在 45s 预算内。旧参数
-    （delay=1.5/backoff=2.0 + 单次 30s）总预算 61.5s，重试必被外层杀掉。
-    """
-    query = (query or "").strip()
-    if not query:
-        return None
-
-    requested = (
-        max(1, min(int(num_results), _SEARCH_MAX_CANDIDATES))
-        if num_results is not None
-        else _SEARCH_DEFAULT_RESULTS
-    )
-    normalized_offset = max(int(offset or 0), 0)
-
-    # MCP/Serper 的 page 从 1 开始，固定按照真实单页大小计算。
-    first_page = normalized_offset // SERPER_PAGE_SIZE + 1
-    last_needed_index = normalized_offset + requested - 1
-    last_page = last_needed_index // SERPER_PAGE_SIZE + 1
-
-    pages = range(first_page, last_page + 1)
-
-    async def fetch_page(page: int) -> list[dict]:
-        arguments: dict[str, Any] = {
-            "q": query,
-            "gl": WEB_SEARCH_REGION,
-            "hl": WEB_SEARCH_LANGUAGE,
-            "page": page,
-            "num": SERPER_PAGE_SIZE,
-        }
-        upstream_exclude = _upstream_domain_exclude_terms()
-        if upstream_exclude:
-            arguments["exclude"] = upstream_exclude
-
-        try:
-            raw_text = await call_mcp_tool(
-                "serper-search",
-                "google_search",
-                arguments,
-            )
-        except MCPToolError as exc:
-            logger.warning("Serper MCP page=%s 搜索失败: %s", page, exc)
-            raise
-
-        return _parse_serper_mcp_result(raw_text, None)
-
-    # return_exceptions=True：单个 page 失败（上游网关抖动、响应体被截断、
-    # 单页超时）不应丢弃其他 page 已成功的结果。
-    page_outcomes = await asyncio.gather(
-        *(fetch_page(p) for p in pages), return_exceptions=True
-    )
-
-    ok_items: dict[int, list[dict]] = {}
-    failed_pages: list[int] = []
-    first_error: BaseException | None = None
-    for page, outcome in zip(pages, page_outcomes):
-        if isinstance(outcome, BaseException):
-            if isinstance(outcome, asyncio.CancelledError):
-                raise outcome
-            failed_pages.append(page)
-            if first_error is None:
-                first_error = outcome
-        else:
-            ok_items[page] = outcome
-
-    # 部分失败时对失败分页做一次定向快速重试：实测 ModelScope 网关的
-    # 截断/挂死是随机抖动，同一 page 重试一次大多能恢复。时间预算
-    # = 首轮 12s（失败页超时）+ 重试 ~12s ≈ 24s，仍在外层 45s 内。
-    # 全部失败的情况不在这里重试，交给外层 retry_async 统一处理，
-    # 避免两层重试叠加超出外层预算。
-    if failed_pages and ok_items:
-        retry_outcomes = await asyncio.gather(
-            *(fetch_page(p) for p in failed_pages), return_exceptions=True
-        )
-        still_failed: list[int] = []
-        for page, outcome in zip(failed_pages, retry_outcomes):
-            if isinstance(outcome, BaseException):
-                if isinstance(outcome, asyncio.CancelledError):
-                    raise outcome
-                still_failed.append(page)
-                if first_error is None:
-                    first_error = outcome
-            else:
-                ok_items[page] = outcome
-        if still_failed:
-            logger.warning(
-                "Serper MCP 定向重试后仍有分页失败，降级返回已获取结果: query=%s failed_pages=%s ok_pages=%s first_error=%s",
-                query,
-                still_failed,
-                sorted(ok_items),
-                first_error,
-            )
-        else:
-            logger.info(
-                "Serper MCP 分页定向重试成功: query=%s retried_pages=%s",
-                query,
-                failed_pages,
-            )
-        failed_pages = still_failed
-
-    if not ok_items and first_error is not None:
-        # 全部 page 都失败：抛第一个错误进入外层重试。
-        if isinstance(first_error, (MCPToolError, MCPSearchTransientError, asyncio.TimeoutError)):
-            raise first_error
-        raise MCPToolError(
-            f"External MCP tool failed: serper-search.google_search: {first_error}"
-        )
-
-    # 按页序聚合（不按完成先后），保证 offset 切片语义稳定。
-    items: list[dict] = []
-    for page in pages:
-        items.extend(ok_items.get(page, []))
-
-    # 去掉前面的 offset，再限制最终数量。
-    start = normalized_offset % SERPER_PAGE_SIZE
-    result = items[start:start + requested]
-
-    if result:
-        logger.info(
-            "Serper MCP query=%s pages=%s returned=%s requested=%s",
-            query,
-            list(pages),
-            len(result),
-            requested,
-        )
-        return result
-
-    logger.info("Serper MCP 搜索服务未返回 organic 结果")
-    raise MCPSearchTransientError("Serper MCP search returned no organic results")
 
 
-def _parse_serper_mcp_result(raw_text: str, num_results: int | None = None) -> list[dict]:
-    """将 Serper ``organic`` JSON 转换为统一的标题、链接和摘要字段。"""
-    if not raw_text:
-        return []
+class SerperSearchTransientError(Exception):
+    """Serper 上游临时未返回结果（例如 organic 为空），可重试。"""
 
+
+SERPER_PAGE_SIZE = 10  # search 端点单页固定 10 条
+
+
+def _serper_api_timeout() -> float:
+    """读取 SERPER_API_TIMEOUT 配置（默认 12s）。"""
     try:
-        data = json.loads(raw_text)
-    except (json.JSONDecodeError, TypeError):
-        logger.warning("Serper MCP 返回了无法解析的非 JSON 内容")
-        return []
+        from apitelegramchat.config import SERPER_API_TIMEOUT
+        if isinstance(SERPER_API_TIMEOUT, (int, float)) and SERPER_API_TIMEOUT >= 1.0:
+            return float(SERPER_API_TIMEOUT)
+    except Exception:
+        pass
+    return _SERPER_DEFAULT_TIMEOUT
 
-    organic = data.get("organic") if isinstance(data, dict) else None
+
+def _parse_serper_search_result(data: dict[str, Any] | None) -> list[dict]:
+    """从 serper.dev /search 响应中提取 organic 列表为统一字段。"""
+    if not isinstance(data, dict):
+        return []
+    organic = data.get("organic")
     if not isinstance(organic, list):
         return []
-
     items: list[dict] = []
     for result in organic:
         if not isinstance(result, dict):
@@ -1367,9 +1282,179 @@ def _parse_serper_mcp_result(raw_text: str, num_results: int | None = None) -> l
         if not link:
             continue
         items.append({"title": title, "link": link, "snippet": snippet})
-        if num_results is not None and len(items) >= num_results:
-            break
     return items
+
+
+def _parse_serper_images_result(data: dict[str, Any] | None) -> list[dict]:
+    """从 serper.dev /images 响应中提取图片列表为统一字段。"""
+    if not isinstance(data, dict):
+        return []
+    images = data.get("images")
+    if not isinstance(images, list):
+        return []
+    items: list[dict] = []
+    for result in images:
+        if not isinstance(result, dict):
+            continue
+        title = str(result.get("title") or "").strip() or "无标题"
+        image_url = str(result.get("imageUrl") or "").strip()
+        link = str(result.get("link") or "").strip() or image_url
+        if not image_url:
+            continue
+        items.append({
+            "title": title,
+            "image_url": image_url,
+            "link": link,
+            "thumbnail_url": str(result.get("thumbnailUrl") or "").strip(),
+            "source": str(result.get("source") or result.get("domain") or "").strip(),
+            "width": result.get("imageWidth"),
+            "height": result.get("imageHeight"),
+        })
+    return items
+
+
+def _parse_serper_videos_result(data: dict[str, Any] | None) -> list[dict]:
+    """从 serper.dev /videos 响应中提取视频列表为统一字段。"""
+    if not isinstance(data, dict):
+        return []
+    videos = data.get("videos")
+    if not isinstance(videos, list):
+        return []
+    items: list[dict] = []
+    for result in videos:
+        if not isinstance(result, dict):
+            continue
+        title = str(result.get("title") or "").strip() or "无标题"
+        link = str(result.get("link") or "").strip()
+        if not link:
+            continue
+        items.append({
+            "title": title,
+            "link": link,
+            "snippet": str(result.get("snippet") or "").strip(),
+            "image_url": str(result.get("imageUrl") or "").strip(),
+            "source": str(result.get("source") or "").strip(),
+            "date": str(result.get("date") or "").strip(),
+        })
+    return items
+
+
+def _parse_serper_lens_result(data: dict[str, Any] | None) -> list[dict]:
+    """从 serper.dev /lens 响应中提取 organic 列表为统一字段。"""
+    if not isinstance(data, dict):
+        return []
+    organic = data.get("organic")
+    if not isinstance(organic, list):
+        return []
+    items: list[dict] = []
+    for result in organic:
+        if not isinstance(result, dict):
+            continue
+        title = str(result.get("title") or "").strip() or "无标题"
+        link = str(result.get("link") or "").strip()
+        image_url = str(result.get("imageUrl") or "").strip()
+        if not link and not image_url:
+            continue
+        items.append({
+            "title": title,
+            "link": link,
+            "image_url": image_url,
+            "thumbnail_url": str(result.get("thumbnailUrl") or "").strip(),
+            "source": str(result.get("source") or "").strip(),
+        })
+    return items
+
+
+async def _serper_search_one_mode(
+    mode: str,
+    *,
+    query: str | None,
+    image_url: str | None,
+    num: int | None,
+    page: int | None,
+    gl: str | None,
+    hl: str | None,
+    tbs: str | None,
+) -> list[dict]:
+    """执行单个 mode 的搜索，返回统一字段的结果列表。
+
+    对于 search mode，单页固定 10 条；当 num > 10 时按页并发取回再合并，
+    保持原有 offset 语义。其他 mode 直接用 serper 返回的列表。
+    """
+    timeout = _serper_api_timeout()
+
+    if mode == "search":
+        if not query:
+            raise SerperSearchTransientError("search mode requires query")
+        # search 端点 num 实际是 page 数：每页固定 10 条。把 num_results 折算成页。
+        requested_num = num if isinstance(num, int) and num > 0 else _SEARCH_DEFAULT_RESULTS
+        requested_num = min(max(requested_num, 1), _SEARCH_MAX_CANDIDATES)
+        # 处理 offset（向后翻页）
+        offset = max(int(page or 1) - 1, 0) * SERPER_PAGE_SIZE if page else 0
+        # page 数从 1 开始
+        first_page = offset // SERPER_PAGE_SIZE + 1
+        last_idx = offset + requested_num - 1
+        last_page = last_idx // SERPER_PAGE_SIZE + 1
+        pages = range(first_page, last_page + 1)
+
+        from apitelegramchat.serper_api import search as serper_search_api
+        async def _fetch_page(p: int) -> list[dict]:
+            data = await serper_search_api(
+                query, gl=gl, hl=hl, tbs=tbs, page=p, timeout=timeout,
+            )
+            return _parse_serper_search_result(data)
+
+        outcomes = await asyncio.gather(
+            *(_fetch_page(p) for p in pages), return_exceptions=True,
+        )
+        items: list[dict] = []
+        first_error: BaseException | None = None
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                if isinstance(outcome, asyncio.CancelledError):
+                    raise outcome
+                if first_error is None:
+                    first_error = outcome
+                continue
+            items.extend(outcome)
+
+        if not items and first_error is not None:
+            if isinstance(first_error, SerperError):
+                raise first_error
+            raise SerperSearchTransientError(
+                f"Serper search returned no results; first error: {first_error}"
+            )
+        start = offset % SERPER_PAGE_SIZE
+        return items[start:start + requested_num]
+
+    if mode == "images":
+        if not query:
+            raise SerperSearchTransientError("images mode requires query")
+        from apitelegramchat.serper_api import images as serper_images_api
+        data = await serper_images_api(
+            query, num=num, page=page, gl=gl, hl=hl, tbs=tbs, timeout=timeout,
+        )
+        return _parse_serper_images_result(data)
+
+    if mode == "videos":
+        if not query:
+            raise SerperSearchTransientError("videos mode requires query")
+        from apitelegramchat.serper_api import videos as serper_videos_api
+        data = await serper_videos_api(
+            query, num=num, page=page, gl=gl, hl=hl, tbs=tbs, timeout=timeout,
+        )
+        return _parse_serper_videos_result(data)
+
+    if mode == "lens":
+        if not image_url:
+            raise SerperSearchTransientError("lens mode requires image_url")
+        from apitelegramchat.serper_api import lens as serper_lens_api
+        data = await serper_lens_api(
+            image_url, query=query, num=num, page=page, gl=gl, hl=hl, tbs=tbs, timeout=timeout,
+        )
+        return _parse_serper_lens_result(data)
+
+    raise SerperSearchTransientError(f"unknown serper mode: {mode}")
 
 
 def _format_search_results(items: list, query: str, engine: str, requested: int | None = None) -> str:
@@ -1384,68 +1469,391 @@ def _format_search_results(items: list, query: str, engine: str, requested: int 
     return "\n".join(lines)
 
 
-async def execute_web_search(query: str, num_results: int | None = None, offset: int | None = None) -> str:
-    """通过 Serper MCP 搜索网页，并在展示前过滤黑名单域名。"""
-    query = (query or "").strip()
+def _format_image_results(items: list, query: str, requested: int | None = None) -> str:
+    success_count = len(items)
+    requested_count = requested if isinstance(requested, int) and requested > 0 else success_count
+    lines = [f"🖼️ [成功: Serper Images] 搜图「{query}」的结果（{success_count}/{requested_count}）：\n"]
+    for i, item in enumerate(items, 1):
+        title = item.get("title", "无标题")
+        image_url = item.get("image_url", "")
+        link = item.get("link", "")
+        source = item.get("source", "")
+        lines.append(
+            f"{i}. 标题：{title}\n"
+            f"   图片：{image_url}\n"
+            f"   来源：{source}\n"
+            f"   页面：{link}\n"
+        )
+    return "\n".join(lines)
+
+
+def _format_video_results(items: list, query: str, requested: int | None = None) -> str:
+    success_count = len(items)
+    requested_count = requested if isinstance(requested, int) and requested > 0 else success_count
+    lines = [f"🎬 [成功: Serper Videos] 搜视频「{query}」的结果（{success_count}/{requested_count}）：\n"]
+    for i, item in enumerate(items, 1):
+        title = item.get("title", "无标题")
+        link = item.get("link", "")
+        snippet = item.get("snippet", "")
+        source = item.get("source", "")
+        date = item.get("date", "")
+        image_url = item.get("image_url", "")
+        lines.append(
+            f"{i}. 标题：{title}\n"
+            f"   摘要：{snippet}\n"
+            f"   来源：{source} {date}\n"
+            f"   链接：{link}\n"
+            f"   封面：{image_url}\n"
+        )
+    return "\n".join(lines)
+
+
+def _format_lens_results(items: list, image_url: str, requested: int | None = None) -> str:
+    success_count = len(items)
+    requested_count = requested if isinstance(requested, int) and requested > 0 else success_count
+    lines = [f"🔎 [成功: Serper Lens] 以图搜图「{image_url}」的结果（{success_count}/{requested_count}）：\n"]
+    for i, item in enumerate(items, 1):
+        title = item.get("title", "无标题")
+        link = item.get("link", "")
+        image_url_item = item.get("image_url", "")
+        source = item.get("source", "")
+        lines.append(
+            f"{i}. 标题：{title}\n"
+            f"   来源：{source}\n"
+            f"   页面：{link}\n"
+            f"   图片：{image_url_item}\n"
+        )
+    return "\n".join(lines)
+
+
+def _normalize_modes(mode: str | list[str] | None) -> list[str]:
+    """把 mode 参数规范化为去重后的有序 list。默认 ["search"]。"""
+    if mode is None:
+        return ["search"]
+    if isinstance(mode, str):
+        m = mode.strip().lower()
+        if not m:
+            return ["search"]
+        return [m]
+    if isinstance(mode, list):
+        out: list[str] = []
+        seen: set[str] = set()
+        for m in mode:
+            if not isinstance(m, str):
+                continue
+            normalized = m.strip().lower()
+            if not normalized or normalized in seen:
+                continue
+            if normalized not in {"search", "images", "videos", "lens"}:
+                continue
+            seen.add(normalized)
+            out.append(normalized)
+        return out or ["search"]
+    return ["search"]
+
+
+async def execute_web_search(
+    query: str | None = None,
+    num_results: int | None = None,
+    offset: int | None = None,
+    *,
+    mode: str | list[str] | None = "search",
+    image_url: str | None = None,
+    gl: str | None = None,
+    hl: str | None = None,
+    tbs: str | None = None,
+) -> str:
+    """通过 Serper 直连 API 搜索，支持 search / images / videos / lens 四种 mode。
+
+    单次调用可同时执行多个 mode（mode 为 list 时并发执行）。各 mode 的失败
+    互不影响：成功 mode 的结果正常返回，失败 mode 在结果末尾以错误说明列出。
+
+    参数：
+      query:       搜索关键词。search / images / videos 必填；lens 可选。
+      num_results: 单 mode 的结果数上限。search: 1-50（多页聚合）；
+                   images / videos / lens: 1-100。
+      offset:      search mode 的偏移量（向后翻页），其他 mode 忽略；
+                   为兼容老调用方，等价于 page = offset // 10 + 1。
+      mode:        "search"（默认） / "images" / "videos" / "lens"，或它们的 list。
+      image_url:   lens mode 必填；其他 mode 忽略。
+      gl:          地区码（如 us / cn），默认取 WEB_SEARCH_REGION。
+      hl:          界面语言（如 en / zh-cn），默认取 WEB_SEARCH_LANGUAGE。
+      tbs:         时间筛选（如 qdr:d 当天 / qdr:w 一周 / qdr:m 一月 / qdr:y 一年）。
+    """
+    modes = _normalize_modes(mode)
     requested = _SEARCH_DEFAULT_RESULTS
     if num_results is not None:
-        requested = min(max(int(num_results), 1), _SEARCH_MAX_RESULTS)
-    page_offset = None
+        requested = max(1, min(int(num_results), _SEARCH_MAX_RESULTS))
+
+    # 对 search mode 的 offset，转为 page（向后兼容旧调用方）
+    page: int | None = None
     if offset is not None:
-        page_offset = max(int(offset), 0)
-    if not query:
+        page = max(int(offset), 0) // SERPER_PAGE_SIZE + 1
+
+    query_str = (query or "").strip()
+    needs_query = any(m in {"search", "images", "videos"} for m in modes)
+    if needs_query and not query_str:
         return "❌ 搜索关键词为空。"
+    if "lens" in modes and not (image_url or "").strip():
+        return "❌ 以图搜图（lens）模式需要 image_url 参数。"
 
-    try:
-        candidate_count = _candidate_result_count(requested)
-        items = await _search_via_mcp(query, candidate_count, page_offset)
-    except MCPToolError as exc:
-        logger.warning(
-            "MCP 搜索失败 category=%s status=%s retryable=%s: %s",
-            exc.category,
-            exc.status_code if exc.status_code is not None else "unknown",
-            exc.retryable,
-            exc,
-        )
-        return exc.user_message("网页搜索服务")
-    except MCPSearchTransientError as exc:
-        logger.warning("MCP 搜索未返回有效 organic 结果: %s", exc)
-        return "❌ 网页搜索服务暂未返回有效结果；请稍后重试。"
-    except Exception as exc:
-        logger.exception("MCP 搜索发生未分类异常")
-        return "❌ 网页搜索服务发生未分类异常；请稍后重试，并检查 MCP 部署调用日志。"
+    timeout = _serper_api_timeout()
 
-    if items:
-        items, filtered_count = _filter_blacklisted_search_results(items)
-        items = items[:requested]
-        if filtered_count:
-            logger.info(
-                "web_search 已过滤 %s 条黑名单域名结果，domains=%s",
-                filtered_count,
-                ", ".join(_BLACKLISTED_SEARCH_DOMAINS),
+    # 单 mode 时走轻量路径；多 mode 时并发执行。
+    if len(modes) == 1:
+        single_mode = modes[0]
+        try:
+            items = await _serper_search_one_mode(
+                single_mode,
+                query=query_str or None,
+                image_url=(image_url or "").strip() or None,
+                num=requested,
+                page=page,
+                gl=gl,
+                hl=hl,
+                tbs=tbs,
             )
-        if items:
-            return _format_search_results(items, query, "Serper / Google", requested=requested)
+        except SerperUnavailableError as exc:
+            logger.warning("Serper API 未配置: %s", exc)
+            return exc.user_message("网页搜索服务")
+        except SerperError as exc:
+            logger.warning(
+                "Serper API 调用失败 mode=%s category=%s status=%s retryable=%s: %s",
+                single_mode, exc.category,
+                exc.status_code if exc.status_code is not None else "unknown",
+                exc.retryable, exc,
+            )
+            return exc.user_message("网页搜索服务")
+        except SerperSearchTransientError as exc:
+            logger.warning("Serper 未返回有效结果 mode=%s: %s", single_mode, exc)
+            return "❌ 网页搜索服务暂未返回有效结果；请稍后重试。"
+        except Exception as exc:
+            logger.exception("Serper 搜索发生未分类异常 mode=%s", single_mode)
+            return "❌ 网页搜索服务发生未分类异常；请稍后重试。"
 
-    return f"❌ 未找到与「{query}」相关的结果。"
+        # 仅 search mode 应用本地黑名单过滤；其他 mode 不涉及域名黑名单语义。
+        if single_mode == "search" and items:
+            items, filtered_count = _filter_blacklisted_search_results(items)
+            items = items[:requested]
+            if filtered_count:
+                logger.info(
+                    "web_search 已过滤 %s 条黑名单域名结果，domains=%s",
+                    filtered_count, ", ".join(_BLACKLISTED_SEARCH_DOMAINS),
+                )
+            if items:
+                return _format_search_results(items, query_str, "Serper / Google", requested=requested)
+            return f"❌ 未找到与「{query_str}」相关的结果。"
+        if single_mode == "images" and items:
+            return _format_image_results(items[:requested], query_str, requested=requested)
+        if single_mode == "videos" and items:
+            return _format_video_results(items[:requested], query_str, requested=requested)
+        if single_mode == "lens" and items:
+            return _format_lens_results(items[:requested], (image_url or "").strip(), requested=requested)
+        # 无结果
+        if single_mode == "lens":
+            return f"❌ 未找到与图片「{(image_url or '').strip()}」相关的结果。"
+        return f"❌ 未找到与「{query_str}」相关的结果。"
+
+    # 多 mode：并发执行，逐 mode 拼接结果
+    async def _run_one(m: str) -> tuple[str, str | None, Exception | None]:
+        try:
+            items = await _serper_search_one_mode(
+                m,
+                query=query_str or None,
+                image_url=(image_url or "").strip() or None,
+                num=requested,
+                page=page,
+                gl=gl,
+                hl=hl,
+                tbs=tbs,
+            )
+            if m == "search" and items:
+                items, _ = _filter_blacklisted_search_results(items)
+                items = items[:requested]
+            elif items:
+                items = items[:requested]
+            if m == "search":
+                text = _format_search_results(items, query_str, "Serper / Google", requested=requested) if items else None
+            elif m == "images":
+                text = _format_image_results(items, query_str, requested=requested) if items else None
+            elif m == "videos":
+                text = _format_video_results(items, query_str, requested=requested) if items else None
+            elif m == "lens":
+                text = _format_lens_results(items, (image_url or "").strip(), requested=requested) if items else None
+            else:
+                text = None
+            return m, text, None
+        except (SerperError, SerperSearchTransientError) as exc:
+            return m, None, exc
+        except Exception as exc:
+            return m, None, exc
+
+    outcomes = await asyncio.gather(*(_run_one(m) for m in modes))
+    sections: list[str] = []
+    errors: list[tuple[str, str]] = []
+    for m, text, exc in outcomes:
+        if exc is not None:
+            if isinstance(exc, SerperError):
+                errors.append((m, exc.user_message(f"{m} 搜索")))
+            else:
+                errors.append((m, f"❌ {m} 搜索失败：{exc}"))
+            continue
+        if text:
+            sections.append(text)
+        else:
+            label = {
+                "search": f"「{query_str}」",
+                "images": f"「{query_str}」",
+                "videos": f"「{query_str}」",
+                "lens": f"「{(image_url or '').strip()}」",
+            }.get(m, "")
+            errors.append((m, f"❌ {m} 未找到与{label}相关的结果。"))
+
+    if not sections and errors:
+        # 全失败：返回第一个错误（让上层 retry_async 触发重试）
+        first_mode, first_msg = errors[0]
+        logger.warning("web_search 全部 mode 失败 modes=%s first=%s", modes, first_msg)
+        return first_msg
+
+    body = "\n\n".join(sections)
+    if errors:
+        body += "\n\n" + "\n".join(msg for _, msg in errors)
+    return body
 
 
 # --------------------- fetch_url (Telegram Rich HTML 输出) ---------------------
+
+# 字符编码检测：优先级与 WHATWG / HTML5 规范对齐。
+#   1. BOM (UTF-8-SIG / UTF-16-LE / UTF-16-BE)
+#   2. HTTP Content-Type 头里的 charset
+#   3. HTML <meta charset="..."> / <meta http-equiv="Content-Type" content="...; charset=...">
+#   4. chardet/charset_normalizer（若已安装）作为兜底
+#   5. UTF-8 with errors='replace'（最后防线）
+#
+# 这条路径之前直接用 response.text（curl_cffi 仅按 HTTP 头 charset 解码），
+# 对于在 meta 标签里写 charset=gb2312 但 HTTP 头里没声明 charset 的网站
+# （如 jxrb.jxwmw.cn），全部会得到 UTF-8 误码后的"馊字"，导致标题和正文
+# 提取都失败。改成从 raw bytes 开始按上面优先级解码后，标题/正文恢复正确。
+_BOM_TABLE = (
+    (b"\xef\xbb\xbf", "utf-8-sig"),
+    (b"\xff\xfe", "utf-16-le"),
+    (b"\xfe\xff", "utf-16-be"),
+)
+# 在头部 4KB 内扫这两条 meta 形式足够覆盖大多数中文站点。
+_META_CHARSET_RE = re.compile(
+    rb"""<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9_\-:]+)""",
+    re.IGNORECASE,
+)
+
+
+def _detect_html_encoding(raw: bytes, http_encoding: str | None) -> str:
+    """按 HTML5 规范的优先级返回最可能的字符集名称。
+
+    raw 是 HTTP 响应体（未经 .text 转换的原始字节）。http_encoding 是
+    curl_cffi 从 Content-Type 头解析出来的字符集（可能为 None / 空 / "None"）。
+    """
+    if not raw:
+        return "utf-8"
+    # 1) BOM
+    for bom, enc in _BOM_TABLE:
+        if raw.startswith(bom):
+            return enc
+    head = raw[:4096]
+    # 2) HTTP 头里给的 charset（curl_cffi 会自动把 .encoding 设成这个）
+    if http_encoding:
+        enc = http_encoding.strip().lower()
+        # 显式 ISO-8859-1 通常只是 curl_cffi 的兜底，不应优先于 meta
+        if enc and enc not in {"iso-8859-1", "latin-1", "ascii"}:
+            return _normalize_encoding_name(enc)
+    # 3) HTML meta charset
+    m = _META_CHARSET_RE.search(head)
+    if m:
+        enc = m.group(1).decode("ascii", errors="ignore").strip().lower()
+        if enc:
+            return _normalize_encoding_name(enc)
+    # 4) chardet / charset_normalizer 兜底
+    try:
+        import chardet  # type: ignore
+        guess = chardet.detect(raw[:32768])
+        if isinstance(guess, dict):
+            enc = (guess.get("encoding") or "").strip().lower()
+            conf = float(guess.get("confidence") or 0.0)
+            if enc and conf >= 0.7:
+                return _normalize_encoding_name(enc)
+    except Exception:
+        pass
+    try:
+        # charset_normalizer 是 requests / chardet 的常见替代品
+        from charset_normalizer import from_bytes  # type: ignore
+        best = from_bytes(raw[:32768]).best()
+        if best is not None:
+            enc = (best.encoding or "").strip().lower()
+            if enc:
+                return _normalize_encoding_name(enc)
+    except Exception:
+        pass
+    # 5) 最后防线：UTF-8 with errors='replace'
+    return "utf-8"
+
+
+def _normalize_encoding_name(name: str) -> str:
+    """把 'gb2312' / 'gbk' / 'utf8' 等常见别名规范化为 Python codecs 认得的形式。"""
+    if not name:
+        return "utf-8"
+    n = name.strip().lower().replace("_", "-")
+    # gb_2312-80 / gb2312-80 / gb2312 → gbk（GBK 是 GB2312 的超集，更稳）
+    if n in {"gb2312", "gb-2312", "gb_2312", "gb2312-80", "gb_2312-80", "chinese", "csiso58gb231280", "csgb2312"}:
+        return "gbk"
+    if n in {"utf8", "utf-8-8", "utf8-8"}:
+        return "utf-8"
+    if n == "utf-8-sig":
+        return "utf-8-sig"
+    if n in {"utf-16le", "utf_16_le"}:
+        return "utf-16-le"
+    if n in {"utf-16be", "utf_16_be"}:
+        return "utf-16-be"
+    return n
+
+
+def _decode_html_bytes(raw: bytes | None, http_encoding: str | None) -> str | None:
+    """把原始字节按检测出的编码安全解码为 str。"""
+    if not raw:
+        return None
+    enc = _detect_html_encoding(raw, http_encoding)
+    try:
+        return raw.decode(enc, errors="replace")
+    except (LookupError, TypeError):
+        # 未知编码名 → 退回 UTF-8
+        return raw.decode("utf-8", errors="replace")
+
+
 async def _fetch_html_with_curl(url: str) -> str | None:
     try:
         async with AsyncSession() as session:
             response = await session.get(url, timeout=CURL_TIMEOUT, impersonate="chrome120",
                                          headers={"Accept": "text/html,application/xhtml+xml,*/*", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
-            if response.status_code == 200:
-                return response.text
-            return None
+            if response.status_code != 200:
+                return None
+            # 优先按 HTTP 头 + meta + chardet 检测的编码解码，避免 GBK 站点被
+            # 错误地按 UTF-8 解析产生馊字标题。
+            raw = response.content
+            http_enc = getattr(response, "encoding", None)
+            decoded = _decode_html_bytes(raw, http_enc)
+            if decoded is not None:
+                return decoded
+            # 兜底：让 curl_cffi 自己用 .text（HTTP 头声明的编码）解码。
+            return response.text
     except Exception as e:
         logger.error(f"curl_cffi 请求异常: {e}, URL: {url}")
         return None
 
 
 async def _download_html_with_trafilatura(url: str) -> str | None:
-    """curl_cffi 失败时用 trafilatura 自带下载器兜底获取原始 HTML。"""
+    """curl_cffi 失败时用 trafilatura 自带下载器兜底获取原始 HTML。
+
+    trafilatura.fetch_url 内部会按 HTML5 规范做编码检测（含 BOM / meta /
+    chardet 兜底），因此对 GBK 站点不会出现馊字。返回值是已解码的 str。
+    """
     if trafilatura is None:
         return None
     try:

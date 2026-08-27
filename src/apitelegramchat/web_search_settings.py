@@ -38,11 +38,10 @@ BLACKLIST_DOMAINS = (
     # "*.example.com",
 )
 
-# True：对 [*.]example.com 类型的规则，生成 `-site:example.com` 并发送给
-# 支持 exclude 参数的 marcopesani/mcp-server-serper，在上游阶段预先排除。
-# 精确规则（example.com）和仅子域名规则（*.example.com）不发送 -site:，以免
-# 过度过滤；它们由本地 URL 主机名匹配作为最终保证。
-# 如果实际连接的 google_search MCP 不接受 exclude 参数，请改为 False。
+# 直连 serper.dev /search 端点不支持 exclude 参数；本地黑名单过滤
+# （filter_blacklisted_search_results）在客户端完成。该开关保留是为了
+# 兼容老的 marcopesani/mcp-server-serper 部署；现版本对该端点不会发送
+# exclude 字段。设为 True/False 均不影响 serper.dev 直连行为。
 WEB_SEARCH_UPSTREAM_DOMAIN_EXCLUDE_ENABLED = True
 
 # fetch_url 的根路径首页回退。仅当请求 URL 没有查询参数或片段且路径为 `/` 时，

@@ -302,6 +302,8 @@ WEBHOOK_URL?token=WEBHOOK_TOKEN
 | `R2_BUCKET_NAME` | 可选 | Bucket |
 | `R2_PUBLIC_URL` | 可选 | 对外资源 URL 前缀 |
 | `R2_REGION` | 可选 | 默认 `auto` |
+| `SERPER_API_KEY` | 可选 | Serper API key（搜索 / 搜图 / 搜视频 / 以图搜图 四合一，https://serper.dev） |
+| `SERPER_API_TIMEOUT` | 可选 | Serper 单次请求超时秒数，默认 `12` |
 | `APITELEGRAMCHAT_DATA_DIR` | 可选 | 数据根目录 |
 | `APITELEGRAMCHAT_WHITELIST_FILE` | 可选 | 白名单文件 |
 | `LOG_LEVEL` | 可选 | 日志级别，默认 `INFO` |
@@ -455,7 +457,7 @@ Telegram Runtime 的工具面比 MCP 更完整。
 ### Web / 信息
 
 ```text
-web_search
+web_search    # 4-in-1: search / images / videos / lens（mode 参数选择）
 fetch_url
 wikipedia
 exchange_rate
@@ -682,20 +684,38 @@ Skill 不应被当作普通 Python import。它更接近 Agent 可以按需加�
 
 ## 外部 MCP
 
-项目使用 Streamable HTTP MCP Client 调用外部服务。
+项目使用 Streamable HTTP MCP Client 调用外部服务（仅保留高德地图）。
 
-目前主要用于：
+### 搜索（直连 Serper 官方 REST API）
 
-### 搜索
+网页搜索已从第三方 ModelScope MCP 迁移到 Serper 官方 REST API
+（`https://google.serper.dev`），通过 `X-API-KEY` 头鉴权，避开上游
+MCP 网关经常出现的"响应体中途被截断 / SSE 流被立即关闭 / 调用挂死"
+等不稳定行为。
 
-Serper MCP：
+一个 `SERPER_API_KEY` 即可同时支持 4 种搜索模式：
+
+| mode    | 端点                          | 用途             |
+|---------|-------------------------------|------------------|
+| search  | `POST /search`                | 普通网页搜索     |
+| images  | `POST /images`                | 文字搜图         |
+| videos  | `POST /videos`                | 视频搜索         |
+| lens    | `POST /lens`                  | 以图搜图（反向） |
 
 ```bash
-export SERPER_MCP_URL="https://mcp.api-inference.modelscope.net/<deployment-id>/mcp"
-export SERPER_MCP_TOKEN="..."
+# Key 从 https://serper.dev 注册并获取，配置在 Render Environment 中作为 secret
+export SERPER_API_KEY="..."
+# 可选：单次请求超时（秒），默认 12s
+export SERPER_API_TIMEOUT=12
 ```
 
-项目只允许访问受信任的 MCP 主机，并限制上游工具。
+调用方式：通过 `web_search` 工具的 `mode` 参数选择搜索类型，可传单个
+字符串或字符串数组（多模式并发执行）。
+
+```text
+web_search({query: "特斯拉 model y", mode: ["search", "images", "videos"], num_results: 5})
+web_search({image_url: "https://example.com/photo.jpg", mode: "lens"})
+```
 
 ### 地图
 
@@ -713,21 +733,22 @@ export GAODE_MCP_TOKEN="..."
 export GAODE_MCP_ALLOWED_HOSTS="mcp.api-inference.modelscope.net"
 ```
 
-### MCP 错误诊断
+### Serper API 错误诊断
 
-搜索 MCP 会区分：
+直连 serper.dev 会区分：
 
 | 状态 | 含义 |
 |---|---|
-| 401 / 403 | token、URL 或授权配置错误 |
-| 404 | endpoint 不存在/失效 |
-| 429 / quota / rate limit | 上游限流或额度限制 |
-| 502 / 503 / 504 | 上游临时不可用 |
+| 401 / 403 | `SERPER_API_KEY` 错误、过期或未配置 |
+| 404 | endpoint 不存在/失效（serper.dev 改了路径段） |
+| 429 / quota / rate limit | 上游限流或额度限制（serper.dev 免费版 2,500 次/月） |
+| 502 / 503 / 504 | serper.dev 上游临时不可用 |
 | 其他 4xx | 参数或工具配置被拒绝 |
+| timeout | 本地到 serper.dev 网络不通或响应过慢 |
 
 特别注意：
 
-> `502/503/504` 不能证明额度用完。
+> `502/503/504` 不能证明额度用完。serper.dev 的限流会明确返回 429。
 
 ---
 
@@ -1151,7 +1172,7 @@ MODELSCOPE_API_KEY
 AGNES_API_KEY
 R2_ACCESS_KEY
 R2_SECRET_KEY
-SERPER_MCP_TOKEN
+SERPER_API_KEY
 GAODE_MCP_TOKEN
 ```
 
@@ -1291,18 +1312,18 @@ Linux 内核需要支持 Landlock。
 
 ---
 
-### 4. 搜索返回 502
+### 4. 搜索返回 502 / 超时
 
-502 通常意味着上游 gateway/service 暂时不可用。
+502 或超时通常意味着 serper.dev 上游或本地到上游的网络暂时不可用。
 
 不要直接把它解释成 quota 用尽。
 
 检查：
 
 ```text
-SERPER_MCP_URL
-SERPER_MCP_TOKEN
-ModelScope MCP deployment 状态
+SERPER_API_KEY         # 是否配置、是否过期、是否拼写正确
+SERPER_API_TIMEOUT     # 单次请求超时（默认 12s）
+serper.dev 控制台       # 上游服务状态、API 健康检查页面
 ```
 
 ---
@@ -1315,7 +1336,7 @@ ModelScope MCP deployment 状态
 - quota；
 - throttling。
 
-检查上游 MCP 部署的调用量和配额。
+检查 serper.dev 控制台的调用量和配额（serper.dev 免费版 2,500 次/月）。
 
 ---
 

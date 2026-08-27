@@ -34,16 +34,18 @@ AGNES_API_KEY = os.getenv("AGNES_API_KEY", "")
 # ModelScope MCP 实例路径（.../3331c36972ff42/mcp），这类路径段通常绑定
 # 到某个具体账号的私有实例。一旦部署方忘记覆盖该环境变量，就会在不知情
 # 的情况下把请求发往别人的实例（可能是私有、限流或按量计费的），且大概率
-# 连不通或返回权限错误。与下方 SERPER_MCP_URL 保持一致，改为必须显式配置。
+# 连不通或返回权限错误。改为必须显式配置（与 SERPER_API_KEY 同口径）。
 GAODE_MCP_ENABLED = os.getenv("GAODE_MCP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 GAODE_MCP_URL = (os.getenv("GAODE_MCP_URL") or "").strip()
 GAODE_MCP_TOKEN = (os.getenv("GAODE_MCP_TOKEN") or "").strip()
 
-# ---------- 网页搜索：Serper MCP 服务 ----------
-# 采用 streamable_http + Bearer token。部署时必须显式配置 URL 与令牌；
-# 客户端仅信任 ModelScope MCP 域名，并只允许调用 google_search。
-SERPER_MCP_URL = (os.getenv("SERPER_MCP_URL") or "").strip()
-SERPER_MCP_TOKEN = (os.getenv("SERPER_MCP_TOKEN") or "").strip()
+# ---------- 网页搜索：Serper 官方 REST API ----------
+# 直接调用 https://google.serper.dev/{search,images,videos,lens}，使用
+# X-API-KEY 头鉴权。Key 从 https://serper.dev 注册并获取，配置在
+# Render Environment 中作为 secret。一个 key 即可同时支持 4 种模式。
+SERPER_API_KEY = (os.getenv("SERPER_API_KEY") or "").strip()
+# 可选：单次请求超时（秒）；默认 12s 与外层 web_search 工具超时（45s）预算匹配。
+# 真正赋值在 _positive_float_env 定义之后（见下文 SERPER_API_TIMEOUT_RESOLVED）。
 
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
@@ -76,6 +78,10 @@ def _positive_int_env(name: str, default: int, minimum: int) -> int:
         return max(minimum, int(os.getenv(name, str(default))))
     except (TypeError, ValueError):
         return default
+
+
+# 现在 _positive_float_env 已定义，可以安全赋值。
+SERPER_API_TIMEOUT = _positive_float_env("SERPER_API_TIMEOUT", 12.0, 1.0)
 
 
 # ---------- 日志截断配置 ----------
@@ -867,7 +873,7 @@ _SENSITIVE_EXACT = {
     "XAI_API_KEY", "GROQ_API_KEY", "MODELSCOPE_API_KEY", "AGNES_API_KEY",
     "R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY",
     "R2_BUCKET_NAME", "R2_PUBLIC_URL", "R2_REGION",
-    "SERPER_MCP_TOKEN", "GAODE_MCP_TOKEN",
+    "SERPER_API_KEY", "GAODE_MCP_TOKEN",
     "WEBHOOK_TOKEN", "WEBHOOK_URL",
 }
 
