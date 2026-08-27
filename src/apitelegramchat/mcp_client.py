@@ -162,7 +162,7 @@ def _build_servers() -> dict[str, MCPServerConfig]:
                     "GAODE_MCP_ALLOWED_HOSTS", {"mcp.api-inference.modelscope.net"}
                 ),
                 allowed_tools=frozenset({
-                    "maps_ip_location", "maps_geo", "maps_text_search", "maps_around_search",
+                    "maps_geo", "maps_text_search", "maps_around_search",
                     "maps_search_detail", "maps_bicycling", "maps_direction_bicycling",
                     "maps_direction_walking", "maps_direction_driving",
                     "maps_direction_transit_integrated", "maps_distance",

@@ -4,8 +4,7 @@ import os
 import logging
 from pathlib import Path
 from apitelegramchat.workspace_paths import (
-    workspace_root, workspace_workdir, workspace_namespace,
-    workspace_upload_root,
+    workspace_root, workspace_namespace,
 )
 
 from apitelegramchat.s3_utils import (
@@ -154,21 +153,6 @@ async def _sync_named_file_to_r2(chat_id: int, local_path: Path, remote_name: st
 # `telegram/{file_id}` R2 缓存负责；历史上也曾有过 upload/ 的 R2 镜像同步
 # （_sync_upload_from_r2 / _persist_upload_file_to_r2），但恢复方向从未被
 # 调用且会造成重复存储，已随 stage_upload 一并移除。
-
-
-async def list_upload_files(chat_id: int, *, namespace: str | None = None) -> list[dict]:
-    """列出 upload/ 下的所有文件（相对路径 + 大小）。"""
-    root = workspace_upload_root(chat_id, namespace)
-    out: list[dict] = []
-    if not root.exists():
-        return out
-    for p in sorted(root.rglob("*")):
-        if p.is_file():
-            try:
-                out.append({"path": str(p.relative_to(root)), "size": p.stat().st_size})
-            except OSError:
-                continue
-    return out
 
 
 # ========== 可选：初始化工作区（后台执行） ==========

@@ -20,7 +20,6 @@ from urllib.parse import urlparse
 from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
     _ensure_runtime_workspace,
-    list_upload_files,
 )
 
 from apitelegramchat.sandbox import (
@@ -46,7 +45,7 @@ from apitelegramchat.search_engine import (
     execute_weather,
     execute_news,
     execute_crypto_price,
-    execute_ip_geo,
+    execute_geocode,
     execute_qr_code,
     execute_generate_image,
     execute_generate_video,
@@ -555,14 +554,6 @@ def _render_map_location_card(payload: object, tool_name: str) -> str | None:
             cards.append(f"<details{' open' if index == 1 else ''}><summary>位置 {index}{' · ' + escape_html(location) if location else ''}</summary>{''.join(body) or '<p><i>上游未返回可展示字段。</i></p>'}</details>")
         return "".join(cards)
 
-    if tool_name == "ip_geo":
-        area = " · ".join(
-            part for part in (_poi_value(data, "country"), _poi_value(data, "province", "provice"), _poi_value(data, "city"), _poi_value(data, "district")) if part
-        )
-        if area:
-            return f"<p><b>🌐 IP 地理位置</b><br/>{escape_html(area)}</p>"
-        return "<p><b>🌐 IP 地理位置</b><br/><i>上游未返回可识别的区域信息。</i></p>"
-
     if tool_name == "regeocode":
         area = " · ".join(
             part for part in (_poi_value(data, "province", "provice"), _poi_value(data, "city"), _poi_value(data, "district")) if part
@@ -696,7 +687,7 @@ def _render_map_payload(payload: object, tool_name: str | None) -> str | None:
     poi_cards = _render_poi_cards(payload)
     if poi_cards:
         return poi_cards
-    if tool_name in {"geocode", "ip_geo", "regeocode"}:
+    if tool_name in {"geocode", "regeocode"}:
         card = _render_map_location_card(payload, tool_name)
         if card:
             return card
@@ -1636,7 +1627,6 @@ _TOOL_TIMEOUT_LABELS = {
     "weather": "Weather fetch",
     "news": "News fetch",
     "crypto_price": "Crypto price lookup",
-    "ip_geo": "IP geolocation",
     "qr_code": "QR code generation",
     "generate_video": "Video generation",
     "geocode": "Geocoding",
@@ -1648,7 +1638,6 @@ _TOOL_TIMEOUT_LABELS = {
     "text_editor": "Text editor operation",
     "bash": "Bash command",
     "present_files": "File presentation",
-    "list_upload": "List upload/",
 }
 
 # ---------- web_search 结果解析与渲染 ----------
@@ -1980,7 +1969,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
     #   - 若解析出 JSON 且含 status=error，则显示为失败
     #   - 否则把原始输出转义后直接展示给用户，让 LLM 在后续轮次里自由解读。
     elif fn_name in ("geocode", "route", "distance", "poi_keyword_search",
-                     "poi_nearby_search", "poi_details", "ip_geo"):
+                     "poi_nearby_search", "poi_details"):
         label_map = {
             "geocode":            "📍 地理编码",
             "route":              "🚗 路线规划",
@@ -1988,7 +1977,6 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             "poi_keyword_search": "📍 POI 关键词搜索",
             "poi_nearby_search": "📍 POI 周边搜索",
             "poi_details":        "📍 POI 详情",
-            "ip_geo":             "🌍 IP 地理位置",
         }
         base_label = label_map.get(fn_name, fn_name)
 
@@ -2004,8 +1992,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             details_html = escape_html(str(message))
             return summary, details_html
 
-        ip = fn_args.get('ip') if fn_name == "ip_geo" else None
-        summary = base_label + (f" {ip}" if ip else "")
+        summary = base_label
         # 外部 MCP 常返回 JSON 文本。对聊天界面渲染结构化卡片，而向模型仍保留原始结果。
         details_html = _render_structured_payload(result_str, map_tool=fn_name) or _render_code_panel("服务响应 · 最近 10 行", result_str)
         return summary, details_html
@@ -2245,26 +2232,6 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
         details_html = "<br/>".join(details_parts)
         return summary, details_html
-    elif fn_name == "list_upload":
-        try:
-            data = json.loads(result_str)
-        except (json.JSONDecodeError, TypeError):
-            data = None
-        if not isinstance(data, dict):
-            return f"📋 {fn_name}", f"<pre><code>{escape_html(result_str)}</code></pre>"
-        files = data.get("files") or []
-        count = data.get("count", len(files))
-        label = "upload/"
-        summary = f"📋 {count} file(s) in {label}"
-        if not files:
-            details_html = f"<i>{label} is empty.</i>"
-        else:
-            items = "".join(
-                f"<li>{escape_html(str(f.get('path')))} <i>({f.get('size')} bytes)</i></li>"
-                for f in files if isinstance(f, dict)
-            )
-            details_html = f"<b>{label}</b><ul>{items}</ul>"
-        return summary, details_html
     else:
         summary = f"🔧 {fn_name}"
         details_html = escape_html(result_str)
@@ -2365,17 +2332,12 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
         return json.dumps({"sent": sent, "failed": failed, "error": None})
 
 
-async def execute_list_upload(chat_id: int) -> str:
-    """List files in upload/ (staged outgoing artifacts)."""
-    items = await list_upload_files(chat_id)
-    return json.dumps({"files": items, "count": len(items)}, ensure_ascii=False)
-
-
 # ---------- 已移除工具的迁移提示 ----------
-# stage_upload / fetch_download / list_download 已删除：upload/ 与 download/
-# 本就是工作区根目录的子目录，bash 可直接读写（`cat download/x.pdf`、
-# `cp out.txt upload/out.txt`）。若模型（尤其是带着旧对话历史）仍调用旧工具，
-# 返回可操作的迁移指引而不是干巴巴的“未知工具”。
+# stage_upload / fetch_download / list_download / list_upload 已删除：upload/
+# 与 download/ 本就是工作区根目录的子目录，bash 可直接读写
+# （`cat download/x.pdf`、`cp out.txt upload/out.txt`、`ls -la upload/`）。
+# 若模型（尤其是带着旧对话历史）仍调用旧工具，返回可操作的迁移指引
+# 而不是干巴巴的“未知工具”。
 _REMOVED_TOOL_HINTS = {
     "fetch_download": (
         "fetch_download 已移除：download/ 就在工作区根目录下，可直接访问。"
@@ -2388,6 +2350,12 @@ _REMOVED_TOOL_HINTS = {
     ),
     "list_download": (
         "list_download 已移除：用 bash 执行 `ls -la download/` 查看用户上传的文件。"
+    ),
+    "list_upload": (
+        "list_upload 已移除：用 bash 执行 `ls -la upload/` 查看发送暂存区里的文件。"
+    ),
+    "ip_geo": (
+        "ip_geo 已移除：不再提供 IP 归属地查询能力，无需重试。"
     ),
 }
 
@@ -2443,8 +2411,6 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             return await execute_news(arguments.get("source", "bbc"), arguments.get("limit", 5))
         elif name == "crypto_price":
             return await execute_crypto_price(arguments.get("coin", ""), arguments.get("currency", "usd"))
-        elif name == "ip_geo":
-            return await execute_ip_geo(arguments.get("ip"))
         elif name == "qr_code":
             return await execute_qr_code(arguments.get("text", ""))
         elif name == "generate_image_from_text":
@@ -2573,10 +2539,8 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             if isinstance(paths, str):
                 paths = [paths]
             return await execute_present_files(chat_id, paths)
-        elif name == "list_upload":
-            return await execute_list_upload(chat_id)
         elif name in _REMOVED_TOOL_HINTS:
-            # stage_upload / fetch_download / list_download 已移除；
+            # stage_upload / fetch_download / list_download / list_upload / ip_geo 已移除；
             # 迁移提示让模型立即改用 bash 直访，避免无意义的重试。
             return f"失败：{_REMOVED_TOOL_HINTS[name]}"
         else:

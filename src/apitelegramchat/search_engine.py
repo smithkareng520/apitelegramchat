@@ -717,19 +717,6 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "ip_geo",
-            "description": "Get geolocation info (country, region, city, ISP, ASN) for an IPv4 address. If ip omitted, queries the server's own IP.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ip": {"type": "string", "description": "IPv4 地址（可选，缺省时查服务器自身）"}
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "qr_code",
             "description": "Generate a QR code image from text or URL and return its public URL.",
             "parameters": {
@@ -976,19 +963,6 @@ SEARCH_TOOLS = [
                 {"_description": "把报告放入发送暂存区", "command": "cp report.pdf upload/report.pdf"},
                 {"_description": "重启卡死的会话", "restart": True}
             ]
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_upload",
-            "description": (
-                "List all files currently staged in upload/ waiting to be sent to the user via present_files."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
         }
     },
     {
@@ -2527,29 +2501,6 @@ async def execute_crypto_price(coin: str, currency: str = "usd") -> str:
     if price is None:
         return f"失败：不支持的目标货币：{currency}"
     return f"<b>{coin.upper()} 当前价格</b><br/>{price} {currency.upper()}"
-
-
-# --------------------- ip_geo ---------------------
-async def execute_ip_geo(ip: str = None) -> str:
-    """IP 地理位置：委托给 amap-maps MCP 的 maps_ip_location 工具。
-
-    未配置 GAODE_MCP_TOKEN 时 mcp_client.py 不会注册 amap-maps 服务，
-    调用会以 MCPToolError 形式抛回，这里转成 JSON 错误信息给上层。
-    """
-    args: dict[str, Any] = {}
-    if ip:
-        args["ip"] = ip
-    try:
-        raw = await call_mcp_tool("amap-maps", "maps_ip_location", args)
-    except MCPToolError as e:
-        return json.dumps(
-            {"status": "error", "message": f"amap-maps MCP 调用失败：{e}"},
-            ensure_ascii=False,
-        )
-    return raw if raw else json.dumps(
-        {"status": "error", "message": "amap-maps 返回空"},
-        ensure_ascii=False,
-    )
 
 
 # --------------------- qr_code ---------------------

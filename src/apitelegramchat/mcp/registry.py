@@ -125,11 +125,6 @@ async def crypto(_: MCPRequestContext, args: JsonObject) -> str:
     return await invoke(execute_crypto_price, args["coin"], args.get("currency", "usd"))
 
 
-async def ip_geo(_: MCPRequestContext, args: JsonObject) -> str:
-    from apitelegramchat.search_engine import execute_ip_geo
-    return await invoke(execute_ip_geo, args.get("ip"))
-
-
 async def geocode(_: MCPRequestContext, args: JsonObject) -> str:
     from apitelegramchat.search_engine import execute_geocode
     return await invoke(execute_geocode, args["address"])
@@ -165,11 +160,6 @@ async def poi_nearby(_: MCPRequestContext, args: JsonObject) -> str:
 async def poi_details(_: MCPRequestContext, args: JsonObject) -> str:
     from apitelegramchat.search_engine import execute_poi_details
     return await invoke(execute_poi_details, args["id"])
-
-
-async def list_upload(context: MCPRequestContext, _: JsonObject) -> str:
-    from apitelegramchat.tool_executors import execute_list_upload
-    return await invoke(execute_list_upload, context.chat_id)
 
 
 async def workspace_view(context: MCPRequestContext, args: JsonObject) -> str:
@@ -226,14 +216,12 @@ READ_ONLY_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("search.weather", "Weather", "Retrieve current weather and forecast for a city. Returns current conditions, up to 24 hours of hourly forecast, and up to 5 days of daily forecast. Use unit='c' for Celsius (default) or 'f' for Fahrenheit.", object_schema({"city": text_field("City or location.", 1), "unit": {"type": "string", "enum": ["c", "f"]}, "hours": int_field("Forecast hours.", 1, 24)}, ("city",)), weather),
     ToolSpec("search.news", "News", "Retrieve news summaries.", object_schema({"source": text_field("Optional source identifier."), "limit": int_field("Maximum result count.", 1, 10)}), news),
     ToolSpec("search.crypto_price", "Crypto price", "Retrieve a cryptocurrency price.", object_schema({"coin": text_field("Coin name or symbol.", 1), "currency": text_field("Quote currency.", 3)}, ("coin",)), crypto),
-    ToolSpec("search.ip_geo", "IP geolocation", "Look up a supplied IP address.", object_schema({"ip": text_field("Optional IP address.")}), ip_geo),
     ToolSpec("geo.geocode", "Geocode", "Convert an address to coordinates.", object_schema({"address": text_field("Address.", 1)}, ("address",)), geocode),
     ToolSpec("geo.route", "Route", "Plan a route between longitude,latitude coordinates.", object_schema({"origin": text_field("Origin longitude,latitude.", 3), "destination": text_field("Destination longitude,latitude.", 3), "mode": {"type": "string", "enum": ["cycling", "walking", "driving", "transit"]}, "city": text_field("Optional origin city."), "cityd": text_field("Optional destination city.")}, ("origin", "destination")), route),
     ToolSpec("geo.distance", "Distance", "Measure straight-line coordinate distance.", object_schema({"origin": text_field("Origin longitude,latitude.", 3), "destination": text_field("Destination longitude,latitude.", 3)}, ("origin", "destination")), distance),
     ToolSpec("geo.poi_keyword_search", "POI keyword search", "Search points of interest by keyword.", object_schema({"keywords": text_field("Search keywords.", 1), "city": text_field("Optional city.")}, ("keywords",)), poi_keyword),
     ToolSpec("geo.poi_nearby_search", "Nearby POI search", "Search points of interest near coordinates.", object_schema({"keywords": text_field("Search keywords.", 1), "location": text_field("Longitude,latitude.", 3), "radius": int_field("Radius in metres.", 1, 50000)}, ("keywords", "location")), poi_nearby),
     ToolSpec("geo.poi_details", "POI details", "Retrieve point-of-interest details.", object_schema({"id": text_field("Point-of-interest identifier.", 1)}, ("id",)), poi_details),
-    ToolSpec("workspace.list_upload", "List staged files", "List files in the private upload staging area.", object_schema({}), list_upload),
     ToolSpec("workspace.view", "View text file", "View a private UTF-8 text file with 1-based line numbers. Directories are not supported.", object_schema({"command": {"type": "string", "enum": ["view"]}, "path": text_field("Relative workspace file path.", 1), "view_range": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}}, ("command", "path")), workspace_view),
 )
 

@@ -521,8 +521,6 @@ class RichMessageBuilder:
             group["outer_summary"] = mapping.get(command, "Editing file")
         elif t == "present_files":
             group["outer_summary"] = "Presenting file(s)"
-        elif t == "list_upload":
-            group["outer_summary"] = "Listing upload/"
         elif t == "ask_user":
             group["outer_summary"] = "Waiting for your answer"
         elif t == "wikipedia":
@@ -531,8 +529,6 @@ class RichMessageBuilder:
             group["outer_summary"] = "Fetching news"
         elif t == "book_lookup":
             group["outer_summary"] = "Looking up a book"
-        elif t == "ip_geo":
-            group["outer_summary"] = "Looking up IP location"
         elif t == "geocode":
             group["outer_summary"] = "Geocoding address"
         elif t == "route":
@@ -583,12 +579,10 @@ class RichMessageBuilder:
         "text_editor_create": ("Created a file", "Created {n} files"),
         "text_editor_delete": ("Deleted a file", "Deleted {n} files"),
         "present_files": ("Presented a file", "Presented {n} files"),
-        "list_upload": ("Listed upload/", "Listed upload/"),
         "wikipedia": ("Looked up on Wikipedia", "Looked up on Wikipedia"),
         "news": ("Fetched news", "Fetched news from {n} sources"),
         "fetch_url": ("Fetched a page", "Fetched {n} pages"),
         "book_lookup": ("Looked up a book", "Looked up {n} books"),
-        "ip_geo": ("Looked up IP location", "Looked up IP location"),
         "geocode": ("Geocoded an address", "Geocoded {n} addresses"),
         "nearby_search": ("Searched nearby", "Searched nearby for {n} categories"),
         "route": ("Planned a route", "Planned {n} routes"),

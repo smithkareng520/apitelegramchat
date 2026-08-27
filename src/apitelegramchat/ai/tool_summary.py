@@ -147,11 +147,9 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     # ---------- 其他工具，按规范进行时文本 ----------
     mapping = {
         "present_files": "Presenting file(s)",
-        "list_upload": "Listing upload/",
         "wikipedia": "Looking up on Wikipedia",
         "news": "Fetching news",
         "book_lookup": "Looking up a book",
-        "ip_geo": "Looking up IP location",
         "geocode": "Geocoding address",
         "route": "Planning route",
         "distance": "Measuring distance",
@@ -192,7 +190,6 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
         "weather": "fetched weather",
         "news": "fetched news",
         "crypto_price": "checked crypto prices",
-        "ip_geo": "located an IP",
         "qr_code": "generated a QR code",
         "generate_video": "generated a video",
         "geocode": "geocoded an address",
@@ -203,7 +200,6 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
         "distance": "measured a distance",
         "bash": "ran a command",
         "present_files": "presented files",
-        "list_upload": "listed upload/",
         "ask_user": "asked for your input",
     }
     return mapping.get(fn_name, f"ran {fn_name}")
@@ -408,9 +404,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         n = len(paths) if isinstance(paths, list) else 0
         return "Presented file" if n <= 1 else f"Presented {n} files"
 
-    if fn_name == "list_upload":
-        return "Listed upload/"
-
     if fn_name == "generate_image_from_text":
         n = _coerce_positive_int(fn_args.get("num_images"), 1)
         return "Generated an image" if n == 1 else f"Generated {n} images"
@@ -426,7 +419,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         "wikipedia": "Looked up on Wikipedia",
         "news": "Fetched news",
         "book_lookup": "Looked up a book",
-        "ip_geo": "Looked up IP location",
         "geocode": "Geocoded an address",
         "nearby_search": "Searched nearby",
         "route": "Planned a route",

@@ -465,7 +465,6 @@ book_lookup
 weather
 news
 crypto_price
-ip_geo
 qr_code
 ```
 
@@ -497,13 +496,13 @@ longitude,latitude
 ```text
 text_editor
 bash
-list_upload
 present_files
 ```
 
 说明：`upload/` 与 `download/` 是工作区根目录的两个子目录，bash / text_editor
-可直接通过相对路径读写（`cat download/x.pdf`、`cp out.txt upload/out.txt`），
-不再提供 stage_upload / fetch_download / list_download 跨边界工具。
+可直接通过相对路径读写（`cat download/x.pdf`、`cp out.txt upload/out.txt`、
+`ls -la upload/`），不再提供 stage_upload / fetch_download / list_download /
+list_upload 跨边界工具。
 
 ### 生成
 
@@ -883,7 +882,6 @@ search.book_lookup
 search.weather
 search.news
 search.crypto_price
-search.ip_geo
 
 geo.geocode
 geo.route
@@ -892,7 +890,6 @@ geo.poi_keyword_search
 geo.poi_nearby_search
 geo.poi_details
 
-workspace.list_upload
 workspace.view
 ```
 

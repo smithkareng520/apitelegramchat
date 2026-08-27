@@ -107,13 +107,12 @@ SUBAGENT_TOOL_TIMEOUT = _env_int("SUBAGENT_TOOL_TIMEOUT", 120, min_value=5, max_
 # prompt cache 失效。用 list + sort 保证稳定顺序。
 DEFAULT_ALLOWED_TOOLS = sorted([
     "web_search", "fetch_url", "wikipedia", "exchange_rate",
-    "book_lookup", "weather", "news", "crypto_price", "ip_geo", "qr_code",
+    "book_lookup", "weather", "news", "crypto_price", "qr_code",
     "geocode", "route", "distance", "poi_keyword_search",
     "poi_nearby_search", "poi_details",
     "bash", "text_editor", "todo",
     # upload/download 是 workspace 根目录的子目录，bash 可直接读写，
-    # 不再需要显式跨边界工具。
-    "list_upload",
+    # 不再需要显式跨边界工具（list_upload 已一并移除，用 `ls -la upload/`）。
     "present_files",
     # 不含 generate_image / video / subagent / memory / skill
     # 注：elevation / traffic / isochrone 工具已随 amap_integration.py 迁移到
