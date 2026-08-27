@@ -71,6 +71,56 @@ def truncate_to_token_budget(
     return encoding.decode(encoded[:keep]) + suffix
 
 
+def truncate_to_token_budget_head_tail(
+    value: Any,
+    token_budget: int,
+    *,
+    head_ratio: float = 0.7,
+    note: str = "\n…[输出超过 token 预算：已保留开头与结尾，中间内容已省略]\n",
+    encoding_name: str = DEFAULT_ENCODING_NAME,
+) -> str:
+    """Truncate text keeping BOTH the head and the tail within the budget.
+
+    Command output is the classic case where the *tail* carries the most
+    valuable information (compiler errors, tracebacks, `tail`-style summaries),
+    while a plain head-truncation silently discards it. This helper keeps
+    ``head_ratio`` of the budget for the beginning and the remainder for the
+    end, inserting a human/model-readable note that states what happened.
+    """
+    if token_budget < 0:
+        raise ValueError("token_budget must be non-negative")
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else str(value)
+    if not text or token_budget == 0:
+        return ""
+
+    encoding = _get_encoding(encoding_name)
+    encoded = encoding.encode(text, disallowed_special=())
+    if len(encoded) <= token_budget:
+        return text
+
+    encoded_note = encoding.encode(note, disallowed_special=()) if note else []
+    if len(encoded_note) >= token_budget:
+        # 预算极小时退化为普通截断，保证输出永远合法。
+        return encoding.decode(encoded[:token_budget])
+
+    usable = token_budget - len(encoded_note)
+    if usable <= 0:
+        return encoding.decode(encoded_note[:token_budget])
+    head_ratio = min(max(head_ratio, 0.1), 0.9)
+    head_tokens = max(1, int(usable * head_ratio))
+    tail_tokens = max(1, usable - head_tokens)
+    omitted = len(encoded) - head_tokens - tail_tokens
+    head_text = encoding.decode(encoded[:head_tokens])
+    tail_text = encoding.decode(encoded[-tail_tokens:])
+    suffix = (
+        f"\n…[输出超过 token 预算：已保留开头 {head_tokens} 与结尾 {tail_tokens} 个 token，"
+        f"中间约 {omitted} 个 token 已省略；如需完整内容请将输出重定向到文件后用 grep/text_editor 查看]\n"
+    )
+    return head_text + suffix + tail_text
+
+
 def fits_token_budget(value: Any, token_budget: int) -> bool:
     """Return whether ``value`` fits within a non-negative token budget."""
     if token_budget < 0:
@@ -94,4 +144,5 @@ __all__ = [
     "fits_token_budget",
     "json_token_count",
     "truncate_to_token_budget",
+    "truncate_to_token_budget_head_tail",
 ]

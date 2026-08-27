@@ -69,7 +69,7 @@ from apitelegramchat.todo_tool import (
 from apitelegramchat.memory_tool import execute_memory, render_memory_card
 from apitelegramchat.subagent_tool import execute_subagent, render_subagent_card
 from apitelegramchat.utils import escape_html
-from apitelegramchat.token_budget import truncate_to_token_budget
+from apitelegramchat.token_budget import truncate_to_token_budget, truncate_to_token_budget_head_tail
 
 logger = logging.getLogger(__name__)
 
@@ -78,14 +78,139 @@ tool_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TOOLS)
 
 TOOL_RESPONSE_TOKEN_BUDGET = int(os.getenv("TOOL_RESPONSE_TOKEN_BUDGET", "20000"))
 
+# ---------- Bash 输出上限（环境变量可调） ----------
+# 单条 Bash 命令返回给模型的内容上限（字符数）。超限时不再像旧版那样
+# 只保留开头 20000 字符，而是「保留开头 + 结尾、省略中间」，因为编译错误、
+# traceback、日志摘要几乎总是出现在输出末尾，纯头部截断会把最有价值的
+# 部分默默丢掉。设为 0 表示不限制（不建议：狂刷输出的命令会撑爆内存与
+# 模型上下文）。
+SANDBOX_OUTPUT_MAX_CHARS = int(os.getenv("SANDBOX_OUTPUT_MAX_CHARS", "80000"))
 
-def _truncate_tool_result(result: str) -> str:
-    """Bound every model-facing tool result by an exact 20k-token budget."""
+
+def _truncate_tool_result(result: str, fn_name: str | None = None) -> str:
+    """Bound every model-facing tool result by an exact 20k-token budget.
+
+    bash 结果改用「头尾保留」策略：命令输出的报错几乎总在结尾，纯头部
+    截断会让模型看不到失败原因，进而盲目重试浪费请求。
+    """
+    if fn_name == "bash":
+        return truncate_to_token_budget_head_tail(
+            result,
+            TOOL_RESPONSE_TOKEN_BUDGET,
+        )
     return truncate_to_token_budget(
         result,
         TOOL_RESPONSE_TOKEN_BUDGET,
         suffix="\n…[内容过长，已按 token 预算截断]",
     )
+
+
+class _BashOutputBuffer:
+    """Bounded accumulator for subprocess output: keeps head + rolling tail.
+
+    旧实现把全部输出无限累积进内存，再一刀切只留开头 20000 字符，存在
+    两个问题：
+      1. 狂刷输出的命令（`yes`、误写的热循环、`find /`）会让应用 OOM；
+      2. 头部截断丢掉了几乎必然位于结尾的错误信息。
+    本缓冲区用固定字符预算同时解决两者：预算内原样保留；超预算后保留
+    开头 head_ratio 比例 + 滚动尾部，中间丢弃并精确计数，最终在结果里
+    插入一条可读说明，让模型知道自己看到的是被裁剪过的输出。
+    """
+
+    __slots__ = ("keep", "head_ratio", "_head", "_tail", "_kept", "_dropped", "_capped", "_total")
+
+    def __init__(self, keep_chars: int = SANDBOX_OUTPUT_MAX_CHARS, head_ratio: float = 0.7):
+        # 下限 200 仅防退化输入（负数/极小值）；0 视为不限制。
+        self.keep = max(200, int(keep_chars)) if keep_chars else 10**12
+        self.head_ratio = min(max(head_ratio, 0.1), 0.9)
+        self._head: list[str] = []
+        self._tail: list[str] = []
+        self._kept = 0
+        self._dropped = 0
+        self._total = 0
+        self._capped = False
+
+    @property
+    def total_seen(self) -> int:
+        """到目前为止接收到的全部字符数（含被丢弃的中间部分）。"""
+        return self._total
+
+    def add(self, text: str) -> None:
+        if not text:
+            return
+        self._total += len(text)
+        if not self._capped:
+            self._head.append(text)
+            self._kept += len(text)
+            if self._kept > self.keep:
+                self._enter_capped_mode()
+            return
+        self._tail.append(text)
+        self._kept += len(text)
+        self._trim_to_budget()
+
+    def _enter_capped_mode(self) -> None:
+        """把已累积内容切成「固定头部 + 滚动尾部」两段。"""
+        self._capped = True
+        whole = "".join(self._head)
+        head_len = max(1, int(self.keep * self.head_ratio))
+        tail_len = max(1, self.keep - head_len)
+        if len(whole) <= self.keep:
+            # 只有跨过预算边界的那一小段超出，无需丢弃。
+            self._tail = [""]
+            return
+        self._head = [whole[:head_len]]
+        self._dropped += len(whole) - head_len - tail_len
+        self._tail = [whole[-tail_len:]] if tail_len else []
+        self._kept = len(self._head[0]) + len(self._tail[0]) if self._tail else len(self._head[0])
+
+    def _trim_to_budget(self) -> None:
+        """超预算时优先消耗头部（挪入 dropped），头部耗尽后滚动丢弃最旧尾部。"""
+        while self._kept > self.keep:
+            if self._head:
+                last = self._head[-1]
+                excess = self._kept - self.keep
+                if len(last) <= excess:
+                    self._head.pop()
+                    self._dropped += len(last)
+                    self._kept -= len(last)
+                else:
+                    cut = len(last) - excess
+                    self._head[-1] = last[:cut]
+                    self._dropped += excess
+                    self._kept -= excess
+            elif self._tail:
+                oldest = self._tail[0]
+                excess = self._kept - self.keep
+                if len(oldest) <= excess:
+                    self._tail.pop(0)
+                    self._dropped += len(oldest)
+                    self._kept -= len(oldest)
+                else:
+                    self._tail[0] = oldest[excess:]
+                    self._dropped += excess
+                    self._kept -= excess
+            else:
+                break
+
+    def preview(self, last_chars: int = 8000) -> str:
+        """进度回调用的最近一段输出。"""
+        whole = "".join(self._head) + "".join(self._tail)
+        return whole[-last_chars:] if last_chars and len(whole) > last_chars else whole
+
+    def finalize(self) -> str:
+        """返回最终文本；中间被省略时插入明确说明。"""
+        head = "".join(self._head)
+        tail = "".join(self._tail)
+        if not self._capped or self._dropped <= 0:
+            return head + tail
+        note = (
+            f"\n... [output truncated: {self._dropped} chars omitted from the middle; "
+            f"kept the first {len(head)} and the last {len(tail)} chars. "
+            f"Redirect full output to a file (e.g. `cmd > out.log`) and inspect it "
+            f"with grep/tail/text_editor if you need the omitted part] ...\n"
+        )
+        return head + note + tail
 
 
 _UI_TAIL_LINES = 10
@@ -626,13 +751,31 @@ def _truncate_ui_lines(text: str, max_lines: int = _TOOL_UI_MAX_LINES) -> str:
     return f"{kept}\n…（已截断，共 {len(lines)} 行，仅显示前 {max_lines} 行）"
 
 
-def _render_editor_quote(label: str, value: str) -> str:
+def _truncate_ui_lines_head_tail(text: str, max_lines: int = _TOOL_UI_MAX_LINES) -> str:
+    """Keep the first ~60% and the last ~40% lines; note the omitted middle.
+
+    Bash 输出的报错/摘要几乎总在结尾，纯头部截断会让用户在卡片里看不到
+    失败原因；这里保头也保尾，中间以说明行代替。
+    """
+    text = text if isinstance(text, str) else str(text or "")
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    head_lines = max(1, int(max_lines * 0.6))
+    tail_lines = max(1, max_lines - head_lines - 1)  # 预留 1 行给省略说明
+    omitted = len(lines) - head_lines - tail_lines
+    head = "\n".join(lines[:head_lines])
+    tail = "\n".join(lines[-tail_lines:])
+    return f"{head}\n…（已截断，共 {len(lines)} 行，省略中间 {omitted} 行）\n{tail}"
+
+
+def _render_editor_quote(label: str, value: str, truncator=_truncate_ui_lines) -> str:
     """Render a tool's input or output as a plain quoted text block, truncated to _TOOL_UI_MAX_LINES lines."""
     text = value if isinstance(value, str) else str(value or "")
     if not text:
         text = "(empty)"
     else:
-        text = _truncate_ui_lines(text)
+        text = truncator(text)
     quoted_text = escape_html(text).replace("\n", "<br/>")
     return f"<p><b>{escape_html(label)}</b></p><blockquote>{quoted_text}</blockquote>"
 
@@ -683,23 +826,62 @@ def _format_image_generation_result(
     return failure_summary, _render_media_failure_result(result_str, failure_fallback)
 
 
-def _render_bash_result(result_str: str) -> str:
-    """Render bash calls the same way as text_editor: quote-formatted Input and Output."""
-    metadata, separator, output = (result_str or "").partition("Output:\n")
-    command = ""
-    exit_code = ""
+def _extract_bash_command_from_envelope(result_str: str) -> str:
+    """从结果信封里恢复命令文本（兜底路径）。
+
+    信封格式为 ``Command: <命令>\nCwd: ...\nExit code: ...``，而命令本身
+    可以包含任意多行（例如 `python3 -c "..."` 跨行书写）。旧的逐行前缀
+    匹配只取得到第一行，这里改为取 ``Command: `` 到 ``Cwd: `` 元数据行
+    之间的完整文本。
+    """
+    metadata = (result_str or "").partition("Output:\n")[0]
+    if not metadata:
+        return ""
+    match = re.search(r"(?ms)^Command: (.*?)\r?\n^Cwd: ", metadata)
+    if match:
+        return match.group(1)
+    # 极旧格式或 Cwd 行缺失：退化为第一个 "Command: " 行。
     for line in metadata.splitlines():
         if line.startswith("Command: "):
-            command = line.removeprefix("Command: ")
-        elif line.startswith("Exit code: "):
+            return line.removeprefix("Command: ")
+    return ""
+
+
+def _render_bash_result(result_str: str, fn_args: dict | None = None) -> str:
+    """Render bash calls the same way as text_editor: quote-formatted Input and Output.
+
+    修复：Input 必须优先取工具调用参数里的原始 command。旧实现从结果信封
+    逐行解析 ``Command: `` 前缀，多行命令（如 ``python3 -c "…"`` 跨行）只剩
+    第一行 —— 用户在草稿富文本里看到 Input 显示成 ``python3 -c "`` 的截断
+    假象就来自这里（并非被过滤，而是解析丢了后续行）。
+    """
+    metadata, separator, output = (result_str or "").partition("Output:\n")
+    command = ""
+    if isinstance(fn_args, dict):
+        raw_command = fn_args.get("command")
+        if isinstance(raw_command, str):
+            command = raw_command
+    if not command:
+        command = _extract_bash_command_from_envelope(result_str)
+    exit_code = ""
+    for line in metadata.splitlines():
+        if line.startswith("Exit code: "):
             exit_code = line.removeprefix("Exit code: ")
     if not separator:
-        # 没有标准的 "Output:" 分隔符时，把完整原始返回当作 Output 展示。
+        # 没有标准的 "Output:" 分隔符时（restart 确认、拒绝原因等），
+        # 若无命令可展示则只渲染 Output，避免出现空 Input 引用块。
+        if not command:
+            return _render_editor_quote("Output", result_str)
         return _render_editor_quote("Input", command) + _render_editor_quote("Output", result_str)
     output_text = output
     if exit_code:
         output_text = f"[exit code {exit_code}]\n{output}"
-    return _render_editor_quote("Input", command) + _render_editor_quote("Output", output_text)
+    # Input 展示原始命令（头部优先：命令开头携带意图）；Output 保头保尾：
+    # 报错信息几乎总在末尾。
+    return (
+        _render_editor_quote("Input", command)
+        + _render_editor_quote("Output", output_text, truncator=_truncate_ui_lines_head_tail)
+    )
 
 
 def _editor_result_summary(result_str: str) -> str:
@@ -1049,7 +1231,7 @@ class BashSession:
             preexec_fn=preexec,
         )
 
-        output_parts: list[str] = []
+        output_buffer = _BashOutputBuffer()
         last_emit = 0.0
 
         async def emit_progress(force: bool = False):
@@ -1059,7 +1241,7 @@ class BashSession:
             now = time.monotonic()
             if not force and now - last_emit < 1.0:
                 return
-            preview = "".join(output_parts)[-8000:]
+            preview = output_buffer.preview(8000)
             try:
                 result = progress_callback(preview or "正在执行 Bash 命令…")
                 if asyncio.iscoroutine(result):
@@ -1075,7 +1257,7 @@ class BashSession:
                 chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=timeout)
                 if not chunk:
                     break
-                output_parts.append(chunk.decode("utf-8", errors="replace"))
+                output_buffer.add(chunk.decode("utf-8", errors="replace"))
                 await emit_progress()
                 # Once the first byte arrived, reset the idle read timer to keep
                 # long-running commands alive while still detecting a total hang.
@@ -1104,7 +1286,7 @@ class BashSession:
 
         await proc.wait()
         await emit_progress(force=True)
-        output = "".join(output_parts)
+        output = output_buffer.finalize()
         exit_code = proc.returncode if proc.returncode is not None else "unknown"
         marker_match = re.search(rf"(?m)^{re.escape(marker)}\s+(-?\d+)\s*$", output)
         if marker_match:
@@ -1114,8 +1296,6 @@ class BashSession:
         actual_cwd = cwd_match.group(1).strip() if cwd_match else cwd
         output = re.sub(r"(?m)^__ONE_SHOT_CWD__\s+.*$\n?", "", output)
         self._last_cwd = actual_cwd
-        if len(output) > 20000:
-            output = output[:20000] + "\n... (truncated)"
         output = re.sub(r'\x1b\[[0-9;]*m', '', output)
         return (f"Command: {command}\n"
                 f"Cwd: {actual_cwd}\n"
@@ -1190,15 +1370,21 @@ class BashSession:
             #   导致整个会话 hang 死。
             # 同时记录命令结束后的真实 PWD，用于结果显示；不会改变 shell 状态。
             full_cmd = (
-                f"{command}; echo; printf '{cwd_marker} %s\n' \"$PWD\"; "
-                f"echo '{marker} $?'\n"
+                # ★ 修复存量 bug ×2：
+                #   1) $? 必须放在引号外（旧写法 echo '{marker} $?' 把 $?
+                #      包进单引号，bash 不展开，退出码永远是 unknown）；
+                #   2) 退出码必须在命令结束的下一刻立刻捕获（__rc=$?），
+                #      否则中间的 echo/printf 会把 $? 重置为 0，失败命令
+                #      在模型眼里和成功无异。
+                f"{command}; __rc=$?; echo; printf '{cwd_marker} %s\n' \"$PWD\"; "
+                f"echo '{marker}' \"$__rc\"\n"
             )
 
             try:
                 self.proc.stdin.write(full_cmd.encode('utf-8'))
                 await self.proc.stdin.drain()
 
-                output_parts = []
+                output_buffer = _BashOutputBuffer()
                 exit_code = "unknown"
                 progress_last_emit = 0.0
                 progress_chars_at_emit = 0
@@ -1207,21 +1393,20 @@ class BashSession:
 
                 async def emit_progress(force: bool = False):
                     nonlocal progress_last_emit, progress_chars_at_emit
-                    if progress_callback is None or not output_parts:
+                    if progress_callback is None or output_buffer.total_seen == 0:
                         return
-                    output_text = "".join(output_parts)
+                    grew = output_buffer.total_seen - progress_chars_at_emit
                     now = time.monotonic()
-                    grew = len(output_text) - progress_chars_at_emit
                     if not force and grew < progress_min_chars and (now - progress_last_emit) < progress_min_interval:
                         return
                     # 前端草稿只需要最近一段日志；完整输出仍由最终结果保留。
-                    preview_text = output_text[-8000:]
+                    preview_text = output_buffer.preview(8000)
                     try:
                         result = progress_callback(preview_text)
                         if asyncio.iscoroutine(result):
                             await result
                         progress_last_emit = now
-                        progress_chars_at_emit = len(output_text)
+                        progress_chars_at_emit = output_buffer.total_seen
                     except asyncio.CancelledError:
                         raise
                     except Exception as cb_error:
@@ -1231,14 +1416,14 @@ class BashSession:
                 async def read_until_marker():
                     nonlocal exit_code
                     # marker 可能跨 chunk 被拆开，因此只保留一个很小的尾部用于跨 chunk 匹配；
-                    # 已经确定不可能包含 marker 的前缀立即写入 output_parts，避免每次都 O(n) 拼接。
+                    # 已经确定不可能包含 marker 的前缀立即写入输出缓冲，避免每次都 O(n) 拼接。
                     pending = ""
                     keep_tail = len(marker) + 64
                     while True:
                         chunk = await self.proc.stdout.read(4096)
                         if not chunk:
                             if pending:
-                                output_parts.append(pending)
+                                output_buffer.add(pending)
                                 pending = ""
                             break
 
@@ -1247,7 +1432,7 @@ class BashSession:
                         if marker_pos >= 0:
                             # marker 前是命令真实输出；后面紧接着是 echo 的退出码。
                             if marker_pos:
-                                output_parts.append(pending[:marker_pos])
+                                output_buffer.add(pending[:marker_pos])
                             marker_tail = pending[marker_pos:]
                             match = re.search(rf"{re.escape(marker)}\s+(-?\d+)", marker_tail)
                             if match:
@@ -1257,16 +1442,16 @@ class BashSession:
                             break
 
                         if len(pending) > keep_tail:
-                            output_parts.append(pending[:-keep_tail])
+                            output_buffer.add(pending[:-keep_tail])
                             pending = pending[-keep_tail:]
 
                         await emit_progress(force=False)
 
                 await asyncio.wait_for(read_until_marker(), timeout=timeout)
 
-                output = "".join(output_parts)
-                if len(output) > 20000:
-                    output = output[:20000] + "\n... (truncated)"
+                # 有界缓冲：预算内完整保留；超预算保留头+尾并省略中间，
+                # 上限由 SANDBOX_OUTPUT_MAX_CHARS 控制（默认 80000，远大于旧版 20000）。
+                output = output_buffer.finalize()
                 output = re.sub(r'\x1b\[[0-9;]*m', '', output)
 
                 # 提取命令结束后的真实 PWD，同时把内部 marker 从用户输出中移除。
@@ -2011,12 +2196,21 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         if "Error:" in result_str or "Command rejected" in result_str:
             summary = "❌ Bash 执行失败"
         else:
-            cmd_line = result_str.split("\n")[0].replace("Command: ", "")
+            # 优先从工具调用参数取原始命令：多行命令从结果信封逐行解析
+            # 只能拿到第一行，摘要会退化成 `python3 -c "` 这样的残句。
+            args_command = ""
+            if isinstance(fn_args, dict):
+                raw = fn_args.get("command")
+                if isinstance(raw, str):
+                    args_command = raw
+            cmd_line = args_command.strip() or _extract_bash_command_from_envelope(result_str)
+            cmd_line = cmd_line.splitlines()[0].strip() if cmd_line else ""
             if len(cmd_line) > 30:
                 cmd_line = cmd_line[:30] + "…"
             summary = f"🖥 {cmd_line or '命令已完成'}"
-        # 保留命令元信息，并将终端输出固定为带行号的最后十行，避免原始日志撑爆工具卡片。
-        details_html = _render_bash_result(result_str)
+        # 保留命令元信息（Input 取原始入参，Output 保头保尾），避免长输出
+        # 撑爆工具卡片的同时让用户始终能看到结尾的报错。
+        details_html = _render_bash_result(result_str, fn_args=fn_args)
         return summary, details_html
 
     elif fn_name == "present_files":

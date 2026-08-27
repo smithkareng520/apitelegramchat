@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from apitelegramchat.workspace_paths import workspace_workdir, runtime_cache_root
+from apitelegramchat.net_shims import ensure_network_shims
 
 logger = logging.getLogger(__name__)
 
@@ -356,6 +357,11 @@ def build_sandbox_env(
                 link.symlink_to(ccache_path)
             except OSError as exc:
                 logger.debug("Unable to prepare ccache wrapper %s: %s", link, exc)
+
+    # 旧镜像没有 curl/wget（Landlock 不拦网络，纯粹是没装）：安装纯 stdlib
+    # 兜底 shim 到 runtime bin（PATH 首位）。镜像里出现真二进制后自动让位。
+    # 这避免了模型执行 `curl ...` 得到 command not found、浪费一次工具调用。
+    ensure_network_shims(runtime_bin)
 
     # Keep runtime_bin first only for local wrappers. The actual compiler remains the
     # system toolchain baked into the image; no apt/pip install happens per Bash run.

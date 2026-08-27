@@ -636,9 +636,14 @@ SANDBOX_MAX_CPU_SEC=300
 SANDBOX_MAX_FILE_SIZE=104857600
 SANDBOX_MAX_OPEN_FILES=256
 SANDBOX_TIMEOUT_SEC=300
+SANDBOX_OUTPUT_MAX_CHARS=80000
 ```
 
-可根据部署环境调整。
+`SANDBOX_OUTPUT_MAX_CHARS` 控制单条 Bash 命令返回内容的字符上限。超限时**保留开头与结尾、只省略中间**（编译错误、traceback 几乎总在末尾，纯头部截断会把失败原因默默丢掉），并在结果中插入明确的省略说明。设为 `0` 可关闭限制（不建议：狂刷输出的命令会撑爆内存与模型上下文）。返回给模型的最终 token 预算仍由 `TOOL_RESPONSE_TOKEN_BUDGET`（默认 20000，bash 同样走头尾保留）兜底。
+
+### 网络与 curl/wget
+
+沙箱（Landlock）只限制文件系统，**不拦截出站网络**。`curl`/`wget`/`git`/`jq`/`zip` 已直接加入 Dockerfile；对暂未重建镜像的存量部署，应用会在 bash 会话启动时自动向 workspace 的 runtime bin（PATH 首位）安装纯 Python 标准库实现的 `curl`/`wget` 兜底 shim——镜像里一旦出现真二进制，shim 自动让位。工具描述中也已声明这些能力，避免模型先撞一次 `command not found` 再换写法、浪费工具调用。
 
 ### 为什么不用 bubblewrap？
 

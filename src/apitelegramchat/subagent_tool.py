@@ -168,7 +168,12 @@ def _filter_tools(allowed: Optional[list[str]]) -> list[dict]:
     return out
 
 
-def _truncate(s: str, token_budget: int = SUBAGENT_TOOL_RESULT_TOKEN_BUDGET) -> str:
+def _truncate(s: str, token_budget: int = SUBAGENT_TOOL_RESULT_TOKEN_BUDGET, fn_name: str | None = None) -> str:
+    # bash 结果用「头尾保留」策略：命令报错几乎总在结尾，纯头部截断
+    # 会让子 agent 看不到失败原因而盲目重试。
+    if fn_name == "bash":
+        from apitelegramchat.token_budget import truncate_to_token_budget_head_tail
+        return truncate_to_token_budget_head_tail(s, token_budget)
     return truncate_to_token_budget(
         s,
         token_budget,
@@ -196,7 +201,7 @@ async def _execute_tool_for_subagent(
                 dispatch_tool_call(name, arguments or {}, chat_id=chat_id),
                 timeout=SUBAGENT_TOOL_TIMEOUT,
             )
-        return _truncate(str(result))
+        return _truncate(str(result), fn_name=name)
     except asyncio.TimeoutError:
         return f"Error: tool '{name}' timed out in subagent context."
     except asyncio.CancelledError:

@@ -219,7 +219,9 @@ async def _run_tool_calls_and_append(
             # 阶段的 bug 丢掉它——格式化失败就退化为纯文本展示，而不是让整个
             # 工具调用从模型上下文和 UI 里"消失"。
             try:
-                safe_content = _truncate_tool_result(result_str)
+                # bash 结果走「头尾保留」截断：报错几乎总在输出末尾，
+                # 纯头部截断会让模型看不到失败原因。
+                safe_content = _truncate_tool_result(result_str, fn_name=fn_name)
             except Exception as e:
                 logger.exception(f"[tool] {fn_name} _truncate_tool_result 失败: {e}")
                 safe_content = "Error: tool output could not be safely constrained to its token budget."

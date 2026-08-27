@@ -14,6 +14,12 @@ ENV APITELEGRAMCHAT_DATA_DIR=/tmp/apitelegramchat_data
 # （内核禁了 unprivileged userns），留着只会造成误导。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
+        wget \
+        git \
+        jq \
+        zip \
+        unzip \
         python3 \
         python3-pip \
         python3-venv \
