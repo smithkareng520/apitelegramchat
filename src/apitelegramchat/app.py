@@ -90,7 +90,19 @@ async def _startup_load_whitelist() -> None:
 
 @app.after_serving
 async def _shutdown_close_http_session() -> None:
-    """关闭全局 aiohttp session，消除 "Unclosed client session" 告警。"""
+    """优雅关闭：先关掉所有持久 bash 沙箱进程，再关全局 aiohttp session。
+
+    之前只关 aiohttp session，BashSessionManager 里所有还在跑的 bash
+    子进程会被进程退出时强杀——但它们的 stdin pipe 缓冲区里的内容
+    不会被 flush，会留下 "Task was destroyed but it is pending!" 之类
+    的告警，也会让 watchdog 任务在退出时报 RuntimeError。显式
+    cleanup_all() 让每个 session 走正常的 close() 流程。
+    """
+    try:
+        from apitelegramchat.tool_executors import _bash_manager
+        await _bash_manager.cleanup_all()
+    except Exception:
+        logger.warning("shutdown _bash_manager.cleanup_all failed", exc_info=True)
     try:
         from apitelegramchat.utils import close_http_session
         await close_http_session()

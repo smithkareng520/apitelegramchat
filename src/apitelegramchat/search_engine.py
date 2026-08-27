@@ -55,7 +55,6 @@ from apitelegramchat.state import set_editor_file_state  # noqa: F401  (保留 s
 
 from apitelegramchat.config import (
     OPENROUTER_API_KEY,
-    SEARCH_CACHE_TTL,
     FETCH_CACHE_TTL,
     SUPPORTED_MODELS,
     get_openrouter_provider_preferences,
@@ -66,13 +65,10 @@ from apitelegramchat.web_search_settings import (
 )
 from apitelegramchat.web_search_filter import (
     BLACKLISTED_SEARCH_DOMAINS as _BLACKLISTED_SEARCH_DOMAINS,
-    SEARCH_CANDIDATE_MULTIPLIER as _SEARCH_CANDIDATE_MULTIPLIER,
     SEARCH_DEFAULT_RESULTS as _SEARCH_DEFAULT_RESULTS,
     SEARCH_MAX_CANDIDATES as _SEARCH_MAX_CANDIDATES,
     SEARCH_MAX_RESULTS as _SEARCH_MAX_RESULTS,
-    candidate_result_count as _candidate_result_count,
     filter_blacklisted_search_results as _filter_blacklisted_search_results,
-    upstream_domain_exclude_terms as _upstream_domain_exclude_terms,
 )
 from apitelegramchat.fetch_url_fallback import root_fallback_urls
 from apitelegramchat.utils import retry_async, escape_html
@@ -109,15 +105,7 @@ if _TRAFILATURA_CONFIG is not None:
         pass
 
 # ---------- 缓存 ----------
-_search_cache = TTLCache(maxsize=200, ttl=SEARCH_CACHE_TTL)
 _fetch_cache = TTLCache(maxsize=200, ttl=FETCH_CACHE_TTL)
-
-
-def _search_cache_key(query: str, num_results: int | None = None) -> str:
-    """Search cache key: keep query + result count distinct."""
-    if num_results is None:
-        return query
-    return f"{query}{num_results}"
 
 
 def _normalize_fetch_cache_key(url: str) -> str:
@@ -151,10 +139,6 @@ def _normalize_editor_text(text: str) -> str:
     if text is None:
         return ""
     return text.replace("\r\n", "\n").replace("\r", "\n")
-
-
-def _split_editor_lines(text: str) -> list[str]:
-    return _normalize_editor_text(text).splitlines(keepends=True)
 
 
 def _format_editor_line(line_no: int, text: str, width: int) -> str:
@@ -364,14 +348,6 @@ async def execute_text_editor(
 
 
 # ========== 缓存函数 ==========
-def get_search_cache(query: str, num_results: int | None = None):
-    return _search_cache.get(_search_cache_key(query, num_results))
-
-
-def set_search_cache(query: str, result: str, num_results: int | None = None):
-    _search_cache[_search_cache_key(query, num_results)] = result
-
-
 def get_fetch_cache(url: str):
     return _fetch_cache.get(_normalize_fetch_cache_key(url))
 

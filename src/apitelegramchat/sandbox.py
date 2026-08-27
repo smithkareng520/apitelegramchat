@@ -119,13 +119,6 @@ _LANDLOCK_ALL_ACCESS_V1 = (
     LANDLOCK_ACCESS_FS_MAKE_SYM
 )
 
-# 只读 + 可执行
-_LANDLOCK_READ_EXEC = (
-    LANDLOCK_ACCESS_FS_READ_FILE |
-    LANDLOCK_ACCESS_FS_READ_DIR |
-    LANDLOCK_ACCESS_FS_EXECUTE
-)
-
 
 class _LandlockRulesetAttr(ctypes.Structure):
     _fields_ = [("handled_access_fs", ctypes.c_uint64)]

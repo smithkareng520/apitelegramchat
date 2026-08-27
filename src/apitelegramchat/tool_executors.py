@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from apitelegramchat.workspace_paths import (
     workspace_root, workspace_workdir, runtime_cache_root, workspace_namespace,
-    workspace_upload_root,
+    workspace_upload_root, workspace_download_root,
     is_inside_upload_or_download,
     _UPLOAD_DIR_NAME,
 )
@@ -51,7 +51,6 @@ from apitelegramchat.search_engine import (
     execute_generate_image,
     execute_generate_video,
     # 地图工具（全部委托给 amap-maps MCP）
-    execute_geocode,
     execute_keyword_search,
     execute_nearby_search,
     execute_poi_details,
@@ -1011,6 +1010,21 @@ class BashSession:
         self.workdir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.workspace, 0o700)
         os.chmod(self.workdir, 0o700)
+        # ★ 显式预创建 upload/ 和 download/：bash 进程一启动，cwd 就是
+        # workspace root，模型几乎立刻会跑 `cp out.txt upload/out.txt`
+        # 或 `cat download/x.pdf`。如果不在这里预创建，bash 进程已经
+        # 在跑、第一次 execute() 时才补创建，会出两个问题：
+        #   1) 如果 execute() 里 _ensure_runtime_workspace 抛异常被
+        #      try/except 吞掉，目录就永远不存在，cp 第一次必然失败，
+        #      模型不得不多跑一轮 `mkdir -p upload && cp ...` 才能补救；
+        #   2) _ensure_runtime_workspace(self.chat_id) 没传 namespace，
+        #      依赖 ContextVar；如果 bash 工具从 background task 里
+        #      调用、ContextVar 不可见，upload/ 会被建到错误的 namespace
+        #      下，bash 进程实际看到的 cwd 下仍然没有 upload/。
+        # 用 self.namespace 直接走 workspace_upload_root /
+        # workspace_download_root，确保和 bash 进程的 cwd 完全一致。
+        workspace_upload_root(self.chat_id, self.namespace)
+        workspace_download_root(self.chat_id, self.namespace)
 
         # 新进程的 cwd 必然是 workdir；重置 _last_cwd，避免上一次会话
         # 残留的 cwd 状态误拒下一条命令。
@@ -1302,8 +1316,13 @@ class BashSession:
         #   不应阻塞其他工具调用获取 workspace lock。init 只需要 init_lock
         #   （在 _ensure_workspace_initialized 内部获取），与 workspace lock 独立。
         #   init 失败不阻断 bash：本地 workspace 可能不全但 bash 仍可运行。
+        # ★ 显式传 self.namespace：避免依赖 ContextVar 在 background task
+        #   里不可见时把 upload/download 建到错误的 namespace 下。
+        #   start() 已经预创建过这两棵子树，这里只是兜底——任何路径下
+        #   失败都不会让 cp 报 "No such file or directory"，因为 start()
+        #   时目录已经存在。
         try:
-            await _ensure_runtime_workspace(self.chat_id)
+            await _ensure_runtime_workspace(self.chat_id, self.namespace)
         except asyncio.CancelledError:
             raise
         except Exception as e:

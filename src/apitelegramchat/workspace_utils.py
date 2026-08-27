@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 from apitelegramchat.workspace_paths import (
     workspace_root, workspace_namespace,
+    workspace_upload_root, workspace_download_root,
 )
 
 from apitelegramchat.s3_utils import (
@@ -44,14 +45,27 @@ async def _get_workspace_init_lock(key: str) -> asyncio.Lock:
 
 
 async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) -> None:
-    """Ensure only the runtime workspace directory exists.
+    """Ensure the runtime workspace tree (root + upload/ + download/) exists.
 
     This function is intentionally safe to call before every tool invocation.
     It MUST NOT synchronize packaged skills: ``workspace/skills`` is runtime
     state and may contain files created or edited by the agent/user.
+
+    upload/ and download/ are pre-created here (rather than lazily on first
+    use) because bash starts with cwd=workspace root and the model almost
+    immediately tries `cp out.txt upload/out.txt` or `cat download/x.pdf`.
+    Without pre-creating these subtrees, the very first such command fails
+    with "No such file or directory" — forcing the model to spend an extra
+    `mkdir -p upload/` round before doing the real work. This is the
+    initialization boundary, not a per-tool concern.
     """
     workspace = workspace_root(chat_id, namespace)
     workspace.mkdir(parents=True, exist_ok=True)
+    # 显式预创建 upload/ 与 download/：workspace_upload_root /
+    # workspace_download_root 是幂等的（mkdir exist_ok + chmod 0o700），
+    # 重复调用不会出错；首次调用就把这两棵子树准备好。
+    workspace_upload_root(chat_id, namespace)
+    workspace_download_root(chat_id, namespace)
 
 
 async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = None) -> None:
