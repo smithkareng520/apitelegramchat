@@ -1006,7 +1006,7 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
             file_list = "、".join(downloaded)
             content_text = (
                 f"📎 用户上传了文档组（共 {len(downloaded)} 个文件）：{file_list}，"
-                f"已保存在 download/ 目录。使用 fetch_download 工具把它们逐个取到工作区后再处理。"
+                f"已保存在工作区根目录的 download/ 子目录，可直接访问。"
             )
             if failed:
                 content_text += f"\n⚠️ 以下文件下载失败：{', '.join(failed)}，请重新发送。"
@@ -1014,8 +1014,8 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
                 content_text += f"\n\n用户指令：{combined_caption}"
             else:
                 content_text += (
-                    "\n\n请根据用户指令处理这些文档。先用 list_download 查看可用文件，"
-                    "再用 fetch_download 把需要的文件取到工作区，然后用 text_editor 或 bash 查看。"
+                    "\n\n请根据用户指令处理这些文档。可用 bash 执行 `ls -la download/` 查看可用文件，"
+                    "再直接读取（如 `cat download/<文件名>`），或用 text_editor（path 填 download/<文件名>）查看。"
                 )
 
         user_message = {"role": "user", "content": content_text, "file_ids": file_ids, "file_names": file_names, "mime_types": mime_types, "type": "document_group", "attachments": [{"kind": "document", "file_id": fid, "file_name": fname, "mime_type": mime} for fid, fname, mime in zip(file_ids, file_names, mime_types)]}
@@ -1527,13 +1527,14 @@ async def webhook() -> tuple:
                         success = await download_file(fid, str(target_path))
                         if success:
                             content_text = (
-                                f"📎 用户上传了文档「{safe_fname}」，已保存在 download/ 目录。"
-                                f"使用 fetch_download 工具把它取到工作区后再处理（fetch_download filenames=[\"{safe_fname}\"]）。"
+                                f"📎 用户上传了文档「{safe_fname}」，已保存在工作区根目录的 "
+                                f"download/ 子目录，可直接访问（如 `cat download/{safe_fname}`，"
+                                f"或用 text_editor 并把 path 填为 download/{safe_fname}）。"
                             )
                             if cap:
                                 content_text += f"\n\n用户指令：{cap}"
                             else:
-                                content_text += "\n\n请根据用户指令处理该文档。取到工作区后可用 text_editor 或 bash 查看。"
+                                content_text += "\n\n请根据用户指令处理该文档，可用 text_editor 或 bash 直接查看。"
                         else:
                             content_text = f"📎 用户上传了文档「{safe_fname}」，但下载失败，请稍后重试。"
 
@@ -1834,8 +1835,8 @@ async def webhook() -> tuple:
                                 success = await download_file(reply_media["file_id"], str(target_path))
                                 if success:
                                     content_text = (
-                                        f"📎 用户引用了文档「{safe_fname}」，已保存在 download/ 目录。"
-                                        f"使用 fetch_download 工具把它取到工作区后再处理（fetch_download filenames=[\"{safe_fname}\"]）。"
+                                        f"📎 用户引用了文档「{safe_fname}」，已保存在工作区根目录的 "
+                                        f"download/ 子目录，可直接访问（如 `cat download/{safe_fname}`）。"
                                     )
                                 else:
                                     content_text = f"📎 用户引用了文档「{safe_fname}」，但下载失败。"

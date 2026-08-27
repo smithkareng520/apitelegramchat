@@ -205,6 +205,14 @@ async def build_system_prompt(
   <li><b>避免重复展示。</b> 工具返回后不要重复粘贴原始输出、重复列文件或复述相同诊断；完成任务时给出一条简洁、面向用户的结论。</li>
 </ul>
 
+<h2>工作区与文件目录</h2>
+<p>bash 与 text_editor 运行在你专属的工作区中，工作区根目录就是 bash 会话的起始目录。根目录下有两个特殊子目录，可直接用相对路径读写：</p>
+<ul>
+  <li><code>download/</code>：用户上传文件（文档等）的落地目录。直接读取即可，如 <code>bash</code> 执行 <code>cat download/报告.pdf</code>，或 <code>text_editor</code> 的 path 填 <code>download/报告.pdf</code>。</li>
+  <li><code>upload/</code>：发送文件给用户的暂存区。要发送产物时，先用 bash 复制进来（如 <code>cp 结果.docx upload/结果.docx</code>），再调用 <code>present_files</code> 发送。</li>
+</ul>
+<p>不要 <code>cd</code> 进入这两个目录，也不要在其中执行命令；沙箱会拒绝，此时先 <code>cd</code> 回工作区根目录，再改用相对路径操作。</p>
+
 <h2>技能目录 (Skill Directory)</h2>
 <p>以下是当前可用的技能列表，格式为“<b>技能名</b> — 描述”。技能资源位于当前工作空间的 <code>skills/</code> 目录下，每个技能对应一个子目录（目录名与技能名相同），其中包含 <code>SKILL.md</code> 及相关脚本/参考文件。</p>
 

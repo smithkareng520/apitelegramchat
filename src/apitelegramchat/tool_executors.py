@@ -20,9 +20,6 @@ from urllib.parse import urlparse
 from apitelegramchat.workspace_utils import (
     _get_workspace_lock,
     _ensure_runtime_workspace,
-    fetch_from_download,
-    stage_to_upload,
-    list_download_files,
     list_upload_files,
 )
 
@@ -854,6 +851,9 @@ def _render_bash_result(result_str: str, fn_args: dict | None = None) -> str:
     逐行解析 ``Command: `` 前缀，多行命令（如 ``python3 -c "…"`` 跨行）只剩
     第一行 —— 用户在草稿富文本里看到 Input 显示成 ``python3 -c "`` 的截断
     假象就来自这里（并非被过滤，而是解析丢了后续行）。
+
+    Input 块只展示实际输入（命令本身）；模型提供的意图描述（_description）
+    由卡片摘要行（``🖥 意图``）单独呈现，不混入 Input，避免重复与语义混淆。
     """
     metadata, separator, output = (result_str or "").partition("Output:\n")
     command = ""
@@ -876,8 +876,7 @@ def _render_bash_result(result_str: str, fn_args: dict | None = None) -> str:
     output_text = output
     if exit_code:
         output_text = f"[exit code {exit_code}]\n{output}"
-    # Input 展示原始命令（头部优先：命令开头携带意图）；Output 保头保尾：
-    # 报错信息几乎总在末尾。
+    # Input 展示原始命令；Output 保头保尾：报错信息几乎总在末尾。
     return (
         _render_editor_quote("Input", command)
         + _render_editor_quote("Output", output_text, truncator=_truncate_ui_lines_head_tail)
@@ -1337,12 +1336,11 @@ class BashSession:
                 if self._UPLOAD_DOWNLOAD_CD_PATTERN.search(command):
                     return (
                         f"Error: Command rejected — `cd` into upload/ or download/ is "
-                        f"not allowed. These directories are staging buffers: read and "
-                        f"write files in them via relative paths (e.g. "
-                        f"`cp out.txt ../upload/out.txt`, `cat ../download/doc.pdf`), "
-                        f"but never execute commands from inside them. To move a file "
-                        f"into upload/ use the stage_upload tool; to pull a file from "
-                        f"download/ use the fetch_download tool."
+                        f"not allowed. These directories are data buffers directly inside "
+                        f"your workspace root: read and write files in them via relative "
+                        f"paths from your workdir (e.g. `cp out.txt upload/out.txt`, "
+                        f"`cat download/doc.pdf`), but never execute commands from "
+                        f"inside them."
                     )
                 return f"Error: Command rejected for security reasons: {command}"
 
@@ -1650,9 +1648,6 @@ _TOOL_TIMEOUT_LABELS = {
     "text_editor": "Text editor operation",
     "bash": "Bash command",
     "present_files": "File presentation",
-    "fetch_download": "Fetch from download/",
-    "stage_upload": "Stage to upload/",
-    "list_download": "List download/",
     "list_upload": "List upload/",
 }
 
@@ -2160,8 +2155,18 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
     # ===================== Bash 工具格式化 =====================
     elif fn_name == "bash":
+        # 优先展示模型提供的意图描述（_description/_summary），让用户一眼
+        # 看到命令目的；未提供时退化为命令首行摘要。意图文本直接原样展示、
+        # 不加符号，与进行时摘要（tool_summary._generate_initial_tool_summary、
+        # rich_message_builder._refresh_outer_summary 的 custom_desc 规范）一致，
+        # 保证执行中与完成后摘要一致、不闪烁变化。
+        # 延迟导入：tool_summary 模块级导入了 tool_executors，顶层导入会循环。
+        from apitelegramchat.ai.tool_summary import _get_tool_description_from_args
+        intent = _get_tool_description_from_args(fn_args) or ""
         if "Error:" in result_str or "Command rejected" in result_str:
             summary = "❌ Bash 执行失败"
+        elif intent:
+            summary = intent
         else:
             # 优先从工具调用参数取原始命令：多行命令从结果信封逐行解析
             # 只能拿到第一行，摘要会退化成 `python3 -c "` 这样的残句。
@@ -2175,8 +2180,8 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             if len(cmd_line) > 30:
                 cmd_line = cmd_line[:30] + "…"
             summary = f"🖥 {cmd_line or '命令已完成'}"
-        # 保留命令元信息（Input 取原始入参，Output 保头保尾），避免长输出
-        # 撑爆工具卡片的同时让用户始终能看到结尾的报错。
+        # 保留命令元信息（Input 只展示原始命令，意图由上方摘要行单独呈现；
+        # Output 保头保尾），避免长输出撑爆工具卡片的同时让用户始终能看到结尾的报错。
         details_html = _render_bash_result(result_str, fn_args=fn_args)
         return summary, details_html
 
@@ -2240,42 +2245,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
         details_html = "<br/>".join(details_parts)
         return summary, details_html
-    elif fn_name in ("fetch_download", "stage_upload"):
-        # 这些工具返回 {"fetched"|"staged": [...], "failed": [...], "error": ...}
-        try:
-            data = json.loads(result_str)
-        except (json.JSONDecodeError, TypeError):
-            data = None
-        if not isinstance(data, dict):
-            return f"📦 {fn_name}", f"<pre><code>{escape_html(result_str)}</code></pre>"
-        ok_key = "fetched" if fn_name == "fetch_download" else "staged"
-        ok_items = data.get(ok_key) or []
-        failed_items = data.get("failed") or []
-        verb = "Fetched" if fn_name == "fetch_download" else "Staged"
-        if not ok_items:
-            summary = f"📦 No files {verb.lower()}"
-        elif len(ok_items) == 1:
-            summary = f"📦 {verb} 1 file"
-        else:
-            summary = f"📦 {verb} {len(ok_items)} files"
-        if failed_items:
-            summary += f" · {len(failed_items)} failed"
-        details_parts: List[str] = []
-        if ok_items:
-            items = "".join(
-                f"<li>{escape_html(str(it.get('path')))}</li>"
-                for it in ok_items if isinstance(it, dict)
-            )
-            label = "file" if len(ok_items) == 1 else "files"
-            details_parts.append(f"<b>✅ {verb} ({len(ok_items)} {label})</b><ul>{items}</ul>")
-        if failed_items:
-            items = "".join(f"<li>{escape_html(str(x))}</li>" for x in failed_items)
-            label = "file" if len(failed_items) == 1 else "files"
-            details_parts.append(f"<b>❌ Failed ({len(failed_items)} {label})</b><ul>{items}</ul>")
-        if not details_parts:
-            details_parts.append("<i>No files were processed.</i>")
-        return summary, "<br/>".join(details_parts)
-    elif fn_name in ("list_download", "list_upload"):
+    elif fn_name == "list_upload":
         try:
             data = json.loads(result_str)
         except (json.JSONDecodeError, TypeError):
@@ -2284,7 +2254,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             return f"📋 {fn_name}", f"<pre><code>{escape_html(result_str)}</code></pre>"
         files = data.get("files") or []
         count = data.get("count", len(files))
-        label = "download/" if fn_name == "list_download" else "upload/"
+        label = "upload/"
         summary = f"📋 {count} file(s) in {label}"
         if not files:
             details_html = f"<i>{label} is empty.</i>"
@@ -2305,10 +2275,10 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
     """Send files from the upload/ staging tree to the chat as attachments.
 
     Files MUST live under upload/ (the dedicated outgoing-artifact buffer).
-    The model is responsible for staging artifacts there first — either via
-    the `stage_upload` tool or via bash using a relative path such as
-    `cp out.txt ../upload/out.txt`. Files left in workspace root/ are not
-    directly sendable; this is the persistence/execution boundary.
+    The model is responsible for staging artifacts there first — e.g. via
+    bash using a relative path such as `cp out.txt upload/out.txt`.
+    Files left in workspace root/ are not directly sendable; this is the
+    persistence/execution boundary.
     """
     if not paths:
         return json.dumps({
@@ -2361,8 +2331,8 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
                     continue
                 if not resolved.is_file():
                     failed.append(
-                        f"{path} (file not found in upload/ — use stage_upload to copy "
-                        f"it from your workdir first)"
+                        f"{path} (file not found in upload/ — copy it from your "
+                        f"workdir first, e.g. `cp {path} upload/{path}`)"
                     )
                     continue
                 try:
@@ -2395,74 +2365,31 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
         return json.dumps({"sent": sent, "failed": failed, "error": None})
 
 
-async def execute_fetch_download(chat_id: int, filenames: List[str], overwrite: bool = False) -> str:
-    """Copy one or more files from download/ into the runtime workdir.
-
-    User-uploaded documents land in download/ (Telegram → R2 → local). bash
-    cannot `cd` into download/, and the model is expected to fetch only the
-    files it actually needs rather than hydrate the whole tree. After
-    fetch_download, the file is available in the workdir under the same
-    relative path and can be opened with text_editor / bash / etc.
-    """
-    if not isinstance(filenames, list) or not filenames:
-        return json.dumps({
-            "fetched": [],
-            "failed": [],
-            "error": "filenames must be a non-empty list.",
-        })
-    fetched = []
-    failed = []
-    for raw in filenames:
-        name = raw if isinstance(raw, str) else str(raw)
-        try:
-            result = await fetch_from_download(chat_id, name, overwrite=overwrite)
-            fetched.append(result)
-        except Exception as exc:
-            failed.append(f"{name}: {str(exc)[:160]}")
-    return json.dumps(
-        {"fetched": fetched, "failed": failed, "error": None if not failed else "Some files were not fetched."},
-        ensure_ascii=False,
-    )
-
-
-async def execute_stage_upload(chat_id: int, paths: List[str]) -> str:
-    """Copy one or more files from the runtime workdir into upload/.
-
-    upload/ is the sole source for present_files. Staging is explicit so
-    that dependency trees, build artifacts, and other runtime material
-    never accidentally get sent to the user.
-    """
-    if not isinstance(paths, list) or not paths:
-        return json.dumps({
-            "staged": [],
-            "failed": [],
-            "error": "paths must be a non-empty list.",
-        })
-    staged = []
-    failed = []
-    for raw in paths:
-        rel = raw if isinstance(raw, str) else str(raw)
-        try:
-            result = await stage_to_upload(chat_id, rel)
-            staged.append(result)
-        except Exception as exc:
-            failed.append(f"{rel}: {str(exc)[:160]}")
-    return json.dumps(
-        {"staged": staged, "failed": failed, "error": None if not failed else "Some files were not staged."},
-        ensure_ascii=False,
-    )
-
-
-async def execute_list_download(chat_id: int) -> str:
-    """List files in download/ (user-uploaded documents)."""
-    items = await list_download_files(chat_id)
-    return json.dumps({"files": items, "count": len(items)}, ensure_ascii=False)
-
-
 async def execute_list_upload(chat_id: int) -> str:
     """List files in upload/ (staged outgoing artifacts)."""
     items = await list_upload_files(chat_id)
     return json.dumps({"files": items, "count": len(items)}, ensure_ascii=False)
+
+
+# ---------- 已移除工具的迁移提示 ----------
+# stage_upload / fetch_download / list_download 已删除：upload/ 与 download/
+# 本就是工作区根目录的子目录，bash 可直接读写（`cat download/x.pdf`、
+# `cp out.txt upload/out.txt`）。若模型（尤其是带着旧对话历史）仍调用旧工具，
+# 返回可操作的迁移指引而不是干巴巴的“未知工具”。
+_REMOVED_TOOL_HINTS = {
+    "fetch_download": (
+        "fetch_download 已移除：download/ 就在工作区根目录下，可直接访问。"
+        "用 bash（如 `ls download/`、`cat download/<文件名>`）或 text_editor"
+        "（path 填 `download/<文件名>`）直接读取即可。"
+    ),
+    "stage_upload": (
+        "stage_upload 已移除：用 bash 把文件复制到 upload/ 子目录即可，"
+        "例如 `cp <文件> upload/<文件名>`，然后调用 present_files 发送给用户。"
+    ),
+    "list_download": (
+        "list_download 已移除：用 bash 执行 `ls -la download/` 查看用户上传的文件。"
+    ),
+}
 
 # ---------- 工具分发 ----------
 async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_callback=None) -> str:
@@ -2646,21 +2573,12 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             if isinstance(paths, str):
                 paths = [paths]
             return await execute_present_files(chat_id, paths)
-        elif name == "fetch_download":
-            filenames = arguments.get("filenames", [])
-            if isinstance(filenames, str):
-                filenames = [filenames]
-            overwrite = bool(arguments.get("overwrite", False))
-            return await execute_fetch_download(chat_id, filenames, overwrite=overwrite)
-        elif name == "stage_upload":
-            paths = arguments.get("paths", [])
-            if isinstance(paths, str):
-                paths = [paths]
-            return await execute_stage_upload(chat_id, paths)
-        elif name == "list_download":
-            return await execute_list_download(chat_id)
         elif name == "list_upload":
             return await execute_list_upload(chat_id)
+        elif name in _REMOVED_TOOL_HINTS:
+            # stage_upload / fetch_download / list_download 已移除；
+            # 迁移提示让模型立即改用 bash 直访，避免无意义的重试。
+            return f"失败：{_REMOVED_TOOL_HINTS[name]}"
         else:
             return f"失败：未知工具: {name}。"
     except asyncio.CancelledError:

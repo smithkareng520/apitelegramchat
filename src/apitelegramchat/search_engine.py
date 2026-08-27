@@ -933,17 +933,18 @@ SEARCH_TOOLS = [
                 "daemons); they will block the session. If a command appears stuck, set restart=true "
                 "to reset the session and retry with a non-interactive variant.\n"
                 "\n"
-                "STAGING BUFFER RULES (enforced by the sandbox):\n"
-                "- upload/ holds outgoing files staged for the user. download/ holds files the user "
-                "has sent that the model could not ingest natively.\n"
-                "- You MAY read and write files inside upload/ and download/ via relative paths from "
-                "your cwd, e.g. `cp out.txt ../upload/out.txt` or `cat ../download/brief.pdf`.\n"
-                "- You MAY NOT `cd` into upload/ or download/, and you MAY NOT execute any command "
-                "while your cwd is inside either of them. The sandbox rejects `cd ../upload/...` and "
-                "any subsequent command.\n"
-                "- To move files INTO upload/ prefer `stage_upload`. To move files OUT OF download/ "
-                "into your cwd prefer `fetch_download`. Use `list_upload` / `list_download` to "
-                "inspect their contents.\n"
+                "UPLOAD & DOWNLOAD DIRECTORIES (inside your workspace root):\n"
+                "- download/ holds files the user has sent you (uploaded documents etc.).\n"
+                "  Read them directly from your cwd: `ls download/`, `cat download/brief.pdf`.\n"
+                "- upload/ is the staging area for outgoing files. To send a file to the\n"
+                "  user, copy it here first (`cp report.pdf upload/report.pdf`), then call\n"
+                "  present_files.\n"
+                "- Both directories live at the root of your workspace (your starting cwd).\n"
+                "  You MAY freely read and write files inside them via relative paths.\n"
+                "- You MAY NOT `cd` into upload/ or download/, and you MAY NOT execute any\n"
+                "  command while your cwd is inside either of them. The sandbox rejects\n"
+                "  `cd upload/...` and any subsequent command; if a command is rejected,\n"
+                "  `cd` back to your workdir first, then operate via relative paths.\n"
                 "\n"
                 "To read a skill's instructions, `cd skills/<skill_id>` from your cwd."
             ),
@@ -952,7 +953,11 @@ SEARCH_TOOLS = [
                 "properties": {
                     "_description": {
                         "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：查看项目文件列表"
+                        "description": (
+                            "意图描述：用一句话说明本次命令的目的（≤60字），会作为执行进度"
+                            "展示给用户。示例：查看项目文件列表 / 安装依赖并运行测试 / "
+                            "读取用户上传的文档"
+                        )
                     },
                     "command": {
                         "type": "string",
@@ -965,94 +970,12 @@ SEARCH_TOOLS = [
                 }
             },
             "input_examples": [
-                {"command": "ls -la"},
-                {"command": "pwd"},
-                {"command": "python3 script.py", "restart": False},
-                {"command": "cp report.pdf ../upload/report.pdf"},
-                {"restart": True}
+                {"_description": "查看项目文件列表", "command": "ls -la"},
+                {"_description": "安装依赖并运行测试", "command": "pip install --user pytest && python3 -m pytest -q"},
+                {"_description": "读取用户上传的文档", "command": "head -c 2000 download/brief.pdf | strings | head -40"},
+                {"_description": "把报告放入发送暂存区", "command": "cp report.pdf upload/report.pdf"},
+                {"_description": "重启卡死的会话", "restart": True}
             ]
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fetch_download",
-            "description": (
-                "Copy one or more user-uploaded files from download/ into the agent workdir so other "
-                "tools (text_editor, bash, etc.) can read them. After fetch_download the file lives at "
-                "the same relative path inside the workdir. Call list_download first when you do not "
-                "know the exact filenames."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。"
-                    },
-                    "filenames": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1,
-                        "description": "要取回的文件相对路径列表（相对 download/ 根）。"
-                    },
-                    "overwrite": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "true 则覆盖工作区已存在的同名文件；默认 false 会跳过并返回 skipped。"
-                    }
-                },
-                "required": ["filenames"]
-            },
-            "input_examples": [
-                {"filenames": ["brief.pdf"]},
-                {"filenames": ["data.csv", "notes.txt"], "overwrite": True}
-            ]
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stage_upload",
-            "description": (
-                "Copy one or more files from the agent workdir into upload/, the staging area for outgoing "
-                "attachments. present_files ONLY reads from upload/, so you must call stage_upload before "
-                "present_files can send a file to the user. Pass exact file paths relative to the "
-                "workdir root; directories and wildcards are not accepted."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。"
-                    },
-                    "paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1,
-                        "description": "要暂存的文件路径列表（相对工作区根，workspace root/ 之下）。"
-                    }
-                },
-                "required": ["paths"]
-            },
-            "input_examples": [
-                {"paths": ["report.pdf"]},
-                {"paths": ["out/data.csv", "out/summary.md"]}
-            ]
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_download",
-            "description": (
-                "List all files currently in download/ that have not been fetched into the workdir yet."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
         }
     },
     {
@@ -1074,9 +997,9 @@ SEARCH_TOOLS = [
             "name": "present_files",
             "description": (
                 "Send one or more files from upload/ to the chat as attachments. Files MUST already be "
-                "staged under upload/ — via the stage_upload tool or via bash "
-                "(e.g. `cp out.txt ../upload/out.txt`). Files left in the workdir are NOT directly "
-                "sendable. Pass exact paths relative to upload/; wildcards are not supported."
+                "staged under upload/ via bash (e.g. `cp out.txt upload/out.txt`); files left "
+                "elsewhere in the workdir are NOT directly sendable. Pass exact paths relative to "
+                "upload/; wildcards are not supported."
             ),
             "parameters": {
                 "type": "object",

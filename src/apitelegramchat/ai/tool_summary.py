@@ -147,9 +147,6 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     # ---------- 其他工具，按规范进行时文本 ----------
     mapping = {
         "present_files": "Presenting file(s)",
-        "fetch_download": "Fetching from download/",
-        "stage_upload": "Staging to upload/",
-        "list_download": "Listing download/",
         "list_upload": "Listing upload/",
         "wikipedia": "Looking up on Wikipedia",
         "news": "Fetching news",
@@ -206,9 +203,6 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
         "distance": "measured a distance",
         "bash": "ran a command",
         "present_files": "presented files",
-        "fetch_download": "fetched files from download/",
-        "stage_upload": "staged files to upload/",
-        "list_download": "listed download/",
         "list_upload": "listed upload/",
         "ask_user": "asked for your input",
     }
@@ -414,16 +408,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         n = len(paths) if isinstance(paths, list) else 0
         return "Presented file" if n <= 1 else f"Presented {n} files"
 
-    if fn_name == "fetch_download":
-        filenames = fn_args.get("filenames", [])
-        n = len(filenames) if isinstance(filenames, list) else 0
-        return "Fetched a file" if n <= 1 else f"Fetched {n} files"
-    if fn_name == "stage_upload":
-        paths = fn_args.get("paths", [])
-        n = len(paths) if isinstance(paths, list) else 0
-        return "Staged a file" if n <= 1 else f"Staged {n} files"
-    if fn_name == "list_download":
-        return "Listed download/"
     if fn_name == "list_upload":
         return "Listed upload/"
 

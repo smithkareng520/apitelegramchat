@@ -111,8 +111,9 @@ DEFAULT_ALLOWED_TOOLS = sorted([
     "geocode", "route", "distance", "poi_keyword_search",
     "poi_nearby_search", "poi_details",
     "bash", "text_editor", "todo",
-    # upload/download 显式跨边界工具：子 agent 也允许使用
-    "fetch_download", "stage_upload", "list_download", "list_upload",
+    # upload/download 是 workspace 根目录的子目录，bash 可直接读写，
+    # 不再需要显式跨边界工具。
+    "list_upload",
     "present_files",
     # 不含 generate_image / video / subagent / memory / skill
     # 注：elevation / traffic / isochrone 工具已随 amap_integration.py 迁移到

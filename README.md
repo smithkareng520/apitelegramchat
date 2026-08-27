@@ -497,12 +497,13 @@ longitude,latitude
 ```text
 text_editor
 bash
-fetch_download
-stage_upload
-list_download
 list_upload
 present_files
 ```
+
+说明：`upload/` 与 `download/` 是工作区根目录的两个子目录，bash / text_editor
+可直接通过相对路径读写（`cat download/x.pdf`、`cp out.txt upload/out.txt`），
+不再提供 stage_upload / fetch_download / list_download 跨边界工具。
 
 ### 生成
 
@@ -554,7 +555,7 @@ src/apitelegramchat/workspace_paths.py
 
 ### `upload/` 与 `download/`
 
-它们是 staging 区，而不是普通工作目录。
+它们是 workspace 根目录下的两个特殊子目录，而不是普通工作目录。
 
 - `download/`：Telegram 上传但尚未进入 workspace 的文件；
 - `upload/`：准备发送给用户的文件。
@@ -566,21 +567,14 @@ Bash **禁止把这两个目录作为工作目录执行命令**，避免：
 - 产物 staging 区被运行时文件污染。
 
 正确流程通常是：
-
 ```text
 Telegram 上传
     ↓
-download/
-    ↓
-fetch_download
-    ↓
-workspace files/
+download/（bash / text_editor 直接读取）
     ↓
 Agent/Bash 编辑
     ↓
-stage_upload
-    ↓
-upload/
+upload/（bash `cp 产物 upload/xxx`）
     ↓
 present_files
     ↓
@@ -898,7 +892,6 @@ geo.poi_keyword_search
 geo.poi_nearby_search
 geo.poi_details
 
-workspace.list_download
 workspace.list_upload
 workspace.view
 ```
@@ -911,8 +904,6 @@ workspace.view
 memory.manage
 todo.manage
 workspace.edit
-workspace.fetch_download
-workspace.stage_upload
 workspace.present
 ```
 

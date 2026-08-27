@@ -136,14 +136,15 @@ def workspace_skills_root(chat_id: object, namespace: object | None = None) -> P
 def workspace_upload_root(chat_id: object, namespace: object | None = None) -> Path:
     """Staging area for files the model wants to send to the user.
 
-    This directory is the sole source for `present_files`. The model must
-    explicitly stage artifacts here (via bash `cp`/redirect or via the
-    `stage_upload` tool) before they can be attached to a chat message.
+    This directory is the sole source for `present_files`. The model stages
+    artifacts here via bash (e.g. `cp out.txt upload/out.txt`) before they
+    can be attached to a chat message.
 
-    Bash is allowed to read/write files here through relative paths
-    (`../upload/<name>`), but the sandbox refuses to `cd` into this tree
-    or execute any command while the cwd is inside it. This prevents
-    package managers / build tools from polluting the staging area.
+    upload/ is a subdirectory of the workspace root, so bash and text_editor
+    can read and write files here through relative paths. The sandbox only
+    refuses to `cd` into this tree or execute any command while the cwd is
+    inside it. This prevents package managers / build tools from polluting
+    the staging area.
     """
     return _secure_directory(workspace_root(chat_id, namespace) / _UPLOAD_DIR_NAME)
 
@@ -153,12 +154,12 @@ def workspace_download_root(chat_id: object, namespace: object | None = None) ->
 
     When a user sends a document and the active model does not support
     native document input, the file is saved here (not into files/).
-    The model can list this directory and explicitly fetch files into
-    its local workspace via the `fetch_download`
-    tool before working on them.
+    download/ is a subdirectory of the workspace root, so the model can
+    read files directly (bash `cat download/<name>`, text_editor
+    `view download/<name>`, `ls download/`).
 
-    Bash is allowed to read files here (`../download/<name>`), but the
-    sandbox refuses to `cd` into this tree or execute any command while
+    Bash is allowed to read and write files here (`download/<name>`), but
+    the sandbox refuses to `cd` into this tree or execute any command while
     the cwd is inside it. This keeps user-supplied files immutable from
     the model's execution perspective.
     """

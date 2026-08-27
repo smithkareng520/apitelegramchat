@@ -167,11 +167,6 @@ async def poi_details(_: MCPRequestContext, args: JsonObject) -> str:
     return await invoke(execute_poi_details, args["id"])
 
 
-async def list_download(context: MCPRequestContext, _: JsonObject) -> str:
-    from apitelegramchat.tool_executors import execute_list_download
-    return await invoke(execute_list_download, context.chat_id)
-
-
 async def list_upload(context: MCPRequestContext, _: JsonObject) -> str:
     from apitelegramchat.tool_executors import execute_list_upload
     return await invoke(execute_list_upload, context.chat_id)
@@ -202,16 +197,6 @@ async def todo_manage(context: MCPRequestContext, args: JsonObject) -> str:
 async def workspace_edit(context: MCPRequestContext, args: JsonObject) -> str:
     from apitelegramchat.search_engine import execute_text_editor
     return await invoke(execute_text_editor, chat_id=context.chat_id, namespace=context.scope, **args)
-
-
-async def fetch_download(context: MCPRequestContext, args: JsonObject) -> str:
-    from apitelegramchat.tool_executors import execute_fetch_download
-    return await invoke(execute_fetch_download, context.chat_id, args["filenames"], overwrite=args.get("overwrite", False))
-
-
-async def stage_upload(context: MCPRequestContext, args: JsonObject) -> str:
-    from apitelegramchat.tool_executors import execute_stage_upload
-    return await invoke(execute_stage_upload, context.chat_id, args["paths"])
 
 
 async def present_files(context: MCPRequestContext, args: JsonObject) -> str:
@@ -248,7 +233,6 @@ READ_ONLY_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("geo.poi_keyword_search", "POI keyword search", "Search points of interest by keyword.", object_schema({"keywords": text_field("Search keywords.", 1), "city": text_field("Optional city.")}, ("keywords",)), poi_keyword),
     ToolSpec("geo.poi_nearby_search", "Nearby POI search", "Search points of interest near coordinates.", object_schema({"keywords": text_field("Search keywords.", 1), "location": text_field("Longitude,latitude.", 3), "radius": int_field("Radius in metres.", 1, 50000)}, ("keywords", "location")), poi_nearby),
     ToolSpec("geo.poi_details", "POI details", "Retrieve point-of-interest details.", object_schema({"id": text_field("Point-of-interest identifier.", 1)}, ("id",)), poi_details),
-    ToolSpec("workspace.list_download", "List downloaded files", "List files in the private download staging area.", object_schema({}), list_download),
     ToolSpec("workspace.list_upload", "List staged files", "List files in the private upload staging area.", object_schema({}), list_upload),
     ToolSpec("workspace.view", "View text file", "View a private UTF-8 text file with 1-based line numbers. Directories are not supported.", object_schema({"command": {"type": "string", "enum": ["view"]}, "path": text_field("Relative workspace file path.", 1), "view_range": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}}, ("command", "path")), workspace_view),
 )
@@ -258,8 +242,6 @@ MUTATION_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("memory.manage", "Manage memory", "Mutate or query persistent private memory. Explicit deployment opt-in required.", object_schema({"action": {"type": "string", "enum": ["add", "get", "list", "search", "update", "delete", "clear"]}, "content": text_field("Memory content."), "memory_id": text_field("Memory identifier."), "category": text_field("Optional category."), "tags": {"type": ["array", "string"], "items": {"type": "string"}}, "importance": text_field("Optional importance."), "query": text_field("Optional query."), "scope": text_field("Optional memory scope."), "limit": int_field("Maximum result count.", 1, 100), "source": text_field("Optional source.")}), memory_manage),
     ToolSpec("todo.manage", "Manage todos", "Mutate or query private todos. Explicit deployment opt-in required.", object_schema({"action": {"type": "string", "enum": ["add", "list", "done", "undone", "delete", "clear", "edit"]}, "title": text_field("Todo title."), "todo_id": text_field("Todo identifier."), "priority": text_field("Optional priority."), "tags": {"type": ["array", "string"], "items": {"type": "string"}}, "note": text_field("Optional note."), "filter": text_field("Optional filter."), "tag": text_field("Optional tag.")}), todo_manage),
     ToolSpec("workspace.edit", "Edit text file", "Create or update a private UTF-8 text file. str_replace requires exactly one exact match. Explicit deployment opt-in required.", object_schema({"command": {"type": "string", "enum": ["create", "str_replace", "insert"]}, "path": text_field("Relative workspace file path.", 1), "old_str": text_field("Exact existing text; it must occur exactly once."), "new_str": text_field("Replacement text."), "insert_line": int_field("Insert after 1-based line; use 0 for the start.", 0), "insert_text": text_field("Text to insert."), "file_text": text_field("Complete initial content for a new file.")}, ("command", "path")), workspace_edit),
-    ToolSpec("workspace.fetch_download", "Copy downloaded files", "Copy selected downloaded files into the workspace. Explicit deployment opt-in required.", object_schema({"filenames": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20}, "overwrite": {"type": "boolean"}}, ("filenames",)), fetch_download),
-    ToolSpec("workspace.stage_upload", "Stage outgoing files", "Stage selected workspace files. Explicit deployment opt-in required.", object_schema({"paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20}}, ("paths",)), stage_upload),
     ToolSpec("workspace.present", "Present staged files", "Present selected staged files. Explicit deployment opt-in required.", object_schema({"paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20}}, ("paths",)), present_files),
 )
 

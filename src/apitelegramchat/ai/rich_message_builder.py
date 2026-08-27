@@ -521,12 +521,6 @@ class RichMessageBuilder:
             group["outer_summary"] = mapping.get(command, "Editing file")
         elif t == "present_files":
             group["outer_summary"] = "Presenting file(s)"
-        elif t == "fetch_download":
-            group["outer_summary"] = "Fetching from download/"
-        elif t == "stage_upload":
-            group["outer_summary"] = "Staging to upload/"
-        elif t == "list_download":
-            group["outer_summary"] = "Listing download/"
         elif t == "list_upload":
             group["outer_summary"] = "Listing upload/"
         elif t == "ask_user":
@@ -589,9 +583,6 @@ class RichMessageBuilder:
         "text_editor_create": ("Created a file", "Created {n} files"),
         "text_editor_delete": ("Deleted a file", "Deleted {n} files"),
         "present_files": ("Presented a file", "Presented {n} files"),
-        "fetch_download": ("Fetched a file from download/", "Fetched {n} files from download/"),
-        "stage_upload": ("Staged a file to upload/", "Staged {n} files to upload/"),
-        "list_download": ("Listed download/", "Listed download/"),
         "list_upload": ("Listed upload/", "Listed upload/"),
         "wikipedia": ("Looked up on Wikipedia", "Looked up on Wikipedia"),
         "news": ("Fetched news", "Fetched news from {n} sources"),
