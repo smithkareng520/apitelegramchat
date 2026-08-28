@@ -23,6 +23,88 @@ _TEXTUAL_TOOL_CALL_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# =====================================================================
+# bash 复合命令"部分成功"识别
+# =====================================================================
+# 场景：`curl -o x.mp3 URL && ls -lh x.mp3 && file x.mp3` —— 容器里没装
+# `file` 时整链退出码为 127，但主体工作（下载）已实际完成。旧判定
+# "退出码非 0 即失败" 会把这种命令标成 error，工具组摘要退化为
+# "Tools failed"，与用户看到的事实（文件已下载）直接矛盾。
+#
+# 判定依据（三条全部满足才判部分成功）：
+#   1. 命令含顺序分隔符（&& / ; / 换行），是复合命令；
+#   2. 输出中存在 shell 的 "command not found" 诊断行；
+#   3. 缺失的命令不是命令链的首命令（首命令 = 主体工作）。
+# 对于 && 链这是可证明的：短路语义保证后段命令能被执行，当且仅当
+# 前面所有段都已成功。
+#
+# 已知局限（可接受）：`for x in …; do missing_cmd …; done` 这类首 token
+# 是 shell 关键字的命令可能被误判为部分成功。误判代价很低——完整输出
+# （含错误文本与退出码）仍会回传给模型自行补救，UI 只是少标一个红叉；
+# 而漏判的代价正是本 bug：用户看到 "Tools failed" 但实际工作已完成。
+
+# bash/dash/zsh 的 "command not found" 诊断行，捕获缺失的命令名：
+#   /bin/bash: line 196: file: command not found   → file
+#   bash: file: command not found                   → file
+#   sh: 1: file: not found                          → file (dash)
+_BASH_CMD_NOT_FOUND_RE = re.compile(
+    r"(?im)(?:^|\s)(?:/[\w./-]+)?(?:ba|z|da)?sh"
+    r"(?::\s*(?:(?:line\s+)?\d+:)?)?\s+([^\s:;]+)\s*:\s+(?:command\s+)?not found\b"
+)
+# zsh 格式：command not found: file
+_ZSH_CMD_NOT_FOUND_RE = re.compile(r'(?im)command not found:\s*([^\s:;"]+)')
+
+# 顺序分隔符：&& / 单个 & / ; / 换行。刻意不匹配 | 和 || ——
+# 管道是单条流水线，尾端命令缺失时（如 `curl … | file -`）流水线的
+# 整体目标（把输出交给 file 检查）并未达成，仍应判失败。
+_BASH_SEQ_SEPARATOR_RE = re.compile(r"&&|&|;|\n")
+
+# 前置 wrapper：真实命令在其后（sudo env nohup time nice 等）。
+_BASH_WRAPPER_CMDS = {
+    "sudo", "env", "nohup", "time", "nice", "command", "exec",
+    "builtin", "stdbuf", "timeout", "watch", "xargs",
+}
+
+
+def _bash_leading_command(command: str) -> str:
+    """提取复合命令中第一个实际执行的命令名。
+
+    跳过前置环境变量赋值（``VAR=value cmd …``）与常见 wrapper
+    （``sudo env nohup …``），并剥离子 shell/花括号前缀（``(cd …``）。
+    解析不出可信结果时返回空串（调用方据此放弃部分成功判定）。
+    """
+    if not command:
+        return ""
+    tokens = command.strip().split()
+    for tok in tokens:
+        if not tok or tok.startswith("#"):
+            # 注释或空 token：其后再无真实命令。
+            return ""
+        head = tok.split("=", 1)[0]
+        if "=" in tok and head.isidentifier():
+            continue  # VAR=value 环境变量前缀
+        if tok in _BASH_WRAPPER_CMDS:
+            continue  # wrapper，继续找其后的真实命令
+        return tok.lstrip("({[\"'")
+    return ""
+
+
+def _bash_cmdnotfound_is_partial(result_text: str, fn_args: dict) -> bool:
+    """退出码 127 时判断是否为复合命令的部分成功（见上方注释）。"""
+    command = str((fn_args or {}).get("command") or "")
+    if not command or not _BASH_SEQ_SEPARATOR_RE.search(command):
+        return False  # 单命令：command not found 就是彻底失败
+    missing = set()
+    for pattern in (_BASH_CMD_NOT_FOUND_RE, _ZSH_CMD_NOT_FOUND_RE):
+        for match in pattern.finditer(result_text or ""):
+            missing.add(match.group(1))
+    if not missing:
+        return False
+    leading = _bash_leading_command(command)
+    if not leading:
+        return False
+    return all(name != leading for name in missing)
+
 def _get_tool_description_from_args(fn_args: dict) -> Optional[str]:
     """从工具参数中获取简短描述（优先使用 _description，其次 _summary）"""
     if not fn_args:
@@ -299,7 +381,17 @@ def _tool_result_is_failure(fn_name: str, fn_args: dict, result_content: Any, de
         # bash 的成功/失败以退出码为准；仅在明确看不到退出码时，再回退到错误前缀判断。
         m = re.search(r"Exit code:\s*(\d+)", text)
         if m:
-            return m.group(1) != "0"
+            if m.group(1) == "0":
+                return False
+            # 127 = command not found。复合命令（a && b && c）中缺失的
+            # 若只是中后段的辅助命令（如 `curl … && ls … && file …` 而
+            # 容器未安装 file），按 && 短路语义，前面的主命令必然已成功
+            # 执行——这是"部分成功"而非整体失败。判为非失败，避免 UI
+            # 把已完成的实际工作显示成 "Tools failed"；完整输出（含
+            # 错误文本与退出码）仍会回传给模型自行补救。
+            if m.group(1) == "127" and _bash_cmdnotfound_is_partial(text, fn_args):
+                return False
+            return True
         if lower.startswith(("error:", "exception:", "failed:", "timeout:", "❌")):
             return True
         return False
@@ -389,6 +481,12 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         return "User answered"
 
     if fn_name == "bash":
+        # 能走到这里且退出码非 0，说明已被判为"部分成功"（复合命令中
+        # 辅助命令缺失，主体命令已完成）。摘要明确标出 partial，避免
+        # 用户把带告警的成功误读为完全成功。
+        m = re.search(r"Exit code:\s*(\d+)", str(result_content or ""))
+        if m and m.group(1) != "0":
+            return "Ran a command (partial success)"
         return "Ran a command"
 
     if fn_name == "text_editor":

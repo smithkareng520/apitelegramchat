@@ -1369,24 +1369,42 @@ class BashSession:
                     command, timeout=timeout, progress_callback=progress_callback
                 )
 
-            marker = f"__END_{uuid.uuid4().hex[:8]}__"
-            cwd_marker = f"__CWD_{uuid.uuid4().hex[:8]}__"
+            tag = uuid.uuid4().hex[:8]
+            marker = f"__END_{tag}__"
+            cwd_marker = f"__CWD_{tag}__"
             # 默认 shell 启动目录为 workspace/workspace root。模型决定使用 skill 后，
             # 可自行 `cd skills/<skill_id>`；persistent bash 会保留该 cwd。
-            # ★ 关键：在 echo marker 前先输出一个换行，确保 marker 单独占一行。
+            # ★ 关键：在输出 marker 前先输出一个换行，确保 marker 单独占一行。
             #   如果命令输出不以换行结尾（如 cat 无换行文件、printf 无 \n），
             #   echo 的输出会粘在前一行，readline() 永远读不到以 marker 开头的行，
             #   导致整个会话 hang 死。
             # 同时记录命令结束后的真实 PWD，用于结果显示；不会改变 shell 状态。
+            # ★ 修复存量 bug ×3：
+            #   1) $? 必须放在引号外（旧写法 echo '{marker} $?' 把 $?
+            #      包进单引号，bash 不展开，退出码永远是 unknown）；
+            #   2) 退出码必须在命令结束的下一刻立刻捕获（__rc=$?），
+            #      否则中间的 echo/printf 会把 $? 重置为 0，失败命令
+            #      在模型眼里和成功无异；
+            #   3) 模型生成的多行命令（如 `python3 -c "..."` 跨行书写）
+            #      几乎总带尾随换行。旧写法 f"{command}; __rc=$?..." 直接拼接
+            #      会让 "; __rc=$?" 落在新一行的行首——bash 对行首的孤立
+            #      分号直接报 syntax error near unexpected token `;'——
+            #      marker 永远不会被输出，退出码停留在 unknown。
+            #      修复：先 rstrip() 去掉尾随空白/换行，再改用 "\n" 换行拼接
+            #      退出码捕获。换行在 bash 里同样是命令分隔符，且能正确
+            #      终结行尾注释（`cmd # note` 后直接拼 `;` 会把整段包装
+            #      代码吞进注释，导致 marker 丢失、会话卡到超时）。
+            #   另：每次执行使用带唯一后缀的退出码变量名（__rc_<tag>）。
+            #   持久 shell 里同名变量会在多次 execute() 之间残留，若某次
+            #   赋值被跳过（如命令以反斜杠续行符结尾时，`__rc=$?` 会被
+            #   join 进上一条命令的参数里），echo 会读到上一次的陈旧退出码，
+            #   把失败伪装成成功。唯一变量名保证最坏情况是 "unknown"
+            #   而不是错误的旧值。
+            rc_var = f"__rc_{tag}"
+            cmd_body = command.rstrip()
             full_cmd = (
-                # ★ 修复存量 bug ×2：
-                #   1) $? 必须放在引号外（旧写法 echo '{marker} $?' 把 $?
-                #      包进单引号，bash 不展开，退出码永远是 unknown）；
-                #   2) 退出码必须在命令结束的下一刻立刻捕获（__rc=$?），
-                #      否则中间的 echo/printf 会把 $? 重置为 0，失败命令
-                #      在模型眼里和成功无异。
-                f"{command}; __rc=$?; echo; printf '{cwd_marker} %s\n' \"$PWD\"; "
-                f"echo '{marker}' \"$__rc\"\n"
+                f"{cmd_body}\n{rc_var}=$?; echo; printf '{cwd_marker} %s\n' \"$PWD\"; "
+                f"echo '{marker}' \"${rc_var}\"\n"
             )
 
             try:
