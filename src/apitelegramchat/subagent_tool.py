@@ -201,7 +201,12 @@ async def _execute_tool_for_subagent(
                 dispatch_tool_call(name, arguments or {}, chat_id=chat_id),
                 timeout=SUBAGENT_TOOL_TIMEOUT,
             )
-        return _truncate(str(result), fn_name=name)
+        # 与主 agent 相同的模型视图精简：子 agent 的单次工具结果预算
+        # （默认 20k token）比主循环更紧张，weather / 地图类结果的
+        # 无价值字段在这里挤占预算的代价更高。
+        from apitelegramchat.tool_result_condense import condense_for_model
+        condensed = condense_for_model(name, arguments or {}, str(result))
+        return _truncate(condensed, fn_name=name)
     except asyncio.TimeoutError:
         return f"Error: tool '{name}' timed out in subagent context."
     except asyncio.CancelledError:

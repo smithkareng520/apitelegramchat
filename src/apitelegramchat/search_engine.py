@@ -75,6 +75,7 @@ from apitelegramchat.fetch_url_fallback import root_fallback_urls
 from apitelegramchat.utils import retry_async, escape_html
 from apitelegramchat.token_budget import truncate_to_token_budget
 from apitelegramchat.mcp_client import call_mcp_tool, MCPToolError
+from apitelegramchat.tool_result_condense import condense_amap_payload
 
 OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 
@@ -676,10 +677,11 @@ SEARCH_TOOLS = [
             "name": "weather",
             "description": (
                 "Get weather conditions and forecasts for a city. Returns current conditions, "
-                "up to 24 hours of hourly forecast, and up to 5 days of daily forecast. "
+                "hourly forecast, and up to 5 days of daily forecast. "
                 "Use for any weather-related question. unit='c' (default) returns Celsius, "
-                "'f' returns Fahrenheit. The `hours` parameter controls how many hourly entries "
-                "are summarized in the returned text."
+                "'f' returns Fahrenheit. The `hours` parameter (default 6, max 24) controls "
+                "how many hourly entries are returned — pass a larger value when the user "
+                "asks about the rest of the day or tomorrow morning."
             ),
             "parameters": {
                 "type": "object",
@@ -690,7 +692,7 @@ SEARCH_TOOLS = [
                     },
                     "city": {"type": "string", "description": "城市名（如 Beijing、Shanghai）"},
                     "unit": {"type": "string", "enum": ["c", "f"], "default": "c"},
-                    "hours": {"type": "integer", "default": 6, "description": "摘要中展示的小时数（完整数据始终可用）"}
+                    "hours": {"type": "integer", "default": 6, "description": "返回的逐时预报条数（1-24，默认 6）。需要更长展望时传大值。"}
                 },
                 "required": ["city"]
             },
@@ -2360,6 +2362,13 @@ async def execute_book_lookup(query: str) -> str:
 
 # --------------------- weather ---------------------
 async def execute_weather(city: str, unit: str = "c", hours: int = 6) -> str:
+    """查询 wttr.in 天气并打包为 JSON。
+
+    注意：本函数返回的是「完整数据」（UI 折叠面板的月相/露点等展示依赖它）。
+    hours 参数不在这一层生效 —— 发给模型的逐时条数与字段白名单由
+    tool_result_condense.condense_for_model 的 weather 视图控制
+    （默认 6 条，与工具 schema 的 hours 参数一致）。
+    """
     url = f"https://wttr.in/{city}?format=j1"
     try:
         async with aiohttp.ClientSession() as session:
@@ -3095,10 +3104,18 @@ async def execute_generate_video(
 # 内部：调用 amap-maps MCP 工具的统一封装
 # ---------------------------------------------------------------------------
 async def _call_amap_mcp(tool_name: str, arguments: dict[str, Any]) -> str:
-    """调用 amap-maps MCP 服务的某个工具，返回 MCP 输出的纯文本。
+    """调用 amap-maps MCP 服务的某个工具，返回清洗后的纯文本。
 
     出错时返回 JSON 错误信息（{"status": "error", "message": ...}），让上层
     工具的调用方（LLM / format_tool_result）能直接看到失败原因。
+
+    成功输出在返回前经过 condense_amap_payload 清洗：删除 polyline / tmcs
+    等导航渲染专用的大体积字段与全部空值字段。这是“源头清洗”而非仅在
+    发给 LLM 前过滤——polyline 坐标串可达几十 KB，若不先清洗，
+    _truncate_tool_result 的 20k token 预算会被坐标串吃光，把 POI
+    名称/地址/导航步骤等真正有用的字段挤出模型视野。UI 渲染层
+    （_render_poi_cards / _render_map_route_card 等）只依赖保留名单内
+    的字段，清洗对用户可见的展示零影响。
     """
     try:
         raw = await call_mcp_tool("amap-maps", tool_name, arguments)
@@ -3112,7 +3129,7 @@ async def _call_amap_mcp(tool_name: str, arguments: dict[str, Any]) -> str:
             {"status": "error", "message": f"amap-maps MCP 返回空（{tool_name}）"},
             ensure_ascii=False,
         )
-    return raw
+    return condense_amap_payload(raw)
 
 
 def _empty_mcp_error(tool_name: str) -> str:
@@ -3143,7 +3160,8 @@ async def _call_amap_mcp_candidates(tool_names: list[str], arguments: dict[str, 
         try:
             raw = await call_mcp_tool("amap-maps", tool_name, arguments)
             if raw:
-                return raw
+                # 与 _call_amap_mcp 同源的清洗策略（见其 docstring）。
+                return condense_amap_payload(raw)
             return _empty_mcp_error(tool_name)
         except MCPToolError as exc:
             last_error = exc
@@ -3180,54 +3198,8 @@ def _normalize_amap_coordinate(value: Any, field_name: str) -> str:
 # ---------------------------------------------------------------------------
 # 内部辅助：通过 amap-maps MCP 把地址转坐标
 # ---------------------------------------------------------------------------
-async def _geocode_coords(address: str) -> tuple[float, float, str] | None:
-    """通过 amap-maps MCP 的 maps_geo 工具将地址转为坐标。
-
-    返回 (lat, lon, display_name)；调用失败或解析失败时返回 None。
-    适配 amap-maps MCP 的常见返回 schema：
-        {"location": "lng,lat", "formatted_address": "...", ...}
-        或
-        {"lat": ..., "lon": ..., "formatted_address": "..."}
-    """
-    if not address or not address.strip():
-        return None
-    try:
-        raw = await call_mcp_tool("amap-maps", "maps_geo", {"address": address.strip()})
-    except MCPToolError:
-        return None
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-    # 优先取 amap 标准的 "location": "lng,lat" 字段
-    location = data.get("location") or data.get("pos") or data.get("coord")
-    if isinstance(location, str) and "," in location:
-        parts = [p.strip() for p in location.split(",")]
-        if len(parts) >= 2:
-            try:
-                lng = float(parts[0])
-                lat = float(parts[1])
-                name = data.get("formatted_address") or data.get("address") or address
-                return lat, lng, name
-            except ValueError:
-                pass
-
-    # 回退：直接读 lat/lon 字段
-    lat = data.get("lat") or data.get("latitude")
-    lon = data.get("lon") or data.get("lng") or data.get("longitude")
-    if lat is not None and lon is not None:
-        try:
-            return (
-                float(lat),
-                float(lon),
-                data.get("formatted_address") or data.get("address") or address,
-            )
-        except (TypeError, ValueError):
-            return None
-    return None
+# _geocode_coords 已删除：全仓库无任何调用方（旧 amap_integration 集成期的
+# 遗留函数）。地址→坐标统一走 execute_geocode / maps_geo 工具链路。
 
 
 # ---------------------------------------------------------------------------

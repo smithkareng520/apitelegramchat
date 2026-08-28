@@ -9,6 +9,7 @@ import uuid
 
 from apitelegramchat.utils import get_logger, escape_html
 from apitelegramchat.token_budget import truncate_to_token_budget
+from apitelegramchat.tool_result_condense import condense_for_model
 from apitelegramchat.tool_executors import (
     dispatch_tool_call,
     format_tool_result,
@@ -238,7 +239,31 @@ async def _run_tool_calls_and_append(
             if safe_content == _TOOL_TIMEOUT_MARKER:
                 llm_content = f"Error: tool {fn_name} timed out. Please try again or refine the request."
             else:
-                llm_content = safe_content
+                # 模型视图：按工具剔除对模型无价值的字段（weather 的月相/
+                # 露点/低频概率与超出 hours 的逐时条目、subagent 的任务回声
+                # 字段等）。UI 草稿的 details_html 已在上方从完整 safe_content
+                # 生成，用户可见的展示不受影响；发给模型的 tool 消息与历史
+                # 存档均使用精简后的 llm_content。
+                #
+                # 顺序刻意是「先精简、后截断」：对原始 result_str 精简后再套
+                # token 预算，截断预算只花在有价值的字段上——若先截断再精简，
+                # 20k 预算会被 24h 低价值逐时数据/路线坐标串吃光，把 POI
+                # 名称、导航步骤等真正有用的字段挤出模型视野（且被截断的
+                # JSON 无法再解析，精简层会整体失效）。
+                try:
+                    model_view = condense_for_model(fn_name, fn_args, result_str)
+                except Exception:
+                    model_view = result_str
+                if model_view == result_str:
+                    # 未发生精简（非目标工具/解析失败/错误文本）：
+                    # 直接复用已按预算截断的 safe_content，避免重复计数。
+                    llm_content = safe_content
+                else:
+                    try:
+                        llm_content = _truncate_tool_result(model_view, fn_name=fn_name)
+                    except Exception:
+                        # 精简版截断失败：退回完整视图的截断结果。
+                        llm_content = safe_content
             return (fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content)
 
     # ====== 串行化"消费者"工具：同批既含 producer（如 bash cp）又含
@@ -337,8 +362,11 @@ async def _run_tool_calls_and_append(
                     f"[bash] 非零退出码，命令可能失败: {safe_content[:300]!r}"
                 )
 
-        # 向 LLM 发送实际工具输出（safe_content），以便 LLM 准确推理
-        tool_msg = {"role": "tool", "tool_call_id": tc_id, "name": fn_name, "content": safe_content}
+        # 向 LLM 发送精简后的模型视图（llm_content）：完整输出先经
+        # condense_for_model 剔除无价值字段，再进入本轮请求与持久化历史。
+        # UI 侧的 details_html / 失败判定 / bash 退出码检查仍基于完整
+        # safe_content（见上方各处），二者互不影响。
+        tool_msg = {"role": "tool", "tool_call_id": tc_id, "name": fn_name, "content": llm_content}
         loop_messages.append(tool_msg)
         new_history_entries.append(tool_msg)
     # 对本批因预算而跳过的调用补齐标准 tool 消息，保证后续无工具总结请求的

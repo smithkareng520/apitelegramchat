@@ -2299,7 +2299,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
     elif fn_name == "present_files":
         # ---- Decoupled data abstraction ----
         # execute_present_files returns a JSON payload:
-        #   {"sent": [...], "failed": [...], "error": str | null}
+        #   {"sent": [...], "failed": [...]}   (+ "error": str only on early failure)
         # The model context receives this raw JSON (so it can reply concisely,
         # e.g. "Files sent"), while the UI gets a rich, detailed report built
         # from the parsed structure.
@@ -2385,7 +2385,6 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
             "failed": [],
             "error": "No paths provided. Files must be staged under upload/ first.",
         })
-
     # ★ init 在 workspace lock 外面执行（同 bash / text_editor）。
     await _ensure_runtime_workspace(chat_id)
 
@@ -2518,7 +2517,10 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
                     if BASE_URL and BASE_URL in safe_msg:
                         safe_msg = "[redacted url]"
                     failed.append(f"{path} (error: {safe_msg[:50]})")
-        return json.dumps({"sent": sent, "failed": failed, "error": None})
+        # 返回结构：{"sent": [...], "failed": [...]}；仅当有真实错误时才附带
+        # "error" 键。成功路径不再输出 "error": null —— 对模型而言是零信息
+        # 字段，且会诱使模型在回复里重复说明“没有错误”。
+        return json.dumps({"sent": sent, "failed": failed})
 
 
 # ---------- 已移除工具的迁移提示 ----------

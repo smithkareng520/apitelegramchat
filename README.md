@@ -526,6 +526,36 @@ longitude,latitude
 116.397128,39.916527
 ```
 
+### 工具返回的「模型视图」精简
+
+工具的原始返回同时服务两个消费者：Telegram 工具卡片的 UI 渲染
+（`tool_executors.format_tool_result`）与 LLM 上下文（`role=tool` 消息）。
+两者对字段的诉求不同——UI 要展示完整信息（月相、露点、逐时表格等），
+而模型只需要回答问题所需的高价值字段。把上游 API 响应一股脑塞进上下文
+会浪费 token、挤占截断预算、降低模型定位关键信息的效率。
+
+`tool_result_condense.py` 统一承载这层「按价值筛选」：
+
+| 工具 | 处理 |
+|---|---|
+| `weather` | 逐时条数按 `hours` 参数生效（默认 6，1-24）；逐时/逐日只保留高价值字段（温度/天气/降水/风力/日出日落等），删除月相、露点、热指数、风寒、短波辐射与低频概率字段 |
+| `subagent` | 删除 `task_preview`（父 agent 任务回声）与 `model_name`（与 `model` 重复） |
+| 地图 6 工具 | 高德 MCP 输出在源头清洗（`_call_amap_mcp` 返回前）：删除 `polyline` 坐标串 / `tmcs` 分段路况 / 全部空值字段，POI `photos` 只保留第一张 URL |
+
+关键设计：
+
+- **双视图**：UI 草稿从完整返回渲染（展示不变），发给模型与写入历史的
+  是精简视图（`tool_call_loop.run_one` 中生成 `llm_content`）；
+- **先精简、后截断**：token 截断预算只花在有价值的字段上，避免 24h 低价值
+  逐时数据 / 路线坐标串把 POI 名称、导航步骤挤出模型视野；
+- **零误伤保底**：错误文本（`Error:` / `❌` / `失败：` 前缀）、非 JSON 内容、
+  解析失败或 schema 变化时一律原样透传，错误连击熔断与失败判定不受影响；
+- **子 agent 同源**：`subagent_tool._execute_tool_for_subagent` 的工具结果
+  走同一套精简（子 agent 的 20k token 预算更紧张）；
+- 地图清洗对 UI 逐字节等价（`scripts/verify_tool_condense.py` 内含
+  UI 等价性断言），其余工具（web_search / bash / memory / todo /
+  text_editor / 生成类等）返回本身就是精简过的，不做二次处理。
+
 ### Workspace / 文件
 
 ```text
