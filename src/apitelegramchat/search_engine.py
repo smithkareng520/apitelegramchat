@@ -2090,6 +2090,232 @@ async def _is_safe_url_to_fetch(url: str) -> tuple[bool, str]:
     return True, ""
 
 
+# 用于在 JS 拼接表达式里识别"host 类"变量并用真实 host 替换。
+# 顺序很重要：先长后短，避免 `location.host` 被先匹配成 `location`。
+_JS_HOST_IDENTIFIERS: tuple[str, ...] = (
+    "window.location.host",
+    "window.location.origin",
+    "window.location.hostname",
+    "window.location.href",
+    "location.host",
+    "location.origin",
+    "location.hostname",
+    "location.href",
+    "wlOrigin",
+    "self.location.host",
+    "self.location.origin",
+)
+
+# 这些变量携带的只是查询串 / 哈希 / 路径本身，不包含跳转目标信息——
+# 拼接时直接丢弃，否则会把当前 URL 的 query 拼进新 URL，污染目标。
+_JS_DROP_IDENTIFIERS: tuple[str, ...] = (
+    "window.location.search",
+    "window.location.hash",
+    "window.location.pathname",
+    "location.search",
+    "location.hash",
+    "location.pathname",
+)
+
+
+def _normalize_url_for_compare(url: str) -> str:
+    """规范化 URL 用于"是否重定向到自身"的对比。
+
+    - scheme / netloc 一律小写
+    - 末尾斜杠去掉
+    - query / fragment 丢弃
+    """
+    try:
+        parts = urlsplit(url)
+    except (ValueError, TypeError):
+        return (url or "").lower()
+    scheme = (parts.scheme or "").lower()
+    netloc = (parts.netloc or "").lower()
+    path = (parts.path or "").rstrip("/")
+    return f"{scheme}://{netloc}{path}"
+
+
+def _extract_js_redirect_targets(html: str, current_url: str) -> list[str]:
+    """从 HTML 的 JavaScript 中提取所有"有用"的跳转目标地址。
+
+    与旧的 naive 正则 ``window\\.location\\.href\\s*=\\s*['"]...['"]`` 相比，
+    本函数覆盖更通用的网页跳转写法：
+
+    * 支持多种 location 别名前缀：``window.`` / ``document.`` / ``top.`` /
+      ``parent.`` / ``self.`` / ``frames.``，以及无前缀的裸 ``location``；
+    * 支持 ``location.href = ...``、``location.replace(...)``、
+      ``location.assign(...)`` 以及裸 ``location = '...'`` 写法；
+    * 字符串拼接表达式：``window.location.href = 'https://' + host + '/index/' + search``
+      会被拆成多个字符串字面量并重新拼起来，host 类变量用真实 host 替换，
+      search / hash / pathname 类变量直接丢弃；
+    * 仅捕获到裸 scheme（如 ``https://``）或目标规范化后等于当前 URL 时，
+      视为"无可用目标"跳过，让调用方继续尝试 Meta Refresh 与根路径回退，
+      而不是返回 ``失败：页面重定向到自身`` 这种误导性错误。
+
+    返回去重后的候选绝对 URL 列表（按文档出现顺序）。同一 if/else 中的
+    多个分支会被全部收集，调用方按顺序尝试，第一个能成功抓取的即返回。
+    """
+    if not html:
+        return []
+
+    base_parts = urlsplit(current_url)
+    base_scheme = (base_parts.scheme or "https").lower() or "https"
+    base_host = base_parts.netloc
+
+    # 匹配 (prefix可选) location (.href/.replace/.assign 可选) (= 或 () 后接 EXPR) ;|)
+    # `(?!\w)` 防止把 `locationBar`、`locationHost` 等普通变量名误识别。
+    pattern = re.compile(
+        r"""(?:window\.|document\.|top\.|parent\.|self\.|frames\.)?"""
+        r"""location(?:\.(?:href|replace|assign))?(?!\w)"""
+        r"""\s*(?:=|\()\s*"""
+        r"""(?P<expr>(?:[^;'"()]+|'[^']*'|"[^"]*")+?)"""
+        r"""\s*(?:\)|;)""",
+        re.IGNORECASE,
+    )
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    for m in pattern.finditer(html):
+        expr = m.group("expr").strip()
+        if not expr:
+            continue
+
+        # 在 expr 中顺序消费字符串字面量与已知标识符，跳过运算符 / 空白。
+        target_parts: list[str] = []
+        pos = 0
+        n = len(expr)
+        while pos < n:
+            ch = expr[pos]
+            if ch in ("'", '"'):
+                end = expr.find(ch, pos + 1)
+                if end == -1:
+                    break
+                target_parts.append(expr[pos + 1:end])
+                pos = end + 1
+                continue
+            rest = expr[pos:]
+            consumed = False
+            # 先匹配要丢弃的标识符（避免被 host 列表里的更短名字误吞）
+            for ident in _JS_DROP_IDENTIFIERS:
+                if rest.startswith(ident):
+                    pos += len(ident)
+                    consumed = True
+                    break
+            if consumed:
+                continue
+            for ident in _JS_HOST_IDENTIFIERS:
+                if rest.startswith(ident):
+                    target_parts.append(base_host)
+                    pos += len(ident)
+                    consumed = True
+                    break
+            if consumed:
+                continue
+            # 跳过运算符 / 空白 / 未知标识符字符
+            pos += 1
+
+        joined = "".join(target_parts).strip()
+        if not joined:
+            continue
+
+        # 裸 scheme（如 'https://'）——没有任何路径信息，直接跳过。
+        if re.fullmatch(r"https?://", joined, re.IGNORECASE):
+            continue
+
+        # 计算候选绝对 URL
+        if joined.startswith(("//", "/")):
+            candidate = urljoin(current_url, joined)
+        elif re.match(r"^https?://", joined, re.IGNORECASE):
+            # 若形如 'https:///index/'（拼接丢了 host），补回 host。
+            try:
+                jp = urlsplit(joined)
+            except ValueError:
+                continue
+            if not jp.netloc and jp.path:
+                candidate = f"{base_scheme}://{base_host}{jp.path}"
+            else:
+                candidate = joined
+        else:
+            candidate = urljoin(current_url, joined)
+
+        # 候选必须是 http(s) 且带 host；否则跳过。
+        try:
+            cp = urlsplit(candidate)
+        except ValueError:
+            continue
+        if cp.scheme.lower() not in ("http", "https") or not cp.netloc:
+            continue
+        # 路径为空或仅 "/" 视为"无可用目标"（重定向到根自己）。
+        if cp.path in ("", "/"):
+            continue
+        # 规范化后等于当前 URL 视为重定向到自身——交给回退处理。
+        if _normalize_url_for_compare(candidate) == _normalize_url_for_compare(current_url):
+            continue
+
+        # 去重：规范化后相同的 URL 视为同一候选。
+        norm = _normalize_url_for_compare(candidate)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        candidates.append(candidate)
+
+    return candidates
+
+
+def _extract_meta_refresh_targets(html: str, current_url: str) -> list[str]:
+    """从 ``<meta http-equiv="refresh" content="N; url=...">`` 提取跳转目标列表。
+
+    与旧实现相比：
+
+    * 当目标规范化后等于当前 URL 时，**跳过该候选**而不是让上层报
+      "重定向到自身"——这样根路径回退仍有机会被尝试；
+    * 同时支持引号包裹的 content 值（标准写法）与无引号的 content 值
+      （非标准但实际页面常见）；
+    * 多个 meta refresh 标签都会被收集，调用方按顺序尝试。
+    """
+    if not html:
+        return []
+    # 1) 引号包裹的标准写法：<meta http-equiv="refresh" content="0; url=/path">
+    quoted = re.compile(
+        r"""<meta\s+http-equiv\s*=\s*["']refresh["']"""
+        r"""\s+content\s*=\s*["']\s*\d+\s*;\s*url\s*=\s*(?P<url>[^"']+)["']""",
+        re.IGNORECASE,
+    )
+    # 2) 无引号写法：<meta http-equiv=refresh content="0; url=/path"> 或
+    #    <meta http-equiv='refresh' content=0;url=/path>
+    unquoted = re.compile(
+        r"""<meta\s+http-equiv\s*=\s*["']?refresh["']?"""
+        r"""\s+content\s*=\s*["']?\s*\d+\s*;\s*url\s*=\s*(?P<url>[^\s"'>]+)""",
+        re.IGNORECASE,
+    )
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for rgx in (quoted, unquoted):
+        for m in rgx.finditer(html):
+            target = (m.group("url") or "").strip()
+            if not target:
+                continue
+            candidate = urljoin(current_url, target)
+            try:
+                cp = urlsplit(candidate)
+            except ValueError:
+                continue
+            if cp.scheme.lower() not in ("http", "https") or not cp.netloc:
+                continue
+            if cp.path in ("", "/"):
+                continue
+            if _normalize_url_for_compare(candidate) == _normalize_url_for_compare(current_url):
+                continue
+            norm = _normalize_url_for_compare(candidate)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            candidates.append(candidate)
+    return candidates
+
+
 async def _try_root_url_fallback(
     url: str,
     redirect_depth: int,
@@ -2176,33 +2402,50 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
                 set_fetch_cache(url, payload)
                 return payload
 
-            # ---- 检测 JavaScript 重定向 ----
-            js_pattern = re.compile(r'window\.location\.href\s*=\s*[\'"]([^\'"]+)[\'"]', re.IGNORECASE)
-            match = js_pattern.search(html)
-            if match:
-                new_url = urljoin(url, match.group(1))
-                if new_url == url:
-                    result = f"失败：页面重定向到自身，无法抓取：{url}"
-                    return result
-                logger.info(f"[fetch_url] 跟随 JS 跳转: {original_url} -> {new_url}")
-                result = await execute_fetch_url(new_url, redirect_depth + 1, start_time)
-                set_fetch_cache(url, result)
-                return result
+            # ---- 检测 JavaScript 重定向（含字符串拼接表达式）----
+            # 旧实现用单字面量正则匹配 `window.location.href = '...'`，遇到
+            # `'https://' + host + '/index/' + search` 这种拼接时会捕获到
+            # `https://`，urljoin 再把它解析回原 URL，误判为"重定向到自身"
+            # 并直接报错——绕过下方根路径回退。新实现把拼接表达式里的字面量
+            # 与已知 host / search 变量分别处理，且当目标不可用时返回空列表
+            # 让流程继续往下走 Meta Refresh 与根路径回退。
+            # 同一 if/else 中的多个分支会被全部收集，按文档顺序尝试——
+            # 这样移动端 / 桌面端不同路径的页面也能命中一个能抓取的候选。
+            for js_target in _extract_js_redirect_targets(html, url):
+                if time.monotonic() - start_time > 30:
+                    logger.warning("[fetch_url] JS 候选超出总超时：%s", url)
+                    break
+                logger.info(f"[fetch_url] 跟随 JS 跳转: {original_url} -> {js_target}")
+                js_result = await execute_fetch_url(
+                    js_target, redirect_depth + 1, start_time,
+                )
+                if not js_result.startswith("失败："):
+                    set_fetch_cache(url, js_result)
+                    return js_result
+                logger.info(
+                    "[fetch_url] JS 跳转目标抓取失败，尝试下一候选：%s -> %s",
+                    url, js_target,
+                )
 
             # ---- 检测 Meta Refresh 重定向 ----
-            meta_pattern = re.compile(r'<meta\s+http-equiv=["\']refresh["\']\s+content=["\']\d+;\s*url=([^"\']+)["\']', re.IGNORECASE)
-            match = meta_pattern.search(html)
-            if match:
-                new_url = urljoin(url, match.group(1))
-                if new_url == url:
-                    result = f"失败：页面重定向到自身，无法抓取：{url}"
-                    return result
-                logger.info(f"[fetch_url] 跟随 Meta Refresh: {original_url} -> {new_url}")
-                result = await execute_fetch_url(new_url, redirect_depth + 1, start_time)
-                set_fetch_cache(url, result)
-                return result
+            for meta_target in _extract_meta_refresh_targets(html, url):
+                if time.monotonic() - start_time > 30:
+                    logger.warning("[fetch_url] Meta 候选超出总超时：%s", url)
+                    break
+                logger.info(f"[fetch_url] 跟随 Meta Refresh: {original_url} -> {meta_target}")
+                meta_result = await execute_fetch_url(
+                    meta_target, redirect_depth + 1, start_time,
+                )
+                if not meta_result.startswith("失败："):
+                    set_fetch_cache(url, meta_result)
+                    return meta_result
+                logger.info(
+                    "[fetch_url] Meta Refresh 目标抓取失败，尝试根路径回退：%s -> %s",
+                    url, meta_target,
+                )
 
-            # 未提取到有效正文：仅根路径可继续尝试配置的同站点首页路径。
+            # 未提取到有效正文 / JS 与 Meta 跳转均不可用：仅根路径可继续
+            # 尝试配置的同站点首页路径（如 splash page 的 `/index/`）。
             fallback_result = await _try_root_url_fallback(
                 url, redirect_depth, start_time,
             )
