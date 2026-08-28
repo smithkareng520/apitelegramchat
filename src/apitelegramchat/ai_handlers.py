@@ -85,7 +85,7 @@ async def build_system_prompt(
 <details open>
 <summary><b>⚠️ 严格格式要求</b></summary>
 <ul>
-  <li><b>严禁使用 Markdown 语法</li>
+  <li><b>严禁使用 Markdown 语法</b></li>
   <li>
     <b>✅ 必须且仅能使用以下 Telegram HTML 标签（下表标签均为你应直接输出的字面写法，未经转义）：</b>
     <table bordered striped>
