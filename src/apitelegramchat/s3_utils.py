@@ -27,6 +27,26 @@ from apitelegramchat.workspace_paths import data_root
 
 logger = logging.getLogger(__name__)
 
+try:
+    from cachetools import TTLCache
+except Exception:  # pragma: no cover - cachetools 是硬依赖，仅为防御性回退
+    TTLCache = None  # type: ignore
+
+# =====================================================================
+# 预签名 URL 记忆化（prompt cache 关键路径）
+# ---------------------------------------------------------------------
+# 预签名 URL 含签名时间戳（X-Amz-Date / X-Amz-Expires），每次重签都是
+# 不同的字符串。若每次解析附件都重新签名，历史消息里的多模态 content
+# 块（image_url / video_url）字节会变，直接打碎 LLM 的前缀缓存——
+# 从第一条含附件 URL 的历史消息起，后面的全部内容都要重新计费/计算。
+# 这里把同一 key 的预签名 URL 缓存到过期前 5 分钟，窗口内字节级稳定，
+# 同时也避免了每轮重复签名的开销。
+# =====================================================================
+_PRESIGN_DEFAULT_EXPIRES = 3600
+_PRESIGN_SAFETY_MARGIN = 300  # 提前 5 分钟失效，避免返回临期/过期 URL
+_presigned_url_cache = TTLCache(maxsize=512, ttl=_PRESIGN_DEFAULT_EXPIRES - _PRESIGN_SAFETY_MARGIN) if TTLCache is not None else None
+_presign_lock = asyncio.Lock()
+
 
 session = aioboto3.Session() if aioboto3 is not None else None
 _LOCAL_R2_ROOT = data_root() / "r2_cache"
@@ -162,19 +182,37 @@ async def generate_presigned_url(
     if not is_r2_configured():
         return _local_public_url(key)
 
-    async with session.client(
-        "s3",
-        endpoint_url=R2_ENDPOINT,
-        aws_access_key_id=R2_ACCESS_KEY,
-        aws_secret_access_key=R2_SECRET_KEY,
-        region_name=R2_REGION,
-        config=_R2_CONFIG,
-    ) as s3:
-        return await s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": R2_BUCKET_NAME, "Key": key},
-            ExpiresIn=expires_in,
-        )
+    # 仅对默认 1h 有效期做记忆化：TTLCache 的 ttl 是 cache 级参数，
+    # 自定义 expires_in 走原路径直接签名。TTLCache 不可用时禁用记忆化，
+    # 避免无过期时间的普通 dict 越积越多。
+    memoizable = expires_in == _PRESIGN_DEFAULT_EXPIRES and TTLCache is not None
+    if memoizable:
+        cached_url = _presigned_url_cache.get(key)
+        if cached_url:
+            return cached_url
+
+    async with _presign_lock:
+        if memoizable:
+            # double-check：等锁期间可能已有并发请求完成签名
+            cached_url = _presigned_url_cache.get(key)
+            if cached_url:
+                return cached_url
+        async with session.client(
+            "s3",
+            endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=R2_ACCESS_KEY,
+            aws_secret_access_key=R2_SECRET_KEY,
+            region_name=R2_REGION,
+            config=_R2_CONFIG,
+        ) as s3:
+            url = await s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": R2_BUCKET_NAME, "Key": key},
+                ExpiresIn=expires_in,
+            )
+        if memoizable and url:
+            _presigned_url_cache[key] = url
+        return url
 
 
 async def public_url_for_existing_key(key: str) -> str | None:

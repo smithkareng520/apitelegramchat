@@ -277,6 +277,19 @@ async def _subagent_agentic_loop(
             )
             if reasoning_top:
                 create_params.update(reasoning_top)
+            # OpenRouter：附带 session_id（粘性路由，从第一次请求就生效，
+            # 多轮工具循环的前缀缓存不因路由漂移而失效）与 Anthropic 系
+            # 模型的顶层自动 cache_control（断点随消息增长自动前移，
+            # 子 agent 多轮循环中每轮的工具结果都能被下一轮命中）。
+            # 与主 agent 共用同一个 per-chat 会话键：粘性按 (model, session)
+            # 粒度跟踪，同模型的父子请求落在同一 provider 上。
+            provider_label = (model_info.provider if model_info else "") or ""
+            if provider_label == "openrouter":
+                existing_extra = dict(create_params.get("extra_body") or {})
+                existing_extra.setdefault("session_id", f"tg-chat-{chat_id}"[:256])
+                if model_info and model_info.supports_prompt_cache:
+                    existing_extra.setdefault("cache_control", {"type": "ephemeral"})
+                create_params["extra_body"] = existing_extra
             if reasoning_extra:
                 existing_extra = dict(create_params.get("extra_body") or {})
                 existing_extra.update(reasoning_extra)

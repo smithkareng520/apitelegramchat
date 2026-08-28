@@ -308,6 +308,41 @@ WEBHOOK_URL?token=WEBHOOK_TOKEN
 | `APITELEGRAMCHAT_WHITELIST_FILE` | 可选 | 白名单文件 |
 | `LOG_LEVEL` | 可选 | 日志级别，默认 `INFO` |
 
+### 缓存与 Prompt Cache
+
+项目里有两类缓存：**LLM 前缀缓存**（省钱的大头）与**工具/附件缓存**（省时延与配额）。
+
+#### LLM 前缀缓存（prompt cache）
+
+各厂商的启用方式不同，但共同前提都是：**请求前缀字节级一致**。
+
+| 厂商 | 机制 | 本项目的处理 |
+|---|---|---|
+| Anthropic（经 OpenRouter） | 显式 `cache_control` 断点（上限 4 个）+ 顶层自动缓存 | 系统提示末尾 / 上一轮末尾 / 本轮 user 消息共 3 个显式断点；`extra_body.cache_control` 开启自动缓存（断点随对话自动前移） |
+| OpenRouter（全部模型） | Provider 粘性路由 | 每个请求携带 `session_id`（`tg-chat-{chat_id}`），粘性路由从第一次请求就生效，不随上下文窗口滑动而漂移 |
+| DeepSeek / GLM / 智谱 | 服务端隐式缓存，无需标记 | 依赖前缀稳定：量化淘汰 + 预签名 URL 记忆化 + 批量压缩 |
+| Gemini（直连） | 隐式缓存（2.5+ 自动） | 系统提示时间戳放在末尾，保证主体前缀逐字节稳定 |
+| OpenAI 系 | 自动（>1024 token） | 同上，靠前缀稳定 |
+
+为保持前缀稳定，系统做了四件事：
+
+1. **系统提示时间戳放末尾**（原有设计）：`当前时间` 是唯一每天必变的内容，放在 prompt 最后，前面的巨型稳定段（格式规范 + 工具通则 + 技能目录）每天都能命中缓存。
+2. **上下文窗口量化淘汰**：`CONTEXT_EVICT_HEADROOM_MESSAGES`（默认 `10`）。普通滑窗每轮滑 1 条，窗口起点逐轮变化会打碎隐式缓存；量化后历史每增长 10 条起点才前进 10 条，中间若干轮前缀字节级一致。设为 `1` 恢复旧行为。
+3. **R2 预签名 URL 记忆化**：预签名 URL 每次重签字节都不同，会让历史消息中的多模态块（图片/视频 URL）打碎前缀缓存。现在同一对象在过期前 5 分钟内复用同一 URL。
+4. **历史压缩批量化**：`HISTORY_COMPACTION_TRIGGER`（默认 `30`）与 `HISTORY_COMPACTION_MIN_BATCH`（默认 `8`）。压缩会重写旧 tool 消息（payload → 指针），攒够一批再做，两次压缩之间的轮次里前缀保持稳定。
+
+缓存命中观测：每轮请求结束后日志会输出一行 `prompt cache usage: {'prompt_tokens': N, 'cached': N, 'cache_write': N, 'hit_ratio': 0.xx}`，兼容 OpenRouter/OpenAI（`cached_tokens`）、Anthropic（`cache_read_input_tokens`）与 DeepSeek（`prompt_cache_hit_tokens`）三种字段。
+
+#### 工具与附件缓存
+
+| 缓存 | TTL / 容量 | 说明 |
+|---|---|---|
+| `fetch_url` 页面缓存 | `FETCH_CACHE_TTL`，默认 3600s，200 条 | 归一化 URL（去 fragment）；根路径回退结果也会写回缓存 |
+| `web_search` 结果缓存 | `SEARCH_CACHE_TTL`，默认 300s，200 条 | 按归一化参数（mode/query/num/page/gl/hl/tbs）缓存格式化结果；服务错误不缓存，空结果缓存 |
+| 图片/音频/文档/视频字节 | `CACHE_TTL`，默认 300s | 内存 TTLCache；R2 冷启动恢复 |
+| R2 预签名 URL | 3300s（1h 有效期 - 5min 安全边际） | 见上文"前缀缓存" |
+| 技能目录 | 进程生命周期 | `lru_cache`，`refresh_skill_cache()` 可清 |
+
 ### OpenRouter 路由
 
 ```bash

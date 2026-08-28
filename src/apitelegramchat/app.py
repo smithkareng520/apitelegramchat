@@ -70,7 +70,7 @@ from apitelegramchat.ask_user_tool import (
 from apitelegramchat.file_handlers import download_file
 from apitelegramchat.workspace_utils import _get_workspace_lock, init_workspace
 from apitelegramchat.context_manager import select_request_context
-from apitelegramchat.tool_context_compaction import compact_older_tool_calls
+from apitelegramchat.tool_context_compaction import compact_older_tool_calls, _eligible_calls
 
 app = Quart(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
@@ -123,7 +123,16 @@ def _reply_params(message_id: int | None) -> dict | None:
     return {"message_id": mid, "allow_sending_without_reply": True}
 
 # ---------- 上下文管理常量 ----------
-MAX_HISTORY_MESSAGES = 30  # Trigger a tool-payload compaction pass; do not delete turns.
+# 触发工具负载压缩的历史长度阈值（可配）。注意：压缩会重写历史里的旧
+# tool 消息（全量 payload → 指针文本），每次重写都会打碎 prompt 前缀
+# 缓存。因此配套 HISTORY_COMPACTION_MIN_BATCH：未归档的可压缩调用
+# 累积到一定数量才触发一次，而不是每轮都重写几条，让窗口内的前缀
+# 在两次压缩之间保持字节稳定。
+MAX_HISTORY_MESSAGES = int(os.getenv("HISTORY_COMPACTION_TRIGGER", "30") or "30")  # Trigger a tool-payload compaction pass; do not delete turns.
+try:
+    HISTORY_COMPACTION_MIN_BATCH = max(0, int(os.getenv("HISTORY_COMPACTION_MIN_BATCH", "8")))
+except (TypeError, ValueError):
+    HISTORY_COMPACTION_MIN_BATCH = 8
 MEDIA_GROUP_TIMEOUT = 5
 REPLY_MARKER = "💡 引用回复:"
 
@@ -557,14 +566,23 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict, new_m
             ledger = ctx.setdefault("token_ledger", [])
             ledger.append({"input_tokens": t_input, "output_tokens": t_output})
         if len(history) > MAX_HISTORY_MESSAGES:
-            stats = await compact_older_tool_calls(chat_id, history)
-            if stats.compacted_calls:
-                logger.info(
-                    "History-size tool compaction: chat=%s calls=%s archived_bytes=%s",
-                    chat_id,
-                    stats.compacted_calls,
-                    stats.archived_bytes,
-                )
+            # 批量触发：只有未归档的可压缩调用积累到 MIN_BATCH 才执行。
+            # 每轮都重写少量旧消息会让 prompt 前缀缓存持续 miss；攒一批
+            # 一次压缩，两次压缩之间的若干轮里历史字节保持稳定。
+            unarchived_eligible = 0
+            try:
+                unarchived_eligible = len(_eligible_calls(history))
+            except Exception:
+                logger.debug("统计未归档工具调用失败", exc_info=True)
+            if unarchived_eligible >= HISTORY_COMPACTION_MIN_BATCH:
+                stats = await compact_older_tool_calls(chat_id, history)
+                if stats.compacted_calls:
+                    logger.info(
+                        "History-size tool compaction: chat=%s calls=%s archived_bytes=%s",
+                        chat_id,
+                        stats.compacted_calls,
+                        stats.archived_bytes,
+                    )
 
 # ---------------------------------------------------------------------------
 # 业务处理

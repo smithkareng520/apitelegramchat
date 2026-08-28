@@ -73,11 +73,48 @@ def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict):
         entry["function"]["arguments"] += fn["arguments"]
 
 
-def _openrouter_extra_body() -> dict:
-    return {"provider": OPENROUTER_PROVIDER_PREFERENCES.copy()}
+def _openrouter_session_id(chat_id: object) -> str:
+    """为 OpenRouter 生成稳定的 per-chat 粘性路由键（≤256 字符）。
+
+    背景：OpenRouter 的默认会话识别靠"首条 system + 首条非 system 消息"
+    哈希。本项目的上下文窗口会滑动（select_request_context 截尾）、历史
+    会被压缩（compact_older_tool_calls 重写旧消息），一旦窗口起点变化，
+    哈希就变，粘性路由（以及它背后的 prompt cache）随之失效。
+    显式传 session_id 后：粘性路由从第一次请求就生效（无需先观察到
+    缓存命中），且不随窗口滑动变化；对经 OpenRouter 转发的 Z.AI/GLM
+    还会作为会话亲和键下发，进一步提升缓存命中。
+    """
+    if chat_id is None:
+        return ""
+    key = f"tg-chat-{chat_id}".strip()
+    return key[:256]
 
 
-def _merged_extra_body(api_label: str, reasoning_extra: Optional[dict]) -> Optional[dict]:
+def _openrouter_extra_body(
+    chat_id: object = None,
+    supports_prompt_cache: bool = False,
+) -> dict:
+    body: dict = {"provider": OPENROUTER_PROVIDER_PREFERENCES.copy()}
+    session_key = _openrouter_session_id(chat_id)
+    if session_key:
+        body["session_id"] = session_key
+    # Anthropic 系模型的"自动缓存"：顶层 cache_control 由网关翻译成打在
+    # 最后一个可缓存块上的断点，并随对话增长自动前移。这让 agentic loop
+    # 的每一轮（含 tool 结果之后的内容）都能作为缓存前缀被下一轮命中，
+    # 下一轮用户请求也能直接命中上一轮的完整前缀（含工具调用中段）。
+    # 与 _apply_cache_control 的显式断点叠加后总数不超过 Anthropic 的
+    # 4 断点上限（3 显式 + 1 自动）。
+    if supports_prompt_cache:
+        body["cache_control"] = {"type": "ephemeral"}
+    return body
+
+
+def _merged_extra_body(
+    api_label: str,
+    reasoning_extra: Optional[dict],
+    chat_id: object = None,
+    supports_prompt_cache: bool = False,
+) -> Optional[dict]:
     """
     合并 OpenRouter 路由偏好与推理控制字段，返回应传给 create() 的
     extra_body；两个来源都为空时返回 None（不发送 extra_body）。
@@ -90,10 +127,87 @@ def _merged_extra_body(api_label: str, reasoning_extra: Optional[dict]) -> Optio
     """
     body = None
     if api_label == "openrouter":
-        body = _openrouter_extra_body()
+        body = _openrouter_extra_body(
+            chat_id=chat_id,
+            supports_prompt_cache=supports_prompt_cache,
+        )
     if reasoning_extra:
         body = {**(body or {}), **reasoning_extra}
     return body
+
+
+# =====================================================================
+# Prompt cache 命中观测：把各家的缓存命中字段统一提取成一份小字典，
+# 在每轮请求结束后打一行 INFO 日志，让"缓存命中率"变成可度量的指标。
+# 字段来源：
+#   OpenRouter / OpenAI : usage.prompt_tokens_details.cached_tokens
+#                         （+ model_extra.cache_write_tokens）
+#   Anthropic（经 OR）  : cache_read_input_tokens / cache_creation_input_tokens
+#   DeepSeek 直连       : prompt_cache_hit_tokens / prompt_cache_miss_tokens
+# =====================================================================
+def _extract_cache_usage(usage) -> dict:
+    if usage is None:
+        return {}
+
+    def _num(value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+        return None
+
+    if isinstance(usage, dict):
+        prompt = _num(usage.get("prompt_tokens"))
+        details = usage.get("prompt_tokens_details") or {}
+        if not isinstance(details, dict):
+            details = {}
+        cached = _num(details.get("cached_tokens"))
+        if cached is None:
+            cached = _num(usage.get("cache_read_input_tokens"))
+        if cached is None:
+            cached = _num(usage.get("prompt_cache_hit_tokens"))
+        cache_write = _num(usage.get("cache_write_tokens"))
+        if cache_write is None:
+            cache_write = _num(usage.get("cache_creation_input_tokens"))
+        if cache_write is None:
+            cache_write = _num(usage.get("prompt_cache_miss_tokens"))
+    else:
+        prompt = _num(getattr(usage, "prompt_tokens", None))
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached = _num(getattr(details, "cached_tokens", None)) if details is not None else None
+        extra = getattr(usage, "model_extra", None)
+        extra = extra if isinstance(extra, dict) else {}
+        if cached is None:
+            cached = _num(extra.get("cache_read_input_tokens"))
+        if cached is None:
+            cached = _num(extra.get("prompt_cache_hit_tokens"))
+        cache_write = _num(extra.get("cache_write_tokens"))
+        if cache_write is None:
+            cache_write = _num(extra.get("cache_creation_input_tokens"))
+        if cache_write is None:
+            cache_write = _num(extra.get("prompt_cache_miss_tokens"))
+
+    stats: dict = {}
+    if prompt:
+        stats["prompt_tokens"] = prompt
+    if cached is not None:
+        stats["cached"] = cached
+    if cache_write is not None:
+        stats["cache_write"] = cache_write
+    if prompt and cached is not None:
+        stats["hit_ratio"] = round(cached / max(1, prompt), 3)
+    return stats
+
+
+def _log_cache_usage(api_label: str, usage) -> None:
+    """每轮请求结束时打一行缓存命中摘要（无缓存字段时静默跳过）。"""
+    try:
+        stats = _extract_cache_usage(usage)
+        if stats:
+            logger.info("[%s] prompt cache usage: %s", api_label, stats)
+    except Exception:
+        # 观测日志绝不影响主流程
+        logger.debug("cache usage 日志记录失败", exc_info=True)
 
 
 async def _agentic_loop_openai_compat(
@@ -116,6 +230,7 @@ async def _agentic_loop_openai_compat(
     # 采样与推理控制统一来自 config.py（含 per-model 覆盖），禁止在此硬编码。
     sampling_params = get_sampling_params(model_info)
     reasoning_top, reasoning_extra = get_reasoning_request_fields(model_info, api_label)
+    prompt_cache_enabled = bool(model_info and model_info.supports_prompt_cache)
 
     for _round in range(MAX_TOOL_CALLS):
         added_tool_indices = set()
@@ -156,7 +271,11 @@ async def _agentic_loop_openai_compat(
                 create_params["tools"] = tools
                 create_params["tool_choice"] = "auto"
                 create_params["parallel_tool_calls"] = parallel_tool_calls
-            extra_body = _merged_extra_body(api_label, reasoning_extra)
+            extra_body = _merged_extra_body(
+                api_label, reasoning_extra,
+                chat_id=builder.chat_id,
+                supports_prompt_cache=prompt_cache_enabled,
+            )
             if extra_body is not None:
                 create_params["extra_body"] = extra_body
 
@@ -330,7 +449,11 @@ async def _agentic_loop_openai_compat(
                     fallback_params["tools"] = tools
                     fallback_params["tool_choice"] = "auto"
                     fallback_params["parallel_tool_calls"] = parallel_tool_calls
-                fallback_extra_body = _merged_extra_body(api_label, reasoning_extra)
+                fallback_extra_body = _merged_extra_body(
+                    api_label, reasoning_extra,
+                    chat_id=builder.chat_id,
+                    supports_prompt_cache=prompt_cache_enabled,
+                )
                 if fallback_extra_body is not None:
                     fallback_params["extra_body"] = fallback_extra_body
 
@@ -456,7 +579,11 @@ async def _agentic_loop_openai_compat(
             }
             synth_params.update(sampling_params)
             synth_params.update(reasoning_top)
-            synth_extra_body = _merged_extra_body(api_label, reasoning_extra)
+            synth_extra_body = _merged_extra_body(
+                api_label, reasoning_extra,
+                chat_id=builder.chat_id,
+                supports_prompt_cache=prompt_cache_enabled,
+            )
             if synth_extra_body is not None:
                 synth_params["extra_body"] = synth_extra_body
             try:
@@ -503,6 +630,7 @@ async def _agentic_loop_openai_compat(
             builder.finish_group(len(builder._tool_groups) - 1)
         # 轮次数耗尽后的兜底文本同样是终局内容：结束旧草稿，不创建下一段。
         await builder.rollover_at_turn_boundary(start_next_draft=False)
+    _log_cache_usage(api_label, final_usage)
     return final_content, final_usage, new_history_entries
 
 
@@ -726,6 +854,7 @@ async def _agentic_loop_gemini_openai_compat(
             builder.finish_group(len(builder._tool_groups) - 1)
         # 轮次数耗尽后的兜底文本没有后续轮次：结束旧草稿，但不创建新草稿。
         await builder.rollover_at_turn_boundary(start_next_draft=False)
+    _log_cache_usage("gemini", final_usage)
     return final_content, final_usage, new_history_entries
 
 

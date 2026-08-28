@@ -56,6 +56,7 @@ from apitelegramchat.state import set_editor_file_state  # noqa: F401  (保留 s
 from apitelegramchat.config import (
     OPENROUTER_API_KEY,
     FETCH_CACHE_TTL,
+    SEARCH_CACHE_TTL,
     SUPPORTED_MODELS,
     get_openrouter_provider_preferences,
 )
@@ -106,6 +107,48 @@ if _TRAFILATURA_CONFIG is not None:
 
 # ---------- 缓存 ----------
 _fetch_cache = TTLCache(maxsize=200, ttl=FETCH_CACHE_TTL)
+
+# web_search 结果缓存：agent 循环里模型重复/改写同一查询报常见，命中后
+# 直接返回上次的格式化结果，省 Serper 配额与延迟；TTL 由 SEARCH_CACHE_TTL
+# 控制（默认 300s，与 fetch 缓存同一套环境变量风格）。
+_search_cache = TTLCache(maxsize=200, ttl=SEARCH_CACHE_TTL)
+
+
+def _search_cache_key(
+    modes: list[str],
+    query: str,
+    requested: int,
+    page: int | None,
+    gl: str | None,
+    hl: str | None,
+    tbs: str | None,
+    image_url: str | None,
+) -> str:
+    """把归一化后的搜索参数序列化成稳定的缓存键。"""
+    return json.dumps(
+        {
+            "m": list(modes),
+            "q": query,
+            "n": requested,
+            "p": page,
+            "gl": gl or "",
+            "hl": hl or "",
+            "tbs": tbs or "",
+            "iu": (image_url or "").strip(),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _is_cacheable_search_result(value: object) -> bool:
+    """只缓存成功结果与确定性空结果；服务错误/异常不缓存，保证可重试。"""
+    if not isinstance(value, str) or not value:
+        return False
+    if value.startswith("❌ 未找到"):
+        return True  # 确定性空结果，短期内复用可省配额
+    return not value.startswith("❌")
 
 
 def _normalize_fetch_cache_key(url: str) -> str:
@@ -1520,6 +1563,10 @@ async def execute_web_search(
 ) -> str:
     """通过 Serper 直连 API 搜索，支持 search / images / videos / lens 四种 mode。
 
+    带结果缓存：归一化参数相同的重复查询在 SEARCH_CACHE_TTL（默认 300s）
+    内直接返回上次的格式化结果。缓存覆盖主 agent、子 agent 与重试路径，
+    agent 循环里模型重复同一查询时不再消耗 Serper 配额。
+
     单次调用可同时执行多个 mode（mode 为 list 时并发执行）。各 mode 的失败
     互不影响：成功 mode 的结果正常返回，失败 mode 在结果末尾以错误说明列出。
 
@@ -1535,6 +1582,51 @@ async def execute_web_search(
       hl:          界面语言（如 en / zh-cn），默认取 WEB_SEARCH_LANGUAGE。
       tbs:         时间筛选（如 qdr:d 当天 / qdr:w 一周 / qdr:m 一月 / qdr:y 一年）。
     """
+    # ---- 参数归一化（与缓存 key 保持同一套逻辑） ----
+    modes = _normalize_modes(mode)
+    requested = _SEARCH_DEFAULT_RESULTS
+    if num_results is not None:
+        requested = max(1, min(int(num_results), _SEARCH_MAX_RESULTS))
+    page: int | None = None
+    if offset is not None:
+        page = max(int(offset), 0) // SERPER_PAGE_SIZE + 1
+    query_str = (query or "").strip()
+
+    cache_key = _search_cache_key(
+        modes, query_str, requested, page, gl, hl, tbs, image_url,
+    )
+    cached = _search_cache.get(cache_key)
+    if cached is not None:
+        logger.debug("Search cache hit: %s", cache_key[:160])
+        return cached
+
+    result = await _execute_web_search_uncached(
+        query=query,
+        num_results=num_results,
+        offset=offset,
+        mode=mode,
+        image_url=image_url,
+        gl=gl,
+        hl=hl,
+        tbs=tbs,
+    )
+    if _is_cacheable_search_result(result):
+        _search_cache[cache_key] = result
+    return result
+
+
+async def _execute_web_search_uncached(
+    query: str | None = None,
+    num_results: int | None = None,
+    offset: int | None = None,
+    *,
+    mode: str | list[str] | None = "search",
+    image_url: str | None = None,
+    gl: str | None = None,
+    hl: str | None = None,
+    tbs: str | None = None,
+) -> str:
+    """execute_web_search 的无缓存实现（原函数体，逻辑未变）。"""
     modes = _normalize_modes(mode)
     requested = _SEARCH_DEFAULT_RESULTS
     if num_results is not None:

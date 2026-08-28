@@ -990,45 +990,56 @@ def _mark_last_content_block_cacheable(msg: dict) -> bool:
 
 def _apply_cache_control(messages: list) -> None:
     """
-    为系统消息和最后一条 user/assistant 消息添加 cache_control 标记。
-    固定最多添加两个标记，无需 token 计数。
+    为系统消息、上一轮对话末尾、最后一条消息添加 cache_control 标记。
+    最多添加三个显式标记（Anthropic 单请求上限 4 个断点，剩余 1 个额度
+    留给 agentic loop 的顶层自动缓存，见 agentic_loops._openrouter_extra_body）。
 
     注意：cache_control 必须打在 content block 上（见
     _mark_last_content_block_cacheable），打在消息顶层对 OpenRouter/
     OpenAI 兼容网关无效，会被静默忽略。
 
     断点策略（Anthropic 前缀缓存最佳实践）：
-      1. system 消息末尾打一个断点 —— 稳定不变的系统提示在每一轮都能命中；
-      2. 从最后一条消息（通常是本轮新 user 消息）往前找第一条
-         user/assistant 消息打断点 —— 断点越靠后，缓存覆盖的前缀越长。
+      1. system 消息末尾 —— 稳定不变的巨型系统提示（含技能目录）在每一轮
+         都能命中，这是收益最大、最稳定的缓存段；
+      2. 上一轮对话的最后一条可标记消息（倒数第二条区域）—— 把上一轮的
+         完整内容（含最终 assistant 回复）纳入缓存前缀。没有这个断点时，
+         下一轮请求最多命中到"上一轮的 user 消息"，上一轮的工具调用
+         中段（往往占一轮 token 的大头）全部按原价重算；
+      3. 最后一条消息（通常是本轮新 user 消息）—— 断点越靠后，缓存覆盖
+         的前缀越长；agentic loop 的第 2..N 轮请求（追加了 tool 结果）
+         可以直接命中到这里。
     本函数必须在"全部消息（含本轮新 user 消息）就位之后"调用，
     供 agentic loop 的每一轮请求复用：loop 内追加的 tool 消息位于
     断点之后，不影响断点之前的前缀命中。
     """
     if not messages:
         return
-    # 为系统消息添加标记
-    markers_added = 0
+    # 为系统消息添加标记（断点 1）
     if messages[0].get("role") == "system":
-        if _mark_last_content_block_cacheable(messages[0]):
-            markers_added = 1
-    # 如果还有余量，从最后一条消息（含本轮新 user 消息）往前找一条
-    # user/assistant 消息添加标记。此前 range 从 len-2 起步且调用时机
-    # 早于新 user 消息 append，导致断点落在倒数第二条历史消息上，
-    # 缓存覆盖范围无谓缩小。
-    if markers_added < 2 and len(messages) >= 2:
-        for i in range(len(messages) - 1, 0, -1):
-            msg = messages[i]
-            role = msg.get("role")
-            if role in ("user", "assistant"):
-                content = msg.get("content")
-                already_marked = (
-                    isinstance(content, list)
-                    and content
-                    and isinstance(content[-1], dict)
-                    and "cache_control" in content[-1]
-                )
-                if not already_marked and _mark_last_content_block_cacheable(msg):
-                    break
+        _mark_last_content_block_cacheable(messages[0])
+    # 断点 2 + 3：从最后一条消息往前找两条 user/assistant 消息。
+    # 最末一条覆盖"本轮新 user 消息"（loop 内多轮复用）；再往前一条
+    # 覆盖"上一轮对话末尾"（跨轮命中）。已带标记的消息同样占用断点
+    # 额度，因此统一计数，保证总数不超过 3。
+    remaining_markers = 2
+    for i in range(len(messages) - 1, 0, -1):
+        if remaining_markers <= 0:
+            break
+        msg = messages[i]
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = msg.get("content")
+        already_marked = (
+            isinstance(content, list)
+            and content
+            and isinstance(content[-1], dict)
+            and "cache_control" in content[-1]
+        )
+        if already_marked:
+            remaining_markers -= 1
+            continue
+        if _mark_last_content_block_cacheable(msg):
+            remaining_markers -= 1
 
 
