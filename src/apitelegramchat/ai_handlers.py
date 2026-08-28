@@ -135,7 +135,7 @@ async def build_system_prompt(
       <tr><td>行内代码 (Inline Code)</td><td><code><code>text</code></code></td></tr>
       <tr><td>高亮 (Highlight)</td><td><code><mark>文本</mark></code></td></tr>
       <tr><td>下标 / 上标</td><td><code><sub>下标</sub></code> / <code><sup>上标</sup></code></td></tr>
-      <tr><td>代码块 (Code Block)</td><td><code><pre><code class="language-python">代码</code></pre></code></td></tr>
+      <tr><td>等宽代码块 (Code Block)</td><td><code><pre><code class="language-python">代码</code></pre></code></td></tr>
       <tr><td>标题 (Headings)</td><td><code><h1></code> 到 <code><h6></code></td></tr>
       <tr><td>段落 (Paragraph)</td><td><code><p>文本</p></code></td></tr>
       <tr><td>引用块 (Blockquote)</td><td><code><blockquote>文本</blockquote></code>（支持可折叠：<code><blockquote expandable></code>）</td></tr>
@@ -146,8 +146,8 @@ async def build_system_prompt(
       <tr><td>地图 / 数学公式</td><td><code><tg-map lat="..." long="..." zoom="..."/></code> / <code><tg-math>公式</tg-math></code></td></tr>
     </table>
   </li>
-  <li>🔴 不要输出 Markdown 语法</li>
   <li>严格按上述定义使用标签，切勿自行发明未定义的 HTML 标签。</li>
+  <li>🔴 不要使用 Markdown 语法 例如 <code>---</code> 或者 <code>**</code></li>
 </ul>
 </details>
 
