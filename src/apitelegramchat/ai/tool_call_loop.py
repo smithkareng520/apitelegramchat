@@ -5,6 +5,7 @@
 import asyncio
 import json
 import re
+import time
 import uuid
 from typing import TYPE_CHECKING
 
@@ -50,6 +51,132 @@ if TYPE_CHECKING:
     from apitelegramchat.ai.rich_message_builder import RichMessageBuilder
 
 logger = get_logger(__name__)
+
+
+# ---------- 子 agent 进度预览渲染 ----------
+# 子 agent 在 _subagent_agentic_loop 里通过 _report 推送的 status_text 是
+# 一组带固定模式的中文短句（"第 X/Y 轮：LLM 思考中…（已耗时 Xs）"、
+# "完成：X 轮，N 次工具调用，Xs" 等）。这里把它们解析成结构化字段，
+# 渲染成 Telegram Rich Message 块级 HTML，让用户能直接读到当前阶段、
+# 当前轮数、已耗时、正在执行的工具名 —— 而不是一行被 italic 化、被
+# 截断到 300 token 的灰色状态句。
+
+# 顺序敏感：先匹配「完成 / 结束 / 超时 / 失败」再匹配「执行工具」、
+# 最后兜底「启动」。
+_SUBAGENT_PROGRESS_PHASE_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
+    ("done",     re.compile(r"^完成[:：]")),
+    ("terminal", re.compile(r"^结束[:：]")),
+    ("timeout",  re.compile(r"整体超时|LLM 调用超时|轮.*超时")),
+    ("error",    re.compile(r"失败|解析失败")),
+    ("tools",    re.compile(r"执行工具")),
+    ("thinking", re.compile(r"LLM 思考中")),
+    ("start",    re.compile(r"^启动子")),
+]
+
+_SUBAGENT_ROUND_RE = re.compile(r"第\s*(\d+)\s*[/／]\s*(\d+)\s*轮")
+_SUBAGENT_PLAIN_ROUND_RE = re.compile(r"第\s*(\d+)\s*轮")
+_SUBAGENT_ELAPSED_RE = re.compile(r"已耗时\s*([0-9.]+)\s*[s秒]")
+# 「完成：X 轮，N 次工具调用，Xs」与「结束：…（X 轮，N 次工具调用）」
+# 共享同一个轮次+工具调用次数模式；秒数仅在完成行出现，故设为可选。
+_SUBAGENT_TOTAL_TIME_RE = re.compile(
+    r"(\d+)\s*轮[，,]\s*(\d+)\s*次工具调用"
+    r"(?:[，,]\s*([0-9.]+)\s*[s秒])?"
+)
+_SUBAGENT_TOOL_NAMES_RE = re.compile(r"执行工具\s*(.+?)\s*[（(]?\s*已耗时")
+_SUBAGENT_MODEL_RE = re.compile(r"模型\s*([^，,（(]+?)\s*[，,]")
+
+
+def _subagent_progress_phase(status_text: str) -> str:
+    """从 status_text 里抽出当前阶段，用于节流决策（同一阶段内合并刷新）。"""
+    if not status_text:
+        return "unknown"
+    for phase, pattern in _SUBAGENT_PROGRESS_PHASE_PATTERNS:
+        if pattern.search(status_text):
+            return phase
+    return "unknown"
+
+
+def _format_subagent_progress_html(status_text: str) -> str:
+    """把子 agent 的中文状态短句渲染成结构化富文本卡片。
+
+    返回的 HTML 片段由若干 ``<p>`` 块级元素组成，可直接嵌入工具卡片的
+    ``<details>``。所有外露文本均经 ``escape_html`` 转义，避免模型或
+    子 agent 控制的字符串破坏 Rich Message 结构。
+    """
+    text = status_text or "正在执行…"
+    phase = _subagent_progress_phase(text)
+    phase_meta = {
+        "start":    ("🤖", "启动子 agent"),
+        "thinking": ("🧠", "LLM 思考中"),
+        "tools":    ("🔧", "正在调用工具"),
+        "done":     ("✅", "子 agent 已完成"),
+        "terminal": ("⚠️", "已结束"),
+        "timeout":  ("⏱️", "超时"),
+        "error":    ("❌", "出错"),
+        "unknown":  ("…",  "进行中"),
+    }.get(phase, ("…", "进行中"))
+    icon, phase_label = phase_meta
+
+    round_match = _SUBAGENT_ROUND_RE.search(text)
+    plain_round_match = _SUBAGENT_PLAIN_ROUND_RE.search(text)
+    elapsed_match = _SUBAGENT_ELAPSED_RE.search(text)
+    total_match = _SUBAGENT_TOTAL_TIME_RE.search(text)
+    tool_names_match = _SUBAGENT_TOOL_NAMES_RE.search(text)
+    model_match = _SUBAGENT_MODEL_RE.search(text)
+
+    rows = []
+    if model_match:
+        rows.append(f"<b>模型</b>：{escape_html(model_match.group(1).strip())}")
+    if round_match:
+        rows.append(
+            f"<b>轮次</b>：{escape_html(round_match.group(1))} / "
+            f"{escape_html(round_match.group(2))}"
+        )
+    elif plain_round_match and phase not in ("done", "terminal"):
+        rows.append(f"<b>轮次</b>：{escape_html(plain_round_match.group(1))}")
+    if tool_names_match:
+        # 子 agent 推送的 status_text 在工具名后追加了「…」，原样展示会
+        # 把省略号当成工具名一部分。统一去除尾部省略号 / 点号。
+        raw_names = tool_names_match.group(1).strip().rstrip("….").strip()
+        tool_list = [t.strip() for t in raw_names.split("+") if t.strip()]
+        if len(tool_list) > 6:
+            tool_display = " + ".join(tool_list[:6]) + f" 等 {len(tool_list)} 个"
+        else:
+            tool_display = " + ".join(tool_list)
+        rows.append(f"<b>调用工具</b>：{escape_html(tool_display)}")
+    if total_match:
+        rounds_s = escape_html(total_match.group(1))
+        tool_calls_s = escape_html(total_match.group(2))
+        seconds_s = escape_html(total_match.group(3)) if total_match.group(3) else None
+        if phase == "done":
+            label = "完成"
+        elif phase == "terminal":
+            label = "结束"
+        else:
+            label = "进度"
+        if seconds_s:
+            rows.append(
+                f"<b>{label}</b>：{rounds_s} 轮 · "
+                f"{tool_calls_s} 次工具调用 · "
+                f"{seconds_s}s"
+            )
+        else:
+            rows.append(
+                f"<b>{label}</b>：{rounds_s} 轮 · "
+                f"{tool_calls_s} 次工具调用"
+            )
+    elif elapsed_match:
+        rows.append(f"<b>已耗时</b>：{escape_html(elapsed_match.group(1))}s")
+
+    header = f"<p>{icon} <b>{escape_html(phase_label)}</b></p>"
+    if rows:
+        body = "<p>" + " · ".join(rows) + "</p>"
+    else:
+        # 兜底：状态文本本身已结构化失败，原样展示但截断到合理长度。
+        safe = escape_html(text[:160])
+        body = f"<p><i>{safe}</i></p>"
+    return header + body
+
 
 async def _run_tool_calls_and_append(
         tool_calls: list,
@@ -147,26 +274,62 @@ async def _run_tool_calls_and_append(
             else:
                 timeout = TOOL_CALL_TIMEOUT
 
-            # 子 agent 专用：每轮 LLM 调用前 / 工具执行前向 builder 推送进度，
-            # 实时刷新草稿，避免 90s 黑屏。
+            # ===== 进度预览策略（v2.3 重构） =====
+            # - Bash：完全不推送实时预览。原始 stdout 对用户价值有限
+            #   （多为命令日志，最终结果卡片已包含头尾完整输出），
+            #   频繁刷新草稿只换来视觉抖动 + Telegram API 限流压力。
+            #   卡片保持初始摘要（命令片段），由最终 update_tool_item
+            #   一次性写入完整结果卡片。
+            # - 子 agent：把每轮 LLM 调用前 / 工具执行前的状态渲染成
+            #   结构化进度卡片（轮数 / 已耗时 / 当前阶段 / 工具名），
+            #   让用户能真正看到子 agent 在干什么，而不是一行 italic
+            #   化的灰色状态句。
+            # - 刷新节流：子 agent 进度回调本身加 2.0s 硬节流（phase
+            #   切换时立即突破节流，保证关键状态变化可见），同时
+            #   不再调 builder.flush(force=True)，改由 update_tool_preview
+            #   内部的 request_flush(force=False) 走全局合并循环，避免
+            #   每次进度回调都立即触发一次草稿 patch。
             tool_progress_callback = None
-            if fn_name in SUBAGENT_TOOLS or fn_name in BASH_TOOLS:
-                label = "🤖 子 agent 运行中" if fn_name in SUBAGENT_TOOLS else "🖥️ Bash 运行中"
+            if fn_name in SUBAGENT_TOOLS:
+                label = "🤖 子 agent 运行中"
+                # 用 list 作闭包可变容器，避免 nonlocal 在嵌套 async
+                # 函数与外层 run_one 之间引发意外作用域。
+                _phase_ref = [None]
+                _emit_ref = [0.0]
 
-                async def tool_progress_callback(status_text: str, _tc_id=tc_id, _label=label):
+                async def tool_progress_callback(status_text: str,
+                                                  _tc_id=tc_id,
+                                                  _label=label,
+                                                  _phase_ref=_phase_ref,
+                                                  _emit_ref=_emit_ref):
                     try:
-                        text = status_text or "正在执行…"
-                        preview = f"<i>{escape_html(truncate_to_token_budget(text, 300, suffix='…'))}</i>"
-                        builder.update_tool_preview(_tc_id, preview, summary=_label)
-                        await builder.flush(force=True)
+                        now = time.monotonic()
+                        phase = _subagent_progress_phase(status_text)
+                        # 同一 phase 内 2s 节流；phase 切换立即推送，
+                        # 保证「思考 → 执行工具 → 完成」等关键状态变化
+                        # 不被合并丢掉。
+                        if phase == _phase_ref[0] and now - _emit_ref[0] < 2.0:
+                            return
+                        _phase_ref[0] = phase
+                        _emit_ref[0] = now
+                        preview_html = _format_subagent_progress_html(status_text)
+                        builder.update_tool_preview(_tc_id, preview_html, summary=_label)
+                        # update_tool_preview 内部已调用
+                        # request_flush(force=False)，由 builder 全局
+                        # _stream_flush_loop 按 STREAM_FLUSH_INTERVAL
+                        # 节流合并发送；不再 force=True。
                     except asyncio.CancelledError:
                         raise
                     except Exception:
                         pass  # 进度推送失败不能影响工具本身
 
-                # 先立即把工具状态从“刚开始”变成“正在执行”，避免长工具在
-                # 第一次真实 stdout/进度出现之前前端没有任何可见变化。
-                await tool_progress_callback("正在执行…")
+                # 立即把卡片从「刚开始」推到「运行中」，避免用户在子
+                # agent 首次 LLM 调用完成前看到空进度。
+                await tool_progress_callback("启动子 agent…")
+            # bash 走默认分支：tool_progress_callback 保持 None，
+            # execute / _execute_heredoc_isolated 内部 emit_progress
+            # 因 progress_callback is None 直接 return，整段 bash 期间
+            # 不再有进度预览，卡片仅展示命令片段摘要。
 
 
             try:

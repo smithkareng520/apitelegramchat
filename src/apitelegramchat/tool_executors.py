@@ -217,11 +217,6 @@ class _BashOutputBuffer:
             else:
                 break
 
-    def preview(self, last_chars: int = 8000) -> str:
-        """进度回调用的最近一段输出。"""
-        whole = "".join(self._head) + "".join(self._tail)
-        return whole[-last_chars:] if last_chars and len(whole) > last_chars else whole
-
     def finalize(self) -> str:
         """返回最终文本；中间被省略时插入明确说明。"""
         head = "".join(self._head)
@@ -1242,7 +1237,7 @@ class BashSession:
             # fall through to the existing heredoc regex as a safety net.
             return False
 
-    async def _execute_heredoc_isolated(self, command: str, timeout: int, progress_callback=None) -> str:
+    async def _execute_heredoc_isolated(self, command: str, timeout: int) -> str:
         """Execute heredoc-heavy (or otherwise syntactically risky) commands
         in a one-shot bash process.
 
@@ -1279,25 +1274,6 @@ class BashSession:
         )
 
         output_buffer = _BashOutputBuffer()
-        last_emit = 0.0
-
-        async def emit_progress(force: bool = False):
-            nonlocal last_emit
-            if progress_callback is None:
-                return
-            now = time.monotonic()
-            if not force and now - last_emit < 1.0:
-                return
-            preview = output_buffer.preview(8000)
-            try:
-                result = progress_callback(preview or "正在执行 Bash 命令…")
-                if asyncio.iscoroutine(result):
-                    await result
-                last_emit = now
-            except asyncio.CancelledError:
-                raise
-            except Exception as cb_error:
-                logger.debug("bash isolated progress callback failed: %s", cb_error)
 
         try:
             while True:
@@ -1305,7 +1281,6 @@ class BashSession:
                 if not chunk:
                     break
                 output_buffer.add(chunk.decode("utf-8", errors="replace"))
-                await emit_progress()
                 # Once the first byte arrived, reset the idle read timer to keep
                 # long-running commands alive while still detecting a total hang.
                 timeout = max(timeout, 1)
@@ -1332,7 +1307,6 @@ class BashSession:
             raise
 
         await proc.wait()
-        await emit_progress(force=True)
         output = output_buffer.finalize()
         exit_code = proc.returncode if proc.returncode is not None else "unknown"
         marker_match = re.search(rf"(?m)^{re.escape(marker)}\s+(-?\d+)\s*$", output)
@@ -1351,8 +1325,16 @@ class BashSession:
         return _format_bash_envelope(cwd, command, exit_code, output)
 
     # ===================== 执行命令 =====================
-    async def execute(self, command: str, timeout: int = SANDBOX_TIMEOUT_SEC, progress_callback=None) -> str:
-        """在沙箱中执行 bash 命令，超时自动终止"""
+    async def execute(self, command: str, timeout: int = SANDBOX_TIMEOUT_SEC) -> str:
+        """在沙箱中执行 bash 命令，超时自动终止
+
+        v2.3：不再接受 ``progress_callback``——bash 工具执行期间不推送
+        任何进度预览。原始 stdout 对用户价值有限（多为命令日志），
+        频繁刷新草稿只换来视觉抖动 + Telegram API 限流压力。
+        卡片摘要由 ``tool_call_loop`` 用 ``_generate_initial_tool_summary``
+        生成的命令片段保持不变；最终结果由 ``update_tool_item``
+        一次性写入包含 Input/Output 块级结构的完整卡片。
+        """
         # ★ init 在 workspace lock 外面执行：R2 网络同步可能耗时数秒，
         #   不应阻塞其他工具调用获取 workspace lock。init 只需要 init_lock
         #   （在 _ensure_workspace_initialized 内部获取），与 workspace lock 独立。
@@ -1407,7 +1389,7 @@ class BashSession:
             has_heredoc = bool(re.search(r"<<-?\s*(?:[\"']?[A-Za-z_][A-Za-z0-9_]*[\"']?)", command))
             if has_heredoc or await self._is_unterminated(command):
                 return await self._execute_heredoc_isolated(
-                    command, timeout=timeout, progress_callback=progress_callback
+                    command, timeout=timeout
                 )
 
             tag = uuid.uuid4().hex[:8]
@@ -1458,32 +1440,6 @@ class BashSession:
 
                 output_buffer = _BashOutputBuffer()
                 exit_code = "unknown"
-                progress_last_emit = 0.0
-                progress_chars_at_emit = 0
-                progress_min_interval = 0.20
-                progress_min_chars = 256
-
-                async def emit_progress(force: bool = False):
-                    nonlocal progress_last_emit, progress_chars_at_emit
-                    if progress_callback is None or output_buffer.total_seen == 0:
-                        return
-                    grew = output_buffer.total_seen - progress_chars_at_emit
-                    now = time.monotonic()
-                    if not force and grew < progress_min_chars and (now - progress_last_emit) < progress_min_interval:
-                        return
-                    # 前端草稿只需要最近一段日志；完整输出仍由最终结果保留。
-                    preview_text = output_buffer.preview(8000)
-                    try:
-                        result = progress_callback(preview_text)
-                        if asyncio.iscoroutine(result):
-                            await result
-                        progress_last_emit = now
-                        progress_chars_at_emit = output_buffer.total_seen
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as cb_error:
-                        # UI 推送失败绝不能影响 Bash 本身执行。
-                        logger.debug(f"bash progress callback failed: {cb_error}")
 
                 async def read_until_marker():
                     nonlocal exit_code
@@ -1510,14 +1466,11 @@ class BashSession:
                             if match:
                                 exit_code = match.group(1)
                             pending = ""
-                            await emit_progress(force=True)
                             break
 
                         if len(pending) > keep_tail:
                             output_buffer.add(pending[:-keep_tail])
                             pending = pending[-keep_tail:]
-
-                        await emit_progress(force=False)
 
                 await asyncio.wait_for(read_until_marker(), timeout=timeout)
 
@@ -1661,13 +1614,15 @@ class BashSessionManager:
 _bash_manager = BashSessionManager()
 
 # =====================================================================
-# execute_bash —— 工具调用入口（保持原签名，外部无需修改）
+# execute_bash —— 工具调用入口
+# v2.3：移除 ``progress_callback`` 参数。bash 执行期间不再推送任何进度
+# 预览（卡片摘要保持命令片段，最终结果由 update_tool_item 一次性写入
+# 包含 Input/Output 块级结构的完整卡片）。
 # =====================================================================
 async def execute_bash(
     chat_id: int,
     command: str = "",
     restart: bool = False,
-    progress_callback=None,
     namespace: str | None = None,
 ) -> str:
     resolved_namespace = workspace_namespace(chat_id, namespace)
@@ -1681,7 +1636,7 @@ async def execute_bash(
     except RuntimeError as e:
         return f"Error: {e}"
     # 执行命令；workspace 本地文件不会自动同步到 R2。
-    return await session.execute(command, progress_callback=progress_callback)
+    return await session.execute(command)
 
 # ---------- 工具结果格式化 ----------
 
@@ -2615,13 +2570,15 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 file_text=arguments.get("file_text"),
             )
         # ========== Bash 工具分支 ==========
+        # v2.3：bash 执行期间不再推送任何进度预览（progress_callback
+        # 不再传递给 execute_bash；卡片摘要保持命令片段，最终结果由
+        # update_tool_item 一次性写入）。
         elif name == "bash":
             return await execute_bash(
                 chat_id=chat_id,
                 namespace=resolved_namespace,
                 command=arguments.get("command", ""),
                 restart=arguments.get("restart", False),
-                progress_callback=progress_callback,
             )
         # ========== Todo 工具分支 ==========
         # 任务 / 待办清单。返回 JSON 字符串给 AI 上下文；UI 渲染由 format_tool_result 处理。
