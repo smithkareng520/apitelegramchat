@@ -76,7 +76,6 @@ def truncate_to_token_budget_head_tail(
     token_budget: int,
     *,
     head_ratio: float = 0.7,
-    note: str = "\n…[输出超过 token 预算：已保留开头与结尾，中间内容已省略]\n",
     encoding_name: str = DEFAULT_ENCODING_NAME,
 ) -> str:
     """Truncate text keeping BOTH the head and the tail within the budget.
@@ -100,32 +99,28 @@ def truncate_to_token_budget_head_tail(
     if len(encoded) <= token_budget:
         return text
 
-    encoded_note = encoding.encode(note, disallowed_special=()) if note else []
-    if len(encoded_note) >= token_budget:
-        # 预算极小时退化为普通截断，保证输出永远合法。
-        return encoding.decode(encoded[:token_budget])
-
-    usable = token_budget - len(encoded_note)
-    if usable <= 0:
-        return encoding.decode(encoded_note[:token_budget])
+    # 先按可用预算切分头尾，再按实际插入的分隔文案的真实 token 数校验
+    # 总量；若超出则收缩头尾重试。保证最终输出严格不超过 token_budget
+    # （旧实现预留的是静态 note 参数的长度，实际插入的却是更长的动态
+    # 文案，导致结果持续超支 30-50 token）。
     head_ratio = min(max(head_ratio, 0.1), 0.9)
-    head_tokens = max(1, int(usable * head_ratio))
-    tail_tokens = max(1, usable - head_tokens)
-    omitted = len(encoded) - head_tokens - tail_tokens
-    head_text = encoding.decode(encoded[:head_tokens])
-    tail_text = encoding.decode(encoded[-tail_tokens:])
-    suffix = (
-        f"\n…[输出超过 token 预算：已保留开头 {head_tokens} 与结尾 {tail_tokens} 个 token，"
-        f"中间约 {omitted} 个 token 已省略；如需完整内容请将输出重定向到文件后用 grep/text_editor 查看]\n"
-    )
-    return head_text + suffix + tail_text
-
-
-def fits_token_budget(value: Any, token_budget: int) -> bool:
-    """Return whether ``value`` fits within a non-negative token budget."""
-    if token_budget < 0:
-        raise ValueError("token_budget must be non-negative")
-    return count_tokens(value) <= token_budget
+    usable = token_budget
+    for _ in range(3):
+        head_tokens = max(1, int(usable * head_ratio))
+        tail_tokens = max(1, usable - head_tokens)
+        omitted = max(0, len(encoded) - head_tokens - tail_tokens)
+        suffix = (
+            f"\n…[输出超过 token 预算：已保留开头 {head_tokens} 与结尾 {tail_tokens} 个 token，"
+            f"中间约 {omitted} 个 token 已省略；如需完整内容请将输出重定向到文件后用 grep/text_editor 查看]\n"
+        )
+        encoded_suffix = encoding.encode(suffix, disallowed_special=())
+        if head_tokens + tail_tokens + len(encoded_suffix) <= token_budget:
+            head_text = encoding.decode(encoded[:head_tokens])
+            tail_text = encoding.decode(encoded[-tail_tokens:])
+            return head_text + suffix + tail_text
+        usable = max(1, token_budget - len(encoded_suffix))
+    # 预算极小时退化为普通截断，保证输出永远合法。
+    return encoding.decode(encoded[:token_budget])
 
 
 def json_token_count(value: Any) -> int:
@@ -141,7 +136,6 @@ def json_token_count(value: Any) -> int:
 __all__ = [
     "DEFAULT_ENCODING_NAME",
     "count_tokens",
-    "fits_token_budget",
     "json_token_count",
     "truncate_to_token_budget",
     "truncate_to_token_budget_head_tail",

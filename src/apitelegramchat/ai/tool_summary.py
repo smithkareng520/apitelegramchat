@@ -198,7 +198,6 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     # ---------- text_editor ----------
     if fn_name == "text_editor":
         command = fn_args.get("command", "")
-        path = fn_args.get("path", "")
         # 进行时只显示描述，不需要详细路径
         return custom_desc or {
             "view": "Viewing file",
@@ -389,12 +388,10 @@ def _tool_result_is_failure(fn_name: str, fn_args: dict, result_content: Any, de
             # 执行——这是"部分成功"而非整体失败。判为非失败，避免 UI
             # 把已完成的实际工作显示成 "Tools failed"；完整输出（含
             # 错误文本与退出码）仍会回传给模型自行补救。
-            if m.group(1) == "127" and _bash_cmdnotfound_is_partial(text, fn_args):
-                return False
-            return True
-        if lower.startswith(("error:", "exception:", "failed:", "timeout:", "❌")):
-            return True
-        return False
+            return not (
+                m.group(1) == "127" and _bash_cmdnotfound_is_partial(text, fn_args)
+            )
+        return lower.startswith(("error:", "exception:", "failed:", "timeout:", "❌"))
     if lower.startswith(("error:", "exception:", "failed:", "timeout:", "❌", "失败：", "失败:")):
         return True
     if text.startswith("{"):

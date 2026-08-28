@@ -153,8 +153,6 @@ def select_request_context(
             continue
         selected_reversed.append(message.copy())
         used_tokens += message_tokens
-    else:
-        natural_drop = 0
 
     # ---- 量化淘汰：一次性多丢 (step - natural % step) 条，换取后续轮次稳定 ----
     keep_min = 0 if (max_messages is not None and max_messages <= 0) else 1
@@ -166,8 +164,10 @@ def select_request_context(
     while selected and selected[0].get("role") == "tool":
         selected.pop(0)
 
+    # 复用循环中累计的 used_tokens（拟合消息用的是拟合后计数），
+    # 避免对全部选中消息再做一次完整的序列化+编码。
     return ContextSnapshot(
         messages=selected,
         dropped_messages=max(0, len(history) - len(selected)),
-        estimated_tokens=sum(_message_token_count(message) for message in selected),
+        estimated_tokens=used_tokens,
     )

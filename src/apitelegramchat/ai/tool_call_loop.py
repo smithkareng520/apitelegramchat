@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import uuid
+from typing import TYPE_CHECKING
 
 from apitelegramchat.utils import get_logger, escape_html
 from apitelegramchat.token_budget import truncate_to_token_budget
@@ -43,6 +44,10 @@ from apitelegramchat.ai.tool_summary import (
     _tool_result_is_failure,
     _INVALID_TOOL_ARGUMENTS_KEY,
 )
+
+if TYPE_CHECKING:
+    # 仅供类型注解使用；运行时由调用方传入，避免运行时循环导入。
+    from apitelegramchat.ai.rich_message_builder import RichMessageBuilder
 
 logger = get_logger(__name__)
 
@@ -118,12 +123,11 @@ async def _run_tool_calls_and_append(
 
     await builder.flush(force=False)
 
-    has_image_tool = any(fn_name in MEDIA_GEN_TOOLS for fn_name, _, _ in tool_tasks)
-    has_bash_tool = any(fn_name in BASH_TOOLS for fn_name, _, _ in tool_tasks)
-    has_ask_user_tool = any(fn_name == "ask_user" for fn_name, _, _ in tool_tasks)
     # 草稿构建器的全局刷新循环会在静默超时后，对当前活跃草稿统一执行
     # force flush。工具批次无需另建心跳任务；图片、视频和普通工具均复用
     # 同一机制，状态变更仍由前面的普通 flush 立即推送。
+    # （旧实现此处还计算过 has_image_tool / has_bash_tool /
+    #  has_ask_user_tool 三个从未被读取的变量，属心跳任务删除后的残留。）
 
     async def run_one(fn_name, fn_args, tc_id):
         async with tool_semaphore:
@@ -389,6 +393,16 @@ async def _run_tool_calls_and_append(
             }
             loop_messages.append(tool_msg)
             new_history_entries.append(tool_msg)
+            # 流式路径已为全部 tool call 建过 UI 条目；被跳过的调用若不
+            # 显式收尾，折叠块会永远停留在 "Running..."。openai-compat
+            # 流式路径已在 agentic_loops 里 add_tool_item（update 在此处
+            # 生效）；未建条目的路径（如 Gemini）update_tool_item 静默跳过。
+            builder.update_tool_item(
+                skipped_id,
+                "Not executed (budget)",
+                f"<p>{escape_html(skipped_content)}</p>",
+                status="error",
+            )
         logger.warning(
             "[%s] 工具调用预算已耗尽：已执行=%s，跳过=%s，上限=%s",
             api_label, tool_call_count_ref[0], len(skipped_tool_calls), MAX_TOOL_CALLS,
@@ -406,9 +420,7 @@ async def _run_tool_calls_and_append(
     for res in results:
         if isinstance(res, tuple) and len(res) >= 5:
             llm_content = res[4]
-            if isinstance(llm_content, str) and (
-                    llm_content.startswith("Error:") or llm_content.startswith("Exception:")
-            ):
+            if isinstance(llm_content, str) and llm_content.startswith(("Error:", "Exception:")):
                 error_msgs.append(llm_content[:80])
     if error_msgs and len(set(error_msgs)) == 1 and len(error_msgs) == len(results):
         key = f"_streak:{error_msgs[0]}"

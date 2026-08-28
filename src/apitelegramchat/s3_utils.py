@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import List
 from urllib.parse import urlparse
 
 try:
@@ -298,41 +297,6 @@ async def download_from_r2(key: str) -> bytes | None:
     except Exception as e:
         logger.warning("R2 download failed: %s", e)
         return None
-
-
-async def list_r2_objects(prefix: str) -> List[str]:
-    if not is_r2_configured():
-        root = _LOCAL_R2_ROOT / prefix
-        if not root.exists():
-            return []
-        items: List[str] = []
-        for path in root.rglob("*"):
-            if path.is_file():
-                rel = path.relative_to(_LOCAL_R2_ROOT).as_posix()
-                items.append(rel)
-        return items
-
-    keys: List[str] = []
-    continuation = None
-    while True:
-        kwargs = {"Bucket": R2_BUCKET_NAME, "Prefix": prefix}
-        if continuation:
-            kwargs["ContinuationToken"] = continuation
-        async with session.client(
-            "s3",
-            endpoint_url=R2_ENDPOINT,
-            aws_access_key_id=R2_ACCESS_KEY,
-            aws_secret_access_key=R2_SECRET_KEY,
-            region_name=R2_REGION,
-            config=_R2_CONFIG,
-        ) as s3:
-            resp = await s3.list_objects_v2(**kwargs)
-        for obj in resp.get("Contents", []):
-            keys.append(obj["Key"])
-        if not resp.get("IsTruncated"):
-            break
-        continuation = resp.get("NextContinuationToken")
-    return keys
 
 
 async def delete_r2_object(key: str) -> bool:

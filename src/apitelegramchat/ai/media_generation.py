@@ -215,7 +215,7 @@ async def _request_modelscope_native_image(
                     continue
                 if normalized.startswith('data:image/'):
                     image_data_urls.append(normalized)
-                elif normalized.startswith('http://') or normalized.startswith('https://'):
+                elif normalized.startswith(('http://', 'https://')):
                     img_bytes = await _download_image_bytes_from_url(session, normalized)
                     if img_bytes:
                         image_data_urls.append(_bytes_to_data_url(img_bytes, normalized))

@@ -272,7 +272,7 @@ def _op_toggle(store: dict, todo_id: str, force: Optional[bool]) -> dict:
     found = _find_todo(store["todos"], todo_id)
     if not found:
         raise _TodoError(f"找不到 id 为 {todo_id} 的待办", "not_found")
-    idx, todo = found
+    _idx, todo = found
     new_state = (not todo["done"]) if force is None else bool(force)
     if todo["done"] == new_state:
         # 状态未变
@@ -340,7 +340,7 @@ def _op_edit(store: dict, todo_id: str, title: Optional[str],
     found = _find_todo(store["todos"], todo_id)
     if not found:
         raise _TodoError(f"找不到 id 为 {todo_id} 的待办", "not_found")
-    idx, todo = found
+    _idx, todo = found
     changed = []
     if title is not None:
         t = title.strip()

@@ -30,7 +30,6 @@ class ToolCompactionStats:
     """Counts produced by one idempotent history compaction pass."""
 
     eligible_calls: int = 0
-    compacted_calls_count: int = 0
     compacted_calls: int = 0
     archived_bytes: int = 0
 
@@ -82,7 +81,7 @@ def _minimal_arguments(name: str, raw: object) -> str:
     return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
 
 
-def _archive_relative_path(round_index: int, call_id: str) -> str:
+def _archive_relative_path(call_id: str) -> str:
     """生成归档文件的相对路径。
 
     修复：原 digest 包含 round_index（history 数组下标），一旦之前的
@@ -192,7 +191,7 @@ async def compact_older_tool_calls(
         for round_index, tool_call, tool_result in calls[:compact_call_count]:
                 name = _tool_name(tool_call)
                 call_id = _tool_call_id(tool_call)
-                relative_path = _archive_relative_path(round_index, call_id)
+                relative_path = _archive_relative_path(call_id)
                 archive_path = (workspace / relative_path).resolve()
                 if workspace not in archive_path.parents:
                     raise ValueError("tool archive path escapes workspace")
@@ -227,15 +226,13 @@ async def compact_older_tool_calls(
 
     stats = ToolCompactionStats(
         eligible_calls=len(calls),
-        compacted_calls_count=compacted_calls,
         compacted_calls=compacted_calls,
         archived_bytes=archived_bytes,
     )
     logger.info(
-        "Tool context compacted: chat=%s eligible_calls=%s compacted_calls_count=%s compacted_calls=%s archived_bytes=%s",
+        "Tool context compacted: chat=%s eligible_calls=%s compacted_calls=%s archived_bytes=%s",
         chat_id,
         stats.eligible_calls,
-        stats.compacted_calls_count,
         stats.compacted_calls,
         stats.archived_bytes,
     )

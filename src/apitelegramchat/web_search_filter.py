@@ -11,7 +11,6 @@ from apitelegramchat.web_search_settings import (
     WEB_SEARCH_DOMAIN_FILTER_ENABLED,
     WEB_SEARCH_MAX_CANDIDATES,
     WEB_SEARCH_MAX_RESULTS,
-    WEB_SEARCH_UPSTREAM_DOMAIN_EXCLUDE_ENABLED,
 )
 
 
@@ -29,11 +28,6 @@ class DomainRule:
         if self.include_root and hostname == self.domain:
             return True
         return self.include_subdomains and hostname.endswith(f".{self.domain}")
-
-    @property
-    def can_use_upstream_site_exclude(self) -> bool:
-        """只有根域名和全部子域名都匹配时，-site: 才不会扩大规则范围。"""
-        return self.include_root and self.include_subdomains
 
 
 def _positive_int_setting(value: Any, default: int, *, minimum: int = 1) -> int:
@@ -96,11 +90,6 @@ def parse_blacklist_rules(domains: Any) -> tuple[DomainRule, ...]:
     return tuple(parsed)
 
 
-def normalize_blacklist_domains(domains: Any) -> tuple[str, ...]:
-    """保留兼容的根域名标准化视图，不丢失配置中的规则顺序。"""
-    return tuple(rule.domain for rule in parse_blacklist_rules(domains))
-
-
 SEARCH_MAX_RESULTS = _positive_int_setting(WEB_SEARCH_MAX_RESULTS, 50)
 SEARCH_DEFAULT_RESULTS = min(
     _positive_int_setting(WEB_SEARCH_DEFAULT_RESULTS, 10),
@@ -116,27 +105,6 @@ SEARCH_CANDIDATE_MULTIPLIER = _positive_int_setting(
 )
 BLACKLIST_RULES = parse_blacklist_rules(BLACKLIST_DOMAINS)
 BLACKLISTED_SEARCH_DOMAINS = tuple(rule.domain for rule in BLACKLIST_RULES)
-
-
-def upstream_domain_exclude_terms() -> str | None:
-    """为能够精确表达范围的规则生成 Serper MCP 的 ``exclude`` 参数。
-
-    `marcopesani/mcp-server-serper` 会把 ``site:example.com`` 拼成 Google
-    查询中的 ``-site:example.com``。只有 ``[*.]example.com`` 一类同时匹配
-    根域名与全部子域名的规则可安全映射为该条件；精确和仅子域名规则继续仅由
-    本地 URL 主机名过滤执行，以避免过度拦截。
-    """
-    if not WEB_SEARCH_UPSTREAM_DOMAIN_EXCLUDE_ENABLED or not BLACKLIST_RULES:
-        return None
-
-    terms: list[str] = []
-    seen: set[str] = set()
-    for rule in BLACKLIST_RULES:
-        if not rule.can_use_upstream_site_exclude or rule.domain in seen:
-            continue
-        seen.add(rule.domain)
-        terms.append(f"site:{rule.domain}")
-    return ",".join(terms) if terms else None
 
 
 def is_blacklisted_search_url(url: str) -> bool:
@@ -173,6 +141,6 @@ def filter_blacklisted_search_results(items: list[dict]) -> tuple[list[dict], in
 def candidate_result_count(requested: int) -> int:
     """计算为补足过滤后的结果而向上游请求的候选数量。"""
     return min(
-        max(requested, requested * SEARCH_CANDIDATE_MULTIPLIER),
+        requested * SEARCH_CANDIDATE_MULTIPLIER,
         SEARCH_MAX_CANDIDATES,
     )

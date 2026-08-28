@@ -9,7 +9,6 @@ from cachetools import LRUCache
 from apitelegramchat.config import (
     TELEGRAM_BOT_TOKEN,
     BASE_URL,
-    PARSE_TIMEOUT,
 )
 
 from apitelegramchat.s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2
@@ -142,25 +141,3 @@ async def _upload_to_r2_after_download(file_id: str, file_path: str):
             logger.warning("R2 上传失败，但本地文件已下载")
     except Exception as e:
         logger.error(f"异步上传到 R2 失败: {e}")
-
-# ========== 音频转录（保持原样） ==========
-async def _parse_audio_file(file_path: str, file_name: str) -> str:
-    """解析音频文件，使用 Groq API 进行转录"""
-    try:
-        ext = os.path.splitext(file_name)[1] or ".ogg"
-        with open(file_path, "rb") as f:
-            audio_bytes = f.read()
-        from apitelegramchat.utils import transcribe_audio_with_groq
-        # 使用配置的 PARSE_TIMEOUT 而非硬编码 30 秒
-        return await asyncio.wait_for(
-            transcribe_audio_with_groq(audio_bytes, ext),
-            timeout=PARSE_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        logger.error(f"音频转录超时: {file_name}")
-        return "⏱️ 音频转录超时，请稍后重试。"
-    except Exception as e:
-        logger.error(f"音频转录失败: {str(e)}")
-        return None
-
-

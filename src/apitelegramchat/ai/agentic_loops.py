@@ -9,7 +9,7 @@ import httpx
 import base64
 import re
 import uuid
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from openai import AsyncOpenAI
 
 from apitelegramchat.config import (
@@ -20,7 +20,6 @@ from apitelegramchat.config import (
 )
 from apitelegramchat.utils import get_logger, escape_html, send_rich_html_message
 from apitelegramchat.s3_utils import upload_bytes_to_r2
-import apitelegramchat.state as state
 
 from apitelegramchat.ai._constants import (
     MAX_TOOL_CALLS,
@@ -57,6 +56,10 @@ from apitelegramchat.ai.tool_summary import (
     _tool_limit_summary,
 )
 from apitelegramchat.ai.tool_call_loop import _run_tool_calls_and_append
+
+if TYPE_CHECKING:
+    # 仅供类型注解使用；运行时由调用方传入，避免运行时循环导入。
+    from apitelegramchat.ai.rich_message_builder import RichMessageBuilder
 
 logger = get_logger(__name__)
 
@@ -515,7 +518,7 @@ async def _agentic_loop_openai_compat(
                 )
 
         if reasoning_acc:
-            builder.finalize_reasoning_block(has_tool_calls=bool(tool_calls_list))
+            builder.finalize_reasoning_block()
         await builder.flush()
 
         assistant_msg: dict = {"role": "assistant", "content": content_acc or None}
@@ -762,7 +765,7 @@ async def _agentic_loop_gemini_openai_compat(
             builder.begin_stream_reasoning()
             builder.append_stream_delta(reasoning_acc)
             builder.end_stream()
-            builder.finalize_reasoning_block(has_tool_calls=bool(tool_calls_list))
+            builder.finalize_reasoning_block()
 
         if tool_calls_list and content_acc:
             # ===== 规范第一部分第4点：文本+工具组合需要新开一个独立的工具折叠块，
@@ -944,13 +947,9 @@ async def _agentic_loop_native_image(
                     )
                 return f"IMAGE_ERROR:{error_notice}", None, []
 
-            class _ImageResponse:
-                def __init__(self, payload: dict):
-                    self._payload = payload
-                    self.choices = [type("Choice", (), {"message": type("Msg", (), {})(), "finish_reason": None})()]
-                    self.usage = payload.get("usage")
-
-            response = _ImageResponse(response_json)
+            # 旧实现构造了带伪 choices/_payload 的 _ImageResponse 对象，
+            # 但下游只读取 usage；直接取值即可。
+            usage = response_json.get("usage")
             image_bytes_list = await _response_items_to_bytes(response_json)
 
             if not image_bytes_list:
@@ -1002,7 +1001,7 @@ async def _agentic_loop_native_image(
             final_content = f"IMAGE_SENT:{final_notice}" if final_notice else "IMAGE_SENT"
             history_content = f"[图片已生成] 指令: {clean_prompt or prompt_text or '(无)'} | {caption_text}"
             new_entries = [{"role": "assistant", "content": history_content}]
-            return final_content, getattr(response, "usage", None), new_entries
+            return final_content, usage, new_entries
 
         # ---- 非 ModelScope 的其他提供商（OpenRouter 等） ----
         try:
@@ -1016,7 +1015,8 @@ async def _agentic_loop_native_image(
             )
         except Exception as e:
             err_text = str(e)
-            if "output modalities" not in err_text and "modalities" not in err_text:
+            # "output modalities" 含子串 "modalities"，前一条件恒被后者包含。
+            if "modalities" not in err_text:
                 raise
             logger.warning(f"Native image model does not support image+text output, retrying image-only: {e}")
             response = await client.chat.completions.create(
@@ -1073,7 +1073,7 @@ async def _agentic_loop_native_image(
             continue
         if img_url.startswith("data:image"):
             try:
-                header, base64_data = img_url.split(",", 1)
+                _, base64_data = img_url.split(",", 1)
                 img_bytes = base64.b64decode(base64_data)
                 image_bytes_list.append(img_bytes)
             except Exception as e:
@@ -1127,7 +1127,6 @@ async def _agentic_loop_native_image(
 
 
 async def _agentic_loop_native_video(
-        client: AsyncOpenAI,  # 保留参数，但可能不用
         current_model: str,
         messages: list,
         builder: "RichMessageBuilder",
@@ -1155,7 +1154,9 @@ async def _agentic_loop_native_video(
     # re 已在文件顶部 import，删除本地的 `import re`（之前是冗余 import）。
     duration = 5
     # 时长解析：兼容中英文（"5秒" 与 "5 seconds" / "5s"）
-    match = re.search(r'(\d+)\s*(?:秒|seconds?|secs?|s)\b', prompt, re.IGNORECASE)
+    # 中文"秒"与后续汉字都是 \w，末尾的 \b 对中文分支永不成立（导致
+    # "生成5秒的视频" 匹配失败、时长恒为默认值）——中文分支不加边界。
+    match = re.search(r'(\d+)\s*(?:秒|seconds?\b|secs?\b|s\b)', prompt, re.IGNORECASE)
     if match:
         try:
             duration = int(match.group(1))

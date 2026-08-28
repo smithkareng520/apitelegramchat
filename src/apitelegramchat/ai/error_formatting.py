@@ -72,7 +72,7 @@ def _coerce_error_payload(payload_text: str) -> Any:
         blob = blob.strip()
         if not blob:
             continue
-        if not (blob.startswith("{") or blob.startswith("[")):
+        if not (blob.startswith(("{", "["))):
             continue
         try:
             return json.loads(blob)

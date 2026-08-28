@@ -7,7 +7,6 @@ from pathlib import Path
 
 
 _NAMESPACE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
-_WORKDIR_NAME = os.getenv("APITELEGRAMCHAT_WORKDIR_NAME", "workspace").strip() or "workspace"
 _STATE_DIR_NAME = os.getenv("APITELEGRAMCHAT_STATE_DIR_NAME", "state").strip() or "state"
 _RUNTIME_DIR_NAME = os.getenv("APITELEGRAMCHAT_RUNTIME_DIR_NAME", "runtime").strip() or "runtime"
 _SKILLS_DIR_NAME = os.getenv("APITELEGRAMCHAT_SKILLS_DIR_NAME", "skills").strip() or "skills"
@@ -79,10 +78,6 @@ def workspace_workdir(chat_id: object, namespace: object | None = None) -> Path:
     return root.resolve()
 
 
-def workspace_file(chat_id: object, filename: str, namespace: object | None = None) -> Path:
-    return workspace_root(chat_id, namespace) / filename
-
-
 def state_root() -> Path:
     return _secure_directory(data_root() / _STATE_DIR_NAME)
 
@@ -112,16 +107,6 @@ def workspace_namespace(chat_id: object, namespace: object | None = None) -> str
     the request ContextVar repeatedly across async tasks/subtasks.
     """
     return _resolved_namespace(chat_id, namespace)
-
-
-def workspace_identity(chat_id: object, namespace: object | None = None) -> tuple[str, Path]:
-    """Resolve the stable namespace and root together.
-
-    The tuple is intentionally cheap to pass through tool dispatch so text_editor,
-    bash, skill sync, and persistence all operate on the exact same filesystem tree.
-    """
-    resolved = workspace_namespace(chat_id, namespace)
-    return resolved, workspace_root(chat_id, resolved)
 
 
 def runtime_cache_root(chat_id: object, namespace: object | None = None) -> Path:

@@ -183,10 +183,6 @@ class _BashOutputBuffer:
         whole = "".join(self._head)
         head_len = max(1, int(self.keep * self.head_ratio))
         tail_len = max(1, self.keep - head_len)
-        if len(whole) <= self.keep:
-            # 只有跨过预算边界的那一小段超出，无需丢弃。
-            self._tail = [""]
-            return
         self._head = [whole[:head_len]]
         self._dropped += len(whole) - head_len - tail_len
         self._tail = [whole[-tail_len:]] if tail_len else []
@@ -426,9 +422,13 @@ def _find_poi_records(payload: object) -> list[dict] | None:
     if isinstance(payload, dict):
         for key in ("pois", "poi", "results", "items"):
             candidate = payload.get(key)
-            if isinstance(candidate, list) and candidate and all(isinstance(item, dict) for item in candidate):
-                if any("name" in item or "address" in item for item in candidate):
-                    return candidate
+            if (
+                isinstance(candidate, list)
+                and candidate
+                and all(isinstance(item, dict) for item in candidate)
+                and any("name" in item or "address" in item for item in candidate)
+            ):
+                return candidate
         for key in ("data", "result", "payload"):
             nested = payload.get(key)
             found = _find_poi_records(nested)
@@ -586,13 +586,6 @@ def _render_map_location_card(payload: object, tool_name: str) -> str | None:
             cards.append(f"<details{' open' if index == 1 else ''}><summary>位置 {index}{' · ' + escape_html(location) if location else ''}</summary>{''.join(body) or '<p><i>上游未返回可展示字段。</i></p>'}</details>")
         return "".join(cards)
 
-    if tool_name == "regeocode":
-        area = " · ".join(
-            part for part in (_poi_value(data, "province", "provice"), _poi_value(data, "city"), _poi_value(data, "district")) if part
-        )
-        if area:
-            return f"<p><b>📍 坐标所属区域</b><br/>{escape_html(area)}</p>"
-        return "<p><b>📍 坐标所属区域</b><br/><i>上游未返回可识别的地址组件。</i></p>"
     return None
 
 
@@ -691,31 +684,7 @@ def _render_distance_card(payload: object) -> str | None:
     )
 
 
-def _render_weather_card(payload: object) -> str | None:
-    data = _dict(payload)
-    forecasts = _list_of_dicts(data.get("forecasts"))
-    if not forecasts:
-        return None
-    city = _poi_value(data, "city") or "天气预报"
-    rows = []
-    for item in forecasts[:7]:
-        daytime = f"{_poi_value(item, 'dayweather')} {_poi_value(item, 'daytemp')}℃".strip()
-        nighttime = f"{_poi_value(item, 'nightweather')} {_poi_value(item, 'nighttemp')}℃".strip()
-        wind = " ".join(part for part in (_poi_value(item, "daywind"), _poi_value(item, "daypower")) if part)
-        rows.append(
-            f"<tr><td>{escape_html(_poi_value(item, 'date'))}</td><td>{escape_html(daytime)}</td>"
-            f"<td>{escape_html(nighttime)}</td><td>{escape_html(wind)}</td></tr>"
-        )
-    return (
-        f"<p><b>🌤️ {escape_html(city)} 预报</b></p>"
-        "<table bordered striped><tr><th>日期</th><th>白天</th><th>夜间</th><th>风力</th></tr>"
-        + "".join(rows) + "</table>"
-    )
-
-
-def _render_map_payload(payload: object, tool_name: str | None) -> str | None:
-    if not tool_name:
-        return None
+def _render_map_payload(payload: object, tool_name: str) -> str | None:
     poi_cards = _render_poi_cards(payload)
     if poi_cards:
         return poi_cards
@@ -727,10 +696,6 @@ def _render_map_payload(payload: object, tool_name: str | None) -> str | None:
         card = _render_distance_card(payload)
         if card:
             return card
-    if tool_name == "weather":
-        card = _render_weather_card(payload)
-        if card:
-            return card
     if tool_name == "route":
         card = _render_map_route_card(payload)
         if card:
@@ -738,16 +703,14 @@ def _render_map_payload(payload: object, tool_name: str | None) -> str | None:
     return None
 
 
-def _render_structured_payload(result_str: str, *, map_tool: str | None = None) -> str | None:
+def _render_structured_payload(result_str: str, *, map_tool: str) -> str | None:
     payload = _parse_structured_payload(result_str)
     if payload is None:
         return None
+    # _render_map_payload 内部已先尝试 POI 卡片，无需在此重算同一纯函数。
     map_card = _render_map_payload(payload, map_tool)
     if map_card:
         return map_card
-    poi_cards = _render_poi_cards(payload)
-    if poi_cards:
-        return poi_cards
     if isinstance(payload, dict) and isinstance(payload.get("data"), (dict, list)) and len(payload) <= 3:
         payload = payload["data"]
     return (
@@ -884,26 +847,14 @@ def _parse_bash_envelope(result_str: str):
 
 
 def _extract_bash_command_from_envelope(result_str: str) -> str:
-    """从结果信封里恢复命令文本（兜底路径）。
+    """从终端回放式信封里恢复命令文本（兜底路径）。
 
-    新式终端信封：命令跟在首行提示符（``/abs/cwd$ ``）之后，可跨多行，
-    直到 ``Exit code: `` 行为止。旧式元数据信封（``Command: …\\nCwd: …``，
-    历史会话存量）仍按旧规则解析，保证升级后旧结果仍可渲染。
+    命令跟在首行提示符（``/abs/cwd$ ``）之后，可跨多行，直到
+    ``Exit code: `` 行为止。旧式元数据信封（``Command: …\nCwd: …``）已无
+    生产者且本项目不重放历史会话，相关兼容解析已移除。
     """
     parsed = _parse_bash_envelope(result_str)
-    if parsed:
-        return parsed[0]
-    metadata = (result_str or "").partition("Output:\n")[0]
-    if not metadata:
-        return ""
-    match = re.search(r"(?ms)^Command: (.*?)\r?\n^Cwd: ", metadata)
-    if match:
-        return match.group(1)
-    # 极旧格式或 Cwd 行缺失：退化为第一个 "Command: " 行。
-    for line in metadata.splitlines():
-        if line.startswith("Command: "):
-            return line.removeprefix("Command: ")
-    return ""
+    return parsed[0] if parsed else ""
 
 
 def _render_bash_result(result_str: str, fn_args: dict | None = None) -> str:
@@ -938,27 +889,13 @@ def _render_bash_result(result_str: str, fn_args: dict | None = None) -> str:
             _render_editor_quote("Input", command)
             + _render_editor_quote("Output", output_text, truncator=_truncate_ui_lines_head_tail)
         )
-    metadata, separator, output = (result_str or "").partition("Output:\n")
+    # 无信封文本（restart 确认、拒绝原因、超时等）：若有命令可展示则带 Input，
+    # 否则只渲染 Output，避免出现空 Input 引用块。
     if not command:
         command = _extract_bash_command_from_envelope(result_str)
-    exit_code = ""
-    for line in metadata.splitlines():
-        if line.startswith("Exit code: "):
-            exit_code = line.removeprefix("Exit code: ")
-    if not separator:
-        # 没有标准的 "Output:" 分隔符时（restart 确认、拒绝原因等），
-        # 若无命令可展示则只渲染 Output，避免出现空 Input 引用块。
-        if not command:
-            return _render_editor_quote("Output", result_str)
-        return _render_editor_quote("Input", command) + _render_editor_quote("Output", result_str)
-    output_text = output
-    if exit_code:
-        output_text = f"[exit code {exit_code}]\n{output}"
-    # Input 展示原始命令；Output 保头保尾：报错信息几乎总在末尾。
-    return (
-        _render_editor_quote("Input", command)
-        + _render_editor_quote("Output", output_text, truncator=_truncate_ui_lines_head_tail)
-    )
+    if not command:
+        return _render_editor_quote("Output", result_str)
+    return _render_editor_quote("Input", command) + _render_editor_quote("Output", result_str)
 
 
 def _editor_result_summary(result_str: str) -> str:
@@ -1075,7 +1012,10 @@ class BashSession:
         self.chat_id = chat_id
         self.namespace = workspace_namespace(chat_id, namespace)
         self.proc: Optional[asyncio.subprocess.Process] = None
-        self._started = False
+        # start() 可能从两条锁路径被调用（execute 的 workspace 锁内、
+        # manager 的全局锁内），两把锁互不互斥；每实例锁串行化 spawn，
+        # 防止并发双开 bash 导致先 spawn 的进程泄漏、新进程无看门狗。
+        self._start_lock = asyncio.Lock()
         self.workspace = workspace_root(chat_id, self.namespace)
         self.workdir = workspace_workdir(chat_id, self.namespace)
         self._watchdog_task: Optional[asyncio.Task] = None
@@ -1093,82 +1033,89 @@ class BashSession:
 
     async def start(self):
         """启动 bash 进程，套上 Landlock 沙箱 + rlimit + no-new-privs"""
+        async with self._start_lock:
+            return await self._start_locked()
+
+    async def _start_locked(self):
+        """start() 的实际实现；调用方必须已持有 self._start_lock。"""
         if self.proc is not None and self.proc.returncode is None:
             return
 
-        # workspace 目录权限 700，防跨 chat 读取
-        self.workspace.mkdir(parents=True, exist_ok=True)
-        self.workdir.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.workspace, 0o700)
-        os.chmod(self.workdir, 0o700)
-        # ★ 显式预创建 upload/ 和 download/：bash 进程一启动，cwd 就是
-        # workspace root，模型几乎立刻会跑 `cp out.txt upload/out.txt`
-        # 或 `cat download/x.pdf`。如果不在这里预创建，bash 进程已经
-        # 在跑、第一次 execute() 时才补创建，会出两个问题：
-        #   1) 如果 execute() 里 _ensure_runtime_workspace 抛异常被
-        #      try/except 吞掉，目录就永远不存在，cp 第一次必然失败，
-        #      模型不得不多跑一轮 `mkdir -p upload && cp ...` 才能补救；
-        #   2) _ensure_runtime_workspace(self.chat_id) 没传 namespace，
-        #      依赖 ContextVar；如果 bash 工具从 background task 里
-        #      调用、ContextVar 不可见，upload/ 会被建到错误的 namespace
-        #      下，bash 进程实际看到的 cwd 下仍然没有 upload/。
-        # 用 self.namespace 直接走 workspace_upload_root /
-        # workspace_download_root，确保和 bash 进程的 cwd 完全一致。
-        workspace_upload_root(self.chat_id, self.namespace)
-        workspace_download_root(self.chat_id, self.namespace)
+            # workspace 目录权限 700，防跨 chat 读取
+            self.workspace.mkdir(parents=True, exist_ok=True)
+            self.workdir.mkdir(parents=True, exist_ok=True)
+            os.chmod(self.workspace, 0o700)
+            os.chmod(self.workdir, 0o700)
+            # ★ 显式预创建 upload/ 和 download/：bash 进程一启动，cwd 就是
+            # workspace root，模型几乎立刻会跑 `cp out.txt upload/out.txt`
+            # 或 `cat download/x.pdf`。如果不在这里预创建，bash 进程已经
+            # 在跑、第一次 execute() 时才补创建，会出两个问题：
+            #   1) 如果 execute() 里 _ensure_runtime_workspace 抛异常被
+            #      try/except 吞掉，目录就永远不存在，cp 第一次必然失败，
+            #      模型不得不多跑一轮 `mkdir -p upload && cp ...` 才能补救；
+            #   2) _ensure_runtime_workspace(self.chat_id) 没传 namespace，
+            #      依赖 ContextVar；如果 bash 工具从 background task 里
+            #      调用、ContextVar 不可见，upload/ 会被建到错误的 namespace
+            #      下，bash 进程实际看到的 cwd 下仍然没有 upload/。
+            # 用 self.namespace 直接走 workspace_upload_root /
+            # workspace_download_root，确保和 bash 进程的 cwd 完全一致。
+            workspace_upload_root(self.chat_id, self.namespace)
+            workspace_download_root(self.chat_id, self.namespace)
 
-        # 新进程的 cwd 必然是 workdir；重置 _last_cwd，避免上一次会话
-        # 残留的 cwd 状态误拒下一条命令。
-        self._last_cwd = str(self.workdir.absolute())
-        self._persistent_cwd = str(self.workdir.absolute())
+            # 新进程的 cwd 必然是 workdir；重置 _last_cwd，避免上一次会话
+            # 残留的 cwd 状态误拒下一条命令。
+            self._last_cwd = str(self.workdir.absolute())
+            self._persistent_cwd = str(self.workdir.absolute())
 
-        argv = build_sandbox_argv()
-        env = build_sandbox_env(self.workspace, self.chat_id, self.namespace)
-        cache_root = runtime_cache_root(self.chat_id, self.namespace)
-        async with self._runtime_prepare_lock:
-            if self._runtime_state is None:
-                # One-time discovery per persistent workspace. Subsequent Bash restarts
-                # reuse the manifest instead of "preparing" the toolchain again.
-                self._runtime_state = await asyncio.to_thread(
-                    _prepare_runtime_once, self.chat_id, cache_root, self.namespace
-                )
+            argv = build_sandbox_argv()
+            env = build_sandbox_env(self.workspace, self.chat_id, self.namespace)
+            cache_root = runtime_cache_root(self.chat_id, self.namespace)
+            async with self._runtime_prepare_lock:
+                if self._runtime_state is None:
+                    # One-time discovery per persistent workspace. Subsequent Bash restarts
+                    # reuse the manifest instead of "preparing" the toolchain again.
+                    self._runtime_state = await asyncio.to_thread(
+                        _prepare_runtime_once, self.chat_id, cache_root, self.namespace
+                    )
 
-        # ★ Landlock：把文件系统访问限制在该 chat 的 workspace 层，
-        #   runtime/、skills/ 都在这里；R2 不再对工作区做全量同步。
-        #   通过 functools.partial 把 workspace 路径传给 preexec。
-        import functools
-        preexec = functools.partial(
-            _preexec_sandbox,
-            str(self.workspace.absolute()),
-        )
+            # ★ Landlock：把文件系统访问限制在该 chat 的 workspace 层，
+            #   runtime/、skills/ 都在这里；R2 不再对工作区做全量同步。
+            #   通过 functools.partial 把 workspace 路径传给 preexec。
+            import functools
+            preexec = functools.partial(
+                _preexec_sandbox,
+                str(self.workspace.absolute()),
+            )
 
-        logger.info(
-            "Starting bash session chat_id=%s runtime_prepared=%s cache=%s",
-            self.chat_id,
-            bool(self._runtime_state and self._runtime_state.get("prepared")),
-            cache_root,
-        )
+            logger.info(
+                "Starting bash session chat_id=%s runtime_prepared=%s cache=%s",
+                self.chat_id,
+                bool(self._runtime_state and self._runtime_state.get("prepared")),
+                cache_root,
+            )
 
-        self.proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            text=False,
-            bufsize=0,
-            env=env,  # ★ 关键: 不传任何敏感变量
-            cwd=str(self.workdir.absolute()),  # ★ 关键: 沙箱进程启动即位于 workspace root
-            start_new_session=True,  # ★ 关键: 创建新会话，便于 killpg
-            preexec_fn=preexec,  # Landlock + no-new-privs + rlimit
-        )
+            self.proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                text=False,
+                bufsize=0,
+                env=env,  # ★ 关键: 不传任何敏感变量
+                cwd=str(self.workdir.absolute()),  # ★ 关键: 沙箱进程启动即位于 workspace root
+                start_new_session=True,  # ★ 关键: 创建新会话，便于 killpg
+                preexec_fn=preexec,  # Landlock + no-new-privs + rlimit
+            )
 
-        # 启动看门狗（fork bomb 防护）
-        if self._watchdog_task is None or self._watchdog_task.done():
+            # 启动看门狗（fork bomb 防护）。无条件跟随本次 spawn 的进程：
+            # 旧实现"看门狗还活着就不重建"会让重启后的新进程处于无防护状态
+            # （旧看门狗盯的是已死的旧进程对象）。
+            if self._watchdog_task and not self._watchdog_task.done():
+                self._watchdog_task.cancel()
             self._watchdog_task = asyncio.create_task(
                 watchdog(self.proc), name=f"watchdog-{self.chat_id}"
             )
 
-        self._started = True
 
     # ===================== 命令安全检查（最小黑名单） =====================
     # 设计原则: 不限制语法（heredoc/管道/重定向/&&/|| 全部允许），
@@ -1302,7 +1249,7 @@ class BashSession:
         A persistent stdin-backed shell can deadlock when a model emits an
         incomplete heredoc or unterminated quote: the shell keeps waiting for
         the terminator, while our synthetic end marker is consumed as input
-        to that still-open construct.  A one-shot `bash -lc` receives an
+        to that still-open construct.  A one-shot `bash -c` receives an
         actual EOF at the end of `command`, so malformed input terminates
         with a shell error instead of hanging the session.
         """
@@ -1315,8 +1262,11 @@ class BashSession:
         marker = f"__ONE_SHOT_END_{uuid.uuid4().hex[:8]}__"
         full_cmd = command.rstrip() + f"\nprintf '{marker} %s\n' \"$?\"\nprintf '__ONE_SHOT_CWD__ %s\n' \"$PWD\"\n"
 
+        # 与持久会话（sandbox.py 的 /bin/bash --noprofile --norc）保持一致：
+        # 登录 shell（-l）会 source /etc/profile 重置 PATH，可能让 runtime_bin
+        # 里的 curl/wget shim 失效，且两条执行路径语义分叉。
         proc = await asyncio.create_subprocess_exec(
-            "bash", "-lc", full_cmd,
+            "bash", "--noprofile", "--norc", "-c", full_cmd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -1437,12 +1387,12 @@ class BashSession:
                     )
                 if self._UPLOAD_DOWNLOAD_CD_PATTERN.search(command):
                     return (
-                        f"Error: Command rejected — `cd` into upload/ or download/ is "
-                        f"not allowed. These directories are data buffers directly inside "
-                        f"your workspace root: read and write files in them via relative "
-                        f"paths from your workdir (e.g. `cp out.txt upload/out.txt`, "
-                        f"`cat download/doc.pdf`), but never execute commands from "
-                        f"inside them."
+                        "Error: Command rejected — `cd` into upload/ or download/ is "
+                        "not allowed. These directories are data buffers directly inside "
+                        "your workspace root: read and write files in them via relative "
+                        "paths from your workdir (e.g. `cp out.txt upload/out.txt`, "
+                        "`cat download/doc.pdf`), but never execute commands from "
+                        "inside them."
                     )
                 return f"Error: Command rejected for security reasons: {command}"
 
@@ -1578,10 +1528,10 @@ class BashSession:
 
                 # 提取命令结束后的真实 PWD，同时把内部 marker 从用户输出中移除。
                 actual_cwd = str(self.workdir.absolute())
-                cwd_match = re.search(rf'(?m)^' + re.escape(cwd_marker) + r' (.+)$', output)
+                cwd_match = re.search(r'(?m)^' + re.escape(cwd_marker) + r' (.+)$', output)
                 if cwd_match:
                     actual_cwd = cwd_match.group(1).strip()
-                    output = re.sub(rf'(?m)^' + re.escape(cwd_marker) + r' .*$\n?', '', output)
+                    output = re.sub(r'(?m)^' + re.escape(cwd_marker) + r' .*$\n?', '', output)
 
                 # 记录最新 cwd，下一次 _is_safe 会据此拒绝在 upload/ 或 download/
                 # 子树内继续执行命令。即便 cd 进入被拒，模型也可能通过 pushd /
@@ -1659,10 +1609,8 @@ class BashSession:
                 logger.exception("bash session close wait failed chat_id=%s", self.chat_id)
             finally:
                 self.proc = None
-                self._started = False
             return
         self.proc = None
-        self._started = False
 
 # =====================================================================
 # BashSessionManager —— 多 chat 共享管理
@@ -1698,7 +1646,7 @@ class BashSessionManager:
             new_session = BashSession(chat_id, resolved_namespace)
             await new_session.start()
             self._sessions[key] = new_session
-            return f"Bash session restarted (sandbox=landlock)"
+            return "Bash session restarted (sandbox=landlock)"
 
     async def cleanup_all(self):
         """优雅关闭所有会话（应用退出时调用）"""
@@ -2124,7 +2072,9 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
     elif fn_name == "text_editor":
         command = fn_args.get("command", "")
         path = fn_args.get("path", "")
-        if any(marker in (result_str or "") for marker in ("Error:", "No match found", "requires ")):
+        # 工具自身错误总是以 "Error" 开头；view 返回的是文件内容，
+        # 内容里出现 "Error:"（如查看日志文件）不代表操作失败。
+        if (result_str or "").startswith("Error"):
             summary = "❌ 文件操作未完成"
         elif command == "view":
             summary = f"📄 查看 {path}" if path else "📄 查看文件"
@@ -2148,8 +2098,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
     # 这里仅渲染工具调用气泡里的折叠预览。
     elif fn_name == "todo":
         try:
-            import json as _json
-            payload = _json.loads(result_str)
+            payload = json.loads(result_str)
         except (json.JSONDecodeError, TypeError):
             payload = None
         if not isinstance(payload, dict):
@@ -2274,7 +2223,14 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         # 延迟导入：tool_summary 模块级导入了 tool_executors，顶层导入会循环。
         from apitelegramchat.ai.tool_summary import _get_tool_description_from_args
         intent = _get_tool_description_from_args(fn_args) or ""
-        if "Error:" in result_str or "Command rejected" in result_str:
+        # 用信封里的退出码判定失败。旧实现对输出内容做 "Error:" 子串匹配,
+        # `grep Error: app.log` 这类命令（exit 0）会被误标为执行失败。
+        parsed_env = _parse_bash_envelope(result_str)
+        bash_failed = (
+            (parsed_env is not None and parsed_env[1] not in ("", "0"))
+            or (parsed_env is None and ("Error:" in result_str or "Command rejected" in result_str))
+        )
+        if bash_failed:
             summary = "❌ Bash 执行失败"
         elif intent:
             summary = intent
@@ -2329,9 +2285,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         failed_count = len(failed)
 
         # ---- Summary with correct pluralization (guards None / 0) ----
-        if error and sent_count == 0:
-            summary = "📂 No files sent"
-        elif sent_count == 0:
+        if sent_count == 0:
             summary = "📂 No files sent"
         elif sent_count == 1:
             summary = "📂 Presented 1 file"
@@ -2362,7 +2316,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         return summary, details_html
 
 
-async def execute_present_files(chat_id: int, paths: List[str]) -> str:
+async def execute_present_files(chat_id: int, paths: List[str], namespace: str | None = None) -> str:
     """Send files from the upload/ staging tree to the chat as attachments.
 
     Files MUST live under upload/ (the dedicated outgoing-artifact buffer).
@@ -2386,11 +2340,13 @@ async def execute_present_files(chat_id: int, paths: List[str]) -> str:
             "error": "No paths provided. Files must be staged under upload/ first.",
         })
     # ★ init 在 workspace lock 外面执行（同 bash / text_editor）。
-    await _ensure_runtime_workspace(chat_id)
+    # 显式接收 namespace：与 bash/text_editor 一致，避免依赖 ContextVar
+    # 在 background task 里解析到错误的 namespace。
+    await _ensure_runtime_workspace(chat_id, namespace)
 
     lock = await _get_workspace_lock(chat_id)
     async with lock:
-        upload_root = workspace_upload_root(chat_id)
+        upload_root = workspace_upload_root(chat_id, namespace)
         sent = []
         failed = []
         # 文件大小上限：50MB，防止 OOM
@@ -2572,23 +2528,10 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 tbs=arguments.get("tbs"),
             )
         elif name == "fetch_url":
-            # 增加重试逻辑：如果超时，重试一次
-            url = arguments.get("url", "")
-            for attempt in range(2):  # 最多尝试2次
-                try:
-                    return await execute_fetch_url(url)
-                except asyncio.TimeoutError:
-                    if attempt == 0:
-                        logger.warning(f"fetch_url timeout, retrying (url={url})")
-                        await asyncio.sleep(1)
-                        continue
-                    else:
-                        # 重试后仍超时，返回友好消息
-                        return "⏱️ 页面抓取超时，该网站可能响应较慢，建议稍后重试或手动访问。"
-                except Exception as e:
-                    logger.exception(f"fetch_url unexpected error: {e}")
-                    return "⚠️ 页面抓取失败，请稍后重试或检查URL。"
-            return "⚠️ 页面抓取失败，请稍后重试。"
+            # execute_fetch_url 内部已自带逐次重试循环，并自行把
+            # TimeoutError 转成失败文案返回——外层的重试包装永远捕获不到
+            # 异常，属于死逻辑（最多让同一 URL 被抓 2x2 次），直接透传。
+            return await execute_fetch_url(arguments.get("url", ""))
         elif name == "wikipedia":
             return await execute_wikipedia(arguments.get("query", ""), arguments.get("lang", "zh"))
         elif name == "exchange_rate":
@@ -2729,7 +2672,7 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             paths = arguments.get("paths", [])
             if isinstance(paths, str):
                 paths = [paths]
-            return await execute_present_files(chat_id, paths)
+            return await execute_present_files(chat_id, paths, namespace=resolved_namespace)
         elif name in _REMOVED_TOOL_HINTS:
             # stage_upload / fetch_download / list_download / list_upload / ip_geo 已移除；
             # 迁移提示让模型立即改用 bash 直访，避免无意义的重试。

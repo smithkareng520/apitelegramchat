@@ -52,7 +52,7 @@ def _parse_frontmatter_lines(lines: list[str]) -> dict[str, Any]:
         if not line.strip():
             continue
 
-        if line.startswith("  - ") or line.startswith("- "):
+        if line.startswith(("  - ", "- ")):
             if current_key is not None and current_list is not None:
                 current_list.append(_parse_scalar(line.split("-", 1)[1].strip()))
             continue
@@ -221,11 +221,6 @@ def _cached_skill_catalog_text() -> str:
     return catalog_text()
 
 
-def refresh_skill_cache() -> None:
-    """清空 skill 目录缓存；在运行时新增/删除 skill 后可调用。"""
-    _cached_skill_catalog_text.cache_clear()
-
-
 def skill_catalog_brief() -> str:
     """给系统提示用的精简技能目录。"""
     return _cached_skill_catalog_text()
@@ -285,32 +280,6 @@ def _iter_files(root: Path) -> Iterable[Path]:
     for path in root.rglob("*"):
         if path.is_file():
             yield path
-
-
-def skill_assets_workspace_relpath(skill_id: str) -> str:
-    """该 skill 在 workspace 内的相对路径。"""
-    return f"{SKILL_ASSETS_DIRNAME}/{skill_id}"
-
-
-def sync_skill_assets_to_workspace(skill_id: str, workspace_root: Path) -> dict[str, Any]:
-    """向后兼容接口：补齐 workspace 中缺失的 packaged skill 资源。"""
-    summary = sync_all_skill_assets_to_workspace(workspace_root)
-    if skill_id not in {rec.skill_id for rec in load_skill_records()}:
-        return {
-            "skill_id": skill_id,
-            "synced": False,
-            "files": 0,
-            "copied": 0,
-            "error": f"Unknown skill: {skill_id}",
-        }
-    return {
-        "skill_id": skill_id,
-        "synced": not bool(summary.get("errors")),
-        "files": int(summary.get("files") or 0),
-        "copied": int(summary.get("copied") or 0),
-        "error": "; ".join(summary.get("errors") or []) or None,
-        "path": str(Path(workspace_root) / SKILL_ASSETS_DIRNAME),
-    }
 
 
 def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:

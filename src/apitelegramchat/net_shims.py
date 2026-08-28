@@ -27,11 +27,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_SHIM_MARKER = "net-shim-v1"
-
 # ----------------------------------------------------------------------
 # curl shim 源码（独立脚本，禁止 import 本项目任何模块）
 # ----------------------------------------------------------------------
+# 注意：shim 文件头的 marker 注释（net-shim-v1）用于版本识别，改版本时同步更新。
 _CURL_SHIM_SOURCE = r'''#!/usr/bin/python3
 # apitelegramchat curl shim (marker: net-shim-v1)
 # Real curl is not installed in this container image; this stdlib-only
@@ -67,7 +66,7 @@ _NOOP_FLAGS = {
     "-0", "--http1.0", "--http1.1", "--http2", "--http2-prior-knowledge",
     "--no-buffer", "-N", "--progress-bar", "-#", "-4", "-6",
     "--no-keepalive", "--keepalive", "--tcp-nodelay", "-g", "--globoff",
-    "--path-as-is", "-#", "--silent-with-error", "--no-progress-meter",
+    "--path-as-is", "--silent-with-error", "--no-progress-meter",
 }
 
 
@@ -266,6 +265,9 @@ def transfer_one(url, opts, method, headers, data, opener):
     start = time.monotonic()
     deadline = (start + opts.max_time) if opts.max_time else None
     timeout = opts.max_time or opts.connect_timeout or 60.0
+    # 重定向计数是类属性；不重置会跨 URL 与 --retry 累积，导致
+    # 多 URL 场景误报 "too many redirects"、-w %{num_redirects} 报累计值。
+    _CountingRedirect.count = 0
 
     req = urllib.request.Request(url, data=data, method=method)
     for k, v in headers.items():
@@ -323,10 +325,16 @@ def transfer_one(url, opts, method, headers, data, opener):
 
     # ---- 输出 ----
     rc = EXIT_OK
-    if status >= 400 and opts.fail:
+    fail_with_body = bool(getattr(opts, "fail_with_body", False))
+    if status >= 400 and opts.fail and not fail_with_body:
+        # 普通 --fail：不输出 body，直接以 22 退出。
+        eprint("curl-shim: (22) The requested URL returned error: %d" % status)
+        return EXIT_HTTP_ERROR
+    if status >= 400 and opts.fail and fail_with_body:
+        # 真 curl 的 --fail-with-body 语义：输出响应体，然后仍以 22 退出。
         eprint("curl-shim: (22) The requested URL returned error: %d" % status)
         rc = EXIT_HTTP_ERROR
-    elif opts.head:
+    if opts.head and rc == EXIT_OK:
         sys.stdout.write(header_text(resp))
     else:
         if opts.include:
@@ -528,8 +536,23 @@ def eprint(*args):
     print(*args, file=sys.stderr)
 
 
-def build_opener(verify):
-    handlers = []
+class _WgetMaxRedirect(urllib.request.HTTPRedirectHandler):
+    """按 --max-redirect 限制重定向次数（默认 20，与 GNU wget 一致）。"""
+
+    def __init__(self, max_redirects):
+        super().__init__()
+        self.max_redirects = max_redirects
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.max_redirects -= 1
+        if self.max_redirects < 0:
+            raise urllib.error.HTTPError(
+                newurl, code, "wget-shim: too many redirects", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def build_opener(verify, max_redirects=20):
+    handlers = [_WgetMaxRedirect(max(0, int(max_redirects)))]
     if not verify:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -620,7 +643,7 @@ def main(argv):
             return 2
 
     quiet = opts.quiet or opts.no_verbose
-    opener = build_opener(not opts.no_check_certificate)
+    opener = build_opener(not opts.no_check_certificate, opts.max_redirect)
     overall = EXIT_OK
     for url in urls:
         tries = max(1, min(opts.tries, 20))
@@ -735,4 +758,4 @@ def ensure_network_shims(runtime_bin: Path) -> None:
         logger.debug("network shim installation skipped: %s", exc)
 
 
-__all__ = ["ensure_network_shims", "SHIM_MARKER"]
+__all__ = ["ensure_network_shims"]

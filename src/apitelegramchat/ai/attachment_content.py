@@ -11,7 +11,7 @@ from PIL import Image
 from typing import Optional
 import aiohttp
 
-from apitelegramchat.config import ModelConfig, TELEGRAM_BOT_TOKEN, R2_PUBLIC_URL, PROVIDERS
+from apitelegramchat.config import ModelConfig, TELEGRAM_BOT_TOKEN, PROVIDERS
 from apitelegramchat.utils import get_logger, transcribe_audio_with_groq
 from apitelegramchat.file_handlers import get_file_path
 from apitelegramchat.s3_utils import (
@@ -538,6 +538,7 @@ async def _build_attachment_fallback_text(
         header = f"📎 用户上传了{safe_kind}组（共 {total} 个）"
     lines.append(header)
 
+    any_url = False
     for idx, fid in enumerate(file_ids, start=1):
         fname = ""
         if file_names and idx - 1 < len(file_names):
@@ -546,6 +547,7 @@ async def _build_attachment_fallback_text(
         if mime_types and idx - 1 < len(mime_types):
             mime = str(mime_types[idx - 1] or "").strip()
         url = await _resolve_public_attachment_url(fid) if fid else ""
+        any_url = any_url or bool(url)
         parts = [f"{safe_kind}{idx if total > 1 else ''}"]
         if fname:
             parts.append(f"文件名：{fname}")
@@ -575,7 +577,9 @@ async def _build_attachment_fallback_text(
         # 这条提示针对「链接」字段为空（R2 未配置）时的降级路径，避免 LLM
         # 自行编造伪 URL 写入 <img src>，导致 Telegram 返回
         # RICH_MESSAGE_PHOTO_URL_INVALID 整条消息发送失败。
-        if not url:
+        # （旧实现读取的是循环泄漏的最后一个文件的 url，多文件部分成功
+        #  部分失败时会错误地加/漏加该警告。）
+        if not any_url:
             lines.append(
                 "⚠️ 上面的「文件名」和「file_id」仅是元数据，不是合法 URL，"
                 "禁止把它们写入 <img src>/<video src>/<a href>；"
@@ -615,7 +619,7 @@ async def _build_audio_fallback_text(
     return "\n\n".join(parts) if parts else (user_text or "请分析这段音频")
 
 
-async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_type: str, chat_id: int | None = None):
+async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_id: int | None = None):
     supports_vision = model_info.vision
     supports_audio = model_info.audio
     # 视频输入模态：默认由 provider 能力决定，模型必须显式设置 video=True 才开启。
@@ -893,27 +897,14 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, api_ty
                 )
             return "\n".join(lines)
 
-        if file_type in ("document", "document_group"):
-            file_name = msg.get("file_name", f"document_{fid[:8]}.pdf")
-            mime_type = msg.get("mime_type", "")
-            url = await _resolve_public_attachment_url(fid)
-            lines = [f"📎 用户上传了文档「{file_name}」"]
-            if url:
-                lines.append(f"链接：{url}")
-            if mime_type:
-                lines.append(f"mime_type：{mime_type}")
-            if user_text:
-                lines.append("")
-                lines.append(f"用户原始指令：{user_text}")
-            else:
-                lines.append("")
-                lines.append("用户未附加文字，请根据文档内容和上下文处理。")
-            return "\n".join(lines)
+        # 说明：document / document_group 在上方"原生文档"分支已全路径
+        # 处理（supports_native_documents 与降级文本均返回），此处不可能
+        # 再收到该类型；历史上遗留的同型降级块已移除。
 
     return user_text
 
 
-async def _append_history_async(messages: list, history: list, api_type: str, model_info: ModelConfig, chat_id: int | None = None) -> None:
+async def _append_history_async(messages: list, history: list, model_info: ModelConfig, chat_id: int | None = None) -> None:
     """把历史消息格式化后追加到 ``messages``。
 
     重要：发给模型 API 的消息体只允许包含 OpenAI 兼容协议认可的字段
@@ -928,7 +919,7 @@ async def _append_history_async(messages: list, history: list, api_type: str, mo
         if msg.get("role") in ("user", "assistant", "tool", "system"):
             out_msg = {"role": msg["role"]}
             if msg.get("role") == "user":
-                resolved = await _resolve_multimodal_content(dict(msg), model_info, api_type, chat_id=chat_id)
+                resolved = await _resolve_multimodal_content(dict(msg), model_info, chat_id=chat_id)
                 out_msg["content"] = resolved
                 # 注意：不要把 file_id / file_ids / file_name / mime_type /
                 # type / attachments 等附件元数据写到出站消息里，部分

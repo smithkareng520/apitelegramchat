@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import re
-from typing import Any
 
 from apitelegramchat.utils import escape_html
 
@@ -86,7 +85,7 @@ def parse_web_search_sections(result_str: str) -> list[dict]:
     if not text:
         return []
 
-    if text.startswith("❌") or text.startswith("失败"):
+    if text.startswith(("❌", "失败")):
         return [{"mode": "error", "raw": text, "items": []}]
 
     header_matches = list(_WEB_SEARCH_SECTION_HEADER_RE.finditer(text))

@@ -10,7 +10,6 @@ from typing import Dict, Optional
 logger = logging.getLogger(__name__)
 
 # ---------- 环境变量 ----------
-AUTHORIZED_USER = "dearella"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 # OpenRouter 全局路由偏好：默认价格优先、允许自动回退；可用环境变量覆盖。
@@ -19,9 +18,7 @@ OPENROUTER_ALLOW_FALLBACKS = os.getenv("OPENROUTER_ALLOW_FALLBACKS", "true").str
 OPENROUTER_REQUIRE_PARAMETERS = os.getenv("OPENROUTER_REQUIRE_PARAMETERS", "false").strip().lower() in {"1", "true", "yes", "on"}
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-XAI_API_KEY = os.getenv("XAI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GLM_API_KEY = os.getenv("GLM_API_KEY", "")
 MODELSCOPE_API_KEY = os.getenv("MODELSCOPE_API_KEY", "")
 AGNES_API_KEY = os.getenv("AGNES_API_KEY", "")
 
@@ -50,13 +47,8 @@ SERPER_API_KEY = (os.getenv("SERPER_API_KEY") or "").strip()
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
 _RAW_WEBHOOK_URL = os.getenv("WEBHOOK_URL") or ""
-# 当 WEBHOOK_URL 已配但 WEBHOOK_TOKEN 缺失时，不再生成 `?token=None`，
-# 避免被 Telegram 当作合法 webhook 注册却失去鉴权。
-WEBHOOK_URL = (
-    f"{_RAW_WEBHOOK_URL}?token={WEBHOOK_TOKEN}"
-    if _RAW_WEBHOOK_URL and WEBHOOK_TOKEN
-    else _RAW_WEBHOOK_URL
-)
+# Webhook 注册由部署平台/运维侧完成（setWebhook 时自行拼接 ?token=…），
+# 应用内只消费原始 WEBHOOK_URL（见 validate_runtime_config 与启动配置汇总）。
 
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 
@@ -165,7 +157,6 @@ class ModelConfig:
     native_image: Optional[bool] = None
     native_document: Optional[bool] = None
     native_video: Optional[bool] = None
-    supports_search: Optional[bool] = None
     supports_sampling: Optional[bool] = None
     supports_prompt_cache: Optional[bool] = None 
     max_output_tokens: Optional[int] = None
@@ -263,7 +254,6 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "native_image": False,
         "native_document": False,
         "native_video": False,
-        "supports_search": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -281,7 +271,6 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_tools": True,
         "native_image": False,
         "native_document": False,
-        "supports_search": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -299,7 +288,6 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_tools": True,
         "native_image": False,
         "native_document": False,
-        "supports_search": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -317,7 +305,6 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_tools": True,
         "native_image": False,
         "native_document": False,
-        "supports_search": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -335,7 +322,6 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_tools": True,
         "native_image": False,
         "native_document": False,
-        "supports_search": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -353,7 +339,6 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "supports_tools": True,
         "native_image": False,
         "native_document": False,
-        "supports_search": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -372,7 +357,6 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "native_image": False,
         "native_document": False,
         "native_video": False,
-        "supports_search": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -448,7 +432,6 @@ def make_model_config(
         native_image=merged.get("native_image"),
         native_document=merged.get("native_document"),
         native_video=merged.get("native_video"),
-        supports_search=merged.get("supports_search"),
         supports_sampling=merged.get("supports_sampling"),
         supports_prompt_cache=merged.get("supports_prompt_cache"),
         max_output_tokens=merged.get("max_output_tokens", 8192),
@@ -747,54 +730,6 @@ assert DEFAULT_MODEL in SUPPORTED_MODELS, f"默认模型 {DEFAULT_MODEL} 未定�
 
 
 # =============================================================================
-# 自动发现模型（可选）：如果用户输入了未在 SUPPORTED_MODELS 中定义的模型，
-# 但符合 {provider}/{model_id} 格式，可自动创建配置。
-# =============================================================================
-def discover_model(model_id: str) -> Optional[ModelConfig]:
-    """根据模型 ID 自动发现配置（如果厂商支持）"""
-    for provider in PROVIDERS:
-        if model_id.startswith(provider + "/"):
-            # 从厂商默认值创建
-            defaults = _PROVIDER_DEFAULTS.get(provider, {})
-            name = model_id.split("/")[-1]
-            return ModelConfig(
-                model_id=model_id,
-                provider=provider,
-                name=name,
-                vision=defaults.get("vision"),
-                audio=defaults.get("audio"),
-                video=defaults.get("video"),
-                supports_tools=defaults.get("supports_tools"),
-                native_image=defaults.get("native_image"),
-                native_document=defaults.get("native_document"),
-                native_video=defaults.get("native_video"),
-                supports_search=defaults.get("supports_search"),
-                supports_sampling=defaults.get("supports_sampling"),
-                supports_prompt_cache=defaults.get("supports_prompt_cache"),
-                max_output_tokens=defaults.get("max_output_tokens", 8192),
-                max_context=defaults.get("max_context", 128000),
-                reasoning_enabled=defaults.get("reasoning_enabled"),
-                reasoning_effort=defaults.get("reasoning_effort"),
-                reasoning_max_tokens=defaults.get("reasoning_max_tokens"),
-                temperature=defaults.get("temperature"),
-                top_p=defaults.get("top_p"),
-            )
-    return None
-
-
-def get_model_config(model_id: str) -> ModelConfig:
-    """获取模型配置，优先从 SUPPORTED_MODELS，否则尝试自动发现"""
-    if model_id in SUPPORTED_MODELS:
-        return SUPPORTED_MODELS[model_id]
-    discovered = discover_model(model_id)
-    if discovered:
-        return discovered
-    # 降级：使用默认模型
-    logger.warning(f"未知模型 {model_id}，降级到 {DEFAULT_MODEL}")
-    return SUPPORTED_MODELS[DEFAULT_MODEL]
-
-
-# =============================================================================
 # 白名单管理
 # =============================================================================
 WHITELIST_FILE = os.getenv("APITELEGRAMCHAT_WHITELIST_FILE") or "whitelist.txt"
@@ -827,8 +762,7 @@ async def save_whitelist():
     async with _whitelist_lock:
         try:
             with open(_resolve_whitelist_path(), "w", encoding="utf-8") as f:
-                for user in sorted(WHITELIST_USERS):
-                    f.write(user + "\n")
+                f.writelines(user + "\n" for user in sorted(WHITELIST_USERS))
         except OSError:
             logger.warning("save_whitelist failed: %s", _resolve_whitelist_path(), exc_info=True)
 
@@ -855,10 +789,6 @@ STREAM_SILENT_FORCE_FLUSH = _positive_float_env(
 
 # ---------- 工具调用并发数 ----------
 MAX_CONCURRENT_TOOLS = _positive_int_env("MAX_CONCURRENT_TOOLS", 16, 1)
-
-# ---------- 文件解析配置 ----------
-PARSE_CONCURRENCY_LIMIT = _positive_int_env("PARSE_CONCURRENCY_LIMIT", 5, 1)
-PARSE_TIMEOUT = _positive_int_env("PARSE_TIMEOUT", 60, 1)
 
 # =============================================================================
 # 安全补丁：读取后立即清洗敏感环境变量

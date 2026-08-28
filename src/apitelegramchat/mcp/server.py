@@ -16,7 +16,7 @@ from apitelegramchat.workspace_paths import data_root
 logger = logging.getLogger(__name__)
 SERVER_NAME = "apitelegramchat"
 # 引用包 __version__ 作为唯一来源，避免与 __init__.py 不同步。
-from apitelegramchat import __version__ as SERVER_VERSION  # noqa: E402
+from apitelegramchat import __version__ as SERVER_VERSION
 
 
 def create_server(context: MCPRequestContext) -> Server:

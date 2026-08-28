@@ -203,9 +203,6 @@ _AMAP_DROP_KEYS = frozenset({
     "scode",          # 部分网关返回的二级状态码
 })
 
-# photos 数组清洗后每条保留的字段。
-_AMAP_PHOTO_KEEP = ("url",)
-
 # 顶层高德状态字段中保留的（status 用于错误判定，info 携带错误原因，
 # count 表明结果规模），其余（如 cost 之外的空 biz_ext 子键）按空值规则删除。
 

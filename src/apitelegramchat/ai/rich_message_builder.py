@@ -3,6 +3,7 @@
 从 ai_handlers.py 拆分而来，逻辑未做改动。
 """
 import asyncio
+import logging
 import re
 import random
 import html
@@ -29,7 +30,6 @@ from apitelegramchat.ai.tool_summary import (
     _generate_initial_tool_summary,
     _get_tool_description_from_args,
 )
-import apitelegramchat.state as state
 
 logger = get_logger(__name__)
 
@@ -92,16 +92,6 @@ _RICH_BLOCK_OPEN_TAG_RE = re.compile(
     r"figure|figcaption|tg-slideshow|tg-map|img|video|audio|tg-math-block|aside|footer)\b",
     re.IGNORECASE,
 )
-# 工具 UI 详情截断时必须原样保留的标签：图片/视频/音频（自闭合或成对）以及
-# 完整的 <a href="URL">文本</a>（下载/查看链接）。这些标签内的 URL 一旦被
-# 通用的“剥标签 + 转义纯文本”截断逻辑处理，就会从可点击链接/可渲染媒体
-# 退化成一段转义后的 URL 文本，导致用户实际访问的不是原始 URL。
-_MEDIA_OR_LINK_TAG_RE = re.compile(
-    r'<(?:img|video|audio)\b[^>]*/?>(?:</(?:video|audio)\s*>)?|'
-    r'<a\b[^>]*href\s*=\s*(?:"[^"]*"|\'[^\']*\')[^>]*>.*?</a\s*>',
-    re.IGNORECASE | re.DOTALL,
-)
-
 
 def _rich_visible_text(text: str) -> str:
     """按 Rich Message 的近似语义计算解析后的可见字符，不计 HTML 标签和属性。"""
@@ -675,13 +665,6 @@ class RichMessageBuilder:
         self._thinking_removed = True
         self.request_flush(force=False)
 
-    def remove_last_reasoning(self):
-        for i in range(len(self.blocks) - 1, -1, -1):
-            if self.block_types[i] == "reasoning":
-                del self.blocks[i]
-                del self.block_types[i]
-                break
-
     def add_initial_thinking(self, text: str = "Thinking...") -> int:
         self._commit_stream_buffer()
         block = f"<tg-thinking>{escape_html(text)}</tg-thinking>"
@@ -795,7 +778,7 @@ class RichMessageBuilder:
     def end_stream_text(self) -> str:
         return self.end_stream()
 
-    def finalize_reasoning_block(self, has_tool_calls: bool = False):
+    def finalize_reasoning_block(self):
         self._commit_stream_buffer()
 
     def _build_tool_group_html(self, group: dict) -> str:
@@ -889,18 +872,12 @@ class RichMessageBuilder:
                 continue
 
             else:
-                if b_type == "skip":
-                    i += 1
-                    continue
+                # text/html 及其他类型的块都按原样拼接（历史上三分支体相同）；
+                # "skip" 类型从未被写入，相关分支已移除。
                 content = block
                 if i == self._stream_text_index:
                     content += self._stream_buffer
-                if b_type == "text":
-                    html_parts.append(content)
-                elif b_type == "html":
-                    html_parts.append(content)
-                else:
-                    html_parts.append(content)
+                html_parts.append(content)
                 i += 1
 
         result = "".join(html_parts)
@@ -941,18 +918,12 @@ class RichMessageBuilder:
                 continue
 
             else:
-                if b_type == "skip":
-                    i += 1
-                    continue
+                # text/html 及其他类型的块都按原样拼接（历史上三分支体相同）；
+                # "skip" 类型从未被写入，相关分支已移除。
                 content = block
                 if i == self._stream_text_index:
                     content += self._stream_buffer
-                if b_type == "text":
-                    html_parts.append(content)
-                elif b_type == "html":
-                    html_parts.append(content)
-                else:
-                    html_parts.append(content)
+                html_parts.append(content)
                 i += 1
 
         result = "".join(html_parts)
@@ -1225,12 +1196,15 @@ class RichMessageBuilder:
                 return
 
             html_content = self._build_html()
-            if not html_content.strip() or html_content.strip() == " ":
+            if not html_content.strip():
                 html_content = "<p>Working...</p>"
 
-            # 统一使用边界扫描器的 token 统计；无论进入哪条执行路径都必须
-            # 初始化，避免 UnboundLocalError。
-            _frame_boundaries, frame_tokens, frame_blocks, _frame_visible_units = _scan_rich_html_boundaries(html_content)
+            # 边界扫描会对全部块做逐块 token 编码（O(块数×全文)），其结果
+            # 只用于 DEBUG 日志；生产（INFO 级别）跳过，流式热路径不再
+            # 每帧做全量编码。
+            frame_tokens = frame_blocks = 0
+            if logger.isEnabledFor(logging.DEBUG):
+                _frame_boundaries, frame_tokens, frame_blocks, _frame_visible_units = _scan_rich_html_boundaries(html_content)
             frame_revision = self._flush_revision
             frame_started = time.monotonic()
             try:

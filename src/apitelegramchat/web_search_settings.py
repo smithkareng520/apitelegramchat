@@ -38,12 +38,6 @@ BLACKLIST_DOMAINS = (
     # "*.example.com",
 )
 
-# 直连 serper.dev /search 端点不支持 exclude 参数；本地黑名单过滤
-# （filter_blacklisted_search_results）在客户端完成。该开关保留是为了
-# 兼容老的 marcopesani/mcp-server-serper 部署；现版本对该端点不会发送
-# exclude 字段。设为 True/False 均不影响 serper.dev 直连行为。
-WEB_SEARCH_UPSTREAM_DOMAIN_EXCLUDE_ENABLED = True
-
 # fetch_url 的根路径首页回退。仅当请求 URL 没有查询参数或片段且路径为 `/` 时，
 # 在常规抓取与正文提取均失败后，按顺序尝试下列同站点路径。
 # 例如 https://www.battleofballs.com/ 失败时，会尝试

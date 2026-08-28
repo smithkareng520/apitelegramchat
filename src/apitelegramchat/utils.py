@@ -79,8 +79,6 @@ def setup_logging() -> bool:
     # 避免重复 import（例如 utils 被 reload）造成 handler 累积和日志重复输出。
     if root_logger.handlers:
         return False
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
 
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(logging.Formatter(
@@ -115,8 +113,13 @@ logger = logging.getLogger(__name__)
 _http_session: Optional[aiohttp.ClientSession] = None
 _http_session_lock = asyncio.Lock()
 
-async def get_http_session(timeout: Optional[aiohttp.ClientTimeout] = None) -> aiohttp.ClientSession:
-    """获取全局 aiohttp session（用于高频内部 API 请求）。"""
+async def get_http_session() -> aiohttp.ClientSession:
+    """获取全局 aiohttp session（用于高频内部 API 请求）。
+
+    session 统一使用默认 30s 总超时；需要更短/更长超时的调用方请在
+    具体请求上传入 ``timeout=``（aiohttp 支持按请求覆盖），避免旧实现
+    中"首次创建者决定全局超时、后到调用方的超时参数被静默丢弃"的问题。
+    """
     global _http_session
     if _http_session is None or _http_session.closed:
         async with _http_session_lock:
@@ -128,7 +131,7 @@ async def get_http_session(timeout: Optional[aiohttp.ClientTimeout] = None) -> a
                 )
                 _http_session = aiohttp.ClientSession(
                     connector=connector,
-                    timeout=timeout or aiohttp.ClientTimeout(total=30),
+                    timeout=aiohttp.ClientTimeout(total=30),
                 )
     return _http_session
 
@@ -203,19 +206,12 @@ def get_current_time() -> str:
               "July", "August", "September", "October", "November", "December"]
     return f"{days[now.weekday()]}, {months[now.month - 1]} {now.day}, {now.year}"
 
-def smart_escape_text(text: str) -> str:
-    if not text:
-        return ""
-    text = _SMART_AMP_PATTERN.sub('&amp;', text)
-    text = text.replace('<', '&lt;').replace('>', '&gt;')
-    return text
-
 def escape_html(text) -> str:
     """转义 HTML 特殊字符（<、>、&）。
 
     历史 BUG：此函数曾是一个 no-op（`return text`），导致 60+ 处调用点
-    实际上未做任何转义，存在 HTML 注入风险。现统一走 smart_escape_text
-    的转义逻辑（智能 ampersand 处理避免对已有的 &amp;/&#39; 实体二次转义）。
+    实际上未做任何转义，存在 HTML 注入风险。现做智能 ampersand 处理
+    （避免对已有的 &amp;/&#39; 实体二次转义）。
     非字符串输入会被先转换为 str。
     """
     if text is None:
@@ -224,7 +220,6 @@ def escape_html(text) -> str:
         text = str(text)
     if not text:
         return ""
-    # 复用 smart_escape_text 的逻辑：保留已存在的 HTML 实体，仅转义裸 & 与 <、>。
     text = _SMART_AMP_PATTERN.sub('&amp;', text)
     text = text.replace('<', '&lt;').replace('>', '&gt;')
     return text
@@ -302,14 +297,6 @@ _WATCH_PAGE_URL_PATTERNS = (
     re.compile(r'nico(?:video)?\.[a-z]+/watch/', re.IGNORECASE),
 )
 
-# 直链视频文件的扩展名（用于"非观看页 URL"再做一次正向确认）。
-# 走 query/path 末尾段判断，匹配大小写不敏感。
-_DIRECT_VIDEO_EXT_RE = re.compile(
-    r'\.(?:mp4|webm|mov|m4v|m3u8|ts|ogg|ogv)(?:$|\?)',
-    re.IGNORECASE,
-)
-
-
 def _looks_like_watch_page(url: str) -> bool:
     """判定 URL 是否为视频观看页（不可作为 <video src> 直链）。"""
     if not url:
@@ -322,13 +309,6 @@ def _looks_like_watch_page(url: str) -> bool:
         if pat.search(u):
             return True
     return False
-
-
-def _looks_like_direct_video(url: str) -> bool:
-    """判定 URL 是否为直链视频文件（保守判定：必须命中扩展名）。"""
-    if not url:
-        return False
-    return bool(_DIRECT_VIDEO_EXT_RE.search(url))
 
 
 def _strip_invalid_media_urls(html_content: str) -> str:
@@ -366,27 +346,7 @@ def _strip_invalid_media_urls(html_content: str) -> str:
 
     def _is_valid_url(url: str) -> bool:
         u = (url or "").strip().lower()
-        return bool(u) and (u.startswith("http://") or u.startswith("https://"))
-
-    def _domain_of(url: str) -> str:
-        m = re.match(r'https?://([^/\s]+)', url or "")
-        return m.group(1) if m else ""
-
-    def _extract_caption(text: str) -> str:
-        """从 <figcaption>...</figcaption> 或裸文本里提取 caption。"""
-        # 优先取 <figcaption>
-        m = re.search(r'<figcaption\b[^>]*>(.*?)</figcaption\s*>', text, re.IGNORECASE | re.DOTALL)
-        if m:
-            inner = m.group(1).strip()
-            if inner:
-                # 去掉内嵌标签，只留纯文本，便于做链接 anchor 文本
-                inner = re.sub(r'<[^>]+>', '', inner).strip()
-                if inner:
-                    return inner
-        # 退化：去掉所有标签后的纯文本
-        bare = re.sub(r'<[^>]+>', ' ', text)
-        bare = re.sub(r'\s+', ' ', bare).strip()
-        return bare[:80] if bare else ""
+        return bool(u) and u.startswith(("http://", "https://"))
 
     # 先处理容器型 <video>...</video> / <audio>...</audio>：
     # 起始标签 src 非法时，连同内部内容一起删掉。
@@ -656,6 +616,20 @@ async def delete_message(chat_id: int, message_id: int) -> None:
                 elif r.status == 429:
                     retry_after = int(r.headers.get("Retry-After", 5))
                     raise RateLimitError(retry_after)
+                elif r.status == 400:
+                    # "message to delete not found"：消息已不存在（例如草稿
+                    # 气泡已被永久消息挤掉）。视为幂等成功，否则会被重试
+                    # 装饰器白白发 5 次请求、耗时 6.5s 后仍抛异常。
+                    body = await r.text()
+                    if "not found" in body.lower():
+                        async with deleted_messages_lock:
+                            deleted_message_ids.add(message_id)
+                        logger.debug(
+                            f"deleteMessage 幂等成功（消息已不存在）: chat={chat_id} msg={message_id}"
+                        )
+                        return
+                    logger.error(f"deleteMessage 失败 HTTP 400: {body[:200]}")
+                    raise aiohttp.ClientResponseError(r.request_info, r.history, status=r.status, message=body)
                 else:
                     body = await r.text()
                     logger.error(f"deleteMessage 失败 HTTP {r.status}: {body[:200]}")
@@ -827,9 +801,12 @@ async def _reassert_active_draft_content(chat_id: int, draft_id: int) -> None:
             "rich_message": _rich_message_html_payload(html_content),
         }
         # reassert 只是视觉保活，失败可由下一次真实 flush 恢复；不应占用草稿锁过久。
-        timeout = aiohttp.ClientTimeout(total=4, connect=2)
-        session = await get_http_session(timeout)
-        async with session.post(f"{BASE_URL}/sendRichMessageDraft", json=payload) as resp:
+        session = await get_http_session()
+        async with session.post(
+            f"{BASE_URL}/sendRichMessageDraft",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=4, connect=2),
+        ) as resp:
                 if resp.status == 200:
                     _draft_last_send_time[cache_key] = time.monotonic()
                     try:
@@ -960,16 +937,18 @@ async def send_rich_message_draft(
             payload["message_thread_id"] = message_thread_id
 
         # 草稿帧可被更晚的完整帧覆盖。把单次等待限制在 5 秒，并至多做一次
-        # 短暂重试，避免网络抖动时 12s × 3 的锁占用造成前端数十秒“卡住”。
-        timeout = aiohttp.ClientTimeout(
-            total=_DRAFT_REQUEST_TIMEOUT,
-            connect=_DRAFT_CONNECT_TIMEOUT,
-        )
-
+        # 短暂重试（按请求传入超时），避免网络抖动时的锁占用造成前端"卡住"。
         for attempt in range(_DRAFT_MAX_ATTEMPTS):
             try:
-                session = await get_http_session(timeout)
-                async with session.post(f"{BASE_URL}/sendRichMessageDraft", json=payload) as resp:
+                session = await get_http_session()
+                async with session.post(
+                    f"{BASE_URL}/sendRichMessageDraft",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(
+                        total=_DRAFT_REQUEST_TIMEOUT,
+                        connect=_DRAFT_CONNECT_TIMEOUT,
+                    ),
+                ) as resp:
                         body = ""
                         if resp.status != 200:
                             try:
@@ -979,17 +958,15 @@ async def send_rich_message_draft(
 
                         if resp.status == 200:
                             _draft_last_send_time[cache_key] = time.monotonic()
+                            _last_sent_draft_cache[cache_key] = html_content
+                            await _reset_draft_failure(chat_id, draft_id_int)
                             try:
                                 data = await resp.json()
                                 msg_id = (data.get("result") or {}).get("message_id")
-                                _last_sent_draft_cache[cache_key] = html_content
-                                await _reset_draft_failure(chat_id, draft_id_int)
                                 if isinstance(msg_id, int) and msg_id > 0:
                                     return msg_id
                             except Exception:
                                 pass
-                            _last_sent_draft_cache[cache_key] = html_content
-                            await _reset_draft_failure(chat_id, draft_id_int)
                             return 0
 
                         if resp.status == 429:
@@ -1035,9 +1012,7 @@ async def send_rich_message_draft(
                             f"sendRichMessageDraft failed (attempt {attempt+1}/{_DRAFT_MAX_ATTEMPTS}, failures={failures}): "
                             f"{resp.status} {body[:200]}"
                         )
-                        if hard_not_found and failures >= 5:
-                            await mark_draft_dead(draft_id_int)
-                        elif failures >= 6:
+                        if hard_not_found and failures >= 5 or failures >= 6:
                             await mark_draft_dead(draft_id_int)
                         return 0
 

@@ -412,8 +412,16 @@ async def _subagent_agentic_loop(
             if isinstance(r, asyncio.CancelledError):
                 raise r
             if isinstance(r, Exception):
-                # 不应该发生，_exec_one 已吞掉异常；防御性记录
-                logger.error(f"subagent: tool exec returned exception: {r}")
+                # 不应该发生，_exec_one 已吞掉异常；防御性记录。
+                # 但必须补一条 tool 消息占位：上方已把带 tool_calls 的
+                # assistant 消息入列，缺配对的 tool 结果会让下一轮 LLM
+                # 调用直接 400。
+                logger.exception(f"subagent: tool exec returned exception: {r}")
+                loop_messages.append({
+                    "role": "tool",
+                    "tool_call_id": getattr(getattr(r, "tc_entry", None), "id", "") or "call_unknown",
+                    "content": f"Error: tool execution failed: {r}",
+                })
                 continue
             tc_id, result_str = r
             loop_messages.append({
@@ -743,8 +751,8 @@ SUBAGENT_TOOL = {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "整体超时（秒）。默认 180，最大 600。",
-                    "default": 180
+                    "description": "整体超时（秒）。默认 900，范围 60-1800。",
+                    "default": 900
                 }
             },
             "required": ["task"]

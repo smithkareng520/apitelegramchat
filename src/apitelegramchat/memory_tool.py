@@ -58,7 +58,6 @@ MEMORY_TAG_TOKEN_BUDGET = 24
 MEMORY_CARD_CONTENT_TOKEN_BUDGET = 200
 MAX_TAGS = 8
 MAX_MEMORIES = 1000  # 单 chat 上限，防止失控增长
-DEFAULT_CATEGORIES = ("fact", "preference", "person", "event", "note")
 
 IMPORTANCE_META = {
     "high":   {"emoji": "🔴", "label": "高"},

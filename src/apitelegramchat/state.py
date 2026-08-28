@@ -3,7 +3,6 @@ import asyncio
 import contextvars
 import time
 from collections import OrderedDict
-from typing import Optional
 from apitelegramchat.config import DEFAULT_MODEL
 
 # ---------- 用户会话 ----------
@@ -122,51 +121,18 @@ def get_or_init_context(chat_id: int) -> dict:
 def get_user_model(chat_id: int) -> str:
     return user_models.get(chat_id, DEFAULT_MODEL)
 
-def set_user_model(chat_id: int, model: str) -> None:
-    user_models[chat_id] = model
-
 # ---------- 安全的异步读写模型（自动加锁） ----------
-async def safe_get_user_model(chat_id: int) -> str:
-    lock = await get_chat_lock(chat_id)
-    async with lock:
-        return user_models.get(chat_id, DEFAULT_MODEL)
-
 async def safe_set_user_model(chat_id: int, model: str) -> None:
     lock = await get_chat_lock(chat_id)
     async with lock:
         user_models[chat_id] = model
 
 # ---------- 安全读写历史 ----------
-async def safe_append_message(chat_id: int, message: dict) -> None:
-    lock = await get_chat_lock(chat_id)
-    async with lock:
-        ctx = get_or_init_context(chat_id)
-        ctx["conversation_history"].append(message)
-
-async def safe_get_history(chat_id: int) -> list:
-    lock = await get_chat_lock(chat_id)
-    async with lock:
-        ctx = get_or_init_context(chat_id)
-        return ctx["conversation_history"].copy()
-
 async def safe_clear_history(chat_id: int) -> None:
     lock = await get_chat_lock(chat_id)
     async with lock:
         ctx = get_or_init_context(chat_id)
         ctx["conversation_history"] = []
-
-
-def get_active_skill(chat_id: int) -> dict | None:
-    ctx = user_contexts.get(chat_id)
-    if not ctx:
-        return None
-    return ctx.get("active_skill")
-
-
-async def safe_get_active_skill(chat_id: int) -> dict | None:
-    lock = await get_chat_lock(chat_id)
-    async with lock:
-        return get_active_skill(chat_id)
 
 
 async def safe_set_active_skill(chat_id: int, skill: dict | None) -> None:
@@ -178,17 +144,6 @@ async def safe_set_active_skill(chat_id: int, skill: dict | None) -> None:
 
 async def safe_clear_active_skill(chat_id: int) -> None:
     await safe_set_active_skill(chat_id, None)
-
-def get_history_length(chat_id: int) -> int:
-    ctx = user_contexts.get(chat_id)
-    if not ctx:
-        return 0
-    return len(ctx.get("conversation_history", []))
-
-async def safe_get_history_length(chat_id: int) -> int:
-    lock = await get_chat_lock(chat_id)
-    async with lock:
-        return get_history_length(chat_id)
 
 # ---------- 角色选择管理 ----------
 _role_selections: dict = {}
@@ -205,36 +160,7 @@ async def set_user_role(chat_id: int, role: str | None) -> None:
         else:
             _role_selections[chat_id] = role
 
-# ========== 编辑器文件状态管理 ==========
-_editor_file_state: dict = {}
-_editor_state_lock = asyncio.Lock()
-
-def get_editor_file_state(chat_id: int, path: str) -> dict | None:
-    key = (chat_id, path)
-    return _editor_file_state.get(key)
-
-def set_editor_file_state(chat_id: int, path: str, content: str, mtime: float) -> None:
-    key = (chat_id, path)
-    # 区分 None（清除状态）和 ""（合法的空文件内容），避免空文件被误判为未跟踪
-    if content is None:
-        _editor_file_state.pop(key, None)
-        return
-    _editor_file_state[key] = {"content": content, "mtime": mtime}
-
-# ========== 最近生成的图片 URL 缓存 ==========
-_last_generated_image: dict = {}
-_last_generated_image_lock = asyncio.Lock()
-
-async def set_last_generated_image_url(chat_id: int, url: str) -> None:
-    async with _last_generated_image_lock:
-        _last_generated_image[chat_id] = url
-
-async def get_last_generated_image_url(chat_id: int) -> Optional[str]:
-    async with _last_generated_image_lock:
-        return _last_generated_image.get(chat_id)
-
-
-# ---------- 活跃草稿追踪 ----------
+# ========== 活跃草稿追踪 ==========
 _active_drafts: dict = {}
 _active_drafts_lock = asyncio.Lock()
 
@@ -245,11 +171,6 @@ _preserved_draft_ids_lock = asyncio.Lock()
 async def set_active_draft(chat_id: int, draft_id: int, message_id: int) -> None:
     async with _active_drafts_lock:
         _active_drafts[chat_id] = (draft_id, message_id)
-
-async def get_active_draft_message_id(chat_id: int) -> Optional[int]:
-    async with _active_drafts_lock:
-        info = _active_drafts.get(chat_id)
-        return info[1] if info else None
 
 async def get_active_draft_info(chat_id: int) -> tuple:
     async with _active_drafts_lock:
@@ -281,23 +202,27 @@ async def is_preserved_draft(draft_id: int) -> bool:
 
 
 # ---------- 消息去重辅助函数 ----------
-async def mark_update_processed(uid: object) -> None:
-    """把 update_id 标记为已处理；超过上限时按插入顺序淘汰最早的一批。"""
+async def mark_update_processed_if_new(uid: object) -> bool:
+    """原子地检查并标记 update_id。
+
+    返回 True 表示首次见到（应当处理）；False 表示已处理过（应当跳过）。
+    检查与标记在同一把锁内完成，避免 webhook 并发重投时同一 update
+    被两个协程同时通过检查导致双重处理。
+    """
     async with _dedup_lock:
         if uid in processed_updates:
-            # 已存在则先 pop，再 set 到末尾，保持"最近访问"在尾部。
-            processed_updates.move_to_end(uid)
-        else:
-            processed_updates[uid] = time.time()
-        # 上限 10000，超过则淘汰最早的 5000 条（按插入顺序，确定性）。
-        if len(processed_updates) > 10000:
-            for _ in range(5000):
-                try:
-                    processed_updates.popitem(last=False)
-                except KeyError:
-                    break
+            return False
+        _record_processed_unlocked(uid)
+        return True
 
 
-async def is_update_processed(uid: object) -> bool:
-    async with _dedup_lock:
-        return uid in processed_updates
+def _record_processed_unlocked(uid: object) -> None:
+    """在已持有 _dedup_lock 的前提下记录 uid 并执行容量淘汰。"""
+    processed_updates[uid] = time.time()
+    # 上限 10000，超过则淘汰最早的 5000 条（按插入顺序，确定性）。
+    if len(processed_updates) > 10000:
+        for _ in range(5000):
+            try:
+                processed_updates.popitem(last=False)
+            except KeyError:
+                break

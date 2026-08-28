@@ -326,9 +326,6 @@ async def call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, A
             category="timeout",
             retryable=True,
         ) from exc
-    except MCPToolError:
-        # 已经是 MCPToolError，避免再包一层导致 chain 不清晰。
-        raise
     except Exception as exc:
         status_code, category, detail, retryable = _diagnose_mcp_exception(
             exc,

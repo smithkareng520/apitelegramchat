@@ -32,22 +32,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
-from typing import Any, Iterable
+from typing import Any
 
 import aiohttp
 
 from apitelegramchat.config import SERPER_API_KEY
 
-logger = logging.getLogger(__name__)
-
 SERPER_BASE_URL = "https://google.serper.dev"
 SERPER_DEFAULT_TIMEOUT = 12.0   # 单次请求超时（秒）
 SERPER_MAX_RETRIES = 2          # 5xx/网络错误重试次数
 SERPER_RETRY_BACKOFF = 0.6      # 重试退避基数（秒）
-SERPER_DEFAULT_NUM = 10         # 多数端点的默认结果数
 SERPER_MAX_NUM = 100            # images/videos/lens 的硬上限
-SERPER_SEARCH_MAX_NUM = 50      # search 端点的硬上限（serper 单页 10，多页聚合）
 
 ENDPOINTS = {
     "search": "/search",
@@ -221,10 +216,12 @@ async def _post_with_retry(
     last_exc: SerperError | None = None
 
     # 单次 timeout 用于每次尝试；外层 web_search 工具超时（45s）兜底总预算。
-    for attempt in range(SERPER_MAX_RETRIES + 1):
-        try:
-            timeout_cfg = aiohttp.ClientTimeout(total=timeout_s, connect=5, sock_read=timeout_s)
-            async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
+    # 整个重试序列共用一个 ClientSession（复用 TCP/TLS 连接），避免旧实现
+    # 在循环内每次尝试都新建 session、对同一 host 反复完整握手。
+    timeout_cfg = aiohttp.ClientTimeout(total=timeout_s, connect=5, sock_read=timeout_s)
+    async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
+        for attempt in range(SERPER_MAX_RETRIES + 1):
+            try:
                 async with session.post(
                     url,
                     headers=_headers(),
@@ -252,42 +249,45 @@ async def _post_with_retry(
                         raise SerperAuthError(msg, status_code=resp.status)
                     if category == "rate_limited":
                         raise SerperRateLimitError(msg, status_code=resp.status)
-                    if category == "server" and attempt < SERPER_MAX_RETRIES:
-                        last_exc = SerperServerError(msg, status_code=resp.status)
-                        await asyncio.sleep(SERPER_RETRY_BACKOFF * (attempt + 1))
-                        continue
+                    if category == "server":
+                        if attempt < SERPER_MAX_RETRIES:
+                            last_exc = SerperServerError(msg, status_code=resp.status)
+                            await asyncio.sleep(SERPER_RETRY_BACKOFF * (attempt + 1))
+                            continue
+                        # 重试耗尽：按类设计抛出 SerperServerError，方便调用方
+                        # isinstance 区分（旧实现落到基类 SerperError，子类从未被抛出）。
+                        raise SerperServerError(msg, status_code=resp.status)
                     if category == "request":
                         raise SerperRequestError(msg, status_code=resp.status)
                     raise SerperError(msg, category=category, status_code=resp.status,
                                       retryable=retryable)
-        except asyncio.TimeoutError as exc:
-            # 超时也重试一次，再失败抛 SerperTimeoutError
-            last_exc = SerperTimeoutError(f"Serper {endpoint} timed out after {timeout_s}s")
-            if attempt < SERPER_MAX_RETRIES:
-                await asyncio.sleep(SERPER_RETRY_BACKOFF * (attempt + 1))
-                continue
-            raise last_exc from exc
-        except aiohttp.ClientError as exc:
-            # 网络错误（DNS、连接、读响应中断）→ 视为可重试
-            last_exc = SerperServerError(
-                f"Serper {endpoint} network error: {exc.__class__.__name__}: {exc}"
-            )
-            if attempt < SERPER_MAX_RETRIES:
-                await asyncio.sleep(SERPER_RETRY_BACKOFF * (attempt + 1))
-                continue
-            raise last_exc from exc
-        except SerperError:
-            raise
-        except Exception as exc:  # 兜底，防止未分类异常向上污染
-            raise SerperError(
-                f"Serper {endpoint} unexpected error: {exc.__class__.__name__}: {exc}",
-                category="unknown",
-                retryable=False,
-            ) from exc
+            except asyncio.TimeoutError as exc:
+                # 超时也重试一次，再失败抛 SerperTimeoutError
+                last_exc = SerperTimeoutError(f"Serper {endpoint} timed out after {timeout_s}s")
+                if attempt < SERPER_MAX_RETRIES:
+                    await asyncio.sleep(SERPER_RETRY_BACKOFF * (attempt + 1))
+                    continue
+                raise last_exc from exc
+            except aiohttp.ClientError as exc:
+                # 网络错误（DNS、连接、读响应中断）→ 视为可重试
+                last_exc = SerperServerError(
+                    f"Serper {endpoint} network error: {exc.__class__.__name__}: {exc}"
+                )
+                if attempt < SERPER_MAX_RETRIES:
+                    await asyncio.sleep(SERPER_RETRY_BACKOFF * (attempt + 1))
+                    continue
+                raise last_exc from exc
+            except SerperError:
+                raise
+            except Exception as exc:  # 兜底，防止未分类异常向上污染
+                raise SerperError(
+                    f"Serper {endpoint} unexpected error: {exc.__class__.__name__}: {exc}",
+                    category="unknown",
+                    retryable=False,
+                ) from exc
 
     if last_exc is not None:
         raise last_exc
-    # 理论上不会到达
     raise SerperError(f"Serper {endpoint} exhausted retries")
 
 
@@ -372,57 +372,3 @@ async def lens(
     )
     return await _post_with_retry(endpoint=ENDPOINTS["lens"], payload=payload, timeout=timeout)
 
-
-async def gather_modes(
-    modes: Iterable[str],
-    *,
-    query: str | None,
-    image_url: str | None,
-    num: int | None,
-    page: int | None,
-    gl: str | None,
-    hl: str | None,
-    tbs: str | None,
-    timeout: float | None = None,
-) -> dict[str, dict[str, Any] | Exception]:
-    """并发执行多个 mode，返回 {mode: result_or_exception}。
-
-    单个 mode 失败不会影响其他 mode 的结果，调用方按需处理。返回的 dict
-    保持调用时给出的 modes 顺序（Python 3.7+ dict 保留插入顺序）。
-    """
-    unique_modes: list[str] = []
-    seen: set[str] = set()
-    for m in modes:
-        if m not in ENDPOINTS:
-            raise SerperRequestError(f"unknown serper mode: {m}")
-        if m not in seen:
-            seen.add(m)
-            unique_modes.append(m)
-
-    async def _run_one(mode: str) -> tuple[str, dict[str, Any] | Exception]:
-        try:
-            if mode == "search":
-                if not query:
-                    raise SerperRequestError("search mode requires query")
-                result = await search(query, num=num, page=page, gl=gl, hl=hl, tbs=tbs, timeout=timeout)
-            elif mode == "images":
-                if not query:
-                    raise SerperRequestError("images mode requires query")
-                result = await images(query, num=num, page=page, gl=gl, hl=hl, tbs=tbs, timeout=timeout)
-            elif mode == "videos":
-                if not query:
-                    raise SerperRequestError("videos mode requires query")
-                result = await videos(query, num=num, page=page, gl=gl, hl=hl, tbs=tbs, timeout=timeout)
-            elif mode == "lens":
-                if not image_url:
-                    raise SerperRequestError("lens mode requires image_url")
-                result = await lens(image_url, query=query, num=num, page=page, gl=gl, hl=hl, tbs=tbs, timeout=timeout)
-            else:  # pragma: no cover - guarded by unique_modes filter
-                raise SerperRequestError(f"unknown serper mode: {mode}")
-            return mode, result
-        except Exception as exc:
-            return mode, exc
-
-    outcomes = await asyncio.gather(*(_run_one(m) for m in unique_modes),
-                                    return_exceptions=False)
-    return {mode: outcome for mode, outcome in outcomes}

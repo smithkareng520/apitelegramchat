@@ -215,7 +215,10 @@ async def create_ask_user_interaction(
         reply_markup=_build_keyboard(interaction),
         reassert_draft=True,
     )
-    if isinstance(message_id, int) and message_id > 0:
+    # send_rich_html_message 在 HTTP 200 但解析不到 message_id 时返回 True；
+    # isinstance(True, int) 为真，必须显式排除 bool，否则后续 Telegram API
+    # 收到 message_id=true 必然 400，交互卡永远无法收尾。
+    if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0:
         interaction.message_id = message_id
     else:
         await cancel_interaction(interaction.id, remove_ui=False)

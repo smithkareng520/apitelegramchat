@@ -27,7 +27,6 @@ from apitelegramchat.utils import (
 from apitelegramchat.ai_handlers import get_ai_response, _get_cached_audio_data
 from apitelegramchat.config import (
     BASE_URL,
-    WEBHOOK_URL,
     SUPPORTED_MODELS,
     SUPPORTED_ROLES,
     WEBHOOK_TOKEN,
@@ -59,8 +58,7 @@ from apitelegramchat.state import (
     mark_preserved_draft,
     mark_protected_message,
     set_current_user_namespace,
-    mark_update_processed,
-    is_update_processed,
+    mark_update_processed_if_new,
 )
 from apitelegramchat.ask_user_tool import (
     get_pending_for_chat,
@@ -109,6 +107,18 @@ async def _shutdown_close_http_session() -> None:
     except Exception:
         logger.warning("shutdown close_http_session failed", exc_info=True)
 
+def _cmd_match(t: str, name: str) -> bool:
+    """严格命令匹配：以 / 开头，首段等于命令名（兼容 /cmd@botname 形式）。
+
+    防止 /roleplay 误触发 /role、/clearall 误触发 /clear（后者会直接
+    清空对话历史，属于数据丢失级误操作）。
+    """
+    if not t.startswith("/"):
+        return False
+    first = t.split(None, 1)[0] if t.strip() else t
+    return first == name or first.startswith(name + "@")
+
+
 def _reply_params(message_id: int | None) -> dict | None:
     try:
         mid = int(message_id)
@@ -138,8 +148,8 @@ REPLY_MARKER = "💡 引用回复:"
 
 active_tasks: dict[int, asyncio.Task] = {}
 active_tasks_lock = asyncio.Lock()
-# 消息去重的锁已下沉到 state.mark_update_processed / is_update_processed，
-# 这里不再需要 app 级别的 _dedup_lock。
+# 消息去重已下沉到 state.mark_update_processed_if_new（原子检查+标记），
+# 这里不需要 app 级别的去重锁。
 
 # ==================== 停止旧草稿（冻结当前流，并落一条永久结束消息） ====================
 
@@ -263,20 +273,18 @@ def get_user_info(msg: dict) -> tuple[str, str]:
     return username, user_id
 
 def is_admin(username: str, user_id: str) -> bool:
-    if username and username in ADMIN_USERS:
-        return True
-    if user_id and user_id in ADMIN_USERS:
-        return True
-    return False
+    return bool(
+        (username and username in ADMIN_USERS)
+        or (user_id and user_id in ADMIN_USERS)
+    )
 
 def is_authorized(username: str, user_id: str) -> bool:
     if is_admin(username, user_id):
         return True
-    if username and username in WHITELIST_USERS:
-        return True
-    if user_id and user_id in WHITELIST_USERS:
-        return True
-    return False
+    return bool(
+        (username and username in WHITELIST_USERS)
+        or (user_id and user_id in WHITELIST_USERS)
+    )
 
 async def reply_unauthorized(chat_id: int, reply_message_id: int | None = None):
     await send_rich_html_message(
@@ -343,14 +351,6 @@ def _get_reply_media(msg: dict) -> dict:
             "mime_type": "video/mp4",
         }
     return {}
-
-async def set_webhook() -> None:
-    async with aiohttp.ClientSession() as session:
-        async with session.post(f"{BASE_URL}/setWebhook?drop_pending_updates=true", json={"url": WEBHOOK_URL}) as resp:
-            if resp.status == 200:
-                logger.info("[INIT] Webhook configured")
-            else:
-                logger.error(f"[ERROR] Webhook setup failed: {await resp.text()}")
 
 # ---------- Token 估算及上下文修剪 ----------
 _MEDIA_TOKEN_OVERHEAD = 64
@@ -631,11 +631,11 @@ async def _handle_text_message(chat_id: int, user_input: str, username: str, use
         if not is_safe:
             await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的内容过长，已超过模型单次处理极限，请分批或精简发送。")
             return
-        full, clean, new_msgs, usage = await get_ai_response(
+        full, _, new_msgs, usage = await get_ai_response(
             chat_id, user_models, user_contexts, username,
             user_message=user_message,
         )
-        if full and not full.startswith(("IMAGE_SENT", "⚠️", "❌")):
+        if full and not full.startswith(("⚠️", "❌")):
             await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
     except asyncio.CancelledError:
         raise
@@ -651,11 +651,11 @@ async def _handle_photo_message(chat_id: int, user_message: dict, username: str)
         if not is_safe:
             await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的图片附加内容过长，已超过模型单次处理极限，请精简发送。")
             return
-        full, clean, new_msgs, usage = await get_ai_response(
+        full, _, new_msgs, usage = await get_ai_response(
             chat_id, user_models, user_contexts, username,
             user_message=user_message,
         )
-        if full and not full.startswith(("IMAGE_SENT", "⚠️", "❌")):
+        if full and not full.startswith(("⚠️", "❌")):
             await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
     except asyncio.CancelledError:
         raise
@@ -671,11 +671,11 @@ async def _handle_document_message(chat_id: int, user_message: dict, username: s
         if not is_safe:
             await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的文档内容过长，已超过模型单次处理极限，请精简发送。")
             return
-        full, clean, new_msgs, usage = await get_ai_response(
+        full, _, new_msgs, usage = await get_ai_response(
             chat_id, user_models, user_contexts, username,
             user_message=user_message,
         )
-        if full and not full.startswith(("IMAGE_SENT", "⚠️", "❌")):
+        if full and not full.startswith(("⚠️", "❌")):
             await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
     except asyncio.CancelledError:
         raise
@@ -691,11 +691,11 @@ async def _handle_audio_message(chat_id: int, user_message: dict, username: str)
         if not is_safe:
             await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的音频转录文本过长，已超过模型单次处理极限，请精简发送。")
             return
-        full, clean, new_msgs, usage = await get_ai_response(
+        full, _, new_msgs, usage = await get_ai_response(
             chat_id, user_models, user_contexts, username,
             user_message=user_message,
         )
-        if full and not full.startswith(("IMAGE_SENT", "⚠️", "❌")):
+        if full and not full.startswith(("⚠️", "❌")):
             await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
     except asyncio.CancelledError:
         raise
@@ -718,11 +718,11 @@ async def _handle_video_message(chat_id: int, user_message: dict, username: str)
         if not is_safe:
             await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的视频附加内容过长，已超过模型单次处理极限，请精简发送。")
             return
-        full, clean, new_msgs, usage = await get_ai_response(
+        full, _, new_msgs, usage = await get_ai_response(
             chat_id, user_models, user_contexts, username,
             user_message=user_message,
         )
-        if full and not full.startswith(("IMAGE_SENT", "VIDEO_SENT", "⚠️", "❌")):
+        if full and not full.startswith(("⚠️", "❌")):
             await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
     except asyncio.CancelledError:
         raise
@@ -755,12 +755,6 @@ async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
         if not is_authorized(username, user_id):
             await reply_unauthorized(chat_id, first_msg.get("message_id"))
             return
-
-        lock = await get_chat_lock(chat_id)
-        async with lock:
-            current_model = get_user_model(chat_id)
-        model_info = SUPPORTED_MODELS.get(current_model)
-        supports_vision = model_info.vision if model_info else False
 
         file_ids = []
         captions = []
@@ -802,11 +796,11 @@ async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
             await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的图片组附加内容过长，已超过模型单次处理极限，请精简发送。")
             return
 
-        full, clean, new_msgs, usage = await get_ai_response(
+        full, _, new_msgs, usage = await get_ai_response(
             chat_id, user_models, user_contexts, username,
             user_message=user_message,
         )
-        if full and not full.startswith(("IMAGE_SENT", "⚠️", "❌")):
+        if full and not full.startswith(("⚠️", "❌")):
             await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
 
     except asyncio.CancelledError:
@@ -912,11 +906,11 @@ async def _process_video_group_once(chat_id: int, group_key: str) -> None:
             await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的视频组附加内容过长，已超过模型单次处理极限，请精简发送。")
             return
 
-        full, clean, new_msgs, usage = await get_ai_response(
+        full, _, new_msgs, usage = await get_ai_response(
             chat_id, user_models, user_contexts, username,
             user_message=user_message,
         )
-        if full and not full.startswith(("IMAGE_SENT", "VIDEO_SENT", "⚠️", "❌")):
+        if full and not full.startswith(("⚠️", "❌")):
             await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
 
     except asyncio.CancelledError:
@@ -948,6 +942,24 @@ async def _schedule_video_group(chat_id: int, group_key: str) -> None:
     task.add_done_callback(_done)
 
 async def _process_document_group_once(chat_id: int, media_group_id: str) -> None:
+    # 与图片/视频组对称的异常保护：下载/建目录等任一环节抛异常时，
+    # 用户能收到错误提示，而不是任务静默终止（旧实现无 try/except，
+    # 异常只会变成 "Task exception was never retrieved"）。
+    try:
+        await _process_document_group_inner(chat_id, media_group_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"处理文档组异常 group={media_group_id}: {e}")
+        try:
+            await send_rich_html_message(
+                chat_id, "❌ <b>处理文档组时出错</b>\n<code>" + str(e)[:100] + "</code>"
+            )
+        except Exception:
+            pass
+
+
+async def _process_document_group_inner(chat_id: int, media_group_id: str) -> None:
     await send_chat_action(chat_id, "upload_document")
     asyncio.create_task(init_workspace(chat_id))
     await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
@@ -1293,9 +1305,10 @@ async def webhook() -> tuple:
 
         # 使用 OrderedDict 保留插入顺序，超过 10000 条时按插入顺序淘汰最早的 5000 条。
         # 之前用 set + list 刉片是随机淘汰，可能把刚加入的 uid 误伤。
-        if await is_update_processed(uid):
+        # 原子地"检查并标记"：旧实现先查后标两段加锁，Telegram 超时重投 +
+        # webhook 并发时同一 update 的两个副本可能同时通过检查被双重处理。
+        if not await mark_update_processed_if_new(uid):
             return "OK", 200
-        await mark_update_processed(uid)
 
         # ── 消息处理 ──────────────────────────────────────────────────────
         if "message" in data and isinstance(data["message"], dict):
@@ -1309,13 +1322,6 @@ async def webhook() -> tuple:
             set_current_user_namespace(user_id or str(chat_id))
 
             text = msg.get("text", "") or ""
-            # 使用更严格的命令匹配：以 / 开头并按空格/ @ 切分首段
-            def _cmd_match(t: str, name: str) -> bool:
-                if not t.startswith("/"):
-                    return False
-                first = t.split(None, 1)[0] if t.strip() else t
-                # 兼容 /cmd@botname 形式
-                return first == name or first.startswith(name + "@")
             is_admin_cmd = (_cmd_match(text, "/adduser") or _cmd_match(text, "/deluser")
                             or _cmd_match(text, "/listusers"))
             if is_admin_cmd:
@@ -1360,7 +1366,7 @@ async def webhook() -> tuple:
                             await send_rich_html_message(chat_id, f"📋 <b>当前白名单用户：</b>\n<ul>{users_list}</ul>", reply_parameters=_reply_params(msg["message_id"]))
                         return "OK", 200
 
-            if text.startswith("/start"):
+            if _cmd_match(text, "/start"):
                 authorized = is_authorized(username, user_id)
                 if authorized:
                     welcome_msg = """
@@ -1466,11 +1472,6 @@ async def webhook() -> tuple:
 
             # ── 单张图片 ──────────────────────────────────────────────────
             if "photo" in msg:
-                async with lock:
-                    cm = get_user_model(chat_id)
-                    model_info = SUPPORTED_MODELS.get(cm)
-                    supports_vision = model_info.vision if model_info else False
-
                 fid = msg["photo"][-1]["file_id"]
                 cap = msg.get("caption", "").strip()
                 context_prefix = _get_reply_context(msg)
@@ -1711,11 +1712,15 @@ async def webhook() -> tuple:
                 # 若当前 ask_user 正在等待自由文本，优先把这条消息交给原 agent turn，
                 # 不要启动新的 AI turn。命令仍保留为真正的 bot 指令入口。
                 pending_ask = await get_pending_for_chat(chat_id)
-                if pending_ask and pending_ask.awaiting_text and not user_input.startswith("/"):
-                    if await resolve_ask_user_text(chat_id, user_input):
-                        return "OK", 200
+                if (
+                    pending_ask
+                    and pending_ask.awaiting_text
+                    and not user_input.startswith("/")
+                    and await resolve_ask_user_text(chat_id, user_input)
+                ):
+                    return "OK", 200
 
-                if user_input.startswith("/role"):
+                if _cmd_match(user_input, "/role"):
                     cr = await get_user_role(chat_id)
                     prev_mid = role_message_ids.get(chat_id)
                     if not prev_mid or not await update_role_list(chat_id, prev_mid, SUPPORTED_ROLES, cr):
@@ -1724,7 +1729,7 @@ async def webhook() -> tuple:
                             role_message_ids[chat_id] = mid
                     return "OK", 200
 
-                if user_input.startswith("/balance"):
+                if _cmd_match(user_input, "/balance"):
                     parts = user_input.split(maxsplit=1)
                     svc = parts[1].lower() if len(parts) > 1 else None
                     msgs = []
@@ -1761,7 +1766,7 @@ async def webhook() -> tuple:
                     )
                     return "OK", 200
 
-                if user_input.startswith("/model"):
+                if _cmd_match(user_input, "/model"):
                     if (msg.get("chat") or {}).get("type") != "private":
                         await _send_via_send_message(
                             chat_id,
@@ -1782,7 +1787,7 @@ async def webhook() -> tuple:
                     )
                     return "OK", 200
 
-                if user_input.startswith("/clear"):
+                if _cmd_match(user_input, "/clear"):
                     await _interrupt_active_generation(chat_id)
                     await safe_clear_history(chat_id)
                     await safe_clear_active_skill(chat_id)
@@ -1806,7 +1811,6 @@ async def webhook() -> tuple:
                 async with lock:
                     cm = get_user_model(chat_id)
                     model_info = SUPPORTED_MODELS.get(cm)
-                    supports_vision = model_info.vision if model_info else False
                     supports_audio = model_info.audio if model_info else False
                     supports_native_document = bool(model_info.native_document) if model_info else False
 

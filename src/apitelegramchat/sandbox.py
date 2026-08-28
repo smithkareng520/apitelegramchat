@@ -478,3 +478,11 @@ async def watchdog(proc: asyncio.subprocess.Process,
         except Exception as e:
             logger.debug(f"watchdog tick error: {e}")
         await asyncio.sleep(interval)
+
+
+# 在父进程（import 时）预热 Landlock ABI 探测缓存。
+# preexec_fn 运行在 fork 之后、exec 之前的子进程里；若首次探测发生在
+# 子进程内，其触发的 logger.info 会拿 logging 模块随 fork 继承的锁，
+# 在多线程父进程（asyncio 线程池 / aiohttp）下有死锁风险。这里提前
+# 填充 _landlock_abi 缓存，子进程内走纯缓存路径，不再触碰 logging。
+_landlock_abi_version()

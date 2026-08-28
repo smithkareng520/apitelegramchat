@@ -70,10 +70,6 @@ _ICONISH_NAME_RE = re.compile(
     r"button|arrow_left|arrow_right|loading|placeholder|1x1|transparent|rating|star)",
     re.IGNORECASE,
 )
-# 允许作为 <img src> 的扩展名（无扩展名时也放行，交给渲染端处理）。
-_IMAGE_EXT_OK = {
-    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp", ".heic", ".svg",
-}
 _VIDEO_EXT = {".mp4", ".webm", ".ogg", ".ogv", ".mov", ".m4v", ".m3u8", ".ts"}
 _AUDIO_EXT = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga", ".flac", ".opus"}
 
@@ -207,9 +203,7 @@ def _is_probably_decorative(url: str) -> bool:
     if _ICONISH_NAME_RE.search(name):
         return True
     # 1x1 / 0x0 尺寸特征（含路径中的尺寸段）。
-    if re.search(r"(?:^|[/_-])(?:1x1|0x0|2x2)(?:[._/-]|$)", path):
-        return True
-    return False
+    return bool(re.search(r"(?:^|[/_-])(?:1x1|0x0|2x2)(?:[._/-]|$)", path))
 
 
 # ---------------------------------------------------------------------------
@@ -313,9 +307,7 @@ def _is_hidden_element(el) -> bool:
         return True
     if "hidden" in (el.get("class") or "").lower():
         return True
-    if el.get("width") == "0" or el.get("height") == "0":
-        return True
-    return False
+    return el.get("width") == "0" or el.get("height") == "0"
 
 
 def _find_carousel_ancestor(el) -> Optional[str]:
@@ -1032,17 +1024,17 @@ def extract_body_blocks(html_text: str, base_url: str = "") -> list[str]:
          走 justext 回退路径，把多段落合并成单段并丢失行内格式/链接。
     """
     try:
-        import trafilatura  # noqa: PLC0415 - 延迟导入避免硬依赖
+        import trafilatura
     except Exception:
         return []
-    kwargs = dict(
-        output_format="xml",
-        include_comments=False,
-        include_tables=True,
-        include_images=True,
-        include_links=True,
-        include_formatting=True,
-    )
+    kwargs = {
+        "output_format": "xml",
+        "include_comments": False,
+        "include_tables": True,
+        "include_images": True,
+        "include_links": True,
+        "include_formatting": True,
+    }
     xml_text = None
     try:
         xml_text = trafilatura.extract(html_text, **kwargs)
@@ -1131,9 +1123,7 @@ def _anchor_text_match(block_text: str, cand_text: str) -> bool:
         return True
     if len(cand_text) >= 8 and (block_text.startswith(cand_text) or cand_text in block_text):
         return True
-    if len(block_text) >= 8 and cand_text.startswith(block_text):
-        return True
-    return False
+    return len(block_text) >= 8 and cand_text.startswith(block_text)
 
 
 def _anchor_entries(entries: list[dict], tree, media: list[DomMedia]) -> list[dict]:
@@ -1461,7 +1451,7 @@ def _apply_carousels(entries: list[dict], media: list[DomMedia]) -> tuple[list[d
     # ---- 轮播归并决策 ----
     extra_slideshows: list[tuple[int, str, str]] = []  # (order, path, html)
     remove_urls: set[str] = set()
-    for carousel_path, imgs in by_carousel.items():
+    for imgs in by_carousel.values():
         if len(imgs) < 2:
             continue
         kept = [i for i in imgs if i.url in kept_urls]
@@ -1474,8 +1464,8 @@ def _apply_carousels(entries: list[dict], media: list[DomMedia]) -> tuple[list[d
             # 全量 slideshow 插入轮播首图位置；已计入的单图块从正文移除。
             for i in imgs:
                 i.skip = True
-            first = min(imgs, key=lambda i: i.order_idx)
             ordered = sorted(imgs, key=lambda i: i.order_idx)
+            first = ordered[0]
             slide = "<tg-slideshow>" + "".join(
                 f'<img src="{esc_attr(i.url)}"/>' for i in ordered
             ) + "</tg-slideshow>"
@@ -1540,12 +1530,17 @@ def build_fallback_text_from_html(html_text: str, token_budget: int = FALLBACK_T
     chunks: list[str] = []
     if desc:
         chunks.append(desc.strip())
+    # 增量维护 token 计数：旧实现对每个新段落都把全部已累积内容重新
+    # join + 编码（O(n^2)），大页面数百段时是数百次全量重编码。
+    total_tokens = count_tokens(desc.strip()) if desc else 0
     for el in tree.iter("p"):
         text = re.sub(r"\s+", " ", "".join(el.itertext())).strip()
         # 阈值 10 字符：中文段落信息密度高，12 个汉字已是完整句子；
         # 按 20 英文词校准的阈值会把中文正文全部过滤掉。
         if len(text) >= 10:
+            piece_tokens = count_tokens(text)
+            total_tokens += piece_tokens + (1 if chunks else 0)
             chunks.append(text)
-        if count_tokens("\n\n".join(chunks)) >= token_budget:
-            break
+            if total_tokens >= token_budget:
+                break
     return truncate_to_token_budget("\n\n".join(chunks), token_budget, suffix="…")

@@ -51,7 +51,6 @@ try:
     from lxml import html as lxml_html  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
     lxml_html = None  # type: ignore
-from apitelegramchat.state import set_editor_file_state  # noqa: F401  (保留 set_editor_file_state 用于编辑器状态追踪)
 
 from apitelegramchat.config import (
     OPENROUTER_API_KEY,
@@ -69,10 +68,14 @@ from apitelegramchat.web_search_filter import (
     SEARCH_DEFAULT_RESULTS as _SEARCH_DEFAULT_RESULTS,
     SEARCH_MAX_CANDIDATES as _SEARCH_MAX_CANDIDATES,
     SEARCH_MAX_RESULTS as _SEARCH_MAX_RESULTS,
+    candidate_result_count,
     filter_blacklisted_search_results as _filter_blacklisted_search_results,
 )
+
+# images/videos/lens 单请求的 num_results 上限（serper 文档口径）。
+_SEARCH_MEDIA_MAX_RESULTS = 100
 from apitelegramchat.fetch_url_fallback import root_fallback_urls
-from apitelegramchat.utils import retry_async, escape_html
+from apitelegramchat.utils import escape_html
 from apitelegramchat.token_budget import truncate_to_token_budget
 from apitelegramchat.mcp_client import call_mcp_tool, MCPToolError
 from apitelegramchat.tool_result_condense import condense_amap_payload
@@ -85,9 +88,9 @@ from apitelegramchat.workspace_utils import (
 )
 # 任务工具：定义在 todo_tool.py / memory_tool.py / subagent_tool.py
 # 本文件只做注册与转出
-from apitelegramchat.todo_tool import TODO_TOOL  # noqa: E402
-from apitelegramchat.memory_tool import MEMORY_TOOL  # noqa: E402
-try:  # noqa: E402
+from apitelegramchat.todo_tool import TODO_TOOL
+from apitelegramchat.memory_tool import MEMORY_TOOL
+try:
     from apitelegramchat.subagent_tool import SUBAGENT_TOOL  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
     SUBAGENT_TOOL = []
@@ -302,7 +305,6 @@ async def execute_text_editor(
                 else:
                     start, end = 1, total_lines
 
-                set_editor_file_state(chat_id, safe_path, content, local_path.stat().st_mtime)
                 if total_lines == 0:
                     return "(empty file)"
                 width = len(str(total_lines))
@@ -324,7 +326,6 @@ async def execute_text_editor(
                         file.write(file_text)
                 except FileExistsError:
                     return "Error: File already exists."
-                set_editor_file_state(chat_id, safe_path, file_text, local_path.stat().st_mtime)
                 asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
                 return _with_latest_editor_snapshot(f"Successfully created file in {local_path}", file_text)
 
@@ -356,7 +357,6 @@ async def execute_text_editor(
                     )
                 new_content = content.replace(old_str, new_str, 1)
                 _write_text_editor_file(local_path, new_content)
-                set_editor_file_state(chat_id, safe_path, new_content, local_path.stat().st_mtime)
                 asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
                 return _with_latest_editor_snapshot(f"Successfully replaced string in {local_path}", new_content)
 
@@ -377,7 +377,6 @@ async def execute_text_editor(
                 text_to_insert += "\n"
             new_content = prefix + text_to_insert + suffix
             _write_text_editor_file(local_path, new_content)
-            set_editor_file_state(chat_id, safe_path, new_content, local_path.stat().st_mtime)
             asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
             return _with_latest_editor_snapshot(f"Successfully inserted string in {local_path} after line {insert_line}", new_content)
 
@@ -1401,8 +1400,15 @@ async def _serper_search_one_mode(
             raise SerperSearchTransientError(
                 f"Serper search returned no results; first error: {first_error}"
             )
-        start = offset % SERPER_PAGE_SIZE
-        return items[start:start + requested_num]
+        if items and first_error is not None:
+            # 部分页失败：拼出来的结果数量会少于请求量。不静默吞掉，
+            # 留下排障线索（结果仍然返回，让调用方拿到可用部分）。
+            logger.warning(
+                "Serper search 部分页失败 modes=search pages=%s first_error=%s",
+                list(pages), first_error,
+            )
+        # offset 只能是页对齐值（上面按页折算），无需子页偏移。
+        return items[:requested_num]
 
     if mode == "images":
         if not query:
@@ -1600,18 +1606,25 @@ async def execute_web_search(
       hl:          界面语言（如 en / zh-cn），默认取 WEB_SEARCH_LANGUAGE。
       tbs:         时间筛选（如 qdr:d 当天 / qdr:w 一周 / qdr:m 一月 / qdr:y 一年）。
     """
-    # ---- 参数归一化（与缓存 key 保持同一套逻辑） ----
+    # ---- 参数归一化（唯一一份；缓存 key 与执行共用同一结果，
+    # 消除旧实现里两份归一化逻辑各自漂移、缓存 key 碎片化的问题） ----
     modes = _normalize_modes(mode)
-    requested = _SEARCH_DEFAULT_RESULTS
-    if num_results is not None:
-        requested = max(1, min(int(num_results), _SEARCH_MAX_RESULTS))
+    requested = _normalize_requested_results(num_results)
+    # offset 只对 search mode 生效（schema/docstring 均如此声明）。
+    # <10 等价于第 1 页，与不带 offset 归一到同一缓存 key，避免 p:1/p:null 碎片。
     page: int | None = None
-    if offset is not None:
+    if offset is not None and "search" in modes:
         page = max(int(offset), 0) // SERPER_PAGE_SIZE + 1
+        if page <= 1:
+            page = None
     query_str = (query or "").strip()
+    image_url_str = (image_url or "").strip()
+    # 应用部署默认地区/语言，使 schema 中“默认 cn / zh-cn”的说明与实际行为一致。
+    gl = gl or WEB_SEARCH_REGION
+    hl = hl or WEB_SEARCH_LANGUAGE
 
     cache_key = _search_cache_key(
-        modes, query_str, requested, page, gl, hl, tbs, image_url,
+        modes, query_str, requested, page, gl, hl, tbs, image_url_str,
     )
     cached = _search_cache.get(cache_key)
     if cached is not None:
@@ -1619,11 +1632,11 @@ async def execute_web_search(
         return cached
 
     result = await _execute_web_search_uncached(
-        query=query,
-        num_results=num_results,
-        offset=offset,
-        mode=mode,
-        image_url=image_url,
+        modes=modes,
+        query_str=query_str,
+        requested=requested,
+        page=page,
+        image_url=image_url_str or None,
         gl=gl,
         hl=hl,
         tbs=tbs,
@@ -1633,36 +1646,47 @@ async def execute_web_search(
     return result
 
 
+def _normalize_requested_results(num_results: int | None) -> int:
+    """归一化 num_results：非法/缺省回退默认值；全局上限 100（schema 口径）。
+
+    各 mode 的差异化上限（search 50 / 其他 100）在执行时按 mode 再钳制。
+    """
+    if num_results is None:
+        return _SEARCH_DEFAULT_RESULTS
+    try:
+        return max(1, min(int(num_results), _SEARCH_MEDIA_MAX_RESULTS))
+    except (TypeError, ValueError):
+        return _SEARCH_DEFAULT_RESULTS
+
+
 async def _execute_web_search_uncached(
-    query: str | None = None,
-    num_results: int | None = None,
-    offset: int | None = None,
-    *,
-    mode: str | list[str] | None = "search",
-    image_url: str | None = None,
-    gl: str | None = None,
-    hl: str | None = None,
-    tbs: str | None = None,
+    modes: list[str],
+    query_str: str,
+    requested: int,
+    page: int | None,
+    image_url: str | None,
+    gl: str | None,
+    hl: str | None,
+    tbs: str | None,
 ) -> str:
-    """execute_web_search 的无缓存实现（原函数体，逻辑未变）。"""
-    modes = _normalize_modes(mode)
-    requested = _SEARCH_DEFAULT_RESULTS
-    if num_results is not None:
-        requested = max(1, min(int(num_results), _SEARCH_MAX_RESULTS))
-
-    # 对 search mode 的 offset，转为 page（向后兼容旧调用方）
-    page: int | None = None
-    if offset is not None:
-        page = max(int(offset), 0) // SERPER_PAGE_SIZE + 1
-
-    query_str = (query or "").strip()
+    """execute_web_search 的无缓存实现（入参已由调用方归一化）。"""
     needs_query = any(m in {"search", "images", "videos"} for m in modes)
     if needs_query and not query_str:
         return "❌ 搜索关键词为空。"
     if "lens" in modes and not (image_url or "").strip():
         return "❌ 以图搜图（lens）模式需要 image_url 参数。"
 
-    timeout = _serper_api_timeout()
+    # 各 mode 的结果数上限不同：search 多页聚合上限 50；images/videos/lens
+    # 单请求上限 100（与 schema 声明及 serper 文档一致；旧实现把所有 mode
+    # 一律钳到 50，与 schema 矛盾）。
+    def _num_for(m: str) -> int:
+        return min(requested, _SEARCH_MAX_RESULTS if m == "search" else _SEARCH_MEDIA_MAX_RESULTS)
+
+    # search mode 为弥补黑名单过滤造成的缺口，按配置倍率向上游多取候选，
+    # 过滤后再截断到请求数（旧实现从未接线该倍率，配置形同虚设）。
+    def _upstream_num_for(m: str) -> int:
+        n = _num_for(m)
+        return candidate_result_count(n) if m == "search" else n
 
     # 单 mode 时走轻量路径；多 mode 时并发执行。
     if len(modes) == 1:
@@ -1672,8 +1696,8 @@ async def _execute_web_search_uncached(
                 single_mode,
                 query=query_str or None,
                 image_url=(image_url or "").strip() or None,
-                num=requested,
-                page=page,
+                num=_upstream_num_for(single_mode),
+                page=page if single_mode == "search" else None,
                 gl=gl,
                 hl=hl,
                 tbs=tbs,
@@ -1692,28 +1716,28 @@ async def _execute_web_search_uncached(
         except SerperSearchTransientError as exc:
             logger.warning("Serper 未返回有效结果 mode=%s: %s", single_mode, exc)
             return "❌ 网页搜索服务暂未返回有效结果；请稍后重试。"
-        except Exception as exc:
+        except Exception:
             logger.exception("Serper 搜索发生未分类异常 mode=%s", single_mode)
             return "❌ 网页搜索服务发生未分类异常；请稍后重试。"
 
         # 仅 search mode 应用本地黑名单过滤；其他 mode 不涉及域名黑名单语义。
         if single_mode == "search" and items:
             items, filtered_count = _filter_blacklisted_search_results(items)
-            items = items[:requested]
+            items = items[:_num_for(single_mode)]
             if filtered_count:
                 logger.info(
                     "web_search 已过滤 %s 条黑名单域名结果，domains=%s",
                     filtered_count, ", ".join(_BLACKLISTED_SEARCH_DOMAINS),
                 )
             if items:
-                return _format_search_results(items, query_str, "Serper / Google", requested=requested)
+                return _format_search_results(items, query_str, "Serper / Google", requested=_num_for(single_mode))
             return f"❌ 未找到与「{query_str}」相关的结果。"
         if single_mode == "images" and items:
-            return _format_image_results(items[:requested], query_str, requested=requested)
+            return _format_image_results(items[:_num_for(single_mode)], query_str, requested=_num_for(single_mode))
         if single_mode == "videos" and items:
-            return _format_video_results(items[:requested], query_str, requested=requested)
+            return _format_video_results(items[:_num_for(single_mode)], query_str, requested=_num_for(single_mode))
         if single_mode == "lens" and items:
-            return _format_lens_results(items[:requested], (image_url or "").strip(), requested=requested)
+            return _format_lens_results(items[:_num_for(single_mode)], (image_url or "").strip(), requested=_num_for(single_mode))
         # 无结果
         if single_mode == "lens":
             return f"❌ 未找到与图片「{(image_url or '').strip()}」相关的结果。"
@@ -1726,30 +1750,31 @@ async def _execute_web_search_uncached(
                 m,
                 query=query_str or None,
                 image_url=(image_url or "").strip() or None,
-                num=requested,
-                page=page,
+                num=_upstream_num_for(m),
+                page=page if m == "search" else None,
                 gl=gl,
                 hl=hl,
                 tbs=tbs,
             )
             if m == "search" and items:
-                items, _ = _filter_blacklisted_search_results(items)
-                items = items[:requested]
-            elif items:
-                items = items[:requested]
+                items, filtered_count = _filter_blacklisted_search_results(items)
+                if filtered_count:
+                    logger.info(
+                        "web_search 已过滤 %s 条黑名单域名结果，domains=%s",
+                        filtered_count, ", ".join(_BLACKLISTED_SEARCH_DOMAINS),
+                    )
+            items = items[:_num_for(m)]
             if m == "search":
-                text = _format_search_results(items, query_str, "Serper / Google", requested=requested) if items else None
+                text = _format_search_results(items, query_str, "Serper / Google", requested=_num_for(m)) if items else None
             elif m == "images":
-                text = _format_image_results(items, query_str, requested=requested) if items else None
+                text = _format_image_results(items, query_str, requested=_num_for(m)) if items else None
             elif m == "videos":
-                text = _format_video_results(items, query_str, requested=requested) if items else None
+                text = _format_video_results(items, query_str, requested=_num_for(m)) if items else None
             elif m == "lens":
-                text = _format_lens_results(items, (image_url or "").strip(), requested=requested) if items else None
+                text = _format_lens_results(items, (image_url or "").strip(), requested=_num_for(m)) if items else None
             else:
                 text = None
             return m, text, None
-        except (SerperError, SerperSearchTransientError) as exc:
-            return m, None, exc
         except Exception as exc:
             return m, None, exc
 
@@ -1775,8 +1800,8 @@ async def _execute_web_search_uncached(
             errors.append((m, f"❌ {m} 未找到与{label}相关的结果。"))
 
     if not sections and errors:
-        # 全失败：返回第一个错误（让上层 retry_async 触发重试）
-        first_mode, first_msg = errors[0]
+        # 全失败：返回第一个错误（上层不做自动重试，直接把失败原因透出给模型）
+        _, first_msg = errors[0]
         logger.warning("web_search 全部 mode 失败 modes=%s first=%s", modes, first_msg)
         return first_msg
 
@@ -2294,7 +2319,8 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
                 extract = _truncate(extract)
                 page_url = page.get("fullurl", f"https://{l}.wikipedia.org/wiki/{quote(title)}")
                 return f"<b>Wikipedia — {title}</b><br/><br/>{extract}<br/><br/>链接：{page_url}"
-        except Exception:
+        except Exception as exc:
+            logger.warning("wikipedia 语言分支查询失败 lang=%s: %s", l, exc)
             continue
     return f"失败：Wikipedia 查询「{query}」未找到结果。"
 
@@ -2406,38 +2432,13 @@ async def execute_weather(city: str, unit: str = "c", hours: int = 6) -> str:
                 hourly_list = first_day.get("hourly", [])
                 hourly_data = []
                 for h in hourly_list[:24]:
+                    # wttr.in 的 time 字段是 "0"…"2300"（HHMM）。
                     time_str = h.get("time", "0")
-                    time_label = "00:00"
                     try:
                         val = int(time_str)
+                        time_label = f"{val // 100:02d}:00" if 0 <= val <= 2359 else str(time_str)
                     except (ValueError, TypeError):
-                        val = None
-                    if val is not None:
-                        if 0 <= val <= 23:
-                            time_label = f"{val:02d}:00"
-                        elif 100 <= val <= 2359:
-                            hours_val = val // 100
-                            if 0 <= hours_val <= 23:
-                                time_label = f"{hours_val:02d}:00"
-                            else:
-                                hrs = val // 60
-                                mins = val % 60
-                                if 0 <= hrs <= 23:
-                                    time_label = f"{hrs:02d}:{mins:02d}"
-                                else:
-                                    time_label = str(val)
-                        else:
-                            hrs = val // 60
-                            mins = val % 60
-                            if 0 <= hrs <= 23:
-                                time_label = f"{hrs:02d}:{mins:02d}"
-                            else:
-                                time_label = str(val)
-                    else:
-                        if ":" in str(time_str):
-                            time_label = time_str
-                        else:
-                            time_label = time_str
+                        time_label = str(time_str)
 
                     temp_key = f"temp{unit.upper()}"
                     hourly_data.append({
@@ -2524,15 +2525,20 @@ async def execute_news(source: str = "bbc", limit: int = 5) -> str:
     limit = min(max(limit, 1), 10)
     source_key = source.lower()
     if source_key == "all":
-        all_items = []
-        for src, url in NEWS_FEEDS.items():
+        # 8 个 RSS 源并行抓取（旧实现串行，总延迟为各源之和）。
+        async def _fetch_feed(src: str, url: str) -> list[tuple[str, str, str]]:
             try:
                 feed = await asyncio.to_thread(feedparser.parse, url)
                 if not feed.bozo:
-                    for item in feed.entries[:min(2, limit)]:
-                        all_items.append((src, item.title, item.link))
-            except Exception:
-                continue
+                    return [(src, item.title, item.link) for item in feed.entries[:min(2, limit)]]
+            except Exception as exc:
+                logger.warning("news 源抓取失败 src=%s: %s", src, exc)
+            return []
+
+        feed_results = await asyncio.gather(
+            *(_fetch_feed(src, url) for src, url in NEWS_FEEDS.items())
+        )
+        all_items = [entry for entries in feed_results for entry in entries]
         if not all_items:
             return "失败：无法获取任何新闻源。"
         lines = ["<ul>"]
@@ -2602,6 +2608,10 @@ async def execute_crypto_price(coin: str, currency: str = "usd") -> str:
 async def execute_qr_code(text: str) -> str:
     if not text:
         return "失败：请提供要编码的文本或 URL。"
+    if qrcode is None:
+        # qrcode 为可选依赖（见文件头部 try/except 导入），缺失时给出
+        # 明确失败原因而不是 AttributeError。
+        return "失败：二维码组件未安装，请联系管理员安装 qrcode 依赖。"
     qr = qrcode.QRCode(box_size=10, border=2)
     qr.add_data(text)
     qr.make(fit=True)
@@ -2619,45 +2629,12 @@ async def execute_qr_code(text: str) -> str:
 
 
 # --------------------- image API helpers ---------------------
-def _extract_modelscope_error_detail(body_text: str) -> tuple[str, str]:
-    detail = body_text[:500] if body_text else ""
-    request_id = ""
-    cleaned = body_text.strip() if body_text else ""
-    if not cleaned:
-        return detail, request_id
-    if " - {" in cleaned:
-        cleaned = cleaned.split(" - ", 1)[1].strip()
-    if cleaned.startswith("{") or cleaned.startswith("["):
-        try:
-            payload = json.loads(cleaned)
-        except Exception:
-            try:
-                import ast
-                payload = ast.literal_eval(cleaned)
-            except Exception:
-                payload = None
-        if isinstance(payload, dict):
-            err = payload.get("error")
-            if isinstance(err, dict):
-                detail = err.get("message") or err.get("detail") or payload.get("message") or detail
-                request_id = err.get("request_id") or payload.get("request_id") or ""
-            elif isinstance(err, str):
-                detail = err
-                request_id = payload.get("request_id") or ""
-            elif payload.get("message"):
-                detail = str(payload.get("message"))
-                request_id = payload.get("request_id") or ""
-    return detail[:500], request_id
-
-
 def _looks_like_image_payload(value: str) -> bool:
     """检查字符串是否可能是图片 URL 或 base64 data URL"""
     if not value:
         return False
     value = value.strip()
-    return (value.startswith('http://') or
-            value.startswith('https://') or
-            value.startswith('data:image/'))
+    return value.startswith(('http://', 'https://', 'data:image/'))
 
 async def _download_image_bytes(session: aiohttp.ClientSession, image_url: str) -> bytes | None:
     if not image_url:
@@ -2935,7 +2912,7 @@ async def execute_generate_image(
                         continue
                     if img_url.startswith("data:image"):
                         try:
-                            header, base64_data = img_url.split(",", 1)
+                            _, base64_data = img_url.split(",", 1)
                             img_bytes = base64.b64decode(base64_data)
                             image_bytes_list.append(img_bytes)
                             continue
