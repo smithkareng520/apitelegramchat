@@ -36,6 +36,54 @@ from apitelegramchat.config import (
 
 _TOOL_TIMEOUT_MARKER = "__TOOL_TIMEOUT__"
 
+
+# =====================================================================
+# 工作区可写范围告警
+# =====================================================================
+def _is_within_tree(path: str, root: str) -> bool:
+    """path 是否位于 root 目录树内（含 root 本身）。
+
+    解析失败时按"位于内部"处理：告警是辅助信息，宁可漏报也不能
+    在模型正常工作时制造噪声。
+    """
+    try:
+        p = os.path.realpath(str(path))
+        r = os.path.realpath(str(root))
+        return p == r or p.startswith(r + os.sep)
+    except Exception:
+        return True
+
+
+def _cwd_outside_workspace_warning(actual_cwd: str, workspace_root: str) -> str:
+    """cwd 离开工作区子树后的即时告警（空串 = 无需告警）。
+
+    Landlock 只放行 workspace 子树：模型 cd 出去之后所有写操作必然失败
+    （curl -o → exit 23，python 写文件 → PermissionError），多数目录连读
+    都被拒绝。生产日志里模型平均浪费 5-7 轮才"撞"回正确路径；把失败
+    原因和回去的方法直接写进当次命令结果，一轮即可自我纠正。
+    """
+    if not actual_cwd or not workspace_root:
+        return ""
+    if _is_within_tree(actual_cwd, workspace_root):
+        return ""
+    return (
+        f"\n[warning] cwd is now OUTSIDE your workspace root ({workspace_root}). "
+        "The Landlock sandbox blocks ALL writes here — curl -o / touch / mkdir / "
+        "pip install will fail (exit code 23 / Permission denied), and most reads "
+        f"are denied too. Run `cd {workspace_root}` to return, then use relative paths."
+    )
+
+
+def _cwd_post_command_warning(actual_cwd: str, workspace_root: str) -> str:
+    """命令结束后按最新 cwd 生成附加告警（upload/download 内 + 工作区外）。"""
+    if is_inside_upload_or_download(actual_cwd):
+        return (
+            "\n[warning] cwd is now inside upload/ or download/. "
+            "The next command will be rejected; run `cd` (back to your "
+            "workdir) first."
+        )
+    return _cwd_outside_workspace_warning(actual_cwd, workspace_root)
+
 import shutil
 from apitelegramchat.search_engine import (
     execute_web_search,
@@ -1302,10 +1350,12 @@ class BashSession:
         output = re.sub(r"(?m)^__ONE_SHOT_CWD__\s+.*$\n?", "", output)
         self._last_cwd = actual_cwd
         output = re.sub(r'\x1b\[[0-9;]*m', '', output)
+        # cd 出工作区（或进入 upload/download）时给出一轮自纠告警。
+        output += _cwd_post_command_warning(actual_cwd, str(self.workdir.absolute()))
         return (f"Command: {command}\n"
                 f"Cwd: {actual_cwd}\n"
                 f"Exit code: {exit_code}\n"
-                f"Sandbox: landlock\n"
+                f"Sandbox: landlock (only {str(self.workdir.absolute())} tree is writable)\n"
                 f"Execution mode: isolated (heredoc-safe)\n"
                 f"Output:\n{output}")
 
@@ -1491,22 +1541,18 @@ class BashSession:
                 # 记录最新 cwd，下一次 _is_safe 会据此拒绝在 upload/ 或 download/
                 # 子树内继续执行命令。即便 cd 进入被拒，模型也可能通过 pushd /
                 # 子 shell 等方式间接进入，这里再做一次防御性检查。
+                # ★ cd 出工作区子树同样告警：Landlock 只放行工作区，在外面
+                #   所有写操作必然失败（curl -o → exit 23），生产日志里模型
+                #   为此平均多浪费 5-7 轮。当次结果直接给出回去的方法。
                 self._last_cwd = actual_cwd
-                if is_inside_upload_or_download(actual_cwd):
-                    # 不在这里 return error —— 命令已经执行完了，输出仍然有用。
-                    # 但在下一次调用时 _is_safe 会拒绝继续执行。
-                    output += (
-                        "\n[warning] cwd is now inside upload/ or download/. "
-                        "The next command will be rejected; run `cd` (back to your "
-                        "workdir) first."
-                    )
+                output += _cwd_post_command_warning(actual_cwd, str(self.workdir.absolute()))
 
                 # 合并后台同步；不会为每次 Bash 创建一个新的全量上传任务。
 
                 return (f"Command: {command}\n"
                         f"Cwd: {actual_cwd}\n"
                         f"Exit code: {exit_code}\n"
-                        f"Sandbox: landlock\n"
+                        f"Sandbox: landlock (only {str(self.workdir.absolute())} tree is writable)\n"
                         f"Output:\n{output}")
 
             except asyncio.CancelledError:

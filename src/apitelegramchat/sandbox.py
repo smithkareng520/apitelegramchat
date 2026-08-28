@@ -358,10 +358,17 @@ def build_sandbox_env(
 
     # Keep runtime_bin first only for local wrappers. The actual compiler remains the
     # system toolchain baked into the image; no apt/pip install happens per Bash run.
+    # ★ 工作区自我描述：让模型不用"猜"自己在哪、哪里可写。生产日志显示
+    #   模型习惯性 `cd /tmp` 下载文件，而 Landlock 只放行 workspace 子树，
+    #   curl -o 直接 exit 23，平均浪费 5-7 轮试错才撞到正确路径。现在
+    #   `echo $WORKSPACE` 一次即可拿到绝对路径；系统提示词与 bash 工具
+    #   description 同步引用该变量。
     return {
         "PATH": f"{runtime_bin}:{cache_root / 'python_user' / 'bin'}:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
         "HOME": str(cache_root),
         "USER": f"chat{chat_id}",
+        "WORKSPACE": workdir_abs,
+        "WORKDIR": workdir_abs,
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "TERM": "xterm-256color",

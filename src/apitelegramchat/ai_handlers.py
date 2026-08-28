@@ -65,6 +65,43 @@ logger = get_logger(__name__)
 # 在生产环境输出大量 debug 噪声。删除该行，让模块日志遵循 root logger
 # 的级别（由 utils.setup_logging 应用 LOG_LEVEL）。
 
+def _workspace_guide_html(chat_id: int | None) -> str:
+    """系统提示词的「工作区与文件目录」章节（含该 chat 的工作区绝对路径）。
+
+    背景：模型此前只知道"工作区根目录是 bash 起始目录"，但既不知道绝对
+    路径，也不知道 Landlock 只放行工作区子树。生产日志里模型习惯性
+    `cd /tmp` 下载文件 → curl exit 23（写失败）→ 反复试错 /tmp、/workspace、
+    根目录探测，平均浪费 5-7 轮才通过 text_editor 回显"撞"到正确路径。
+    这里把三件事显式写进提示词：① 绝对路径；② 只有工作区可写（含
+    典型报错特征）；③ TMPDIR 已重定向，临时文件开箱即用。
+    路径对同一 chat 稳定不变，不影响 prompt cache 的前缀复用。
+    """
+    ws_path = ""
+    try:
+        if chat_id is not None:
+            from apitelegramchat.workspace_paths import workspace_workdir
+            ws_path = str(workspace_workdir(chat_id))
+    except Exception:
+        ws_path = ""
+    if ws_path:
+        path_html = f"（绝对路径 <code>{escape_html(ws_path)}</code>，也可 <code>echo $WORKSPACE</code> 查看）"
+    else:
+        path_html = "（绝对路径用 <code>echo $WORKSPACE</code> 查看）"
+    return f"""
+<h2>工作区与文件目录</h2>
+<p>bash 与 text_editor 运行在你专属的工作区中，工作区根目录{path_html}就是 bash 会话的起始目录，也是<b>整个环境里唯一可写的位置</b>：Landlock 沙箱只放行这一棵目录树，<code>/tmp</code>、<code>/home</code>、<code>/</code> 等其他路径一律不可写（多数连读都被拒绝）——在那里写文件会得到 <code>curl</code> exit code 23、Python <code>PermissionError</code>。根目录下有两个特殊子目录，直接用相对路径读写：</p>
+<ul>
+  <li><code>download/</code>：用户上传文件（文档等）的落地目录。直接读取即可，如 <code>bash</code> 执行 <code>cat download/报告.pdf</code>，或 <code>text_editor</code> 的 path 填 <code>download/报告.pdf</code>。</li>
+  <li><code>upload/</code>：发送文件给用户的暂存区。要发送产物时，先用 bash 复制进来（如 <code>cp 结果.docx upload/结果.docx</code>），再调用 <code>present_files</code> 发送。</li>
+</ul>
+<ul>
+  <li><b>禁止 <code>cd</code> 出工作区</b>（包括习惯性的 <code>cd /tmp</code>）。下载、生成文件一律用相对路径落在当前目录：<code>curl -LO &lt;url&gt;</code>，或 <code>mkdir -p 目录 &amp;&amp; curl -o 目录/文件 &lt;url&gt;</code>。</li>
+  <li>临时文件无需操心：<code>TMPDIR</code> 已指向沙箱内可写缓存，mktemp / Python tempfile 开箱即用。</li>
+  <li>不要 <code>cd</code> 进入 upload/ 或 download/，也不要在其中执行命令；沙箱会拒绝，此时先 <code>cd</code> 回工作区根目录，再改用相对路径操作。</li>
+</ul>
+"""
+
+
 async def build_system_prompt(
     chat_id: int | None = None,
     username: str = "用户",
@@ -205,13 +242,7 @@ async def build_system_prompt(
   <li><b>避免重复展示。</b> 工具返回后不要重复粘贴原始输出、重复列文件或复述相同诊断；完成任务时给出一条简洁、面向用户的结论。</li>
 </ul>
 
-<h2>工作区与文件目录</h2>
-<p>bash 与 text_editor 运行在你专属的工作区中，工作区根目录就是 bash 会话的起始目录。根目录下有两个特殊子目录，可直接用相对路径读写：</p>
-<ul>
-  <li><code>download/</code>：用户上传文件（文档等）的落地目录。直接读取即可，如 <code>bash</code> 执行 <code>cat download/报告.pdf</code>，或 <code>text_editor</code> 的 path 填 <code>download/报告.pdf</code>。</li>
-  <li><code>upload/</code>：发送文件给用户的暂存区。要发送产物时，先用 bash 复制进来（如 <code>cp 结果.docx upload/结果.docx</code>），再调用 <code>present_files</code> 发送。</li>
-</ul>
-<p>不要 <code>cd</code> 进入这两个目录，也不要在其中执行命令；沙箱会拒绝，此时先 <code>cd</code> 回工作区根目录，再改用相对路径操作。</p>
+{_workspace_guide_html(chat_id)}
 
 <h2>技能目录 (Skill Directory)</h2>
 <p>以下是当前可用的技能列表，格式为“<b>技能名</b> — 描述”。技能资源位于当前工作空间的 <code>skills/</code> 目录下，每个技能对应一个子目录（目录名与技能名相同），其中包含 <code>SKILL.md</code> 及相关脚本/参考文件。</p>
