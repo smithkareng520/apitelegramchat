@@ -38,51 +38,35 @@ _TOOL_TIMEOUT_MARKER = "__TOOL_TIMEOUT__"
 
 
 # =====================================================================
-# 工作区可写范围告警
+# bash 结果信封（终端回放式）
 # =====================================================================
-def _is_within_tree(path: str, root: str) -> bool:
-    """path 是否位于 root 目录树内（含 root 本身）。
+def _format_bash_envelope(prompt_cwd: str, command: str, exit_code, output: str) -> str:
+    """把一次 bash 执行渲染成终端回放式结果信封。
 
-    解析失败时按"位于内部"处理：告警是辅助信息，宁可漏报也不能
-    在模型正常工作时制造噪声。
+    形如::
+
+        /abs/cwd$ <command>
+        Exit code: <code>
+        <output>
+
+    设计（对齐真实终端的使用体验）：
+    - 首行是 PS1 风格提示符：模型像人一样直接"看到"命令前面的当前
+      目录；``cd`` 之后下一条命令的提示符随之变化。工作区在哪、现在
+      在哪，由提示符天然承载，不再需要 Sandbox/Cwd/Command 等元数据
+      行（工作区绝对路径与可写范围已在系统提示词和工具描述中声明，
+      每轮重复只会浪费 token）。
+    - ``Exit code:`` 紧跟命令行、位于输出之前。下游解析（tool_summary
+      / tool_call_loop）用首个 ``Exit code: `` 匹配退出码——放在输出
+      前面可保证命令输出里即使出现 "Exit code: N" 字样也不会遮蔽
+      真实退出码（与旧信封同等安全，且整体更短）。
+    - 输出为空时只有两行，与真实终端一致。
     """
-    try:
-        p = os.path.realpath(str(path))
-        r = os.path.realpath(str(root))
-        return p == r or p.startswith(r + os.sep)
-    except Exception:
-        return True
-
-
-def _cwd_outside_workspace_warning(actual_cwd: str, workspace_root: str) -> str:
-    """cwd 离开工作区子树后的即时告警（空串 = 无需告警）。
-
-    Landlock 只放行 workspace 子树：模型 cd 出去之后所有写操作必然失败
-    （curl -o → exit 23，python 写文件 → PermissionError），多数目录连读
-    都被拒绝。生产日志里模型平均浪费 5-7 轮才"撞"回正确路径；把失败
-    原因和回去的方法直接写进当次命令结果，一轮即可自我纠正。
-    """
-    if not actual_cwd or not workspace_root:
-        return ""
-    if _is_within_tree(actual_cwd, workspace_root):
-        return ""
-    return (
-        f"\n[warning] cwd is now OUTSIDE your workspace root ({workspace_root}). "
-        "The Landlock sandbox blocks ALL writes here — curl -o / touch / mkdir / "
-        "pip install will fail (exit code 23 / Permission denied), and most reads "
-        f"are denied too. Run `cd {workspace_root}` to return, then use relative paths."
-    )
-
-
-def _cwd_post_command_warning(actual_cwd: str, workspace_root: str) -> str:
-    """命令结束后按最新 cwd 生成附加告警（upload/download 内 + 工作区外）。"""
-    if is_inside_upload_or_download(actual_cwd):
-        return (
-            "\n[warning] cwd is now inside upload/ or download/. "
-            "The next command will be rejected; run `cd` (back to your "
-            "workdir) first."
-        )
-    return _cwd_outside_workspace_warning(actual_cwd, workspace_root)
+    cmd_text = str(command or "").rstrip()
+    header = f"{prompt_cwd}$ {cmd_text}\nExit code: {exit_code}"
+    body = str(output or "").rstrip("\n")
+    if not body:
+        return header
+    return f"{header}\n{body}"
 
 import shutil
 from apitelegramchat.search_engine import (
@@ -862,14 +846,53 @@ def _format_image_generation_result(
     return failure_summary, _render_media_failure_result(result_str, failure_fallback)
 
 
+def _parse_bash_envelope(result_str: str):
+    """解析终端回放式信封 → ``(command, exit_code, output)``；非信封返回 None。
+
+    新格式::
+
+        /abs/cwd$ <command>          ← 提示符行，命令可跨多行
+        Exit code: <code>
+        <output>
+
+    判定规则：
+    - 首行以 ``Command: `` 开头的是旧式元数据信封（历史会话存量结果），
+      走旧解析路径，这里直接返回 None；
+    - 首行不含 ``$ ``、或后续找不到 ``Exit code: `` 行的（超时/拒绝等
+      纯错误文本）同样返回 None，由调用方走兜底渲染。
+
+    已知边界（仅影响 UI 草稿展示，不影响回传模型的文本）：命令本身
+    含有以 ``Exit code: `` 开头的行时会被提前截断——与旧解析器对
+    ``Cwd: `` 行的脆弱性同级，可接受。
+    """
+    lines = (result_str or "").splitlines()
+    if not lines or lines[0].startswith("Command: ") or "$ " not in lines[0]:
+        return None
+    command = lines[0].split("$ ", 1)[1]
+    exit_code = ""
+    output_start = None
+    for idx in range(1, len(lines)):
+        line = lines[idx]
+        if line.startswith("Exit code: "):
+            exit_code = line.removeprefix("Exit code: ")
+            output_start = idx + 1
+            break
+        command += "\n" + line
+    if output_start is None:
+        return None
+    return command, exit_code, "\n".join(lines[output_start:])
+
+
 def _extract_bash_command_from_envelope(result_str: str) -> str:
     """从结果信封里恢复命令文本（兜底路径）。
 
-    信封格式为 ``Command: <命令>\nCwd: ...\nExit code: ...``，而命令本身
-    可以包含任意多行（例如 `python3 -c "..."` 跨行书写）。旧的逐行前缀
-    匹配只取得到第一行，这里改为取 ``Command: `` 到 ``Cwd: `` 元数据行
-    之间的完整文本。
+    新式终端信封：命令跟在首行提示符（``/abs/cwd$ ``）之后，可跨多行，
+    直到 ``Exit code: `` 行为止。旧式元数据信封（``Command: …\\nCwd: …``，
+    历史会话存量）仍按旧规则解析，保证升级后旧结果仍可渲染。
     """
+    parsed = _parse_bash_envelope(result_str)
+    if parsed:
+        return parsed[0]
     metadata = (result_str or "").partition("Output:\n")[0]
     if not metadata:
         return ""
@@ -893,13 +916,29 @@ def _render_bash_result(result_str: str, fn_args: dict | None = None) -> str:
 
     Input 块只展示实际输入（命令本身）；模型提供的意图描述（_description）
     由卡片摘要行（``🖥 意图``）单独呈现，不混入 Input，避免重复与语义混淆。
+
+    信封格式现为终端回放式（``/abs/cwd$ cmd`` + ``Exit code:`` + 输出）；
+    旧式元数据信封与无信封文本（restart 确认、拒绝原因等）仍可渲染。
     """
-    metadata, separator, output = (result_str or "").partition("Output:\n")
     command = ""
     if isinstance(fn_args, dict):
         raw_command = fn_args.get("command")
         if isinstance(raw_command, str):
             command = raw_command
+    parsed = _parse_bash_envelope(result_str)
+    if parsed:
+        env_command, exit_code, output = parsed
+        if not command:
+            command = env_command
+        output_text = output
+        if exit_code:
+            output_text = f"[exit code {exit_code}]\n{output}"
+        # Input 展示原始命令；Output 保头保尾：报错信息几乎总在末尾。
+        return (
+            _render_editor_quote("Input", command)
+            + _render_editor_quote("Output", output_text, truncator=_truncate_ui_lines_head_tail)
+        )
+    metadata, separator, output = (result_str or "").partition("Output:\n")
     if not command:
         command = _extract_bash_command_from_envelope(result_str)
     exit_code = ""
@@ -1047,6 +1086,10 @@ class BashSession:
         # 跟踪上一次命令结束后的真实 PWD，用于在 upload/ 或 download/ 子树内
         # 拒绝执行下一条命令。None 表示尚未执行过命令，假定位于 workdir。
         self._last_cwd: Optional[str] = str(self.workdir.absolute())
+        # persistent shell 自身的 cwd（隔离/heredoc 执行不回写该值）。
+        # 结果信封的提示符用它：保证模型看到的 ``path$`` 永远是命令真正
+        # 运行的目录，不会被子 shell 的 cd 污染。
+        self._persistent_cwd: Optional[str] = str(self.workdir.absolute())
 
     async def start(self):
         """启动 bash 进程，套上 Landlock 沙箱 + rlimit + no-new-privs"""
@@ -1077,6 +1120,7 @@ class BashSession:
         # 新进程的 cwd 必然是 workdir；重置 _last_cwd，避免上一次会话
         # 残留的 cwd 状态误拒下一条命令。
         self._last_cwd = str(self.workdir.absolute())
+        self._persistent_cwd = str(self.workdir.absolute())
 
         argv = build_sandbox_argv()
         env = build_sandbox_env(self.workspace, self.chat_id, self.namespace)
@@ -1350,14 +1394,11 @@ class BashSession:
         output = re.sub(r"(?m)^__ONE_SHOT_CWD__\s+.*$\n?", "", output)
         self._last_cwd = actual_cwd
         output = re.sub(r'\x1b\[[0-9;]*m', '', output)
-        # cd 出工作区（或进入 upload/download）时给出一轮自纠告警。
-        output += _cwd_post_command_warning(actual_cwd, str(self.workdir.absolute()))
-        return (f"Command: {command}\n"
-                f"Cwd: {actual_cwd}\n"
-                f"Exit code: {exit_code}\n"
-                f"Sandbox: landlock (only {str(self.workdir.absolute())} tree is writable)\n"
-                f"Execution mode: isolated (heredoc-safe)\n"
-                f"Output:\n{output}")
+        # 终端式信封：提示符 = 本次隔离进程的起始 cwd（命令的真实执行
+        # 位置）。隔离命令里的 cd 不会影响 persistent shell，下一条命令
+        # 的提示符会如实回到 persistent cwd——和真实终端的子 shell 语义
+        # 一致，模型看提示符即可自行推断。
+        return _format_bash_envelope(cwd, command, exit_code, output)
 
     # ===================== 执行命令 =====================
     async def execute(self, command: str, timeout: int = SANDBOX_TIMEOUT_SEC, progress_callback=None) -> str:
@@ -1422,6 +1463,10 @@ class BashSession:
             tag = uuid.uuid4().hex[:8]
             marker = f"__END_{tag}__"
             cwd_marker = f"__CWD_{tag}__"
+            # 信封提示符取 persistent shell 当前 cwd（命令的真实执行位置）。
+            # 隔离执行（heredoc）不回写 _persistent_cwd，因此提示符不会
+            # 被子 shell 的 cd 污染，永远真实。
+            prompt_cwd = self._persistent_cwd or str(self.workdir.absolute())
             # 默认 shell 启动目录为 workspace/workspace root。模型决定使用 skill 后，
             # 可自行 `cd skills/<skill_id>`；persistent bash 会保留该 cwd。
             # ★ 关键：在输出 marker 前先输出一个换行，确保 marker 单独占一行。
@@ -1541,19 +1586,14 @@ class BashSession:
                 # 记录最新 cwd，下一次 _is_safe 会据此拒绝在 upload/ 或 download/
                 # 子树内继续执行命令。即便 cd 进入被拒，模型也可能通过 pushd /
                 # 子 shell 等方式间接进入，这里再做一次防御性检查。
-                # ★ cd 出工作区子树同样告警：Landlock 只放行工作区，在外面
-                #   所有写操作必然失败（curl -o → exit 23），生产日志里模型
-                #   为此平均多浪费 5-7 轮。当次结果直接给出回去的方法。
                 self._last_cwd = actual_cwd
-                output += _cwd_post_command_warning(actual_cwd, str(self.workdir.absolute()))
+                self._persistent_cwd = actual_cwd
 
                 # 合并后台同步；不会为每次 Bash 创建一个新的全量上传任务。
 
-                return (f"Command: {command}\n"
-                        f"Cwd: {actual_cwd}\n"
-                        f"Exit code: {exit_code}\n"
-                        f"Sandbox: landlock (only {str(self.workdir.absolute())} tree is writable)\n"
-                        f"Output:\n{output}")
+                # 终端式信封：模型像人看终端一样，从提示符直接读出命令运行
+                # 目录；cd 之后下一条命令的提示符随之变化。
+                return _format_bash_envelope(prompt_cwd, command, exit_code, output)
 
             except asyncio.CancelledError:
                 # 外层 asyncio.wait_for 超时、请求取消或应用关闭时，必须同步清理
