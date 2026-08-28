@@ -1041,80 +1041,80 @@ class BashSession:
         if self.proc is not None and self.proc.returncode is None:
             return
 
-            # workspace 目录权限 700，防跨 chat 读取
-            self.workspace.mkdir(parents=True, exist_ok=True)
-            self.workdir.mkdir(parents=True, exist_ok=True)
-            os.chmod(self.workspace, 0o700)
-            os.chmod(self.workdir, 0o700)
-            # ★ 显式预创建 upload/ 和 download/：bash 进程一启动，cwd 就是
-            # workspace root，模型几乎立刻会跑 `cp out.txt upload/out.txt`
-            # 或 `cat download/x.pdf`。如果不在这里预创建，bash 进程已经
-            # 在跑、第一次 execute() 时才补创建，会出两个问题：
-            #   1) 如果 execute() 里 _ensure_runtime_workspace 抛异常被
-            #      try/except 吞掉，目录就永远不存在，cp 第一次必然失败，
-            #      模型不得不多跑一轮 `mkdir -p upload && cp ...` 才能补救；
-            #   2) _ensure_runtime_workspace(self.chat_id) 没传 namespace，
-            #      依赖 ContextVar；如果 bash 工具从 background task 里
-            #      调用、ContextVar 不可见，upload/ 会被建到错误的 namespace
-            #      下，bash 进程实际看到的 cwd 下仍然没有 upload/。
-            # 用 self.namespace 直接走 workspace_upload_root /
-            # workspace_download_root，确保和 bash 进程的 cwd 完全一致。
-            workspace_upload_root(self.chat_id, self.namespace)
-            workspace_download_root(self.chat_id, self.namespace)
+        # workspace 目录权限 700，防跨 chat 读取
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.workspace, 0o700)
+        os.chmod(self.workdir, 0o700)
+        # ★ 显式预创建 upload/ 和 download/：bash 进程一启动，cwd 就是
+        # workspace root，模型几乎立刻会跑 `cp out.txt upload/out.txt`
+        # 或 `cat download/x.pdf`。如果不在这里预创建，bash 进程已经
+        # 在跑、第一次 execute() 时才补创建，会出两个问题：
+        #   1) 如果 execute() 里 _ensure_runtime_workspace 抛异常被
+        #      try/except 吞掉，目录就永远不存在，cp 第一次必然失败，
+        #      模型不得不多跑一轮 `mkdir -p upload && cp ...` 才能补救；
+        #   2) _ensure_runtime_workspace(self.chat_id) 没传 namespace，
+        #      依赖 ContextVar；如果 bash 工具从 background task 里
+        #      调用、ContextVar 不可见，upload/ 会被建到错误的 namespace
+        #      下，bash 进程实际看到的 cwd 下仍然没有 upload/。
+        # 用 self.namespace 直接走 workspace_upload_root /
+        # workspace_download_root，确保和 bash 进程的 cwd 完全一致。
+        workspace_upload_root(self.chat_id, self.namespace)
+        workspace_download_root(self.chat_id, self.namespace)
 
-            # 新进程的 cwd 必然是 workdir；重置 _last_cwd，避免上一次会话
-            # 残留的 cwd 状态误拒下一条命令。
-            self._last_cwd = str(self.workdir.absolute())
-            self._persistent_cwd = str(self.workdir.absolute())
+        # 新进程的 cwd 必然是 workdir；重置 _last_cwd，避免上一次会话
+        # 残留的 cwd 状态误拒下一条命令。
+        self._last_cwd = str(self.workdir.absolute())
+        self._persistent_cwd = str(self.workdir.absolute())
 
-            argv = build_sandbox_argv()
-            env = build_sandbox_env(self.workspace, self.chat_id, self.namespace)
-            cache_root = runtime_cache_root(self.chat_id, self.namespace)
-            async with self._runtime_prepare_lock:
-                if self._runtime_state is None:
-                    # One-time discovery per persistent workspace. Subsequent Bash restarts
-                    # reuse the manifest instead of "preparing" the toolchain again.
-                    self._runtime_state = await asyncio.to_thread(
-                        _prepare_runtime_once, self.chat_id, cache_root, self.namespace
-                    )
+        argv = build_sandbox_argv()
+        env = build_sandbox_env(self.workspace, self.chat_id, self.namespace)
+        cache_root = runtime_cache_root(self.chat_id, self.namespace)
+        async with self._runtime_prepare_lock:
+            if self._runtime_state is None:
+                # One-time discovery per persistent workspace. Subsequent Bash restarts
+                # reuse the manifest instead of "preparing" the toolchain again.
+                self._runtime_state = await asyncio.to_thread(
+                    _prepare_runtime_once, self.chat_id, cache_root, self.namespace
+                )
 
-            # ★ Landlock：把文件系统访问限制在该 chat 的 workspace 层，
-            #   runtime/、skills/ 都在这里；R2 不再对工作区做全量同步。
-            #   通过 functools.partial 把 workspace 路径传给 preexec。
-            import functools
-            preexec = functools.partial(
-                _preexec_sandbox,
-                str(self.workspace.absolute()),
-            )
+        # ★ Landlock：把文件系统访问限制在该 chat 的 workspace 层，
+        #   runtime/、skills/ 都在这里；R2 不再对工作区做全量同步。
+        #   通过 functools.partial 把 workspace 路径传给 preexec。
+        import functools
+        preexec = functools.partial(
+            _preexec_sandbox,
+            str(self.workspace.absolute()),
+        )
 
-            logger.info(
-                "Starting bash session chat_id=%s runtime_prepared=%s cache=%s",
-                self.chat_id,
-                bool(self._runtime_state and self._runtime_state.get("prepared")),
-                cache_root,
-            )
+        logger.info(
+            "Starting bash session chat_id=%s runtime_prepared=%s cache=%s",
+            self.chat_id,
+            bool(self._runtime_state and self._runtime_state.get("prepared")),
+            cache_root,
+        )
 
-            self.proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                text=False,
-                bufsize=0,
-                env=env,  # ★ 关键: 不传任何敏感变量
-                cwd=str(self.workdir.absolute()),  # ★ 关键: 沙箱进程启动即位于 workspace root
-                start_new_session=True,  # ★ 关键: 创建新会话，便于 killpg
-                preexec_fn=preexec,  # Landlock + no-new-privs + rlimit
-            )
+        self.proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            text=False,
+            bufsize=0,
+            env=env,  # ★ 关键: 不传任何敏感变量
+            cwd=str(self.workdir.absolute()),  # ★ 关键: 沙箱进程启动即位于 workspace root
+            start_new_session=True,  # ★ 关键: 创建新会话，便于 killpg
+            preexec_fn=preexec,  # Landlock + no-new-privs + rlimit
+        )
 
-            # 启动看门狗（fork bomb 防护）。无条件跟随本次 spawn 的进程：
-            # 旧实现"看门狗还活着就不重建"会让重启后的新进程处于无防护状态
-            # （旧看门狗盯的是已死的旧进程对象）。
-            if self._watchdog_task and not self._watchdog_task.done():
-                self._watchdog_task.cancel()
-            self._watchdog_task = asyncio.create_task(
-                watchdog(self.proc), name=f"watchdog-{self.chat_id}"
-            )
+        # 启动看门狗（fork bomb 防护）。无条件跟随本次 spawn 的进程：
+        # 旧实现"看门狗还活着就不重建"会让重启后的新进程处于无防护状态
+        # （旧看门狗盯的是已死的旧进程对象）。
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+        self._watchdog_task = asyncio.create_task(
+            watchdog(self.proc), name=f"watchdog-{self.chat_id}"
+        )
 
 
     # ===================== 命令安全检查（最小黑名单） =====================
