@@ -532,6 +532,162 @@ def _demote_watch_page_videos(html_content: str) -> str:
     return result
 
 
+def _demote_all_media_to_links(html_content: str) -> str:
+    """把所有 ``<video>/<audio>/<img>`` 媒体块降级为 ``<a href>`` 链接。
+
+    用于 ``sendRichMessage`` 因媒体 URL 在 Telegram 服务端抓取失败而拒绝
+    整条消息时的**反应式兜底**——例如：
+
+      * LLM 嵌入了 ``<video src="...upload.wikimedia.org/.../x.ogv.480p.vp9.webm">``，
+        URL 在浏览器侧能拿到 200 + ``video/webm``，但 Telegram 媒体抓取
+        服务对该格式 / 编解码 / host 的支持有限，返回
+        ``RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND``，导致**整条消息丢失**；
+      * LLM 嵌入了看似合法的 ``<img src>`` 但目标服务端拒绝 Telegram
+        bot 的 User-Agent，返回 ``RICH_MESSAGE_PHOTO_URL_INVALID`` 等。
+
+    与 ``_demote_watch_page_videos``（仅在 URL 命中已知观看页模式时降级）
+    不同，本函数**无差别降级所有媒体**——只在初次发送已经被服务端拒绝
+    之后才触发，因此激进策略是安全的：宁可丢失"内嵌播放器"也不可丢失
+    整条用户可见的回复。
+
+    降级规则：
+
+      * ``<figure><video src="URL"></video><figcaption>CAP</figcaption></figure>``
+        → ``<a href="URL"><b>🎬 CAP</b></a>``（保留 figcaption 文本，让用户
+        仍能点击跳转到原媒体页）；
+      * 裸 ``<video src="URL"></video>`` 或自闭合 ``<video src="URL"/>``
+        → ``<a href="URL"><b>🎬 观看视频 · {domain}</b></a>``；
+      * ``<figure><img src="URL"/><figcaption>CAP</figcaption></figure>``
+        → ``<a href="URL"><b>🖼 CAP</b></a>``；
+      * 裸 ``<img src="URL"/>`` → ``<a href="URL"><b>🖼 {domain}</b></a>``；
+      * ``<audio>`` 同理用 🎵 前缀；
+      * ``src`` 非法（非 http(s):// 开头）的媒体块直接整块删除——这种
+        URL 在 ``_strip_invalid_media_urls`` 阶段也已被处理，这里是冗余
+        兜底。
+    """
+    if not html_content:
+        return ""
+
+    def _extract_src(tag_text: str) -> str:
+        m = re.search(r'\bsrc\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))',
+                      tag_text, re.IGNORECASE)
+        if not m:
+            return ""
+        return (m.group(2) or m.group(3) or m.group(4) or "").strip()
+
+    def _is_valid_url(url: str) -> bool:
+        u = (url or "").strip().lower()
+        return bool(u) and u.startswith(("http://", "https://"))
+
+    def _domain_of(url: str) -> str:
+        m = re.match(r'https?://([^/\s]+)', url or "")
+        return m.group(1) if m else ""
+
+    def _strip_inner_tags(inner: str) -> str:
+        """去掉 inner 里所有 <video>/<audio>/<img>/<figcaption> 标签，
+        仅保留可能存在的其他内联文本。"""
+        inner = re.sub(
+            r'<(?:video|audio|img)\b[^>]*/?>|</?(?:video|audio|img)\s*>',
+            '', inner, flags=re.IGNORECASE,
+        )
+        # figcaption 文本由调用方单独提取，这里把已取过文本的空标签也清掉
+        inner = re.sub(
+            r'<figcaption\b[^>]*>.*?</figcaption\s*>|</?figcaption\s*>',
+            '', inner, flags=re.IGNORECASE | re.DOTALL,
+        )
+        return inner
+
+    def _figcaption_text(inner: str) -> str:
+        m = re.search(
+            r'<figcaption\b[^>]*>(.*?)</figcaption\s*>',
+            inner, re.IGNORECASE | re.DOTALL,
+        )
+        if not m:
+            return ""
+        text = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+        return text
+
+    def _build_anchor(src: str, caption: str, kind: str) -> str:
+        """构造降级后的 <a> 锚点。src 必须合法；caption 为空时按 kind 兜底。"""
+        if not caption:
+            domain = _domain_of(src)
+            label_map = {"video": "🎬 观看视频", "audio": "🎵 收听音频", "image": "🖼 查看图片"}
+            caption = label_map.get(kind, "🔗 查看链接")
+            if domain:
+                caption = f"{caption} · {domain}"
+        # 转义 caption 中的 < > & 防止破坏 HTML 结构
+        safe_caption = caption.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return f'<a href="{src}"><b>{safe_caption}</b></a>'
+
+    # 1) 处理 <figure>...</figure> 内的媒体（含 figcaption）
+    figure_re = re.compile(
+        r'<figure\b[^>]*>(.*?)</figure\s*>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    media_in_figure_re = re.compile(
+        r'<(video|audio|img)\b[^>]*?/?>.*?</\1\s*>|<(video|audio|img)\b[^>]*/>',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def _replace_figure(m: re.Match) -> str:
+        inner = m.group(1) or ""
+        mm = media_in_figure_re.search(inner)
+        if not mm:
+            # 没有 media——保留原 figure（可能是纯文字 figure）
+            return m.group(0)
+        # 取 media 标签名（video / audio / img）
+        kind = (mm.group(1) or mm.group(2) or "").lower()
+        block = mm.group(0)
+        src = _extract_src(block)
+        # figcaption 文本先提取，不论 src 是否合法，都应作为可见内容保留
+        cap_text = _figcaption_text(inner)
+        if not src or not _is_valid_url(src):
+            # 非法 src：删除该 media 块，但保留 figcaption 文本作为可见内容
+            rest = inner.replace(block, "")
+            rest = _strip_inner_tags(rest).strip()
+            if cap_text:
+                rest = f"{cap_text} {rest}".strip() if rest else cap_text
+            return rest or ""
+        anchor = _build_anchor(src, cap_text, kind)
+        # 把 media 块和 figcaption 都从 inner 里去掉，剩余文本追加在后
+        rest = _strip_inner_tags(inner.replace(block, "")).strip()
+        if rest:
+            return f"{anchor} {rest}"
+        return anchor
+
+    result = figure_re.sub(_replace_figure, html_content)
+
+    # 2) 处理裸 media（不在 <figure> 里的）
+    bare_media_re = re.compile(
+        r'<(video|audio)\b[^>]*>.*?</\1\s*>|<(video|audio|img)\b[^>]*/>',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def _replace_bare_media(m: re.Match) -> str:
+        block = m.group(0)
+        kind = (m.group(1) or m.group(2) or "").lower()
+        src = _extract_src(block)
+        if not src or not _is_valid_url(src):
+            return ""  # 非法 src：整块删除
+        # 从 block 内部提取可能的 figcaption / 裸文本作为 caption
+        caption = _figcaption_text(block)
+        if not caption:
+            bare = re.sub(r'<[^>]+>', ' ', block)
+            bare = re.sub(r'\s+', ' ', bare).strip()
+            caption = bare[:80] if bare else ""
+        return _build_anchor(src, caption, kind)
+
+    result = bare_media_re.sub(_replace_bare_media, result)
+
+    # 3) 清理可能残留的空 <figure>...</figure>（内部 media 已被替换为 <a>，
+    #    figure 容器不再需要）
+    result = re.sub(
+        r'<figure\b[^>]*>\s*</figure\s*>',
+        '', result, flags=re.IGNORECASE,
+    )
+    return result
+
+
 def strip_html_tags(text: str) -> str:
     if not text:
         return ""
@@ -1130,6 +1286,7 @@ async def send_rich_html_message(
         timeout = aiohttp.ClientTimeout(total=15, connect=5)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
+                # ---------- 第 1 次尝试：原样发送 ----------
                 async with session.post(f"{BASE_URL}/sendRichMessage", json=payload) as resp:
                     if resp.status == 200:
                         try:
@@ -1142,18 +1299,62 @@ async def send_rich_html_message(
                         return True
                     body = await resp.text()
                     body_lower = body.lower()
-                    content_required = (
-                        resp.status == 400 and "rich_message_content_required" in body_lower
+                    # 任何 4xx 都进入下面的反应式兜底——而不是只有
+                    # RICH_MESSAGE_CONTENT_REQUIRED 才降级。
+                    # 旧实现遇到 RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND /
+                    # RICH_MESSAGE_PHOTO_URL_INVALID 等媒体错误时直接 return False，
+                    # 导致**整条用户回复丢失**。新链路：媒体错误 → 全部媒体降级为
+                    # <a> 链接 → 重发；如仍失败，再退化为纯文本段落兜底。
+                    if resp.status != 400:
+                        logger.error(f"sendRichHtmlMessage failed: {resp.status} {body[:200]}")
+                        return False
+
+                    logger.warning(
+                        "sendRichHtmlMessage received 400 (body=%s); entering reactive fallback chain",
+                        body[:200],
                     )
+
+                    # ---------- 第 2 次尝试：把所有 <video>/<audio>/<img> 降级为 <a> ----------
+                    media_demoted = _demote_all_media_to_links(html_content)
+                    if media_demoted and media_demoted != html_content:
+                        media_payload = {
+                            **payload,
+                            "rich_message": _rich_message_html_payload(media_demoted),
+                        }
+                        logger.warning(
+                            "sendRichHtmlMessage retrying with all media demoted to <a> links "
+                            "(orig_len=%s, demoted_len=%s)",
+                            len(html_content), len(media_demoted),
+                        )
+                        async with session.post(f"{BASE_URL}/sendRichMessage", json=media_payload) as fb_resp:
+                            if fb_resp.status == 200:
+                                try:
+                                    fb_data = await fb_resp.json()
+                                    fb_msg_id = (fb_data.get("result") or {}).get("message_id")
+                                    if isinstance(fb_msg_id, int) and fb_msg_id > 0:
+                                        return fb_msg_id
+                                except Exception as e:
+                                    logger.debug(f"sendRichHtmlMessage media-demoted parse failed: {e}")
+                                return True
+                            fb_body = await fb_resp.text()
+                            logger.warning(
+                                "sendRichHtmlMessage media-demoted retry also failed: %s %s",
+                                fb_resp.status, fb_body[:200],
+                            )
+                            # 继续走纯文本兜底
+
+                    # ---------- 第 3 次尝试：纯文本段落兜底 ----------
                     fallback_html = _rich_message_plain_text_fallback(html_content)
-                    if content_required and fallback_html and fallback_html != html_content:
+                    content_required = "rich_message_content_required" in body_lower
+                    if fallback_html and fallback_html != html_content:
                         fallback_payload = {
                             **payload,
                             "rich_message": _rich_message_html_payload(fallback_html),
                         }
                         logger.warning(
-                            "sendRichHtmlMessage received RICH_MESSAGE_CONTENT_REQUIRED; "
-                            "retrying once with a safe paragraph fallback"
+                            "sendRichHtmlMessage retrying with plain-text fallback "
+                            "(content_required=%s, fallback_len=%s)",
+                            content_required, len(fallback_html),
                         )
                         async with session.post(f"{BASE_URL}/sendRichMessage", json=fallback_payload) as fallback_resp:
                             if fallback_resp.status == 200:
@@ -1172,7 +1373,12 @@ async def send_rich_html_message(
                                 fallback_body[:200],
                             )
                             return False
-                    logger.error(f"sendRichHtmlMessage failed: {resp.status} {body[:200]}")
+
+                    # 既无媒体可降级，也无可见文本可兜底——彻底失败
+                    logger.error(
+                        "sendRichHtmlMessage exhausted all fallbacks: %s %s",
+                        resp.status, body[:200],
+                    )
                     return False
         except (aiohttp.ClientError, asyncio.TimeoutError):
             raise
