@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 import uuid
 from pathlib import Path
 from apitelegramchat.workspace_paths import todo_state_file
@@ -195,7 +196,38 @@ class _TodoError(Exception):
 
 
 # ---------- 各操作的实现 ----------
-def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optional[str]) -> dict:
+def _normalize_due_at(value: Optional[str]) -> Optional[str]:
+    """规范化可选截止时间；保留 ISO 8601 字符串，便于模型和日志判断。"""
+    if value is None or not str(value).strip():
+        return None
+    raw = str(value).strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise _TodoError("due_at 必须是 ISO 8601 时间，例如 2026-08-29T18:00:00-07:00", "bad_due_at")
+    if dt.tzinfo is None:
+        # 无时区时按服务器本地时间保存；模型通常会根据当前时间提示词理解用户时区。
+        return dt.isoformat(timespec="minutes")
+    return dt.isoformat(timespec="minutes")
+
+
+def _due_status(due_at: Optional[str]) -> str:
+    if not due_at:
+        return "none"
+    try:
+        dt = datetime.fromisoformat(str(due_at).replace("Z", "+00:00"))
+        now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+        delta = (dt - now).total_seconds()
+        if delta < 0:
+            return "overdue"
+        if delta <= 24 * 3600:
+            return "due_soon"
+        return "upcoming"
+    except Exception:
+        return "unknown"
+
+
+def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optional[str], due_at: Optional[str]) -> dict:
     title = (title or "").strip()
     if not title:
         raise _TodoError("title 不能为空", "empty_title")
@@ -203,6 +235,7 @@ def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optio
     if len(store["todos"]) >= MAX_TODOS:
         raise _TodoError(f"待办数量已达上限 {MAX_TODOS}，请先清理", "too_many")
 
+    due_at = _normalize_due_at(due_at)
     todo = {
         "id": _new_id(),
         "title": title,
@@ -210,6 +243,7 @@ def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optio
         "priority": _normalize_priority(priority),
         "tags": _normalize_tags(tags),
         "note": truncate_to_token_budget((note or "").strip(), TODO_NOTE_TOKEN_BUDGET, suffix="…") if note else "",
+        "due_at": due_at,
         "created_at": int(time.time()),
         "completed_at": None,
     }
@@ -336,7 +370,8 @@ def _op_clear(store: dict, filter_: str) -> dict:
 
 
 def _op_edit(store: dict, todo_id: str, title: Optional[str],
-             priority: Optional[str], tags: Any, note: Optional[str]) -> dict:
+             priority: Optional[str], tags: Any, note: Optional[str],
+             due_at: Optional[str]) -> dict:
     found = _find_todo(store["todos"], todo_id)
     if not found:
         raise _TodoError(f"找不到 id 为 {todo_id} 的待办", "not_found")
@@ -357,6 +392,9 @@ def _op_edit(store: dict, todo_id: str, title: Optional[str],
     if note is not None:
         todo["note"] = truncate_to_token_budget((note or "").strip(), TODO_NOTE_TOKEN_BUDGET, suffix="…")
         changed.append("note")
+    if due_at is not None:
+        todo["due_at"] = _normalize_due_at(due_at)
+        changed.append("due_at")
     return store, {
         "ok": True,
         "action": "edit",
@@ -376,6 +414,8 @@ def _todo_summary(t: dict) -> dict:
         "priority": t.get("priority", "medium"),
         "tags": list(t.get("tags", [])),
         "note": t.get("note", ""),
+        "due_at": t.get("due_at"),
+        "due_status": _due_status(t.get("due_at")),
         "created_at": t.get("created_at"),
         "completed_at": t.get("completed_at"),
     }
@@ -390,6 +430,7 @@ async def execute_todo(
     priority: Optional[str] = None,
     tags: Any = None,
     note: Optional[str] = None,
+    due_at: Optional[str] = None,
     filter: Optional[str] = None,
     tag: Optional[str] = None,
 ) -> str:
@@ -403,51 +444,40 @@ async def execute_todo(
     if filter_ not in VALID_FILTERS:
         filter_ = "all"
 
+    # TIMER 主动巡检依赖 Todo 作为第一检查项；这里记录操作元数据，
+    # 不记录任务标题/备注，避免后台日志泄露不必要的用户内容。
+    logger.info(
+        "[TIMER-TODO] chat=%s action=%s filter=%s todo_id=%s",
+        chat_id, action, filter_, todo_id or "-",
+    )
+
     if action == "add":
-        return json.dumps(
-            await _mutate(chat_id, lambda s: _op_add(s, title, priority or "medium", tags, note)),
-            ensure_ascii=False,
-        )
-    if action == "list":
-        return json.dumps(
-            await _read_store(chat_id, lambda s: _op_list(s, filter_, tag, priority)),
-            ensure_ascii=False,
-        )
-    if action == "done":
-        return json.dumps(
-            await _mutate(chat_id, lambda s: _op_toggle(s, todo_id, True)),
-            ensure_ascii=False,
-        )
-    if action == "undone":
-        return json.dumps(
-            await _mutate(chat_id, lambda s: _op_toggle(s, todo_id, False)),
-            ensure_ascii=False,
-        )
-    if action == "toggle":
-        return json.dumps(
-            await _mutate(chat_id, lambda s: _op_toggle(s, todo_id, None)),
-            ensure_ascii=False,
-        )
-    if action == "delete":
-        return json.dumps(
-            await _mutate(chat_id, lambda s: _op_delete(s, todo_id)),
-            ensure_ascii=False,
-        )
-    if action == "clear":
+        payload = await _mutate(chat_id, lambda s: _op_add(s, title, priority or "medium", tags, note, due_at))
+    elif action == "list":
+        payload = await _read_store(chat_id, lambda s: _op_list(s, filter_, tag, priority))
+    elif action == "done":
+        payload = await _mutate(chat_id, lambda s: _op_toggle(s, todo_id, True))
+    elif action == "undone":
+        payload = await _mutate(chat_id, lambda s: _op_toggle(s, todo_id, False))
+    elif action == "toggle":
+        payload = await _mutate(chat_id, lambda s: _op_toggle(s, todo_id, None))
+    elif action == "delete":
+        payload = await _mutate(chat_id, lambda s: _op_delete(s, todo_id))
+    elif action == "clear":
         # 默认只清已完成，避免误删
         f = filter_ if filter_ in ("done", "all") else "done"
-        return json.dumps(
-            await _mutate(chat_id, lambda s: _op_clear(s, f)),
-            ensure_ascii=False,
-        )
-    if action == "edit":
-        return json.dumps(
-            await _mutate(chat_id, lambda s: _op_edit(s, todo_id, title, priority, tags, note)),
-            ensure_ascii=False,
-        )
+        payload = await _mutate(chat_id, lambda s: _op_clear(s, f))
+    elif action == "edit":
+        payload = await _mutate(chat_id, lambda s: _op_edit(s, todo_id, title, priority, tags, note, due_at))
+    else:
+        payload = {"ok": False, "error": f"未知 action: {action}", "code": "bad_action"}
 
-    return json.dumps({"ok": False, "error": f"未知 action: {action}", "code": "bad_action"},
-                      ensure_ascii=False)
+    if isinstance(payload, dict):
+        logger.info(
+            "[TIMER-TODO] chat=%s result ok=%s total=%s pending=%s",
+            chat_id, payload.get("ok"), payload.get("total", "-"), payload.get("pending", "-"),
+        )
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # ---------- 富文本渲染 ----------
@@ -613,7 +643,7 @@ TODO_TOOL = {
         "name": "todo",
         "description": (
             "Persistent per-chat todo list. 8 actions: add / list / done / undone / toggle / delete / clear / edit. "
-            "Todos are stored in the dedicated state store and survive across sessions. After any write action (add/done/undone/delete/edit/clear) immediately call list so the user sees the updated state."
+            "Todos are stored in the dedicated state store and survive across sessions. due_at is optional and enables overdue / due-soon detection. After any write action (add/done/undone/delete/edit/clear) immediately call list so the user sees the updated state."
         ),
         "parameters": {
             "type": "object",
@@ -649,6 +679,10 @@ TODO_TOOL = {
                     "type": "string",
                     "description": "可选的较长备注（最多 500 tokens）。add/edit 使用。"
                 },
+                "due_at": {
+                    "type": "string",
+                    "description": "可选截止时间，ISO 8601，例如 2026-08-29T18:00:00-07:00。add/edit 使用；list 返回 due_status=overdue/due_soon/upcoming/none。"
+                },
                 "filter": {
                     "type": "string",
                     "enum": ["all", "pending", "done"],
@@ -662,7 +696,7 @@ TODO_TOOL = {
             "required": ["action"]
         },
         "input_examples": [
-            {"action": "add", "title": "买牛奶", "priority": "high", "tags": ["购物", "周末"]},
+            {"action": "add", "title": "买牛奶", "priority": "high", "tags": ["购物", "周末"], "due_at": "2026-08-29T18:00:00-07:00"},
             {"action": "list", "filter": "pending"},
             {"action": "done", "todo_id": "a1b2c3d4"},
             {"action": "delete", "todo_id": "a1b2c3d4"},

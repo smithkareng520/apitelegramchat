@@ -2591,6 +2591,7 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 priority=arguments.get("priority"),
                 tags=arguments.get("tags"),
                 note=arguments.get("note"),
+                due_at=arguments.get("due_at"),
                 filter=arguments.get("filter"),
                 tag=arguments.get("tag"),
             )

@@ -122,20 +122,59 @@ _PLAIN_TEXT_LIMIT = 4000
 # 唤醒提示词与工具定义
 # =====================================================================
 WAKEUP_PROMPT = """
-[系统后台唤醒｜Jarvis 主动模式]
+[系统后台唤醒｜TIMER 主动巡检回合]
 
-现在是你的主动活动时间。你的任务不是等待用户提问，而是像一个长期陪伴用户的智能管家一样检查当前上下文。
+你现在处于“主动巡检回合”。不要把这次唤醒当成普通聊天请求。
+这是一次“由你主动判断现在是否应该为用户做点什么”的机会。
 
-请主动判断：
-1. 是否存在之前未完成的话题、承诺或跟进事项；
-2. 是否有用户可能关心的信息、提醒、建议或自然的交流机会；
-3. 是否可以发送一句简短、有价值、像真人聊天一样的主动消息。
+必须按下面顺序工作，并以“有价值才行动、没有价值就静默”为原则：
 
-如果存在任何轻量但真实的价值，请优先调用 send_message_to_user。
-不要只回复“明白”“我会注意”“有什么可以帮您的吗”等等待式内容。
-不要把最终文本回复当作主动消息渠道；主动联系用户必须使用 send_message_to_user 工具。
+1. 检查当前 Todo
+   - 优先调用 todo 的 list，检查未完成任务。
+   - 判断是否存在：已到期、临近到期、长期未推进、现在适合推进、或现在值得提醒的任务。
+   - 如果任务明确且安全、且无需用户补充信息，可以推进 Todo 状态；否则优先提醒用户。
+   - 不要为了“有事可做”而虚构任务、修改无关任务或重复提醒已经处理过的事情。
 
-只有在完全没有自然交流价值时，才保持安静。你的目标是成为可靠的主动助手，而不是被动客服。
+2. 检查最近上下文
+   - 回看最近对话，寻找未完成的话题、用户留下的待办、承诺、等待结果、计划和自然后续。
+   - 判断是否有事情到了“现在联系用户最自然”的时间点。
+   - 注意避免重复发送上一轮已经说过的内容。
+
+3. 判断主动沟通价值
+   按优先级判断：
+   A. 明确任务需要推进/提醒 → 推进或提醒；
+   B. 有自然、具体的跟进 → 主动联系；
+   C. 有与用户上下文相关、现在有价值的新信息 → 主动分享；
+   D. 没有重大事项，但存在轻量、真实、自然的交流机会 → 可以联系；
+   E. 以上都没有 → 保持静默。
+
+   “轻量交流机会”必须与用户近期上下文有真实关联，不能只是泛泛寒暄。
+   宁可少发，也不要为了完成 TIMER 回合而制造消息。
+
+4. 如果决定联系用户
+   - 必须调用 send_message_to_user。
+   - 不要只生成 assistant 文本；assistant 最终文本不会直接送达用户。
+   - 一次回合通常只发一条最有价值的消息；只有确有必要时才发送多条。
+   - 消息要短、自然、具体，像真人主动想起一件事后发来的消息。
+   - 不要解释“这是 TIMER/后台唤醒”，不要报告内部检查过程。
+   - 不要使用 Markdown/HTML。
+
+5. 如果没有任何合理行动
+   - 不调用 send_message_to_user。
+   - 保持静默即可。
+
+禁止：
+- “明白，我会注意……”
+- “有什么我可以帮您的吗？”
+- “我会等待您的消息。”
+- “只是想问问你最近怎么样”
+- 为了完成回合而发送无意义寒暄。
+- 把内部推理、工具检查过程或“我决定不联系”发送给用户。
+
+重要：
+- 本回合的目标不是“必须发消息”，而是“主动判断是否值得发消息”。
+- Todo 与最近上下文是第一优先级；不要跳过 Todo 检查直接闲聊。
+- 只在有充分依据时行动，不编造用户意图、时间、承诺或事实。
 """
 
 SEND_MESSAGE_TO_USER_TOOL = {
@@ -378,6 +417,10 @@ async def execute_send_message_to_user(chat_id: int, arguments: dict) -> str:
         except asyncio.CancelledError:
             raise  # 让打断流程负责收尾与撤回
         if msg_id:
+            logger.info(
+                "[TIMER] chat=%s action=SEND message_id=%s chars=%s",
+                chat_id, msg_id, len(text),
+            )
             preview = text if len(text) <= 60 else text[:60] + "…"
             return f"已发送（message_id={msg_id}）：{preview}"
         return "失败：消息发送失败（网络或 Telegram 错误），可稍后重试。"
@@ -539,7 +582,7 @@ async def _fire_turn(chat_id: int) -> None:
         return
     try:
         if _busy_check_callback is not None and _busy_check_callback(chat_id):
-            logger.info("[proactive] chat=%s 用户流程进行中，跳过本次唤醒", chat_id)
+            logger.info("[TIMER] chat=%s 决策=SKIP：用户流程进行中", chat_id)
             return
     except Exception:
         logger.debug("[proactive] chat=%s busy check 失败，按空闲处理", chat_id, exc_info=True)
@@ -558,6 +601,10 @@ async def _fire_turn(chat_id: int) -> None:
             logger.exception("[proactive] chat=%s TIMER 回合异常", chat_id)
         finally:
             await _drain_pending_sends(flow, timeout=2.0)
+            logger.info(
+                "[TIMER] chat=%s 回合收尾：sent_messages=%s interrupted=%s",
+                chat_id, len(flow.sent_message_ids), flow.interrupted,
+            )
             if _active_flows.get(chat_id) is flow:
                 _active_flows.pop(chat_id, None)
 
@@ -572,7 +619,10 @@ async def _fire_turn(chat_id: int) -> None:
             logger.error("[proactive] chat=%s TIMER 回合任务异常退出: %s", _cid, exc)
 
     flow.task.add_done_callback(_log_unexpected)
-    logger.info("[proactive] chat=%s 触发 TIMER 唤醒回合", chat_id)
+    logger.info(
+        "[TIMER] chat=%s 决策=RUN：开始执行主动巡检（todo→context→value→action）",
+        chat_id,
+    )
 
 
 async def _drain_pending_sends(flow: _ProactiveFlow, *, timeout: float) -> None:
@@ -609,6 +659,10 @@ async def _chat_scheduler_loop(chat_id: int) -> None:
                     return
                 idle = time.monotonic() - sched.last_activity
                 if idle >= idle_start:
+                    logger.info(
+                        "[TIMER] chat=%s 空闲阈值达到：idle=%ss threshold=%ss，进入主动巡检",
+                        chat_id, int(idle), int(idle_start),
+                    )
                     break
                 if await _sleep_or_stop(min(_PROACTIVE_POLL_SECONDS, idle_start - idle + 0.5)):
                     return
@@ -623,6 +677,10 @@ async def _chat_scheduler_loop(chat_id: int) -> None:
                     # 正常节奏：先触发（首次进入时立即，之后在间隔后）
                     await _fire_turn(chat_id)
                     interval = random.choice(PROACTIVE_INTERVAL_CHOICES)
+                    logger.info(
+                        "[TIMER] chat=%s 下一次巡检计划：%ss 后（候选=%s）",
+                        chat_id, interval, PROACTIVE_INTERVAL_CHOICES,
+                    )
                     state = await _wait_activity_or_stop(chat_id, interval)
                     if state == "activity":
                         break  # 用户回来了：回到阶段 1 重新计空闲

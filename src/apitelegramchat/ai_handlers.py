@@ -470,21 +470,31 @@ async def get_ai_response(
                 client, current_model, messages, builder, chat_id
             )
         elif is_timer:
-            # TIMER：在基础工具之上暴露 send_message_to_user；
-            # 移除 ask_user（后台回合不应阻塞等待用户输入）与
-            # present_files（绕过纯文本原则直接投递文件）。
+            # TIMER 使用“安全主动工具面”，而不是完整 USER 工具面。
+            # 后台巡检允许读取/搜索信息、检查 Todo/Memory，并通过唯一的
+            # send_message_to_user 对用户发消息；禁止直接投递文件/媒体、等待用户、
+            # 任意 Bash/文件写入，避免 TIMER 为了“找点事做”产生副作用。
             from apitelegramchat.proactive import SEND_MESSAGE_TO_USER_TOOL
             from apitelegramchat.search_engine import SEARCH_TOOLS
+            _PROACTIVE_ALLOWED_TOOLS = {
+                "web_search", "fetch_url", "wikipedia",
+                "exchange_rate", "book_lookup", "weather", "news", "crypto_price",
+                "qr_code",
+                "geocode", "route", "distance",
+                "poi_keyword_search", "poi_nearby_search", "poi_details",
+                "todo", "memory",
+            }
             timer_tools = [
                 t for t in SEARCH_TOOLS
-                if (t.get("function") or {}).get("name") not in {"ask_user", "present_files"}
+                if (t.get("function") or {}).get("name") in _PROACTIVE_ALLOWED_TOOLS
             ] + [SEND_MESSAGE_TO_USER_TOOL]
-            # Jarvis 模式：明确告诉模型 TIMER 是主动陪伴任务，而不是普通问答。
+            # Jarvis 模式：协议本身决定是否联系用户，而不是要求每轮都发消息。
             messages.append({
                 "role": "system",
                 "content": (
-                    "主动唤醒规则：本轮目标是维护用户关系。优先寻找值得主动分享的内容。"
-                    "如果有任何自然交流机会，请调用 send_message_to_user；不要返回等待式寒暄。"
+                    "TIMER 是主动巡检回合，不是普通问答。必须先检查 Todo，再结合最近上下文判断。"
+                    "只有存在具体价值时才调用 send_message_to_user；没有合理行动就保持静默。"
+                    "不要为了完成回合而寒暄，也不要输出“我会等待”等等待式文本。"
                 ),
             })
             raw_content, usage, new_msgs = await _call_api(

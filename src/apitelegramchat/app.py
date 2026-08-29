@@ -792,6 +792,17 @@ async def _handle_timer_wakeup(chat_id: int):
             logger.info(f"[proactive] chat={chat_id} 当前模型 {cm} 为原生媒体模型，跳过本次后台唤醒")
             return
 
+        # TIMER 运行日志：只记录运行元数据，不记录模型隐藏推理或完整私密上下文。
+        history_count = 0
+        try:
+            history_count = len(ctx.get("conversation_history", []) or [])
+        except Exception:
+            pass
+        logger.info(
+            "[TIMER] chat=%s 开始主动巡检：model=%s history_messages=%s username=%s",
+            chat_id, cm, history_count, username,
+        )
+
         # 与用户消息同款的上下文预算检查；超限则静默跳过本回合
         wakeup_msg = {"role": "user", "content": proactive.WAKEUP_PROMPT}
         is_safe = await pre_flight_context_check(chat_id, wakeup_msg)
@@ -811,6 +822,13 @@ async def _handle_timer_wakeup(chat_id: int):
         # 仅沉淀 assistant/tool 消息；失败/空回合不落库。
         if new_msgs and not (full or "").startswith(("⚠️", "❌")):
             await update_conversation_and_ledger(chat_id, None, new_msgs, usage)
+
+        # TIMER 可观测性：不输出隐藏推理，只记录本轮是否产生了持久化活动。
+        sent_count = len(proactive._active_flows.get(chat_id).sent_message_ids) if chat_id in proactive._active_flows else 0
+        logger.info(
+            "[TIMER] chat=%s 巡检完成：assistant_tool_messages=%s sent_messages=%s final_text_chars=%s",
+            chat_id, len(new_msgs or []), sent_count, len((full or "").strip()),
+        )
     except asyncio.CancelledError:
         # 被用户消息打断：不持久化半成品回合，直接退出
         raise
