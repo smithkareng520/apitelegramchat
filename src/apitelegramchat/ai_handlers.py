@@ -360,31 +360,50 @@ async def get_ai_response(
         user_contexts: dict,
         username: str,
         user_message: dict = None,
+        event_source: str = "USER",
 ) -> tuple[str, str, list, Optional[dict]]:
+    """统一调度入口：按事件源（USER / TIMER）动态分配工具与输出处理。
+
+    - USER（用户主动发消息）：行为与旧实现完全一致——可见草稿流式输出、
+      工具列表不包含 send_message_to_user、最终富文本推送给用户。
+    - TIMER（系统定时唤醒，见 proactive.py）：使用 SilentMessageBuilder，
+      agent 过程（草稿/工具进度/最终文本）不输出到 Telegram；工具列表在
+      基础工具之上追加 send_message_to_user（并移除 ask_user/present_files
+      这类会直接触达用户或阻塞等待用户输入的工具）；最终文本只留在历史
+      上下文中，不直接推送给用户。
+    """
     builder = None
     new_msgs = []
     usage = None
+    is_timer = (event_source == "TIMER")
     try:
-        # 草稿首帧必须先于系统提示词、历史归档和多模态解析出现。这些准备操作在
-        # 文件、图片或长历史场景下可能耗时数秒；旧顺序会让用户误以为 Agent 卡死。
-        builder = RichMessageBuilder(chat_id)
-        builder.add_initial_thinking("Thinking...")
-        # 先登记为当前活跃草稿，让首帧和后续流式刷新都能通过 active 校验。
-        # message_id 先占位为 0，等首帧真正发出后再回填真实 message_id。
-        try:
-            from apitelegramchat.state import set_active_draft
-            await set_active_draft(chat_id, builder.draft_id, 0)
-        except Exception:
-            pass
-        await builder.flush(force=True)
-        # 首帧发出后，用真实 message_id 覆盖占位值。
-        if builder.draft_message_id:
+        if is_timer:
+            # TIMER：静默回合——不创建可见草稿、不注册活跃草稿、不发首帧。
+            # SilentMessageBuilder 保留全部状态机接口，只是零 Telegram 副作用。
+            from apitelegramchat.ai.rich_message_builder import SilentMessageBuilder
+            builder = SilentMessageBuilder(chat_id)
+            builder.add_initial_thinking("Thinking...")
+        else:
+            # 草稿首帧必须先于系统提示词、历史归档和多模态解析出现。这些准备操作在
+            # 文件、图片或长历史场景下可能耗时数秒；旧顺序会让用户误以为 Agent 卡死。
+            builder = RichMessageBuilder(chat_id)
+            builder.add_initial_thinking("Thinking...")
+            # 先登记为当前活跃草稿，让首帧和后续流式刷新都能通过 active 校验。
+            # message_id 先占位为 0，等首帧真正发出后再回填真实 message_id。
             try:
                 from apitelegramchat.state import set_active_draft
-                await set_active_draft(chat_id, builder.draft_id, builder.draft_message_id)
+                await set_active_draft(chat_id, builder.draft_id, 0)
             except Exception:
                 pass
-        builder.start_flush_loop()
+            await builder.flush(force=True)
+            # 首帧发出后，用真实 message_id 覆盖占位值。
+            if builder.draft_message_id:
+                try:
+                    from apitelegramchat.state import set_active_draft
+                    await set_active_draft(chat_id, builder.draft_id, builder.draft_message_id)
+                except Exception:
+                    pass
+            builder.start_flush_loop()
 
         lock = await state.get_chat_lock(chat_id)
         async with lock:
@@ -450,6 +469,19 @@ async def get_ai_response(
             raw_content, usage, new_msgs = await _agentic_loop_native_image(
                 client, current_model, messages, builder, chat_id
             )
+        elif is_timer:
+            # TIMER：在基础工具之上暴露 send_message_to_user；
+            # 移除 ask_user（后台回合不应阻塞等待用户输入）与
+            # present_files（绕过纯文本原则直接投递文件）。
+            from apitelegramchat.proactive import SEND_MESSAGE_TO_USER_TOOL
+            from apitelegramchat.search_engine import SEARCH_TOOLS
+            timer_tools = [
+                t for t in SEARCH_TOOLS
+                if (t.get("function") or {}).get("name") not in {"ask_user", "present_files"}
+            ] + [SEND_MESSAGE_TO_USER_TOOL]
+            raw_content, usage, new_msgs = await _call_api(
+                current_model, model_info, messages, chat_id, builder, tools=timer_tools
+            )
         else:
             raw_content, usage, new_msgs = await _call_api(
                 current_model, model_info, messages, chat_id, builder
@@ -458,11 +490,13 @@ async def get_ai_response(
         await builder.stop_flush_loop()
 
         # 本轮流式已结束：后续永久消息不再 reassert 草稿，避免最终回复后再弹出预览气泡。
-        # 若外部已 interrupt 并 mark_dead，这里再标一次无害。
-        try:
-            await mark_draft_dead(builder.draft_id)
-        except Exception:
-            pass
+        # 若外部已 interrupt 并 mark_dead，这里再标一次无害。TIMER 静默回合
+        # 从未注册草稿，跳过标记。
+        if not is_timer:
+            try:
+                await mark_draft_dead(builder.draft_id)
+            except Exception:
+                pass
 
         if raw_content and isinstance(raw_content, str) and raw_content.startswith("IMAGE_ERROR:"):
             error_notice = raw_content.split(":", 1)[1].strip()
@@ -542,6 +576,10 @@ async def get_ai_response(
 
         if not cleaned_content and not final_html.strip():
             logger.warning("AI 返回空内容（model=%s）", current_model)
+            if is_timer:
+                # TIMER：静默返回，不打扰用户；new_msgs 里可能仍有工具消息
+                # （如已通过 send_message_to_user 发出的内容），交由上层沉淀历史。
+                return "", "", new_msgs, usage
             fallback = "⚠️ AI 响应为空。请尝试换一个模型或提供更多上下文。"
             await send_rich_html_message(chat_id, fallback, reassert_draft=False)
             if builder.draft_message_id:
@@ -561,7 +599,15 @@ async def get_ai_response(
 
         final_html = re.sub(r'\n\s*\n', '\n', final_html)
 
-        if final_tail_empty_after_rollover:
+        if is_timer:
+            # TIMER：agent 过程不输出到 Telegram——最终文本只留在历史上下文中，
+            # 不直接推送给用户；用户可见输出只能来自 send_message_to_user。
+            success = True
+            logger.info(
+                "[%s] TIMER 回合完成：最终内容不推送用户（长度=%s，前 500 字）：\n%s",
+                chat_id, len(cleaned_content), cleaned_content[:500],
+            )
+        elif final_tail_empty_after_rollover:
             success = True
             logger.info(f"[{chat_id}] 最后一段已在滚动时永久化，无需重复发送")
         else:
@@ -608,12 +654,13 @@ async def get_ai_response(
             len(content_str),
             content_str,
         )
-        logger.info(
-            "[%s] 最终 Telegram 富文本（未压缩、未截断；长度=%s）：\n%s",
-            chat_id,
-            len(final_html),
-            final_html,
-        )
+        if not is_timer:
+            logger.info(
+                "[%s] 最终 Telegram 富文本（未压缩、未截断；长度=%s）：\n%s",
+                chat_id,
+                len(final_html),
+                final_html,
+            )
         logger.debug("最终清洗后输出（未截断）：\n%s", cleaned_content)
         return cleaned_content, "", new_msgs, usage
 
@@ -690,6 +737,13 @@ async def get_ai_response(
             endpoint="/v1/images/generations" if is_native_image else "/v1/chat/completions",
             model=current_model,
         )
+        if is_timer:
+            # TIMER：后台回合失败不打扰用户，只记日志；下一个唤醒间隔自动重试
+            logger.warning(
+                "[%s] TIMER 回合异常（静默处理，不通知用户 error_id=%s）：\n%s",
+                chat_id, error_id, error_msg,
+            )
+            return error_msg, "", [], None
         await send_rich_html_message(chat_id, error_msg)
         return error_msg, "", [], None
 

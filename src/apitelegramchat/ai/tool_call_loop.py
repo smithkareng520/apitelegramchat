@@ -340,26 +340,37 @@ async def _run_tool_calls_and_append(
                         f"arguments ({invalid_arguments}). Reissue the same tool call with a valid JSON object."
                     )
                 elif fn_name == "ask_user":
-                    question = fn_args.get("question", "")
-                    options = fn_args.get("options", [])
-                    multiple = bool(fn_args.get("multiple", False))
-                    allow_custom = bool(fn_args.get("allow_custom", True))
-                    interaction = await create_ask_user_interaction(
-                        builder.chat_id,
-                        question,
-                        options,
-                        multiple=multiple,
-                        allow_custom=allow_custom,
-                    )
-                    builder.update_tool_item(
-                        tc_id,
-                        "Waiting for your answer",
-                        f"<p>{escape_html(truncate_to_token_budget(str(question), 64, suffix='…'))}</p>",
-                        status="waiting",
-                    )
-                    await builder.flush(force=True)
-                    answer = await wait_for_answer(interaction)
-                    result_str = answer_to_tool_result(answer)
+                    if getattr(builder, "silent", False):
+                        # 静默（TIMER 后台唤醒）回合不允许阻塞等待用户输入：
+                        # 按钮消息会绕过 send_message_to_user 的纯文本原则，
+                        # 且回合会被用户的下一条消息打断。引导模型改用
+                        # send_message_to_user 以自然语言提问后结束回合。
+                        result_str = (
+                            "失败：ask_user 在系统后台唤醒回合中不可用。"
+                            "如需向用户提问，请改用 send_message_to_user 发送一句自然、"
+                            "口语化的纯文本提问，然后结束本回合等待用户回复。"
+                        )
+                    else:
+                        question = fn_args.get("question", "")
+                        options = fn_args.get("options", [])
+                        multiple = bool(fn_args.get("multiple", False))
+                        allow_custom = bool(fn_args.get("allow_custom", True))
+                        interaction = await create_ask_user_interaction(
+                            builder.chat_id,
+                            question,
+                            options,
+                            multiple=multiple,
+                            allow_custom=allow_custom,
+                        )
+                        builder.update_tool_item(
+                            tc_id,
+                            "Waiting for your answer",
+                            f"<p>{escape_html(truncate_to_token_budget(str(question), 64, suffix='…'))}</p>",
+                            status="waiting",
+                        )
+                        await builder.flush(force=True)
+                        answer = await wait_for_answer(interaction)
+                        result_str = answer_to_tool_result(answer)
                 else:
                     result_str = await asyncio.wait_for(
                         dispatch_tool_call(

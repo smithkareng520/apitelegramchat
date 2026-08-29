@@ -69,6 +69,7 @@ from apitelegramchat.file_handlers import download_file
 from apitelegramchat.workspace_utils import _get_workspace_lock, init_workspace
 from apitelegramchat.context_manager import select_request_context
 from apitelegramchat.tool_context_compaction import compact_older_tool_calls, _eligible_calls
+from apitelegramchat import proactive
 
 app = Quart(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
@@ -84,18 +85,25 @@ async def _startup_load_whitelist() -> None:
         await load_whitelist()
     except Exception:
         logger.warning("startup load_whitelist failed", exc_info=True)
+    # ── 主动唤醒（TIMER 事件源）初始化 ──
+    # 注册回调后启动调度器：chat 在首次授权用户活动时才被跟踪。
+    try:
+        proactive.register_turn_runner(_handle_timer_wakeup)
+        proactive.register_busy_check(_is_user_flow_active)
+        await proactive.start_proactive_scheduler()
+    except Exception:
+        logger.warning("startup proactive scheduler failed", exc_info=True)
 
 
 @app.after_serving
 async def _shutdown_close_http_session() -> None:
-    """优雅关闭：先关掉所有持久 bash 沙箱进程，再关全局 aiohttp session。
-
-    之前只关 aiohttp session，BashSessionManager 里所有还在跑的 bash
-    子进程会被进程退出时强杀——但它们的 stdin pipe 缓冲区里的内容
-    不会被 flush，会留下 "Task was destroyed but it is pending!" 之类
-    的告警，也会让 watchdog 任务在退出时报 RuntimeError。显式
-    cleanup_all() 让每个 session 走正常的 close() 流程。
+    """优雅关闭：先停掉主动唤醒调度器，再关掉所有持久 bash 沙箱进程，
+    最后关全局 aiohttp session。
     """
+    try:
+        await proactive.stop_proactive_scheduler()
+    except Exception:
+        logger.warning("shutdown proactive scheduler failed", exc_info=True)
     try:
         from apitelegramchat.tool_executors import _bash_manager
         await _bash_manager.cleanup_all()
@@ -191,7 +199,16 @@ async def _interrupt_active_generation(chat_id: int) -> None:
     刷新请求）真正结束，只有在确认没有任何后台刷新还在跑之后，才去
     标记草稿死亡、发送停止提示 / 新消息。
     """
-    # 0) 提前记录当前活跃草稿信息，因为取消旧任务后它的 finally 里可能
+    # 0) 新用户回合接管时，同样要打断进行中的 TIMER 主动唤醒回合：
+    #    取消其后台任务并静默撤回该回合已发出的普通消息。
+    #    （webhook 中心入口已对每条用户消息调用过一次；这里是兜底，
+    #     覆盖媒体组聚合等待期结束后才启动用户回合等时序，重复调用无害。）
+    try:
+        await proactive.interrupt_proactive_flow(chat_id)
+    except Exception as e:
+        logger.warning(f"interrupt_proactive_flow 异常: {e}")
+
+    # 0.1) 提前记录当前活跃草稿信息，因为取消旧任务后它的 finally 里可能
     #    会自己清掉这个注册，届时就取不到了。
     try:
         draft_info = await get_active_draft_info(chat_id)
@@ -532,15 +549,22 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
         # itself, or a system-only snapshot that is already beyond the budget.
         return request_estimate + new_input_est <= safe_limit
 
-async def update_conversation_and_ledger(chat_id: int, user_message: dict, new_msgs: list, usage: dict = None) -> None:
+async def update_conversation_and_ledger(chat_id: int, user_message: dict | None, new_msgs: list, usage: dict = None) -> None:
+    """将本轮对话写入持久历史并维护 token 台账。
+
+    user_message 为 None 时（TIMER 主动唤醒回合）：不写入唤醒用的合成
+    user 消息（timer 唤醒不写入历史），只沉淀回合产生的 assistant/tool
+    消息，保证统一上下文的前提下不污染触发器痕迹。
+    """
     lock = await get_chat_lock(chat_id)
     async with lock:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
-        block_content = user_message.get("content", "")
-        if isinstance(block_content, str) and REPLY_MARKER in block_content:
-            user_message["content"] = block_content.split(REPLY_MARKER)[-1].strip()
-        history.append(user_message)
+        if user_message is not None:
+            block_content = user_message.get("content", "")
+            if isinstance(block_content, str) and REPLY_MARKER in block_content:
+                user_message["content"] = block_content.split(REPLY_MARKER)[-1].strip()
+            history.append(user_message)
         for msg in new_msgs:
             if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
                 msg["content"] = msg["content"].strip()
@@ -729,6 +753,69 @@ async def _handle_video_message(chat_id: int, user_message: dict, username: str)
     except Exception as e:
         logger.exception(f"_handle_video_message 异常: {e}")
         await send_rich_html_message(chat_id, f"❌ <b>处理视频时出错</b>\n<code>{str(e)[:100]}</code>")
+
+
+# ==================== TIMER 主动唤醒（统一事件源调度） ====================
+
+def _is_user_flow_active(chat_id: int) -> bool:
+    """该 chat 是否有用户发起（USER 事件源）的回合正在运行。
+
+    注册给 proactive 调度器作为 busy check：用户回合进行中（含 ask_user
+    等待期）不触发 TIMER 唤醒，避免两个回合并发竞争同一份历史。
+    """
+    task = active_tasks.get(chat_id)
+    return task is not None and not task.done()
+
+
+async def _handle_timer_wakeup(chat_id: int):
+    """TIMER 事件源回合：系统后台唤醒 agent 的“自己的活动时间”。
+
+    与用户回合共用同一份会话历史（统一上下文），但：
+    - 不发 typing、不建草稿：agent 过程对用户完全不可见；
+    - 向请求上下文追加合成 user 消息（WAKEUP_PROMPT），但不写入持久历史；
+    - 工具面在基础工具上追加 send_message_to_user；
+    - 最终文本不推送给用户，只沉淀进历史；
+    - 回合被用户消息打断时由 proactive.interrupt_proactive_flow 负责
+      静默撤回已发出的普通消息（此处无需感知）。
+    """
+    try:
+        # 原生图片/视频模型不适合后台回合（会直接生成媒体并推给用户），跳过
+        lock = await get_chat_lock(chat_id)
+        async with lock:
+            cm = get_user_model(chat_id)
+            ctx = get_or_init_context(chat_id)
+            username = ctx.get("username") or f"User_{chat_id}"
+        model_info = SUPPORTED_MODELS.get(cm)
+        if model_info is not None and (
+            getattr(model_info, "native_image", False) or getattr(model_info, "native_video", False)
+        ):
+            logger.info(f"[proactive] chat={chat_id} 当前模型 {cm} 为原生媒体模型，跳过本次后台唤醒")
+            return
+
+        # 与用户消息同款的上下文预算检查；超限则静默跳过本回合
+        wakeup_msg = {"role": "user", "content": proactive.WAKEUP_PROMPT}
+        is_safe = await pre_flight_context_check(chat_id, wakeup_msg)
+        if not is_safe:
+            logger.warning(f"[proactive] chat={chat_id} 上下文超限，跳过本次后台唤醒")
+            return
+
+        # 后台预初始化 workspace（与用户回合一致，避免首个工具调用 no-op）
+        asyncio.create_task(init_workspace(chat_id))
+
+        full, _, new_msgs, usage = await get_ai_response(
+            chat_id, user_models, user_contexts, username,
+            user_message=wakeup_msg,
+            event_source="TIMER",
+        )
+        # 持久化：唤醒 user 消息不写入历史（user_message=None），
+        # 仅沉淀 assistant/tool 消息；失败/空回合不落库。
+        if new_msgs and not (full or "").startswith(("⚠️", "❌")):
+            await update_conversation_and_ledger(chat_id, None, new_msgs, usage)
+    except asyncio.CancelledError:
+        # 被用户消息打断：不持久化半成品回合，直接退出
+        raise
+    except Exception as e:
+        logger.exception(f"_handle_timer_wakeup 异常: {e}")
 
 # ---------------------------------------------------------------------------
 # 媒体组和文档组处理（保持不变）
@@ -1403,6 +1490,25 @@ async def webhook() -> tuple:
                 user_models.setdefault(chat_id, DEFAULT_MODEL)
             username = ctx["username"]
 
+            # ── 统一事件源入口（USER）────────────────────────────────────
+            # 1) 记录用户活动：重置该 chat 的空闲计时（主动唤醒调度器据此
+            #    决定何时进入 agent 的"活动时间"）。仅私聊参与主动唤醒。
+            # 2) 打断进行中的 TIMER 主动唤醒回合：取消后台 agent 任务，并
+            #    静默撤回该回合已通过 send_message_to_user 发出的普通消息
+            #    （不显示"已停止"之类的任何提示）。
+            # 该入口位于所有消息类型/命令分发之前，覆盖全部授权用户输入。
+            try:
+                await proactive.note_user_activity(
+                    chat_id,
+                    private=(msg.get("chat") or {}).get("type") == "private",
+                )
+            except Exception as e:
+                logger.warning(f"note_user_activity 异常: {e}")
+            try:
+                await proactive.interrupt_proactive_flow(chat_id)
+            except Exception as e:
+                logger.warning(f"interrupt_proactive_flow 异常: {e}")
+
             # ── Telegram 原生 location（用户分享位置 / 实时位置） ───────
             # 直接把坐标交给 LLM；如需反查中文地址，LLM 可在后续轮次调用
             # amap-maps MCP 的 maps_regeocode 工具。
@@ -1982,6 +2088,13 @@ async def webhook() -> tuple:
                 async with aiohttp.ClientSession() as s:
                     await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "无权限"})
                 return "OK", 200
+
+            # 按钮点击也是用户活动：重置主动唤醒的空闲计时
+            # （不打断 TIMER 回合——按钮交互不产生新的 USER 模型回合）
+            try:
+                await proactive.note_user_activity(chat_id, private=True)
+            except Exception as e:
+                logger.warning(f"note_user_activity(callback) 异常: {e}")
 
             try:
                 if sel in SUPPORTED_ROLES:

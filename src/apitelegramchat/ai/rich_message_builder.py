@@ -1308,3 +1308,54 @@ class RichMessageBuilder:
                 logger.debug("%s 停止时出现异常（可忽略）: %s", attr, exc)
 
 
+class SilentMessageBuilder(RichMessageBuilder):
+    """静默构建器：保留 RichMessageBuilder 的全部状态机接口（agentic loop
+    依赖它们做工具组管理、流式缓冲、组收束等），但**从不向 Telegram 发送
+    任何草稿帧，也从不做滚动永久化**。
+
+    用于 TIMER 主动唤醒回合（proactive wake-up）：agent 的思考、工具进度
+    与最终文本对用户完全不可见——它们只存在于请求上下文与持久历史中；
+    用户唯一可见的输出来自模型显式调用的 send_message_to_user 工具。
+
+    约定：``silent`` 属性为 True，供 tool_call_loop 等下层模块用
+    ``getattr(builder, "silent", False)`` 做静默分支判断（如禁用 ask_user）。
+    """
+
+    def __init__(self, chat_id: int):
+        super().__init__(chat_id)
+        self.silent = True
+
+    # ---------- 覆盖所有会产生 Telegram 副作用的路径 ----------
+
+    def request_flush(self, force: bool = False) -> None:
+        # 静默回合没有草稿，无需合并/补发任何帧
+        return
+
+    async def flush(self, force: bool = False):
+        # 永不发送草稿帧；draft_message_id 保持 None，
+        # 上层据此自然跳过所有"删除草稿气泡"的分支。
+        return
+
+    def start_flush_loop(self):
+        # 没有需要驱动的刷新循环
+        return
+
+    async def stop_flush_loop(self):
+        # 从未启动任何后台任务，直接返回
+        return
+
+    def _arm_rollover_if_needed(self, html_content: str | None = None) -> bool:
+        # 静默回合不存在容量滚动问题
+        return False
+
+    async def rollover_at_turn_boundary(self, *, start_next_draft: bool = True) -> bool:
+        # 关键覆盖：父类实现会把旧段"永久化"为 Telegram 消息，
+        # 这会把 agent 过程泄漏给用户。静默回合永不滚动。
+        return False
+
+    async def _register_active_draft(self, message_id: int = 0) -> None:
+        # 不注册活跃草稿：打断逻辑（mark_draft_dead / clear_active_draft）
+        # 与新用户回合的草稿占位都与之无关。
+        return
+
+
