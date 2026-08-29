@@ -340,6 +340,7 @@ WEBHOOK_URL?token=WEBHOOK_TOKEN
 | `PROACTIVE_MAX_IDLE_SECONDS` | `10800` | 用户连续空闲多久后停止高频触发（3h） |
 | `PROACTIVE_REST_SECONDS` | `3600` | 休息时长；休息结束后再触发一次（1h） |
 | `PROACTIVE_POLL_SECONDS` | `10` | 调度协程轮询粒度（秒） |
+| `TOOL_VISIBILITY_FILTER` | `true` | 按事件源的工具可见性过滤器总开关。USER 回合把历史中 `send_message_to_user` 的调用痕迹折叠成普通文本摘要（保留语义、消除调用形状），从根源上防止模型在用户主动发消息时模仿调用该工具；TIMER 回合不受影响。设为 `false` 恢复旧行为。规则注册表见 `src/apitelegramchat/tool_visibility.py` |
 
 说明：仅**私聊**参与主动唤醒；bot 被用户屏蔽（sendMessage 403）时会自动停用
 该会话的调度；进程重启后空闲计时重新开始（chat 在首次用户活动时重新被跟踪）。

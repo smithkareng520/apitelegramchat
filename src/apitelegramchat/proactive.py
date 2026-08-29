@@ -31,6 +31,20 @@
   ``send_message_to_user`` 发出的普通消息被**静默撤回**（不显示"已停止"之类
   的提示）。
 
+USER 回合的防幻觉（分层防御，见 tool_visibility.py）
+====================================================
+
+统一上下文会把 TIMER 回合的 ``send_message_to_user`` 调用沉淀进历史，历史
+里的成功调用先例会诱导模型在 USER 回合模仿调用（tools 白名单外调用名网关
+不拦截）。三层防御：
+
+1. 根因层：USER 回合构建请求时，``tool_visibility.apply_tool_visibility``
+   把历史中本工具的调用折叠成普通文本摘要（保留语义、消除调用形状）；
+2. 工具面层：USER 回合的 tools 列表本就不含本工具（既有行为）；
+3. 兜底层：模型仍幻觉调用时，``execute_send_message_to_user`` 返回无害化
+   引导文案——不说"失败"、不指示"直接把回复写给用户"（旧文案会在任务
+   中途诱发提前收尾），只说明未执行并要求继续当前任务。
+
 调度节奏（均可用环境变量覆盖）
 ==============================
 
@@ -386,20 +400,30 @@ async def _edit_plain_message(chat_id: int, message_id: int, text: str) -> bool:
 async def execute_send_message_to_user(chat_id: int, arguments: dict) -> str:
     """执行 send_message_to_user 工具调用。
 
-    仅在 TIMER 回合中可用：USER 回合的工具列表不包含本工具，若模型仍
-    幻觉调用，这里会返回明确的错误说明。
+    仅在 TIMER 回合中可用：USER 回合的工具列表不包含本工具，且历史中的
+    调用痕迹已被 tool_visibility.apply_tool_visibility 折叠成文本摘要
+    （消除模仿诱导的根因）；若模型仍幻觉调用，这里的兜底文案只做
+    “无害化引导”，绝不能用“失败”开头或指示模型“直接把回复写给用户”——
+    那会在多步任务中途被理解成“立即收尾”，把任务打断成提前终止。
     """
     if chat_id is None:
         return json.dumps({"error": "chat_id is required"}, ensure_ascii=False)
 
     flow = _active_flows.get(chat_id)
     if flow is None:
+        # 幻觉兜底：本调用未执行、也无需重试；明确“继续当前任务，
+        # 不要提前收尾”，内容留到最终回复——避免旧文案“请直接把回复
+        # 内容写给用户即可”诱发的提前终止。不以“失败”开头，防止
+        # _tool_result_is_failure 把本条归为 error（UI 标红会进一步
+        # 强化模型“出错了”的错误判断）。
         return (
-            "失败：当前没有处于后台唤醒状态的 agent 回合，send_message_to_user 不可用。"
-            "请直接把回复内容写给用户即可。"
+            "提示：当前回合是用户主动发起的会话，本工具仅在系统后台唤醒"
+            "回合可用，本次调用未执行、无需重试。请继续完成你正在进行的"
+            "任务，不要因此中断或提前收尾；需要让用户看到的内容，在任务"
+            "完成后写进本轮最终回复即可。"
         )
     if flow.interrupted:
-        return "失败：本回合已被用户的新消息打断，不要再发送消息。"
+        return "提示：本回合已被用户的新消息打断，不要再通过本工具发送消息，也不要重试。"
 
     action = str(arguments.get("action") or "send").strip().lower()
     content = arguments.get("content")

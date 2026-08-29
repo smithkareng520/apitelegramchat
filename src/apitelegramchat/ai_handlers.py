@@ -39,6 +39,7 @@ from apitelegramchat.utils import (
 )
 from apitelegramchat.skills import skill_catalog_brief
 from apitelegramchat.context_manager import select_request_context
+from apitelegramchat.tool_visibility import apply_tool_visibility
 from apitelegramchat.api_client import api_client
 import apitelegramchat.state as state
 
@@ -365,7 +366,11 @@ async def get_ai_response(
     """统一调度入口：按事件源（USER / TIMER）动态分配工具与输出处理。
 
     - USER（用户主动发消息）：行为与旧实现完全一致——可见草稿流式输出、
-      工具列表不包含 send_message_to_user、最终富文本推送给用户。
+      工具列表不包含 send_message_to_user、最终富文本推送给用户。此外
+      历史中 TIMER 回合沉淀的 send_message_to_user 调用会被
+      apply_tool_visibility 折叠成普通文本摘要（见 tool_visibility.py）——
+      消除“历史里有成功调用先例”的模仿诱导，这是 USER 回合幻觉调用该
+      工具的根因；TIMER 回合则原样保留完整调用史。
     - TIMER（系统定时唤醒，见 proactive.py）：使用 SilentMessageBuilder，
       agent 过程（草稿/工具进度/最终文本）不输出到 Telegram；工具列表在
       基础工具之上追加 send_message_to_user（并移除 ask_user/present_files
@@ -419,6 +424,13 @@ async def get_ai_response(
             context_snapshot = select_request_context(stored_history)
             history = context_snapshot.messages
             supports_tools = model_info.supports_tools
+
+        # 按事件源改写历史中“回合专属工具”的调用痕迹（可拔插，见
+        # tool_visibility.py）：USER 回合把 send_message_to_user 的历史调用
+        # 折叠成普通文本摘要，消除模型模仿调用的根因；TIMER 回合零开销
+        # 直通（edit/delete 仍依赖完整调用史中的 message_id）。只改出站
+        # 副本，持久历史不受影响。
+        history = apply_tool_visibility(history, event_source)
 
         if context_snapshot.dropped_messages:
             logger.info(
