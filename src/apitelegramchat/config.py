@@ -11,27 +11,25 @@ logger = logging.getLogger(__name__)
 
 # ---------- 环境变量 ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+GLM_API_KEY = os.getenv("GLM_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+XAI_API_KEY = os.getenv("XAI_API_KEY", "")
+
 # OpenRouter 全局路由偏好：默认价格优先、允许自动回退；可用环境变量覆盖。
 OPENROUTER_PROVIDER_SORT = (os.getenv("OPENROUTER_PROVIDER_SORT") or "price").strip() or "price"
 OPENROUTER_ALLOW_FALLBACKS = os.getenv("OPENROUTER_ALLOW_FALLBACKS", "true").strip().lower() in {"1", "true", "yes", "on"}
 OPENROUTER_REQUIRE_PARAMETERS = os.getenv("OPENROUTER_REQUIRE_PARAMETERS", "false").strip().lower() in {"1", "true", "yes", "on"}
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 MODELSCOPE_API_KEY = os.getenv("MODELSCOPE_API_KEY", "")
 AGNES_API_KEY = os.getenv("AGNES_API_KEY", "")
+
 
 # ---------- 高德地图 MCP 服务（@amap/amap-maps on ModelScope）----------
 # 通过 streamable_http 调用，使用 Bearer token 鉴权。
 # 替代了原先的 amap_integration.py 直接调用高德 Web 服务 API 的方式。
 # 未配置 GAODE_MCP_TOKEN 或 GAODE_MCP_URL 时该 MCP 服务不可用（mcp_client.py 会跳过注册）。
-#
-# 注意：GAODE_MCP_URL 不设默认值——之前的默认值硬编码了一个具体的
-# ModelScope MCP 实例路径（.../3331c36972ff42/mcp），这类路径段通常绑定
-# 到某个具体账号的私有实例。一旦部署方忘记覆盖该环境变量，就会在不知情
-# 的情况下把请求发往别人的实例（可能是私有、限流或按量计费的），且大概率
-# 连不通或返回权限错误。改为必须显式配置（与 SERPER_API_KEY 同口径）。
 GAODE_MCP_ENABLED = os.getenv("GAODE_MCP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 GAODE_MCP_URL = (os.getenv("GAODE_MCP_URL") or "").strip()
 GAODE_MCP_TOKEN = (os.getenv("GAODE_MCP_TOKEN") or "").strip()
@@ -40,7 +38,7 @@ GAODE_MCP_TOKEN = (os.getenv("GAODE_MCP_TOKEN") or "").strip()
 # 直接调用 https://google.serper.dev/{search,images,videos,lens}，使用
 # X-API-KEY 头鉴权。Key 从 https://serper.dev 注册并获取，配置在
 # Render Environment 中作为 secret。一个 key 即可同时支持 4 种模式。
-SERPER_API_KEY = (os.getenv("SERPER_API_KEY") or "").strip()
+SERPER_API_KEY = (os.getenv("SERPER_API_KEY", "") or "").strip()
 # 可选：单次请求超时（秒）；默认 12s 与外层 web_search 工具超时（45s）预算匹配。
 # 真正赋值在 _positive_float_env 定义之后（见下文 SERPER_API_TIMEOUT_RESOLVED）。
 
@@ -798,7 +796,7 @@ _SENSITIVE_PATTERNS = (
     "CREDENTIAL", "PRIVATE", "ACCESS", "WEBHOOK_TOKEN",
 )
 _SENSITIVE_EXACT = {
-    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN", "GLM_API_KEY",
     "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY",
     "XAI_API_KEY", "GROQ_API_KEY", "MODELSCOPE_API_KEY", "AGNES_API_KEY",
     "R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY",
