@@ -5,13 +5,25 @@
 ==========
 
 本模块让 Agent 拥有"自己的活动时间"：用户空闲约 20 分钟后，调度器开始像人
-一样不定期地唤醒 Agent（随机 10/20/40 分钟，总之 1 小时以内）；每次唤醒与
-用户主动发消息（USER 事件源）共用同一份会话历史（统一上下文），但行为不同：
+一样不定期地唤醒 Agent（随机 10 分钟到 1 小时）；每次唤醒与用户主动发消息
+（USER 事件源）共用同一份会话历史（统一上下文），但行为不同：
 
 - TIMER 回合对用户**完全静默**：不创建草稿、不显示工具进度、最终文本也不
   推送到 Telegram——这些只存在于历史上下文中。唯一能触达用户的通道是模型
   显式调用 ``send_message_to_user``，且内容按**普通纯文本**（不带任何格式）
   通过 sendMessage 发送，像人随手发消息一样。
+
+必发消息（提示词层，无代码兜底）
+==================================
+
+``WAKEUP_PROMPT`` 要求模型把每个 TIMER 回合当作一次主动发起对话的机会，
+结束时用户必须收到一条消息（唯一通道仍是 ``send_message_to_user``）：
+
+1. 有要紧事（Todo 到期/临近、上下文遗留的跟进、相关新信息）→ 优先说要紧事；
+2. 没有要紧事 → 像朋友一样自然地找话题聊（近期兴趣、时段、开放式小问题）。
+
+发送完全由模型自己完成：调度器不做任何代码层补发，也没有开关。
+
 - 唤醒用的合成 user 消息（WAKEUP_PROMPT）只进入本轮请求，**不写入持久历史**
   （timer 唤醒不写入历史）；回合产生的 assistant/tool 消息正常沉淀，保证
   用户下次回复时模型仍知道后台做过什么（统一上下文）。
@@ -109,8 +121,9 @@ PROACTIVE_IDLE_START_SECONDS = _env_seconds("PROACTIVE_IDLE_START_SECONDS", 20 *
 # 根据用户状态动态调整，避免机械节奏
 PROACTIVE_INTERVAL_MIN_SECONDS = _env_seconds("PROACTIVE_INTERVAL_MIN_SECONDS", 10 * 60)
 PROACTIVE_INTERVAL_MAX_SECONDS = _env_seconds("PROACTIVE_INTERVAL_MAX_SECONDS", 60 * 60)
-# 主动消息保护：默认每天最多主动联系次数
-PROACTIVE_DAILY_MESSAGE_LIMIT = _env_seconds("PROACTIVE_DAILY_MESSAGE_LIMIT", 2)
+# 主动消息保护（【已废弃】：不再限制每日主动消息数，默认值改为大数=不生效；
+# 保留变量名仅为兼容旧配置/旧导入，如需限流可显式设置较小值）
+PROACTIVE_DAILY_MESSAGE_LIMIT = _env_seconds("PROACTIVE_DAILY_MESSAGE_LIMIT", 10 ** 9)
 # 用户连续多久没发消息 → 停止高频触发
 PROACTIVE_MAX_IDLE_SECONDS = _env_seconds("PROACTIVE_MAX_IDLE_SECONDS", 3 * 3600)
 # 停止触发后的休息时长；休息结束后再触发一次（用户仍无回应则继续休息）
@@ -129,70 +142,61 @@ _PLAIN_TEXT_LIMIT = 4000
 WAKEUP_PROMPT = """
 [系统后台唤醒｜TIMER 主动巡检回合]
 
-你现在处于“主动巡检回合”。不要把这次唤醒当成普通聊天请求。
-这是一次“由你主动判断现在是否应该为用户做点什么”的机会。
+你现在处于“主动巡检回合”。这不是一次普通的聊天请求，而是一次由你主动
+发起对话的机会。
 
-必须按下面顺序工作，并以“有价值才行动、没有价值就静默”为原则：
+本回合有一条硬性要求：结束时用户必须收到你的一条消息。你的 assistant 最终
+文本不会送达用户，唯一通道是 send_message_to_user——不发工具调用，用户就
+什么都收不到。所以“查完之后什么都不发”不是谨慎，而是失职。
 
-1. 检查当前 Todo
-   - 优先调用 todo 的 list，检查未完成任务。
-   - 判断是否存在：已到期、临近到期、长期未推进、现在适合推进、或现在值得提醒的任务。
-   - 如果任务明确且安全、且无需用户补充信息，可以推进 Todo 状态；否则优先提醒用户。
-   - 不要为了“有事可做”而虚构任务、修改无关任务或重复提醒已经处理过的事情。
+按下面的优先级决定说什么：
+
+1. 检查当前 Todo（第一优先级）
+   - 优先调用 todo 的 list，检查未完成任务：已到期、临近到期、长期未推进、
+     现在适合推进、或现在值得提醒的任务。
+   - 任务明确且安全、且无需用户补充信息时，可以推进 Todo 状态；否则提醒用户。
+   - 不要为了“有事可做”而虚构任务、修改无关任务或重复提醒已处理过的事。
 
 2. 检查最近上下文
-   - 回看最近对话，寻找未完成的话题、用户留下的待办、承诺、等待结果、计划和自然后续。
-   - 判断是否有事情到了“现在联系用户最自然”的时间点。
-   - 注意避免重复发送上一轮已经说过的内容。
+   - 回看最近对话，寻找未完成的话题、用户留下的待办、承诺、等待结果、计划
+     和自然后续；有话到了“现在联系最自然”的时间点就顺着聊。
+   - 可以（适度）用 web_search 查证与用户上下文相关的新信息再分享，但不要
+     每个回合都变成新闻播报。
 
-3. 判断主动沟通价值
-   按优先级判断：
-   A. 明确任务需要推进/提醒 → 推进或提醒；
-   B. 有自然、具体的跟进 → 主动联系；
-   C. 有与用户上下文相关、现在有价值的新信息 → 主动分享；
-   D. 没有重大事项，但存在轻量、真实、自然的交流机会 → 可以联系；
-   E. 以上都没有 → 保持静默。
+3. 没有要紧事 → 主动找话题聊（这是本回合的兜底动作，不是可选项）
+   - 从最近聊天里挑一个用户表现出兴趣的点接着聊（爱好、近况、之前提过的事）；
+   - 结合当下时间（早晨/午后/晚上/深夜/周几）自然开场；
+   - 抛一个轻松、具体、开放式的小问题，或分享一个有趣的想法；
+   - 像朋友随手发消息那样：短、自然、能让人想回一句；
+   - 换着花样来，不要每次都用同一种开场方式，不要重复上一轮说过的话。
 
-   “轻量交流机会”必须与用户近期上下文有真实关联，不能只是泛泛寒暄。
-   宁可少发，也不要为了完成 TIMER 回合而制造消息。
-
-4. 如果决定联系用户
-   - 必须调用 send_message_to_user。
-   - 不要只生成 assistant 文本；assistant 最终文本不会直接送达用户。
-   - 一次回合通常只发一条最有价值的消息；只有确有必要时才发送多条。
-   - 消息要短、自然、具体，像真人主动想起一件事后发来的消息。
-   - 不要解释“这是 TIMER/后台唤醒”，不要报告内部检查过程。
-   - 不要使用 Markdown/HTML。
-
-5. 如果没有任何合理行动
-   - 不调用 send_message_to_user。
-   - 保持静默即可。
+消息风格（无论哪个优先级都适用）：
+- 必须通过 send_message_to_user 发送；一次回合通常只发一条，确有必要才多条。
+- 短、口语化、像真人主动想起一件事后随手发的消息；不要 Markdown/HTML。
+- 不要解释“这是 TIMER/后台唤醒”，不要报告你的检查过程或决策过程。
 
 禁止：
-- “明白，我会注意……”
-- “有什么我可以帮您的吗？”
-- “我会等待您的消息。”
-- “只是想问问你最近怎么样”
-- 为了完成回合而发送无意义寒暄。
-- 因为孤独、活跃度或系统要求而强行制造互动。
-- 把内部推理、工具检查过程或“我决定不联系”发送给用户。
+- 空洞的服务性套话：“明白，我会注意……”“有什么我可以帮您的吗？”“我会等待您的消息。”
+- 查完 Todo 和上下文之后什么都不发。
+- 把内部推理、工具检查过程或“我决定不发”之类的说明发给用户。
+- 编造用户没说过的承诺、时间或事实。
 
-重要：
-- 本回合的目标不是“必须发消息”，而是“主动判断是否值得发消息”。
-- Todo 与最近上下文是第一优先级；不要跳过 Todo 检查直接闲聊。
-- 只在有充分依据时行动，不编造用户意图、时间、承诺或事实。
+一句话总结：有要紧事，优先说要紧事；没有要紧事，就找个自然的话题聊——
+但本回合绝不能以沉默收场。
 """
+
 
 SEND_MESSAGE_TO_USER_TOOL = {
     "type": "function",
     "function": {
         "name": "send_message_to_user",
         "description": (
-            "向当前用户推送一条即时消息（仅在系统后台唤醒的活动时间可用）。"
+            "向当前用户推送一条即时消息（系统后台唤醒回合里唯一能触达用户的通道）。"
+            "后台唤醒回合必须至少调用一次本工具：有要紧事（任务提醒、上下文跟进、相关新信息）"
+            "就说要紧事；没有要紧事就自然地找个话题聊，但绝不能不发。"
             "内容必须是普通纯文本：不使用任何 Markdown、HTML 或格式符号——像人随手发消息一样简短自然。"
             "同一个工具通过 action 控制行为：send 发送新消息（返回 message_id）；"
             "edit 编辑你此前发出的某条消息；delete 撤回（删除）你此前发出的某条消息。"
-            "不要频繁打扰用户，但不要因为没有重大事件而避免发送。只要消息自然、有帮助或能推进关系维护，就可以主动发送。"
         ),
         "parameters": {
             "type": "object",
@@ -558,7 +562,7 @@ async def _sleep_or_stop(seconds: float) -> bool:
         return False
 
 
-async def _wait_activity_or_stop(chat_id: int, timeout: float) -> bool:
+async def _wait_activity_or_stop(chat_id: int, timeout: float) -> str:
     """等待 timeout 秒；期间用户有新活动返回 'activity'，调度器停止返回 'stop'。"""
     deadline = time.monotonic() + timeout
     sched = _schedules.get(chat_id)
@@ -626,7 +630,7 @@ async def _fire_turn(chat_id: int) -> None:
 
     flow.task.add_done_callback(_log_unexpected)
     logger.info(
-        "[TIMER] chat=%s 决策=RUN：开始执行主动巡检（todo→context→value→action）",
+        "[TIMER] chat=%s 决策=RUN：开始执行主动巡检（todo→context→info→chat，必发消息）",
         chat_id,
     )
 
@@ -691,10 +695,8 @@ async def _chat_scheduler_loop(chat_id: int) -> None:
                     else:
                         interval = random.randint(PROACTIVE_INTERVAL_MAX_SECONDS, 90 * 60)
                     logger.info(
-                        "[TIMER] chat=%s 下一次智能巡检计划：%ss 后（human_random=true，priority=adaptive）",
-                        chat_id, interval,
-                        PROACTIVE_INTERVAL_MIN_SECONDS,
-                        PROACTIVE_INTERVAL_MAX_SECONDS,
+                        "[TIMER] chat=%s 下一次巡检计划：%smin 后（human_random=true）",
+                        chat_id, max(1, round(interval / 60)),
                     )
                     state = await _wait_activity_or_stop(chat_id, interval)
                     if state == "activity":
@@ -731,10 +733,10 @@ async def start_proactive_scheduler() -> None:
         return
     _stop_event.clear()
     logger.info(
-        "[proactive] 调度器启动：idle_start=%ss interval_range=%s-%ss max_idle=%ss rest=%ss daily_limit=%s",
+        "[proactive] 调度器启动：idle_start=%ss interval_range=%s-%ss max_idle=%ss rest=%ss",
         PROACTIVE_IDLE_START_SECONDS, PROACTIVE_INTERVAL_MIN_SECONDS,
         PROACTIVE_INTERVAL_MAX_SECONDS, PROACTIVE_MAX_IDLE_SECONDS,
-        PROACTIVE_REST_SECONDS, PROACTIVE_DAILY_MESSAGE_LIMIT,
+        PROACTIVE_REST_SECONDS,
     )
 
 
