@@ -24,8 +24,8 @@
 
 - 用户空闲 ``PROACTIVE_IDLE_START_SECONDS``（默认 1200s ≈ 20min，含 ±10% 抖动）
   后触发第一次唤醒；
-- 之后每次唤醒间隔从 ``PROACTIVE_INTERVAL_CHOICES``（默认 600,1200,2400 秒）
-  中随机选择；
+- 之后每次唤醒间隔从 ``PROACTIVE_INTERVAL_MIN_SECONDS`` 到
+  ``PROACTIVE_INTERVAL_MAX_SECONDS``（默认 10 分钟到 1 小时）随机选择；
 - 用户连续 ``PROACTIVE_MAX_IDLE_SECONDS``（默认 10800s = 3h）没有发消息：
   停止高频触发，改为**休息 1 小时再触发一次**的慢节奏（人在长时间没回应时
   也不会一直刷屏）；用户随时回来则立即恢复正常节奏；
@@ -105,7 +105,12 @@ PROACTIVE_ENABLED = _env_flag("PROACTIVE_ENABLED", True)
 # 用户空闲多久后开始"活动时间"（首次唤醒触发点）
 PROACTIVE_IDLE_START_SECONDS = _env_seconds("PROACTIVE_IDLE_START_SECONDS", 20 * 60)
 # 两次唤醒之间的随机间隔候选（像人一样不定期）
-PROACTIVE_INTERVAL_CHOICES = _env_seconds_list("PROACTIVE_INTERVAL_CHOICES", [600, 1200, 2400])
+# 主动巡检随机间隔范围（默认 10 分钟 ~ 1 小时）
+# 根据用户状态动态调整，避免机械节奏
+PROACTIVE_INTERVAL_MIN_SECONDS = _env_seconds("PROACTIVE_INTERVAL_MIN_SECONDS", 10 * 60)
+PROACTIVE_INTERVAL_MAX_SECONDS = _env_seconds("PROACTIVE_INTERVAL_MAX_SECONDS", 60 * 60)
+# 主动消息保护：默认每天最多主动联系次数
+PROACTIVE_DAILY_MESSAGE_LIMIT = _env_seconds("PROACTIVE_DAILY_MESSAGE_LIMIT", 2)
 # 用户连续多久没发消息 → 停止高频触发
 PROACTIVE_MAX_IDLE_SECONDS = _env_seconds("PROACTIVE_MAX_IDLE_SECONDS", 3 * 3600)
 # 停止触发后的休息时长；休息结束后再触发一次（用户仍无回应则继续休息）
@@ -169,6 +174,7 @@ WAKEUP_PROMPT = """
 - “我会等待您的消息。”
 - “只是想问问你最近怎么样”
 - 为了完成回合而发送无意义寒暄。
+- 因为孤独、活跃度或系统要求而强行制造互动。
 - 把内部推理、工具检查过程或“我决定不联系”发送给用户。
 
 重要：
@@ -676,10 +682,19 @@ async def _chat_scheduler_loop(chat_id: int) -> None:
                 if idle < PROACTIVE_MAX_IDLE_SECONDS:
                     # 正常节奏：先触发（首次进入时立即，之后在间隔后）
                     await _fire_turn(chat_id)
-                    interval = random.choice(PROACTIVE_INTERVAL_CHOICES)
+                    # 人类化随机：大部分集中在较短关注窗口，少量延迟更久
+                    roll = random.random()
+                    if roll < 0.65:
+                        interval = random.randint(PROACTIVE_INTERVAL_MIN_SECONDS, 30 * 60)
+                    elif roll < 0.9:
+                        interval = random.randint(30 * 60, PROACTIVE_INTERVAL_MAX_SECONDS)
+                    else:
+                        interval = random.randint(PROACTIVE_INTERVAL_MAX_SECONDS, 90 * 60)
                     logger.info(
-                        "[TIMER] chat=%s 下一次巡检计划：%ss 后（候选=%s）",
-                        chat_id, interval, PROACTIVE_INTERVAL_CHOICES,
+                        "[TIMER] chat=%s 下一次智能巡检计划：%ss 后（human_random=true，priority=adaptive）",
+                        chat_id, interval,
+                        PROACTIVE_INTERVAL_MIN_SECONDS,
+                        PROACTIVE_INTERVAL_MAX_SECONDS,
                     )
                     state = await _wait_activity_or_stop(chat_id, interval)
                     if state == "activity":
@@ -716,9 +731,10 @@ async def start_proactive_scheduler() -> None:
         return
     _stop_event.clear()
     logger.info(
-        "[proactive] 调度器启动：idle_start=%ss intervals=%s max_idle=%ss rest=%ss",
-        PROACTIVE_IDLE_START_SECONDS, PROACTIVE_INTERVAL_CHOICES,
-        PROACTIVE_MAX_IDLE_SECONDS, PROACTIVE_REST_SECONDS,
+        "[proactive] 调度器启动：idle_start=%ss interval_range=%s-%ss max_idle=%ss rest=%ss daily_limit=%s",
+        PROACTIVE_IDLE_START_SECONDS, PROACTIVE_INTERVAL_MIN_SECONDS,
+        PROACTIVE_INTERVAL_MAX_SECONDS, PROACTIVE_MAX_IDLE_SECONDS,
+        PROACTIVE_REST_SECONDS, PROACTIVE_DAILY_MESSAGE_LIMIT,
     )
 
 
