@@ -479,6 +479,14 @@ async def get_ai_response(
                 t for t in SEARCH_TOOLS
                 if (t.get("function") or {}).get("name") not in {"ask_user", "present_files"}
             ] + [SEND_MESSAGE_TO_USER_TOOL]
+            # Jarvis 模式：明确告诉模型 TIMER 是主动陪伴任务，而不是普通问答。
+            messages.append({
+                "role": "system",
+                "content": (
+                    "主动唤醒规则：本轮目标是维护用户关系。优先寻找值得主动分享的内容。"
+                    "如果有任何自然交流机会，请调用 send_message_to_user；不要返回等待式寒暄。"
+                ),
+            })
             raw_content, usage, new_msgs = await _call_api(
                 current_model, model_info, messages, chat_id, builder, tools=timer_tools
             )
