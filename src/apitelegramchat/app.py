@@ -22,6 +22,8 @@ from apitelegramchat.utils import (
     get_logger,
     set_request_id,
     extract_message_text,
+    extract_sticker_metadata,
+    sticker_metadata_to_text,
     transcribe_audio_with_groq,
 )
 from apitelegramchat.ai_handlers import get_ai_response, _get_cached_audio_data
@@ -753,6 +755,34 @@ async def _handle_video_message(chat_id: int, user_message: dict, username: str)
     except Exception as e:
         logger.exception(f"_handle_video_message 异常: {e}")
         await send_rich_html_message(chat_id, f"❌ <b>处理视频时出错</b>\n<code>{str(e)[:100]}</code>")
+
+async def _handle_sticker_message(chat_id: int, user_message: dict, username: str):
+    """处理用户发送的贴纸（sticker）。
+
+    贴纸本体（TGS / WebP / WebM）目前主流 LLM 不可直接识别，因此只把
+    Telegram Sticker 对象携带的可语义化字段——emoji / emoji_list / type /
+    set_name / custom_emoji_id / format——拼成文本作为 user 消息发给模型。
+    不携带 file_id 附件，避免 _resolve_multimodal_content 把不可识别的
+    媒体推到模型 API 触发 400。
+    """
+    await send_chat_action(chat_id, "typing")
+    asyncio.create_task(init_workspace(chat_id))
+    try:
+        is_safe = await pre_flight_context_check(chat_id, user_message)
+        if not is_safe:
+            await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的贴纸附加内容过长，已超过模型单次处理极限，请精简发送。")
+            return
+        full, _, new_msgs, usage = await get_ai_response(
+            chat_id, user_models, user_contexts, username,
+            user_message=user_message,
+        )
+        if full and not full.startswith(("⚠️", "❌")):
+            await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"_handle_sticker_message 异常: {e}")
+        await send_rich_html_message(chat_id, f"❌ <b>处理贴纸时出错</b>\n<code>{str(e)[:100]}</code>")
 
 
 # ==================== TIMER 主动唤醒（统一事件源调度） ====================
@@ -1828,6 +1858,48 @@ async def webhook() -> tuple:
                         active_tasks[chat_id] = task
                     task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
                     return "OK", 200
+
+            # ── 贴纸（sticker）─────────────────────────────────────────────
+            # Sticker 本体（TGS / WebP / WebM）当前主流 LLM 不可直接识别，
+            # 但 Sticker 对象携带 emoji / emoji_list / type / set_name 等
+            # 可语义化字段，把它们的元数据拼成文本作为 user 消息发给模型；
+            # 不把 file_id 推为附件，避免 _resolve_multimodal_content 把
+            # 不可识别媒体推到模型 API 触发 400。
+            if "sticker" in msg:
+                sticker_obj = msg["sticker"] or {}
+                sticker_meta = extract_sticker_metadata(sticker_obj)
+                sticker_text = sticker_metadata_to_text(sticker_obj)
+
+                context_prefix = _get_reply_context(msg)
+
+                content_lines = [f"📎 用户发送了贴纸"]
+                if sticker_text and sticker_text != "[贴纸]":
+                    content_lines.append(sticker_text)
+                else:
+                    # 退化场景：Sticker 没有任何可读元数据时也至少给个
+                    # 占位，避免把空内容塞给模型。
+                    content_lines.append("[贴纸]（无可读元数据）")
+                if context_prefix:
+                    content_lines.append("")
+                    content_lines.append(context_prefix.rstrip())
+                content_text = "\n".join(l for l in content_lines if l is not None).strip()
+
+                user_message = {
+                    "role": "user",
+                    "content": content_text,
+                    "type": "sticker",
+                    # 保留 sticker 元数据快照，方便后续历史回看 / 工具调用
+                    # 引用，但不会出现在出站 LLM 消息里（_append_history_async
+                    # 已经过滤掉所有非 OpenAI 协议字段）。
+                    "sticker_meta": sticker_meta,
+                }
+
+                await _interrupt_active_generation(chat_id)
+                task = asyncio.create_task(_handle_sticker_message(chat_id, user_message, username))
+                async with active_tasks_lock:
+                    active_tasks[chat_id] = task
+                task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
+                return "OK", 200
 
             # ── 文本消息 ──────────────────────────────────────────────────
             if "text" in msg:

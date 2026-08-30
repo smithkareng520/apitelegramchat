@@ -1438,6 +1438,88 @@ def _extract_rich_message_text(rich_obj: Union[dict, list, str]) -> str:
             return "".join(result)
     return ""
 
+def extract_sticker_metadata(sticker: dict) -> dict:
+    """从 Telegram Sticker 对象里抽取**对 LLM 有语义价值**的字段。
+
+    Telegram Bot API 的 Sticker 对象字段（已查证
+    https://core.telegram.org/bots/api#sticker 与 changelog）很多，
+    但大部分对 LLM 没有意义（file_id / file_unique_id 是不透明 ID，
+    width / height / file_size 是数字尺寸，thumbnail / 
+    premium_animation / mask_position 是几何 / 文件对象），
+    LLM 拿到也只是噪声。本函数只保留 LLM 能真正读懂的语义字段。
+
+    ⚠️ 已确认事实（已查证官方文档与 changelog）：
+      - Sticker 对象 **没有** `emoji_list` 字段（该字段只在 InputSticker
+        上，即 bot 上传贴纸时使用的请求对象）。Sticker 上 emoji 相关
+        的字段只有一个：`emoji`（单个字符串，可选）。
+      - Sticker 对象 **没有** `format` 字段；格式由 `is_animated` /
+        `is_video` 两个布尔表达。本函数按官方说明派生 format=
+        static/animated/video 便于 LLM 阅读。
+
+    输出字段（缺字段的直接跳过，不写入字典；只为 LLM 服务的字段）：
+      emoji     : str  - Sticker.emoji 原值（唯一的情感语义信号）
+      type      : str  - regular / mask / custom_emoji
+      format    : str  - 由 is_animated / is_video 派生为
+                          static / animated / video
+      set_name  : str  - 贴纸包名（如 "AnimatedEmojis" / "Cats"，
+                          包名本身常带语义提示）
+    """
+    if not isinstance(sticker, dict) or not sticker:
+        return {}
+    meta = {}
+    # emoji：Sticker 唯一的 emoji 字段，单个字符串，可选。
+    emoji_value = sticker.get("emoji")
+    if emoji_value:
+        meta["emoji"] = emoji_value
+    # type：regular / mask / custom_emoji。
+    type_value = sticker.get("type")
+    if type_value:
+        meta["type"] = type_value
+    # set_name：贴纸包名（可空）。
+    set_name = sticker.get("set_name")
+    if set_name:
+        meta["set_name"] = set_name
+    # format：派生字段，Sticker 本身没有，由 is_animated / is_video 合成。
+    if sticker.get("is_video"):
+        meta["format"] = "video"
+    elif sticker.get("is_animated"):
+        meta["format"] = "animated"
+    else:
+        meta["format"] = "static"
+    return meta
+
+
+def sticker_metadata_to_text(sticker: dict) -> str:
+    """把 Sticker 元数据渲染成对 LLM 友好的短文本。
+
+    用于：用户直接发贴纸 / 引用回复贴纸 / extract_message_text 占位时，
+    把贴纸携带的 emoji 等语义信息显式带到对话里，避免 AI 只看到
+    "[贴纸]" 这样的无信息占位。
+
+    只输出对 LLM 有语义价值的字段：emoji / 类型 / 格式 / 贴纸包名。
+    """
+    meta = extract_sticker_metadata(sticker)
+    if not meta:
+        return "[贴纸]"
+    parts = []
+    # emoji 优先放在最前，这是 LLM 唯一能直接看见的情感语义信号。
+    if meta.get("emoji"):
+        parts.append(f"emoji：{meta['emoji']}")
+    type_str = meta.get("type")
+    if type_str:
+        type_label = {
+            "regular": "普通贴纸",
+            "mask": "面具贴纸",
+            "custom_emoji": "自定义表情贴纸",
+        }.get(type_str, type_str)
+        parts.append(f"类型：{type_label}")
+    if meta.get("format"):
+        parts.append(f"格式：{meta['format']}")
+    if meta.get("set_name"):
+        parts.append(f"贴纸包：{meta['set_name']}")
+    return "[贴纸] " + " | ".join(parts) if parts else "[贴纸]"
+
+
 def extract_message_text(message: dict) -> str:
     if not message:
         return ""
@@ -1459,8 +1541,9 @@ def extract_message_text(message: dict) -> str:
                 return plain
     if message.get("photo") or message.get("video") or message.get("audio") or message.get("document"):
         return "[媒体内容]"
-    if message.get("sticker"):
-        return "[贴纸]"
+    sticker = message.get("sticker")
+    if sticker:
+        return sticker_metadata_to_text(sticker)
     if message.get("voice"):
         return "[语音消息]"
     content = message.get("content")
