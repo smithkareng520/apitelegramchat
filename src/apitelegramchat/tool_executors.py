@@ -2467,9 +2467,48 @@ _REMOVED_TOOL_HINTS = {
     "ip_geo": (
         "ip_geo 已移除：不再提供 IP 归属地查询能力，无需重试。"
     ),
+    "send_message_to_user": (
+        "send_message_to_user 已移除：请改用 message_user（提问/留言，超时即用户不在）"
+        "或 deliver_reply（静默模式下交付最终回复）。无需重试本工具。"
+    ),
+    "ask_user": (
+        "ask_user 已更名为 message_user：参数与行为兼容（question 必填，options 可选），"
+        "请改用 message_user。无需重试本工具。"
+    ),
 }
 
 # ---------- 工具分发 ----------
+async def execute_deliver_reply(chat_id: int, arguments: dict) -> str:
+    """deliver_reply：静默模式（/show off）下交付最终回复给用户。
+
+    通过 sendRichMessage 发送永久富文本消息（不经过草稿）；发送成功后
+    在 turn_recovery 里标记"本轮已主动交付"，get_ai_response 收尾时据此
+    判断用户主动回合是否需要兜底直发。
+    """
+    content = arguments.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return "失败：deliver_reply 需要 content（要发送的富文本 HTML 内容）。"
+    from apitelegramchat.utils import send_rich_html_message
+    from apitelegramchat import turn_recovery
+    try:
+        result = await send_rich_html_message(chat_id, content, reassert_draft=False)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"[deliver_reply] 发送失败: {e}")
+        return "失败：消息发送异常，可稍后重试。"
+    if isinstance(result, int) and not isinstance(result, bool) and result > 0:
+        turn_recovery.mark_reply_delivered(chat_id)
+        preview = content if len(content) <= 60 else content[:60] + "…"
+        logger.info("[deliver_reply] chat=%s 已交付最终回复 message_id=%s chars=%s", chat_id, result, len(content))
+        return f"已发送给用户（message_id={result}）：{preview}"
+    if result is True:
+        # HTTP 200 但未解析到 message_id：按成功处理。
+        turn_recovery.mark_reply_delivered(chat_id)
+        return "已发送给用户。"
+    return "失败：消息发送失败（网络或 Telegram 错误），可稍后重试。"
+
+
 async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_callback=None) -> str:
     if chat_id is None:
         # 早期失败：避免创建 ./workspace/None 造成跨会话数据泄漏
@@ -2639,12 +2678,10 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             if isinstance(paths, str):
                 paths = [paths]
             return await execute_present_files(chat_id, paths, namespace=resolved_namespace)
-        elif name == "send_message_to_user":
-            # 主动唤醒（TIMER）回合专用：向用户推送/编辑/撤回普通纯文本消息。
-            # USER 回合的工具列表不含本工具；若模型仍幻觉调用，executor 会
-            # 返回明确的错误说明。见 proactive.py。
-            from apitelegramchat import proactive as _proactive
-            return await _proactive.execute_send_message_to_user(chat_id, arguments)
+        elif name == "deliver_reply":
+            # 静默模式（/show off）下模型自主选择的最终内容交付通道：
+            # 经 sendRichMessage 发送永久富文本消息（不经过草稿）。
+            return await execute_deliver_reply(chat_id, arguments)
         elif name in _REMOVED_TOOL_HINTS:
             # stage_upload / fetch_download / list_download / list_upload / ip_geo 已移除；
             # 迁移提示让模型立即改用 bash 直访，避免无意义的重试。

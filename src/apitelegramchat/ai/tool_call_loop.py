@@ -24,6 +24,7 @@ from apitelegramchat.ask_user_tool import (
     wait_for_answer,
     answer_to_tool_result,
 )
+from apitelegramchat.turn_recovery import INTERRUPTED_TOOL_PLACEHOLDER
 from apitelegramchat.ai._constants import (
     MAX_TOOL_CALLS,
     TOOL_CALL_TIMEOUT,
@@ -257,6 +258,12 @@ async def _run_tool_calls_and_append(
     #  has_ask_user_tool 三个从未被读取的变量，属心跳任务删除后的残留。）
 
     async def run_one(fn_name, fn_args, tc_id):
+        # 打断保全：工具真正执行完成时把结果登记到共享 dict。
+        # 批次被取消时（asyncio.gather 抛 CancelledError），已完成的工具
+        # 结果由 _salvage_interrupted_batch 回填真实 tool 消息，未完成的
+        # 补占位 tool 消息——保证 assistant.tool_calls 全部配对，
+        # 已完成的进度不因打断丢失（见 turn_recovery.py）。
+        completed_results = _batch_completed_results
         async with tool_semaphore:
             # 图像 / 视频工具不设超时（内部已有轮询超时控制）
             # 子 agent 走 930s 超时（内部默认 900s，用户可配到 1800s）
@@ -340,38 +347,32 @@ async def _run_tool_calls_and_append(
                         f"Error: tool {fn_name} was not executed because the model returned malformed JSON "
                         f"arguments ({invalid_arguments}). Reissue the same tool call with a valid JSON object."
                     )
-                elif fn_name == "ask_user":
-                    if getattr(builder, "silent", False):
-                        # 静默（TIMER 后台唤醒）回合不允许阻塞等待用户输入：
-                        # 按钮消息会绕过 send_message_to_user 的纯文本原则，
-                        # 且回合会被用户的下一条消息打断。引导模型改用
-                        # send_message_to_user 以自然语言提问后结束回合。
-                        result_str = (
-                            "失败：ask_user 在系统后台唤醒回合中不可用。"
-                            "如需向用户提问，请改用 send_message_to_user 发送一句自然、"
-                            "口语化的纯文本提问，然后结束本回合等待用户回复。"
-                        )
-                    else:
-                        question = fn_args.get("question", "")
-                        options = fn_args.get("options", [])
-                        multiple = bool(fn_args.get("multiple", False))
-                        allow_custom = bool(fn_args.get("allow_custom", True))
-                        interaction = await create_ask_user_interaction(
-                            builder.chat_id,
-                            question,
-                            options,
-                            multiple=multiple,
-                            allow_custom=allow_custom,
-                        )
-                        builder.update_tool_item(
-                            tc_id,
-                            "Waiting for your answer",
-                            f"<p>{escape_html(truncate_to_token_budget(str(question), 64, suffix='…'))}</p>",
-                            status="waiting",
-                        )
-                        await builder.flush(force=True)
-                        answer = await wait_for_answer(interaction)
-                        result_str = answer_to_tool_result(answer)
+                elif fn_name == "message_user":
+                    # message_user（原 ask_user）：提问 / 通知双用途。
+                    # - 带选项：出按钮卡等待用户点选；
+                    # - 无选项：作为通知/主动消息发送，等待用户自由回复，
+                    #   超时即"用户不在"（见 ask_user_tool 模块）。
+                    # USER 与 TIMER 回合均可用（TIMER 主动巡检靠它触达用户）。
+                    question = fn_args.get("question", "")
+                    options = fn_args.get("options", []) or []
+                    multiple = bool(fn_args.get("multiple", False))
+                    allow_custom = bool(fn_args.get("allow_custom", True))
+                    interaction = await create_ask_user_interaction(
+                        builder.chat_id,
+                        question,
+                        options,
+                        multiple=multiple,
+                        allow_custom=allow_custom,
+                    )
+                    builder.update_tool_item(
+                        tc_id,
+                        "Waiting for your answer",
+                        f"<p>{escape_html(truncate_to_token_budget(str(question), 64, suffix='…'))}</p>",
+                        status="waiting",
+                    )
+                    await builder.flush(force=True)
+                    answer = await wait_for_answer(interaction)
+                    result_str = answer_to_tool_result(answer)
                 else:
                     result_str = await asyncio.wait_for(
                         dispatch_tool_call(
@@ -445,6 +446,7 @@ async def _run_tool_calls_and_append(
                         # 精简版截断失败：退回完整视图的截断结果。
                         logger.debug("run_one 内部忽略的异常", exc_info=True)
                         llm_content = safe_content
+            completed_results[tc_id] = llm_content
             return (fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content)
 
     # ====== 串行化"消费者"工具：同批既含 producer（如 bash cp）又含
@@ -461,31 +463,49 @@ async def _run_tool_calls_and_append(
     consumer_indices = [
         i for i, (fn_name, _, _) in enumerate(tool_tasks) if fn_name in CONSUMER_TOOLS
     ]
-    if producer_indices and consumer_indices:
-        # Phase 1: 并行执行所有 producer（如 bash 复制文件到 upload/）
-        phase1_results = await asyncio.gather(
-            *[run_one(*tool_tasks[i]) for i in producer_indices],
-            return_exceptions=True,
+    # 打断保全：整批工具的共享完成登记（tc_id -> 真实 llm_content）。
+    # 放在闭包外层，run_one 与取消路径都能访问。
+    _batch_completed_results: dict = {}
+    try:
+        if producer_indices and consumer_indices:
+            # Phase 1: 并行执行所有 producer（如 bash 复制文件到 upload/）
+            phase1_results = await asyncio.gather(
+                *[run_one(*tool_tasks[i]) for i in producer_indices],
+                return_exceptions=True,
+            )
+            # Phase 2: producer 全部完成后，并行执行所有 consumer（如 present_files）
+            phase2_results = await asyncio.gather(
+                *[run_one(*tool_tasks[i]) for i in consumer_indices],
+                return_exceptions=True,
+            )
+            # 按 tool_tasks 的原始位置重组 results，后续的状态写入和
+            # tool_msg 配对逻辑都基于原始顺序，不需要改动。
+            results = [None] * len(tool_tasks)
+            for i, r in zip(producer_indices, phase1_results):
+                results[i] = r
+            for i, r in zip(consumer_indices, phase2_results):
+                results[i] = r
+        else:
+            results = await asyncio.gather(
+                *[run_one(fn, args, tid) for fn, args, tid in tool_tasks],
+                return_exceptions=True
+            )
+    except asyncio.CancelledError:
+        # 用户新消息 / TIMER 唤醒打断了本批次：同步补齐 tool 消息后向上传播。
+        # 只做纯同步列表操作，不做任何 await（取消路径必须最小化）。
+        for fn_name, fn_args, tc_id in tool_tasks:
+            real_content = _batch_completed_results.get(tc_id)
+            content = real_content if isinstance(real_content, str) and real_content else INTERRUPTED_TOOL_PLACEHOLDER
+            tool_msg = {"role": "tool", "tool_call_id": tc_id, "name": fn_name, "content": content}
+            loop_messages.append(tool_msg)
+            new_history_entries.append(tool_msg)
+        logger.info(
+            "[%s] 工具批次被取消：已回填 %s 条 tool 消息（真实结果 %s 条，占位 %s 条）",
+            api_label, len(tool_tasks),
+            sum(1 for _, _, t in tool_tasks if t in _batch_completed_results),
+            sum(1 for _, _, t in tool_tasks if t not in _batch_completed_results),
         )
-        # Phase 2: producer 全部完成后，并行执行所有 consumer（如 present_files）
-        phase2_results = await asyncio.gather(
-            *[run_one(*tool_tasks[i]) for i in consumer_indices],
-            return_exceptions=True,
-        )
-        # 按 tool_tasks 的原始位置重组 results，后续的状态写入和
-        # tool_msg 配对逻辑都基于原始顺序，不需要改动。
-        results = [None] * len(tool_tasks)
-        for i, r in zip(producer_indices, phase1_results):
-            results[i] = r
-        for i, r in zip(consumer_indices, phase2_results):
-            results[i] = r
-    else:
-        results = await asyncio.gather(
-            *[run_one(fn, args, tid) for fn, args, tid in tool_tasks],
-            return_exceptions=True
-        )
-
-    await builder.flush(force=False)
+        raise
 
     # ===== 修改：根据结果标记状态 =====
     # tool_tasks 与 results 顺序一一对应（asyncio.gather 保序），用于在

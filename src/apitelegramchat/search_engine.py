@@ -462,28 +462,40 @@ def _get_video_models() -> list[str]:
 VIDEO_MODELS = _get_video_models()
 
 # ---------- 工具定义 ----------
-ASK_USER_TOOL = {
+# message_user（原 ask_user）：双用途人类交互工具。
+# - 提问：带 options，出按钮卡等用户选；
+# - 发消息 / 主动留言：不带 options，只发一条消息等用户自由回复；
+#   超时即"用户不在"（不是错误），用户回复了就是正常。
+MESSAGE_USER_TOOL = {
     "type": "function",
     "function": {
-        "name": "ask_user",
+        "name": "message_user",
         "description": (
-            "Pause the agent and ask the current user for a required clarification or choice. "
-            "Use this only when the next step materially depends on missing user preference or confirmation. "
-            "The tool suspends until the user answers in Telegram, then returns a structured result and the same agent turn continues. "
-            "Prefer 2-6 concise options. Do not use for information you can reasonably infer or discover yourself. "
-            "Never call this tool more than once in the same tool-call batch; ask one question at a time."
+            "Send a message to the user and optionally wait for their reply. Two use cases: "
+            "(a) ask a clarifying question — provide 2-6 concise options as buttons; "
+            "(b) send a notification or proactive message — omit options entirely, and any text "
+            "the user types next is returned as the reply. "
+            "The tool suspends until the user answers in Telegram, the user cancels, or the timeout "
+            "(default 10 minutes) elapses. A timeout returns {\"type\":\"expired\"} which simply means "
+            "the user is currently away — it is NOT an error; wrap up the turn gracefully. "
+            "In proactive/background turns this is also the natural channel to reach the user. "
+            "Never call this tool more than once in the same tool-call batch."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "question": {
                     "type": "string",
-                    "description": "清晰、具体的问题。不要重复用户已经明确提供的信息。"
+                    "description": "消息正文（问题或通知内容）。清晰、具体；不要重复用户已明确提供的信息。"
                 },
                 "options": {
                     "type": "array",
-                    "minItems": 1,
+                    "minItems": 0,
                     "maxItems": 8,
+                    "description": (
+                        "可选的选项列表。提供时渲染为按钮提问卡；完全省略（或空数组）则为"
+                        "纯通知/主动消息模式，等待用户自由文本回复。"
+                    ),
                     "items": {
                         "type": "object",
                         "properties": {
@@ -497,15 +509,48 @@ ASK_USER_TOOL = {
                 "multiple": {
                     "type": "boolean",
                     "default": False,
-                    "description": "是否允许多选。多选时用户需要点击提交。"
+                    "description": "是否允许多选（仅提问模式）。多选时用户需要点击提交。"
                 },
                 "allow_custom": {
                     "type": "boolean",
                     "default": True,
-                    "description": "是否允许用户放弃预设选项，直接输入自定义回答。"
+                    "description": "是否允许用户放弃预设选项，直接输入自定义回答（仅提问模式）。"
                 }
             },
-            "required": ["question", "options"]
+            "required": ["question"]
+        }
+    }
+}
+
+# 向后兼容别名：旧代码 / 旧引用仍可导入 ASK_USER_TOOL。
+ASK_USER_TOOL = MESSAGE_USER_TOOL
+
+# deliver_reply：/show off（静默模式）下模型自主选择是否把最终内容
+# 通过 sendRichMessage 交付给用户。草稿开启（/show on）时系统会自动发送
+# 最终回复，本工具不进入工具面。
+DELIVER_REPLY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "deliver_reply",
+        "description": (
+            "仅在草稿预览关闭（静默模式，/show off）时可用：把你希望用户看到的最终内容"
+            "作为一条永久富文本消息（Telegram Rich HTML）直接发送给用户，不经过草稿。"
+            "静默模式下你的流式输出与最终回复都不会自动送达用户——若本轮需要用户看到结论，"
+            "必须在结束前调用本工具；若整轮无需用户知晓（例如后台巡检无值得汇报的内容），"
+            "则不要调用，保持静默。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": (
+                        "要发送的富文本内容（Telegram Rich HTML，遵循系统提示词的标签规范）。"
+                        "应当是完整、自包含的最终回复，而不是片段。"
+                    )
+                }
+            },
+            "required": ["content"]
         }
     }
 }
@@ -1153,11 +1198,11 @@ SEARCH_TOOLS = [
         }]
         if VIDEO_MODELS else []
     ),
-    ASK_USER_TOOL,
+    ASK_USER_TOOL,  # message_user（已改名，见上方定义）
     # ===================== 任务 / 待办工具 =====================
     # 让 agent 拥有持久化的待办清单能力：add/list/done/undone/delete/clear/edit。
     # 数据按用户隔离，存放在 ./state/{user_id}/todos.json 并随 R2 同步。
-    # 仅在工具结果区显示富文本摘要；交互由 ask_user 工具统一处理。
+    # 仅在工具结果区显示富文本摘要；交互由 message_user 工具统一处理。
     TODO_TOOL,
     # ===================== 长期记忆工具 =====================
     # 跨会话保留的事实/偏好/人物/事件——不同于会自动修剪的对话历史。

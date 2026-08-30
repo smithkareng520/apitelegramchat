@@ -1,58 +1,40 @@
 # tool_visibility.py
 """按事件源（USER / TIMER）控制历史中工具调用的可见性——可拔插的出站消息过滤器。
 
-背景与问题
-==========
-``proactive.py`` 的 ``send_message_to_user`` 只在 TIMER（后台唤醒）回合的工具面
-里暴露，但统一上下文会把 TIMER 回合产生的 ``assistant.tool_calls`` 与配对
-``tool`` 结果消息原样沉淀进 ``conversation_history``。用户主动发消息（USER
-回合）时，这段历史会原样发给模型：模型看到"历史里这个工具被成功调用过"的
-示范，即使本轮 ``tools`` 列表并不包含它，也会高概率模仿调用（OpenAI 兼容
-网关对 tools 白名单之外的调用名不做拦截），随后命中
-``execute_send_message_to_user`` 的守卫分支。旧版守卫文案以"失败"开头并指示
-"请直接把回复内容写给用户即可"，在多步任务中途会被模型理解成"立即收尾
-输出"，把进行中的任务打断成提前终止。
+现状（本轮重构）
+================
 
-本模块在**请求构建**这一侧做改写（挂载点见 ``ai_handlers.get_ai_response``），
-按事件源把指定工具的历史痕迹转换形态：
+``send_message_to_user`` 工具已随 TIMER 静默机制整体移除；替代它的
+``message_user`` 在 USER 与 TIMER 两类回合的工具面里都存在，历史中的
+调用痕迹无需再按事件源折叠——因此当前注册表为空，
+``apply_tool_visibility`` 走零开销直通路径。
 
-- ``keep``：原样保留（默认，零改动、零开销）；
-- ``drop``：tool_call 连同配对 tool 结果一起从出站消息中移除，语义不留痕；
-- ``shadow``：把 tool_call 折叠成一条普通 assistant 文本摘要——保留"我此前
-  给用户主动发过什么"的上下文连续性（用户后续说"你上次发的那条"时模型仍
-  知道），但消除工具调用形状，不再给模型提供可模仿的调用示范；摘要里刻意
-  不出现工具名字面量，避免字符串级别的再诱导。
+本模块的可拔插机制保留，供未来需要按事件源隐藏某个工具时使用：在
+``TOOL_VISIBILITY_RULES`` 加一行规则即可。
 
-三条硬性保证
-============
-1. **只改出站副本，绝不改持久历史**：需要改写的消息一律深拷贝。注意
-   ``select_request_context`` 返回的是浅拷贝，``tool_calls`` 列表与存储共享
-   引用——原地改动会污染 ``conversation_history``，本模块禁止这种行为。
+三条硬性保证（机制不变）
+========================
+
+1. **只改出站副本，绝不改持久历史**：需要改写的消息一律深拷贝。
 2. **结构合法性**：被移除/折叠的 tool_call 与其配对 tool 消息总是成对处理，
    出站消息里不存在悬空 ``tool_call_id``（否则多数供应商直接 400）。
-3. **确定性**：同一份历史在同一事件源下的改写结果逐字节一致。USER 与 TIMER
-   两条请求序列各自保持稳定前缀，隐式前缀缓存（DeepSeek/GLM/Gemini 等）在
-   各序列内部持续命中；USER 与 TIMER 之间本就因工具面和追加 system 注记
-   不同而无法共享缓存，本模块不引入额外退化。
+3. **确定性**：同一份历史在同一事件源下的改写结果逐字节一致，隐式前缀
+   缓存不会因本模块而额外退化。
 
 可拔插设计
 ==========
-- 注册表 ``TOOL_VISIBILITY_RULES`` 是唯一扩展点：要隐藏别的工具，加一行
-  规则即可；删掉对应条目即恢复旧行为。
-- 每条规则分别指定 ``user_turn`` / ``timer_turn`` 两个方向的模式，互不影响；
-  TIMER 方向默认 ``keep``，因此 TIMER 回合走零开销直通路径。
-- 环境变量 ``TOOL_VISIBILITY_FILTER=false`` 可整体关闭（等价于拔掉本模块，
-  与旧版行为逐字节一致）。
-- shadow 摘要文案通过规则的 ``shadow_note_builder`` 注入，不同工具可以定制
-  各自的摘要生成逻辑。
+
+- 注册表 ``TOOL_VISIBILITY_RULES`` 是唯一扩展点：要隐藏某个工具，加一行
+  规则即可；删掉对应条目即恢复直通。
+- 每条规则分别指定 ``user_turn`` / ``timer_turn`` 两个方向的模式，互不影响。
+- 环境变量 ``TOOL_VISIBILITY_FILTER=false`` 可整体关闭（等价于拔掉本模块）。
+- shadow 摘要文案通过规则的 ``shadow_note_builder`` 注入。
 """
 
 from __future__ import annotations
 
 import copy
-import json
 import os
-import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -95,51 +77,6 @@ def _default_shadow_note(tool_call: dict, tool_result: Optional[dict]) -> str:
     return f"（历史记录：此处曾有一次 {tool_call.get('function', {}).get('name', 'unknown')} 调用，已按可见性规则隐藏）"
 
 
-def _proactive_shadow_note(tool_call: dict, tool_result: Optional[dict]) -> str:
-    """send_message_to_user 专用摘要：保留"发过什么"的语义，隐去工具调用形状。
-
-    刻意不输出工具名字面量：模型对历史中的字符串同样敏感，摘要里出现
-    "send_message_to_user" 会重新构成字符串级诱导。
-    """
-    args: dict = {}
-    raw_args = (tool_call.get("function") or {}).get("arguments")
-    if isinstance(raw_args, str):
-        try:
-            args = json.loads(raw_args)
-        except (json.JSONDecodeError, TypeError):
-            args = {}
-    elif isinstance(raw_args, dict):
-        args = raw_args
-
-    action = str(args.get("action") or "send").strip().lower()
-    content = args.get("content")
-
-    # 从工具结果文本里恢复 message_id（如 "已发送（message_id=123）：…"），
-    # 让摘要保留可追溯性；解析失败不影响摘要生成。
-    message_id = None
-    if tool_result is not None:
-        m = re.search(r"message_id[=＝]\s*(\d+)", str(tool_result.get("content") or ""))
-        if m:
-            message_id = m.group(1)
-
-    snippet = ""
-    if isinstance(content, str) and content.strip():
-        snippet = content.strip()
-        if len(snippet) > 80:
-            snippet = snippet[:80] + "…"
-
-    mid_suffix = f"（message_id={message_id}）" if message_id else ""
-    if action == "send":
-        if snippet:
-            return f"（后台巡检记录：此前已主动向用户发送过消息「{snippet}」{mid_suffix}）"
-        return f"（后台巡检记录：此前曾主动向用户发送过消息{mid_suffix}）"
-    if action == "edit":
-        return f"（后台巡检记录：此前曾编辑过一条主动消息{mid_suffix}）"
-    if action == "delete":
-        return f"（后台巡检记录：此前曾撤回过一条主动消息{mid_suffix}）"
-    return "（后台巡检记录：此前曾通过主动消息通道与用户交互）"
-
-
 @dataclass(frozen=True)
 class ToolVisibilityRule:
     """单个工具在两类事件源下的可见性规则。
@@ -168,15 +105,8 @@ class ToolVisibilityRule:
 
 
 # 扩展点：新增需要按事件源隐藏的工具，在这里加一行规则即可。
-TOOL_VISIBILITY_RULES: dict[str, ToolVisibilityRule] = {
-    "send_message_to_user": ToolVisibilityRule(
-        tool_name="send_message_to_user",
-        user_turn=VISIBILITY_SHADOW,
-        timer_turn=VISIBILITY_KEEP,
-        shadow_note_builder=_proactive_shadow_note,
-    ),
-}
-
+# 当前为空：message_user 在 USER / TIMER 两类回合都合法存在，无需折叠。
+TOOL_VISIBILITY_RULES: dict[str, ToolVisibilityRule] = {}
 
 # =====================================================================
 # 核心：出站消息改写（纯函数，绝不原地修改入参）

@@ -58,10 +58,12 @@ from apitelegramchat.state import (
     get_active_draft_info,
     clear_active_draft,
     mark_preserved_draft,
-    mark_protected_message,
+    get_show_drafts,
+    set_show_drafts,
     set_current_user_namespace,
     mark_update_processed_if_new,
 )
+from apitelegramchat import turn_recovery
 from apitelegramchat.ask_user_tool import (
     get_pending_for_chat,
     resolve_callback as resolve_ask_user_callback,
@@ -161,48 +163,27 @@ active_tasks_lock = asyncio.Lock()
 # 消息去重已下沉到 state.mark_update_processed_if_new（原子检查+标记），
 # 这里不需要 app 级别的去重锁。
 
-# ==================== 停止旧草稿（冻结当前流，并落一条永久结束消息） ====================
-
-async def _send_stopped_output_message(chat_id: int) -> bool:
-    """发送一条不会跟着草稿生命周期消失的停止消息。"""
-    try:
-        msg = await send_rich_html_message(chat_id, "<i>⏹️ 已停止输出</i>")
-        if isinstance(msg, int) and msg > 0:
-            try:
-                await mark_protected_message(msg)
-                logger.info(f"已保护停止消息: chat={chat_id} msg={msg}")
-            except Exception as e:
-                logger.warning(f"标记停止消息保护失败: {e}")
-            return True
-        return bool(msg)
-    except Exception as e:
-        logger.warning(f"发送停止消息异常: {e}")
-        return False
-
+# ==================== 打断旧轮次（保全进度 + 冻结旧草稿） ====================
 
 async def _interrupt_active_generation(chat_id: int) -> None:
     """
-    中断当前正在进行的生成任务。
+    中断当前正在进行的生成任务，并把已完成的进度沉淀进历史。
 
-    【修复】旧实现是先“标记草稿死亡 + 发一条已停止消息”，再去取消后台
-    生成任务。但生成任务的草稿刷新循环（RichMessageBuilder._flush_task /
-    _pending_flush_task）是独立的 asyncio.Task，并不会因为外层任务被
-    cancel() 就立刻停止；而且旧版 stop_flush_loop() 是“只通知不等”，
-    根本不保证它已经真正退出。
+    设计（打断保全，见 turn_recovery.py）：
+      1. 打断进行中的 TIMER 主动唤醒回合（兜底，webhook 中心入口已调用过；
+         重复调用无害）；
+      2. 彻底取消并等待旧 USER 任务结束——包括其草稿刷新循环与所有在途
+         刷新请求；
+      3. 旧任务停止后，把该轮已完成的 assistant/tool 消息补齐占位
+         tool_result 并写入持久历史（进度不丢弃，新轮次从断点继续）；
+      4. 冻结旧草稿（mark dead + 注销活跃注册 + 标记保留），不再发送
+         "⏹️ 已停止输出"之类的提示消息——该提示在打断保全机制下已无价值。
 
-    于是会出现这样的时序：
-      1. 标记草稿死亡、发送“⏹️ 已停止输出” / 新指令的确认消息
-      2. 旧任务里恰好已经通过存活检查、正在发起网络请求的那一次草稿刷新
-         才姗姗来迟地送达
-    结果就是：新消息先出现，旧草稿的最后一次刷新反而排在新消息之后，
-    看起来像“草稿位置被新消息占据，随后又在新消息下方重新刷新”。
-
-    修复方式：先彻底取消并等待旧任务（含其草稿刷新循环、所有在途的
-    刷新请求）真正结束，只有在确认没有任何后台刷新还在跑之后，才去
-    标记草稿死亡、发送停止提示 / 新消息。
+    时序说明：必须先确认旧任务（含草稿刷新循环）真正结束，再冻结草稿并
+    启动新任务；否则旧任务迟到的刷新帧会排在新消息之后，出现"草稿位置
+    错乱、在新消息下方重新刷新"的旧 bug。
     """
-    # 0) 新用户回合接管时，同样要打断进行中的 TIMER 主动唤醒回合：
-    #    取消其后台任务并静默撤回该回合已发出的普通消息。
+    # 0) 新用户回合接管时，同样要打断进行中的 TIMER 主动唤醒回合。
     #    （webhook 中心入口已对每条用户消息调用过一次；这里是兜底，
     #     覆盖媒体组聚合等待期结束后才启动用户回合等时序，重复调用无害。）
     try:
@@ -222,39 +203,38 @@ async def _interrupt_active_generation(chat_id: int) -> None:
     #    还在飞行中，再继续后面的步骤。
     await _cancel_old_task(chat_id)
 
+    # 2) 旧任务已完全停止：轮次日志保全——已完成的 assistant/tool 消息
+    #    补齐占位 tool_result 后沉淀进持久历史。新轮次的 user 消息会在
+    #    get_ai_response 里按规则合并/追加（见 turn_recovery.persist_user_message_entry）。
+    try:
+        salvaged = await turn_recovery.finalize_pending_turns(chat_id, reason="user-interrupt")
+        if salvaged:
+            logger.info(f"打断保全：chat={chat_id} 已沉淀旧轮次进度 {salvaged} 条消息")
+    except Exception as e:
+        logger.warning(f"finalize_pending_turns 异常: {e}")
+
     if not draft_info:
         return
 
     draft_id, _msg_id = draft_info
 
-    # 2) 旧任务已经完全停止，这里再标记一次死亡只是双重保险。
+    # 3) 旧任务已停止，标记草稿死亡：旧草稿冻结在当前位置，不再接收任何
+    #    刷新。不再发送"已停止输出"提示消息（用户要求移除）。
     try:
         await mark_draft_dead(draft_id)
         logger.info(f"已标记草稿死亡: chat={chat_id} draft={draft_id}")
     except Exception as e:
         logger.warning(f"mark_draft_dead 异常: {e}")
 
-    # 3) 落一条普通消息作为最终停止态，避免 draft 消息后续被回收。
-    #    此时旧任务的刷新循环已确认停止，这条消息不会再被旧草稿的
-    #    迟到刷新“追上”。
-    sent = False
+    # 4) 注销活跃草稿注册，让新轮次的草稿能干净地接管。
     try:
-        sent = await _send_stopped_output_message(chat_id)
-        if sent:
-            logger.info(f"已发送永久停止消息: chat={chat_id} draft={draft_id}")
-    except Exception as e:
-        logger.warning(f"发送永久停止消息异常: {e}")
-
-    # 4) 如果稳定消息发送成功，旧草稿就可以从活跃注册中移除；
-    #    即使失败，也不要删除旧草稿消息本身。
-    try:
-        if sent:
-            await clear_active_draft(chat_id, draft_id)
-            logger.info(f"已清除活跃草稿注册: chat={chat_id} draft={draft_id}")
+        await clear_active_draft(chat_id, draft_id)
+        logger.info(f"已清除活跃草稿注册: chat={chat_id} draft={draft_id}")
     except Exception as e:
         logger.warning(f"clear_active_draft 异常: {e}")
 
-    # 5) 仍然标记保留，确保任何“只删除草稿”的清理路径都不会碰它。
+    # 5) 标记保留：冻结的旧草稿作为本轮进度的可见现场，任何"只删除草稿"
+    #    的清理路径都不得碰它。
     try:
         await mark_preserved_draft(draft_id)
         logger.info(f"已标记草稿保留: chat={chat_id} draft={draft_id}")
@@ -567,20 +547,32 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
     user_message 为 None 时（TIMER 主动唤醒回合）：不写入唤醒用的合成
     user 消息（timer 唤醒不写入历史），只沉淀回合产生的 assistant/tool
     消息，保证统一上下文的前提下不污染触发器痕迹。
+
+    打断保全配合（见 turn_recovery.py）：USER 回合的 user 消息已在
+    get_ai_response 开始时提前持久化（带 early-persisted 标记），此处
+    跳过重复 append；无论哪种路径，消息写入完成后立即注销轮次登记
+    （note_turn_persisted）——注销点与 append 同在 chat 锁内，保证
+    "写入"与"注销"原子成对，取消竞态下既不双写也不漏写。
     """
     lock = await get_chat_lock(chat_id)
     async with lock:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
-        if user_message is not None:
+        if user_message is not None and not user_message.get(turn_recovery.EARLY_PERSIST_FLAG):
             block_content = user_message.get("content", "")
             if isinstance(block_content, str) and REPLY_MARKER in block_content:
                 user_message["content"] = block_content.split(REPLY_MARKER)[-1].strip()
             history.append(user_message)
+        # 历史标记清理：早持久化的消息进入历史时去掉内部标记。
+        if isinstance(user_message, dict):
+            user_message.pop(turn_recovery.EARLY_PERSIST_FLAG, None)
         for msg in new_msgs:
             if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
                 msg["content"] = msg["content"].strip()
             history.append(msg)
+        # 消息已落历史：立即注销该轮的 in-flight 登记（在释放 chat 锁前）。
+        if new_msgs:
+            turn_recovery.note_turn_persisted(chat_id, new_msgs)
         if usage:
             if hasattr(usage, "model_dump"):
                 usage_dict = usage.model_dump()
@@ -800,7 +792,7 @@ async def _handle_sticker_message(chat_id: int, user_message: dict, username: st
 def _is_user_flow_active(chat_id: int) -> bool:
     """该 chat 是否有用户发起（USER 事件源）的回合正在运行。
 
-    注册给 proactive 调度器作为 busy check：用户回合进行中（含 ask_user
+    注册给 proactive 调度器作为 busy check：用户回合进行中（含 message_user
     等待期）不触发 TIMER 唤醒，避免两个回合并发竞争同一份历史。
     """
     task = active_tasks.get(chat_id)
@@ -810,13 +802,14 @@ def _is_user_flow_active(chat_id: int) -> bool:
 async def _handle_timer_wakeup(chat_id: int):
     """TIMER 事件源回合：系统后台唤醒 agent 的“自己的活动时间”。
 
-    与用户回合共用同一份会话历史（统一上下文），但：
-    - 不发 typing、不建草稿：agent 过程对用户完全不可见；
+    与用户回合共用同一份会话历史（统一上下文），并走**同一套草稿与交付
+    流程**（由 /show 开关统一决定，见 ai_handlers.get_ai_response）：
+    - /show on：展示富文本草稿，最终回复经 sendRichMessage 送达用户；
+    - /show off：静默运行，模型经 deliver_reply / message_user 触达用户；
     - 向请求上下文追加合成 user 消息（WAKEUP_PROMPT），但不写入持久历史；
-    - 工具面在基础工具上追加 send_message_to_user；
-    - 最终文本不推送给用户，只沉淀进历史；
-    - 回合被用户消息打断时由 proactive.interrupt_proactive_flow 负责
-      静默撤回已发出的普通消息（此处无需感知）。
+    - 回合被用户消息打断时由 proactive.interrupt_proactive_flow 取消
+      任务并触发 turn_recovery 轮次日志保全（已完成的进度沉淀进历史，
+      此处无需感知）。
     """
     try:
         # 原生图片/视频模型不适合后台回合（会直接生成媒体并推给用户），跳过
@@ -865,13 +858,12 @@ async def _handle_timer_wakeup(chat_id: int):
             await update_conversation_and_ledger(chat_id, None, new_msgs, usage)
 
         # TIMER 可观测性：不输出隐藏推理，只记录本轮是否产生了持久化活动。
-        sent_count = len(proactive._active_flows.get(chat_id).sent_message_ids) if chat_id in proactive._active_flows else 0
         logger.info(
-            "[TIMER] chat=%s 巡检完成：assistant_tool_messages=%s sent_messages=%s final_text_chars=%s",
-            chat_id, len(new_msgs or []), sent_count, len((full or "").strip()),
+            "[TIMER] chat=%s 巡检完成：assistant_tool_messages=%s final_text_chars=%s",
+            chat_id, len(new_msgs or []), len((full or "").strip()),
         )
     except asyncio.CancelledError:
-        # 被用户消息打断：不持久化半成品回合，直接退出
+        # 被用户消息打断：轮次进度由打断方经 turn_recovery 保全，直接退出。
         raise
     except Exception as e:
         logger.exception(f"_handle_timer_wakeup 异常: {e}")
@@ -1556,8 +1548,8 @@ async def webhook() -> tuple:
             # 1) 记录用户活动：重置该 chat 的空闲计时（主动唤醒调度器据此
             #    决定何时进入 agent 的"活动时间"）。仅私聊参与主动唤醒。
             # 2) 打断进行中的 TIMER 主动唤醒回合：取消后台 agent 任务，并
-            #    静默撤回该回合已通过 send_message_to_user 发出的普通消息
-            #    （不显示"已停止"之类的任何提示）。
+            #    通过 turn_recovery 保全该回合已完成的进度（补占位
+            #    tool_result 后沉淀进历史，全程静默，不显示"已停止"提示）。
             # 该入口位于所有消息类型/命令分发之前，覆盖全部授权用户输入。
             try:
                 await proactive.note_user_activity(
@@ -1919,12 +1911,13 @@ async def webhook() -> tuple:
             if "text" in msg:
                 user_input = msg["text"]
 
-                # 若当前 ask_user 正在等待自由文本，优先把这条消息交给原 agent turn，
+                # 若当前 message_user 正在等待回复，优先把这条消息交给原 agent turn，
                 # 不要启动新的 AI turn。命令仍保留为真正的 bot 指令入口。
+                # 提问卡与通知卡均适用：用户直接打字即视为回复
+                # （"用户回复了就是正常"），无需先点"自定义回答"按钮。
                 pending_ask = await get_pending_for_chat(chat_id)
                 if (
                     pending_ask
-                    and pending_ask.awaiting_text
                     and not user_input.startswith("/")
                     and await resolve_ask_user_text(chat_id, user_input)
                 ):
@@ -2008,6 +2001,39 @@ async def webhook() -> tuple:
                         ctx["last_completion_tokens"] = 0
                         ctx["token_ledger"] = []
                     await send_rich_html_message(chat_id, "✅ <b>操作成功</b>\n对话历史已清空", reply_parameters=_reply_params(msg["message_id"]))
+                    return "OK", 200
+
+                # ── /show on|off：草稿预览开关（USER 与 TIMER 回合统一生效）──
+                if _cmd_match(user_input, "/show"):
+                    parts = user_input.split()
+                    arg = parts[1].strip().lower() if len(parts) > 1 else ""
+                    if arg in ("on", "开", "1", "true"):
+                        await set_show_drafts(chat_id, True)
+                        await _send_via_send_message(
+                            chat_id,
+                            "✅ <b>草稿预览已开启</b>\n"
+                            "你发送消息和后台主动巡检（TIMER）时，都会实时展示"
+                            "富文本草稿，最终回复自动送达。",
+                            reply_message_id=msg["message_id"],
+                        )
+                    elif arg in ("off", "关", "0", "false"):
+                        await set_show_drafts(chat_id, False)
+                        await _send_via_send_message(
+                            chat_id,
+                            "✅ <b>草稿预览已关闭（静默模式）</b>\n"
+                            "过程与最终回复不再自动展示；由 AI 自主决定何时通过"
+                            " deliver_reply 把最终内容发送给你，提问/留言走 message_user。",
+                            reply_message_id=msg["message_id"],
+                        )
+                    else:
+                        current_show = await get_show_drafts(chat_id)
+                        state_line = "开启（/show on）" if current_show else "关闭（/show off）"
+                        await _send_via_send_message(
+                            chat_id,
+                            f"ℹ️ 当前草稿预览：<b>{state_line}</b>\n"
+                            "用法：<code>/show on</code> 开启 · <code>/show off</code> 关闭",
+                            reply_message_id=msg["message_id"],
+                        )
                     return "OK", 200
 
                 # 普通文本对话

@@ -1,9 +1,22 @@
-"""Human-in-the-loop interaction for the agent.
+"""Human-in-the-loop interaction for the agent: the ``message_user`` tool.
 
-The agent can pause on an ask_user tool call while the Telegram draft keeps
-streaming. A persistent message with an InlineKeyboard collects the answer;
-the resolved value is returned to the original tool call and the same agent
-loop continues.
+（工具原名 ask_user，现改名为 message_user——意图扩展为"向用户发消息
+并等待回复"：带选项时是提问卡，不带选项时是纯通知/主动消息。）
+
+The agent can pause on a ``message_user`` tool call while the Telegram draft
+keeps streaming. A persistent message with an InlineKeyboard collects the
+answer; the resolved value is returned to the original tool call and the same
+agent loop continues.
+
+双用途语义：
+
+- 提问（带 options）：发按钮卡等待用户点选；
+- 通知 / 主动留言（不带 options）：只发一条消息，等待用户自由回复；
+  用户在下一条非命令文本里的任何回复都会作为 custom 答案回填工具，
+  原轮次继续（"用户回复了就是正常"）；
+- 超时（默认 10 分钟，ASK_USER_TIMEOUT 可配）：返回 {"type": "expired"}
+  ——含义是"用户当前不在"，不是错误。模型据此结束回合即可，
+  用户回来后的下一次交互会重新建立对话。
 """
 from __future__ import annotations
 
@@ -143,7 +156,7 @@ def _build_keyboard(interaction: AskUserInteraction) -> dict:
 
 
 def _question_html(interaction: AskUserInteraction) -> str:
-    """构造 ask_user 问题卡片 HTML。
+    """构造 message_user 消息卡片 HTML。
 
     安全修复：question / label / description 均来自 LLM 工具调用参数，
     若不转义，LLM 一旦输出含 ``<script>`` 或 ``<img onerror=...>`` 的
@@ -151,21 +164,26 @@ def _question_html(interaction: AskUserInteraction) -> str:
     escape_html 转义。
     """
     question = escape_html(interaction.question)
+    if not interaction.options:
+        # 通知 / 主动留言模式：无需选择，用户直接回复文本即可。
+        return (
+            f"<p>📨 <b>助手消息</b></p><p>{question}</p>"
+            f"<p><i>直接回复文本即可；长时间不回复本消息会自动过期。</i></p>"
+        )
     lines = [f"<p>🤔 <b>需要你的确认</b></p><p>{question}</p>"]
-    if interaction.options:
-        lines.append("<ul>")
-        for option in interaction.options:
-            label = escape_html(option.get("label", ""))
-            desc = option.get("description") or ""
-            if desc:
-                lines.append(f"<li><b>{label}</b>：{escape_html(desc)}</li>")
-            else:
-                lines.append(f"<li><b>{label}</b></li>")
-        lines.append("</ul>")
+    lines.append("<ul>")
+    for option in interaction.options:
+        label = escape_html(option.get("label", ""))
+        desc = option.get("description") or ""
+        if desc:
+            lines.append(f"<li><b>{label}</b>：{escape_html(desc)}</li>")
+        else:
+            lines.append(f"<li><b>{label}</b></li>")
+    lines.append("</ul>")
     if interaction.multiple:
-        lines.append("<i>可多选，完成后点击“提交选择”。</i>")
+        lines.append("<i>可多选，完成后点击“提交选择”；也可以直接回复文字。</i>")
     else:
-        lines.append("<i>请选择一项：</i>")
+        lines.append("<i>请选择一项，或直接回复文字：</i>")
     return "".join(lines)
 
 
@@ -181,12 +199,16 @@ async def create_ask_user_interaction(
     multiple: bool = False,
     allow_custom: bool = True,
 ) -> AskUserInteraction:
+    """创建一次 message_user 交互。
+
+    - options 非空：提问卡（按钮选择）；
+    - options 为空：通知模式——不显示选项按钮，用户任意文本直接作为
+      回复回填（awaiting_text 置位）。
+    """
     question = truncate_to_token_budget(str(question or "").strip(), ASK_USER_QUESTION_TOKEN_BUDGET, suffix="…")
-    normalized = _normalized_options(options)
     if not question:
-        raise ValueError("ask_user.question 不能为空")
-    if not normalized:
-        raise ValueError("ask_user.options 至少需要一个有效选项")
+        raise ValueError("message_user.question 不能为空")
+    normalized = _normalized_options(options)
 
     async with _lock:
         old_id = _pending_by_chat.get(chat_id)
@@ -202,8 +224,10 @@ async def create_ask_user_interaction(
             chat_id=chat_id,
             question=question,
             options=normalized,
-            multiple=bool(multiple),
+            multiple=bool(multiple) if normalized else False,
             allow_custom=bool(allow_custom),
+            # 通知模式：没有选项可点，任何文本回复都作为 custom 答案。
+            awaiting_text=not normalized,
         )
         interaction.future = asyncio.get_running_loop().create_future()
         _pending[interaction.id] = interaction
@@ -222,7 +246,7 @@ async def create_ask_user_interaction(
         interaction.message_id = message_id
     else:
         await cancel_interaction(interaction.id, remove_ui=False)
-        raise RuntimeError("无法发送 ask_user 交互消息")
+        raise RuntimeError("无法发送 message_user 交互消息")
     return interaction
 
 
@@ -303,7 +327,7 @@ def _answered_html(interaction: AskUserInteraction, answer: dict[str, Any]) -> s
     if kind == "cancelled":
         return f"<p>✖️ <b>已取消</b></p><p>{q}</p>"
     if kind == "expired":
-        return f"<p>⌛ <b>问题已过期</b></p><p>{q}</p>"
+        return f"<p>⌛ <b>用户未回复</b>（可能不在线）</p><p>{q}</p>"
     return f"<p>✅ <b>已收到回答</b></p><p>{q}</p>"
 
 
@@ -399,13 +423,19 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
 
 
 async def resolve_text(chat_id: int, text: str) -> bool:
+    """把用户的一条自由文本作为当前 message_user 的回复。
+
+    提问卡与通知卡均适用：只要还有等待中的交互，用户直接打字即视为
+    回复（"用户回复了就是正常"），不再要求先点“自定义回答”按钮。
+    命令（以 / 开头）由上层拦截，不会进入本函数。
+    """
     text = str(text or "").strip()
     if not text:
         return False
     async with _lock:
         interaction_id = _pending_by_chat.get(chat_id)
         interaction = _pending.get(interaction_id) if interaction_id else None
-        if not interaction or interaction.status != "waiting" or not interaction.awaiting_text:
+        if not interaction or interaction.status != "waiting":
             return False
         interaction.status = "answered"
         answer = {"type": "custom", "value": truncate_to_token_budget(text, ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET, suffix="…")}
@@ -451,6 +481,11 @@ async def cancel_interaction(interaction_id: str, remove_ui: bool = True) -> Non
 
 
 def answer_to_tool_result(answer: dict[str, Any]) -> str:
+    """把交互结果转成 message_user 工具的 tool 消息内容。"""
     result = dict(answer or {})
     result.setdefault("type", "unknown")
+    if result.get("type") == "expired":
+        # "用户不在"语义：明确告诉模型这不是错误，可以结束回合，
+        # 也可以继续做不需要用户参与的事。
+        result["note"] = "用户在超时时间内没有回复（用户可能不在）。这不是错误；可结束本回合，用户回来后会再联系。"
     return _answer_json(result)

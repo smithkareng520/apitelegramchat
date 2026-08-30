@@ -40,6 +40,7 @@
 - [外部 MCP](#外部-mcp)
 - [MCP Server](#mcp-server)
 - [数据目录与持久化](#数据目录与持久化)
+- [打断保全（Turn Recovery）与统一草稿流](#打断保全turn-recovery与统一草稿流)
 - [安全模型](#安全模型)
 - [Docker 部署](#docker-部署)
 - [Render 部署](#render-部署)
@@ -474,6 +475,7 @@ provider/model-id
 /model
 /role
 /clear
+/show
 ```
 
 ### `/model`
@@ -501,6 +503,16 @@ isla
 ### `/clear`
 
 清空当前会话历史，并同时清理当前 active skill 状态。
+
+### `/show`
+
+草稿预览开关（详见[打断保全与统一草稿流](#打断保全turn-recovery与统一草稿流)）：
+
+```text
+/show on    # 开启草稿预览（默认）：USER 与 TIMER 回合都实时展示富文本草稿
+/show off   # 静默模式：过程不展示，模型经 deliver_reply 自主交付最终内容
+/show       # 查看当前状态
+```
 
 ### 回复消息
 
@@ -619,7 +631,8 @@ generate_video
 - Memory；
 - Todo；
 - Subagent；
-- Ask User；
+- Message User（原 Ask User，提问 / 通知双用途）；
+- Deliver Reply（静默模式下的最终回复交付）；
 - Skills；
 - 上下文压缩；
 - 工具结果摘要。
@@ -1173,6 +1186,109 @@ pending 保留
 ```text
 Telegram#U5bcc#U6d88#U606f#U8349#U7a3f#U6eda#U52a8#U7b56#U7565.md
 ```
+
+---
+
+## 打断保全（Turn Recovery）与统一草稿流
+
+本轮重构引入两个核心机制：**轮次打断保全**（agent 进度不再因打断丢失）
+与 **/show 统一草稿流**（USER 与 TIMER 事件源走同一套草稿与交付流程）。
+
+### 1. 打断保全：旧草稿正常关闭，新草稿从断点继续
+
+旧行为：用户发新消息（或 TIMER 唤醒）会**取消并丢弃**进行中的 agent
+轮次——已完成的 assistant 消息、工具调用与结果全部作废。
+
+新行为（`turn_recovery.py`）：`get_ai_response` 开始时登记一份**轮次日志
+（turn journal）**，agentic 循环把已完成的消息持续追加进去：
+
+- **正常收尾**：`update_conversation_and_ledger` 在写历史的同一把 chat 锁
+  内注销登记（`note_turn_persisted` 与消息 append 连成原子区间，取消
+  竞态下既不双写也不漏写）；
+- **被用户消息 / TIMER 打断**：打断方（`_interrupt_active_generation` /
+  `proactive.interrupt_proactive_flow`）在旧任务完全停止后调用
+  `finalize_interrupted_turn`，把 journal 沉淀进持久历史；
+- **异常中断（额度不足 / 网关错误等）**：`get_ai_response` 的异常路径调用
+  `persist_salvaged_journal` 保全进度，下一轮从断点继续。
+
+补齐结构（保证历史合法，OpenAI 格式）：
+
+- assistant 里的每个 `tool_calls[i].id` 都必须有配对的 `role=tool` 消息；
+  打断时未执行 / 被取消的调用统一补占位结果：`"用户打断，未执行"`；
+- `tool_call_loop` 在取消路径上先把**已执行完**的工具回填真实结果，
+  只剩真正未完成的才落占位——最大化保留进度。
+
+新 user 消息落位规则（`persist_user_message_entry`，轮次开始时提前持久化）：
+
+| 打断时机 | 历史末尾 | 新消息处理 |
+|---|---|---|
+| 任何 assistant 输出之前 | user | **合并**进上一条 user（content 拼接、附件数组拼接），避免连续两条 user |
+| tool_call 已发出、工具未执行 | assistant(tool_calls) | 补占位 tool 消息 → 新 user 消息**追加** |
+| 工具执行中 | assistant + 部分 tool | 已完成的回填真实结果、其余占位 → 新 user 消息**追加** |
+| 工具结果已回填、模型生成中 | tool | 无需补结构，新 user 消息**追加**（OpenAI 允许 tool 后跟 user） |
+
+多模态打断：用户打断时发的图片 / 文档，附件元数据（file_ids / attachments）
+与文本一起合并或追加，不丢内容。
+
+同时移除了打断时的「⏹️ 已停止输出」提示消息——进度已保全在历史中，
+该提示不再有价值；旧草稿冻结（mark dead + 保留标记）作为进度现场。
+
+### 2. /show 指令：统一草稿显示开关
+
+```text
+/show        # 查看当前状态
+/show on     # 开启草稿预览（默认）
+/show off    # 关闭草稿预览（静默模式）
+```
+
+开关对 **USER 回合与 TIMER 主动巡检回合统一生效**——后台随机事件与
+用户主动消息走相同流程：
+
+| 模式 | USER 回合 | TIMER 回合 |
+|---|---|---|
+| /show on | 富文本草稿实时展示，最终回复自动送达 | 同左（统一流程） |
+| /show off | 静默运行；模型经 `deliver_reply` 自主交付最终内容，`message_user` 提问/留言 | 同左 |
+
+### 3. 工具变更：send_message_to_user 移除，ask_user → message_user
+
+- **send_message_to_user 已整体移除**（工具定义、executor、消息撤回注册表、
+  tool_visibility 折叠规则等全部清理）。若模型带着旧历史幻觉调用，返回
+  迁移指引（改用 message_user / deliver_reply）。
+- **ask_user 更名为 message_user**，意图扩展为「向用户发消息并等待回复」：
+
+  - 带选项：按钮提问卡（与原 ask_user 一致）；
+  - 不带选项：**通知 / 主动留言模式**——只发一条消息，用户任意文本回复
+    即回填工具结果，原轮次继续（提问卡同样支持直接打字回答，无需先点
+    「自定义回答」）；
+  - 超时（默认 10 分钟，`ASK_USER_TIMEOUT` 可配）：返回
+    `{"type":"expired"}`——含义是**用户当前不在**，不是错误；模型据此
+    自然收尾，用户回来后下一条消息会重新触发对话。
+
+- **新增 deliver_reply 工具**（仅 /show off 静默模式可用）：把最终内容
+  经 sendRichMessage 作为永久富文本消息交付（不经过草稿）。静默模式下
+  模型的流式输出与最终回复都不会自动送达用户，必须由模型显式选择是否
+  交付。用户主动回合（USER）若模型忘记调用而产出了非空回复，系统兜底
+  直发一次，保证提问不会石沉大海。
+
+### 4. TIMER 主动巡检（proactive）适配
+
+- 唤醒节奏与调度器不变（空闲 20min 进入活动时间，随机 10~90min 巡检，
+  连续 3h 无响应进入慢节奏）；
+- WAKEUP_PROMPT 重写：不再依赖 send_message_to_user，改为 message_user
+  （交互）+ deliver_reply（静默交付）；
+- TIMER 回合被用户消息打断时，取消任务并经 turn_recovery 保全该回合
+  已完成的进度（不再是整轮丢弃），全程静默。
+
+### 5. 富文本原生按钮
+
+系统提示词已加入 Telegram Bot API 10.3 的原生 Rich Message 按钮结构
+（RichBlockButtons / RichTextButton / RichMessageButton）：
+
+```html
+<tg-button-row>…</tg-button-row>
+```
+
+按钮行必须作为独立块级元素输出，不得嵌套在段落 / 表格 / 列表 / 引用内。
 
 ---
 

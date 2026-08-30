@@ -511,7 +511,7 @@ class RichMessageBuilder:
             group["outer_summary"] = mapping.get(command, "Editing file")
         elif t == "present_files":
             group["outer_summary"] = "Presenting file(s)"
-        elif t == "ask_user":
+        elif t in ("ask_user", "message_user"):
             group["outer_summary"] = "Waiting for your answer"
         elif t == "wikipedia":
             group["outer_summary"] = "Looking up on Wikipedia"
@@ -589,6 +589,8 @@ class RichMessageBuilder:
         "generate_image_from_text": ("Generated an image", "Generated {n} images"),
         "edit_image_with_reference": ("Edited an image", "Edited {n} images"),
         "ask_user": ("Asked you a question", "Asked you questions"),
+        "message_user": ("Messaged you", "Messaged you"),
+        "deliver_reply": ("Delivered the final reply", "Delivered the final reply"),
     }
 
     def _get_group_type_for_item(self, item: dict) -> str:
@@ -1313,12 +1315,12 @@ class SilentMessageBuilder(RichMessageBuilder):
     依赖它们做工具组管理、流式缓冲、组收束等），但**从不向 Telegram 发送
     任何草稿帧，也从不做滚动永久化**。
 
-    用于 TIMER 主动唤醒回合（proactive wake-up）：agent 的思考、工具进度
-    与最终文本对用户完全不可见——它们只存在于请求上下文与持久历史中；
-    用户唯一可见的输出来自模型显式调用的 send_message_to_user 工具。
+    用于 /show off（静默模式）的回合——USER 与 TIMER 一致：agent 的思考、
+    工具进度与最终文本对用户不可见；需要触达用户时，模型通过
+    deliver_reply（交付最终回复）或 message_user（提问/留言）完成。
 
-    约定：``silent`` 属性为 True，供 tool_call_loop 等下层模块用
-    ``getattr(builder, "silent", False)`` 做静默分支判断（如禁用 ask_user）。
+    约定：``silent`` 属性为 True，供下层模块用
+    ``getattr(builder, "silent", False)`` 做静默分支判断。
     """
 
     def __init__(self, chat_id: int):

@@ -93,9 +93,10 @@ SUBAGENT_CARD_PREVIEW_TOKEN_BUDGET = _env_int(
 
 
 # 子 agent 不允许调用的工具（防递归 / 防爆炸 / 防资源滥用）
-FORBIDDEN_TOOLS = {"subagent", "memory", "skill", "ask_user"}
+FORBIDDEN_TOOLS = {"subagent", "memory", "skill", "ask_user", "message_user", "deliver_reply"}
 # 注意：todo / bash / text_editor 仍允许，因为子 agent 可能需要查 / 写工作区文件。
-# ask_user 不允许由子 agent 调用，否则会让父 agent 陷入不可控的嵌套人工等待。
+# message_user（原 ask_user）不允许由子 agent 调用，否则会让父 agent 陷入
+# 不可控的嵌套人工等待；deliver_reply 同理（最终交付由父 agent 负责）。
 # 但 memory / skill 跨会话状态复杂，子 agent 不应触碰
 
 SUBAGENT_LLM_TIMEOUT = _env_int("SUBAGENT_LLM_TIMEOUT", 180, min_value=30, max_value=900)
@@ -127,7 +128,7 @@ SUBAGENT_SYSTEM_PROMPT_TEMPLATE = """\
 - 专心完成本任务，不要扩展话题。
 - 可以调用提供的工具来获取信息或操作文件。
 - 如果有多个彼此独立的检索、查询或操作目标，请在同一轮中一次性发出多个工具调用，不要拆成串行多轮。
-- 禁止调用 subagent 工具（不能递归派生子 agent），也不能调用 ask_user（人工交互必须由父 agent 负责）。
+- 禁止调用 subagent 工具（不能递归派生子 agent），也不能调用 message_user / ask_user（人工交互必须由父 agent 负责）。
 - 完成后用一段简洁的中文答复给父 agent，长度不超过 2000 字。
 - 答复里直接给结论 / 数据 / 代码 / 步骤，不要寒暄。
 
@@ -754,7 +755,7 @@ SUBAGENT_TOOL = {
                 "allowed_tools": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "可选的工具白名单。缺省时使用安全默认集（web_search/fetch_url/wikipedia/weather/bash/text_editor/todo 等）。传空数组则禁用所有工具。无论是否指定，subagent/memory/skill/ask_user 始终禁用。"
+                    "description": "可选的工具白名单。缺省时使用安全默认集（web_search/fetch_url/wikipedia/weather/bash/text_editor/todo 等）。传空数组则禁用所有工具。无论是否指定，subagent/memory/skill/message_user 始终禁用。"
                 },
                 "timeout": {
                     "type": "integer",

@@ -203,7 +203,8 @@ def _log_cache_usage(api_label: str, usage) -> None:
 
 async def _agentic_loop_openai_compat(
         client: AsyncOpenAI, current_model: str, messages: list, api_label: str,
-        builder: "RichMessageBuilder", tools: list = None, supports_tools: bool = True
+        builder: "RichMessageBuilder", tools: list = None, supports_tools: bool = True,
+        journal: list = None,
 ) -> tuple[str | None, object | None, list]:
     if tools is None:
         from apitelegramchat.search_engine import SEARCH_TOOLS
@@ -212,7 +213,9 @@ async def _agentic_loop_openai_compat(
     final_content = None
     final_usage = None
     tool_call_count_ref = [0]
-    new_history_entries = []
+    # journal：由 get_ai_response 注入的轮次日志（打断保全用，见 turn_recovery.py）。
+    # 注入时循环直接往里追加，轮次被打断时已完成的消息不至于丢失。
+    new_history_entries = journal if journal is not None else []
     plain_text_tool_attempts = 0
     parallel_tool_calls = True
 
@@ -639,6 +642,7 @@ async def _agentic_loop_gemini_openai_compat(
         builder: "RichMessageBuilder",
         tools: list = None,
         supports_tools: bool = True,
+        journal: list = None,
 ) -> tuple[str | None, object | None, list]:
     def _clean_tools_for_gemini(tools: list) -> list:
         if not tools:
@@ -675,7 +679,8 @@ async def _agentic_loop_gemini_openai_compat(
     final_content: str | None = None
     final_usage = None
     tool_call_count_ref = [0]
-    new_history_entries: list = []
+    # journal：由 get_ai_response 注入的轮次日志（打断保全用）。
+    new_history_entries: list = journal if journal is not None else []
 
     for _round in range(MAX_TOOL_CALLS):
         payload: dict = {
@@ -864,6 +869,7 @@ async def _agentic_loop_native_image(
         messages: list,
         builder: "RichMessageBuilder",
         chat_id: int,
+        journal: list = None,
 ) -> tuple[str | None, object | None, list]:
     model_info = SUPPORTED_MODELS.get(current_model)
     provider = model_info.provider if model_info else ""  # <-- 新增 provider
@@ -999,6 +1005,8 @@ async def _agentic_loop_native_image(
             final_content = f"IMAGE_SENT:{final_notice}" if final_notice else "IMAGE_SENT"
             history_content = f"[图片已生成] 指令: {clean_prompt or prompt_text or '(无)'} | {caption_text}"
             new_entries = [{"role": "assistant", "content": history_content}]
+            if journal is not None:
+                journal.extend(new_entries)
             return final_content, usage, new_entries
 
         # ---- 非 ModelScope 的其他提供商（OpenRouter 等） ----
@@ -1123,6 +1131,8 @@ async def _agentic_loop_native_image(
     else:
         history_content = final_notice or "（已生成图片）"
     new_entries = [{"role": "assistant", "content": history_content}]
+    if journal is not None:
+        journal.extend(new_entries)
     return final_content, getattr(response, "usage", None), new_entries
 
 
@@ -1131,6 +1141,7 @@ async def _agentic_loop_native_video(
         messages: list,
         builder: "RichMessageBuilder",
         chat_id: int,
+        journal: list = None,
 ) -> tuple[str | None, object | None, list]:
     """
     处理视频生成模型。
@@ -1264,6 +1275,8 @@ async def _agentic_loop_native_video(
     # 生成历史记录
     history_content = f"[视频已生成] 提示词: {prompt[:200]}" if prompt else "[视频已生成]"
     new_entries = [{"role": "assistant", "content": history_content}]
+    if journal is not None:
+        journal.extend(new_entries)
 
     final_content = f"VIDEO_SENT:{prompt[:100]}"  # 用于上游判断
     return final_content, None, new_entries

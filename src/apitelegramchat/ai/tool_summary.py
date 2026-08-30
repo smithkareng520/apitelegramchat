@@ -222,7 +222,7 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     if fn_name == "generate_video":
         return "Generating a video"
 
-    if fn_name == "ask_user":
+    if fn_name in ("ask_user", "message_user"):
         return "Waiting for your answer"
 
     # ---------- 其他工具，按规范进行时文本 ----------
@@ -282,6 +282,8 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
         "bash": "ran a command",
         "present_files": "presented files",
         "ask_user": "asked for your input",
+        "message_user": "messaged you",
+        "deliver_reply": "delivered the final reply",
     }
     return mapping.get(fn_name, f"ran {fn_name}")
 
@@ -462,7 +464,7 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
             title = query
         return f"Looked up: {title}" if title else "Looked up on Wikipedia"
 
-    if fn_name == "ask_user":
+    if fn_name in ("ask_user", "message_user"):
         try:
             payload = json.loads(str(result_content or "{}"))
             if payload.get("type") == "choice":
@@ -473,7 +475,7 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
             if payload.get("type") == "cancelled":
                 return "User cancelled"
             if payload.get("type") == "expired":
-                return "User answer expired"
+                return "User is away (no reply)"
         except Exception:
             logger.debug("_generate_tool_summary_done 内部忽略的异常", exc_info=True)
             pass

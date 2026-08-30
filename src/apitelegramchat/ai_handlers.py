@@ -42,6 +42,7 @@ from apitelegramchat.skills import skill_catalog_brief
 from apitelegramchat.context_manager import select_request_context
 from apitelegramchat.tool_visibility import apply_tool_visibility
 from apitelegramchat.api_client import api_client
+from apitelegramchat import turn_recovery
 import apitelegramchat.state as state
 
 from apitelegramchat.ai.error_formatting import (
@@ -147,6 +148,7 @@ async def build_system_prompt(
       <tr><td>表格 (Table)</td><td><code><table bordered striped><tr><td>单元格</td></tr></table></code></td></tr>
       <tr><td>分割线 / 链接 / 图片</td><td><code><hr/></code> / <code><a href="URL">文本</a></code> / <code><img src="URL"/></code></td></tr>
       <tr><td>地图 / 数学公式</td><td><code><tg-map lat="..." long="..." zoom="..."/></code> / <code><tg-math>公式</tg-math></code></td></tr>
+      <tr><td>按钮行 (Button Row)</td><td><code><tg-button-row>…</tg-button-row></code>（Telegram Bot API 10.3 原生 Rich Message 按钮结构，对应 RichBlockButtons / RichTextButton / RichMessageButton）</td></tr>
     </table>
   </li>
   <li>严格按上述定义使用标签，切勿自行发明未定义的 HTML 标签。</li>
@@ -156,6 +158,7 @@ async def build_system_prompt(
 
 <h3>排版与布局规则</h3>
 <ul>
+  <li><b>按钮行：</b> 富文本输出可包含原生按钮行 <code><tg-button-row>…</tg-button-row></code>（Telegram Bot API 10.3 新增的 Rich Message 原生按钮结构：RichBlockButtons / RichTextButton / RichMessageButton）。按钮行必须作为独立块级元素输出，不得嵌套在段落、表格、列表或引用内。</li>
   <li><b>文件与代码输出：</b> 对于文件摘录和编辑器样式的输出，必须保留原有的空格与行号，并置于等宽代码块（<code><pre><code>...</code></pre></code>）中。</li>
   <li><b>表格增强：</b> 单元格支持 <code>colspan</code>、<code>rowspan</code>、<code>align="left/center/right"</code> 以及 <code>valign="top/middle/bottom"</code>。单元格内仅允许包含行内格式元素。</li>
   <li><b>引用与强调：</b>
@@ -365,24 +368,40 @@ async def get_ai_response(
         user_message: dict = None,
         event_source: str = "USER",
 ) -> tuple[str, str, list, Optional[dict]]:
-    """统一调度入口：按事件源（USER / TIMER）动态分配工具与输出处理。
+    """统一调度入口：USER / TIMER 走同一套草稿与交付流程，由 /show 控制。
 
-    - USER（用户主动发消息）：行为与旧实现完全一致——可见草稿流式输出、
-      工具列表不包含 send_message_to_user、最终富文本推送给用户。此外
-      历史中 TIMER 回合沉淀的 send_message_to_user 调用会被
-      apply_tool_visibility 折叠成普通文本摘要（见 tool_visibility.py）——
-      消除“历史里有成功调用先例”的模仿诱导，这是 USER 回合幻觉调用该
-      工具的根因；TIMER 回合则原样保留完整调用史。
-    - TIMER（系统定时唤醒，见 proactive.py）：使用 SilentMessageBuilder，
-      agent 过程（草稿/工具进度/最终文本）不输出到 Telegram；工具列表在
-      基础工具之上追加 send_message_to_user（并移除 ask_user/present_files
-      这类会直接触达用户或阻塞等待用户输入的工具）；最终文本只留在历史
-      上下文中，不直接推送给用户。
+    草稿可见性（/show on|off，per-chat，默认 on）统一决定两类事件源的行为：
+
+    - /show on（草稿模式）：USER 与 TIMER 回合都使用 RichMessageBuilder——
+      思考、工具进度、流式文本以富文本草稿实时展示；最终回复统一通过
+      sendRichMessage 永久化送达用户（"后台随机事件后与用户主动走相同流程"）。
+    - /show off（静默模式）：USER 与 TIMER 回合都使用 SilentMessageBuilder——
+      过程与最终文本都不自动送达；工具面追加 deliver_reply，由模型自主
+      选择是否把最终内容作为永久富文本消息交付；message_user 仍是
+      提问 / 主动留言的交互通道（超时 = 用户不在）。
+
+    打断保全（turn_recovery.py）：get_ai_response 开始时登记轮次日志
+    journal，agentic 循环向其追加已完成消息；正常收尾由
+    update_conversation_and_ledger 注销，被打断 / 异常时由打断方或异常
+    路径补齐占位 tool_result 后沉淀进历史——进度不再因打断而丢失。
+
+    USER 回合的新 user 消息在本入口提前持久化（persist_user_message_entry）：
+    历史末尾若仍是上一条未获回应的 user 消息则合并，避免连续两条 user；
+    update_conversation_and_ledger 依据 early-persisted 标记跳过重复写入。
+    TIMER 的合成唤醒消息不写历史，仍按原逻辑单独注入请求。
     """
     builder = None
     new_msgs = []
     usage = None
     is_timer = (event_source == "TIMER")
+    # 草稿开关：USER 与 TIMER 统一生效。
+    show_drafts = await state.get_show_drafts(chat_id)
+    silent_mode = not show_drafts
+    # 轮次日志（打断保全）：agentic 循环往里追加，正常收尾在
+    # update_conversation_and_ledger 里注销；取消路径留在注册表里
+    # 由打断方 finalize。
+    journal: list = []
+    user_msg_in_history = False
     # 预处理阶段耗时追踪：用于诊断"草稿卡在 Thinking..."问题。
     # 从日志看，webhook 收到后到模型请求发出之间可能有数分钟延迟，
     # 需要逐阶段定位是锁竞争、上下文压缩还是 system prompt 构建导致的。
@@ -405,13 +424,31 @@ async def get_ai_response(
                 chat_id, stage_name, elapsed_ms, total_ms,
             )
     try:
-        if is_timer:
-            # TIMER：静默回合——不创建可见草稿、不注册活跃草稿、不发首帧。
-            # SilentMessageBuilder 保留全部状态机接口，只是零 Telegram 副作用。
+        # ── 轮次登记（打断保全，见 turn_recovery.py）──────────────────
+        # 放在最前：此后任何阶段被打断，已完成的消息都在 journal 里。
+        try:
+            await turn_recovery.register_inflight_turn(chat_id, journal, event_source=event_source)
+        except Exception:
+            logger.debug("register_inflight_turn 失败（打断保全降级）", exc_info=True)
+
+        # ── 新 user 消息提前持久化（USER 回合）────────────────────────
+        # 历史末尾是上一条未获回应的 user 消息时合并（避免连续 user），
+        # 否则直接追加。提前持久化让快速连发消息的合并链天然成立。
+        if user_message is not None and not is_timer:
+            try:
+                user_msg_in_history = await turn_recovery.persist_user_message_entry(chat_id, user_message)
+            except Exception:
+                logger.debug("persist_user_message_entry 失败", exc_info=True)
+                user_msg_in_history = False
+
+        if silent_mode:
+            # /show off（静默模式，USER 与 TIMER 一致）：不创建可见草稿、
+            # 不注册活跃草稿、不发首帧。交付渠道 = deliver_reply / message_user。
             from apitelegramchat.ai.rich_message_builder import SilentMessageBuilder
             builder = SilentMessageBuilder(chat_id)
             builder.add_initial_thinking("Thinking...")
         else:
+            # 草稿模式（/show on，USER 与 TIMER 统一）：富文本草稿实时展示。
             # 草稿首帧必须先于系统提示词、历史归档和多模态解析出现。这些准备操作在
             # 文件、图片或长历史场景下可能耗时数秒；旧顺序会让用户误以为 Agent 卡死。
             builder = RichMessageBuilder(chat_id)
@@ -453,10 +490,8 @@ async def get_ai_response(
         _log_stage("获取chat_lock+上下文快照完成")
 
         # 按事件源改写历史中"回合专属工具"的调用痕迹（可拔插，见
-        # tool_visibility.py）：USER 回合把 send_message_to_user 的历史调用
-        # 折叠成普通文本摘要，消除模型模仿调用的根因；TIMER 回合零开销
-        # 直通（edit/delete 仍依赖完整调用史中的 message_id）。只改出站
-        # 副本，持久历史不受影响。
+        # tool_visibility.py）。send_message_to_user 已移除，当前注册表为空，
+        # 此调用为零开销直通；保留机制供未来按事件源隐藏其他工具。
         history = apply_tool_visibility(history, event_source)
 
         if context_snapshot.dropped_messages:
@@ -480,7 +515,10 @@ async def get_ai_response(
         _log_stage("system_prompt构建完成")
         await _append_history_async(messages, history, model_info, chat_id=chat_id)
         _log_stage("历史消息追加完成")
-        if user_message:
+        if user_message and not user_msg_in_history:
+            # TIMER 合成唤醒消息（不写历史）或极少数未提前持久化的路径：
+            # 单独注入请求末尾。USER 回合的新消息已在提前持久化时进入
+            # 历史快照，这里不再重复 append（否则同一条消息会出现两次）。
             builder.set_thinking_status("Thinking...")
             await builder.flush(force=False)
             out_msg = {"role": "user"}
@@ -488,6 +526,20 @@ async def get_ai_response(
             _log_stage("多模态内容解析完成")
             out_msg["content"] = resolved
             messages.append(out_msg)
+
+        # 静默模式（/show off）运行时告知：流式输出与最终回复不会自动送达，
+        # 需要用户看到内容时必须用 deliver_reply / message_user。缺失这层
+        # 告知，模型会误以为自己的正文用户能看到。
+        if silent_mode:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "当前会话已关闭草稿预览（静默模式，/show off）：你的流式输出与本轮最终回复"
+                    "不会自动送达用户。若需要用户看到本轮内容，必须在结束前调用 deliver_reply "
+                    "发送最终富文本回复；需要提问或留言可用 message_user（其超时表示用户不在，"
+                    "不是错误）。若整轮无需用户知晓，可以不调用任何交付工具，保持静默。"
+                ),
+            })
 
         # 缓存标记必须在所有消息（含本轮新 user 消息）就位之后再打：
         # Anthropic 前缀缓存断点越靠后，能复用的前缀越长。此前在 user
@@ -505,55 +557,69 @@ async def get_ai_response(
 
         if model_info.native_video:
             raw_content, usage, new_msgs = await _agentic_loop_native_video(
-                current_model, messages, builder, chat_id
+                current_model, messages, builder, chat_id, journal=journal
             )
         elif model_info.native_image:
             client = api_client.get_client(model_info.provider)
             raw_content, usage, new_msgs = await _agentic_loop_native_image(
-                client, current_model, messages, builder, chat_id
+                client, current_model, messages, builder, chat_id, journal=journal
             )
         elif is_timer:
-            # TIMER 使用“安全主动工具面”，而不是完整 USER 工具面。
-            # 后台巡检允许读取/搜索信息、检查 Todo/Memory，并通过唯一的
-            # send_message_to_user 对用户发消息；禁止直接投递文件/媒体、等待用户、
-            # 任意 Bash/文件写入，避免 TIMER 为了“找点事做”产生副作用。
-            from apitelegramchat.proactive import SEND_MESSAGE_TO_USER_TOOL
-            from apitelegramchat.search_engine import SEARCH_TOOLS
+            # TIMER 使用"安全主动工具面"，而不是完整 USER 工具面。
+            # 后台巡检允许读取/搜索信息、检查 Todo/Memory，并通过
+            # message_user 提问/留言触达用户；静默模式下另有 deliver_reply
+            # 交付最终内容。禁止直接投递文件/媒体、任意 Bash/文件写入，
+            # 避免 TIMER 为了"找点事做"产生副作用。
+            from apitelegramchat.search_engine import SEARCH_TOOLS, DELIVER_REPLY_TOOL
             _PROACTIVE_ALLOWED_TOOLS = {
                 "web_search", "fetch_url", "wikipedia",
                 "exchange_rate", "book_lookup", "weather", "news", "crypto_price",
                 "qr_code",
                 "geocode", "route", "distance",
                 "poi_keyword_search", "poi_nearby_search", "poi_details",
-                "todo", "memory",
+                "todo", "memory", "message_user",
             }
             timer_tools = [
                 t for t in SEARCH_TOOLS
                 if (t.get("function") or {}).get("name") in _PROACTIVE_ALLOWED_TOOLS
-            ] + [SEND_MESSAGE_TO_USER_TOOL]
-            # Jarvis 模式：协议本身决定是否联系用户，而不是要求每轮都发消息。
+            ]
+            if silent_mode:
+                timer_tools = timer_tools + [DELIVER_REPLY_TOOL]
+            # TIMER 回合说明：统一草稿流后，/show on 时过程与最终回复对用户
+            # 可见；/show off 时静默，交付渠道是 deliver_reply / message_user。
             messages.append({
                 "role": "system",
                 "content": (
-                    "TIMER 是主动巡检回合，不是普通问答。必须先检查 Todo，再结合最近上下文判断。"
-                    "只有存在具体价值时才调用 send_message_to_user；没有合理行动就保持静默。"
-                    "不要为了完成回合而寒暄，也不要输出“我会等待”等等待式文本。"
+                    "TIMER 是主动巡检回合，不是普通问答。先检查 Todo，再结合最近上下文判断："
+                    "有具体价值就自然地告知或推进；没有合理行动就保持简短，不要为了完成回合"
+                    "而寒暄，也不要输出“我会等待”等等待式文本。需要用户回应时用 message_user；"
+                    "静默模式下需要用户看到结论时用 deliver_reply。"
                 ),
             })
             raw_content, usage, new_msgs = await _call_api(
-                current_model, model_info, messages, chat_id, builder, tools=timer_tools
+                current_model, model_info, messages, chat_id, builder,
+                tools=timer_tools, journal=journal,
             )
         else:
-            raw_content, usage, new_msgs = await _call_api(
-                current_model, model_info, messages, chat_id, builder
-            )
+            # USER 回合：静默模式（/show off）追加 deliver_reply，由模型
+            # 自主决定是否交付最终内容；草稿模式下系统会自动发送最终回复。
+            if silent_mode:
+                from apitelegramchat.search_engine import DELIVER_REPLY_TOOL
+                raw_content, usage, new_msgs = await _call_api(
+                    current_model, model_info, messages, chat_id, builder,
+                    tools=None, journal=journal, extra_tools=[DELIVER_REPLY_TOOL],
+                )
+            else:
+                raw_content, usage, new_msgs = await _call_api(
+                    current_model, model_info, messages, chat_id, builder, journal=journal
+                )
 
         await builder.stop_flush_loop()
 
         # 本轮流式已结束：后续永久消息不再 reassert 草稿，避免最终回复后再弹出预览气泡。
-        # 若外部已 interrupt 并 mark_dead，这里再标一次无害。TIMER 静默回合
+        # 若外部已 interrupt 并 mark_dead，这里再标一次无害。静默回合
         # 从未注册草稿，跳过标记。
-        if not is_timer:
+        if not silent_mode:
             try:
                 await mark_draft_dead(builder.draft_id)
             except Exception:
@@ -639,10 +705,12 @@ async def get_ai_response(
         if not cleaned_content and not final_html.strip():
             logger.warning("AI 返回空内容（model=%s）", current_model)
             if is_timer:
-                # TIMER：静默返回，不打扰用户；new_msgs 里可能仍有工具消息
-                # （如已通过 send_message_to_user 发出的内容），交由上层沉淀历史。
+                # TIMER：静默返回，不打扰用户（无论 /show 开关）；new_msgs 里
+                # 可能仍有工具消息，交由上层沉淀历史。
                 return "", "", new_msgs, usage
             fallback = "⚠️ AI 响应为空。请尝试换一个模型或提供更多上下文。"
+            # 静默模式下的空响应是系统级异常提示（非模型内容），仍然送达，
+            # 避免用户提问后彻底石沉大海。
             await send_rich_html_message(chat_id, fallback, reassert_draft=False)
             if builder.draft_message_id:
                 try:
@@ -661,18 +729,30 @@ async def get_ai_response(
 
         final_html = re.sub(r'\n\s*\n', '\n', final_html)
 
-        if is_timer:
-            # TIMER：agent 过程不输出到 Telegram——最终文本只留在历史上下文中，
-            # 不直接推送给用户；用户可见输出只能来自 send_message_to_user。
-            success = True
-            logger.info(
-                "[%s] TIMER 回合完成：最终内容不推送用户（长度=%s，前 500 字）：\n%s",
-                chat_id, len(cleaned_content), cleaned_content[:500],
-            )
+        # ── 最终交付（统一由 /show 开关决定，不再区分事件源）──────
+        delivered_this_turn = turn_recovery.pop_reply_delivered(chat_id)
+        if silent_mode:
+            # 静默模式（/show off，USER 与 TIMER 一致）：最终内容不自动
+            # 送达；交付渠道 = deliver_reply（模型已选）/ message_user。
+            # 用户主动回合的兑底：若模型忘了调用 deliver_reply 但产出了
+            # 非空最终内容，仍然直发——用户提问不能石沉大海。
+            if not is_timer and not delivered_this_turn and cleaned_content:
+                logger.warning(
+                    "[%s] 静默 USER 回合未调用 deliver_reply，兑底直发最终内容（长度=%s）",
+                    chat_id, len(cleaned_content),
+                )
+                success = await send_rich_html_message(chat_id, final_html, reassert_draft=False)
+            else:
+                success = True
+                logger.info(
+                    "[%s] 静默回合完成：最终内容不自动推送（delivered=%s，长度=%s，前 500 字）：\n%s",
+                    chat_id, delivered_this_turn, len(cleaned_content), cleaned_content[:500],
+                )
         elif final_tail_empty_after_rollover:
             success = True
             logger.info(f"[{chat_id}] 最后一段已在滚动时永久化，无需重复发送")
         else:
+            # 草稿模式（/show on，USER 与 TIMER 统一）：最终回复永久化送达。
             success = await send_rich_html_message(chat_id, final_html, reassert_draft=False)
             if not success:
                 logger.error(
@@ -716,7 +796,7 @@ async def get_ai_response(
             len(content_str),
             content_str,
         )
-        if not is_timer:
+        if not silent_mode:
             logger.info(
                 "[%s] 最终 Telegram 富文本（未压缩、未截断；长度=%s）：\n%s",
                 chat_id,
@@ -729,6 +809,8 @@ async def get_ai_response(
     except asyncio.CancelledError:
         # 外部新请求接管时，不能只依赖 finally 的常规收尾：后台 rollover
         # 若继续运行，会在旧任务已取消后把尾段注册成新的草稿并抢占新请求。
+        # 轮次登记（journal）故意不在此注销：打断方在旧任务完全停止后
+        # 会调用 turn_recovery.finalize_* 把已完成的进度保全进历史。
         if builder:
             try:
                 await builder.stop_flush_loop()
@@ -801,6 +883,15 @@ async def get_ai_response(
             endpoint="/v1/images/generations" if is_native_image else "/v1/chat/completions",
             model=current_model,
         )
+        # 异常路径保全（额度不足/网关错误/网络中断等）：已完成的
+        # assistant/tool 消息补齐占位后沉淀进历史，下一轮可从断点继续，
+        # 而不是整轮作废。
+        try:
+            await turn_recovery.persist_salvaged_journal(
+                chat_id, journal, reason=f"turn-error:{error_id}",
+            )
+        except Exception:
+            logger.debug("异常路径轮次保全失败（可忽略）", exc_info=True)
         if is_timer:
             # TIMER：后台回合失败不打扰用户，只记日志；下一个唤醒间隔自动重试
             logger.warning(
@@ -808,6 +899,8 @@ async def get_ai_response(
                 chat_id, error_id, error_msg,
             )
             return error_msg, "", [], None
+        # 静默模式下的错误提示是系统级通知（非模型内容），仍然送达，
+        # 避免用户提问后彻底石沉大海。
         await send_rich_html_message(chat_id, error_msg)
         return error_msg, "", [], None
 
@@ -836,11 +929,16 @@ async def _call_api(
         messages: list,
         chat_id: int,
         builder: "RichMessageBuilder",
-        tools: list = None
+        tools: list = None,
+        journal: list = None,
+        extra_tools: list = None,
 ) -> tuple[str | None, object | None, list]:
     if tools is None:
         from apitelegramchat.search_engine import SEARCH_TOOLS
         tools = SEARCH_TOOLS
+    if extra_tools:
+        # 静默模式等场景在基础工具面之外追加的工具（如 deliver_reply）。
+        tools = list(tools) + list(extra_tools)
 
     api_type = model_info.provider
     supports_tools = model_info.supports_tools
@@ -858,12 +956,12 @@ async def _call_api(
     if use_dedicated_loop:
         return await _agentic_loop_gemini_openai_compat(
             current_model, messages, builder,
-            tools=tools_to_pass, supports_tools=supports_tools
+            tools=tools_to_pass, supports_tools=supports_tools, journal=journal,
         )
     else:
         return await _agentic_loop_openai_compat(
             client, current_model, messages, api_type, builder,
-            tools=tools_to_pass, supports_tools=supports_tools
+            tools=tools_to_pass, supports_tools=supports_tools, journal=journal,
         )
 
 

@@ -135,6 +135,23 @@ async def safe_clear_history(chat_id: int) -> None:
         ctx["conversation_history"] = []
 
 
+# ---------- 草稿预览开关（/show on|off，USER 与 TIMER 回合统一生效） ----------
+async def get_show_drafts(chat_id: int) -> bool:
+    """读取该 chat 的草稿预览开关；默认开启（True）。"""
+    lock = await get_chat_lock(chat_id)
+    async with lock:
+        ctx = get_or_init_context(chat_id)
+        return bool(ctx.get("show_drafts", True))
+
+
+async def set_show_drafts(chat_id: int, enabled: bool) -> None:
+    """设置该 chat 的草稿预览开关（False = 静默模式，走 deliver_reply 交付）。"""
+    lock = await get_chat_lock(chat_id)
+    async with lock:
+        ctx = get_or_init_context(chat_id)
+        ctx["show_drafts"] = bool(enabled)
+
+
 async def safe_set_active_skill(chat_id: int, skill: dict | None) -> None:
     lock = await get_chat_lock(chat_id)
     async with lock:
