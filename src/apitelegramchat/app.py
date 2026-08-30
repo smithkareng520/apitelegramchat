@@ -865,10 +865,9 @@ async def _handle_timer_wakeup(chat_id: int):
             await update_conversation_and_ledger(chat_id, None, new_msgs, usage)
 
         # TIMER 可观测性：不输出隐藏推理，只记录本轮是否产生了持久化活动。
-        sent_count = len(proactive._active_flows.get(chat_id).sent_message_ids) if chat_id in proactive._active_flows else 0
         logger.info(
-            "[TIMER] chat=%s 巡检完成：assistant_tool_messages=%s sent_messages=%s final_text_chars=%s",
-            chat_id, len(new_msgs or []), sent_count, len((full or "").strip()),
+            "[TIMER] chat=%s 巡检完成：assistant_tool_messages=%s final_text_chars=%s",
+            chat_id, len(new_msgs or []), len((full or "").strip()),
         )
     except asyncio.CancelledError:
         # 被用户消息打断：不持久化半成品回合，直接退出

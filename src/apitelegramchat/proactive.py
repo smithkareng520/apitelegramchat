@@ -26,13 +26,12 @@
   （timer 唤醒不写入历史）；回合产生的 assistant/tool 消息正常沉淀，保证
   用户下次回复时模型仍知道后台做过什么（统一上下文）。
 - 用户发新消息会**打断**进行中的 TIMER 回合：后台任务被取消，该回合已通过
-  ``主动消息工具`` 发出的普通消息被**静默撤回**（不显示"已停止"之类
-  的提示）。
+  后台任务被取消，不显示额外提示。
 
 USER 回合的防幻觉（分层防御，见 tool_visibility.py）
 ====================================================
 
-统一上下文会把 TIMER 回合的 ``主动消息工具`` 调用沉淀进历史，历史
+统一上下文会把 TIMER 回合产生的 assistant/tool 消息沉淀进历史，历史
 里的成功调用先例会诱导模型在 USER 回合模仿调用（tools 白名单外调用名网关
 不拦截）。三层防御：
 
@@ -58,36 +57,39 @@ USER 回合的防幻觉（分层防御，见 tool_visibility.py）
 消息撤回与编辑
 ==============
 
-``主动消息工具`` 做成单工具 + ``action`` 参数：
+后台回合不提供直接触达用户的专用工具：
 
-- ``send``：发送新的纯文本消息，返回 ``message_id``；
-- ``edit``：编辑此前发出的某条消息（传 ``message_id`` + 新 ``content``）；
-- ``delete``：撤回此前发出的某条消息（传 ``message_id``）。
+用户可见消息统一由 AI 输出流程控制。
 
-跨回合的消息 id 注册表（``_proactive_message_ids``）让后续 TIMER 回合仍能
-编辑/撤回更早主动发出的消息；被打断的当回合消息则由打断逻辑统一撤回。
+TIMER 回合只由调度器负责启动、取消和生命周期管理；用户可见消息由统一的 AI 输出流程负责。
 
 线程与并发模型
 ==============
 
 - 每个 chat 一个调度协程（``_chat_scheduler_loop``），轮询用户活动时间戳；
-- 进行中的 TIMER 回合登记在 ``_active_flows``；工具执行中的 sendMessage 用
-  ``asyncio.shield`` 包裹并登记到 ``flow.pending_sends``——即使回合被取消，
-  在途请求也会完成注册，随后由打断逻辑统一撤回，不会产生"撤不掉"的残留消息。
+- 进行中的 TIMER 回合登记在 ``_active_flows``；用户发来新消息时取消对应后台任务。
 """
 import asyncio
-import json
 import os
 import random
 import time
 from typing import Awaitable, Callable, Optional
 
-import aiohttp
 
-from apitelegramchat.config import BASE_URL
-from apitelegramchat.utils import get_logger, delete_message_fast
+from apitelegramchat.utils import get_logger
 
 logger = get_logger(__name__)
+
+
+class _ProactiveFlow:
+    """一次 TIMER 回合的生命周期状态；不再追踪或撤回主动消息。"""
+
+    __slots__ = ("chat_id", "task", "interrupted")
+
+    def __init__(self, chat_id: int):
+        self.chat_id = chat_id
+        self.task: Optional[asyncio.Task] = None
+        self.interrupted = False
 
 
 
@@ -227,10 +229,9 @@ async def _fire_turn(chat_id: int) -> None:
         except Exception:
             logger.exception("[proactive] chat=%s TIMER 回合异常", chat_id)
         finally:
-            await _drain_pending_sends(flow, timeout=2.0)
             logger.info(
-                "[TIMER] chat=%s 回合收尾：sent_messages=%s interrupted=%s",
-                chat_id, len(flow.sent_message_ids), flow.interrupted,
+                "[TIMER] chat=%s 回合收尾：interrupted=%s",
+                chat_id, flow.interrupted,
             )
             if _active_flows.get(chat_id) is flow:
                 _active_flows.pop(chat_id, None)
@@ -250,20 +251,6 @@ async def _fire_turn(chat_id: int) -> None:
         "[TIMER] chat=%s 决策=RUN：开始执行主动巡检（todo→context→info→chat，必发消息）",
         chat_id,
     )
-
-
-async def _drain_pending_sends(flow: _ProactiveFlow, *, timeout: float) -> None:
-    """等待仍在途的 shield 发送完成注册（用于回合收尾与打断撤回前）。"""
-    pending = [t for t in flow.pending_sends if not t.done()]
-    if not pending:
-        return
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(*pending, return_exceptions=True),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("[proactive] chat=%s 仍有 %s 个在途发送未完成", flow.chat_id, len(pending))
 
 
 async def _chat_scheduler_loop(chat_id: int) -> None:
@@ -391,7 +378,7 @@ async def interrupt_proactive_flow(chat_id: int) -> bool:
     if flow is None:
         return False
 
-    logger.info("[proactive] chat=%s 用户消息打断 TIMER 回合，开始静默撤回", chat_id)
+    logger.info("[proactive] chat=%s 用户消息打断 TIMER 回合", chat_id)
 
     # 1) 标记打断：此后落地的新消息会立即自清理
     flow.interrupted = True
@@ -409,20 +396,9 @@ async def interrupt_proactive_flow(chat_id: int) -> bool:
         except Exception:
             logger.debug("[proactive] chat=%s TIMER 回合取消时出现异常", chat_id, exc_info=True)
 
-    # 3) 等待 shield 保护的在途发送完成注册，确保撤回不漏
-    await _drain_pending_sends(flow, timeout=2.0)
-
-    # 4) 静默撤回该回合发出的全部普通消息
-    recalled = 0
-    for mid in list(flow.sent_message_ids):
-        if await _recall_message_quietly(chat_id, mid):
-            recalled += 1
-    _forget_proactive_messages(chat_id, flow.sent_message_ids)
-    flow.sent_message_ids.clear()
-
-    # 5) 注销回合
+    # 注销回合；消息发送不再由 proactive 模块负责。
     if _active_flows.get(chat_id) is flow:
         _active_flows.pop(chat_id, None)
 
-    logger.info("[proactive] chat=%s TIMER 回合已打断，静默撤回 %s 条消息", chat_id, recalled)
+    logger.info("[proactive] chat=%s TIMER 回合已打断", chat_id)
     return True
