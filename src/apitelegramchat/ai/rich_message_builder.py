@@ -243,17 +243,6 @@ class RichMessageBuilder:
         self._flush_dirty: bool = False
         self._stop_flush = False
         self._thinking_removed: bool = False
-        # ===== Thinking 进度反馈 =====
-        # 问题：模型首 token 迟迟不到时，草稿会静态显示 "Thinking..." 最久
-        # （httpx read timeout = 300s × 2 次重试 ≈ 10 分钟）— 用户看到的就是一帧
-        # 不变的草稿，以为 Agent 卡死了。
-        # 解决：在 <tg-thinking> 占位仍在、且本轮还没收到任何流式增量时，
-        # 按 5 秒一档更新占位文本为 "Thinking... (Ns)"，让用户看见时间在走。
-        # 只要流式首字到达（append_stream_delta 首次被调用）立刻停用进度反馈，
-        # 以免和真实内容同时出现造成视觉冲突。
-        self._thinking_start_time: float = 0.0
-        self._last_thinking_progress_bucket: int = -1
-        self._has_streamed_content: bool = False
         self._pending_reasoning_html: str = ""
         self._flush_lock = asyncio.Lock()
         self._rollover_lock = asyncio.Lock()
@@ -674,9 +663,6 @@ class RichMessageBuilder:
         self.blocks = new_blocks
         self.block_types = new_types
         self._thinking_removed = True
-        # 思考占位被移除后，进度反馈机制自动失效：不再产生新的“Thinking... (Ns)”。
-        self._thinking_start_time = 0.0
-        self._last_thinking_progress_bucket = -1
         self.request_flush(force=False)
 
     def add_initial_thinking(self, text: str = "Thinking...") -> int:
@@ -684,12 +670,8 @@ class RichMessageBuilder:
         block = f"<tg-thinking>{escape_html(text)}</tg-thinking>"
         self.blocks.append(block)
         self.block_types.append("html")
-        # 记录 "思考期" 起点，供 _stream_flush_loop 在静默超时时打进度文本。
         # 不在此处调用 request_flush，由 get_ai_response 中显式 await flush() 统一触发，
         # 避免与显式 flush 产生重复的 sendRichMessageDraft API 调用。
-        self._thinking_start_time = time.monotonic()
-        self._last_thinking_progress_bucket = -1
-        self._has_streamed_content = False
         return len(self.blocks) - 1
 
     def set_thinking_status(self, text: str, *, force: bool = True) -> bool:
@@ -703,35 +685,6 @@ class RichMessageBuilder:
                     self.request_flush(force=force)
                 return True
         return False
-
-    def _update_thinking_progress(self, elapsed_seconds: int) -> None:
-        """把首个 <tg-thinking> 占位的文本更新为 "Thinking... (Ns)"。
-
-        只在当前文本是默认 "Thinking..." 或我们自己写过的进度变体
-        （"Thinking... (Ns)"）时才更新；调用方手动设置的其它占位文本
-        （例如 "正在准备工具..."）会被保留，不会被进度计数覆盖。
-        """
-        new_text = f"Thinking... ({elapsed_seconds}s)"
-        new_block = f"<tg-thinking>{escape_html(new_text)}</tg-thinking>"
-        prefix_len = len("<tg-thinking>")
-        suffix_len = len("</tg-thinking>")
-        for index, (block, block_type) in enumerate(zip(self.blocks, self.block_types)):
-            if block_type != "html" or not block.startswith("<tg-thinking>"):
-                continue
-            if block == new_block:
-                return  # 已经是目标文本，无需重复写
-            # 取出 <tg-thinking>...</tg-thinking> 的 inner 文本，判断是否
-            # 是默认或我们自己的进度变体；调用方自定义文本不覆盖。
-            if len(block) <= prefix_len + suffix_len:
-                continue
-            inner = block[prefix_len:-suffix_len]
-            if inner == "Thinking..." or inner.startswith("Thinking... ("):
-                self.blocks[index] = new_block
-                # force=False：不抢在主 flush 之前强制发送，由 _stream_flush_loop
-                # 末尾的 await flush(force=silent_too_long) 顺手带上去；这样
-                # 一次循环只发一帧，避免连续 sendRichMessageDraft 调用。
-                self.request_flush(force=False)
-            return  # 只更新首个 thinking 占位
 
     def add_text(self, text: str):
         if not text or not text.strip():
@@ -798,16 +751,6 @@ class RichMessageBuilder:
         if self._handoff_text is not None:
             self._handoff_text.append(delta)
             return
-        # 真实内容的首片 delta 到达——立刻停用 Thinking 进度反馈，并把占位
-        # 文本从 "Thinking... (Ns)" 复位回 "Thinking..."，避免后续整轮里
-        # 用户一直看到过期的进度计数与真实内容并排。
-        if not self._has_streamed_content:
-            self._has_streamed_content = True
-            if self._last_thinking_progress_bucket > 0 and not self._thinking_removed:
-                # 复位为默认文本；set_thinking_status 内部已经做了内容比对，
-                # 只在文本确实变化时才会触发 request_flush，不会造成额外发送。
-                self.set_thinking_status("Thinking...", force=False)
-                self._last_thinking_progress_bucket = -1
         self._stream_buffer += delta
         # 流式增量未必每片都调用 request_flush；将其标记为新版本，可确保一旦
         # 当前发送结束，后台刷新不会把已累积的增量误认为已经展示。
@@ -1038,12 +981,9 @@ class RichMessageBuilder:
         self._current_group_idx = -1
         self._stream_buffer = ""
         self._stream_text_index = -1
-        # 滚动产生的是新草稿，进入新一轮“等待首字”阶段：把 Thinking 进度
-        # 反馈的状态全部重置，让 _stream_flush_loop 重新从 0 开始计时与打档。
+        # 滚动产生的是新草稿：重置思考占位状态，使下一轮的 add_initial_thinking
+        # 占位仍可被 set_thinking_status / append_stream_delta 正确管理。
         self._thinking_removed = False
-        self._thinking_start_time = time.monotonic()
-        self._last_thinking_progress_bucket = -1
-        self._has_streamed_content = False
 
     async def _register_active_draft(self, message_id: int = 0) -> None:
         try:
@@ -1334,27 +1274,6 @@ class RichMessageBuilder:
                     (self._flush_dirty and time_elapsed >= STREAM_FLUSH_INTERVAL)
                     or silent_too_long
             )
-            # ===== Thinking 进度反馈 =====
-            # 静默超过 STREAM_SILENT_FORCE_FLUSH 时，如果 <tg-thinking> 占位仍在、
-            # 还没收到任何流式增量，就在占位文本里打上 "Thinking... (Ns)"，
-            # 按 5 秒一档更新。否则 httpx read 超时（300s × 2 次）期间草稿
-            # 就是一帧不动，看起来像 Agent 卡死。
-            # 一旦 append_stream_delta 收到首片真实内容，_has_streamed_content
-            # 立即变 True，本分支自动失效；占位文本也会在 append_stream_delta
-            # 中复位为 "Thinking..."。
-            if (
-                silent_too_long
-                and not self._thinking_removed
-                and not self._has_streamed_content
-                and self._thinking_start_time
-            ):
-                elapsed = int(now - self._thinking_start_time)
-                # 5 秒一档：避免高频更新草稿 API；同时 "Thinking... (5s)" 的
-                # 步长对用户来说也足够看到 "在动"。
-                bucket = (elapsed // 5) * 5
-                if bucket >= 5 and bucket != self._last_thinking_progress_bucket:
-                    self._last_thinking_progress_bucket = bucket
-                    self._update_thinking_progress(bucket)
             if should_flush:
                 self._commit_stream_buffer()
                 await self.flush(force=silent_too_long)

@@ -4,6 +4,7 @@
 """
 import asyncio
 import json
+import os
 import aiohttp
 import httpx
 import base64
@@ -62,6 +63,40 @@ if TYPE_CHECKING:
     from apitelegramchat.ai.rich_message_builder import RichMessageBuilder
 
 logger = get_logger(__name__)
+
+# 流式“首字等待”超时：在 90 秒内必须收到第一个 SSE chunk，否则视为上游
+# 已经冷挂起，立即取消本次请求并重试。该项独立于 httpx.Timeout(read=300s)，
+# 后者只覆盖流式持续阶段两个 chunk 之间的间隔；首字阶段的“长时间无任何
+# 字节”无法被 httpx 的 read timeout 精准捕获（流式响应一旦开始，
+# 第一个 chunk 与下一次 recv 之间都被算作“read 间隔”）。
+# 90s 是经验阈值：上游冷启动 + 模型 reasoning 起步偶尔需要 30~60s，
+# 90s 给足缓冲；超过 90s 通常意味着上游已卡死，继续等也只是把整个
+# 草稿冻在 "Thinking..."，让用户看到“卡几分钟才有回复”的现象。
+FIRST_TOKEN_TIMEOUT_SECONDS: float = float(os.environ.get("AGENTIC_FIRST_TOKEN_TIMEOUT", "90"))
+
+# 首字超时后的最大重试次数。3 次的“最坏等待 = 3×90s = 270s”远低于
+# 原来的 6×300s=30 分钟；若 3 次仍首字超时，进入非流式兜底请求，
+# 非流式没有“首字”概念，按其本身的 httpx read timeout 上限走。
+STREAM_FIRST_TOKEN_RETRY_MAX: int = 3
+
+
+async def _stream_with_first_token_timeout(stream, timeout: float):
+    """异步生成器：包一层 stream，让首片 SSE chunk 必须在 timeout 秒内到达。
+
+    首片到达后，剩余 chunk 不再受 timeout 限制，按 httpx read timeout 走
+    （默认 300s，覆盖两个 chunk 之间的间隔）。这样把“首字等待”与“持续
+    流式”两段超时解耦，避免 httpx.read_timeout 在首字阶段被 300s 上限
+    绑死——上游冷挂起时，用户会看到草稿停在 "Thinking..." 长达几分钟。
+
+    超时通过 asyncio.wait_for 触发，会取消 stream.__anext__() 内部协程；
+    调用方收到 asyncio.TimeoutError 后，应主动 aclose() 关闭残留 stream，
+    再重试或转非流式。
+    """
+    first = await asyncio.wait_for(stream.__anext__(), timeout=timeout)
+    yield first
+    async for chunk in stream:
+        yield chunk
+
 
 def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict):
     if index not in accumulator:
@@ -285,10 +320,22 @@ async def _agentic_loop_openai_compat(
             # 某些聚合网关会在长工具链后的首个 SSE 事件前沉默较久。
             # 只有尚未收到任何增量时，重试相同请求才是幂等且安全的；一旦已经向
             # 用户或工具状态写入增量，必须直接抛出，避免重放半个模型回合。
-            for stream_attempt in range(2):
+            #
+            # 首字超时 + 重试策略：
+            #   - 首片 SSE chunk 必须在 FIRST_TOKEN_TIMEOUT_SECONDS（默认 90s）内到达，
+            #     否则视为上游冷挂起，立即取消本次请求并重试。
+            #   - 共重试 STREAM_FIRST_TOKEN_RETRY_MAX（默认 3）次：最坏等待 3×90s=270s，
+            #     远低于原来的“SDK 内置 2 次 + 我们的 2 次 = 6×300s=30 分钟”。
+            #   - 全部重试都首字超时：不抛 ReadTimeout，而是让循环自然结束，
+            #     使下面的“not received_any”分支进入非流式兜底请求。
+            #   - 已经收到过任何 chunk（received_any=True）后再抛超时：
+            #     不能重试，直接 raise，避免重放半个模型回合。
+            for stream_attempt in range(STREAM_FIRST_TOKEN_RETRY_MAX):
                 try:
                     comp_stream = await client.chat.completions.create(**create_params)
-                    async for chunk in comp_stream:
+                    async for chunk in _stream_with_first_token_timeout(
+                        comp_stream, FIRST_TOKEN_TIMEOUT_SECONDS
+                    ):
                         received_any = True
                         if getattr(chunk, "usage", None):
                             final_usage = chunk.usage
@@ -418,14 +465,32 @@ async def _agentic_loop_openai_compat(
                                     parsed_args = _safe_parse_args(current_args)
                                     builder.update_tool_args(tc_id, parsed_args)
                     break
-                except httpx.ReadTimeout:
-                    if received_any or stream_attempt >= 1:
+                except (httpx.ReadTimeout, asyncio.TimeoutError) as stream_err:
+                    # 已经开始接收内容后中断：不能重试，避免重放半个模型回合
+                    if received_any:
                         raise
+                    # 残留 stream 必须显式关闭，否则连接泄漏
+                    try:
+                        await comp_stream.aclose()
+                    except Exception:
+                        pass
+                    is_last_attempt = stream_attempt >= STREAM_FIRST_TOKEN_RETRY_MAX - 1
+                    if is_last_attempt:
+                        # 全部重试都首字超时——不抛出，让循环自然结束；
+                        # 下面的 “not received_any” 分支会触发非流式兜底请求
+                        logger.warning(
+                            "[%s] 第 %s 轮模型首字等待超过 %.0fs（重试 %s 次全部超时: %r），转非流式兜底",
+                            api_label, _round + 1, FIRST_TOKEN_TIMEOUT_SECONDS,
+                            STREAM_FIRST_TOKEN_RETRY_MAX, stream_err,
+                        )
+                        break
                     logger.warning(
-                        "[%s] 第 %s 轮模型流在首个增量前读取超时，等待后重试一次",
-                        api_label, _round + 1,
+                        "[%s] 第 %s 轮模型首字等待超过 %.0fs，立即重试 (%s/%s): %r",
+                        api_label, _round + 1, FIRST_TOKEN_TIMEOUT_SECONDS,
+                        stream_attempt + 2, STREAM_FIRST_TOKEN_RETRY_MAX, stream_err,
                     )
-                    await asyncio.sleep(1.0)
+                    # 短休眠后重试：上游冷启动慢，给 0.5s 缓冲避免立刻撞同一节点
+                    await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -614,7 +679,9 @@ async def _agentic_loop_openai_compat(
                 builder.begin_stream_text()
                 synth_text = ""
                 synth_usage = None
-                async for chunk in synth_stream:
+                async for chunk in _stream_with_first_token_timeout(
+                    synth_stream, FIRST_TOKEN_TIMEOUT_SECONDS
+                ):
                     # 与主循环一致：usage chunk 通常出现在流末尾，需独立捕获。
                     if getattr(chunk, "usage", None):
                         synth_usage = chunk.usage
