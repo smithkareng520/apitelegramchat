@@ -20,6 +20,7 @@ search_engine.py 等）无需修改任何 import 语句。
 import asyncio
 import json
 import re
+import time
 from typing import Optional
 
 from apitelegramchat.config import (
@@ -817,19 +818,36 @@ async def _call_api(
 
     client = api_client.get_client(api_type)
 
+    # 观测 agent loop 调度延迟：Telegram Thinking 首帧已经发出后，
+    # 如果长时间没有模型请求，日志可以直接定位是在调度/上下文准备阶段，
+    # 而不是误判为 Telegram 草稿卡死。
+    loop_started_at = time.monotonic()
+
     provider_config = PROVIDERS.get(api_type)
     use_dedicated_loop = provider_config.use_dedicated_loop if provider_config else False
 
-    if use_dedicated_loop:
-        return await _agentic_loop_gemini_openai_compat(
-            current_model, messages, builder,
-            tools=tools_to_pass, supports_tools=supports_tools
+    try:
+        if use_dedicated_loop:
+            result = await _agentic_loop_gemini_openai_compat(
+                current_model, messages, builder,
+                tools=tools_to_pass, supports_tools=supports_tools
+            )
+        else:
+            result = await _agentic_loop_openai_compat(
+                client, current_model, messages, api_type, builder,
+                tools=tools_to_pass, supports_tools=supports_tools
+            )
+        logger.info(
+            "[%s] agent loop 完成耗时 %.3fs model=%s provider=%s",
+            chat_id, time.monotonic() - loop_started_at, current_model, api_type
         )
-    else:
-        return await _agentic_loop_openai_compat(
-            client, current_model, messages, api_type, builder,
-            tools=tools_to_pass, supports_tools=supports_tools
+        return result
+    except Exception:
+        logger.exception(
+            "[%s] agent loop 异常，耗时 %.3fs model=%s provider=%s",
+            chat_id, time.monotonic() - loop_started_at, current_model, api_type
         )
+        raise
 
 
 

@@ -487,6 +487,10 @@ async def _agentic_loop_openai_compat(
                 content_acc = "请求失败，请稍后重试。"
 
         tool_calls_list = [tool_calls_acc[i] for i in sorted(tool_calls_acc.keys())] if tool_calls_acc else []
+        # 每一轮模型请求都记录 usage/cache，而不是等整个 agent loop 结束后只记录最后一轮。
+        # 这样多工具链场景可以看到每一次 LLM call 的真实 prompt/cache 状态。
+        _log_cache_usage(f"{api_label} round={_round + 1}", final_usage)
+
         try:
             tool_call_names = [tc.get("function", {}).get("name", "") or "" for tc in tool_calls_list]
             tool_call_ids = [tc.get("id", "") or "" for tc in tool_calls_list]
@@ -633,7 +637,6 @@ async def _agentic_loop_openai_compat(
             builder.finish_group(len(builder._tool_groups) - 1)
         # 轮次数耗尽后的兜底文本同样是终局内容：结束旧草稿，不创建下一段。
         await builder.rollover_at_turn_boundary(start_next_draft=False)
-    _log_cache_usage(api_label, final_usage)
     return final_content, final_usage, new_history_entries
 
 
