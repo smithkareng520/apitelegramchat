@@ -1,5 +1,5 @@
 # proactive.py
-"""统一上下文的主动唤醒（TIMER 事件源）与 ``send_message_to_user`` 工具。
+"""统一上下文的主动唤醒（TIMER 事件源）调度器。
 
 背景与设计
 ==========
@@ -9,39 +9,37 @@
 （USER 事件源）共用同一份会话历史（统一上下文），但行为不同：
 
 - TIMER 回合对用户**完全静默**：不创建草稿、不显示工具进度、最终文本也不
-  推送到 Telegram——这些只存在于历史上下文中。唯一能触达用户的通道是模型
-  显式调用 ``send_message_to_user``，且内容按**普通纯文本**（不带任何格式）
-  通过 sendMessage 发送，像人随手发消息一样。
+  推送到 Telegram——这些只存在于历史上下文中。TIMER 回合本身不向用户发送最终文本。
 
 必发消息（提示词层，无代码兜底）
 ==================================
 
 ``WAKEUP_PROMPT`` 要求模型把每个 TIMER 回合当作一次主动发起对话的机会，
-结束时用户必须收到一条消息（唯一通道仍是 ``send_message_to_user``）：
+结束时完成一次主动巡检：
 
 1. 有要紧事（Todo 到期/临近、上下文遗留的跟进、相关新信息）→ 优先说要紧事；
 2. 没有要紧事 → 像朋友一样自然地找话题聊（近期兴趣、时段、开放式小问题）。
 
-发送完全由模型自己完成：调度器不做任何代码层补发，也没有开关。
+巡检回合由调度器负责启动，不向用户暴露后台过程。
 
 - 唤醒用的合成 user 消息（WAKEUP_PROMPT）只进入本轮请求，**不写入持久历史**
   （timer 唤醒不写入历史）；回合产生的 assistant/tool 消息正常沉淀，保证
   用户下次回复时模型仍知道后台做过什么（统一上下文）。
 - 用户发新消息会**打断**进行中的 TIMER 回合：后台任务被取消，该回合已通过
-  ``send_message_to_user`` 发出的普通消息被**静默撤回**（不显示"已停止"之类
+  ``主动消息工具`` 发出的普通消息被**静默撤回**（不显示"已停止"之类
   的提示）。
 
 USER 回合的防幻觉（分层防御，见 tool_visibility.py）
 ====================================================
 
-统一上下文会把 TIMER 回合的 ``send_message_to_user`` 调用沉淀进历史，历史
+统一上下文会把 TIMER 回合的 ``主动消息工具`` 调用沉淀进历史，历史
 里的成功调用先例会诱导模型在 USER 回合模仿调用（tools 白名单外调用名网关
 不拦截）。三层防御：
 
 1. 根因层：USER 回合构建请求时，``tool_visibility.apply_tool_visibility``
    把历史中本工具的调用折叠成普通文本摘要（保留语义、消除调用形状）；
 2. 工具面层：USER 回合的 tools 列表本就不含本工具（既有行为）；
-3. 兜底层：模型仍幻觉调用时，``execute_send_message_to_user`` 返回无害化
+3. 兜底层：模型仍幻觉调用时，``execute_主动消息工具`` 返回无害化
    引导文案——不说"失败"、不指示"直接把回复写给用户"（旧文案会在任务
    中途诱发提前收尾），只说明未执行并要求继续当前任务。
 
@@ -60,7 +58,7 @@ USER 回合的防幻觉（分层防御，见 tool_visibility.py）
 消息撤回与编辑
 ==============
 
-``send_message_to_user`` 做成单工具 + ``action`` 参数：
+``主动消息工具`` 做成单工具 + ``action`` 参数：
 
 - ``send``：发送新的纯文本消息，返回 ``message_id``；
 - ``edit``：编辑此前发出的某条消息（传 ``message_id`` + 新 ``content``）；
@@ -91,414 +89,6 @@ from apitelegramchat.utils import get_logger, delete_message_fast
 
 logger = get_logger(__name__)
 
-
-# =====================================================================
-# 配置（全部可用环境变量覆盖）
-# =====================================================================
-def _env_flag(name: str, default: bool = True) -> bool:
-    raw = os.getenv(name)
-    if raw is None or not str(raw).strip():
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_seconds(name: str, default: int, *, minimum: int = 1) -> int:
-    raw = os.getenv(name)
-    try:
-        value = int(str(raw).strip()) if raw is not None and str(raw).strip() else default
-    except (TypeError, ValueError):
-        value = default
-    return max(minimum, value)
-
-
-def _env_seconds_list(name: str, default: list[int]) -> list[int]:
-    raw = os.getenv(name)
-    if raw is None or not str(raw).strip():
-        return list(default)
-    out: list[int] = []
-    for part in str(raw).replace("，", ",").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            out.append(max(1, int(float(part))))
-        except (TypeError, ValueError):
-            continue
-    return out or list(default)
-
-
-PROACTIVE_ENABLED = _env_flag("PROACTIVE_ENABLED", True)
-# 用户空闲多久后开始"活动时间"（首次唤醒触发点）
-PROACTIVE_IDLE_START_SECONDS = _env_seconds("PROACTIVE_IDLE_START_SECONDS", 20 * 60)
-# 两次唤醒之间的随机间隔候选（像人一样不定期）
-# 主动巡检随机间隔范围（默认 10 分钟 ~ 1 小时）
-# 根据用户状态动态调整，避免机械节奏
-PROACTIVE_INTERVAL_MIN_SECONDS = _env_seconds("PROACTIVE_INTERVAL_MIN_SECONDS", 10 * 60)
-PROACTIVE_INTERVAL_MAX_SECONDS = _env_seconds("PROACTIVE_INTERVAL_MAX_SECONDS", 60 * 60)
-# 主动消息保护（【已废弃】：不再限制每日主动消息数，默认值改为大数=不生效；
-# 保留变量名仅为兼容旧配置/旧导入，如需限流可显式设置较小值）
-PROACTIVE_DAILY_MESSAGE_LIMIT = _env_seconds("PROACTIVE_DAILY_MESSAGE_LIMIT", 10 ** 9)
-# 用户连续多久没发消息 → 停止高频触发
-PROACTIVE_MAX_IDLE_SECONDS = _env_seconds("PROACTIVE_MAX_IDLE_SECONDS", 3 * 3600)
-# 停止触发后的休息时长；休息结束后再触发一次（用户仍无回应则继续休息）
-PROACTIVE_REST_SECONDS = _env_seconds("PROACTIVE_REST_SECONDS", 3600)
-# 调度协程的轮询粒度
-_PROACTIVE_POLL_SECONDS = _env_seconds("PROACTIVE_POLL_SECONDS", 10, minimum=1)
-# 跨回合消息 id 注册表容量（仅用于 edit/delete 校验）
-_PROACTIVE_REMEMBER_LIMIT = _env_seconds("PROACTIVE_REMEMBER_LIMIT", 50, minimum=1)
-# 普通消息单条文本上限（Telegram sendMessage 协议限制 4096）
-_PLAIN_TEXT_LIMIT = 4000
-
-
-# =====================================================================
-# 唤醒提示词与工具定义
-# =====================================================================
-WAKEUP_PROMPT = """
-[系统后台唤醒｜TIMER 主动巡检回合]
-
-你现在处于“主动巡检回合”。这不是一次普通的聊天请求，而是一次由你主动
-发起对话的机会。
-
-本回合有一条硬性要求：结束时用户必须收到你的一条消息。你的 assistant 最终
-文本不会送达用户，唯一通道是 send_message_to_user——不发工具调用，用户就
-什么都收不到。所以“查完之后什么都不发”不是谨慎，而是失职。
-
-按下面的优先级决定说什么：
-
-1. 检查当前 Todo（第一优先级）
-   - 优先调用 todo 的 list，检查未完成任务：已到期、临近到期、长期未推进、
-     现在适合推进、或现在值得提醒的任务。
-   - 任务明确且安全、且无需用户补充信息时，可以推进 Todo 状态；否则提醒用户。
-   - 不要为了“有事可做”而虚构任务、修改无关任务或重复提醒已处理过的事。
-
-2. 检查最近上下文
-   - 回看最近对话，寻找未完成的话题、用户留下的待办、承诺、等待结果、计划
-     和自然后续；有话到了“现在联系最自然”的时间点就顺着聊。
-   - 可以（适度）用 web_search 查证与用户上下文相关的新信息再分享，但不要
-     每个回合都变成新闻播报。
-
-3. 没有要紧事 → 主动找话题聊（这是本回合的兜底动作，不是可选项）
-   - 从最近聊天里挑一个用户表现出兴趣的点接着聊（爱好、近况、之前提过的事）；
-   - 结合当下时间（早晨/午后/晚上/深夜/周几）自然开场；
-   - 抛一个轻松、具体、开放式的小问题，或分享一个有趣的想法；
-   - 像朋友随手发消息那样：短、自然、能让人想回一句；
-   - 换着花样来，不要每次都用同一种开场方式，不要重复上一轮说过的话。
-
-消息风格（无论哪个优先级都适用）：
-- 必须通过 send_message_to_user 发送；一次回合通常只发一条，确有必要才多条。
-- 短、口语化、像真人主动想起一件事后随手发的消息；不要 Markdown/HTML。
-- 不要解释“这是 TIMER/后台唤醒”，不要报告你的检查过程或决策过程。
-
-禁止：
-- 空洞的服务性套话：“明白，我会注意……”“有什么我可以帮您的吗？”“我会等待您的消息。”
-- 查完 Todo 和上下文之后什么都不发。
-- 把内部推理、工具检查过程或“我决定不发”之类的说明发给用户。
-- 编造用户没说过的承诺、时间或事实。
-
-一句话总结：有要紧事，优先说要紧事；没有要紧事，就找个自然的话题聊——
-但本回合绝不能以沉默收场。
-"""
-
-
-SEND_MESSAGE_TO_USER_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "send_message_to_user",
-        "description": (
-            "向当前用户推送一条即时消息（系统后台唤醒回合里唯一能触达用户的通道）。"
-            "后台唤醒回合必须至少调用一次本工具：有要紧事（任务提醒、上下文跟进、相关新信息）"
-            "就说要紧事；没有要紧事就自然地找个话题聊，但绝不能不发。"
-            "内容必须是普通纯文本：不使用任何 Markdown、HTML 或格式符号——像人随手发消息一样简短自然。"
-            "同一个工具通过 action 控制行为：send 发送新消息（返回 message_id）；"
-            "edit 编辑你此前发出的某条消息；delete 撤回（删除）你此前发出的某条消息。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["send", "edit", "delete"],
-                    "description": "send=发送新消息；edit=修改已发送的消息；delete=撤回已发送的消息。",
-                },
-                "content": {
-                    "type": "string",
-                    "description": (
-                        "消息文本，send/edit 时必填。纯文本无格式，口语化、简短自然，"
-                        "像一个真人发来的消息。"
-                    ),
-                },
-                "message_id": {
-                    "type": "integer",
-                    "description": "edit/delete 时必填：此前 send 返回的 message_id。",
-                },
-            },
-            "required": ["action"],
-        },
-    },
-}
-
-
-# =====================================================================
-# 回合注册表：进行中的 TIMER 回合 + 消息追踪
-# =====================================================================
-class _ProactiveFlow:
-    """一次进行中的 TIMER 回合及其发出的普通消息。"""
-
-    __slots__ = ("chat_id", "task", "sent_message_ids", "pending_sends", "interrupted")
-
-    def __init__(self, chat_id: int):
-        self.chat_id = chat_id
-        self.task: Optional[asyncio.Task] = None
-        # 本回合通过 send_message_to_user 发出的消息（打断时整体静默撤回）
-        self.sent_message_ids: list[int] = []
-        # 被 shield 保护、仍在途的发送任务（取消后也会完成注册）
-        self.pending_sends: set[asyncio.Task] = set()
-        # 打断标记：置位后新消息立即自清理，不再进入撤回列表
-        self.interrupted: bool = False
-
-
-_active_flows: dict[int, _ProactiveFlow] = {}
-# 跨回合消息 id 注册表：chat_id -> 最近发出的 message_id 列表（edit/delete 校验用）
-_proactive_message_ids: dict[int, list[int]] = {}
-
-
-def is_proactive_flow_active(chat_id: int) -> bool:
-    """该 chat 是否有进行中的 TIMER 回合。"""
-    return chat_id in _active_flows
-
-
-def _remember_proactive_message(chat_id: int, message_id: int) -> None:
-    ids = _proactive_message_ids.setdefault(chat_id, [])
-    if message_id in ids:
-        return
-    ids.append(message_id)
-    if len(ids) > _PROACTIVE_REMEMBER_LIMIT:
-        del ids[: len(ids) - _PROACTIVE_REMEMBER_LIMIT]
-
-
-def _forget_proactive_messages(chat_id: int, message_ids: list[int]) -> None:
-    ids = _proactive_message_ids.get(chat_id)
-    if not ids:
-        return
-    drop = {int(m) for m in message_ids}
-    ids[:] = [m for m in ids if m not in drop]
-
-
-def _is_known_proactive_message(chat_id: int, message_id) -> bool:
-    try:
-        mid = int(message_id)
-    except (TypeError, ValueError):
-        return False
-    if mid <= 0:
-        return False
-    return mid in _proactive_message_ids.get(chat_id, [])
-
-
-def _register_sent_message(flow: _ProactiveFlow, chat_id: int, message_id) -> None:
-    """把一条已发出的普通消息登记到回合与跨回合注册表。"""
-    try:
-        mid = int(message_id)
-    except (TypeError, ValueError):
-        return
-    if mid <= 0:
-        return
-    if flow.interrupted:
-        # 回合已被打断、撤回已经执行过：这条迟到消息立即自清理，
-        # 避免出现"撤不掉"的残留。
-        asyncio.create_task(_recall_message_quietly(chat_id, mid))
-        return
-    flow.sent_message_ids.append(mid)
-    _remember_proactive_message(chat_id, mid)
-
-
-async def _recall_message_quietly(chat_id: int, message_id: int) -> bool:
-    """静默撤回一条普通消息：尽力而为、不抛异常、不产生任何用户可见提示。"""
-    try:
-        ok = await delete_message_fast(chat_id, message_id)
-        if ok:
-            _forget_proactive_messages(chat_id, [message_id])
-        return ok
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.debug("_recall_message_quietly 内部忽略的异常", exc_info=True)
-        return False
-
-
-# =====================================================================
-# Telegram 普通消息 HTTP 原语（纯文本、无 parse_mode，像人发消息）
-# =====================================================================
-async def _telegram_post(method: str, payload: dict, *, retries: int = 1) -> tuple[bool, dict | None, str]:
-    """调用 Telegram Bot API，返回 (ok, result_dict, body_text)。
-
-    超时设计：单次 5s / 连接 2s。send 路径最多重试 2 次（最坏 ~11s），
-    必须落在 tool_call_loop 的外层超时（send_message_to_user 已加入
-    LONG_RUNNING_TOOLS，45s）之内——否则外层会误判超时并可能重发，
-    造成重复消息。
-    """
-    url = f"{BASE_URL}/{method}"
-    last_body = ""
-    for attempt in range(max(1, retries)):
-        try:
-            timeout = aiohttp.ClientTimeout(total=5, connect=2)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, json=payload) as resp:
-                    body = await resp.text()
-                    last_body = body
-                    if resp.status == 200:
-                        try:
-                            return True, await resp.json(), body
-                        except Exception:
-                            logger.debug("_telegram_post 内部忽略的异常", exc_info=True)
-                            return True, None, body
-                    # 4xx 属于确定性失败，重试没有意义
-                    if 400 <= resp.status < 500:
-                        return False, None, body
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning("[proactive] %s 请求异常(第 %s 次): %s", method, attempt + 1, e)
-            last_body = str(e)
-        if attempt < max(1, retries) - 1:
-            await asyncio.sleep(1.0)
-    return False, None, last_body
-
-
-async def _send_plain_message(chat_id: int, text: str) -> Optional[int]:
-    """发送一条普通纯文本消息（不带任何格式），返回 message_id。"""
-    payload = {"chat_id": chat_id, "text": text}
-    ok, data, body = await _telegram_post("sendMessage", payload, retries=2)
-    if not ok:
-        # 403 = 用户屏蔽/移除了 bot：停止对该 chat 的主动唤醒，避免永远空转
-        if "403" in body or "blocked" in body.lower() or "kicked" in body.lower():
-            logger.warning("[proactive] chat=%s sendMessage 被拒（%s），停用该会话的主动唤醒", chat_id, body[:120])
-            await _deactivate_chat(chat_id)
-        else:
-            logger.warning("[proactive] chat=%s sendMessage 失败: %s", chat_id, body[:200])
-        return None
-    try:
-        msg_id = (data or {}).get("result", {}).get("message_id")
-        if isinstance(msg_id, int) and msg_id > 0:
-            return msg_id
-    except Exception:
-        logger.debug("_send_plain_message 内部忽略的异常", exc_info=True)
-        pass
-    return None
-
-
-async def _edit_plain_message(chat_id: int, message_id: int, text: str) -> bool:
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
-    ok, _data, body = await _telegram_post("editMessageText", payload, retries=1)
-    if not ok and "message is not modified" in body.lower():
-        # 幂等：内容没变化视为成功
-        return True
-    if not ok:
-        logger.warning("[proactive] chat=%s editMessageText 失败: %s", chat_id, body[:200])
-    return ok
-
-
-# =====================================================================
-# send_message_to_user 工具执行器（由 dispatch_tool_call 调用）
-# =====================================================================
-async def execute_send_message_to_user(chat_id: int, arguments: dict) -> str:
-    """执行 send_message_to_user 工具调用。
-
-    仅在 TIMER 回合中可用：USER 回合的工具列表不包含本工具，且历史中的
-    调用痕迹已被 tool_visibility.apply_tool_visibility 折叠成文本摘要
-    （消除模仿诱导的根因）；若模型仍幻觉调用，这里的兜底文案只做
-    “无害化引导”，绝不能用“失败”开头或指示模型“直接把回复写给用户”——
-    那会在多步任务中途被理解成“立即收尾”，把任务打断成提前终止。
-    """
-    if chat_id is None:
-        return json.dumps({"error": "chat_id is required"}, ensure_ascii=False)
-
-    flow = _active_flows.get(chat_id)
-    if flow is None:
-        # 幻觉兜底：本调用未执行、也无需重试；明确“继续当前任务，
-        # 不要提前收尾”，内容留到最终回复——避免旧文案“请直接把回复
-        # 内容写给用户即可”诱发的提前终止。不以“失败”开头，防止
-        # _tool_result_is_failure 把本条归为 error（UI 标红会进一步
-        # 强化模型“出错了”的错误判断）。
-        return (
-            "提示：当前回合是用户主动发起的会话，本工具仅在系统后台唤醒"
-            "回合可用，本次调用未执行、无需重试。请继续完成你正在进行的"
-            "任务，不要因此中断或提前收尾；需要让用户看到的内容，在任务"
-            "完成后写进本轮最终回复即可。"
-        )
-    if flow.interrupted:
-        return "提示：本回合已被用户的新消息打断，不要再通过本工具发送消息，也不要重试。"
-
-    action = str(arguments.get("action") or "send").strip().lower()
-    content = arguments.get("content")
-
-    if action == "send":
-        if not isinstance(content, str) or not content.strip():
-            return "失败：action=send 需要 content（纯文本消息内容）。"
-        text = content.strip()
-        if len(text) > _PLAIN_TEXT_LIMIT:
-            text = text[:_PLAIN_TEXT_LIMIT]
-
-        async def _do_send() -> Optional[int]:
-            msg_id = await _send_plain_message(chat_id, text)
-            if msg_id:
-                _register_sent_message(flow, chat_id, msg_id)
-            return msg_id
-
-        # shield + 注册表：回合被取消时，在途请求仍会完成注册，
-        # 随后由打断逻辑统一撤回，不会产生撤不掉的残留消息。
-        send_task = asyncio.ensure_future(_do_send())
-        flow.pending_sends.add(send_task)
-        send_task.add_done_callback(lambda _t, _f=flow: _f.pending_sends.discard(_t))
-        try:
-            msg_id = await asyncio.shield(send_task)
-        except asyncio.CancelledError:
-            raise  # 让打断流程负责收尾与撤回
-        if msg_id:
-            logger.info(
-                "[TIMER] chat=%s action=SEND message_id=%s chars=%s",
-                chat_id, msg_id, len(text),
-            )
-            preview = text if len(text) <= 60 else text[:60] + "…"
-            return f"已发送（message_id={msg_id}）：{preview}"
-        return "失败：消息发送失败（网络或 Telegram 错误），可稍后重试。"
-
-    elif action == "edit":
-        message_id = arguments.get("message_id")
-        if not isinstance(content, str) or not content.strip():
-            return "失败：action=edit 需要 content（新的纯文本内容）。"
-        if not _is_known_proactive_message(chat_id, message_id):
-            return (
-                "失败：message_id 无效——只能编辑本助手通过 send_message_to_user "
-                "发出的消息（使用 send 返回的 message_id）。"
-            )
-        text = content.strip()
-        if len(text) > _PLAIN_TEXT_LIMIT:
-            text = text[:_PLAIN_TEXT_LIMIT]
-        ok = await _edit_plain_message(chat_id, int(message_id), text)
-        if ok:
-            preview = text if len(text) <= 60 else text[:60] + "…"
-            return f"已编辑消息 {int(message_id)}：{preview}"
-        return "失败：编辑消息失败（消息可能已被删除或超过可编辑时限）。"
-
-    elif action == "delete":
-        message_id = arguments.get("message_id")
-        if not _is_known_proactive_message(chat_id, message_id):
-            return (
-                "失败：message_id 无效——只能撤回本助手通过 send_message_to_user "
-                "发出的消息（使用 send 返回的 message_id）。"
-            )
-        mid = int(message_id)
-        ok = await _recall_message_quietly(chat_id, mid)
-        if ok:
-            # 该回合自己的列表里也移除，避免打断时重复删除
-            try:
-                flow.sent_message_ids.remove(mid)
-            except ValueError:
-                pass
-            return f"已撤回消息 {mid}。"
-        return "失败：撤回失败（消息可能已不存在），可忽略并继续。"
-
-    return f"失败：未知 action：{action}（可选 send / edit / delete）。"
 
 
 # =====================================================================

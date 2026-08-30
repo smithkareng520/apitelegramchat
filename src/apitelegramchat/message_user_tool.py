@@ -1,6 +1,6 @@
 """Human-in-the-loop interaction for the agent.
 
-The agent can pause on an ask_user tool call while the Telegram draft keeps
+The agent can send a message and pause on a message_user tool call while the Telegram draft keeps
 streaming. A persistent message with an InlineKeyboard collects the answer;
 the resolved value is returned to the original tool call and the same agent
 loop continues.
@@ -30,7 +30,7 @@ ASK_USER_OPTION_DESCRIPTION_TOKEN_BUDGET = 64
 ASK_USER_ID_TOKEN_BUDGET = 32
 ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET = 1_000
 MAX_OPTIONS = 8
-# 修复：24h 超时太长——一个未回答的 ask_user 会把 agent 循环挂起整整一天，
+# 修复：24h 超时太长——一个未回答的 message_user 会把 agent 循环挂起整整一天，
 # 中间所有事件循环资源（chat lock、内存里的消息、模型 prompt cache 等）都
 # 不能释放。改成默认 10 分钟，足够用户做选择又不至于让会话僵死。
 # 如需更长等待可通过环境变量 ASK_USER_TIMEOUT 覆盖。
@@ -143,7 +143,7 @@ def _build_keyboard(interaction: AskUserInteraction) -> dict:
 
 
 def _question_html(interaction: AskUserInteraction) -> str:
-    """构造 ask_user 问题卡片 HTML。
+    """构造 message_user 问题卡片 HTML。
 
     安全修复：question / label / description 均来自 LLM 工具调用参数，
     若不转义，LLM 一旦输出含 ``<script>`` 或 ``<img onerror=...>`` 的
@@ -173,7 +173,7 @@ def _answer_json(answer: dict[str, Any]) -> str:
     return json.dumps(answer, ensure_ascii=False, separators=(",", ":"))
 
 
-async def create_ask_user_interaction(
+async def create_message_user_interaction(
     chat_id: int,
     question: str,
     options: Any,
@@ -184,9 +184,9 @@ async def create_ask_user_interaction(
     question = truncate_to_token_budget(str(question or "").strip(), ASK_USER_QUESTION_TOKEN_BUDGET, suffix="…")
     normalized = _normalized_options(options)
     if not question:
-        raise ValueError("ask_user.question 不能为空")
-    if not normalized:
-        raise ValueError("ask_user.options 至少需要一个有效选项")
+        raise ValueError("message_user.question 不能为空")
+    if not normalized and not bool(allow_custom):
+        raise ValueError("message_user.options 为空时必须允许自由文本回答")
 
     async with _lock:
         old_id = _pending_by_chat.get(chat_id)
@@ -222,7 +222,7 @@ async def create_ask_user_interaction(
         interaction.message_id = message_id
     else:
         await cancel_interaction(interaction.id, remove_ui=False)
-        raise RuntimeError("无法发送 ask_user 交互消息")
+        raise RuntimeError("无法发送 message_user 交互消息")
     return interaction
 
 
@@ -256,9 +256,9 @@ async def _set_markup(message_id: int, chat_id: int, markup: dict | None) -> Non
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8, connect=3)) as session:
             async with session.post(f"{BASE_URL}/editMessageReplyMarkup", json=payload) as resp:
                 if resp.status != 200:
-                    logger.debug("ask_user editMessageReplyMarkup failed: %s %s", resp.status, (await resp.text())[:200])
+                    logger.debug("message_user editMessageReplyMarkup failed: %s %s", resp.status, (await resp.text())[:200])
     except Exception as exc:
-        logger.debug("ask_user editMessageReplyMarkup exception: %s", exc)
+        logger.debug("message_user editMessageReplyMarkup exception: %s", exc)
 
 
 async def _edit_question_message(interaction: AskUserInteraction, body_html: str) -> None:
@@ -277,9 +277,9 @@ async def _edit_question_message(interaction: AskUserInteraction, body_html: str
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8, connect=3)) as session:
             async with session.post(f"{BASE_URL}/editMessageText", json=payload) as resp:
                 if resp.status != 200:
-                    logger.debug("ask_user editMessageText failed: %s %s", resp.status, (await resp.text())[:200])
+                    logger.debug("message_user editMessageText failed: %s %s", resp.status, (await resp.text())[:200])
     except Exception as exc:
-        logger.debug("ask_user editMessageText exception: %s", exc)
+        logger.debug("message_user editMessageText exception: %s", exc)
 
 
 def _answered_html(interaction: AskUserInteraction, answer: dict[str, Any]) -> str:

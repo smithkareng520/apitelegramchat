@@ -3,17 +3,19 @@
 
 背景与问题
 ==========
-``proactive.py`` 的 ``send_message_to_user`` 只在 TIMER（后台唤醒）回合的工具面
+``proactive.py`` 的 ``主动消息`` 只在 TIMER（后台唤醒）回合的工具面
 里暴露，但统一上下文会把 TIMER 回合产生的 ``assistant.tool_calls`` 与配对
 ``tool`` 结果消息原样沉淀进 ``conversation_history``。用户主动发消息（USER
 回合）时，这段历史会原样发给模型：模型看到"历史里这个工具被成功调用过"的
 示范，即使本轮 ``tools`` 列表并不包含它，也会高概率模仿调用（OpenAI 兼容
 网关对 tools 白名单之外的调用名不做拦截），随后命中
-``execute_send_message_to_user`` 的守卫分支。旧版守卫文案以"失败"开头并指示
+``execute_主动消息`` 的守卫分支。旧版守卫文案以"失败"开头并指示
 "请直接把回复内容写给用户即可"，在多步任务中途会被模型理解成"立即收尾
 输出"，把进行中的任务打断成提前终止。
 
-本模块在**请求构建**这一侧做改写（挂载点见 ``ai_handlers.get_ai_response``），
+本模块在**请求构建**这一侧做改写（挂载点见 ``ai_handlers.get_ai_response``）；当前没有专用隐藏规则，保留此扩展点供未来使用。
+
+
 按事件源把指定工具的历史痕迹转换形态：
 
 - ``keep``：原样保留（默认，零改动、零开销）；
@@ -50,9 +52,7 @@
 from __future__ import annotations
 
 import copy
-import json
 import os
-import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -95,51 +95,6 @@ def _default_shadow_note(tool_call: dict, tool_result: Optional[dict]) -> str:
     return f"（历史记录：此处曾有一次 {tool_call.get('function', {}).get('name', 'unknown')} 调用，已按可见性规则隐藏）"
 
 
-def _proactive_shadow_note(tool_call: dict, tool_result: Optional[dict]) -> str:
-    """send_message_to_user 专用摘要：保留"发过什么"的语义，隐去工具调用形状。
-
-    刻意不输出工具名字面量：模型对历史中的字符串同样敏感，摘要里出现
-    "send_message_to_user" 会重新构成字符串级诱导。
-    """
-    args: dict = {}
-    raw_args = (tool_call.get("function") or {}).get("arguments")
-    if isinstance(raw_args, str):
-        try:
-            args = json.loads(raw_args)
-        except (json.JSONDecodeError, TypeError):
-            args = {}
-    elif isinstance(raw_args, dict):
-        args = raw_args
-
-    action = str(args.get("action") or "send").strip().lower()
-    content = args.get("content")
-
-    # 从工具结果文本里恢复 message_id（如 "已发送（message_id=123）：…"），
-    # 让摘要保留可追溯性；解析失败不影响摘要生成。
-    message_id = None
-    if tool_result is not None:
-        m = re.search(r"message_id[=＝]\s*(\d+)", str(tool_result.get("content") or ""))
-        if m:
-            message_id = m.group(1)
-
-    snippet = ""
-    if isinstance(content, str) and content.strip():
-        snippet = content.strip()
-        if len(snippet) > 80:
-            snippet = snippet[:80] + "…"
-
-    mid_suffix = f"（message_id={message_id}）" if message_id else ""
-    if action == "send":
-        if snippet:
-            return f"（后台巡检记录：此前已主动向用户发送过消息「{snippet}」{mid_suffix}）"
-        return f"（后台巡检记录：此前曾主动向用户发送过消息{mid_suffix}）"
-    if action == "edit":
-        return f"（后台巡检记录：此前曾编辑过一条主动消息{mid_suffix}）"
-    if action == "delete":
-        return f"（后台巡检记录：此前曾撤回过一条主动消息{mid_suffix}）"
-    return "（后台巡检记录：此前曾通过主动消息通道与用户交互）"
-
-
 @dataclass(frozen=True)
 class ToolVisibilityRule:
     """单个工具在两类事件源下的可见性规则。
@@ -168,14 +123,7 @@ class ToolVisibilityRule:
 
 
 # 扩展点：新增需要按事件源隐藏的工具，在这里加一行规则即可。
-TOOL_VISIBILITY_RULES: dict[str, ToolVisibilityRule] = {
-    "send_message_to_user": ToolVisibilityRule(
-        tool_name="send_message_to_user",
-        user_turn=VISIBILITY_SHADOW,
-        timer_turn=VISIBILITY_KEEP,
-        shadow_note_builder=_proactive_shadow_note,
-    ),
-}
+TOOL_VISIBILITY_RULES: dict[str, ToolVisibilityRule] = {}
 
 
 # =====================================================================

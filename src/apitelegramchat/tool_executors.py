@@ -2639,12 +2639,6 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             if isinstance(paths, str):
                 paths = [paths]
             return await execute_present_files(chat_id, paths, namespace=resolved_namespace)
-        elif name == "send_message_to_user":
-            # 主动唤醒（TIMER）回合专用：向用户推送/编辑/撤回普通纯文本消息。
-            # USER 回合的工具列表不含本工具；若模型仍幻觉调用，executor 会
-            # 返回明确的错误说明。见 proactive.py。
-            from apitelegramchat import proactive as _proactive
-            return await _proactive.execute_send_message_to_user(chat_id, arguments)
         elif name in _REMOVED_TOOL_HINTS:
             # stage_upload / fetch_download / list_download / list_upload / ip_geo 已移除；
             # 迁移提示让模型立即改用 bash 直访，避免无意义的重试。

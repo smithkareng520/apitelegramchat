@@ -30,10 +30,7 @@ OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 # text_editor 需要初始化一次隔离 workspace，但不再做工作区级 R2 全量同步。
 # 编辑操作只持久化被编辑的具体文件。
 #
-# send_message_to_user（TIMER 主动唤醒）：内部 sendMessage 带重试（最坏 ~11s），
-# 且发送用 asyncio.shield 保护——外层若在发送完成前超时取消，模型会误以为
-# 发送失败而重发，产生重复消息；45s 上限留足余量。
-LONG_RUNNING_TOOLS = {"web_search", "fetch_url", "text_editor", "send_message_to_user"}
+LONG_RUNNING_TOOLS = {"web_search", "fetch_url", "text_editor"}
 LONG_TOOL_CALL_TIMEOUT = 45
 # bash 工具单独一档，比 LONG_RUNNING_TOOLS 更宽松：
 #   - 沙箱首次启动要 fork+exec+安装 Landlock 规则；

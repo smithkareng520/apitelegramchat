@@ -368,14 +368,14 @@ async def get_ai_response(
     """统一调度入口：按事件源（USER / TIMER）动态分配工具与输出处理。
 
     - USER（用户主动发消息）：行为与旧实现完全一致——可见草稿流式输出、
-      工具列表不包含 send_message_to_user、最终富文本推送给用户。此外
-      历史中 TIMER 回合沉淀的 send_message_to_user 调用会被
+      工具列表不包含 主动消息、最终富文本推送给用户。此外
+      历史中 TIMER 回合沉淀的 主动消息 调用会被
       apply_tool_visibility 折叠成普通文本摘要（见 tool_visibility.py）——
       消除“历史里有成功调用先例”的模仿诱导，这是 USER 回合幻觉调用该
       工具的根因；TIMER 回合则原样保留完整调用史。
     - TIMER（系统定时唤醒，见 proactive.py）：使用 SilentMessageBuilder，
       agent 过程（草稿/工具进度/最终文本）不输出到 Telegram；工具列表在
-      基础工具之上追加 send_message_to_user（并移除 ask_user/present_files
+      基础工具之上追加 主动消息（并移除 message_user/present_files
       这类会直接触达用户或阻塞等待用户输入的工具）；最终文本只留在历史
       上下文中，不直接推送给用户。
     """
@@ -453,7 +453,7 @@ async def get_ai_response(
         _log_stage("获取chat_lock+上下文快照完成")
 
         # 按事件源改写历史中"回合专属工具"的调用痕迹（可拔插，见
-        # tool_visibility.py）：USER 回合把 send_message_to_user 的历史调用
+        # tool_visibility.py）：USER 回合把 主动消息 的历史调用
         # 折叠成普通文本摘要，消除模型模仿调用的根因；TIMER 回合零开销
         # 直通（edit/delete 仍依赖完整调用史中的 message_id）。只改出站
         # 副本，持久历史不受影响。
@@ -515,7 +515,7 @@ async def get_ai_response(
         elif is_timer:
             # TIMER 使用“安全主动工具面”，而不是完整 USER 工具面。
             # 后台巡检允许读取/搜索信息、检查 Todo/Memory，并通过唯一的
-            # send_message_to_user 对用户发消息；禁止直接投递文件/媒体、等待用户、
+            # 主动消息 对用户发消息；禁止直接投递文件/媒体、等待用户、
             # 任意 Bash/文件写入，避免 TIMER 为了“找点事做”产生副作用。
             from apitelegramchat.proactive import SEND_MESSAGE_TO_USER_TOOL
             from apitelegramchat.search_engine import SEARCH_TOOLS
@@ -536,7 +536,7 @@ async def get_ai_response(
                 "role": "system",
                 "content": (
                     "TIMER 是主动巡检回合，不是普通问答。必须先检查 Todo，再结合最近上下文判断。"
-                    "只有存在具体价值时才调用 send_message_to_user；没有合理行动就保持静默。"
+                    "只有存在具体价值时才调用 主动消息；没有合理行动就保持静默。"
                     "不要为了完成回合而寒暄，也不要输出“我会等待”等等待式文本。"
                 ),
             })
@@ -640,7 +640,7 @@ async def get_ai_response(
             logger.warning("AI 返回空内容（model=%s）", current_model)
             if is_timer:
                 # TIMER：静默返回，不打扰用户；new_msgs 里可能仍有工具消息
-                # （如已通过 send_message_to_user 发出的内容），交由上层沉淀历史。
+                # （如已通过 主动消息 发出的内容），交由上层沉淀历史。
                 return "", "", new_msgs, usage
             fallback = "⚠️ AI 响应为空。请尝试换一个模型或提供更多上下文。"
             await send_rich_html_message(chat_id, fallback, reassert_draft=False)
@@ -663,7 +663,7 @@ async def get_ai_response(
 
         if is_timer:
             # TIMER：agent 过程不输出到 Telegram——最终文本只留在历史上下文中，
-            # 不直接推送给用户；用户可见输出只能来自 send_message_to_user。
+            # 不直接推送给用户；用户可见输出只能来自 主动消息。
             success = True
             logger.info(
                 "[%s] TIMER 回合完成：最终内容不推送用户（长度=%s，前 500 字）：\n%s",

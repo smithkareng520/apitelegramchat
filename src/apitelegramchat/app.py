@@ -62,10 +62,10 @@ from apitelegramchat.state import (
     set_current_user_namespace,
     mark_update_processed_if_new,
 )
-from apitelegramchat.ask_user_tool import (
+from apitelegramchat.message_user_tool import (
     get_pending_for_chat,
-    resolve_callback as resolve_ask_user_callback,
-    resolve_text as resolve_ask_user_text,
+    resolve_callback as resolve_message_user_callback,
+    resolve_text as resolve_message_user_text,
 )
 from apitelegramchat.file_handlers import download_file
 from apitelegramchat.workspace_utils import _get_workspace_lock, init_workspace
@@ -800,7 +800,7 @@ async def _handle_sticker_message(chat_id: int, user_message: dict, username: st
 def _is_user_flow_active(chat_id: int) -> bool:
     """该 chat 是否有用户发起（USER 事件源）的回合正在运行。
 
-    注册给 proactive 调度器作为 busy check：用户回合进行中（含 ask_user
+    注册给 proactive 调度器作为 busy check：用户回合进行中（含 message_user
     等待期）不触发 TIMER 唤醒，避免两个回合并发竞争同一份历史。
     """
     task = active_tasks.get(chat_id)
@@ -813,7 +813,7 @@ async def _handle_timer_wakeup(chat_id: int):
     与用户回合共用同一份会话历史（统一上下文），但：
     - 不发 typing、不建草稿：agent 过程对用户完全不可见；
     - 向请求上下文追加合成 user 消息（WAKEUP_PROMPT），但不写入持久历史；
-    - 工具面在基础工具上追加 send_message_to_user；
+    - 工具面在基础工具上追加 主动消息；
     - 最终文本不推送给用户，只沉淀进历史；
     - 回合被用户消息打断时由 proactive.interrupt_proactive_flow 负责
       静默撤回已发出的普通消息（此处无需感知）。
@@ -1556,7 +1556,7 @@ async def webhook() -> tuple:
             # 1) 记录用户活动：重置该 chat 的空闲计时（主动唤醒调度器据此
             #    决定何时进入 agent 的"活动时间"）。仅私聊参与主动唤醒。
             # 2) 打断进行中的 TIMER 主动唤醒回合：取消后台 agent 任务，并
-            #    静默撤回该回合已通过 send_message_to_user 发出的普通消息
+            #    静默撤回该回合已通过 主动消息 发出的普通消息
             #    （不显示"已停止"之类的任何提示）。
             # 该入口位于所有消息类型/命令分发之前，覆盖全部授权用户输入。
             try:
@@ -1919,14 +1919,14 @@ async def webhook() -> tuple:
             if "text" in msg:
                 user_input = msg["text"]
 
-                # 若当前 ask_user 正在等待自由文本，优先把这条消息交给原 agent turn，
+                # 若当前 message_user 正在等待自由文本，优先把这条消息交给原 agent turn，
                 # 不要启动新的 AI turn。命令仍保留为真正的 bot 指令入口。
                 pending_ask = await get_pending_for_chat(chat_id)
                 if (
                     pending_ask
                     and pending_ask.awaiting_text
                     and not user_input.startswith("/")
-                    and await resolve_ask_user_text(chat_id, user_input)
+                    and await resolve_message_user_text(chat_id, user_input)
                 ):
                     return "OK", 200
 
@@ -2264,7 +2264,7 @@ async def webhook() -> tuple:
                     interaction_id = parts[1] if len(parts) > 1 else ""
                     action = parts[2] if len(parts) > 2 else ""
                     arg = parts[3] if len(parts) > 3 else ""
-                    ok, notice = await resolve_ask_user_callback(
+                    ok, notice = await resolve_message_user_callback(
                         chat_id, uid, interaction_id, action, arg
                     )
                     async with aiohttp.ClientSession() as s:

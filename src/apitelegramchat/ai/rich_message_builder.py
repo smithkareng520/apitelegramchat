@@ -511,7 +511,7 @@ class RichMessageBuilder:
             group["outer_summary"] = mapping.get(command, "Editing file")
         elif t == "present_files":
             group["outer_summary"] = "Presenting file(s)"
-        elif t == "ask_user":
+        elif t == "message_user":
             group["outer_summary"] = "Waiting for your answer"
         elif t == "wikipedia":
             group["outer_summary"] = "Looking up on Wikipedia"
@@ -588,7 +588,7 @@ class RichMessageBuilder:
         "qr_code": ("Generated a QR code", "Generated {n} QR codes"),
         "generate_image_from_text": ("Generated an image", "Generated {n} images"),
         "edit_image_with_reference": ("Edited an image", "Edited {n} images"),
-        "ask_user": ("Asked you a question", "Asked you questions"),
+        "message_user": ("Asked you a question", "Asked you questions"),
     }
 
     def _get_group_type_for_item(self, item: dict) -> str:
@@ -1315,10 +1315,10 @@ class SilentMessageBuilder(RichMessageBuilder):
 
     用于 TIMER 主动唤醒回合（proactive wake-up）：agent 的思考、工具进度
     与最终文本对用户完全不可见——它们只存在于请求上下文与持久历史中；
-    用户唯一可见的输出来自模型显式调用的 send_message_to_user 工具。
+    用户唯一可见的输出来自模型显式调用的 主动消息 工具。
 
     约定：``silent`` 属性为 True，供 tool_call_loop 等下层模块用
-    ``getattr(builder, "silent", False)`` 做静默分支判断（如禁用 ask_user）。
+    ``getattr(builder, "silent", False)`` 做静默分支判断（如禁用 message_user）。
     """
 
     def __init__(self, chat_id: int):

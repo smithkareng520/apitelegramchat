@@ -222,7 +222,7 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     if fn_name == "generate_video":
         return "Generating a video"
 
-    if fn_name == "ask_user":
+    if fn_name == "message_user":
         return "Waiting for your answer"
 
     # ---------- 其他工具，按规范进行时文本 ----------
@@ -281,7 +281,7 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
         "distance": "measured a distance",
         "bash": "ran a command",
         "present_files": "presented files",
-        "ask_user": "asked for your input",
+        "message_user": "asked for your input",
     }
     return mapping.get(fn_name, f"ran {fn_name}")
 
@@ -462,7 +462,7 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
             title = query
         return f"Looked up: {title}" if title else "Looked up on Wikipedia"
 
-    if fn_name == "ask_user":
+    if fn_name == "message_user":
         try:
             payload = json.loads(str(result_content or "{}"))
             if payload.get("type") == "choice":

@@ -75,12 +75,12 @@ Telegram 是主要用户界面。收到消息后，Runtime 会：
 |---|---|---|
 | 触发 | 用户任意消息/命令 | 用户空闲约 20min 后进入"活动时间"，此后随机 10/20/40min 唤醒一次 |
 | user 消息 | 用户输入写入历史 | 合成唤醒消息（`[系统后台唤醒] …`）只进请求上下文，**不写入历史** |
-| 工具面 | `SEARCH_TOOLS`（不含 `send_message_to_user`） | 基础工具 + `send_message_to_user`（移除 `ask_user` / `present_files`） |
+| 工具面 | `SEARCH_TOOLS`（不含 `主动消息`） | 基础工具 + `主动消息`（移除 `message_user` / `present_files`） |
 | 可见输出 | 富消息草稿流式 + 最终富文本推送 | **完全静默**：无草稿、无工具进度、最终文本不推送 |
 | 打断 | 打断旧 USER 草稿（发"已停止"） | 用户消息打断 TIMER 回合：取消后台任务 + **静默撤回**该回合已发消息，不提示 |
 | 休息节奏 | — | 用户连续 3h 无消息 → 停止高频触发，休息 1h 再触发一次 |
 
-TIMER 回合里用户唯一可见的输出来自模型显式调用 `send_message_to_user`
+TIMER 回合里用户唯一可见的输出来自模型显式调用 `主动消息`
 （单工具 + `action` 参数）：`send` 发送、`edit` 编辑、`delete` 撤回；内容按
 **普通纯文本**（不带任何格式）经 `sendMessage` 发送，像人随手发消息。
 回合的 assistant/tool 消息正常沉淀进历史，保证用户下次回复时模型仍知道
@@ -129,7 +129,7 @@ MCP Server 与 Telegram Runtime 共用业务能力，但**不是把 Telegram Run
 | 生成 | 图片生成、参考图编辑、视频生成 |
 | Skills | 从 `.claude/skills` 等位置加载项目技能 |
 | Subagent | 将复杂任务拆给独立 Agent Loop |
-| 主动唤醒 | TIMER 事件源：空闲后后台"活动"，必要时用 send_message_to_user 主动发普通消息（可编辑/撤回），被打断时静默撤回 |
+| 主动唤醒 | TIMER 事件源：空闲后后台"活动"，必要时用 主动消息 主动发普通消息（可编辑/撤回），被打断时静默撤回 |
 | Memory / Todo | 持久化私有记忆和任务 |
 | 对象存储 | S3/R2 兼容的文件持久化与公开资源 URL |
 | MCP | stdio Server + 外部 Streamable HTTP MCP Client |
@@ -340,7 +340,7 @@ WEBHOOK_URL?token=WEBHOOK_TOKEN
 | `PROACTIVE_MAX_IDLE_SECONDS` | `10800` | 用户连续空闲多久后停止高频触发（3h） |
 | `PROACTIVE_REST_SECONDS` | `3600` | 休息时长；休息结束后再触发一次（1h） |
 | `PROACTIVE_POLL_SECONDS` | `10` | 调度协程轮询粒度（秒） |
-| `TOOL_VISIBILITY_FILTER` | `true` | 按事件源的工具可见性过滤器总开关。USER 回合把历史中 `send_message_to_user` 的调用痕迹折叠成普通文本摘要（保留语义、消除调用形状），从根源上防止模型在用户主动发消息时模仿调用该工具；TIMER 回合不受影响。设为 `false` 恢复旧行为。规则注册表见 `src/apitelegramchat/tool_visibility.py` |
+| `TOOL_VISIBILITY_FILTER` | `true` | 按事件源的工具可见性过滤器总开关。USER 回合把历史中 `主动消息` 的调用痕迹折叠成普通文本摘要（保留语义、消除调用形状），从根源上防止模型在用户主动发消息时模仿调用该工具；TIMER 回合不受影响。设为 `false` 恢复旧行为。规则注册表见 `src/apitelegramchat/tool_visibility.py` |
 
 说明：仅**私聊**参与主动唤醒；bot 被用户屏蔽（sendMessage 403）时会自动停用
 该会话的调度；进程重启后空闲计时重新开始（chat 在首次用户活动时重新被跟踪）。
@@ -1317,7 +1317,7 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 │       ├── memory_tool.py            # Memory
 │       ├── todo_tool.py              # Todo
 │       ├── subagent_tool.py          # Subagent
-│       ├── ask_user_tool.py          # 向用户请求确认/输入
+│       ├── message_user_tool.py          # 向用户请求确认/输入
 │       ├── ai/
 │       │   ├── agentic_loops.py      # Agent loop
 │       │   ├── tool_call_loop.py     # Tool call orchestration

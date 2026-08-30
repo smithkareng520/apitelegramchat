@@ -462,10 +462,10 @@ def _get_video_models() -> list[str]:
 VIDEO_MODELS = _get_video_models()
 
 # ---------- 工具定义 ----------
-ASK_USER_TOOL = {
+MESSAGE_USER_TOOL = {
     "type": "function",
     "function": {
-        "name": "ask_user",
+        "name": "message_user",
         "description": (
             "Pause the agent and ask the current user for a required clarification or choice. "
             "Use this only when the next step materially depends on missing user preference or confirmation. "
@@ -482,7 +482,7 @@ ASK_USER_TOOL = {
                 },
                 "options": {
                     "type": "array",
-                    "minItems": 1,
+                    "minItems": 0,
                     "maxItems": 8,
                     "items": {
                         "type": "object",
@@ -505,7 +505,7 @@ ASK_USER_TOOL = {
                     "description": "是否允许用户放弃预设选项，直接输入自定义回答。"
                 }
             },
-            "required": ["question", "options"]
+            "required": ["question"]
         }
     }
 }
@@ -1153,11 +1153,11 @@ SEARCH_TOOLS = [
         }]
         if VIDEO_MODELS else []
     ),
-    ASK_USER_TOOL,
+    MESSAGE_USER_TOOL,
     # ===================== 任务 / 待办工具 =====================
     # 让 agent 拥有持久化的待办清单能力：add/list/done/undone/delete/clear/edit。
     # 数据按用户隔离，存放在 ./state/{user_id}/todos.json 并随 R2 同步。
-    # 仅在工具结果区显示富文本摘要；交互由 ask_user 工具统一处理。
+    # 仅在工具结果区显示富文本摘要；交互由 message_user 工具统一处理。
     TODO_TOOL,
     # ===================== 长期记忆工具 =====================
     # 跨会话保留的事实/偏好/人物/事件——不同于会自动修剪的对话历史。

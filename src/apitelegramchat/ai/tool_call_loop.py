@@ -19,8 +19,8 @@ from apitelegramchat.tool_executors import (
     tool_semaphore,
     _TOOL_TIMEOUT_MARKER,
 )
-from apitelegramchat.ask_user_tool import (
-    create_ask_user_interaction,
+from apitelegramchat.message_user_tool import (
+    create_message_user_interaction,
     wait_for_answer,
     answer_to_tool_result,
 )
@@ -254,7 +254,7 @@ async def _run_tool_calls_and_append(
     # force flush。工具批次无需另建心跳任务；图片、视频和普通工具均复用
     # 同一机制，状态变更仍由前面的普通 flush 立即推送。
     # （旧实现此处还计算过 has_image_tool / has_bash_tool /
-    #  has_ask_user_tool 三个从未被读取的变量，属心跳任务删除后的残留。）
+    #  has_message_user_tool 三个从未被读取的变量，属心跳任务删除后的残留。）
 
     async def run_one(fn_name, fn_args, tc_id):
         async with tool_semaphore:
@@ -340,15 +340,15 @@ async def _run_tool_calls_and_append(
                         f"Error: tool {fn_name} was not executed because the model returned malformed JSON "
                         f"arguments ({invalid_arguments}). Reissue the same tool call with a valid JSON object."
                     )
-                elif fn_name == "ask_user":
+                elif fn_name == "message_user":
                     if getattr(builder, "silent", False):
                         # 静默（TIMER 后台唤醒）回合不允许阻塞等待用户输入：
-                        # 按钮消息会绕过 send_message_to_user 的纯文本原则，
+                        # 按钮消息会绕过 主动消息 的纯文本原则，
                         # 且回合会被用户的下一条消息打断。引导模型改用
-                        # send_message_to_user 以自然语言提问后结束回合。
+                        # 主动消息 以自然语言提问后结束回合。
                         result_str = (
-                            "失败：ask_user 在系统后台唤醒回合中不可用。"
-                            "如需向用户提问，请改用 send_message_to_user 发送一句自然、"
+                            "失败：message_user 在系统后台唤醒回合中不可用。"
+                            "如需向用户提问，请改用 主动消息 发送一句自然、"
                             "口语化的纯文本提问，然后结束本回合等待用户回复。"
                         )
                     else:
@@ -356,7 +356,7 @@ async def _run_tool_calls_and_append(
                         options = fn_args.get("options", [])
                         multiple = bool(fn_args.get("multiple", False))
                         allow_custom = bool(fn_args.get("allow_custom", True))
-                        interaction = await create_ask_user_interaction(
+                        interaction = await create_message_user_interaction(
                             builder.chat_id,
                             question,
                             options,
