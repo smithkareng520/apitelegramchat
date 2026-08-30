@@ -480,7 +480,15 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
     (about 75% cumulatively for even-sized sets).  Only if both passes fail does
     the final fallback remove the oldest non-system conversation blocks.
     """
+    _pf_start = time.monotonic()
+    _pf_lock_wait_start = time.monotonic()
     lock = await get_chat_lock(chat_id)
+    _pf_lock_wait_ms = int((time.monotonic() - _pf_lock_wait_start) * 1000)
+    if _pf_lock_wait_ms > 1000:
+        logger.warning(
+            "pre_flight_context_check 等待 chat_lock 超时: chat=%s wait_ms=%s",
+            chat_id, _pf_lock_wait_ms,
+        )
     async with lock:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])

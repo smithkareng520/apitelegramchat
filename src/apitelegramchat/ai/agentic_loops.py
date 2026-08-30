@@ -4,7 +4,6 @@
 """
 import asyncio
 import json
-import os
 import aiohttp
 import httpx
 import base64
@@ -63,40 +62,6 @@ if TYPE_CHECKING:
     from apitelegramchat.ai.rich_message_builder import RichMessageBuilder
 
 logger = get_logger(__name__)
-
-# 流式“首字等待”超时：在 90 秒内必须收到第一个 SSE chunk，否则视为上游
-# 已经冷挂起，立即取消本次请求并重试。该项独立于 httpx.Timeout(read=300s)，
-# 后者只覆盖流式持续阶段两个 chunk 之间的间隔；首字阶段的“长时间无任何
-# 字节”无法被 httpx 的 read timeout 精准捕获（流式响应一旦开始，
-# 第一个 chunk 与下一次 recv 之间都被算作“read 间隔”）。
-# 90s 是经验阈值：上游冷启动 + 模型 reasoning 起步偶尔需要 30~60s，
-# 90s 给足缓冲；超过 90s 通常意味着上游已卡死，继续等也只是把整个
-# 草稿冻在 "Thinking..."，让用户看到“卡几分钟才有回复”的现象。
-FIRST_TOKEN_TIMEOUT_SECONDS: float = float(os.environ.get("AGENTIC_FIRST_TOKEN_TIMEOUT", "90"))
-
-# 首字超时后的最大重试次数。3 次的“最坏等待 = 3×90s = 270s”远低于
-# 原来的 6×300s=30 分钟；若 3 次仍首字超时，进入非流式兜底请求，
-# 非流式没有“首字”概念，按其本身的 httpx read timeout 上限走。
-STREAM_FIRST_TOKEN_RETRY_MAX: int = 3
-
-
-async def _stream_with_first_token_timeout(stream, timeout: float):
-    """异步生成器：包一层 stream，让首片 SSE chunk 必须在 timeout 秒内到达。
-
-    首片到达后，剩余 chunk 不再受 timeout 限制，按 httpx read timeout 走
-    （默认 300s，覆盖两个 chunk 之间的间隔）。这样把“首字等待”与“持续
-    流式”两段超时解耦，避免 httpx.read_timeout 在首字阶段被 300s 上限
-    绑死——上游冷挂起时，用户会看到草稿停在 "Thinking..." 长达几分钟。
-
-    超时通过 asyncio.wait_for 触发，会取消 stream.__anext__() 内部协程；
-    调用方收到 asyncio.TimeoutError 后，应主动 aclose() 关闭残留 stream，
-    再重试或转非流式。
-    """
-    first = await asyncio.wait_for(stream.__anext__(), timeout=timeout)
-    yield first
-    async for chunk in stream:
-        yield chunk
-
 
 def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict):
     if index not in accumulator:
@@ -320,22 +285,10 @@ async def _agentic_loop_openai_compat(
             # 某些聚合网关会在长工具链后的首个 SSE 事件前沉默较久。
             # 只有尚未收到任何增量时，重试相同请求才是幂等且安全的；一旦已经向
             # 用户或工具状态写入增量，必须直接抛出，避免重放半个模型回合。
-            #
-            # 首字超时 + 重试策略：
-            #   - 首片 SSE chunk 必须在 FIRST_TOKEN_TIMEOUT_SECONDS（默认 90s）内到达，
-            #     否则视为上游冷挂起，立即取消本次请求并重试。
-            #   - 共重试 STREAM_FIRST_TOKEN_RETRY_MAX（默认 3）次：最坏等待 3×90s=270s，
-            #     远低于原来的“SDK 内置 2 次 + 我们的 2 次 = 6×300s=30 分钟”。
-            #   - 全部重试都首字超时：不抛 ReadTimeout，而是让循环自然结束，
-            #     使下面的“not received_any”分支进入非流式兜底请求。
-            #   - 已经收到过任何 chunk（received_any=True）后再抛超时：
-            #     不能重试，直接 raise，避免重放半个模型回合。
-            for stream_attempt in range(STREAM_FIRST_TOKEN_RETRY_MAX):
+            for stream_attempt in range(2):
                 try:
                     comp_stream = await client.chat.completions.create(**create_params)
-                    async for chunk in _stream_with_first_token_timeout(
-                        comp_stream, FIRST_TOKEN_TIMEOUT_SECONDS
-                    ):
+                    async for chunk in comp_stream:
                         received_any = True
                         if getattr(chunk, "usage", None):
                             final_usage = chunk.usage
@@ -465,32 +418,14 @@ async def _agentic_loop_openai_compat(
                                     parsed_args = _safe_parse_args(current_args)
                                     builder.update_tool_args(tc_id, parsed_args)
                     break
-                except (httpx.ReadTimeout, asyncio.TimeoutError) as stream_err:
-                    # 已经开始接收内容后中断：不能重试，避免重放半个模型回合
-                    if received_any:
+                except httpx.ReadTimeout:
+                    if received_any or stream_attempt >= 1:
                         raise
-                    # 残留 stream 必须显式关闭，否则连接泄漏
-                    try:
-                        await comp_stream.aclose()
-                    except Exception:
-                        pass
-                    is_last_attempt = stream_attempt >= STREAM_FIRST_TOKEN_RETRY_MAX - 1
-                    if is_last_attempt:
-                        # 全部重试都首字超时——不抛出，让循环自然结束；
-                        # 下面的 “not received_any” 分支会触发非流式兜底请求
-                        logger.warning(
-                            "[%s] 第 %s 轮模型首字等待超过 %.0fs（重试 %s 次全部超时: %r），转非流式兜底",
-                            api_label, _round + 1, FIRST_TOKEN_TIMEOUT_SECONDS,
-                            STREAM_FIRST_TOKEN_RETRY_MAX, stream_err,
-                        )
-                        break
                     logger.warning(
-                        "[%s] 第 %s 轮模型首字等待超过 %.0fs，立即重试 (%s/%s): %r",
-                        api_label, _round + 1, FIRST_TOKEN_TIMEOUT_SECONDS,
-                        stream_attempt + 2, STREAM_FIRST_TOKEN_RETRY_MAX, stream_err,
+                        "[%s] 第 %s 轮模型流在首个增量前读取超时，等待后重试一次",
+                        api_label, _round + 1,
                     )
-                    # 短休眠后重试：上游冷启动慢，给 0.5s 缓冲避免立刻撞同一节点
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -526,15 +461,11 @@ async def _agentic_loop_openai_compat(
                     fallback_params["extra_body"] = fallback_extra_body
 
                 resp = await client.chat.completions.create(**fallback_params)
+                # 非流式回退同样需要捕获 usage，否则本轮缓存命中统计会丢失
+                if getattr(resp, "usage", None):
+                    final_usage = resp.usage
                 msg = resp.choices[0].message
                 content_acc = msg.content or ""
-                # 回退路径同样要捕获 usage：流式失败时不一定拿到 usage chunk，
-                # 非流式响应里的 resp.usage 才是这一轮真实的 token 计数与缓存命中字段。
-                # 不补这一行会导致整轮回退期间 _log_cache_usage 拿不到数据，
-                # 缓存命中率统计缺失，难以排查缓存是否真的命中。
-                fallback_usage = getattr(resp, "usage", None)
-                if fallback_usage is not None:
-                    final_usage = fallback_usage
                 if supports_tools and tools and hasattr(msg, "tool_calls") and msg.tool_calls:
                     for idx, tc in enumerate(msg.tool_calls):
                         tool_calls_acc[idx] = {
@@ -554,9 +485,6 @@ async def _agentic_loop_openai_compat(
                     )
                 except Exception:
                     logger.exception(f"[{api_label}] 记录回退 tool_calls 日志失败")
-                # 与流式路径保持一致：回退成功后立即记录这一轮的缓存命中摘要，
-                # 不能等到循环结束才统一打——循环里 final_usage 会被下一轮覆盖。
-                _log_cache_usage(api_label, final_usage)
             except Exception as e:
                 logger.exception(f"非流式回退失败: {e}")
                 content_acc = "请求失败，请稍后重试。"
@@ -572,11 +500,10 @@ async def _agentic_loop_openai_compat(
             )
         except Exception:
             logger.exception(f"[{api_label}] 记录 tool_calls 日志失败")
-        # 修复：原来只在 for 循环结束之后（line 末尾）打一次 _log_cache_usage，
-        # 多轮工具调用场景里 final_usage 会被每轮的最后一帧覆盖，用户只能看到
-        # 末轮的缓存命中，无法判断中间轮的缓存是否生效。改为每轮流式完成后
-        # 立即记录，与上面 "第 N 轮模型原始返回" 的日志对齐，方便定位具体哪一轮
-        # 缓存命中率掉了。
+        # 每轮请求结束后立即打印本轮缓存命中统计。
+        # 旧实现把 _log_cache_usage 放在 for 循环外面，且 final_usage 每轮被覆盖，
+        # 导致多轮 agentic 循环只打印最后一轮的缓存统计，中间轮次的命中情况不可观测。
+        # 此处每轮独立打印；final_usage 仍保留最后一轮的值供返回值（token 台账）使用。
         _log_cache_usage(api_label, final_usage)
         for idx, tc in enumerate(tool_calls_list):
             if not tc.get("id"):
@@ -660,10 +587,6 @@ async def _agentic_loop_openai_compat(
                                               "content": f"System: Maximum tool calls ({MAX_TOOL_CALLS}) reached for this turn. Tool usage is now DISABLED. Please immediately summarize what you have successfully done so far, explicitly state what failed or what is left to do, and ask the user if they want to continue the operation in the next turn."}],
                 "stream": True,
                 "max_tokens": max_tokens,
-                # 与主请求一致地请求 usage：合成流也是一次真实的模型请求，
-                # 不开 include_usage 会让 "工具上限总结" 这条路径的缓存命中
-                # 一直无数据，难以判断总结轮的缓存是否生效。
-                "stream_options": {"include_usage": True},
             }
             synth_params.update(sampling_params)
             synth_params.update(reasoning_top)
@@ -678,13 +601,7 @@ async def _agentic_loop_openai_compat(
                 synth_stream = await client.chat.completions.create(**synth_params)
                 builder.begin_stream_text()
                 synth_text = ""
-                synth_usage = None
-                async for chunk in _stream_with_first_token_timeout(
-                    synth_stream, FIRST_TOKEN_TIMEOUT_SECONDS
-                ):
-                    # 与主循环一致：usage chunk 通常出现在流末尾，需独立捕获。
-                    if getattr(chunk, "usage", None):
-                        synth_usage = chunk.usage
+                async for chunk in synth_stream:
                     if chunk.choices:
                         c_delta = getattr(chunk.choices[0].delta, "content", None) or ""
                         if c_delta:
@@ -697,9 +614,6 @@ async def _agentic_loop_openai_compat(
                 if not final_content:
                     final_content = _tool_limit_summary()
                     builder.add_text(final_content)
-                # 合成流是一次独立的模型请求，缓存命中与主循环不同：
-                # 独立打一行，方便区分哪一条是主轮、哪一条是总结轮。
-                _log_cache_usage(f"{api_label}/synth", synth_usage)
             except Exception as synth_err:
                 # 合成流失败时使用兜底文本，避免丢失整个工具调用历史或泄漏工具 XML。
                 logger.warning(f"OpenAI 合成流失败: {synth_err}")
@@ -727,8 +641,6 @@ async def _agentic_loop_openai_compat(
             builder.finish_group(len(builder._tool_groups) - 1)
         # 轮次数耗尽后的兜底文本同样是终局内容：结束旧草稿，不创建下一段。
         await builder.rollover_at_turn_boundary(start_next_draft=False)
-    # 注意：每轮的缓存命中已在循环内部记录（流式 / 回退两条路径都已覆盖），
-    # 这里不再重复打最后一轮的日志，避免与循环内输出重复。
     return final_content, final_usage, new_history_entries
 
 
@@ -818,10 +730,6 @@ async def _agentic_loop_gemini_openai_compat(
         raw_msg = choices[0].get("message", {})
         content_acc: str = raw_msg.get("content") or ""
         final_usage = data.get("usage")
-        # 修复：Gemini 同样要每轮独立打缓存命中日志。原来只在 for 循环结束之后
-        # 打一次，多轮工具调用里前几轮的 final_usage 会被末轮覆盖，从日志上
-        # 看不出中间轮是否被缓存命中。与 OpenAI 兼容路径保持一致。
-        _log_cache_usage("gemini", final_usage)
 
         tool_calls_list: list[dict] = []
         for tc in (raw_msg.get("tool_calls") or []):
@@ -893,7 +801,9 @@ async def _agentic_loop_gemini_openai_compat(
 
         loop_messages.append(assistant_msg)
         new_history_entries.append(assistant_msg)
-
+        # 每轮请求结束后立即打印本轮缓存命中统计（与 OpenAI 兼容 loop 一致）。
+        # 旧实现只在循环外打印一次，导致多轮工具调用中间轮次的缓存命中不可观测。
+        _log_cache_usage("gemini", final_usage)
         if not tool_calls_list:
             final_content = content_acc
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
@@ -925,8 +835,6 @@ async def _agentic_loop_gemini_openai_compat(
                     ) as resp:
                         if resp.status == 200:
                             synth_data = await resp.json()
-                            # 合成轮是独立的模型请求，缓存命中独立统计。
-                            _log_cache_usage("gemini/synth", synth_data.get("usage"))
                             synth_choices = synth_data.get("choices") or []
                             if synth_choices:
                                 raw_synth_content = (
@@ -958,8 +866,6 @@ async def _agentic_loop_gemini_openai_compat(
             builder.finish_group(len(builder._tool_groups) - 1)
         # 轮次数耗尽后的兜底文本没有后续轮次：结束旧草稿，但不创建新草稿。
         await builder.rollover_at_turn_boundary(start_next_draft=False)
-    # 注意：每轮的缓存命中已在循环内部记录（主路径 + synth 路径都已覆盖），
-    # 这里不再重复打最后一轮的日志，避免与循环内输出重复。
     return final_content, final_usage, new_history_entries
 
 
@@ -1052,9 +958,6 @@ async def _agentic_loop_native_image(
             # 旧实现构造了带伪 choices/_payload 的 _ImageResponse 对象，
             # 但下游只读取 usage；直接取值即可。
             usage = response_json.get("usage")
-            # 与 agentic loop 一致：原生图像请求也是一次独立的模型调用，
-            # 缓存命中摘要同样要观测，便于排查图像路径的缓存是否生效。
-            _log_cache_usage("native_image/modelscope", usage)
             image_bytes_list = await _response_items_to_bytes(response_json)
 
             if not image_bytes_list:
@@ -1160,9 +1063,6 @@ async def _agentic_loop_native_image(
     finish_reason = str(getattr(choice, "finish_reason", "") or "")
     content = _extract_native_message_text(getattr(choice.message, "content", ""))
     refusal_text = _extract_native_refusal_text(choice.message)
-    # 与 ModelScope 路径一致：OpenRouter 原生图像请求也要打一行缓存命中，
-    # 让图像路径的 token 使用与缓存命中率可观测。
-    _log_cache_usage("native_image/openrouter", getattr(response, "usage", None))
 
     # 使用统一的 _extract_image_items 提取图片
     try:

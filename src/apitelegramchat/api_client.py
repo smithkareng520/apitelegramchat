@@ -64,17 +64,8 @@ class APIClient:
             api_key=api_key,
             # Agent 在多轮工具调用后，下一轮 SSE 的首个事件可能显著晚于普通聊天。
             # 使用分项超时：连接保持短，流读取允许 300 秒，避免 90 秒默认值中断长任务。
-            # 注意：read=300s 只覆盖“流式持续阶段中两个 chunk 之间的间隔”，
-            # “首字等待”由 agentic_loops._agentic_loop_openai_compat 中的
-            # asyncio.wait_for(first_chunk, FIRST_TOKEN_TIMEOUT) 单独兜底（90s
-            # 内必须出首字，否则立即重试）。两段超时互不重叠。
             timeout=httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=60.0),
             default_headers=headers,
-            # 关闭 SDK 内置重试：默认 max_retries=2 会与 agentic_loops 的显式
-            # 重试循环叠加，遇到上游 ReadTimeout 时最坏 6×300s=30 分钟才抛错，
-            # 草稿全程静止，用户看到“Thinking…”卡几分钟。改为由我们的循环
-            # 单独控制重试节奏（首字超时 90s + 3 次尝试 + 非流式兜底）。
-            max_retries=0,
         )
 
     def get_client(self, api_type: str) -> AsyncOpenAI:

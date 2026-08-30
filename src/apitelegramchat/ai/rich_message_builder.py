@@ -981,9 +981,6 @@ class RichMessageBuilder:
         self._current_group_idx = -1
         self._stream_buffer = ""
         self._stream_text_index = -1
-        # 滚动产生的是新草稿：重置思考占位状态，使下一轮的 add_initial_thinking
-        # 占位仍可被 set_thinking_status / append_stream_delta 正确管理。
-        self._thinking_removed = False
 
     async def _register_active_draft(self, message_id: int = 0) -> None:
         try:

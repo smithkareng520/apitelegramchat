@@ -20,6 +20,7 @@ search_engine.py 等）无需修改任何 import 语句。
 import asyncio
 import json
 import re
+import time
 from typing import Optional
 
 from apitelegramchat.config import (
@@ -381,6 +382,27 @@ async def get_ai_response(
     new_msgs = []
     usage = None
     is_timer = (event_source == "TIMER")
+    # 预处理阶段耗时追踪：用于诊断"草稿卡在 Thinking..."问题。
+    # 从日志看，webhook 收到后到模型请求发出之间可能有数分钟延迟，
+    # 需要逐阶段定位是锁竞争、上下文压缩还是 system prompt 构建导致的。
+    _resp_t0 = time.monotonic()
+    _resp_last_stage = _resp_t0
+    def _log_stage(stage_name: str, *, warn_after_ms: int = 2000) -> None:
+        nonlocal _resp_last_stage
+        now = time.monotonic()
+        elapsed_ms = int((now - _resp_last_stage) * 1000)
+        total_ms = int((now - _resp_t0) * 1000)
+        _resp_last_stage = now
+        if elapsed_ms >= warn_after_ms:
+            logger.warning(
+                "AI 响应预处理阶段耗时过长: chat=%s stage=%s stage_ms=%s total_ms=%s",
+                chat_id, stage_name, elapsed_ms, total_ms,
+            )
+        else:
+            logger.debug(
+                "AI 响应预处理阶段: chat=%s stage=%s stage_ms=%s total_ms=%s",
+                chat_id, stage_name, elapsed_ms, total_ms,
+            )
     try:
         if is_timer:
             # TIMER：静默回合——不创建可见草稿、不注册活跃草稿、不发首帧。
@@ -409,6 +431,7 @@ async def get_ai_response(
                 except Exception:
                     pass
             builder.start_flush_loop()
+            _log_stage("首帧草稿已发送+刷新循环启动")
 
         lock = await state.get_chat_lock(chat_id)
         async with lock:
@@ -424,8 +447,9 @@ async def get_ai_response(
             context_snapshot = select_request_context(stored_history)
             history = context_snapshot.messages
             supports_tools = model_info.supports_tools
+        _log_stage("获取chat_lock+上下文快照完成")
 
-        # 按事件源改写历史中“回合专属工具”的调用痕迹（可拔插，见
+        # 按事件源改写历史中"回合专属工具"的调用痕迹（可拔插，见
         # tool_visibility.py）：USER 回合把 send_message_to_user 的历史调用
         # 折叠成普通文本摘要，消除模型模仿调用的根因；TIMER 回合零开销
         # 直通（edit/delete 仍依赖完整调用史中的 message_id）。只改出站
@@ -450,12 +474,15 @@ async def get_ai_response(
             skill_catalog_text=skill_catalog_brief(),
         )
         messages = _build_initial_messages(system_prompt)
+        _log_stage("system_prompt构建完成")
         await _append_history_async(messages, history, model_info, chat_id=chat_id)
+        _log_stage("历史消息追加完成")
         if user_message:
             builder.set_thinking_status("Thinking...")
             await builder.flush(force=False)
             out_msg = {"role": "user"}
             resolved = await _resolve_multimodal_content(user_message, model_info, chat_id=chat_id)
+            _log_stage("多模态内容解析完成")
             out_msg["content"] = resolved
             messages.append(out_msg)
 
@@ -468,6 +495,7 @@ async def get_ai_response(
 
         builder.set_thinking_status("Thinking...")
         await builder.flush(force=False)
+        _log_stage("预处理全部完成，开始模型请求")
 
         logger.debug("发送给 %s (api=%s): %s", current_model, api_type,
                      json.dumps(messages, ensure_ascii=False, indent=2)[:1000])
