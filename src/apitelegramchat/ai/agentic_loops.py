@@ -193,12 +193,18 @@ def _extract_cache_usage(usage) -> dict:
     stats: dict = {}
     if prompt:
         stats["prompt_tokens"] = prompt
-    if cached is not None:
-        stats["cached"] = cached
-    if cache_write is not None:
-        stats["cache_write"] = cache_write
-    if prompt and cached is not None:
-        stats["hit_ratio"] = round(cached / max(1, prompt), 3)
+        # 只要有总输入 token，就显示命中/写入字段（网关未返回时默认为 0）。
+        # 旧逻辑在 cached 为 None 时跳过这两个字段，导致第一轮（缓存未建立）
+        # 的日志只有 prompt_tokens，缺少命中率；多轮循环里看起来像"字段丢失"。
+        stats["cached"] = cached if cached is not None else 0
+        stats["cache_write"] = cache_write if cache_write is not None else 0
+        stats["hit_ratio"] = round(stats["cached"] / max(1, prompt), 3)
+    else:
+        # 极端情况：usage 中没有 prompt_tokens 但有缓存字段，仍如实显示。
+        if cached is not None:
+            stats["cached"] = cached
+        if cache_write is not None:
+            stats["cache_write"] = cache_write
     return stats
 
 

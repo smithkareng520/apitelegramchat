@@ -1163,6 +1163,60 @@ async def send_rich_message_draft(
                             )
                             return 0
 
+                        # 媒体抓取失败类错误（RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND /
+                        # RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND）是不可恢复的内容问题：
+                        # 同一个 URL 再发多少次都会被 Telegram 拒绝。旧逻辑只 bump
+                        # failure 并 return，builder 的 flush 循环会继续用原始内容
+                        # 重试，最多累计 6 次失败才 mark dead，用户看到草稿卡很久。
+                        # 此处立即在同一个调用内把所有媒体降级为 <a> 链接并重试一次，
+                        # 失败一次就直接降级，不再让上层循环重复无效请求。
+                        media_not_found = (
+                            "rich_message_photo_no_media_found" in body_lower
+                            or "rich_message_video_no_media_found" in body_lower
+                        )
+                        if media_not_found:
+                            demoted = _demote_all_media_to_links(html_content)
+                            if demoted and demoted != html_content:
+                                demoted_payload = {
+                                    **payload,
+                                    "rich_message": _rich_message_html_payload(demoted),
+                                }
+                                logger.warning(
+                                    "sendRichMessageDraft 媒体抓取失败，立即降级为链接重试: "
+                                    "chat=%s draft=%s orig_len=%s demoted_len=%s",
+                                    chat_id, draft_id_int, len(html_content), len(demoted),
+                                )
+                                try:
+                                    async with session.post(
+                                        f"{BASE_URL}/sendRichMessageDraft",
+                                        json=demoted_payload,
+                                        timeout=aiohttp.ClientTimeout(
+                                            total=_DRAFT_REQUEST_TIMEOUT,
+                                            connect=_DRAFT_CONNECT_TIMEOUT,
+                                        ),
+                                    ) as demoted_resp:
+                                        if demoted_resp.status == 200:
+                                            _draft_last_send_time[cache_key] = time.monotonic()
+                                            _last_sent_draft_cache[cache_key] = demoted
+                                            await _reset_draft_failure(chat_id, draft_id_int)
+                                            try:
+                                                demoted_data = await demoted_resp.json()
+                                                demoted_msg_id = (demoted_data.get("result") or {}).get("message_id")
+                                                if isinstance(demoted_msg_id, int) and demoted_msg_id > 0:
+                                                    return demoted_msg_id
+                                            except Exception:
+                                                pass
+                                            return 0
+                                        demoted_body = await demoted_resp.text()
+                                        logger.warning(
+                                            "sendRichMessageDraft 降级后仍失败: %s %s",
+                                            demoted_resp.status, demoted_body[:200],
+                                        )
+                                except Exception as demoted_err:
+                                    logger.warning(
+                                        "sendRichMessageDraft 降级重试异常: %s", demoted_err,
+                                    )
+
                         failures = await _bump_draft_failure(chat_id, draft_id_int)
                         logger.warning(
                             f"sendRichMessageDraft failed (attempt {attempt+1}/{_DRAFT_MAX_ATTEMPTS}, failures={failures}): "
@@ -1341,42 +1395,14 @@ async def send_rich_html_message(
                                 "sendRichHtmlMessage media-demoted retry also failed: %s %s",
                                 fb_resp.status, fb_body[:200],
                             )
-                            # 继续走纯文本兜底
-
-                    # ---------- 第 3 次尝试：纯文本段落兜底 ----------
-                    fallback_html = _rich_message_plain_text_fallback(html_content)
-                    content_required = "rich_message_content_required" in body_lower
-                    if fallback_html and fallback_html != html_content:
-                        fallback_payload = {
-                            **payload,
-                            "rich_message": _rich_message_html_payload(fallback_html),
-                        }
-                        logger.warning(
-                            "sendRichHtmlMessage retrying with plain-text fallback "
-                            "(content_required=%s, fallback_len=%s)",
-                            content_required, len(fallback_html),
-                        )
-                        async with session.post(f"{BASE_URL}/sendRichMessage", json=fallback_payload) as fallback_resp:
-                            if fallback_resp.status == 200:
-                                try:
-                                    fallback_data = await fallback_resp.json()
-                                    fallback_msg_id = (fallback_data.get("result") or {}).get("message_id")
-                                    if isinstance(fallback_msg_id, int) and fallback_msg_id > 0:
-                                        return fallback_msg_id
-                                except Exception as e:
-                                    logger.debug(f"sendRichHtmlMessage fallback parse failed: {e}")
-                                return True
-                            fallback_body = await fallback_resp.text()
-                            logger.error(
-                                "sendRichHtmlMessage fallback failed: %s %s",
-                                fallback_resp.status,
-                                fallback_body[:200],
-                            )
+                            # 媒体降级后仍失败：不再做纯文本兜底（该兜底会丢失所有富文本结构，
+                            # 且通常是因为内容本身有问题而非媒体问题），直接返回失败。
                             return False
 
-                    # 既无媒体可降级，也无可见文本可兜底——彻底失败
+                    # 没有可降级的媒体（内容中本就不含 <img>/<video>/<audio>），
+                    # 或媒体降级未改变内容——400 错误由其他原因导致，不再重试。
                     logger.error(
-                        "sendRichHtmlMessage exhausted all fallbacks: %s %s",
+                        "sendRichHtmlMessage 400 且无媒体可降级: %s %s",
                         resp.status, body[:200],
                     )
                     return False
