@@ -348,7 +348,6 @@ def _strip_invalid_media_urls(html_content: str) -> str:
     """
     if not html_content:
         return ""
-
     def _extract_src(tag_text: str) -> str:
         m = re.search(r'\bsrc\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))',
                       tag_text, re.IGNORECASE)
@@ -544,8 +543,15 @@ def _demote_watch_page_videos(html_content: str) -> str:
     return result
 
 
-def _demote_all_media_to_links(html_content: str) -> str:
-    """把所有 ``<video>/<audio>/<img>`` 媒体块降级为 ``<a href>`` 链接。
+def _demote_all_media_to_links(
+    html_content: str,
+    media_kinds: Optional[set[str]] = None,
+) -> str:
+    """按指定媒体类型把 ``<video>/<audio>/<img>`` 降级为 ``<a href>``。
+
+    ``media_kinds`` 为 ``None`` 时保持兼容；传入 ``{"image"}``、
+    ``{"video"}`` 或 ``{"audio"}`` 时只处理对应类型，避免某一种媒体
+    失败时牵连同一条消息中的其他媒体。
 
     用于 ``sendRichMessage`` 因媒体 URL 在 Telegram 服务端抓取失败而拒绝
     整条消息时的**反应式兜底**——例如：
@@ -579,6 +585,8 @@ def _demote_all_media_to_links(html_content: str) -> str:
     """
     if not html_content:
         return ""
+    if media_kinds is not None:
+        media_kinds = {str(kind).lower() for kind in media_kinds}
 
     def _extract_src(tag_text: str) -> str:
         m = re.search(r'\bsrc\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))',
@@ -653,6 +661,8 @@ def _demote_all_media_to_links(html_content: str) -> str:
         src = _extract_src(block)
         # figcaption 文本先提取，不论 src 是否合法，都应作为可见内容保留
         cap_text = _figcaption_text(inner)
+        if media_kinds is not None and kind not in media_kinds:
+            return m.group(0)
         if not src or not _is_valid_url(src):
             # 非法 src：删除该 media 块，但保留 figcaption 文本作为可见内容
             rest = inner.replace(block, "")
@@ -679,6 +689,8 @@ def _demote_all_media_to_links(html_content: str) -> str:
         block = m.group(0)
         kind = (m.group(1) or m.group(2) or "").lower()
         src = _extract_src(block)
+        if media_kinds is not None and kind not in media_kinds:
+            return block
         if not src or not _is_valid_url(src):
             return ""  # 非法 src：整块删除
         # 从 block 内部提取可能的 figcaption / 裸文本作为 caption
@@ -1380,58 +1392,87 @@ async def send_rich_html_message(
                         return True
                     body = await resp.text()
                     body_lower = body.lower()
-                    # 任何 4xx 都进入下面的反应式兜底——而不是只有
-                    # RICH_MESSAGE_CONTENT_REQUIRED 才降级。
-                    # 旧实现遇到 RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND /
-                    # RICH_MESSAGE_PHOTO_URL_INVALID 等媒体错误时直接 return False，
-                    # 导致**整条用户回复丢失**。新链路：媒体错误 → 全部媒体降级为
-                    # <a> 链接 → 重发；如仍失败，再退化为纯文本段落兜底。
+                    # 只有明确的内容错误才进入针对性兜底。网络错误由装饰器重试，
+                    # 认证、权限、限流和参数错误不能靠改 HTML 修复，必须原样失败。
                     if resp.status != 400:
                         logger.error(f"sendRichHtmlMessage failed: {resp.status} {body[:200]}")
                         return False
 
-                    logger.warning(
-                        "sendRichHtmlMessage received 400 (body=%s); entering reactive fallback chain",
-                        body[:200],
-                    )
+                    body_lower = body.lower()
+                    media_kinds: set[str] = set()
+                    if "rich_message_photo_" in body_lower or "rich_message_photo_url_invalid" in body_lower:
+                        media_kinds.add("img")
+                    if "rich_message_video_" in body_lower or "rich_message_video_url_invalid" in body_lower:
+                        media_kinds.add("video")
+                    if "rich_message_audio_" in body_lower or "rich_message_audio_url_invalid" in body_lower:
+                        media_kinds.add("audio")
 
-                    # ---------- 第 2 次尝试：把所有 <video>/<audio>/<img> 降级为 <a> ----------
-                    media_demoted = _demote_all_media_to_links(html_content)
-                    if media_demoted and media_demoted != html_content:
-                        media_payload = {
-                            **payload,
-                            "rich_message": _rich_message_html_payload(media_demoted),
-                        }
-                        logger.warning(
-                            "sendRichHtmlMessage retrying with all media demoted to <a> links "
-                            "(orig_len=%s, demoted_len=%s)",
-                            len(html_content), len(media_demoted),
+                    # ---------- 第 2 次尝试：只降级服务端明确报错的媒体类型 ----------
+                    # image/video/audio 映射到实际 HTML 标签名，避免 photo 失败时把
+                    # 同一条消息中本来正常的视频和音频也一并变成链接。
+                    if media_kinds:
+                        media_demoted = _demote_all_media_to_links(
+                            html_content,
+                            media_kinds,
                         )
-                        async with session.post(f"{BASE_URL}/sendRichMessage", json=media_payload) as fb_resp:
-                            if fb_resp.status == 200:
-                                try:
-                                    fb_data = await fb_resp.json()
-                                    fb_msg_id = (fb_data.get("result") or {}).get("message_id")
-                                    if isinstance(fb_msg_id, int) and fb_msg_id > 0:
-                                        return fb_msg_id
-                                except Exception as e:
-                                    logger.debug(f"sendRichHtmlMessage media-demoted parse failed: {e}")
-                                return True
-                            fb_body = await fb_resp.text()
+                        if media_demoted and media_demoted != html_content:
+                            media_payload = {
+                                **payload,
+                                "rich_message": _rich_message_html_payload(media_demoted),
+                            }
                             logger.warning(
-                                "sendRichHtmlMessage media-demoted retry also failed: %s %s",
-                                fb_resp.status, fb_body[:200],
+                                "sendRichHtmlMessage retrying with affected media demoted to <a> links "
+                                "(kinds=%s, orig_len=%s, demoted_len=%s)",
+                                sorted(media_kinds), len(html_content), len(media_demoted),
                             )
-                            # 媒体降级后仍失败：不再做纯文本兜底（该兜底会丢失所有富文本结构，
-                            # 且通常是因为内容本身有问题而非媒体问题），直接返回失败。
-                            return False
+                            async with session.post(f"{BASE_URL}/sendRichMessage", json=media_payload) as fb_resp:
+                                if fb_resp.status == 200:
+                                    try:
+                                        fb_data = await fb_resp.json()
+                                        fb_msg_id = (fb_data.get("result") or {}).get("message_id")
+                                        if isinstance(fb_msg_id, int) and fb_msg_id > 0:
+                                            return fb_msg_id
+                                    except Exception as e:
+                                        logger.debug(f"sendRichHtmlMessage media-demoted parse failed: {e}")
+                                    return True
+                                fb_body = await fb_resp.text()
+                                logger.warning(
+                                    "sendRichHtmlMessage selective media fallback failed: %s %s",
+                                    fb_resp.status, fb_body[:200],
+                                )
+                                return False
 
-                    # 没有可降级的媒体（内容中本就不含 <img>/<video>/<audio>），
-                    # 或媒体降级未改变内容——400 错误由其他原因导致，不再重试。
-                    logger.error(
-                        "sendRichHtmlMessage 400 且无媒体可降级: %s %s",
-                        resp.status, body[:200],
-                    )
+                    # ---------- 结构/内容错误：保留可见文字，去掉全部富文本标记 ----------
+                    # CONTENT_REQUIRED 或未知 Rich Message 400 不是媒体问题，不应把
+                    # 无辜的媒体改成链接；纯文本段落是最后一道、语义不丢失的兜底。
+                    if "rich_message_content_required" in body_lower or "rich_message_" in body_lower:
+                        plain_html = _rich_message_plain_text_fallback(html_content)
+                        if plain_html and plain_html != html_content:
+                            plain_payload = {
+                                **payload,
+                                "rich_message": _rich_message_html_payload(plain_html),
+                            }
+                            logger.warning(
+                                "sendRichHtmlMessage retrying with plain-text paragraph fallback "
+                                "after content/structure error (orig_len=%s, plain_len=%s)",
+                                len(html_content), len(plain_html),
+                            )
+                            async with session.post(f"{BASE_URL}/sendRichMessage", json=plain_payload) as fb_resp:
+                                if fb_resp.status == 200:
+                                    try:
+                                        fb_data = await fb_resp.json()
+                                        fb_msg_id = (fb_data.get("result") or {}).get("message_id")
+                                        if isinstance(fb_msg_id, int) and fb_msg_id > 0:
+                                            return fb_msg_id
+                                    except Exception as e:
+                                        logger.debug(f"sendRichHtmlMessage plain fallback parse failed: {e}")
+                                    return True
+                                fb_body = await fb_resp.text()
+                                logger.warning(
+                                    "sendRichHtmlMessage plain-text fallback failed: %s %s",
+                                    fb_resp.status, fb_body[:200],
+                                )
+                    logger.error("sendRichHtmlMessage 400 未命中可恢复错误类型: %s %s", resp.status, body[:200])
                     return False
         except (aiohttp.ClientError, asyncio.TimeoutError):
             raise
