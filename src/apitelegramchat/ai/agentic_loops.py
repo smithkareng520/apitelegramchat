@@ -144,8 +144,7 @@ def _merged_extra_body(
 # 在每轮请求结束后打一行 INFO 日志，让"缓存命中率"变成可度量的指标。
 # 字段来源：
 #   OpenRouter / OpenAI : usage.prompt_tokens_details.cached_tokens
-#   Anthropic（经 OR）  : cache_read_input_tokens / cache_creation_input_tokens
-#   DeepSeek 直连       : prompt_cache_hit_tokens / prompt_cache_miss_tokens
+#   其他兼容 provider   : cache read 字段（如 provider 返回）
 # =====================================================================
 def _extract_cache_usage(usage) -> dict:
     if usage is None:

@@ -128,8 +128,7 @@ fetch_url/wikipedia/text_editor 密集的会话（本项目最典型的用法）
 **修复**：每轮请求结束打一行 INFO：
 `[openrouter] prompt cache usage: {'prompt_tokens': 10339, 'cached': 9500, 'hit_ratio': 0.918}`。
 统一解析三种字段族：OpenRouter/OpenAI（`prompt_tokens_details.cached_tokens`）、
-Anthropic（`cache_read_input_tokens`/`cache_creation_input_tokens`）、DeepSeek 直连
-（`prompt_cache_hit_tokens`）。Gemini 循环同样接入（dict 形态 usage）。
+其他兼容 provider 的 cache-read 字段（如 provider 返回）。Gemini 循环同样接入（dict 形态 usage）。
 
 ---
 
