@@ -8,6 +8,7 @@
 """
 
 import logging
+import os
 import httpx
 from typing import Dict, Optional
 from openai import AsyncOpenAI
@@ -59,9 +60,19 @@ class APIClient:
 
         logger.debug(f"创建 {config.name} 客户端，base_url={config.base_url}")
 
+        # 禁用 OpenAI SDK 的隐式自动重试。SDK 默认会依据服务端 Retry-After
+        # 睡眠，可能出现“Retrying request ... in 60.000000 seconds”，并且会与
+        # agentic_loops 的首增量超时重试叠加。429/5xx 由上层统一处理，避免一次
+        # 请求在 SDK 内部无感等待数十秒后才返回。
+        try:
+            sdk_max_retries = max(0, int(os.getenv("OPENAI_SDK_MAX_RETRIES", "0")))
+        except (TypeError, ValueError):
+            sdk_max_retries = 0
+
         return AsyncOpenAI(
             base_url=config.base_url,
             api_key=api_key,
+            max_retries=sdk_max_retries,
             # Agent 在多轮工具调用后，下一轮 SSE 的首个事件可能显著晚于普通聊天。
             # 使用分项超时：连接保持短，流读取允许 300 秒，避免 90 秒默认值中断长任务。
             timeout=httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=60.0),
