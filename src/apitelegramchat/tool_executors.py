@@ -2478,16 +2478,23 @@ _REMOVED_TOOL_HINTS = {
 }
 
 # ---------- 工具分发 ----------
-async def execute_deliver_reply(chat_id: int, arguments: dict) -> str:
+async def execute_deliver_reply(chat_id: int, content) -> str:
     """deliver_reply：静默模式（/show off）下交付最终回复给用户。
 
-    通过 sendRichMessage 发送永久富文本消息（不经过草稿）；发送成功后
+    语义（改版）：发送的是 agent 轮次的最后一条助手消息正文——由
+    ai/tool_call_loop.run_one 在轮次日志里回溯得到后传入（通常就是当前
+    这条含 deliver_reply 调用的消息的 content），模型无需在工具参数里
+    重复正文。本函数只负责发送与交付标记：通过 sendRichMessage 发送
+    永久富文本消息（不经过草稿）；发送成功后
     在 turn_recovery 里标记"本轮已主动交付"，get_ai_response 收尾时据此
     判断用户主动回合是否需要兜底直发。
     """
-    content = arguments.get("content")
     if not isinstance(content, str) or not content.strip():
-        return "失败：deliver_reply 需要 content（要发送的富文本 HTML 内容）。"
+        return (
+            "失败：deliver_reply 没有可发送的正文。请把完整、自包含的最终回复直接写成"
+            "当前消息的正文（Telegram Rich HTML），并在同一条消息中再次调用本工具"
+            "（无需任何参数，系统会发送该正文）。"
+        )
     from apitelegramchat.utils import send_rich_html_message
     from apitelegramchat import turn_recovery
     try:
@@ -2501,11 +2508,11 @@ async def execute_deliver_reply(chat_id: int, arguments: dict) -> str:
         turn_recovery.mark_reply_delivered(chat_id)
         preview = content if len(content) <= 60 else content[:60] + "…"
         logger.info("[deliver_reply] chat=%s 已交付最终回复 message_id=%s chars=%s", chat_id, result, len(content))
-        return f"已发送给用户（message_id={result}）：{preview}"
+        return f"已发送给用户（message_id={result}）：本轮最后一条消息正文（{len(content)} 字符）：{preview}"
     if result is True:
         # HTTP 200 但未解析到 message_id：按成功处理。
         turn_recovery.mark_reply_delivered(chat_id)
-        return "已发送给用户。"
+        return f"已发送给用户：本轮最后一条消息正文（{len(content)} 字符）。"
     return "失败：消息发送失败（网络或 Telegram 错误），可稍后重试。"
 
 
@@ -2679,9 +2686,11 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 paths = [paths]
             return await execute_present_files(chat_id, paths, namespace=resolved_namespace)
         elif name == "deliver_reply":
-            # 静默模式（/show off）下模型自主选择的最终内容交付通道：
-            # 经 sendRichMessage 发送永久富文本消息（不经过草稿）。
-            return await execute_deliver_reply(chat_id, arguments)
+            # 防御路径：正常情况下 deliver_reply 由 tool_call_loop.run_one 的
+            # 专用分支处理（自动携带「本轮最后一条助手消息正文」，模型无需
+            # 参数）。仅当其他路径（如子 agent 误用）直达 dispatch 时才走到
+            # 这里——此时只能使用显式传入的 content（若有）。
+            return await execute_deliver_reply(chat_id, arguments.get("content"))
         elif name in _REMOVED_TOOL_HINTS:
             # stage_upload / fetch_download / list_download / list_upload / ip_geo 已移除；
             # 迁移提示让模型立即改用 bash 直访，避免无意义的重试。

@@ -59,7 +59,9 @@ msg3 再打断 → 若 msg2 的轮次仍无任何输出，msg3 继续并入同�
 ================
 
 ``/show off``（静默模式）下，模型通过 ``deliver_reply`` 工具自主选择是否
-把最终内容发给用户。executor 调用 ``mark_reply_delivered`` 记录"本轮已经
+把最终内容发给用户——工具无需参数，发送的是 agent 轮次的最后一条助手
+消息正文（由 ``ai/tool_call_loop`` 在 journal 里回溯解析后传入 executor）。
+executor 调用 ``mark_reply_delivered`` 记录"本轮已经
 主动交付过"，``get_ai_response`` 收尾时据此判断用户主动回合是否需要兜底
 直发（防止模型忘记调用导致用户提问石沉大海）。
 

@@ -525,32 +525,29 @@ MESSAGE_USER_TOOL = {
 # 向后兼容别名：旧代码 / 旧引用仍可导入 ASK_USER_TOOL。
 ASK_USER_TOOL = MESSAGE_USER_TOOL
 
-# deliver_reply：/show off（静默模式）下模型自主选择是否把最终内容
-# 通过 sendRichMessage 交付给用户。草稿开启（/show on）时系统会自动发送
+# deliver_reply：/show off（静默模式）下模型自主选择是否把「本轮最后一条
+# 助手消息正文」通过 sendRichMessage 交付给用户。无需任何参数——系统会
+# 原样发送调用本工具的那条消息的 content（即 agent 轮次的最后消息），
+# 模型不必把正文重复写进参数。草稿开启（/show on）时系统会自动发送
 # 最终回复，本工具不进入工具面。
 DELIVER_REPLY_TOOL = {
     "type": "function",
     "function": {
         "name": "deliver_reply",
         "description": (
-            "仅在草稿预览关闭（静默模式，/show off）时可用：把你希望用户看到的最终内容"
-            "作为一条永久富文本消息（Telegram Rich HTML）直接发送给用户，不经过草稿。"
-            "静默模式下你的流式输出与最终回复都不会自动送达用户——若本轮需要用户看到结论，"
-            "必须在结束前调用本工具；若整轮无需用户知晓（例如后台巡检无值得汇报的内容），"
-            "则不要调用，保持静默。"
+            "仅在草稿预览关闭（静默模式，/show off）时可用：把你当前这条消息的正文"
+            "（即本轮最后一条助手内容）作为一条永久富文本消息（Telegram Rich HTML）"
+            "通过 sendRichMessage 直接发送给用户，不经过草稿。无需任何参数——系统"
+            "发送的就是你当前消息的正文本身，因此正确用法是：先把完整、自包含的最终"
+            "回复直接写成消息正文，再在同一条消息里调用本工具（每轮最多一次）。"
+            "静默模式下你的流式输出与最终回复都不会自动送达用户——若本轮需要用户"
+            "看到结论，必须用本工具交付；若整轮无需用户知晓（例如后台巡检无值得"
+            "汇报的内容），则不要调用，保持静默。"
         ),
         "parameters": {
             "type": "object",
-            "properties": {
-                "content": {
-                    "type": "string",
-                    "description": (
-                        "要发送的富文本内容（Telegram Rich HTML，遵循系统提示词的标签规范）。"
-                        "应当是完整、自包含的最终回复，而不是片段。"
-                    )
-                }
-            },
-            "required": ["content"]
+            "properties": {},
+            "required": []
         }
     }
 }
