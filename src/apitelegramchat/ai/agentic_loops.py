@@ -24,7 +24,6 @@ from apitelegramchat.s3_utils import upload_bytes_to_r2
 from apitelegramchat.ai._constants import (
     MAX_TOOL_CALLS,
     MAX_PLAIN_TEXT_TOOL_CALL_RETRIES,
-    MAX_PSEUDO_DELIVERY_RETRIES,
     OPENROUTER_PROVIDER_PREFERENCES,
     TIMEOUT,
 )
@@ -48,11 +47,9 @@ from apitelegramchat.ai.media_generation import (
     _response_items_to_bytes,
 )
 from apitelegramchat.ai.tool_summary import (
-    PSEUDO_DELIVERY_CORRECTION_MESSAGE,
     _contains_textual_tool_call,
     _generate_action_description,
     _generate_initial_tool_summary,
-    _mentions_deliver_reply_affirmatively,
     _normalize_tool_call_arguments,
     _safe_parse_args,
     _strip_textual_tool_calls,
@@ -204,32 +201,6 @@ def _log_cache_usage(api_label: str, usage) -> None:
         logger.debug("cache usage 日志记录失败", exc_info=True)
 
 
-def _log_tool_face(api_label: str, tools: list, supports_tools: bool) -> None:
-    """打一行 INFO：本次真正随请求发送的工具面名称列表。
-
-    观测用途：静默模式（/show off）下用户侧反复出现"模型声称调用了
-    deliver_reply 但 tool_calls=0"的问题，需要能直接从日志确认工具
-    定义到底有没有进入 API 请求的 tools 数组（supports_tools=False 的
-    模型会整体不发送工具）。每回合只打一次（调用方在循环前调用）。
-    """
-    effective = tools if (supports_tools and tools) else []
-    names = [(t.get("function") or {}).get("name") for t in effective]
-    names = [n for n in names if n]
-    logger.info(
-        "[%s] 本次请求工具面（%s 个）：%s",
-        api_label, len(names), ", ".join(names) if names else "（无——工具未随请求发送）",
-    )
-
-
-def _tool_face_has_deliver_reply(tools: list, supports_tools: bool) -> bool:
-    """本次请求的工具面里是否暴露了 deliver_reply（静默回合判定用）。"""
-    if not supports_tools or not tools:
-        return False
-    return any(
-        (t.get("function") or {}).get("name") == "deliver_reply" for t in tools
-    )
-
-
 async def _agentic_loop_openai_compat(
         client: AsyncOpenAI, current_model: str, messages: list, api_label: str,
         builder: "RichMessageBuilder", tools: list = None, supports_tools: bool = True,
@@ -247,8 +218,6 @@ async def _agentic_loop_openai_compat(
     new_history_entries = journal if journal is not None else []
     plain_text_tool_attempts = 0
     parallel_tool_calls = True
-    # deliver_reply「文本伪交付」纠正计数（静默回合专用，独立于 XML 伪调用计数）。
-    pseudo_delivery_attempts = 0
 
     model_info = SUPPORTED_MODELS.get(current_model)
     max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
@@ -256,10 +225,6 @@ async def _agentic_loop_openai_compat(
     sampling_params = get_sampling_params(model_info)
     reasoning_top, reasoning_extra = get_reasoning_request_fields(model_info, api_label)
     prompt_cache_enabled = bool(model_info and model_info.supports_prompt_cache)
-
-    # 观测：本次请求真正发送的工具面（静默模式排障用，每回合一次）。
-    _log_tool_face(api_label, tools, supports_tools)
-    deliver_reply_available = _tool_face_has_deliver_reply(tools, supports_tools)
 
     for _round in range(MAX_TOOL_CALLS):
         added_tool_indices = set()
@@ -591,30 +556,6 @@ async def _agentic_loop_openai_compat(
                 )
                 if not content_acc:
                     builder.add_text(final_content)
-            elif (
-                deliver_reply_available
-                and pseudo_delivery_attempts < MAX_PSEUDO_DELIVERY_RETRIES
-                and _mentions_deliver_reply_affirmatively(content_acc)
-            ):
-                # deliver_reply「文本伪交付」：模型在正文里用文字冒称"已通过
-                # deliver_reply 发送"，但 tool_calls=0——正文文字不触发任何
-                # 操作，用户实际什么都没收到。注入纠正消息（只进 loop_messages
-                # 的临时副本，不进持久历史），让模型重新发起真实调用；纠正轮
-                # 模型可以只发 tool_call 不写正文，run_one 的 _last_assistant_text
-                # 会回溯找到上面这条含正文的助手消息并把该正文发送给用户。
-                pseudo_delivery_attempts += 1
-                logger.warning(
-                    "[%s] 模型在正文中冒称已通过 deliver_reply 交付但未真正调用工具，"
-                    "注入纠正消息重试（第 %s/%s 次，正文 %s 字）",
-                    api_label, pseudo_delivery_attempts, MAX_PSEUDO_DELIVERY_RETRIES,
-                    len(content_acc or ""),
-                )
-                loop_messages.append({
-                    "role": "user",
-                    "content": PSEUDO_DELIVERY_CORRECTION_MESSAGE,
-                })
-                await builder.rollover_at_turn_boundary(start_next_draft=True)
-                continue
             else:
                 final_content = content_acc
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
@@ -740,13 +681,6 @@ async def _agentic_loop_gemini_openai_compat(
     tool_call_count_ref = [0]
     # journal：由 get_ai_response 注入的轮次日志（打断保全用）。
     new_history_entries: list = journal if journal is not None else []
-    # deliver_reply「文本伪交付」纠正计数（与 OpenAI 兼容 loop 同构）。
-    pseudo_delivery_attempts = 0
-
-    # 观测：本次请求真正发送的工具面（静默模式排障用，每回合一次）。
-    # Gemini 循环发送的是 cleaned_tools（剥离 input_examples 后的副本）。
-    _log_tool_face("gemini", cleaned_tools, supports_tools)
-    deliver_reply_available = _tool_face_has_deliver_reply(cleaned_tools, supports_tools)
 
     for _round in range(MAX_TOOL_CALLS):
         payload: dict = {
@@ -865,27 +799,6 @@ async def _agentic_loop_gemini_openai_compat(
         # 旧实现只在循环外打印一次，导致多轮工具调用中间轮次的缓存命中不可观测。
         _log_cache_usage("gemini", final_usage)
         if not tool_calls_list:
-            if (
-                deliver_reply_available
-                and pseudo_delivery_attempts < MAX_PSEUDO_DELIVERY_RETRIES
-                and _mentions_deliver_reply_affirmatively(content_acc)
-            ):
-                # deliver_reply「文本伪交付」纠正（与 OpenAI 兼容 loop 同构）：
-                # 模型在正文里冒称已交付但未真正调用工具，注入纠正消息重试；
-                # 纠正消息只进 loop_messages 临时副本，不进持久历史。
-                pseudo_delivery_attempts += 1
-                logger.warning(
-                    "[gemini] 模型在正文中冒称已通过 deliver_reply 交付但未真正调用工具，"
-                    "注入纠正消息重试（第 %s/%s 次，正文 %s 字）",
-                    pseudo_delivery_attempts, MAX_PSEUDO_DELIVERY_RETRIES,
-                    len(content_acc or ""),
-                )
-                loop_messages.append({
-                    "role": "user",
-                    "content": PSEUDO_DELIVERY_CORRECTION_MESSAGE,
-                })
-                await builder.rollover_at_turn_boundary(start_next_draft=True)
-                continue
             final_content = content_acc
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)

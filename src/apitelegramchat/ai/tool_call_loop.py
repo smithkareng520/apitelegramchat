@@ -183,10 +183,11 @@ def _format_subagent_progress_html(status_text: str) -> str:
 def _last_assistant_text(journal: list) -> str:
     """回溯轮次日志，返回最后一条非空 assistant 消息的正文。
 
-    deliver_reply 用它解析「agent 轮次的最后一条消息正文」：从 journal
-    末尾向前找，跳过 content 为空/None 的纯工具调用消息；找不到返回 ""。
-    （journal 即 new_history_entries，与 turn_recovery 登记的是同一列表，
-    调用时刻当前 assistant 消息——含 deliver_reply 调用的那条——已写入。）
+    deliver_reply(send=true) 用它解析「agent 轮次的最后一条消息正文」：
+    从 journal 末尾向前找，跳过 content 为空/None 的纯工具调用消息；
+    找不到返回 ""。（journal 即 new_history_entries，与 turn_recovery
+    登记的是同一列表，调用时刻当前 assistant 消息——含 deliver_reply
+    调用的那条——已写入。）
     """
     if not isinstance(journal, list):
         return ""
@@ -394,28 +395,35 @@ async def _run_tool_calls_and_append(
                     answer = await wait_for_answer(interaction)
                     result_str = answer_to_tool_result(answer)
                 elif fn_name == "deliver_reply":
-                    # deliver_reply：静默模式（/show off）下模型自主决定是否
-                    # 交付最终内容。语义：发送「本轮最后一条助手消息正文」
-                    # （即 agent 轮次的最后消息）——通常就是当前这条含本
-                    # 工具调用的消息的 content，模型无需把正文重复写进参数
-                    # （工具定义为无参数）。
-                    # 防御：个别模型仍会带 content 参数（旧习惯/幻觉），
-                    # 非空时尊重显式传入值。
-                    explicit = fn_args.get("content")
-                    body = explicit if isinstance(explicit, str) and explicit.strip() else None
-                    if body is None:
-                        body = _last_assistant_text(new_history_entries)
-                    if not body:
+                    # deliver_reply：静默模式（/show off）下模型通过 send 布尔参数
+                    # 自主决定是否交付最终内容。send=true：发送「本轮最后一条助手
+                    # 消息正文」（即 agent 轮次的最后消息，通常就是当前这条含本
+                    # 工具调用的消息的 content）；send=false 或不填（默认 false）：
+                    # 不发送，保持静默——与"不调用本工具"语义等价。每一轮都默认
+                    # false，上一轮是否交付过不影响本轮。
+                    # 容错：个别模型会把布尔写成字符串（"true"/"false"）。
+                    send_flag = fn_args.get("send")
+                    if isinstance(send_flag, str):
+                        send_flag = send_flag.strip().lower() in ("true", "1", "yes")
+                    send_flag = bool(send_flag)
+                    if not send_flag:
                         result_str = (
-                            "失败：本轮还没有可交付的正文。请把完整、自包含的最终回复直接写成"
-                            "当前消息的正文（Telegram Rich HTML），并在同一条消息中再次调用 "
-                            "deliver_reply（无需任何参数，系统会发送该正文）。"
+                            "未发送：send=false（或不填，默认 false），本轮保持静默，"
+                            "用户不会收到任何内容。无需再次调用本工具确认这一结果。"
                         )
                     else:
-                        result_str = await asyncio.wait_for(
-                            execute_deliver_reply(builder.chat_id, body),
-                            timeout=timeout,
-                        )
+                        body = _last_assistant_text(new_history_entries)
+                        if not body:
+                            result_str = (
+                                "失败：本轮还没有可发送的正文。请把完整、自包含的最终回复直接写成"
+                                "当前消息的正文（Telegram Rich HTML），并在同一条消息中再次调用 "
+                                "deliver_reply（send=true）。"
+                            )
+                        else:
+                            result_str = await asyncio.wait_for(
+                                execute_deliver_reply(builder.chat_id, body),
+                                timeout=timeout,
+                            )
                 else:
                     result_str = await asyncio.wait_for(
                         dispatch_tool_call(

@@ -536,8 +536,8 @@ async def get_ai_response(
             messages.append(out_msg)
 
         # 静默模式（/show off）运行时告知：流式输出与最终回复不会自动送达，
-        # 需要用户看到内容时必须用 deliver_reply / message_user。缺失这层
-        # 告知，模型会误以为自己的正文用户能看到。
+        # 需要用户看到内容时必须用 deliver_reply(send=true) / message_user。缺失
+        # 这层告知，模型会误以为自己的正文用户能看到。
         if silent_mode:
             messages.append({
                 "role": "system",
@@ -545,12 +545,14 @@ async def get_ai_response(
                     "当前会话已关闭草稿预览（静默模式，/show off）：你的流式输出与本轮最终回复"
                     "不会自动送达用户，不调用交付工具时系统也不会兑底发送。若需要用户看到本轮"
                     "内容，必须先把完整、自包含的最终回复直接写成消息正文，并在同一条消息中调用 "
-                    "deliver_reply（无需任何参数，系统会把该正文的 content 本身用 sendRichMessage "
-                    "永久发送给用户，不经过草稿，也不附带其他内容）。特别强调：deliver_reply 是"
-                    "本次请求工具列表中真实存在的函数，在正文里用文字\"声称已通过 deliver_reply "
-                    "发送\"不会有任何效果——必须通过 tool_calls API 真正发起调用，否则用户什么"
-                    "都收不到。需要提问或留言可用 message_user（其超时表示用户不在，不是错误）。"
-                    "若整轮无需用户知晓，可以不调用任何交付工具，保持静默。"
+                    "deliver_reply 且填写 send=true（系统会把该正文的 content 本身用 sendRichMessage "
+                    "永久发送给用户，不经过草稿，也不附带其他内容）；send=false 或不填均表示不发送"
+                    "（默认 false）。特别强调：deliver_reply 是本次请求工具列表中真实存在的函数，"
+                    "在正文里用文字\"声称已通过 deliver_reply 发送\"不会有任何效果——必须通过 "
+                    "tool_calls API 真正发起调用，否则用户什么都收不到。交付成功后不要再调用 "
+                    "deliver_reply，也不要输出\"已发送/已确认\"之类的确认正文——用户已经收到，"
+                    "重复确认只会造成冗余消息。需要提问或留言可用 message_user（其超时表示用户"
+                    "不在，不是错误）。若整轮无需用户知晓，可以不调用任何交付工具，保持静默。"
                 ),
             })
 
@@ -607,7 +609,7 @@ async def get_ai_response(
                     "有具体价值就自然地告知或推进；没有合理行动就保持简短，不要为了完成回合"
                     "而寒暄，也不要输出“我会等待”等等待式文本。需要用户回应时用 message_user；"
                     "静默模式下需要用户看到结论时，把结论写成消息正文并调用 deliver_reply"
-                    "（无需参数，系统会把该正文直接发送给用户）。"
+                    "（send=true，系统会把该正文直接发送给用户；交付后不要再重复确认）。"
                 ),
             })
             raw_content, usage, new_msgs = await _call_api(

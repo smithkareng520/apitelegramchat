@@ -2482,18 +2482,24 @@ async def execute_deliver_reply(chat_id: int, content) -> str:
     """deliver_reply：静默模式（/show off）下交付最终回复给用户。
 
     语义：发送的是 agent 轮次最后一条助手消息的 content 字段本身——由
-    ai/tool_call_loop.run_one 在轮次日志里回溯得到后传入（通常就是当前
-    这条含 deliver_reply 调用的消息的 content），模型无需在工具参数里
-    重复正文，也不会附带 reasoning 等其他字段。本函数只负责发送与交付
-    标记：通过 sendRichMessage 发送永久富文本消息（不经过草稿）；发送成功后
-    在 turn_recovery 里标记"本轮已主动交付"，get_ai_response 收尾时据此在日志中观测交付情况；静默回合没有兜底
-    直发——模型不调用本工具，本轮就不会有任何内容送达用户。
+    ai/tool_call_loop.run_one 在 send=true 时从轮次日志里回溯得到后传入
+    （通常就是当前这条含 deliver_reply 调用的消息的 content），也不会附带
+    reasoning 等其他字段。本函数只负责发送与交付标记：通过 sendRichMessage
+    发送永久富文本消息（不经过草稿）；发送成功后在 turn_recovery 里标记
+    "本轮已主动交付"，get_ai_response 收尾时据此在日志中观测交付情况；
+    静默回合没有兜底直发——send 不为 true（或不调用本工具），本轮就不会
+    有任何内容送达用户。
+
+    工具结果刻意不携带 message_id 与正文预览：旧版结果里的
+    "已发送给用户（message_id=…）：正文预览"会诱导模型在后续轮次把
+    "已确认：deliver_reply 工具已成功调用"之类的回执当成新正文再次交付，
+    造成冗余消息链。message_id 只写入服务端日志。
     """
     if not isinstance(content, str) or not content.strip():
         return (
             "失败：deliver_reply 没有可发送的正文。请把完整、自包含的最终回复直接写成"
             "当前消息的正文（Telegram Rich HTML），并在同一条消息中再次调用本工具"
-            "（无需任何参数，系统会发送该正文）。"
+            "（send=true，系统会发送该正文）。"
         )
     from apitelegramchat.utils import send_rich_html_message
     from apitelegramchat import turn_recovery
@@ -2506,13 +2512,20 @@ async def execute_deliver_reply(chat_id: int, content) -> str:
         return "失败：消息发送异常，可稍后重试。"
     if isinstance(result, int) and not isinstance(result, bool) and result > 0:
         turn_recovery.mark_reply_delivered(chat_id)
-        preview = content if len(content) <= 60 else content[:60] + "…"
         logger.info("[deliver_reply] chat=%s 已交付最终回复 message_id=%s chars=%s", chat_id, result, len(content))
-        return f"已发送给用户（message_id={result}）：本轮最后一条消息正文（{len(content)} 字符）：{preview}"
+        return (
+            "已发送：本轮最后一条消息正文已永久发送给用户，交付完成。"
+            "不要再调用 deliver_reply，也不要输出\"已发送/已确认\"之类的确认正文——"
+            "用户已经收到，重复确认只会造成冗余消息。"
+        )
     if result is True:
         # HTTP 200 但未解析到 message_id：按成功处理。
         turn_recovery.mark_reply_delivered(chat_id)
-        return f"已发送给用户：本轮最后一条消息正文（{len(content)} 字符）。"
+        return (
+            "已发送：本轮最后一条消息正文已永久发送给用户，交付完成。"
+            "不要再调用 deliver_reply，也不要输出\"已发送/已确认\"之类的确认正文——"
+            "用户已经收到，重复确认只会造成冗余消息。"
+        )
     return "失败：消息发送失败（网络或 Telegram 错误），可稍后重试。"
 
 
@@ -2687,10 +2700,14 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             return await execute_present_files(chat_id, paths, namespace=resolved_namespace)
         elif name == "deliver_reply":
             # 防御路径：正常情况下 deliver_reply 由 tool_call_loop.run_one 的
-            # 专用分支处理（自动携带「本轮最后一条助手消息正文」，模型无需
-            # 参数）。仅当其他路径（如子 agent 误用）直达 dispatch 时才走到
-            # 这里——此时只能使用显式传入的 content（若有）。
-            return await execute_deliver_reply(chat_id, arguments.get("content"))
+            # 专用分支处理（send=true 时自动携带「本轮最后一条助手消息正文」）。
+            # 仅当其他路径（如子 agent 误用）直达 dispatch 时才走到这里——
+            # 此时没有轮次日志可回溯，统一按未发送处理，避免误发。
+            return (
+                "未发送：deliver_reply 只能在主对话的静默回合中生效"
+                "（send=true 时由系统发送本轮最后一条助手消息正文），"
+                "当前路径无法执行交付。"
+            )
         elif name in _REMOVED_TOOL_HINTS:
             # stage_upload / fetch_download / list_download / list_upload / ip_geo 已移除；
             # 迁移提示让模型立即改用 bash 直访，避免无意义的重试。

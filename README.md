@@ -510,7 +510,7 @@ isla
 
 ```text
 /show on    # 开启草稿预览（默认）：USER 与 TIMER 回合都实时展示富文本草稿
-/show off   # 静默模式：过程不展示，模型经 deliver_reply 自主交付最终内容（不调用则不发送）
+/show off   # 静默模式：过程不展示，模型经 deliver_reply（send=true）自主交付最终内容（send=false / 不调用则不发送，默认 false）
 /show       # 查看当前状态
 ```
 
@@ -1247,7 +1247,7 @@ Telegram#U5bcc#U6d88#U606f#U8349#U7a3f#U6eda#U52a8#U7b56#U7565.md
 | 模式 | USER 回合 | TIMER 回合 |
 |---|---|---|
 | /show on | 富文本草稿实时展示，最终回复自动送达 | 同左（统一流程） |
-| /show off | 静默运行；模型经 `deliver_reply` 自主交付最终内容（不调用则本轮不发送任何内容），`message_user` 提问/留言 | 同左 |
+| /show off | 静默运行；模型经 `deliver_reply`（send=true）自主交付最终内容（send=false / 不调用则本轮不发送任何内容，默认 false），`message_user` 提问/留言 | 同左 |
 
 ### 3. 工具变更：send_message_to_user 移除，ask_user → message_user
 
@@ -1264,33 +1264,24 @@ Telegram#U5bcc#U6d88#U606f#U8349#U7a3f#U6eda#U52a8#U7b56#U7565.md
     `{"type":"expired"}`——含义是**用户当前不在**，不是错误；模型据此
     自然收尾，用户回来后下一条消息会重新触发对话。
 
-- **新增 deliver_reply 工具**（仅 /show off 静默模式可用）：**无需任何参数**，
-  发送的是 **agent 轮次最后一条助手消息的 content 字段本身**（不含 reasoning
-  等其他字段）——模型只做「发 / 不发」的决策，不必把正文重复写进工具参数。
-  正确用法：先把完整、自包含的最终回复直接写成消息正文，再在同一条消息里
-  调用 `deliver_reply`，系统即把该正文经 sendRichMessage 作为永久富文本消息
-  交付（不经过草稿）。静默模式下模型的流式输出与最终回复都不会自动
-  送达用户，**也没有任何兜底直发**——模型不调用，本轮就对用户完全静默
-  （USER 与 TIMER 回合一致）。
+- **deliver_reply 工具**（仅 /show off 静默模式可用）：模型通过 **send 布尔
+  参数**做「发 / 不发」的决策，发送的是 **agent 轮次最后一条助手消息的
+  content 字段本身**（不含 reasoning 等其他字段），不必把正文重复写进工具
+  参数。正确用法：先把完整、自包含的最终回复直接写成消息正文，再在同一条
+  消息里调用 `deliver_reply` 并填 `send=true`，系统即把该正文经
+  sendRichMessage 作为永久富文本消息交付（不经过草稿）；`send=false` 或
+  不填（**默认 false**）则不发送，与「不调用」语义等价——每一轮都默认
+  false，上一轮交付过与否不影响本轮。因为默认 false，/show on 时该工具
+  不进入工具面、模型看不到也就不会调用，除了草稿外不会产生单独 content。
+  静默模式下模型的流式输出与最终回复都不会自动送达用户，**也没有任何
+  兜底直发**——send 不为 true 或模型不调用，本轮就对用户完全静默（USER
+  与 TIMER 回合一致）。交付成功后系统会明确告知模型不要再调用、也不要
+  输出「已发送/已确认」之类的确认正文，避免冗余回执消息链。
 - **deliver_reply 工具插拔**：该工具只在静默回合的工具面中暴露；非静默
   回合（/show on）出站历史副本中已有的 deliver_reply 调用痕迹（assistant
   的 tool_calls 与配对的 tool 消息）会被成对拔除，避免模型模仿调用一个
   当前不可用的工具；回到静默回合时痕迹在原位置原样插回。持久历史本身
   从不被改动（见 `tool_visibility.SILENT_ONLY_TOOLS`）。
-- **deliver_reply「文本伪交付」纠正**：个别模型不通过 tool_calls API 发起
-  调用，而是在正文里用文字"冒称"已通过 deliver_reply 发送（日志表现为
-  `tool_calls=0` 但正文声称已交付）——正文文字不触发任何操作，用户实际
-  什么都收不到。agentic 循环检测到这种"肯定式提及"（排除"不调用
-  deliver_reply 保持静默"这类否定式提及）时，注入纠正消息让模型重新发起
-  真实调用（最多 `MAX_PSEUDO_DELIVERY_RETRIES=2` 次，OpenAI 兼容与
-  Gemini 两个循环同构支持）；纠正轮模型可以只发 tool_call 不写正文，
-  系统回溯发送上一条含正文的助手消息。次数耗尽仍不调用则保持零发送，
-  只记 WARNING。工具描述、静默运行时 system 告知与 TIMER 唤醒提示均已
-  明确"文字提及不等于调用"。
-- **工具面观测日志**：每回合请求前打一行 INFO（`本次请求工具面（N 个）：…`），
-  列出真正随请求发送的工具名列表——可直接从日志确认 deliver_reply 到底
-  有没有进入 API 请求（`supports_tools=False` 的模型会显示"工具未随请求
-  发送"）。
 
 ### 4. TIMER 主动巡检（proactive）适配
 

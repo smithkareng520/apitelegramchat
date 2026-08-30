@@ -58,14 +58,15 @@ msg3 再打断 → 若 msg2 的轮次仍无任何输出，msg3 继续并入同�
 静默回复交付标记
 ================
 
-``/show off``（静默模式）下，模型通过 ``deliver_reply`` 工具自主选择是否
-把最终内容发给用户——工具无需参数，发送的是 agent 轮次最后一条助手
-消息的 content 字段（由 ``ai/tool_call_loop`` 在 journal 里回溯解析后
-传入 executor，不含 reasoning 等其他字段）。
-executor 调用 ``mark_reply_delivered`` 记录"本轮已经
-主动交付过"，``get_ai_response`` 收尾时据此在日志中观测交付情况。静默回合
-没有兜底直发——模型不调用 deliver_reply，本轮就对用户完全静默
-（是否交付完全由模型的工具调用决定）。
+``/show off``（静默模式）下，模型通过 ``deliver_reply`` 工具的 send 布尔
+参数自主选择是否把最终内容发给用户——send=true 时发送的是 agent 轮次
+最后一条助手消息的 content 字段（由 ``ai/tool_call_loop`` 在 journal 里
+回溯解析后传入 executor，不含 reasoning 等其他字段）；send=false 或不填
+（默认 false）则不发送，与"不调用"语义等价。executor 调用
+``mark_reply_delivered`` 记录"本轮已经主动交付过"，``get_ai_response``
+收尾时据此在日志中观测交付情况。静默回合没有兜底直发——send 不为 true
+或模型不调用 deliver_reply，本轮就对用户完全静默（是否交付完全由模型的
+工具调用决定）。
 
 锁顺序约定（防 ABBA 死锁）
 ==========================
