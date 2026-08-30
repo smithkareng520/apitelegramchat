@@ -9,7 +9,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING
 
-from apitelegramchat.utils import get_logger, escape_html
+from apitelegramchat.utils import get_logger, escape_html, send_rich_html_message
 from apitelegramchat.token_budget import truncate_to_token_budget
 from apitelegramchat.tool_result_condense import condense_for_model
 from apitelegramchat.tool_executors import (
@@ -340,6 +340,21 @@ async def _run_tool_calls_and_append(
                         f"Error: tool {fn_name} was not executed because the model returned malformed JSON "
                         f"arguments ({invalid_arguments}). Reissue the same tool call with a valid JSON object."
                     )
+                elif fn_name == "send_final_message":
+                    content = fn_args.get("content")
+                    if not isinstance(content, str) or not content.strip():
+                        result_str = "失败：content 不能为空。"
+                    elif getattr(builder, "final_message_sent", False):
+                        result_str = "提示：本轮最终内容已经发送过，不要重复发送。"
+                    else:
+                        sent = await send_rich_html_message(
+                            builder.chat_id, content.strip(), reassert_draft=False
+                        )
+                        if sent:
+                            builder.final_message_sent = True
+                            result_str = "已通过富文本消息发送本轮最终内容。不要重复发送同一内容。"
+                        else:
+                            result_str = "失败：富文本消息发送失败，请不要假设用户已收到。"
                 elif fn_name == "message_user":
                     if getattr(builder, "silent", False):
                         # 静默（TIMER 后台唤醒）回合不允许阻塞等待用户输入：

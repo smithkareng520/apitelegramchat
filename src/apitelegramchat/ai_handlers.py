@@ -53,7 +53,7 @@ from apitelegramchat.ai.attachment_content import (
     _apply_cache_control,
     _resolve_multimodal_content,
 )
-from apitelegramchat.ai.rich_message_builder import RichMessageBuilder
+from apitelegramchat.ai.rich_message_builder import RichMessageBuilder, SilentMessageBuilder
 from apitelegramchat.ai.agentic_loops import (
     _agentic_loop_gemini_openai_compat,
     _agentic_loop_native_image,
@@ -383,6 +383,7 @@ async def get_ai_response(
     new_msgs = []
     usage = None
     is_timer = (event_source == "TIMER")
+    show_drafts = await state.get_show_drafts(chat_id)
     # 预处理阶段耗时追踪：用于诊断"草稿卡在 Thinking..."问题。
     # 从日志看，webhook 收到后到模型请求发出之间可能有数分钟延迟，
     # 需要逐阶段定位是锁竞争、上下文压缩还是 system prompt 构建导致的。
@@ -405,36 +406,30 @@ async def get_ai_response(
                 chat_id, stage_name, elapsed_ms, total_ms,
             )
     try:
-        if is_timer:
-            # TIMER：静默回合——不创建可见草稿、不注册活跃草稿、不发首帧。
-            # SilentMessageBuilder 保留全部状态机接口，只是零 Telegram 副作用。
-            from apitelegramchat.ai.rich_message_builder import SilentMessageBuilder
-            builder = SilentMessageBuilder(chat_id)
-            builder.add_initial_thinking("Thinking...")
-        else:
-            # 草稿首帧必须先于系统提示词、历史归档和多模态解析出现。这些准备操作在
-            # 文件、图片或长历史场景下可能耗时数秒；旧顺序会让用户误以为 Agent 卡死。
+        if show_drafts:
+            # USER 与 TIMER 使用同一套可见 RichMessageBuilder，保持状态、工具进度
+            # 和首帧行为一致。
             builder = RichMessageBuilder(chat_id)
             builder.add_initial_thinking("Thinking...")
-            # 先登记为当前活跃草稿，让首帧和后续流式刷新都能通过 active 校验。
-            # message_id 先占位为 0，等首帧真正发出后再回填真实 message_id。
             try:
                 from apitelegramchat.state import set_active_draft
                 await set_active_draft(chat_id, builder.draft_id, 0)
             except Exception:
                 logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
-                pass
             await builder.flush(force=True)
-            # 首帧发出后，用真实 message_id 覆盖占位值。
             if builder.draft_message_id:
                 try:
                     from apitelegramchat.state import set_active_draft
                     await set_active_draft(chat_id, builder.draft_id, builder.draft_message_id)
                 except Exception:
                     logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
-                    pass
             builder.start_flush_loop()
             _log_stage("首帧草稿已发送+刷新循环启动")
+        else:
+            # USER/TIMER 均走同一个静默 builder；USER 仍会在最终阶段发送正式回复，
+            # TIMER 只有模型调用 send_final_message 时才主动发送。
+            builder = SilentMessageBuilder(chat_id)
+            builder.add_initial_thinking("Thinking...")
 
         lock = await state.get_chat_lock(chat_id)
         async with lock:
@@ -513,11 +508,8 @@ async def get_ai_response(
                 client, current_model, messages, builder, chat_id
             )
         elif is_timer:
-            # TIMER 使用“安全主动工具面”，而不是完整 USER 工具面。
-            # 后台巡检允许读取/搜索信息、检查 Todo/Memory，并通过唯一的
-            # 主动消息 对用户发消息；禁止直接投递文件/媒体、等待用户、
-            # 任意 Bash/文件写入，避免 TIMER 为了“找点事做”产生副作用。
-            from apitelegramchat.proactive import SEND_MESSAGE_TO_USER_TOOL
+            # TIMER 使用安全工具面；静默时由模型自行决定是否发送最终内容。
+            from apitelegramchat.search_engine import SEND_FINAL_MESSAGE_TOOL
             from apitelegramchat.search_engine import SEARCH_TOOLS
             _PROACTIVE_ALLOWED_TOOLS = {
                 "web_search", "fetch_url", "wikipedia",
@@ -530,7 +522,9 @@ async def get_ai_response(
             timer_tools = [
                 t for t in SEARCH_TOOLS
                 if (t.get("function") or {}).get("name") in _PROACTIVE_ALLOWED_TOOLS
-            ] + [SEND_MESSAGE_TO_USER_TOOL]
+            ]
+            if not show_drafts:
+                timer_tools.append(SEND_FINAL_MESSAGE_TOOL)
             # Jarvis 模式：协议本身决定是否联系用户，而不是要求每轮都发消息。
             messages.append({
                 "role": "system",
@@ -544,8 +538,12 @@ async def get_ai_response(
                 current_model, model_info, messages, chat_id, builder, tools=timer_tools
             )
         else:
+            user_tools = None
+            if not show_drafts:
+                from apitelegramchat.search_engine import SEARCH_TOOLS, SEND_FINAL_MESSAGE_TOOL
+                user_tools = list(SEARCH_TOOLS) + [SEND_FINAL_MESSAGE_TOOL]
             raw_content, usage, new_msgs = await _call_api(
-                current_model, model_info, messages, chat_id, builder
+                current_model, model_info, messages, chat_id, builder, tools=user_tools
             )
 
         await builder.stop_flush_loop()
@@ -661,14 +659,16 @@ async def get_ai_response(
 
         final_html = re.sub(r'\n\s*\n', '\n', final_html)
 
-        if is_timer:
-            # TIMER：agent 过程不输出到 Telegram——最终文本只留在历史上下文中，
-            # 不直接推送给用户；用户可见输出只能来自 主动消息。
+        if is_timer and not show_drafts:
+            # TIMER 静默模式：只有 send_final_message 工具才会将内容发送给用户。
             success = True
             logger.info(
                 "[%s] TIMER 回合完成：最终内容不推送用户（长度=%s，前 500 字）：\n%s",
                 chat_id, len(cleaned_content), cleaned_content[:500],
             )
+        elif getattr(builder, "final_message_sent", False):
+            success = True
+            logger.info(f"[{chat_id}] 本轮最终内容已由 send_final_message 工具发送")
         elif final_tail_empty_after_rollover:
             success = True
             logger.info(f"[{chat_id}] 最后一段已在滚动时永久化，无需重复发送")

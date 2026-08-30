@@ -462,6 +462,29 @@ def _get_video_models() -> list[str]:
 VIDEO_MODELS = _get_video_models()
 
 # ---------- 工具定义 ----------
+# 静默模式专用工具：模型可自行决定是否把本轮最终内容作为永久富文本消息发送。
+SEND_FINAL_MESSAGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "send_final_message",
+        "description": (
+            "仅当草稿显示已关闭时使用：把你本轮准备给用户看的最终内容通过富文本消息直接发送。"
+            "这是可选动作；如果本轮没有值得主动发送给用户的内容，就不要调用。"
+            "调用后不要再重复发送同一段内容。支持 Rich Message HTML（如 <p>、<b>、<ul> 等）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "要发送给用户的本轮最终富文本内容。",
+                },
+            },
+            "required": ["content"],
+        },
+    },
+}
+
 MESSAGE_USER_TOOL = {
     "type": "function",
     "function": {

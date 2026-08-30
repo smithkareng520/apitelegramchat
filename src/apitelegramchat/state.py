@@ -8,6 +8,9 @@ from apitelegramchat.config import DEFAULT_MODEL
 # ---------- 用户会话 ----------
 user_contexts: dict = {}
 user_models: dict = {}
+# 草稿显示设置：默认关闭；/show on|off 控制 USER 与 TIMER 是否显示统一草稿。
+_show_drafts: dict[int, bool] = {}
+_show_drafts_lock = asyncio.Lock()
 
 # ---------- 当前用户命名空间（用于按 user_id 隔离工作区/状态文件） ----------
 _current_user_namespace: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -122,6 +125,16 @@ def get_user_model(chat_id: int) -> str:
     return user_models.get(chat_id, DEFAULT_MODEL)
 
 # ---------- 安全的异步读写模型（自动加锁） ----------
+async def get_show_drafts(chat_id: int) -> bool:
+    async with _show_drafts_lock:
+        return _show_drafts.get(chat_id, False)
+
+
+async def set_show_drafts(chat_id: int, enabled: bool) -> None:
+    async with _show_drafts_lock:
+        _show_drafts[chat_id] = bool(enabled)
+
+
 async def safe_set_user_model(chat_id: int, model: str) -> None:
     lock = await get_chat_lock(chat_id)
     async with lock:

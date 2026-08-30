@@ -1545,6 +1545,25 @@ async def webhook() -> tuple:
                 await reply_unauthorized(chat_id, msg.get("message_id"))
                 return "OK", 200
 
+            if _cmd_match(text, "/show"):
+                parts = text.split()
+                if len(parts) != 2 or parts[1].lower() not in {"on", "off"}:
+                    await send_rich_html_message(
+                        chat_id,
+                        "❌ <b>用法错误</b>\n用法：<code>/show on</code> 或 <code>/show off</code>",
+                        reply_parameters=_reply_params(msg["message_id"]),
+                    )
+                    return "OK", 200
+                enabled = parts[1].lower() == "on"
+                await state.set_show_drafts(chat_id, enabled)
+                status = "已开启" if enabled else "已关闭"
+                detail = "用户消息和 TIMER 后台回合都会显示富文本草稿。" if enabled else "不显示草稿；模型可自行决定是否发送本轮最终富文本消息。"
+                await send_rich_html_message(
+                    chat_id, f"✅ <b>草稿显示{status}</b>\n{detail}",
+                    reply_parameters=_reply_params(msg["message_id"]),
+                )
+                return "OK", 200
+
             lock = await get_chat_lock(chat_id)
             async with lock:
                 ctx = get_or_init_context(chat_id)
