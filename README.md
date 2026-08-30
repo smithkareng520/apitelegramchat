@@ -1277,6 +1277,20 @@ Telegram#U5bcc#U6d88#U606f#U8349#U7a3f#U6eda#U52a8#U7b56#U7565.md
   的 tool_calls 与配对的 tool 消息）会被成对拔除，避免模型模仿调用一个
   当前不可用的工具；回到静默回合时痕迹在原位置原样插回。持久历史本身
   从不被改动（见 `tool_visibility.SILENT_ONLY_TOOLS`）。
+- **deliver_reply「文本伪交付」纠正**：个别模型不通过 tool_calls API 发起
+  调用，而是在正文里用文字"冒称"已通过 deliver_reply 发送（日志表现为
+  `tool_calls=0` 但正文声称已交付）——正文文字不触发任何操作，用户实际
+  什么都收不到。agentic 循环检测到这种"肯定式提及"（排除"不调用
+  deliver_reply 保持静默"这类否定式提及）时，注入纠正消息让模型重新发起
+  真实调用（最多 `MAX_PSEUDO_DELIVERY_RETRIES=2` 次，OpenAI 兼容与
+  Gemini 两个循环同构支持）；纠正轮模型可以只发 tool_call 不写正文，
+  系统回溯发送上一条含正文的助手消息。次数耗尽仍不调用则保持零发送，
+  只记 WARNING。工具描述、静默运行时 system 告知与 TIMER 唤醒提示均已
+  明确"文字提及不等于调用"。
+- **工具面观测日志**：每回合请求前打一行 INFO（`本次请求工具面（N 个）：…`），
+  列出真正随请求发送的工具名列表——可直接从日志确认 deliver_reply 到底
+  有没有进入 API 请求（`supports_tools=False` 的模型会显示"工具未随请求
+  发送"）。
 
 ### 4. TIMER 主动巡检（proactive）适配
 
@@ -1297,12 +1311,6 @@ Telegram#U5bcc#U6d88#U606f#U8349#U7a3f#U6eda#U52a8#U7b56#U7565.md
 ```
 
 按钮行必须作为独立块级元素输出，不得嵌套在段落 / 表格 / 列表 / 引用内。
-
-运行时兜底：Telegram Rich HTML 官方规范实际不支持任何按钮标签
-（见 `Telegram_bot_api.md` 「Rich HTML style」：仅支持列出的标签）。模型仍输出
-`<tg-button-row>` / `<tg-message-button>` 等标记（含嵌套、畸形写法）时，
-`utils._strip_invalid_button_rows` 会在发送前将其整块剥离（草稿、最终消息、
-deliver_reply 均覆盖），不会以原始文本形式显示给用户，剥离时记 WARNING 日志。
 
 ---
 

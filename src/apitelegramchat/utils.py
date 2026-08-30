@@ -237,89 +237,10 @@ def escape_html(text) -> str:
     return text
 
 
-# =====================================================================
-# 按钮行标记清理（tg-button-row 等）
-# =====================================================================
-# Telegram Rich HTML 官方规范（见项目 Telegram_bot_api.md「Rich HTML style」）
-# 明确「Only the tags mentioned above are currently supported」——支持集内
-# 不存在任何按钮标签。模型偶发输出的 <tg-button-row> / <tg-message-button>
-# 等标记无法被 Telegram 渲染，原样发送只会以原始文本形式显示在用户
-# 消息里。发送前在此统一整块剥离（含嵌套与未配平的畸形写法）。
-
-# 内层完整按钮行块（块内不含嵌套的 tg-button-row 开标签）：
-# 从内向外逐层剥离，可处理任意深度嵌套。
-_BUTTON_ROW_BLOCK_RE = re.compile(
-    r"<tg-button-row\b[^>]*>(?:(?!<tg-button-row\b).)*?</tg-button-row\s*>",
-    re.IGNORECASE | re.DOTALL,
-)
-# 残留的孤立按钮行标签（未配平的畸形写法）。
-_BUTTON_ROW_TAG_RE = re.compile(
-    r"</?tg-button-row\b[^>]*/?>",
-    re.IGNORECASE,
-)
-# 游离在按钮行之外、成对出现的按钮子标签（连同内部内容一起剥离）。
-_BUTTON_TAG_PAIR_RE = re.compile(
-    r"<tg-[a-z-]*button\b[^>]*>.*?</tg-[a-z-]*button\s*>",
-    re.IGNORECASE | re.DOTALL,
-)
-# 残留的孤立按钮子标签（自闭合 / 未配平）。
-_BUTTON_TAG_RE = re.compile(
-    r"</?tg-[a-z-]*button\b[^>]*/?>",
-    re.IGNORECASE,
-)
-
-
-def _strip_invalid_button_rows(html_content: str) -> str:
-    """剥离模型输出的按钮行标记（tg-button-row 及 tg-*button 子标签）。
-
-    Telegram Rich HTML 不支持任何按钮标签，这类标记原样发送只会以原始
-    文本显示给用户。处理顺序：
-
-      1. 从内向外逐层剥掉完整的 ``<tg-button-row>…</tg-button-row>`` 块
-         （含任意嵌套层数与块内全部内容）；
-      2. 清掉未配平的孤立 ``tg-button-row`` 标签；
-      3. 剥掉成对出现、游离在按钮行之外的 ``tg-*button`` 子标签及其内容；
-      4. 清掉残留的孤立按钮子标签（自闭合 / 未配平）；
-      5. 收敛因剥离留下的连续空行。
-
-    纯函数：不修改入参；无按钮标记时原样返回（正文中出现
-    “button”一词的正常文本不会被误伤）。
-    """
-    if not html_content or "button" not in html_content.lower():
-        return html_content
-
-    result = html_content
-    # 1) 内层优先，循环到没有完整块为止（处理任意深度嵌套）。
-    for _ in range(16):
-        stripped = _BUTTON_ROW_BLOCK_RE.sub("", result)
-        if stripped == result:
-            break
-        result = stripped
-    # 2) 未配平的按钮行标签。
-    result = _BUTTON_ROW_TAG_RE.sub("", result)
-    # 3) 游离的成对按钮子标签（含内容）。
-    for _ in range(16):
-        stripped = _BUTTON_TAG_PAIR_RE.sub("", result)
-        if stripped == result:
-            break
-        result = stripped
-    # 4) 残留孤立按钮子标签。
-    result = _BUTTON_TAG_RE.sub("", result)
-    # 5) 收敛连续空行。
-    result = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", result)
-    return result
-
-
 def _rich_message_html_payload(html_content: str) -> dict:
     """构造符合 InputRichMessage 规范的 HTML 富消息。
 
-    在交付给 Telegram 前，依次跑三道兜底清理：
-
-    0. ``_strip_invalid_button_rows``：剥离模型输出的按钮行标记
-       （``<tg-button-row>``、``<tg-message-button>`` 等，含嵌套与
-       畸形写法）。Telegram Rich HTML 规范不支持任何按钮标签
-       （见 Telegram_bot_api.md「Rich HTML style」），这类标记原样
-       发送只会以原始文本显示在用户消息里，因此整块剥离。
+    在交付给 Telegram 前，依次跑两道兜底清理：
 
     1. ``_strip_invalid_media_urls``：剥离 ``src`` 不是合法 http(s) URL
        的 ``<img>``/``<video>``/``<audio>`` 标签。处理 LLM 把附件
@@ -333,18 +254,9 @@ def _rich_message_html_payload(html_content: str) -> dict:
        页面，以 ``RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND`` 拒绝整条消息。
        降级后保留模型生成的 figcaption 文本，让用户仍可点击跳转观看页。
     """
-    cleaned = _strip_invalid_button_rows(html_content)
-    if cleaned != html_content:
-        logger.warning(
-            "sendRichMessage 兜底清理：检测到不支持的按钮行标记"
-            "（tg-button-row / tg-*button），已整块剥离，不展示给用户。"
-            "原始长度=%s，清理后长度=%s",
-            len(html_content),
-            len(cleaned),
-        )
-    cleaned = _strip_invalid_media_urls(cleaned)
+    cleaned = _strip_invalid_media_urls(html_content)
     demoted = _demote_watch_page_videos(cleaned)
-    if demoted != cleaned:
+    if demoted != html_content:
         logger.warning(
             "sendRichMessage 兜底清理：检测到伪 URL 或观看页 URL 媒体块，"
             "已剥离/降级以保证消息送达。原始长度=%s，清理后长度=%s",

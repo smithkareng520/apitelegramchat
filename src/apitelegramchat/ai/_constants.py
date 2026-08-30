@@ -21,6 +21,11 @@ def _positive_env_int(name: str, default: int, *, minimum: int = 1) -> int:
 # 不依赖模型的单轮并发数量，调用预算按实际执行的工具数精确累计。
 MAX_TOOL_CALLS = 100
 MAX_PLAIN_TEXT_TOOL_CALL_RETRIES = 3
+# deliver_reply「文本伪交付」纠正重试上限：静默回合模型在正文里声称"已通过
+# deliver_reply 发送"但并未真正发起 tool_calls API 调用时，注入纠正消息让
+# 模型重新发起真实调用的最大次数。每次纠正都是一次完整的模型请求，耗尽后
+# 保持零发送（静默模式语义不变），只记 WARNING 日志。
+MAX_PSEUDO_DELIVERY_RETRIES = 2
 TOOL_ERROR_STREAK_LIMIT = 3
 TOOL_CALL_TIMEOUT = 12
 OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()

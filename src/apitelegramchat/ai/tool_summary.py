@@ -292,6 +292,63 @@ def _contains_textual_tool_call(content: str) -> bool:
     return bool(content and re.search(r"<(?:longcat_)?tool_call\b", content, re.IGNORECASE))
 
 
+# =====================================================================
+# deliver_reply「文本伪交付」检测
+# =====================================================================
+# 场景：静默模式（/show off）下，个别模型不通过 tool_calls API 机制发起
+# deliver_reply 调用，而是在正文里用自然语言"冒称"已交付（如"此消息通过
+# deliver_reply 直接发送给您"、"消息由 deliver_reply 交付发送"）。正文
+# 文字不会触发任何操作——用户实际什么也收不到。检测到这种"肯定式提及"
+# 时，agentic loop 注入纠正消息让模型重新发起真实调用（见
+# agentic_loops._agentic_loop_openai_compat 的伪交付纠正分支）。
+#
+# 否定式提及（"本轮不调用 deliver_reply，保持静默"）是模型的合法决策，
+# 不能触发纠正——检测时先剔除带否定前缀的提及，剩下的提及才算"肯定式"。
+_PSEUDO_DELIVERY_TOOL_NAME = "deliver_reply"
+# 否定词与工具名之间的容许间隔（同一小句内、不跨越句读），覆盖
+# "不调用 / 未调用 / 无需调用 / 没有调用 / 不会调用 / 不必使用"等写法，
+# 以及英文 "not call / won't call / never call / without calling" 等。
+_PSEUDO_DELIVERY_NEGATION_RE = re.compile(
+    r"(?:不|未|没有|没|无需|无须|不必|别|不会|不能|无法|尚未|还没)"
+    r"[^。；;\n]{0,12}deliver_reply"
+    r"|\b(?:not|never|without|won['’]?t|don['’]?t|doesn['’]?t|shouldn['’]?t)\b"
+    r"[^.;\n]{0,24}deliver_reply",
+    re.IGNORECASE,
+)
+
+
+def _mentions_deliver_reply_affirmatively(content: str) -> bool:
+    """正文是否"肯定式"提及 deliver_reply（排除否定式提及后仍有残留）。
+
+    - 完全未提及 -> False；
+    - 全部提及都被否定词覆盖（"不调用 deliver_reply 保持静默"）-> False；
+    - 至少一处提及不带否定前缀（"通过 deliver_reply 直接发送给您"）-> True。
+
+    触发后的纠正消息本身是非强迫的（模型仍可选择不交付），因此条件式
+    提及（"可调用 deliver_reply"）误触发也无害，只会多一轮确认。
+    """
+    if not content or _PSEUDO_DELIVERY_TOOL_NAME not in content.lower():
+        return False
+    # 剔除所有否定式提及后，若仍有残留提及即视为肯定式。
+    residual = _PSEUDO_DELIVERY_NEGATION_RE.sub("", content)
+    return _PSEUDO_DELIVERY_TOOL_NAME in residual.lower()
+
+
+# 纠正消息：明确告知"正文文字不等于工具调用"，并给出两条出路（真调用 /
+# 明确不交付）。纠正轮模型可以只发 tool_call 不写正文——run_one 的
+# _last_assistant_text 会回溯找到上一条含正文的助手消息并把该正文
+# 发送给用户，无需模型重复输出。
+PSEUDO_DELIVERY_CORRECTION_MESSAGE = (
+    "System: 你的上一条回复在正文中用文字声称通过 deliver_reply 发送/交付了内容，"
+    "但这不是真正的工具调用——正文里的文字不会触发任何操作，用户到目前为止"
+    "什么都没有收到。deliver_reply 是本次请求 tools 列表中真实存在的函数，"
+    "必须通过标准 tool_calls API 机制发起调用才会执行。如果你确实要把内容交付"
+    "给用户，请立即真正调用 deliver_reply（无需任何参数：系统会自动把你上一条"
+    "消息的正文原样发送给用户，不要在参数里重复正文，也不要重写正文）；"
+    "如果你决定本轮不交付，请直接简短说明，不要再声称已经发送。"
+)
+
+
 def _strip_textual_tool_calls(content: str) -> str:
     """移除模型误以纯文本输出的 function-call XML，防止其泄漏到最终用户消息。"""
     if not content:
