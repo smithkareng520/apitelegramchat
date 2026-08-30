@@ -451,6 +451,24 @@ async def cancel_interaction(interaction_id: str, remove_ui: bool = True) -> Non
 
 
 def answer_to_tool_result(answer: dict[str, Any]) -> str:
+    """将交互结果转换为模型可直接理解的工具结果。
+
+    ``expired`` 表示等待窗口结束时用户没有完成选择；除了保留稳定的
+    ``type`` 字段外，显式告知模型用户当前不可用/未响应，避免模型把它
+    误判为用户选择了某个选项，或继续无条件等待同一个交互。
+    """
     result = dict(answer or {})
     result.setdefault("type", "unknown")
+    if result["type"] == "expired":
+        result.setdefault("user_present", False)
+        result.setdefault(
+            "message",
+            "用户当前不在或未响应，未在等待期限内完成选择；请不要假设用户已选择，"
+            "可继续处理、稍后再询问，或明确告知用户需要重新选择。",
+        )
+    elif result["type"] == "cancelled":
+        result.setdefault("user_present", True)
+        result.setdefault("message", "用户取消了本次选择，未提供有效选项。")
+    elif result["type"] in {"choice", "custom"}:
+        result.setdefault("user_present", True)
     return _answer_json(result)
