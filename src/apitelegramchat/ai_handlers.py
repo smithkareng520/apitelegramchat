@@ -40,7 +40,7 @@ from apitelegramchat.utils import (
 )
 from apitelegramchat.skills import skill_catalog_brief
 from apitelegramchat.context_manager import select_request_context
-from apitelegramchat.tool_visibility import apply_tool_visibility
+from apitelegramchat.tool_visibility import apply_tool_visibility, SILENT_ONLY_TOOLS
 from apitelegramchat.api_client import api_client
 from apitelegramchat import turn_recovery
 import apitelegramchat.state as state
@@ -376,9 +376,11 @@ async def get_ai_response(
       思考、工具进度、流式文本以富文本草稿实时展示；最终回复统一通过
       sendRichMessage 永久化送达用户（"后台随机事件后与用户主动走相同流程"）。
     - /show off（静默模式）：USER 与 TIMER 回合都使用 SilentMessageBuilder——
-      过程与最终文本都不自动送达；工具面追加 deliver_reply，由模型自主
-      选择是否把最终内容作为永久富文本消息交付；message_user 仍是
-      提问 / 主动留言的交互通道（超时 = 用户不在）。
+      过程与最终文本都不自动送达，也不兜底直发：不调用 deliver_reply 就
+      什么都不发送。deliver_reply 仅在静默回合暴露（工具面追加；非静默
+      回合连同历史中的调用痕迹一起拔除，见 tool_visibility.SILENT_ONLY_TOOLS），
+      交付的就是 agent 轮次最后一条助手消息的 content 字段本身；
+      message_user 仍是提问 / 主动留言的交互通道（超时 = 用户不在）。
 
     打断保全（turn_recovery.py）：get_ai_response 开始时登记轮次日志
     journal，agentic 循环向其追加已完成消息；正常收尾由
@@ -489,10 +491,16 @@ async def get_ai_response(
             supports_tools = model_info.supports_tools
         _log_stage("获取chat_lock+上下文快照完成")
 
-        # 按事件源改写历史中"回合专属工具"的调用痕迹（可拔插，见
-        # tool_visibility.py）。send_message_to_user 已移除，当前注册表为空，
-        # 此调用为零开销直通；保留机制供未来按事件源隐藏其他工具。
-        history = apply_tool_visibility(history, event_source)
+        # 按事件源改写历史中"回合专属工具"的调用痕迹，并对静默专属工具做
+        # 历史上下文插拔（均可拔插，见 tool_visibility.py）：deliver_reply 只在
+        # 静默回合暴露——非静默回合不仅工具面不提供它（见下方 _call_api 分支），
+        # 历史里已有的调用痕迹也从出站副本中拔除，避免模型模仿调用一个当前
+        # 不可用的工具；静默回合原样保留（插回原位置）。持久历史本身从不被
+        # 改动，开关切换后痕迹仍在原处。注册表当前为空，本调用仅处理插拔。
+        history = apply_tool_visibility(
+            history, event_source,
+            hidden_tools=None if silent_mode else SILENT_ONLY_TOOLS,
+        )
 
         if context_snapshot.dropped_messages:
             logger.info(
@@ -535,11 +543,12 @@ async def get_ai_response(
                 "role": "system",
                 "content": (
                     "当前会话已关闭草稿预览（静默模式，/show off）：你的流式输出与本轮最终回复"
-                    "不会自动送达用户。若需要用户看到本轮内容，必须先把完整、自包含的最终回复"
-                    "直接写成消息正文，并在同一条消息中调用 deliver_reply（无需任何参数，系统"
-                    "会把该正文用 sendRichMessage 永久发送给用户，不经过草稿）；需要提问或留言"
-                    "可用 message_user（其超时表示用户不在，不是错误）。若整轮无需用户知晓，"
-                    "可以不调用任何交付工具，保持静默。"
+                    "不会自动送达用户，不调用交付工具时系统也不会兑底发送。若需要用户看到本轮"
+                    "内容，必须先把完整、自包含的最终回复直接写成消息正文，并在同一条消息中调用 "
+                    "deliver_reply（无需任何参数，系统会把该正文的 content 本身用 sendRichMessage "
+                    "永久发送给用户，不经过草稿，也不附带其他内容）；需要提问或留言可用 "
+                    "message_user（其超时表示用户不在，不是错误）。若整轮无需用户知晓，可以不"
+                    "调用任何交付工具，保持静默。"
                 ),
             })
 
@@ -735,22 +744,16 @@ async def get_ai_response(
         # ── 最终交付（统一由 /show 开关决定，不再区分事件源）──────
         delivered_this_turn = turn_recovery.pop_reply_delivered(chat_id)
         if silent_mode:
-            # 静默模式（/show off，USER 与 TIMER 一致）：最终内容不自动
-            # 送达；交付渠道 = deliver_reply（模型已选）/ message_user。
-            # 用户主动回合的兑底：若模型忘了调用 deliver_reply 但产出了
-            # 非空最终内容，仍然直发——用户提问不能石沉大海。
-            if not is_timer and not delivered_this_turn and cleaned_content:
-                logger.warning(
-                    "[%s] 静默 USER 回合未调用 deliver_reply，兑底直发最终内容（长度=%s）",
-                    chat_id, len(cleaned_content),
-                )
-                success = await send_rich_html_message(chat_id, final_html, reassert_draft=False)
-            else:
-                success = True
-                logger.info(
-                    "[%s] 静默回合完成：最终内容不自动推送（delivered=%s，长度=%s，前 500 字）：\n%s",
-                    chat_id, delivered_this_turn, len(cleaned_content), cleaned_content[:500],
-                )
+            # 静默模式（/show off，USER 与 TIMER 一致）：最终内容一律不自动
+            # 送达，也没有兜底直发——是否把内容发给用户完全由模型的
+            # deliver_reply 调用决定；模型没有调用，本轮就对用户保持完全
+            # 静默（什么都不发送）。交付的也只是最后一条助手消息的 content
+            # 字段本身，不附带 reasoning 等其他字段。
+            success = True
+            logger.info(
+                "[%s] 静默回合完成：最终内容不自动推送（delivered=%s，长度=%s，前 500 字）：\n%s",
+                chat_id, delivered_this_turn, len(cleaned_content), cleaned_content[:500],
+            )
         elif final_tail_empty_after_rollover:
             success = True
             logger.info(f"[{chat_id}] 最后一段已在滚动时永久化，无需重复发送")

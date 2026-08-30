@@ -510,7 +510,7 @@ isla
 
 ```text
 /show on    # 开启草稿预览（默认）：USER 与 TIMER 回合都实时展示富文本草稿
-/show off   # 静默模式：过程不展示，模型经 deliver_reply 自主交付最终内容
+/show off   # 静默模式：过程不展示，模型经 deliver_reply 自主交付最终内容（不调用则不发送）
 /show       # 查看当前状态
 ```
 
@@ -1247,7 +1247,7 @@ Telegram#U5bcc#U6d88#U606f#U8349#U7a3f#U6eda#U52a8#U7b56#U7565.md
 | 模式 | USER 回合 | TIMER 回合 |
 |---|---|---|
 | /show on | 富文本草稿实时展示，最终回复自动送达 | 同左（统一流程） |
-| /show off | 静默运行；模型经 `deliver_reply` 自主交付最终内容，`message_user` 提问/留言 | 同左 |
+| /show off | 静默运行；模型经 `deliver_reply` 自主交付最终内容（不调用则本轮不发送任何内容），`message_user` 提问/留言 | 同左 |
 
 ### 3. 工具变更：send_message_to_user 移除，ask_user → message_user
 
@@ -1265,13 +1265,18 @@ Telegram#U5bcc#U6d88#U606f#U8349#U7a3f#U6eda#U52a8#U7b56#U7565.md
     自然收尾，用户回来后下一条消息会重新触发对话。
 
 - **新增 deliver_reply 工具**（仅 /show off 静默模式可用）：**无需任何参数**，
-  发送的是 **agent 轮次的最后一条助手消息正文**——模型只做「发 / 不发」的
-  决策，不必把正文重复写进工具参数。正确用法：先把完整、自包含的最终回复
-  直接写成消息正文，再在同一条消息里调用 `deliver_reply`，系统即把该正文
-  经 sendRichMessage 作为永久富文本消息交付（不经过草稿）。静默模式下
-  模型的流式输出与最终回复都不会自动送达用户，必须由模型显式选择是否
-  交付。用户主动回合（USER）若模型忘记调用而产出了非空回复，系统兜底
-  直发一次，保证提问不会石沉大海。
+  发送的是 **agent 轮次最后一条助手消息的 content 字段本身**（不含 reasoning
+  等其他字段）——模型只做「发 / 不发」的决策，不必把正文重复写进工具参数。
+  正确用法：先把完整、自包含的最终回复直接写成消息正文，再在同一条消息里
+  调用 `deliver_reply`，系统即把该正文经 sendRichMessage 作为永久富文本消息
+  交付（不经过草稿）。静默模式下模型的流式输出与最终回复都不会自动
+  送达用户，**也没有任何兜底直发**——模型不调用，本轮就对用户完全静默
+  （USER 与 TIMER 回合一致）。
+- **deliver_reply 工具插拔**：该工具只在静默回合的工具面中暴露；非静默
+  回合（/show on）出站历史副本中已有的 deliver_reply 调用痕迹（assistant
+  的 tool_calls 与配对的 tool 消息）会被成对拔除，避免模型模仿调用一个
+  当前不可用的工具；回到静默回合时痕迹在原位置原样插回。持久历史本身
+  从不被改动（见 `tool_visibility.SILENT_ONLY_TOOLS`）。
 
 ### 4. TIMER 主动巡检（proactive）适配
 
@@ -1292,6 +1297,12 @@ Telegram#U5bcc#U6d88#U606f#U8349#U7a3f#U6eda#U52a8#U7b56#U7565.md
 ```
 
 按钮行必须作为独立块级元素输出，不得嵌套在段落 / 表格 / 列表 / 引用内。
+
+运行时兜底：Telegram Rich HTML 官方规范实际不支持任何按钮标签
+（见 `Telegram_bot_api.md` 「Rich HTML style」：仅支持列出的标签）。模型仍输出
+`<tg-button-row>` / `<tg-message-button>` 等标记（含嵌套、畸形写法）时，
+`utils._strip_invalid_button_rows` 会在发送前将其整块剥离（草稿、最终消息、
+deliver_reply 均覆盖），不会以原始文本形式显示给用户，剥离时记 WARNING 日志。
 
 ---
 

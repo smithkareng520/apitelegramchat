@@ -6,11 +6,17 @@
 
 ``send_message_to_user`` 工具已随 TIMER 静默机制整体移除；替代它的
 ``message_user`` 在 USER 与 TIMER 两类回合的工具面里都存在，历史中的
-调用痕迹无需再按事件源折叠——因此当前注册表为空，
-``apply_tool_visibility`` 走零开销直通路径。
+调用痕迹无需再按事件源折叠——因此事件源注册表为空。
 
-本模块的可拔插机制保留，供未来需要按事件源隐藏某个工具时使用：在
-``TOOL_VISIBILITY_RULES`` 加一行规则即可。
+但静默专属工具 ``deliver_reply`` 需要按 ``/show`` 开关做**历史上下文
+插拔**（见 ``SILENT_ONLY_TOOLS``）：它只在静默回合（/show off）的工具面
+里暴露；非静默回合除了不提供工具定义，出站历史副本中已有的调用痕迹
+（assistant 的 tool_calls 与配对的 tool 消息）也一并拔除，避免模型看到
+并模仿调用一个当前不可用的工具；回到静默回合时痕迹在原位置原样插回
+（持久历史从不被改动，插拔只作用于出站副本）。
+
+事件源维度的可拔插机制保留，供未来需要按事件源隐藏某个工具时使用：
+在 ``TOOL_VISIBILITY_RULES`` 加一行规则即可。
 
 三条硬性保证（机制不变）
 ========================
@@ -24,9 +30,11 @@
 可拔插设计
 ==========
 
-- 注册表 ``TOOL_VISIBILITY_RULES`` 是唯一扩展点：要隐藏某个工具，加一行
-  规则即可；删掉对应条目即恢复直通。
+- 注册表 ``TOOL_VISIBILITY_RULES`` 是事件源维度的唯一扩展点：要隐藏
+  某个工具，加一行规则即可；删掉对应条目即恢复直通。
 - 每条规则分别指定 ``user_turn`` / ``timer_turn`` 两个方向的模式，互不影响。
+- ``hidden_tools`` 参数是开关维度的扩展点：与事件源无关、两个方向都
+  DROP 的工具集合（``SILENT_ONLY_TOOLS`` 即由此驱动）。
 - 环境变量 ``TOOL_VISIBILITY_FILTER=false`` 可整体关闭（等价于拔掉本模块）。
 - shadow 摘要文案通过规则的 ``shadow_note_builder`` 注入。
 """
@@ -36,7 +44,7 @@ from __future__ import annotations
 import copy
 import os
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 __all__ = [
     "VISIBILITY_KEEP",
@@ -44,6 +52,7 @@ __all__ = [
     "VISIBILITY_SHADOW",
     "ToolVisibilityRule",
     "TOOL_VISIBILITY_RULES",
+    "SILENT_ONLY_TOOLS",
     "apply_tool_visibility",
 ]
 
@@ -108,6 +117,14 @@ class ToolVisibilityRule:
 # 当前为空：message_user 在 USER / TIMER 两类回合都合法存在，无需折叠。
 TOOL_VISIBILITY_RULES: dict[str, ToolVisibilityRule] = {}
 
+# 静默专属工具（开关维度插拔，与事件源无关）：仅在 /show off（静默）
+# 回合的工具面里暴露。非静默回合由 get_ai_response 通过
+# ``apply_tool_visibility(..., hidden_tools=SILENT_ONLY_TOOLS)`` 把这些
+# 工具在出站历史副本中的调用痕迹（assistant 的 tool_calls 与配对的
+# tool 消息成对）整体拔除；静默回合不传 hidden_tools，痕迹在原位置
+# 原样保留（插回原位置）。持久历史从不被改动。
+SILENT_ONLY_TOOLS: frozenset[str] = frozenset({"deliver_reply"})
+
 # =====================================================================
 # 核心：出站消息改写（纯函数，绝不原地修改入参）
 # =====================================================================
@@ -138,13 +155,20 @@ def _merge_note_into_content(content, note: str):
 
 
 def apply_tool_visibility(
-    messages: list, event_source: str = "USER"
+    messages: list,
+    event_source: str = "USER",
+    hidden_tools: Optional[Iterable[str]] = None,
 ) -> list:
-    """按事件源改写出站消息列表。
+    """按事件源 + 开关改写出站消息列表。
 
     纯函数：返回新列表；未被改写的消息原样引用（零拷贝），被改写的一律
-    深拷贝——绝不污染调用方持有的持久历史。无活跃规则时直接返回原列表
-    （TIMER 回合的零开销直通路径）。
+    深拷贝——绝不污染调用方持有的持久历史。无活跃规则且无 hidden_tools
+    时直接返回原列表（零开销直通路径）。
+
+    ``hidden_tools``：与事件源无关、一律 DROP 的工具名集合（如非静默
+    回合的 ``SILENT_ONLY_TOOLS``）。被拔除的 tool_call 与其配对的 tool
+    结果消息总是成对处理，出站消息里不存在悬空 ``tool_call_id``；
+    同名的事件源注册表规则优先于 hidden_tools。
     """
     if not TOOL_VISIBILITY_FILTER or not messages:
         return messages
@@ -155,6 +179,17 @@ def apply_tool_visibility(
         mode = _rule_mode_for(rule, event_source)
         if mode != VISIBILITY_KEEP:
             active_rules[rule.tool_name] = (rule, mode)
+    # 开关维度插拔：hidden_tools 一律按 DROP 处理，两个事件源方向相同。
+    for name in (hidden_tools or ()):
+        if isinstance(name, str) and name and name not in active_rules:
+            active_rules[name] = (
+                ToolVisibilityRule(
+                    tool_name=name,
+                    user_turn=VISIBILITY_DROP,
+                    timer_turn=VISIBILITY_DROP,
+                ),
+                VISIBILITY_DROP,
+            )
     if not active_rules:
         return messages
 

@@ -2481,13 +2481,13 @@ _REMOVED_TOOL_HINTS = {
 async def execute_deliver_reply(chat_id: int, content) -> str:
     """deliver_reply：静默模式（/show off）下交付最终回复给用户。
 
-    语义（改版）：发送的是 agent 轮次的最后一条助手消息正文——由
+    语义：发送的是 agent 轮次最后一条助手消息的 content 字段本身——由
     ai/tool_call_loop.run_one 在轮次日志里回溯得到后传入（通常就是当前
     这条含 deliver_reply 调用的消息的 content），模型无需在工具参数里
-    重复正文。本函数只负责发送与交付标记：通过 sendRichMessage 发送
-    永久富文本消息（不经过草稿）；发送成功后
-    在 turn_recovery 里标记"本轮已主动交付"，get_ai_response 收尾时据此
-    判断用户主动回合是否需要兜底直发。
+    重复正文，也不会附带 reasoning 等其他字段。本函数只负责发送与交付
+    标记：通过 sendRichMessage 发送永久富文本消息（不经过草稿）；发送成功后
+    在 turn_recovery 里标记"本轮已主动交付"，get_ai_response 收尾时据此在日志中观测交付情况；静默回合没有兜底
+    直发——模型不调用本工具，本轮就不会有任何内容送达用户。
     """
     if not isinstance(content, str) or not content.strip():
         return (

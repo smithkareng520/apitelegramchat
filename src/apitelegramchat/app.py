@@ -2021,8 +2021,10 @@ async def webhook() -> tuple:
                         await _send_via_send_message(
                             chat_id,
                             "✅ <b>草稿预览已关闭（静默模式）</b>\n"
-                            "过程与最终回复不再自动展示；由 AI 自主决定是否把最终回复"
-                            "直接发送给你（deliver_reply，不经草稿），提问/留言走 message_user。",
+                            "过程与最终回复不再自动展示，也不会自动发送——AI 认为"
+                            "需要你看到结论时，会主动把最终回复直接发送给你"
+                            "（deliver_reply，不经草稿）；不发送则本轮完全静默。"
+                            "提问/留言走 message_user。",
                             reply_message_id=msg["message_id"],
                         )
                     else:
