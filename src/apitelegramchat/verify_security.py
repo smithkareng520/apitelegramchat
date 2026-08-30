@@ -131,6 +131,7 @@ async def check_sandbox_isolation(landlock_ok: bool):
     try:
         base = data_root()
     except Exception:
+        logger.debug("check_sandbox_isolation 内部忽略的异常", exc_info=True)
         base = Path("/tmp")
     base.mkdir(parents=True, exist_ok=True)
     workspace = Path(tempfile.mkdtemp(prefix="verify_workspace_", dir=str(base)))
@@ -218,6 +219,7 @@ def check_resource_limits():
         report("5.1 NPROC 限制存在", hard != resource.RLIM_INFINITY,
                f"soft={soft} hard={hard}")
     except Exception as e:
+        logger.debug("check_resource_limits 内部忽略的异常", exc_info=True)
         warn("5.1 NPROC 限制", str(e))
 
     try:
@@ -225,6 +227,7 @@ def check_resource_limits():
         report("5.2 NOFILE 限制存在", hard < 65536,
                f"soft={soft} hard={hard}")
     except Exception as e:
+        logger.debug("check_resource_limits 内部忽略的异常", exc_info=True)
         warn("5.2 NOFILE 限制", str(e))
 
 
@@ -237,6 +240,7 @@ def check_workspace_perms():
         from apitelegramchat.workspace_paths import data_root
         ws = data_root()
     except Exception:
+        logger.debug("check_workspace_perms 内部忽略的异常", exc_info=True)
         ws = Path("/app/workspace")
     if not ws.exists():
         warn("6.x workspace 权限", f"{ws} 不存在")

@@ -84,6 +84,7 @@ def _workspace_guide_html(chat_id: int | None) -> str:
             from apitelegramchat.workspace_paths import workspace_workdir
             ws_path = str(workspace_workdir(chat_id))
     except Exception:
+        logger.debug("_workspace_guide_html 内部忽略的异常", exc_info=True)
         ws_path = ""
     if ws_path:
         path_html = f"（绝对路径 <code>{escape_html(ws_path)}</code>，也可 <code>echo $WORKSPACE</code> 查看）"
@@ -421,6 +422,7 @@ async def get_ai_response(
                 from apitelegramchat.state import set_active_draft
                 await set_active_draft(chat_id, builder.draft_id, 0)
             except Exception:
+                logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
                 pass
             await builder.flush(force=True)
             # 首帧发出后，用真实 message_id 覆盖占位值。
@@ -429,6 +431,7 @@ async def get_ai_response(
                     from apitelegramchat.state import set_active_draft
                     await set_active_draft(chat_id, builder.draft_id, builder.draft_message_id)
                 except Exception:
+                    logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
                     pass
             builder.start_flush_loop()
             _log_stage("首帧草稿已发送+刷新循环启动")
@@ -554,6 +557,7 @@ async def get_ai_response(
             try:
                 await mark_draft_dead(builder.draft_id)
             except Exception:
+                logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
                 pass
 
         if raw_content and isinstance(raw_content, str) and raw_content.startswith("IMAGE_ERROR:"):
@@ -749,6 +753,7 @@ async def get_ai_response(
                 api_name = getattr(model_cfg, "name", current_model)
                 is_native_image = bool(getattr(model_cfg, "native_image", False))
         except Exception:
+            logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
             current_model = DEFAULT_MODEL
             api_name = "模型"
             is_native_image = False
@@ -784,6 +789,7 @@ async def get_ai_response(
                         f"get_ai_response 上游错误 body 非 JSON (error_id={error_id}, status={code}): {body[:300]}"
                     )
             except Exception:
+                logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
                 pass
 
         error_msg = await get_error_notification_message(
@@ -820,6 +826,7 @@ async def get_ai_response(
                 from apitelegramchat.state import clear_active_draft
                 await clear_active_draft(chat_id, builder.draft_id)
             except Exception:
+                logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
                 pass
 
 

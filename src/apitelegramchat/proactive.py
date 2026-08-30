@@ -321,6 +321,7 @@ async def _recall_message_quietly(chat_id: int, message_id: int) -> bool:
     except asyncio.CancelledError:
         raise
     except Exception:
+        logger.debug("_recall_message_quietly 内部忽略的异常", exc_info=True)
         return False
 
 
@@ -348,6 +349,7 @@ async def _telegram_post(method: str, payload: dict, *, retries: int = 1) -> tup
                         try:
                             return True, await resp.json(), body
                         except Exception:
+                            logger.debug("_telegram_post 内部忽略的异常", exc_info=True)
                             return True, None, body
                     # 4xx 属于确定性失败，重试没有意义
                     if 400 <= resp.status < 500:
@@ -379,6 +381,7 @@ async def _send_plain_message(chat_id: int, text: str) -> Optional[int]:
         if isinstance(msg_id, int) and msg_id > 0:
             return msg_id
     except Exception:
+        logger.debug("_send_plain_message 内部忽略的异常", exc_info=True)
         pass
     return None
 

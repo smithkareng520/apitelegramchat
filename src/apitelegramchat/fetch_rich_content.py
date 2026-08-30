@@ -41,6 +41,8 @@ try:
     from lxml import etree as _etree
     from lxml import html as _lxml_html
 except Exception:  # pragma: no cover - lxml 为硬依赖，仅防御性兜底
+    # 注意：这里在模块级 `logger = logging.getLogger(__name__)`（下方）赋值
+    # 之前执行，不能引用 logger，否则 NameError。
     _etree = None
     _lxml_html = None
 
@@ -158,10 +160,12 @@ def _sanitize_url(raw: Optional[str], base_url: str = "") -> Optional[str]:
         try:
             candidate = urljoin(base_url, candidate)
         except Exception:
+            logger.debug("_sanitize_url 内部忽略的异常", exc_info=True)
             return None
     try:
         parts = urlsplit(candidate)
     except Exception:
+        logger.debug("_sanitize_url 内部忽略的异常", exc_info=True)
         return None
     if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
         return None
@@ -198,6 +202,7 @@ def _is_probably_decorative(url: str) -> bool:
     try:
         path = urlsplit(url).path.lower()
     except Exception:
+        logger.debug("_is_probably_decorative 内部忽略的异常", exc_info=True)
         return True
     name = path.rsplit("/", 1)[-1]
     if _ICONISH_NAME_RE.search(name):
@@ -266,6 +271,7 @@ def _canonicalize_embed(raw_url: str, base_url: str) -> Optional[tuple[str, str]
     try:
         parts = urlsplit(url)
     except Exception:
+        logger.debug("_canonicalize_embed 内部忽略的异常", exc_info=True)
         return None
     host = (parts.hostname or "").lower()
     path = parts.path or "/"
@@ -329,8 +335,10 @@ def _find_carousel_ancestor(el) -> Optional[str]:
                 try:
                     outermost = anc.getroottree().getpath(anc)
                 except Exception:
+                    logger.debug("_find_carousel_ancestor 内部忽略的异常", exc_info=True)
                     break
     except Exception:
+        logger.debug("_find_carousel_ancestor 内部忽略的异常", exc_info=True)
         return outermost
     return outermost
 
@@ -357,6 +365,7 @@ def _collect_dom_media(tree, base_url: str) -> list[DomMedia]:
     try:
         root_tree = tree.getroottree()
     except Exception:
+        logger.debug("_collect_dom_media 内部忽略的异常", exc_info=True)
         root_tree = None
 
     for order_idx, el in enumerate(tree.iter()):
@@ -406,6 +415,7 @@ def _collect_dom_media(tree, base_url: str) -> list[DomMedia]:
                                     label = label or cap
                                 break
                 except Exception:
+                    logger.debug("_collect_dom_media 内部忽略的异常", exc_info=True)
                     pass
 
         if not kind or not url or url in seen:
@@ -419,6 +429,7 @@ def _collect_dom_media(tree, base_url: str) -> list[DomMedia]:
         try:
             path = root_tree.getpath(el) if root_tree is not None else ""
         except Exception:
+            logger.debug("_collect_dom_media 内部忽略的异常", exc_info=True)
             path = ""
         media.append(DomMedia(
             order_idx=order_idx, path=path, kind=kind, url=url,
@@ -443,6 +454,7 @@ def _in_boilerplate(el) -> bool:
             if _local_name(anc) in _BOILERPLATE_TAGS:
                 return True
     except Exception:
+        logger.debug("_in_boilerplate 内部忽略的异常", exc_info=True)
         return False
     return False
 
@@ -841,9 +853,11 @@ def _table_cell_text(cell) -> str:
         ):
             texts.append(str(node))
     except Exception:
+        logger.debug("_table_cell_text 内部忽略的异常", exc_info=True)
         try:
             texts.append("".join(cell.itertext()))
         except Exception:
+            logger.debug("_table_cell_text 内部忽略的异常", exc_info=True)
             return ""
     return _collapse_table_text(" ".join(texts))
 
@@ -854,6 +868,7 @@ def _table_rows_from_dom(table) -> list[list[dict[str, object]]]:
     try:
         row_nodes = table.xpath(".//tr")
     except Exception:
+        logger.debug("_table_rows_from_dom 内部忽略的异常", exc_info=True)
         return rows
     for row in row_nodes:
         owner = None
@@ -863,6 +878,7 @@ def _table_rows_from_dom(table) -> list[list[dict[str, object]]]:
                     owner = ancestor
                     break
         except Exception:
+            logger.debug("_table_rows_from_dom 内部忽略的异常", exc_info=True)
             continue
         if owner is not table:
             continue
@@ -943,6 +959,7 @@ def _rich_table_rows(block: str) -> list[list[dict[str, object]]]:
         root = _lxml_html.fragment_fromstring(block, create_parent="div")
         table = root.find(".//table")
     except Exception:
+        logger.debug("_rich_table_rows 内部忽略的异常", exc_info=True)
         return []
     return _table_rows_from_dom(table) if table is not None else []
 
@@ -1026,6 +1043,7 @@ def extract_body_blocks(html_text: str, base_url: str = "") -> list[str]:
     try:
         import trafilatura
     except Exception:
+        logger.debug("extract_body_blocks 内部忽略的异常", exc_info=True)
         return []
     kwargs = {
         "output_format": "xml",
@@ -1144,6 +1162,7 @@ def _anchor_entries(entries: list[dict], tree, media: list[DomMedia]) -> list[di
     try:
         root_tree = tree.getroottree()
     except Exception:
+        logger.debug("_anchor_entries 内部忽略的异常", exc_info=True)
         root_tree = None
     if root_tree is not None:
         for order_idx, el in enumerate(tree.iter()):
@@ -1153,6 +1172,7 @@ def _anchor_entries(entries: list[dict], tree, media: list[DomMedia]) -> list[di
                     try:
                         cands.append((order_idx, root_tree.getpath(el), txt))
                     except Exception:
+                        logger.debug("_anchor_entries 内部忽略的异常", exc_info=True)
                         continue
 
     ptr = 0
@@ -1504,6 +1524,7 @@ def extract_title_from_html(html_text: str) -> str:
         parser = _lxml_html.HTMLParser(recover=True, encoding="utf-8", huge_tree=True)
         tree = _lxml_html.fromstring(html_text, parser=parser)
     except Exception:
+        logger.debug("extract_title_from_html 内部忽略的异常", exc_info=True)
         return ""
     og = _meta_content(tree, {"og:title", "twitter:title"})
     if og:
@@ -1513,6 +1534,7 @@ def extract_title_from_html(html_text: str) -> str:
         if title_el is not None and title_el.text:
             return truncate_to_token_budget(re.sub(r"\s+", " ", title_el.text).strip(), TITLE_TOKEN_BUDGET, suffix="…")
     except Exception:
+        logger.debug("extract_title_from_html 内部忽略的异常", exc_info=True)
         pass
     return ""
 
@@ -1525,6 +1547,7 @@ def build_fallback_text_from_html(html_text: str, token_budget: int = FALLBACK_T
         parser = _lxml_html.HTMLParser(recover=True, encoding="utf-8", huge_tree=True)
         tree = _lxml_html.fromstring(html_text, parser=parser)
     except Exception:
+        logger.debug("build_fallback_text_from_html 内部忽略的异常", exc_info=True)
         return ""
     desc = _meta_content(tree, {"og:description", "twitter:description", "description"})
     chunks: list[str] = []

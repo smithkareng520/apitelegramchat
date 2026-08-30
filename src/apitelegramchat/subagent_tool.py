@@ -160,6 +160,7 @@ def _filter_tools(allowed: Optional[list[str]]) -> list[dict]:
         try:
             fn_name = t.get("function", {}).get("name", "")
         except Exception:
+            logger.debug("_filter_tools 内部忽略的异常", exc_info=True)
             continue
         if fn_name in FORBIDDEN_TOOLS:
             continue
@@ -191,6 +192,7 @@ async def _execute_tool_for_subagent(
     try:
         from apitelegramchat.tool_executors import dispatch_tool_call, tool_semaphore
     except Exception as e:
+        logger.debug("_execute_tool_for_subagent 内部忽略的异常", exc_info=True)
         return f"Error: cannot import dispatch_tool_call: {e}"
     try:
         # 复用主 agent 同一个全局信号量：多个子 agent 并行运行时，
@@ -212,6 +214,7 @@ async def _execute_tool_for_subagent(
     except asyncio.CancelledError:
         raise
     except Exception as e:
+        logger.debug("_execute_tool_for_subagent 内部忽略的异常", exc_info=True)
         return f"Error: tool '{name}' failed: {str(e)[:200]}"
 
 
@@ -241,6 +244,7 @@ async def _subagent_agentic_loop(
             try:
                 await progress_callback(status_text)
             except Exception:
+                logger.debug("_report 内部忽略的异常", exc_info=True)
                 pass  # 进度回调失败不能影响子 agent 主流程
 
     # 支持工具调用？
@@ -381,6 +385,7 @@ async def _subagent_agentic_loop(
             if tc_list:
                 assistant_msg["tool_calls"] = tc_list
         except Exception:
+            logger.debug("_subagent_agentic_loop 内部忽略的异常", exc_info=True)
             pass
         loop_messages.append(assistant_msg)
 
@@ -488,6 +493,7 @@ async def execute_subagent(
     try:
         client = api_client.get_client(model_info.provider)
     except Exception as e:
+        logger.debug("execute_subagent 内部忽略的异常", exc_info=True)
         return json.dumps({"ok": False, "error": f"API client 创建失败: {e}", "code": "no_client"},
                           ensure_ascii=False)
 
@@ -669,6 +675,7 @@ def _truncate_html_preview(fragment: str, token_budget: int = SUBAGENT_CARD_PREV
             return preview, True
     except Exception:
         # 模型输出不应因预览格式化失败而令整个工具卡片消失。
+        logger.debug("_truncate_html_preview 内部忽略的异常", exc_info=True)
         pass
     safe_text = truncate_to_token_budget(text, token_budget, suffix="…")
     return truncate_to_token_budget(_esc(safe_text), token_budget, suffix="…"), True

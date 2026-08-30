@@ -626,6 +626,7 @@ async def _agentic_loop_openai_compat(
                 try:
                     builder.end_stream_text()
                 except Exception:
+                    logger.debug("_agentic_loop_openai_compat 内部忽略的异常", exc_info=True)
                     pass
                 final_content = _tool_limit_summary()
                 builder.add_text(final_content)
@@ -970,6 +971,7 @@ async def _agentic_loop_native_image(
                 try:
                     json_preview = json.dumps(response_json, ensure_ascii=False, indent=2)
                 except Exception:
+                    logger.debug("_agentic_loop_native_image 内部忽略的异常", exc_info=True)
                     json_preview = str(response_json)
                 logger.debug(
                     "[NativeImage/ModelScope] no image bytes extracted, raw response preview=%r",
@@ -1048,6 +1050,7 @@ async def _agentic_loop_native_image(
                 body = await e.response.text()
                 logger.error(f"Response body: {body[:1000]}")
             except Exception:
+                logger.debug("_agentic_loop_native_image 内部忽略的异常", exc_info=True)
                 pass
         err_str = str(e)
         if _is_content_safety_error(err_str):
@@ -1078,6 +1081,7 @@ async def _agentic_loop_native_image(
         if not images:
             images = getattr(choice.message, "images", []) or []
     except Exception:
+        logger.debug("_agentic_loop_native_image 内部忽略的异常", exc_info=True)
         images = []
 
     image_bytes_list = []

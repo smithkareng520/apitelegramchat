@@ -743,6 +743,7 @@ def _resolve_whitelist_path() -> str:
         from apitelegramchat.workspace_paths import data_root
         return str(data_root() / WHITELIST_FILE)
     except Exception:
+        logger.debug("_resolve_whitelist_path 内部忽略的异常", exc_info=True)
         return WHITELIST_FILE
 
 async def load_whitelist():

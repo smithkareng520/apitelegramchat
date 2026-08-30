@@ -143,6 +143,7 @@ async def _request_modelscope_native_image(
             )
             return None
         except Exception:
+            logger.debug("_safe_json_parse 内部忽略的异常", exc_info=True)
             return None
 
     async def _post_or_get_json(
@@ -546,6 +547,7 @@ def _extract_native_refusal_text(message: Any) -> str:
             msg_dump = message.model_dump()
             refusal = msg_dump.get("refusal")
         except Exception:
+            logger.debug("_extract_native_refusal_text 内部忽略的异常", exc_info=True)
             refusal = None
     if isinstance(refusal, str):
         return refusal.strip()
@@ -697,6 +699,7 @@ async def _request_agnes_video(
                 try:
                     data = json.loads(resp_text)
                 except Exception:
+                    logger.debug("_request_agnes_video 内部忽略的异常", exc_info=True)
                     return None, f"Agnes 提交返回非 JSON: {resp_text[:200]}", None
 
                 video_id = data.get("video_id") or data.get("id")
@@ -887,6 +890,7 @@ async def _request_openrouter_video(
                 try:
                     data = json.loads(resp_text)
                 except Exception:
+                    logger.debug("_request_openrouter_video 内部忽略的异常", exc_info=True)
                     return None, f"OpenRouter 提交返回非 JSON: {resp_text[:200]}", None
 
                 job_id = data.get("id")
@@ -907,6 +911,7 @@ async def _request_openrouter_video(
                     from urllib.parse import urlparse
                     _parsed_poll = urlparse(str(polling_url))
                 except Exception:
+                    logger.debug("_request_openrouter_video 内部忽略的异常", exc_info=True)
                     _parsed_poll = None
                 if (
                     not _parsed_poll

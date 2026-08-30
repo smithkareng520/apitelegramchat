@@ -272,6 +272,7 @@ def _diagnose_mcp_exception(
             try:
                 response_text = getattr(response, "text", "")
             except Exception:
+                logger.debug("_diagnose_mcp_exception 内部忽略的异常", exc_info=True)
                 response_text = ""
             if response_text:
                 response_details.append(_truncate_safe_detail(response_text))

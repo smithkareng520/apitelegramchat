@@ -321,6 +321,7 @@ async def _run_tool_calls_and_append(
                     except asyncio.CancelledError:
                         raise
                     except Exception:
+                        logger.debug("tool_progress_callback 内部忽略的异常", exc_info=True)
                         pass  # 进度推送失败不能影响工具本身
 
                 # 立即把卡片从「刚开始」推到「运行中」，避免用户在子
@@ -431,6 +432,7 @@ async def _run_tool_calls_and_append(
                 try:
                     model_view = condense_for_model(fn_name, fn_args, result_str)
                 except Exception:
+                    logger.debug("run_one 内部忽略的异常", exc_info=True)
                     model_view = result_str
                 if model_view == result_str:
                     # 未发生精简（非目标工具/解析失败/错误文本）：
@@ -441,6 +443,7 @@ async def _run_tool_calls_and_append(
                         llm_content = _truncate_tool_result(model_view, fn_name=fn_name)
                     except Exception:
                         # 精简版截断失败：退回完整视图的截断结果。
+                        logger.debug("run_one 内部忽略的异常", exc_info=True)
                         llm_content = safe_content
             return (fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content)
 

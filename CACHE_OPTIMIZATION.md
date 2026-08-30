@@ -193,7 +193,41 @@ Anthropic（`cache_read_input_tokens`/`cache_creation_input_tokens`）、DeepSee
 
 ---
 
-## 六、遗留建议（本次未做）
+## 六、本次复查记录（日志健壮性 + 缓存复核）
+
+**缓存策略复核**：对上述 P1-P7 的核心断言逐条与源码比对（不仅是读文档），
+包括手工模拟 `_quantized_drop` 的量化数学、确认 `_apply_cache_control`
+唯一调用点位于用户消息 append 之后、确认 `_log_cache_usage` 确实在
+`for _round` 循环内部（而非循环外）、确认 `execute_web_search` 的参数
+归一化只有一份等。结论：本文档描述与实现一致。
+
+发现一处遗留的小问题（非缓存正确性问题，未修复，供后续处理）：
+`s3_utils.py::generate_presigned_url` 用**单个全局** `asyncio.Lock()`
+去重并发签名，而非按 key 加锁——不同 R2 key 的并发签名请求会被互相
+串行阻塞（含一次网络往返），而不仅仅是同 key 去重。缓存本身的正确性
+不受影响，只是并发场景下多花一点延迟。
+
+**日志健壮性**：给 20 个文件里约 116 处"完全静默"的 `except Exception:`
+补充了 `logger.debug(..., exc_info=True)`（不改变任何控制流，只是让
+失败可观测）。过程中用 AST 扫描（而非文本替换）逐处插入，并在插入后
+额外做了两轮系统性复查，排除了两类会引入新 bug 的插入位置：
+  1. 模块级"可选依赖导入失败静默降级"的 `except`（在 `logger` 变量
+     真正赋值*之前*就会执行，插入会导致 `NameError`）——`search_engine.py`
+     的 6 处可选依赖兜底（trafilatura/curl_cffi/feedparser/qrcode/lxml）
+     与 `fetch_rich_content.py` 的 lxml 兜底，均已排除，保持原样静默；
+  2. `logging.Filter.filter()` 内部——从过滤器里再记一条日志有重入
+     日志管线的风险，`utils.py::_MCPStreamableHTTPNoiseFilter.filter()`
+     已排除，保持原样静默。
+`utils.py::setup_logging()` 内部两处也因同样的"logger 尚未赋值"原因
+排除（该函数在模块级于 `logger = logging.getLogger(__name__)` 之前
+被调用）；文件写入失败分支保留 `print(..., file=sys.stderr)` 兜底，
+新增 `traceback.print_exc()` 以保留原本会被 `exc_info=True` 记录的
+完整堆栈。
+
+所有改动后用 `py_compile` 对全部 19 个改动文件与全项目做了编译期
+检查，均通过。
+
+## 七、遗留建议（本次未做）
 
 1. **1 小时 TTL**：Anthropic 显式断点可加 `"ttl": "1h"`（写 2x、读仍 0.1x）。适合
    低频（>5 分钟间隔）长会话；高频会话 5 分钟 TTL 每次命中都会刷新，已够用。

@@ -224,6 +224,7 @@ def _due_status(due_at: Optional[str]) -> str:
             return "due_soon"
         return "upcoming"
     except Exception:
+        logger.debug("_due_status 内部忽略的异常", exc_info=True)
         return "unknown"
 
 

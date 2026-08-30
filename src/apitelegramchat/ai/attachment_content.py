@@ -707,6 +707,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                     try:
                         temp_url = await _resolve_public_attachment_url(fid)
                     except Exception:
+                        logger.debug("_resolve_multimodal_content 内部忽略的异常", exc_info=True)
                         temp_url = ""
                     if temp_url:
                         url_lines.append(f"原始图片 URL: {temp_url}")

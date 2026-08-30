@@ -36,6 +36,9 @@ class _MCPStreamableHTTPNoiseFilter(logging.Filter):
         try:
             message = record.getMessage()
         except Exception:
+            # 故意不在这里调用 logger：本方法运行在 logging 过滤器管线内部，
+            # 从 filter() 里再发一条日志有重入/递归风险（新日志记录会重新
+            # 经过同一套 handler/filter 链）。保持静默放行是安全的选择。
             return True
         if record.levelno >= logging.ERROR and "Error parsing JSON response" in message:
             record.msg = message + "（上游网关截断响应体；已由超时+定向重试+降级处理）"
@@ -58,6 +61,9 @@ def setup_logging() -> bool:
     try:
         level = getattr(logging, LOG_LEVEL, logging.INFO)
     except Exception:
+        # 注意：本函数在模块级可能于 `logger = logging.getLogger(__name__)`
+        # （文件末尾）赋值之前就被调用（见文件底部的 import-time 触发），
+        # 此处不能引用模块级 logger，否则会抛 NameError。
         level = logging.INFO
     if root_logger.level == logging.NOTSET or root_logger.level > level:
         root_logger.setLevel(level)
@@ -95,7 +101,12 @@ def setup_logging() -> bool:
         ))
         root_logger.addHandler(file_handler)
     except Exception as e:
-        print(f"Warning: 无法创建文件日志 {LOG_FILE}: {e}")
+        # 同上：此处不能用模块级 logger（可能尚未赋值），保留 print 到 stderr
+        # 作为在 logger 就绪前也不会丢失的兜底，同时把详情打全（原来只有 e 的
+        # str()，堆栈信息会丢失）。
+        import traceback
+        print(f"Warning: 无法创建文件日志 {LOG_FILE}: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
 
     return True
 
@@ -152,6 +163,7 @@ async def close_http_session() -> None:
             try:
                 await _http_session.close()
             except Exception:
+                logger.debug("close_http_session 内部忽略的异常", exc_info=True)
                 pass
         _http_session = None
 
@@ -728,6 +740,7 @@ async def check_deepseek_balance() -> tuple:
                 else:
                     return None, f"HTTP {resp.status}"
     except Exception as e:
+        logger.debug("check_deepseek_balance 内部忽略的异常", exc_info=True)
         return None, str(e)[:100]
 
 async def check_openrouter_balance() -> float:
@@ -742,6 +755,7 @@ async def check_openrouter_balance() -> float:
                 else:
                     return -1.0
     except Exception:
+        logger.debug("check_openrouter_balance 内部忽略的异常", exc_info=True)
         return -1.0
 
 class RateLimitError(Exception):
@@ -803,6 +817,7 @@ async def delete_message_fast(chat_id: int, message_id: int) -> bool:
             if message_id in deleted_message_ids:
                 return True
     except Exception:
+        logger.debug("delete_message_fast 内部忽略的异常", exc_info=True)
         pass
 
     timeout = aiohttp.ClientTimeout(total=3, connect=2)
@@ -818,6 +833,7 @@ async def delete_message_fast(chat_id: int, message_id: int) -> bool:
                         async with deleted_messages_lock:
                             deleted_message_ids.add(message_id)
                     except Exception:
+                        logger.debug("delete_message_fast 内部忽略的异常", exc_info=True)
                         pass
                     return True
                 if r.status == 400:
@@ -828,6 +844,7 @@ async def delete_message_fast(chat_id: int, message_id: int) -> bool:
                             async with deleted_messages_lock:
                                 deleted_message_ids.add(message_id)
                         except Exception:
+                            logger.debug("delete_message_fast 内部忽略的异常", exc_info=True)
                             pass
                         return True
                 return False
@@ -923,12 +940,14 @@ async def _is_current_active_draft(chat_id: int, draft_id) -> bool:
         info = await get_active_draft_info(chat_id)
     except Exception:
         # 取不到状态时不要误伤发送，交给死亡标记兜底
+        logger.debug("_is_current_active_draft 内部忽略的异常", exc_info=True)
         return True
     if not info:
         return False
     try:
         return int(info[0]) == draft_id_int
     except Exception:
+        logger.debug("_is_current_active_draft 内部忽略的异常", exc_info=True)
         return False
 
 
@@ -973,12 +992,14 @@ async def _reassert_active_draft_content(chat_id: int, draft_id: int) -> None:
                                 f"reassert draft ok: chat={chat_id} draft={draft_id} msg_id={msg_id}"
                             )
                     except Exception:
+                        logger.debug("_reassert_active_draft_content 内部忽略的异常", exc_info=True)
                         pass
                 else:
                     body = ""
                     try:
                         body = await resp.text()
                     except Exception:
+                        logger.debug("_reassert_active_draft_content 内部忽略的异常", exc_info=True)
                         pass
                     logger.debug(
                         f"reassert draft failed: chat={chat_id} draft={draft_id} "
@@ -1009,6 +1030,7 @@ async def serialize_with_active_draft(chat_id: int, *, reassert: bool = True):
         if info:
             draft_id = int(info[0])
     except Exception:
+        logger.debug("serialize_with_active_draft 内部忽略的异常", exc_info=True)
         draft_id = None
 
     if draft_id is None:
@@ -1026,6 +1048,7 @@ async def serialize_with_active_draft(chat_id: int, *, reassert: bool = True):
                 if await is_draft_dead(draft_id):
                     return
             except Exception:
+                logger.debug("serialize_with_active_draft 内部忽略的异常", exc_info=True)
                 pass
             await _reassert_active_draft_content(chat_id, draft_id)
 
@@ -1110,6 +1133,7 @@ async def send_rich_message_draft(
                             try:
                                 body = await resp.text()
                             except Exception:
+                                logger.debug("send_rich_message_draft 内部忽略的异常", exc_info=True)
                                 body = ""
 
                         if resp.status == 200:
@@ -1122,6 +1146,7 @@ async def send_rich_message_draft(
                                 if isinstance(msg_id, int) and msg_id > 0:
                                     return msg_id
                             except Exception:
+                                logger.debug("send_rich_message_draft 内部忽略的异常", exc_info=True)
                                 pass
                             return 0
 
@@ -1130,6 +1155,7 @@ async def send_rich_message_draft(
                                 data = json.loads(body)
                                 retry_after = int(data.get("parameters", {}).get("retry_after", 5))
                             except Exception:
+                                logger.debug("send_rich_message_draft 内部忽略的异常", exc_info=True)
                                 retry_after = 5
                             raise RateLimitError(retry_after)
 
@@ -1205,6 +1231,7 @@ async def send_rich_message_draft(
                                                 if isinstance(demoted_msg_id, int) and demoted_msg_id > 0:
                                                     return demoted_msg_id
                                             except Exception:
+                                                logger.debug("send_rich_message_draft 内部忽略的异常", exc_info=True)
                                                 pass
                                             return 0
                                         demoted_body = await demoted_resp.text()

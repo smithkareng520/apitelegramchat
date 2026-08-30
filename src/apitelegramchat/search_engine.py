@@ -107,6 +107,7 @@ if _TRAFILATURA_CONFIG is not None:
     try:
         _TRAFILATURA_CONFIG.set("DEFAULT", "DOWNLOAD_TIMEOUT", str(TRAFILATURA_TIMEOUT))
     except Exception:
+        logger.debug("module 内部忽略的异常", exc_info=True)
         pass
 
 # ---------- 缓存 ----------
@@ -161,6 +162,7 @@ def _normalize_fetch_cache_key(url: str) -> str:
         parts = urlsplit(url)
         return urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
     except Exception:
+        logger.debug("_normalize_fetch_cache_key 内部忽略的异常", exc_info=True)
         return url
 
 
@@ -425,6 +427,7 @@ def _get_title_from_html(html_content: str) -> str:
             title = title_elem.text.strip()
             return truncate_to_token_budget(title, FETCH_TITLE_TOKEN_BUDGET, suffix="…") if title else "无标题"
     except Exception:
+        logger.debug("_get_title_from_html 内部忽略的异常", exc_info=True)
         pass
     return "无标题"
 
@@ -1196,6 +1199,7 @@ def _serper_api_timeout() -> float:
         if isinstance(SERPER_API_TIMEOUT, (int, float)) and SERPER_API_TIMEOUT >= 1.0:
             return float(SERPER_API_TIMEOUT)
     except Exception:
+        logger.debug("_serper_api_timeout 内部忽略的异常", exc_info=True)
         pass
     return _SERPER_DEFAULT_TIMEOUT
 
@@ -1776,6 +1780,7 @@ async def _execute_web_search_uncached(
                 text = None
             return m, text, None
         except Exception as exc:
+            logger.debug("_run_one 内部忽略的异常", exc_info=True)
             return m, None, exc
 
     outcomes = await asyncio.gather(*(_run_one(m) for m in modes))
@@ -1871,6 +1876,7 @@ def _detect_html_encoding(raw: bytes, http_encoding: str | None) -> str:
             if enc and conf >= 0.7:
                 return _normalize_encoding_name(enc)
     except Exception:
+        logger.debug("_detect_html_encoding 内部忽略的异常", exc_info=True)
         pass
     try:
         # charset_normalizer 是 requests / chardet 的常见替代品
@@ -1881,6 +1887,7 @@ def _detect_html_encoding(raw: bytes, http_encoding: str | None) -> str:
             if enc:
                 return _normalize_encoding_name(enc)
     except Exception:
+        logger.debug("_detect_html_encoding 内部忽略的异常", exc_info=True)
         pass
     # 5) 最后防线：UTF-8 with errors='replace'
     return "utf-8"
@@ -2023,6 +2030,7 @@ def _is_safe_url_to_fetch_sync(url: str) -> tuple[bool, str]:
     try:
         parts = urlsplit(url)
     except Exception as e:
+        logger.debug("_is_safe_url_to_fetch_sync 内部忽略的异常", exc_info=True)
         return False, f"URL 解析失败: {e}"
     if parts.scheme.lower() not in _ALLOWED_FETCH_SCHEMES:
         return False, f"不支持的协议: {parts.scheme}"
@@ -2081,6 +2089,7 @@ async def _is_safe_url_to_fetch(url: str) -> tuple[bool, str]:
     except socket.gaierror as e:
         return False, f"DNS 解析失败: {e}"
     except Exception as e:
+        logger.debug("_is_safe_url_to_fetch 内部忽略的异常", exc_info=True)
         return False, f"DNS 解析异常: {e}"
     for _family, _stype, _proto, _canon, sockaddr in infos:
         ip_str = sockaddr[0]
@@ -2599,6 +2608,7 @@ async def execute_exchange_rate(base: str, target: str = None) -> str:
                 lines.append(f"1 {base} = {rate_val:.4f} {cur}")
         return "<br/>".join(lines)
     except Exception as e:
+        logger.debug("execute_exchange_rate 内部忽略的异常", exc_info=True)
         return f"失败：汇率查询出错：{str(e)[:100]}"
 
 
@@ -2626,6 +2636,7 @@ async def execute_book_lookup(query: str) -> str:
             lines.append(f"{i}. 《{title}》<br/>   作者：{authors}<br/>   首次出版：{year} 年<br/>" + (f"   主题：{subjects}<br/>" if subjects else "") + (f"   详情：{ol_url_html}<br/>" if ol_url_html else ""))
         return "<br/>".join(lines)
     except Exception as e:
+        logger.debug("execute_book_lookup 内部忽略的异常", exc_info=True)
         return f"失败：书籍查询出错：{str(e)[:100]}"
 
 
@@ -2749,6 +2760,7 @@ async def execute_weather(city: str, unit: str = "c", hours: int = 6) -> str:
     except asyncio.TimeoutError:
         return json.dumps({"error": "天气查询超时"}, ensure_ascii=False)
     except Exception as e:
+        logger.debug("execute_weather 内部忽略的异常", exc_info=True)
         return json.dumps({"error": f"天气查询异常：{str(e)[:100]}"}, ensure_ascii=False)
 
 
@@ -2805,6 +2817,7 @@ async def execute_news(source: str = "bbc", limit: int = 5) -> str:
         lines.append("</ul>")
         return "\n".join(lines)
     except Exception as e:
+        logger.debug("execute_news 内部忽略的异常", exc_info=True)
         return f"失败：新闻获取失败：{str(e)[:100]}"
 
 
@@ -2838,6 +2851,7 @@ async def execute_crypto_price(coin: str, currency: str = "usd") -> str:
                     return f"失败：无法获取 {coin} 的价格（HTTP {resp.status}）。"
                 data = await resp.json()
     except Exception as e:
+        logger.debug("execute_crypto_price 内部忽略的异常", exc_info=True)
         return f"失败：价格查询失败：{str(e)[:100]}"
     if coin_id not in data:
         return f"失败：未找到加密货币：{coin}。支持：{', '.join(COIN_MAP.keys())}"
@@ -2887,12 +2901,14 @@ async def _download_image_bytes(session: aiohttp.ClientSession, image_url: str) 
             _, b64 = image_url.split(",", 1)
             return base64.b64decode(b64)
         except Exception:
+            logger.debug("_download_image_bytes 内部忽略的异常", exc_info=True)
             return None
     try:
         async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=30), headers={"User-Agent": "Mozilla/5.0"}) as resp:
             if resp.status == 200:
                 return await resp.read()
     except Exception:
+        logger.debug("_download_image_bytes 内部忽略的异常", exc_info=True)
         return None
     return None
 
@@ -2987,6 +3003,7 @@ async def _images_response_to_bytes(data: dict) -> list[bytes]:
                     image_bytes_list.append(base64.b64decode(b64_json))
                     continue
                 except Exception:
+                    logger.debug("_images_response_to_bytes 内部忽略的异常", exc_info=True)
                     pass
             if img_url:
                 img_bytes = await _download_image_bytes(session, img_url)
@@ -3250,6 +3267,7 @@ async def execute_generate_video(
     try:
         duration = int(duration)
     except Exception:
+        logger.debug("execute_generate_video 内部忽略的异常", exc_info=True)
         duration = 5
     duration = max(3, min(duration, 30))
 

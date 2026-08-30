@@ -400,6 +400,7 @@ def _tool_result_is_failure(fn_name: str, fn_args: dict, result_content: Any, de
             if isinstance(payload, dict) and payload.get("error"):
                 return True
         except Exception:
+            logger.debug("_tool_result_is_failure 内部忽略的异常", exc_info=True)
             pass
     return False
 
@@ -474,6 +475,7 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
             if payload.get("type") == "expired":
                 return "User answer expired"
         except Exception:
+            logger.debug("_generate_tool_summary_done 内部忽略的异常", exc_info=True)
             pass
         return "User answered"
 

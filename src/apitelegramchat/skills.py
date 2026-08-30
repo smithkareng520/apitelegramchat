@@ -33,6 +33,7 @@ def _parse_scalar(value: str) -> Any:
         try:
             return int(raw)
         except Exception:
+            logger.debug("_parse_scalar 内部忽略的异常", exc_info=True)
             return raw
     lower = raw.lower()
     if lower in {"true", "yes"}:
@@ -97,6 +98,7 @@ def _read_skill_header(skill_md: Path) -> dict[str, Any]:
     except FileNotFoundError:
         return {}
     except Exception:
+        logger.debug("_read_skill_header 内部忽略的异常", exc_info=True)
         return {}
 
 
@@ -111,6 +113,7 @@ def _candidate_skill_roots() -> list[Path]:
     try:
         roots.append(Path(__file__).resolve().parents[2] / ".claude" / "skills")
     except Exception:
+        logger.debug("_candidate_skill_roots 内部忽略的异常", exc_info=True)
         pass
 
     seen: set[str] = set()
@@ -119,6 +122,7 @@ def _candidate_skill_roots() -> list[Path]:
         try:
             resolved = root.expanduser().resolve()
         except Exception:
+            logger.debug("_candidate_skill_roots 内部忽略的异常", exc_info=True)
             continue
         key = str(resolved)
         if key in seen:
@@ -270,6 +274,7 @@ def _project_skill_source_root() -> Path | None:
         try:
             root = root.resolve()
         except Exception:
+            logger.debug("_project_skill_source_root 内部忽略的异常", exc_info=True)
             continue
         if root.is_dir():
             return root

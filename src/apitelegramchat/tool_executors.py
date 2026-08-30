@@ -1235,6 +1235,7 @@ class BashSession:
         except Exception:
             # If we can't run the syntax check at all, don't block execution —
             # fall through to the existing heredoc regex as a safety net.
+            logger.debug("_is_unterminated 内部忽略的异常", exc_info=True)
             return False
 
     async def _execute_heredoc_isolated(self, command: str, timeout: int) -> str:
@@ -1293,6 +1294,7 @@ class BashSession:
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
             except Exception:
+                logger.debug("_execute_heredoc_isolated 内部忽略的异常", exc_info=True)
                 pass
             return f"Error: Command timed out after {timeout} seconds (isolated bash killed)"
         except asyncio.CancelledError:
@@ -1303,6 +1305,7 @@ class BashSession:
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
             except Exception:
+                logger.debug("_execute_heredoc_isolated 内部忽略的异常", exc_info=True)
                 pass
             raise
 
@@ -1608,6 +1611,7 @@ class BashSessionManager:
                 try:
                     await s.close()
                 except Exception:
+                    logger.debug("cleanup_all 内部忽略的异常", exc_info=True)
                     pass
             self._sessions.clear()
 
@@ -2315,6 +2319,7 @@ async def execute_present_files(chat_id: int, paths: List[str], namespace: str |
         try:
             upload_resolved = upload_root.resolve()
         except Exception:
+            logger.debug("execute_present_files 内部忽略的异常", exc_info=True)
             upload_resolved = upload_root
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for path in paths:
@@ -2342,6 +2347,7 @@ async def execute_present_files(chat_id: int, paths: List[str], namespace: str |
                     try:
                         abs_resolved = Path(raw_path).expanduser().resolve()
                     except Exception:
+                        logger.debug("execute_present_files 内部忽略的异常", exc_info=True)
                         failed.append(f"{path} (invalid path)")
                         continue
                     # 必须严格落在 upload_resolved 之内（包含 upload_resolved 本身，
@@ -2381,6 +2387,7 @@ async def execute_present_files(chat_id: int, paths: List[str], namespace: str |
                     try:
                         resolved = local_path.resolve()
                     except Exception:
+                        logger.debug("execute_present_files 内部忽略的异常", exc_info=True)
                         failed.append(f"{path} (invalid path)")
                         continue
                     if resolved != upload_resolved and upload_resolved not in resolved.parents:
@@ -2424,6 +2431,7 @@ async def execute_present_files(chat_id: int, paths: List[str], namespace: str |
                     failed.append(f"{path} (network error: {safe_msg[:80]})")
                 except Exception as e:
                     # 通用兜底：同样脱敏 URL，避免 token 泄露给 LLM 上下文。
+                    logger.debug("execute_present_files 内部忽略的异常", exc_info=True)
                     safe_msg = str(e)
                     if BASE_URL and BASE_URL in safe_msg:
                         safe_msg = "[redacted url]"

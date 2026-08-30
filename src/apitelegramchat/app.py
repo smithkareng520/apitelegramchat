@@ -215,6 +215,7 @@ async def _interrupt_active_generation(chat_id: int) -> None:
     try:
         draft_info = await get_active_draft_info(chat_id)
     except Exception:
+        logger.debug("_interrupt_active_generation 内部忽略的异常", exc_info=True)
         draft_info = None
 
     # 1) 先彻底停掉旧任务（包括其草稿刷新循环），确保没有任何后台刷新
@@ -419,6 +420,7 @@ def _estimate_message_tokens(message: dict) -> int:
         try:
             tokens += estimate_tokens(json.dumps(tool_calls, ensure_ascii=False))
         except Exception:
+            logger.debug("_estimate_message_tokens 内部忽略的异常", exc_info=True)
             tokens += _MEDIA_TOKEN_OVERHEAD * len(tool_calls)
     return tokens
 
@@ -835,6 +837,7 @@ async def _handle_timer_wakeup(chat_id: int):
         try:
             history_count = len(ctx.get("conversation_history", []) or [])
         except Exception:
+            logger.debug("_handle_timer_wakeup 内部忽略的异常", exc_info=True)
             pass
         logger.info(
             "[TIMER] chat=%s 开始主动巡检：model=%s history_messages=%s username=%s",
@@ -956,6 +959,7 @@ async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
             try:
                 await delete_message(chat_id, temp_msg_id)
             except Exception:
+                logger.debug("_process_media_group_once 内部忽略的异常", exc_info=True)
                 pass
 
 async def _schedule_media_group(chat_id: int, media_group_id: str) -> None:
@@ -1066,6 +1070,7 @@ async def _process_video_group_once(chat_id: int, group_key: str) -> None:
             try:
                 await delete_message(chat_id, temp_msg_id)
             except Exception:
+                logger.debug("_process_video_group_once 内部忽略的异常", exc_info=True)
                 pass
 
 async def _schedule_video_group(chat_id: int, group_key: str) -> None:
@@ -1099,6 +1104,7 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
                 chat_id, "❌ <b>处理文档组时出错</b>\n<code>" + str(e)[:100] + "</code>"
             )
         except Exception:
+            logger.debug("_process_document_group_once 内部忽略的异常", exc_info=True)
             pass
 
 

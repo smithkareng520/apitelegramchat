@@ -77,9 +77,11 @@ def _coerce_error_payload(payload_text: str) -> Any:
         try:
             return json.loads(blob)
         except Exception:
+            logger.debug("_coerce_error_payload 内部忽略的异常", exc_info=True)
             try:
                 return ast.literal_eval(blob)
             except Exception:
+                logger.debug("_coerce_error_payload 内部忽略的异常", exc_info=True)
                 continue
     return None
 
@@ -193,6 +195,7 @@ def _extract_error_details(error_message: str = "", exception: Optional[Exceptio
         try:
             chunks.append(str(item))
         except Exception:
+            logger.debug("_extract_error_details 内部忽略的异常", exc_info=True)
             continue
 
     raw_text = "\n".join(part for part in chunks if part).strip()
