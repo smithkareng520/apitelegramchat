@@ -368,7 +368,7 @@ WEBHOOK_URL?token=WEBHOOK_TOKEN
 3. **R2 预签名 URL 记忆化**：预签名 URL 每次重签字节都不同，会让历史消息中的多模态块（图片/视频 URL）打碎前缀缓存。现在同一对象在过期前 5 分钟内复用同一 URL。
 4. **历史压缩批量化**：`HISTORY_COMPACTION_TRIGGER`（默认 `30`）与 `HISTORY_COMPACTION_MIN_BATCH`（默认 `8`）。压缩会重写旧 tool 消息（payload → 指针），攒够一批再做，两次压缩之间的轮次里前缀保持稳定。
 
-缓存命中观测：每轮请求结束后日志会输出一行 `prompt cache usage: {'prompt_tokens': N, 'cached': N, 'cache_write': N, 'hit_ratio': 0.xx}`，兼容 OpenRouter/OpenAI（`cached_tokens`）、Anthropic（`cache_read_input_tokens`）与 DeepSeek（`prompt_cache_hit_tokens`）三种字段。
+缓存命中观测：每轮请求结束后日志会输出一行 `prompt cache usage: {'prompt_tokens': N, 'cached': N, 'hit_ratio': 0.xx}`，兼容 OpenRouter/OpenAI（`cached_tokens`）、Anthropic（`cache_read_input_tokens`）与 DeepSeek（`prompt_cache_hit_tokens`）三种字段。
 
 #### 工具与附件缓存
 

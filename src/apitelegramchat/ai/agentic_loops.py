@@ -144,7 +144,6 @@ def _merged_extra_body(
 # 在每轮请求结束后打一行 INFO 日志，让"缓存命中率"变成可度量的指标。
 # 字段来源：
 #   OpenRouter / OpenAI : usage.prompt_tokens_details.cached_tokens
-#                         （+ model_extra.cache_write_tokens）
 #   Anthropic（经 OR）  : cache_read_input_tokens / cache_creation_input_tokens
 #   DeepSeek 直连       : prompt_cache_hit_tokens / prompt_cache_miss_tokens
 # =====================================================================
@@ -169,11 +168,6 @@ def _extract_cache_usage(usage) -> dict:
             cached = _num(usage.get("cache_read_input_tokens"))
         if cached is None:
             cached = _num(usage.get("prompt_cache_hit_tokens"))
-        cache_write = _num(usage.get("cache_write_tokens"))
-        if cache_write is None:
-            cache_write = _num(usage.get("cache_creation_input_tokens"))
-        if cache_write is None:
-            cache_write = _num(usage.get("prompt_cache_miss_tokens"))
     else:
         prompt = _num(getattr(usage, "prompt_tokens", None))
         details = getattr(usage, "prompt_tokens_details", None)
@@ -184,27 +178,16 @@ def _extract_cache_usage(usage) -> dict:
             cached = _num(extra.get("cache_read_input_tokens"))
         if cached is None:
             cached = _num(extra.get("prompt_cache_hit_tokens"))
-        cache_write = _num(extra.get("cache_write_tokens"))
-        if cache_write is None:
-            cache_write = _num(extra.get("cache_creation_input_tokens"))
-        if cache_write is None:
-            cache_write = _num(extra.get("prompt_cache_miss_tokens"))
 
     stats: dict = {}
     if prompt:
         stats["prompt_tokens"] = prompt
-        # 只要有总输入 token，就显示命中/写入字段（网关未返回时默认为 0）。
-        # 旧逻辑在 cached 为 None 时跳过这两个字段，导致第一轮（缓存未建立）
-        # 的日志只有 prompt_tokens，缺少命中率；多轮循环里看起来像"字段丢失"。
         stats["cached"] = cached if cached is not None else 0
-        stats["cache_write"] = cache_write if cache_write is not None else 0
         stats["hit_ratio"] = round(stats["cached"] / max(1, prompt), 3)
     else:
         # 极端情况：usage 中没有 prompt_tokens 但有缓存字段，仍如实显示。
         if cached is not None:
             stats["cached"] = cached
-        if cache_write is not None:
-            stats["cache_write"] = cache_write
     return stats
 
 
