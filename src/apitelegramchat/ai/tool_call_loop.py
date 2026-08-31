@@ -25,6 +25,7 @@ from apitelegramchat.message_user_tool import (
     wait_for_answer,
     answer_to_tool_result,
 )
+from apitelegramchat import turn_recovery
 from apitelegramchat.turn_recovery import INTERRUPTED_TOOL_PLACEHOLDER
 from apitelegramchat.ai._constants import (
     MAX_TOOL_CALLS,
@@ -395,22 +396,43 @@ async def _run_tool_calls_and_append(
                     answer = await wait_for_answer(interaction)
                     result_str = answer_to_tool_result(answer)
                 elif fn_name == "deliver_reply":
-                    # deliver_reply：静默模式（/show off）下模型通过 send 布尔参数
-                    # 自主决定是否交付最终内容。send=true：发送「本轮最后一条助手
-                    # 消息正文」（即 agent 轮次的最后消息，通常就是当前这条含本
-                    # 工具调用的消息的 content）；send=false 或不填（默认 false）：
-                    # 不发送，保持静默——与"不调用本工具"语义等价。每一轮都默认
-                    # false，上一轮是否交付过不影响本轮。
+                    # deliver_reply：静默模式（/show off）下模型通过 send 布尔
+                    # 参数选择是否交付最终内容。send=true：发送「本轮最后一条
+                    # 助手消息正文」（即 agent 轮次的最后消息，通常就是当前
+                    # 这条含本工具调用的消息的 content）。send 的**缺省值按
+                    # 事件源区分**（get_ai_response 在 agent 开始时经
+                    # turn_recovery.reset_turn_delivery_state 重置）：静默
+                    # USER 回合（用户主动发消息）缺省 true——不填按发送处理
+                    # （模型整轮不调用时收尾还会兑底发送）；显式 false 才
+                    # 标记抑制、本轮静默。静默 TIMER 回合（后台巡检）缺省
+                    # false——不填 / false 均不发送（与"不调用本工具"语义
+                    # 等价），必须显式 true 才发送。
                     # 容错：个别模型会把布尔写成字符串（"true"/"false"）。
                     send_flag = fn_args.get("send")
+                    send_explicit = send_flag is not None
+                    if send_flag is None:
+                        # 未填 send → 采用本轮缺省值（USER=true / TIMER=false）。
+                        send_flag = turn_recovery.default_send_value(builder.chat_id)
                     if isinstance(send_flag, str):
                         send_flag = send_flag.strip().lower() in ("true", "1", "yes")
                     send_flag = bool(send_flag)
                     if not send_flag:
-                        result_str = (
-                            "未发送：send=false（或不填，默认 false），本轮保持静默，"
-                            "用户不会收到任何内容。无需再次调用本工具确认这一结果。"
-                        )
+                        # 不发送（显式 false 或 TIMER 缺省 false）：标记本轮
+                        # 抑制，收尾不再兑底（对 USER 回合即"模型明确选择
+                        # 不发送"；TIMER 回合本来就没有兑底）。
+                        turn_recovery.mark_reply_suppressed(builder.chat_id)
+                        if send_explicit:
+                            result_str = (
+                                "未发送：send=false，本轮保持静默，用户不会收到任何内容。"
+                                "无需再次调用本工具确认这一结果；若想让用户收到，把完整、"
+                                "自包含的最终回复写成当前消息正文后再次调用并填 send=true。"
+                            )
+                        else:
+                            result_str = (
+                                "未发送：本回合 send 未填，默认 false（TIMER 主动巡检回合缺省"
+                                "不发送），本轮保持静默。若需要用户看到结论，请显式填 send=true "
+                                "再次调用。"
+                            )
                     else:
                         body = _last_assistant_text(new_history_entries)
                         if not body:

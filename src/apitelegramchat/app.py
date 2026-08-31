@@ -863,9 +863,12 @@ async def _handle_timer_wakeup(chat_id: int):
     """TIMER 事件源回合：系统后台唤醒 agent 的“自己的活动时间”。
 
     与用户回合共用同一份会话历史（统一上下文），并走**同一套草稿与交付
-    流程**（由 /show 开关统一决定，见 ai_handlers.get_ai_response）：
+    流程**（由 /show 开关统一决定，见 ai_handlers.get_ai_response；
+    静默交付的 send 缺省值按事件源区分——TIMER 缺省 false，USER 缺省
+    true）：
     - /show on：展示富文本草稿，最终回复经 sendRichMessage 送达用户；
-    - /show off：静默运行，模型经 deliver_reply / message_user 触达用户；
+    - /show off：静默运行（TIMER 回合 send 缺省 false，不填 / 不调用均
+      不发送），模型经 deliver_reply(send=true) / message_user 触达用户；
     - 向请求上下文追加合成 user 消息（WAKEUP_PROMPT），但不写入持久历史；
     - 回合被用户消息打断时由 proactive.interrupt_proactive_flow 取消
       任务并触发 turn_recovery 轮次日志保全（已完成的进度沉淀进历史，
@@ -2096,10 +2099,13 @@ async def webhook() -> tuple:
                         await _send_via_send_message(
                             chat_id,
                             "✅ <b>草稿预览已关闭（静默模式）</b>\n"
-                            "过程与最终回复不再自动展示，也不会自动发送——AI 认为"
-                            "需要你看到结论时，会主动把最终回复直接发送给你"
-                            "（deliver_reply，不经草稿）；不发送则本轮完全静默。"
-                            "提问/留言走 message_user。",
+                            "过程不再实时展示。交付规则分两种：\n"
+                            "①你主动发消息时<b>默认交付</b>——最终回复会在回合结束时"
+                            "自动发送给你（AI 也可主动提前发送；仅当 AI 明确选择不发送时"
+                            "本轮才完全静默）；\n"
+                            "②后台主动巡检（TIMER）时默认静默——AI 认为需要你看到"
+                            "结论时才会主动发送（deliver_reply，不经草稿），不发送则"
+                            "本轮完全静默。提问/留言走 message_user。",
                             reply_message_id=msg["message_id"],
                         )
                     else:

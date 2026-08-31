@@ -145,7 +145,11 @@ async def get_show_drafts(chat_id: int) -> bool:
 
 
 async def set_show_drafts(chat_id: int, enabled: bool) -> None:
-    """设置该 chat 的草稿预览开关（False = 静默模式，走 deliver_reply 交付）。"""
+    """设置该 chat 的草稿预览开关。
+
+    False = 静默模式：交付走 deliver_reply，send 缺省值按事件源区分
+    （USER 回合默认 true、收尾有兜底；TIMER 回合默认 false、无兜底）。
+    """
     lock = await get_chat_lock(chat_id)
     async with lock:
         ctx = get_or_init_context(chat_id)

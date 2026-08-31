@@ -530,49 +530,85 @@ MESSAGE_USER_TOOL = {
 # 向后兼容别名：旧代码 / 旧引用仍可导入 ASK_USER_TOOL。
 ASK_USER_TOOL = MESSAGE_USER_TOOL
 
-# deliver_reply：/show off（静默模式）下模型通过 send 布尔参数自主选择是否
+# deliver_reply：/show off（静默模式）下模型通过 send 布尔参数选择是否
 # 把「本轮最后一条助手消息的 content 字段」通过 sendRichMessage 交付给用户。
 # send=true：系统发送该正文（不经过草稿，也不含 reasoning 等其他字段）；
-# send=false 或不填（默认 false）：不发送——"不调用"与"调用但填 false"
-# 语义等价，都保持静默。每一轮都默认 false：上一轮交付过与否不影响本轮，
-# 必须显式填 true 才发送。草稿开启（/show on）时本工具不进入工具面，
-# 模型看不到也就不会调用，除了草稿外不会产生单独 content；历史中的调用
-# 痕迹也会从出站上下文拔除（见 tool_visibility.SILENT_ONLY_TOOLS）。
-DELIVER_REPLY_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "deliver_reply",
-        "description": (
-            "仅在草稿预览关闭（静默模式，/show off）时可用：通过 send 参数决定是否"
-            "把你当前这条消息的正文（即本轮最后一条助手内容的 content 字段本身，"
-            "不含其他内容）作为一条永久富文本消息（Telegram Rich HTML）通过 "
-            "sendRichMessage 直接发送给用户，不经过草稿。send=true：发送——系统发送"
-            "的就是你当前消息的正文本身，因此正确用法是先把完整、自包含的最终回复"
-            "直接写成消息正文，再在同一条消息里调用本工具并填 send=true；send=false "
-            "或不填：不发送（默认，保持静默）。重要：在正文中用文字\"提到\"或\"声称已"
-            "使用\"本工具不会产生任何效果——只有通过标准 tool_calls API 机制真正发起"
-            "调用才会执行。静默模式下你的流式输出与最终回复都不会自动送达用户，系统"
-            "也不会代替你兑底发送——若本轮需要用户看到结论，必须填 send=true；若整轮"
-            "无需用户知晓（例如后台巡检无值得汇报的内容），则填 false 或不调用，保持"
-            "静默。交付成功后不要再调用本工具，也不要输出\"已发送/已确认\"之类的确认"
-            "正文——用户已经收到，重复确认只会造成冗余消息。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "send": {
-                    "type": "boolean",
-                    "description": (
-                        "是否把本轮最后一条助手消息正文发送给用户：true=发送；"
-                        "false 或不填=不发送（默认）。"
-                    ),
-                    "default": False,
+# send=false：显式不发送。send 的**缺省值（不填）按事件源区分**（见
+# build_deliver_reply_tool）：静默 USER 回合（用户主动发消息）默认 true
+# ——不填按发送处理，整轮不调用时收尾还会兜底发送最终回复，只有显式
+# send=false 才保持静默；静默 TIMER 回合（后台巡检）默认 false——不填 /
+# 不调用均不发送，必须显式填 true。上一轮交付或抑制与否不影响本轮，
+# 缺省值由 get_ai_response 在每轮 agent 开始时重置。草稿开启（/show on）
+# 时本工具不进入工具面，模型看不到也就不会调用，除了草稿外不会产生
+# 单独 content；历史中的调用痕迹也会从出站上下文拔除（见
+# tool_visibility.SILENT_ONLY_TOOLS）。
+def build_deliver_reply_tool(default_send: bool = False) -> dict:
+    """按本轮 send 缺省值生成 deliver_reply 工具定义。
+
+    - ``default_send=True``（/show off + USER 回合）：send 不填默认发送，
+      显式填 false 才静默（用户主动发消息默认应收到回复）；
+    - ``default_send=False``（/show off + TIMER 回合，保持旧行为）：send
+      不填 / false 均不发送，必须显式填 true 才交付。
+    工具名不变（deliver_reply），描述与参数 default 随缺省值调整，供模型
+    在当轮请求中读到正确的默认语义。
+    """
+    if default_send:
+        send_param_desc = (
+            "是否把本轮最后一条助手消息正文发送给用户：true 或不填（默认 true）"
+            "=发送；显式填 false=本轮不发送、完全静默。"
+        )
+        default_clause = (
+            "本回合 send=true 或不填（默认 true）都会发送；只有当你明确判断"
+            "本轮内容不该发给用户时，才显式填 send=false——此后本轮完全静默，"
+            "系统不再兜底发送，用户不会收到任何内容。"
+        )
+    else:
+        send_param_desc = (
+            "是否把本轮最后一条助手消息正文发送给用户：true=发送；"
+            "false 或不填=不发送（默认 false，TIMER 主动巡检回合默认保持静默）。"
+        )
+        default_clause = (
+            "本回合是 TIMER 主动巡检回合：send=false 或不填（默认 false）"
+            "均不发送——与\"不调用\"语义等价，本轮保持静默；需要用户看到"
+            "结论时必须显式填 send=true。"
+        )
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "deliver_reply",
+            "description": (
+                "仅在草稿预览关闭（静默模式，/show off）时可用：通过 send 参数决定是否"
+                "把你当前这条消息的正文（即本轮最后一条助手内容的 content 字段本身，"
+                "不含其他内容）作为一条永久富文本消息（Telegram Rich HTML）通过 "
+                "sendRichMessage 直接发送给用户，不经过草稿。send=true：发送——系统发送"
+                "的就是你当前消息的正文本身，因此正确用法是先把完整、自包含的最终回复"
+                "直接写成消息正文，再在同一条消息里调用本工具并填 send=true。"
+                + default_clause
+                + " 重要：在正文中用文字\"提到\"或\"声称已使用\"本工具不会产生任何"
+                "效果——只有通过标准 tool_calls API 机制真正发起调用才会执行。静默模式下"
+                "你的流式输出不会自动送达用户。交付成功后不要再调用本工具，也不要输出"
+                "\"已发送/已确认\"之类的确认正文——用户已经收到，重复确认只会造成冗余"
+                "消息。需要提问或留言可用 message_user（其超时表示用户不在，不是错误）。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "send": {
+                        "type": "boolean",
+                        "description": send_param_desc,
+                        "default": bool(default_send),
+                    },
                 },
-            },
-            "required": []
+                "required": []
+            }
         }
     }
-}
+    return tool
+
+
+# 向后兼容别名：等价于 TIMER 回合（默认 false）的工具定义。新代码请用
+# build_deliver_reply_tool(default_send=...) 按事件源生成。
+DELIVER_REPLY_TOOL = build_deliver_reply_tool(default_send=False)
 
 SEARCH_TOOLS = [
     {

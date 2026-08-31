@@ -2482,13 +2482,17 @@ async def execute_deliver_reply(chat_id: int, content) -> str:
     """deliver_reply：静默模式（/show off）下交付最终回复给用户。
 
     语义：发送的是 agent 轮次最后一条助手消息的 content 字段本身——由
-    ai/tool_call_loop.run_one 在 send=true 时从轮次日志里回溯得到后传入
-    （通常就是当前这条含 deliver_reply 调用的消息的 content），也不会附带
-    reasoning 等其他字段。本函数只负责发送与交付标记：通过 sendRichMessage
-    发送永久富文本消息（不经过草稿）；发送成功后在 turn_recovery 里标记
-    "本轮已主动交付"，get_ai_response 收尾时据此在日志中观测交付情况；
-    静默回合没有兜底直发——send 不为 true（或不调用本工具），本轮就不会
-    有任何内容送达用户。
+    ai/tool_call_loop.run_one 在 send 解析为 true 时从轮次日志里回溯得到后
+    传入（通常就是当前这条含 deliver_reply 调用的消息的 content），也不会
+    附带 reasoning 等其他字段。send 的缺省值按事件源区分（run_one 内经
+    turn_recovery.default_send_value 解析）：静默 USER 回合（用户主动发
+    消息）不填按 true 处理，静默 TIMER 回合（后台巡检）不填按 false
+    处理（必须显式 true）。本函数只负责发送与交付标记：通过
+    sendRichMessage 发送永久富文本消息（不经过草稿）；发送成功后在
+    turn_recovery 里标记"本轮已主动交付"，get_ai_response 收尾时据此决定
+    静默 USER 回合是否还需要按默认 true 兜底发送（已交付则不再兜底，
+    避免双发）；TIMER 回合没有兜底直发，不调用（或不显式填 true）本轮
+    就不会有任何内容送达用户。
 
     工具结果刻意不携带 message_id 与正文预览：旧版结果里的
     "已发送给用户（message_id=…）：正文预览"会诱导模型在后续轮次把
@@ -2700,9 +2704,11 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             return await execute_present_files(chat_id, paths, namespace=resolved_namespace)
         elif name == "deliver_reply":
             # 防御路径：正常情况下 deliver_reply 由 tool_call_loop.run_one 的
-            # 专用分支处理（send=true 时自动携带「本轮最后一条助手消息正文」）。
-            # 仅当其他路径（如子 agent 误用）直达 dispatch 时才走到这里——
-            # 此时没有轮次日志可回溯，统一按未发送处理，避免误发。
+            # 专用分支处理（send 解析为 true 时自动携带「本轮最后一条助手
+            # 消息正文」；send 缺省值按事件源区分——静默 USER 回合 true、
+            # 静默 TIMER 回合 false）。仅当其他路径（如子 agent 误用）直达
+            # dispatch 时才走到这里——此时没有轮次日志可回溯，统一按未发送
+            # 处理，避免误发。
             return (
                 "未发送：deliver_reply 只能在主对话的静默回合中生效"
                 "（send=true 时由系统发送本轮最后一条助手消息正文），"

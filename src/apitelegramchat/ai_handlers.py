@@ -375,11 +375,19 @@ async def get_ai_response(
       思考、工具进度、流式文本以富文本草稿实时展示；最终回复统一通过
       sendRichMessage 永久化送达用户（"后台随机事件后与用户主动走相同流程"）。
     - /show off（静默模式）：USER 与 TIMER 回合都使用 SilentMessageBuilder——
-      过程与最终文本都不自动送达，也不兜底直发：不调用 deliver_reply 就
-      什么都不发送。deliver_reply 仅在静默回合暴露（工具面追加；非静默
-      回合连同历史中的调用痕迹一起拔除，见 tool_visibility.SILENT_ONLY_TOOLS），
-      交付的就是 agent 轮次最后一条助手消息的 content 字段本身；
-      message_user 仍是提问 / 主动留言的交互通道（超时 = 用户不在）。
+      过程与流式文本不自动展示。deliver_reply 仅在静默回合暴露（工具面
+      追加；非静默回合连同历史中的调用痕迹一起拔除，见
+      tool_visibility.SILENT_ONLY_TOOLS），交付的是 agent 轮次最后一条
+      助手消息的 content 字段本身；message_user 仍是提问 / 主动留言的
+      交互通道（超时 = 用户不在）。静默回合的交付默认值按事件源区分
+      （每轮 agent 开始时经 turn_recovery.reset_turn_delivery_state 重置）：
+
+      - USER 回合（用户主动发消息）：deliver_reply 的 send 缺省为 true
+        ——不填按发送处理；整轮不调用 deliver_reply 时，收尾默认兜底
+        发送最终回复（用户主动提问理应收到回答）；只有模型显式填
+        send=false 才本轮完全静默。
+      - TIMER 回合（后台主动巡检）：send 缺省为 false（旧行为不变）
+        ——不填 / 不调用均不发送，无兜底直发，必须显式 send=true 才交付。
 
     打断保全（turn_recovery.py）：get_ai_response 开始时登记轮次日志
     journal，agentic 循环向其追加已完成消息；正常收尾由
@@ -398,6 +406,16 @@ async def get_ai_response(
     # 草稿开关：USER 与 TIMER 统一生效。
     show_drafts = await state.get_show_drafts(chat_id)
     silent_mode = not show_drafts
+    # 交付默认值重置（agent 开始时）：/show off 下按事件源区分 send 缺省值
+    # ——USER 回合默认 true（不填即发送，收尾有兜底；显式 send=false 才
+    # 静默）；TIMER 回合 / 非静默回合默认 false（旧行为）。顺带清掉上一轮
+    # （含异常 / 打断路径）残留的 delivered / suppressed 标记。
+    try:
+        turn_recovery.reset_turn_delivery_state(
+            chat_id, default_send=(silent_mode and not is_timer),
+        )
+    except Exception:
+        logger.debug("reset_turn_delivery_state 失败（可忽略）", exc_info=True)
     # 轮次日志（打断保全）：agentic 循环往里追加，正常收尾在
     # update_conversation_and_ledger 里注销；取消路径留在注册表里
     # 由打断方 finalize。
@@ -443,8 +461,9 @@ async def get_ai_response(
                 user_msg_in_history = False
 
         if silent_mode:
-            # /show off（静默模式，USER 与 TIMER 一致）：不创建可见草稿、
-            # 不注册活跃草稿、不发首帧。交付渠道 = deliver_reply / message_user。
+            # /show off（静默模式）：不创建可见草稿、不注册活跃草稿、不发
+            # 首帧。交付渠道 = deliver_reply / message_user；send 缺省值按
+            # 事件源区分（USER 默认 true、TIMER 默认 false，见开头重置）。
             from apitelegramchat.ai.rich_message_builder import SilentMessageBuilder
             builder = SilentMessageBuilder(chat_id)
             builder.add_initial_thinking("Thinking...")
@@ -534,26 +553,52 @@ async def get_ai_response(
             out_msg["content"] = resolved
             messages.append(out_msg)
 
-        # 静默模式（/show off）运行时告知：流式输出与最终回复不会自动送达，
-        # 需要用户看到内容时必须用 deliver_reply(send=true) / message_user。缺失
-        # 这层告知，模型会误以为自己的正文用户能看到。
+        # 静默模式（/show off）运行时告知：流式输出不实时展示，交付语义按
+        # 事件源分叉——USER 回合默认交付（收尾有兜底，显式 send=false 才
+        # 静默），TIMER 回合默认静默（必须显式 send=true）。缺失这层告知，
+        # 模型会误以为自己的正文用户能看到，或把两类回合的默认值弄混。
         if silent_mode:
-            messages.append({
-                "role": "system",
-                "content": (
-                    "当前会话已关闭草稿预览（静默模式，/show off）：你的流式输出与本轮最终回复"
-                    "不会自动送达用户，不调用交付工具时系统也不会兑底发送。若需要用户看到本轮"
-                    "内容，必须先把完整、自包含的最终回复直接写成消息正文，并在同一条消息中调用 "
-                    "deliver_reply 且填写 send=true（系统会把该正文的 content 本身用 sendRichMessage "
-                    "永久发送给用户，不经过草稿，也不附带其他内容）；send=false 或不填均表示不发送"
-                    "（默认 false）。特别强调：deliver_reply 是本次请求工具列表中真实存在的函数，"
-                    "在正文里用文字\"声称已通过 deliver_reply 发送\"不会有任何效果——必须通过 "
-                    "tool_calls API 真正发起调用，否则用户什么都收不到。交付成功后不要再调用 "
-                    "deliver_reply，也不要输出\"已发送/已确认\"之类的确认正文——用户已经收到，"
-                    "重复确认只会造成冗余消息。需要提问或留言可用 message_user（其超时表示用户"
-                    "不在，不是错误）。若整轮无需用户知晓，可以不调用任何交付工具，保持静默。"
-                ),
-            })
+            if is_timer:
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "当前会话已关闭草稿预览（静默模式，/show off），且本轮是 TIMER 后台"
+                        "主动巡检回合：你的流式输出与本轮最终回复不会自动送达用户，系统也不会"
+                        "兜底发送。若需要用户看到本轮内容，必须先把完整、自包含的最终回复直接"
+                        "写成消息正文，并在同一条消息中调用 deliver_reply 且显式填写 send=true"
+                        "（系统会把该正文的 content 本身用 sendRichMessage 永久发送给用户，"
+                        "不经过草稿，也不附带其他内容）；send=false 或不填均表示不发送"
+                        "（TIMER 回合默认 false，与不调用语义等价）。特别强调：deliver_reply "
+                        "是本次请求工具列表中真实存在的函数，在正文里用文字\"声称已通过 "
+                        "deliver_reply 发送\"不会有任何效果——必须通过 tool_calls API 真正"
+                        "发起调用，否则用户什么都收不到。交付成功后不要再调用 deliver_reply，"
+                        "也不要输出\"已发送/已确认\"之类的确认正文——用户已经收到，重复确认"
+                        "只会造成冗余消息。需要提问或留言可用 message_user（其超时表示用户"
+                        "不在，不是错误）。若整轮无需用户知晓，可以不调用任何交付工具，保持"
+                        "静默。注意：用户主动发消息的静默回合里 send 缺省值是 true，与本回合"
+                        "不同。"
+                    ),
+                })
+            else:
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "当前会话已关闭草稿预览（静默模式，/show off），本轮是用户主动发来的"
+                        "消息：默认交付——你的流式输出虽不会实时展示，但本轮最终回复会在回合"
+                        "结束时自动发送给用户，无需为此做额外操作；正常把完整、自包含的最终"
+                        "回复写成消息正文即可。也可以在同一条消息中调用 deliver_reply 主动"
+                        "交付（send=true 或不填，本回合默认 true；系统会把该正文的 content "
+                        "本身用 sendRichMessage 永久发送给用户，不经过草稿，也不附带其他"
+                        "内容）。只有当你明确判断本轮内容不该发给用户时，才调用 deliver_reply "
+                        "并显式填写 send=false——此后本轮完全静默，系统不再兜底发送，用户"
+                        "不会收到任何内容。特别强调：deliver_reply 是本次请求工具列表中真实"
+                        "存在的函数，在正文里用文字\"声称已通过 deliver_reply 发送\"不会有任何"
+                        "效果——必须通过 tool_calls API 真正发起调用。交付成功后不要再调用 "
+                        "deliver_reply，也不要输出\"已发送/已确认\"之类的确认正文——用户已经"
+                        "收到，重复确认只会造成冗余消息。需要提问或留言可用 message_user"
+                        "（其超时表示用户不在，不是错误）。"
+                    ),
+                })
 
         # 缓存标记必须在所有消息（含本轮新 user 消息）就位之后再打：
         # Anthropic 前缀缓存断点越靠后，能复用的前缀越长。此前在 user
@@ -584,7 +629,7 @@ async def get_ai_response(
             # message_user 提问/留言触达用户；静默模式下另有 deliver_reply
             # 交付最终内容。禁止直接投递文件/媒体、任意 Bash/文件写入，
             # 避免 TIMER 为了"找点事做"产生副作用。
-            from apitelegramchat.search_engine import SEARCH_TOOLS, DELIVER_REPLY_TOOL
+            from apitelegramchat.search_engine import SEARCH_TOOLS, build_deliver_reply_tool
             _PROACTIVE_ALLOWED_TOOLS = {
                 "web_search", "fetch_url", "wikipedia",
                 "exchange_rate", "book_lookup", "weather", "news", "crypto_price",
@@ -598,7 +643,9 @@ async def get_ai_response(
                 if (t.get("function") or {}).get("name") in _PROACTIVE_ALLOWED_TOOLS
             ]
             if silent_mode:
-                timer_tools = timer_tools + [DELIVER_REPLY_TOOL]
+                # TIMER 回合的 deliver_reply：send 缺省 false（与旧行为一致）
+                # ——必须显式 send=true 才交付，收尾无兑底。
+                timer_tools = timer_tools + [build_deliver_reply_tool(default_send=False)]
             # TIMER 回合说明：统一草稿流后，/show on 时过程与最终回复对用户
             # 可见；/show off 时静默，交付渠道是 deliver_reply / message_user。
             messages.append({
@@ -608,7 +655,8 @@ async def get_ai_response(
                     "有具体价值就自然地告知或推进；没有合理行动就保持简短，不要为了完成回合"
                     "而寒暄，也不要输出“我会等待”等等待式文本。需要用户回应时用 message_user；"
                     "静默模式下需要用户看到结论时，把结论写成消息正文并调用 deliver_reply"
-                    "（send=true，系统会把该正文直接发送给用户；交付后不要再重复确认）。"
+                    "（显式 send=true，系统会把该正文直接发送给用户；TIMER 回合不填 send 默认"
+                    "false 即不发送，交付后不要再重复确认）。"
                 ),
             })
             raw_content, usage, new_msgs = await _call_api(
@@ -616,13 +664,16 @@ async def get_ai_response(
                 tools=timer_tools, journal=journal,
             )
         else:
-            # USER 回合：静默模式（/show off）追加 deliver_reply，由模型
-            # 自主决定是否交付最终内容；草稿模式下系统会自动发送最终回复。
+            # USER 回合：静默模式（/show off）追加 deliver_reply，send 缺省
+            # true（用户主动发消息，默认交付；显式 send=false 才静默），
+            # 模型不调用时收尾由系统兑底发送最终回复；草稿模式下系统
+            # 自动发送最终回复（不暴露该工具）。
             if silent_mode:
-                from apitelegramchat.search_engine import DELIVER_REPLY_TOOL
+                from apitelegramchat.search_engine import build_deliver_reply_tool
                 raw_content, usage, new_msgs = await _call_api(
                     current_model, model_info, messages, chat_id, builder,
-                    tools=None, journal=journal, extra_tools=[DELIVER_REPLY_TOOL],
+                    tools=None, journal=journal,
+                    extra_tools=[build_deliver_reply_tool(default_send=True)],
                 )
             else:
                 raw_content, usage, new_msgs = await _call_api(
@@ -744,19 +795,48 @@ async def get_ai_response(
 
         final_html = re.sub(r'\n\s*\n', '\n', final_html)
 
-        # ── 最终交付（统一由 /show 开关决定，不再区分事件源）──────
+        # ── 最终交付（由 /show 开关 + 事件源共同决定）──────────────
         delivered_this_turn = turn_recovery.pop_reply_delivered(chat_id)
+        suppressed_this_turn = turn_recovery.pop_reply_suppressed(chat_id)
         if silent_mode:
-            # 静默模式（/show off，USER 与 TIMER 一致）：最终内容一律不自动
-            # 送达，也没有兜底直发——是否把内容发给用户完全由模型的
-            # deliver_reply 调用决定；模型没有调用，本轮就对用户保持完全
-            # 静默（什么都不发送）。交付的也只是最后一条助手消息的 content
-            # 字段本身，不附带 reasoning 等其他字段。
-            success = True
-            logger.info(
-                "[%s] 静默回合完成：最终内容不自动推送（delivered=%s，长度=%s，前 500 字）：\n%s",
-                chat_id, delivered_this_turn, len(cleaned_content), cleaned_content[:500],
-            )
+            if is_timer:
+                # 静默 TIMER 回合（旧行为不变）：最终内容一律不自动送达，
+                # 也没有兜底直发——是否交付完全由模型的 deliver_reply(send=true)
+                # 调用决定；模型没有调用，本轮对用户保持完全静默。
+                success = True
+                logger.info(
+                    "[%s] 静默 TIMER 回合完成：最终内容不自动推送（delivered=%s，长度=%s，前 500 字）：\n%s",
+                    chat_id, delivered_this_turn, len(cleaned_content), cleaned_content[:500],
+                )
+            elif delivered_this_turn:
+                # 静默 USER 回合：模型已通过 deliver_reply（send=true 或缺省 true）
+                # 主动交付过正文，不再兜底，避免双发。
+                success = True
+                logger.info(
+                    "[%s] 静默 USER 回合完成：已由 deliver_reply 交付（长度=%s，前 500 字）：\n%s",
+                    chat_id, len(cleaned_content), cleaned_content[:500],
+                )
+            elif suppressed_this_turn:
+                # 静默 USER 回合：模型显式 send=false 抑制交付，本轮完全静默
+                # （系统不兜底，用户不会收到任何内容）。
+                success = True
+                logger.info(
+                    "[%s] 静默 USER 回合完成：模型显式 send=false，本轮保持静默（长度=%s，前 500 字）：\n%s",
+                    chat_id, len(cleaned_content), cleaned_content[:500],
+                )
+            else:
+                # 静默 USER 回合默认交付（agent 开始时 send 缺省重置为 true）：
+                # 模型整轮未调用 deliver_reply → 按默认 true 兜底发送最终回复
+                # （用户主动发消息理应收到回答）。发送的就是与草稿模式一致的
+                # 最终富文本（builder 静默累积的正文），不附带 reasoning。
+                success = await send_rich_html_message(chat_id, final_html, reassert_draft=False)
+                if not success:
+                    logger.error(
+                        "[%s] 静默 USER 回合默认交付失败。完整待发送 HTML（未压缩、未截断）：\n%s",
+                        chat_id, final_html,
+                    )
+                else:
+                    logger.info(f"[{chat_id}] 静默 USER 回合默认交付成功（未调用 deliver_reply，按缺省 true 兜底）")
         elif final_tail_empty_after_rollover:
             success = True
             logger.info(f"[{chat_id}] 最后一段已在滚动时永久化，无需重复发送")

@@ -1316,8 +1316,11 @@ class SilentMessageBuilder(RichMessageBuilder):
     任何草稿帧，也从不做滚动永久化**。
 
     用于 /show off（静默模式）的回合——USER 与 TIMER 一致：agent 的思考、
-    工具进度与最终文本对用户不可见；需要触达用户时，模型通过
-    deliver_reply（交付最终回复）或 message_user（提问/留言）完成。
+    工具进度对用户不可见。触达用户的渠道按事件源有所区别：模型可通过
+    deliver_reply（交付最终回复；send 缺省值按事件源区分——USER 回合
+    默认 true / TIMER 回合默认 false）或 message_user（提问/留言）触达；
+    静默 USER 回合在模型未调用 deliver_reply 且未显式 send=false 时，
+    收尾还会按默认 true 兜底发送最终回复（见 get_ai_response 交付分支）。
 
     约定：``silent`` 属性为 True，供下层模块用
     ``getattr(builder, "silent", False)`` 做静默分支判断。

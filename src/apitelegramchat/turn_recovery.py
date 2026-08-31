@@ -55,18 +55,30 @@ user 消息落位（OpenAI 格式）
 让"快速连发多条消息"的合并链天然成立：msg2 打断 msg1 → msg2 并入 user1；
 msg3 再打断 → 若 msg2 的轮次仍无任何输出，msg3 继续并入同一条 user 消息。
 
-静默回复交付标记
-================
+静默回复交付标记（按事件源区分默认值）
+================================
 
 ``/show off``（静默模式）下，模型通过 ``deliver_reply`` 工具的 send 布尔
-参数自主选择是否把最终内容发给用户——send=true 时发送的是 agent 轮次
+参数选择是否把最终内容发给用户——send=true 时发送的是 agent 轮次
 最后一条助手消息的 content 字段（由 ``ai/tool_call_loop`` 在 journal 里
-回溯解析后传入 executor，不含 reasoning 等其他字段）；send=false 或不填
-（默认 false）则不发送，与"不调用"语义等价。executor 调用
-``mark_reply_delivered`` 记录"本轮已经主动交付过"，``get_ai_response``
-收尾时据此在日志中观测交付情况。静默回合没有兜底直发——send 不为 true
-或模型不调用 deliver_reply，本轮就对用户完全静默（是否交付完全由模型的
-工具调用决定）。
+回溯解析后传入 executor，不含 reasoning 等其他字段）。send 的**缺省值
+（不填）按事件源区分**，在每轮 agent 开始时由 ``reset_turn_delivery_state``
+重置：
+
+- **USER 回合**（用户主动发消息）：默认 **true**——不填按发送处理；
+  模型整轮都不调用 deliver_reply 时，``get_ai_response`` 收尾会按默认
+  交付兜底发送最终回复（用户主动提问理应收到回答）；只有显式填
+  ``send=false`` 才会标记 ``_reply_suppressed``，本轮对用户完全静默。
+- **TIMER 回合**（后台主动巡检）：默认 **false**——不填 / false / 不调用
+  均不发送，与旧行为一致，必须显式填 ``send=true`` 才发送；收尾无
+  兜底直发。
+
+executor 发送成功后调用 ``mark_reply_delivered`` 记录"本轮已经主动交付过"
+（对 USER 回合意味着收尾不再兜底）；``run_one`` 在显式 ``send=false`` 时
+调用 ``mark_reply_suppressed`` 记录"本轮显式抑制"。``get_ai_response``
+收尾时用 ``pop_reply_delivered`` / ``pop_reply_suppressed`` 读取并清除，
+据此决定 USER 静默回合是否需要兜底发送。三类标记都是轮次开始时重置，
+上一轮的取值不会泄漏到本轮（也顺带清理了异常/打断路径残留的旧标记）。
 
 锁顺序约定（防 ABBA 死锁）
 ==========================
@@ -103,8 +115,12 @@ __all__ = [
     "drain_completed_turns",
     "persist_salvaged_journal",
     "persist_user_message_entry",
+    "reset_turn_delivery_state",
+    "default_send_value",
     "mark_reply_delivered",
     "pop_reply_delivered",
+    "mark_reply_suppressed",
+    "pop_reply_suppressed",
 ]
 
 # 打断时未执行/被取消的工具调用的占位结果（OpenAI 格式 tool 消息 content）。
@@ -135,6 +151,16 @@ _inflight: dict[int, list[_InFlightEntry]] = {}
 
 # chat_id -> 本轮是否已通过 deliver_reply 主动交付过回复。
 _reply_delivered: set[int] = set()
+
+# chat_id -> 本轮模型是否显式抑制过交付（deliver_reply send=false）。
+# 仅对静默 USER 回合有意义：显式抑制后收尾不再兜底发送。
+_reply_suppressed: set[int] = set()
+
+# chat_id -> 本轮 deliver_reply 的 send 缺省值（在集合中 = 缺省 true）。
+# agent 轮次开始时由 reset_turn_delivery_state 重置：静默 USER 回合
+# 重置为 true（默认交付，收尾有兜底），静默 TIMER 回合 / 非静默回合
+# 重置为 false（保持旧行为）。
+_default_send: set[int] = set()
 
 
 # =====================================================================
@@ -445,8 +471,35 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
 
 
 # =====================================================================
-# 静默模式 deliver_reply 交付标记
+# 静默模式 deliver_reply 交付标记（轮次开始时重置，收尾时读取清除）
 # =====================================================================
+def reset_turn_delivery_state(chat_id: int, *, default_send: bool) -> None:
+    """agent 轮次开始时重置本轮交付状态，并设定 send 的缺省值。
+
+    - ``default_send=True``（/show off + USER 回合）：deliver_reply 的 send
+      不填按 true 处理；整轮未调用时收尾由 get_ai_response 兜底发送最终
+      回复；
+    - ``default_send=False``（/show off + TIMER 回合，或非静默回合）：
+      send 不填 / false / 不调用均不发送，无兜底（旧行为）。
+
+    顺带清理上一轮（含异常 / 打断路径）残留的 delivered / suppressed 标记，
+    保证"agent 开始时重置"语义成立：上一轮交付或抑制与否绝不影响本轮。
+    """
+    if chat_id is None:
+        return
+    _reply_delivered.discard(chat_id)
+    _reply_suppressed.discard(chat_id)
+    if default_send:
+        _default_send.add(chat_id)
+    else:
+        _default_send.discard(chat_id)
+
+
+def default_send_value(chat_id: int) -> bool:
+    """读取本轮 deliver_reply 的 send 缺省值（tool_call_loop.run_one 用）。"""
+    return chat_id is not None and chat_id in _default_send
+
+
 def mark_reply_delivered(chat_id: int) -> None:
     """deliver_reply executor 成功发送后调用。"""
     if chat_id is not None:
@@ -459,5 +512,21 @@ def pop_reply_delivered(chat_id: int) -> bool:
         return False
     if chat_id in _reply_delivered:
         _reply_delivered.discard(chat_id)
+        return True
+    return False
+
+
+def mark_reply_suppressed(chat_id: int) -> None:
+    """模型显式调用 deliver_reply(send=false) 后调用：本轮抑制兜底交付。"""
+    if chat_id is not None:
+        _reply_suppressed.add(chat_id)
+
+
+def pop_reply_suppressed(chat_id: int) -> bool:
+    """get_ai_response 收尾时读取并清除本轮显式抑制标记。"""
+    if chat_id is None:
+        return False
+    if chat_id in _reply_suppressed:
+        _reply_suppressed.discard(chat_id)
         return True
     return False
