@@ -94,6 +94,13 @@ async def _startup_load_whitelist() -> None:
     try:
         proactive.register_turn_runner(_handle_timer_wakeup)
         proactive.register_busy_check(_is_user_flow_active)
+        # 白名单二次校验：保证非授权 chat 永远不会被创建 timer / 触发
+        # TIMER 主动消息（即使按钮回调绕过了上层 is_authorized）。
+        proactive.register_authorized_check(_is_chat_authorized)
+        # 媒体模型门禁：当前模型为原生图片/视频生成模型时 _fire_turn
+        # 直接返回，不创建 runner 任务、不重排下一次——timer 自然死亡，
+        # 等用户切换回对话型模型后由 note_user_activity 恢复。
+        proactive.register_media_model_check(_is_media_model_active)
         await proactive.start_proactive_scheduler()
     except Exception:
         logger.warning("startup proactive scheduler failed", exc_info=True)
@@ -808,6 +815,50 @@ def _is_user_flow_active(chat_id: int) -> bool:
     return task is not None and not task.done()
 
 
+def _is_chat_authorized(chat_id: int) -> bool:
+    """该 chat_id 是否在白名单内（供 proactive 调度器二次校验）。
+
+    私聊场景下 chat_id == user_id；白名单条目可能是 @username 或纯数字
+    user_id 字符串。这里同时查两条路径：
+      1. ``str(chat_id)`` 直接查 user_id 路径；
+      2. 从会话上下文读出之前缓存的 ``username``，查 @username 路径。
+    这样无论用户是以哪种形式被 /adduser 加入白名单，proactive 都能
+    准确判断该 chat 是否授权，避免非白名单用户因 callback 等旁路入口
+    被误创建 timer 进而收到 TIMER 主动消息。
+    """
+    uid = str(chat_id)
+    if uid in ADMIN_USERS or uid in WHITELIST_USERS:
+        return True
+    try:
+        ctx = get_or_init_context(chat_id)
+        username = (ctx.get("username") or "").strip()
+    except Exception:
+        username = ""
+    if username and (username in ADMIN_USERS or username in WHITELIST_USERS):
+        return True
+    return False
+
+
+def _is_media_model_active(chat_id: int) -> bool:
+    """该 chat 当前模型是否为原生图片/视频生成模型（供 proactive 门禁）。
+
+    返回 True 时 proactive._fire_turn 会跳过 runner 创建且不重排下一次，
+    timer 自然死亡——等用户切换回对话型模型并产生任意活动后再恢复。
+    """
+    try:
+        cm = get_user_model(chat_id)
+    except Exception:
+        logger.debug("_is_media_model_active 读取模型失败，按非媒体模型处理", exc_info=True)
+        return False
+    model_info = SUPPORTED_MODELS.get(cm)
+    if model_info is None:
+        return False
+    return bool(
+        getattr(model_info, "native_image", False)
+        or getattr(model_info, "native_video", False)
+    )
+
+
 async def _handle_timer_wakeup(chat_id: int):
     """TIMER 事件源回合：系统后台唤醒 agent 的“自己的活动时间”。
 
@@ -821,7 +872,13 @@ async def _handle_timer_wakeup(chat_id: int):
       此处无需感知）。
     """
     try:
-        # 原生图片/视频模型不适合后台回合（会直接生成媒体并推给用户），跳过
+        # 纵深防御：proactive._fire_turn 在创建本 runner 之前已经做过一次
+        # 媒体模型门禁（且不会重排下一次 timer）。这里再检查一次是为了覆盖
+        # 极小的竞态窗口——proactive 检查通过后、runner 启动前用户刚好把
+        # 模型切到原生图片/视频生成模型。这里发现就 return（防止把
+        # WAKEUP_PROMPT 喂给媒体模型导致意外生成媒体并推给用户）；return
+        # 后 _run 的 finally 会调 note_turn_finished 重排下一次 timer，
+        # 那次 timer 触发时 proactive 层的门禁会彻底终止自递归调度。
         lock = await get_chat_lock(chat_id)
         async with lock:
             cm = get_user_model(chat_id)
@@ -831,7 +888,10 @@ async def _handle_timer_wakeup(chat_id: int):
         if model_info is not None and (
             getattr(model_info, "native_image", False) or getattr(model_info, "native_video", False)
         ):
-            logger.info(f"[proactive] chat={chat_id} 当前模型 {cm} 为原生媒体模型，跳过本次后台唤醒")
+            logger.info(
+                f"[proactive] chat={chat_id} 当前模型 {cm} 为原生媒体模型"
+                f"（runner 兜底命中，回合空转退出；下一次 timer 触发时 proactive 层门将彻底终止自递归）"
+            )
             return
 
         # TIMER 运行日志：只记录运行元数据，不记录模型隐藏推理或完整私密上下文。

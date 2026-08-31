@@ -24,6 +24,24 @@
 turn_recovery 保全已完成的进度，随后 USER 回合正常续上；该回合结束时
 再随机 5~20min 布置下一次——即"打断不影响节奏，只重算下一次"。
 
+白名单与媒体模型隔离
+====================
+
+- 通过 ``register_authorized_check`` 注册的回调，在 ``note_user_activity``
+  与 ``_fire_turn`` 两个入口都做白名单二次校验：非授权 chat 永远不会被
+  创建 timer 任务、永远不会触发 TIMER 回合——这意味着即使按钮回调绕过了
+  上层 ``is_authorized`` 检查，非白名单用户也收不到任何 TIMER 主动消息。
+  不同 chat 的 timer 完全独立（``_schedules`` 以 chat_id 为 key），多用户
+  共用同一 bot 时互不干扰。
+- 通过 ``register_media_model_check`` 注册的回调，在 ``_fire_turn`` 创建
+  runner 任务之前判断当前模型是否为原生图片/视频生成模型：
+  * 是 → 不创建 runner 任务、不调用 ``note_turn_finished``、不布置下一次；
+    timer 自然"死亡"，等用户切换回对话型模型并通过任意活动（发消息 /
+    点击按钮）触发 ``note_user_activity`` 后再恢复。
+  * 否 → 正常运行 TIMER 回合，回合结束时按原节奏布置下一次。
+  这一设计的关键：因为根本不产生 agent 回合，所以也不会触发"回合结束
+  时重置"——timer 不会自递归调度，正好满足"媒体模型时段彻底静默"的需求。
+
 实现要点
 ========
 
@@ -175,6 +193,14 @@ _stop_event = asyncio.Event()
 # 由 app.py 注册的回调：运行一个 TIMER 回合 / 判断 USER 流程是否进行中
 _turn_runner_callback: Optional[Callable[[int], Awaitable[None]]] = None
 _busy_check_callback: Optional[Callable[[int], bool]] = None
+# 由 app.py 注册的回调：判断该 chat 当前是否为原生图片/视频生成模型
+#   （native_image 或 native_video）。返回 True 时 _fire_turn 不会创建
+#   runner 任务、不会布置下一次 timer（详见模块 docstring）。
+_media_model_check_callback: Optional[Callable[[int], bool]] = None
+# 由 app.py 注册的回调：判断该 chat_id 是否在白名单内。返回 False 时
+#   note_user_activity 与 _fire_turn 都会直接返回，不会为该 chat 创建
+#   任何 timer / 主动消息——保证非白名单用户永远收不到 TIMER 主动消息。
+_authorized_check_callback: Optional[Callable[[int], bool]] = None
 
 
 def register_turn_runner(cb: Callable[[int], Awaitable[None]]) -> None:
@@ -187,6 +213,39 @@ def register_busy_check(cb: Callable[[int], bool]) -> None:
     """注册"该 chat 是否有 USER 流程进行中"的判断回调。"""
     global _busy_check_callback
     _busy_check_callback = cb
+
+
+def register_media_model_check(cb: Callable[[int], bool]) -> None:
+    """注册"该 chat 当前模型是否为原生媒体生成模型"的判断回调。
+
+    返回 True 时 ``_fire_turn`` 会跳过 runner 创建且**不布置下一次**——
+    timer 自然死亡，等用户切换回对话型模型并产生任意活动（发消息或
+    点击按钮触发 ``note_user_activity``）后再恢复调度。
+    """
+    global _media_model_check_callback
+    _media_model_check_callback = cb
+
+
+def register_authorized_check(cb: Callable[[int], bool]) -> None:
+    """注册"该 chat 是否在白名单内"的判断回调。
+
+    在 ``note_user_activity``（防止为非授权 chat 创建 timer）与
+    ``_fire_turn``（防止已存在的 timer 触发后向非授权 chat 发消息）
+    两个入口都做二次校验，保证非白名单用户永远收不到 TIMER 主动消息。
+    """
+    global _authorized_check_callback
+    _authorized_check_callback = cb
+
+
+def _is_chat_authorized(chat_id: int) -> bool:
+    """该 chat 是否在白名单内（未注册回调或回调异常时按授权处理，
+    以免白名单机制异常导致全量用户被静默）。"""
+    try:
+        if _authorized_check_callback is not None:
+            return bool(_authorized_check_callback(chat_id))
+    except Exception:
+        logger.debug("[proactive] chat=%s authorized check 异常，按授权处理", chat_id, exc_info=True)
+    return True
 
 
 def _busy_now(chat_id: int) -> bool:
@@ -322,10 +381,15 @@ async def note_user_activity(chat_id: int, *, private: bool = True) -> None:
     - 首次见到私聊 chat：一开始就随机 5~20min 布置第一次唤醒。
 
     任何授权用户消息（含命令、按钮点击）都算活动。群聊不参与主动唤醒。
+    非白名单 chat 直接返回：不为它创建任何 timer，保证非授权用户永远
+    收不到 TIMER 主动消息（即使按钮回调绕过了上层 is_authorized）。
     """
     if not PROACTIVE_ENABLED or chat_id is None:
         return
     if not private:
+        return
+    if not _is_chat_authorized(chat_id):
+        logger.info("[proactive] chat=%s 非白名单 chat，跳过主动唤醒调度", chat_id)
         return
     now = time.monotonic()
     async with _schedules_lock:
@@ -399,8 +463,21 @@ async def _sleep_or_stop(seconds: float) -> bool:
 
 
 async def _fire_turn(chat_id: int) -> None:
-    """触发一次 TIMER 唤醒回合；回合正常结束后布置下一次。"""
+    """触发一次 TIMER 唤醒回合；回合正常结束后布置下一次。
+
+    两道前置门禁（都在创建 runner 任务之前，因此不会触发
+    ``note_turn_finished`` 的自递归重排）：
+    1. 白名单校验：非授权 chat 直接返回，不创建任务、不重排下一次。
+       这是 timer 已挂起但用户中途被移出白名单时的兜底。
+    2. 媒体模型校验：当前模型为原生图片/视频生成模型时直接返回，
+       不创建任务、不重排下一次——timer 自然死亡，等用户切换回对话型
+       模型并产生任意活动（发消息 / 点击按钮触发 note_user_activity）
+       后再恢复调度。
+    """
     if _stop_event.is_set():
+        return
+    if not _is_chat_authorized(chat_id):
+        logger.info("[TIMER] chat=%s 决策=SKIP_UNAUTHORIZED：非白名单 chat，不触发主动唤醒", chat_id)
         return
     if chat_id in _active_flows:
         # 上一回合尚未结束（防御）：改期下一次
@@ -420,6 +497,19 @@ async def _fire_turn(chat_id: int) -> None:
             return
     except Exception:
         logger.debug("[proactive] chat=%s busy check 失败，按空闲处理", chat_id, exc_info=True)
+    # 媒体模型门禁：原生图片/视频模型不适合后台回合（会直接生成媒体并推
+    # 给用户）。返回前不调用 note_turn_finished，timer 不会自递归下一次；
+    # 用户切换回对话型模型并产生任意活动后由 note_user_activity 恢复。
+    try:
+        if _media_model_check_callback is not None and _media_model_check_callback(chat_id):
+            logger.info(
+                "[TIMER] chat=%s 决策=SKIP_MEDIA：当前模型为原生图片/视频生成模型，"
+                "不进行后台唤醒回合；不重排下一次（等用户切换模型后由其活动恢复）",
+                chat_id,
+            )
+            return
+    except Exception:
+        logger.debug("[proactive] chat=%s media model check 异常，按正常处理", chat_id, exc_info=True)
     runner = _turn_runner_callback
     if runner is None:
         return
