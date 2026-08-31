@@ -19,6 +19,10 @@ services:
     healthCheckPath: /health
     autoDeploy: true
     envVars:
+      - key: PORT
+        value: "10000"
+      - key: TZ
+        value: Asia/Shanghai
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: WEBHOOK_TOKEN
