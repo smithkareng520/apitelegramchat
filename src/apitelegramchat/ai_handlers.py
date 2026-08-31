@@ -96,10 +96,10 @@ def _workspace_guide_html(chat_id: int | None) -> str:
 <p>bash 与 text_editor 运行在你专属的工作区中，工作区根目录{path_html}就是 bash 会话的起始目录，也是<b>整个环境里唯一可写的位置</b>：Landlock 沙箱只放行这一棵目录树，<code>/tmp</code>、<code>/home</code>、<code>/</code> 等其他路径一律不可写（多数连读都被拒绝）——在那里写文件会得到 <code>curl</code> exit code 23、Python <code>PermissionError</code>。根目录下有两个特殊子目录，直接用相对路径读写：</p>
 <ul>
   <li><code>download/</code>：用户上传文件（文档等）的落地目录。直接读取即可，如 <code>bash</code> 执行 <code>cat download/报告.pdf</code>，或 <code>text_editor</code> 的 path 填 <code>download/报告.pdf</code>。</li>
-  <li><code>upload/</code>：发送文件给用户的暂存区。要发送产物时，先用 bash 复制进来（如 <code>cp 结果.docx upload/结果.docx</code>），再调用 <code>present_files</code> 发送。</li>
+  <li><code>upload/</code>：发送文件给用户的暂存区。所有相对路径都相对于工作区根目录解析。要发送产物时，先用 bash 复制进来（如 <code>cp 结果.docx upload/结果.docx</code>），再调用 <code>present_files</code>，参数必须写工作区相对路径 <code>upload/结果.docx</code>。</li>
 </ul>
 <ul>
-  <li><b>禁止 <code>cd</code> 出工作区</b>（包括习惯性的 <code>cd /tmp</code>）。下载、生成文件一律用相对路径落在当前目录：<code>curl -LO &lt;url&gt;</code>，或 <code>mkdir -p 目录 &amp;&amp; curl -o 目录/文件 &lt;url&gt;</code>。</li>
+  <li><b>工作区根目录是唯一相对路径根</b>，bash 每次新会话都从这里启动；禁止 <code>cd</code> 出工作区（包括习惯性的 <code>cd /tmp</code>）。下载、生成文件一律用相对路径落在工作区内：<code>curl -LO &lt;url&gt;</code>，或 <code>mkdir -p 目录 &amp;&amp; curl -o 目录/文件 &lt;url&gt;</code>。</li>
   <li>临时文件无需操心：<code>TMPDIR</code> 已指向沙箱内可写缓存，mktemp / Python tempfile 开箱即用。</li>
   <li>不要 <code>cd</code> 进入 upload/ 或 download/，也不要在其中执行命令；沙箱会拒绝，此时先 <code>cd</code> 回工作区根目录，再改用相对路径操作。</li>
 </ul>

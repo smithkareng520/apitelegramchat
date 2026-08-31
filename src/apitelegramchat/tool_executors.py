@@ -2276,21 +2276,14 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
 
 async def execute_present_files(chat_id: int, paths: List[str], namespace: str | None = None) -> str:
-    """Send files from the upload/ staging tree to the chat as attachments.
+    """Send staged files from the workspace to the chat as attachments.
 
-    Files MUST live under upload/ (the dedicated outgoing-artifact buffer).
-    The model is responsible for staging artifacts there first — e.g. via
-    bash using a relative path such as `cp out.txt upload/out.txt`.
-    Files left in workspace root/ are not directly sendable; this is the
-    persistence/execution boundary.
-
-    Path handling is intentionally lenient to accommodate common model
-    patterns: leading `./` is stripped, a single leading `upload/` segment
-    is stripped (so `present_files(["upload/hello.py"])` and
-    `present_files(["hello.py"])` are equivalent), and absolute paths that
-    resolve inside the per-chat upload/ root are accepted and converted to
-    their upload-relative form. Any path that escapes upload/ after
-    normalization is rejected.
+    Paths are workspace-relative. Files MUST be staged under ``upload/``
+    first, for example ``cp out.txt upload/out.txt``; the corresponding call
+    is ``present_files([\"upload/out.txt\"])``. Absolute paths are accepted
+    only when they resolve inside this chat's workspace. The final resolved
+    file must remain inside ``upload/``. This keeps Bash, file tools, and file
+    presentation in one path namespace.
     """
     if not paths:
         return json.dumps({
@@ -2331,81 +2324,40 @@ async def execute_present_files(chat_id: int, paths: List[str], namespace: str |
                     failed.append(f"{path} (invalid path)")
                     continue
 
-                # ----- 路径归一化 -----
-                # 模型经常按照 bash 示例 `cp out.txt upload/out.txt` 的写法
-                # 把 `upload/` 前缀也带上调用 present_files，这会导致
-                # upload_root/upload/<file> 这种"双重 upload"路径，文件找不到。
-                # 还有些模型会传 upload_root 的绝对路径。两种情况都要兼容，
-                # 否则会出现"明明文件就在 upload/，工具却报 not found"的
-                # 反直觉循环（历史上发生过：模型尝试 7 轮后放弃）。
+                # ----- 统一 workspace-relative 路径解析 -----
+                # 所有相对路径都相对于唯一 workspace 根目录解析；不再把
+                # present_files 的参数解释成相对于 upload/ 的第二套命名空间。
                 raw_path = path.strip()
-                # 去掉前导 "./"
                 while raw_path.startswith("./"):
                     raw_path = raw_path[2:]
-                # 处理绝对路径：若它落在 upload_root 子树内，提取其相对部分。
-                if os.path.isabs(raw_path):
-                    try:
-                        abs_resolved = Path(raw_path).expanduser().resolve()
-                    except Exception:
-                        logger.debug("execute_present_files 内部忽略的异常", exc_info=True)
-                        failed.append(f"{path} (invalid path)")
-                        continue
-                    # 必须严格落在 upload_resolved 之内（包含 upload_resolved 本身，
-                    # 但 upload_resolved 本身是目录不是文件，后面 is_file 会拦）。
-                    if abs_resolved != upload_resolved and upload_resolved not in abs_resolved.parents:
-                        failed.append(f"{path} (invalid path)")
-                        continue
-                    resolved = abs_resolved
-                    try:
-                        safe_rel = abs_resolved.relative_to(upload_resolved)
-                    except ValueError:
-                        safe_rel = Path(raw_path).name
-                    display_path = str(safe_rel)
-                else:
-                    # relative path: normpath first, then strip the leading
-                    # "<UPLOAD_DIR_NAME>/" segment if the model included it.
-                    norm = os.path.normpath(raw_path)
-                    if norm == "." or norm.startswith(".."):
-                        failed.append(f"{path} (invalid path)")
-                        continue
-                    parts = norm.split(os.sep)
-                    # 只要开头第一段是 upload dir 名，就剥掉它一次（且只剥一次，
-                    # 保留后续目录里同名子目录的可能性）。
-                    if parts and parts[0] == _UPLOAD_DIR_NAME:
-                        parts = parts[1:]
-                    if not parts or (len(parts) == 1 and parts[0] in ("", ".")):
-                        failed.append(f"{path} (invalid path)")
-                        continue
-                    # 重组剥掉 upload/ 后的相对路径；若剩下还以 .. 开头，则拒绝。
-                    rel = os.path.join(*parts) if not (len(parts) == 1 and parts[0] == ".") else ""
-                    if not rel or rel == "." or rel.startswith(".."):
-                        failed.append(f"{path} (invalid path)")
-                        continue
-                    display_path = rel
-                    local_path = upload_root / rel
-                    # 关键：使用 resolve() 跟随符号链接，再校验最终路径仍在 upload/ 之下
-                    try:
-                        resolved = local_path.resolve()
-                    except Exception:
-                        logger.debug("execute_present_files 内部忽略的异常", exc_info=True)
-                        failed.append(f"{path} (invalid path)")
-                        continue
-                    if resolved != upload_resolved and upload_resolved not in resolved.parents:
-                        failed.append(f"{path} (invalid path)")
-                        continue
+                workspace = workspace_workdir(chat_id, namespace).resolve()
+                try:
+                    if os.path.isabs(raw_path):
+                        candidate = Path(raw_path).expanduser()
+                        display_path = str(candidate.resolve().relative_to(workspace))
+                    else:
+                        norm = os.path.normpath(raw_path)
+                        if norm in ("", ".") or norm == ".." or norm.startswith(".." + os.sep):
+                            raise ValueError("path escapes workspace")
+                        display_path = norm
+                        candidate = workspace / norm
+                    resolved = candidate.resolve()
+                except (OSError, ValueError):
+                    failed.append(f"{path} (invalid workspace-relative path)")
+                    continue
+                if resolved != upload_resolved and upload_resolved not in resolved.parents:
+                    failed.append(
+                        f"{path} (not staged: workspace-relative path must be under "
+                        f"upload/, for example upload/{Path(display_path).name})"
+                    )
+                    continue
 
                 if not resolved.is_file():
-                    # 错误信息要把"模型实际该用的路径"说清楚：建议从 workdir 根
-                    # cp 到 upload/<basename>，并告诉模型下次直接传 upload 相对
-                    # 路径（不带 upload/ 前缀）。历史上这里曾用 `cp {path}
-                    # upload/{path}` —— 当 path 形如 "upload/hello.py" 时会被
-                    # 展开成 `cp upload/hello.py upload/upload/hello.py`，造成
-                    # 误导模型去创建 upload/upload/ 子目录。
                     failed.append(
-                        f"{path} (file not found under upload/ — stage it first via "
-                        f"`cp {display_path} upload/{display_path}` from workdir root, "
-                        f"then call present_files with the upload-relative path "
-                        f"'{display_path}', not the full '{path}')"
+                        f"{path} (file not found at workspace path {display_path!r}; "
+                        f"stage it from workspace root with `cp {display_path} "
+                        f"upload/{Path(display_path).name}` and call present_files with "
+                        f"the workspace-relative path `upload/{Path(display_path).name}`)"
                     )
                     continue
                 try:
@@ -2444,8 +2396,9 @@ async def execute_present_files(chat_id: int, paths: List[str], namespace: str |
 
 # ---------- 已移除工具的迁移提示 ----------
 # stage_upload / fetch_download / list_download / list_upload 已删除：upload/
-# 与 download/ 本就是工作区根目录的子目录，bash 可直接读写
-# （`cat download/x.pdf`、`cp out.txt upload/out.txt`、`ls -la upload/`）。
+# 与 download/ 本就是工作区根目录的子目录，bash 可直接读写；所有文件工具
+# 的相对路径也以 workspace 根目录解析（`cat download/x.pdf`、
+# `cp out.txt upload/out.txt`、`present_files(["upload/out.txt"])`）。
 # 若模型（尤其是带着旧对话历史）仍调用旧工具，返回可操作的迁移指引
 # 而不是干巴巴的“未知工具”。
 _REMOVED_TOOL_HINTS = {
@@ -2456,7 +2409,7 @@ _REMOVED_TOOL_HINTS = {
     ),
     "stage_upload": (
         "stage_upload 已移除：用 bash 把文件复制到 upload/ 子目录即可，"
-        "例如 `cp <文件> upload/<文件名>`，然后调用 present_files 发送给用户。"
+        "例如 `cp <文件> upload/<文件名>`，然后调用 present_files([\"upload/<文件名>\"]) 发送给用户。"
     ),
     "list_download": (
         "list_download 已移除：用 bash 执行 `ls -la download/` 查看用户上传的文件。"

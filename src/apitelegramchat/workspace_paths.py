@@ -67,8 +67,11 @@ def workspace_root(chat_id: object, namespace: object | None = None) -> Path:
 
 
 def workspace_workdir(chat_id: object, namespace: object | None = None) -> Path:
-    """Use the user workspace root directly as the agent working directory.
+    """Return the single canonical workspace root used as the agent cwd.
 
+    Every relative path in Bash, text_editor, staging, and file presentation is
+    resolved against this directory. It intentionally returns the same path as
+    :func:`workspace_root`; there is no separate project cwd or second path root.
     The workspace is local-only and is never mirrored wholesale to R2. Packaged
     skills live under ``skills/``; runtime/ remains available for local caches.
     """

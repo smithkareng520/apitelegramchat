@@ -614,10 +614,7 @@ bash
 present_files
 ```
 
-说明：`upload/` 与 `download/` 是工作区根目录的两个子目录，bash / text_editor
-可直接通过相对路径读写（`cat download/x.pdf`、`cp out.txt upload/out.txt`、
-`ls -la upload/`），不再提供 stage_upload / fetch_download / list_download /
-list_upload 跨边界工具。
+说明：每个会话只有一个 workspace 根目录，bash、text_editor 和文件展示工具都以它解析相对路径。`upload/` 与 `download/` 是该根目录的两个子目录，bash / text_editor 可直接通过相对路径读写（`cat download/x.pdf`、`cp out.txt upload/out.txt`、`ls -la upload/`）。发送文件时，`present_files` 也使用 workspace-relative 路径，例如 `present_files(["upload/out.txt"])`。
 
 ### 生成
 
@@ -652,7 +649,6 @@ generate_video
 <data-root>/
 ├── workspaces/
 │   └── <chat-or-scope>/
-│       ├── files/
 │       ├── upload/
 │       ├── download/
 │       ├── runtime/
@@ -670,7 +666,7 @@ src/apitelegramchat/workspace_paths.py
 
 ### `upload/` 与 `download/`
 
-它们是 workspace 根目录下的两个特殊子目录，而不是普通工作目录。
+它们是 workspace 根目录下的两个特殊子目录，而不是普通工作目录。workspace 根目录是 Shell 的固定起始目录，也是所有相对路径的唯一解析根；`present_files` 的参数同样相对于此根目录。
 
 - `download/`：Telegram 上传但尚未进入 workspace 的文件；
 - `upload/`：准备发送给用户的文件。
@@ -691,7 +687,7 @@ Agent/Bash 编辑
     ↓
 upload/（bash `cp 产物 upload/xxx`）
     ↓
-present_files
+present_files(["upload/xxx"])
     ↓
 Telegram
 ```

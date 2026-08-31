@@ -1068,7 +1068,7 @@ SEARCH_TOOLS = [
                 "  Read them directly from your cwd: `ls download/`, `cat download/brief.pdf`.\n"
                 "- upload/ is the staging area for outgoing files. To send a file to the\n"
                 "  user, copy it here first (`cp report.pdf upload/report.pdf`), then call\n"
-                "  present_files.\n"
+                "  present_files with the workspace-relative path `upload/report.pdf`.\n"
                 "- Both directories live at the root of your workspace (your starting cwd).\n"
                 "  You MAY freely read and write files inside them via relative paths.\n"
                 "- You MAY NOT `cd` into upload/ or download/, and you MAY NOT execute any\n"
@@ -1114,11 +1114,10 @@ SEARCH_TOOLS = [
             "name": "present_files",
             "description": (
                 "Send one or more files from upload/ to the chat as attachments. Files MUST already be "
-                "staged under upload/ via bash (e.g. `cp out.txt upload/out.txt`); files left "
-                "elsewhere in the workdir are NOT directly sendable. Pass paths relative to "
-                "upload/ (e.g. `hello.py` or `out/report.pdf`). A single leading `upload/` "
-                "prefix and a leading `./` are tolerated; absolute paths inside the per-chat "
-                "upload/ root are also accepted. Wildcards are not supported."
+                "staged under upload/ via bash (e.g. `cp out.txt upload/out.txt`). Pass "
+                "workspace-relative paths, including the `upload/` prefix (e.g. "
+                "`upload/out.txt` or `upload/reports/report.pdf`). Absolute paths inside "
+                "the per-chat workspace are also accepted. Wildcards are not supported."
             ),
             "parameters": {
                 "type": "object",
@@ -1126,7 +1125,7 @@ SEARCH_TOOLS = [
                     "paths": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "要发送的文件路径列表（相对 upload/ 根）。"
+                        "description": "要发送的文件路径列表（相对于 workspace 根目录；待发送文件必须位于 upload/ 下，例如 upload/report.pdf）。"
                     }
                 },
                 "required": ["paths"]
