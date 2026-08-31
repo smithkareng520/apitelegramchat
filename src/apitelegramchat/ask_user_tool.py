@@ -11,12 +11,14 @@ agent loop continues.
 双用途语义：
 
 - 提问（带 options）：发按钮卡等待用户点选；
-- 通知 / 主动留言（不带 options）：只发一条消息，等待用户自由回复；
-  用户在下一条非命令文本里的任何回复都会作为 custom 答案回填工具，
-  原轮次继续（"用户回复了就是正常"）；
-- 超时（默认 10 分钟，ASK_USER_TIMEOUT 可配）：返回 {"type": "expired"}
-  ——含义是"用户当前不在"，不是错误。模型据此结束回合即可，
-  用户回来后的下一次交互会重新建立对话。
+- 给用户发消息（不带 options）：像现实中给同学发一条消息——发送后
+  等待用户自由回复；用户在下一条非命令文本里的任何回复都会作为 custom
+  答案回填工具，原轮次继续（"用户回复了就是正常"）；
+- 超时（默认 2 分钟，ASK_USER_TIMEOUT 可配）：返回 {"type": "expired"}
+  ——含义是"用户当前不在"，不是错误，就像发消息等了两分钟没人回。
+  模型据此结束回合即可，用户回来后的下一次交互会重新建立对话。
+  发消息模式超时后，已发送的消息卡片会被编辑成纯文本正文本身
+  （去掉「📨 助手消息」标题与过期提示），安静地留在聊天记录里。
 """
 from __future__ import annotations
 
@@ -43,11 +45,12 @@ ASK_USER_OPTION_DESCRIPTION_TOKEN_BUDGET = 64
 ASK_USER_ID_TOKEN_BUDGET = 32
 ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET = 1_000
 MAX_OPTIONS = 8
-# 修复：24h 超时太长——一个未回答的 ask_user 会把 agent 循环挂起整整一天，
+# 修复：24h 超时太长——一个未回答的 message_user 会把 agent 循环挂起整整一天，
 # 中间所有事件循环资源（chat lock、内存里的消息、模型 prompt cache 等）都
-# 不能释放。改成默认 10 分钟，足够用户做选择又不至于让会话僵死。
+# 不能释放。默认 2 分钟：像现实中给同学发消息——等两分钟没人回，就是不在；
+# 足够用户看到消息并做选择，又不至于让会话僵死。
 # 如需更长等待可通过环境变量 ASK_USER_TIMEOUT 覆盖。
-INTERACTION_TIMEOUT = int(os.getenv("ASK_USER_TIMEOUT", str(10 * 60)))
+INTERACTION_TIMEOUT = int(os.getenv("ASK_USER_TIMEOUT", str(2 * 60)))
 
 
 @dataclass
@@ -165,7 +168,8 @@ def _question_html(interaction: AskUserInteraction) -> str:
     """
     question = escape_html(interaction.question)
     if not interaction.options:
-        # 通知 / 主动留言模式：无需选择，用户直接回复文本即可。
+        # 发消息模式（给用户发消息）：无需选择，用户直接回复文本即可。
+        # 超时后本卡片会被编辑成只剩纯文本正文（见 wait_for_answer）。
         return (
             f"<p>📨 <b>助手消息</b></p><p>{question}</p>"
             f"<p><i>直接回复文本即可；长时间不回复本消息会自动过期。</i></p>"
@@ -453,7 +457,18 @@ async def wait_for_answer(interaction: AskUserInteraction) -> dict[str, Any]:
         interaction.status = "expired"
         if interaction.future and not interaction.future.done():
             interaction.future.set_result({"type": "expired"})
-        await _edit_question_message(interaction, _answered_html(interaction, {"type": "expired"}))
+        if interaction.options:
+            # 提问卡超时：显示「用户未回复」状态卡。
+            await _edit_question_message(interaction, _answered_html(interaction, {"type": "expired"}))
+        else:
+            # 发消息模式超时：把消息编辑成纯文本正文本身——去掉
+            # 「📨 助手消息」标题与「会自动过期」提示，也不显示
+            # 「用户未回复」状态。就像现实中给同学发消息：等了两分钟
+            # 没人回，消息本身安静地留在聊天记录里就够了。
+            await _edit_question_message(
+                interaction,
+                f"<p>{escape_html(interaction.question)}</p>",
+            )
         await _clear_pending(interaction)
         return {"type": "expired"}
     except asyncio.CancelledError:

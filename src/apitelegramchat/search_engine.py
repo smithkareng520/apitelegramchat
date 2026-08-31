@@ -464,8 +464,9 @@ VIDEO_MODELS = _get_video_models()
 # ---------- 工具定义 ----------
 # message_user（原 ask_user）：双用途人类交互工具。
 # - 提问：带 options，出按钮卡等用户选；
-# - 发消息 / 主动留言：不带 options，只发一条消息等用户自由回复；
-#   超时即"用户不在"（不是错误），用户回复了就是正常。
+# - 给用户发消息：不带 options，像给同学发一条消息——发送后等用户自由
+#   回复；超时（默认 2 分钟）即"用户不在"（不是错误），已发送的消息
+#   卡片会被简化成纯文本正文留在聊天记录里；用户回复了就是正常。
 MESSAGE_USER_TOOL = {
     "type": "function",
     "function": {
@@ -473,11 +474,14 @@ MESSAGE_USER_TOOL = {
         "description": (
             "Send a message to the user and optionally wait for their reply. Two use cases: "
             "(a) ask a clarifying question — provide 2-6 concise options as buttons; "
-            "(b) send a notification or proactive message — omit options entirely, and any text "
-            "the user types next is returned as the reply. "
-            "The tool suspends until the user answers in Telegram, the user cancels, or the timeout "
-            "(default 10 minutes) elapses. A timeout returns {\"type\":\"expired\"} which simply means "
-            "the user is currently away — it is NOT an error; wrap up the turn gracefully. "
+            "(b) message the user — omit options entirely and the question is delivered "
+            "as a plain text message, like texting a friend: you send it, wait briefly "
+            "(default 2 minutes), and if there is no reply the user is simply away. Any "
+            "text the user types next is returned as the reply. "
+            "The tool suspends until the user answers in Telegram, the user cancels, or the "
+            "timeout (default 2 minutes) elapses. A timeout returns {\"type\":\"expired\"} which "
+            "simply means the user is currently away — it is NOT an error; wrap up the turn "
+            "gracefully (after a timeout the sent message stays in the chat as plain text). "
             "In proactive/background turns this is also the natural channel to reach the user. "
             "Never call this tool more than once in the same tool-call batch."
         ),
@@ -494,7 +498,8 @@ MESSAGE_USER_TOOL = {
                     "maxItems": 8,
                     "description": (
                         "可选的选项列表。提供时渲染为按钮提问卡；完全省略（或空数组）则为"
-                        "纯通知/主动消息模式，等待用户自由文本回复。"
+                        "给用户发消息模式（纯文本消息，像给朋友发一条消息），等待用户自由"
+                        "文本回复。"
                     ),
                     "items": {
                         "type": "object",
