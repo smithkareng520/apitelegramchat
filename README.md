@@ -511,7 +511,7 @@ isla
 
 ```text
 /show on    # 开启草稿预览（默认）：USER 与 TIMER 回合都实时展示富文本草稿
-/show off   # 静默模式：过程不展示。交付分事件源：用户主动发消息时默认交付（send 缺省 true，收尾有兑底，显式 send=false 才静默）；TIMER 巡检时 send 缺省 false，模型经 deliver_reply(send=true) 自主交付
+/show off   # 静默模式：过程不展示。交付分事件源：用户主动发消息时默认交付（send 缺省 true，收尾有兜底——兜底发送最后一条非空助手消息正文，与 deliver_reply 同源；显式 send=false 才静默）；TIMER 巡检时 send 缺省 false，模型经 deliver_reply(send=true) 自主交付
 /show       # 查看当前状态
 ```
 
@@ -1248,7 +1248,7 @@ Telegram#U5bcc#U6d88#U606f#U8349#U7a3f#U6eda#U52a8#U7b56#U7565.md
 | 模式 | USER 回合 | TIMER 回合 |
 |---|---|---|
 | /show on | 富文本草稿实时展示，最终回复自动送达 | 同左（统一流程） |
-| /show off | 静默运行；`deliver_reply` 的 send **缺省 true**：不填 / send=true 均交付（不调用时收尾由系统兑底发送最终回复），只有显式 send=false 才本轮不发送任何内容；`message_user` 提问/留言 | 静默运行；send **缺省 false**（旧行为）：模型经 `deliver_reply`（显式 send=true）自主交付最终内容，不填 / false / 不调用均不发送，无兑底；`message_user` 提问/留言 |
+| /show off | 静默运行；`deliver_reply` 的 send **缺省 true**：不填 / send=true 均交付（不调用时收尾由系统兜底发送最后一条非空助手消息正文，与工具交付同源），只有显式 send=false 才本轮不发送任何内容；`message_user` 提问/留言 | 静默运行；send **缺省 false**（旧行为）：模型经 `deliver_reply`（显式 send=true）自主交付最终内容，不填 / false / 不调用均不发送，无兜底；`message_user` 提问/留言 |
 
 ### 3. 工具变更：send_message_to_user 移除，ask_user → message_user
 
@@ -1277,15 +1277,18 @@ Telegram#U5bcc#U6d88#U606f#U8349#U7a3f#U6eda#U52a8#U7b56#U7565.md
   且每轮 agent 开始时重置（上一轮交付或抑制与否不影响本轮）：
 
   - **USER 回合**（用户主动发消息）：缺省 **true**——不填 / send=true 均发送；
-    模型整轮不调用时，收尾由系统按默认 true 兑底发送最终回复（用户主动
-    提问理应收到回答）；只有显式 `send=false` 才本轮完全静默（无兑底）。
+    模型整轮不调用时，收尾由系统按默认 true 兜底发送最终回复（用户主动
+    提问理应收到回答）——兜底与工具交付**同源**，发送的都是 agent 轮次
+    最后一条非空 assistant 消息的 content 本身（经 sendRichMessage 直发，
+    不使用整轮草稿累积，也不附带中间轮次的过程文本与工具卡片）；只有
+    显式 `send=false` 才本轮完全静默（无兜底）。
   - **TIMER 回合**（后台主动巡检）：缺省 **false**——不填 / false / 不调用
-    均不发送（与旧行为一致），必须显式 `send=true` 才交付，收尾无兑底。
+    均不发送（与旧行为一致），必须显式 `send=true` 才交付，收尾无兜底。
 
   因为 /show on 时该工具不进入工具面、模型看不到也就不会调用，除了草稿
   外不会产生单独 content。静默模式下模型的流式输出不会实时送达用户；
-  USER 回合有默认交付兑底（显式 send=false 除外），TIMER 回合则完全
-  没有兑底——不显式 send=true，本轮就对用户完全静默。交付成功后系统会
+  USER 回合有默认交付兜底（显式 send=false 除外），TIMER 回合则完全
+  没有兜底——不显式 send=true，本轮就对用户完全静默。交付成功后系统会
   明确告知模型不要再调用、也不要输出「已发送/已确认」之类的确认正文，
   避免冗余回执消息链。
 - **deliver_reply 工具插拔**：该工具只在静默回合的工具面中暴露；非静默

@@ -184,7 +184,13 @@ def _format_subagent_progress_html(status_text: str) -> str:
 def _last_assistant_text(journal: list) -> str:
     """回溯轮次日志，返回最后一条非空 assistant 消息的正文。
 
-    deliver_reply(send=true) 用它解析「agent 轮次的最后一条消息正文」：
+    两处调用方共用本函数，保证交付内容同源：
+
+    1. ``deliver_reply(send=true)``：在 ``run_one`` 里解析「agent 轮次的
+       最后一条消息正文」传给 executor；
+    2. ``get_ai_response`` 收尾的静默 USER 回合兜底交付：模型整轮未调用
+       deliver_reply 时，兜底发送的也是这里回溯出的同一段正文。
+
     从 journal 末尾向前找，跳过 content 为空/None 的纯工具调用消息；
     找不到返回 ""。（journal 即 new_history_entries，与 turn_recovery
     登记的是同一列表，调用时刻当前 assistant 消息——含 deliver_reply
@@ -403,7 +409,8 @@ async def _run_tool_calls_and_append(
                     # 事件源区分**（get_ai_response 在 agent 开始时经
                     # turn_recovery.reset_turn_delivery_state 重置）：静默
                     # USER 回合（用户主动发消息）缺省 true——不填按发送处理
-                    # （模型整轮不调用时收尾还会兑底发送）；显式 false 才
+                    # （模型整轮不调用时收尾还会兜底发送同一段最后一条非空
+                    # assistant 正文，与本工具交付内容同源）；显式 false 才
                     # 标记抑制、本轮静默。静默 TIMER 回合（后台巡检）缺省
                     # false——不填 / false 均不发送（与"不调用本工具"语义
                     # 等价），必须显式 true 才发送。
@@ -418,8 +425,8 @@ async def _run_tool_calls_and_append(
                     send_flag = bool(send_flag)
                     if not send_flag:
                         # 不发送（显式 false 或 TIMER 缺省 false）：标记本轮
-                        # 抑制，收尾不再兑底（对 USER 回合即"模型明确选择
-                        # 不发送"；TIMER 回合本来就没有兑底）。
+                        # 抑制，收尾不再兜底（对 USER 回合即"模型明确选择
+                        # 不发送"；TIMER 回合本来就没有兜底）。
                         turn_recovery.mark_reply_suppressed(builder.chat_id)
                         if send_explicit:
                             result_str = (

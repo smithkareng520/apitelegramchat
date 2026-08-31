@@ -2491,7 +2491,9 @@ async def execute_deliver_reply(chat_id: int, content) -> str:
     sendRichMessage 发送永久富文本消息（不经过草稿）；发送成功后在
     turn_recovery 里标记"本轮已主动交付"，get_ai_response 收尾时据此决定
     静默 USER 回合是否还需要按默认 true 兜底发送（已交付则不再兜底，
-    避免双发）；TIMER 回合没有兜底直发，不调用（或不显式填 true）本轮
+    避免双发；兜底路径发送的也是同一段最后一条非空 assistant 正文——
+    同样复用 _last_assistant_text 回溯，两条路径交付内容完全同源）；
+    TIMER 回合没有兜底直发，不调用（或不显式填 true）本轮
     就不会有任何内容送达用户。
 
     工具结果刻意不携带 message_id 与正文预览：旧版结果里的

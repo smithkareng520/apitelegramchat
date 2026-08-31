@@ -560,7 +560,11 @@ def build_deliver_reply_tool(default_send: bool = False) -> dict:
         default_clause = (
             "本回合 send=true 或不填（默认 true）都会发送；只有当你明确判断"
             "本轮内容不该发给用户时，才显式填 send=false——此后本轮完全静默，"
-            "系统不再兜底发送，用户不会收到任何内容。"
+            "系统不再兜底发送，用户不会收到任何内容。另请注意：即使你整轮"
+            "不调用本工具，回合结束时系统也会把本轮最后一条非空助手消息的"
+            "正文本身经 sendRichMessage 兜底交付给用户（与本工具 send=true "
+            "发送的内容完全同源）——因此中间轮次的过程性文字用户收不到，"
+            "务必把完整、自包含的最终回复写成最后一条消息的正文。"
         )
     else:
         send_param_desc = (

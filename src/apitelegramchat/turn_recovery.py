@@ -67,8 +67,11 @@ msg3 再打断 → 若 msg2 的轮次仍无任何输出，msg3 继续并入同�
 
 - **USER 回合**（用户主动发消息）：默认 **true**——不填按发送处理；
   模型整轮都不调用 deliver_reply 时，``get_ai_response`` 收尾会按默认
-  交付兜底发送最终回复（用户主动提问理应收到回答）；只有显式填
-  ``send=false`` 才会标记 ``_reply_suppressed``，本轮对用户完全静默。
+  交付兜底发送最终回复（用户主动提问理应收到回答）——兜底发送的内容
+  与工具交付**同源**：同为 agent 轮次最后一条非空 assistant 消息的
+  content 本身（同样经 sendRichMessage 直发，不使用整轮草稿累积，
+  也不附带中间轮次的过程文本与工具卡片）；只有显式填 ``send=false``
+  才会标记 ``_reply_suppressed``，本轮对用户完全静默。
 - **TIMER 回合**（后台主动巡检）：默认 **false**——不填 / false / 不调用
   均不发送，与旧行为一致，必须显式填 ``send=true`` 才发送；收尾无
   兜底直发。
@@ -477,8 +480,8 @@ def reset_turn_delivery_state(chat_id: int, *, default_send: bool) -> None:
     """agent 轮次开始时重置本轮交付状态，并设定 send 的缺省值。
 
     - ``default_send=True``（/show off + USER 回合）：deliver_reply 的 send
-      不填按 true 处理；整轮未调用时收尾由 get_ai_response 兜底发送最终
-      回复；
+      不填按 true 处理；整轮未调用时收尾由 get_ai_response 兜底发送最后
+      一条非空 assistant 消息正文（与工具交付同源）；
     - ``default_send=False``（/show off + TIMER 回合，或非静默回合）：
       send 不填 / false / 不调用均不发送，无兜底（旧行为）。
 

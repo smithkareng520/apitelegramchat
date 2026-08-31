@@ -11,7 +11,7 @@
 但静默专属工具 ``deliver_reply`` 需要按 ``/show`` 开关做**历史上下文
 插拔**（见 ``SILENT_ONLY_TOOLS``）：它只在静默回合（/show off）的工具面
 里暴露（模型通过 send 布尔参数决定是否发送；send 缺省值按事件源区分
-——静默 USER 回合默认 true（不填即发送，收尾有兑底），静默 TIMER
+——静默 USER 回合默认 true（不填即发送，收尾有兜底），静默 TIMER
 回合默认 false，因此 /show on 下模型看不到该工具也就不会产生除草稿
 外的单独发送）；非静默回合除了不提供工具定义，出站历史副本中已有的
 调用痕迹（assistant 的 tool_calls 与配对的 tool 消息）也一并拔除，

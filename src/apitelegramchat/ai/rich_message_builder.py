@@ -1320,7 +1320,10 @@ class SilentMessageBuilder(RichMessageBuilder):
     deliver_reply（交付最终回复；send 缺省值按事件源区分——USER 回合
     默认 true / TIMER 回合默认 false）或 message_user（提问/留言）触达；
     静默 USER 回合在模型未调用 deliver_reply 且未显式 send=false 时，
-    收尾还会按默认 true 兜底发送最终回复（见 get_ai_response 交付分支）。
+    收尾还会按默认 true 兜底发送最后一条非空 assistant 消息正文（与
+    deliver_reply 交付同源，见 get_ai_response 交付分支——收尾交付
+    **不使用** builder 静默累积的整轮草稿 HTML，以免把中间过程倾倒给
+    用户）。
 
     约定：``silent`` 属性为 True，供下层模块用
     ``getattr(builder, "silent", False)`` 做静默分支判断。
