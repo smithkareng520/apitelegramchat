@@ -126,7 +126,8 @@ async def build_system_prompt(
 <details open>
 <summary><b>⚠️ 严格格式要求</b></summary>
 <ul>
-  <li><b>严禁使用 Markdown 语法</b></li>
+  <li>严格按上述定义使用标签，切勿自行发明未定义的 HTML 标签。</li>
+  <li><b>严禁使用 Markdown 语法：例如 <code>---</code> 或者 <code>**</code></b></li>
   <li>
     <b>✅ 必须且仅能使用以下 Telegram HTML 标签（下表标签均为你应直接输出的字面写法，未经转义）：</b>
     <table bordered striped>
@@ -151,8 +152,6 @@ async def build_system_prompt(
       <tr><td>按钮行 (Button Row)</td><td><code><tg-button-row>…</tg-button-row></code>（Telegram Bot API 10.3 原生 Rich Message 按钮结构，对应 RichBlockButtons / RichTextButton / RichMessageButton）</td></tr>
     </table>
   </li>
-  <li>严格按上述定义使用标签，切勿自行发明未定义的 HTML 标签。</li>
-  <li>🔴 不要使用 Markdown 语法 例如 <code>---</code> 或者 <code>**</code></li>
 </ul>
 </details>
 
