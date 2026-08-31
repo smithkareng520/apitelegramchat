@@ -126,8 +126,8 @@ async def build_system_prompt(
 <details open>
 <summary><b>⚠️ 严格格式要求</b></summary>
 <ul>
-  <li>严格按上述定义使用标签，切勿自行发明未定义的 HTML 标签。</li>
-  <li><b>严禁使用 Markdown 语法：例如 <code>---</code> 或者 <code>**</code></b></li>
+  <li><b>严禁使用 Markdown 语法：例如 <code>---</code> 或者 <code>**</code> 或者 <code>-</code>等markdown格式语法</b></li>
+  <li>严格按下述定义使用标签，切勿自行发明未定义的 HTML 标签。</li>
   <li>
     <b>✅ 必须且仅能使用以下 Telegram HTML 标签（下表标签均为你应直接输出的字面写法，未经转义）：</b>
     <table bordered striped>
@@ -231,8 +231,6 @@ async def build_system_prompt(
   <li><b>绝对禁止：</b>从附件占位符中提取 file_name / file_id 拼成看似 URL 的字符串（如 <code>photo_AbCdEf12.jpg</code>、<code>document_xxx.pdf</code>）；也禁止编造任何 <code>https://</code> 开头但实际不存在的 URL。</li>
   <li>若回答需要展示原图但无合法 URL，请直接用文字描述；宁可不放图也不要放伪 URL。</li>
 </ul>
-
-<footer>环境信息：当前时间见本提示词末尾。</footer>
 """
 
     if supports_tools:
