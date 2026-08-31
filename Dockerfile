@@ -9,6 +9,9 @@ ENV PYTHONPATH=/app/src
 ENV APITELEGRAMCHAT_DATA_DIR=/tmp/apitelegramchat_data
 ENV TZ=Asia/Shanghai
 
+# 配置系统时区为上海（CST/UTC+8）
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
 # 沙箱用 Landlock（Linux 5.13+ 内核特性，非特权进程可用）。
 # node:22-bookworm-slim 基于 Debian 12 (bookworm)，内核 5.15+，Render 上 Landlock 可用。
 # 不需要 bubblewrap —— bwrap 在 Render 的非 privileged 容器里永远起不来
