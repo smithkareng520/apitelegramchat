@@ -14,7 +14,6 @@ from apitelegramchat.token_budget import count_tokens
 
 from apitelegramchat.utils import (
     send_rich_html_message,
-    get_last_sent_draft_content,
     delete_message,
     mark_draft_dead,
     check_deepseek_balance,
@@ -185,8 +184,11 @@ async def _interrupt_active_generation(chat_id: int) -> None:
          刷新请求；
       3. 旧任务停止后，把该轮已完成的 assistant/tool 消息补齐占位
          tool_result 并写入持久历史（进度不丢弃，新轮次从断点继续）；
-      4. 冻结旧草稿（mark dead + 注销活跃注册 + 标记保留），不再发送
-         "⏹️ 已停止输出"之类的提示消息——该提示在打断保全机制下已无价值。
+      4. 冻结旧草稿（mark dead + 注销活跃注册 + 标记保留）。旧任务的取消
+         路径已先尝试把草稿内容经 sendRichMessage 固定为永久消息
+         （ai_handlers → builder.finalize_interrupted_draft），本步骤只
+         作为固定失败 / 无可见内容时的兜底现场；不再发送"⏹️ 已停止
+         输出"之类的提示消息——该提示在打断保全机制下已无价值。
 
     时序说明：必须先确认旧任务（含草稿刷新循环）真正结束，再冻结草稿并
     启动新任务；否则旧任务迟到的刷新帧会排在新消息之后，出现"草稿位置
@@ -227,43 +229,22 @@ async def _interrupt_active_generation(chat_id: int) -> None:
 
     draft_id, _msg_id = draft_info
 
-    # 3) 旧任务已停止。先把用户已经看到的最后一帧草稿固定成永久富文本消息，
-    #    再标记草稿死亡；mark_draft_dead 会清理该瞬态 HTML 缓存，顺序不可反。
-    #    没有成功发送过的草稿帧时不发送空消息，原有冻结逻辑照常执行。
-    draft_html = get_last_sent_draft_content(chat_id, draft_id)
-    if draft_html:
-        try:
-            fixed = await send_rich_html_message(
-                chat_id, draft_html, reassert_draft=False,
-            )
-            if fixed:
-                logger.info(
-                    f"已将中断草稿固定为永久富文本消息: chat={chat_id} "
-                    f"draft={draft_id}"
-                )
-            else:
-                logger.warning(
-                    f"中断草稿固定发送失败，将保留原草稿现场: chat={chat_id} "
-                    f"draft={draft_id}"
-                )
-        except Exception as e:
-            logger.warning(f"固定中断草稿异常，将保留原草稿现场: {e}")
-
-    # 4) 标记草稿死亡：旧草稿不再接收任何刷新。
+    # 3) 旧任务已停止，标记草稿死亡：旧草稿冻结在当前位置，不再接收任何
+    #    刷新。不再发送"已停止输出"提示消息（用户要求移除）。
     try:
         await mark_draft_dead(draft_id)
         logger.info(f"已标记草稿死亡: chat={chat_id} draft={draft_id}")
     except Exception as e:
         logger.warning(f"mark_draft_dead 异常: {e}")
 
-    # 5) 注销活跃草稿注册，让新轮次的草稿能干净地接管。
+    # 4) 注销活跃草稿注册，让新轮次的草稿能干净地接管。
     try:
         await clear_active_draft(chat_id, draft_id)
         logger.info(f"已清除活跃草稿注册: chat={chat_id} draft={draft_id}")
     except Exception as e:
         logger.warning(f"clear_active_draft 异常: {e}")
 
-    # 6) 标记保留：若固定发送失败，旧草稿作为本轮进度的可见现场，任何"只删除草稿"
+    # 5) 标记保留：冻结的旧草稿作为本轮进度的可见现场，任何"只删除草稿"
     #    的清理路径都不得碰它。
     try:
         await mark_preserved_draft(draft_id)

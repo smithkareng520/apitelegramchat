@@ -18,6 +18,7 @@ from apitelegramchat.utils import (
     get_logger,
     delete_message_fast,
     mark_draft_dead,
+    is_draft_dead,
     RateLimitError,
     escape_html,
 )
@@ -1079,6 +1080,9 @@ class RichMessageBuilder:
             self._rollover_in_progress = True
             self._handoff_text = []
 
+        # 预置 None：取消可能落在赋值之前，下方 CancelledError 分支要
+        # 通过它判断“旧段是否已永久化”，未赋值时引用会 UnboundLocalError。
+        completed_message_id = None
         try:
             # 此处被调用在回合边界；等待永久消息期间不会启动下一次模型请求。
             completed_message_id = await send_rich_html_message(
@@ -1171,12 +1175,104 @@ class RichMessageBuilder:
                 _track_task(_cleanup_old_preview())
             return True
         except asyncio.CancelledError:
-            self._restore_handoff_text()
+            if (
+                completed_message_id
+                and self._rollover_in_progress
+                and self.draft_id == old_draft_id
+            ):
+                # 取消落在“旧段已永久化 → 状态换血”之间（sendRichMessage
+                # 已送达、blocks 尚未替换为尾段）：立即完成换血，让
+                # blocks 只剩未永久化的尾段（含交接缓冲）。否则上层打断
+                # 固定化（finalize_interrupted_draft）会按未换血的 blocks
+                # 把已永久化段落再发一遍，产生重复永久消息。
+                handoff_text = "".join(self._handoff_text or [])
+                self._handoff_text = None
+                self._replace_with_rollover_remainder(remainder, handoff_text)
+                self._rollover_pending = False
+                self._rollover_count += 1
+            else:
+                self._restore_handoff_text()
             self._rollover_in_progress = False
             raise
         except Exception:
             self._restore_handoff_text()
             self._rollover_in_progress = False
+            raise
+
+    async def finalize_interrupted_draft(self) -> bool:
+        """打断收尾：把草稿已累积的内容经 sendRichMessage 固定为永久消息。
+
+        与正常收尾的最终交付、回合边界滚动永久化**同源同法**：
+        - 内容构建：``_commit_stream_buffer`` + ``remove_thinking`` +
+          ``_build_html_no_thinking``（与 get_ai_response 正常路径同一套，
+          打断时的部分流式文本也随之固定，不因截断而丢弃可见进度）；
+        - 交付通道：``send_rich_html_message``（``reassert_draft=False``，
+          本轮流式已结束，不再把旧草稿回挂到新消息下方）；
+        - 清理语义：送达成功才删除瞬态草稿气泡；失败则保留冻结草稿，
+          由打断方（app._interrupt_active_generation 的 mark_dead +
+          mark_preserved_draft）兜底为可见进度现场。
+
+        守卫：
+        - 草稿已死亡时跳过——打断若恰好落在正常收尾阶段（stop_flush 后
+          已 mark_dead），该轮交付由正常路径负责，再发会造成重复消息；
+        - 无可见内容（打断仍停留在 Thinking 占位阶段）时跳过。
+
+        取消安全：调用语境是 get_ai_response 的 CancelledError 路径
+        （旧任务正在被取消）。固定化放在后台任务中经 ``asyncio.shield``
+        等待——打断方 _cancel_old_task 的 3s 等待超时会二次取消本任务，
+        届时固定化仍在后台继续完成（含气泡清理），不会半途而废。
+        """
+        if await is_draft_dead(self.draft_id):
+            return False
+        # 滚动交接缓冲兜底（正常由 rollover 的取消路径恢复，双保险）。
+        self._restore_handoff_text()
+        self._commit_stream_buffer()
+        self.remove_thinking()
+        final_html = self._build_html_no_thinking()
+        if not final_html.strip() or not _rich_visible_text(final_html).strip():
+            # 打断发生在任何可见内容产出之前：无可固定内容。
+            return False
+        chat_id = self.chat_id
+        draft_id = self.draft_id
+        draft_message_id = self.draft_message_id
+
+        async def _deliver_and_cleanup() -> bool:
+            try:
+                success = await send_rich_html_message(
+                    chat_id, final_html, reassert_draft=False,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "打断草稿永久化异常，保留冻结草稿作为可见兜底: chat=%s draft=%s",
+                    chat_id, draft_id, exc_info=True,
+                )
+                return False
+            if not success:
+                logger.warning(
+                    "打断草稿永久化失败，保留冻结草稿作为可见兜底: chat=%s draft=%s",
+                    chat_id, draft_id,
+                )
+                return False
+            if draft_message_id:
+                # 永久消息已送达：清理瞬态草稿气泡（与正常收尾同语义）。
+                # 保留标记（mark_preserved_draft）的意义是“没有永久替代时
+                # 保住可见现场”，此刻替代已固定，删除不属于误删清理。
+                deleted = await delete_message_fast(chat_id, draft_message_id)
+                if not deleted:
+                    logger.debug(
+                        "打断草稿气泡清理未完成: chat=%s msg=%s",
+                        chat_id, draft_message_id,
+                    )
+            return True
+
+        delivery = _track_task(_deliver_and_cleanup())
+        try:
+            return await asyncio.shield(delivery)
+        except asyncio.CancelledError:
+            # 二次取消（打断方对旧任务的等待超时）：固定化继续在后台完成；
+            # 取消照常向上传播，不打断取消协议。
             raise
 
     # ---------- 刷新与清理 ----------
@@ -1359,6 +1455,13 @@ class SilentMessageBuilder(RichMessageBuilder):
     async def rollover_at_turn_boundary(self, *, start_next_draft: bool = True) -> bool:
         # 关键覆盖：父类实现会把旧段"永久化"为 Telegram 消息，
         # 这会把 agent 过程泄漏给用户。静默回合永不滚动。
+        return False
+
+    async def finalize_interrupted_draft(self) -> bool:
+        # 关键覆盖：父类实现会把打断时已累积的草稿内容经 sendRichMessage
+        # 固定为永久消息——静默回合没有可见草稿，整轮倾倒过程正文会违反
+        # /show off 语义（交付只经 deliver_reply / 收尾兜底，且只发最后
+        # 一条 assistant 正文）。静默回合的打断只走 turn_recovery 保全。
         return False
 
     async def _register_active_draft(self, message_id: int = 0) -> None:

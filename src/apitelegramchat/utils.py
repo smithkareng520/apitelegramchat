@@ -963,20 +963,6 @@ async def _cleanup_dead_draft_state(chat_id: int, draft_id: int) -> None:
         _draft_failure_counts.pop(key, None)
         _draft_last_send_time.pop(key, None)
 
-
-def get_last_sent_draft_content(chat_id: int, draft_id: int) -> Optional[str]:
-    """返回当前草稿最近一次成功发送的 HTML 快照。
-
-    该快照只用于取消时把用户已经看到的草稿固定成永久消息；调用方必须在
-    ``mark_draft_dead`` 之前读取，因为死亡标记会清理这份瞬态缓存。
-    """
-    try:
-        content = _last_sent_draft_cache.get((chat_id, int(draft_id)))
-    except (TypeError, ValueError):
-        return None
-    return content if isinstance(content, str) and content.strip() else None
-
-
 async def mark_draft_dead(draft_id) -> None:
     try:
         draft_id_int = int(draft_id)

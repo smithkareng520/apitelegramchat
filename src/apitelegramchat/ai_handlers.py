@@ -929,6 +929,19 @@ async def get_ai_response(
                 await builder.stop_flush_loop()
             except Exception as e:
                 logger.debug(f"取消时停止草稿滚动异常（可忽略）: {e}")
+            # 打断保全的可见侧：旧草稿已累积的内容经 sendRichMessage 固定
+            # 为永久消息（与正常最终交付同源同法；静默回合为 no-op，不会
+            # 把过程倾倒给用户）。无可见内容或发送失败时保留冻结草稿，
+            # 由打断方 mark_preserved_draft 兜底——见
+            # RichMessageBuilder.finalize_interrupted_draft。
+            try:
+                await builder.finalize_interrupted_draft()
+            except asyncio.CancelledError:
+                # 二次取消（打断方对旧任务的等待超时）：后台固定化继续，
+                # 取消本身照常向上传播。
+                raise
+            except Exception:
+                logger.debug("打断草稿固定化异常（保留冻结草稿兜底）", exc_info=True)
         raise
 
     except Exception as e:
