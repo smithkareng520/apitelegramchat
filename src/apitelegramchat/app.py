@@ -64,10 +64,10 @@ from apitelegramchat.state import (
     mark_update_processed_if_new,
 )
 from apitelegramchat import turn_recovery
-from apitelegramchat.ask_user_tool import (
+from apitelegramchat.message_user_tool import (
     get_pending_for_chat,
-    resolve_callback as resolve_ask_user_callback,
-    resolve_text as resolve_ask_user_text,
+    resolve_callback as resolve_message_user_callback,
+    resolve_text as resolve_message_user_text,
 )
 from apitelegramchat.file_handlers import download_file
 from apitelegramchat.workspace_utils import _get_workspace_lock, init_workspace
@@ -645,8 +645,17 @@ async def _log_task_cancel(task: "asyncio.Task", chat_id: int) -> None:
 
 async def _cleanup_task(chat_id: int, task: asyncio.Task):
     async with active_tasks_lock:
-        if chat_id in active_tasks and active_tasks.get(chat_id) == task:
+        is_current = chat_id in active_tasks and active_tasks.get(chat_id) == task
+        if is_current:
             del active_tasks[chat_id]
+    if is_current:
+        # 当前 USER 回合完整结束（含异常收尾）：通知主动唤醒调度器布置
+        # 下一次 TIMER（随机 5~20min）。若该任务是"被打断后由新回合替换"
+        # 的旧任务（is_current=False），不打扰新回合——由新回合结束时再布置。
+        try:
+            await proactive.note_turn_finished(chat_id)
+        except Exception as e:
+            logger.warning(f"note_turn_finished 异常: {e}")
 
 # -------------------- 各类型消息处理 --------------------
 async def _handle_text_message(chat_id: int, user_input: str, username: str, user_message: dict):
@@ -1919,7 +1928,7 @@ async def webhook() -> tuple:
                 if (
                     pending_ask
                     and not user_input.startswith("/")
-                    and await resolve_ask_user_text(chat_id, user_input)
+                    and await resolve_message_user_text(chat_id, user_input)
                 ):
                     return "OK", 200
 
@@ -2000,6 +2009,12 @@ async def webhook() -> tuple:
                         ctx["last_prompt_tokens"] = 0
                         ctx["last_completion_tokens"] = 0
                         ctx["token_ledger"] = []
+                    # /clear 是语义边界：历史清空意味着重新开始，主动唤醒
+                    # timer 也重置为随机 5~20min 下一次。
+                    try:
+                        await proactive.reset_proactive_timer(chat_id)
+                    except Exception as e:
+                        logger.warning(f"reset_proactive_timer 异常: {e}")
                     await send_rich_html_message(chat_id, "✅ <b>操作成功</b>\n对话历史已清空", reply_parameters=_reply_params(msg["message_id"]))
                     return "OK", 200
 
@@ -2292,7 +2307,7 @@ async def webhook() -> tuple:
                     interaction_id = parts[1] if len(parts) > 1 else ""
                     action = parts[2] if len(parts) > 2 else ""
                     arg = parts[3] if len(parts) > 3 else ""
-                    ok, notice = await resolve_ask_user_callback(
+                    ok, notice = await resolve_message_user_callback(
                         chat_id, uid, interaction_id, action, arg
                     )
                     async with aiohttp.ClientSession() as s:

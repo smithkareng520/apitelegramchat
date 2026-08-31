@@ -1,7 +1,8 @@
 """Human-in-the-loop interaction for the agent: the ``message_user`` tool.
 
 （工具原名 ask_user，现改名为 message_user——意图扩展为"向用户发消息
-并等待回复"：带选项时是提问卡，不带选项时是纯通知/主动消息。）
+并等待回复"：带选项时是提问卡，不带选项时是给用户发一条消息。
+模块文件也由 ask_user_tool.py 同步更名为 message_user_tool.py。）
 
 The agent can pause on a ``message_user`` tool call while the Telegram draft
 keeps streaming. A persistent message with an InlineKeyboard collects the

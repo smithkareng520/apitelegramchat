@@ -20,7 +20,7 @@ from apitelegramchat.tool_executors import (
     tool_semaphore,
     _TOOL_TIMEOUT_MARKER,
 )
-from apitelegramchat.ask_user_tool import (
+from apitelegramchat.message_user_tool import (
     create_ask_user_interaction,
     wait_for_answer,
     answer_to_tool_result,
@@ -372,7 +372,7 @@ async def _run_tool_calls_and_append(
                     # message_user（原 ask_user）：提问 / 通知双用途。
                     # - 带选项：出按钮卡等待用户点选；
                     # - 无选项：作为通知/主动消息发送，等待用户自由回复，
-                    #   超时即"用户不在"（见 ask_user_tool 模块）。
+                    #   超时即"用户不在"（见 message_user_tool 模块）。
                     # USER 与 TIMER 回合均可用（TIMER 主动巡检靠它触达用户）。
                     question = fn_args.get("question", "")
                     options = fn_args.get("options", []) or []

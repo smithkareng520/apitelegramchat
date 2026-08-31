@@ -336,15 +336,16 @@ WEBHOOK_URL?token=WEBHOOK_TOKEN
 | 变量 | 默认 | 用途 |
 |---|---|---|
 | `PROACTIVE_ENABLED` | `true` | 主动唤醒总开关 |
-| `PROACTIVE_IDLE_START_SECONDS` | `1200` | 用户空闲多久后首次唤醒（20min，含 ±10% 抖动） |
-| `PROACTIVE_INTERVAL_CHOICES` | `600,1200,2400` | 唤醒间隔候选（秒，随机选择） |
-| `PROACTIVE_MAX_IDLE_SECONDS` | `10800` | 用户连续空闲多久后停止高频触发（3h） |
-| `PROACTIVE_REST_SECONDS` | `3600` | 休息时长；休息结束后再触发一次（1h） |
-| `PROACTIVE_POLL_SECONDS` | `10` | 调度协程轮询粒度（秒） |
+| `PROACTIVE_INTERVAL_MIN_SECONDS` | `300` | 两次唤醒间隔下限（秒） |
+| `PROACTIVE_INTERVAL_MAX_SECONDS` | `1200` | 两次唤醒间隔上限（秒，与下限构成随机 5~20min） |
+| `PROACTIVE_MAX_IDLE_SECONDS` | `7200` | 用户连续多久没发消息 → 进入慢节奏（2h） |
+| `PROACTIVE_REST_SECONDS` | `3600` | 慢节奏暂停时长：暂停 1h 再触发一次，用户仍无回应则继续（每 1h 看一眼） |
+| `PROACTIVE_WATCH_DELAY` | `2` | 用户事件后的观望窗口（秒）：纯命令/按钮输入在窗口后没有 agent 回合接管时直接布置下一次唤醒 |
 | `TOOL_VISIBILITY_FILTER` | `true` | 按事件源的工具可见性过滤器总开关。USER 回合把历史中 `send_message_to_user` 的调用痕迹折叠成普通文本摘要（保留语义、消除调用形状），从根源上防止模型在用户主动发消息时模仿调用该工具；TIMER 回合不受影响。设为 `false` 恢复旧行为。规则注册表见 `src/apitelegramchat/tool_visibility.py` |
 
 说明：仅**私聊**参与主动唤醒；bot 被用户屏蔽（sendMessage 403）时会自动停用
-该会话的调度；进程重启后空闲计时重新开始（chat 在首次用户活动时重新被跟踪）。
+该会话的调度；进程重启后调度重新开始（chat 在首次用户活动时重新被跟踪，
+一开始就随机 5~20min 布置第一次唤醒）。
 
 ### 缓存与 Prompt Cache
 
@@ -1288,8 +1289,17 @@ Telegram#U5bcc#U6d88#U606f#U8349#U7a3f#U6eda#U52a8#U7b56#U7565.md
 
 ### 4. TIMER 主动巡检（proactive）适配
 
-- 唤醒节奏与调度器不变（空闲 20min 进入活动时间，随机 10~90min 巡检，
-  连续 3h 无响应进入慢节奏）；
+- 唤醒节奏重构为**事件驱动单 timer 模型**（无轮询状态机、无复杂计算）：
+  - 一开始（首次跟踪 chat）就随机 **5~20min** 布置第一次唤醒；
+  - timer 到点触发一次 TIMER 回合，**回合结束后**再随机 5~20min 布置下一次；
+  - 用户发送任何消息：先取消挂起的 timer（不提前触发），等当前 agent 回合
+    完整结束后再随机 5~20min 布置下一次。用户消息打断 TIMER 回合的情形
+    同理：打断 → turn_recovery 保全 → 新 USER 回合正常续上 → 该回合结束时
+    再随机 5~20min 下一次（打断只重算下一次，不丢节奏）；
+  - **2 小时**内用户都没有主动发消息：暂停 **1 小时**再触发，之后保持
+    "每 1h 看一眼"的慢节奏（用户一回来立即恢复正常 5~20min）；
+  - `/clear` 后 timer 重置为随机 5~20min 下一次；
+  - 纯命令 / 按钮输入（不产生 agent 回合）：短暂观望窗口后直接布置下一次。
 - WAKEUP_PROMPT 重写：不再依赖 send_message_to_user，改为 message_user
   （交互）+ deliver_reply（静默交付）；
 - TIMER 回合被用户消息打断时，取消任务并经 turn_recovery 保全该回合
@@ -1449,7 +1459,7 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 │       ├── memory_tool.py            # Memory
 │       ├── todo_tool.py              # Todo
 │       ├── subagent_tool.py          # Subagent
-│       ├── ask_user_tool.py          # 向用户请求确认/输入
+│       ├── message_user_tool.py      # message_user 工具（提问/给用户发消息）
 │       ├── ai/
 │       │   ├── agentic_loops.py      # Agent loop
 │       │   ├── tool_call_loop.py     # Tool call orchestration
