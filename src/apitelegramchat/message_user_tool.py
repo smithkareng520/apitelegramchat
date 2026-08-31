@@ -251,6 +251,19 @@ async def create_ask_user_interaction(
         interaction.message_id = message_id
     else:
         await cancel_interaction(interaction.id, remove_ui=False)
+        # 发送失败时区分语义：若已触发 403 类永久性错误熔断（用户屏蔽
+        # bot / 账号停用），向模型明确说明"用户收不到任何消息、重试无
+        # 用、结束回合即可"，避免模型在 TIMER 回合里反复重试注定失败的
+        # message_user 调用，白烧 token。
+        try:
+            from apitelegramchat import proactive
+            if proactive.is_chat_unreachable(chat_id):
+                raise RuntimeError(
+                    "无法送达：该用户当前收不到 bot 的消息（可能已屏蔽 bot 或账号停用）。"
+                    "这不是临时故障，重试也不会成功；请直接结束本回合，不要再调用 message_user。"
+                )
+        except ImportError:
+            pass
         raise RuntimeError("无法发送 message_user 交互消息")
     return interaction
 

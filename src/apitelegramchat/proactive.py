@@ -32,7 +32,17 @@ turn_recovery 保全已完成的进度，随后 USER 回合正常续上；该回
   创建 timer 任务、永远不会触发 TIMER 回合——这意味着即使按钮回调绕过了
   上层 ``is_authorized`` 检查，非白名单用户也收不到任何 TIMER 主动消息。
   不同 chat 的 timer 完全独立（``_schedules`` 以 chat_id 为 key），多用户
-  共用同一 bot 时互不干扰。
+  共用同一 bot 时互不干扰。用户被移出白名单后：已挂起的 timer 触发时会被
+  ``_fire_turn`` 的白名单门禁拦截（SKIP_UNAUTHORIZED，不重排下一次，
+  timer 自然死亡）；用户重新入白名单并产生任意活动后调度自动恢复。
+- 用户屏蔽/封禁 bot（Telegram 对该 chat 返回 403 Forbidden 类永久错误）
+  时的熔断：发送层（utils 的各发送函数）识别到 403/"chat not found"
+  等永久性错误后调用 ``notify_chat_unreachable``——停用该 chat 的调度
+  （取消挂起 timer/watch、移除 schedule），避免 TIMER 继续每 5~20min
+  空转一轮完整 LLM 回合却永远送达不了。用户解除屏蔽并再次发消息/
+  点按钮时，``note_user_activity`` 会清除不可达标记并自动恢复调度
+  （一次活动即视为"用户回来了"；若实际上仍被屏蔽，下一轮 403 会再次
+  熔断，自愈式收敛，最多浪费一轮）。
 - 通过 ``register_media_model_check`` 注册的回调，在 ``_fire_turn`` 创建
   runner 任务之前判断当前模型是否为原生图片/视频生成模型：
   * 是 → 不创建 runner 任务、不调用 ``note_turn_finished``、不布置下一次；
@@ -191,6 +201,11 @@ class _ChatSchedule:
 _schedules: dict[int, _ChatSchedule] = {}
 _schedules_lock = asyncio.Lock()
 _stop_event = asyncio.Event()
+# 熔断标记：bot 对该 chat 的发送出现 403 类永久性失败（用户屏蔽 bot /
+# 账号注销 / 被踢出）。置位后停用该 chat 的主动唤醒调度；用户再次产生
+# 真实活动（发消息、点按钮——能到达 webhook 本身就说明已解除屏蔽）时
+# 在 note_user_activity 里清除并恢复调度。
+_unreachable_chats: set[int] = set()
 
 # 由 app.py 注册的回调：运行一个 TIMER 回合 / 判断 USER 流程是否进行中
 _turn_runner_callback: Optional[Callable[[int], Awaitable[None]]] = None
@@ -203,6 +218,16 @@ _media_model_check_callback: Optional[Callable[[int], bool]] = None
 #   note_user_activity 与 _fire_turn 都会直接返回，不会为该 chat 创建
 #   任何 timer / 主动消息——保证非白名单用户永远收不到 TIMER 主动消息。
 _authorized_check_callback: Optional[Callable[[int], bool]] = None
+
+
+def is_chat_unreachable(chat_id: int) -> bool:
+    """该 chat 是否因 403 类永久性发送失败被熔断（用户屏蔽 bot 等）。
+
+    供发送失败后的上层（如 message_user 卡片发送失败）判断：向模型报告
+    “用户收不到消息”而非笼统的发送异常，避免模型反复重试注定失败的
+    message_user 调用。用户产生真实活动后由 note_user_activity 解除。
+    """
+    return chat_id in _unreachable_chats
 
 
 def register_turn_runner(cb: Callable[[int], Awaitable[None]]) -> None:
@@ -385,6 +410,11 @@ async def note_user_activity(chat_id: int, *, private: bool = True) -> None:
     任何授权用户消息（含命令、按钮点击）都算活动。群聊不参与主动唤醒。
     非白名单 chat 直接返回：不为它创建任何 timer，保证非授权用户永远
     收不到 TIMER 主动消息（即使按钮回调绕过了上层 is_authorized）。
+
+    恢复语义：用户的活动能到达 webhook，本身就说明此前的"不可达"
+    （屏蔽/封禁）已被解除——清除熔断标记并正常调度。若实际仍不可达
+    （极端情况：消息能进来但 bot 发不出去），下一轮 TIMER 触发后发送
+    会再次 403 熔断，最多浪费一轮，自愈式收敛。
     """
     if not PROACTIVE_ENABLED or chat_id is None:
         return
@@ -393,6 +423,13 @@ async def note_user_activity(chat_id: int, *, private: bool = True) -> None:
     if not _is_chat_authorized(chat_id):
         logger.info("[proactive] chat=%s 非白名单 chat，跳过主动唤醒调度", chat_id)
         return
+    if chat_id in _unreachable_chats:
+        _unreachable_chats.discard(chat_id)
+        logger.info(
+            "[proactive] chat=%s 用户活动恢复可达（此前被熔断：bot 发送遇 403 类永久错误），"
+            "清除熔断标记并恢复主动唤醒调度",
+            chat_id,
+        )
     now = time.monotonic()
     async with _schedules_lock:
         sched = _schedules.get(chat_id)
@@ -445,14 +482,47 @@ async def reset_proactive_timer(chat_id: int) -> None:
         )
 
 
-async def _deactivate_chat(chat_id: int) -> None:
-    """停止对某个 chat 的主动唤醒（例如 bot 被用户屏蔽）。"""
+async def deactivate_chat(chat_id: int, *, reason: str = "") -> None:
+    """停止对某个 chat 的主动唤醒调度：取消挂起 timer/watch、移除 schedule。
+
+    移除（pop）schedule 后，``note_turn_finished`` / ``reset_proactive_timer``
+    都会因 schedule 不存在而直接返回，不会重新布置下一次——正在运行的
+    回合自然收尾后调度即彻底停止；唯一的恢复入口是 ``note_user_activity``
+    （用户真实活动 → 重建 schedule）。
+    """
     async with _schedules_lock:
         sched = _schedules.pop(chat_id, None)
     if sched is not None:
         _cancel_task(sched.timer_task)
         _cancel_task(sched.watch_task)
-    logger.info("[proactive] chat=%s 已停用主动唤醒", chat_id)
+    logger.info(
+        "[proactive] chat=%s 已停用主动唤醒%s",
+        chat_id, f"（{reason}）" if reason else "",
+    )
+
+
+async def notify_chat_unreachable(chat_id: int, reason: str = "") -> None:
+    """发送层识别到 403 类永久性错误（用户屏蔽 bot / 账号注销 / 被踢出）后
+    的熔断入口：停用该 chat 的主动唤醒调度。
+
+    背景：白名单无法覆盖这一场景——用户仍在白名单里，但已把 bot 屏蔽，
+    Telegram 对该 chat 的所有发送永久 403。若不熔断，TIMER 会每 5~20min
+    照常触发一轮完整 LLM 回合（白白消耗 token），且所有送达永远失败，
+    形成无限空转循环。此处 pop 掉 schedule 后：进行中的回合照常结束，
+    但 ``note_turn_finished`` 找不到 schedule，不再重排下一次；用户解除
+    屏蔽并产生任意活动时由 ``note_user_activity`` 自动恢复。
+
+    幂等：重复调用安全（pop 无则 None；set 重复 add 无副作用）。
+    """
+    first_time = chat_id not in _unreachable_chats
+    _unreachable_chats.add(chat_id)
+    if first_time:
+        logger.warning(
+            "[proactive] chat=%s 发送永久失败（%s）——判定 chat 不可达"
+            "（用户可能已屏蔽 bot），熔断主动唤醒；用户回来后会自动恢复",
+            chat_id, reason or "403 Forbidden",
+        )
+    await deactivate_chat(chat_id, reason=reason or "chat unreachable")
 
 
 async def _sleep_or_stop(seconds: float) -> bool:

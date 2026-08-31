@@ -25,6 +25,7 @@ from apitelegramchat.utils import (
     extract_sticker_metadata,
     sticker_metadata_to_text,
     transcribe_audio_with_groq,
+    _notify_chat_unreachable,
 )
 from apitelegramchat.ai_handlers import get_ai_response, _get_cached_audio_data
 from apitelegramchat.config import (
@@ -882,6 +883,17 @@ async def _handle_timer_wakeup(chat_id: int):
         # WAKEUP_PROMPT 喂给媒体模型导致意外生成媒体并推给用户）；return
         # 后 _run 的 finally 会调 note_turn_finished 重排下一次 timer，
         # 那次 timer 触发时 proactive 层的门禁会彻底终止自递归调度。
+        #
+        # 白名单同款复检：_fire_turn 检查通过后、本 runner 真正开跑前，用户
+        # 可能刚被管理员 /deluser 移出白名单——此处拦截后整轮不执行，
+        # finally 的 note_turn_finished 只会重排 timer，下一次触发时会被
+        # proactive 层的白名单门禁（SKIP_UNAUTHORIZED）彻底拦下。
+        if not _is_chat_authorized(chat_id):
+            logger.info(
+                "[TIMER] chat=%s 回合开跑前复检发现已被移出白名单，本轮不执行",
+                chat_id,
+            )
+            return
         lock = await get_chat_lock(chat_id)
         async with lock:
             cm = get_user_model(chat_id)
@@ -1431,6 +1443,10 @@ async def _send_via_send_message(
                         return mid
                 else:
                     body = await resp.text()
+                    # 403 类永久性失败（用户屏蔽 bot 等）：与 sendRichMessage
+                    # 路径同款熔断，停掉该 chat 的主动唤醒调度。
+                    if await _notify_chat_unreachable(chat_id, resp.status, body):
+                        return 0
                     logger.error(
                         f"_send_via_send_message failed: {resp.status} {body[:200]}"
                     )

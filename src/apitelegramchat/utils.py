@@ -167,6 +167,51 @@ async def close_http_session() -> None:
                 pass
         _http_session = None
 
+# ---------- chat 不可达熔断（403 类永久性发送失败） ----------
+# 用户把 bot 屏蔽/封禁后，Telegram 对该 chat 的所有发送一律返回
+# 403 Forbidden（"bot was blocked by the user" / "user is deactivated" /
+# "bot was kicked ..."）；"chat not found"（400）则表示 chat 已不存在。
+# 这些都是**永久性**错误：重试、降级富文本、换 sendMessage 都救不回来。
+# 白名单管不住这种用户（他仍在白名单里），若不熔断，proactive TIMER 会
+# 每 5~20min 触发一轮完整 LLM 回合却永远送达不了，无限空转烧 token。
+# 识别到这类错误后统一通知 proactive 停用该 chat 的调度；用户解除屏蔽
+# 并再次发消息时由 note_user_activity 自动恢复（详见 proactive.py）。
+def _permanent_chat_error_reason(status: int, body: str) -> Optional[str]:
+    """判断一次 Telegram 发送失败是否为该 chat 的永久性不可达。
+
+    返回人类可读的原因字符串；非永久性错误（429 限流、5xx、网络错误、
+    400 内容错误等）返回 None——那些应该走既有的重试/降级/失败计数路径。
+    """
+    body_lower = (body or "").lower()
+    if status == 403:
+        # Telegram Bot API 对 chat 定向的 403 一律是权限级永久失败
+        #（bot 被屏蔽 / 账号停用 / 被踢出群）。区别于 401（bot token
+        # 级认证失败，会影响所有 chat，不能据此熔断单个 chat）。
+        return body[:120] or "403 Forbidden"
+    if "chat not found" in body_lower:
+        return body[:120] or "chat not found"
+    return None
+
+
+async def _notify_chat_unreachable(chat_id: int, status: int, body: str) -> bool:
+    """若该失败是永久性不可达，通知 proactive 熔断该 chat 的主动唤醒。
+
+    返回 True 表示已判定为永久性错误（调用方应立即放弃重试/降级路径）。
+    惰性导入 proactive 以保持 utils 作为底层 Telegram 助手模块的分层
+    （proactive 不反向依赖 utils，无循环导入风险）。
+    """
+    try:
+        reason = _permanent_chat_error_reason(status, body)
+        if reason is None:
+            return False
+        from apitelegramchat import proactive
+        await proactive.notify_chat_unreachable(chat_id, reason=reason)
+        return True
+    except Exception:
+        logger.debug("notify_chat_unreachable 失败（可忽略）", exc_info=True)
+        return False
+
+
 # ---------- 请求ID上下文 ----------
 # 使用 contextvars 替代全局 dict，避免并发协程间 request_id 互相覆盖
 import contextvars
@@ -1256,6 +1301,13 @@ async def send_rich_message_draft(
                                         "sendRichMessageDraft 降级重试异常: %s", demoted_err,
                                     )
 
+                        # 403 类永久性失败（用户屏蔽 bot 等）：熔断该 chat 的
+                        # 主动唤醒调度，并立即判死本草稿——flush 循环继续用
+                        # 原内容重试只会无限撞墙，草稿永远出不去。
+                        if await _notify_chat_unreachable(chat_id, resp.status, body):
+                            await mark_draft_dead(draft_id_int)
+                            return 0
+
                         failures = await _bump_draft_failure(chat_id, draft_id_int)
                         logger.warning(
                             f"sendRichMessageDraft failed (attempt {attempt+1}/{_DRAFT_MAX_ATTEMPTS}, failures={failures}): "
@@ -1395,6 +1447,12 @@ async def send_rich_html_message(
                     # 只有明确的内容错误才进入针对性兜底。网络错误由装饰器重试，
                     # 认证、权限、限流和参数错误不能靠改 HTML 修复，必须原样失败。
                     if resp.status != 400:
+                        # 403 类永久性失败（用户屏蔽 bot / 账号注销 / chat 不
+                        # 存在）：重试与降级都救不回来。熔断该 chat 的主动唤
+                        # 醒调度，避免 TIMER 每 5~20min 空转一轮完整 LLM
+                        # 回合却永远送达不了；用户解除屏蔽后会自动恢复。
+                        if await _notify_chat_unreachable(chat_id, resp.status, body):
+                            return False
                         logger.error(f"sendRichHtmlMessage failed: {resp.status} {body[:200]}")
                         return False
 
@@ -1493,7 +1551,15 @@ async def send_chat_action(chat_id: int, action: str) -> None:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(f"{BASE_URL}/sendChatAction", json=payload) as resp:
                 if resp.status != 200:
-                    logger.warning(f"sendChatAction failed: {await resp.text()}")
+                    body = ""
+                    try:
+                        body = await resp.text()
+                    except Exception:
+                        pass
+                    # 用户屏蔽 bot 时连 typing 指示都会 403：顺手熔断
+                    #（幂等，仅标记 + 停调度，不影响本调用返回）。
+                    await _notify_chat_unreachable(chat_id, resp.status, body)
+                    logger.warning(f"sendChatAction failed: {body[:200]}")
     except Exception as e:
         logger.warning(f"sendChatAction exception: {e}")
 
