@@ -1211,6 +1211,11 @@ async def _agentic_loop_native_video(
     #   “录制”视频），每 4 秒循环重发，覆盖动辄数十秒到数分钟的生成过程；
     # - 发送阶段（视频下载 / R2 上传 / sendRichMessage 携带 <video>）
     #   → upload_video（bot 正在发送视频）。
+    #   注意与 generate_video 工具路径的区别：原生视频模型的输出就是
+    #   最终要发给用户的视频，不存在「工具结果返回给模型」的中间环节，
+    #   因此下载 / R2 上传全程属于发送动作；而工具路径的同类下载 / 上传
+    #   属于 AI 接收信息，不触发 upload_video（见 search_engine.
+    #   execute_generate_video 的注释）。
     if provider == "agnes":
         async with chat_action_scope(chat_id, "record_video"):
             video_url, error, video_meta = await _request_agnes_video(prompt, duration, current_model)

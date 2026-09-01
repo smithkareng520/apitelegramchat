@@ -36,13 +36,10 @@ except Exception:  # pragma: no cover - optional dependency fallback
     feedparser = _FeedParserStub()  # type: ignore
 from pathlib import Path
 from apitelegramchat.workspace_paths import workspace_workdir, workspace_namespace
-# chat action 状态指示：generate_video 生成期 record_video、下载/上传期
-# upload_video、地图工具族 find_location（见 chat_actions.py 白名单）。
-from apitelegramchat.chat_actions import (
-    chat_action_scope,
-    start_chat_action,
-    stop_chat_action,
-)
+# chat action 状态指示：generate_video 生成期 record_video（其下载/上传
+# 期不触发 upload_video——工具结果是 AI 收到的信息，不是 bot 在发送
+# 视频）、地图工具族 find_location（见 chat_actions.py 白名单）。
+from apitelegramchat.chat_actions import chat_action_scope
 
 # 高德地图能力现已迁移到外部 MCP 服务 `amap-maps`（@amap/amap-maps on
 # ModelScope）。所有地理编码 / POI / 路径 / 距离 / IP 定位工具都通过
@@ -3395,7 +3392,13 @@ async def execute_generate_video(
     # chat action 语义（与 chat_actions.py 白名单约定一致）：
     # - 生成阶段（工具调用生视频模型的轮询/生成）→ record_video；
     #   生成动辄数十秒到数分钟，4 秒循环重发保证指示不闪断。
-    # - 下载/上传阶段 → upload_video（bot 上传视频字节）。
+    # - 下载/上传阶段不触发任何 chat action：工具结果（视频 URL）是
+    #   「AI 收到的信息」而非 bot 在向用户发送视频，upload_video 在此处
+    #   属于错误语义。真正的发送发生在 utils.send_rich_html_message
+    #   携带 <video> 的永久消息（那里自带 upload_video 钩子）。
+    #   对比：原生视频模型路径（_agentic_loop_native_video）的模型输出
+    #   就是最终要发给用户的视频，其下载/R2 上传全程属于发送动作，
+    #   因此该路径保留 upload_video。
     # chat_id 可能为 None（极端调用路径）：chat_action_scope 会静默降级。
     if provider == "agnes":
         async with chat_action_scope(chat_id, "record_video"):
@@ -3419,10 +3422,9 @@ async def execute_generate_video(
     # （Rich Message 媒体 block 仅支持 HTTP/HTTPS URL）
     final_video_url = video_url
     video_bytes_len = 0
-    # upload_video 状态：视频字节下载与 R2 上传是 bot 侧的上传动作；
-    # 后续模型把 URL 嵌入最终回复时，utils.send_rich_html_message 内部
-    # 会再次触发 upload_video（同一动作，引用计数叠加，不会重复显示）。
-    await start_chat_action(chat_id, "upload_video")
+    # 此处不触发 upload_video：下载与 R2 上传完成后，视频 URL 作为工具
+    # 结果返回给模型（AI 收到信息），模型再决定如何在回复中使用它；
+    # 真正的「bot 发送视频」发生在最终永久消息发送（见上方语义注释）。
     try:
         timeout = aiohttp.ClientTimeout(total=180)
         async with aiohttp.ClientSession(timeout=timeout) as dl_session:
@@ -3443,8 +3445,6 @@ async def execute_generate_video(
                     )
     except Exception:
         logger.exception("[generate_video] 视频下载/上传异常，回退原始 URL: %s", str(video_url)[:200])
-    finally:
-        await stop_chat_action(chat_id, "upload_video")
 
     if video_bytes_len == 0 and isinstance(video_meta, dict):
         out_size = video_meta.get("perf_output_size")

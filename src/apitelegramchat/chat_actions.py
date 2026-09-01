@@ -15,8 +15,13 @@ upload_photo / upload_voice / upload_document / upload_video 的做法全部
                   ——那等价于模型把文本直接粘贴发送，没有输入过程。
   record_video    视频生成过程：generate_video 工具调用生视频模型，或原生
                   视频模型（_agentic_loop_native_video）自身的生成阶段。
-  upload_video    bot 使用「发送视频」方法时：永久富文本消息（sendRichMessage）
-                  携带 <video> 的发送，以及视频下载 / R2 上传等发送准备。
+  upload_video    bot 使用「发送视频」方法时。仅限两类位置：a) 原生视频
+                  模型路径（_agentic_loop_native_video）——模型输出就是
+                  最终要发给用户的视频，其下载 / R2 上传 / 发送全程属于
+                  发送动作；b) 携带 <video> 的永久消息发送（utils.send_
+                  rich_html_message 钩子）。generate_video 工具自身的下载 /
+                  R2 上传不触发——工具结果是 AI 收到的信息，不是 bot 在
+                  发送视频。
   upload_document bot 使用「发送文件」方法时（present_files → sendDocument）。
   find_location   模型调用查找位置类方法时（amap 地图工具族）。
 
@@ -57,7 +62,8 @@ CHAT_ACTION_RESEND_INTERVAL = 4.0
 VALID_CHAT_ACTIONS = frozenset({
     "typing",          # 模型流式输出（思考/文本字段增量）期间
     "record_video",    # 视频生成过程（工具调用生视频模型 / 原生视频模型）
-    "upload_video",    # bot 发送视频（含视频下载与 R2 上传的发送准备）
+    "upload_video",    # bot 发送视频（仅原生视频模型路径与实际消息发送；
+                       # generate_video 工具结果是 AI 收到信息，不触发）
     "upload_document", # bot 发送文件（sendDocument）
     "find_location",   # 模型调用查找位置类（amap 地图）工具
 })
