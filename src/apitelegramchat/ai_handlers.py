@@ -61,6 +61,9 @@ from apitelegramchat.ai.agentic_loops import (
     _agentic_loop_native_video,
     _agentic_loop_openai_compat,
 )
+# chat action 状态指示：回合开始时清场（防止上一回合被取消时残留的
+# 后台重发任务跨回合存活）、收尾时兑底熄灭（正常/异常/取消路径均生效）。
+from apitelegramchat.chat_actions import reset_chat_actions, stop_all_chat_actions
 
 logger = get_logger(__name__)
 # 修复 BUG：此前这里硬性 setLevel(DEBUG)，无论 config.LOG_LEVEL 是 INFO
@@ -403,6 +406,11 @@ async def get_ai_response(
     new_msgs = []
     usage = None
     is_timer = (event_source == "TIMER")
+    # chat action 清场：新回合开始意味着旧回合已彻底结束（app 的打断
+    # 机制会先等待旧任务退出）。若旧回合被二次取消打断了作用域收尾，
+    # 引用可能泄漏、重发循环可能残留——这里无条件清空，保证指示
+    # 绝不跨回合存活。
+    await reset_chat_actions(chat_id)
     # 草稿开关：USER 与 TIMER 统一生效。
     show_drafts = await state.get_show_drafts(chat_id)
     silent_mode = not show_drafts
@@ -1031,7 +1039,7 @@ async def get_ai_response(
         return error_msg, "", [], None
 
     finally:
-        # 统一清理：停止刷新循环 + 清理 active_draft 注册
+        # 统一清理：停止刷新循环 + 清理 active_draft 注册 + 熄灭全部 chat action
         # 关键：被取消时不在 finally 里删草稿——webhook 入口已经删过了
         # （或者正在删，或者下一个任务已经注册了新草稿）
         # 强行删会跟下一个任务的草稿打架
@@ -1047,6 +1055,15 @@ async def get_ai_response(
             except Exception:
                 logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
                 pass
+        # chat action 兑底熄灭：typing / record_video / upload_video /
+        # upload_document / find_location 的作用域在各自调用点正常收尾，
+        # 这里是最后一道防线，确保任何退出路径（含异常与取消）都不会
+        # 留下持续重发的状态指示。
+        try:
+            await stop_all_chat_actions(chat_id)
+        except Exception:
+            logger.debug("stop_all_chat_actions 异常（可忽略）", exc_info=True)
+            pass
 
 
 async def _call_api(

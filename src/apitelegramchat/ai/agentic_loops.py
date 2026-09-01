@@ -19,6 +19,11 @@ from apitelegramchat.config import (
     get_reasoning_request_fields,
 )
 from apitelegramchat.utils import get_logger, escape_html, send_rich_html_message
+from apitelegramchat.chat_actions import (
+    chat_action_scope,
+    start_chat_action,
+    stop_chat_action,
+)
 from apitelegramchat.s3_utils import upload_bytes_to_r2
 
 from apitelegramchat.ai._constants import (
@@ -279,6 +284,14 @@ async def _agentic_loop_openai_compat(
             for stream_attempt in range(2):
                 try:
                     comp_stream = await client.chat.completions.create(**create_params)
+                    # typing 状态：仅在本轮真实消费流式增量（思考/文本字段）
+                    # 期间显示——“模型正在打字”。状态每 4 秒循环重发：
+                    # Telegram 的 chat action 最多持续约 5 秒，且 bot 发出的
+                    # 任何消息（含草稿刷新）都会清除指示；/show on 时草稿
+                    # 流式本身就是输入可视化，指示被反复清除属预期设计。
+                    # 非流式回退（下方 stream=False）不触发 typing：一次性
+                    # 返回完整文本等价于直接粘贴发送，没有输入过程。
+                    await start_chat_action(builder.chat_id, "typing")
                     async for chunk in comp_stream:
                         received_any = True
                         if getattr(chunk, "usage", None):
@@ -417,6 +430,10 @@ async def _agentic_loop_openai_compat(
                         api_label, _round + 1,
                     )
                     await asyncio.sleep(1.0)
+                finally:
+                    # 无论本轮流式正常结束、读取超时重试还是异常/取消，
+                    # 消费流式增量的过程已结束，typing 随之熄灭。
+                    await stop_chat_action(builder.chat_id, "typing")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -590,6 +607,8 @@ async def _agentic_loop_openai_compat(
                 synth_params["extra_body"] = synth_extra_body
             try:
                 synth_stream = await client.chat.completions.create(**synth_params)
+                # 合成总结同样走流式输出：消费增量期间显示 typing（同主流语义）。
+                await start_chat_action(builder.chat_id, "typing")
                 builder.begin_stream_text()
                 synth_text = ""
                 async for chunk in synth_stream:
@@ -615,6 +634,8 @@ async def _agentic_loop_openai_compat(
                     pass
                 final_content = _tool_limit_summary()
                 builder.add_text(final_content)
+            finally:
+                await stop_chat_action(builder.chat_id, "typing")
             new_history_entries.append({"role": "assistant", "content": final_content})
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
@@ -1185,10 +1206,17 @@ async def _agentic_loop_native_video(
     error = None
     video_meta: Optional[dict] = None
 
+    # chat action 语义（与 chat_actions.py 的白名单约定一致）：
+    # - 生成阶段（调用生视频模型的轮询/生成）→ record_video（bot 正在
+    #   “录制”视频），每 4 秒循环重发，覆盖动辄数十秒到数分钟的生成过程；
+    # - 发送阶段（视频下载 / R2 上传 / sendRichMessage 携带 <video>）
+    #   → upload_video（bot 正在发送视频）。
     if provider == "agnes":
-        video_url, error, video_meta = await _request_agnes_video(prompt, duration, current_model)
+        async with chat_action_scope(chat_id, "record_video"):
+            video_url, error, video_meta = await _request_agnes_video(prompt, duration, current_model)
     elif provider == "openrouter":
-        video_url, error, video_meta = await _request_openrouter_video(prompt, duration, current_model)
+        async with chat_action_scope(chat_id, "record_video"):
+            video_url, error, video_meta = await _request_openrouter_video(prompt, duration, current_model)
     else:
         return f"VIDEO_ERROR:不支持的视频提供商 {provider}", None, []
 
@@ -1206,6 +1234,12 @@ async def _agentic_loop_native_video(
     # 而是来自 Telegram 拉取不到匹配 MIME 的媒体）。
     final_video_url = video_url
     video_bytes_len = 0
+    # upload_video 状态：从下载视频字节、上传 R2（bot 上传视频）直到
+    # 发送完成，全程显示“正在发送视频”。下载/上传可能耗时数十秒，
+    # 4 秒循环重发保证指示不闪断；最终 sendRichMessage 携带 <video>
+    # 时，utils.send_rich_html_message 内部会再次确保 upload_video 激活
+    # （同一动作引用计数，不会重复发送状态）。
+    await start_chat_action(chat_id, "upload_video")
     try:
         timeout = aiohttp.ClientTimeout(total=180)
         async with aiohttp.ClientSession(timeout=timeout) as dl_session:
@@ -1248,6 +1282,10 @@ async def _agentic_loop_native_video(
             "[NativeVideo] 视频下载/上传异常，回退使用原始 URL: url=%s err=%s",
             str(video_url)[:200], e,
         )
+    finally:
+        # 下载 / R2 上传阶段结束，熄灭 upload_video（发送动作由
+        # send_rich_html_message 内部的 upload_video 钩子接管）。
+        await stop_chat_action(chat_id, "upload_video")
 
     # 构造富文本：用 <figure>+<video>+<figcaption> 的文档推荐写法（视频只能作为独立 media block）
     # caption 走与图片一致的“元数据”风格（分辨率/帧率/帧数/大小/模型），不再附提示词。

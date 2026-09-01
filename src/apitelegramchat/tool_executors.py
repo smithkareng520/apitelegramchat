@@ -98,11 +98,25 @@ from apitelegramchat.memory_tool import execute_memory, render_memory_card
 from apitelegramchat.subagent_tool import execute_subagent, render_subagent_card
 from apitelegramchat.utils import escape_html
 from apitelegramchat.token_budget import truncate_to_token_budget, truncate_to_token_budget_head_tail
+# chat action 状态指示（白名单与触发位置约定见 chat_actions.py）：
+# 地图工具族 → find_location；present_files 发送文件 → upload_document。
+from apitelegramchat.chat_actions import chat_action_scope
 
 logger = logging.getLogger(__name__)
 
 # ---------- 信号量控制并发工具调用 ----------
 tool_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TOOLS)
+
+# 查找位置类工具（amap 地图族）：模型调用期间显示 find_location。
+# 全部经 dispatch_tool_call 分发，含子 agent 内的同名调用。
+LOCATION_LOOKUP_TOOLS = frozenset({
+    "geocode",
+    "route",
+    "distance",
+    "poi_keyword_search",
+    "poi_nearby_search",
+    "poi_details",
+})
 
 TOOL_RESPONSE_TOKEN_BUDGET = int(os.getenv("TOOL_RESPONSE_TOKEN_BUDGET", "20000"))
 
@@ -2370,11 +2384,15 @@ async def execute_present_files(chat_id: int, paths: List[str], namespace: str |
                     form = aiohttp.FormData()
                     form.add_field("chat_id", str(chat_id))
                     form.add_field("document", file_data, filename=resolved.name)
-                    async with session.post(f"{BASE_URL}/sendDocument", data=form) as resp:
-                        if resp.status == 200:
-                            sent.append(resolved.name)
-                        else:
-                            failed.append(f"{path} (send failed: HTTP {resp.status})")
+                    # chat action：bot 正在发送文件（sendDocument）。每个文件的
+                    # 上传期间显示 upload_document；多文件连续发送时引用计数
+                    # 叠加，指示无断档；上传超 5 秒由 4 秒循环重发保活。
+                    async with chat_action_scope(chat_id, "upload_document"):
+                        async with session.post(f"{BASE_URL}/sendDocument", data=form) as resp:
+                            if resp.status == 200:
+                                sent.append(resolved.name)
+                            else:
+                                failed.append(f"{path} (send failed: HTTP {resp.status})")
                 except aiohttp.ClientError as e:
                     # 网络层错误：str(e) 可能含 URL（带 bot token），脱敏后再写。
                     safe_msg = str(e)
@@ -2553,35 +2571,41 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 duration=arguments.get("duration", 5),
                 chat_id=chat_id,
             )
-        # 地图工具
-        elif name == "geocode":
-            return await execute_geocode(arguments.get("address", ""))
-        elif name == "route":
-            return await execute_route(
-                arguments.get("origin", ""),
-                arguments.get("destination", ""),
-                arguments.get("mode", "driving"),
-                arguments.get("city"),
-                arguments.get("cityd"),
-            )
-        elif name == "distance":
-            return await execute_distance(
-                arguments.get("origin", ""),
-                arguments.get("destination", ""),
-            )
-        elif name == "poi_keyword_search":
-            return await execute_keyword_search(
-                arguments.get("keywords", ""),
-                arguments.get("city"),
-            )
-        elif name == "poi_nearby_search":
-            return await execute_nearby_search(
-                arguments.get("keywords", ""),
-                arguments.get("location", ""),
-                arguments.get("radius"),
-            )
-        elif name == "poi_details":
-            return await execute_poi_details(arguments.get("id", ""))
+        # 地图工具：模型调用查找位置类方法期间显示 find_location。
+        # 同批次并发的多个地图工具共享同一条指示（引用计数），全部结束
+        # 才熄灭；单次查询通常数秒内完成，长查询由 4 秒循环保活。
+        elif name in LOCATION_LOOKUP_TOOLS:
+            async with chat_action_scope(chat_id, "find_location"):
+                if name == "geocode":
+                    return await execute_geocode(arguments.get("address", ""))
+                elif name == "route":
+                    return await execute_route(
+                        arguments.get("origin", ""),
+                        arguments.get("destination", ""),
+                        arguments.get("mode", "driving"),
+                        arguments.get("city"),
+                        arguments.get("cityd"),
+                    )
+                elif name == "distance":
+                    return await execute_distance(
+                        arguments.get("origin", ""),
+                        arguments.get("destination", ""),
+                    )
+                elif name == "poi_keyword_search":
+                    return await execute_keyword_search(
+                        arguments.get("keywords", ""),
+                        arguments.get("city"),
+                    )
+                elif name == "poi_nearby_search":
+                    return await execute_nearby_search(
+                        arguments.get("keywords", ""),
+                        arguments.get("location", ""),
+                        arguments.get("radius"),
+                    )
+                elif name == "poi_details":
+                    return await execute_poi_details(arguments.get("id", ""))
+                else:
+                    return f"失败：未知工具: {name}。"
         elif name == "text_editor":
             return await execute_text_editor(
                 chat_id=chat_id,

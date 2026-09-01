@@ -1353,6 +1353,22 @@ async def send_rich_message_draft(
     return 0
 
 # ---------- 发送普通富文本消息 ----------
+# 检测永久消息是否携带 <video> 媒体块：命中时在发送期间显示 upload_video
+# （bot 侧“发送视频”动作，与 chat_actions.py 白名单语义一致）。
+# 只匹配真正的标签开头，避免误匹配纯文本里的 “<video” 字样或已转义的
+# &lt;video；大小写不敏感，兼容自闭合 <video/>。
+_VIDEO_TAG_RE = re.compile(r"<video[\s/>]", re.IGNORECASE)
+
+
+def _rich_html_contains_video(html_content: Optional[str]) -> bool:
+    """永久富文本是否携带 <video> 媒体块（用于触发 upload_video 状态）。"""
+    try:
+        return bool(html_content) and bool(_VIDEO_TAG_RE.search(html_content))
+    except Exception:
+        logger.debug("_rich_html_contains_video 内部忽略的异常", exc_info=True)
+        return False
+
+
 async def send_rich_html_message(
     chat_id: int,
     html_content: str,
@@ -1363,6 +1379,11 @@ async def send_rich_html_message(
 ) -> int | bool:
     """
     发送永久富文本消息。
+
+    chat action：当消息携带 <video> 媒体块时，发送期间会显示 upload_video
+    （bot 正在发送视频；4 秒循环重发，覆盖 Telegram 服务端拉取视频可能
+    耗费的数十秒）。草稿刷新（sendRichMessageDraft）不触发任何动作：
+    草稿是流式预览，属 typing 语义，且高频刷新会与状态循环互相干扰。
 
     reassert_draft:
       False — 仅串行发送，不重新挂回草稿。适合绝大多数永久消息，
@@ -1538,10 +1559,27 @@ async def send_rich_html_message(
             logger.exception("sendRichHtmlMessage unexpected exception")
             return False
 
-    async with serialize_with_active_draft(chat_id, reassert=reassert_draft):
-        return await _send_inner()
+    # —— chat action：bot 正在发送视频 ——
+    # 仅当永久消息携带 <video> 媒体块时触发 upload_video；发送（含内部
+    # 至多 3 次重试、媒体降级重试）期间由 chat_actions 的 4 秒循环保活。
+    # 周期导入：chat_actions 顶层依赖 utils，这里函数内延迟导入避免循环。
+    _video_action = _rich_html_contains_video(html_content)
+    if _video_action:
+        from apitelegramchat.chat_actions import start_chat_action
+        await start_chat_action(chat_id, "upload_video")
+    try:
+        async with serialize_with_active_draft(chat_id, reassert=reassert_draft):
+            return await _send_inner()
+    finally:
+        if _video_action:
+            from apitelegramchat.chat_actions import stop_chat_action
+            await stop_chat_action(chat_id, "upload_video")
 
 # ==================== 发送 Chat Action ====================
+# 低层原语：直接 POST sendChatAction（单次、无循环）。
+# 状态最多持续约 5 秒，长任务必须循环重发——该职责由 chat_actions.py
+# 统一承担（4 秒重发循环 + 白名单 + 引用计数）。业务代码请勿直接调用
+# 本函数，一律走 apitelegramchat.chat_actions。
 async def send_chat_action(chat_id: int, action: str) -> None:
     payload = {"chat_id": chat_id, "action": action}
     # 必须设置超时：此前完全没设 timeout，Telegram API 偶尔 stall 时

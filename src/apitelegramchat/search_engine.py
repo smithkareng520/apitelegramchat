@@ -36,6 +36,13 @@ except Exception:  # pragma: no cover - optional dependency fallback
     feedparser = _FeedParserStub()  # type: ignore
 from pathlib import Path
 from apitelegramchat.workspace_paths import workspace_workdir, workspace_namespace
+# chat action 状态指示：generate_video 生成期 record_video、下载/上传期
+# upload_video、地图工具族 find_location（见 chat_actions.py 白名单）。
+from apitelegramchat.chat_actions import (
+    chat_action_scope,
+    start_chat_action,
+    stop_chat_action,
+)
 
 # 高德地图能力现已迁移到外部 MCP 服务 `amap-maps`（@amap/amap-maps on
 # ModelScope）。所有地理编码 / POI / 路径 / 距离 / IP 定位工具都通过
@@ -3385,14 +3392,21 @@ async def execute_generate_video(
     error: Optional[str] = None
     video_meta: Optional[dict] = None
 
+    # chat action 语义（与 chat_actions.py 白名单约定一致）：
+    # - 生成阶段（工具调用生视频模型的轮询/生成）→ record_video；
+    #   生成动辄数十秒到数分钟，4 秒循环重发保证指示不闪断。
+    # - 下载/上传阶段 → upload_video（bot 上传视频字节）。
+    # chat_id 可能为 None（极端调用路径）：chat_action_scope 会静默降级。
     if provider == "agnes":
-        video_url, error, video_meta = await _request_agnes_video(
-            prompt=prompt, duration=duration, model=model,
-        )
+        async with chat_action_scope(chat_id, "record_video"):
+            video_url, error, video_meta = await _request_agnes_video(
+                prompt=prompt, duration=duration, model=model,
+            )
     elif provider == "openrouter":
-        video_url, error, video_meta = await _request_openrouter_video(
-            prompt=prompt, duration=duration, model=model,
-        )
+        async with chat_action_scope(chat_id, "record_video"):
+            video_url, error, video_meta = await _request_openrouter_video(
+                prompt=prompt, duration=duration, model=model,
+            )
     else:
         return f"❌ 暂不支持的视频提供商：{provider}"
 
@@ -3405,6 +3419,10 @@ async def execute_generate_video(
     # （Rich Message 媒体 block 仅支持 HTTP/HTTPS URL）
     final_video_url = video_url
     video_bytes_len = 0
+    # upload_video 状态：视频字节下载与 R2 上传是 bot 侧的上传动作；
+    # 后续模型把 URL 嵌入最终回复时，utils.send_rich_html_message 内部
+    # 会再次触发 upload_video（同一动作，引用计数叠加，不会重复显示）。
+    await start_chat_action(chat_id, "upload_video")
     try:
         timeout = aiohttp.ClientTimeout(total=180)
         async with aiohttp.ClientSession(timeout=timeout) as dl_session:
@@ -3425,6 +3443,8 @@ async def execute_generate_video(
                     )
     except Exception:
         logger.exception("[generate_video] 视频下载/上传异常，回退原始 URL: %s", str(video_url)[:200])
+    finally:
+        await stop_chat_action(chat_id, "upload_video")
 
     if video_bytes_len == 0 and isinstance(video_meta, dict):
         out_size = video_meta.get("perf_output_size")

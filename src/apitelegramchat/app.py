@@ -18,7 +18,6 @@ from apitelegramchat.utils import (
     mark_draft_dead,
     check_deepseek_balance,
     check_openrouter_balance,
-    send_chat_action,
     get_logger,
     set_request_id,
     extract_message_text,
@@ -654,8 +653,13 @@ async def _cleanup_task(chat_id: int, task: asyncio.Task):
             logger.warning(f"note_turn_finished 异常: {e}")
 
 # -------------------- 各类型消息处理 --------------------
+# 注意：这里不再发送任何 sendChatAction。旧版在消息入口处按用户发送的
+# 媒体类型回发 typing / upload_photo / upload_voice / upload_document /
+# upload_video —— 但 chat action 描述的是 bot 自己正在做的动作，用户
+# 上传媒体时回发这些动作会被客户端渲染成“bot 正在上传照片/语音/…”，
+# 语义完全相反；typing 也只在模型流式输出期间才有意义（见
+# chat_actions.py 与 ai/agentic_loops.py 的实现）。
 async def _handle_text_message(chat_id: int, user_input: str, username: str, user_message: dict):
-    await send_chat_action(chat_id, "typing")
     # 后台预初始化 workspace：与模型生成响应并行，避免第一个工具调用
     # 是 no-op。
     asyncio.create_task(init_workspace(chat_id))
@@ -677,7 +681,6 @@ async def _handle_text_message(chat_id: int, user_input: str, username: str, use
         await send_rich_html_message(chat_id, f"❌ <b>处理消息时出错</b>\n<code>{str(e)[:100]}</code>")
 
 async def _handle_photo_message(chat_id: int, user_message: dict, username: str):
-    await send_chat_action(chat_id, "upload_photo")
     asyncio.create_task(init_workspace(chat_id))
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
@@ -697,7 +700,6 @@ async def _handle_photo_message(chat_id: int, user_message: dict, username: str)
         await send_rich_html_message(chat_id, f"❌ <b>处理图片时出错</b>\n<code>{str(e)[:100]}</code>")
 
 async def _handle_document_message(chat_id: int, user_message: dict, username: str):
-    await send_chat_action(chat_id, "upload_document")
     asyncio.create_task(init_workspace(chat_id))
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
@@ -717,7 +719,8 @@ async def _handle_document_message(chat_id: int, user_message: dict, username: s
         await send_rich_html_message(chat_id, f"❌ <b>处理文档时出错</b>\n<code>{str(e)[:100]}</code>")
 
 async def _handle_audio_message(chat_id: int, user_message: dict, username: str):
-    await send_chat_action(chat_id, "upload_voice")
+    # 用户上传语音时回发 upload_voice 是错误语义（那是“bot 正在上传语音”
+    # 的指示）——用户上传的内容与 chat action 无关，这里不发送任何动作。
     asyncio.create_task(init_workspace(chat_id))
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
@@ -744,7 +747,6 @@ async def _handle_video_message(chat_id: int, user_message: dict, username: str)
     ——支持视频输入的模型（stealth/ox-alpha、Gemini 系列等）收到
     video_url content part，不支持的模型收到文本占位；切换模型不丢信息。
     """
-    await send_chat_action(chat_id, "upload_video")
     asyncio.create_task(init_workspace(chat_id))
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
@@ -772,7 +774,6 @@ async def _handle_sticker_message(chat_id: int, user_message: dict, username: st
     不携带 file_id 附件，避免 _resolve_multimodal_content 把不可识别的
     媒体推到模型 API 触发 400。
     """
-    await send_chat_action(chat_id, "typing")
     asyncio.create_task(init_workspace(chat_id))
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
@@ -951,7 +952,6 @@ _video_group_tasks: dict[str, asyncio.Task] = {}
 
 async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
     try:
-        await send_chat_action(chat_id, "upload_photo")
         await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
         messages = await pop_media_group(media_group_id)
         _media_group_tasks.pop(media_group_id, None)
@@ -1044,7 +1044,6 @@ async def _process_video_group_once(chat_id: int, group_key: str) -> None:
     占位——与单视频、图片组行为完全一致，切换模型不丢信息。
     """
     try:
-        await send_chat_action(chat_id, "upload_video")
         await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
         messages = await pop_media_group(group_key)
         _video_group_tasks.pop(group_key, None)
@@ -1157,7 +1156,6 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
 
 
 async def _process_document_group_inner(chat_id: int, media_group_id: str) -> None:
-    await send_chat_action(chat_id, "upload_document")
     asyncio.create_task(init_workspace(chat_id))
     await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
     messages = await pop_media_group(media_group_id)
