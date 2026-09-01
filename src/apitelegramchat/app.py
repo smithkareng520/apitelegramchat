@@ -35,11 +35,12 @@ from apitelegramchat.config import (
     DEFAULT_MODEL,
     WHITELIST_USERS,
     ADMIN_USERS,
-    save_whitelist,
+    add_whitelist_user,
+    remove_whitelist_user,
+    snapshot_whitelist,
     GROQ_API_KEY,
     LOG_TRUNCATE_LIMIT,
     LOG_LEVEL,
-    global_lock,
 )
 from apitelegramchat.state import (
     user_contexts,
@@ -1527,43 +1528,51 @@ async def webhook() -> tuple:
                 if not is_admin(username, user_id):
                     await send_rich_html_message(chat_id, "❌ <b>权限不足</b>\n只有管理员可以执行此操作。", reply_parameters=_reply_params(msg["message_id"]))
                     return "OK", 200
-                async with global_lock:
-                    if _cmd_match(text, "/adduser"):
-                        parts = text.split()
-                        if len(parts) != 2:
-                            await send_rich_html_message(chat_id, "❌ <b>用法错误</b>\n用法：<code>/adduser @username</code> 或 <code>/adduser 123456789</code>", reply_parameters=_reply_params(msg["message_id"]))
-                            return "OK", 200
-                        target = parts[1].strip().lstrip("@")
-                        if not target:
-                            await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
-                            return "OK", 200
-                        WHITELIST_USERS.add(target)
-                        await save_whitelist()
+                # 【修复】不再用进程级 global_lock 包裹这三个命令：那把锁会让
+                # 白名单操作和其他用户正在做的 /model /role 等命令排队等待，
+                # 且 admin 命令之间也会互相等待。白名单的读改写已经由
+                # config.add_whitelist_user / remove_whitelist_user /
+                # snapshot_whitelist 内部的 _whitelist_lock 原子完成
+                # （改内存集合 + 落盘在同一把锁内，不会有裸读写竞态），
+                # 这把锁只保护白名单文件本身，不会阻塞其他用户或其他命令。
+                if _cmd_match(text, "/adduser"):
+                    parts = text.split()
+                    if len(parts) != 2:
+                        await send_rich_html_message(chat_id, "❌ <b>用法错误</b>\n用法：<code>/adduser @username</code> 或 <code>/adduser 123456789</code>", reply_parameters=_reply_params(msg["message_id"]))
+                        return "OK", 200
+                    target = parts[1].strip().lstrip("@")
+                    if not target:
+                        await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
+                        return "OK", 200
+                    added = await add_whitelist_user(target)
+                    if added:
                         await send_rich_html_message(chat_id, f"✅ <b>添加成功</b>\n已添加 <code>{target}</code> 到白名单。", reply_parameters=_reply_params(msg["message_id"]))
+                    else:
+                        await send_rich_html_message(chat_id, f"ℹ️ <b>无需操作</b>\n<code>{target}</code> 已在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
+                    return "OK", 200
+                elif _cmd_match(text, "/deluser"):
+                    parts = text.split()
+                    if len(parts) != 2:
+                        await send_rich_html_message(chat_id, "❌ <b>用法错误</b>\n用法：<code>/deluser @username</code> 或 <code>/deluser 123456789</code>", reply_parameters=_reply_params(msg["message_id"]))
                         return "OK", 200
-                    elif _cmd_match(text, "/deluser"):
-                        parts = text.split()
-                        if len(parts) != 2:
-                            await send_rich_html_message(chat_id, "❌ <b>用法错误</b>\n用法：<code>/deluser @username</code> 或 <code>/deluser 123456789</code>", reply_parameters=_reply_params(msg["message_id"]))
-                            return "OK", 200
-                        target = parts[1].strip().lstrip("@")
-                        if not target:
-                            await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
-                            return "OK", 200
-                        if target not in WHITELIST_USERS:
-                            await send_rich_html_message(chat_id, f"❌ <b>用户不存在</b>\n<code>{target}</code> 不在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
-                            return "OK", 200
-                        WHITELIST_USERS.remove(target)
-                        await save_whitelist()
+                    target = parts[1].strip().lstrip("@")
+                    if not target:
+                        await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
+                        return "OK", 200
+                    removed = await remove_whitelist_user(target)
+                    if removed:
                         await send_rich_html_message(chat_id, f"✅ <b>移除成功</b>\n已移除 <code>{target}</code>。", reply_parameters=_reply_params(msg["message_id"]))
-                        return "OK", 200
-                    elif _cmd_match(text, "/listusers"):
-                        if not WHITELIST_USERS:
-                            await send_rich_html_message(chat_id, "📋 <b>白名单为空</b>", reply_parameters=_reply_params(msg["message_id"]))
-                        else:
-                            users_list = "".join(f"<li><code>{str(u)}</code></li>" for u in sorted(WHITELIST_USERS))
-                            await send_rich_html_message(chat_id, f"📋 <b>当前白名单用户：</b>\n<ul>{users_list}</ul>", reply_parameters=_reply_params(msg["message_id"]))
-                        return "OK", 200
+                    else:
+                        await send_rich_html_message(chat_id, f"❌ <b>用户不存在</b>\n<code>{target}</code> 不在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
+                    return "OK", 200
+                elif _cmd_match(text, "/listusers"):
+                    users = await snapshot_whitelist()
+                    if not users:
+                        await send_rich_html_message(chat_id, "📋 <b>白名单为空</b>", reply_parameters=_reply_params(msg["message_id"]))
+                    else:
+                        users_list = "".join(f"<li><code>{str(u)}</code></li>" for u in users)
+                        await send_rich_html_message(chat_id, f"📋 <b>当前白名单用户：</b>\n<ul>{users_list}</ul>", reply_parameters=_reply_params(msg["message_id"]))
+                    return "OK", 200
 
             if _cmd_match(text, "/start"):
                 authorized = is_authorized(username, user_id)
@@ -2035,8 +2044,10 @@ async def webhook() -> tuple:
                             reply_message_id=msg["message_id"],
                         )
                         return "OK", 200
-                    async with global_lock:
-                        current_role = await get_user_role(chat_id)
+                    # 【修复】get_user_role 内部已经用 state._role_lock 保护，
+                    # 这里不需要再套一层进程级 global_lock——那会让 /model
+                    # 命令等待其他用户正在做的 /adduser 等操作释放锁。
+                    current_role = await get_user_role(chat_id)
                     banner_html = ""
                     if current_role:
                         banner_html = f"⚠️ <b>兼容性提示</b>\n当前角色「<b>{current_role}</b>」可能与新模型不兼容，请留意。"
@@ -2297,7 +2308,15 @@ async def webhook() -> tuple:
 
             try:
                 if sel in SUPPORTED_ROLES:
-                    async with global_lock:
+                    # 【修复】原来用进程级 global_lock 包住"读角色→切换→回读→
+                    # 更新列表消息（含 Telegram API 网络往返）"整个序列：
+                    # 网络请求的往返时间会把锁一直占着，导致其他用户此刻的
+                    # /adduser /model /role 等操作全部排队等待。
+                    # 这里的锁只需要保证"同一个 chat 快速连点时序列不交叉"
+                    # （注释提到的竞态），与其他用户无关，因此改用按 chat_id
+                    # 分片的 get_chat_lock，不再影响其他 chat。
+                    lock = await get_chat_lock(chat_id)
+                    async with lock:
                         prev = await get_user_role(chat_id)
                         if prev == sel:
                             await set_user_role(chat_id, None)
@@ -2337,8 +2356,9 @@ async def webhook() -> tuple:
                     # 打 √，列表仍由发送时的 delete_after 定时清理。列表消失前
                     # 的每一次点击都会得到 "√ 移动 + ✅ 消息" 双重反馈。
                     try:
-                        async with global_lock:
-                            current_role = await get_user_role(chat_id)
+                        # 【修复】get_user_role 内部已用 state._role_lock 保护，
+                        # 这里不需要再套一层进程级 global_lock。
+                        current_role = await get_user_role(chat_id)
                         banner_html = ""
                         if current_role:
                             banner_html = f"⚠️ <b>兼容性提示</b>\n当前角色「<b>{current_role}</b>」可能与新模型不兼容，请留意。"

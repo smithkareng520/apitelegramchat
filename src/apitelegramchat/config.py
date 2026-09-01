@@ -759,11 +759,49 @@ async def load_whitelist():
 
 async def save_whitelist():
     async with _whitelist_lock:
-        try:
-            with open(_resolve_whitelist_path(), "w", encoding="utf-8") as f:
-                f.writelines(user + "\n" for user in sorted(WHITELIST_USERS))
-        except OSError:
-            logger.warning("save_whitelist failed: %s", _resolve_whitelist_path(), exc_info=True)
+        _save_whitelist_unlocked()
+
+
+def _save_whitelist_unlocked() -> None:
+    """在已持有 _whitelist_lock 的前提下把 WHITELIST_USERS 写入磁盘。"""
+    try:
+        with open(_resolve_whitelist_path(), "w", encoding="utf-8") as f:
+            f.writelines(user + "\n" for user in sorted(WHITELIST_USERS))
+    except OSError:
+        logger.warning("save_whitelist failed: %s", _resolve_whitelist_path(), exc_info=True)
+
+
+async def add_whitelist_user(target: str) -> bool:
+    """原子地把 target 加入白名单并落盘。
+
+    "改内存集合 + 写文件" 整体在 _whitelist_lock 内完成，与
+    load_whitelist/save_whitelist 互斥，避免裸读写 WHITELIST_USERS
+    与落盘之间出现竞态窗口（例如两个管理员并发 /adduser 时互相覆盖）。
+    这把锁只保护白名单文件本身，不影响其他用户的对话/命令处理。
+    返回 True 表示确实发生了新增（此前不在白名单中）。
+    """
+    async with _whitelist_lock:
+        if target in WHITELIST_USERS:
+            return False
+        WHITELIST_USERS.add(target)
+        _save_whitelist_unlocked()
+        return True
+
+
+async def remove_whitelist_user(target: str) -> bool:
+    """原子地把 target 从白名单移除并落盘。返回 True 表示确实存在并被移除。"""
+    async with _whitelist_lock:
+        if target not in WHITELIST_USERS:
+            return False
+        WHITELIST_USERS.discard(target)
+        _save_whitelist_unlocked()
+        return True
+
+
+async def snapshot_whitelist() -> list[str]:
+    """加锁读取白名单快照（排序后的列表），避免与并发的增删操作交叉读到中间态。"""
+    async with _whitelist_lock:
+        return sorted(WHITELIST_USERS)
 
 # ---------- 缓存 TTL ----------
 CACHE_TTL = _positive_int_env("CACHE_TTL", 300, 10)
