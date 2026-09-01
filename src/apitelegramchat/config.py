@@ -554,12 +554,13 @@ def get_reasoning_request_fields(model_info, api_label: str = "") -> tuple:
 SUPPORTED_MODELS: Dict[str, ModelConfig] = {}
 
 # ---------- OpenRouter 模型 ----------
-SUPPORTED_MODELS["dots-studio/dots-3-note-preview:free"] = make_model_config(
-    model_id="dots-studio/dots-3-note-preview:free",
+SUPPORTED_MODELS["thinkingmachines/inkling:free"] = make_model_config(
+    model_id="thinkingmachines/inkling:free",
     provider="openrouter",
-    name="Dots-3-Note Preview Free",
+    name="Inkling Free",
     vision=True,
-    max_context=512000,
+    audio=True,
+    max_context=1000000,
     # 笔记型预览模型：不发送推理控制（预览期能力未知），采样不发送、走供应商默认。
 )
 SUPPORTED_MODELS["poolside/laguna-s-2.1:free"] = make_model_config(
