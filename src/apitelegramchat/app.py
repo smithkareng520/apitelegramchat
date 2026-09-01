@@ -251,22 +251,7 @@ async def _interrupt_active_generation(chat_id: int) -> None:
         logger.info(f"已标记草稿保留: chat={chat_id} draft={draft_id}")
     except Exception as e:
         logger.warning(f"mark_preserved_draft 异常: {e}")
-# ---------------------------------------------------------------------------
-# 辅助函数（保持不变）
-# ---------------------------------------------------------------------------
-async def _send_temp_message(chat_id: int, text: str) -> int:
-    try:
-        async with aiohttp.ClientSession() as session:
-            payload = {"chat_id": chat_id, "text": text}
-            async with session.post(f"{BASE_URL}/sendMessage", json=payload) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    # `data.get("result", {})` 在 result 为 None 时返回 None，
-                    # 再 `.get` 会 AttributeError。用 `or {}` 兜底。
-                    return (data.get("result") or {}).get("message_id")
-    except Exception as e:
-        logger.warning(f"_send_temp_message failed (chat_id={chat_id}): {e}")
-    return None
+
 
 @app.route('/health', methods=['GET'])
 async def health_check():
@@ -965,7 +950,6 @@ _document_group_tasks: dict[str, asyncio.Task] = {}
 _video_group_tasks: dict[str, asyncio.Task] = {}
 
 async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
-    temp_msg_id = await _send_temp_message(chat_id, "📷 正在处理您发送的图片组，请稍候…")
     try:
         await send_chat_action(chat_id, "upload_photo")
         await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
@@ -1033,13 +1017,6 @@ async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
     except Exception as e:
         logger.exception(f"_process_media_group_once 异常: {e}")
         await send_rich_html_message(chat_id, f"❌ <b>处理图片组时出错</b>\n<code>{str(e)[:100]}</code>")
-    finally:
-        if temp_msg_id:
-            try:
-                await delete_message(chat_id, temp_msg_id)
-            except Exception:
-                logger.debug("_process_media_group_once 内部忽略的异常", exc_info=True)
-                pass
 
 async def _schedule_media_group(chat_id: int, media_group_id: str) -> None:
     """将图片组的等待/处理任务作为当前 chat 的可取消生成任务登记。"""
@@ -1066,7 +1043,6 @@ async def _process_video_group_once(chat_id: int, group_key: str) -> None:
     支持视频的模型收到多个 video_url content part，不支持的模型收到文本
     占位——与单视频、图片组行为完全一致，切换模型不丢信息。
     """
-    temp_msg_id = await _send_temp_message(chat_id, "🎬 正在处理您发送的视频组，请稍候…")
     try:
         await send_chat_action(chat_id, "upload_video")
         await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
@@ -1144,13 +1120,6 @@ async def _process_video_group_once(chat_id: int, group_key: str) -> None:
     except Exception as e:
         logger.exception(f"_process_video_group_once 异常: {e}")
         await send_rich_html_message(chat_id, f"❌ <b>处理视频组时出错</b>\n<code>{str(e)[:100]}</code>")
-    finally:
-        if temp_msg_id:
-            try:
-                await delete_message(chat_id, temp_msg_id)
-            except Exception:
-                logger.debug("_process_video_group_once 内部忽略的异常", exc_info=True)
-                pass
 
 async def _schedule_video_group(chat_id: int, group_key: str) -> None:
     """将视频组的等待/处理任务作为当前 chat 的可取消生成任务登记（对称 _schedule_media_group）。"""
