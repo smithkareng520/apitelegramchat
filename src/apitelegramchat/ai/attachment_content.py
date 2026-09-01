@@ -619,6 +619,168 @@ async def _build_audio_fallback_text(
     return "\n\n".join(parts) if parts else (user_text or "请分析这段音频")
 
 
+async def _build_image_content_part(
+    chat_id: int | None, file_id: str, vision_prefer_url: bool
+) -> Optional[dict]:
+    """把单个图片 file_id 解析为 image_url content part（失败返回 None）。
+
+    从 photo_group 分支抽出的公共逻辑，混合附件分支复用：
+    vision_prefer_url 网关（Agnes）优先 R2 公开 URL，失败回退 base64；
+    其余网关直接 base64 内联，并顺带做 R2 预上传与 TTL 缓存。
+    """
+    # Agnes 等 vision_prefer_url 网关：走公开 URL 路径。
+    # 失败回退到 base64（OpenAI 等多数网关都支持）。
+    if vision_prefer_url:
+        public_url = await _resolve_r2_public_url_for_vision(file_id)
+        if public_url:
+            return {
+                "type": "image_url",
+                "image_url": {"url": public_url, "detail": "high"},
+            }
+        # R2 不可用，回退到 base64（仍然好过完全没图）。
+        logger.debug(
+            f"vision_prefer_url=True 但 R2 URL 不可用，回退 base64: {file_id[:12]}"
+        )
+
+    img_bytes = await get_cached_image_data(chat_id, file_id) if chat_id else None
+    if not img_bytes:
+        return None
+
+    # 预防性后台上传到 R2：fire-and-forget，不阻塞 base64 编码。
+    # 目的：
+    #   1. 让内存 TTLCache (~5min) 过期后能从 R2 拉取，避免再调
+    #      Telegram getFile API（Telegram bot getFile 有 rate limit）。
+    #   2. 让未来切换到 Agnes (vision_prefer_url=True) 的轮次能
+    #      零延迟拿 R2 公开 URL，不必再走同步上传路径。
+    # Agnes 路径不经过这里（vision_prefer_url=True 时早已 return），
+    # 所以同一张图不会被 put_object 两次。
+    r2_key = _get_r2_key(file_id)
+    _track_task(_upload_and_mark(file_id, img_bytes, r2_key))
+
+    try:
+        # 用 with 语句确保 PIL Image 在异常路径上也会被 close，
+        # 避免大量并发图片处理时文件描述符泄露。
+        with Image.open(io.BytesIO(img_bytes)) as img:
+            fmt = img.format.lower() if img.format else "jpeg"
+            if fmt not in ("jpeg", "png"):
+                fmt = "jpeg"
+            if fmt == "png" and img.mode == "RGBA":
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode()
+            else:
+                # convert() 返回的是新 Image 对象，同样需要 close。
+                with img.convert("RGB") as img_rgb:
+                    buf = io.BytesIO()
+                    img_rgb.save(buf, format=fmt.upper())
+                    b64 = base64.b64encode(buf.getvalue()).decode()
+            return {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/{fmt};base64,{b64}", "detail": "high"}
+            }
+    except Exception as e:
+        logger.exception(f"处理图片 {file_id} 失败: {e}")
+        return None
+
+
+async def _resolve_mixed_attachments(
+    entries: list[dict],
+    model_info: ModelConfig,
+    chat_id: int | None,
+    user_text: str,
+    vision_prefer_url: bool,
+):
+    """逐条解析混合 kind / 多音频附件（打断合并产物，无单一 type 可路由）。
+
+    每个附件独立判断当前模型能力：支持的模态生成对应原生 content part
+    （image_url / video_url / input_audio / file），不支持或解析失败的
+    降级为文本占位（音频走转录降级，视频顺带后台持久化，保证切换模型
+    后可恢复）。返回 content parts 列表；全部失败时返回占位文本。
+    """
+    supports_vision = model_info.vision
+    supports_audio = model_info.audio
+    supports_video = bool(getattr(model_info, "video", False))
+    supports_native_documents = bool(getattr(model_info, "native_document", False))
+
+    content_parts: list[dict] = []
+    fallback_texts: list[str] = []
+
+    for entry in entries:
+        kind = str(entry.get("kind") or "").strip().lower()
+        fid = str(entry.get("file_id") or "").strip()
+        if not fid:
+            continue
+        fname = str(entry.get("file_name") or "").strip()
+        mime = str(entry.get("mime_type") or "").strip()
+
+        resolved_part = None
+        if kind == "photo" and supports_vision:
+            resolved_part = await _build_image_content_part(chat_id, fid, vision_prefer_url)
+        elif kind == "video" and supports_video:
+            public_url = await _resolve_r2_public_url_for_video(fid, mime or "video/mp4")
+            if public_url:
+                resolved_part = {"type": "video_url", "video_url": {"url": public_url}}
+            else:
+                # URL 不可用（R2 未配置/上传失败）：后台持久化，
+                # 万一 R2 稍后恢复，下一轮可重新解析为原生视频。
+                _track_task(_ensure_video_persisted(fid, mime or "video/mp4"))
+        elif kind in ("audio", "voice"):
+            if supports_audio:
+                audio_bytes = await _get_cached_audio_data(chat_id, fid)
+                if audio_bytes:
+                    b64_data = base64.b64encode(audio_bytes).decode()
+                    audio_format = (Path(fname).suffix.lstrip(".") or "ogg").lower()
+                    if audio_format == "oga":
+                        audio_format = "ogg"
+                    resolved_part = {
+                        "type": "input_audio",
+                        "input_audio": {"data": b64_data, "format": audio_format},
+                    }
+            if resolved_part is None:
+                # 模型不支持音频 / 字节获取失败：转录降级（与单音频路径一致）。
+                fallback_texts.append(await _build_audio_fallback_text(
+                    chat_id=chat_id,
+                    file_id=fid,
+                    file_name=fname or f"audio_{fid[:8]}.ogg",
+                    user_text="",
+                ))
+                continue
+        elif kind == "document" and supports_native_documents:
+            resolved_part = await _build_native_document_part(
+                chat_id,
+                fid,
+                file_name=fname or f"document_{fid[:8]}.pdf",
+                mime_type=mime,
+            )
+
+        if resolved_part is not None:
+            content_parts.append(resolved_part)
+            continue
+
+        # 该附件模态不被当前模型支持 / 解析失败：文本占位；视频顺带
+        # 后台持久化，保证之后切换到支持的模型时不丢信息。
+        if kind == "video":
+            _track_task(_ensure_video_persisted(fid, mime or "video/mp4"))
+        fallback_kind = kind if kind in ("photo", "video", "document") else "document"
+        fallback_texts.append(await _build_attachment_fallback_text(
+            kind=fallback_kind,
+            file_ids=[fid],
+            user_text="",
+            chat_id=chat_id,
+            file_names=[fname] if fname else [],
+            mime_types=[mime] if mime else [],
+        ))
+
+    text_bits = [t for t in fallback_texts if t and str(t).strip()]
+    if user_text and str(user_text).strip():
+        text_bits.append(str(user_text))
+    if text_bits:
+        content_parts.append({"type": "text", "text": "\n\n".join(text_bits)})
+    if content_parts:
+        return content_parts
+    return user_text
+
+
 async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_id: int | None = None):
     supports_vision = model_info.vision
     supports_audio = model_info.audio
@@ -637,66 +799,30 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
     if isinstance(user_text, str):
         user_text = _strip_reply_prefix(user_text)
 
+    # ---------- 混合类型 / 多音频附件（打断合并产物） ----------
+    # 打断合并（turn_recovery._merge_user_message）可能产生一条携带多种
+    # kind 附件（如图片+视频）或多个音频的用户消息：这类消息没有单一
+    # type 可供下方分支路由，这里按 attachments 逐条解析——支持该模态
+    # 的附件生成对应 content part，不支持的降级为文本占位。普通消息
+    # 不会进入本分支：所有生产者写入的 attachments 均为单一 kind；同类
+    # 多附件场景在合并时已归一为 photo_group / video_group /
+    # document_group 数组形态，由下方各分支按数组原生处理。
+    atts = msg.get("attachments")
+    if isinstance(atts, list) and len(atts) >= 2:
+        entries = [a for a in atts if isinstance(a, dict) and a.get("file_id")]
+        att_kinds = {str(a.get("kind") or "").strip().lower() for a in entries}
+        if entries and (len(att_kinds) > 1 or att_kinds <= {"audio", "voice"}):
+            return await _resolve_mixed_attachments(
+                entries, model_info, chat_id, user_text, vision_prefer_url
+            )
+
     # ---------- 图片 / 图片组 ----------
     if "file_ids" in msg and msg.get("type") in ("photo", "photo_group"):
         file_ids = list(msg.get("file_ids") or [])
         if supports_vision:
-            async def process_one(fid):
-                # Agnes 等 vision_prefer_url 网关：走公开 URL 路径。
-                # 失败回退到 base64（OpenAI 等多数网关都支持）。
-                if vision_prefer_url:
-                    public_url = await _resolve_r2_public_url_for_vision(fid)
-                    if public_url:
-                        return {
-                            "type": "image_url",
-                            "image_url": {"url": public_url, "detail": "high"},
-                        }
-                    # R2 不可用，回退到 base64（仍然好过完全没图）。
-                    logger.debug(
-                        f"vision_prefer_url=True 但 R2 URL 不可用，回退 base64: {fid[:12]}"
-                    )
-
-                img_bytes = await get_cached_image_data(chat_id, fid) if chat_id else None
-                if not img_bytes:
-                    return None
-
-                # 预防性后台上传到 R2：fire-and-forget，不阻塞 base64 编码。
-                # 目的：
-                #   1. 让内存 TTLCache (~5min) 过期后能从 R2 拉取，避免再调
-                #      Telegram getFile API（Telegram bot getFile 有 rate limit）。
-                #   2. 让未来切换到 Agnes (vision_prefer_url=True) 的轮次能
-                #      零延迟拿 R2 公开 URL，不必再走同步上传路径。
-                # Agnes 路径不经过这里（vision_prefer_url=True 时早已 return），
-                # 所以同一张图不会被 put_object 两次。
-                r2_key = _get_r2_key(fid)
-                _track_task(_upload_and_mark(fid, img_bytes, r2_key))
-
-                try:
-                    # 用 with 语句确保 PIL Image 在异常路径上也会被 close，
-                    # 避免大量并发图片处理时文件描述符泄露。
-                    with Image.open(io.BytesIO(img_bytes)) as img:
-                        fmt = img.format.lower() if img.format else "jpeg"
-                        if fmt not in ("jpeg", "png"):
-                            fmt = "jpeg"
-                        if fmt == "png" and img.mode == "RGBA":
-                            buf = io.BytesIO()
-                            img.save(buf, format="PNG")
-                            b64 = base64.b64encode(buf.getvalue()).decode()
-                        else:
-                            # convert() 返回的是新 Image 对象，同样需要 close。
-                            with img.convert("RGB") as img_rgb:
-                                buf = io.BytesIO()
-                                img_rgb.save(buf, format=fmt.upper())
-                                b64 = base64.b64encode(buf.getvalue()).decode()
-                        return {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/{fmt};base64,{b64}", "detail": "high"}
-                        }
-                except Exception as e:
-                    logger.exception(f"处理图片 {fid} 失败: {e}")
-                    return None
-
-            results = await asyncio.gather(*[process_one(fid) for fid in file_ids])
+            results = await asyncio.gather(
+                *[_build_image_content_part(chat_id, fid, vision_prefer_url) for fid in file_ids]
+            )
             content_parts = [r for r in results if r is not None]
             if content_parts:
                 # 即使当前模型支持视觉输入，也额外注入附件临时 URL。

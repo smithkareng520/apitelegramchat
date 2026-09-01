@@ -42,7 +42,9 @@ user 消息落位（OpenAI 格式）
 
 - 打断发生在任何 assistant 输出之前：journal 为空，历史末尾仍是上一条
   user 消息 → 新 user 消息由 ``persist_user_message_entry`` **合并**进
-  该消息（content 以空行拼接，附件数组拼接），避免连续两条 user；
+  该消息（content 以空行拼接；媒体附件按 kind 归一——同类升级为
+  photo_group / video_group / document_group 数组，混合 kind / 多音频
+  保留 attachments 列表由解析器逐个解析），避免连续两条 user；
 - 打断发生在 tool_call 之后：占位 tool 消息补齐配对，新 user 消息直接
   追加在 tool 消息之后（OpenAI 允许 tool 后跟 user，tool 角色不破坏
   user 交替）；
@@ -414,19 +416,101 @@ async def persist_salvaged_journal(chat_id: int, journal: list, *, reason: str) 
 # =====================================================================
 _ARRAY_KEYS = ("file_ids", "file_names", "mime_types", "attachments")
 
+# 同类多附件可归一的组形态（_resolve_multimodal_content 原生支持多附件）。
+_KIND_GROUP_TYPE = {
+    "photo": "photo_group",
+    "video": "video_group",
+    "document": "document_group",
+}
+# 允许从单数字段重建附件条目的消息类型（历史遗留消息可能没有 attachments）。
+_SINGLE_ATTACHMENT_TYPES = ("photo", "video", "document", "audio", "voice")
+# 解析器可按 type 路由的类型（用于判断旧消息的 type 是否仍然可路由）。
+_RESOLVER_TYPES = {
+    "photo", "photo_group", "video", "video_group",
+    "document", "document_group", "audio", "voice",
+}
+
+
+def _attachment_entries(msg: dict) -> list[dict]:
+    """提取消息携带的附件条目（attachments 优先，缺失时从单数字段重建）。
+
+    打断合并需要统一的附件视图：组消息（photo_group 等）、单发消息
+    （file_id 单数字段）以及历史遗留的无 attachments 消息，都要能归到
+    同一个 (kind, file_id) 列表上，后续才能按 kind 判断合并形态。
+    """
+    atts = msg.get("attachments")
+    entries: list[dict] = []
+    if isinstance(atts, list):
+        entries = [dict(a) for a in atts if isinstance(a, dict) and a.get("file_id")]
+    if entries:
+        return entries
+    kind = str(msg.get("type") or "").strip().lower()
+    fid = msg.get("file_id")
+    if fid and kind in _SINGLE_ATTACHMENT_TYPES:
+        entry = {"kind": kind, "file_id": fid}
+        if msg.get("file_name"):
+            entry["file_name"] = msg["file_name"]
+        if msg.get("mime_type"):
+            entry["mime_type"] = msg["mime_type"]
+        return [entry]
+    return []
+
 
 def _merge_user_message(old: dict, new: dict) -> None:
     """把新 user 消息合并进历史末尾的旧 user 消息（原地修改 old）。
 
     - content：字符串以空行拼接（保持出站管线对 str content 的假设）；
-    - 附件数组（file_ids / attachments 等）：顺序拼接；
-    - type / file_id：旧消息缺失时采纳新消息的（保证多模态解析生效）。
+    - 媒体附件：合并双方全部附件并按 kind 归一——
+      * 同类多附件（图/视频/文档，含旧消息 type 不可路由的场景）升级为
+        photo_group / video_group / document_group 数组形态，解析器原生
+        支持多附件；
+      * 混合 kind（如图片+视频）或多音频：保留合并后的 attachments
+        列表，由 _resolve_multimodal_content 的混合附件分支逐个解析
+        （旧实现只拼 attachments 而解析器从不读它，第二条视频/音频/
+        混合媒体会被静默丢弃）；
+      * 单一音频并入纯文本/贴纸消息：沿用单数字段补位（audio 无组形态）；
+    - type / file_id：旧消息缺失或不可路由时采纳新消息的（保证多模态解析生效）。
     """
     old_text = old.get("content")
     new_text = new.get("content")
     parts = [str(t).strip() for t in (old_text, new_text) if isinstance(t, str) and str(t).strip()]
     if parts:
         old["content"] = "\n\n".join(parts)
+
+    combined = _attachment_entries(old) + _attachment_entries(new)
+    if combined:
+        kinds = {str(a.get("kind") or "").strip().lower() for a in combined}
+        if len(kinds) == 1:
+            kind = kinds.pop()
+            group_type = _KIND_GROUP_TYPE.get(kind)
+            old_type = str(old.get("type") or "").strip().lower()
+            if group_type and (len(combined) >= 2 or old_type not in _RESOLVER_TYPES):
+                # 同类多附件（或旧消息 type 不可路由，如纯文本/贴纸）→
+                # 归一为解析器原生支持的组形态。
+                old["type"] = group_type
+                old["file_ids"] = [a["file_id"] for a in combined]
+                if kind == "photo":
+                    old["file_names"] = [
+                        a.get("file_name") or f"photo_{str(a['file_id'])[:8]}.jpg"
+                        for a in combined
+                    ]
+                else:
+                    old["file_names"] = [a.get("file_name") or "" for a in combined]
+                    old["mime_types"] = [a.get("mime_type") or "" for a in combined]
+                old["attachments"] = combined
+                for key in ("file_id", "file_name", "mime_type"):
+                    old.pop(key, None)
+                return
+        if len(combined) >= 2:
+            # 混合 kind 或多音频：保留 attachments 列表交给解析器混合分支。
+            old["attachments"] = combined
+            for key in ("file_id", "file_ids", "file_name", "file_names",
+                        "mime_type", "mime_types"):
+                old.pop(key, None)
+            return
+        # 单一附件且无组形态（音频并入纯文本/贴纸消息）：落到下方单数
+        # 字段补位，保持与未合并消息一致的可路由形态。
+
     for key in _ARRAY_KEYS:
         new_vals = new.get(key)
         if isinstance(new_vals, list) and new_vals:
@@ -434,8 +518,10 @@ def _merge_user_message(old: dict, new: dict) -> None:
             if not isinstance(existing, list):
                 existing = []
             old[key] = existing + list(new_vals)
-    if not old.get("type") and new.get("type"):
-        old["type"] = new["type"]
+    if new.get("type"):
+        old_type = str(old.get("type") or "").strip().lower()
+        if not old.get("type") or old_type not in _RESOLVER_TYPES:
+            old["type"] = new["type"]
     if not old.get("file_id") and new.get("file_id"):
         old["file_id"] = new["file_id"]
     if not old.get("file_name") and new.get("file_name"):
