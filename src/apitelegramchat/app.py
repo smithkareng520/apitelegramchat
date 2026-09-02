@@ -400,9 +400,14 @@ def _estimate_message_tokens(message: dict) -> int:
             tokens += _MEDIA_TOKEN_OVERHEAD * len(tool_calls)
     return tokens
 
-def _estimate_request_snapshot(history: list[dict]) -> tuple[object, int]:
-    """Select the next API snapshot and estimate its prompt cost."""
-    snapshot = select_request_context(history)
+def _estimate_request_snapshot(history: list[dict], model_max_context: Optional[int] = None) -> tuple[object, int]:
+    """Select the next API snapshot and estimate its prompt cost.
+    
+    Args:
+        history: 历史消息列表
+        model_max_context: 模型的最大上下文窗口（用于动态 token 预算）
+    """
+    snapshot = select_request_context(history, model_max_context=model_max_context)
     return snapshot, sum(_estimate_message_tokens(message) for message in snapshot.messages)
 
 
@@ -477,12 +482,12 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
         safe_limit = max_context - max_output
         new_input_est = max(1, _estimate_message_tokens(new_user_message))
 
-        _, request_estimate = _estimate_request_snapshot(history)
+        _, request_estimate = _estimate_request_snapshot(history, model_max_context=max_context)
         if request_estimate + new_input_est <= safe_limit:
             return True
 
         first_pass = await compact_older_tool_calls(chat_id, history)
-        _, request_estimate = _estimate_request_snapshot(history)
+        _, request_estimate = _estimate_request_snapshot(history, model_max_context=max_context)
         if first_pass.compacted_calls:
             logger.info(
                 "Pre-flight tool compaction pass=1 chat=%s calls=%s archived_bytes=%s request_estimate=%s",

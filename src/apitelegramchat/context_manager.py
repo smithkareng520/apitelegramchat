@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 from apitelegramchat.token_budget import json_token_count, truncate_to_token_budget
 
@@ -17,7 +17,9 @@ from apitelegramchat.token_budget import json_token_count, truncate_to_token_bud
 # A long conversation can easily exceed a model's useful context window.  Keep
 # the latest 50 messages and, by default, no more than 50k exact input tokens.
 DEFAULT_MAX_MESSAGES = int(os.getenv("CONTEXT_MAX_MESSAGES", "50"))
-DEFAULT_MAX_TOKENS = int(os.getenv("CONTEXT_MAX_TOKENS", "50000"))
+
+# 默认 token 上限：优先使用环境变量，其次在调用时根据模型动态计算
+DEFAULT_MAX_TOKENS_ENV = int(os.getenv("CONTEXT_MAX_TOKENS", "0"))
 
 
 # =====================================================================
@@ -108,6 +110,7 @@ def select_request_context(
     *,
     max_messages: int | None = None,
     max_tokens: int | None = None,
+    model_max_context: Optional[int] = None,
 ) -> ContextSnapshot:
     """Return a bounded, structurally valid tail of the conversation.
 
@@ -120,11 +123,29 @@ def select_request_context(
     倍（见 _quantized_drop）。窗口起点因此按阶梯前进而非逐轮滑动，两次
     跳跃之间的若干轮里请求前缀字节级一致，隐式前缀缓存可跨轮命中。
     设 CONTEXT_EVICT_HEADROOM_MESSAGES=1 可恢复旧版逐轮滑动行为。
+    
+    Args:
+        history: 完整的历史消息列表
+        max_messages: 最大消息数量（可选，默认 DEFAULT_MAX_MESSAGES）
+        max_tokens: 最大 token 数（可选，优先使用此值，其次根据模型动态计算）
+        model_max_context: 模型的最大上下文窗口（用于动态计算 max_tokens）
     """
     if max_messages is None:
         max_messages = DEFAULT_MAX_MESSAGES
+    
+    # 动态上下文策略：
+    # 1. 如果显式传入 max_tokens，直接使用
+    # 2. 否则如果提供了 model_max_context，使用模型上下文的 80% 作为软上限
+    # 3. 否则使用环境变量 DEFAULT_MAX_TOKENS_ENV（如果 > 0）
+    # 4. 最后退回到 50000 的硬编码默认值
     if max_tokens is None:
-        max_tokens = DEFAULT_MAX_TOKENS
+        if model_max_context is not None:
+            # 使用模型上下文的 80% 作为动态 token 上限，留出余量给响应和工具输出
+            max_tokens = int(model_max_context * 0.8)
+        elif DEFAULT_MAX_TOKENS_ENV > 0:
+            max_tokens = DEFAULT_MAX_TOKENS_ENV
+        else:
+            max_tokens = 50000  # 硬编码默认值
 
     supported = [message for message in history if _is_supported(message)]
     total = len(supported)

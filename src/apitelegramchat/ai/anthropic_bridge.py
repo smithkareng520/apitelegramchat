@@ -368,15 +368,44 @@ async def _agentic_loop_anthropic(
         system_prompt, anthropic_messages = _convert_messages_to_anthropic(loop_messages)
 
         if prompt_cache_enabled and anthropic_messages:
-            # 在最后一条消息的最后一个块上打显式缓存断点，随对话增长自动
-            # 前移（与 OpenRouter 分支的注释语义一致，Anthropic 官方推荐
-            # 做法：ephemeral cache_control 打在希望复用的前缀末尾）。
-            last_msg = anthropic_messages[-1]
-            if last_msg.get("content"):
-                last_msg["content"][-1] = {
-                    **last_msg["content"][-1],
-                    "cache_control": {"type": "ephemeral"},
-                }
+            # Anthropic 多断点缓存策略（官方上限：单请求最多 4 个显式断点）
+            # 断点应打在希望下一轮请求能复用的前缀末尾，按重要性排序：
+            # 1. system 消息末尾（最稳定，几乎每轮都命中）
+            # 2. 倒数第二条 user/assistant 消息末尾（覆盖上一轮完整内容）
+            # 3. 最后一条消息末尾（覆盖本轮新输入，loop 内多轮复用）
+            # 第 4 个断点额度保留给 agentic loop 内的动态追加
+            cache_points_applied = 0
+            MAX_CACHE_POINTS = 3  # 保留 1 个额度给 loop 内动态使用
+            
+            # 断点 1: system 消息
+            if system_prompt and anthropic_messages:
+                first_msg = anthropic_messages[0]
+                if first_msg.get("role") == "user" and first_msg.get("content"):
+                    content = first_msg["content"]
+                    if isinstance(content, list) and content:
+                        content[-1] = {
+                            **content[-1],
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                        cache_points_applied += 1
+            
+            # 断点 2 & 3: 从后往前找两条 user/assistant 消息
+            remaining = MAX_CACHE_POINTS - cache_points_applied
+            for i in range(len(anthropic_messages) - 1, 0, -1):
+                if remaining <= 0:
+                    break
+                msg = anthropic_messages[i]
+                if msg.get("role") in ("user", "assistant") and msg.get("content"):
+                    content = msg["content"]
+                    if isinstance(content, list) and content:
+                        already_marked = "cache_control" in content[-1]
+                        if not already_marked:
+                            content[-1] = {
+                                **content[-1],
+                                "cache_control": {"type": "ephemeral"},
+                            }
+                            remaining -= 1
+                            cache_points_applied += 1
 
         request_kwargs: dict = {
             "model": current_model,
