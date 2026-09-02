@@ -52,6 +52,10 @@ from apitelegramchat.config import (
     get_reasoning_request_fields,
 )
 from apitelegramchat.token_budget import count_tokens, truncate_to_token_budget
+# Anthropic 原生厂商的非流式调用桥接（仅当 model_info.provider == "anthropic"
+# 时使用；其余厂商的 client.chat.completions.create 调用路径完全不变）。
+# 注意：延迟到 _create_chat_completion 内部导入，避免模块级循环导入
+# （anthropic_bridge -> tool_summary -> tool_executors -> subagent_tool）。
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +223,29 @@ async def _execute_tool_for_subagent(
         return f"Error: tool '{name}' failed: {str(e)[:200]}"
 
 
+async def _create_chat_completion(client, model_info, create_params: dict):
+    """按厂商分流的一次性（非流式）补全调用。
+
+    - model_info.provider == "anthropic"：走原生 Messages API
+      （anthropic_chat_completions_create，返回值形状模拟
+      OpenAI 的 resp.choices[0].message，下游解析代码零改动）。
+    - 其余厂商：完全不变，原样调用 client.chat.completions.create。
+    """
+    provider = getattr(model_info, "provider", "") if model_info else ""
+    if provider == "anthropic":
+        from apitelegramchat.ai.anthropic_bridge import anthropic_chat_completions_create
+        return await anthropic_chat_completions_create(
+            client,
+            model=create_params["model"],
+            messages=create_params["messages"],
+            max_tokens=create_params.get("max_tokens", 8192),
+            temperature=create_params.get("temperature"),
+            top_p=create_params.get("top_p"),
+            tools=create_params.get("tools"),
+        )
+    return await client.chat.completions.create(**create_params)
+
+
 async def _subagent_agentic_loop(
     client,
     model: str,
@@ -310,7 +337,7 @@ async def _subagent_agentic_loop(
                 create_params["parallel_tool_calls"] = True
 
             resp = await asyncio.wait_for(
-                client.chat.completions.create(**create_params),
+                _create_chat_completion(client, model_info, create_params),
                 timeout=SUBAGENT_LLM_TIMEOUT,
             )
         except asyncio.TimeoutError:

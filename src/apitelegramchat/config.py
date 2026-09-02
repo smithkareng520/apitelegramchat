@@ -24,6 +24,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 MODELSCOPE_API_KEY = os.getenv("MODELSCOPE_API_KEY", "")
 AGNES_API_KEY = os.getenv("AGNES_API_KEY", "")
+# Anthropic 官方 API（原生 Messages API，非 OpenAI 兼容协议）。
+# 与其余厂商并存：其余厂商继续走 AsyncOpenAI + chat.completions.create，
+# 互不影响；本 key 仅供 anthropic 厂商专用循环
+# （ai/agentic_loops._agentic_loop_anthropic）使用。
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 
 # ---------- 高德地图 MCP 服务（@amap/amap-maps on ModelScope）----------
@@ -124,6 +129,10 @@ class ProviderConfig:
     default_headers: Optional[Dict[str, str]] = None
     # 是否使用专用循环（如 Gemini 非流式特殊处理）
     use_dedicated_loop: bool = False
+    # 专用循环的具体协议标签，仅在 use_dedicated_loop=True 时读取。
+    # "gemini_openai_compat"（默认，向后兼容旧值）-> _agentic_loop_gemini_openai_compat
+    # "anthropic_native"                          -> _agentic_loop_anthropic
+    dedicated_loop_kind: str = "gemini_openai_compat"
     # 是否支持 Prompt Caching（仅部分厂商需要显式标记）
     supports_prompt_cache: bool = False
     # 视觉输入是否需要"公开可访问 HTTP URL"而非 data:image/...;base64,... 内联格式。
@@ -236,6 +245,19 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         # Agnes 官方文档明确只接受 image_url 中的公开 URL（不接受 data: base64），
         # 因此 _resolve_multimodal_content 会优先用 R2 公开 URL，R2 不可用时回退 base64。
         vision_prefer_url=True,
+    ),
+    "anthropic": ProviderConfig(
+        name="Anthropic",
+        # base_url 仅为占位（保持 ProviderConfig 结构一致），api_client 对
+        # anthropic 厂商不会用它构造 AsyncOpenAI 客户端，而是构造原生
+        # AsyncAnthropic 客户端（见 api_client.py）。
+        base_url="https://api.anthropic.com",
+        api_key_env="ANTHROPIC_API_KEY",
+        use_dedicated_loop=True,
+        dedicated_loop_kind="anthropic_native",
+        # Anthropic 原生 prompt caching（cache_control 显式断点），由
+        # _agentic_loop_anthropic 按 supports_prompt_cache 开启。
+        supports_prompt_cache=True,
     ),
 }
 
@@ -364,6 +386,24 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "reasoning_max_tokens": None,
         "max_output_tokens": 8192,
         "max_context": 128000,
+    },
+    "anthropic": {
+        "vision": True,
+        "audio": False,
+        "video": False,
+        "supports_tools": True,
+        "native_image": False,
+        "native_document": True,
+        "native_video": False,
+        "supports_sampling": True,
+        "supports_prompt_cache": True,
+        "temperature": None,          # None -> 不发送，走供应商默认
+        "top_p": None,                # None -> 不发送，走供应商默认
+        "reasoning_enabled": None,    # None -> 不发送推理控制参数
+        "reasoning_effort": None,
+        "reasoning_max_tokens": None,
+        "max_output_tokens": 8192,
+        "max_context": 200000,
     },
 }
 
@@ -541,6 +581,19 @@ def get_reasoning_request_fields(model_info, api_label: str = "") -> tuple:
         if budget is not None:
             extra["thinking_budget"] = int(budget)
         return ({}, extra)
+
+    if provider == "anthropic":
+        # Anthropic 原生 Messages API：thinking 是顶层字段
+        # {"type": "enabled"/"disabled", "budget_tokens": int}（enabled 时
+        # budget_tokens 必填，未显式配置预算时给一个保守默认值）。
+        # 该分支仅供 _agentic_loop_anthropic 自行解读使用（该循环不经过
+        # chat.completions.create/extra_body，是直接读取 SUPPORTED_MODELS
+        # 字段，这里返回值主要供调用方一致性参考，不影响其它厂商）。
+        if enabled is False:
+            return ({}, {"thinking": {"type": "disabled"}})
+        if enabled is True or budget is not None:
+            return ({}, {"thinking": {"type": "enabled", "budget_tokens": int(budget) if budget else 10000}})
+        return _REASONING_NOOP
 
     # 其他 OpenAI 兼容厂商：只透传 effort（能力不明的网关不发未知字段）。
     if effort is not None:
@@ -722,6 +775,9 @@ SUPPORTED_MODELS["agnes-video-v2.0"] = make_model_config(
     max_context=32768,
     max_output_tokens=4000,
 )
+
+# ---------- Anthropic 官方模型（原生 Messages API，专用循环）----------
+
 
 # ========== 默认模型 ==========
 DEFAULT_MODEL = "agnes-2.5-flash"

@@ -62,6 +62,13 @@ from apitelegramchat.ai.tool_summary import (
 )
 from apitelegramchat.ai.tool_call_loop import _run_tool_calls_and_append
 
+# Anthropic 原生 Messages API 专用循环：独立实现，位于 anthropic_bridge.py
+# （职责分离 + 避免本已很大的文件继续膨胀）。此处重导出保持调用方
+# "from apitelegramchat.ai.agentic_loops import _agentic_loop_anthropic"
+# 这一路径可用，与 _agentic_loop_openai_compat / _agentic_loop_gemini_openai_compat
+# 并列，风格一致。
+from apitelegramchat.ai.anthropic_bridge import _agentic_loop_anthropic  # noqa: F401
+
 if TYPE_CHECKING:
     # 仅供类型注解使用；运行时由调用方传入，避免运行时循环导入。
     from apitelegramchat.ai.rich_message_builder import RichMessageBuilder

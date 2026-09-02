@@ -1804,3 +1804,47 @@ turn finished
 ```text
 LICENSE
 ```
+
+## Anthropic（Claude 官方 API）支持
+
+本项目新增了一个走 Anthropic 原生 Messages API 的厂商选项，与原有 7 个
+OpenAI 兼容厂商（OpenRouter / ModelScope / Gemini / Grok / DeepSeek / GLM /
+Agnes）并存，互不影响，可在对话中直接切换模型使用。
+
+### 配置
+
+设置环境变量：
+
+```
+ANTHROPIC_API_KEY=sk-ant-xxxxx
+```
+
+未设置该变量时，Claude 系列模型不可用，其余厂商行为不受任何影响。
+
+### 已内置的模型
+
+见 `config.py` 中 `SUPPORTED_MODELS` 的 "Anthropic 官方模型" 部分：
+
+- `claude-sonnet-4-5-20250929`
+- `claude-opus-4-1-20250805`
+- `claude-haiku-4-5-20251001`
+
+> 以上模型 ID 为占位值，请在正式使用前核实并按需替换为
+> Anthropic 官方当前实际可用的模型字符串（见
+> https://docs.claude.com/en/docs/about-claude/models ）。
+
+### 实现说明
+
+- `api_client.py`：`anthropic` 厂商使用原生 `AsyncAnthropic` 客户端，
+  其余厂商仍使用 `AsyncOpenAI`，两套逻辑完全独立。
+- `ai/anthropic_bridge.py`：新文件，负责
+  - 工具 schema 转换（OpenAI `function` 格式 → Anthropic `input_schema`）
+  - 消息格式转换（`role: system` → 顶层 `system` 参数；
+    `role: tool` → `tool_result` 内容块）
+  - 完整的原生流式 agentic 循环 `_agentic_loop_anthropic`
+  - 供 `subagent_tool.py` 复用的非流式调用适配器
+    `anthropic_chat_completions_create`
+- 全局对话历史（跨模型共享）中持久化的消息格式**保持不变**（仍是原有的
+  OpenAI 兼容形状）；协议转换只发生在"即将请求 Anthropic API 之前"和
+  "刚收到 Anthropic 响应之后"这两个边界点，因此用户在同一对话中切换
+  厂商（例如从 Claude 切回 OpenRouter）不会导致历史格式冲突。

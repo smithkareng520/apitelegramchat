@@ -56,6 +56,7 @@ from apitelegramchat.ai.attachment_content import (
 )
 from apitelegramchat.ai.rich_message_builder import RichMessageBuilder
 from apitelegramchat.ai.agentic_loops import (
+    _agentic_loop_anthropic,
     _agentic_loop_gemini_openai_compat,
     _agentic_loop_native_image,
     _agentic_loop_native_video,
@@ -1095,8 +1096,14 @@ async def _call_api(
 
     provider_config = PROVIDERS.get(api_type)
     use_dedicated_loop = provider_config.use_dedicated_loop if provider_config else False
+    dedicated_loop_kind = getattr(provider_config, "dedicated_loop_kind", "gemini_openai_compat")
 
-    if use_dedicated_loop:
+    if use_dedicated_loop and dedicated_loop_kind == "anthropic_native":
+        return await _agentic_loop_anthropic(
+            client, current_model, messages, builder,
+            tools=tools_to_pass, supports_tools=supports_tools, journal=journal,
+        )
+    elif use_dedicated_loop:
         return await _agentic_loop_gemini_openai_compat(
             current_model, messages, builder,
             tools=tools_to_pass, supports_tools=supports_tools, journal=journal,
