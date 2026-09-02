@@ -721,9 +721,34 @@ def invalid_arguments_message(fn_name: str, fn_args: dict) -> str:
         parts.append("[How to fix] Reissue the SAME tool call (" + str(fn_name) + ") with corrected arguments:")
         for rule in _rules_for_issues(issues + ([reason] if not issues else [])):
             parts.append(f"- {rule}")
-        parts.append(
-            "Do not change the tool or the task — only fix the JSON syntax of the arguments."
-        )
+        if truncated:
+            # v2.4：截断专属补充指引。诊断层无法从截断的参数里区分"偶发流断连"
+            # 还是"单参数载荷超限"，但"重发完整参数"对后者是死循环陷阱——
+            # 同样的巨参数会以同样的方式再次被切断。因此明确给出重试上限与
+            # 分块降级策略，避免模型在超大 file_text/new_str 上反复撞墙。
+            parts.append(
+                "[If the arguments were cut off mid-generation] A single oversized "
+                "argument (large file_text / new_str / long command) often exceeds the "
+                "output limit and CANNOT be delivered in one call no matter how you "
+                "re-quote it. Reissue the complete call ONCE; if truncation repeats, "
+                "switch strategy immediately:"
+            )
+            parts.append(
+                "- Split the payload: create the file with a small skeleton, then add "
+                "the remaining content through several smaller insert / str_replace "
+                "calls (keep each argument well under ~4KB)."
+            )
+            parts.append(
+                "- Or write large content via a bash heredoc / script file in chunks."
+            )
+            parts.append(
+                "In the truncated case you MAY adjust how the content is delivered "
+                "(chunked), as long as the task itself is unchanged."
+            )
+        else:
+            parts.append(
+                "Do not change the tool or the task — only fix the JSON syntax of the arguments."
+            )
         return "\n".join(parts)
     except Exception as exc:  # noqa: BLE001
         logger.warning("invalid_arguments_message 内部异常: %s", exc, exc_info=True)

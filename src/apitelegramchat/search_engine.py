@@ -1196,11 +1196,11 @@ SEARCH_TOOLS = [
                     },
                     "new_str": {
                         "type": "string",
-                        "description": "For str_replace: replacement text; may be an empty string."
+                        "description": "For str_replace: replacement text; may be an empty string. Keep each replacement SMALL (under ~4KB) — oversized arguments get truncated in transit and the whole call fails. Apply big changes as several small str_replace calls instead."
                     },
                     "file_text": {
                         "type": "string",
-                        "description": "For create: complete initial file content; may be empty."
+                        "description": "For create: complete initial file content; may be empty. IMPORTANT: keep it small (a skeleton under ~4KB) — oversized arguments get truncated in transit and the call fails. Create the file small, then add the remaining content with several insert / str_replace calls."
                     },
                     "insert_line": {
                         "type": "integer",
@@ -1208,7 +1208,7 @@ SEARCH_TOOLS = [
                     },
                     "insert_text": {
                         "type": "string",
-                        "description": "For insert: text to add after insert_line; may be empty."
+                        "description": "For insert: text to add after insert_line; may be empty. Keep each insert SMALL (under ~4KB) — split large additions into several insert calls."
                     }
                 },
                 "required": ["command", "path"]

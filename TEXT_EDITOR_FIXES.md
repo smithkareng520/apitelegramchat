@@ -105,6 +105,37 @@ file: a.txt`）。UI 摘要本来就按 `fn_args.path` 渲染，无下游解析�
   `TEXT_EDITOR_VIEW_TOKEN_BUDGET` / `TEXT_EDITOR_MAX_LINE_CHARS`），
   超限返回可操作错误并指引 bash head/tail/grep。
 
+## 二轮修复（v2.4）：截断巨载荷场景（线上案例）
+
+线上真实案例：agent 调用 `text_editor` create，试图把整个 HTML
+游戏文件（几十 KB）塞进单次调用的 `file_text`。模型流式输出在
+`"file_text":` 值刚开始处（第 161 字符）被切断（输出 token 耗尽 /
+网关流截断——小字段全部完整，切断点精确落在巨串值开头）。
+管线的既有防线全部正确工作：双引擎修复→判定截断→按安全约束
+拒绝猜测补全→返回带行列位置的诊断信封→工具未执行（没写出半个
+文件）。但复盘暴露两个真实缺陷，已修复：
+
+### 8.（中）截断时的恢复指引是死循环陷阱
+
+旧消息对截断场景说「Reissue the SAME tool call with the COMPLETE
+arguments」+「Do not change the tool or the task——only fix the JSON
+syntax」。对「偶发流断连」重发确实能好；但对「单参数载荷超限」，
+同样的巨参数会以同样方式再次被切断——模型陷入重发循环，只能靠
+连击熔断止损。修复（`json_repair.py` `invalid_arguments_message`）：
+截断分支追加 `[If the arguments were cut off mid-generation]` 段，
+明确「重发一次；若再截断立即换策略」+ 分块降级路径（小骨架 create
++ 多次 insert / str_replace，每块远小于 ~4KB，或 bash heredoc 分块），
+并允许截断场景调整内容交付方式（任务不变）。首行格式未动，
+熔断签名稳定性不受影响。
+
+### 9.（低）schema 邀请失败：file_text 无大小约束
+
+旧 schema 描述「complete initial file content」字面上就是让模型把
+整个文件一次性塞进来，大文件场景必然命中传输截断。修复
+（`search_engine.py` SEARCH_TOOLS）：`file_text` / `new_str` /
+`insert_text` 描述加入「keep it small（~4KB 以内）+ 超大载荷会被截断
++ 分块交付策略」指引，从源头减少巨参数调用。
+
 ## 未改动（确认无问题的部分）
 
 - 四命令严格性（`str_replace` 唯一匹配、`create` 拒绝覆盖、错误消息
@@ -114,7 +145,9 @@ file: a.txt`）。UI 摘要本来就按 `fn_args.path` 渲染，无下游解析�
   正确兜底成 `Error:`）本身逻辑正确；
 - workspace 锁与原子写（mkstemp + os.replace，保权限）；
 - 工具 schema（SEARCH_TOOLS 中的 text_editor 定义）与 MCP
-  `workspace.view` / `workspace.edit` spec 一致，无需变更；
+  `workspace.view` / `workspace.edit` spec 一致；二轮仅强化了
+  `file_text` / `new_str` / `insert_text` 的 description（含分块指引），
+  结构、类型、必填字段零变更，不破坏 strict 模式；
 - `insert` 的行语义（0 = 文件头、无尾换行补 `\n`、空文件）经
   边界测试全部正确。
 
@@ -122,7 +155,7 @@ file: a.txt`）。UI 摘要本来就按 `fn_args.path` 渲染，无下游解析�
 
 ```
 PYTHONPATH=src python scripts/test_text_editor.py        # 新增 56 项断言
-PYTHONPATH=src python scripts/test_tool_args_pipeline.py # 既有 64 项，回归通过
+PYTHONPATH=src python scripts/test_tool_args_pipeline.py # 71 项（含二轮新增 D9-D15，线上案例回归）
 PYTHONPATH=src python scripts/test_run_one_gate.py       # 既有 12 项，回归通过
 ```
 
@@ -133,3 +166,7 @@ PYTHONPATH=src python scripts/test_run_one_gate.py       # 既有 12 项，回�
 续读指引闭环（按尾注的行号回读校验）；单行截断；体积上限；
 后台持久化（Task 可等待、content_bytes 直传、R2 key 用户隔离）；
 相对路径消息约定；非 UTF-8 拒绝。
+
+二轮新增（D9-D15）：线上截断案例精确复现（拒绝猜测补全、信封
+looks_truncated、分块策略指引、首行稳定、非截断路径无回归、
+schema 描述含 ~4KB 分块提示）。

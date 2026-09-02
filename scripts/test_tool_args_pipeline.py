@@ -292,6 +292,49 @@ check("D8 诊断信封可序列化为合法 JSON（回传不 400）",
       isinstance(json.loads(json.dumps(_envd, ensure_ascii=False)), dict))
 
 # =========================================================================
+section("D+. 截断巨载荷场景（线上案例回归）")
+# 线上真实案例：text_editor create 携带整个 HTML 文件，流式输出在
+# "file_text": 值开始处（第 161 字符）被切断 —— 传输层截断，工具未执行。
+
+_TRUNCATED_ARGS = (
+    '{"_description": "创建无人机模拟器主文件", "command": "create", '
+    '"path": "drone_simulator/index.html", "view_range": [1, -1], '
+    '"old_str": null, "new_str": null, "file_text":'
+)
+_rep, _info = repair_json_arguments(_TRUNCATED_ARGS)
+check("D9 截断巨载荷拒绝猜测补全（file_text 未送达）",
+      _rep is None and _info["truncated"] is True)
+
+_env = build_invalid_arguments_envelope(_TRUNCATED_ARGS)
+check("D10 截断信封标记 looks_truncated 且本身合法 JSON",
+      _env.get("looks_truncated") is True
+      and isinstance(json.loads(json.dumps(_env, ensure_ascii=False)), dict))
+
+_tmsg = invalid_arguments_message("text_editor", _env)
+check("D11 截断消息含分块降级策略指引（打破重发死循环）",
+      "[If the arguments were cut off mid-generation]" in _tmsg
+      and "file_text" in _tmsg and "~4KB" in _tmsg)
+check("D12 截断消息不再以『只修语法』收尾（允许调整交付方式）",
+      not _tmsg.rstrip().endswith("only fix the JSON syntax of the arguments."))
+check("D13 截断消息首行稳定（熔断签名不变）",
+      _tmsg.split("\n", 1)[0] ==
+      "Error: tool text_editor was NOT executed: its arguments are not valid JSON, "
+      "so they could not be parsed into tool input. The JSON also appears "
+      "truncated (unexpected end of input).")
+
+_arrnorm, _arrcorr, _arrmeta = _normalize_tool_arguments('[1, 2, 3]')
+_syncmsg = invalid_arguments_message("bash", json.loads(_arrnorm))
+check("D14 非截断消息保持『只修语法』原指引（无行为回归）",
+      _arrmeta["kind"] == "invalid" and not json.loads(_arrnorm).get("looks_truncated")
+      and _syncmsg.rstrip().endswith("only fix the JSON syntax of the arguments."))
+
+_te_schema = find_tool_schema("text_editor", SEARCH_TOOLS)
+_props = (_te_schema or {}).get("properties", {})
+check("D15 schema 引导小载荷：file_text/new_str/insert_text 描述含分块与 ~4KB 提示",
+      all("~4KB" in str(_props.get(k, {}).get("description", "")) for k in
+          ("file_text", "new_str", "insert_text")))
+
+# =========================================================================
 section("E. 集成：三条循环的 tools 透传与签名兼容")
 
 import inspect  # noqa: E402
