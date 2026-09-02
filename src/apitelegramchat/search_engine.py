@@ -1,5 +1,8 @@
 # search_engine.py — 完整版（集成搜索缓存 & 抓取缓存）
 # 文本编辑器：仅支持 view、str_replace、create 和 insert 四个命令。
+# 行尾保真：所有读写按原始字节进行（CRLF 不会被 universal newlines
+# 静默翻译成 LF）；纯 CRLF 文件在匹配/写入时整体按 CRLF 空间处理，
+# 编辑后行尾风格保持不变（详见 TEXT_EDITOR_FIXES.md）。
 import asyncio
 import aiohttp
 import re
@@ -80,7 +83,7 @@ from apitelegramchat.web_search_filter import (
 _SEARCH_MEDIA_MAX_RESULTS = 100
 from apitelegramchat.fetch_url_fallback import root_fallback_urls
 from apitelegramchat.utils import escape_html
-from apitelegramchat.token_budget import truncate_to_token_budget
+from apitelegramchat.token_budget import count_tokens, truncate_to_token_budget
 from apitelegramchat.mcp_client import call_mcp_tool, MCPToolError
 from apitelegramchat.tool_result_condense import condense_amap_payload
 
@@ -171,21 +174,58 @@ def _normalize_fetch_cache_key(url: str) -> str:
 
 
 # ===================== 显式持久化单个编辑文件 =====================
+# 后台持久化任务的强引用集合：asyncio.create_task 返回的 Task 若不保存
+# 引用，事件循环只持弱引用，任务可能在执行中途被垃圾回收（Python 官方
+# 文档明确要求保存引用）。任务完成后经 done 回调从集合移除，避免泄漏。
+_editor_persist_tasks: set = set()
+
+
 async def _persist_edited_file(
     chat_id: int,
     rel_path: str,
     *,
     delete: bool = False,
     namespace: str | None = None,
+    content_bytes: bytes | None = None,
 ):
-    """Persist only the file explicitly changed through text_editor."""
+    """Persist only the file explicitly changed through text_editor.
+
+    ``content_bytes``：调用方传入本次编辑**实际写入**的字节。后台任务
+    若重新从磁盘读取，可能读到后续并发编辑的新内容（或读到写入前的
+    旧内容，取决于时序），让 R2 镜像与本次结果不一致；直传字节同时
+    消除这个竞态和一次额外 IO。
+    """
     try:
         result = await persist_workspace_file(
-            chat_id, rel_path, delete=delete, namespace=namespace
+            chat_id, rel_path, delete=delete, namespace=namespace,
+            content_bytes=content_bytes,
         )
         logger.debug("显式持久化成功：%s", result.get("key", rel_path))
     except Exception as e:
         logger.error("显式持久化失败 %s: %s", rel_path, e)
+
+
+def _spawn_persist_task(
+    chat_id: int,
+    safe_path: str,
+    *,
+    namespace: str,
+    content_bytes: bytes | None = None,
+) -> None:
+    """调度后台持久化任务，并保存 Task 引用防止被 GC 中途回收。"""
+    try:
+        task = asyncio.create_task(
+            _persist_edited_file(
+                chat_id, safe_path, namespace=namespace,
+                content_bytes=content_bytes,
+            )
+        )
+    except RuntimeError:
+        # 没有正在运行的事件循环（同步测试上下文等）：跳过后台持久化。
+        logger.debug("无运行事件循环，跳过后台持久化 %s", safe_path)
+        return
+    _editor_persist_tasks.add(task)
+    task.add_done_callback(_editor_persist_tasks.discard)
 
 
 def _normalize_editor_text(text: str) -> str:
@@ -194,9 +234,89 @@ def _normalize_editor_text(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
+def _read_editor_content(path: Path) -> str:
+    """Read a UTF-8 text file preserving its exact line-ending bytes.
+
+    旧实现用 ``Path.read_text``（universal newlines）：读取时把 CRLF/CR
+    全部翻译成 LF，任何一次 str_replace/insert 都会把 CRLF 文件整体
+    静默改写成 LF 风格（编辑一行 = 重写全文件行尾）。这里按原始字节
+    读回并 decode，行尾原样保留，由各命令自行决定是否（以及在哪个
+    空间里）做行尾归一化。
+    """
+    return path.read_bytes().decode("utf-8")
+
+
+def _is_pure_crlf(content: str) -> bool:
+    """True 当文件行尾全部是 CRLF（每个 ``\n`` 都属于某个 ``\r\n``）。"""
+    return content.count("\r\n") > 0 and content.count("\n") == content.count("\r\n")
+
+
+def _is_plain_int(value: object) -> bool:
+    """int 且不是 bool（bool 是 int 的子类，True 会被当成 1 放行）。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+# 文本编辑器输出与读入体积上限（可用环境变量覆盖）。
+# - 单行截断：超长行（minified JS / base64 单行）截到 2000 字符，
+#   否则一行就能吃光整个 view 预算；
+# - view 预算：与全局 TOOL_RESPONSE_TOKEN_BUDGET 同口径（20k token），
+#   在工具内部按【完整行】截断并给出 view_range 续读指引，比外层
+#   一刀切截断（截半个词/半行）对模型自纠友好得多；
+# - 体积上限：防止把超大文件整个读进内存（会 OOM 整个进程，影响所有
+#   用户的会话），超限时返回可操作错误并建议 bash head/tail/grep。
+_EDITOR_MAX_LINE_CHARS = int(os.getenv("TEXT_EDITOR_MAX_LINE_CHARS", "2000"))
+_EDITOR_VIEW_TOKEN_BUDGET = int(os.getenv("TEXT_EDITOR_VIEW_TOKEN_BUDGET", "20000"))
+_EDITOR_MAX_VIEW_BYTES = int(os.getenv("TEXT_EDITOR_MAX_VIEW_BYTES", str(16 * 1024 * 1024)))
+_EDITOR_MAX_EDIT_BYTES = int(os.getenv("TEXT_EDITOR_MAX_EDIT_BYTES", str(64 * 1024 * 1024)))
+
+
 def _format_editor_line(line_no: int, text: str, width: int) -> str:
     """Format a text-editor view line with an absolute 1-based line number."""
-    return f"{line_no:>{width}}: {text.rstrip(chr(10))}"
+    text = text.rstrip("\r\n")
+    if len(text) > _EDITOR_MAX_LINE_CHARS:
+        text = text[:_EDITOR_MAX_LINE_CHARS] + "…[line truncated]"
+    return f"{line_no:>{width}}: {text}"
+
+
+def _render_view_output(
+    lines: list[str], start: int, end: int, total_lines: int, width: int,
+) -> str:
+    """Join numbered view lines, truncating at line boundaries within budget.
+
+    小输出直接返回（避免每次 view 都跑 tokenizer）；超过预算时按完整行
+    截断并附上总行数与 ``view_range`` 续读指引，让模型一轮就能精确
+    继续读取，而不是被外层截断器截在半行后盲目重试。
+    """
+    rendered = "\n".join(
+        _format_editor_line(line_number, lines[line_number - 1], width)
+        for line_number in range(start, end + 1)
+    )
+    if len(rendered) <= _EDITOR_VIEW_TOKEN_BUDGET:
+        # 字符数不超预算时 token 数也不可能超（1 token 至少 1 字符）。
+        return rendered
+    if count_tokens(rendered) <= _EDITOR_VIEW_TOKEN_BUDGET:
+        return rendered
+
+    kept: list[str] = []
+    used = 0
+    reserve = 64  # 预留给尾注行
+    for line_number in range(start, end + 1):
+        line = _format_editor_line(line_number, lines[line_number - 1], width)
+        cost = count_tokens(line) + 1  # +1 for the joining newline
+        if used + cost > _EDITOR_VIEW_TOKEN_BUDGET - reserve:
+            break
+        kept.append(line)
+        used += cost
+    shown_end = start + len(kept) - 1  # 最后一个已展示的绝对行号
+    resume_from = shown_end + 1
+    note = (
+        f"…[file has {total_lines} lines; output truncated at line "
+        f"{shown_end} to fit the token budget; continue reading with "
+        f"view_range=[{resume_from}, -1]]"
+    )
+    if not kept:
+        return note
+    return "\n".join(kept) + "\n" + note
 
 
 def _latest_editor_snapshot(content: str, max_lines: int = 10) -> str:
@@ -214,13 +334,19 @@ def _with_latest_editor_snapshot(message: str, content: str) -> str:
 
 
 def _write_text_editor_file(local_path: Path, new_content: str) -> None:
-    """Atomically replace an existing UTF-8 text file while preserving its mode."""
+    """Atomically replace an existing UTF-8 text file while preserving its mode.
+
+    以字节写入：绕过文本模式的平台换行翻译（``newline=None`` 会把 ``\n``
+    翻成 ``os.linesep``），确保落盘内容与 ``new_content`` 逐字节一致
+    （CRLF 保持 CRLF，不会被二次改写）。
+    """
     mode = local_path.stat().st_mode & 0o777
+    data = new_content.encode("utf-8")
     fd, temp_name = tempfile.mkstemp(prefix=f".{local_path.name}.", dir=local_path.parent)
     temp_path = Path(temp_name)
     try:
-        with open(fd, "w", encoding="utf-8", closefd=True) as temp_file:
-            temp_file.write(new_content)
+        with os.fdopen(fd, "wb") as temp_file:
+            temp_file.write(data)
         os.chmod(temp_path, mode)
         os.replace(temp_path, local_path)
     except Exception:
@@ -229,6 +355,16 @@ def _write_text_editor_file(local_path: Path, new_content: str) -> None:
         except OSError:
             pass
         raise
+
+
+def _file_too_large_error(action: str, local_path: Path, limit_bytes: int) -> str:
+    """体积上限错误：读入整个大文件会 OOM 全进程，必须提前拒绝。"""
+    size_mb = local_path.stat().st_size / (1024 * 1024)
+    limit_mb = limit_bytes / (1024 * 1024)
+    return (
+        f"Error: File too large to {action} ({size_mb:.1f} MB, limit {limit_mb:.0f} MB). "
+        "Inspect or edit it with bash (head/tail/grep/sed) instead."
+    )
 
 
 def _permission_error(command: str) -> str:
@@ -274,6 +410,10 @@ async def execute_text_editor(
         return _permission_error(command)
     except OSError as exc:
         return f"Error: Cannot access workspace: {exc.strerror or str(exc)}"
+    except RuntimeError as exc:
+        # _secure_directory 拒绝符号链接化的 runtime 目录时抛 RuntimeError，
+        # 此前会直接冒泡成裸异常（不在任何 except 分支里）。
+        return f"Error: Cannot access workspace: {exc}"
 
     lock = await _get_workspace_lock(chat_id, resolved_namespace)
     async with lock:
@@ -286,8 +426,10 @@ async def execute_text_editor(
                     return "Error: File not found"
                 if local_path.is_dir():
                     return "Error: Path is a directory. view only supports files."
+                if local_path.stat().st_size > _EDITOR_MAX_VIEW_BYTES:
+                    return _file_too_large_error("view", local_path, _EDITOR_MAX_VIEW_BYTES)
                 try:
-                    content = local_path.read_text(encoding="utf-8")
+                    content = _read_editor_content(local_path)
                 except UnicodeDecodeError:
                     return "Error: File is not valid UTF-8 text."
                 lines = content.splitlines()
@@ -296,9 +438,9 @@ async def execute_text_editor(
                     if (
                         not isinstance(view_range, list)
                         or len(view_range) != 2
-                        or not all(isinstance(value, int) for value in view_range)
+                        or not all(_is_plain_int(value) for value in view_range)
                     ):
-                        return "Error: view_range must be [start_line, end_line]."
+                        return "Error: view_range must be [start_line, end_line] with integer values."
                     start, end = view_range
                     if start < 1:
                         return "Error: view_range start_line must be at least 1."
@@ -314,10 +456,7 @@ async def execute_text_editor(
                 if total_lines == 0:
                     return "(empty file)"
                 width = len(str(total_lines))
-                return "\n".join(
-                    _format_editor_line(line_number, lines[line_number - 1], width)
-                    for line_number in range(start, end + 1)
-                )
+                return _render_view_output(lines, start, end, total_lines, width)
 
             if command == "create":
                 if not isinstance(file_text, str):
@@ -327,20 +466,27 @@ async def execute_text_editor(
                         return "Error: A directory already exists at this path."
                     return "Error: File already exists."
                 local_path.parent.mkdir(parents=True, exist_ok=True)
+                data = file_text.encode("utf-8")
                 try:
-                    with open(local_path, "x", encoding="utf-8") as file:
-                        file.write(file_text)
+                    # "xb"：排他创建 + 字节写入（无平台换行翻译）。
+                    with open(local_path, "xb") as file:
+                        file.write(data)
                 except FileExistsError:
                     return "Error: File already exists."
-                asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
-                return _with_latest_editor_snapshot(f"Successfully created file in {local_path}", file_text)
+                _spawn_persist_task(
+                    chat_id, safe_path, namespace=resolved_namespace, content_bytes=data)
+                # 成功消息使用 workspace 相对路径：绝对路径会泄漏服务器
+                # 目录结构，也违背「一切路径相对 workspace 根」的约定。
+                return _with_latest_editor_snapshot(f"Successfully created file: {safe_path}", file_text)
 
             if not local_path.exists():
                 return "Error: File not found"
             if local_path.is_dir():
                 return "Error: Path is a directory. Text editing only supports files."
+            if local_path.stat().st_size > _EDITOR_MAX_EDIT_BYTES:
+                return _file_too_large_error("edit", local_path, _EDITOR_MAX_EDIT_BYTES)
             try:
-                content = local_path.read_text(encoding="utf-8")
+                content = _read_editor_content(local_path)
             except UnicodeDecodeError:
                 return "Error: File is not valid UTF-8 text."
 
@@ -349,7 +495,32 @@ async def execute_text_editor(
                     return "Error: Missing old_str or new_str for str_replace."
                 if not old_str:
                     return "Error: old_str must be non-empty for str_replace."
-                match_count = content.count(old_str)
+
+                # 行尾策略（见 TEXT_EDITOR_FIXES.md）：
+                # - 纯 CRLF 文件：在 LF 空间匹配（old_str/new_str 一并归一），
+                #   写回时统一还原成 CRLF —— 编辑后行尾风格保持不变；
+                # - 其他文件：按原始字节精确匹配（LF 文件行为与旧版一致）；
+                #   匹配失败且文件含 CR 时，再按 LF 归一化重试一次（混合
+                #   行尾文件），命中则写入归一化结果并在消息里明说，
+                #   不做静默改写。
+                crlf = _is_pure_crlf(content)
+                work = content.replace("\r\n", "\n") if crlf else content
+                old_work = old_str.replace("\r\n", "\n") if crlf else old_str
+                new_work = new_str.replace("\r\n", "\n") if crlf else new_str
+                match_count = work.count(old_work)
+                normalized_note = ""
+                if match_count == 0 and not crlf and "\r" in content and old_str:
+                    lf_content = _normalize_editor_text(content)
+                    lf_old = _normalize_editor_text(old_str)
+                    lf_count = lf_content.count(lf_old)
+                    if lf_count == 1:
+                        work, old_work = lf_content, lf_old
+                        new_work = _normalize_editor_text(new_str)
+                        match_count = 1
+                        normalized_note = " (file had mixed line endings; normalized to LF)"
+                    elif lf_count > 1:
+                        match_count = lf_count
+
                 if match_count == 0:
                     return (
                         "Error: No match found for replacement. Recovery: call text_editor "
@@ -361,30 +532,42 @@ async def execute_text_editor(
                         "Recovery: call text_editor view, then retry once with a longer exact old_str "
                         "that includes surrounding context."
                     )
-                new_content = content.replace(old_str, new_str, 1)
+                new_content = work.replace(old_work, new_work, 1)
+                if crlf:
+                    new_content = new_content.replace("\n", "\r\n")
                 _write_text_editor_file(local_path, new_content)
-                asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
-                return _with_latest_editor_snapshot(f"Successfully replaced string in {local_path}", new_content)
+                _spawn_persist_task(
+                    chat_id, safe_path, namespace=resolved_namespace,
+                    content_bytes=new_content.encode("utf-8"))
+                return _with_latest_editor_snapshot(
+                    f"Successfully replaced string in {safe_path}{normalized_note}", new_content)
 
             # command == "insert"
-            if not isinstance(insert_line, int) or not isinstance(insert_text, str):
-                return "Error: Missing insert_line or insert_text for insert."
-            lines = content.splitlines(keepends=True)
+            if not _is_plain_int(insert_line) or not isinstance(insert_text, str):
+                return "Error: insert_line must be an integer between 0 and the file's line count, and insert_text must be a string."
+            crlf = _is_pure_crlf(content)
+            work = content.replace("\r\n", "\n") if crlf else content
+            text_to_insert = insert_text.replace("\r\n", "\n") if crlf else insert_text
+            lines = work.splitlines(keepends=True)
             total_lines = len(lines)
             if insert_line < 0 or insert_line > total_lines:
                 return f"Error: insert_line must be between 0 and {total_lines}."
 
             prefix = "".join(lines[:insert_line])
             suffix = "".join(lines[insert_line:])
-            text_to_insert = insert_text
             if prefix and not prefix.endswith(("\n", "\r")):
                 prefix += "\n"
             if suffix and text_to_insert and not text_to_insert.endswith(("\n", "\r")):
                 text_to_insert += "\n"
             new_content = prefix + text_to_insert + suffix
+            if crlf:
+                new_content = new_content.replace("\n", "\r\n")
             _write_text_editor_file(local_path, new_content)
-            asyncio.create_task(_persist_edited_file(chat_id, safe_path, namespace=resolved_namespace))
-            return _with_latest_editor_snapshot(f"Successfully inserted string in {local_path} after line {insert_line}", new_content)
+            _spawn_persist_task(
+                chat_id, safe_path, namespace=resolved_namespace,
+                content_bytes=new_content.encode("utf-8"))
+            return _with_latest_editor_snapshot(
+                f"Successfully inserted string in {safe_path} after line {insert_line}", new_content)
 
         except FileNotFoundError:
             return "Error: File not found"
@@ -394,6 +577,14 @@ async def execute_text_editor(
             return "Error: Path is a directory. Text editing only supports files."
         except OSError as exc:
             return f"Error: File operation failed: {exc.strerror or str(exc)}"
+        except (ValueError, RuntimeError) as exc:
+            # ValueError：_resolve_editor_path 检出逃逸 workspace 的符号
+            # 链接、或写入时遇到不可编码字符（UnicodeEncodeError 是
+            # ValueError 子类）。此前这类异常会直接冒泡成裸 Exception
+            # （except 链只接 OSError 家族），主循环兜底成 "Exception: ..."
+            # 丢失 Error: 前缀约定与恢复指引，MCP 入口（invoke 无兜底）
+            # 则直接把调用打崩。RuntimeError：workspace 根目录异常。
+            return f"Error: {exc}"
 
 
 # ========== 缓存函数 ==========
@@ -3753,6 +3944,7 @@ async def persist_workspace_file(
     *,
     delete: bool = False,
     namespace: str | None = None,
+    content_bytes: bytes | None = None,
 ) -> dict[str, str | bool]:
     """Persist exactly one file edited by text_editor.
 
@@ -3760,7 +3952,9 @@ async def persist_workspace_file(
     the explicitly changed file to the existing R2 editor namespace; it never
     scans or syncs the whole workspace. Namespace is accepted so callers can keep
     a single workspace identity end-to-end, while the legacy R2 key remains keyed
-    by chat_id for backward compatibility.
+    by chat_id for backward compatibility. ``content_bytes`` lets the caller
+    persist exactly the bytes it just wrote (avoiding a re-read that could race
+    with a concurrent later edit); when omitted the file is read from disk.
     """
     # Resolve the namespace here as an integrity check even though the current R2
     # key format remains chat-id based for compatibility.
@@ -3776,9 +3970,12 @@ async def persist_workspace_file(
         deleted = await delete_r2_object(key)
         return {"key": key, "deleted": bool(deleted)}
 
-    if not local_path.is_file():
-        raise FileNotFoundError(f"workspace file not found: {safe}")
-    data = await asyncio.to_thread(local_path.read_bytes)
+    if content_bytes is None:
+        if not local_path.is_file():
+            raise FileNotFoundError(f"workspace file not found: {safe}")
+        data = await asyncio.to_thread(local_path.read_bytes)
+    else:
+        data = content_bytes
     content_type = mimetypes.guess_type(safe)[0] or "application/octet-stream"
     url = await upload_bytes_to_r2(data, key, content_type)
     return {"key": key, "persisted": url is not None}

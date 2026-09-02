@@ -1444,6 +1444,14 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 - 搜索结果最终过滤；
 - URL 根路径回退。
 
+脚本级回归测试（无额外依赖，直接运行）：
+
+```bash
+PYTHONPATH=src python scripts/test_text_editor.py         # text_editor 回归（含 CRLF 行尾保真 / 路径安全 / 输出上限，见 TEXT_EDITOR_FIXES.md）
+PYTHONPATH=src python scripts/test_tool_args_pipeline.py  # 工具参数四层管线（strict/repair/validate/信封）
+PYTHONPATH=src python scripts/test_run_one_gate.py        # 执行闸门集成（缺必填不执行、类型错误回传等）
+```
+
 ---
 
 ## 项目结构
