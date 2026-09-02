@@ -242,6 +242,10 @@ async def _create_chat_completion(client, model_info, create_params: dict):
             temperature=create_params.get("temperature"),
             top_p=create_params.get("top_p"),
             tools=create_params.get("tools"),
+            thinking=create_params.get("thinking"),
+            supports_prompt_cache=bool(
+                model_info and model_info.supports_prompt_cache
+            ),
         )
     return await client.chat.completions.create(**create_params)
 

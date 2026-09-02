@@ -250,6 +250,7 @@ async def anthropic_chat_completions_create(
         top_p: Optional[float] = None,
         tools: Optional[list] = None,
         thinking: Optional[dict] = None,
+        supports_prompt_cache: bool = False,
         **_ignored,
 ) -> _SimpleResponse:
     """非流式调用 Anthropic Messages API，返回值形状模拟
@@ -263,6 +264,25 @@ async def anthropic_chat_completions_create(
     OpenAI 形状，调用方感知不到协议差异。
     """
     system_prompt, anthropic_messages = _convert_messages_to_anthropic(messages)
+    if supports_prompt_cache and anthropic_messages:
+        last_msg = anthropic_messages[-1]
+        content = last_msg.get("content")
+
+        if isinstance(content, list) and content:
+            last_block = content[-1]
+            if isinstance(last_block, dict):
+                content[-1] = {
+                    **last_block,
+                    "cache_control": {"type": "ephemeral"},
+                }
+        elif isinstance(content, str) and content:
+            last_msg["content"] = [
+                {
+                    "type": "text",
+                    "text": content,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
     anthropic_tools = _convert_tools_to_anthropic(tools) if tools else None
 
     request_kwargs: dict = {
