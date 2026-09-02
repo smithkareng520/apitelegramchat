@@ -7,15 +7,20 @@
 "arguments were not valid JSON" 回传给模型，模型既不知道错在哪一列、
 也不知道怎么改，只能盲猜重试，往往连续失败多轮。
 
-本模块提供三层能力：
+本模块提供三层能力（主流修复管线：社区标准库优先，自研只做兜底）：
 
-1. ``repair_json_arguments`` —— 保守的语法级自动修复。只做**无歧义**的
-   修复（双引号化、尾逗号删除、转义控制字符等），每一步都记录修复
-   说明；修复结果必须通过 ``json.loads`` 且为 dict 才被接受。能在
-   修复成功的场景直接省掉一整轮模型重试。截断的 JSON **不会**被
-   猜测补全（除非显式 ``allow_close_truncated=True``，仅用于 UI 预览
-   这类展示性场景），因为对被截断的命令参数做"猜补全再执行"可能
-   产生危险语义（例如把 ``rm -rf /tmp/ju`` 补成完整字符串执行）。
+1. ``repair_json_arguments`` —— 双引擎保守自动修复：
+
+   - 引擎 1：``json-repair`` **社区标准库**（LangChain / LlamaIndex 等
+     框架修复 LLM JSON 输出的同款路线，覆盖面远大于任何自研修复器），
+     未安装时静默跳过；
+   - 引擎 2：自研语法级状态机（只做无歧义修复：双引号化、尾逗号删除、
+     转义控制字符等），作为库缺失 / 修复失败时的兜底；
+   - 修复结果必须通过 ``json.loads`` 且为 dict 才被接受。能在修复
+     成功的场景直接省掉一整轮模型重试。截断的 JSON **不会**被
+     猜测补全（除非显式 ``allow_close_truncated=True``，仅用于 UI 预览
+     这类展示性场景），因为对被截断的命令参数做"猜补全再执行"可能
+     产生危险语义（例如把 ``rm -rf /tmp/ju`` 补成完整字符串执行）。
 
 2. ``build_invalid_arguments_envelope`` —— 修复失败时构建带完整诊断
    的可恢复错误信封：解析器原始报错（含行/列/字符位置）、出错位置
@@ -427,19 +432,63 @@ def _extract_jsonish(raw: str) -> tuple[str, list]:
 # 公开 API：修复 / 诊断 / 消息渲染
 # ---------------------------------------------------------------------------
 
+# json-repair 社区标准库（可选依赖）的函数句柄缓存：
+# None = 尚未探测；False = 不可用（未安装）；其余 = 可调用的 repair_json。
+# 流式预览路径每 20 字符就会重解析一次，import 探测结果必须缓存，
+# 避免每次调用都付出一次 import 开销。
+_LIB_REPAIR_JSON = None
+
+
+def _repair_with_library(candidate: str) -> Optional[dict]:
+    """用 json-repair 社区标准库修复并解析为 dict。
+
+    - 库不可用（未安装 / 导入失败）时返回 ``None``，调用方走自研兜底
+      引擎，行为与旧版完全一致；
+    - 修复后必须是 dict（工具参数是对象），否则视为失败；
+    - 任何异常都吞掉——库是增强项，绝不阻塞关键路径。
+    """
+    global _LIB_REPAIR_JSON
+    try:
+        if _LIB_REPAIR_JSON is False:
+            return None
+        if _LIB_REPAIR_JSON is None:
+            # 注意：本模块名为 apitelegramchat.ai.json_repair，绝对导入
+            # 顶层 json_repair 解析到的是 site-packages 里的社区库，
+            # 不会命中自身。
+            from json_repair import repair_json as _fn
+            _LIB_REPAIR_JSON = _fn
+        repaired_text = _LIB_REPAIR_JSON(candidate)
+        if not isinstance(repaired_text, str) or not repaired_text.strip():
+            return None
+        parsed = json.loads(repaired_text)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
 def repair_json_arguments(
         raw: str, *, allow_close_truncated: bool = False,
 ) -> tuple[Optional[dict], dict]:
-    """尝试把畸形 JSON 参数修复为 dict。
+    """尝试把畸形 JSON 参数修复为 dict（双引擎：社区标准库优先）。
 
     返回 ``(repaired, info)``：
     - ``repaired``：修复成功且解析为 dict 时返回该 dict，否则 None；
     - ``info``：``{"fixes": [..], "truncated": bool, "note": str}``，
       无论成败都携带已尝试的修复说明（用于日志与诊断）。
 
-    安全约束：``allow_close_truncated=False``（默认，模型参数路径）时，
-    截断的 JSON 一律返回 None——绝不猜测补全后执行。任何内部异常都
-    兜底返回 ``(None, info)``。
+    引擎优先级（主流做法：先社区标准库，自研状态机只作兜底）：
+
+    1. **截断安全预检**：先用现有扫描器判定截断。执行路径
+       （``allow_close_truncated=False``）命中截断一律拒绝——
+       json-repair 库默认会补全截断输入，但「猜补全再执行」可能产生
+       危险语义（把 ``rm -rf /tmp/ju" 补成完整命令执行），因此安全
+       闸门必须在库之前。
+    2. **json-repair 社区标准库**（可选依赖）：覆盖面远大于自研状态机
+       （未转义引号、嵌套结构、注释、尾逗号等），未安装时静默跳过。
+    3. **自研保守状态机**：原有行为不变，作为库缺失 / 修复失败时的
+       兜底引擎。
+
+    任何内部异常都兜底返回 ``(None, info)``。
     """
     info = {"fixes": [], "truncated": False, "note": ""}
     try:
@@ -460,6 +509,14 @@ def repair_json_arguments(
         if truncated and not allow_close_truncated:
             info["note"] = "arguments JSON is truncated / incomplete"
             return None, info
+        # 引擎 1：json-repair 社区标准库（未安装时返回 None 走兜底引擎）。
+        lib_repaired = _repair_with_library(candidate)
+        if isinstance(lib_repaired, dict):
+            note = "repaired with the json-repair library"
+            if note not in info["fixes"]:
+                info["fixes"].append(note)
+            return lib_repaired, info
+        # 引擎 2：自研保守状态机的重写结果（原有行为）。
         try:
             parsed = json.loads(rewritten)
         except (json.JSONDecodeError, ValueError) as exc:

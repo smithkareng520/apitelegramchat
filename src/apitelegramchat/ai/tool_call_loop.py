@@ -1,6 +1,10 @@
 """并行执行模型请求的工具调用，并将结果写回消息历史。
 
-从 ai_handlers.py 拆分而来，逻辑未做改动。
+从 ai_handlers.py 拆分而来。v2.4 起接入工具参数主流四层管线：本模块是
+三层循环（OpenAI 兼容 / Gemini / Anthropic）共用的执行咽喉，在分发前
+执行 L2 语义校验（null 剥离 → 常见写法容错 → JSON Schema 校验，见
+ schema_validation.py），校验失败不执行工具，错误作为工具结果回传
+模型自纠。
 """
 import asyncio
 import json
@@ -47,11 +51,13 @@ from apitelegramchat.ai.json_repair import (
     build_invalid_arguments_envelope,
     invalid_arguments_message,
 )
+from apitelegramchat.ai.schema_validation import normalize_and_validate
 from apitelegramchat.ai.tool_summary import (
     _generate_action_description,
     _generate_initial_tool_summary,
     _generate_tool_summary_done,
     _kind_of_value,
+    _normalize_tool_arguments,
     _tool_result_is_failure,
     _INVALID_TOOL_ARGUMENTS_KEY,
 )
@@ -222,6 +228,7 @@ async def _run_tool_calls_and_append(
         api_label: str,
         builder: "RichMessageBuilder",
         chat_id: int = None,
+        tools: list = None,
 ) -> str:
     valid_tool_calls = []
     skipped_tool_calls = []
@@ -251,21 +258,32 @@ async def _run_tool_calls_and_append(
             fn_name = tc["function"]["name"]
             try:
                 fn_args = json.loads(tc["function"]["arguments"])
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, TypeError):
                 # 未经过 _normalize_tool_call_arguments 的旁路路径（如
-                # Anthropic bridge 旧版直接拼接）：在这里就地构建诊断信封，
-                # 避免静默地把参数容成 {} 执行——那会让模型完全收不到
-                # 自己参数写坏了的反馈，陷入盲重试。
-                fn_args = build_invalid_arguments_envelope(
-                    tc["function"].get("arguments", ""))
+                # Anthropic bridge 旧版直接拼接）：复用与主流路径完全
+                # 相同的规范化链（双引擎修复 → 诊断信封），保证旁路行为
+                # 不与主路径分叉；修复失败时信封会让模型收到带行列位置的
+                # 诊断反馈，而不是被静默容成 {} 执行后盲重试。
+                try:
+                    normalized, _was_corrected, _meta = _normalize_tool_arguments(
+                        tc["function"].get("arguments", ""))
+                    fn_args = json.loads(normalized)
+                except Exception:
+                    fn_args = build_invalid_arguments_envelope(
+                        tc["function"].get("arguments", ""))
             tc_id = tc["id"]
         else:
             fn_name = tc.function.name
             try:
                 fn_args = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, AttributeError, TypeError):
-                fn_args = build_invalid_arguments_envelope(
-                    getattr(tc.function, "arguments", ""))
+                try:
+                    normalized, _was_corrected, _meta = _normalize_tool_arguments(
+                        getattr(tc.function, "arguments", ""))
+                    fn_args = json.loads(normalized)
+                except Exception:
+                    fn_args = build_invalid_arguments_envelope(
+                        getattr(tc.function, "arguments", ""))
             tc_id = tc.id
         if not isinstance(fn_args, dict):
             # 合法 JSON 但顶层非对象（数组/字符串等）：交给同一套诊断
@@ -276,9 +294,11 @@ async def _run_tool_calls_and_append(
         search_query = None
         domain = None
         if fn_name == "web_search":
-            search_query = fn_args.get("query", "")
+            # str() 兼容：模型可能给出类型错误的 query（如数字）——L2
+            # 校验会拦截并回传错误，但 UI 摘要必须先不崩。
+            search_query = str(fn_args.get("query", "") or "")
         elif fn_name == "fetch_url":
-            url = fn_args.get('url', '')
+            url = str(fn_args.get('url', '') or "")
             domain = extract_domain(url)
 
         initial_summary = _generate_initial_tool_summary(fn_name, fn_args)
@@ -316,6 +336,15 @@ async def _run_tool_calls_and_append(
         repair_note = ""
         if isinstance(fn_args, dict):
             repair_note = str(fn_args.pop(_JSON_REPAIR_NOTE_KEY, "") or "")
+        # v2.4 L2 语义校验层（主流：分发前按工具 schema 校验）：
+        # strict 结构化输出的可选字段以 null 表达 → 剥掉（executor 的
+        # .get(k, default) 默认值语义保留）；字符串布尔/数字按 schema
+        # 容错矫正（省一轮模型重试）；再按工具真实 schema 校验。
+        # 校验失败 → 不执行工具，错误消息作为该工具的结果回传模型自纠
+        # （Error: 开头，与诊断信封同风格，并参与连击熔断签名）。
+        schema_error = None
+        if tools and isinstance(fn_args, dict):
+            fn_args, schema_error = normalize_and_validate(fn_name, fn_args, tools)
         async with tool_semaphore:
             # 图像 / 视频工具不设超时（内部已有轮询超时控制）
             # 子 agent 走 930s 超时（内部默认 900s，用户可配到 1800s）
@@ -401,6 +430,10 @@ async def _run_tool_calls_and_append(
                     # （^ 指示）、病因清单、原始参数摘录和针对性修复规则
                     # 全部渲染出来，让模型一轮即可精准自纠。
                     result_str = invalid_arguments_message(fn_name, fn_args)
+                elif schema_error:
+                    # v2.4 L2 语义校验：参数是合法 JSON 但不符合工具 schema
+                    # （缺必填 / 类型错 / 枚举外取值）——不执行，错误回传。
+                    result_str = schema_error
                 elif fn_name == "message_user":
                     # message_user（原 ask_user）：提问 / 通知双用途。
                     # - 带选项：出按钮卡等待用户点选；

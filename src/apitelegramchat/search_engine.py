@@ -1101,7 +1101,12 @@ SEARCH_TOOLS = [
                         "type": "boolean",
                         "description": "true 则重启 bash 会话（清空状态）。"
                     }
-                }
+                },
+                # command 是功能上的必填字段（没有命令的 bash 调用无意义）：
+                # 显式声明后，L2 schema 校验层能把「缺 command」以可操作
+                # 错误回传模型自纠，strict 规范化也会正确将其保持为
+                # 非可空必填，而不是被当作可选字段。
+                "required": ["command"]
             },
             "input_examples": [
                 {"_description": "查看项目文件列表", "command": "ls -la"},

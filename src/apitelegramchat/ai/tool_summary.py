@@ -182,9 +182,10 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     """
     fn_args = fn_args or {}
 
-    # web_search 单工具进行态固定显示搜索词。
+    # web_search 单工具进行态固定显示搜索词。str() 防御：类型错误的
+    # query（如数字）会被 L2 校验拦截回传，但 UI 摘要必须先不崩。
     if fn_name == "web_search":
-        query = (fn_args.get("query") or "").strip()
+        query = str(fn_args.get("query") or "").strip()
         return query if query else "Searching the web"
 
     custom_desc = _get_tool_description_from_args(fn_args)
@@ -194,12 +195,12 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     # ---------- 特殊处理 ----------
 
     if fn_name == "fetch_url":
-        url = (fn_args.get("url") or "").strip()
+        url = str(fn_args.get("url") or "").strip()
         domain = extract_domain(url) if url else ""
         return f"Fetching from {domain}" if domain else "Fetching a page"
 
     if fn_name == "bash":
-        cmd = (fn_args.get("command") or "").strip()
+        cmd = str(fn_args.get("command") or "").strip()
         if cmd:
             short_cmd = cmd[:30] + "..." if len(cmd) > 30 else cmd
             return short_cmd
@@ -207,7 +208,7 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
 
     # ---------- text_editor ----------
     if fn_name == "text_editor":
-        command = fn_args.get("command", "")
+        command = str(fn_args.get("command") or "")
         # 进行时只显示描述，不需要详细路径
         return custom_desc or {
             "view": "Viewing file",
@@ -264,7 +265,7 @@ def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
         return custom_desc
 
     if fn_name == "text_editor":
-        cmd = fn_args.get("command", "")
+        cmd = str(fn_args.get("command") or "")
         return {
             "view": "viewed a file",
             "create": "created a file",
@@ -521,7 +522,7 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
     fn_args = fn_args or {}
 
     if fn_name == "web_search":
-        query = (fn_args.get("query") or "").strip()
+        query = str(fn_args.get("query") or "").strip()
         count = _extract_web_search_result_count(result_content)
         if query and count is not None:
             return f"{query} {count} result" if count == 1 else f"{query} {count} results"
@@ -532,7 +533,7 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         return custom_desc
 
     if fn_name == "fetch_url":
-        url = (fn_args.get("url") or "").strip()
+        url = str(fn_args.get("url") or "").strip()
         domain = extract_domain(url) if url else ""
         text = str(result_content or "").strip()
         if _tool_result_is_failure(fn_name, fn_args, result_content):
@@ -555,7 +556,7 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         return f"Fetched: {title}" if title else (f"Fetched: {domain}" if domain else "Fetched a page")
 
     if fn_name == "wikipedia":
-        query = (fn_args.get("query") or "").strip()
+        query = str(fn_args.get("query") or "").strip()
         text = str(result_content or "").strip()
         if _tool_result_is_failure(fn_name, fn_args, result_content):
             return f"Failed to look up {query}" if query else "Failed to look up on Wikipedia"
@@ -605,7 +606,7 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
             "create": "Created a file",
             "str_replace": "Replaced exact text in a file",
             "insert": "Inserted text into a file",
-        }.get(fn_args.get("command", ""), "Edited a file")
+        }.get(str(fn_args.get("command") or ""), "Edited a file")
 
     if fn_name == "present_files":
         paths = fn_args.get("paths", [])

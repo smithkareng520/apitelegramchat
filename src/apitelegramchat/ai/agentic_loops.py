@@ -10,7 +10,7 @@ import base64
 import re
 import uuid
 from typing import TYPE_CHECKING, Optional
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 
 from apitelegramchat.config import (
     GEMINI_API_KEY,
@@ -61,6 +61,12 @@ from apitelegramchat.ai.tool_summary import (
     _tool_limit_summary,
 )
 from apitelegramchat.ai.tool_call_loop import _run_tool_calls_and_append
+from apitelegramchat.ai.strict_tools import (
+    gemini_strict_env_enabled,
+    looks_like_strict_tool_rejection,
+    mark_strict_tools_rejected,
+    strict_tools_for_request,
+)
 
 # Anthropic 原生 Messages API 专用循环：独立实现，位于 anthropic_bridge.py
 # （职责分离 + 避免本已很大的文件继续膨胀）。此处重导出保持调用方
@@ -238,6 +244,13 @@ async def _agentic_loop_openai_compat(
     reasoning_top, reasoning_extra = get_reasoning_request_fields(model_info, api_label)
     prompt_cache_enabled = bool(model_info and model_info.supports_prompt_cache)
 
+    # L0 预防层（主流：OpenAI Structured Outputs）：对能安全规范化的工具
+    # 注入 strict:true + 递归 schema 规范化（全部必填 + additionalProperties:false
+    # + 可选字段可空）。per-tool best-effort，schema 复杂（union/anyOf）的工具
+    # 原样发送；网关拒绝时运行时自动降级（见下方 except BadRequestError）。
+    # 手动总开关：环境变量 DISABLE_STRICT_TOOL_SCHEMA=1。
+    request_tools = strict_tools_for_request(api_label, tools)
+
     for _round in range(MAX_TOOL_CALLS):
         added_tool_indices = set()
         last_arg_len = {}
@@ -274,7 +287,7 @@ async def _agentic_loop_openai_compat(
             create_params.update(sampling_params)
             create_params.update(reasoning_top)
             if supports_tools and tools:
-                create_params["tools"] = tools
+                create_params["tools"] = request_tools
                 create_params["tool_choice"] = "auto"
                 create_params["parallel_tool_calls"] = parallel_tool_calls
             extra_body = _merged_extra_body(
@@ -429,6 +442,19 @@ async def _agentic_loop_openai_compat(
                                     parsed_args = _safe_parse_args(current_args)
                                     builder.update_tool_args(tc_id, parsed_args)
                     break
+                except BadRequestError as exc:
+                    # strict 工具 schema 被网关拒绝（聚合网关对 strict 的支持
+                    # 参差不齐，OpenRouter/ModelScope/agnes 等转发厂商行为各异）：
+                    # 标记该 api_label（进程内记忆），摘除 strict 后用原始
+                    # schema 立即重试一次，后续轮次不再撞墙。报错文本不指向
+                    # schema/strict 时按原样抛出，不误降级。
+                    if (request_tools is not tools
+                            and looks_like_strict_tool_rejection(str(exc))):
+                        mark_strict_tools_rejected(api_label, str(exc))
+                        request_tools = tools
+                        create_params["tools"] = tools
+                        continue
+                    raise
                 except httpx.ReadTimeout:
                     if received_any or stream_attempt >= 1:
                         raise
@@ -464,7 +490,7 @@ async def _agentic_loop_openai_compat(
                 fallback_params.update(sampling_params)
                 fallback_params.update(reasoning_top)
                 if supports_tools and tools:
-                    fallback_params["tools"] = tools
+                    fallback_params["tools"] = request_tools
                     fallback_params["tool_choice"] = "auto"
                     fallback_params["parallel_tool_calls"] = parallel_tool_calls
                 fallback_extra_body = _merged_extra_body(
@@ -475,7 +501,19 @@ async def _agentic_loop_openai_compat(
                 if fallback_extra_body is not None:
                     fallback_params["extra_body"] = fallback_extra_body
 
-                resp = await client.chat.completions.create(**fallback_params)
+                # 非流式回退：create 带同样的 strict 降级重试（与流式路径
+                # 同一套逻辑——网关拒绝 strict schema 时摘除后立即重试一次）。
+                try:
+                    resp = await client.chat.completions.create(**fallback_params)
+                except BadRequestError as exc:
+                    if (request_tools is not tools
+                            and looks_like_strict_tool_rejection(str(exc))):
+                        mark_strict_tools_rejected(api_label, str(exc))
+                        request_tools = tools
+                        fallback_params["tools"] = tools
+                        resp = await client.chat.completions.create(**fallback_params)
+                    else:
+                        raise
                 # 非流式回退同样需要捕获 usage，否则本轮缓存命中统计会丢失
                 if getattr(resp, "usage", None):
                     final_usage = resp.usage
@@ -589,7 +627,8 @@ async def _agentic_loop_openai_compat(
             break
         status = await _run_tool_calls_and_append(
             tool_calls_list, loop_messages, new_history_entries,
-            tool_call_count_ref, api_label, builder, chat_id=builder.chat_id
+            tool_call_count_ref, api_label, builder, chat_id=builder.chat_id,
+            tools=tools,
         )
         # 工具批次已完整收束；后续仍会请求模型，因此在函数内创建新草稿。
         await builder.rollover_at_turn_boundary(start_next_draft=True)
@@ -689,6 +728,15 @@ async def _agentic_loop_gemini_openai_compat(
 
     cleaned_tools = _clean_tools_for_gemini(tools) if tools else None
 
+    # L0 预防层（默认关闭）：Gemini OpenAI-compat 层官方文档未承诺对
+    # strict 工具 schema 的支持，默认保持 cleaned_tools 原样（现有 schema
+    # 在该端点已稳定工作）。需要实验时设置 ENABLE_STRICT_TOOL_SCHEMA_GEMINI=1，
+    # 同样带网关拒绝自动降级（见下方请求重试结构）。
+    gemini_strict_tools = (
+        strict_tools_for_request("gemini", cleaned_tools)
+        if gemini_strict_env_enabled() and cleaned_tools else cleaned_tools
+    )
+
     model_info = SUPPORTED_MODELS.get(current_model)
     max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
     # 采样与推理控制统一来自 config.py。Gemini 官方 OpenAI 兼容层：
@@ -721,22 +769,33 @@ async def _agentic_loop_gemini_openai_compat(
         payload.update(reasoning_top)
         if reasoning_extra:
             payload.update(reasoning_extra)
-        if supports_tools and cleaned_tools:
-            payload["tools"] = cleaned_tools
+        if supports_tools and gemini_strict_tools:
+            payload["tools"] = gemini_strict_tools
             payload["tool_choice"] = "auto"
 
         try:
-            async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
-                async with session.post(
-                        GEMINI_OPENAI_URL, headers=req_headers, json=payload
-                ) as resp:
-                    if resp.status not in (200, 201):
+            data = None
+            for _strict_attempt in range(2):
+                async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+                    async with session.post(
+                            GEMINI_OPENAI_URL, headers=req_headers, json=payload
+                    ) as resp:
+                        if resp.status in (200, 201):
+                            data = await resp.json()
+                            break
                         err_text = await resp.text()
+                        # strict schema 被网关拒绝：摘除后用原始工具列表
+                        # 立即重试一次，并记住该 label 不再尝试。
+                        if (_strict_attempt == 0
+                                and payload.get("tools") is not cleaned_tools
+                                and looks_like_strict_tool_rejection(err_text)):
+                            mark_strict_tools_rejected("gemini", err_text)
+                            payload["tools"] = cleaned_tools
+                            continue
                         raise aiohttp.ClientResponseError(
                             resp.request_info, resp.history,
                             status=resp.status, message=err_text,
                         )
-                    data = await resp.json()
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -835,7 +894,8 @@ async def _agentic_loop_gemini_openai_compat(
             break
         status = await _run_tool_calls_and_append(
             tool_calls_list, loop_messages, new_history_entries,
-            tool_call_count_ref, "gemini", builder, chat_id=builder.chat_id
+            tool_call_count_ref, "gemini", builder, chat_id=builder.chat_id,
+            tools=tools,
         )
         # Gemini 工具批次后仍会继续请求模型，因此在函数内创建新草稿。
         await builder.rollover_at_turn_boundary(start_next_draft=True)

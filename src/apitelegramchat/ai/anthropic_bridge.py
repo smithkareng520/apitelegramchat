@@ -564,6 +564,7 @@ async def _agentic_loop_anthropic(
         status = await _run_tool_calls_and_append(
             tool_calls_list, loop_messages, new_history_entries,
             tool_call_count_ref, api_label, builder, chat_id=builder.chat_id,
+            tools=tools,
         )
         await builder.rollover_at_turn_boundary(start_next_draft=True)
 

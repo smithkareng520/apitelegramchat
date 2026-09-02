@@ -31,6 +31,8 @@ dependencies = [
   "pytesseract==0.3.13",
   "pandas==2.2.3",
   "tiktoken==0.11.0",
+  "json-repair>=0.30,<1",
+  "jsonschema>=4.23,<5",
 ]
 
 [project.scripts]
