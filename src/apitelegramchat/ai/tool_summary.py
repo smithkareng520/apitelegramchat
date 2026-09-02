@@ -1,6 +1,9 @@
 """工具调用的摘要/描述生成、参数解析与失败判定。
 
-从 ai_handlers.py 拆分而来，逻辑未做改动。
+从 ai_handlers.py 拆分而来。v2.3 起参数规范化接入 json_repair 的自动修复
+与精准诊断（Self-Correction 增强）：修复成功直接用修复后的参数执行工具，
+省掉一整轮模型重试；修复失败则把解析器报错/位置/病因写进可恢复信封，
+由执行层渲染成给模型的定向修复指引。
 """
 import json
 import re
@@ -10,13 +13,20 @@ from apitelegramchat.utils import get_logger
 from apitelegramchat.tool_executors import _TOOL_TIMEOUT_MARKER
 from apitelegramchat.ai._constants import MAX_TOOL_CALLS
 from apitelegramchat.ai.error_formatting import extract_domain
+from apitelegramchat.ai.json_repair import (
+    _INVALID_TOOL_ARGUMENTS_KEY,
+    _INVALID_TOOL_ARGUMENTS_RAW_KEY,
+    _JSON_REPAIR_NOTE_KEY,
+    build_invalid_arguments_envelope,
+    repair_json_arguments,
+    repair_note_for_result,
+    _STREAM_REPAIR_SIZE_LIMIT,
+)
 
 logger = get_logger(__name__)
 
-# 流式调用偶发截断/拼接异常时，不能把原始坏字符串写回下一轮请求，否则网关会在
-# 模型开始生成前直接 400。此标记本身是合法 JSON，并让执行层返回可恢复错误。
-_INVALID_TOOL_ARGUMENTS_KEY = "__apitelegram_invalid_tool_arguments__"
-_INVALID_TOOL_ARGUMENTS_RAW_KEY = "raw_arguments_excerpt"
+# 旧导入路径兼容：tool_call_loop 等模块仍从本模块导入这两个常量，
+# 其定义已迁移到 json_repair.py（单一数据源）。
 
 _TEXTUAL_TOOL_CALL_RE = re.compile(
     r"<(?:longcat_)?tool_call\b[^>]*>.*?(?:</(?:longcat_)?tool_call\s*>|$)",
@@ -307,6 +317,12 @@ def _tool_limit_summary() -> str:
 
 
 def _safe_parse_args(args_str: str) -> dict:
+    """尽力从参数字符串中提取可用的 dict（UI 摘要用途）。
+
+    解析优先级：完整 json.loads → 正则提取 _description → 保守自动修复
+    （限流：仅小于 _STREAM_REPAIR_SIZE_LIMIT 的输入；流式截断时允许
+    猜测补全，因为结果仅用于展示预览，不会真正执行）。
+    """
     if not args_str:
         return {}
     try:
@@ -328,45 +344,138 @@ def _safe_parse_args(args_str: str) -> dict:
             # 兜底：如果 json.loads 失败，退回到旧的简单反转义。
             desc = desc_match.group(1).replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t')
             return {"_description": desc}
+    # 最终兜底：保守自动修复（仅展示用途——允许补全截断，不进入执行层）。
+    if len(args_str) < _STREAM_REPAIR_SIZE_LIMIT:
+        try:
+            repaired, _info = repair_json_arguments(
+                args_str, allow_close_truncated=True)
+            if isinstance(repaired, dict) and repaired:
+                # 剔除修复提示键，只保留真实参数字段供摘要展示。
+                repaired.pop(_JSON_REPAIR_NOTE_KEY, None)
+                return repaired
+        except Exception:
+            logger.debug("_safe_parse_args 修复兜底内部忽略的异常", exc_info=True)
+            pass
     return {}
 
 
-def _normalize_tool_arguments(arguments: Any) -> tuple[str, bool]:
-    """返回可安全回传给 provider 的 JSON object 字符串及是否发生规范化。"""
+def _normalize_tool_arguments(arguments: Any) -> tuple[str, bool, dict]:
+    """规范化单个工具调用的参数，返回 ``(JSON 字符串, 是否写入可恢复错误, 元信息)``。
+
+    v2.3 Self-Correction 增强后的处理链（优先级从高到低）：
+
+    1. 原文即合法 JSON object → 重新序列化（去冗余空白），元信息
+       ``{"kind": "valid"}``；
+    2. 合法 JSON 但顶层非 object → 生成带 arg_kind 诊断的信封，执行层
+       会告诉模型「参数是数组/字符串，必须是对象」；
+    3. 畸形 JSON → 先尝试保守自动修复。修复成功且为 dict → 直接用修复
+       后的参数（注入 ``__apitelegram_json_repair_note__`` 键，run_one
+       会把它转成工具结果里的透明提示），元信息
+       ``{"kind": "repaired", "fixes": [...]}``。工具照常执行，省掉
+       一整轮模型重试；
+    4. 修复失败（含截断——绝不猜测补全后执行）→ 生成带完整诊断的
+       可恢复信封：解析器报错原文（行/列/字符位置）、出错位置上下文、
+       病因清单、原始参数摘录。元信息 ``{"kind": "invalid", ...}``。
+
+    信封/修复结果本身都是合法 JSON，保证回传 provider 不 400。
+    """
+    meta: dict = {"kind": "valid"}
     raw = arguments if isinstance(arguments, str) else str(arguments or "")
+    # 注意：Python 3 的 `except ... as exc` 在块结束时删除绑定名，函数后段
+    # 还要用解析器报错构建诊断信封，因此必须先把异常转移到不会被删除的
+    # 局部变量里（旧写法直接引用 exc 会 UnboundLocalError——畸形且不可
+    # 修复的参数恰恰是本函数最关键的路径）。
+    parse_exc: Optional[Exception] = None
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict):
             # 重新序列化同时移除无意义空白，确保所有兼容端收到相同的合法 JSON。
-            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":")), False
-        reason = "arguments must be a JSON object"
-    except (json.JSONDecodeError, TypeError, ValueError):
-        reason = "arguments were not valid JSON"
+            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":")), False, meta
+        # 合法 JSON 但顶层不是 object：不修复、直接诊断（数组/字符串等
+        # 无法「修复」成对象，语义重排只能交给模型）。
+        arg_kind = _kind_of_value(parsed)
+        envelope = build_invalid_arguments_envelope(raw, arg_kind=arg_kind)
+        meta = {"kind": "invalid", "reason": envelope.get(_INVALID_TOOL_ARGUMENTS_KEY)}
+        return (
+            json.dumps(envelope, ensure_ascii=False, separators=(",", ":")),
+            True,
+            meta,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        parse_exc = exc
 
-    safe_excerpt = raw[:2000]
-    normalized = {
-        _INVALID_TOOL_ARGUMENTS_KEY: reason,
-        _INVALID_TOOL_ARGUMENTS_RAW_KEY: safe_excerpt,
+    # 畸形 JSON：先尝试保守自动修复（截断不猜测补全，安全优先）。
+    repaired, repair_info = repair_json_arguments(raw, allow_close_truncated=False)
+    if isinstance(repaired, dict):
+        note = repair_note_for_result(repair_info.get("fixes"))
+        if note:
+            repaired[_JSON_REPAIR_NOTE_KEY] = note
+        meta = {"kind": "repaired", "fixes": repair_info.get("fixes", [])}
+        return (
+            json.dumps(repaired, ensure_ascii=False, separators=(",", ":")),
+            False,
+            meta,
+        )
+
+    # 修复失败：生成带完整诊断的可恢复信封（parse_exc 携带解析器原始
+    # 报错——行/列/字符位置——由信封透传给模型做 Self-Correction）。
+    envelope = build_invalid_arguments_envelope(raw, exc=parse_exc)
+    meta = {
+        "kind": "invalid",
+        "reason": envelope.get(_INVALID_TOOL_ARGUMENTS_KEY),
+        "parse_error": envelope.get("parse_error"),
+        "truncated": envelope.get("looks_truncated", False),
     }
-    return json.dumps(normalized, ensure_ascii=False, separators=(",", ":")), True
+    return (
+        json.dumps(envelope, ensure_ascii=False, separators=(",", ":")),
+        True,
+        meta,
+    )
+
+
+def _kind_of_value(parsed: Any) -> str:
+    """合法 JSON 非对象值的可读描述（用于 arg_kind 诊断）。"""
+    if isinstance(parsed, list):
+        return "a JSON array"
+    if isinstance(parsed, str):
+        return "a JSON string"
+    if isinstance(parsed, bool):
+        return "a JSON boolean"
+    if isinstance(parsed, (int, float)):
+        return "a JSON number"
+    if parsed is None:
+        return "JSON null"
+    return type(parsed).__name__
 
 
 def _normalize_tool_call_arguments(tool_calls: list[dict], api_label: str, round_number: int) -> int:
-    """就地规范化一个模型返回中的所有工具参数，并返回修复数量。"""
+    """就地规范化一个模型返回中的所有工具参数，并返回写入可恢复错误的数量。
+
+    v2.3：自动修复与不可修复分别记日志——修复意味着零重试成本直接恢复，
+    不可修复才走可恢复错误路径。两者都不再把坏字符串写回下一轮请求。
+    """
     corrected = 0
+    repaired_count = 0
     for tc in tool_calls:
         if not isinstance(tc, dict):
             continue
         function = tc.setdefault("function", {})
         if not isinstance(function, dict):
             tc["function"] = function = {}
-        normalized, was_corrected = _normalize_tool_arguments(function.get("arguments", ""))
+        normalized, was_corrected, meta = _normalize_tool_arguments(function.get("arguments", ""))
         function["arguments"] = normalized
         if was_corrected:
             corrected += 1
+        elif meta.get("kind") == "repaired":
+            repaired_count += 1
+    if repaired_count:
+        logger.info(
+            "[%s] 第 %s 轮自动修复了 %s 个畸形工具参数 JSON（工具将直接用修复后的参数执行，无需模型重试）",
+            api_label, round_number, repaired_count,
+        )
     if corrected:
         logger.warning(
-            "[%s] 第 %s 轮检测到 %s 个非法工具参数 JSON，已写入可恢复错误并阻止其污染下一轮请求",
+            "[%s] 第 %s 轮检测到 %s 个无法自动修复的工具参数 JSON，已写入带诊断的可恢复错误并阻止其污染下一轮请求",
             api_label, round_number, corrected,
         )
     return corrected

@@ -41,10 +41,17 @@ from apitelegramchat.ai._constants import (
     CONSUMER_TOOLS,
 )
 from apitelegramchat.ai.error_formatting import extract_domain
+from apitelegramchat.ai.json_repair import (
+    _INVALID_TOOL_ARGUMENTS_KEY,
+    _JSON_REPAIR_NOTE_KEY,
+    build_invalid_arguments_envelope,
+    invalid_arguments_message,
+)
 from apitelegramchat.ai.tool_summary import (
     _generate_action_description,
     _generate_initial_tool_summary,
     _generate_tool_summary_done,
+    _kind_of_value,
     _tool_result_is_failure,
     _INVALID_TOOL_ARGUMENTS_KEY,
 )
@@ -245,15 +252,26 @@ async def _run_tool_calls_and_append(
             try:
                 fn_args = json.loads(tc["function"]["arguments"])
             except (json.JSONDecodeError, KeyError):
-                fn_args = {}
+                # 未经过 _normalize_tool_call_arguments 的旁路路径（如
+                # Anthropic bridge 旧版直接拼接）：在这里就地构建诊断信封，
+                # 避免静默地把参数容成 {} 执行——那会让模型完全收不到
+                # 自己参数写坏了的反馈，陷入盲重试。
+                fn_args = build_invalid_arguments_envelope(
+                    tc["function"].get("arguments", ""))
             tc_id = tc["id"]
         else:
             fn_name = tc.function.name
             try:
                 fn_args = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, AttributeError, TypeError):
-                fn_args = {}
+                fn_args = build_invalid_arguments_envelope(
+                    getattr(tc.function, "arguments", ""))
             tc_id = tc.id
+        if not isinstance(fn_args, dict):
+            # 合法 JSON 但顶层非对象（数组/字符串等）：交给同一套诊断
+            # 消息路径，而不是让下游 fn_args.get() 直接 AttributeError。
+            fn_args = build_invalid_arguments_envelope(
+                json.dumps(fn_args, ensure_ascii=False), arg_kind=_kind_of_value(fn_args))
 
         search_query = None
         domain = None
@@ -292,6 +310,12 @@ async def _run_tool_calls_and_append(
         # 补占位 tool 消息——保证 assistant.tool_calls 全部配对，
         # 已完成的进度不因打断丢失（见 turn_recovery.py）。
         completed_results = _batch_completed_results
+        # v2.3：参数由 json_repair 自动修复时携带的透明提示键——在进入
+        # 工具分发前取出（不能让内部标记键流进工具参数），执行完毕后
+        # 附加到结果末尾，让模型知道参数被修过、验证结果是否符合意图。
+        repair_note = ""
+        if isinstance(fn_args, dict):
+            repair_note = str(fn_args.pop(_JSON_REPAIR_NOTE_KEY, "") or "")
         async with tool_semaphore:
             # 图像 / 视频工具不设超时（内部已有轮询超时控制）
             # 子 agent 走 930s 超时（内部默认 900s，用户可配到 1800s）
@@ -371,10 +395,12 @@ async def _run_tool_calls_and_append(
             try:
                 invalid_arguments = fn_args.get(_INVALID_TOOL_ARGUMENTS_KEY)
                 if invalid_arguments:
-                    result_str = (
-                        f"Error: tool {fn_name} was not executed because the model returned malformed JSON "
-                        f"arguments ({invalid_arguments}). Reissue the same tool call with a valid JSON object."
-                    )
+                    # v2.3 Self-Correction 增强：不再回传一句笼统的
+                    # “malformed JSON”，而是把 json_repair 诊断信封里的
+                    # 解析器报错原文（行/列/字符位置）、出错位置上下文
+                    # （^ 指示）、病因清单、原始参数摘录和针对性修复规则
+                    # 全部渲染出来，让模型一轮即可精准自纠。
+                    result_str = invalid_arguments_message(fn_name, fn_args)
                 elif fn_name == "message_user":
                     # message_user（原 ask_user）：提问 / 通知双用途。
                     # - 带选项：出按钮卡等待用户点选；
@@ -470,6 +496,11 @@ async def _run_tool_calls_and_append(
             except Exception as e:
                 logger.exception(f"[tool] {fn_name} failed: {e}")
                 result_str = f"Exception: tool {fn_name} failed - {truncate_to_token_budget(str(e), 64, suffix='…')}"
+            # v2.3：参数被自动修复过 → 在真实结果后附加透明提示，让模型
+            # 能对冲“修复猜测与原意图不一致”的风险（去核对结果），并
+            # 学习下次直接产出严格合法的 JSON。
+            if repair_note and isinstance(result_str, str) and result_str and result_str != _TOOL_TIMEOUT_MARKER:
+                result_str = f"{result_str}\n\n{repair_note}"
             # 修复：_truncate_tool_result / format_tool_result 处理的是工具的原始
             # 输出（可能是任意格式的字符串），二者内部有大量字符串切分/正则/索引
             # 操作，遇到非预期形状的内容时可能抛出未捕获异常（IndexError /
@@ -698,7 +729,11 @@ async def _run_tool_calls_and_append(
         if isinstance(res, tuple) and len(res) >= 5:
             llm_content = res[4]
             if isinstance(llm_content, str) and llm_content.startswith(("Error:", "Exception:")):
-                error_msgs.append(llm_content[:80])
+                # v2.3：签名取首行（截 100 字符）而非前 80 字符跨行拼接——
+                # 诊断增强后的错误消息首行是稳定的（工具名+错误类别），
+                # 其后才是含行列位置等易变细节的行；取首行可保证同一错误
+                # 反复发生时熔断计数准确命中，不会因细节差异而漏判。
+                error_msgs.append(llm_content.split("\n", 1)[0][:100])
     if error_msgs and len(set(error_msgs)) == 1 and len(error_msgs) == len(results):
         key = f"_streak:{error_msgs[0]}"
         prev = getattr(builder, key, 0)

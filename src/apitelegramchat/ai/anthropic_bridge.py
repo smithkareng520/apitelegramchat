@@ -38,6 +38,12 @@ from apitelegramchat.utils import get_logger
 from apitelegramchat.chat_actions import start_chat_action, stop_chat_action
 
 from apitelegramchat.ai._constants import MAX_TOOL_CALLS
+from apitelegramchat.ai.json_repair import (
+    _JSON_REPAIR_NOTE_KEY,
+    build_invalid_arguments_envelope,
+    repair_json_arguments,
+    repair_note_for_result,
+)
 from apitelegramchat.ai.tool_summary import (
     _generate_action_description,
     _generate_initial_tool_summary,
@@ -502,12 +508,35 @@ async def _agentic_loop_anthropic(
         for idx in sorted(tool_use_blocks.keys()):
             entry = tool_use_blocks[idx]
             args_str = entry["args_json"] or "{}"
-            # 确保是合法 JSON 字符串（Anthropic 的 partial_json 拼接完成后
-            # 理应是完整 JSON；容错解析失败时退化为空对象，不让整轮崩溃）。
+            # v2.3 Self-Correction：Anthropic 的 partial_json 拼接完成后
+            # 理应是完整 JSON；解析失败时不再静默换成 "{}"（那会让工具
+            # 带空参数执行、模型收不到任何参数写坏了的反馈，陷入盲重试），
+            # 而是先尝试保守自动修复，失败则写入带完整诊断的可恢复信封
+            # （信封本身是合法 JSON，不会污染下一轮请求），由执行层把
+            # 解析器报错/位置/病因精准回传给模型。
             try:
                 json.loads(args_str)
             except json.JSONDecodeError:
-                args_str = "{}"
+                repaired, repair_info = repair_json_arguments(args_str)
+                if isinstance(repaired, dict):
+                    note = repair_note_for_result(repair_info.get("fixes"))
+                    if note:
+                        repaired[_JSON_REPAIR_NOTE_KEY] = note
+                    args_str = json.dumps(
+                        repaired, ensure_ascii=False, separators=(",", ":"))
+                    logger.info(
+                        "[anthropic] 工具 %s 参数 JSON 已自动修复（直接用修复后参数执行）",
+                        entry["name"],
+                    )
+                else:
+                    args_str = json.dumps(
+                        build_invalid_arguments_envelope(args_str),
+                        ensure_ascii=False, separators=(",", ":"),
+                    )
+                    logger.warning(
+                        "[anthropic] 工具 %s 参数 JSON 非法且无法自动修复，已写入带诊断的可恢复错误",
+                        entry["name"],
+                    )
             tool_calls_list.append({
                 "id": entry["id"], "type": "function",
                 "function": {"name": entry["name"], "arguments": args_str},
