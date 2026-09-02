@@ -620,7 +620,7 @@ SUPPORTED_MODELS["minimax/minimax-m3:free"] = make_model_config(
     name="Minimax M3 Free",
     vision=True,
     video=True,
-    max_context=262000,
+    max_context=1000000,
     # 代码模型，免费档：不发送推理控制与采样参数，走供应商默认。
 )
 SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
