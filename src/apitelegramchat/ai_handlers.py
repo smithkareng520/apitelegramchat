@@ -513,7 +513,13 @@ async def get_ai_response(
             api_type = model_info.api_type
             # 复制历史快照，避免在锁外被并发请求追加导致竞态
             stored_history = list(user_contexts.get(chat_id, {}).get("conversation_history", []))
-            context_snapshot = select_request_context(stored_history)
+            # 动态上下文：传入模型的 max_context 配置，让 select_request_context
+            # 根据模型能力自动调整 token 上限（大窗口模型如 Gemini 2.5 Flash 可
+            # 使用更多上下文，小窗口模型自动收紧）
+            context_snapshot = select_request_context(
+                stored_history,
+                model_max_context=model_info.max_context,
+            )
             history = context_snapshot.messages
             supports_tools = model_info.supports_tools
         _log_stage("获取chat_lock+上下文快照完成")
