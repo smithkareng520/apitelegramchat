@@ -281,7 +281,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "reasoning_enabled": None,    # None -> 不发送推理控制参数
         "reasoning_effort": None,
         "reasoning_max_tokens": None,
-        "max_output_tokens": 8192,
+        "max_output_tokens": 65536,
         "max_context": 128000,
     },
     "modelscope": {
@@ -298,7 +298,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "reasoning_enabled": None,    # None -> 不发送推理控制参数
         "reasoning_effort": None,
         "reasoning_max_tokens": None,
-        "max_output_tokens": 8192,
+        "max_output_tokens": 65536,
         "max_context": 128000,
     },
     "gemini": {
@@ -315,7 +315,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "reasoning_enabled": None,    # None -> 不发送推理控制参数
         "reasoning_effort": None,
         "reasoning_max_tokens": None,
-        "max_output_tokens": 8192,
+        "max_output_tokens": 65536,
         "max_context": 1000000,
     },
     "grok": {
@@ -332,7 +332,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "reasoning_enabled": None,    # None -> 不发送推理控制参数
         "reasoning_effort": None,
         "reasoning_max_tokens": None,
-        "max_output_tokens": 8192,
+        "max_output_tokens": 65536,
         "max_context": 128000,
     },
     "deepseek": {
@@ -349,7 +349,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "reasoning_enabled": None,    # None -> 不发送推理控制参数
         "reasoning_effort": None,
         "reasoning_max_tokens": None,
-        "max_output_tokens": 8192,
+        "max_output_tokens": 65536,
         "max_context": 128000,
     },
     "glm": {
@@ -366,7 +366,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "reasoning_enabled": None,    # None -> 不发送推理控制参数
         "reasoning_effort": None,
         "reasoning_max_tokens": None,
-        "max_output_tokens": 8192,
+        "max_output_tokens": 65536,
         "max_context": 128000,
     },
     "agnes": {
@@ -384,7 +384,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "reasoning_enabled": None,    # None -> 不发送推理控制参数
         "reasoning_effort": None,
         "reasoning_max_tokens": None,
-        "max_output_tokens": 8192,
+        "max_output_tokens": 65536,
         "max_context": 128000,
     },
     "anthropic": {
@@ -402,7 +402,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "reasoning_enabled": None,    # None -> 不发送推理控制参数
         "reasoning_effort": None,
         "reasoning_max_tokens": None,
-        "max_output_tokens": 8192,
+        "max_output_tokens": 65536,
         "max_context": 200000,
     },
 }
