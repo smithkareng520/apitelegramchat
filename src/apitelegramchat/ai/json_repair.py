@@ -58,6 +58,13 @@ _PARSE_ERROR_KEY = "parse_error"
 _ERROR_CONTEXT_KEY = "error_context"
 _DIAGNOSED_ISSUES_KEY = "diagnosed_issues"
 _TRUNCATED_KEY = "looks_truncated"
+# v2.5：流结束原因观测。None = 调用方无信息（保持旧行为）；
+# "length" / "max_tokens" / "content_filter" = 确认被上限/过滤器切断；
+# "" = 流消费完毕但从未见到终止事件（网关断流）；
+# "stop" / "tool_calls" / "end_turn" / "tool_use" 等 = 正常结束。
+_STREAM_FINISH_REASON_KEY = "stream_finish_reason"
+_STREAM_CUT_KEY = "stream_cut"
+_STREAM_CUT_CAUSE_KEY = "stream_cut_cause"
 # 自动修复成功时注入 fn_args 的提示键（run_one 会 pop 掉并转成结果附注）
 _JSON_REPAIR_NOTE_KEY = "__apitelegram_json_repair_note__"
 
@@ -565,8 +572,33 @@ def _parser_error_text(exc: Optional[Exception], raw: str) -> str:
         return "arguments were not valid JSON"
 
 
+def _finish_reason_cut_info(stream_finish_reason: Optional[str]) -> tuple:
+    """把流结束原因归类为「是否异常截断 + 面向模型的原因描述」。
+
+    返回 ``(is_cut, cause)``。仅基于积极证据判定截断：
+    - ``length`` / ``max_tokens``：输出 token 上限（OpenAI / Anthropic 各自的拼写）；
+    - ``content_filter``：内容过滤器拦停；
+    - ``""``：流被完整消费但从未出现终止事件——正常兼容端一定会发
+      finish_reason，缺失本身就是断流证据（网关提前关闭 / 连接中断）；
+    - ``None``：调用方没有该信息（旧行为，不下结论）；
+    - 其余（stop / tool_calls / end_turn / tool_use…）：正常结束，
+      参数写坏了是模型自己的问题——这同样是有价值的定向信息。
+    """
+    if stream_finish_reason is None:
+        return False, ""
+    fr = str(stream_finish_reason).strip().lower()
+    if not fr:
+        return True, "the stream ended without a finish_reason termination event (connection or gateway cutoff)"
+    if fr in ("length", "max_tokens"):
+        return True, "the output token limit was reached before the tool call finished"
+    if fr == "content_filter":
+        return True, "the response was stopped by the content filter"
+    return False, ""
+
+
 def build_invalid_arguments_envelope(
         raw: str, *, exc: Optional[Exception] = None, arg_kind: Optional[str] = None,
+        stream_finish_reason: Optional[str] = None,
 ) -> dict:
     """修复失败后构建带完整诊断的可恢复错误信封（合法 JSON dict）。
 
@@ -578,6 +610,7 @@ def build_invalid_arguments_envelope(
     try:
         raw = raw if isinstance(raw, str) else str(raw or "")
         excerpt = raw[:_RAW_EXCERPT_LIMIT]
+        cut, cut_cause = _finish_reason_cut_info(stream_finish_reason)
         if arg_kind:
             reason = f"arguments must be a JSON object, but the value parsed as {arg_kind}"
             return {
@@ -593,14 +626,32 @@ def build_invalid_arguments_envelope(
             }
         if not raw.strip():
             reason = "arguments were empty — provide the required arguments as a JSON object"
-            return {
+            issues = ["arguments field was empty or whitespace-only"]
+            truncated = False
+            # v2.5：带 id/name 的工具调用不会自愿发空参数；若流结束原因
+            # 显示异常截断（上限/断流），根因几乎必是「参数还没开始生成就
+            # 被切断」——明说根因并标记截断，让分块降级指引生效。
+            if cut:
+                reason = (
+                    "arguments were empty — the response stream was cut off before any "
+                    f"argument content was generated ({cut_cause})"
+                )
+                issues.append(f"truncated: no argument content arrived — {cut_cause}")
+                truncated = True
+            env = {
                 _INVALID_TOOL_ARGUMENTS_KEY: reason,
                 _INVALID_TOOL_ARGUMENTS_RAW_KEY: "",
                 _PARSE_ERROR_KEY: reason,
-                _DIAGNOSED_ISSUES_KEY: ["arguments field was empty or whitespace-only"],
+                _DIAGNOSED_ISSUES_KEY: issues,
                 _ERROR_CONTEXT_KEY: "",
-                _TRUNCATED_KEY: False,
+                _TRUNCATED_KEY: truncated,
             }
+            if stream_finish_reason is not None:
+                env[_STREAM_FINISH_REASON_KEY] = str(stream_finish_reason)
+                env[_STREAM_CUT_KEY] = bool(cut)
+                if cut:
+                    env[_STREAM_CUT_CAUSE_KEY] = cut_cause
+            return env
         parser_error = _parser_error_text(exc, raw)
         # 复用修复器的重写扫描来收集病因（不需要修复成功）
         candidate, _ = _extract_jsonish(raw)
@@ -609,6 +660,12 @@ def build_invalid_arguments_envelope(
         for f in rewrite_fixes:
             if f not in issues:
                 issues.append(f)
+        # v2.5：流结束原因佐证——finish_reason=length 与截断判定互相印证，
+        # 把根因写进病因清单（含 "cut off"，供消息层渲染专属段）。
+        if cut:
+            marker = f"response was cut off mid-generation — {cut_cause}"
+            if marker not in issues:
+                issues.append(marker)
         # 解析器报错位置（来自原始 raw，而非重写结果）
         pos = getattr(exc, "pos", None)
         if pos is None:
@@ -620,7 +677,9 @@ def build_invalid_arguments_envelope(
         reason = "arguments were not valid JSON (auto-repair failed)"
         if truncated:
             reason = "arguments were not valid JSON (appear truncated / incomplete)"
-        return {
+        elif cut:
+            reason = f"arguments were not valid JSON ({cut_cause})"
+        env = {
             _INVALID_TOOL_ARGUMENTS_KEY: reason,
             _INVALID_TOOL_ARGUMENTS_RAW_KEY: excerpt,
             _PARSE_ERROR_KEY: parser_error,
@@ -628,6 +687,12 @@ def build_invalid_arguments_envelope(
             _DIAGNOSED_ISSUES_KEY: issues[:10],
             _TRUNCATED_KEY: bool(truncated),
         }
+        if stream_finish_reason is not None:
+            env[_STREAM_FINISH_REASON_KEY] = str(stream_finish_reason)
+            env[_STREAM_CUT_KEY] = bool(cut)
+            if cut:
+                env[_STREAM_CUT_CAUSE_KEY] = cut_cause
+        return env
     except Exception as exc:  # noqa: BLE001
         logger.warning("build_invalid_arguments_envelope 内部异常: %s", exc, exc_info=True)
         return {
@@ -706,6 +771,30 @@ def invalid_arguments_message(fn_name: str, fn_args: dict) -> str:
 
         parts = [first_line, ""]
         parts.append(f"[Parser error] {parse_error}")
+        # v2.5：流结束原因专属段——把「传输层被切断」与「模型写坏了 JSON"
+        # 两种根因彻底分开。前者重引号没用，必须缩输出/分块；后者才是
+        # 语法修复路径。正常结束（stop/tool_calls）时明确告诉模型
+        # 「问题在你自己的 JSON」，避免误归因。
+        stream_fr = fn_args.get(_STREAM_FINISH_REASON_KEY)
+        stream_cut = bool(fn_args.get(_STREAM_CUT_KEY))
+        if stream_cut:
+            cause = str(fn_args.get(_STREAM_CUT_CAUSE_KEY) or "the stream ended before the arguments were complete")
+            parts.append(f"[Why: the response stream was cut off] finish_reason={stream_fr or 'not reported'} — {cause}.")
+            parts.append(
+                "This is NOT a JSON syntax problem: the arguments were never fully generated, so "
+                "re-quoting the same oversized call will fail the same way."
+            )
+            parts.append(
+                "- Shorten the text/thinking you emit BEFORE the tool call — start tool calls early in the response."
+            )
+            parts.append(
+                "- Split large payloads into several smaller calls (each argument well under ~4KB)."
+            )
+        elif stream_fr:
+            parts.append(
+                f"[Stream status] The response ended normally (finish_reason={stream_fr}); "
+                "the malformed JSON is on your side — fixing the syntax is the right fix."
+            )
         if context:
             parts.append("[Where the parser stopped]")
             parts.append(context)

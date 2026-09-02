@@ -432,6 +432,8 @@ async def _agentic_loop_anthropic(
         reasoning_acc = ""
         tool_use_blocks: dict[int, dict] = {}
         current_stream = None
+        # v2.5：Anthropic 流结束原因（max_tokens / end_turn / tool_use…）。
+        stop_reason = ""
 
         def switch_stream(target: str):
             nonlocal current_stream
@@ -492,6 +494,9 @@ async def _agentic_loop_anthropic(
                 final_message = await stream.get_final_message()
                 if getattr(final_message, "usage", None):
                     final_usage = final_message.usage
+                # v2.5：捕获流结束原因（max_tokens = 输出上限切断），
+                # 供下方参数诊断信封定性「参数被切断」的根因。
+                stop_reason = str(getattr(final_message, "stop_reason", "") or "")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -530,12 +535,14 @@ async def _agentic_loop_anthropic(
                     )
                 else:
                     args_str = json.dumps(
-                        build_invalid_arguments_envelope(args_str),
+                        build_invalid_arguments_envelope(
+                            args_str, stream_finish_reason=(stop_reason or None)),
                         ensure_ascii=False, separators=(",", ":"),
                     )
                     logger.warning(
-                        "[anthropic] 工具 %s 参数 JSON 非法且无法自动修复，已写入带诊断的可恢复错误",
-                        entry["name"],
+                        "[anthropic] 工具 %s 参数 JSON 非法且无法自动修复，已写入带诊断的可恢复错误"
+                        "（流结束原因 stop_reason=%r）",
+                        entry["name"], stop_reason,
                     )
             tool_calls_list.append({
                 "id": entry["id"], "type": "function",

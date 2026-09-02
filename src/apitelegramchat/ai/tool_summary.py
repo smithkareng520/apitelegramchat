@@ -17,6 +17,7 @@ from apitelegramchat.ai.json_repair import (
     _INVALID_TOOL_ARGUMENTS_KEY,
     _INVALID_TOOL_ARGUMENTS_RAW_KEY,
     _JSON_REPAIR_NOTE_KEY,
+    _finish_reason_cut_info,
     build_invalid_arguments_envelope,
     repair_json_arguments,
     repair_note_for_result,
@@ -360,7 +361,9 @@ def _safe_parse_args(args_str: str) -> dict:
     return {}
 
 
-def _normalize_tool_arguments(arguments: Any) -> tuple[str, bool, dict]:
+def _normalize_tool_arguments(
+        arguments: Any, stream_finish_reason: Optional[str] = None,
+) -> tuple[str, bool, dict]:
     """规范化单个工具调用的参数，返回 ``(JSON 字符串, 是否写入可恢复错误, 元信息)``。
 
     v2.3 Self-Correction 增强后的处理链（优先级从高到低）：
@@ -379,6 +382,10 @@ def _normalize_tool_arguments(arguments: Any) -> tuple[str, bool, dict]:
        病因清单、原始参数摘录。元信息 ``{"kind": "invalid", ...}``。
 
     信封/修复结果本身都是合法 JSON，保证回传 provider 不 400。
+
+    v2.5：``stream_finish_reason``（可选）来自本轮流式/非流式响应的
+    结束原因，透传给信封——finish_reason=length 时模型能明确知道
+    「参数是被输出上限切断的」而非自己写坏了 JSON。
     """
     meta: dict = {"kind": "valid"}
     raw = arguments if isinstance(arguments, str) else str(arguments or "")
@@ -420,12 +427,14 @@ def _normalize_tool_arguments(arguments: Any) -> tuple[str, bool, dict]:
 
     # 修复失败：生成带完整诊断的可恢复信封（parse_exc 携带解析器原始
     # 报错——行/列/字符位置——由信封透传给模型做 Self-Correction）。
-    envelope = build_invalid_arguments_envelope(raw, exc=parse_exc)
+    envelope = build_invalid_arguments_envelope(
+        raw, exc=parse_exc, stream_finish_reason=stream_finish_reason)
     meta = {
         "kind": "invalid",
         "reason": envelope.get(_INVALID_TOOL_ARGUMENTS_KEY),
         "parse_error": envelope.get("parse_error"),
         "truncated": envelope.get("looks_truncated", False),
+        "stream_cut": envelope.get("stream_cut", False),
     }
     return (
         json.dumps(envelope, ensure_ascii=False, separators=(",", ":")),
@@ -449,11 +458,17 @@ def _kind_of_value(parsed: Any) -> str:
     return type(parsed).__name__
 
 
-def _normalize_tool_call_arguments(tool_calls: list[dict], api_label: str, round_number: int) -> int:
+def _normalize_tool_call_arguments(
+        tool_calls: list[dict], api_label: str, round_number: int,
+        stream_finish_reason: Optional[str] = None,
+) -> int:
     """就地规范化一个模型返回中的所有工具参数，并返回写入可恢复错误的数量。
 
     v2.3：自动修复与不可修复分别记日志——修复意味着零重试成本直接恢复，
     不可修复才走可恢复错误路径。两者都不再把坏字符串写回下一轮请求。
+    v2.5：``stream_finish_reason``（可选）为空参数/截断参数的根因定性和
+    指引方向提供决定性证据（length = 输出上限切断；"" = 断流；
+    stop/tool_calls = 正常结束、语法问题在模型自身）。
     """
     corrected = 0
     repaired_count = 0
@@ -463,7 +478,8 @@ def _normalize_tool_call_arguments(tool_calls: list[dict], api_label: str, round
         function = tc.setdefault("function", {})
         if not isinstance(function, dict):
             tc["function"] = function = {}
-        normalized, was_corrected, meta = _normalize_tool_arguments(function.get("arguments", ""))
+        normalized, was_corrected, meta = _normalize_tool_arguments(
+            function.get("arguments", ""), stream_finish_reason=stream_finish_reason)
         function["arguments"] = normalized
         if was_corrected:
             corrected += 1
@@ -476,8 +492,10 @@ def _normalize_tool_call_arguments(tool_calls: list[dict], api_label: str, round
         )
     if corrected:
         logger.warning(
-            "[%s] 第 %s 轮检测到 %s 个无法自动修复的工具参数 JSON，已写入带诊断的可恢复错误并阻止其污染下一轮请求",
-            api_label, round_number, corrected,
+            "[%s] 第 %s 轮检测到 %s 个无法自动修复的工具参数 JSON，已写入带诊断的可恢复错误并阻止其污染下一轮请求"
+            "（流结束原因 finish_reason=%r，stream_cut=%s）",
+            api_label, round_number, corrected, stream_finish_reason,
+            bool(_finish_reason_cut_info(stream_finish_reason)[0]),
         )
     return corrected
 

@@ -261,6 +261,11 @@ async def _agentic_loop_openai_compat(
         in_reasoning = False
         current_stream = None
         received_any = False
+        # v2.5：本轮流结束原因（length / stop / tool_calls / content_filter…）。
+        # 初始 None = 尚未见到任何终止事件；流被完整消费却仍为 None 时，
+        # 归一化层会把 ""（断流证据）传入诊断信封——空参数/截断参数的
+        # 根因自此可被准确区分（输出上限 vs 断流 vs 模型自身语法错）。
+        stream_finish_reason: Optional[str] = None
         # 本轮"第一个出现的内容类型"：'tool'（先出现工具调用）或 'content'（先出现思考/文本）。
         # 只有第一次出现时才据此决定是否要关闭上一个未闭合的工具块，之后不再重复判断。
         round_leading_kind = None
@@ -319,6 +324,9 @@ async def _agentic_loop_openai_compat(
                         choices = chunk.choices or []
                         if not choices:
                             continue
+                        fr = getattr(choices[0], "finish_reason", None)
+                        if fr:
+                            stream_finish_reason = str(fr)
                         delta = choices[0].delta
                         c_delta = getattr(delta, "content", None) or ""
                         if isinstance(c_delta, list):
@@ -518,6 +526,9 @@ async def _agentic_loop_openai_compat(
                 if getattr(resp, "usage", None):
                     final_usage = resp.usage
                 msg = resp.choices[0].message
+                fr = str(getattr(resp.choices[0], "finish_reason", "") or "")
+                if fr:
+                    stream_finish_reason = fr
                 content_acc = msg.content or ""
                 if supports_tools and tools and hasattr(msg, "tool_calls") and msg.tool_calls:
                     for idx, tc in enumerate(msg.tool_calls):
@@ -543,13 +554,17 @@ async def _agentic_loop_openai_compat(
                 content_acc = "请求失败，请稍后重试。"
 
         tool_calls_list = [tool_calls_acc[i] for i in sorted(tool_calls_acc.keys())] if tool_calls_acc else []
+        # v2.5：流被完整消费却从未见到终止事件，且本轮确实产出了工具调用 →
+        # 记为 ""（断流证据，非"无信息"），供归一化层定性空参数/截断参数。
+        if stream_finish_reason is None and tool_calls_list:
+            stream_finish_reason = ""
         try:
             tool_call_names = [tc.get("function", {}).get("name", "") or "" for tc in tool_calls_list]
             tool_call_ids = [tc.get("id", "") or "" for tc in tool_calls_list]
             logger.info(
                 f"[{api_label}] 第 {_round + 1} 轮模型原始返回: tool_calls={len(tool_calls_list)}, "
                 f"ids={tool_call_ids}, names={tool_call_names}, content_len={len(content_acc.strip())}, "
-                f"reasoning_len={len(reasoning_acc.strip())}"
+                f"reasoning_len={len(reasoning_acc.strip())}, finish_reason={stream_finish_reason!r}"
             )
         except Exception:
             logger.exception(f"[{api_label}] 记录 tool_calls 日志失败")
@@ -561,7 +576,9 @@ async def _agentic_loop_openai_compat(
         for idx, tc in enumerate(tool_calls_list):
             if not tc.get("id"):
                 tc["id"] = f"call_{_round}_{idx}_{uuid.uuid4().hex[:8]}"
-        _normalize_tool_call_arguments(tool_calls_list, api_label, _round + 1)
+        _normalize_tool_call_arguments(
+            tool_calls_list, api_label, _round + 1,
+            stream_finish_reason=stream_finish_reason)
 
         if not tool_calls_list and not content_acc.strip():
             content_acc = "（模型未返回任何内容）"
@@ -811,6 +828,7 @@ async def _agentic_loop_gemini_openai_compat(
         raw_msg = choices[0].get("message", {})
         content_acc: str = raw_msg.get("content") or ""
         final_usage = data.get("usage")
+        gemini_finish_reason = str(choices[0].get("finish_reason") or "") or None
 
         tool_calls_list: list[dict] = []
         for tc in (raw_msg.get("tool_calls") or []):
@@ -840,7 +858,9 @@ async def _agentic_loop_gemini_openai_compat(
                 # Keep the legacy field too for maximum compatibility.
                 tc_entry["thought_signature"] = thought_signature
             tool_calls_list.append(tc_entry)
-        _normalize_tool_call_arguments(tool_calls_list, "gemini", _round + 1)
+        _normalize_tool_call_arguments(
+            tool_calls_list, "gemini", _round + 1,
+            stream_finish_reason=gemini_finish_reason)
 
         # Gemini/OpenAI 兼容端也可能把函数调用 XML 放在普通 content 中；在写入
         # 草稿和历史前先清理，避免最终消息暴露内部调用语法。
