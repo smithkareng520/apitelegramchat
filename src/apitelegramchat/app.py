@@ -9,6 +9,7 @@ import os
 import time
 import hmac
 import mimetypes
+from typing import Optional
 from apitelegramchat.workspace_paths import workspace_download_root
 from apitelegramchat.token_budget import count_tokens
 
