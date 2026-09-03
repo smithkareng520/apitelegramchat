@@ -246,6 +246,22 @@ class _BashOutputBuffer:
         return head + note + tail
 
 
+_ANSI_ESCAPE_RE = re.compile(
+    r'\x1B(?:'
+    r'\][^\x07\x1b]*(?:\x07|\x1b\\)|'  # OSC (Operating System Command)
+    r'\[[0-?]*[ -/]*[@-~]|'            # CSI (Control Sequence Introducer)
+    r'[@-Z\\-_]'                       # Other 7-bit C1 sequences
+    r')'
+)
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences (colors, cursor navigation, hyperlinks, OSC titles)."""
+    if not text:
+        return ""
+    return _ANSI_ESCAPE_RE.sub('', text)
+
+
 _UI_TAIL_LINES = 10
 _UI_VALUE_TOKEN_BUDGET = 120
 _UI_MAX_FIELDS = 10
@@ -1301,6 +1317,11 @@ class BashSession:
                 timeout = max(timeout, 1)
         except asyncio.TimeoutError:
             logger.warning("Bash isolated timeout chat_id=%s cmd=%s", self.chat_id, command[:120])
+            partial_output = ""
+            try:
+                partial_output = _strip_ansi(output_buffer.finalize()).strip()
+            except Exception:
+                pass
             try:
                 os.killpg(os.getpgid(proc.pid), 9)
             except (ProcessLookupError, PermissionError):
@@ -1310,7 +1331,10 @@ class BashSession:
             except Exception:
                 logger.debug("_execute_heredoc_isolated 内部忽略的异常", exc_info=True)
                 pass
-            return f"Error: Command timed out after {timeout} seconds (isolated bash killed)"
+            msg = f"Error: Command timed out after {timeout} seconds (isolated bash killed)"
+            if partial_output:
+                return f"{msg}\n\nCaptured partial output before timeout:\n{partial_output}"
+            return msg
         except asyncio.CancelledError:
             try:
                 os.killpg(os.getpgid(proc.pid), 9)
@@ -1334,7 +1358,7 @@ class BashSession:
         actual_cwd = cwd_match.group(1).strip() if cwd_match else cwd
         output = re.sub(r"(?m)^__ONE_SHOT_CWD__\s+.*$\n?", "", output)
         self._last_cwd = actual_cwd
-        output = re.sub(r'\x1b\[[0-9;]*m', '', output)
+        output = _strip_ansi(output)
         # 终端式信封：提示符 = 本次隔离进程的起始 cwd（命令的真实执行
         # 位置）。隔离命令里的 cd 不会影响 persistent shell，下一条命令
         # 的提示符会如实回到 persistent cwd——和真实终端的子 shell 语义
@@ -1494,7 +1518,7 @@ class BashSession:
                 # 有界缓冲：预算内完整保留；超预算保留头+尾并省略中间，
                 # 上限由 SANDBOX_OUTPUT_MAX_CHARS 控制（默认 80000，远大于旧版 20000）。
                 output = output_buffer.finalize()
-                output = re.sub(r'\x1b\[[0-9;]*m', '', output)
+                output = _strip_ansi(output)
 
                 # 提取命令结束后的真实 PWD，同时把内部 marker 从用户输出中移除。
                 actual_cwd = str(self.workdir.absolute())
@@ -1532,13 +1556,23 @@ class BashSession:
 
             except asyncio.TimeoutError:
                 logger.warning(f"Bash timeout chat_id={self.chat_id} cmd={command[:100]}")
+                partial_output = ""
+                try:
+                    if 'pending' in locals() and pending:
+                        output_buffer.add(pending)
+                    partial_output = _strip_ansi(output_buffer.finalize()).strip()
+                except Exception:
+                    pass
                 try:
                     os.killpg(os.getpgid(self.proc.pid), 9)
                 except ProcessLookupError:
                     pass
                 # 重启会话
                 await self.close()
-                return f"Error: Command timed out after {timeout} seconds (sandbox killed & session will restart)"
+                msg = f"Error: Command timed out after {timeout} seconds (sandbox killed & session will restart)"
+                if partial_output:
+                    return f"{msg}\n\nCaptured partial output before timeout:\n{partial_output}"
+                return msg
 
             except Exception as e:
                 logger.exception(f"Bash execute error chat_id={self.chat_id}")

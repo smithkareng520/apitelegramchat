@@ -17,6 +17,7 @@ import socket
 import uuid
 import tempfile
 import mimetypes
+from collections import defaultdict
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from typing import Any, Optional
 try:
@@ -333,6 +334,95 @@ def _with_latest_editor_snapshot(message: str, content: str) -> str:
     return f"{message}\n\nLatest file snapshot (tail 10):\n{_latest_editor_snapshot(content)}"
 
 
+_file_history: dict[tuple[int, str, str], list[str]] = defaultdict(list)
+_MAX_FILE_HISTORY = 10
+SNIPPET_LINES = 4
+
+
+def _record_file_history(chat_id: int, namespace: str, safe_path: str, content: str) -> None:
+    history = _file_history[(chat_id, namespace, safe_path)]
+    history.append(content)
+    if len(history) > _MAX_FILE_HISTORY:
+        history.pop(0)
+
+
+def _format_editor_snippet(
+    content: str,
+    target_line: int,
+    snippet_lines: int = SNIPPET_LINES,
+    total_new_lines: int = 0,
+) -> str:
+    """Generate a snippet around the modified section with 1-based line numbers.
+    
+    This matches official Claude text_editor behavior: providing immediate context
+    around the edited section so the model can verify changes without needing an extra view.
+    """
+    lines = _normalize_editor_text(content).splitlines()
+    if not lines:
+        return "(empty file)"
+    total_lines = len(lines)
+    start_line = max(1, target_line - snippet_lines)
+    end_line = min(total_lines, target_line + snippet_lines + max(0, total_new_lines))
+    width = max(len(str(total_lines)), 4)
+    snippet = "\n".join(
+        _format_editor_line(idx, lines[idx - 1], width)
+        for idx in range(start_line, end_line + 1)
+    )
+    return (
+        f"Here's the result of running `cat -n` on a snippet of the file (lines {start_line}-{end_line}):\n"
+        f"{snippet}\n"
+        "Review the changes and make sure they are as expected. Edit the file again if necessary."
+    )
+
+
+def _with_editor_snippet_or_tail(message: str, content: str, target_line: int | None = None, new_lines: int = 0) -> str:
+    if target_line is not None and target_line >= 1:
+        snippet = _format_editor_snippet(content, target_line, total_new_lines=new_lines)
+        return f"{message}\n\n{snippet}"
+    return _with_latest_editor_snapshot(message, content)
+
+
+def _list_directory_contents(dir_path: Path, display_name: str, max_depth: int = 2) -> str:
+    """List directory contents up to max_depth levels deep, excluding hidden items."""
+    entries = []
+    root_level = len(dir_path.parts)
+    try:
+        for current_root, dirs, files in os.walk(dir_path):
+            current_path = Path(current_root)
+            depth = len(current_path.parts) - root_level
+            # 过滤隐藏目录
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            if depth >= max_depth:
+                dirs.clear()
+
+            for f in sorted(files):
+                if f.startswith("."):
+                    continue
+                try:
+                    rel_file = (current_path / f).relative_to(dir_path)
+                    entries.append(str(rel_file))
+                except ValueError:
+                    entries.append(f)
+            for d in sorted(dirs):
+                try:
+                    rel_dir = (current_path / d).relative_to(dir_path)
+                    entries.append(str(rel_dir) + "/")
+                except ValueError:
+                    entries.append(d + "/")
+    except Exception as exc:
+        return f"Error listing directory: {exc}"
+
+    entries.sort()
+    header_name = display_name if display_name and display_name != "." else "the workspace root"
+    if not entries:
+        return f"Directory {header_name} is empty (excluding hidden items)."
+    listing = "\n".join(entries)
+    return (
+        f"Here's the files and directories up to 2 levels deep in {header_name}, "
+        f"excluding hidden items:\n{listing}\n"
+    )
+
+
 def _write_text_editor_file(local_path: Path, new_content: str) -> None:
     """Atomically replace an existing UTF-8 text file while preserving its mode.
 
@@ -394,12 +484,13 @@ async def execute_text_editor(
     in the entire file. This prevents accidental broad edits and tells the model
     to re-view the relevant text when its context is stale.
     """
-    allowed_commands = {"view", "str_replace", "create", "insert"}
+    allowed_commands = {"view", "str_replace", "create", "insert", "undo_edit"}
     if command not in allowed_commands:
-        return f"Error: Unknown command: {command}. Allowed commands are view, str_replace, create, and insert."
+        return f"Error: Unknown command: {command}. Allowed commands are view, str_replace, create, insert, and undo_edit."
 
+    allow_root = (command == "view")
     try:
-        safe_path = _editor_safe_path(path)
+        safe_path = _editor_safe_path(path, allow_root=allow_root)
     except ValueError as exc:
         return f"Error: {exc}"
 
@@ -419,13 +510,15 @@ async def execute_text_editor(
     async with lock:
         try:
             workspace = workspace_workdir(chat_id, resolved_namespace).resolve()
-            local_path = _resolve_editor_path(workspace, safe_path)
+            local_path = _resolve_editor_path(workspace, safe_path, allow_root=allow_root)
 
             if command == "view":
                 if not local_path.exists():
                     return "Error: File not found"
                 if local_path.is_dir():
-                    return "Error: Path is a directory. view only supports files."
+                    if view_range is not None:
+                        return "Error: The `view_range` parameter is not allowed when `path` points to a directory."
+                    return _list_directory_contents(local_path, safe_path)
                 if local_path.stat().st_size > _EDITOR_MAX_VIEW_BYTES:
                     return _file_too_large_error("view", local_path, _EDITOR_MAX_VIEW_BYTES)
                 try:
@@ -473,11 +566,34 @@ async def execute_text_editor(
                         file.write(data)
                 except FileExistsError:
                     return "Error: File already exists."
+                _record_file_history(chat_id, resolved_namespace, safe_path, "")
                 _spawn_persist_task(
                     chat_id, safe_path, namespace=resolved_namespace, content_bytes=data)
                 # 成功消息使用 workspace 相对路径：绝对路径会泄漏服务器
                 # 目录结构，也违背「一切路径相对 workspace 根」的约定。
                 return _with_latest_editor_snapshot(f"Successfully created file: {safe_path}", file_text)
+
+            if command == "undo_edit":
+                history_key = (chat_id, resolved_namespace, safe_path)
+                history = _file_history.get(history_key)
+                if not history:
+                    return f"Error: No edit history available to undo for {safe_path}."
+                prev_content = history.pop()
+                if prev_content == "":
+                    if local_path.exists() and not local_path.is_dir():
+                        local_path.unlink(missing_ok=True)
+                    _spawn_persist_task(chat_id, safe_path, namespace=resolved_namespace, delete=True)
+                    return f"Successfully reverted {safe_path}: file was newly created, now removed."
+                else:
+                    _write_text_editor_file(local_path, prev_content)
+                    _spawn_persist_task(
+                        chat_id, safe_path, namespace=resolved_namespace,
+                        content_bytes=prev_content.encode("utf-8"))
+                    return _with_editor_snippet_or_tail(
+                        f"Successfully reverted changes in {safe_path} to previous version.",
+                        prev_content,
+                        target_line=1
+                    )
 
             if not local_path.exists():
                 return "Error: File not found"
@@ -527,11 +643,21 @@ async def execute_text_editor(
                         "view on this file, then retry once with an exact old_str copied from the latest view."
                     )
                 if match_count > 1:
+                    lines_matching = [idx + 1 for idx, line in enumerate(work.splitlines()) if old_work in line]
+                    line_nums_str = str(lines_matching[:10]) + ("..." if len(lines_matching) > 10 else "")
                     return (
-                        f"Error: Found {match_count} matches for replacement text. "
+                        f"Error: Found {match_count} matches for replacement text in lines {line_nums_str}. "
                         "Recovery: call text_editor view, then retry once with a longer exact old_str "
-                        "that includes surrounding context."
+                        "that includes surrounding context lines to make it unique."
                     )
+
+                # 记录修改前的状态
+                _record_file_history(chat_id, resolved_namespace, safe_path, content)
+
+                match_char_idx = work.find(old_work)
+                replacement_line = work[:match_char_idx].count("\n") + 1 if match_char_idx != -1 else 1
+                new_str_lines_count = new_work.count("\n")
+
                 new_content = work.replace(old_work, new_work, 1)
                 if crlf:
                     new_content = new_content.replace("\n", "\r\n")
@@ -539,15 +665,19 @@ async def execute_text_editor(
                 _spawn_persist_task(
                     chat_id, safe_path, namespace=resolved_namespace,
                     content_bytes=new_content.encode("utf-8"))
-                return _with_latest_editor_snapshot(
-                    f"Successfully replaced string in {safe_path}{normalized_note}", new_content)
+                success_msg = f"The file {safe_path} has been edited.{normalized_note}"
+                return _with_editor_snippet_or_tail(
+                    success_msg, new_content, target_line=replacement_line, new_lines=new_str_lines_count
+                )
 
             # command == "insert"
-            if not _is_plain_int(insert_line) or not isinstance(insert_text, str):
-                return "Error: insert_line must be an integer between 0 and the file's line count, and insert_text must be a string."
+            # 兼容官方参数名：insert_text (20250728) 和 new_str (20241022)
+            actual_insert_text = insert_text if insert_text is not None else new_str
+            if not _is_plain_int(insert_line) or not isinstance(actual_insert_text, str):
+                return "Error: insert_line must be an integer between 0 and the file's line count, and insert_text (or new_str) must be a string."
             crlf = _is_pure_crlf(content)
             work = content.replace("\r\n", "\n") if crlf else content
-            text_to_insert = insert_text.replace("\r\n", "\n") if crlf else insert_text
+            text_to_insert = actual_insert_text.replace("\r\n", "\n") if crlf else actual_insert_text
             lines = work.splitlines(keepends=True)
             total_lines = len(lines)
             if insert_line < 0 or insert_line > total_lines:
@@ -562,12 +692,18 @@ async def execute_text_editor(
             new_content = prefix + text_to_insert + suffix
             if crlf:
                 new_content = new_content.replace("\n", "\r\n")
+
+            # 记录修改前的状态
+            _record_file_history(chat_id, resolved_namespace, safe_path, content)
+
             _write_text_editor_file(local_path, new_content)
             _spawn_persist_task(
                 chat_id, safe_path, namespace=resolved_namespace,
                 content_bytes=new_content.encode("utf-8"))
-            return _with_latest_editor_snapshot(
-                f"Successfully inserted string in {safe_path} after line {insert_line}", new_content)
+            success_msg = f"The file {safe_path} has been edited. Successfully inserted text after line {insert_line}."
+            return _with_editor_snippet_or_tail(
+                success_msg, new_content, target_line=max(1, insert_line), new_lines=text_to_insert.count("\n")
+            )
 
         except FileNotFoundError:
             return "Error: File not found"
@@ -1158,14 +1294,16 @@ SEARCH_TOOLS = [
         "function": {
             "name": "text_editor",
             "description": (
-                "Safely view or edit UTF-8 text files. Only four commands are available: "
-                "view, str_replace, create, and insert. Always call view immediately before editing. "
-                "str_replace requires old_str to match exactly once in the entire file. If it finds zero or multiple matches, "
-                "the next action must be view; then retry once with exact text copied from that latest view and enough surrounding context "
-                "to identify a unique match. Never infer from stale line numbers or truncated output, and never bypass a text_editor failure "
-                "with bash, sed, perl, or python. After two failures of the same edit, stop and explain the blocker. "
-                "view returns 1-based line numbers and accepts view_range=[start_line, end_line], "
-                "where -1 means the end of the file. insert_line is also 1-based; use 0 to insert at the start."
+                "Safely view or edit UTF-8 text files and explore directories inside the workspace. "
+                "The available commands are: view, str_replace, create, insert, and undo_edit. "
+                "Always call view immediately before editing. "
+                "view: displays file contents with 1-based line numbers (supports view_range=[start_line, end_line], where -1 means end of file). "
+                "If path is a directory (or '.' for workspace root), view lists files and directories up to 2 levels deep. "
+                "create: creates a new file with file_text (fails if file already exists). "
+                "str_replace: replaces old_str with new_str. old_str must match exactly once in the file; if multiple matches occur, their line numbers are reported. "
+                "insert: inserts insert_text (or new_str) after insert_line (1-based; use 0 to insert at the beginning). "
+                "undo_edit: reverts the last edit performed on the file. "
+                "After edits, a snippet around the modified section is returned for immediate verification."
             ),
             "parameters": {
                 "type": "object",
@@ -1176,31 +1314,31 @@ SEARCH_TOOLS = [
                     },
                     "command": {
                         "type": "string",
-                        "enum": ["view", "str_replace", "create", "insert"],
-                        "description": "The text-editor operation to perform."
+                        "enum": ["view", "str_replace", "create", "insert", "undo_edit"],
+                        "description": "The text-editor operation to perform: view, str_replace, create, insert, or undo_edit."
                     },
                     "path": {
                         "type": "string",
-                        "description": "Relative path of a text file inside the workspace. Directories are not supported."
+                        "description": "Path of a file or directory inside the workspace (e.g. 'src/main.py', '.' for root). Leading slashes and '/workspace/' prefixes are automatically normalized."
                     },
                     "view_range": {
                         "type": "array",
                         "items": {"type": "integer"},
                         "minItems": 2,
                         "maxItems": 2,
-                        "description": "For view: [start_line, end_line], 1-based; end_line=-1 reads to the end."
+                        "description": "For view (files only): [start_line, end_line], 1-based; end_line=-1 reads to the end."
                     },
                     "old_str": {
                         "type": "string",
-                        "description": "For str_replace: exact existing text. It must have exactly one match."
+                        "description": "For str_replace: exact existing text. It must have exactly one match in the file."
                     },
                     "new_str": {
                         "type": "string",
-                        "description": "For str_replace: replacement text; may be an empty string. Keep each replacement SMALL (under ~4KB) — oversized arguments get truncated in transit and the whole call fails. Apply big changes as several small str_replace calls instead."
+                        "description": "For str_replace: replacement text. Also accepted as the text to insert for insert command."
                     },
                     "file_text": {
                         "type": "string",
-                        "description": "For create: complete initial file content; may be empty. IMPORTANT: keep it small (a skeleton under ~4KB) — oversized arguments get truncated in transit and the call fails. Create the file small, then add the remaining content with several insert / str_replace calls."
+                        "description": "For create: complete initial file content; may be empty."
                     },
                     "insert_line": {
                         "type": "integer",
@@ -1208,7 +1346,7 @@ SEARCH_TOOLS = [
                     },
                     "insert_text": {
                         "type": "string",
-                        "description": "For insert: text to add after insert_line; may be empty. Keep each insert SMALL (under ~4KB) — split large additions into several insert calls."
+                        "description": "For insert: text to add after insert_line (alternatively use new_str)."
                     }
                 },
                 "required": ["command", "path"]
@@ -3924,23 +4062,51 @@ async def execute_distance(origin: str, destination: str) -> str:
 # 编辑器配置
 EDITOR_PREFIX = "editor"
 
-def _editor_safe_path(path: str) -> str:
-    """Return a normalized relative path without traversal segments."""
-    if not path or not isinstance(path, str) or path.strip() in ("", "/", "."):
-        raise ValueError("Invalid path: empty or root path not allowed")
+def _editor_safe_path(path: str, allow_root: bool = False) -> str:
+    """Return a normalized relative path without traversal segments.
+    
+    Tolerates leading slashes and common workspace prefixes (e.g. /workspace/foo.py),
+    mapping them safely into the workspace while strictly rejecting directory traversal.
+    If allow_root is True (used by 'view'), root paths like '.' or '/' are normalized to '.'.
+    """
+    if not path or not isinstance(path, str):
+        raise ValueError("Invalid path: empty or non-string path not allowed")
     if "\x00" in path:
         raise ValueError("Invalid path: null byte not allowed")
-    norm = os.path.normpath(path)
-    if norm == "." or norm.startswith("..") or os.path.isabs(norm):
+
+    cleaned = path.strip()
+    if cleaned in ("", ".", "/", "./"):
+        if allow_root:
+            return "."
+        raise ValueError("Invalid path: empty or root path not allowed for file editing")
+
+    # 剥离常见的虚拟工作区前缀与前导斜杠
+    if cleaned.startswith("/workspace/"):
+        cleaned = cleaned[len("/workspace/"):]
+    elif cleaned.startswith("workspace/"):
+        cleaned = cleaned[len("workspace/"):]
+    elif cleaned.startswith("/"):
+        cleaned = cleaned.lstrip("/")
+
+    norm = os.path.normpath(cleaned)
+    if norm in ("", "."):
+        if allow_root:
+            return "."
+        raise ValueError("Invalid path: root path not allowed for file editing")
+    if norm.startswith("..") or norm.startswith("/") or os.path.isabs(norm):
         raise ValueError("Invalid path: directory traversal not allowed")
     return norm
 
 
-def _resolve_editor_path(workspace: Path, safe_path: str) -> Path:
+def _resolve_editor_path(workspace: Path, safe_path: str, allow_root: bool = False) -> Path:
     """Resolve a path and reject any file or parent symlink escaping workspace."""
     root = workspace.resolve()
+    if safe_path == ".":
+        if allow_root:
+            return root
+        raise ValueError("Invalid path: root path not allowed for file editing")
     resolved = (root / safe_path).resolve(strict=False)
-    if resolved == root or root not in resolved.parents:
+    if (resolved == root and not allow_root) or (resolved != root and root not in resolved.parents):
         raise ValueError("Invalid path: symlink escapes workspace")
     return resolved
 

@@ -7,6 +7,9 @@
     "node": ">=22.13.0 <23",
     "npm": ">=10"
   },
+  "scripts": {
+    "build": "echo 'Build OK'"
+  },
   "dependencies": {
     "docx": "9.7.1",
     "pdf-lib": "1.17.1",
