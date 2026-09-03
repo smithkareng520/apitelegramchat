@@ -163,6 +163,10 @@ def _merged_extra_body(
 # 字段来源：
 #   OpenRouter / OpenAI : usage.prompt_tokens_details.cached_tokens
 #   其他兼容 provider   : cache read 字段（如 provider 返回）
+# 口径说明（重要）：
+#   OpenAI 兼容接口中 prompt_tokens 为纯输入 token 数（输出单独记录在
+#   completion_tokens 中），cached_tokens 是 prompt_tokens 的子集，
+#   因此命中率 = Cached / Input_tokens，分母不含输出 token。
 # =====================================================================
 def _extract_cache_usage(usage) -> dict:
     if usage is None:
@@ -177,6 +181,7 @@ def _extract_cache_usage(usage) -> dict:
 
     if isinstance(usage, dict):
         prompt = _num(usage.get("prompt_tokens"))
+        completion = _num(usage.get("completion_tokens"))
         details = usage.get("prompt_tokens_details") or {}
         if not isinstance(details, dict):
             details = {}
@@ -187,6 +192,7 @@ def _extract_cache_usage(usage) -> dict:
             cached = _num(usage.get("prompt_cache_hit_tokens"))
     else:
         prompt = _num(getattr(usage, "prompt_tokens", None))
+        completion = _num(getattr(usage, "completion_tokens", None))
         details = getattr(usage, "prompt_tokens_details", None)
         cached = _num(getattr(details, "cached_tokens", None)) if details is not None else None
         extra = getattr(usage, "model_extra", None)
@@ -198,13 +204,16 @@ def _extract_cache_usage(usage) -> dict:
 
     stats: dict = {}
     if prompt:
-        stats["prompt_tokens"] = prompt
-        stats["cached"] = cached if cached is not None else 0
-        stats["hit_ratio"] = round(stats["cached"] / max(1, prompt), 3)
+        # 命中率口径：Cached / Input_tokens（prompt_tokens 即纯输入，
+        # cached_tokens 是其子集；分母不含输出 token）。
+        stats["Input_tokens"] = prompt
+        stats["Output_tokens"] = completion if completion is not None else 0
+        stats["Cached"] = cached if cached is not None else 0
+        stats["Hit_ratio"] = stats["Cached"] / max(1, prompt)
     else:
         # 极端情况：usage 中没有 prompt_tokens 但有缓存字段，仍如实显示。
         if cached is not None:
-            stats["cached"] = cached
+            stats["Cached"] = cached
     return stats
 
 
@@ -213,7 +222,21 @@ def _log_cache_usage(api_label: str, usage) -> None:
     try:
         stats = _extract_cache_usage(usage)
         if stats:
-            logger.info("[%s] prompt cache usage: %s", api_label, stats)
+            if "Hit_ratio" in stats:
+                # 按固定键序格式化，Hit_ratio 以百分数显示（一位小数），
+                # 避免直接 dump dict 导致字符串值带引号、浮点数带多余位数。
+                logger.info(
+                    "[%s] prompt cache usage: "
+                    "{'Input_tokens': %s, 'Output_tokens': %s, "
+                    "'Cached': %s, 'Hit_ratio': %.1f%%}",
+                    api_label,
+                    stats.get("Input_tokens", "-"),
+                    stats.get("Output_tokens", "-"),
+                    stats.get("Cached", "-"),
+                    stats["Hit_ratio"] * 100,
+                )
+            else:
+                logger.info("[%s] prompt cache usage: %s", api_label, stats)
     except Exception:
         # 观测日志绝不影响主流程
         logger.debug("cache usage 日志记录失败", exc_info=True)
