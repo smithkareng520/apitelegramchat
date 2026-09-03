@@ -1220,9 +1220,13 @@ SEARCH_TOOLS = [
         "function": {
             "name": "bash",
             "description": (
-                "Execute bash commands inside the user's per-session workspace. Use this tool for "
-                "installs, tests, builds, running scripts, git operations, and inspecting workspace "
-                "files.\n"
+                "Execute bash commands inside the user's per-session workspace. "
+                "IMPORTANT: every call MUST fill the _description parameter with one short "
+                "sentence (≤60 chars, same language as the user) saying what this command is "
+                "for — it is shown to the user as live execution progress; calls missing it "
+                "will be rejected by argument validation. "
+                "Use this tool for installs, tests, builds, running scripts, git operations, "
+                "and inspecting workspace files.\n"
                 "\n"
                 "ENVIRONMENT & NETWORK (important — read once, saves you wasted calls):\n"
                 "- Outbound network IS allowed. curl and wget are available (if the image lacks the "
@@ -1278,10 +1282,11 @@ SEARCH_TOOLS = [
                 "properties": {
                     "_description": {
                         "type": "string",
+                        "minLength": 1,
                         "description": (
-                            "意图描述：用一句话说明本次命令的目的（≤60字），会作为执行进度"
-                            "展示给用户。示例：查看项目文件列表 / 安装依赖并运行测试 / "
-                            "读取用户上传的文档"
+                            "【必填】意图描述：用一句话说明本次命令的目的（≤60字，与用户语言一致），"
+                            "会作为执行进度实时展示给用户。示例：查看项目文件列表 / "
+                            "安装依赖并运行测试 / 读取用户上传的文档"
                         )
                     },
                     "command": {
@@ -1297,7 +1302,13 @@ SEARCH_TOOLS = [
                 # 显式声明后，L2 schema 校验层能把「缺 command」以可操作
                 # 错误回传模型自纠，strict 规范化也会正确将其保持为
                 # 非可空必填，而不是被当作可选字段。
-                "required": ["command"]
+                # _description 同样显式声明为必填：草稿消息（rich draft 的
+                # 工具组/单工具块进行态摘要）依赖它展示命令意图；漏填时
+                # L2 会拒绝并回传「补 _description」的可操作错误，模型一
+                # 轮自纠即可；strict 模式下保持非可空 string，不会被模型
+                # 用 null 糊弄过去（null 会在 strip_null_arguments 后变成
+                # 缺键，同样被 L2 拦截）。
+                "required": ["_description", "command"]
             },
             "input_examples": [
                 {"_description": "查看项目文件列表", "command": "ls -la"},
