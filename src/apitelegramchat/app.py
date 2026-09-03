@@ -9,7 +9,6 @@ import os
 import time
 import hmac
 import mimetypes
-from typing import Optional
 from apitelegramchat.workspace_paths import workspace_download_root
 from apitelegramchat.token_budget import count_tokens
 
@@ -73,7 +72,16 @@ from apitelegramchat.message_user_tool import (
 )
 from apitelegramchat.file_handlers import download_file
 from apitelegramchat.workspace_utils import _get_workspace_lock, init_workspace
-from apitelegramchat.context_manager import select_request_context
+from apitelegramchat.context_window import (
+    CONTEXT_COMPACT_TARGET_RATIO,
+    CONTEXT_COMPACT_TRIGGER_RATIO,
+    CONTEXT_PROTECTED_TURNS,
+    apply_eviction_plan,
+    build_digest_text,
+    effective_digest_budget,
+    plan_turn_eviction,
+    resolve_history_budget,
+)
 from apitelegramchat.tool_context_compaction import compact_older_tool_calls, _eligible_calls
 from apitelegramchat import proactive
 
@@ -153,17 +161,6 @@ def _reply_params(message_id: int | None) -> dict | None:
     # 消息继续送达，避免"操作已生效但用户看不到任何反馈"。
     return {"message_id": mid, "allow_sending_without_reply": True}
 
-# ---------- 上下文管理常量 ----------
-# 触发工具负载压缩的历史长度阈值（可配）。注意：压缩会重写历史里的旧
-# tool 消息（全量 payload → 指针文本），每次重写都会打碎 prompt 前缀
-# 缓存。因此配套 HISTORY_COMPACTION_MIN_BATCH：未归档的可压缩调用
-# 累积到一定数量才触发一次，而不是每轮都重写几条，让窗口内的前缀
-# 在两次压缩之间保持字节稳定。
-MAX_HISTORY_MESSAGES = int(os.getenv("HISTORY_COMPACTION_TRIGGER", "30") or "30")  # Trigger a tool-payload compaction pass; do not delete turns.
-try:
-    HISTORY_COMPACTION_MIN_BATCH = max(0, int(os.getenv("HISTORY_COMPACTION_MIN_BATCH", "8")))
-except (TypeError, ValueError):
-    HISTORY_COMPACTION_MIN_BATCH = 8
 MEDIA_GROUP_TIMEOUT = 5
 REPLY_MARKER = "💡 引用回复:"
 
@@ -401,68 +398,40 @@ def _estimate_message_tokens(message: dict) -> int:
             tokens += _MEDIA_TOKEN_OVERHEAD * len(tool_calls)
     return tokens
 
-def _estimate_request_snapshot(history: list[dict], model_max_context: Optional[int] = None) -> tuple[object, int]:
-    """Select the next API snapshot and estimate its prompt cost.
-    
-    Args:
-        history: 历史消息列表
-        model_max_context: 模型的最大上下文窗口（用于动态 token 预算）
+def _estimate_history_tokens(history: list[dict]) -> int:
+    """按请求侧同一口径估算当前持久历史的 token 量。
+
+    旧版经由 select_request_context 生成快照再估算（每轮产生整份浅拷贝
+    且语义上依赖"滑动视图"）；新策略下历史本身就是请求上下文，直接计数。
     """
-    snapshot = select_request_context(history, model_max_context=model_max_context)
-    return snapshot, sum(_estimate_message_tokens(message) for message in snapshot.messages)
-
-
-def _drop_oldest_non_system_block(history: list[dict]) -> bool:
-    """Drop one oldest structural block without leaving orphaned tool messages.
-
-    A user message owns every following non-system message up to the next user
-    message.  If history starts with an assistant tool call, that call and its
-    contiguous paired tool results are dropped together.  System messages are
-    never selected for deletion.
-    """
-    start = next((index for index, message in enumerate(history) if message.get("role") != "system"), None)
-    if start is None:
-        return False
-
-    first = history[start]
-    if first.get("role") == "user":
-        end = start + 1
-        while end < len(history):
-            role = history[end].get("role")
-            if role in {"user", "system"}:
-                break
-            end += 1
-        del history[start:end]
-        return True
-
-    if first.get("role") == "assistant":
-        end = start + 1
-        calls = first.get("tool_calls")
-        expected_ids = {
-            call.get("id")
-            for call in calls
-            if isinstance(call, dict) and isinstance(call.get("id"), str)
-        } if isinstance(calls, list) else set()
-        while end < len(history) and history[end].get("role") == "tool":
-            call_id = history[end].get("tool_call_id")
-            if expected_ids and call_id not in expected_ids:
-                break
-            end += 1
-        del history[start:end]
-        return True
-
-    # A stray non-system message is removed only as a last structural unit.
-    del history[start]
-    return True
+    return sum(_estimate_message_tokens(message) for message in history)
 
 
 async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool:
-    """Apply two reversible compaction passes, then structural trimming if needed.
+    """上下文窗口自动压缩（auto-compaction，主流 Agent 上下文策略）。
 
-    The first pass archives the older half of eligible target-tool calls.  If
-    still over budget, the second archives half of the remaining complete tool calls
-    (about 75% cumulatively for even-sized sets).  Only if both passes fail does
-    the final fallback remove the oldest non-system conversation blocks.
+    策略要点（详见 CACHE_OPTIMIZATION.md）：
+
+    - **快路径（常态）**：历史 + 新输入 ≤ 触发水位（budget ×
+      ``CONTEXT_COMPACT_TRIGGER_RATIO``）→ 一字节不改直接放行。两次
+      压缩事件之间请求前缀字节级一致，provider 端 prompt/KV 缓存
+      全量命中——这是本策略的第一目标。
+    - **压缩事件（罕见、摊销）**：两级杠杆按顺序使用，直到降到
+      目标水位（budget × ``CONTEXT_COMPACT_TARGET_RATIO``），而不是
+      "刚好塞得下"：
+        L1（无损）：较老一半的工具负载归档为指针（payload →
+          workspace 归档文件，模型可经 text_editor 取回）；
+        L2（结构）：待淘汰区内的工具调用先归档，然后从最老的用户
+          轮块开始整块淘汰（保护最近 ``CONTEXT_PROTECTED_TURNS``
+          轮），被淘汰轮合并进历史头部稳定槽位的滚动摘要。
+      一次事件清出约 40% 预算的空间，之后很多轮内不再触发（滞后 /
+      hysteresis）。
+    - 旧版每轮"从历史前端逐块删到塞得下"的行为被完全取代：淘汰
+      不再是历史长度的连续函数，而是离散事件。
+
+    返回 False 仅当新消息自身超过预算（即便空历史也放不下）；
+    历史侧超限由请求守卫（context_manager.select_request_context）
+    在出站视图上兜底，并在下一轮的压缩事件中收敛回预算内。
     """
     _pf_start = time.monotonic()
     _pf_lock_wait_start = time.monotonic()
@@ -480,68 +449,103 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
         model_info = SUPPORTED_MODELS.get(cm)
         max_context = getattr(model_info, "max_context", None) or 128000
         max_output = getattr(model_info, "max_output_tokens", None) or 8192
-        safe_limit = max_context - max_output
+        budget = resolve_history_budget(max_context, max_output)
+        trigger_tokens = int(budget * CONTEXT_COMPACT_TRIGGER_RATIO)
+        target_tokens = int(budget * CONTEXT_COMPACT_TARGET_RATIO)
         new_input_est = max(1, _estimate_message_tokens(new_user_message))
 
-        _, request_estimate = _estimate_request_snapshot(history, model_max_context=max_context)
-        if request_estimate + new_input_est <= safe_limit:
+        history_est = _estimate_history_tokens(history)
+        if history_est + new_input_est <= trigger_tokens:
             return True
 
+        # ───────── 压缩事件（单一代码路径） ─────────
+        archived_calls = 0
+        evicted_blocks = 0
+        evicted_messages = 0
+        # L1：较老一半 eligible 工具调用 → 归档指针（无损，可取回）。
         first_pass = await compact_older_tool_calls(chat_id, history)
-        _, request_estimate = _estimate_request_snapshot(history, model_max_context=max_context)
+        history_est = _estimate_history_tokens(history)
+        archived_calls += first_pass.compacted_calls
         if first_pass.compacted_calls:
             logger.info(
-                "Pre-flight tool compaction pass=1 chat=%s calls=%s archived_bytes=%s request_estimate=%s",
-                chat_id,
-                first_pass.compacted_calls,
-                first_pass.archived_bytes,
-                request_estimate,
+                "Context compaction L1 (tool payload archive): chat=%s calls=%s "
+                "archived_bytes=%s history_tokens=%s target=%s",
+                chat_id, first_pass.compacted_calls, first_pass.archived_bytes,
+                history_est, target_tokens,
             )
-        if request_estimate + new_input_est <= safe_limit:
-            return True
 
-        remaining_calls = max(0, first_pass.eligible_calls - first_pass.compacted_calls_count)
-        second_pass_count = max(1, remaining_calls // 2) if remaining_calls else 0
-        second_pass = await compact_older_tool_calls(
-            chat_id,
-            history,
-            calls_to_compact=second_pass_count,
+        # L2：仍超目标水位 → 结构性淘汰（先归档待淘汰区，再整块淘汰进摘要）。
+        history_target = max(0, target_tokens - new_input_est)
+        if history_est > history_target:
+            plan = plan_turn_eviction(
+                history,
+                target_tokens=history_target,
+                protected_turns=CONTEXT_PROTECTED_TURNS,
+                token_fn=_estimate_message_tokens,
+            )
+            if plan.evicted_blocks:
+                # 待淘汰区内的 eligible 调用先归档，让摘要 T 行能指向
+                # 可取回的归档文件（旧版把负载连同轮块一起丢掉）。
+                # 注意下标口径：_eligible_calls 的 idx 是含摘要消息的
+                # 全历史下标，块内消息数需要补上摘要槽位的偏移。
+                digest_offset = 1 if plan.digest_message is not None else 0
+                region_end = digest_offset + plan.evicted_message_count
+                region_calls = sum(
+                    1 for idx, _tc, _tr in _eligible_calls(history)
+                    if digest_offset <= idx < region_end
+                )
+                if region_calls > 0:
+                    region_pass = await compact_older_tool_calls(
+                        chat_id, history, calls_to_compact=region_calls,
+                    )
+                    archived_calls += region_pass.compacted_calls
+                    if region_pass.compacted_calls:
+                        history_est = _estimate_history_tokens(history)
+                # 载荷变指针后历史变小，重新规划（往往可以少淘汰几轮）。
+                plan = plan_turn_eviction(
+                    history,
+                    target_tokens=history_target,
+                    protected_turns=CONTEXT_PROTECTED_TURNS,
+                    token_fn=_estimate_message_tokens,
+                )
+            if plan.evicted_blocks:
+                prev_digest_text = (
+                    plan.digest_message.get("content")
+                    if plan.digest_message is not None else None
+                )
+                digest_text = build_digest_text(
+                    prev_digest_text,
+                    plan.evicted_blocks,
+                    budget_tokens=effective_digest_budget(budget),
+                )
+                apply_eviction_plan(history, plan, digest_text)
+                history_est = _estimate_history_tokens(history)
+                evicted_blocks = len(plan.evicted_blocks)
+                evicted_messages = plan.evicted_message_count
+                # 结构性淘汰后旧台账不再与剩余历史一一对应。
+                ctx["token_ledger"] = []
+                ctx["last_prompt_tokens"] = 0
+                ctx["last_completion_tokens"] = 0
+
+        logger.info(
+            "Context compaction event: chat=%s model=%s budget=%s trigger=%s target=%s "
+            "archived_calls=%s evicted_blocks=%s evicted_messages=%s history_tokens=%s "
+            "elapsed_ms=%s",
+            chat_id, cm, budget, trigger_tokens, target_tokens,
+            archived_calls, evicted_blocks, evicted_messages, history_est,
+            int((time.monotonic() - _pf_start) * 1000),
         )
-        _, request_estimate = _estimate_request_snapshot(history)
-        if second_pass.compacted_calls:
-            logger.info(
-                "Pre-flight tool compaction pass=2 chat=%s calls=%s archived_bytes=%s request_estimate=%s",
-                chat_id,
-                second_pass.compacted_calls,
-                second_pass.archived_bytes,
-                request_estimate,
-            )
-        if request_estimate + new_input_est <= safe_limit:
-            return True
 
-        deleted_blocks = 0
-        while request_estimate + new_input_est > safe_limit:
-            if not _drop_oldest_non_system_block(history):
-                break
-            deleted_blocks += 1
-            _, request_estimate = _estimate_request_snapshot(history)
-
-        if deleted_blocks:
-            # The old ledger no longer maps one-to-one to remaining history.
-            ctx["token_ledger"] = []
-            ctx["last_prompt_tokens"] = 0
-            ctx["last_completion_tokens"] = 0
+        # 唯一不可服务情形：新消息自身超预算（空历史也放不下）。
+        if new_input_est >= budget:
+            return False
+        if history_est + new_input_est > budget:
             logger.warning(
-                "Pre-flight structural trim: chat=%s deleted_blocks=%s request_estimate=%s safe_limit=%s",
-                chat_id,
-                deleted_blocks,
-                request_estimate,
-                safe_limit,
+                "Pre-flight compaction 未达预算（保护尾过大）: chat=%s "
+                "history_tokens=%s budget=%s —— 出站视图将由请求守卫兜底裁剪。",
+                chat_id, history_est, budget,
             )
-
-        # The only unserviceable case is a new user message that is oversized by
-        # itself, or a system-only snapshot that is already beyond the budget.
-        return request_estimate + new_input_est <= safe_limit
+        return True
 
 async def update_conversation_and_ledger(chat_id: int, user_message: dict | None, new_msgs: list, usage: dict = None) -> None:
     """将本轮对话写入持久历史并维护 token 台账。
@@ -595,24 +599,11 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
             ctx["last_completion_tokens"] = current_comp
             ledger = ctx.setdefault("token_ledger", [])
             ledger.append({"input_tokens": t_input, "output_tokens": t_output})
-        if len(history) > MAX_HISTORY_MESSAGES:
-            # 批量触发：只有未归档的可压缩调用积累到 MIN_BATCH 才执行。
-            # 每轮都重写少量旧消息会让 prompt 前缀缓存持续 miss；攒一批
-            # 一次压缩，两次压缩之间的若干轮里历史字节保持稳定。
-            unarchived_eligible = 0
-            try:
-                unarchived_eligible = len(_eligible_calls(history))
-            except Exception:
-                logger.debug("统计未归档工具调用失败", exc_info=True)
-            if unarchived_eligible >= HISTORY_COMPACTION_MIN_BATCH:
-                stats = await compact_older_tool_calls(chat_id, history)
-                if stats.compacted_calls:
-                    logger.info(
-                        "History-size tool compaction: chat=%s calls=%s archived_bytes=%s",
-                        chat_id,
-                        stats.compacted_calls,
-                        stats.archived_bytes,
-                    )
+        # 历史有界性维护已全部收敛到 pre_flight_context_check 的压缩事件
+        # （触发水位 × 预算，滞后触发）。旧版按"消息条数 > 30 且未归档
+        # 调用 ≥ 8"在回合末尾触发的工具负载压缩已被移除：消息条数与
+        # token 预算无关，会在大窗口模型上过早、小窗口模型上过晚触发，
+        # 且与 pre-flight 属于两套互不知情的口径。
 
 # ---------------------------------------------------------------------------
 # 业务处理

@@ -358,19 +358,37 @@ WEBHOOK_URL?token=WEBHOOK_TOKEN
 | 厂商 | 机制 | 本项目的处理 |
 |---|---|---|
 | Anthropic（经 OpenRouter） | 显式 `cache_control` 断点（上限 4 个）+ 顶层自动缓存 | 系统提示末尾 / 上一轮末尾 / 本轮 user 消息共 3 个显式断点；`extra_body.cache_control` 开启自动缓存（断点随对话自动前移） |
-| OpenRouter（全部模型） | Provider 粘性路由 | 每个请求携带 `session_id`（`tg-chat-{chat_id}`），粘性路由从第一次请求就生效，不随上下文窗口滑动而漂移 |
-| DeepSeek / GLM / 智谱 | 服务端隐式缓存，无需标记 | 依赖前缀稳定：量化淘汰 + 预签名 URL 记忆化 + 批量压缩 |
+| OpenRouter（全部模型） | Provider 粘性路由 | 每个请求携带 `session_id`（`tg-chat-{chat_id}`），粘性路由从第一次请求就生效，不随压缩事件漂移 |
+| DeepSeek / GLM / 智谱 | 服务端隐式缓存，无需标记 | 依赖前缀稳定：有界窗口 + 摊销式自动压缩 + 预签名 URL 记忆化 |
 | Gemini（直连） | 隐式缓存（2.5+ 自动） | 系统提示时间戳放在末尾，保证主体前缀逐字节稳定 |
 | OpenAI 系 | 自动（>1024 token） | 同上，靠前缀稳定 |
 
 为保持前缀稳定，系统做了四件事：
 
 1. **系统提示时间戳放末尾**（原有设计）：`当前时间` 是唯一每天必变的内容，放在 prompt 最后，前面的巨型稳定段（格式规范 + 工具通则 + 技能目录）每天都能命中缓存。
-2. **上下文窗口量化淘汰**：`CONTEXT_EVICT_HEADROOM_MESSAGES`（默认 `10`）。普通滑窗每轮滑 1 条，窗口起点逐轮变化会打碎隐式缓存；量化后历史每增长 10 条起点才前进 10 条，中间若干轮前缀字节级一致。设为 `1` 恢复旧行为。
+2. **有界会话窗口 + 摊销式自动压缩**（对齐 Claude Code / Cline 等主流 Agent 的上下文管理）：历史在预算内时**逐字节透传**（不是每轮滑动截尾）；当 `历史 + 新输入 > 90% 预算`（`CONTEXT_COMPACT_TRIGGER_RATIO`）时触发一次压缩事件——先无损归档较老的工具负载（payload → 指针，`text_editor` 可取回），不够再从最老的用户轮开始整轮淘汰（保护最近 `CONTEXT_PROTECTED_TURNS` 轮，默认 6），被淘汰轮合并进历史头部稳定槽位的滚动摘要（每轮一行 U/A/T 骨架，确定性生成无时间戳）——一次压回 50% 预算（`CONTEXT_COMPACT_TARGET_RATIO`），之后几十轮内不再触发，期间所有请求前缀完全一致。详见 `CACHE_OPTIMIZATION.md`。
 3. **R2 预签名 URL 记忆化**：预签名 URL 每次重签字节都不同，会让历史消息中的多模态块（图片/视频 URL）打碎前缀缓存。现在同一对象在过期前 5 分钟内复用同一 URL。
-4. **历史压缩批量化**：`HISTORY_COMPACTION_TRIGGER`（默认 `30`）与 `HISTORY_COMPACTION_MIN_BATCH`（默认 `8`）。压缩会重写旧 tool 消息（payload → 指针），攒够一批再做，两次压缩之间的轮次里前缀保持稳定。
+4. **压缩只在事件内发生**：工具负载归档、轮次淘汰、摘要重写全部收敛到同一个压缩事件（`pre_flight_context_check`），同一个触发器、同一个预算口径；旧版"按消息条数 >30 攒批压缩"的独立触发路径已移除。
 
 缓存命中观测：每轮请求结束后日志会输出一行 `prompt cache usage: {'prompt_tokens': N, 'cached': N, 'hit_ratio': 0.xx}`，兼容 OpenRouter/OpenAI（`cached_tokens`）、Anthropic（`cache_read_input_tokens`）与 DeepSeek（`prompt_cache_hit_tokens`）三种字段。
+
+#### 上下文窗口与自动压缩
+
+历史预算 = `min(CONTEXT_BUDGET_RATIO × max_context, max_context − max_output)`；
+请求侧守卫（`context_manager.py`）与压缩事件（`app.py::pre_flight_context_check`）
+共用同一解析（`context_window.py::resolve_history_budget`）：
+
+| 变量 | 默认 | 用途 |
+|---|---|---|
+| `CONTEXT_MAX_TOKENS` | 不设置 | 历史预算绝对覆盖（兼容旧语义） |
+| `CONTEXT_BUDGET_RATIO` | `0.8` | 历史预算占 max_context 比例 |
+| `CONTEXT_COMPACT_TRIGGER_RATIO` | `0.90` | 触发压缩事件的高水位（历史+新输入超过它即触发） |
+| `CONTEXT_COMPACT_TARGET_RATIO` | `0.50` | 压缩事件要压回的目标水位（滞后区间，决定两次事件间隔） |
+| `CONTEXT_PROTECTED_TURNS` | `6` | 永不淘汰的最近用户轮数 |
+| `CONTEXT_DIGEST_TOKEN_BUDGET` | `1500` | 滚动摘要 token 预算（实际不超过预算的 1/4） |
+
+行为验证：`python3 scripts/verify_context_strategy.py`（48 项断言：预算 / 分块 /
+淘汰规划 / 摘要 / 守卫 / 多轮前缀稳定性模拟）。
 
 #### 工具与附件缓存
 
@@ -1463,7 +1481,8 @@ PYTHONPATH=src python scripts/test_run_one_gate.py        # 执行闸门集成�
 │       ├── app.py                    # Quart Webhook / Telegram Runtime
 │       ├── config.py                 # Provider / Model / runtime config
 │       ├── state.py                  # 会话状态
-│       ├── context_manager.py        # 上下文选择
+│       ├── context_manager.py        # 请求侧上下文守卫（预算内全量透传，超预算按块裁剪出站视图）
+│       ├── context_window.py         # 上下文窗口核心：预算解析/双水位/淘汰规划/滚动摘要
 │       ├── token_budget.py            # token 预算
 │       ├── workspace_paths.py        # workspace 路径边界
 │       ├── workspace_utils.py        # workspace 操作

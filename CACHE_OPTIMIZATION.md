@@ -46,17 +46,31 @@
 
 ### P1. 上下文窗口逐轮滑动 → 隐式缓存历史段每轮全 miss
 
-**现象**：`select_request_context` 取"最近 50 条 / 50k token"。历史一旦超限，每轮
-新增几条消息，窗口起点就向后挪几条。
+**现象**：旧版 `select_request_context` 从尾部回退装配"最近 token 预算内"的历史。
+历史一旦超限，每轮新增几条消息，窗口起点就向后挪几条。
 
 **根因**：DeepSeek/GLM/Gemini/OpenAI 的隐式缓存是**前缀完全匹配**。窗口起点一变，
 从起点到结尾的整段历史（可能几万 token）全部按原价重算；只有 system+tools 前缀
 （断点 1 之前）还能命中。
 
-**修复**：量化淘汰（`_quantized_drop`）。淘汰量向上取整到 `CONTEXT_EVICT_HEADROOM_MESSAGES`
-（默认 10）的整数倍，窗口起点成为历史长度的**阶梯函数**：历史每增长 10 条，起点才
-前进 10 条；中间约 10 轮内请求前缀字节级一致。token 上限触顶走同一量化。
-验证脚本证明：起点可连续 9 轮保持不变（旧版每轮都变）。
+**修复（2026-09 重构，取代更早的量化淘汰方案）**：有界会话窗口 + 摊销式
+自动压缩（`context_window.py` + `app.pre_flight_context_check`），对齐
+Claude Code / Cline 等主流 Agent 的上下文管理形态：
+
+- **存储历史即请求上下文**：预算内 `select_request_context` 退化为守卫，
+  全量透传（浅拷贝）、一字节不改；
+- **高/低水位滞后触发**：历史 + 新输入 > 触发水位（90% 预算）才进入
+  压缩事件，一次压回目标水位（50%），而不是"刚好塞得下"——事件之后
+  历史要重新长回 40% 预算才会再次触发，期间所有请求前缀逐字节稳定；
+- **事件内两级杠杆**：L1 工具负载归档为指针（无损，text_editor 可取回）
+  → L2 从最老的用户轮块开始整块淘汰（保护最近 6 轮），被淘汰轮合并进
+  历史头部稳定槽位的**滚动摘要**（确定性纯函数，无时间戳，同输入同字节）；
+- **请求侧守卫只做兑底**（压缩事件失败 / 会话中途切到小窗口模型时
+  按块裁剪出站视图），常态零介入。
+
+验证脚本（`scripts/verify_context_strategy.py`）模拟 40 轮对话：每一次前缀
+变化都恰好对应一次压缩事件（无滑动漂移）、事件不连发（无抖动）、守卫输出
+永远不超预算、被淘汰信息以摘要 + 归档指针形式保留。
 
 ### P2. OpenRouter 路由漂移 → 同一对话被路由到不同 provider
 
@@ -109,17 +123,16 @@ agent 循环里模型重复/微调同一查询非常常见（子 agent 与主 ag
 键为归一化参数（modes/query/num/page/gl/hl/tbs/image_url）。**服务错误不缓存**
 （保证可重试），确定性空结果缓存（省配额）。
 
-### P6. 历史压缩每轮触发 → 前缀持续 churn
+### P6. 历史压缩按消息条数触发 → 与 token 预算脱节（已并入压缩事件）
 
-**现象**：`len(history) > 30` 时每轮都跑 `compact_older_tool_calls`，把约一半未归档
-的旧 tool 消息重写成指针（payload → 指针文本）。**消息内容变了 = 前缀从那里断了**。
-fetch_url/wikipedia/text_editor 密集的会话（本项目最典型的用法）在历史超过 30 条后，
-每轮都在 churn。
+**现象**：旧版 `len(history) > 30` 时按消息条数触发 `compact_older_tool_calls`，
+后来用 `HISTORY_COMPACTION_MIN_BATCH` 攒批缓解前缀 churn。但消息条数与
+token 预算无关：大窗口模型上过早触发、小窗口模型上过晚触发，且与
+pre-flight 属于两套互不知情的口径。
 
-**修复**：批量化——`HISTORY_COMPACTION_MIN_BATCH`（默认 8）：未归档的可压缩调用
-攒够一批才压缩一次。两次压缩之间的若干轮里前缀保持稳定。压缩本身仍保留
-（它是控制内存/请求体积的必要手段，只是不再每轮触发）。
-另外触发阈值改为可配：`HISTORY_COMPACTION_TRIGGER`（默认 30，保持原值）。
+**修复**：整块移除按条数触发的机制（含两个环境变量）。工具负载归档只在
+压缩事件内作为 L1 / L2 的前置步骤执行（见 P1）——同一个触发器、同一个
+预算口径、同一个（稀疏的）时机，不再存在"回合末尾顺手压缩"的独立路径。
 
 ### P7. 缓存命中完全不可见
 
@@ -134,71 +147,103 @@ fetch_url/wikipedia/text_editor 密集的会话（本项目最典型的用法）
 
 ## 三、改动清单
 
+### 本次（2026-09 上下文策略重构）
+
+| 文件 | 函数/位置 | 改动 |
+|------|-----------|------|
+| `context_window.py`（新） | 整个模块 | 有界窗口核心：预算解析 / 双水位 / 用户轮块拆分 / 淘汰规划 / 滚动摘要（确定性纯函数，无 IO）（P1） |
+| `context_manager.py` | `select_request_context` 重写 | 滑动截尾 → 守卫语义：预算内全量透传；超预算按块裁剪出站视图 + 单消息截断兑底（P1） |
+| `app.py` | `pre_flight_context_check` 重写 | 双水位滞后触发 + 单一压缩事件（L1 归档 → L2 整轮淘汰 + 摘要合并）；移除逐块删到塞得下的循环（P1） |
+| `app.py` | `update_conversation_and_ledger`、模块常量 | 移除按消息条数触发的压缩机制及其两个环境变量（P6） |
+| `app.py` | 顺带修复 | 旧代码引用不存在的 `ToolCompactionStats.compacted_calls_count` 属性，第二遍归档路径一旦触发即 `AttributeError`（潜伏 bug，已随重写消除） |
+| `ai_handlers.py` | `select_request_context` 调用点 | 传入 `model_max_output`，守卫预算与 pre-flight 压缩预算共用同一解析 |
+| `ai/agentic_loops.py` | `_openrouter_session_id` 注释 | 与新策略对齐（session_id 依据不变） |
+| `scripts/verify_context_strategy.py`（新） | 整个脚本 | 48 项行为断言（见「五、验证」） |
+| `README.md` / `CACHE_OPTIMIZATION.md` | 缓存章节 | 与新策略同步，移除量化淘汰 / 批量压缩描述 |
+
+### 新增环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `CONTEXT_MAX_TOKENS` | 不设置 | 历史预算绝对覆盖（兼容旧语义；设了则忽略比例推导） |
+| `CONTEXT_BUDGET_RATIO` | `0.8` | 历史预算占 max_context 比例（同时与 `max_context − max_output` 取更紧者） |
+| `CONTEXT_COMPACT_TRIGGER_RATIO` | `0.90` | 触发压缩事件的高水位（占预算比例） |
+| `CONTEXT_COMPACT_TARGET_RATIO` | `0.50` | 压缩事件要压回的目标水位（滞后区间 = 两者之差） |
+| `CONTEXT_PROTECTED_TURNS` | `6` | 永不淘汰的最近用户轮数（活跃工作集） |
+| `CONTEXT_DIGEST_TOKEN_BUDGET` | `1500` | 滚动摘要 token 预算（实际不超过预算的 1/4） |
+
+移除的环境变量：`CONTEXT_EVICT_HEADROOM_MESSAGES`（量化淘汰，已随方案取代）、
+`HISTORY_COMPACTION_TRIGGER`、`HISTORY_COMPACTION_MIN_BATCH`（按消息条数触发，已移除）。
+
+### 此前批次（2026-08）
+
 | 文件 | 函数/位置 | 改动 |
 |------|-----------|------|
 | `ai/agentic_loops.py` | `_openrouter_session_id`（新）、`_openrouter_extra_body`、`_merged_extra_body` | session_id 粘性路由 + 顶层自动 cache_control（P2/P3） |
 | `ai/agentic_loops.py` | 主循环 / 回退 / 总结三处 create 调用 | 传入 chat_id 与 supports_prompt_cache |
 | `ai/agentic_loops.py` | `_extract_cache_usage`（新）、`_log_cache_usage`（新） | 缓存命中观测（P7），两个循环出口接入 |
 | `ai/attachment_content.py` | `_apply_cache_control` | 3 显式断点策略：system / 上一轮末尾 / 本轮 user（P3） |
-| `context_manager.py` | `_quantized_drop`（新）、`select_request_context` | 量化淘汰，消息数与 token 双维度（P1） |
 | `s3_utils.py` | `generate_presigned_url` | 预签名 URL 记忆化 + 并发签名去重（P4） |
-| `search_engine.py` | `execute_web_search` / `_execute_web_search_uncached` | 拆分为缓存壳 + 原实现；`_search_cache_key` / `_is_cacheable_search_result`（新）（P5） |
+| `search_engine.py` | `execute_web_search` / `_execute_web_search_uncached` | 拆分为缓存壳 + 原实现（P5） |
 | `subagent_tool.py` | 子 agent LLM 调用 | OpenRouter session_id + 顶层 cache_control（P2/P3） |
-| `app.py` | `update_conversation_and_ledger`、模块常量 | 压缩批量化 + 阈值可配（P6） |
 | `README.md` | 「缓存与 Prompt Cache」新章节 | 全部机制与配置项文档化 |
 
-### 新增环境变量
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `CONTEXT_EVICT_HEADROOM_MESSAGES` | `10` | 上下文窗口量化淘汰步长；`1` = 恢复旧版逐轮滑动 |
-| `HISTORY_COMPACTION_TRIGGER` | `30` | 触发历史压缩的历史长度阈值（原硬编码 30） |
-| `HISTORY_COMPACTION_MIN_BATCH` | `8` | 未归档工具调用攒够几条才压缩一次 |
-
-已有但 previously-unused 的 `SEARCH_CACHE_TTL`（默认 300s）本次被正式启用。
+已有但 previously-unused 的 `SEARCH_CACHE_TTL`（默认 300s）被正式启用。
 
 ---
 
 ## 四、效果预估
 
 以一个典型"工具密集"会话为例（系统提示+工具 schema 约 6k token，历史 30k token，
-每轮工具中段新增 3k token）：
+每轮工具中段新增 3k token，预算 0.8×128k ≈ 102k）：
 
 | 场景 | 旧版命中 | 新版命中 |
 |---|---|---|
 | Anthropic：loop 第 2..N 轮 | system+工具+历史前段（≈6k+稳定段） | 同左 + 每轮工具结果跨轮命中 |
 | Anthropic：下一轮用户消息 | 到上一轮 user 消息为止 | 到上一轮最后一条 tool 结果为止（多命中整轮工具中段） |
-| DeepSeek/GLM（隐式）：窗口未滑动 | 基本全命中（与旧版相同） | 相同 |
-| DeepSeek/GLM：历史>50 条后 | 每轮仅 system+tools 段命中，历史段全 miss | 约 10 轮里 9 轮历史段全命中（量化窗口） |
-| OpenRouter 路由 | 首次命中后才粘性，且窗口滑动即断 | 从第一次请求即粘性，窗口滑动不断 |
+| DeepSeek/GLM（隐式）：历史远未到水位 | 基本全命中（与旧版相同） | 相同 |
+| DeepSeek/GLM：历史超过预算后 | 每轮仅 system+tools 段命中，历史段（几万 token）全 miss | 历史段只在稀疏的压缩事件轮 miss，两次事件之间（几十轮）全命中 |
+| OpenRouter 路由 | 首次命中后才粘性，且窗口滑动即断 | 从第一次请求即粘性，压缩事件不断 |
 | web_search 重复查询 | 每次真实调用 Serper | 300s 内直接返回缓存 |
 | 含附件 URL 的多模态历史 | 每轮重签 URL → 前缀全断 | 有效期内前缀稳定 |
+| 被淘汰的早期对话 | 静默丢弃（旧 pre-flight 逐块删） | 滚动摘要（每轮一行 U/A/T）+ 归档指针可 text_editor 取回 |
 
 综合：Anthropic 路径的输入费用约可再降 30-60%（取决于工具密度）；隐式缓存厂商在
-长会话中的历史段命中率从"几乎总是 miss"提升到"大多数轮全命中"。
+长会话中的历史段命中率从"几乎总是 miss"提升到"除压缩事件轮外全部命中"
+（事件频率约为每几十轮一次，取决于增速）。
 
 ---
 
 ## 五、验证
 
-`python3 scripts/verify_cache_changes.py`（随包附带）覆盖 49 项行为断言，全部通过：
+`python3 scripts/verify_context_strategy.py`（随包附带）覆盖 48 项行为断言，
+全部通过：
 
-1. `_apply_cache_control`：三断点位置 / tool 消息不打标 / 幂等 / 多模态末块 / ≤3 显式断点；
-2. extra_body：session_id 与 cache_control 的注入与隔离（非 OpenRouter 不注入）；
-3. 量化淘汰：起点阶梯前进 / 连续 9 轮稳定 / step=1 恢复旧行为 / 孤立 tool 首条剔除 / token 触顶同样量化；
-4. 搜索缓存：命中 / 参数归一化隔离 / 错误不缓存 / 空结果缓存；
-5. 预签名 URL：同 key 字节稳定 / 不同 key 各签 / 自定义 expiry 绕过 / 并发签名一次；
-6. usage 解析：三家字段族 / dict 与对象形态 / 命中率计算。
+1. 预算解析：比例 / 输出约束取 min / 绝对覆盖优先 / 兑底 50000 / 小窗口下限；
+2. 结构拆分：用户轮锚定 / 前导孤立块 / 摘要槽位单独抽出 / 轮内 system 归属；
+3. 淘汰规划：预算内 no-op / 从最老整轮开始 / 压到目标水位 / 保护尾 ≥ 6 轮 /
+   摘要永不淘汰 / 单块超大不抛异常；
+4. 滚动摘要：确定性（同输入同字节）/ 合并旧行 + 轮数累计 / 归档指针进入 T 行 /
+   预算从最老行丢弃并标注 / 多模态占位；
+5. 请求守卫：快路径全量透传 / 浅拷贝隔离 / 兑底按块淘汰且不超预算 /
+   孤儿 tool 首条剔除 / 单消息超预算截断 / 极端小预算仍合法；
+6. 多轮模拟（40 轮）：**每次前缀变化都恰好对应一次压缩事件**（无滑动漂移）/
+   事件不连发（无抖动）/ 守卫输出永远不超预算 / 早期信息以摘要保留 /
+   持久历史回到目标水位附近。
+
+另对全部改动文件与全项目做了 `py_compile` / `compileall` 编译期检查，均通过。
+
+（更早批次的 `scripts/verify_cache_changes.py` 覆盖断点 / session_id / 搜索缓存 /
+预签名 URL / usage 解析，不在本次包内；对应行为未改动。）
 
 ---
 
 ## 六、本次复查记录（日志健壮性 + 缓存复核）
 
 **缓存策略复核**：对上述 P1-P7 的核心断言逐条与源码比对（不仅是读文档），
-包括手工模拟 `_quantized_drop` 的量化数学、确认 `_apply_cache_control`
-唯一调用点位于用户消息 append 之后、确认 `_log_cache_usage` 确实在
-`for _round` 循环内部（而非循环外）、确认 `execute_web_search` 的参数
-归一化只有一份等。结论：本文档描述与实现一致。
+包括确认 `_apply_cache_control` 唯一调用点位于用户消息 append 之后、确认
+`_log_cache_usage` 确实在 `for _round` 循环内部（而非循环外）、确认
+`execute_web_search` 的参数归一化只有一份等。结论：本文档描述与实现一致。
 
 发现一处遗留的小问题（非缓存正确性问题，未修复，供后续处理）：
 `s3_utils.py::generate_presigned_url` 用**单个全局** `asyncio.Lock()`
@@ -237,5 +282,62 @@ fetch_url/wikipedia/text_editor 密集的会话（本项目最典型的用法）
    缓存），但 TTL 过期后会重新下载 Telegram/R2——可加大 `CACHE_TTL` 或做磁盘层。
 4. **Gemini 显式 context cache**（`cachedContent`）：OpenAI 兼容层不支持，需要原生
    REST 调用才能用；当前隐式缓存已能吃到大部分收益。
-5. **`_eligible_calls` 在 app.py 每轮 O(n) 扫描**：历史很长时有轻微开销，可接受；
-   若将来历史上限大幅提高可加增量计数器。
+5. **LLM 摘要替代确定性摘要**：当前滚动摘要每轮只保留 U/A/T 骨架行（确定性、零
+   成本、零延迟）。若希望摘要质量更高，可在压缩事件中用一次 LLM 调用重写摘要
+   （Claude Code 式）；代价是事件轮增加一次请求的延迟与费用，以及摘要内容的不
+   确定性。接口已预留（`build_digest_text` 是纯函数，可整体替换）。
+6. **摘要的历史层次**：摘要行数超预算时按"最老先丢"处理，长会话的远古信息会
+   从摘要中淡出。若需要更强的长期记忆，可把摘要沉淀进 `memory_tool`（已有
+   跨会话持久化），而不是无限扩大摘要预算。
+
+---
+
+## 八、2026-09 上下文策略重构记录（取代量化淘汰方案）
+
+### 背景
+
+用户反馈：量化淘汰思路"设计不够好，也很复杂"，要求按主流 Agent 上下文
+策略重做。复查发现更严重的问题——**文档与代码已经脱节**：本文档此前描述
+的 `_quantized_drop` 量化淘汰在当前代码里并不存在，`select_request_context`
+实际是"纯 token 预算的尾部滑动选取"（对隐式缓存是最差形态：每轮起点必变）；
+按消息条数（>30）触发的批量压缩与 pre-flight 的 token 口径互不知情。
+
+### 新策略（一句话版）
+
+**淘汰不再是历史长度的连续函数，而是离散事件**：历史在预算内时请求前缀
+一字节不变；超过触发水位（90%）时一次性压回目标水位（50%），被淘汰的
+轮进入滚动摘要、其工具负载先归档为可取回的指针。
+
+### 关键设计决策
+
+1. **确定性摘要而非 LLM 摘要**：Claude Code 的 auto-compact 用一次 LLM 调用
+   生成摘要；本项目选择确定性骨架行（U/A/T，见 `build_digest_text`）。
+   理由：压缩事件发生在用户回合的 pre-flight，加 LLM 调用会引入延迟、
+   费用与失败模式三重代价，而确定性摘要零成本、可单测、可复现。接口
+   已预留，将来可整体替换为 LLM 摘要（见遗留建议 5）。
+2. **摘要无时间戳**：摘要只在压缩事件中被重写，但即便如此也不放时间戳
+   等易变内容——同输入永远同字节，把"字节稳定"贯彻到每一个槽位。
+3. **摘要用 role=system、置于历史下标 0**：这是持久历史中唯一的 system
+   消息（业务消息只会是 user/assistant/tool），Anthropic 桥接会把它拼进
+   顶层 system（缓存断点 1 覆盖），OpenAI 兼容厂商接受中段 system 消息。
+4. **预算 = min(0.8×max_context, max_context−max_output)**：统一了旧版
+   两套互相矛盾的口径（视图 0.8× vs safe_limit max−output）。128k/8k 输出
+   的模型取 102.4k，128k/64k 输出的取 62.5k（旧版后者名义 62.5k、视图却
+   允许 102k，自相矛盾）。
+5. **保护尾 6 轮不淘汰**：活跃工作集（当前任务的上下文）优先于历史纵深；
+   保护尾超出预算的极端场景交给请求守卫按块裁剪，宁可临时丢老轮也不
+   让请求非法。
+6. **守卫保留最后一个块**：兜底路径至少保留最新一轮（由尾部装配做单
+   消息级截断），避免"一条超大新消息被整块丢弃"的反直觉行为。
+
+### 常见问题：什么时候会发生上下文剪切？
+
+- **压缩事件（唯一的常规剪切点）**：新回合 pre-flight 时，若
+  `历史 token + 新输入 token > 90% × 预算`。工具密集会话通常每几十轮
+  一次；事件内先归档工具负载（无损），不够再整轮淘汰进摘要。
+- **请求守卫（兜底剪切，非常规）**：仅当持久历史超出预算（压缩事件
+  失败 / 会话中途切到小窗口模型）时，在**出站视图**上按块裁剪，持久
+  历史不动，下一轮压缩事件把它收敛回预算内。
+- **单消息截断（最后防线）**：单条消息自身超预算时按 token 截断该
+  消息正文。
+- 其余一切时刻（即绝大多数请求）：历史全量透传，前缀字节稳定。

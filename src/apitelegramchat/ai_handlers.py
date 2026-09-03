@@ -514,12 +514,14 @@ async def get_ai_response(
             api_type = model_info.api_type
             # 复制历史快照，避免在锁外被并发请求追加导致竞态
             stored_history = list(user_contexts.get(chat_id, {}).get("conversation_history", []))
-            # 动态上下文：传入模型的 max_context 配置，让 select_request_context
-            # 根据模型能力自动调整 token 上限（大窗口模型如 Gemini 2.5 Flash 可
-            # 使用更多上下文，小窗口模型自动收紧）
+            # 动态上下文：传入模型的 max_context / max_output_tokens 配置，
+            # 守卫预算与 pre_flight_context_check 的压缩预算共用同一解析
+            # （context_window.resolve_history_budget：0.8×窗口 与 窗口−
+            # max_output 取更紧者），历史在预算内时全量透传、前缀字节稳定。
             context_snapshot = select_request_context(
                 stored_history,
                 model_max_context=model_info.max_context,
+                model_max_output=getattr(model_info, "max_output_tokens", None),
             )
             history = context_snapshot.messages
             supports_tools = model_info.supports_tools

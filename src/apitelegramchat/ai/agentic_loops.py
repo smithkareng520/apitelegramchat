@@ -98,12 +98,12 @@ def _openrouter_session_id(chat_id: object) -> str:
     """为 OpenRouter 生成稳定的 per-chat 粘性路由键（≤256 字符）。
 
     背景：OpenRouter 的默认会话识别靠"首条 system + 首条非 system 消息"
-    哈希。本项目的上下文窗口会滑动（select_request_context 截尾）、历史
-    会被压缩（compact_older_tool_calls 重写旧消息），一旦窗口起点变化，
-    哈希就变，粘性路由（以及它背后的 prompt cache）随之失效。
-    显式传 session_id 后：粘性路由从第一次请求就生效（无需先观察到
-    缓存命中），且不随窗口滑动变化；对经 OpenRouter 转发的 Z.AI/GLM
-    还会作为会话亲和键下发，进一步提升缓存命中。
+    哈希。本项目的上下文窗口虽然只在自动压缩事件中收缩（事件之间前缀
+    字节稳定，见 context_window.py），但事件发生时历史仍会被重写
+    （滚动摘要合并、工具负载归档为指针）。显式传 session_id 后：粘性
+    路由从第一次请求就生效（无需先观察到缓存命中），且不随压缩事件
+    漂移；对经 OpenRouter 转发的 Z.AI/GLM 还会作为会话亲和键下发，
+    进一步提升缓存命中。
     """
     if chat_id is None:
         return ""
