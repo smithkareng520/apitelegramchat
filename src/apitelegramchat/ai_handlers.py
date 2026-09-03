@@ -153,7 +153,6 @@ async def build_system_prompt(
       <tr><td>表格 (Table)</td><td><code><table bordered striped><tr><td>单元格</td></tr></table></code></td></tr>
       <tr><td>分割线 / 链接 / 图片</td><td><code><hr/></code> / <code><a href="URL">文本</a></code> / <code><img src="URL"/></code></td></tr>
       <tr><td>地图 / 数学公式</td><td><code><tg-map lat="..." long="..." zoom="..."/></code> / <code><tg-math>公式</tg-math></code></td></tr>
-      <tr><td>按钮行 (Button Row)</td><td><code><tg-button-row>…</tg-button-row></code>（Telegram Bot API 10.3 原生 Rich Message 按钮结构，对应 RichBlockButtons / RichTextButton / RichMessageButton）</td></tr>
     </table>
   </li>
 </ul>
@@ -161,7 +160,6 @@ async def build_system_prompt(
 
 <h3>排版与布局规则</h3>
 <ul>
-  <li><b>按钮行：</b> 富文本输出可包含原生按钮行 <code><tg-button-row>…</tg-button-row></code>（Telegram Bot API 10.3 新增的 Rich Message 原生按钮结构：RichBlockButtons / RichTextButton / RichMessageButton）。按钮行必须作为独立块级元素输出，不得嵌套在段落、表格、列表或引用内。</li>
   <li><b>文件与代码输出：</b> 对于文件摘录和编辑器样式的输出，必须保留原有的空格与行号，并置于等宽代码块（<code><pre><code>...</code></pre></code>）中。</li>
   <li><b>表格增强：</b> 单元格支持 <code>colspan</code>、<code>rowspan</code>、<code>align="left/center/right"</code> 以及 <code>valign="top/middle/bottom"</code>。单元格内仅允许包含行内格式元素。</li>
   <li><b>引用与强调：</b>
