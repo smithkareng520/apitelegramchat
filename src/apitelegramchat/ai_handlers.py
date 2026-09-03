@@ -649,6 +649,7 @@ async def get_ai_response(
             # 交付最终内容。禁止直接投递文件/媒体、任意 Bash/文件写入，
             # 避免 TIMER 为了"找点事做"产生副作用。
             from apitelegramchat.search_engine import SEARCH_TOOLS, build_deliver_reply_tool
+            from apitelegramchat.tool_assembly import prioritize_tool_defs, restrict_tool_defs
             _PROACTIVE_ALLOWED_TOOLS = {
                 "web_search", "fetch_url", "wikipedia",
                 "exchange_rate", "book_lookup", "weather", "news", "crypto_price",
@@ -657,10 +658,14 @@ async def get_ai_response(
                 "poi_keyword_search", "poi_nearby_search", "poi_details",
                 "todo", "memory", "message_user",
             }
-            timer_tools = [
-                t for t in SEARCH_TOOLS
-                if (t.get("function") or {}).get("name") in _PROACTIVE_ALLOWED_TOOLS
-            ]
+            # 运行时稳定排列：允许工具作为 SEARCH_TOOLS 的逻辑前缀，
+            # 不改动源代码中的常量声明，也不影响其他回合的工具顺序。
+            ordered_search_tools = prioritize_tool_defs(
+                SEARCH_TOOLS, _PROACTIVE_ALLOWED_TOOLS
+            )
+            timer_tools = restrict_tool_defs(
+                ordered_search_tools, _PROACTIVE_ALLOWED_TOOLS
+            )
             if silent_mode:
                 # TIMER 回合的 deliver_reply：send 缺省 false（与旧行为一致）
                 # ——必须显式 send=true 才交付，收尾无兜底。
@@ -1087,9 +1092,12 @@ async def _call_api(
     if tools is None:
         from apitelegramchat.search_engine import SEARCH_TOOLS
         tools = SEARCH_TOOLS
+    from apitelegramchat.tool_assembly import valid_tool_defs
+    # 严格网关不接受 SEARCH_TOOLS 中偶发混入的 [] 等非 dict 元素。
+    tools = valid_tool_defs(tools)
     if extra_tools:
         # 静默模式等场景在基础工具面之外追加的工具（如 deliver_reply）。
-        tools = list(tools) + list(extra_tools)
+        tools = tools + valid_tool_defs(extra_tools)
 
     api_type = model_info.provider
     supports_tools = model_info.supports_tools

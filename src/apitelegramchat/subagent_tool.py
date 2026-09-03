@@ -163,6 +163,10 @@ def _filter_tools(allowed: Optional[list[str]]) -> list[dict]:
                 names.add(n)
     out = []
     for t in SEARCH_TOOLS:
+        # 可选导入失败时可能混入字面 []；严格网关要求每个工具定义都是 dict。
+        if not isinstance(t, dict):
+            logger.debug("_filter_tools 忽略非 dict 工具定义: %r", t)
+            continue
         try:
             fn_name = t.get("function", {}).get("name", "")
         except Exception:
