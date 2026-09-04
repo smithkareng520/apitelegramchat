@@ -72,6 +72,7 @@ from apitelegramchat.ai.tool_summary import (
     _tool_limit_summary,
 )
 from apitelegramchat.ai.tool_call_loop import _run_tool_calls_and_append
+from apitelegramchat.ai.gemini_cache import manager as _gemini_cache_manager
 
 if TYPE_CHECKING:
     from apitelegramchat.ai.rich_message_builder import RichMessageBuilder
@@ -806,21 +807,71 @@ async def _agentic_loop_gemini_native(
                 builder.begin_stream_text()
             current_stream = target
 
-        request_body = _build_gemini_request_body(
-            loop_messages,
-            max_tokens=max_tokens,
-            sampling_params=sampling_params,
-            thinking_config=thinking_config,
+        # 显式缓存（cachedContent API）：可用则只发送“当前回合后缀”并引用
+        # 缓存（systemInstruction / 前缀 contents 由缓存提供）；不可用则
+        # 照旧全量请求。任何缓存故障都不影响主流程（见 gemini_cache.py）。
+        cache_handle = await _gemini_cache_manager.acquire(
+            chat_id=builder.chat_id,
+            model=current_model,
+            messages=loop_messages,
             gemini_tools=gemini_tools,
+            convert_fn=_convert_messages_to_gemini,
+            base_url=_GEMINI_NATIVE_BASE,
+            headers=req_headers,
         )
+        if cache_handle is not None:
+            request_body = _build_gemini_request_body(
+                cache_handle.suffix_messages,
+                max_tokens=max_tokens,
+                sampling_params=sampling_params,
+                thinking_config=thinking_config,
+                gemini_tools=gemini_tools,
+            )
+            request_body["cachedContent"] = cache_handle.name
+            logger.info(
+                "[%s] 第 %s 轮引用显式缓存 %s（前缀 %s 条消息 + 后缀 %s 条）",
+                api_label, _round + 1, cache_handle.name,
+                cache_handle.prefix_len, len(cache_handle.suffix_messages),
+            )
+        else:
+            request_body = _build_gemini_request_body(
+                loop_messages,
+                max_tokens=max_tokens,
+                sampling_params=sampling_params,
+                thinking_config=thinking_config,
+                gemini_tools=gemini_tools,
+            )
 
         try:
             await start_chat_action(builder.chat_id, "typing")
             # typing 状态语义与 OpenAI / Anthropic 循环一致：仅在真实消费
             # 流式增量期间显示（finally 统一熄灭）。
             async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
-                async with await _post_gemini_stream(
-                        session, stream_url, req_headers, request_body) as resp:
+                try:
+                    resp_cm = await _post_gemini_stream(
+                        session, stream_url, req_headers, request_body)
+                except aiohttp.ClientResponseError as cache_err:
+                    if cache_handle is None or cache_err.status not in (400, 404):
+                        raise
+                    # 缓存引用被拒（过期/不一致/不支持等）：失效该条目并
+                    # 降级为全量请求重试一次（自我愈合）。400 发生在流
+                    # 开始之前，重试不会产生任何重复输出。
+                    logger.warning(
+                        "[%s] 第 %s 轮显式缓存被拒（HTTP %s），回退全量请求重试",
+                        api_label, _round + 1, cache_err.status)
+                    _gemini_cache_manager.invalidate(
+                        cache_handle, f"HTTP {cache_err.status}")
+                    cache_handle = None
+                    request_body = _build_gemini_request_body(
+                        loop_messages,
+                        max_tokens=max_tokens,
+                        sampling_params=sampling_params,
+                        thinking_config=thinking_config,
+                        gemini_tools=gemini_tools,
+                    )
+                    resp_cm = await _post_gemini_stream(
+                        session, stream_url, req_headers, request_body)
+                async with resp_cm as resp:
                     async for event in _iter_gemini_stream_events(resp):
                         received_any = True
                         kind = event["kind"]
