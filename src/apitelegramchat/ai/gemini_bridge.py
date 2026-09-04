@@ -45,6 +45,7 @@ Claude，历史读出来仍是标准 OpenAI 形状，不会导致任何其它厂
 出错——完全不影响现有项目行为。
 """
 import asyncio
+import copy
 import json
 import uuid
 from typing import TYPE_CHECKING, Optional
@@ -155,10 +156,81 @@ def _split_union_type(schema: dict, depth: int) -> dict:
     return out
 
 
+def _repair_anyof_branch_required(sub: dict, parent_raw_props: Optional[dict],
+                                  depth: int) -> dict:
+    """重建 anyOf 分支的 required，使其满足 Gemini 硬校验不变式。
+
+    Gemini 要求任意层级的 ``required`` 中每个名字都必须在**同一层**
+    ``properties`` 中有定义，否则整个请求 400（线上实测 2026-09-05，
+    gemini-3.5-flash-lite）::
+
+        parameters.any_of[0].required[0]: property is not defined
+
+    JSON Schema 惯用的条件必填写法 ``anyOf: [{"required": ["query"]},
+    {"required": ["image_url"]}]``（分支只声明属性名、属性定义留给父级，
+    OpenAI / Anthropic 侧完全合法）在 Gemini 必炸。
+
+    修复：把每个分支重建为**自包含 object**——从父级原始 properties
+    取回被引用属性的定义补进分支；父级也没有的名字只能剔除（宁可丢
+    一条约束，不冒 400 风险）。全部名字都无法落地时分支的 required
+    整体移除，退化分支由调用方剔除。
+
+    注意：必须在递归清洗**之前**调用——清洗后置校验看不到父级属性，
+    先清洗会把 required 误删。
+    """
+    req = sub.get("required")
+    if not isinstance(req, list) or not req:
+        return sub
+    branch_props = sub.get("properties")
+    if not isinstance(branch_props, dict):
+        branch_props = None
+    kept: list = []
+    injected: dict = {}
+    for name in req:
+        if not isinstance(name, str):
+            continue
+        if branch_props is not None and name in branch_props:
+            kept.append(name)
+        elif parent_raw_props and name in parent_raw_props:
+            prop_schema = parent_raw_props[name]
+            injected[name] = (
+                _clean_schema_for_gemini(prop_schema, depth + 1)
+                if isinstance(prop_schema, dict) else {"type": "string"}
+            )
+            kept.append(name)
+    if not kept:
+        sub.pop("required", None)
+        return sub
+    sub["required"] = kept
+    if injected:
+        if branch_props is None:
+            branch_props = {}
+            sub["properties"] = branch_props
+        branch_props.update(injected)
+    return sub
+
+
 def _clean_schema_for_gemini(schema, depth: int = 0) -> dict:
-    """递归清洗一个 JSON Schema 片段为 Gemini 原生 Schema 子集。"""
+    """递归清洗一个 JSON Schema 片段为 Gemini 原生 Schema 子集。
+
+    清洗结果保证 Gemini 两条硬校验不变式在任意层级成立（违反即整请求
+    400，线上实测见 _repair_anyof_branch_required docstring）：
+
+    1. ``required`` ⊆ 同层 ``properties``：定义不明的 required 名字剔除，
+       空 / 畸形 required 整体移除；
+    2. 声明 required / properties 的子 schema 必须带 ``type: "object"``。
+
+    另：空 ``properties: {}`` 与不写等价，一并剥掉，避开部分 Gemini
+    版本对 OBJECT 空属性的严格校验。
+
+    本函数是**纯函数**：入口深拷贝（仅 depth==0，递归复用已拷贝树），
+    绝不修改调用方原始 schema——SEARCH_TOOLS 等模块级常量同时被
+    OpenAI / Anthropic 路径共享，原地修改会造成跨 provider 污染。
+    """
     if not isinstance(schema, dict):
         return {}
+    if depth == 0:
+        schema = copy.deepcopy(schema)
     if depth > _MAX_SCHEMA_DEPTH:
         # 超深 schema 防御：保语义占位，不让畸形输入打穿请求。
         return {"type": "string", "description": "(schema 嵌套过深，已降级为字符串)"}
@@ -178,13 +250,19 @@ def _clean_schema_for_gemini(schema, depth: int = 0) -> dict:
         elif key == "items" and isinstance(value, dict):
             out["items"] = _clean_schema_for_gemini(value, depth + 1)
         elif key == "anyOf" and isinstance(value, list):
+            # 分支自包含修复所需的父级原始 properties（未清洗态）。
+            parent_raw_props = schema.get("properties")
+            if not isinstance(parent_raw_props, dict):
+                parent_raw_props = None
             cleaned_subs = []
             for sub in value:
                 if not isinstance(sub, dict):
                     continue
+                # 先修 required（原始层，能看见父级属性），再递归清洗；
+                # 顺序不能反，原因见 _repair_anyof_branch_required docstring。
+                sub = _repair_anyof_branch_required(sub, parent_raw_props, depth)
                 sub = _clean_schema_for_gemini(sub, depth + 1)
-                # 只有 required / properties 而没有 type 的退化子 schema
-                # （如 web_search 的 anyOf: [{"required": ["query"]}, ...]）：
+                # 只有 required / properties 而没有 type 的子 schema：
                 # Gemini 的 Schema 子对象缺 type 会被拒，补全为 object。
                 if "type" not in sub and ("required" in sub or "properties" in sub):
                     sub["type"] = "object"
@@ -194,6 +272,22 @@ def _clean_schema_for_gemini(schema, depth: int = 0) -> dict:
                 out["anyOf"] = cleaned_subs
         else:
             out[key] = value
+    # 硬校验不变式 1：required ⊆ properties（对任意层级生效，含顶层
+    # parameters；anyOf 分支已在上方单独修复）。
+    req = out.get("required")
+    if req is not None:
+        props = out.get("properties")
+        kept_req = [
+            n for n in (req if isinstance(req, list) else [])
+            if isinstance(n, str) and isinstance(props, dict) and n in props
+        ]
+        if kept_req:
+            out["required"] = kept_req
+        else:
+            out.pop("required", None)
+    # 空 properties 与不写 properties 等价，剥掉以避开严格校验。
+    if isinstance(out.get("properties"), dict) and not out["properties"]:
+        out.pop("properties", None)
     return out
 
 
@@ -222,7 +316,11 @@ def _convert_tools_to_gemini(tools: Optional[list]) -> Optional[list]:
         }
         params = fn.get("parameters")
         if isinstance(params, dict) and params:
-            decl["parameters"] = _clean_schema_for_gemini(params)
+            cleaned_params = _clean_schema_for_gemini(params)
+            # 清洗后可能只剩空壳（如畸形 schema 全字段被剥）——
+            # Gemini 对空 parameters 不报错，但省略更干净。
+            if cleaned_params:
+                decl["parameters"] = cleaned_params
         declarations.append(decl)
     return [{"functionDeclarations": declarations}] if declarations else None
 
