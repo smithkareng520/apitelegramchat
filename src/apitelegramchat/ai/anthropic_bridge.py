@@ -13,7 +13,7 @@
 2. 因此本文件的策略是"边界转换"：
    - _agentic_loop_anthropic 接收到的 messages 参数、以及它追加进
      new_history_entries 的内容，全部是 OpenAI 形状（与
-     _agentic_loop_openai_compat / _agentic_loop_gemini_openai_compat
+     _agentic_loop_openai_compat / _agentic_loop_gemini_native
      完全一致），可以直接复用 tool_call_loop._run_tool_calls_and_append。
    - 仅在"即将调用 Anthropic API"之前，把当前累积的 OpenAI 形状
      loop_messages 转换成 Anthropic 的 {system, messages} 形状
@@ -341,7 +341,7 @@ async def _agentic_loop_anthropic(
 ) -> tuple[str | None, object | None, list]:
     """Anthropic 原生 Messages API 专用循环。
 
-    对外契约与 _agentic_loop_openai_compat / _agentic_loop_gemini_openai_compat
+    对外契约与 _agentic_loop_openai_compat / _agentic_loop_gemini_native
     完全一致：入参/出参（messages、返回的 new_history_entries）都是 OpenAI
     形状，只在请求 Anthropic API 前后做边界转换（见模块头注释）。
     """

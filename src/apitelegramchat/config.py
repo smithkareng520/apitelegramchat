@@ -123,12 +123,14 @@ class ProviderConfig:
     base_url: str
     api_key_env: str
     default_headers: Optional[Dict[str, str]] = None
-    # 是否使用专用循环（如 Gemini 非流式特殊处理）
+    # 是否使用专用循环（如 Gemini / Anthropic 的原生协议专用循环）
     use_dedicated_loop: bool = False
     # 专用循环的具体协议标签，仅在 use_dedicated_loop=True 时读取。
-    # "gemini_openai_compat"（默认，向后兼容旧值）-> _agentic_loop_gemini_openai_compat
-    # "anthropic_native"                          -> _agentic_loop_anthropic
-    dedicated_loop_kind: str = "gemini_openai_compat"
+    # "gemini_native"（Gemini 原生 API 流式桥接）  -> _agentic_loop_gemini_native
+    # "anthropic_native"（Anthropic 原生 Messages）-> _agentic_loop_anthropic
+    # 旧值 "gemini_openai_compat"（OpenAI 兼容层非流式循环）已随 v2.6
+    # Gemini 原生流式改造移除；未识别的标签回落主流 OpenAI 兼容循环。
+    dedicated_loop_kind: str = "gemini_native"
     # 是否支持 Prompt Caching（仅部分厂商需要显式标记）
     supports_prompt_cache: bool = False
     # 视觉输入是否需要"公开可访问 HTTP URL"而非 data:image/...;base64,... 内联格式。
@@ -220,9 +222,15 @@ PROVIDERS: Dict[str, ProviderConfig] = {
     ),
     "gemini": ProviderConfig(
         name="Gemini",
+        # base_url 仅供 subagent 的一次性非流式补全调用继续使用
+        # （subagent_tool._create_chat_completion 的 OpenAI 兼容客户端）；
+        # 主 Agent Loop 已切换为原生 API 流式桥接（ai/gemini_bridge.py，
+        # streamGenerateContent?alt=sse + 原生 function calling），
+        # 不再经过该兼容端点。
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         api_key_env="GEMINI_API_KEY",
-        use_dedicated_loop=True,      # Gemini 使用非流式专用循环
+        use_dedicated_loop=True,      # Gemini 使用原生流式专用循环
+        dedicated_loop_kind="gemini_native",
         supports_prompt_cache=False,  # Gemini 隐式缓存，无需标记
     ),
     "grok": ProviderConfig(
@@ -536,7 +544,11 @@ def get_reasoning_request_fields(model_info, api_label: str = "") -> tuple:
                      （OpenRouter 统一推理接口，会自动转换到具体后端）
       gemini      -> 顶层 reasoning_effort + extra_body.google.thinking_config
                      .thinkingBudget（官方 OpenAI 兼容层；enabled=False 映射
-                     thinkingBudget=0 关闭思考）
+                     thinkingBudget=0 关闭思考）。该形状仍供 subagent 的
+                     OpenAI 兼容客户端使用；主循环的原生流式桥接
+                     （gemini_bridge._gemini_thinking_config）在同一出口上
+                     解码为原生 generationConfig.thinkingConfig
+                     （thinkingLevel / thinkingBudget / includeThoughts）。
       glm         -> extra_body.thinking = {"type": "enabled"/"disabled"}
                      （智谱官方 v4 接口；预算暂不支持，静默忽略）
       modelscope  -> extra_body.enable_thinking / thinking_budget

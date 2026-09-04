@@ -57,7 +57,7 @@ from apitelegramchat.ai.attachment_content import (
 from apitelegramchat.ai.rich_message_builder import RichMessageBuilder
 from apitelegramchat.ai.agentic_loops import (
     _agentic_loop_anthropic,
-    _agentic_loop_gemini_openai_compat,
+    _agentic_loop_gemini_native,
     _agentic_loop_native_image,
     _agentic_loop_native_video,
     _agentic_loop_openai_compat,
@@ -1133,23 +1133,25 @@ async def _call_api(
         logger.error(f"未知的 api_type: {api_type}，降级到 openrouter")
         api_type = "openrouter"
 
-    client = api_client.get_client(api_type)
-
     provider_config = PROVIDERS.get(api_type)
     use_dedicated_loop = provider_config.use_dedicated_loop if provider_config else False
-    dedicated_loop_kind = getattr(provider_config, "dedicated_loop_kind", "gemini_openai_compat")
+    dedicated_loop_kind = getattr(provider_config, "dedicated_loop_kind", "gemini_native")
 
     if use_dedicated_loop and dedicated_loop_kind == "anthropic_native":
+        client = api_client.get_client(api_type)
         return await _agentic_loop_anthropic(
             client, current_model, messages, builder,
             tools=tools_to_pass, supports_tools=supports_tools, journal=journal,
         )
-    elif use_dedicated_loop:
-        return await _agentic_loop_gemini_openai_compat(
+    elif use_dedicated_loop and dedicated_loop_kind == "gemini_native":
+        # Gemini 原生流式桥接：aiohttp 直连原生 REST（v1beta
+        # streamGenerateContent?alt=sse），不经过 OpenAI 兼容客户端。
+        return await _agentic_loop_gemini_native(
             current_model, messages, builder,
             tools=tools_to_pass, supports_tools=supports_tools, journal=journal,
         )
     else:
+        client = api_client.get_client(api_type)
         return await _agentic_loop_openai_compat(
             client, current_model, messages, api_type, builder,
             tools=tools_to_pass, supports_tools=supports_tools, journal=journal,

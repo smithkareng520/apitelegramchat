@@ -1,6 +1,13 @@
-"""四种 agentic 循环实现：OpenAI 兼容流式 / Gemini OpenAI 兼容 / 原生图片 / 原生视频。
+"""四种 agentic 循环实现：OpenAI 兼容流式 / Gemini 原生流式 / 原生图片 / 原生视频。
 
-从 ai_handlers.py 拆分而来，逻辑未做改动。
+从 ai_handlers.py 拆分而来。
+
+v2.6：Gemini 从 OpenAI 兼容层（v1beta/openai/）非流式专用循环切换为
+原生 API 流式桥接（ai/gemini_bridge.py，streamGenerateContent SSE +
+原生 function calling），架构与 anthropic_bridge.py 同构的“边界转换”
+模式：loop_messages 全程 OpenAI 形状，仅请求前后做协议转换，复用同一
+套 _run_tool_calls_and_append 工具执行咽喉与草稿流式 UI。旧的
+_agentic_loop_gemini_openai_compat 已移除。
 """
 import asyncio
 import json
@@ -13,7 +20,6 @@ from typing import TYPE_CHECKING, Optional
 from openai import AsyncOpenAI, BadRequestError
 
 from apitelegramchat.config import (
-    GEMINI_API_KEY,
     SUPPORTED_MODELS,
     get_sampling_params,
     get_reasoning_request_fields,
@@ -63,7 +69,6 @@ from apitelegramchat.ai.tool_summary import (
 )
 from apitelegramchat.ai.tool_call_loop import _run_tool_calls_and_append
 from apitelegramchat.ai.strict_tools import (
-    gemini_strict_env_enabled,
     looks_like_strict_tool_rejection,
     mark_strict_tools_rejected,
     strict_tools_for_request,
@@ -72,9 +77,22 @@ from apitelegramchat.ai.strict_tools import (
 # Anthropic 原生 Messages API 专用循环：独立实现，位于 anthropic_bridge.py
 # （职责分离 + 避免本已很大的文件继续膨胀）。此处重导出保持调用方
 # "from apitelegramchat.ai.agentic_loops import _agentic_loop_anthropic"
-# 这一路径可用，与 _agentic_loop_openai_compat / _agentic_loop_gemini_openai_compat
+# 这一路径可用，与 _agentic_loop_openai_compat / _agentic_loop_gemini_native
 # 并列，风格一致。
 from apitelegramchat.ai.anthropic_bridge import _agentic_loop_anthropic  # noqa: F401
+
+# Gemini 原生 API（streamGenerateContent SSE + 原生 function calling）专用
+# 循环：独立实现位于 gemini_bridge.py，与 anthropic_bridge 同构的边界转换
+# 模式。重导出保持调用方旧导入路径可用。
+from apitelegramchat.ai.gemini_bridge import _agentic_loop_gemini_native  # noqa: F401
+
+# Prompt cache 命中观测（三循环共用）：拆至独立模块 cache_usage，避免
+# gemini_bridge -> agentic_loops 的循环导入。此处重导出保持旧路径可用。
+from apitelegramchat.ai.cache_usage import (  # noqa: F401
+    _cached_from_usage,
+    _extract_cache_usage,
+    _log_cache_usage,
+)
 
 if TYPE_CHECKING:
     # 仅供类型注解使用；运行时由调用方传入，避免运行时循环导入。
@@ -208,158 +226,6 @@ def _merged_extra_body(
     if reasoning_extra:
         body = {**(body or {}), **reasoning_extra}
     return body
-
-
-# =====================================================================
-# Prompt cache 命中观测：把各家的缓存命中字段统一提取成一份小字典，
-# 在每轮请求结束后打一行 INFO 日志，让"缓存命中率"变成可度量的指标。
-# 字段来源：
-#   OpenRouter / OpenAI : usage.prompt_tokens_details.cached_tokens
-#   其他兼容 provider   : cache read 字段（如 provider 返回）
-# 口径说明（重要）：
-#   OpenAI 兼容接口中 prompt_tokens 为纯输入 token 数（输出单独记录在
-#   completion_tokens 中），cached_tokens 是 prompt_tokens 的子集，
-#   因此命中率 = Cached / Input_tokens，分母不含输出 token。
-# 上报缺口（2026-09 实测）：agnes 网关流式 usage 的 prompt_tokens_details
-#   时有时无（同一逐字节相同请求连发数次，带与不带随机出现；带 tools 时
-#   甚至整块缺失）。缺失时无法区分"真实脱靶"与"命中但未上报"，该轮
-#   降为 DEBUG 不计入命中率统计，并用本轮最近一份带缓存字段的 usage
-#   快照（cache_hint）尽力补齐，避免把真实命中记成假 0。
-# =====================================================================
-def _cached_from_usage(usage):
-    """从 usage（dict 或 pydantic 对象）中只提取缓存命中数字。
-
-    兼容三种字段形态：OpenAI prompt_tokens_details.cached_tokens /
-    Anthropic 风格 cache_read_input_tokens / DeepSeek 风格
-    prompt_cache_hit_tokens。取不到返回 None（=网关未上报）。
-    """
-    def _num(value):
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, (int, float)):
-            return int(value)
-        return None
-
-    if usage is None:
-        return None
-    if isinstance(usage, dict):
-        details = usage.get("prompt_tokens_details") or {}
-        if not isinstance(details, dict):
-            details = {}
-        for value in (
-            details.get("cached_tokens"),
-            usage.get("cache_read_input_tokens"),
-            usage.get("prompt_cache_hit_tokens"),
-        ):
-            num = _num(value)
-            if num is not None:
-                return num
-        return None
-    details = getattr(usage, "prompt_tokens_details", None)
-    num = _num(getattr(details, "cached_tokens", None)) if details is not None else None
-    extra = getattr(usage, "model_extra", None)
-    extra = extra if isinstance(extra, dict) else {}
-    if num is None:
-        num = _num(extra.get("cache_read_input_tokens"))
-    if num is None:
-        num = _num(extra.get("prompt_cache_hit_tokens"))
-    return num
-
-
-def _extract_cache_usage(usage, cache_hint=None) -> dict:
-    if usage is None:
-        return {}
-
-    def _num(value):
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, (int, float)):
-            return int(value)
-        return None
-
-    if isinstance(usage, dict):
-        prompt = _num(usage.get("prompt_tokens"))
-        completion = _num(usage.get("completion_tokens"))
-        details = usage.get("prompt_tokens_details") or {}
-        if not isinstance(details, dict):
-            details = {}
-        cached = _num(details.get("cached_tokens"))
-        if cached is None:
-            cached = _num(usage.get("cache_read_input_tokens"))
-        if cached is None:
-            cached = _num(usage.get("prompt_cache_hit_tokens"))
-    else:
-        prompt = _num(getattr(usage, "prompt_tokens", None))
-        completion = _num(getattr(usage, "completion_tokens", None))
-        details = getattr(usage, "prompt_tokens_details", None)
-        cached = _num(getattr(details, "cached_tokens", None)) if details is not None else None
-        extra = getattr(usage, "model_extra", None)
-        extra = extra if isinstance(extra, dict) else {}
-        if cached is None:
-            cached = _num(extra.get("cache_read_input_tokens"))
-        if cached is None:
-            cached = _num(extra.get("prompt_cache_hit_tokens"))
-
-    # 缓存字段是否被网关真实上报（cached=0 也算上报；字段整体缺失=未上报）。
-    # 未上报时用本轮最近一份带缓存字段的快照（cache_hint）尽力补齐。
-    reported = cached is not None
-    if cached is None and cache_hint is not None:
-        hinted = _cached_from_usage(cache_hint)
-        if hinted is not None:
-            cached = hinted
-            reported = True
-
-    stats: dict = {}
-    if prompt:
-        # 命中率口径：Cached / Input_tokens（prompt_tokens 即纯输入，
-        # cached_tokens 是其子集；分母不含输出 token）。
-        stats["Input_tokens"] = prompt
-        stats["Output_tokens"] = completion if completion is not None else 0
-        stats["Cached"] = cached if cached is not None else 0
-        stats["Hit_ratio"] = stats["Cached"] / max(1, prompt)
-        # 仅供 _log_cache_usage 判断，展示前会被 pop 掉。
-        stats["_reported"] = reported
-    else:
-        # 极端情况：usage 中没有 prompt_tokens 但有缓存字段，仍如实显示。
-        if cached is not None:
-            stats["Cached"] = cached
-    return stats
-
-
-def _log_cache_usage(api_label: str, usage, cache_hint=None) -> None:
-    """每轮请求结束时打一行缓存命中摘要（无缓存字段时静默跳过）。"""
-    try:
-        stats = _extract_cache_usage(usage, cache_hint)
-        if stats:
-            reported = stats.pop("_reported", True)
-            if "Hit_ratio" in stats:
-                if not reported:
-                    # 网关整轮未上报任何缓存字段（agnes 流式实测高发）：
-                    # 记 0 会把"命中但未上报"伪装成"全脱靶"，污染命中率
-                    # 统计，故降为 DEBUG，命中率均值只按真实上报的轮次算。
-                    logger.debug(
-                        "[%s] cache usage 未上报缓存字段（流式 usage 缺 "
-                        "prompt_tokens_details，无法区分命中与脱靶）",
-                        api_label,
-                    )
-                    return
-                # 按固定键序格式化，Hit_ratio 以百分数显示（一位小数），
-                # 避免直接 dump dict 导致字符串值带引号、浮点数带多余位数。
-                logger.info(
-                    "[%s] prompt cache usage: "
-                    "{'Input_tokens': %s, 'Output_tokens': %s, "
-                    "'Cached': %s, 'Hit_ratio': %.1f%%}",
-                    api_label,
-                    stats.get("Input_tokens", "-"),
-                    stats.get("Output_tokens", "-"),
-                    stats.get("Cached", "-"),
-                    stats["Hit_ratio"] * 100,
-                )
-            else:
-                logger.info("[%s] prompt cache usage: %s", api_label, stats)
-    except Exception:
-        # 观测日志绝不影响主流程
-        logger.debug("cache usage 日志记录失败", exc_info=True)
 
 
 async def _agentic_loop_openai_compat(
@@ -930,257 +796,6 @@ async def _agentic_loop_openai_compat(
         if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
             builder.finish_group(len(builder._tool_groups) - 1)
         # 轮次数耗尽后的兜底文本同样是终局内容：结束旧草稿，不创建下一段。
-        await builder.rollover_at_turn_boundary(start_next_draft=False)
-    return final_content, final_usage, new_history_entries
-
-
-async def _agentic_loop_gemini_openai_compat(
-        current_model: str,
-        messages: list,
-        builder: "RichMessageBuilder",
-        tools: list = None,
-        supports_tools: bool = True,
-        journal: list = None,
-) -> tuple[str | None, object | None, list]:
-    def _clean_tools_for_gemini(tools: list) -> list:
-        if not tools:
-            return tools
-        cleaned = []
-        for tool in tools:
-            new_tool = {
-                "type": tool.get("type", "function"),
-                "function": {
-                    k: v for k, v in tool.get("function", {}).items()
-                    if k != "input_examples"
-                }
-            }
-            cleaned.append(new_tool)
-        return cleaned
-
-    cleaned_tools = _clean_tools_for_gemini(tools) if tools else None
-
-    # L0 预防层（默认关闭）：Gemini OpenAI-compat 层官方文档未承诺对
-    # strict 工具 schema 的支持，默认保持 cleaned_tools 原样（现有 schema
-    # 在该端点已稳定工作）。需要实验时设置 ENABLE_STRICT_TOOL_SCHEMA_GEMINI=1，
-    # 同样带网关拒绝自动降级（见下方请求重试结构）。
-    gemini_strict_tools = (
-        strict_tools_for_request("gemini", cleaned_tools)
-        if gemini_strict_env_enabled() and cleaned_tools else cleaned_tools
-    )
-
-    model_info = SUPPORTED_MODELS.get(current_model)
-    max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
-    # 采样与推理控制统一来自 config.py。Gemini 官方 OpenAI 兼容层：
-    # reasoning_effort 为顶层字段；google.thinking_config.thinkingBudget
-    # 通过 extra_body 下发（本循环用原始 JSON payload，等价于顶层 google 键）。
-    sampling_params = get_sampling_params(model_info)
-    reasoning_top, reasoning_extra = get_reasoning_request_fields(model_info, "gemini")
-
-    GEMINI_OPENAI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-    req_headers = {
-        "Authorization": f"Bearer {GEMINI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    loop_messages = list(messages)
-    final_content: str | None = None
-    final_usage = None
-    tool_call_count_ref = [0]
-    # journal：由 get_ai_response 注入的轮次日志（打断保全用）。
-    new_history_entries: list = journal if journal is not None else []
-
-    for _round in range(MAX_TOOL_CALLS):
-        payload: dict = {
-            "model": current_model,
-            "messages": loop_messages,
-            "max_tokens": max_tokens,
-            "stream": False,
-        }
-        payload.update(sampling_params)
-        payload.update(reasoning_top)
-        if reasoning_extra:
-            payload.update(reasoning_extra)
-        if supports_tools and gemini_strict_tools:
-            payload["tools"] = gemini_strict_tools
-            payload["tool_choice"] = "auto"
-
-        try:
-            data = None
-            for _strict_attempt in range(2):
-                async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
-                    async with session.post(
-                            GEMINI_OPENAI_URL, headers=req_headers, json=payload
-                    ) as resp:
-                        if resp.status in (200, 201):
-                            data = await resp.json()
-                            break
-                        err_text = await resp.text()
-                        # strict schema 被网关拒绝：摘除后用原始工具列表
-                        # 立即重试一次，并记住该 label 不再尝试。
-                        if (_strict_attempt == 0
-                                and payload.get("tools") is not cleaned_tools
-                                and looks_like_strict_tool_rejection(err_text)):
-                            mark_strict_tools_rejected("gemini", err_text)
-                            payload["tools"] = cleaned_tools
-                            continue
-                        raise aiohttp.ClientResponseError(
-                            resp.request_info, resp.history,
-                            status=resp.status, message=err_text,
-                        )
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.exception(f"[Gemini/aiohttp] round {_round} error: {e}")
-            raise
-
-        choices = data.get("choices") or []
-        if not choices:
-            final_content = "（Gemini 未返回内容）"
-            new_history_entries.append({"role": "assistant", "content": final_content})
-            break
-
-        raw_msg = choices[0].get("message", {})
-        content_acc: str = raw_msg.get("content") or ""
-        final_usage = data.get("usage")
-        gemini_finish_reason = str(choices[0].get("finish_reason") or "") or None
-
-        tool_calls_list: list[dict] = []
-        for tc in (raw_msg.get("tool_calls") or []):
-            tc_entry: dict = {
-                "id": tc.get("id", ""),
-                "type": "function",
-                "function": {
-                    "name": tc.get("function", {}).get("name", ""),
-                    "arguments": tc.get("function", {}).get("arguments", ""),
-                },
-            }
-            # Gemini OpenAI-compat expects the signature to be returned in the
-            # original part structure. The compat format mirrors this via
-            # extra_content.google.thought_signature.
-            thought_signature = tc.get("thought_signature")
-            if thought_signature is None:
-                extra_content = tc.get("extra_content") or {}
-                thought_signature = (
-                    extra_content.get("google", {}).get("thought_signature")
-                )
-            if thought_signature is not None:
-                tc_entry["extra_content"] = {
-                    "google": {
-                        "thought_signature": thought_signature,
-                    }
-                }
-                # Keep the legacy field too for maximum compatibility.
-                tc_entry["thought_signature"] = thought_signature
-            tool_calls_list.append(tc_entry)
-        _normalize_tool_call_arguments(
-            tool_calls_list, "gemini", _round + 1,
-            stream_finish_reason=gemini_finish_reason)
-
-        # Gemini/OpenAI 兼容端也可能把函数调用 XML 放在普通 content 中；在写入
-        # 草稿和历史前先清理，避免最终消息暴露内部调用语法。
-        textual_tool_call = not tool_calls_list and _contains_textual_tool_call(content_acc)
-        if textual_tool_call:
-            content_acc = _strip_textual_tool_calls(content_acc)
-
-        reasoning_acc: str = raw_msg.get("reasoning_content") or ""
-        if reasoning_acc:
-            builder.begin_stream_reasoning()
-            builder.append_stream_delta(reasoning_acc)
-            builder.end_stream()
-            builder.finalize_reasoning_block()
-
-        if tool_calls_list and content_acc:
-            # ===== 规范第一部分第4点：文本+工具组合需要新开一个独立的工具折叠块，
-            # 因此要先把上一个尚未总结的工具块（可能来自连续的纯工具轮次）总结掉。=====
-            if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-                builder.finish_group(len(builder._tool_groups) - 1)
-            builder.start_new_tool_group()
-            builder.append_to_current_tool_group_text(content_acc)
-
-        if not tool_calls_list and content_acc:
-            builder.add_text(content_acc)
-
-        await builder.flush()
-
-        assistant_msg: dict = dict(raw_msg)
-        assistant_msg["role"] = "assistant"
-        assistant_msg["content"] = content_acc or None
-        if tool_calls_list:
-            assistant_msg["tool_calls"] = tool_calls_list
-        else:
-            assistant_msg.pop("tool_calls", None)
-        if reasoning_acc:
-            assistant_msg["reasoning_content"] = reasoning_acc
-        elif "reasoning_content" in assistant_msg:
-            assistant_msg.pop("reasoning_content", None)
-
-        loop_messages.append(assistant_msg)
-        new_history_entries.append(assistant_msg)
-        # 每轮请求结束后立即打印本轮缓存命中统计（与 OpenAI 兼容 loop 一致）。
-        # final_usage 每轮被覆盖，只在循环外打印会让中间轮次的命中不可观测。
-        _log_cache_usage("gemini", final_usage)
-        if not tool_calls_list:
-            final_content = content_acc
-            if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-                builder.finish_group(len(builder._tool_groups) - 1)
-            # 无工具调用即为终局响应；统一结束旧草稿，不额外开新草稿。
-            await builder.rollover_at_turn_boundary(start_next_draft=False)
-            break
-        status = await _run_tool_calls_and_append(
-            tool_calls_list, loop_messages, new_history_entries,
-            tool_call_count_ref, "gemini", builder, chat_id=builder.chat_id,
-            tools=tools,
-        )
-        # Gemini 工具批次后仍会继续请求模型，因此在函数内创建新草稿。
-        await builder.rollover_at_turn_boundary(start_next_draft=True)
-
-        if status == "over_limit":
-            synth_payload = {
-                k: v for k, v in payload.items() if k not in ("tools", "tool_choice")
-            }
-            # 采样/推理参数已随 payload 拷贝带入，无需重复覆盖。
-            synth_payload["messages"] = loop_messages + [
-                {"role": "user",
-                 "content": f"System: Maximum tool calls ({MAX_TOOL_CALLS}) reached for this turn. Tool usage is now DISABLED. Please immediately summarize what you have successfully done so far, explicitly state what failed or what is left to do, and ask the user if they want to continue the operation in the next turn."}
-            ]
-            synth_payload["max_tokens"] = max_tokens
-            try:
-                async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
-                    async with session.post(
-                            GEMINI_OPENAI_URL, headers=req_headers, json=synth_payload
-                    ) as resp:
-                        if resp.status == 200:
-                            synth_data = await resp.json()
-                            synth_choices = synth_data.get("choices") or []
-                            if synth_choices:
-                                raw_synth_content = (
-                                    synth_choices[0].get("message", {}).get("content") or ""
-                                )
-                                final_content = _strip_textual_tool_calls(raw_synth_content)
-                                if final_content:
-                                    builder.add_text(final_content)
-            except Exception as e:
-                logger.exception(f"[Gemini] synthesis error: {e}")
-                final_content = ""
-            if not final_content:
-                final_content = _tool_limit_summary()
-                builder.add_text(final_content)
-            new_history_entries.append(
-                {"role": "assistant", "content": final_content or ""}
-            )
-            if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-                builder.finish_group(len(builder._tool_groups) - 1)
-            # 工具上限总结后没有后续模型轮次：结束旧草稿，禁止创建空新草稿。
-            await builder.rollover_at_turn_boundary(start_next_draft=False)
-            break
-    if final_content is None:
-        final_content = _tool_limit_summary()
-
-        builder.add_text(final_content)
-        new_history_entries.append({"role": "assistant", "content": final_content})
-        if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-            builder.finish_group(len(builder._tool_groups) - 1)
-        # 轮次数耗尽后的兜底文本没有后续轮次：结束旧草稿，但不创建新草稿。
         await builder.rollover_at_turn_boundary(start_next_draft=False)
     return final_content, final_usage, new_history_entries
 
