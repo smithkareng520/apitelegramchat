@@ -281,362 +281,36 @@ def escape_html(text) -> str:
     return text
 
 
-def _rich_message_html_payload(html_content: str, escape_attr_amp: bool = True) -> dict:
+def _rich_message_html_payload(html_content: str) -> dict:
     """构造符合 InputRichMessage 规范的 HTML 富消息。
 
-    在交付给 Telegram 前，依次跑五道清理（前四道为兜底救援，第五道为常规传输转义）：
+    在交付给 Telegram 前，依次跑两道兜底清理：
 
-    0. ``_unwrap_markdown_link_urls``：把 src/href 属性里被 Markdown 链接
-       语法（``[url](url)`` / ``![alt](url)``）包裹的 URL 解包成裸 URL。
-       处理 LLM 把整段 Markdown 链接写进 ``<tg-document src>`` / ``<img src>``
-       等属性的情况——Telegram 会以 ``RICH_MESSAGE_DOCUMENT_URL_INVALID``
-       等错误拒绝整条消息。
+    1. ``_strip_invalid_media_urls``：剥离 ``src`` 不是合法 http(s) URL
+       的 ``<img>``/``<video>``/``<audio>`` 标签。处理 LLM 把附件
+       file_name（如 ``photo_AgACAgUA.jpg``）或 file_id 误当成 URL 的情况，
+       Telegram 会以 ``RICH_MESSAGE_PHOTO_URL_INVALID`` 拒绝整条消息。
 
-    1. ``_neutralize_stray_media_tags``：把"游离"媒体标签转义为字面文本。
-       处理 LLM 把标签名当普通文字写出的情况（典型：``使用 `<tg-document>`
-       标签``）——无 src / 未闭合 / 孤立闭合的 ``<tg-document>`` 等标签会被
-       Telegram 当真实媒体解析，以 ``RICH_MESSAGE_DOCUMENT_INVALID`` /
-       ``RICH_MESSAGE_DOCUMENT_NO_MEDIA_FOUND`` 拒绝整条消息；反引号 code
-       span 内的裸标签示例同样转义（模型本意是展示字面文本）。
-
-    2. ``_strip_invalid_media_urls``：剥离 ``src`` 不是合法 http(s) URL
-       的 ``<img>``/``<video>``/``<audio>``/``<tg-document>`` 标签。处理 LLM
-       把附件 file_name（如 ``photo_AgACAgUA.jpg``）或 file_id 误当成 URL
-       的情况，Telegram 会以 ``RICH_MESSAGE_PHOTO_URL_INVALID`` 拒绝整条消息。
-
-    3. ``_demote_watch_page_videos``：把 ``<video src="WATCH_PAGE_URL">``
+    2. ``_demote_watch_page_videos``：把 ``<video src="WATCH_PAGE_URL">``
        块降级为 ``<a href>`` 链接。处理 LLM 把 YouTube / Bilibili 等
        观看页 URL 误当直链视频嵌入 ``<video src>`` 的情况——这种 URL
        看着合法（``http(s)://`` 开头），但 Telegram 去抓会拿到 HTML
        页面，以 ``RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND`` 拒绝整条消息。
        降级后保留模型生成的 figcaption 文本，让用户仍可点击跳转观看页。
-
-    4. ``_escape_media_src_ampersands``：把媒体标签 ``src`` 属性值中的裸
-       ``&`` 按 HTML 规范幂等转义为 ``&amp;``。处理 R2 预签名 URL 等
-       带查询参数的媒体地址——裸 ``&`` 直发时，Rich Message 服务端
-       解析出的 src 会在 ``&`` 处损坏或被判非法，服务端媒体抓取必然
-       失败，以 ``RICH_MESSAGE_DOCUMENT_URL_INVALID`` /
-       ``RICH_MESSAGE_*_NO_MEDIA_FOUND`` 拒绝整条消息（2026-09-05 线上
-       chat=7162243624 案例：文档始终无法内联送达，两次降级为链接）。
-       ``escape_attr_amp=False`` 跳过本步：供发送被拒后改用"裸 & 形态"
-       备用重试，两种形态都不被接受时才降级为链接。
     """
-    cleaned = _unwrap_markdown_link_urls(html_content)
-    cleaned = _neutralize_stray_media_tags(cleaned)
-    cleaned = _strip_invalid_media_urls(cleaned)
+    cleaned = _strip_invalid_media_urls(html_content)
     demoted = _demote_watch_page_videos(cleaned)
     if demoted != html_content:
         logger.warning(
-            "sendRichMessage 兜底清理：检测到 Markdown 包裹 URL / 伪 URL 或观看页 URL 媒体块，"
-            "已解包/剥离/降级以保证消息送达。原始长度=%s，清理后长度=%s",
+            "sendRichMessage 兜底清理：检测到伪 URL 或观看页 URL 媒体块，"
+            "已剥离/降级以保证消息送达。原始长度=%s，清理后长度=%s",
             len(html_content),
             len(demoted),
         )
-    # 注意：& 转义不计入上方"兜底清理"警告——预签名 URL 的属性转义是每次
-    # 发送的常规路径而非异常救援，避免每帧草稿都刷 WARNING。
-    html_out = _escape_media_src_ampersands(demoted) if escape_attr_amp else demoted
     return {
-        "html": html_out,
+        "html": demoted,
         "skip_entity_detection": True,
     }
-
-
-# ---------- 媒体 src 属性中裸 & 的 HTML 转义（第 5 道清理） ----------
-# R2 预签名 URL 带多个查询参数（X-Amz-Algorithm=...&X-Amz-Credential=...&...），
-# 写进 <tg-document>/<img>/<video>/<audio>/<source> 的 src 属性后必然含裸 &。
-# 按 HTML 序列化规范，属性值中的 & 必须写作 &amp;：Rich Message 服务端解析
-# 属性值时会把 &amp; 解码回 & 再交给媒体抓取器。直接裸发 & 时，服务端解析出
-# 的 src 会在 & 处损坏或被判非法，抓取必然失败（R2 侧拿不到鉴权参数 → 403），
-# 消息被 RICH_MESSAGE_DOCUMENT_URL_INVALID / RICH_MESSAGE_*_NO_MEDIA_FOUND
-# 拒绝并触发整条降级——这正是 s3_utils.generate_presigned_url 注释中约定由
-# "调用方"完成的转义（此前一直缺失，2026-09-05 线上定位补齐）。
-# 只处理会触发服务端抓取的媒体 src；<a href> 由客户端点击打开，客户端对裸 &
-# 的解析是宽容的，保持原样以兼容既有行为（历史日志中裸 & href 均正常送达）。
-_MEDIA_AMP_TAG_SPAN_RE = re.compile(
-    r'<(?:tg-document|img|video|audio|source)\b[^<>]*/?>',
-    re.IGNORECASE,
-)
-_MEDIA_AMP_SRC_VALUE_RE = re.compile(
-    r'(?<![\w\-])(src\s*=\s*)("([^"\n]*)"|\'([^\'\n]*)\')',
-    re.IGNORECASE,
-)
-
-
-def _escape_media_src_ampersands(html_content: str) -> str:
-    """把媒体标签 src 属性值中的裸 & 幂等转义为 &amp;。
-
-    - 幂等：_SMART_AMP_PATTERN 只转义不构成合法实体的 &，已转义的
-      &amp;/&#39; 不会被二次处理。
-    - 归一化：模型偶尔会照抄 HTML 教程把 & 写成 &amp;，先还原为裸 &
-      再统一转义，避免出现 &amp;amp; 双重转义。
-    - 范围：仅 <tg-document>/<img>/<video>/<audio>/<source> 的 src；
-      <a href> 与纯文本不受影响。
-    """
-    if not html_content or "&" not in html_content:
-        return html_content
-
-    def _fix_tag(tag_match: "re.Match") -> str:
-        tag = tag_match.group(0)
-        if "src" not in tag.lower():
-            return tag
-
-        def _fix_attr(attr_match: "re.Match") -> str:
-            prefix = attr_match.group(1)
-            double_inner = attr_match.group(3)
-            single_inner = attr_match.group(4)
-            inner = double_inner if double_inner is not None else single_inner
-            if inner is None:
-                return attr_match.group(0)
-            # 先归一化模型可能照抄的 &amp;，再按规范转义（幂等）
-            canonical = re.sub(r'&amp;', '&', inner, flags=re.IGNORECASE)
-            escaped = _SMART_AMP_PATTERN.sub('&amp;', canonical)
-            if escaped == inner:
-                return attr_match.group(0)
-            quote = '"' if double_inner is not None else "'"
-            return f"{prefix}{quote}{escaped}{quote}"
-
-        return _MEDIA_AMP_SRC_VALUE_RE.sub(_fix_attr, tag)
-
-    return _MEDIA_AMP_TAG_SPAN_RE.sub(_fix_tag, html_content)
-
-
-# LLM 偶尔会把 Markdown 链接语法整体塞进 src/href 属性，例如：
-#   <tg-document src="[https://a.com/f.pdf?x=1&y=2](https://a.com/f.pdf?x=1&y=2)"/>
-# Telegram 收到后判定 src 以 "[" 开头而非 http(s)，以
-# RICH_MESSAGE_DOCUMENT_URL_INVALID / RICH_MESSAGE_PHOTO_URL_INVALID 等拒绝
-# 整条消息。这里匹配"整个属性值恰好是一个 Markdown 链接"的形态，
-# 捕获其中的真实 URL（支持 [text](url)、![alt](url)、[text](<url> "title")）。
-# 注意开头的 "!?"：感叹号必须可选，否则普通链接 [url](url) 无法匹配。
-_MD_LINK_VALUE_RE = re.compile(
-    r'^!?\s*\[[^\]\n]*\]\(\s*(?:<([^<>\n]*)>|([^()\s\n]+))(?:\s+"[^"\n]*")?\s*\)\s*$',
-)
-
-# 匹配 src/href 属性（双引号或单引号），用于整属性重写。
-_MD_LINK_ATTR_RE = re.compile(
-    r'(\b(?:src|href)\s*=\s*)("([^"\n]*)"|\'([^\'\n]*)\')',
-    re.IGNORECASE,
-)
-
-
-def _unwrap_markdown_link_url(value: str) -> str:
-    """若属性值是 Markdown 链接语法包裹的 URL，返回内部真实 URL；否则原样返回。
-
-    处理 LLM 把 ``[https://a.com/f.pdf](https://a.com/f.pdf?sig=x)``、
-    ``![alt](https://a.com/f.png)`` 之类的 Markdown 片段误写入
-    ``src=``/``href=`` 属性的情况。仅在值整体符合 Markdown 链接形态时解包，
-    避免误伤本来就合法的 URL。
-    """
-    if not value:
-        return value
-    v = value.strip()
-    # 注意 "![alt](url)" 图片形态以 "!" 开头，需与普通链接一并放行
-    if not v.startswith(("[", "![")):
-        return value
-    m = _MD_LINK_VALUE_RE.match(v)
-    if not m:
-        return value
-    url = (m.group(1) if m.group(1) is not None else m.group(2) or "").strip()
-    return url or value
-
-
-def _unwrap_markdown_link_urls(html_content: str) -> str:
-    """重写 HTML 中被 Markdown 链接语法包裹的 src/href 属性值。
-
-    必须在 ``_strip_invalid_media_urls`` **之前**运行：后者只做"校验 + 删除"，
-    若属性值仍是 ``[url](url)`` 形态，校验必然失败、标签被删，用户丢失文档/
-    图片；先解包则大多数标签可直接恢复为合法媒体块原样送达。
-    """
-    if not html_content or "[" not in html_content:
-        return html_content
-
-    def _sub(m: re.Match) -> str:
-        prefix = m.group(1)
-        double_inner = m.group(3)
-        single_inner = m.group(4)
-        inner = double_inner if double_inner is not None else single_inner
-        if inner is None:
-            return m.group(0)
-        unwrapped = _unwrap_markdown_link_url(inner)
-        if unwrapped == inner:
-            return m.group(0)
-        quote = '"' if double_inner is not None else "'"
-        return f"{prefix}{quote}{unwrapped}{quote}"
-
-    return _MD_LINK_ATTR_RE.sub(_sub, html_content)
-
-
-# 匹配"标签模样"的片段：<开头、可选 /、字母开标签名、不含 < >、以 > 结尾。
-# 用于反引号 code span 与游离媒体标签的中和——只转义真正的标签形态，
-# 不碰 "a < b"、"<3" 之类的普通文本，也不碰已是实体形态的 &lt;xxx&gt;
-#（实体里没有裸 < 字符，天然不会命中本正则）。
-_TAGLIKE_RE = re.compile(r'<\s*/?\s*[a-zA-Z][^<>]*>')
-
-# 反引号围栏代码块（```...```，可跨行）
-_CODE_FENCE_RE = re.compile(r'```.*?(?:```|$)', re.DOTALL)
-# 行内反引号 code span（`...`，不跨行）
-_INLINE_CODE_RE = re.compile(r'`([^`\n]+)`')
-
-# 需要做"开/闭配对平衡检查"的容器型媒体标签。
-# <a> 不参与：锚点缺失闭合不会让 Telegram 拒绝整条消息，且剥离锚点
-# 会丢失链接文本；<img> 是 void 标签，单独按"无 src 即转义"处理。
-_BALANCED_MEDIA_TAGS = ("tg-document", "video", "audio")
-
-# 单个媒体标签 occurrence：<(/?)(tagname)\b...(/?)>
-# 分支不区分自闭合——用 group(0) 结尾是否为 "/>" 判断。
-_MEDIA_TAG_OCC_RE = re.compile(
-    r'<(/?)(' + '|'.join(_BALANCED_MEDIA_TAGS) + r'|img)\b[^>]*?(/?)>',
-    re.IGNORECASE,
-)
-
-# src 属性探测。负向环视排除 data-src / form-src 等 "xxx-src" 复合属性名，
-# 避免 \bsrc 在连字符后误判为存在 src。
-_TAG_HAS_SRC_RE = re.compile(r'(?<![\w\-])src\s*=', re.IGNORECASE)
-
-
-def _escape_tag_literal(tag_text: str) -> str:
-    """把一段"应当按字面显示"的标签文本转义为 HTML 实体。"""
-    return tag_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-
-
-def _escape_taglike_sequences(text: str) -> str:
-    """把 text 中所有"标签模样"的裸片段转义为字面文本。"""
-    if '<' not in text:
-        return text
-    return _TAGLIKE_RE.sub(lambda m: _escape_tag_literal(m.group(0)), text)
-
-
-def _escape_raw_tags_in_code_spans(html_content: str) -> str:
-    """转义反引号 code span（``` 围栏与行内 `` ` ``）内的裸 HTML 标签。
-
-    LLM 被禁止使用 Markdown 反引号但仍会写，且经常把标签名包在反引号里
-    当"行内代码"展示，例如：
-
-        明白了，使用 `<tg-document>` 标签发送：
-        `<figure><tg-document src="https://example.com/x.pdf"></tg-document></figure>`
-
-    反引号对 Telegram 没有特殊含义，其中的裸 <tg-document> 会被当作
-    **真实标签**解析：无 src 的字面量直接触发 RICH_MESSAGE_DOCUMENT_INVALID；
-    带 src 的示例 URL（如 example.com）会被服务端去抓取，抓取失败又触发
-    NO_MEDIA_FOUND / URL_INVALID 降级链。模型的本意显然是"展示字面文本"，
-    因此这里把 code span 内的标签统一转义为 &lt;...&gt;（Telegram 对实体
-    只做字面渲染，已由线上 plain-text fallback 成功送达的案例反向证实）。
-
-    处理顺序：先围栏（可跨行、可未闭合——流式中的草稿常见"只开了围栏"
-    的中间态），后行内 span（不跨行）。未配对的单个反引号不处理。
-    """
-    if '`' not in html_content or '<' not in html_content:
-        return html_content
-
-    out: list[str] = []
-    cursor = 0
-    for fence in _CODE_FENCE_RE.finditer(html_content):
-        gap = html_content[cursor:fence.start()]
-        out.append(_escape_taglike_inline_spans(gap))
-        out.append(_escape_taglike_sequences(fence.group(0)))
-        cursor = fence.end()
-    out.append(_escape_taglike_inline_spans(html_content[cursor:]))
-    return ''.join(out)
-
-
-def _escape_taglike_inline_spans(text: str) -> str:
-    """对非围栏文本做行内 `` `code` `` span 内的标签转义。"""
-    if '`' not in text or '<' not in text:
-        return text
-
-    def _sub(m: re.Match) -> str:
-        return '`' + _escape_taglike_sequences(m.group(1)) + '`'
-
-    return _INLINE_CODE_RE.sub(_sub, text)
-
-
-def _neutralize_stray_media_tags(html_content: str) -> str:
-    """把"游离"的媒体标签转义为字面文本，防止 Telegram 解析成真实媒体。
-
-    处理三类会让 <tg-document>/<video>/<audio>/<img> 变成毒药的场景：
-
-      1. **无 src 的标签**（含裸 `<tg-document>`、`<img>` 等）——模型把
-         标签名当普通文字写出（典型：``使用 `<tg-document>` 标签``）。
-         Telegram 解析到无 src 的媒体标签会以
-         RICH_MESSAGE_DOCUMENT_INVALID / NO_MEDIA_FOUND 拒绝整条消息；
-      2. **未闭合的开标签**——后续同标签的合法开标签会被服务端正则类
-         解析吞并，产生跨块错配（本文件 _strip_container 曾修复过同型
-         bug，这里是源头预防）；
-      3. **孤立的闭标签**（如多余或错位的 `</tg-document>`）。
-
-    转义（而非删除）保留模型想表达的"字面文本"，用户仍能看到
-    `<tg-document>` 字样；且 Telegram 对实体只做字面渲染，不会再次解析。
-
-    配对规则：img 按 void 处理（逐个独立判断）；tg-document/video/audio
-    做"开→闭"顺序配对——开标签有 src 且下一个同标签 occurrence 是其闭
-    标签才视为合法媒体对保留，其余一律转义。规范的
-    `<figure><tg-document src="URL"></tg-document>...</figure>` 不受影响。
-    """
-    if not html_content or '<' not in html_content:
-        return html_content
-
-    text = _escape_raw_tags_in_code_spans(html_content)
-
-    occurrences = list(_MEDIA_TAG_OCC_RE.finditer(text))
-    if not occurrences:
-        return text
-
-    decisions: list[bool] = [True] * len(occurrences)  # True=保留, False=转义
-    # 每个容器标签记录"等待闭合的开标签"下标（同标签不允许嵌套，存一个即可）
-    pending_open: dict[str, int | None] = {t: None for t in _BALANCED_MEDIA_TAGS}
-
-    for i, m in enumerate(occurrences):
-        is_closing = bool(m.group(1))
-        tag = m.group(2).lower()
-        self_closing = m.group(0)[:-1].rstrip().endswith('/')
-        has_src = bool(_TAG_HAS_SRC_RE.search(m.group(0)))
-
-        if tag == 'img':
-            # void 标签：有 src 属性即交给 _strip_invalid_media_urls 校验
-            # URL 值的合法性；完全没有 src 属性的字面量转义为文本。
-            decisions[i] = has_src
-            continue
-
-        if is_closing:
-            if pending_open[tag] is not None:
-                decisions[i] = True   # 与前面的开标签配对成功
-                pending_open[tag] = None
-            else:
-                decisions[i] = False  # 孤立闭标签 → 字面文本
-            continue
-
-        if self_closing:
-            decisions[i] = has_src
-            continue
-
-        # 非自闭合开标签：若前一个同标签开标签还没等到闭合，说明它是
-        # 未闭合标签，必须转义；随后再看自身是否有 src。
-        prev = pending_open[tag]
-        if prev is not None:
-            decisions[prev] = False
-            pending_open[tag] = None
-        if not has_src:
-            decisions[i] = False      # 无 src 的开标签永远不可能合法
-        else:
-            decisions[i] = True
-            pending_open[tag] = i     # 等待闭合；若最终没等到，收尾时转义
-
-    for tag, i in pending_open.items():
-        if i is not None:
-            decisions[i] = False      # 未闭合的开标签 → 字面文本
-
-    if all(decisions):
-        return text
-
-    out: list[str] = []
-    cursor = 0
-    for m, keep in zip(occurrences, decisions):
-        if keep:
-            continue
-        out.append(text[cursor:m.start()])
-        out.append(_escape_tag_literal(m.group(0)))
-        cursor = m.end()
-    out.append(text[cursor:])
-    return ''.join(out)
 
 
 # 匹配完整的 <img ...> 标签（含可选自闭合斜杠），直到第一个 >。
@@ -694,23 +368,20 @@ def _looks_like_watch_page(url: str) -> bool:
 
 
 def _strip_invalid_media_urls(html_content: str) -> str:
-    """剥离 src 不是合法 http(s) URL 的 <img>/<video>/<audio>/<tg-document> 标签。
+    """剥离 src 不是合法 http(s) URL 的 <img>/<video>/<audio> 标签。
 
-    Telegram Rich Message 要求 ``<img src>``/``<tg-document src>`` 必须是公开
-    可访问的 http(s) URL；LLM 偶尔会把附件 file_name（如
-    ``photo_AgACAgUA.jpg``）或 file_id 当作 URL 写入，会被服务端以
-    ``RICH_MESSAGE_PHOTO_URL_INVALID`` /
-    ``RICH_MESSAGE_DOCUMENT_URL_INVALID`` 拒绝。
+    Telegram Rich Message 要求 ``<img src>`` 必须是公开可访问的 http(s)
+    URL；LLM 偶尔会把附件 file_name（如 ``photo_AgACAgUA.jpg``）或 file_id
+    当作 URL 写入，会被服务端以 ``RICH_MESSAGE_PHOTO_URL_INVALID`` 拒绝。
 
-    本函数逐个扫描 ``<img>``/``<video>``/``<audio>``/``<tg-document>``
-    标签的 ``src`` 属性，若不以 ``http://`` 或 ``https://`` 开头，则：
+    本函数逐个扫描 ``<img>``/``<video>``/``<audio>`` 标签的 ``src`` 属性，
+    若不以 ``http://`` 或 ``https://`` 开头，则：
 
       * 对 ``<img .../>`` 自闭合形式：直接删除整个标签；
-      * 对 ``<video>...</video>`` / ``<audio>...</audio>`` /
-        ``<tg-document>...</tg-document>`` 容器形式（含自闭合）：
-        删除整个标签（容器形式连同内部内容），避免出现孤立结束标签；
+      * 对 ``<video>...</video>`` / ``<audio>...</audio>`` 容器形式：
+        删除整个开闭标签对（包含内部内容），避免出现孤立结束标签；
       * 若外层是 ``<figure>`` 且剥离后 figure 内既无 ``<img>``/``<video>``
-        也无 ``<figcaption>``/``<tg-document>``，则一并删除该空 figure。
+        也无 ``<figcaption>``，则一并删除该空 figure。
 
     另外，对 ``<video src="WATCH_PAGE_URL">`` 还会做"观看页降级"：
     若 URL 命中 YouTube / Bilibili / Vimeo / 抖音 / Twitter / Facebook
@@ -732,15 +403,11 @@ def _strip_invalid_media_urls(html_content: str) -> str:
         u = (url or "").strip().lower()
         return bool(u) and u.startswith(("http://", "https://"))
 
-    # 先处理容器型 <video>...</video> / <audio>...</audio> /
-    # <tg-document>...</tg-document>：起始标签 src 非法时，连同内部内容一起删掉。
+    # 先处理容器型 <video>...</video> / <audio>...</audio>：
+    # 起始标签 src 非法时，连同内部内容一起删掉。
     def _strip_container(text: str, tag: str) -> str:
-        # 注意分支顺序：自闭合 <tag .../> 必须放在容器形式之前。
-        # 否则自闭合标签会被 "<tag ...>.*?</tag>" 分支跨块吞掉后面同标签的
-        # 合法容器块（如 <tg-document src="bad"/> ... <tg-document src="good">
-        # </tg-document> 会被误当成一个整块而全部删除）。
         pattern = re.compile(
-            rf'<{tag}\b[^>]*/>|<{tag}\b[^>]*>.*?</{tag}\s*>',
+            rf'<{tag}\b[^>]*>.*?</{tag}\s*>|<{tag}\b[^>]*/>',
             re.IGNORECASE | re.DOTALL,
         )
 
@@ -754,7 +421,7 @@ def _strip_invalid_media_urls(html_content: str) -> str:
         return pattern.sub(_check, text)
 
     result = html_content
-    for tag in ("video", "audio", "tg-document"):
+    for tag in ("video", "audio"):
         result = _strip_container(result, tag)
 
     # 再处理 <img .../> 自闭合形式
@@ -778,9 +445,9 @@ def _strip_invalid_media_urls(html_content: str) -> str:
 
     def _clean_empty_figure(m: re.Match) -> str:
         inner = m.group(1) or ""
-        # 仍然有 img/video/audio/tg-document/figcaption 就保留
+        # 仍然有 img/video/audio/figcaption 就保留
         has_media = re.search(
-            r'<(img|video|audio|figcaption|tg-document)\b',
+            r'<(img|video|audio|figcaption)\b',
             inner,
             re.IGNORECASE,
         )
@@ -920,277 +587,15 @@ def _demote_watch_page_videos(html_content: str) -> str:
     return result
 
 
-# ---------- 预签名 URL 诊断提示（v4 观测性辅助） ----------
-# 背景：R2 预签名 URL 公网可访问（2026-09-05 实测 GET 200），但 Telegram
-# 富文本抓取器无法将其解析为可用媒体。v4 起新产生的媒体 URL 已是稳定形态
-# （/media 代理或 R2_PUBLIC_URL）；历史对话里回显的旧预签名 URL 仍可能触发
-# 降级。这里在降级日志中追加可操作提示，排障时一眼区分“URL 形态问题”
-# 与其它媒体错误。
-_PRESIGN_HINT_MARKER_HOST = ".r2.cloudflarestorage.com"
-
-
-def _presigned_media_diagnostic_hint(html_content: str) -> str:
-    """当被降级媒体的 src 命中 R2 S3 API/预签名形态时返回一行诊断提示。"""
-    try:
-        match = re.search(
-            r'<(?:tg-document|img|video|audio)\b[^<>]*?\bsrc\s*=\s*"([^"]+)"',
-            html_content or "",
-            re.IGNORECASE,
-        )
-        if not match:
-            return ""
-        src = _unwrap_markdown_link_url(match.group(1) or "")
-        low = src.lower()
-        if "x-amz-signature=" in low or _PRESIGN_HINT_MARKER_HOST in low:
-            return (
-                "（诊断：src 为 R2 S3 API/预签名 URL——该形态实测公网可访问，"
-                "但 Telegram 富文本抓取器无法解析为可用媒体；v4 起新媒体 URL "
-                "应为本服务 /media 稳定代理或 R2_PUBLIC_URL 公开域，请检查 "
-                "WEBHOOK_URL/MEDIA_PROXY_BASE_URL 配置；历史消息里的旧预签名 "
-                "URL 无法挽救，重传文件即可换得稳定 URL）"
-            )
-    except Exception:
-        return ""
-    return ""
-
-
-# ---------- v5：tg-document 原生 sendDocument 兜底（先于链接降级） ----------
-# 背景（2026-09-05 02:31 日志 chat=7162243624 trace cc963c9b）：v4 稳定代理
-# URL 交付后，Telegram 富文本抓取器对 /media/<hmac>/telegram/<file_id>
-# 成功下载了全部字节（代理侧两次 200 + 89257B，时间与两次发送尝试一一
-# 对应），却仍以 RICH_MESSAGE_DOCUMENT_NO_MEDIA_FOUND 拒绝——抓取成功
-# 不等于建档成功：URL/响应均无文件名与真实类型（octet-stream + 裸
-# file_id），抓取器无法把字节归类为文档媒体。v5 双管齐下：
-#   a) 交付 URL 末段携带原始文件名 + 代理按扩展名给出正确 Content-Type
-#      （根治，见 media_proxy.build_media_proxy_url / app.media_proxy_serve）；
-#   b) 本模块兜底：文档本来来自 Telegram（用户上传），bot 手里就有
-#      file_id —— 富文本被拒时先用 sendDocument(file_id) 原生把文件送达，
-#      再从富文本里移除该标签（保留 figcaption 文本），确保用户拿到真实
-#      文件而不是一个 <a> 链接。外部 URL 的 tg-document 没有 file_id，
-#      不适用本兜底，仍走既有降级链。
-
-# 匹配"指向本系统 telegram/<file_id> 资源"的 URL（覆盖三种历史形态）：
-#   * v4/v5 自托管代理：https://host/media/<hmac>/telegram/<file_id>[/<filename>]
-#   * R2 公开域：      https://pub-xxx.r2.dev/telegram/<file_id>
-#   * 历史预签名回显：  https://<account>.r2.cloudflarestorage.com/<bucket>/telegram/<file_id>?X-Amz-...
-# file_id 是 base64url 安全字符（字母/数字/_/-），长度下限过滤偶撞。
-_OWN_TELEGRAM_FILE_URL_RE = re.compile(
-    r'^https?://[^/\s]+/'
-    r'(?:[^?\'"\s]*/)?'                 # 任意路径前缀（bucket / media/<hmac> 等）
-    r'telegram/'
-    r'(?P<fid>[A-Za-z0-9_\-]{16,})'
-    r'(?:/[^?\'"\s]*)?'                 # v5：可选的展示文件名段
-    r'(?:[?#].*)?$',
-    re.IGNORECASE,
-)
-
-# 原生兜底去重窗口：同 chat 同 file_id 在窗口内不重复原样发送（草稿/
-# 正式双路径、同轮重发、重试等场景防重复送文件）。
-_NATIVE_RESCUE_TTL_SECONDS = 300
-try:
-    from cachetools import TTLCache as _NativeRescueTTLCache
-    _native_rescued_recent = _NativeRescueTTLCache(
-        maxsize=128, ttl=_NATIVE_RESCUE_TTL_SECONDS
-    )
-except Exception:  # cachetools 缺失时退化为普通 dict（带时间戳自清理）
-    _native_rescued_recent: dict = {}
-
-# 自闭合分支在前：防止 "<tg-document .../>" 被容器分支跨块吞并
-# （与 _demote_all_media_to_links 的分支顺序约定一致）。
-_DOCUMENT_TAG_BLOCK_RE = re.compile(
-    r'<tg-document\b[^>]*/>|<tg-document\b[^>]*>.*?</tg-document\s*>',
-    re.IGNORECASE | re.DOTALL,
-)
-_DOCUMENT_FIGURE_RE = re.compile(
-    r'<figure\b[^>]*>(.*?)</figure\s*>',
-    re.IGNORECASE | re.DOTALL,
-)
-_DOCUMENT_FIGCAPTION_RE = re.compile(
-    r'<figcaption\b[^>]*>(.*?)</figcaption\s*>',
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _extract_media_src_attr(tag_text: str) -> str:
-    """提取媒体标签的 src 属性值（双/单引号/无引号），解包 Markdown 包裹。"""
-    m = re.search(
-        r'\bsrc\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))',
-        tag_text, re.IGNORECASE,
-    )
-    if not m:
-        return ""
-    raw = (m.group(2) or m.group(3) or m.group(4) or "").strip()
-    return _unwrap_markdown_link_url(raw)
-
-
-def _match_own_telegram_file_url(src: str) -> str:
-    """src 指向本系统 telegram/<file_id> 资源时返回 file_id，否则空串。
-
-    属性值可能残留 &amp; 形态（发送前的转义管线产物），先还原再匹配。
-    """
-    if not src:
-        return ""
-    s = _unwrap_markdown_link_url(src.strip()).replace("&amp;", "&")
-    m = _OWN_TELEGRAM_FILE_URL_RE.match(s)
-    return m.group("fid") if m else ""
-
-
-async def _native_send_document(chat_id: int, file_id: str) -> bool:
-    """用 Bot API sendDocument(file_id) 原生发送文档。
-
-    file_id 是 bot 已见过的文件引用（用户上传给本 bot 的原件），按
-    Telegram Bot API 语义可直接重发，无需上传字节。
-    """
-    try:
-        session = await get_http_session()
-        async with session.post(
-            f"{BASE_URL}/sendDocument",
-            json={"chat_id": chat_id, "document": file_id},
-            timeout=aiohttp.ClientTimeout(total=20, connect=5),
-        ) as resp:
-            if resp.status == 200:
-                return True
-            body = await resp.text()
-            logger.warning(
-                "sendDocument 原生兜底失败: %s %s", resp.status, body[:160]
-            )
-            return False
-    except Exception as e:
-        logger.warning("sendDocument 原生兜底异常: %s", e)
-        return False
-
-
-async def _maybe_native_send_document(chat_id: int, file_id: str) -> bool:
-    """带去重的原生发送：去重窗口内同 chat+file_id 直接视为已送达。
-
-    返回 True 表示文件已（或刚刚被）原生送达，调用方可安全移除对应标签。
-    """
-    now = time.monotonic()
-    key = (chat_id, file_id)
-    try:
-        last = _native_rescued_recent.get(key)
-    except Exception:
-        last = None
-    if last is not None and (now - last) < _NATIVE_RESCUE_TTL_SECONDS:
-        return True
-    if not isinstance(_native_rescued_recent, dict):
-        # TTLCache 路径：过期条目由缓存自动淘汰
-        pass
-    elif len(_native_rescued_recent) > 256:
-        # dict 兜底路径：按时间戳清理过期/最旧条目，防无界增长
-        cutoff = now - _NATIVE_RESCUE_TTL_SECONDS
-        stale = [k for k, ts in _native_rescued_recent.items() if ts < cutoff]
-        for k in stale:
-            _native_rescued_recent.pop(k, None)
-        if len(_native_rescued_recent) > 256:
-            for k in sorted(
-                _native_rescued_recent, key=lambda kk: _native_rescued_recent[kk]
-            )[:128]:
-                _native_rescued_recent.pop(k, None)
-    if not await _native_send_document(chat_id, file_id):
-        return False
-    try:
-        _native_rescued_recent[key] = now
-    except Exception:
-        pass
-    return True
-
-
-def _find_document_blocks(html_content: str) -> list:
-    """收集所有 <tg-document> 块（figure 包裹的以整个 figure 为一块）。
-
-    返回按出现位置排序的 [{"start", "end", "src", "cap_html"}]；figure 块
-    的 span 覆盖整个 <figure>…</figure>，内层标签不会在裸块扫描中被二次
-    处理（_consumed 判定）。
-    """
-    blocks: list = []
-    consumed: list = []
-    for m in _DOCUMENT_FIGURE_RE.finditer(html_content):
-        inner = m.group(1) or ""
-        mm = _DOCUMENT_TAG_BLOCK_RE.search(inner)
-        if not mm:
-            continue
-        cap = ""
-        cm = _DOCUMENT_FIGCAPTION_RE.search(inner)
-        if cm:
-            cap = (cm.group(1) or "").strip()
-        blocks.append({
-            "start": m.start(), "end": m.end(),
-            "src": _extract_media_src_attr(mm.group(0)),
-            "cap_html": cap,
-        })
-        consumed.append(m.span())
-
-    def _consumed(s: int, e: int) -> bool:
-        return any(s >= cs and e <= ce for cs, ce in consumed)
-
-    for m in _DOCUMENT_TAG_BLOCK_RE.finditer(html_content):
-        if _consumed(m.start(), m.end()):
-            continue
-        blocks.append({
-            "start": m.start(), "end": m.end(),
-            "src": _extract_media_src_attr(m.group(0)),
-            "cap_html": "",
-        })
-    blocks.sort(key=lambda b: b["start"])
-    return blocks
-
-
-async def _rescue_documents_via_native_send(
-    chat_id: int, html_content: str
-) -> Optional[str]:
-    """把指向本系统 telegram/<file_id> 的 <tg-document> 改为原生送达并移除标签。
-
-    返回改写后的 HTML（至少成功救援一个文档且内容有变化）；返回 None
-    表示无候选 / 原生发送失败 / 均为外部 URL——调用方继续走既有降级链。
-    """
-    text = html_content or ""
-    if "<tg-document" not in text.lower():
-        return None
-    candidates = []
-    for b in _find_document_blocks(text):
-        fid = _match_own_telegram_file_url(b["src"])
-        if fid:
-            candidates.append((b, fid))
-    if not candidates:
-        return None
-
-    out: list = []
-    cursor = 0
-    rescued_any = False
-    for b, fid in candidates:
-        s, e = b["start"], b["end"]
-        if not await _maybe_native_send_document(chat_id, fid):
-            continue  # 原生发送失败：保留原块，交给后续降级链
-        rescued_any = True
-        out.append(text[cursor:s])
-        cap = (b["cap_html"] or "").strip()
-        if cap:
-            # 保留模型给的文档名/说明文字作为普通段落；文件本体已由
-            # sendDocument 送达，不再需要链接或媒体标签
-            out.append(f"<p>{cap}</p>")
-        logger.info(
-            "[v5] tg-document 原生兜底：sendDocument(file_id) 已送达，"
-            "标签从富文本移除: chat=%s file_id=%s",
-            chat_id, fid[:16],
-        )
-        cursor = e
-    if not rescued_any:
-        return None
-    out.append(text[cursor:])
-    return "".join(out)
-
-
 def _demote_all_media_to_links(
     html_content: str,
     media_kinds: Optional[set[str]] = None,
 ) -> str:
-    """按指定媒体类型把 ``<video>/<audio>/<img>/<tg-document>`` 降级为 ``<a href>``。
+    """按指定媒体类型把 ``<video>/<audio>/<img>`` 降级为 ``<a href>``。
 
-    ``media_kinds`` 为 ``None`` 时保持兼容（降级全部类型）；传入 ``{"img"}``、
-    ``{"video"}``、``{"audio"}`` 或 ``{"tg-document"}``（也接受语义名
-    ``"document"``，内部统一映射到标签名 ``tg-document``）时只处理对应类型，
-    避免某一种媒体失败时牵连同一条消息中的其他媒体。
+    ``media_kinds`` 为 ``None`` 时保持兼容；传入 ``{"image"}``、
+    ``{"video"}`` 或 ``{"audio"}`` 时只处理对应类型，避免某一种媒体
+    失败时牵连同一条消息中的其他媒体。
 
     用于 ``sendRichMessage`` 因媒体 URL 在 Telegram 服务端抓取失败而拒绝
     整条消息时的**反应式兜底**——例如：
@@ -1218,9 +623,6 @@ def _demote_all_media_to_links(
         → ``<a href="URL"><b>🖼 CAP</b></a>``；
       * 裸 ``<img src="URL"/>`` → ``<a href="URL"><b>🖼 {domain}</b></a>``；
       * ``<audio>`` 同理用 🎵 前缀；
-      * ``<figure><tg-document src="URL"></tg-document><figcaption>CAP</figcaption></figure>``
-        → ``<a href="URL"><b>📄 CAP</b></a>``；
-      * 裸 ``<tg-document src="URL"/>`` → ``<a href="URL"><b>📄 查看文档</b></a>``；
       * ``src`` 非法（非 http(s):// 开头）的媒体块直接整块删除——这种
         URL 在 ``_strip_invalid_media_urls`` 阶段也已被处理，这里是冗余
         兜底。
@@ -1228,24 +630,14 @@ def _demote_all_media_to_links(
     if not html_content:
         return ""
     if media_kinds is not None:
-        normalized: set[str] = set()
-        for kind in media_kinds:
-            k = str(kind).strip().lower()
-            # 允许调用方用语义名 "document"，统一映射到实际标签名
-            if k == "document":
-                k = "tg-document"
-            normalized.add(k)
-        media_kinds = normalized
+        media_kinds = {str(kind).lower() for kind in media_kinds}
 
     def _extract_src(tag_text: str) -> str:
         m = re.search(r'\bsrc\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))',
                       tag_text, re.IGNORECASE)
         if not m:
             return ""
-        raw = (m.group(2) or m.group(3) or m.group(4) or "").strip()
-        # LLM 偶尔把 Markdown 链接 [url](url) 整个塞进 src；本函数会重建
-        # 标签，所以这里解包出真实 URL 才不会把可救的媒体块误删。
-        return _unwrap_markdown_link_url(raw)
+        return (m.group(2) or m.group(3) or m.group(4) or "").strip()
 
     def _is_valid_url(url: str) -> bool:
         u = (url or "").strip().lower()
@@ -1256,10 +648,10 @@ def _demote_all_media_to_links(
         return m.group(1) if m else ""
 
     def _strip_inner_tags(inner: str) -> str:
-        """去掉 inner 里所有 <video>/<audio>/<img>/<tg-document>/<figcaption> 标签，
+        """去掉 inner 里所有 <video>/<audio>/<img>/<figcaption> 标签，
         仅保留可能存在的其他内联文本。"""
         inner = re.sub(
-            r'<(?:video|audio|img|tg-document)\b[^>]*/?>|</?(?:video|audio|img|tg-document)\s*>',
+            r'<(?:video|audio|img)\b[^>]*/?>|</?(?:video|audio|img)\s*>',
             '', inner, flags=re.IGNORECASE,
         )
         # figcaption 文本由调用方单独提取，这里把已取过文本的空标签也清掉
@@ -1283,14 +675,7 @@ def _demote_all_media_to_links(
         """构造降级后的 <a> 锚点。src 必须合法；caption 为空时按 kind 兜底。"""
         if not caption:
             domain = _domain_of(src)
-            label_map = {
-                "video": "🎬 观看视频",
-                "audio": "🎵 收听音频",
-                "image": "🖼 查看图片",
-                "img": "🖼 查看图片",
-                "tg-document": "📄 查看文档",
-                "document": "📄 查看文档",
-            }
+            label_map = {"video": "🎬 观看视频", "audio": "🎵 收听音频", "image": "🖼 查看图片"}
             caption = label_map.get(kind, "🔗 查看链接")
             if domain:
                 caption = f"{caption} · {domain}"
@@ -1304,11 +689,7 @@ def _demote_all_media_to_links(
         re.IGNORECASE | re.DOTALL,
     )
     media_in_figure_re = re.compile(
-        # 自闭合分支在前，防止 "<tag .../>" 被容器分支 "<tag ...>.*?</tag>"
-        # 跨块吞并与后面同标签的合法容器块。自闭合分支捕获组为 group(1)，
-        # 容器分支为 group(2)，回溯引用用 \\2。
-        r'<(video|audio|img|tg-document)\b[^>]*/>'
-        r'|<(video|audio|tg-document)\b[^>]*>.*?</\2\s*>',
+        r'<(video|audio|img)\b[^>]*?/?>.*?</\1\s*>|<(video|audio|img)\b[^>]*/>',
         re.IGNORECASE | re.DOTALL,
     )
 
@@ -1318,7 +699,7 @@ def _demote_all_media_to_links(
         if not mm:
             # 没有 media——保留原 figure（可能是纯文字 figure）
             return m.group(0)
-        # 取 media 标签名（video / audio / img / tg-document）
+        # 取 media 标签名（video / audio / img）
         kind = (mm.group(1) or mm.group(2) or "").lower()
         block = mm.group(0)
         src = _extract_src(block)
@@ -1344,10 +725,7 @@ def _demote_all_media_to_links(
 
     # 2) 处理裸 media（不在 <figure> 里的）
     bare_media_re = re.compile(
-        # 分支顺序与分组号规则同 media_in_figure_re：自闭合在前（group 1），
-        # 容器在后（group 2，回溯引用 \\2）。
-        r'<(video|audio|img|tg-document)\b[^>]*/>'
-        r'|<(video|audio|tg-document)\b[^>]*>.*?</\2\s*>',
+        r'<(video|audio)\b[^>]*>.*?</\1\s*>|<(video|audio|img)\b[^>]*/>',
         re.IGNORECASE | re.DOTALL,
     )
 
@@ -1867,67 +1245,18 @@ async def send_rich_message_draft(
                             )
                             return 0
 
-                        # 媒体抓取/URL 非法类错误（RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND /
-                        # RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND /
-                        # RICH_MESSAGE_DOCUMENT_URL_INVALID 等）是不可恢复的内容问题：
+                        # 媒体抓取失败类错误（RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND /
+                        # RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND）是不可恢复的内容问题：
                         # 同一个 URL 再发多少次都会被 Telegram 拒绝。若只 bump
                         # failure 并 return，builder 的 flush 循环会继续用原始内容
                         # 重试，最多累计 6 次失败才 mark dead，用户看到草稿卡很久。
                         # 因此立即在同一个调用内把所有媒体降级为 <a> 链接并重试一次，
                         # 失败一次就直接降级，不让上层循环重复无效请求。
-                        # 注意必须包含 rich_message_document_ 前缀：否则
-                        # <tg-document> 报错时会落进下方 "rich_message_" 大网，
-                        # 整条草稿被误降级为纯文本。
                         media_not_found = (
                             "rich_message_photo_no_media_found" in body_lower
                             or "rich_message_video_no_media_found" in body_lower
-                            or "rich_message_document_" in body_lower
                         )
                         if media_not_found:
-                            # —— 备用 & 形态重试（先于降级，破坏性最小）——
-                            # 首次发送已按 HTML 规范把媒体 src 的裸 & 转义为
-                            # &amp;；若服务端解析层不解码属性实体（或该形态
-                            # 同样被拒），先改用与模型原始输出一致的裸 & 形态
-                            # 重试一次，两种形态都失败才降级为链接。仅当两种
-                            # 形态的 payload 确有差异（src 里确实有 &）时才尝试。
-                            alt_rich = _rich_message_html_payload(html_content, escape_attr_amp=False)
-                            if alt_rich["html"] and alt_rich["html"] != payload["rich_message"]["html"]:
-                                logger.warning(
-                                    "sendRichMessageDraft &amp; 转义形态被拒，改用裸 & 形态重试"
-                                    "（Telegram 响应: %s）: chat=%s draft=%s orig_len=%s",
-                                    body[:160], chat_id, draft_id_int, len(html_content),
-                                )
-                                try:
-                                    async with session.post(
-                                        f"{BASE_URL}/sendRichMessageDraft",
-                                        json={**payload, "rich_message": alt_rich},
-                                        timeout=aiohttp.ClientTimeout(
-                                            total=_DRAFT_REQUEST_TIMEOUT,
-                                            connect=_DRAFT_CONNECT_TIMEOUT,
-                                        ),
-                                    ) as alt_resp:
-                                        if alt_resp.status == 200:
-                                            _draft_last_send_time[cache_key] = time.monotonic()
-                                            _last_sent_draft_cache[cache_key] = html_content
-                                            await _reset_draft_failure(chat_id, draft_id_int)
-                                            try:
-                                                alt_data = await alt_resp.json()
-                                                alt_msg_id = (alt_data.get("result") or {}).get("message_id")
-                                                if isinstance(alt_msg_id, int) and alt_msg_id > 0:
-                                                    return alt_msg_id
-                                            except Exception:
-                                                logger.debug("send_rich_message_draft 内部忽略的异常", exc_info=True)
-                                            return 0
-                                        alt_body = await alt_resp.text()
-                                        logger.warning(
-                                            "sendRichMessageDraft 裸 & 形态仍失败: %s %s",
-                                            alt_resp.status, alt_body[:200],
-                                        )
-                                except Exception as alt_err:
-                                    logger.warning(
-                                        "sendRichMessageDraft 裸 & 形态重试异常: %s", alt_err,
-                                    )
-
                             demoted = _demote_all_media_to_links(html_content)
                             if demoted and demoted != html_content:
                                 demoted_payload = {
@@ -1935,10 +1264,9 @@ async def send_rich_message_draft(
                                     "rich_message": _rich_message_html_payload(demoted),
                                 }
                                 logger.warning(
-                                    "sendRichMessageDraft 媒体抓取失败，立即降级为链接重试"
-                                    "（Telegram 响应: %s）: chat=%s draft=%s orig_len=%s demoted_len=%s%s",
-                                    body[:160], chat_id, draft_id_int, len(html_content), len(demoted),
-                                    _presigned_media_diagnostic_hint(html_content),
+                                    "sendRichMessageDraft 媒体抓取失败，立即降级为链接重试: "
+                                    "chat=%s draft=%s orig_len=%s demoted_len=%s",
+                                    chat_id, draft_id_int, len(html_content), len(demoted),
                                 )
                                 try:
                                     async with session.post(
@@ -2156,99 +1484,72 @@ async def send_rich_html_message(
                         media_kinds.add("video")
                     if "rich_message_audio_" in body_lower or "rich_message_audio_url_invalid" in body_lower:
                         media_kinds.add("audio")
-                    if "rich_message_document_" in body_lower:
-                        # RICH_MESSAGE_DOCUMENT_URL_INVALID 等：<tg-document> 的
-                        # src 非法或不可抓取。必须与 img/video/audio 一样进入
-                        # 下方的定向媒体降级（只把文档变成 <a> 链接，其余媒体
-                        # 原样保留）；否则会落进后面 "rich_message_" 大网，
-                        # 触发整条消息纯文本 fallback —— 这正是本次“降级”问题的
-                        # 直接原因。
-                        media_kinds.add("tg-document")
 
-                    # ---------- 降级候选按"破坏性从小到大"逐个尝试 ----------
-                    #   a) 只降级服务端明确报错的媒体类型（最大限度保留其余媒体）；
-                    #   b) 全部媒体降级（同一条消息里多种媒体都坏时一次到位）；
-                    #   c) 纯文本段落（最后兜底——丢格式总比丢整条回复好）。
-                    # 2026-09-05 线上案例：正文里出现裸的 <tg-document> 字面量
-                    # （模型想表达"使用 tg-document 标签"），定向降级只替换了
-                    # 规范的 <figure><tg-document>，字面量仍在，Telegram 依旧以
-                    # RICH_MESSAGE_DOCUMENT_INVALID 拒绝——此前直接 return False
-                    # 会把整条回复丢掉，故改为级联兜底，确保消息必达。
-                    fallback_attempts: list[tuple[str, str, bool]] = []
+                    # ---------- 第 2 次尝试：只降级服务端明确报错的媒体类型 ----------
+                    # image/video/audio 映射到实际 HTML 标签名，避免 photo 失败时把
+                    # 同一条消息中本来正常的视频和音频也一并变成链接。
                     if media_kinds:
-                        # 记录原始 400 响应体：此前定向降级一旦成功，原始错误
-                        # 从不落日志，线上无法区分 URL_INVALID（解析层损坏）
-                        # 与 NO_MEDIA_FOUND（服务端抓取失败），排障成本高。
-                        logger.warning(
-                            "sendRichHtmlMessage 400 媒体错误（kinds=%s），原始响应: %s%s",
-                            sorted(media_kinds), body[:300],
-                            _presigned_media_diagnostic_hint(html_content),
+                        media_demoted = _demote_all_media_to_links(
+                            html_content,
+                            media_kinds,
                         )
-                        # —— 备用 & 形态重试（破坏性最小的一档，先于降级）——
-                        # 首次发送已按 HTML 规范把媒体 src 的裸 & 转义为 &amp;；
-                        # 若服务端解析层不解码属性实体（或该形态同样被拒），
-                        # 先改用与模型原始输出一致的裸 & 形态重试一次，两种
-                        # 形态都失败才进入降级。仅当两种形态的 payload 确有
-                        # 差异（src 里确实有 &）时才尝试。
-                        alt_rich = _rich_message_html_payload(html_content, escape_attr_amp=False)
-                        if alt_rich["html"] and alt_rich["html"] != payload["rich_message"]["html"]:
-                            fallback_attempts.append(
-                                ("media src ampersands re-sent as raw & form", alt_rich["html"], False)
+                        if media_demoted and media_demoted != html_content:
+                            media_payload = {
+                                **payload,
+                                "rich_message": _rich_message_html_payload(media_demoted),
+                            }
+                            logger.warning(
+                                "sendRichHtmlMessage retrying with affected media demoted to <a> links "
+                                "(kinds=%s, orig_len=%s, demoted_len=%s)",
+                                sorted(media_kinds), len(html_content), len(media_demoted),
                             )
-                        # —— v5 原生文档兜底（先于链接降级，破坏性更小）——
-                        # 文档来自用户上传，bot 手里有 file_id：直接
-                        # sendDocument 原生送达文件本体，再从富文本移除该
-                        # 标签（保留 figcaption 文本）。成功时用户拿到的是
-                        # 真实文件而非 <a> 链接；无候选/发送失败时原样进入
-                        # 下方定向降级，外部 URL 的 tg-document 不受影响。
-                        if "tg-document" in media_kinds:
-                            rescued = await _rescue_documents_via_native_send(chat_id, html_content)
-                            if rescued and rescued != html_content:
-                                fallback_attempts.append(
-                                    (
-                                        "documents delivered natively via sendDocument(file_id), media tags removed",
-                                        rescued,
-                                        True,
-                                    )
+                            async with session.post(f"{BASE_URL}/sendRichMessage", json=media_payload) as fb_resp:
+                                if fb_resp.status == 200:
+                                    try:
+                                        fb_data = await fb_resp.json()
+                                        fb_msg_id = (fb_data.get("result") or {}).get("message_id")
+                                        if isinstance(fb_msg_id, int) and fb_msg_id > 0:
+                                            return fb_msg_id
+                                    except Exception as e:
+                                        logger.debug(f"sendRichHtmlMessage media-demoted parse failed: {e}")
+                                    return True
+                                fb_body = await fb_resp.text()
+                                logger.warning(
+                                    "sendRichHtmlMessage selective media fallback failed: %s %s",
+                                    fb_resp.status, fb_body[:200],
                                 )
-                        targeted = _demote_all_media_to_links(html_content, media_kinds)
-                        if targeted and targeted != html_content:
-                            fallback_attempts.append(
-                                (f"affected media demoted to <a> links (kinds={sorted(media_kinds)})", targeted, True)
-                            )
-                        all_demoted = _demote_all_media_to_links(html_content)
-                        if all_demoted and all_demoted != html_content and all_demoted != targeted:
-                            fallback_attempts.append(("all media demoted to <a> links", all_demoted, True))
-                    if "rich_message_" in body_lower:
+                                return False
+
+                    # ---------- 结构/内容错误：保留可见文字，去掉全部富文本标记 ----------
+                    # CONTENT_REQUIRED 或未知 Rich Message 400 不是媒体问题，不应把
+                    # 无辜的媒体改成链接；纯文本段落是最后一道、语义不丢失的兜底。
+                    if "rich_message_content_required" in body_lower or "rich_message_" in body_lower:
                         plain_html = _rich_message_plain_text_fallback(html_content)
                         if plain_html and plain_html != html_content:
-                            fallback_attempts.append(("plain-text paragraph fallback", plain_html, True))
-
-                    for fb_label, fb_html, fb_escape_amp in fallback_attempts:
-                        fb_payload = {
-                            **payload,
-                            "rich_message": _rich_message_html_payload(fb_html, escape_attr_amp=fb_escape_amp),
-                        }
-                        logger.warning(
-                            "sendRichHtmlMessage retrying with %s (orig_len=%s, fallback_len=%s)",
-                            fb_label, len(html_content), len(fb_html),
-                        )
-                        async with session.post(f"{BASE_URL}/sendRichMessage", json=fb_payload) as fb_resp:
-                            if fb_resp.status == 200:
-                                try:
-                                    fb_data = await fb_resp.json()
-                                    fb_msg_id = (fb_data.get("result") or {}).get("message_id")
-                                    if isinstance(fb_msg_id, int) and fb_msg_id > 0:
-                                        return fb_msg_id
-                                except Exception as e:
-                                    logger.debug(f"sendRichHtmlMessage fallback parse failed: {e}")
-                                return True
-                            fb_body = await fb_resp.text()
+                            plain_payload = {
+                                **payload,
+                                "rich_message": _rich_message_html_payload(plain_html),
+                            }
                             logger.warning(
-                                "sendRichHtmlMessage %s failed: %s %s",
-                                fb_label, fb_resp.status, fb_body[:200],
+                                "sendRichHtmlMessage retrying with plain-text paragraph fallback "
+                                "after content/structure error (orig_len=%s, plain_len=%s)",
+                                len(html_content), len(plain_html),
                             )
-
+                            async with session.post(f"{BASE_URL}/sendRichMessage", json=plain_payload) as fb_resp:
+                                if fb_resp.status == 200:
+                                    try:
+                                        fb_data = await fb_resp.json()
+                                        fb_msg_id = (fb_data.get("result") or {}).get("message_id")
+                                        if isinstance(fb_msg_id, int) and fb_msg_id > 0:
+                                            return fb_msg_id
+                                    except Exception as e:
+                                        logger.debug(f"sendRichHtmlMessage plain fallback parse failed: {e}")
+                                    return True
+                                fb_body = await fb_resp.text()
+                                logger.warning(
+                                    "sendRichHtmlMessage plain-text fallback failed: %s %s",
+                                    fb_resp.status, fb_body[:200],
+                                )
                     logger.error("sendRichHtmlMessage 400 未命中可恢复错误类型: %s %s", resp.status, body[:200])
                     return False
         except (aiohttp.ClientError, asyncio.TimeoutError):

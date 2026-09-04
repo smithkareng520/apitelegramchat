@@ -1,5 +1,5 @@
 # app.py
-from quart import Quart, request, Response
+from quart import Quart, request
 import asyncio
 import aiohttp
 import json
@@ -258,67 +258,6 @@ async def health_check():
     return {
         "status": "ok",
     }, 200
-
-
-# ---------- 自托管稳定媒体代理（v4，2026-09-05；v5 增强文件名/类型元数据） ----------
-# 背景见 media_proxy.py 模块注释：Telegram 富文本抓取器无法解析 R2 预签名
-# URL（实测公网 GET 200 却仍报 RICH_MESSAGE_*_NO_MEDIA_FOUND），媒体一律以
-# {base}/media/<hmac>/<key> 稳定形态交付，由本路由鉴权后从 R2/Telegram 回源。
-#
-# v5（2026-09-05 02:31 日志复盘）：抓取器对 {base}/media/<hmac>/telegram/<file_id>
-# 成功下载了全部字节（代理日志两次 200 + 89257B），仍报 NO_MEDIA_FOUND ——
-# 根因是 URL/响应均无文件名与真实类型（octet-stream + 裸 file_id），抓取器
-# 无法把字节建档为文档媒体。因此：
-#   1) 交付 URL 末段附加原始文件名（build_media_proxy_url(filename=...)），
-#      本路由用 resolve_proxy_key 兼容解析（验签仍只针对真实 key）；
-#   2) Content-Type 优先按该文件名扩展名推断；
-#   3) Content-Disposition 用 RFC 6266 filename* 携带原始（中文）文件名。
-@app.route('/media/<token>/<path:key>', methods=['GET'])
-async def media_proxy_serve(token: str, key: str):
-    from apitelegramchat import media_proxy as _mp
-
-    # v5：resolve_proxy_key 先按 v4 形态整体验签；失败则把末段视为展示
-    # 文件名、对父 key 重验。伪造末段无法越权——能读什么仍由 HMAC 决定。
-    resolved = _mp.resolve_proxy_key(key, token)
-    if not resolved:
-        # 404 而非 403：不向探测者确认“路径存在但签名错误”。
-        return "", 404
-    serving_key, display_name = resolved
-
-    got = await _mp.collect_media_bytes(serving_key)
-    if not got:
-        logger.warning(f"[media-proxy] 回源失败: {serving_key[:120]}")
-        return "", 404
-    data, content_type = got
-    if len(data) > _mp.MEDIA_PROXY_MAX_BYTES:
-        logger.warning(f"[media-proxy] 对象超过大小上限: {serving_key[:120]} ({len(data)}B)")
-        return "", 413
-
-    if display_name:
-        # v5：URL 末段的原始文件名是唯一可信的扩展名来源（R2 上
-        # telegram/<file_id> 键无扩展名、ContentType 常为 octet-stream），
-        # 优先据此给出正确的 Content-Type。
-        content_type = _mp.guess_content_type_from_filename(
-            display_name, fallback=content_type
-        )
-        disposition = _mp.content_disposition_inline(display_name)
-    else:
-        # v4 兼容路径（历史 URL 无展示文件名）：维持原文件名兜底。
-        disposition = _mp.content_disposition_inline(
-            serving_key.rsplit("/", 1)[-1] or "file"
-        )
-    response = Response(data, content_type=content_type)
-    # inline + 文件名：文档类媒体在 Telegram 客户端的展示名优先来自
-    # figcaption，这里的 header 主要帮助通用抓取器识别对象。
-    response.headers["Content-Disposition"] = disposition
-    response.headers["Cache-Control"] = "public, max-age=86400"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    logger.info(
-        f"[media-proxy] 200 {serving_key[:120]}"
-        f"{(' as ' + display_name[:80]) if display_name else ''}"
-        f" ({len(data)}B, {content_type})"
-    )
-    return response
 
 # ---------- 权限辅助 ----------
 def get_user_info(msg: dict) -> tuple[str, str]:
@@ -1277,7 +1216,7 @@ async def _process_document_group_inner(chat_id: int, media_group_id: str) -> No
         workspace.mkdir(parents=True, exist_ok=True)
         downloaded = []
         failed = []
-        for doc_idx, (fid, fname) in enumerate(zip(file_ids, file_names)):
+        for fid, fname in zip(file_ids, file_names):
             safe_fname = os.path.basename(fname)
             target_path = workspace / safe_fname
             counter = 1
@@ -1287,14 +1226,7 @@ async def _process_document_group_inner(chat_id: int, media_group_id: str) -> No
                 counter += 1
             # download_file 内部已经把字节缓存到 R2 的 telegram/{file_id} 前缀，
             # download/ 只是本地落地缓冲，不需要再往 R2 镜像一份。
-            # v5：透传 Telegram 报告的真实 mime_type，R2 ContentType 不再是
-            # 无信息量的 octet-stream（代理/公开域据此给出正确类型）。
-            doc_mime = ""
-            try:
-                doc_mime = str(mime_types[doc_idx] or "")
-            except (IndexError, TypeError):
-                doc_mime = ""
-            success = await download_file(fid, str(target_path), mime_type=doc_mime)
+            success = await download_file(fid, str(target_path))
             if success:
                 downloaded.append(target_path.name)
             else:
@@ -1845,8 +1777,7 @@ async def webhook() -> tuple:
                     async with workspace_lock:
                         # download_file 内部已经把字节缓存到 R2 的 telegram/{file_id} 前缀，
                         # download/ 只是本地落地缓冲，不需要再往 R2 镜像一份。
-                        # v5：透传真实 mime_type（见 media_proxy_serve v5 注释）。
-                        success = await download_file(fid, str(target_path), mime_type=mime_type)
+                        success = await download_file(fid, str(target_path))
                         if success:
                             content_text = (
                                 f"📎 用户上传了文档「{safe_fname}」，已保存在工作区根目录的 "
@@ -2246,10 +2177,7 @@ async def webhook() -> tuple:
                             async with workspace_lock:
                                 # download_file 内部已经把字节缓存到 R2 的 telegram/{file_id} 前缀，
                                 # download/ 只是本地落地缓冲，不需要再往 R2 镜像一份。
-                                # v5：透传真实 mime_type（见 media_proxy_serve v5 注释）。
-                                success = await download_file(
-                                    reply_media["file_id"], str(target_path), mime_type=mime_type
-                                )
+                                success = await download_file(reply_media["file_id"], str(target_path))
                                 if success:
                                     content_text = (
                                         f"📎 用户引用了文档「{safe_fname}」，已保存在工作区根目录的 "

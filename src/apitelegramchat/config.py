@@ -51,10 +51,6 @@ WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
 _RAW_WEBHOOK_URL = os.getenv("WEBHOOK_URL") or ""
 # Webhook 注册由部署平台/运维侧完成（setWebhook 时自行拼接 ?token=…），
 # 应用内只消费原始 WEBHOOK_URL（见 validate_runtime_config 与启动配置汇总）。
-# 公网别名：供 media_proxy 推导自托管媒体代理基地址（只取 scheme://netloc，
-# 不含路径与 query）——webhook 能收到 Telegram 的请求，同一域名其媒体
-# 抓取器必然可达。
-PUBLIC_WEBHOOK_URL = _RAW_WEBHOOK_URL
 
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 
@@ -873,22 +869,6 @@ R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
 R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
 R2_REGION = os.getenv("R2_REGION", "auto")
 
-# ---------- 自托管媒体代理（2026-09-05 v4） ----------
-# 背景：R2 S3 API 预签名 URL 实测公网可访问（GET 200），但 Telegram 富文本
-# 抓取器无法将其解析为可用媒体（RICH_MESSAGE_*_NO_MEDIA_FOUND，v3 的
-# &amp;/裸 & 双形态重试均被拒，已排除转义因素）。媒体对外交付改用稳定 URL，
-# 解析顺序见 s3_utils.resolve_stable_delivery_url：
-#   1) R2_PUBLIC_URL（r2.dev / 自定义域）直连；
-#   2) 本服务自托管代理 {base}/media/<hmac>/<key>（默认；基地址按
-#      MEDIA_PROXY_BASE_URL → PUBLIC_BASE_URL → WEBHOOK_URL origin 推导）；
-#   3) 都不可用才退回预签名 URL（本地开发等场景）。
-MEDIA_PROXY_BASE_URL = (os.getenv("MEDIA_PROXY_BASE_URL") or "").strip()
-PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()
-# HMAC 签名密钥：未配置时从 bot token 派生（见 media_proxy._media_proxy_secret）。
-# 注意：必须在 scrub_environment() 之前在此捕获为常量——含 SECRET 字样的
-# 环境变量会被运行期清洗，之后 os.getenv 永远拿不到。
-MEDIA_PROXY_SECRET = (os.getenv("MEDIA_PROXY_SECRET") or "").strip()
-
 # ---------- 流式刷新阈值 ----------
 # 草稿是用户感知 Agent 正在工作的唯一实时界面。默认值优先保证首字与
 # 状态变更的可见性，同时仍低于 Telegram 草稿 API 的常规刷新频率。
@@ -913,7 +893,6 @@ _SENSITIVE_EXACT = {
     "XAI_API_KEY", "GROQ_API_KEY", "MODELSCOPE_API_KEY", "AGNES_API_KEY",
     "R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY",
     "R2_BUCKET_NAME", "R2_PUBLIC_URL", "R2_REGION",
-    "MEDIA_PROXY_BASE_URL", "PUBLIC_BASE_URL", "PUBLIC_WEBHOOK_URL",
     "SERPER_API_KEY", "GAODE_MCP_TOKEN",
     "WEBHOOK_TOKEN", "WEBHOOK_URL",
 }

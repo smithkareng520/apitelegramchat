@@ -20,7 +20,6 @@ from apitelegramchat.s3_utils import (
     download_from_r2,
     public_url_for_existing_key,
     generate_presigned_url,
-    resolve_stable_delivery_url,
     is_r2_configured,
 )
 import apitelegramchat.state as state
@@ -436,38 +435,26 @@ def _attachment_label(kind: str) -> str:
     return _ATTACHMENT_KIND_LABELS.get(str(kind or "").lower(), str(kind or "附件"))
 
 
-async def _resolve_public_attachment_url(file_id: str, file_name: str = "") -> str:
+async def _resolve_public_attachment_url(file_id: str) -> str:
     """把 Telegram file_id 解析成一个可供模型/工具继续引用的公开 URL。
 
     安全约束：此函数的返回值会被嵌入到发送给 LLM 的 fallback 文本里
     （见 ``_build_attachment_fallback_text``），因此**绝对不能**返回
     Telegram 直链 —— 那会暴露 ``bot{TELEGRAM_BOT_TOKEN}/`` 给第三方模型
-    API。优先返回稳定公开 URL（R2 公开域 / 自托管 /media 代理）；若
-    R2 未配置且代理基地址不可得则返回空串，由调用方降级为 file_id 文本。
-
-    v4（2026-09-05）：不再直接返回预签名 URL。该 URL 虽然公网可访问，
-    但 Telegram 富文本抓取器无法将其解析为可用媒体
-    （RICH_MESSAGE_*_NO_MEDIA_FOUND，且 1h 过期后历史消息里回显的旧
-    URL 全部失效）——预签名只作为稳定链路都不可得时的最后兜底。
+    API。优先返回 R2 公开 URL；若 R2 未配置则返回空串，由调用方降级为
+    file_id 文本。
     """
     fid = str(file_id or "").strip()
     if not fid:
         return ""
 
     # 不再返回 Telegram 直链（避免把 bot token 暴露给第三方模型 API）。
-    # 稳定公开 URL（R2 公开域 / 自托管代理）是唯一安全的形态。
+    # 仅 R2 公开 URL 是安全的：它要么是自定义域，要么是 r2.dev。
     try:
         r2_key = _get_r2_key(fid)
         if await file_exists_in_r2(r2_key):
-            # v4：优先稳定 URL（无签名、无过期、无查询参数）——模型把它
-            # 写进 <tg-document src>/<a href> 后 Telegram 抓取器才能取到。
-            # v5: pass through the original file name (proxy path appends
-            # it to the URL tail so the Telegram fetcher can classify the
-            # document by its extension).
-            stable = await resolve_stable_delivery_url(r2_key, str(file_name or "").strip())
-            if stable:
-                return stable
-            # 稳定链路都不可得（无公开域且代理基地址未配置）时的兜底。
+            # fallback 与多模态注入统一使用上传后的临时访问 URL。
+            # 不依赖永久公开域名，避免切换模型时丢失可访问地址。
             return await generate_presigned_url(r2_key)
     except Exception as e:
         logger.debug(f"解析 R2 文件 URL 失败 {fid[:12]}: {e}")
@@ -559,7 +546,7 @@ async def _build_attachment_fallback_text(
         mime = ""
         if mime_types and idx - 1 < len(mime_types):
             mime = str(mime_types[idx - 1] or "").strip()
-        url = await _resolve_public_attachment_url(fid, fname) if fid else ""
+        url = await _resolve_public_attachment_url(fid) if fid else ""
         any_url = any_url or bool(url)
         parts = [f"{safe_kind}{idx if total > 1 else ''}"]
         if fname:
@@ -841,16 +828,10 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                 # 即使当前模型支持视觉输入，也额外注入附件临时 URL。
                 # 该 URL 与非多模态 fallback 使用同一套解析逻辑，
                 # 便于图片编辑工具调用，以及后续模型切换后继续复用。
-                # v5: pass through the original file names so the proxy URL
-                # tail carries the extension/type hint for the fetcher.
-                photo_names = list(msg.get("file_names") or [])
                 url_lines = []
-                for p_idx, fid in enumerate(file_ids):
+                for fid in file_ids:
                     try:
-                        p_name = ""
-                        if p_idx < len(photo_names):
-                            p_name = str(photo_names[p_idx] or "").strip()
-                        temp_url = await _resolve_public_attachment_url(fid, p_name)
+                        temp_url = await _resolve_public_attachment_url(fid)
                     except Exception:
                         logger.debug("_resolve_multimodal_content 内部忽略的异常", exc_info=True)
                         temp_url = ""
@@ -1021,7 +1002,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                 # 保证后续切换到支持视频的模型时不丢信息。
                 _track_task(_ensure_video_persisted(fid, mime_type or "video/mp4"))
 
-            url = await _resolve_public_attachment_url(fid, file_name)
+            url = await _resolve_public_attachment_url(fid)
             lines = [f"📎 用户上传了{_attachment_label(file_type)}「{file_name}」"]
             if url:
                 lines.append(f"链接：{url}")

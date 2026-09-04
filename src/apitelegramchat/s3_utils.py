@@ -22,7 +22,6 @@ from apitelegramchat.config import (
     R2_PUBLIC_URL,
     R2_REGION,
 )
-from apitelegramchat.media_proxy import build_media_proxy_url, guess_content_type
 from apitelegramchat.workspace_paths import data_root
 
 logger = logging.getLogger(__name__)
@@ -131,11 +130,6 @@ async def upload_bytes_to_r2(
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
             logger.info("Local R2 cache saved: %s", key)
-            # v4：本地缓存也优先走稳定 URL（代理可从 r2_cache 回源），
-            # 无代理基地址时才是 file://（仅供本机读取，外部抓不到）。
-            stable = await resolve_stable_delivery_url(key)
-            if stable:
-                return stable
             return _local_public_url(key)
         except Exception:
             # logger.exception 自带 traceback，不必再传 e。
@@ -164,16 +158,12 @@ async def upload_bytes_to_r2(
                     ContentType=content_type,
                 )
             logger.info("R2 上传成功：%s", key)
-            # v4：对外交付一律用稳定 URL（无签名、无过期、无查询参数）。
-            # 预签名 URL 虽公网可达（2026-09-05 实测 GET 200），但 Telegram
-            # 富文本抓取器无法将其解析为可用媒体（RICH_MESSAGE_*_NO_MEDIA_FOUND，
-            # 同一时段 &amp; 与裸 & 两种形态均被拒，公网 GET 同一 URL 却是 200）。
-            stable = await resolve_stable_delivery_url(key)
-            if stable:
-                return stable
-            # 既无公开域名也未配置媒体代理基地址时的最后兜底（预签名 URL）。
-            # 属性中的裸 & 由 utils._rich_message_html_payload 在发送前按
-            # HTML 规范幂等转义为 &amp;（见 _escape_media_src_ampersands）。
+            public_base = _public_delivery_base_url()
+            if public_base:
+                return f"{public_base}/{key}"
+            # R2 S3 API endpoint 并非公开 URL。使用预签名 URL，使 Telegram 的
+            # 媒体抓取器无需 R2 凭据也能读取刚上传的视频；调用方会在 HTML 属性
+            # 中将查询参数的 & 幂等转义为 &amp;。
             return await generate_presigned_url(key)
         except Exception:
             logger.exception("R2 上传失败（第 %d/%d 次）：%s", attempt + 1, max_attempts, key)
@@ -224,68 +214,6 @@ async def generate_presigned_url(
         return url
 
 
-async def resolve_stable_delivery_url(key: str, filename: str = "") -> str | None:
-    """为对象 key 解析一个"稳定公开交付 URL"，供 Telegram 富文本抓取器等
-    外部抓取方使用。解析顺序：
-
-      1. ``R2_PUBLIC_URL``（r2.dev / 自定义域）：直连，无签名无过期；
-      2. 自托管媒体代理 ``{base}/media/<hmac>/<key>``：同样无查询参数，
-         由本服务鉴权后从 R2/Telegram 回源（见 media_proxy.py）；
-      3. 都不可用 → ``None``（调用方自行决定是否退回预签名 URL）。
-
-    v5（2026-09-05 02:31 日志复盘）：``filename``（原始文件名，含扩展名）
-    仅在自托管代理路径生效——URL 变为 ``{base}/media/<hmac>/<key>/<fname>``。
-    背景：Telegram 抓取器对 v4 的 ``telegram/<file_id>`` 代理 URL 成功下载
-    了全部字节仍报 ``RICH_MESSAGE_DOCUMENT_NO_MEDIA_FOUND``，原因是 URL 与
-    响应都不携带文件名/类型（octet-stream + 裸 file_id），抓取器无法把
-    字节建档为文档媒体；URL 末段的真实文件名是它唯一可用的类型线索。
-    R2 公开域路径不能附加伪路径段（对象 key 不含文件名，会 404），其类型
-    信息依赖上传端写入的真实 ContentType（file_handlers v5 起已透传
-    Telegram 报告的 mime_type）。
-    """
-    base = _public_delivery_base_url()
-    if base:
-        return f"{base}/{key}"
-    try:
-        return build_media_proxy_url(key, filename)
-    except Exception as e:  # 防御：代理 URL 构造失败不阻塞主流程
-        logger.warning("构建媒体代理 URL 失败 %s: %s", key, e)
-        return None
-
-
-async def fetch_r2_object(key: str) -> tuple[bytes, str] | None:
-    """get_object 一次取回 body 与 ContentType，供媒体代理回源使用。
-
-    本地缓存模式（R2 未配置）从 r2_cache 目录读取，Content-Type 按 key
-    扩展名推断。任何失败返回 None，调用方自行回退（Telegram 直下等）。
-    """
-    if not is_r2_configured():
-        path = _safe_local_key_path(key)
-        if path.exists() and path.is_file():
-            try:
-                return path.read_bytes(), guess_content_type(key)
-            except Exception as e:
-                logger.warning("本地 R2 缓存读取失败 %s: %s", key, e)
-        return None
-
-    try:
-        async with session.client(
-            "s3",
-            endpoint_url=R2_ENDPOINT,
-            aws_access_key_id=R2_ACCESS_KEY,
-            aws_secret_access_key=R2_SECRET_KEY,
-            region_name=R2_REGION,
-            config=_R2_CONFIG,
-        ) as s3:
-            resp = await s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)
-            data = await resp["Body"].read()
-            content_type = resp.get("ContentType") or guess_content_type(key)
-            return data, content_type
-    except Exception as e:
-        logger.warning("R2 get_object 失败（媒体代理回源）: %s: %s", key, e)
-        return None
-
-
 async def public_url_for_existing_key(key: str) -> str | None:
     """Return a publicly-accessible URL for an object that's already in R2.
 
@@ -293,15 +221,13 @@ async def public_url_for_existing_key(key: str) -> str | None:
     satisfy the "publicly accessible image_url" requirement without
     re-uploading the same bytes every turn.
 
-    Resolution order (v4):
+    Resolution order:
       1. If R2_PUBLIC_URL is configured (custom domain or r2.dev):
          return ``{R2_PUBLIC_URL}/{key}`` — no signature, no expiry.
-      2. Else if the self-hosted media proxy base URL is derivable:
-         return ``{base}/media/<hmac>/<key>`` — no query params, no expiry.
-      3. Otherwise, if R2 is configured remotely: return a presigned URL
+      2. Otherwise, if R2 is configured remotely: return a presigned URL
          (default 1h expiry). The URL is publicly fetchable but expires;
          long-running sessions will re-issue a fresh one on the next turn.
-      4. R2 is not configured at all (local-cache fallback): return None.
+      3. R2 is not configured at all (local-cache fallback): return None.
          ``file://`` URLs aren't publicly reachable, so the vision caller
          must fall back to base64 (or skip the image entirely).
     """
@@ -310,9 +236,9 @@ async def public_url_for_existing_key(key: str) -> str | None:
         # the caller to fall back to base64.
         return None
 
-    stable = await resolve_stable_delivery_url(key)
-    if stable:
-        return stable
+    base = _public_delivery_base_url()
+    if base:
+        return f"{base}/{key}"
     # No public delivery URL — issue a presigned URL instead.
     try:
         return await generate_presigned_url(key)

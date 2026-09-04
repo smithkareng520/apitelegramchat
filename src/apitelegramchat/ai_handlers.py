@@ -131,7 +131,6 @@ async def build_system_prompt(
 <summary><b>⚠️ 严格格式要求</b></summary>
 <ul>
   <li><b>严禁使用 Markdown 语法：例如 <code>---</code>，<code>**</code>，<code>-</code>或者<code>`</code>等markdown格式语法</b></li>
-  <li><b>严禁把媒体标签的“字面量”写进回复或思考正文：</b>需要提及标签名时只写名字本身（如 tg-document、img、video），<b>绝对禁止</b>输出裸的 <code>&lt;tg-document&gt;</code>、<code>&lt;img&gt;</code>、<code>&lt;video&gt;</code>、<code>&lt;figure&gt;</code> 等字面标签——包在反引号或任何引号里也不行，它们会被 Telegram 当作真实标签解析，以 <code>RICH_MESSAGE_DOCUMENT_INVALID</code> 等错误拒绝整条回复。需要展示 HTML 示例时，必须把尖括号全部转义（如 <code>&amp;lt;figure&amp;gt;…&amp;lt;/figure&amp;gt;</code>）。</li>
   <li>严格按下述定义使用标签，切勿自行发明未定义的 HTML 标签。</li>
   <li>
     <b>✅ 必须且仅能使用以下 Telegram HTML 标签（下表标签均为你应直接输出的字面写法，未经转义）：</b>
@@ -187,7 +186,6 @@ async def build_system_prompt(
   <li><b>带图注媒体：</b> <code><figure><img src="URL"/><figcaption>图注文本<cite>来源/署名</cite></figcaption></figure></code>。视频示例：<code><figure><video src="URL"></video><figcaption>视频说明</figcaption></figure></code>。</li>
   <li><b>GIF 规则：</b>GIF 是图片资源。URL 路径以 <code>.gif</code> 结尾时，必须使用 <code><img src="URL"/></code>；需要图注时使用 <code><figure><img src="URL"/><figcaption>…</figcaption></figure></code>。严禁使用 <code><video></code> 包裹 GIF。</li>
   <li><b>图片工具结果处理：</b> 当 <code>generate_image_from_text</code> / <code>edit_image_with_reference</code> 成功返回 <code>图片链接：URL</code>（可能多行、每行一个 URL）时，必须在最终回复中把每个 URL 作为独立媒体块发送：单张用 <code><img src="URL"/></code>，多张（≥2）用 <code><tg-slideshow><img src="URL1"/><img src="URL2"/></tg-slideshow></code>。<b>绝对禁止使用 Markdown 图片/链接语法</b>（<code>![...](URL)</code> 或 <code>[...](URL)</code>），也不得只输出裸 URL 或普通文字描述。仅使用工具返回的原始 HTTP/HTTPS URL，并将 URL 原样写入 <code>src</code> 和需要时的下载 <code>href</code>；不得转义、解码、重写、拼接或截断。</li>
-  <li><b>文档：</b><code><figure><tg-document src="https://example.com/document.pdf"></tg-document><figcaption>项目方案 PDF</figcaption></figure></code>。src 只能写裸 URL，严禁包裹 Markdown 链接语法（详见下方「媒体 URL 严格规则」）。向用户说明用法时只写标签名 tg-document，<b>严禁在正文/思考中输出该标签的字面形式</b>（如 <code>&lt;tg-document&gt;</code>），否则整条回复会被 Telegram 拒绝。</li>
 </ul>
 
 <h3>锚点与引用说明</h3>
@@ -228,11 +226,9 @@ async def build_system_prompt(
       <li>工具 <code>generate_video</code> 返回的 <code>视频链接：https://...</code>；</li>
       <li>Web 检索 / <code>fetch_url</code> / Wikipedia / 二维码等工具明确返回的 <code>https://</code> 开头的 URL。<b>fetch_url 与 Wikipedia 查询的结果本身就是按原页面文档顺序组织的 Telegram Rich Message HTML</b>：其中的 <code>&lt;img src="..."/&gt;</code>、<code>&lt;video src="..."/&gt;</code>、<code>&lt;a href="..."&gt;</code> 标签内的媒体与链接地址均为合法 URL，可直接复用（保持其在页面中的原始位置与顺序）；</li>
       <li>用户消息中明示给出的 <code>https://</code> 或 <code>http://</code> 开头的 URL。</li>
-      <li>用户上传附件占位文本中的「链接：https://...」字段（R2 公开域名或本服务 <code>/media/</code> 稳定代理地址）：<b>这是可直接写入 <code>src</code>/<code>href</code> 的稳定公开 URL</b>，无查询参数、长期有效，原样使用即可；不得改写路径、追加查询参数或与其他字符串拼接。<b>URL 末段是原始文件名（含扩展名，可能为 %XX 编码形态）</b>，Telegram 依赖它识别文档类型——必须整条复制到 <code>src</code>，严禁删去或改写末尾文件名段。</li>
     </ol>
   </li>
   <li><b>绝对禁止：</b>从附件占位符中提取 file_name / file_id 拼成看似 URL 的字符串（如 <code>photo_AbCdEf12.jpg</code>、<code>document_xxx.pdf</code>）；也禁止编造任何 <code>https://</code> 开头但实际不存在的 URL。</li>
-  <li><b>绝对禁止在属性值内使用 Markdown 链接语法：</b><code>src=</code> / <code>href=</code> 的值只能是裸 URL 本身。严禁写成 <code>src="[URL](URL)"</code>、<code>src="![alt](URL)"</code> 或 <code>href="[文本](URL)"</code>——属性值里出现 <code>[</code> 会让 Telegram 直接以 <code>RICH_MESSAGE_DOCUMENT_URL_INVALID</code> 等错误拒绝整条回复。Markdown 链接语法只能用于普通正文文本，永远不能进入任何 HTML 属性值；需要链接时写 <code>&lt;a href="URL"&gt;文本&lt;/a&gt;</code>。</li>
   <li>若回答需要展示原图但无合法 URL，请直接用文字描述；宁可不放图也不要放伪 URL。</li>
 </ul>
 """
