@@ -162,8 +162,10 @@ async def upload_bytes_to_r2(
             if public_base:
                 return f"{public_base}/{key}"
             # R2 S3 API endpoint 并非公开 URL。使用预签名 URL，使 Telegram 的
-            # 媒体抓取器无需 R2 凭据也能读取刚上传的视频；调用方会在 HTML 属性
-            # 中将查询参数的 & 幂等转义为 &amp;。
+            # 媒体抓取器无需 R2 凭据也能读取刚上传的视频；预签名 URL 查询参数
+            # 中的裸 & 由 utils._rich_message_html_payload 在发送前按 HTML 规范
+            # 幂等转义为 &amp;（见 _escape_media_src_ampersands，2026-09-05 补齐
+            # 此前缺失的实现）。
             return await generate_presigned_url(key)
         except Exception:
             logger.exception("R2 上传失败（第 %d/%d 次）：%s", attempt + 1, max_attempts, key)

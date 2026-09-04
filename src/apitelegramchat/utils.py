@@ -281,10 +281,10 @@ def escape_html(text) -> str:
     return text
 
 
-def _rich_message_html_payload(html_content: str) -> dict:
+def _rich_message_html_payload(html_content: str, escape_attr_amp: bool = True) -> dict:
     """构造符合 InputRichMessage 规范的 HTML 富消息。
 
-    在交付给 Telegram 前，依次跑四道兜底清理：
+    在交付给 Telegram 前，依次跑五道清理（前四道为兜底救援，第五道为常规传输转义）：
 
     0. ``_unwrap_markdown_link_urls``：把 src/href 属性里被 Markdown 链接
        语法（``[url](url)`` / ``![alt](url)``）包裹的 URL 解包成裸 URL。
@@ -310,6 +310,16 @@ def _rich_message_html_payload(html_content: str) -> dict:
        看着合法（``http(s)://`` 开头），但 Telegram 去抓会拿到 HTML
        页面，以 ``RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND`` 拒绝整条消息。
        降级后保留模型生成的 figcaption 文本，让用户仍可点击跳转观看页。
+
+    4. ``_escape_media_src_ampersands``：把媒体标签 ``src`` 属性值中的裸
+       ``&`` 按 HTML 规范幂等转义为 ``&amp;``。处理 R2 预签名 URL 等
+       带查询参数的媒体地址——裸 ``&`` 直发时，Rich Message 服务端
+       解析出的 src 会在 ``&`` 处损坏或被判非法，服务端媒体抓取必然
+       失败，以 ``RICH_MESSAGE_DOCUMENT_URL_INVALID`` /
+       ``RICH_MESSAGE_*_NO_MEDIA_FOUND`` 拒绝整条消息（2026-09-05 线上
+       chat=7162243624 案例：文档始终无法内联送达，两次降级为链接）。
+       ``escape_attr_amp=False`` 跳过本步：供发送被拒后改用"裸 & 形态"
+       备用重试，两种形态都不被接受时才降级为链接。
     """
     cleaned = _unwrap_markdown_link_urls(html_content)
     cleaned = _neutralize_stray_media_tags(cleaned)
@@ -322,10 +332,72 @@ def _rich_message_html_payload(html_content: str) -> dict:
             len(html_content),
             len(demoted),
         )
+    # 注意：& 转义不计入上方"兜底清理"警告——预签名 URL 的属性转义是每次
+    # 发送的常规路径而非异常救援，避免每帧草稿都刷 WARNING。
+    html_out = _escape_media_src_ampersands(demoted) if escape_attr_amp else demoted
     return {
-        "html": demoted,
+        "html": html_out,
         "skip_entity_detection": True,
     }
+
+
+# ---------- 媒体 src 属性中裸 & 的 HTML 转义（第 5 道清理） ----------
+# R2 预签名 URL 带多个查询参数（X-Amz-Algorithm=...&X-Amz-Credential=...&...），
+# 写进 <tg-document>/<img>/<video>/<audio>/<source> 的 src 属性后必然含裸 &。
+# 按 HTML 序列化规范，属性值中的 & 必须写作 &amp;：Rich Message 服务端解析
+# 属性值时会把 &amp; 解码回 & 再交给媒体抓取器。直接裸发 & 时，服务端解析出
+# 的 src 会在 & 处损坏或被判非法，抓取必然失败（R2 侧拿不到鉴权参数 → 403），
+# 消息被 RICH_MESSAGE_DOCUMENT_URL_INVALID / RICH_MESSAGE_*_NO_MEDIA_FOUND
+# 拒绝并触发整条降级——这正是 s3_utils.generate_presigned_url 注释中约定由
+# "调用方"完成的转义（此前一直缺失，2026-09-05 线上定位补齐）。
+# 只处理会触发服务端抓取的媒体 src；<a href> 由客户端点击打开，客户端对裸 &
+# 的解析是宽容的，保持原样以兼容既有行为（历史日志中裸 & href 均正常送达）。
+_MEDIA_AMP_TAG_SPAN_RE = re.compile(
+    r'<(?:tg-document|img|video|audio|source)\b[^<>]*/?>',
+    re.IGNORECASE,
+)
+_MEDIA_AMP_SRC_VALUE_RE = re.compile(
+    r'(?<![\w\-])(src\s*=\s*)("([^"\n]*)"|\'([^\'\n]*)\')',
+    re.IGNORECASE,
+)
+
+
+def _escape_media_src_ampersands(html_content: str) -> str:
+    """把媒体标签 src 属性值中的裸 & 幂等转义为 &amp;。
+
+    - 幂等：_SMART_AMP_PATTERN 只转义不构成合法实体的 &，已转义的
+      &amp;/&#39; 不会被二次处理。
+    - 归一化：模型偶尔会照抄 HTML 教程把 & 写成 &amp;，先还原为裸 &
+      再统一转义，避免出现 &amp;amp; 双重转义。
+    - 范围：仅 <tg-document>/<img>/<video>/<audio>/<source> 的 src；
+      <a href> 与纯文本不受影响。
+    """
+    if not html_content or "&" not in html_content:
+        return html_content
+
+    def _fix_tag(tag_match: "re.Match") -> str:
+        tag = tag_match.group(0)
+        if "src" not in tag.lower():
+            return tag
+
+        def _fix_attr(attr_match: "re.Match") -> str:
+            prefix = attr_match.group(1)
+            double_inner = attr_match.group(3)
+            single_inner = attr_match.group(4)
+            inner = double_inner if double_inner is not None else single_inner
+            if inner is None:
+                return attr_match.group(0)
+            # 先归一化模型可能照抄的 &amp;，再按规范转义（幂等）
+            canonical = re.sub(r'&amp;', '&', inner, flags=re.IGNORECASE)
+            escaped = _SMART_AMP_PATTERN.sub('&amp;', canonical)
+            if escaped == inner:
+                return attr_match.group(0)
+            quote = '"' if double_inner is not None else "'"
+            return f"{prefix}{quote}{escaped}{quote}"
+
+        return _MEDIA_AMP_SRC_VALUE_RE.sub(_fix_attr, tag)
+
+    return _MEDIA_AMP_TAG_SPAN_RE.sub(_fix_tag, html_content)
 
 
 # LLM 偶尔会把 Markdown 链接语法整体塞进 src/href 属性，例如：
@@ -1551,6 +1623,50 @@ async def send_rich_message_draft(
                             or "rich_message_document_" in body_lower
                         )
                         if media_not_found:
+                            # —— 备用 & 形态重试（先于降级，破坏性最小）——
+                            # 首次发送已按 HTML 规范把媒体 src 的裸 & 转义为
+                            # &amp;；若服务端解析层不解码属性实体（或该形态
+                            # 同样被拒），先改用与模型原始输出一致的裸 & 形态
+                            # 重试一次，两种形态都失败才降级为链接。仅当两种
+                            # 形态的 payload 确有差异（src 里确实有 &）时才尝试。
+                            alt_rich = _rich_message_html_payload(html_content, escape_attr_amp=False)
+                            if alt_rich["html"] and alt_rich["html"] != payload["rich_message"]["html"]:
+                                logger.warning(
+                                    "sendRichMessageDraft &amp; 转义形态被拒，改用裸 & 形态重试"
+                                    "（Telegram 响应: %s）: chat=%s draft=%s orig_len=%s",
+                                    body[:160], chat_id, draft_id_int, len(html_content),
+                                )
+                                try:
+                                    async with session.post(
+                                        f"{BASE_URL}/sendRichMessageDraft",
+                                        json={**payload, "rich_message": alt_rich},
+                                        timeout=aiohttp.ClientTimeout(
+                                            total=_DRAFT_REQUEST_TIMEOUT,
+                                            connect=_DRAFT_CONNECT_TIMEOUT,
+                                        ),
+                                    ) as alt_resp:
+                                        if alt_resp.status == 200:
+                                            _draft_last_send_time[cache_key] = time.monotonic()
+                                            _last_sent_draft_cache[cache_key] = html_content
+                                            await _reset_draft_failure(chat_id, draft_id_int)
+                                            try:
+                                                alt_data = await alt_resp.json()
+                                                alt_msg_id = (alt_data.get("result") or {}).get("message_id")
+                                                if isinstance(alt_msg_id, int) and alt_msg_id > 0:
+                                                    return alt_msg_id
+                                            except Exception:
+                                                logger.debug("send_rich_message_draft 内部忽略的异常", exc_info=True)
+                                            return 0
+                                        alt_body = await alt_resp.text()
+                                        logger.warning(
+                                            "sendRichMessageDraft 裸 & 形态仍失败: %s %s",
+                                            alt_resp.status, alt_body[:200],
+                                        )
+                                except Exception as alt_err:
+                                    logger.warning(
+                                        "sendRichMessageDraft 裸 & 形态重试异常: %s", alt_err,
+                                    )
+
                             demoted = _demote_all_media_to_links(html_content)
                             if demoted and demoted != html_content:
                                 demoted_payload = {
@@ -1558,9 +1674,9 @@ async def send_rich_message_draft(
                                     "rich_message": _rich_message_html_payload(demoted),
                                 }
                                 logger.warning(
-                                    "sendRichMessageDraft 媒体抓取失败，立即降级为链接重试: "
-                                    "chat=%s draft=%s orig_len=%s demoted_len=%s",
-                                    chat_id, draft_id_int, len(html_content), len(demoted),
+                                    "sendRichMessageDraft 媒体抓取失败，立即降级为链接重试"
+                                    "（Telegram 响应: %s）: chat=%s draft=%s orig_len=%s demoted_len=%s",
+                                    body[:160], chat_id, draft_id_int, len(html_content), len(demoted),
                                 )
                                 try:
                                     async with session.post(
@@ -1796,25 +1912,43 @@ async def send_rich_html_message(
                     # 规范的 <figure><tg-document>，字面量仍在，Telegram 依旧以
                     # RICH_MESSAGE_DOCUMENT_INVALID 拒绝——此前直接 return False
                     # 会把整条回复丢掉，故改为级联兜底，确保消息必达。
-                    fallback_attempts: list[tuple[str, str]] = []
+                    fallback_attempts: list[tuple[str, str, bool]] = []
                     if media_kinds:
+                        # 记录原始 400 响应体：此前定向降级一旦成功，原始错误
+                        # 从不落日志，线上无法区分 URL_INVALID（解析层损坏）
+                        # 与 NO_MEDIA_FOUND（服务端抓取失败），排障成本高。
+                        logger.warning(
+                            "sendRichHtmlMessage 400 媒体错误（kinds=%s），原始响应: %s",
+                            sorted(media_kinds), body[:300],
+                        )
+                        # —— 备用 & 形态重试（破坏性最小的一档，先于降级）——
+                        # 首次发送已按 HTML 规范把媒体 src 的裸 & 转义为 &amp;；
+                        # 若服务端解析层不解码属性实体（或该形态同样被拒），
+                        # 先改用与模型原始输出一致的裸 & 形态重试一次，两种
+                        # 形态都失败才进入降级。仅当两种形态的 payload 确有
+                        # 差异（src 里确实有 &）时才尝试。
+                        alt_rich = _rich_message_html_payload(html_content, escape_attr_amp=False)
+                        if alt_rich["html"] and alt_rich["html"] != payload["rich_message"]["html"]:
+                            fallback_attempts.append(
+                                ("media src ampersands re-sent as raw & form", alt_rich["html"], False)
+                            )
                         targeted = _demote_all_media_to_links(html_content, media_kinds)
                         if targeted and targeted != html_content:
                             fallback_attempts.append(
-                                (f"affected media demoted to <a> links (kinds={sorted(media_kinds)})", targeted)
+                                (f"affected media demoted to <a> links (kinds={sorted(media_kinds)})", targeted, True)
                             )
                         all_demoted = _demote_all_media_to_links(html_content)
                         if all_demoted and all_demoted != html_content and all_demoted != targeted:
-                            fallback_attempts.append(("all media demoted to <a> links", all_demoted))
+                            fallback_attempts.append(("all media demoted to <a> links", all_demoted, True))
                     if "rich_message_" in body_lower:
                         plain_html = _rich_message_plain_text_fallback(html_content)
                         if plain_html and plain_html != html_content:
-                            fallback_attempts.append(("plain-text paragraph fallback", plain_html))
+                            fallback_attempts.append(("plain-text paragraph fallback", plain_html, True))
 
-                    for fb_label, fb_html in fallback_attempts:
+                    for fb_label, fb_html, fb_escape_amp in fallback_attempts:
                         fb_payload = {
                             **payload,
-                            "rich_message": _rich_message_html_payload(fb_html),
+                            "rich_message": _rich_message_html_payload(fb_html, escape_attr_amp=fb_escape_amp),
                         }
                         logger.warning(
                             "sendRichHtmlMessage retrying with %s (orig_len=%s, fallback_len=%s)",
