@@ -532,6 +532,19 @@ class RichMessageBuilder:
             self.request_flush(force=False)
             return
 
+        # text_editor 不再声明 _description（意图）参数：折叠块进行时标题
+        # 与单工具块摘要保持完全一致，一律按「动作 + 文件名 + diff 统计」
+        # 规范生成（Viewing/Creating/Editing file xxx.py +n -n）。模型即使
+        # 惯性携带 _description 也不被采用，因此本分支必须位于 custom_desc
+        # 检查之前。旧的固定映射（"Replacing exact text"/"Inserting text"
+        # 等，无文件名、无统计、与单工具块措辞不一致）已废弃。参数流式
+        # 更新期间 update_tool_args 会反复调用本函数，折叠块标题因此随
+        # diff 统计动态刷新。
+        if t == "text_editor":
+            group["outer_summary"] = _generate_initial_tool_summary("text_editor", fn_args)
+            self.request_flush(force=False)
+            return
+
         custom_desc = _get_tool_description_from_args(fn_args)
         if custom_desc:
             group["outer_summary"] = custom_desc
@@ -557,16 +570,6 @@ class RichMessageBuilder:
                 group["outer_summary"] = short
             else:
                 group["outer_summary"] = "Running command"
-        elif t == "text_editor":
-            command = fn_args.get("command", "")
-            # 进行时只显示动作，不显示路径
-            mapping = {
-                "view": "Viewing file",
-                "create": "Creating file",
-                "str_replace": "Replacing exact text",
-                "insert": "Inserting text",
-            }
-            group["outer_summary"] = mapping.get(command, "Editing file")
         elif t == "present_files":
             group["outer_summary"] = "Presenting file(s)"
         elif t in ("ask_user", "message_user"):
