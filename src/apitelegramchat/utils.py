@@ -954,6 +954,233 @@ def _presigned_media_diagnostic_hint(html_content: str) -> str:
     return ""
 
 
+# ---------- v5：tg-document 原生 sendDocument 兜底（先于链接降级） ----------
+# 背景（2026-09-05 02:31 日志 chat=7162243624 trace cc963c9b）：v4 稳定代理
+# URL 交付后，Telegram 富文本抓取器对 /media/<hmac>/telegram/<file_id>
+# 成功下载了全部字节（代理侧两次 200 + 89257B，时间与两次发送尝试一一
+# 对应），却仍以 RICH_MESSAGE_DOCUMENT_NO_MEDIA_FOUND 拒绝——抓取成功
+# 不等于建档成功：URL/响应均无文件名与真实类型（octet-stream + 裸
+# file_id），抓取器无法把字节归类为文档媒体。v5 双管齐下：
+#   a) 交付 URL 末段携带原始文件名 + 代理按扩展名给出正确 Content-Type
+#      （根治，见 media_proxy.build_media_proxy_url / app.media_proxy_serve）；
+#   b) 本模块兜底：文档本来来自 Telegram（用户上传），bot 手里就有
+#      file_id —— 富文本被拒时先用 sendDocument(file_id) 原生把文件送达，
+#      再从富文本里移除该标签（保留 figcaption 文本），确保用户拿到真实
+#      文件而不是一个 <a> 链接。外部 URL 的 tg-document 没有 file_id，
+#      不适用本兜底，仍走既有降级链。
+
+# 匹配"指向本系统 telegram/<file_id> 资源"的 URL（覆盖三种历史形态）：
+#   * v4/v5 自托管代理：https://host/media/<hmac>/telegram/<file_id>[/<filename>]
+#   * R2 公开域：      https://pub-xxx.r2.dev/telegram/<file_id>
+#   * 历史预签名回显：  https://<account>.r2.cloudflarestorage.com/<bucket>/telegram/<file_id>?X-Amz-...
+# file_id 是 base64url 安全字符（字母/数字/_/-），长度下限过滤偶撞。
+_OWN_TELEGRAM_FILE_URL_RE = re.compile(
+    r'^https?://[^/\s]+/'
+    r'(?:[^?\'"\s]*/)?'                 # 任意路径前缀（bucket / media/<hmac> 等）
+    r'telegram/'
+    r'(?P<fid>[A-Za-z0-9_\-]{16,})'
+    r'(?:/[^?\'"\s]*)?'                 # v5：可选的展示文件名段
+    r'(?:[?#].*)?$',
+    re.IGNORECASE,
+)
+
+# 原生兜底去重窗口：同 chat 同 file_id 在窗口内不重复原样发送（草稿/
+# 正式双路径、同轮重发、重试等场景防重复送文件）。
+_NATIVE_RESCUE_TTL_SECONDS = 300
+try:
+    from cachetools import TTLCache as _NativeRescueTTLCache
+    _native_rescued_recent = _NativeRescueTTLCache(
+        maxsize=128, ttl=_NATIVE_RESCUE_TTL_SECONDS
+    )
+except Exception:  # cachetools 缺失时退化为普通 dict（带时间戳自清理）
+    _native_rescued_recent: dict = {}
+
+# 自闭合分支在前：防止 "<tg-document .../>" 被容器分支跨块吞并
+# （与 _demote_all_media_to_links 的分支顺序约定一致）。
+_DOCUMENT_TAG_BLOCK_RE = re.compile(
+    r'<tg-document\b[^>]*/>|<tg-document\b[^>]*>.*?</tg-document\s*>',
+    re.IGNORECASE | re.DOTALL,
+)
+_DOCUMENT_FIGURE_RE = re.compile(
+    r'<figure\b[^>]*>(.*?)</figure\s*>',
+    re.IGNORECASE | re.DOTALL,
+)
+_DOCUMENT_FIGCAPTION_RE = re.compile(
+    r'<figcaption\b[^>]*>(.*?)</figcaption\s*>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_media_src_attr(tag_text: str) -> str:
+    """提取媒体标签的 src 属性值（双/单引号/无引号），解包 Markdown 包裹。"""
+    m = re.search(
+        r'\bsrc\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))',
+        tag_text, re.IGNORECASE,
+    )
+    if not m:
+        return ""
+    raw = (m.group(2) or m.group(3) or m.group(4) or "").strip()
+    return _unwrap_markdown_link_url(raw)
+
+
+def _match_own_telegram_file_url(src: str) -> str:
+    """src 指向本系统 telegram/<file_id> 资源时返回 file_id，否则空串。
+
+    属性值可能残留 &amp; 形态（发送前的转义管线产物），先还原再匹配。
+    """
+    if not src:
+        return ""
+    s = _unwrap_markdown_link_url(src.strip()).replace("&amp;", "&")
+    m = _OWN_TELEGRAM_FILE_URL_RE.match(s)
+    return m.group("fid") if m else ""
+
+
+async def _native_send_document(chat_id: int, file_id: str) -> bool:
+    """用 Bot API sendDocument(file_id) 原生发送文档。
+
+    file_id 是 bot 已见过的文件引用（用户上传给本 bot 的原件），按
+    Telegram Bot API 语义可直接重发，无需上传字节。
+    """
+    try:
+        session = await get_http_session()
+        async with session.post(
+            f"{BASE_URL}/sendDocument",
+            json={"chat_id": chat_id, "document": file_id},
+            timeout=aiohttp.ClientTimeout(total=20, connect=5),
+        ) as resp:
+            if resp.status == 200:
+                return True
+            body = await resp.text()
+            logger.warning(
+                "sendDocument 原生兜底失败: %s %s", resp.status, body[:160]
+            )
+            return False
+    except Exception as e:
+        logger.warning("sendDocument 原生兜底异常: %s", e)
+        return False
+
+
+async def _maybe_native_send_document(chat_id: int, file_id: str) -> bool:
+    """带去重的原生发送：去重窗口内同 chat+file_id 直接视为已送达。
+
+    返回 True 表示文件已（或刚刚被）原生送达，调用方可安全移除对应标签。
+    """
+    now = time.monotonic()
+    key = (chat_id, file_id)
+    try:
+        last = _native_rescued_recent.get(key)
+    except Exception:
+        last = None
+    if last is not None and (now - last) < _NATIVE_RESCUE_TTL_SECONDS:
+        return True
+    if not isinstance(_native_rescued_recent, dict):
+        # TTLCache 路径：过期条目由缓存自动淘汰
+        pass
+    elif len(_native_rescued_recent) > 256:
+        # dict 兜底路径：按时间戳清理过期/最旧条目，防无界增长
+        cutoff = now - _NATIVE_RESCUE_TTL_SECONDS
+        stale = [k for k, ts in _native_rescued_recent.items() if ts < cutoff]
+        for k in stale:
+            _native_rescued_recent.pop(k, None)
+        if len(_native_rescued_recent) > 256:
+            for k in sorted(
+                _native_rescued_recent, key=lambda kk: _native_rescued_recent[kk]
+            )[:128]:
+                _native_rescued_recent.pop(k, None)
+    if not await _native_send_document(chat_id, file_id):
+        return False
+    try:
+        _native_rescued_recent[key] = now
+    except Exception:
+        pass
+    return True
+
+
+def _find_document_blocks(html_content: str) -> list:
+    """收集所有 <tg-document> 块（figure 包裹的以整个 figure 为一块）。
+
+    返回按出现位置排序的 [{"start", "end", "src", "cap_html"}]；figure 块
+    的 span 覆盖整个 <figure>…</figure>，内层标签不会在裸块扫描中被二次
+    处理（_consumed 判定）。
+    """
+    blocks: list = []
+    consumed: list = []
+    for m in _DOCUMENT_FIGURE_RE.finditer(html_content):
+        inner = m.group(1) or ""
+        mm = _DOCUMENT_TAG_BLOCK_RE.search(inner)
+        if not mm:
+            continue
+        cap = ""
+        cm = _DOCUMENT_FIGCAPTION_RE.search(inner)
+        if cm:
+            cap = (cm.group(1) or "").strip()
+        blocks.append({
+            "start": m.start(), "end": m.end(),
+            "src": _extract_media_src_attr(mm.group(0)),
+            "cap_html": cap,
+        })
+        consumed.append(m.span())
+
+    def _consumed(s: int, e: int) -> bool:
+        return any(s >= cs and e <= ce for cs, ce in consumed)
+
+    for m in _DOCUMENT_TAG_BLOCK_RE.finditer(html_content):
+        if _consumed(m.start(), m.end()):
+            continue
+        blocks.append({
+            "start": m.start(), "end": m.end(),
+            "src": _extract_media_src_attr(m.group(0)),
+            "cap_html": "",
+        })
+    blocks.sort(key=lambda b: b["start"])
+    return blocks
+
+
+async def _rescue_documents_via_native_send(
+    chat_id: int, html_content: str
+) -> Optional[str]:
+    """把指向本系统 telegram/<file_id> 的 <tg-document> 改为原生送达并移除标签。
+
+    返回改写后的 HTML（至少成功救援一个文档且内容有变化）；返回 None
+    表示无候选 / 原生发送失败 / 均为外部 URL——调用方继续走既有降级链。
+    """
+    text = html_content or ""
+    if "<tg-document" not in text.lower():
+        return None
+    candidates = []
+    for b in _find_document_blocks(text):
+        fid = _match_own_telegram_file_url(b["src"])
+        if fid:
+            candidates.append((b, fid))
+    if not candidates:
+        return None
+
+    out: list = []
+    cursor = 0
+    rescued_any = False
+    for b, fid in candidates:
+        s, e = b["start"], b["end"]
+        if not await _maybe_native_send_document(chat_id, fid):
+            continue  # 原生发送失败：保留原块，交给后续降级链
+        rescued_any = True
+        out.append(text[cursor:s])
+        cap = (b["cap_html"] or "").strip()
+        if cap:
+            # 保留模型给的文档名/说明文字作为普通段落；文件本体已由
+            # sendDocument 送达，不再需要链接或媒体标签
+            out.append(f"<p>{cap}</p>")
+        logger.info(
+            "[v5] tg-document 原生兜底：sendDocument(file_id) 已送达，"
+            "标签从富文本移除: chat=%s file_id=%s",
+            chat_id, fid[:16],
+        )
+        cursor = e
+    if not rescued_any:
+        return None
+    out.append(text[cursor:])
+    return "".join(out)
+
+
 def _demote_all_media_to_links(
     html_content: str,
     media_kinds: Optional[set[str]] = None,
@@ -1968,6 +2195,22 @@ async def send_rich_html_message(
                             fallback_attempts.append(
                                 ("media src ampersands re-sent as raw & form", alt_rich["html"], False)
                             )
+                        # —— v5 原生文档兜底（先于链接降级，破坏性更小）——
+                        # 文档来自用户上传，bot 手里有 file_id：直接
+                        # sendDocument 原生送达文件本体，再从富文本移除该
+                        # 标签（保留 figcaption 文本）。成功时用户拿到的是
+                        # 真实文件而非 <a> 链接；无候选/发送失败时原样进入
+                        # 下方定向降级，外部 URL 的 tg-document 不受影响。
+                        if "tg-document" in media_kinds:
+                            rescued = await _rescue_documents_via_native_send(chat_id, html_content)
+                            if rescued and rescued != html_content:
+                                fallback_attempts.append(
+                                    (
+                                        "documents delivered natively via sendDocument(file_id), media tags removed",
+                                        rescued,
+                                        True,
+                                    )
+                                )
                         targeted = _demote_all_media_to_links(html_content, media_kinds)
                         if targeted and targeted != html_content:
                             fallback_attempts.append(

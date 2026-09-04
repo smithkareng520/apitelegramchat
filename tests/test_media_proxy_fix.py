@@ -170,18 +170,18 @@ p = Patcher()
 try:
     p.set(s3u, "_public_delivery_base_url", lambda: "https://pub.r2dev.example.com")
     p.set(s3u, "build_media_proxy_url",
-          lambda k: (_ for _ in ()).throw(AssertionError("不应走到代理")))
+          lambda k, filename="": (_ for _ in ()).throw(AssertionError("不应走到代理")))
     check("R2 公开域优先于代理",
           asyncio.run(s3u.resolve_stable_delivery_url(KEY))
           == f"https://pub.r2dev.example.com/{KEY}")
 
     p.set(s3u, "_public_delivery_base_url", lambda: None)
-    p.set(s3u, "build_media_proxy_url", lambda k: f"https://bot.example.com/media/ff/{k}")
+    p.set(s3u, "build_media_proxy_url", lambda k, filename="": f"https://bot.example.com/media/ff/{k}")
     check("无公开域时走自托管代理",
           asyncio.run(s3u.resolve_stable_delivery_url(KEY))
           == f"https://bot.example.com/media/ff/{KEY}")
 
-    p.set(s3u, "build_media_proxy_url", lambda k: None)
+    p.set(s3u, "build_media_proxy_url", lambda k, filename="": None)
     check("两者都不可得 → None",
           asyncio.run(s3u.resolve_stable_delivery_url(KEY)) is None)
 
@@ -202,13 +202,13 @@ try:
     p.set(s3u, "is_r2_configured", lambda: False)
     p.set(s3u, "_public_delivery_base_url", lambda: None)
 
-    p.set(s3u, "build_media_proxy_url", lambda k: f"https://bot.example.com/media/aa/{k}")
+    p.set(s3u, "build_media_proxy_url", lambda k, filename="": f"https://bot.example.com/media/aa/{k}")
     url = asyncio.run(s3u.upload_bytes_to_r2(b"v4-proxy-test", TEST_KEY, "text/plain"))
     check("本地缓存 + 代理可用 → 返回代理 URL", url == f"https://bot.example.com/media/aa/{TEST_KEY}",
           f"actual={url}")
     check("本地缓存文件已写入 r2_cache", s3u._safe_local_key_path(TEST_KEY).exists())
 
-    p.set(s3u, "build_media_proxy_url", lambda k: None)
+    p.set(s3u, "build_media_proxy_url", lambda k, filename="": None)
     url2 = asyncio.run(s3u.upload_bytes_to_r2(b"v4-local-test", TEST_KEY, "text/plain"))
     check("本地缓存 + 无代理基地址 → file:// 兜底",
           isinstance(url2, str) and url2.startswith("file://"), f"actual={url2}")
@@ -332,10 +332,10 @@ try:
     async def _exists(key):
         return True
 
-    async def _stable_hit(key):
+    async def _stable_hit(key, filename=""):
         return f"https://bot.example.com/media/bb/{key}"
 
-    async def _stable_miss(key):
+    async def _stable_miss(key, filename=""):
         return None
 
     async def _presigned(key):

@@ -224,7 +224,7 @@ async def generate_presigned_url(
         return url
 
 
-async def resolve_stable_delivery_url(key: str) -> str | None:
+async def resolve_stable_delivery_url(key: str, filename: str = "") -> str | None:
     """为对象 key 解析一个"稳定公开交付 URL"，供 Telegram 富文本抓取器等
     外部抓取方使用。解析顺序：
 
@@ -233,15 +233,21 @@ async def resolve_stable_delivery_url(key: str) -> str | None:
          由本服务鉴权后从 R2/Telegram 回源（见 media_proxy.py）；
       3. 都不可用 → ``None``（调用方自行决定是否退回预签名 URL）。
 
-    背景：R2 S3 API 预签名 URL 实测公网可访问（HTTP 200），但 Telegram
-    富文本抓取器无法把这种带长查询串的 URL 解析为可用媒体，一律报
-    ``RICH_MESSAGE_*_NO_MEDIA_FOUND`` —— 参见 media_proxy.py 模块注释。
+    v5（2026-09-05 02:31 日志复盘）：``filename``（原始文件名，含扩展名）
+    仅在自托管代理路径生效——URL 变为 ``{base}/media/<hmac>/<key>/<fname>``。
+    背景：Telegram 抓取器对 v4 的 ``telegram/<file_id>`` 代理 URL 成功下载
+    了全部字节仍报 ``RICH_MESSAGE_DOCUMENT_NO_MEDIA_FOUND``，原因是 URL 与
+    响应都不携带文件名/类型（octet-stream + 裸 file_id），抓取器无法把
+    字节建档为文档媒体；URL 末段的真实文件名是它唯一可用的类型线索。
+    R2 公开域路径不能附加伪路径段（对象 key 不含文件名，会 404），其类型
+    信息依赖上传端写入的真实 ContentType（file_handlers v5 起已透传
+    Telegram 报告的 mime_type）。
     """
     base = _public_delivery_base_url()
     if base:
         return f"{base}/{key}"
     try:
-        return build_media_proxy_url(key)
+        return build_media_proxy_url(key, filename)
     except Exception as e:  # 防御：代理 URL 构造失败不阻塞主流程
         logger.warning("构建媒体代理 URL 失败 %s: %s", key, e)
         return None

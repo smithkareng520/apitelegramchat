@@ -436,7 +436,7 @@ def _attachment_label(kind: str) -> str:
     return _ATTACHMENT_KIND_LABELS.get(str(kind or "").lower(), str(kind or "附件"))
 
 
-async def _resolve_public_attachment_url(file_id: str) -> str:
+async def _resolve_public_attachment_url(file_id: str, file_name: str = "") -> str:
     """把 Telegram file_id 解析成一个可供模型/工具继续引用的公开 URL。
 
     安全约束：此函数的返回值会被嵌入到发送给 LLM 的 fallback 文本里
@@ -461,7 +461,10 @@ async def _resolve_public_attachment_url(file_id: str) -> str:
         if await file_exists_in_r2(r2_key):
             # v4：优先稳定 URL（无签名、无过期、无查询参数）——模型把它
             # 写进 <tg-document src>/<a href> 后 Telegram 抓取器才能取到。
-            stable = await resolve_stable_delivery_url(r2_key)
+            # v5: pass through the original file name (proxy path appends
+            # it to the URL tail so the Telegram fetcher can classify the
+            # document by its extension).
+            stable = await resolve_stable_delivery_url(r2_key, str(file_name or "").strip())
             if stable:
                 return stable
             # 稳定链路都不可得（无公开域且代理基地址未配置）时的兜底。
@@ -556,7 +559,7 @@ async def _build_attachment_fallback_text(
         mime = ""
         if mime_types and idx - 1 < len(mime_types):
             mime = str(mime_types[idx - 1] or "").strip()
-        url = await _resolve_public_attachment_url(fid) if fid else ""
+        url = await _resolve_public_attachment_url(fid, fname) if fid else ""
         any_url = any_url or bool(url)
         parts = [f"{safe_kind}{idx if total > 1 else ''}"]
         if fname:
@@ -838,10 +841,16 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                 # 即使当前模型支持视觉输入，也额外注入附件临时 URL。
                 # 该 URL 与非多模态 fallback 使用同一套解析逻辑，
                 # 便于图片编辑工具调用，以及后续模型切换后继续复用。
+                # v5: pass through the original file names so the proxy URL
+                # tail carries the extension/type hint for the fetcher.
+                photo_names = list(msg.get("file_names") or [])
                 url_lines = []
-                for fid in file_ids:
+                for p_idx, fid in enumerate(file_ids):
                     try:
-                        temp_url = await _resolve_public_attachment_url(fid)
+                        p_name = ""
+                        if p_idx < len(photo_names):
+                            p_name = str(photo_names[p_idx] or "").strip()
+                        temp_url = await _resolve_public_attachment_url(fid, p_name)
                     except Exception:
                         logger.debug("_resolve_multimodal_content 内部忽略的异常", exc_info=True)
                         temp_url = ""
@@ -1012,7 +1021,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                 # 保证后续切换到支持视频的模型时不丢信息。
                 _track_task(_ensure_video_persisted(fid, mime_type or "video/mp4"))
 
-            url = await _resolve_public_attachment_url(fid)
+            url = await _resolve_public_attachment_url(fid, file_name)
             lines = [f"📎 用户上传了{_attachment_label(file_type)}「{file_name}」"]
             if url:
                 lines.append(f"链接：{url}")

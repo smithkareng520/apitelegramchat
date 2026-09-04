@@ -35,7 +35,7 @@ import hmac
 import logging
 import mimetypes
 import os
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from apitelegramchat.config import (
     MEDIA_PROXY_BASE_URL,
@@ -69,6 +69,11 @@ _EXTRA_MIME_BY_EXT = {
     ".md": "text/markdown",
     ".csv": "text/csv",
     ".json": "application/json",
+    # v5：html/htm 是用户上传文档的常见扩展名（Telegram 报 text/html），
+    # 必须显式列出：mimetypes 在部分环境对 .htm 返回 None 或非预期值。
+    ".htm": "text/html",
+    ".html": "text/html",
+    ".xml": "application/xml",
     ".doc": "application/msword",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xls": "application/vnd.ms-excel",
@@ -139,8 +144,18 @@ def media_proxy_base_url() -> str | None:
     return None
 
 
-def build_media_proxy_url(key: str) -> str | None:
-    """构造 ``{base}/media/<token>/<key>`` 稳定代理 URL；基地址不可得时 None。"""
+def build_media_proxy_url(key: str, filename: str = "") -> str | None:
+    """构造 ``{base}/media/<token>/<key>`` 稳定代理 URL；基地址不可得时 None。
+
+    v5（2026-09-05 02:31 线上案例）：支持附加 ``filename``（原始文件名，
+    含扩展名）——URL 变为 ``{base}/media/<token>/<key>/<quoted-filename>``。
+    背景：``telegram/<file_id>`` 形态的 key 与响应 Content-Type 都不携带
+    任何文件名/类型信息（octet-stream + 裸 base64url file_id），Telegram
+    抓取器成功下载 89257 字节后仍无法把字节建档为文档媒体，报
+    ``RICH_MESSAGE_DOCUMENT_NO_MEDIA_FOUND``。URL 末段的真实文件名是
+    抓取器唯一可用的扩展名/类型线索，必须携带（app.media_proxy_serve
+    按“末段为展示名”解析，验签仍针对真实 key，安全性与 v4 相同）。
+    """
     base = media_proxy_base_url()
     if not base:
         return None
@@ -149,7 +164,82 @@ def build_media_proxy_url(key: str) -> str | None:
         return None
     # safe='/'：保留 key 内的层级结构，供 Quart <path:key> 转换器匹配。
     # file_id 属于 base64url 安全字符，quote 后不变。
-    return f"{base}/media/{sign_media_key(k)}/{quote(k, safe='/')}"
+    url = f"{base}/media/{sign_media_key(k)}/{quote(k, safe='/')}"
+    fname = str(filename or "").strip()
+    if fname:
+        # 展示文件名整段编码（safe=''）：中文名/空格均转 %XX，段内不含 '/'，
+        # 与 key 的路径结构无歧义；解析端 unquote 还原。
+        url += "/" + quote(fname, safe="")
+    return url
+
+
+def resolve_proxy_key(key: str, token: str) -> tuple[str, str] | None:
+    """校验代理路径并兼容 v5 的“末段展示文件名”形态。
+
+    返回 ``(serving_key, display_filename)``：
+
+      * v4 形态 ``<token>/<key>``：验签直接通过 → ``(key, "")``；
+      * v5 形态 ``<token>/<key>/<quoted-filename>``：整体验签必然失败
+        （签名只覆盖真实 key），剥离末段后对父 key 重验 →
+        ``(key, unquote(末段))``；
+      * 两种形态都不通过 → ``None``（调用方回 404，防探测语义不变）。
+
+    注意：末段只是展示名（响应头/类型推断用），**不参与回源寻址**，
+    因此伪造末段无法越权读取其他对象——能读什么仍完全由 HMAC 验签
+    决定。
+    """
+    k = str(key or "").strip()
+    if verify_media_token(k, token):
+        return k, ""
+    if "/" in k:
+        parent, _, tail = k.rpartition("/")
+        if parent and tail and verify_media_token(parent, token):
+            try:
+                return parent, unquote(tail)
+            except Exception:
+                return parent, tail
+    return None
+
+
+def guess_content_type_from_filename(
+    filename: str, fallback: str = "application/octet-stream"
+) -> str:
+    """按文件名（扩展名）推断 Content-Type，推断不出时返回 fallback。
+
+    v5：代理 URL 末段携带的原始文件名是唯一可信的扩展名来源——R2 上
+    ``telegram/<file_id>`` 键无扩展名、上传端 ContentType 可能是
+    octet-stream。``.htm/.html`` 等已显式列在 _EXTRA_MIME_BY_EXT，其余
+    交给标准库 mimetypes 兜底。
+    """
+    name = str(filename or "").strip()
+    if not name:
+        return fallback
+    ext = os.path.splitext(name)[1].lower()
+    if ext in _EXTRA_MIME_BY_EXT:
+        return _EXTRA_MIME_BY_EXT[ext]
+    try:
+        guessed, _ = mimetypes.guess_type(name)
+        if guessed:
+            return guessed
+    except Exception:
+        pass
+    return fallback
+
+
+def content_disposition_inline(filename: str) -> str:
+    """构造 RFC 6266 Content-Disposition（inline）头。
+
+    同时给出 ASCII ``filename=`` 兜底与 UTF-8 ``filename*=``：中文名
+    （如用户上传的「教程.htm」）必须走 filename* 才是合法 header；
+    去除 CR/LF/引号防 header 注入。
+    """
+    name = str(filename or "").strip() or "file"
+    name = name.replace("\r", "").replace("\n", "").replace('"', "'")
+    try:
+        ascii_name = name.encode("ascii").decode("ascii")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        ascii_name = "file"
+    return f'inline; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(name, safe="")}'
 
 
 def guess_content_type(key: str, provided: str | None = None) -> str:
@@ -158,6 +248,10 @@ def guess_content_type(key: str, provided: str | None = None) -> str:
     优先使用 R2 上传时记录的 ContentType（``application/octet-stream``
     视为"未记录"，因为上传端对未知扩展名会写这个默认值）；否则按
     key / 远端文件路径的扩展名推断；最后兜底 octet-stream。
+
+    v5 起调用方应优先用 ``guess_content_type_from_filename`` 按代理 URL
+    末段的真实文件名推断（那是唯一带扩展名的来源），本函数作为无文件名
+    场景的回退。
     """
     ct = (provided or "").strip().lower()
     if ct and ct != "application/octet-stream":

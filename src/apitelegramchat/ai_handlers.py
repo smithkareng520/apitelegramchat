@@ -228,7 +228,7 @@ async def build_system_prompt(
       <li>工具 <code>generate_video</code> 返回的 <code>视频链接：https://...</code>；</li>
       <li>Web 检索 / <code>fetch_url</code> / Wikipedia / 二维码等工具明确返回的 <code>https://</code> 开头的 URL。<b>fetch_url 与 Wikipedia 查询的结果本身就是按原页面文档顺序组织的 Telegram Rich Message HTML</b>：其中的 <code>&lt;img src="..."/&gt;</code>、<code>&lt;video src="..."/&gt;</code>、<code>&lt;a href="..."&gt;</code> 标签内的媒体与链接地址均为合法 URL，可直接复用（保持其在页面中的原始位置与顺序）；</li>
       <li>用户消息中明示给出的 <code>https://</code> 或 <code>http://</code> 开头的 URL。</li>
-      <li>用户上传附件占位文本中的「链接：https://...」字段（R2 公开域名或本服务 <code>/media/</code> 稳定代理地址）：<b>这是可直接写入 <code>src</code>/<code>href</code> 的稳定公开 URL</b>，无查询参数、长期有效，原样使用即可；不得改写路径、追加查询参数或与其他字符串拼接。</li>
+      <li>用户上传附件占位文本中的「链接：https://...」字段（R2 公开域名或本服务 <code>/media/</code> 稳定代理地址）：<b>这是可直接写入 <code>src</code>/<code>href</code> 的稳定公开 URL</b>，无查询参数、长期有效，原样使用即可；不得改写路径、追加查询参数或与其他字符串拼接。<b>URL 末段是原始文件名（含扩展名，可能为 %XX 编码形态）</b>，Telegram 依赖它识别文档类型——必须整条复制到 <code>src</code>，严禁删去或改写末尾文件名段。</li>
     </ol>
   </li>
   <li><b>绝对禁止：</b>从附件占位符中提取 file_name / file_id 拼成看似 URL 的字符串（如 <code>photo_AbCdEf12.jpg</code>、<code>document_xxx.pdf</code>）；也禁止编造任何 <code>https://</code> 开头但实际不存在的 URL。</li>
