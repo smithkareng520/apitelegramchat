@@ -55,6 +55,7 @@ from apitelegramchat.ai.tool_summary import (
     _contains_textual_tool_call,
     _generate_action_description,
     _generate_initial_tool_summary,
+    _generate_pending_tool_summary,
     _normalize_tool_call_arguments,
     _safe_parse_args,
     _strip_textual_tool_calls,
@@ -277,6 +278,12 @@ async def _agentic_loop_openai_compat(
     for _round in range(MAX_TOOL_CALLS):
         added_tool_indices = set()
         last_arg_len = {}
+        # ★ 修复"工具块不即时显示"：每个 tool_call 索引当前使用的 UI 条目
+        # id（占位阶段为 pending_* id）与已确认的函数名。部分网关会先流式
+        # 传输参数增量、把 id/函数名拖到很晚才补发；占位条目保证工具块在
+        # 第一片增量到达时就上屏，id/名称到达后再原地改绑/回填。
+        stream_item_ids: dict = {}
+        stream_item_names: dict = {}
 
         content_acc = ""
         reasoning_acc = ""
@@ -429,49 +436,80 @@ async def _agentic_loop_openai_compat(
                                  "function": {"name": getattr(tc_delta.function, "name", "") or "",
                                               "arguments": getattr(tc_delta.function, "arguments", "") or ""}}
                             )
+                            tc = tool_calls_acc[idx]
+                            tc_id = tc.get("id")
+                            tc_name = tc.get("function", {}).get("name")
+
+                            # ★ 修复"工具块不即时显示"：该工具调用的第一片增量到达就
+                            # 立即建条目，不再要求 id 与函数名都齐备。部分网关把
+                            # tool_call 的 id/name 拖到流末尾才补发（参数增量却在正常
+                            # 流式）；旧实现 `if tc_id and tc_name` 会在整段参数流期间
+                            # （例如 text_editor create 写整个 file_text 的几十秒里）
+                            # 不显示任何工具块，直到创建完毕才一次性出现完成态。
+                            # 现在用占位 id 先建条目，id/name 到达后再原地改绑与回填。
                             if idx not in added_tool_indices:
-                                tc = tool_calls_acc[idx]
-                                tc_id = tc.get("id")
-                                tc_name = tc.get("function", {}).get("name")
-                                if tc_id and tc_name:
-                                    if round_leading_kind is None:
-                                        # 本轮第一个出现的就是工具调用：沿用/合并到上一个未闭合的工具块。
-                                        round_leading_kind = "tool"
-                                    elif round_leading_kind == "content" and builder._tool_groups and not builder._tool_groups[
-                                        -1].get("finished", False):
-                                        # 本轮先出现了文本/思考才轮到工具调用：这段文本已经在上面把旧工具块
-                                        # 关闭掉了，这里创建的会是全新的独立工具块，不需要再次关闭。
-                                        pass
-                                    args_str = tc.get("function", {}).get("arguments", "")
-                                    parsed_args = _safe_parse_args(args_str)
+                                if round_leading_kind is None:
+                                    # 本轮第一个出现的就是工具调用：沿用/合并到上一个未闭合的工具块。
+                                    round_leading_kind = "tool"
+                                elif round_leading_kind == "content" and builder._tool_groups and not builder._tool_groups[
+                                    -1].get("finished", False):
+                                    # 本轮先出现了文本/思考才轮到工具调用：这段文本已经在上面把旧工具块
+                                    # 关闭掉了，这里创建的会是全新的独立工具块，不需要再次关闭。
+                                    pass
+                                item_id = tc_id or f"pending_{_round}_{idx}"
+                                args_str = tc.get("function", {}).get("arguments", "")
+                                parsed_args = _safe_parse_args(args_str)
+                                if tc_name:
                                     summary = _generate_initial_tool_summary(tc_name, parsed_args)
                                     action_desc = _generate_action_description(tc_name, parsed_args)
-                                    builder.add_tool_item(
-                                        tc_id,
-                                        tc_name,
-                                        summary,
-                                        action_description=action_desc,
-                                        fn_args=parsed_args
+                                    stream_item_names[idx] = tc_name
+                                else:
+                                    # 函数名尚未到达：按参数形状推断（如 text_editor 的
+                                    # command 枚举），推断不出时显示通用进行态文本。
+                                    summary = _generate_pending_tool_summary(parsed_args)
+                                    action_desc = None
+                                builder.add_tool_item(
+                                    item_id,
+                                    tc_name or "",
+                                    summary,
+                                    action_description=action_desc,
+                                    fn_args=parsed_args
+                                )
+                                stream_item_ids[idx] = item_id
+                                added_tool_indices.add(idx)
+                                builder.request_flush(force=False)
+                            else:
+                                # 已建条目：真实 id / 函数名到达时原地改绑与回填，
+                                # 避免执行批次按真实 id 再建一个重复的工具块。
+                                item_id = stream_item_ids.get(idx) or ""
+                                known_name = stream_item_names.get(idx) or ""
+                                need_rebind = bool(tc_id and item_id and tc_id != item_id)
+                                need_name = bool(tc_name and tc_name != known_name)
+                                if item_id and (need_rebind or need_name):
+                                    builder.attach_stream_tool_identity(
+                                        item_id,
+                                        new_id=tc_id if need_rebind else None,
+                                        tool_type=tc_name or None,
                                     )
-                                    added_tool_indices.add(idx)
-                                    builder.request_flush(force=False)
+                                    if need_rebind:
+                                        stream_item_ids[idx] = tc_id
+                                    if need_name:
+                                        stream_item_names[idx] = tc_name
 
                             if idx in added_tool_indices:
-                                tc = tool_calls_acc[idx]
-                                tc_id = tc.get("id")
-                                if not tc_id:
-                                    continue
                                 # 工具调用参数在流式接收过程中不再实时渲染预览；
                                 # 最终结果会在工具执行完成后按统一的 Input/Output 格式一次性展示。
                                 # 但参数中一旦解析出模型提交的简短描述（_description/_summary），
                                 # 或完整 JSON 解析出 query/command/url 等字段，就立即更新摘要上屏，
                                 # 不再等到整段参数流结束后才由工具批次补写。
+                                # 更新一律按条目当前 id（占位或真实）寻址，占位条目同样
+                                # 能在参数流式期间刷新摘要。
                                 current_args = tc.get("function", {}).get("arguments", "")
                                 current_len = len(current_args)
                                 if current_len - last_arg_len.get(idx, 0) >= 20:
                                     last_arg_len[idx] = current_len
                                     parsed_args = _safe_parse_args(current_args)
-                                    builder.update_tool_args(tc_id, parsed_args)
+                                    builder.update_tool_args(stream_item_ids[idx], parsed_args)
                     break
                 except BadRequestError as exc:
                     # strict 工具 schema 被网关拒绝（聚合网关对 strict 的支持
@@ -599,6 +637,21 @@ async def _agentic_loop_openai_compat(
         for idx, tc in enumerate(tool_calls_list):
             if not tc.get("id"):
                 tc["id"] = f"call_{_round}_{idx}_{uuid.uuid4().hex[:8]}"
+        # ★ 流结束：把仍处于占位 id 的条目改绑到最终 id（含上面补发的合成
+        # id），并回填函数名。这样 _run_tool_calls_and_append 里的
+        # add_tool_item(真实 id, ...) 会合并进已经显示的条目，而不是另建
+        # 一个重复的工具块。acc 索引与 tool_calls_list 位置按排序键对齐。
+        if stream_item_ids:
+            for acc_idx in sorted(tool_calls_acc.keys()):
+                tc_entry = tool_calls_acc[acc_idx]
+                item_id = stream_item_ids.get(acc_idx)
+                if item_id and item_id != tc_entry.get("id"):
+                    builder.attach_stream_tool_identity(
+                        item_id,
+                        new_id=tc_entry.get("id") or None,
+                        tool_type=tc_entry.get("function", {}).get("name") or None,
+                    )
+                    stream_item_ids[acc_idx] = tc_entry.get("id") or item_id
         _normalize_tool_call_arguments(
             tool_calls_list, api_label, _round + 1,
             stream_finish_reason=stream_finish_reason)

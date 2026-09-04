@@ -257,9 +257,34 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     return mapping.get(fn_name, "Running...")
 
 
+# text_editor 的 command 封闭枚举：工具名尚未到达时，可据参数形状把
+# 占位条目的进行态摘要推断为 text_editor 风格（如 "Creating file"）。
+_TEXT_EDITOR_COMMAND_ENUM = frozenset({"view", "create", "str_replace", "insert", "undo_edit"})
+
+
+def _generate_pending_tool_summary(fn_args: dict) -> str:
+    """工具名尚未到达时的进行态摘要（流式占位工具条目用）。
+
+    部分网关的 tool_call 增量会先流式传输参数、后补发 id/函数名。
+    在函数名到达前，尽量从参数形状推断一个有意义的进行态文本：
+    text_editor 的 command 是封闭枚举，可直接识别（覆盖"创建文件"
+    等最长参数流场景）；其余情况显示通用进行态，待函数名到达后由
+    ``attach_stream_tool_identity`` 按真实工具名覆写。
+    """
+    command = str((fn_args or {}).get("command") or "")
+    if command in _TEXT_EDITOR_COMMAND_ENUM:
+        return _generate_initial_tool_summary("text_editor", fn_args or {})
+    return "Preparing tool call..."
+
+
 def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
     """生成动作描述（用于 fallback）"""
     fn_args = fn_args or {}
+
+    if not fn_name:
+        # 流式占位条目（函数名尚未到达）没有可描述的工具名：
+        # 返回空串，让调用方落到各自的通用进行态文本。
+        return ""
 
     custom_desc = _get_tool_description_from_args(fn_args)
     if custom_desc:
@@ -318,12 +343,53 @@ def _tool_limit_summary() -> str:
     )
 
 
+# 有界快速字段扫描：只看头部前 4KB。command/path/query/url/_description
+# 等控制字段在参数对象的最前面（大体积负载如 file_text / new_str 排在其
+# 后），因此即使参数超过修复器的尺寸闸门、或 JSON 尚未闭合，也能拿到
+# 进行态摘要所需的关键字段。
+_FAST_SCAN_PREFIX_LEN = 4096
+_FAST_FIELD_RE = re.compile(
+    r'"(command|path|query|url|_description|_summary)"\s*:\s*"((?:[^"\\]|\\.)*)"'
+)
+
+
+def _fast_scan_fields(args_str: str) -> dict:
+    """从（可能截断的）参数字符串头部快速提取控制字段（UI 摘要用途）。
+
+    只匹配未转义的真实字段键——字符串值内部的引号在 JSON 里必然被
+    转义（\\"），不会被误认成字段边界。同一字段取首次出现，反转义
+    优先按 JSON 字符串字面量解析（与旧 _description 正则相同的策略，
+    可正确处理 \\uXXXX、\\\\ 等全部转义序列）。
+    """
+    fields: dict = {}
+    head = (args_str or "")[:_FAST_SCAN_PREFIX_LEN]
+    for match in _FAST_FIELD_RE.finditer(head):
+        key = match.group(1)
+        if key in fields:
+            continue
+        raw = match.group(2)
+        try:
+            fields[key] = json.loads(f'"{raw}"')
+        except (json.JSONDecodeError, ValueError):
+            # 兜底：极少数非法转义序列下退回到手工反转义。
+            fields[key] = (
+                raw.replace('\\"', '"')
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\\\", "\\")
+            )
+    return fields
+
+
 def _safe_parse_args(args_str: str) -> dict:
     """尽力从参数字符串中提取可用的 dict（UI 摘要用途）。
 
-    解析优先级：完整 json.loads → 正则提取 _description → 保守自动修复
-    （限流：仅小于 _STREAM_REPAIR_SIZE_LIMIT 的输入；流式截断时允许
-    猜测补全，因为结果仅用于展示预览，不会真正执行）。
+    解析优先级：完整 json.loads → 保守自动修复（限流：仅小于
+    ``_STREAM_REPAIR_SIZE_LIMIT`` 的输入；流式截断时允许猜测补全，
+    因为结果仅用于展示预览，不会真正执行）→ 有界快速字段扫描。
+    快速扫描不受尺寸闸门限制：超大参数（如 text_editor create 的整份
+    ``file_text``）在流式期间也能把 "Creating file" 等进行态摘要及时
+    上屏，而不是退化为泛化的 "Editing file"。
     """
     if not args_str:
         return {}
@@ -333,20 +399,9 @@ def _safe_parse_args(args_str: str) -> dict:
             return parsed
     except (json.JSONDecodeError, ValueError):
         pass
-    # 流式不完整时，用正则兜底提取 _description
-    desc_match = re.search(r'"_description"\s*:\s*"((?:[^"\\]|\\.)*)"', args_str)
-    if desc_match:
-        # 修复：原代码用三个 .replace() 手工反转义，遗漏 \\u、\\r、\\\\、\\/ 等，
-        # 对 `C:\\path` 这样的输入会丢一个反斜杠。改成把正则捕获的字符串
-        # 当作 JSON 字符串字面量解析，让 json 模块处理全部转义序列。
-        try:
-            desc = json.loads(f'"{desc_match.group(1)}"')
-            return {"_description": desc}
-        except (json.JSONDecodeError, ValueError):
-            # 兜底：如果 json.loads 失败，退回到旧的简单反转义。
-            desc = desc_match.group(1).replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t')
-            return {"_description": desc}
-    # 最终兜底：保守自动修复（仅展示用途——允许补全截断，不进入执行层）。
+    # 快速字段扫描结果：修复器可用时并入修复结果，否则单独作为兜底。
+    fast_fields = _fast_scan_fields(args_str)
+    # 保守自动修复（仅展示用途——允许补全截断，不进入执行层）。
     if len(args_str) < _STREAM_REPAIR_SIZE_LIMIT:
         try:
             repaired, _info = repair_json_arguments(
@@ -354,11 +409,13 @@ def _safe_parse_args(args_str: str) -> dict:
             if isinstance(repaired, dict) and repaired:
                 # 剔除修复提示键，只保留真实参数字段供摘要展示。
                 repaired.pop(_JSON_REPAIR_NOTE_KEY, None)
+                for key, value in fast_fields.items():
+                    repaired.setdefault(key, value)
                 return repaired
         except Exception:
             logger.debug("_safe_parse_args 修复兜底内部忽略的异常", exc_info=True)
             pass
-    return {}
+    return fast_fields
 
 
 def _normalize_tool_arguments(

@@ -29,6 +29,7 @@ from apitelegramchat.ai.tool_summary import (
     _coerce_positive_int,
     _generate_action_description,
     _generate_initial_tool_summary,
+    _generate_pending_tool_summary,
     _get_tool_description_from_args,
 )
 
@@ -371,6 +372,10 @@ class RichMessageBuilder:
 
         for item in group["items"]:
             if item["id"] == tool_id:
+                # 流式占位条目可能在建条目时函数名尚未到达（type 为空或
+                # 待修正）：执行批次按真实工具名补建摘要时一并回填 type。
+                if tool_type and item.get("type") != tool_type:
+                    item["type"] = tool_type
                 if search_query:
                     item["search_query"] = search_query
                 if domain:
@@ -398,6 +403,47 @@ class RichMessageBuilder:
         group["items"].append(item)
         self._refresh_outer_summary(group)
         self.request_flush(force=False)
+
+    def attach_stream_tool_identity(self, item_id: str, new_id: str = None,
+                                    tool_type: str = None) -> bool:
+        """流式占位工具条目的身份补全（原地改绑，绝不新建条目）。
+
+        流式增量里 tool_call 的 id/函数名可能晚于参数增量到达（部分聚合
+        网关会把它们拖到流末尾才补发）。占位条目先以 ``pending_*`` id
+        上屏；真实 id / 工具名到达后由本方法原地改绑并回填：
+
+        - ``new_id``：改绑条目 id，让执行批次的 ``add_tool_item(真实 id)``
+          合并进同一条目，而不是另建一个重复的工具块；
+        - ``tool_type``：回填/修正工具名，并按最新参数重算进行态摘要
+          （含工具组外部摘要），占位期的通用文本随即被真实摘要替换。
+
+        返回是否找到并更新了条目。
+        """
+        for group in self._tool_groups:
+            for item in group["items"]:
+                if item["id"] != item_id:
+                    continue
+                changed = False
+                if new_id and new_id != item["id"]:
+                    item["id"] = new_id
+                    changed = True
+                if tool_type and item.get("type") != tool_type:
+                    item["type"] = tool_type
+                    changed = True
+                if changed:
+                    if item.get("status") in ("running", "waiting"):
+                        args = item.get("fn_args") or {}
+                        if item.get("type"):
+                            new_summary = _generate_initial_tool_summary(item["type"], args)
+                        else:
+                            new_summary = _generate_pending_tool_summary(args)
+                        if new_summary and new_summary != item["summary"]:
+                            item["summary"] = new_summary
+                        self._refresh_outer_summary(group)
+                    else:
+                        self.request_flush(force=False)
+                return True
+        return False
 
     def update_tool_item(self, tool_id: str, summary: str, details_html: str, status: str = "done"):
         for group in self._tool_groups:
@@ -437,7 +483,11 @@ class RichMessageBuilder:
                     continue
                 item["fn_args"] = args
                 if item.get("status") in ("running", "waiting"):
-                    new_summary = _generate_initial_tool_summary(item.get("type", ""), args)
+                    if item.get("type"):
+                        new_summary = _generate_initial_tool_summary(item.get("type", ""), args)
+                    else:
+                        # 占位条目（函数名尚未到达）：按参数形状推断进行态摘要。
+                        new_summary = _generate_pending_tool_summary(args)
                     if new_summary and new_summary != item["summary"]:
                         item["summary"] = new_summary
                     self._refresh_outer_summary(group)
@@ -485,6 +535,13 @@ class RichMessageBuilder:
         custom_desc = _get_tool_description_from_args(fn_args)
         if custom_desc:
             group["outer_summary"] = custom_desc
+            self.request_flush(force=False)
+            return
+
+        if not t:
+            # 流式占位条目（工具名尚未到达）：fn_args 可能已能给出自定义
+            # 描述（上面已优先采用）；此处兜底为通用进行态文本。
+            group["outer_summary"] = "Working..."
             self.request_flush(force=False)
             return
 
