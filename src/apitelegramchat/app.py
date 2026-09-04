@@ -1,5 +1,5 @@
 # app.py
-from quart import Quart, request
+from quart import Quart, request, Response
 import asyncio
 import aiohttp
 import json
@@ -258,6 +258,38 @@ async def health_check():
     return {
         "status": "ok",
     }, 200
+
+
+# ---------- 自托管稳定媒体代理（v4，2026-09-05） ----------
+# 背景见 media_proxy.py 模块注释：Telegram 富文本抓取器无法解析 R2 预签名
+# URL（实测公网 GET 200 却仍报 RICH_MESSAGE_*_NO_MEDIA_FOUND），媒体一律以
+# {base}/media/<hmac>/<key> 稳定形态交付，由本路由鉴权后从 R2/Telegram 回源。
+@app.route('/media/<token>/<path:key>', methods=['GET'])
+async def media_proxy_serve(token: str, key: str):
+    from apitelegramchat import media_proxy as _mp
+
+    if not _mp.verify_media_token(key, token):
+        # 404 而非 403：不向探测者确认“路径存在但签名错误”。
+        return "", 404
+
+    got = await _mp.collect_media_bytes(key)
+    if not got:
+        logger.warning(f"[media-proxy] 回源失败: {key[:120]}")
+        return "", 404
+    data, content_type = got
+    if len(data) > _mp.MEDIA_PROXY_MAX_BYTES:
+        logger.warning(f"[media-proxy] 对象超过大小上限: {key[:120]} ({len(data)}B)")
+        return "", 413
+
+    filename = key.rsplit("/", 1)[-1] or "file"
+    response = Response(data, content_type=content_type)
+    # inline + 文件名：文档类媒体在 Telegram 客户端的展示名优先来自
+    # figcaption，这里的 header 主要帮助通用抓取器识别对象。
+    response.headers["Content-Disposition"] = f'inline; filename="{filename}"'
+    response.headers["Cache-Control"] = "public, max-age=86400"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    logger.info(f"[media-proxy] 200 {key[:120]} ({len(data)}B, {content_type})")
+    return response
 
 # ---------- 权限辅助 ----------
 def get_user_info(msg: dict) -> tuple[str, str]:

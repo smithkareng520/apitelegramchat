@@ -920,6 +920,40 @@ def _demote_watch_page_videos(html_content: str) -> str:
     return result
 
 
+# ---------- 预签名 URL 诊断提示（v4 观测性辅助） ----------
+# 背景：R2 预签名 URL 公网可访问（2026-09-05 实测 GET 200），但 Telegram
+# 富文本抓取器无法将其解析为可用媒体。v4 起新产生的媒体 URL 已是稳定形态
+# （/media 代理或 R2_PUBLIC_URL）；历史对话里回显的旧预签名 URL 仍可能触发
+# 降级。这里在降级日志中追加可操作提示，排障时一眼区分“URL 形态问题”
+# 与其它媒体错误。
+_PRESIGN_HINT_MARKER_HOST = ".r2.cloudflarestorage.com"
+
+
+def _presigned_media_diagnostic_hint(html_content: str) -> str:
+    """当被降级媒体的 src 命中 R2 S3 API/预签名形态时返回一行诊断提示。"""
+    try:
+        match = re.search(
+            r'<(?:tg-document|img|video|audio)\b[^<>]*?\bsrc\s*=\s*"([^"]+)"',
+            html_content or "",
+            re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        src = _unwrap_markdown_link_url(match.group(1) or "")
+        low = src.lower()
+        if "x-amz-signature=" in low or _PRESIGN_HINT_MARKER_HOST in low:
+            return (
+                "（诊断：src 为 R2 S3 API/预签名 URL——该形态实测公网可访问，"
+                "但 Telegram 富文本抓取器无法解析为可用媒体；v4 起新媒体 URL "
+                "应为本服务 /media 稳定代理或 R2_PUBLIC_URL 公开域，请检查 "
+                "WEBHOOK_URL/MEDIA_PROXY_BASE_URL 配置；历史消息里的旧预签名 "
+                "URL 无法挽救，重传文件即可换得稳定 URL）"
+            )
+    except Exception:
+        return ""
+    return ""
+
+
 def _demote_all_media_to_links(
     html_content: str,
     media_kinds: Optional[set[str]] = None,
@@ -1675,8 +1709,9 @@ async def send_rich_message_draft(
                                 }
                                 logger.warning(
                                     "sendRichMessageDraft 媒体抓取失败，立即降级为链接重试"
-                                    "（Telegram 响应: %s）: chat=%s draft=%s orig_len=%s demoted_len=%s",
+                                    "（Telegram 响应: %s）: chat=%s draft=%s orig_len=%s demoted_len=%s%s",
                                     body[:160], chat_id, draft_id_int, len(html_content), len(demoted),
+                                    _presigned_media_diagnostic_hint(html_content),
                                 )
                                 try:
                                     async with session.post(
@@ -1918,8 +1953,9 @@ async def send_rich_html_message(
                         # 从不落日志，线上无法区分 URL_INVALID（解析层损坏）
                         # 与 NO_MEDIA_FOUND（服务端抓取失败），排障成本高。
                         logger.warning(
-                            "sendRichHtmlMessage 400 媒体错误（kinds=%s），原始响应: %s",
+                            "sendRichHtmlMessage 400 媒体错误（kinds=%s），原始响应: %s%s",
                             sorted(media_kinds), body[:300],
+                            _presigned_media_diagnostic_hint(html_content),
                         )
                         # —— 备用 & 形态重试（破坏性最小的一档，先于降级）——
                         # 首次发送已按 HTML 规范把媒体 src 的裸 & 转义为 &amp;；

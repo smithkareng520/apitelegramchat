@@ -20,6 +20,7 @@ from apitelegramchat.s3_utils import (
     download_from_r2,
     public_url_for_existing_key,
     generate_presigned_url,
+    resolve_stable_delivery_url,
     is_r2_configured,
 )
 import apitelegramchat.state as state
@@ -441,20 +442,29 @@ async def _resolve_public_attachment_url(file_id: str) -> str:
     安全约束：此函数的返回值会被嵌入到发送给 LLM 的 fallback 文本里
     （见 ``_build_attachment_fallback_text``），因此**绝对不能**返回
     Telegram 直链 —— 那会暴露 ``bot{TELEGRAM_BOT_TOKEN}/`` 给第三方模型
-    API。优先返回 R2 公开 URL；若 R2 未配置则返回空串，由调用方降级为
-    file_id 文本。
+    API。优先返回稳定公开 URL（R2 公开域 / 自托管 /media 代理）；若
+    R2 未配置且代理基地址不可得则返回空串，由调用方降级为 file_id 文本。
+
+    v4（2026-09-05）：不再直接返回预签名 URL。该 URL 虽然公网可访问，
+    但 Telegram 富文本抓取器无法将其解析为可用媒体
+    （RICH_MESSAGE_*_NO_MEDIA_FOUND，且 1h 过期后历史消息里回显的旧
+    URL 全部失效）——预签名只作为稳定链路都不可得时的最后兜底。
     """
     fid = str(file_id or "").strip()
     if not fid:
         return ""
 
     # 不再返回 Telegram 直链（避免把 bot token 暴露给第三方模型 API）。
-    # 仅 R2 公开 URL 是安全的：它要么是自定义域，要么是 r2.dev。
+    # 稳定公开 URL（R2 公开域 / 自托管代理）是唯一安全的形态。
     try:
         r2_key = _get_r2_key(fid)
         if await file_exists_in_r2(r2_key):
-            # fallback 与多模态注入统一使用上传后的临时访问 URL。
-            # 不依赖永久公开域名，避免切换模型时丢失可访问地址。
+            # v4：优先稳定 URL（无签名、无过期、无查询参数）——模型把它
+            # 写进 <tg-document src>/<a href> 后 Telegram 抓取器才能取到。
+            stable = await resolve_stable_delivery_url(r2_key)
+            if stable:
+                return stable
+            # 稳定链路都不可得（无公开域且代理基地址未配置）时的兜底。
             return await generate_presigned_url(r2_key)
     except Exception as e:
         logger.debug(f"解析 R2 文件 URL 失败 {fid[:12]}: {e}")
