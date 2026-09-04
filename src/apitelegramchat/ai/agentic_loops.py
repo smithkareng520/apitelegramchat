@@ -131,6 +131,52 @@ def _openrouter_extra_body(
     return body
 
 
+# =====================================================================
+# 会话亲和（session affinity）：agnes 等聚合网关的多副本缓存隔离缓解。
+# 背景（2026-09 排查结论，agnes 缓存命中率偏低的根因）：
+#   apihub.agnes-ai.com 实测链路为 Cloudflare -> new-api -> LiteLLM ->
+#   多个上游推理副本（响应头 x-litellm-model-name / x-new-api-version），
+#   按请求随机分发且各副本前缀缓存互相隔离。直接 API 探针证实：同一
+#   逐字节稳定前缀的连续请求，命中率随落在哪个副本在 0%~100% 间随机
+#   波动；插入另一会话的噪声请求后，原会话甚至共享 system prompt 头
+#   都可能瞬间清零。客户端侧 prompt 构建已逐字节稳定（system prompt
+#   当日内稳定、历史只追加、R2 预签名 URL 55 分钟内记忆化），非根因。
+#   OpenRouter 同样的问题靠 body.session_id 粘性路由解决；agnes 未见
+#   官方文档，这里 best-effort 同时下发 body.session_id 与
+#   X-Session-Id 请求头（键格式与 OpenRouter 完全一致）：网关任何一层
+#   支持任一形式即可从第一个请求起粘住同一副本；都不支持时未知字段
+#   /请求头被安全忽略，零副作用（已实测带 session_id 的请求 HTTP 200）。
+# =====================================================================
+def _session_affinity_key(chat_id: object = None) -> str:
+    """会话亲和键：与 OpenRouter 的 session_id 同格式（tg-chat-{chat_id}）。"""
+    return _openrouter_session_id(chat_id)
+
+
+def _session_affinity_body(api_label: str, chat_id: object = None) -> dict:
+    """声明了 session_affinity 的网关返回 body 级亲和键，否则空 dict。"""
+    from apitelegramchat.config import PROVIDERS
+    cfg = PROVIDERS.get(api_label)
+    if not (cfg and getattr(cfg, "session_affinity", False)):
+        return {}
+    session_key = _session_affinity_key(chat_id)
+    if not session_key:
+        return {}
+    return {"session_id": session_key}
+
+
+def _session_affinity_headers(api_label: str, chat_id: object = None) -> Optional[dict]:
+    """声明了 session_affinity 的网关返回请求头级亲和键，否则 None。
+
+    OpenAI SDK 的 create(**params) 接受 extra_headers 逐请求透传，
+    不影响按 provider 缓存的 AsyncOpenAI 客户端实例。
+    """
+    body = _session_affinity_body(api_label, chat_id)
+    session_key = body.get("session_id")
+    if not session_key:
+        return None
+    return {"X-Session-Id": session_key}
+
+
 def _merged_extra_body(
     api_label: str,
     reasoning_extra: Optional[dict],
@@ -153,6 +199,12 @@ def _merged_extra_body(
             chat_id=chat_id,
             supports_prompt_cache=supports_prompt_cache,
         )
+    else:
+        # agnes 等声明了 session_affinity 的聚合网关：body 级会话亲和键
+        # （多副本缓存隔离缓解，详见 _session_affinity_body 上方说明）。
+        affinity_body = _session_affinity_body(api_label, chat_id)
+        if affinity_body:
+            body = affinity_body
     if reasoning_extra:
         body = {**(body or {}), **reasoning_extra}
     return body
@@ -267,6 +319,10 @@ async def _agentic_loop_openai_compat(
     sampling_params = get_sampling_params(model_info)
     reasoning_top, reasoning_extra = get_reasoning_request_fields(model_info, api_label)
     prompt_cache_enabled = bool(model_info and model_info.supports_prompt_cache)
+    # 会话亲和请求头（agnes 等聚合网关多副本缓存隔离缓解）：chat_id 在
+    # 整个 loop 内不变，算一次即可，三个请求出口（主流式/非流式兑底/
+    # over-limit 合成）共用。声明了 session_affinity 的网关才非空。
+    affinity_headers = _session_affinity_headers(api_label, builder.chat_id)
 
     # L0 预防层（主流：OpenAI Structured Outputs）：对能安全规范化的工具
     # 注入 strict:true + 递归 schema 规范化（全部必填 + additionalProperties:false
@@ -332,6 +388,8 @@ async def _agentic_loop_openai_compat(
             )
             if extra_body is not None:
                 create_params["extra_body"] = extra_body
+            if affinity_headers:
+                create_params["extra_headers"] = affinity_headers
 
             # 某些聚合网关会在长工具链后的首个 SSE 事件前沉默较久。
             # 只有尚未收到任何增量时，重试相同请求才是幂等且安全的；一旦已经向
@@ -569,6 +627,8 @@ async def _agentic_loop_openai_compat(
                 )
                 if fallback_extra_body is not None:
                     fallback_params["extra_body"] = fallback_extra_body
+                if affinity_headers:
+                    fallback_params["extra_headers"] = affinity_headers
 
                 # 非流式回退：create 带同样的 strict 降级重试（与流式路径
                 # 同一套逻辑——网关拒绝 strict schema 时摘除后立即重试一次）。
@@ -743,6 +803,8 @@ async def _agentic_loop_openai_compat(
             )
             if synth_extra_body is not None:
                 synth_params["extra_body"] = synth_extra_body
+            if affinity_headers:
+                synth_params["extra_headers"] = affinity_headers
             try:
                 synth_stream = await client.chat.completions.create(**synth_params)
                 # 合成总结同样走流式输出：消费增量期间显示 typing（同主流语义）。

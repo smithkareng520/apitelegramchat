@@ -136,6 +136,16 @@ class ProviderConfig:
     # 内联 base64 会被静默忽略甚至报 4xx。开启后，会在 _resolve_multimodal_content
     # 里优先用 R2 公开 URL（不泄露 Telegram bot token），R2 不可用时回退 base64。
     vision_prefer_url: bool = False
+    # 是否向该网关下发"会话亲和键"（session_id / X-Session-Id，按 chat 稳定）。
+    # 背景：OpenRouter 官方支持 body.session_id 粘性路由（见
+    # agentic_loops._openrouter_extra_body）；而 Agnes 这类聚合网关
+    # （Cloudflare -> new-api -> LiteLLM -> 多上游推理副本）按请求随机分发、
+    # 各副本的前缀缓存互相隔离，实测同一逐字节稳定前缀的连续请求命中率在
+    # 0%~100% 间随机波动（命中完全取决于落在哪个副本）。开启后会在每个
+    # 请求上附带会话亲和键：网关若支持任一形式的 session 路由即可从第一
+    # 个请求起粘住同一副本，让 agentic loop 的后续轮次直接命中上一轮写入
+    # 的前缀缓存；不支持时未知字段/请求头会被网关安全忽略，零副作用。
+    session_affinity: bool = False
 
 
 @dataclass
@@ -241,6 +251,11 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         # Agnes 官方文档明确只接受 image_url 中的公开 URL（不接受 data: base64），
         # 因此 _resolve_multimodal_content 会优先用 R2 公开 URL，R2 不可用时回退 base64。
         vision_prefer_url=True,
+        # 聚合网关多副本缓存隔离：不下发会话亲和键时，同一前缀的命中率随
+        # 路由到的副本随机波动（生产日志中 run 边界 40%、run 内 90%+ 的
+        # 交替即此原因）。开启后每个请求携带 session_id + X-Session-Id，
+        # 网关支持时粘住同一副本；不支持时被忽略，无副作用。
+        session_affinity=True,
     ),
     "anthropic": ProviderConfig(
         name="Anthropic",
