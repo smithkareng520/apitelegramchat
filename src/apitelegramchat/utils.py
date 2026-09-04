@@ -284,12 +284,18 @@ def escape_html(text) -> str:
 def _rich_message_html_payload(html_content: str) -> dict:
     """构造符合 InputRichMessage 规范的 HTML 富消息。
 
-    在交付给 Telegram 前，依次跑两道兜底清理：
+    在交付给 Telegram 前，依次跑三道兜底清理：
+
+    0. ``_unwrap_markdown_link_urls``：把 src/href 属性里被 Markdown 链接
+       语法（``[url](url)`` / ``![alt](url)``）包裹的 URL 解包成裸 URL。
+       处理 LLM 把整段 Markdown 链接写进 ``<tg-document src>`` / ``<img src>``
+       等属性的情况——Telegram 会以 ``RICH_MESSAGE_DOCUMENT_URL_INVALID``
+       等错误拒绝整条消息。
 
     1. ``_strip_invalid_media_urls``：剥离 ``src`` 不是合法 http(s) URL
-       的 ``<img>``/``<video>``/``<audio>`` 标签。处理 LLM 把附件
-       file_name（如 ``photo_AgACAgUA.jpg``）或 file_id 误当成 URL 的情况，
-       Telegram 会以 ``RICH_MESSAGE_PHOTO_URL_INVALID`` 拒绝整条消息。
+       的 ``<img>``/``<video>``/``<audio>``/``<tg-document>`` 标签。处理 LLM
+       把附件 file_name（如 ``photo_AgACAgUA.jpg``）或 file_id 误当成 URL
+       的情况，Telegram 会以 ``RICH_MESSAGE_PHOTO_URL_INVALID`` 拒绝整条消息。
 
     2. ``_demote_watch_page_videos``：把 ``<video src="WATCH_PAGE_URL">``
        块降级为 ``<a href>`` 链接。处理 LLM 把 YouTube / Bilibili 等
@@ -298,12 +304,13 @@ def _rich_message_html_payload(html_content: str) -> dict:
        页面，以 ``RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND`` 拒绝整条消息。
        降级后保留模型生成的 figcaption 文本，让用户仍可点击跳转观看页。
     """
-    cleaned = _strip_invalid_media_urls(html_content)
+    cleaned = _unwrap_markdown_link_urls(html_content)
+    cleaned = _strip_invalid_media_urls(cleaned)
     demoted = _demote_watch_page_videos(cleaned)
     if demoted != html_content:
         logger.warning(
-            "sendRichMessage 兜底清理：检测到伪 URL 或观看页 URL 媒体块，"
-            "已剥离/降级以保证消息送达。原始长度=%s，清理后长度=%s",
+            "sendRichMessage 兜底清理：检测到 Markdown 包裹 URL / 伪 URL 或观看页 URL 媒体块，"
+            "已解包/剥离/降级以保证消息送达。原始长度=%s，清理后长度=%s",
             len(html_content),
             len(demoted),
         )
@@ -311,6 +318,71 @@ def _rich_message_html_payload(html_content: str) -> dict:
         "html": demoted,
         "skip_entity_detection": True,
     }
+
+
+# LLM 偶尔会把 Markdown 链接语法整体塞进 src/href 属性，例如：
+#   <tg-document src="[https://a.com/f.pdf?x=1&y=2](https://a.com/f.pdf?x=1&y=2)"/>
+# Telegram 收到后判定 src 以 "[" 开头而非 http(s)，以
+# RICH_MESSAGE_DOCUMENT_URL_INVALID / RICH_MESSAGE_PHOTO_URL_INVALID 等拒绝
+# 整条消息。这里匹配"整个属性值恰好是一个 Markdown 链接"的形态，
+# 捕获其中的真实 URL（支持 [text](url)、![alt](url)、[text](<url> "title")）。
+# 注意开头的 "!?"：感叹号必须可选，否则普通链接 [url](url) 无法匹配。
+_MD_LINK_VALUE_RE = re.compile(
+    r'^!?\s*\[[^\]\n]*\]\(\s*(?:<([^<>\n]*)>|([^()\s\n]+))(?:\s+"[^"\n]*")?\s*\)\s*$',
+)
+
+# 匹配 src/href 属性（双引号或单引号），用于整属性重写。
+_MD_LINK_ATTR_RE = re.compile(
+    r'(\b(?:src|href)\s*=\s*)("([^"\n]*)"|\'([^\'\n]*)\')',
+    re.IGNORECASE,
+)
+
+
+def _unwrap_markdown_link_url(value: str) -> str:
+    """若属性值是 Markdown 链接语法包裹的 URL，返回内部真实 URL；否则原样返回。
+
+    处理 LLM 把 ``[https://a.com/f.pdf](https://a.com/f.pdf?sig=x)``、
+    ``![alt](https://a.com/f.png)`` 之类的 Markdown 片段误写入
+    ``src=``/``href=`` 属性的情况。仅在值整体符合 Markdown 链接形态时解包，
+    避免误伤本来就合法的 URL。
+    """
+    if not value:
+        return value
+    v = value.strip()
+    # 注意 "![alt](url)" 图片形态以 "!" 开头，需与普通链接一并放行
+    if not v.startswith(("[", "![")):
+        return value
+    m = _MD_LINK_VALUE_RE.match(v)
+    if not m:
+        return value
+    url = (m.group(1) if m.group(1) is not None else m.group(2) or "").strip()
+    return url or value
+
+
+def _unwrap_markdown_link_urls(html_content: str) -> str:
+    """重写 HTML 中被 Markdown 链接语法包裹的 src/href 属性值。
+
+    必须在 ``_strip_invalid_media_urls`` **之前**运行：后者只做"校验 + 删除"，
+    若属性值仍是 ``[url](url)`` 形态，校验必然失败、标签被删，用户丢失文档/
+    图片；先解包则大多数标签可直接恢复为合法媒体块原样送达。
+    """
+    if not html_content or "[" not in html_content:
+        return html_content
+
+    def _sub(m: re.Match) -> str:
+        prefix = m.group(1)
+        double_inner = m.group(3)
+        single_inner = m.group(4)
+        inner = double_inner if double_inner is not None else single_inner
+        if inner is None:
+            return m.group(0)
+        unwrapped = _unwrap_markdown_link_url(inner)
+        if unwrapped == inner:
+            return m.group(0)
+        quote = '"' if double_inner is not None else "'"
+        return f"{prefix}{quote}{unwrapped}{quote}"
+
+    return _MD_LINK_ATTR_RE.sub(_sub, html_content)
 
 
 # 匹配完整的 <img ...> 标签（含可选自闭合斜杠），直到第一个 >。
@@ -368,20 +440,23 @@ def _looks_like_watch_page(url: str) -> bool:
 
 
 def _strip_invalid_media_urls(html_content: str) -> str:
-    """剥离 src 不是合法 http(s) URL 的 <img>/<video>/<audio> 标签。
+    """剥离 src 不是合法 http(s) URL 的 <img>/<video>/<audio>/<tg-document> 标签。
 
-    Telegram Rich Message 要求 ``<img src>`` 必须是公开可访问的 http(s)
-    URL；LLM 偶尔会把附件 file_name（如 ``photo_AgACAgUA.jpg``）或 file_id
-    当作 URL 写入，会被服务端以 ``RICH_MESSAGE_PHOTO_URL_INVALID`` 拒绝。
+    Telegram Rich Message 要求 ``<img src>``/``<tg-document src>`` 必须是公开
+    可访问的 http(s) URL；LLM 偶尔会把附件 file_name（如
+    ``photo_AgACAgUA.jpg``）或 file_id 当作 URL 写入，会被服务端以
+    ``RICH_MESSAGE_PHOTO_URL_INVALID`` /
+    ``RICH_MESSAGE_DOCUMENT_URL_INVALID`` 拒绝。
 
-    本函数逐个扫描 ``<img>``/``<video>``/``<audio>`` 标签的 ``src`` 属性，
-    若不以 ``http://`` 或 ``https://`` 开头，则：
+    本函数逐个扫描 ``<img>``/``<video>``/``<audio>``/``<tg-document>``
+    标签的 ``src`` 属性，若不以 ``http://`` 或 ``https://`` 开头，则：
 
       * 对 ``<img .../>`` 自闭合形式：直接删除整个标签；
-      * 对 ``<video>...</video>`` / ``<audio>...</audio>`` 容器形式：
-        删除整个开闭标签对（包含内部内容），避免出现孤立结束标签；
+      * 对 ``<video>...</video>`` / ``<audio>...</audio>`` /
+        ``<tg-document>...</tg-document>`` 容器形式（含自闭合）：
+        删除整个标签（容器形式连同内部内容），避免出现孤立结束标签；
       * 若外层是 ``<figure>`` 且剥离后 figure 内既无 ``<img>``/``<video>``
-        也无 ``<figcaption>``，则一并删除该空 figure。
+        也无 ``<figcaption>``/``<tg-document>``，则一并删除该空 figure。
 
     另外，对 ``<video src="WATCH_PAGE_URL">`` 还会做"观看页降级"：
     若 URL 命中 YouTube / Bilibili / Vimeo / 抖音 / Twitter / Facebook
@@ -403,11 +478,15 @@ def _strip_invalid_media_urls(html_content: str) -> str:
         u = (url or "").strip().lower()
         return bool(u) and u.startswith(("http://", "https://"))
 
-    # 先处理容器型 <video>...</video> / <audio>...</audio>：
-    # 起始标签 src 非法时，连同内部内容一起删掉。
+    # 先处理容器型 <video>...</video> / <audio>...</audio> /
+    # <tg-document>...</tg-document>：起始标签 src 非法时，连同内部内容一起删掉。
     def _strip_container(text: str, tag: str) -> str:
+        # 注意分支顺序：自闭合 <tag .../> 必须放在容器形式之前。
+        # 否则自闭合标签会被 "<tag ...>.*?</tag>" 分支跨块吞掉后面同标签的
+        # 合法容器块（如 <tg-document src="bad"/> ... <tg-document src="good">
+        # </tg-document> 会被误当成一个整块而全部删除）。
         pattern = re.compile(
-            rf'<{tag}\b[^>]*>.*?</{tag}\s*>|<{tag}\b[^>]*/>',
+            rf'<{tag}\b[^>]*/>|<{tag}\b[^>]*>.*?</{tag}\s*>',
             re.IGNORECASE | re.DOTALL,
         )
 
@@ -421,7 +500,7 @@ def _strip_invalid_media_urls(html_content: str) -> str:
         return pattern.sub(_check, text)
 
     result = html_content
-    for tag in ("video", "audio"):
+    for tag in ("video", "audio", "tg-document"):
         result = _strip_container(result, tag)
 
     # 再处理 <img .../> 自闭合形式
@@ -445,9 +524,9 @@ def _strip_invalid_media_urls(html_content: str) -> str:
 
     def _clean_empty_figure(m: re.Match) -> str:
         inner = m.group(1) or ""
-        # 仍然有 img/video/audio/figcaption 就保留
+        # 仍然有 img/video/audio/tg-document/figcaption 就保留
         has_media = re.search(
-            r'<(img|video|audio|figcaption)\b',
+            r'<(img|video|audio|figcaption|tg-document)\b',
             inner,
             re.IGNORECASE,
         )
@@ -591,11 +670,12 @@ def _demote_all_media_to_links(
     html_content: str,
     media_kinds: Optional[set[str]] = None,
 ) -> str:
-    """按指定媒体类型把 ``<video>/<audio>/<img>`` 降级为 ``<a href>``。
+    """按指定媒体类型把 ``<video>/<audio>/<img>/<tg-document>`` 降级为 ``<a href>``。
 
-    ``media_kinds`` 为 ``None`` 时保持兼容；传入 ``{"image"}``、
-    ``{"video"}`` 或 ``{"audio"}`` 时只处理对应类型，避免某一种媒体
-    失败时牵连同一条消息中的其他媒体。
+    ``media_kinds`` 为 ``None`` 时保持兼容（降级全部类型）；传入 ``{"img"}``、
+    ``{"video"}``、``{"audio"}`` 或 ``{"tg-document"}``（也接受语义名
+    ``"document"``，内部统一映射到标签名 ``tg-document``）时只处理对应类型，
+    避免某一种媒体失败时牵连同一条消息中的其他媒体。
 
     用于 ``sendRichMessage`` 因媒体 URL 在 Telegram 服务端抓取失败而拒绝
     整条消息时的**反应式兜底**——例如：
@@ -623,6 +703,9 @@ def _demote_all_media_to_links(
         → ``<a href="URL"><b>🖼 CAP</b></a>``；
       * 裸 ``<img src="URL"/>`` → ``<a href="URL"><b>🖼 {domain}</b></a>``；
       * ``<audio>`` 同理用 🎵 前缀；
+      * ``<figure><tg-document src="URL"></tg-document><figcaption>CAP</figcaption></figure>``
+        → ``<a href="URL"><b>📄 CAP</b></a>``；
+      * 裸 ``<tg-document src="URL"/>`` → ``<a href="URL"><b>📄 查看文档</b></a>``；
       * ``src`` 非法（非 http(s):// 开头）的媒体块直接整块删除——这种
         URL 在 ``_strip_invalid_media_urls`` 阶段也已被处理，这里是冗余
         兜底。
@@ -630,14 +713,24 @@ def _demote_all_media_to_links(
     if not html_content:
         return ""
     if media_kinds is not None:
-        media_kinds = {str(kind).lower() for kind in media_kinds}
+        normalized: set[str] = set()
+        for kind in media_kinds:
+            k = str(kind).strip().lower()
+            # 允许调用方用语义名 "document"，统一映射到实际标签名
+            if k == "document":
+                k = "tg-document"
+            normalized.add(k)
+        media_kinds = normalized
 
     def _extract_src(tag_text: str) -> str:
         m = re.search(r'\bsrc\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))',
                       tag_text, re.IGNORECASE)
         if not m:
             return ""
-        return (m.group(2) or m.group(3) or m.group(4) or "").strip()
+        raw = (m.group(2) or m.group(3) or m.group(4) or "").strip()
+        # LLM 偶尔把 Markdown 链接 [url](url) 整个塞进 src；本函数会重建
+        # 标签，所以这里解包出真实 URL 才不会把可救的媒体块误删。
+        return _unwrap_markdown_link_url(raw)
 
     def _is_valid_url(url: str) -> bool:
         u = (url or "").strip().lower()
@@ -648,10 +741,10 @@ def _demote_all_media_to_links(
         return m.group(1) if m else ""
 
     def _strip_inner_tags(inner: str) -> str:
-        """去掉 inner 里所有 <video>/<audio>/<img>/<figcaption> 标签，
+        """去掉 inner 里所有 <video>/<audio>/<img>/<tg-document>/<figcaption> 标签，
         仅保留可能存在的其他内联文本。"""
         inner = re.sub(
-            r'<(?:video|audio|img)\b[^>]*/?>|</?(?:video|audio|img)\s*>',
+            r'<(?:video|audio|img|tg-document)\b[^>]*/?>|</?(?:video|audio|img|tg-document)\s*>',
             '', inner, flags=re.IGNORECASE,
         )
         # figcaption 文本由调用方单独提取，这里把已取过文本的空标签也清掉
@@ -675,7 +768,14 @@ def _demote_all_media_to_links(
         """构造降级后的 <a> 锚点。src 必须合法；caption 为空时按 kind 兜底。"""
         if not caption:
             domain = _domain_of(src)
-            label_map = {"video": "🎬 观看视频", "audio": "🎵 收听音频", "image": "🖼 查看图片"}
+            label_map = {
+                "video": "🎬 观看视频",
+                "audio": "🎵 收听音频",
+                "image": "🖼 查看图片",
+                "img": "🖼 查看图片",
+                "tg-document": "📄 查看文档",
+                "document": "📄 查看文档",
+            }
             caption = label_map.get(kind, "🔗 查看链接")
             if domain:
                 caption = f"{caption} · {domain}"
@@ -689,7 +789,11 @@ def _demote_all_media_to_links(
         re.IGNORECASE | re.DOTALL,
     )
     media_in_figure_re = re.compile(
-        r'<(video|audio|img)\b[^>]*?/?>.*?</\1\s*>|<(video|audio|img)\b[^>]*/>',
+        # 自闭合分支在前，防止 "<tag .../>" 被容器分支 "<tag ...>.*?</tag>"
+        # 跨块吞并与后面同标签的合法容器块。自闭合分支捕获组为 group(1)，
+        # 容器分支为 group(2)，回溯引用用 \\2。
+        r'<(video|audio|img|tg-document)\b[^>]*/>'
+        r'|<(video|audio|tg-document)\b[^>]*>.*?</\2\s*>',
         re.IGNORECASE | re.DOTALL,
     )
 
@@ -699,7 +803,7 @@ def _demote_all_media_to_links(
         if not mm:
             # 没有 media——保留原 figure（可能是纯文字 figure）
             return m.group(0)
-        # 取 media 标签名（video / audio / img）
+        # 取 media 标签名（video / audio / img / tg-document）
         kind = (mm.group(1) or mm.group(2) or "").lower()
         block = mm.group(0)
         src = _extract_src(block)
@@ -725,7 +829,10 @@ def _demote_all_media_to_links(
 
     # 2) 处理裸 media（不在 <figure> 里的）
     bare_media_re = re.compile(
-        r'<(video|audio)\b[^>]*>.*?</\1\s*>|<(video|audio|img)\b[^>]*/>',
+        # 分支顺序与分组号规则同 media_in_figure_re：自闭合在前（group 1），
+        # 容器在后（group 2，回溯引用 \\2）。
+        r'<(video|audio|img|tg-document)\b[^>]*/>'
+        r'|<(video|audio|tg-document)\b[^>]*>.*?</\2\s*>',
         re.IGNORECASE | re.DOTALL,
     )
 
@@ -1245,16 +1352,21 @@ async def send_rich_message_draft(
                             )
                             return 0
 
-                        # 媒体抓取失败类错误（RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND /
-                        # RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND）是不可恢复的内容问题：
+                        # 媒体抓取/URL 非法类错误（RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND /
+                        # RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND /
+                        # RICH_MESSAGE_DOCUMENT_URL_INVALID 等）是不可恢复的内容问题：
                         # 同一个 URL 再发多少次都会被 Telegram 拒绝。若只 bump
                         # failure 并 return，builder 的 flush 循环会继续用原始内容
                         # 重试，最多累计 6 次失败才 mark dead，用户看到草稿卡很久。
                         # 因此立即在同一个调用内把所有媒体降级为 <a> 链接并重试一次，
                         # 失败一次就直接降级，不让上层循环重复无效请求。
+                        # 注意必须包含 rich_message_document_ 前缀：否则
+                        # <tg-document> 报错时会落进下方 "rich_message_" 大网，
+                        # 整条草稿被误降级为纯文本。
                         media_not_found = (
                             "rich_message_photo_no_media_found" in body_lower
                             or "rich_message_video_no_media_found" in body_lower
+                            or "rich_message_document_" in body_lower
                         )
                         if media_not_found:
                             demoted = _demote_all_media_to_links(html_content)
@@ -1484,10 +1596,18 @@ async def send_rich_html_message(
                         media_kinds.add("video")
                     if "rich_message_audio_" in body_lower or "rich_message_audio_url_invalid" in body_lower:
                         media_kinds.add("audio")
+                    if "rich_message_document_" in body_lower:
+                        # RICH_MESSAGE_DOCUMENT_URL_INVALID 等：<tg-document> 的
+                        # src 非法或不可抓取。必须与 img/video/audio 一样进入
+                        # 下方的定向媒体降级（只把文档变成 <a> 链接，其余媒体
+                        # 原样保留）；否则会落进后面 "rich_message_" 大网，
+                        # 触发整条消息纯文本 fallback —— 这正是本次“降级”问题的
+                        # 直接原因。
+                        media_kinds.add("tg-document")
 
                     # ---------- 第 2 次尝试：只降级服务端明确报错的媒体类型 ----------
-                    # image/video/audio 映射到实际 HTML 标签名，避免 photo 失败时把
-                    # 同一条消息中本来正常的视频和音频也一并变成链接。
+                    # img/video/audio/tg-document 映射到实际 HTML 标签名，避免 photo
+                    # 失败时把同一条消息中本来正常的视频、音频和文档也一并变成链接。
                     if media_kinds:
                         media_demoted = _demote_all_media_to_links(
                             html_content,
