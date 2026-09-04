@@ -220,8 +220,53 @@ def _merged_extra_body(
 #   OpenAI 兼容接口中 prompt_tokens 为纯输入 token 数（输出单独记录在
 #   completion_tokens 中），cached_tokens 是 prompt_tokens 的子集，
 #   因此命中率 = Cached / Input_tokens，分母不含输出 token。
+# 上报缺口（2026-09 实测）：agnes 网关流式 usage 的 prompt_tokens_details
+#   时有时无（同一逐字节相同请求连发数次，带与不带随机出现；带 tools 时
+#   甚至整块缺失）。缺失时无法区分"真实脱靶"与"命中但未上报"，该轮
+#   降为 DEBUG 不计入命中率统计，并用本轮最近一份带缓存字段的 usage
+#   快照（cache_hint）尽力补齐，避免把真实命中记成假 0。
 # =====================================================================
-def _extract_cache_usage(usage) -> dict:
+def _cached_from_usage(usage):
+    """从 usage（dict 或 pydantic 对象）中只提取缓存命中数字。
+
+    兼容三种字段形态：OpenAI prompt_tokens_details.cached_tokens /
+    Anthropic 风格 cache_read_input_tokens / DeepSeek 风格
+    prompt_cache_hit_tokens。取不到返回 None（=网关未上报）。
+    """
+    def _num(value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+        return None
+
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        details = usage.get("prompt_tokens_details") or {}
+        if not isinstance(details, dict):
+            details = {}
+        for value in (
+            details.get("cached_tokens"),
+            usage.get("cache_read_input_tokens"),
+            usage.get("prompt_cache_hit_tokens"),
+        ):
+            num = _num(value)
+            if num is not None:
+                return num
+        return None
+    details = getattr(usage, "prompt_tokens_details", None)
+    num = _num(getattr(details, "cached_tokens", None)) if details is not None else None
+    extra = getattr(usage, "model_extra", None)
+    extra = extra if isinstance(extra, dict) else {}
+    if num is None:
+        num = _num(extra.get("cache_read_input_tokens"))
+    if num is None:
+        num = _num(extra.get("prompt_cache_hit_tokens"))
+    return num
+
+
+def _extract_cache_usage(usage, cache_hint=None) -> dict:
     if usage is None:
         return {}
 
@@ -255,6 +300,15 @@ def _extract_cache_usage(usage) -> dict:
         if cached is None:
             cached = _num(extra.get("prompt_cache_hit_tokens"))
 
+    # 缓存字段是否被网关真实上报（cached=0 也算上报；字段整体缺失=未上报）。
+    # 未上报时用本轮最近一份带缓存字段的快照（cache_hint）尽力补齐。
+    reported = cached is not None
+    if cached is None and cache_hint is not None:
+        hinted = _cached_from_usage(cache_hint)
+        if hinted is not None:
+            cached = hinted
+            reported = True
+
     stats: dict = {}
     if prompt:
         # 命中率口径：Cached / Input_tokens（prompt_tokens 即纯输入，
@@ -263,6 +317,8 @@ def _extract_cache_usage(usage) -> dict:
         stats["Output_tokens"] = completion if completion is not None else 0
         stats["Cached"] = cached if cached is not None else 0
         stats["Hit_ratio"] = stats["Cached"] / max(1, prompt)
+        # 仅供 _log_cache_usage 判断，展示前会被 pop 掉。
+        stats["_reported"] = reported
     else:
         # 极端情况：usage 中没有 prompt_tokens 但有缓存字段，仍如实显示。
         if cached is not None:
@@ -270,12 +326,23 @@ def _extract_cache_usage(usage) -> dict:
     return stats
 
 
-def _log_cache_usage(api_label: str, usage) -> None:
+def _log_cache_usage(api_label: str, usage, cache_hint=None) -> None:
     """每轮请求结束时打一行缓存命中摘要（无缓存字段时静默跳过）。"""
     try:
-        stats = _extract_cache_usage(usage)
+        stats = _extract_cache_usage(usage, cache_hint)
         if stats:
+            reported = stats.pop("_reported", True)
             if "Hit_ratio" in stats:
+                if not reported:
+                    # 网关整轮未上报任何缓存字段（agnes 流式实测高发）：
+                    # 记 0 会把"命中但未上报"伪装成"全脱靶"，污染命中率
+                    # 统计，故降为 DEBUG，命中率均值只按真实上报的轮次算。
+                    logger.debug(
+                        "[%s] cache usage 未上报缓存字段（流式 usage 缺 "
+                        "prompt_tokens_details，无法区分命中与脱靶）",
+                        api_label,
+                    )
+                    return
                 # 按固定键序格式化，Hit_ratio 以百分数显示（一位小数），
                 # 避免直接 dump dict 导致字符串值带引号、浮点数带多余位数。
                 logger.info(
@@ -306,6 +373,9 @@ async def _agentic_loop_openai_compat(
     loop_messages = list(messages)
     final_content = None
     final_usage = None
+    # 本轮最近一份带缓存字段的 usage 快照（流式网关可能丢弃
+    # prompt_tokens_details，见 _extract_cache_usage 上方说明）。
+    usage_with_cache = None
     tool_call_count_ref = [0]
     # journal：由 get_ai_response 注入的轮次日志（打断保全用，见 turn_recovery.py）。
     # 注入时循环直接往里追加，轮次被打断时已完成的消息不至于丢失。
@@ -344,6 +414,9 @@ async def _agentic_loop_openai_compat(
         content_acc = ""
         reasoning_acc = ""
         tool_calls_acc: dict = {}
+        # 每轮重置缓存字段快照：hint 必须与本轮 token 数同源，
+        # 跨轮复用会把上一轮的命中量安到本轮头上。
+        usage_with_cache = None
         in_reasoning = False
         current_stream = None
         received_any = False
@@ -409,6 +482,8 @@ async def _agentic_loop_openai_compat(
                         received_any = True
                         if getattr(chunk, "usage", None):
                             final_usage = chunk.usage
+                            if _cached_from_usage(chunk.usage) is not None:
+                                usage_with_cache = chunk.usage
                         choices = chunk.choices or []
                         if not choices:
                             continue
@@ -646,6 +721,8 @@ async def _agentic_loop_openai_compat(
                 # 非流式回退同样需要捕获 usage，否则本轮缓存命中统计会丢失
                 if getattr(resp, "usage", None):
                     final_usage = resp.usage
+                    if _cached_from_usage(resp.usage) is not None:
+                        usage_with_cache = resp.usage
                 msg = resp.choices[0].message
                 fr = str(getattr(resp.choices[0], "finish_reason", "") or "")
                 if fr:
@@ -692,7 +769,7 @@ async def _agentic_loop_openai_compat(
         # 每轮请求结束后立即打印本轮缓存命中统计：final_usage 每轮被覆盖，
         # 若只在循环外打印，多轮 agentic 循环中间轮次的命中情况不可观测。
         # final_usage 仍保留最后一轮的值供返回值（token 台账）使用。
-        _log_cache_usage(api_label, final_usage)
+        _log_cache_usage(api_label, final_usage, cache_hint=usage_with_cache)
         for idx, tc in enumerate(tool_calls_list):
             if not tc.get("id"):
                 tc["id"] = f"call_{_round}_{idx}_{uuid.uuid4().hex[:8]}"
