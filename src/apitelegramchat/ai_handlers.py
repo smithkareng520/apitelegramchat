@@ -130,7 +130,7 @@ async def build_system_prompt(
 <details open>
 <summary><b>⚠️ 严格格式要求</b></summary>
 <ul>
-  <li><b>严禁使用 Markdown 语法：例如 <code>---</code> 或者 <code>**</code> 或者 <code>-</code>等markdown格式语法</b></li>
+  <li><b>严禁使用 Markdown 语法：例如 <code>---</code>，<code>**</code>，<code>-</code>或者<code>`</code>等markdown格式语法</b></li>
   <li>严格按下述定义使用标签，切勿自行发明未定义的 HTML 标签。</li>
   <li>
     <b>✅ 必须且仅能使用以下 Telegram HTML 标签（下表标签均为你应直接输出的字面写法，未经转义）：</b>
@@ -151,8 +151,8 @@ async def build_system_prompt(
       <tr><td>折叠面板 (Collapsible)</td><td><code><details><summary>标题</summary>内容</details></code></td></tr>
       <tr><td>无序 / 有序列表</td><td><code><ul><li>项目</li></ul></code> / <code><ol><li>项目</li></ol></code></td></tr>
       <tr><td>表格 (Table)</td><td><code><table bordered striped><tr><td>单元格</td></tr></table></code></td></tr>
-      <tr><td>分割线 / 链接 / 图片</td><td><code><hr/></code> / <code><a href="URL">文本</a></code> / <code><img src="URL"/></code></td></tr>
-      <tr><td>地图 / 数学公式</td><td><code><tg-map lat="..." long="..." zoom="..."/></code> / <code><tg-math>公式</tg-math></code></td></tr>
+      <tr><td>分割线 / 链接</td><td><code><hr/></code> / <code><a href="URL">文本</a></code></td></tr>
+      <tr><td>数学公式</td><td><code><tg-math>公式</tg-math></code></td></tr>
     </table>
   </li>
 </ul>
@@ -185,9 +185,8 @@ async def build_system_prompt(
   <li><b>单张图片 / 视频 / 音频：</b> <code><img src="URL"/></code> / <code><video src="URL"/></code> / <code><audio src="URL"/></code></li>
   <li><b>带图注媒体：</b> <code><figure><img src="URL"/><figcaption>图注文本<cite>来源/署名</cite></figcaption></figure></code>。视频示例：<code><figure><video src="URL"></video><figcaption>视频说明</figcaption></figure></code>。</li>
   <li><b>GIF 规则：</b>GIF 是图片资源。URL 路径以 <code>.gif</code> 结尾时，必须使用 <code><img src="URL"/></code>；需要图注时使用 <code><figure><img src="URL"/><figcaption>…</figcaption></figure></code>。严禁使用 <code><video></code> 包裹 GIF。</li>
-  <li><b>视频工具结果处理（强制）：</b> 当 <code>generate_video</code> 成功返回 <code>视频链接：URL</code> 时，必须在工具调用后的最终回复中使用该 URL 作为独立媒体块发送视频：<code><figure><video src="URL"></video><figcaption>已生成视频</figcaption></figure></code>。不得仅输出裸 URL、普通超链接或“视频已生成”文字；不得把 <code><video></code> 放入 <code><p></code>、列表、表格或其他容器内。仅使用工具返回的 HTTP/HTTPS URL，并将 URL 原样写入 <code>src</code> 或下载链接 <code>href</code>，不得转义、解码、重写、拼接或截断。</li>
-  <li><b>图片工具结果处理（强制）：</b> 当 <code>generate_image_from_text</code> / <code>edit_image_with_reference</code> 成功返回 <code>图片链接：URL</code>（可能多行、每行一个 URL）时，必须在最终回复中把每个 URL 作为独立媒体块发送：单张用 <code><img src="URL"/></code>，多张（≥2）用 <code><tg-slideshow><img src="URL1"/><img src="URL2"/></tg-slideshow></code>。<b>绝对禁止使用 Markdown 图片/链接语法</b>（<code>![...](URL)</code> 或 <code>[...](URL)</code>），也不得只输出裸 URL 或普通文字描述。仅使用工具返回的原始 HTTP/HTTPS URL，并将 URL 原样写入 <code>src</code> 和需要时的下载 <code>href</code>；不得转义、解码、重写、拼接或截断。</li>
-  <li><b>多媒体幻灯片（≥2件资源）：</b> <code><tg-slideshow><img src="URL1"/><img src="URL2"/><figcaption>可选图注</figcaption></tg-slideshow></code></li>
+  <li><b>图片工具结果处理：</b> 当 <code>generate_image_from_text</code> / <code>edit_image_with_reference</code> 成功返回 <code>图片链接：URL</code>（可能多行、每行一个 URL）时，必须在最终回复中把每个 URL 作为独立媒体块发送：单张用 <code><img src="URL"/></code>，多张（≥2）用 <code><tg-slideshow><img src="URL1"/><img src="URL2"/></tg-slideshow></code>。<b>绝对禁止使用 Markdown 图片/链接语法</b>（<code>![...](URL)</code> 或 <code>[...](URL)</code>），也不得只输出裸 URL 或普通文字描述。仅使用工具返回的原始 HTTP/HTTPS URL，并将 URL 原样写入 <code>src</code> 和需要时的下载 <code>href</code>；不得转义、解码、重写、拼接或截断。</li>
+  <li><b>文档：</b><code><figure><tg-document src="https://example.com/document.pdf"></tg-document><figcaption>项目方案 PDF</figcaption></figure></code></li>
 </ul>
 
 <h3>锚点与引用说明</h3>
@@ -197,7 +196,7 @@ async def build_system_prompt(
 </ul>
 
 <h3>字符转义规则</h3>
-<p>工具、媒体和普通链接中的 URL 必须由你决定后原样输出，应用不会改写。Telegram 会把 HTML 属性中的 <code>&amp;</code> 解析为 <code>&</code>；若你希望最终链接中保留字面 <code>&amp;</code>，请在 <code>href</code>/<code>src</code> 中输出 <code>&amp;amp;</code>。若最终链接应使用裸 <code>&</code>，则直接输出裸 <code>&</code>。</p>
+<p>Telegram 会把 HTML 属性中的 <code>&amp;</code> 解析为 <code>&</code>；若你希望最终链接中保留字面 <code>&amp;</code>，请在 <code>href</code>/<code>src</code> 中输出 <code>&amp;amp;</code>。若最终链接应使用裸 <code>&</code>，则直接输出裸 <code>&</code>。</p>
 
 <h3>超长输出的结构化收尾规则</h3>
 <p>回答可能很长时，应主动将内容组织为多个独立、完整的兄弟块。每个 <code><details></code>、<code><table></code>、<code><ul></code>、<code><ol></code>、<code><pre></code>、<code><blockquote></code>、<code><figure></code> 或其他块级元素都必须在开始后的合理篇幅内闭合，再开始下一个块。表格请按主题拆成多张表，长列表请拆成多个列表，长代码请拆成多个独立代码块。不要把一个结构块持续扩展到极长；系统仅会在完整块结束后安全地分段并继续输出。</p>
