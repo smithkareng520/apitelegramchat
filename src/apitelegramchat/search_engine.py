@@ -17,7 +17,6 @@ import socket
 import uuid
 import tempfile
 import mimetypes
-from collections import defaultdict
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from typing import Any, Optional
 try:
@@ -334,16 +333,7 @@ def _with_latest_editor_snapshot(message: str, content: str) -> str:
     return f"{message}\n\nLatest file snapshot (tail 10):\n{_latest_editor_snapshot(content)}"
 
 
-_file_history: dict[tuple[int, str, str], list[str]] = defaultdict(list)
-_MAX_FILE_HISTORY = 10
 SNIPPET_LINES = 4
-
-
-def _record_file_history(chat_id: int, namespace: str, safe_path: str, content: str) -> None:
-    history = _file_history[(chat_id, namespace, safe_path)]
-    history.append(content)
-    if len(history) > _MAX_FILE_HISTORY:
-        history.pop(0)
 
 
 def _format_editor_snippet(
@@ -484,9 +474,9 @@ async def execute_text_editor(
     in the entire file. This prevents accidental broad edits and tells the model
     to re-view the relevant text when its context is stale.
     """
-    allowed_commands = {"view", "str_replace", "create", "insert", "undo_edit"}
+    allowed_commands = {"view", "str_replace", "create", "insert"}
     if command not in allowed_commands:
-        return f"Error: Unknown command: {command}. Allowed commands are view, str_replace, create, insert, and undo_edit."
+        return f"Error: Unknown command: {command}. Allowed commands are view, str_replace, create, and insert."
 
     allow_root = (command == "view")
     try:
@@ -566,34 +556,11 @@ async def execute_text_editor(
                         file.write(data)
                 except FileExistsError:
                     return "Error: File already exists."
-                _record_file_history(chat_id, resolved_namespace, safe_path, "")
                 _spawn_persist_task(
                     chat_id, safe_path, namespace=resolved_namespace, content_bytes=data)
                 # 成功消息使用 workspace 相对路径：绝对路径会泄漏服务器
                 # 目录结构，也违背「一切路径相对 workspace 根」的约定。
                 return _with_latest_editor_snapshot(f"Successfully created file: {safe_path}", file_text)
-
-            if command == "undo_edit":
-                history_key = (chat_id, resolved_namespace, safe_path)
-                history = _file_history.get(history_key)
-                if not history:
-                    return f"Error: No edit history available to undo for {safe_path}."
-                prev_content = history.pop()
-                if prev_content == "":
-                    if local_path.exists() and not local_path.is_dir():
-                        local_path.unlink(missing_ok=True)
-                    _spawn_persist_task(chat_id, safe_path, namespace=resolved_namespace, delete=True)
-                    return f"Successfully reverted {safe_path}: file was newly created, now removed."
-                else:
-                    _write_text_editor_file(local_path, prev_content)
-                    _spawn_persist_task(
-                        chat_id, safe_path, namespace=resolved_namespace,
-                        content_bytes=prev_content.encode("utf-8"))
-                    return _with_editor_snippet_or_tail(
-                        f"Successfully reverted changes in {safe_path} to previous version.",
-                        prev_content,
-                        target_line=1
-                    )
 
             if not local_path.exists():
                 return "Error: File not found"
@@ -651,9 +618,6 @@ async def execute_text_editor(
                         "that includes surrounding context lines to make it unique."
                     )
 
-                # 记录修改前的状态
-                _record_file_history(chat_id, resolved_namespace, safe_path, content)
-
                 match_char_idx = work.find(old_work)
                 replacement_line = work[:match_char_idx].count("\n") + 1 if match_char_idx != -1 else 1
                 new_str_lines_count = new_work.count("\n")
@@ -692,9 +656,6 @@ async def execute_text_editor(
             new_content = prefix + text_to_insert + suffix
             if crlf:
                 new_content = new_content.replace("\n", "\r\n")
-
-            # 记录修改前的状态
-            _record_file_history(chat_id, resolved_namespace, safe_path, content)
 
             _write_text_editor_file(local_path, new_content)
             _spawn_persist_task(
@@ -1295,27 +1256,22 @@ SEARCH_TOOLS = [
             "name": "text_editor",
             "description": (
                 "Safely view or edit UTF-8 text files and explore directories inside the workspace. "
-                "The available commands are: view, str_replace, create, insert, and undo_edit. "
+                "The available commands are: view, str_replace, create, and insert. "
                 "Always call view immediately before editing. "
                 "view: displays file contents with 1-based line numbers (supports view_range=[start_line, end_line], where -1 means end of file). "
                 "If path is a directory (or '.' for workspace root), view lists files and directories up to 2 levels deep. "
                 "create: creates a new file with file_text (fails if file already exists). "
                 "str_replace: replaces old_str with new_str. old_str must match exactly once in the file; if multiple matches occur, their line numbers are reported. "
                 "insert: inserts insert_text (or new_str) after insert_line (1-based; use 0 to insert at the beginning). "
-                "undo_edit: reverts the last edit performed on the file. "
                 "After edits, a snippet around the modified section is returned for immediate verification."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "Briefly describe the operation (60 characters or fewer)."
-                    },
                     "command": {
                         "type": "string",
-                        "enum": ["view", "str_replace", "create", "insert", "undo_edit"],
-                        "description": "The text-editor operation to perform: view, str_replace, create, insert, or undo_edit."
+                        "enum": ["view", "str_replace", "create", "insert"],
+                        "description": "The text-editor operation to perform: view, str_replace, create, or insert."
                     },
                     "path": {
                         "type": "string",

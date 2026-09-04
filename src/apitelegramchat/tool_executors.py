@@ -933,8 +933,15 @@ def _render_editor_result(command: str, path: str, result_str: str, arguments: d
     """Render text-editor calls as explicit, quote-formatted Input and Output."""
     arguments = arguments or {}
     if command == "view":
-        intent = str(arguments.get("_description") or "Inspect the requested text file.")
-        return _render_editor_quote("Input", intent) + _render_editor_quote("Output", result_str)
+        # text_editor 已移除 _description（意图）参数：Input 直接展示实际
+        # 输入（目标路径 + 可选行范围），与写操作展示真实参数的策略一致。
+        view_input = str(path or "").strip()
+        view_range = arguments.get("view_range")
+        if isinstance(view_range, (list, tuple)) and len(view_range) == 2:
+            view_input = f"{view_input} (lines {view_range[0]}-{view_range[1]})".strip()
+        if not view_input:
+            view_input = "Inspect the requested text file."
+        return _render_editor_quote("Input", view_input) + _render_editor_quote("Output", result_str)
 
     if result_str.startswith("Error:"):
         return _render_editor_quote("Result", result_str)

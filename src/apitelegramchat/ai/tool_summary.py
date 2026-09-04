@@ -129,6 +129,65 @@ def _get_tool_description_from_args(fn_args: dict) -> Optional[str]:
     return None
 
 
+# ---------- text_editor 工具块摘要（文件名 + 行数差异） ----------
+def _editor_target_name(fn_args: dict) -> str:
+    """text_editor 目标文件名（带后缀）：取 path 的最后一段。
+
+    无有效文件名（path 缺失、为 '.' 或 '/' 等根引用）返回空串，
+    调用方据此退回不含文件名的旧文案。
+    """
+    path = str((fn_args or {}).get("path") or "").strip().replace("\\", "/")
+    if not path:
+        return ""
+    trimmed = path.rstrip("/")
+    if trimmed in ("", ".", "/"):
+        return ""
+    return trimmed.split("/")[-1]
+
+
+def _count_edit_lines(text: Any) -> int:
+    """按显示行数统计文本行数（尾部换行不计作新行；非字符串按 0 行）。"""
+    if not isinstance(text, str) or not text:
+        return 0
+    lines = text.replace("\r\n", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return len(lines)
+
+
+def _editor_diff_suffix(fn_args: dict, command: str) -> str:
+    """根据参数计算 text_editor 写操作的 ``+n -n`` 行数差异后缀。
+
+    - create：+file_text 行数（新建无删除）；
+    - str_replace：-old_str 行数、+new_str 行数；
+    - insert：+插入文本（insert_text 或 new_str）行数；
+    - view / 未知命令：无后缀。
+
+    展示规则：双方都大于 0 显示 `` +a -r``；只有一方大于 0 时只显示
+    对应一侧（`` +a`` 或 `` -r``）；均为 0 则不加后缀。数值直接来自
+    参数（流式期间随参数增量增长，实现工具块动态刷新）。
+    """
+    if command == "create":
+        added, removed = _count_edit_lines((fn_args or {}).get("file_text")), 0
+    elif command == "str_replace":
+        removed = _count_edit_lines((fn_args or {}).get("old_str"))
+        added = _count_edit_lines((fn_args or {}).get("new_str"))
+    elif command == "insert":
+        text = (fn_args or {}).get("insert_text")
+        if text is None:
+            text = (fn_args or {}).get("new_str")
+        added, removed = _count_edit_lines(text), 0
+    else:
+        return ""
+    if added > 0 and removed > 0:
+        return f" +{added} -{removed}"
+    if added > 0:
+        return f" +{added}"
+    if removed > 0:
+        return f" -{removed}"
+    return ""
+
+
 def _coerce_positive_int(value: Any, default: int = 1) -> int:
     try:
         num = int(value)
@@ -189,6 +248,22 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
         query = str(fn_args.get("query") or "").strip()
         return query if query else "Searching the web"
 
+    # ---------- text_editor ----------
+    # 注意：text_editor 不再声明 _description（意图）参数，摘要一律按
+    # 「动作 + 文件名 + 行数差异」规范生成，模型即使惯性带上 _description
+    # 也不被采用（因此本分支必须位于 custom_desc 检查之前）。
+    if fn_name == "text_editor":
+        command = str(fn_args.get("command") or "")
+        name = _editor_target_name(fn_args)
+        suffix = _editor_diff_suffix(fn_args, command)
+        if command == "view":
+            return f"Viewing file {name}" if name else "Viewing file"
+        if command == "create":
+            return f"Creating file {name}{suffix}" if name else "Creating file"
+        if command in ("str_replace", "insert"):
+            return f"Editing file {name}{suffix}" if name else "Editing file"
+        return f"Editing file {name}" if name else "Editing file"
+
     custom_desc = _get_tool_description_from_args(fn_args)
     if custom_desc:
         return custom_desc
@@ -206,17 +281,6 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
             short_cmd = cmd[:30] + "..." if len(cmd) > 30 else cmd
             return short_cmd
         return "Running command"
-
-    # ---------- text_editor ----------
-    if fn_name == "text_editor":
-        command = str(fn_args.get("command") or "")
-        # 进行时只显示描述，不需要详细路径
-        return custom_desc or {
-            "view": "Viewing file",
-            "create": "Creating file",
-            "str_replace": "Replacing exact text",
-            "insert": "Inserting text",
-        }.get(command, "Editing file")
 
     # ---------- 图片类 ----------
     if fn_name == "generate_image_from_text":
@@ -259,7 +323,8 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
 
 # text_editor 的 command 封闭枚举：工具名尚未到达时，可据参数形状把
 # 占位条目的进行态摘要推断为 text_editor 风格（如 "Creating file"）。
-_TEXT_EDITOR_COMMAND_ENUM = frozenset({"view", "create", "str_replace", "insert", "undo_edit"})
+# undo_edit 已随该命令一同移除，不再属于合法枚举。
+_TEXT_EDITOR_COMMAND_ENUM = frozenset({"view", "create", "str_replace", "insert"})
 
 
 def _generate_pending_tool_summary(fn_args: dict) -> str:
@@ -603,6 +668,22 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
             return f"{query} {count} result" if count == 1 else f"{query} {count} results"
         return "Searched the web"
 
+    # ---------- text_editor ----------
+    # text_editor 不再声明 _description（意图）参数：完成态摘要一律按
+    # 「动作 + 文件名 + 行数差异」规范生成（本分支位于 custom_desc 检查
+    # 之前，模型惯性携带的 _description 不会被采用）。
+    if fn_name == "text_editor":
+        command = str(fn_args.get("command") or "")
+        name = _editor_target_name(fn_args)
+        suffix = _editor_diff_suffix(fn_args, command)
+        if command == "view":
+            return f"Viewed file {name}" if name else "Viewed a file"
+        if command == "create":
+            return f"Created file {name}{suffix}" if name else "Created a file"
+        if command in ("str_replace", "insert"):
+            return f"Edited file {name}{suffix}" if name else f"Edited a file{suffix}"
+        return f"Edited file {name}" if name else "Edited a file"
+
     custom_desc = _get_tool_description_from_args(fn_args)
     if custom_desc:
         return custom_desc
@@ -674,14 +755,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         if m and m.group(1) != "0":
             return "Ran a command (partial success)"
         return "Ran a command"
-
-    if fn_name == "text_editor":
-        return {
-            "view": "Viewed a file",
-            "create": "Created a file",
-            "str_replace": "Replaced exact text in a file",
-            "insert": "Inserted text into a file",
-        }.get(str(fn_args.get("command") or ""), "Edited a file")
 
     if fn_name == "present_files":
         paths = fn_args.get("paths", [])
