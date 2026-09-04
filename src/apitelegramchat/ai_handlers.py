@@ -131,6 +131,7 @@ async def build_system_prompt(
 <summary><b>⚠️ 严格格式要求</b></summary>
 <ul>
   <li><b>严禁使用 Markdown 语法：例如 <code>---</code>，<code>**</code>，<code>-</code>或者<code>`</code>等markdown格式语法</b></li>
+  <li><b>严禁把媒体标签的“字面量”写进回复或思考正文：</b>需要提及标签名时只写名字本身（如 tg-document、img、video），<b>绝对禁止</b>输出裸的 <code>&lt;tg-document&gt;</code>、<code>&lt;img&gt;</code>、<code>&lt;video&gt;</code>、<code>&lt;figure&gt;</code> 等字面标签——包在反引号或任何引号里也不行，它们会被 Telegram 当作真实标签解析，以 <code>RICH_MESSAGE_DOCUMENT_INVALID</code> 等错误拒绝整条回复。需要展示 HTML 示例时，必须把尖括号全部转义（如 <code>&amp;lt;figure&amp;gt;…&amp;lt;/figure&amp;gt;</code>）。</li>
   <li>严格按下述定义使用标签，切勿自行发明未定义的 HTML 标签。</li>
   <li>
     <b>✅ 必须且仅能使用以下 Telegram HTML 标签（下表标签均为你应直接输出的字面写法，未经转义）：</b>
@@ -186,7 +187,7 @@ async def build_system_prompt(
   <li><b>带图注媒体：</b> <code><figure><img src="URL"/><figcaption>图注文本<cite>来源/署名</cite></figcaption></figure></code>。视频示例：<code><figure><video src="URL"></video><figcaption>视频说明</figcaption></figure></code>。</li>
   <li><b>GIF 规则：</b>GIF 是图片资源。URL 路径以 <code>.gif</code> 结尾时，必须使用 <code><img src="URL"/></code>；需要图注时使用 <code><figure><img src="URL"/><figcaption>…</figcaption></figure></code>。严禁使用 <code><video></code> 包裹 GIF。</li>
   <li><b>图片工具结果处理：</b> 当 <code>generate_image_from_text</code> / <code>edit_image_with_reference</code> 成功返回 <code>图片链接：URL</code>（可能多行、每行一个 URL）时，必须在最终回复中把每个 URL 作为独立媒体块发送：单张用 <code><img src="URL"/></code>，多张（≥2）用 <code><tg-slideshow><img src="URL1"/><img src="URL2"/></tg-slideshow></code>。<b>绝对禁止使用 Markdown 图片/链接语法</b>（<code>![...](URL)</code> 或 <code>[...](URL)</code>），也不得只输出裸 URL 或普通文字描述。仅使用工具返回的原始 HTTP/HTTPS URL，并将 URL 原样写入 <code>src</code> 和需要时的下载 <code>href</code>；不得转义、解码、重写、拼接或截断。</li>
-  <li><b>文档：</b><code><figure><tg-document src="https://example.com/document.pdf"></tg-document><figcaption>项目方案 PDF</figcaption></figure></code>。src 只能写裸 URL，严禁包裹 Markdown 链接语法（详见下方「媒体 URL 严格规则」）。</li>
+  <li><b>文档：</b><code><figure><tg-document src="https://example.com/document.pdf"></tg-document><figcaption>项目方案 PDF</figcaption></figure></code>。src 只能写裸 URL，严禁包裹 Markdown 链接语法（详见下方「媒体 URL 严格规则」）。向用户说明用法时只写标签名 tg-document，<b>严禁在正文/思考中输出该标签的字面形式</b>（如 <code>&lt;tg-document&gt;</code>），否则整条回复会被 Telegram 拒绝。</li>
 </ul>
 
 <h3>锚点与引用说明</h3>

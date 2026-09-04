@@ -284,7 +284,7 @@ def escape_html(text) -> str:
 def _rich_message_html_payload(html_content: str) -> dict:
     """构造符合 InputRichMessage 规范的 HTML 富消息。
 
-    在交付给 Telegram 前，依次跑三道兜底清理：
+    在交付给 Telegram 前，依次跑四道兜底清理：
 
     0. ``_unwrap_markdown_link_urls``：把 src/href 属性里被 Markdown 链接
        语法（``[url](url)`` / ``![alt](url)``）包裹的 URL 解包成裸 URL。
@@ -292,12 +292,19 @@ def _rich_message_html_payload(html_content: str) -> dict:
        等属性的情况——Telegram 会以 ``RICH_MESSAGE_DOCUMENT_URL_INVALID``
        等错误拒绝整条消息。
 
-    1. ``_strip_invalid_media_urls``：剥离 ``src`` 不是合法 http(s) URL
+    1. ``_neutralize_stray_media_tags``：把"游离"媒体标签转义为字面文本。
+       处理 LLM 把标签名当普通文字写出的情况（典型：``使用 `<tg-document>`
+       标签``）——无 src / 未闭合 / 孤立闭合的 ``<tg-document>`` 等标签会被
+       Telegram 当真实媒体解析，以 ``RICH_MESSAGE_DOCUMENT_INVALID`` /
+       ``RICH_MESSAGE_DOCUMENT_NO_MEDIA_FOUND`` 拒绝整条消息；反引号 code
+       span 内的裸标签示例同样转义（模型本意是展示字面文本）。
+
+    2. ``_strip_invalid_media_urls``：剥离 ``src`` 不是合法 http(s) URL
        的 ``<img>``/``<video>``/``<audio>``/``<tg-document>`` 标签。处理 LLM
        把附件 file_name（如 ``photo_AgACAgUA.jpg``）或 file_id 误当成 URL
        的情况，Telegram 会以 ``RICH_MESSAGE_PHOTO_URL_INVALID`` 拒绝整条消息。
 
-    2. ``_demote_watch_page_videos``：把 ``<video src="WATCH_PAGE_URL">``
+    3. ``_demote_watch_page_videos``：把 ``<video src="WATCH_PAGE_URL">``
        块降级为 ``<a href>`` 链接。处理 LLM 把 YouTube / Bilibili 等
        观看页 URL 误当直链视频嵌入 ``<video src>`` 的情况——这种 URL
        看着合法（``http(s)://`` 开头），但 Telegram 去抓会拿到 HTML
@@ -305,6 +312,7 @@ def _rich_message_html_payload(html_content: str) -> dict:
        降级后保留模型生成的 figcaption 文本，让用户仍可点击跳转观看页。
     """
     cleaned = _unwrap_markdown_link_urls(html_content)
+    cleaned = _neutralize_stray_media_tags(cleaned)
     cleaned = _strip_invalid_media_urls(cleaned)
     demoted = _demote_watch_page_videos(cleaned)
     if demoted != html_content:
@@ -383,6 +391,180 @@ def _unwrap_markdown_link_urls(html_content: str) -> str:
         return f"{prefix}{quote}{unwrapped}{quote}"
 
     return _MD_LINK_ATTR_RE.sub(_sub, html_content)
+
+
+# 匹配"标签模样"的片段：<开头、可选 /、字母开标签名、不含 < >、以 > 结尾。
+# 用于反引号 code span 与游离媒体标签的中和——只转义真正的标签形态，
+# 不碰 "a < b"、"<3" 之类的普通文本，也不碰已是实体形态的 &lt;xxx&gt;
+#（实体里没有裸 < 字符，天然不会命中本正则）。
+_TAGLIKE_RE = re.compile(r'<\s*/?\s*[a-zA-Z][^<>]*>')
+
+# 反引号围栏代码块（```...```，可跨行）
+_CODE_FENCE_RE = re.compile(r'```.*?(?:```|$)', re.DOTALL)
+# 行内反引号 code span（`...`，不跨行）
+_INLINE_CODE_RE = re.compile(r'`([^`\n]+)`')
+
+# 需要做"开/闭配对平衡检查"的容器型媒体标签。
+# <a> 不参与：锚点缺失闭合不会让 Telegram 拒绝整条消息，且剥离锚点
+# 会丢失链接文本；<img> 是 void 标签，单独按"无 src 即转义"处理。
+_BALANCED_MEDIA_TAGS = ("tg-document", "video", "audio")
+
+# 单个媒体标签 occurrence：<(/?)(tagname)\b...(/?)>
+# 分支不区分自闭合——用 group(0) 结尾是否为 "/>" 判断。
+_MEDIA_TAG_OCC_RE = re.compile(
+    r'<(/?)(' + '|'.join(_BALANCED_MEDIA_TAGS) + r'|img)\b[^>]*?(/?)>',
+    re.IGNORECASE,
+)
+
+# src 属性探测。负向环视排除 data-src / form-src 等 "xxx-src" 复合属性名，
+# 避免 \bsrc 在连字符后误判为存在 src。
+_TAG_HAS_SRC_RE = re.compile(r'(?<![\w\-])src\s*=', re.IGNORECASE)
+
+
+def _escape_tag_literal(tag_text: str) -> str:
+    """把一段"应当按字面显示"的标签文本转义为 HTML 实体。"""
+    return tag_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
+def _escape_taglike_sequences(text: str) -> str:
+    """把 text 中所有"标签模样"的裸片段转义为字面文本。"""
+    if '<' not in text:
+        return text
+    return _TAGLIKE_RE.sub(lambda m: _escape_tag_literal(m.group(0)), text)
+
+
+def _escape_raw_tags_in_code_spans(html_content: str) -> str:
+    """转义反引号 code span（``` 围栏与行内 `` ` ``）内的裸 HTML 标签。
+
+    LLM 被禁止使用 Markdown 反引号但仍会写，且经常把标签名包在反引号里
+    当"行内代码"展示，例如：
+
+        明白了，使用 `<tg-document>` 标签发送：
+        `<figure><tg-document src="https://example.com/x.pdf"></tg-document></figure>`
+
+    反引号对 Telegram 没有特殊含义，其中的裸 <tg-document> 会被当作
+    **真实标签**解析：无 src 的字面量直接触发 RICH_MESSAGE_DOCUMENT_INVALID；
+    带 src 的示例 URL（如 example.com）会被服务端去抓取，抓取失败又触发
+    NO_MEDIA_FOUND / URL_INVALID 降级链。模型的本意显然是"展示字面文本"，
+    因此这里把 code span 内的标签统一转义为 &lt;...&gt;（Telegram 对实体
+    只做字面渲染，已由线上 plain-text fallback 成功送达的案例反向证实）。
+
+    处理顺序：先围栏（可跨行、可未闭合——流式中的草稿常见"只开了围栏"
+    的中间态），后行内 span（不跨行）。未配对的单个反引号不处理。
+    """
+    if '`' not in html_content or '<' not in html_content:
+        return html_content
+
+    out: list[str] = []
+    cursor = 0
+    for fence in _CODE_FENCE_RE.finditer(html_content):
+        gap = html_content[cursor:fence.start()]
+        out.append(_escape_taglike_inline_spans(gap))
+        out.append(_escape_taglike_sequences(fence.group(0)))
+        cursor = fence.end()
+    out.append(_escape_taglike_inline_spans(html_content[cursor:]))
+    return ''.join(out)
+
+
+def _escape_taglike_inline_spans(text: str) -> str:
+    """对非围栏文本做行内 `` `code` `` span 内的标签转义。"""
+    if '`' not in text or '<' not in text:
+        return text
+
+    def _sub(m: re.Match) -> str:
+        return '`' + _escape_taglike_sequences(m.group(1)) + '`'
+
+    return _INLINE_CODE_RE.sub(_sub, text)
+
+
+def _neutralize_stray_media_tags(html_content: str) -> str:
+    """把"游离"的媒体标签转义为字面文本，防止 Telegram 解析成真实媒体。
+
+    处理三类会让 <tg-document>/<video>/<audio>/<img> 变成毒药的场景：
+
+      1. **无 src 的标签**（含裸 `<tg-document>`、`<img>` 等）——模型把
+         标签名当普通文字写出（典型：``使用 `<tg-document>` 标签``）。
+         Telegram 解析到无 src 的媒体标签会以
+         RICH_MESSAGE_DOCUMENT_INVALID / NO_MEDIA_FOUND 拒绝整条消息；
+      2. **未闭合的开标签**——后续同标签的合法开标签会被服务端正则类
+         解析吞并，产生跨块错配（本文件 _strip_container 曾修复过同型
+         bug，这里是源头预防）；
+      3. **孤立的闭标签**（如多余或错位的 `</tg-document>`）。
+
+    转义（而非删除）保留模型想表达的"字面文本"，用户仍能看到
+    `<tg-document>` 字样；且 Telegram 对实体只做字面渲染，不会再次解析。
+
+    配对规则：img 按 void 处理（逐个独立判断）；tg-document/video/audio
+    做"开→闭"顺序配对——开标签有 src 且下一个同标签 occurrence 是其闭
+    标签才视为合法媒体对保留，其余一律转义。规范的
+    `<figure><tg-document src="URL"></tg-document>...</figure>` 不受影响。
+    """
+    if not html_content or '<' not in html_content:
+        return html_content
+
+    text = _escape_raw_tags_in_code_spans(html_content)
+
+    occurrences = list(_MEDIA_TAG_OCC_RE.finditer(text))
+    if not occurrences:
+        return text
+
+    decisions: list[bool] = [True] * len(occurrences)  # True=保留, False=转义
+    # 每个容器标签记录"等待闭合的开标签"下标（同标签不允许嵌套，存一个即可）
+    pending_open: dict[str, int | None] = {t: None for t in _BALANCED_MEDIA_TAGS}
+
+    for i, m in enumerate(occurrences):
+        is_closing = bool(m.group(1))
+        tag = m.group(2).lower()
+        self_closing = m.group(0)[:-1].rstrip().endswith('/')
+        has_src = bool(_TAG_HAS_SRC_RE.search(m.group(0)))
+
+        if tag == 'img':
+            # void 标签：有 src 属性即交给 _strip_invalid_media_urls 校验
+            # URL 值的合法性；完全没有 src 属性的字面量转义为文本。
+            decisions[i] = has_src
+            continue
+
+        if is_closing:
+            if pending_open[tag] is not None:
+                decisions[i] = True   # 与前面的开标签配对成功
+                pending_open[tag] = None
+            else:
+                decisions[i] = False  # 孤立闭标签 → 字面文本
+            continue
+
+        if self_closing:
+            decisions[i] = has_src
+            continue
+
+        # 非自闭合开标签：若前一个同标签开标签还没等到闭合，说明它是
+        # 未闭合标签，必须转义；随后再看自身是否有 src。
+        prev = pending_open[tag]
+        if prev is not None:
+            decisions[prev] = False
+            pending_open[tag] = None
+        if not has_src:
+            decisions[i] = False      # 无 src 的开标签永远不可能合法
+        else:
+            decisions[i] = True
+            pending_open[tag] = i     # 等待闭合；若最终没等到，收尾时转义
+
+    for tag, i in pending_open.items():
+        if i is not None:
+            decisions[i] = False      # 未闭合的开标签 → 字面文本
+
+    if all(decisions):
+        return text
+
+    out: list[str] = []
+    cursor = 0
+    for m, keep in zip(occurrences, decisions):
+        if keep:
+            continue
+        out.append(text[cursor:m.start()])
+        out.append(_escape_tag_literal(m.group(0)))
+        cursor = m.end()
+    out.append(text[cursor:])
+    return ''.join(out)
 
 
 # 匹配完整的 <img ...> 标签（含可选自闭合斜杠），直到第一个 >。
@@ -1605,71 +1787,55 @@ async def send_rich_html_message(
                         # 直接原因。
                         media_kinds.add("tg-document")
 
-                    # ---------- 第 2 次尝试：只降级服务端明确报错的媒体类型 ----------
-                    # img/video/audio/tg-document 映射到实际 HTML 标签名，避免 photo
-                    # 失败时把同一条消息中本来正常的视频、音频和文档也一并变成链接。
+                    # ---------- 降级候选按"破坏性从小到大"逐个尝试 ----------
+                    #   a) 只降级服务端明确报错的媒体类型（最大限度保留其余媒体）；
+                    #   b) 全部媒体降级（同一条消息里多种媒体都坏时一次到位）；
+                    #   c) 纯文本段落（最后兜底——丢格式总比丢整条回复好）。
+                    # 2026-09-05 线上案例：正文里出现裸的 <tg-document> 字面量
+                    # （模型想表达"使用 tg-document 标签"），定向降级只替换了
+                    # 规范的 <figure><tg-document>，字面量仍在，Telegram 依旧以
+                    # RICH_MESSAGE_DOCUMENT_INVALID 拒绝——此前直接 return False
+                    # 会把整条回复丢掉，故改为级联兜底，确保消息必达。
+                    fallback_attempts: list[tuple[str, str]] = []
                     if media_kinds:
-                        media_demoted = _demote_all_media_to_links(
-                            html_content,
-                            media_kinds,
-                        )
-                        if media_demoted and media_demoted != html_content:
-                            media_payload = {
-                                **payload,
-                                "rich_message": _rich_message_html_payload(media_demoted),
-                            }
-                            logger.warning(
-                                "sendRichHtmlMessage retrying with affected media demoted to <a> links "
-                                "(kinds=%s, orig_len=%s, demoted_len=%s)",
-                                sorted(media_kinds), len(html_content), len(media_demoted),
+                        targeted = _demote_all_media_to_links(html_content, media_kinds)
+                        if targeted and targeted != html_content:
+                            fallback_attempts.append(
+                                (f"affected media demoted to <a> links (kinds={sorted(media_kinds)})", targeted)
                             )
-                            async with session.post(f"{BASE_URL}/sendRichMessage", json=media_payload) as fb_resp:
-                                if fb_resp.status == 200:
-                                    try:
-                                        fb_data = await fb_resp.json()
-                                        fb_msg_id = (fb_data.get("result") or {}).get("message_id")
-                                        if isinstance(fb_msg_id, int) and fb_msg_id > 0:
-                                            return fb_msg_id
-                                    except Exception as e:
-                                        logger.debug(f"sendRichHtmlMessage media-demoted parse failed: {e}")
-                                    return True
-                                fb_body = await fb_resp.text()
-                                logger.warning(
-                                    "sendRichHtmlMessage selective media fallback failed: %s %s",
-                                    fb_resp.status, fb_body[:200],
-                                )
-                                return False
-
-                    # ---------- 结构/内容错误：保留可见文字，去掉全部富文本标记 ----------
-                    # CONTENT_REQUIRED 或未知 Rich Message 400 不是媒体问题，不应把
-                    # 无辜的媒体改成链接；纯文本段落是最后一道、语义不丢失的兜底。
-                    if "rich_message_content_required" in body_lower or "rich_message_" in body_lower:
+                        all_demoted = _demote_all_media_to_links(html_content)
+                        if all_demoted and all_demoted != html_content and all_demoted != targeted:
+                            fallback_attempts.append(("all media demoted to <a> links", all_demoted))
+                    if "rich_message_" in body_lower:
                         plain_html = _rich_message_plain_text_fallback(html_content)
                         if plain_html and plain_html != html_content:
-                            plain_payload = {
-                                **payload,
-                                "rich_message": _rich_message_html_payload(plain_html),
-                            }
+                            fallback_attempts.append(("plain-text paragraph fallback", plain_html))
+
+                    for fb_label, fb_html in fallback_attempts:
+                        fb_payload = {
+                            **payload,
+                            "rich_message": _rich_message_html_payload(fb_html),
+                        }
+                        logger.warning(
+                            "sendRichHtmlMessage retrying with %s (orig_len=%s, fallback_len=%s)",
+                            fb_label, len(html_content), len(fb_html),
+                        )
+                        async with session.post(f"{BASE_URL}/sendRichMessage", json=fb_payload) as fb_resp:
+                            if fb_resp.status == 200:
+                                try:
+                                    fb_data = await fb_resp.json()
+                                    fb_msg_id = (fb_data.get("result") or {}).get("message_id")
+                                    if isinstance(fb_msg_id, int) and fb_msg_id > 0:
+                                        return fb_msg_id
+                                except Exception as e:
+                                    logger.debug(f"sendRichHtmlMessage fallback parse failed: {e}")
+                                return True
+                            fb_body = await fb_resp.text()
                             logger.warning(
-                                "sendRichHtmlMessage retrying with plain-text paragraph fallback "
-                                "after content/structure error (orig_len=%s, plain_len=%s)",
-                                len(html_content), len(plain_html),
+                                "sendRichHtmlMessage %s failed: %s %s",
+                                fb_label, fb_resp.status, fb_body[:200],
                             )
-                            async with session.post(f"{BASE_URL}/sendRichMessage", json=plain_payload) as fb_resp:
-                                if fb_resp.status == 200:
-                                    try:
-                                        fb_data = await fb_resp.json()
-                                        fb_msg_id = (fb_data.get("result") or {}).get("message_id")
-                                        if isinstance(fb_msg_id, int) and fb_msg_id > 0:
-                                            return fb_msg_id
-                                    except Exception as e:
-                                        logger.debug(f"sendRichHtmlMessage plain fallback parse failed: {e}")
-                                    return True
-                                fb_body = await fb_resp.text()
-                                logger.warning(
-                                    "sendRichHtmlMessage plain-text fallback failed: %s %s",
-                                    fb_resp.status, fb_body[:200],
-                                )
+
                     logger.error("sendRichHtmlMessage 400 未命中可恢复错误类型: %s %s", resp.status, body[:200])
                     return False
         except (aiohttp.ClientError, asyncio.TimeoutError):
