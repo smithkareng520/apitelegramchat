@@ -278,7 +278,7 @@ async def _agentic_loop_openai_compat(
     for _round in range(MAX_TOOL_CALLS):
         added_tool_indices = set()
         last_arg_len = {}
-        # ★ 修复"工具块不即时显示"：每个 tool_call 索引当前使用的 UI 条目
+        # 每个 tool_call 索引当前使用的 UI 条目
         # id（占位阶段为 pending_* id）与已确认的函数名。部分网关会先流式
         # 传输参数增量、把 id/函数名拖到很晚才补发；占位条目保证工具块在
         # 第一片增量到达时就上屏，id/名称到达后再原地改绑/回填。
@@ -440,13 +440,13 @@ async def _agentic_loop_openai_compat(
                             tc_id = tc.get("id")
                             tc_name = tc.get("function", {}).get("name")
 
-                            # ★ 修复"工具块不即时显示"：该工具调用的第一片增量到达就
-                            # 立即建条目，不再要求 id 与函数名都齐备。部分网关把
-                            # tool_call 的 id/name 拖到流末尾才补发（参数增量却在正常
-                            # 流式）；旧实现 `if tc_id and tc_name` 会在整段参数流期间
+                            # 该工具调用的第一片增量到达就立即建条目，不要求
+                            # id 与函数名都齐备：部分网关把 tool_call 的
+                            # id/name 拖到流末尾才补发（参数增量却在正常
+                            # 流式），若等 id/name 齐备再建条目，整段参数流期间
                             # （例如 text_editor create 写整个 file_text 的几十秒里）
-                            # 不显示任何工具块，直到创建完毕才一次性出现完成态。
-                            # 现在用占位 id 先建条目，id/name 到达后再原地改绑与回填。
+                            # 都不会显示任何工具块，直到创建完毕才一次性出现完成态。
+                            # 用占位 id 先建条目，id/name 到达后再原地改绑与回填。
                             if idx not in added_tool_indices:
                                 if round_leading_kind is None:
                                     # 本轮第一个出现的就是工具调用：沿用/合并到上一个未闭合的工具块。
@@ -629,10 +629,9 @@ async def _agentic_loop_openai_compat(
             )
         except Exception:
             logger.exception(f"[{api_label}] 记录 tool_calls 日志失败")
-        # 每轮请求结束后立即打印本轮缓存命中统计。
-        # 旧实现把 _log_cache_usage 放在 for 循环外面，且 final_usage 每轮被覆盖，
-        # 导致多轮 agentic 循环只打印最后一轮的缓存统计，中间轮次的命中情况不可观测。
-        # 此处每轮独立打印；final_usage 仍保留最后一轮的值供返回值（token 台账）使用。
+        # 每轮请求结束后立即打印本轮缓存命中统计：final_usage 每轮被覆盖，
+        # 若只在循环外打印，多轮 agentic 循环中间轮次的命中情况不可观测。
+        # final_usage 仍保留最后一轮的值供返回值（token 台账）使用。
         _log_cache_usage(api_label, final_usage)
         for idx, tc in enumerate(tool_calls_list):
             if not tc.get("id"):
@@ -979,7 +978,7 @@ async def _agentic_loop_gemini_openai_compat(
         loop_messages.append(assistant_msg)
         new_history_entries.append(assistant_msg)
         # 每轮请求结束后立即打印本轮缓存命中统计（与 OpenAI 兼容 loop 一致）。
-        # 旧实现只在循环外打印一次，导致多轮工具调用中间轮次的缓存命中不可观测。
+        # final_usage 每轮被覆盖，只在循环外打印会让中间轮次的命中不可观测。
         _log_cache_usage("gemini", final_usage)
         if not tool_calls_list:
             final_content = content_acc
@@ -1134,8 +1133,7 @@ async def _agentic_loop_native_image(
                     )
                 return f"IMAGE_ERROR:{error_notice}", None, []
 
-            # 旧实现构造了带伪 choices/_payload 的 _ImageResponse 对象，
-            # 但下游只读取 usage；直接取值即可。
+            # 响应里下游只读取 usage；直接取值即可。
             usage = response_json.get("usage")
             image_bytes_list = await _response_items_to_bytes(response_json)
 
@@ -1346,7 +1344,6 @@ async def _agentic_loop_native_video(
         return "VIDEO_ERROR:未提供提示词", None, []
 
     # 可选：解析时长
-    # re 已在文件顶部 import，删除本地的 `import re`（之前是冗余 import）。
     duration = 5
     # 时长解析：兼容中英文（"5秒" 与 "5 seconds" / "5s"）
     # 中文"秒"与后续汉字都是 \w，末尾的 \b 对中文分支永不成立（导致
@@ -1444,8 +1441,6 @@ async def _agentic_loop_native_video(
                         dl_resp.status, str(video_url)[:200],
                     )
     except Exception as e:
-        # 修复：原 logger.exception 把 %s 视频字符串作为参数但 %s 占位符只有
-        # 一个，导致 e 本身被 logger 内部忽略。改为把 e 也传入。
         logger.exception(
             "[NativeVideo] 视频下载/上传异常，回退使用原始 URL: url=%s err=%s",
             str(video_url)[:200], e,

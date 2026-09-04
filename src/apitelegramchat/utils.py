@@ -110,9 +110,8 @@ def setup_logging() -> bool:
 
     return True
 
-# 仅在显式开启或 root logger 还没有 handler 时执行初始化。
-# 此前是 import-time 无条件覆盖 root logger，会让 MCP server、tests 等宿主
-# 失去对自己 logging 配置的控制。
+# 仅在显式开启或 root logger 还没有 handler 时执行初始化；无条件覆盖
+# root logger 会让 MCP server、tests 等宿主失去对自己 logging 配置的控制。
 if os.getenv("APITELEGRAMCHAT_REQUIRE_LOGGING", "0") in {"1", "true", "yes", "on"} or not logging.getLogger().handlers:
     setup_logging()
 
@@ -1248,11 +1247,11 @@ async def send_rich_message_draft(
 
                         # 媒体抓取失败类错误（RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND /
                         # RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND）是不可恢复的内容问题：
-                        # 同一个 URL 再发多少次都会被 Telegram 拒绝。旧逻辑只 bump
+                        # 同一个 URL 再发多少次都会被 Telegram 拒绝。若只 bump
                         # failure 并 return，builder 的 flush 循环会继续用原始内容
                         # 重试，最多累计 6 次失败才 mark dead，用户看到草稿卡很久。
-                        # 此处立即在同一个调用内把所有媒体降级为 <a> 链接并重试一次，
-                        # 失败一次就直接降级，不再让上层循环重复无效请求。
+                        # 因此立即在同一个调用内把所有媒体降级为 <a> 链接并重试一次，
+                        # 失败一次就直接降级，不让上层循环重复无效请求。
                         media_not_found = (
                             "rich_message_photo_no_media_found" in body_lower
                             or "rich_message_video_no_media_found" in body_lower
@@ -1441,12 +1440,12 @@ async def send_rich_html_message(
     if message_thread_id:
         payload["message_thread_id"] = message_thread_id
 
-    # 永久消息需要比草稿更强的送达可靠性，因此保留重试；但此前完全没有设置
-    # timeout（aiohttp 默认是几分钟级），一旦网络抖动或 Telegram 侧偶发变慢，
-    # 三次重试 × 每次可能挂到默认超时，会让调用方（草稿滚动）阻塞数分钟。
-    # 给一个不算激进的有界超时：单次总超时 15s、连接超时 5s，三次重试封顶
-    # 约 45~90s（含 1s/4s/7s 退避），比之前的"无上限"收窄了一个数量级，
-    # 同时仍然给网络抖动足够的恢复空间。
+    # 永久消息需要比草稿更强的送达可靠性，因此保留重试；但不能不设
+    # timeout（aiohttp 默认是几分钟级），否则一旦网络抖动或 Telegram 侧
+    # 偶发变慢，三次重试 × 每次可能挂到默认超时，会让调用方（草稿滚动）
+    # 阻塞数分钟。这里给一个不算激进的有界超时：单次总超时 15s、连接
+    # 超时 5s，三次重试封顶约 45~90s（含 1s/4s/7s 退避），同时仍然给
+    # 网络抖动足够的恢复空间。
     @retry_async(max_retries=3, delay=1, backoff=3, exceptions=(aiohttp.ClientError, asyncio.TimeoutError))
     async def _send_inner():
         timeout = aiohttp.ClientTimeout(total=15, connect=5)

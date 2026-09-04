@@ -46,10 +46,10 @@ ASK_USER_OPTION_DESCRIPTION_TOKEN_BUDGET = 64
 ASK_USER_ID_TOKEN_BUDGET = 32
 ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET = 1_000
 MAX_OPTIONS = 8
-# 修复：24h 超时太长——一个未回答的 message_user 会把 agent 循环挂起整整一天，
-# 中间所有事件循环资源（chat lock、内存里的消息、模型 prompt cache 等）都
-# 不能释放。默认 2 分钟：像现实中给同学发消息——等两分钟没人回，就是不在；
-# 足够用户看到消息并做选择，又不至于让会话僵死。
+# 超时不能太长（如 24h）：一个未回答的 message_user 会把 agent 循环挂起
+# 整整一天，中间所有事件循环资源（chat lock、内存里的消息、模型 prompt
+# cache 等）都不能释放。默认 2 分钟：像现实中给同学发消息——等两分钟
+# 没人回，就是不在；足够用户看到消息并做选择，又不至于让会话僵死。
 # 如需更长等待可通过环境变量 ASK_USER_TIMEOUT 覆盖。
 INTERACTION_TIMEOUT = int(os.getenv("ASK_USER_TIMEOUT", str(2 * 60)))
 

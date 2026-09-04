@@ -216,8 +216,8 @@ async def _post_with_retry(
     last_exc: SerperError | None = None
 
     # 单次 timeout 用于每次尝试；外层 web_search 工具超时（45s）兜底总预算。
-    # 整个重试序列共用一个 ClientSession（复用 TCP/TLS 连接），避免旧实现
-    # 在循环内每次尝试都新建 session、对同一 host 反复完整握手。
+    # 整个重试序列共用一个 ClientSession（复用 TCP/TLS 连接），避免在循环内
+    # 每次尝试都新建 session、对同一 host 反复完整握手。
     timeout_cfg = aiohttp.ClientTimeout(total=timeout_s, connect=5, sock_read=timeout_s)
     async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
         for attempt in range(SERPER_MAX_RETRIES + 1):
@@ -254,8 +254,8 @@ async def _post_with_retry(
                             last_exc = SerperServerError(msg, status_code=resp.status)
                             await asyncio.sleep(SERPER_RETRY_BACKOFF * (attempt + 1))
                             continue
-                        # 重试耗尽：按类设计抛出 SerperServerError，方便调用方
-                        # isinstance 区分（旧实现落到基类 SerperError，子类从未被抛出）。
+                        # 重试耗尽：抛出具体的 SerperServerError 子类，方便调用方
+                        # isinstance 区分错误类别。
                         raise SerperServerError(msg, status_code=resp.status)
                     if category == "request":
                         raise SerperRequestError(msg, status_code=resp.status)

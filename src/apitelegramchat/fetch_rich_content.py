@@ -835,7 +835,7 @@ _XML_BLOCK_RE = re.compile(r"<(?:p|head|list|table|quote|code|graphic|media)\b")
 _RAW_HTML_BLOCK_RE = re.compile(r"<(?:p|h[1-6]|li|blockquote|pre|table)\b", re.IGNORECASE)
 
 # DOM 表格回填仅用于已验证的“同表严重丢行”场景。它不替换正文提取器，也不
-# 新增没有转换表锚点的原始表格；详见 DOM_TABLE_FALLBACK_DESIGN.md。
+# 新增没有转换表锚点的原始表格。
 _DOM_TABLE_MIN_DATA_ROWS = 3
 _DOM_TABLE_MIN_ROW_DELTA = 3
 
@@ -1553,8 +1553,8 @@ def build_fallback_text_from_html(html_text: str, token_budget: int = FALLBACK_T
     chunks: list[str] = []
     if desc:
         chunks.append(desc.strip())
-    # 增量维护 token 计数：旧实现对每个新段落都把全部已累积内容重新
-    # join + 编码（O(n^2)），大页面数百段时是数百次全量重编码。
+    # 增量维护 token 计数，避免每来一个新段落都对全部已累积内容重新
+    # join + 编码（O(n^2)，大页面数百段时是数百次全量重编码）。
     total_tokens = count_tokens(desc.strip()) if desc else 0
     for el in tree.iter("p"):
         text = re.sub(r"\s+", " ", "".join(el.itertext())).strip()

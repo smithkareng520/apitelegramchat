@@ -124,9 +124,9 @@ async def check_sandbox_isolation(landlock_ok: bool):
     import functools
     from apitelegramchat.sandbox import build_sandbox_argv, build_sandbox_env, _preexec_sandbox
 
-    # 修复 symlink 攻击：原代码用固定路径 /tmp/verify_workspace，
-    # 本地攻击者可以提前创建该路径并指向 /etc，让 verify_security 写
-    # 测试文件到 /etc。改用 mkdtemp 在私有 data_root 下创建唯一目录。
+    # 防 symlink 攻击：不用固定路径 /tmp/verify_workspace——本地攻击者
+    # 可以提前创建该路径并指向 /etc，诱骗本脚本把测试文件写进 /etc。
+    # 用 mkdtemp 在私有 data_root 下创建唯一目录。
     from apitelegramchat.workspace_paths import data_root
     try:
         base = data_root()

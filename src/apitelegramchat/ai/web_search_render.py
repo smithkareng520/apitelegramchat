@@ -400,7 +400,7 @@ def format_web_search_result(fn_args: dict, result_str: str) -> tuple[str, str]:
     query = (fn_args or {}).get("query", "") or ""
     text = str(result_str or "")
 
-    # ---- summary（与旧逻辑保持一致，供工具折叠块摘要行使用）----
+    # ---- summary（供工具折叠块摘要行使用）----
     count_match = re.search(
         r'\[成功:[^\]]+\].*?[（(]\s*(\d+)\s*/\s*(\d+)\s*[）)]', text, re.S
     )

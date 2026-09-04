@@ -13,7 +13,7 @@ qrcode==7.4.2
 cachetools==5.5.0
 aioboto3==12.4.0
 numpy<2.0.0
-# 工具参数主流四层管线（TOOL_ARGS_PIPELINE.md）：
+# 工具参数四层修复/校验管线：
 # - json-repair：社区标准库，L1 语法修复主引擎（未安装时自动退回内置引擎）
 # - jsonschema：社区标准校验器，L2 语义校验（未安装时自动退回内置轻量校验）
 json-repair>=0.30,<1

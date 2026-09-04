@@ -5,13 +5,11 @@ import subprocess
 import uuid
 import aiohttp
 import json
-import time
 from pathlib import Path
 from apitelegramchat.workspace_paths import (
     workspace_root, workspace_workdir, runtime_cache_root, workspace_namespace,
     workspace_upload_root, workspace_download_root,
     is_inside_upload_or_download,
-    _UPLOAD_DIR_NAME,
 )
 import re
 import html
@@ -121,11 +119,10 @@ LOCATION_LOOKUP_TOOLS = frozenset({
 TOOL_RESPONSE_TOKEN_BUDGET = int(os.getenv("TOOL_RESPONSE_TOKEN_BUDGET", "20000"))
 
 # ---------- Bash 输出上限（环境变量可调） ----------
-# 单条 Bash 命令返回给模型的内容上限（字符数）。超限时不再像旧版那样
-# 只保留开头 20000 字符，而是「保留开头 + 结尾、省略中间」，因为编译错误、
-# traceback、日志摘要几乎总是出现在输出末尾，纯头部截断会把最有价值的
-# 部分默默丢掉。设为 0 表示不限制（不建议：狂刷输出的命令会撑爆内存与
-# 模型上下文）。
+# 单条 Bash 命令返回给模型的内容上限（字符数）。超限时「保留开头 + 结尾、
+# 省略中间」：编译错误、traceback、日志摘要几乎总是出现在输出末尾，纯
+# 头部截断会把最有价值的部分默默丢掉。设为 0 表示不限制（不建议：狂刷
+# 输出的命令会撑爆内存与模型上下文）。
 SANDBOX_OUTPUT_MAX_CHARS = int(os.getenv("SANDBOX_OUTPUT_MAX_CHARS", "80000"))
 
 
@@ -933,7 +930,7 @@ def _render_editor_result(command: str, path: str, result_str: str, arguments: d
     """Render text-editor calls as explicit, quote-formatted Input and Output."""
     arguments = arguments or {}
     if command == "view":
-        # text_editor 已移除 _description（意图）参数：Input 直接展示实际
+        # text_editor 不声明 _description（意图）参数：Input 直接展示实际
         # 输入（目标路径 + 可选行范围），与写操作展示真实参数的策略一致。
         view_input = str(path or "").strip()
         view_range = arguments.get("view_range")
@@ -1139,9 +1136,9 @@ class BashSession:
             preexec_fn=preexec,  # Landlock + no-new-privs + rlimit
         )
 
-        # 启动看门狗（fork bomb 防护）。无条件跟随本次 spawn 的进程：
-        # 旧实现"看门狗还活着就不重建"会让重启后的新进程处于无防护状态
-        # （旧看门狗盯的是已死的旧进程对象）。
+        # 启动看门狗（fork bomb 防护）。无条件跟随本次 spawn 的进程重建：
+        # 复用旧看门狗会让重启后的新进程处于无防护状态
+        # （它盯的是已死的旧进程对象）。
         if self._watchdog_task and not self._watchdog_task.done():
             self._watchdog_task.cancel()
         self._watchdog_task = asyncio.create_task(
@@ -1454,18 +1451,18 @@ class BashSession:
             #   echo 的输出会粘在前一行，readline() 永远读不到以 marker 开头的行，
             #   导致整个会话 hang 死。
             # 同时记录命令结束后的真实 PWD，用于结果显示；不会改变 shell 状态。
-            # ★ 修复存量 bug ×3：
-            #   1) $? 必须放在引号外（旧写法 echo '{marker} $?' 把 $?
-            #      包进单引号，bash 不展开，退出码永远是 unknown）；
+            # ★ 包裹命令的三个关键点：
+            #   1) $? 必须放在引号外（若把 $? 包进单引号，bash 不展开，
+            #      退出码永远是 unknown）；
             #   2) 退出码必须在命令结束的下一刻立刻捕获（__rc=$?），
             #      否则中间的 echo/printf 会把 $? 重置为 0，失败命令
             #      在模型眼里和成功无异；
             #   3) 模型生成的多行命令（如 `python3 -c "..."` 跨行书写）
-            #      几乎总带尾随换行。旧写法 f"{command}; __rc=$?..." 直接拼接
-            #      会让 "; __rc=$?" 落在新一行的行首——bash 对行首的孤立
-            #      分号直接报 syntax error near unexpected token `;'——
-            #      marker 永远不会被输出，退出码停留在 unknown。
-            #      修复：先 rstrip() 去掉尾随空白/换行，再改用 "\n" 换行拼接
+            #      几乎总带尾随换行，直接用 "; __rc=$?..." 拼接会让分号
+            #      落在新一行的行首——bash 对行首的孤立分号直接报
+            #      syntax error near unexpected token `;'——marker 永远不会
+            #      被输出，退出码停留在 unknown。
+            #      因此先 rstrip() 去掉尾随空白/换行，再用 "\n" 换行拼接
             #      退出码捕获。换行在 bash 里同样是命令分隔符，且能正确
             #      终结行尾注释（`cmd # note` 后直接拼 `;` 会把整段包装
             #      代码吞进注释，导致 marker 丢失、会话卡到超时）。
@@ -1523,7 +1520,7 @@ class BashSession:
                 await asyncio.wait_for(read_until_marker(), timeout=timeout)
 
                 # 有界缓冲：预算内完整保留；超预算保留头+尾并省略中间，
-                # 上限由 SANDBOX_OUTPUT_MAX_CHARS 控制（默认 80000，远大于旧版 20000）。
+                # 上限由 SANDBOX_OUTPUT_MAX_CHARS 控制（默认 80000）。
                 output = output_buffer.finalize()
                 output = _strip_ansi(output)
 
@@ -1736,10 +1733,9 @@ from apitelegramchat.ai.web_search_render import (
 
 
 async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tuple[str, str]:
-    # 历史上这里曾重复定义一个本地 escape_text（与 import 的 escape_html
-    # 行为不完全一致：本地版会对已经合法的实体再做一次 `&` -> `&amp;` 转换，
-    # 导致双重转义），是容易飘移的脏代码。现已删除本地定义，全部走
-    # utils.escape_html（它做了智能 ampersand 处理，不会重复转义）。
+    # 统一用 utils.escape_html 做转义（它做了智能 ampersand 处理，
+    # 不会重复转义）；不要在本地另写简化版 escape_text——对已经合法的
+    # 实体再做一次 `&` -> `&amp;` 转换会导致双重转义。
     # ---- Intercept timeout magic marker BEFORE any other branch ----
     # The raw exception (with TOOL_CALL_TIMEOUT seconds) is kept in
     # logger.error on the backend; the UI only sees the friendly version.
@@ -2028,7 +2024,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 # ⚠️ R2 presigned URL 含大量 & 查询参数（X-Amz-Algorithm、X-Amz-Credential、
                 # X-Amz-Signature 等），HTML 属性值中未转义的 & 会被 Telegram HTML
                 # 解析器当作实体名起点，导致 URL 被截断 → RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND。
-                # 必须用 escape_html 转义（与 _agentic_loop_native_video 老路径一致）。
+                # 必须用 escape_html 转义（与 _agentic_loop_native_video 路径一致）。
                 video_url = url_match.group(1).strip()
                 duration_str = ""
                 m = re.search(r'(\d+)\s*秒', fn_args.get("prompt", "") or "")
@@ -2048,10 +2044,9 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         return summary, details_html
 
     # ===================== 地图工具（amap-maps MCP 直通） =====================
-    # 所有地理 / 路径 / POI / 距离 / IP 工具现在都委托给 amap-maps MCP 服务，
-    # 返回内容是该 MCP 的原生输出（通常是 JSON 文本）。这里不再尝试解析特定
-    # schema（旧 amap_integration.py / Overpass / OSRM / TomTom / ORS 的字段
-    # 都已废弃），改为：
+    # 所有地理 / 路径 / POI / 距离 / IP 工具都委托给 amap-maps MCP 服务，
+    # 返回内容是该 MCP 的原生输出（通常是 JSON 文本）。这里不解析特定
+    # schema，改为：
     #   - 若解析出 JSON 且含 status=error，则显示为失败
     #   - 否则把原始输出转义后直接展示给用户，让 LLM 在后续轮次里自由解读。
     elif fn_name in ("geocode", "route", "distance", "poi_keyword_search",
@@ -2237,8 +2232,8 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         # 延迟导入：tool_summary 模块级导入了 tool_executors，顶层导入会循环。
         from apitelegramchat.ai.tool_summary import _get_tool_description_from_args
         intent = _get_tool_description_from_args(fn_args) or ""
-        # 用信封里的退出码判定失败。旧实现对输出内容做 "Error:" 子串匹配,
-        # `grep Error: app.log` 这类命令（exit 0）会被误标为执行失败。
+        # 用信封里的退出码判定失败：对输出内容做 "Error:" 子串匹配会把
+        # `grep Error: app.log` 这类命令（exit 0）误标为执行失败。
         parsed_env = _parse_bash_envelope(result_str)
         bash_failed = (
             (parsed_env is not None and parsed_env[1] not in ("", "0"))

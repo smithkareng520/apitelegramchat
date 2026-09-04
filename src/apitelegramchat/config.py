@@ -33,7 +33,6 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 # ---------- 高德地图 MCP 服务（@amap/amap-maps on ModelScope）----------
 # 通过 streamable_http 调用，使用 Bearer token 鉴权。
-# 替代了原先的 amap_integration.py 直接调用高德 Web 服务 API 的方式。
 # 未配置 GAODE_MCP_TOKEN 或 GAODE_MCP_URL 时该 MCP 服务不可用（mcp_client.py 会跳过注册）。
 GAODE_MCP_ENABLED = os.getenv("GAODE_MCP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 GAODE_MCP_URL = (os.getenv("GAODE_MCP_URL") or "").strip()
@@ -109,9 +108,6 @@ if os.getenv("APITELEGRAMCHAT_REQUIRE_STRICT_CONFIG", "0") in {"1", "true", "yes
         # 导入期 logger 还没配置 basicConfig，print 到 stderr 兜底。
         print(f"[apitelegramchat.config] {exc}", file=sys.stderr)
         raise
-
-# ---------- 全局锁 ----------
-global_lock = asyncio.Lock()
 
 # ---------- 角色相关 ----------
 SUPPORTED_ROLES = ["china", "think", "neko_catgirl", "succubus", "isla"]

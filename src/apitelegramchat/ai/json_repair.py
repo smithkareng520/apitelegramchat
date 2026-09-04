@@ -44,8 +44,8 @@ from apitelegramchat.utils import get_logger
 logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# 与 provider 交互的信封常量（原定义于 tool_summary.py，迁移至此作为单一
-# 数据源；tool_summary 重新导出以保持旧导入路径兼容）。
+# 与 provider 交互的信封常量（单一数据源；tool_summary 重新导出以保持
+# 导入路径兼容）。
 # ---------------------------------------------------------------------------
 
 # 流式调用偶发截断/拼接异常时，不能把原始坏字符串写回下一轮请求，否则
@@ -68,7 +68,7 @@ _STREAM_CUT_CAUSE_KEY = "stream_cut_cause"
 # 自动修复成功时注入 fn_args 的提示键（run_one 会 pop 掉并转成结果附注）
 _JSON_REPAIR_NOTE_KEY = "__apitelegram_json_repair_note__"
 
-# 信封里保留的原始参数摘录上限（与旧实现一致），错误消息里展示更短。
+# 信封里保留的原始参数摘录上限；错误消息里展示更短的摘录。
 _RAW_EXCERPT_LIMIT = 2000
 _MESSAGE_EXCERPT_LIMIT = 500
 _MAX_ISSUES_IN_MESSAGE = 6
@@ -538,21 +538,6 @@ def repair_json_arguments(
         logger.warning("repair_json_arguments 内部异常: %s", exc, exc_info=True)
         info["note"] = f"repair crashed: {exc}"
         return None, info
-
-
-def _kind_of_valid_json(parsed) -> Optional[str]:
-    """json.loads 成功但非 dict 时，返回可读的类型描述。"""
-    if isinstance(parsed, list):
-        return "a JSON array"
-    if isinstance(parsed, str):
-        return "a JSON string"
-    if isinstance(parsed, bool):
-        return "a JSON boolean"
-    if isinstance(parsed, (int, float)):
-        return "a JSON number"
-    if parsed is None:
-        return "JSON null"
-    return None
 
 
 def _parser_error_text(exc: Optional[Exception], raw: str) -> str:

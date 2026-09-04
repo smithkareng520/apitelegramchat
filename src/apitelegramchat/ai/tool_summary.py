@@ -15,7 +15,6 @@ from apitelegramchat.ai._constants import MAX_TOOL_CALLS
 from apitelegramchat.ai.error_formatting import extract_domain
 from apitelegramchat.ai.json_repair import (
     _INVALID_TOOL_ARGUMENTS_KEY,
-    _INVALID_TOOL_ARGUMENTS_RAW_KEY,
     _JSON_REPAIR_NOTE_KEY,
     _finish_reason_cut_info,
     build_invalid_arguments_envelope,
@@ -26,8 +25,8 @@ from apitelegramchat.ai.json_repair import (
 
 logger = get_logger(__name__)
 
-# 旧导入路径兼容：tool_call_loop 等模块仍从本模块导入这两个常量，
-# 其定义已迁移到 json_repair.py（单一数据源）。
+# 兼容导入：tool_call_loop 等模块仍从本模块导入这两个常量；
+# 定义在 json_repair.py（单一数据源）。
 
 _TEXTUAL_TOOL_CALL_RE = re.compile(
     r"<(?:longcat_)?tool_call\b[^>]*>.*?(?:</(?:longcat_)?tool_call\s*>|$)",
@@ -323,7 +322,7 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
 
 # text_editor 的 command 封闭枚举：工具名尚未到达时，可据参数形状把
 # 占位条目的进行态摘要推断为 text_editor 风格（如 "Creating file"）。
-# undo_edit 已随该命令一同移除，不再属于合法枚举。
+# undo_edit 命令不存在，不属于合法枚举。
 _TEXT_EDITOR_COMMAND_ENUM = frozenset({"view", "create", "str_replace", "insert"})
 
 

@@ -1,14 +1,14 @@
 # =====================================================================
 # net_shims.py — curl / wget 的 Python stdlib 兜底 shim
 # =====================================================================
-# 背景：项目旧版 Dockerfile（node:22-bookworm-slim）没有安装 curl/wget，
-# Landlock 沙箱本身并不拦截网络，模型执行 `curl https://...` 得到的只是
+# 背景：若运行环境没有安装 curl/wget（Landlock 沙箱本身并不拦截网络），
+# 模型执行 `curl https://...` 得到的只是
 # "command not found"，白白浪费一次工具调用（还得靠模型自己聪明地改用
 # python urllib 重试）。
 #
 # 解决方案（双保险）：
-#   1. 新 Dockerfile 已直接安装真 curl / wget / git / jq / zip；
-#   2. 对于暂未重建镜像的存量部署，本模块在 bash 会话启动时把纯 stdlib
+#   1. Dockerfile 直接安装真 curl / wget / git / jq / zip；
+#   2. 对没有这些工具的环境，本模块在 bash 会话启动时把纯 stdlib
 #      实现的 curl / wget 脚本放进 runtime bin（PATH 第一位）。镜像里
 #      一旦出现真二进制，shim 自动让位（shutil.which 检测）。
 #

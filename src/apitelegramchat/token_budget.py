@@ -100,9 +100,9 @@ def truncate_to_token_budget_head_tail(
         return text
 
     # 先按可用预算切分头尾，再按实际插入的分隔文案的真实 token 数校验
-    # 总量；若超出则收缩头尾重试。保证最终输出严格不超过 token_budget
-    # （旧实现预留的是静态 note 参数的长度，实际插入的却是更长的动态
-    # 文案，导致结果持续超支 30-50 token）。
+    # 总量；若超出则收缩头尾重试。校验必须基于动态文案的真实 token 数，
+    # 静态估计会导致结果持续超支 30-50 token。保证最终输出严格不超过
+    # token_budget。
     head_ratio = min(max(head_ratio, 0.1), 0.9)
     usable = token_budget
     for _ in range(3):

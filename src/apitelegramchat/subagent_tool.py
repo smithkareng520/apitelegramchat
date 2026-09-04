@@ -117,11 +117,11 @@ DEFAULT_ALLOWED_TOOLS = sorted([
     "poi_nearby_search", "poi_details",
     "bash", "text_editor", "todo",
     # upload/download 是 workspace 根目录的子目录，bash 可直接读写，
-    # 不再需要显式跨边界工具（list_upload 已一并移除，用 `ls -la upload/`）。
+    # 无需显式跨边界工具（用 `ls -la upload/`）。
     "present_files",
     # 不含 generate_image / video / subagent / memory / skill
-    # 注：elevation / traffic / isochrone 工具已随 amap_integration.py 迁移到
-    # amap-maps MCP 而移除（MCP 不提供等价能力）。
+    # 注：elevation / traffic / isochrone 能力不存在（amap-maps MCP 无等价
+    # 工具），子 agent 同样不可用。
 ])
 
 SUBAGENT_SYSTEM_PROMPT_TEMPLATE = """\
@@ -572,10 +572,10 @@ async def execute_subagent(
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        # 安全修复：traceback 里可能包含文件路径、env var 名、甚至 URL
+        # 安全：traceback 里可能包含文件路径、env var 名、甚至 URL
         # 形态的 secret（如 API key 拼在 endpoint URL 里）。把它原样返回
-        # 给 LLM 等于把这些信息泄露给模型 API。改成只返回一个本进程内
-        # 生成的短 error_id，把完整 traceback 留在后端 logger 里供运维查。
+        # 给 LLM 等于把这些信息泄露给模型 API。只返回一个本进程内
+        # 生成的短 error_id，完整 traceback 留在后端 logger 里供运维查。
         error_id = uuid.uuid4().hex[:12]
         logger.exception(f"subagent: unexpected error (error_id={error_id}): {e}")
         return json.dumps({

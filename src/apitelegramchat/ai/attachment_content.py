@@ -577,8 +577,8 @@ async def _build_attachment_fallback_text(
         # 这条提示针对「链接」字段为空（R2 未配置）时的降级路径，避免 LLM
         # 自行编造伪 URL 写入 <img src>，导致 Telegram 返回
         # RICH_MESSAGE_PHOTO_URL_INVALID 整条消息发送失败。
-        # （旧实现读取的是循环泄漏的最后一个文件的 url，多文件部分成功
-        #  部分失败时会错误地加/漏加该警告。）
+        # 判定基于全部文件而不是单个文件：多文件部分成功部分失败时
+        # 不会误加/漏加该警告。
         if not any_url:
             lines.append(
                 "⚠️ 上面的「文件名」和「file_id」仅是元数据，不是合法 URL，"
@@ -1026,7 +1026,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
 
         # 说明：document / document_group 在上方"原生文档"分支已全路径
         # 处理（supports_native_documents 与降级文本均返回），此处不可能
-        # 再收到该类型；历史上遗留的同型降级块已移除。
+        # 再收到该类型，无需再降级。
 
     return user_text
 

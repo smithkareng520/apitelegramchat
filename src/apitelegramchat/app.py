@@ -485,7 +485,7 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
             )
             if plan.evicted_blocks:
                 # 待淘汰区内的 eligible 调用先归档，让摘要 T 行能指向
-                # 可取回的归档文件（旧版把负载连同轮块一起丢掉）。
+                # 可取回的归档文件，负载不随轮块一起丢弃。
                 # 注意下标口径：_eligible_calls 的 idx 是含摘要消息的
                 # 全历史下标，块内消息数需要补上摘要槽位的偏移。
                 digest_offset = 1 if plan.digest_message is not None else 0
@@ -600,10 +600,9 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
             ledger = ctx.setdefault("token_ledger", [])
             ledger.append({"input_tokens": t_input, "output_tokens": t_output})
         # 历史有界性维护已全部收敛到 pre_flight_context_check 的压缩事件
-        # （触发水位 × 预算，滞后触发）。旧版按"消息条数 > 30 且未归档
-        # 调用 ≥ 8"在回合末尾触发的工具负载压缩已被移除：消息条数与
-        # token 预算无关，会在大窗口模型上过早、小窗口模型上过晚触发，
-        # 且与 pre-flight 属于两套互不知情的口径。
+        # （触发水位 × 预算，滞后触发）。工具负载压缩不按消息条数触发：
+        # 条数与 token 预算无关，会在大窗口模型上过早、小窗口模型上过晚
+        # 触发，且与 pre-flight 属于两套互不知情的口径。
 
 # ---------------------------------------------------------------------------
 # 业务处理
@@ -651,12 +650,10 @@ async def _cleanup_task(chat_id: int, task: asyncio.Task):
             logger.warning(f"note_turn_finished 异常: {e}")
 
 # -------------------- 各类型消息处理 --------------------
-# 注意：这里不再发送任何 sendChatAction。旧版在消息入口处按用户发送的
-# 媒体类型回发 typing / upload_photo / upload_voice / upload_document /
-# upload_video —— 但 chat action 描述的是 bot 自己正在做的动作，用户
-# 上传媒体时回发这些动作会被客户端渲染成“bot 正在上传照片/语音/…”，
-# 语义完全相反；typing 也只在模型流式输出期间才有意义（见
-# chat_actions.py 与 ai/agentic_loops.py 的实现）。
+# 注意：这里不发送任何 sendChatAction：chat action 描述的是 bot 自己
+# 正在做的动作，用户上传媒体时回发这些动作会被客户端渲染成“bot 正在
+# 上传照片/语音/…”，语义完全相反；typing 也只在模型流式输出期间才有
+# 意义（见 chat_actions.py 与 ai/agentic_loops.py 的实现）。
 async def _handle_text_message(chat_id: int, user_input: str, username: str, user_message: dict):
     # 后台预初始化 workspace：与模型生成响应并行，避免第一个工具调用
     # 是 no-op。
@@ -1136,8 +1133,8 @@ async def _schedule_video_group(chat_id: int, group_key: str) -> None:
 
 async def _process_document_group_once(chat_id: int, media_group_id: str) -> None:
     # 与图片/视频组对称的异常保护：下载/建目录等任一环节抛异常时，
-    # 用户能收到错误提示，而不是任务静默终止（旧实现无 try/except，
-    # 异常只会变成 "Task exception was never retrieved"）。
+    # 用户能收到错误提示，而不是任务静默终止、只留下
+    # "Task exception was never retrieved" 日志。
     try:
         await _process_document_group_inner(chat_id, media_group_id)
     except asyncio.CancelledError:
@@ -1357,19 +1354,19 @@ async def _send_via_send_message(
     """
     使用 sendMessage（而非 sendRichMessage）发送指令响应。
 
-    【修复】在 AI 生成过程中发送 /model、/role、/balance 等指令时，
-    旧实现走 sendRichMessage。Telegram 客户端在收到 sendRichMessage 时
-    会把这条永久消息画在当前 draft 预览的视觉位（草稿被"转正"/挤开），
-    紧接着 serialize_with_active_draft 里的 _reassert_active_draft_content
-    又用同一个 draft_id 推了一帧 sendRichMessageDraft——但旧草稿已被
+    指令响应必须走 sendMessage：在 AI 生成过程中发送 /model、/role、
+    /balance 等指令时，若改走 sendRichMessage，Telegram 客户端会把这条
+    永久消息画在当前 draft 预览的视觉位（草稿被"转正"/挤开），紧接着
+    serialize_with_active_draft 里的 _reassert_active_draft_content
+    又用同一个 draft_id 推了一帧 sendRichMessageDraft——但草稿已被
     sendRichMessage 消费掉，于是 Telegram 把它当成一个全新的草稿，
     画在永久消息下方。AI 的 flush 循环随后继续刷新这个新草稿。
 
-    用户看到的错乱就是：
+    用户看到的错乱会是：
       1) 列表占了草稿位（列表出现在草稿原来的位置，而不是指令下方）
       2) 草稿在指令下方重新刷新（reassert + flush 循环创建的新草稿）
 
-    修复思路：Telegram Bot API 文档明确指出"once the output is finalized,
+    原理：Telegram Bot API 文档明确指出"once the output is finalized,
     you must call sendRichMessage to persist it"——也就是说，只有
     sendRichMessage 会触发"草稿转正"行为。改用 sendMessage（普通文本
     消息）发送指令响应，不会消费/挤开活跃草稿，列表自然出现在指令
@@ -1500,10 +1497,11 @@ async def webhook() -> tuple:
                     msg_debug = msg_debug[:LOG_TRUNCATE_LIMIT] + "... (truncated)"
                 logger.debug(f"截断的 Webhook 数据: {msg_debug}")
 
-        # 使用 OrderedDict 保留插入顺序，超过 10000 条时按插入顺序淘汰最早的 5000 条。
-        # 之前用 set + list 刉片是随机淘汰，可能把刚加入的 uid 误伤。
-        # 原子地"检查并标记"：旧实现先查后标两段加锁，Telegram 超时重投 +
-        # webhook 并发时同一 update 的两个副本可能同时通过检查被双重处理。
+        # 使用 OrderedDict 保留插入顺序，超过 10000 条时按插入顺序淘汰
+        # 最早的 5000 条，保证淘汰的总是最早加入的 uid。
+        # mark_update_processed_if_new 原子地"检查并标记"：若拆成先查后标
+        # 两段加锁，Telegram 超时重投 + webhook 并发会让同一 update 的两个
+        # 副本同时通过检查、被双重处理。
         if not await mark_update_processed_if_new(uid):
             return "OK", 200
 
@@ -1525,13 +1523,13 @@ async def webhook() -> tuple:
                 if not is_admin(username, user_id):
                     await send_rich_html_message(chat_id, "❌ <b>权限不足</b>\n只有管理员可以执行此操作。", reply_parameters=_reply_params(msg["message_id"]))
                     return "OK", 200
-                # 【修复】不再用进程级 global_lock 包裹这三个命令：那把锁会让
-                # 白名单操作和其他用户正在做的 /model /role 等命令排队等待，
-                # 且 admin 命令之间也会互相等待。白名单的读改写已经由
-                # config.add_whitelist_user / remove_whitelist_user /
-                # snapshot_whitelist 内部的 _whitelist_lock 原子完成
-                # （改内存集合 + 落盘在同一把锁内，不会有裸读写竞态），
-                # 这把锁只保护白名单文件本身，不会阻塞其他用户或其他命令。
+                # 不用进程级锁包裹这三个命令：那会让白名单操作和其他用户
+                # 正在做的 /model /role 等命令排队等待，admin 命令之间也会
+                # 互相等待。白名单的读改写由 config.add_whitelist_user /
+                # remove_whitelist_user / snapshot_whitelist 内部的
+                # _whitelist_lock 原子完成（改内存集合 + 落盘在同一把锁内，
+                # 不会有裸读写竞态）。这把锁只保护白名单文件本身，不会阻塞
+                # 其他用户或其他命令。
                 if _cmd_match(text, "/adduser"):
                     parts = text.split()
                     if len(parts) != 2:
@@ -1942,7 +1940,7 @@ async def webhook() -> tuple:
 
                 context_prefix = _get_reply_context(msg)
 
-                content_lines = [f"📎 用户发送了贴纸"]
+                content_lines = ["📎 用户发送了贴纸"]
                 if sticker_text and sticker_text != "[贴纸]":
                     content_lines.append(sticker_text)
                 else:
@@ -2041,9 +2039,9 @@ async def webhook() -> tuple:
                             reply_message_id=msg["message_id"],
                         )
                         return "OK", 200
-                    # 【修复】get_user_role 内部已经用 state._role_lock 保护，
-                    # 这里不需要再套一层进程级 global_lock——那会让 /model
-                    # 命令等待其他用户正在做的 /adduser 等操作释放锁。
+                    # get_user_role 内部已用 state._role_lock 保护，无需再套
+                    # 进程级锁——那会让 /model 命令等待其他用户正在做的
+                    # /adduser 等操作释放锁。
                     current_role = await get_user_role(chat_id)
                     banner_html = ""
                     if current_role:
@@ -2305,13 +2303,12 @@ async def webhook() -> tuple:
 
             try:
                 if sel in SUPPORTED_ROLES:
-                    # 【修复】原来用进程级 global_lock 包住"读角色→切换→回读→
-                    # 更新列表消息（含 Telegram API 网络往返）"整个序列：
-                    # 网络请求的往返时间会把锁一直占着，导致其他用户此刻的
-                    # /adduser /model /role 等操作全部排队等待。
-                    # 这里的锁只需要保证"同一个 chat 快速连点时序列不交叉"
-                    # （注释提到的竞态），与其他用户无关，因此改用按 chat_id
-                    # 分片的 get_chat_lock，不再影响其他 chat。
+                    # 锁的粒度只到单个 chat："读角色→切换→回读→更新列表消息
+                    # （含 Telegram API 网络往返）"整个序列必须串行，保证
+                    # 同一个 chat 快速连点时序列不交叉；但若用进程级锁包住，
+                    # 网络往返时间会把锁一直占着，导致其他用户此刻的
+                    # /adduser /model /role 等操作全部排队等待。因此用按
+                    # chat_id 分片的 get_chat_lock，不影响其他 chat。
                     lock = await get_chat_lock(chat_id)
                     async with lock:
                         prev = await get_user_role(chat_id)
@@ -2342,19 +2339,19 @@ async def webhook() -> tuple:
                         f"✅ <b>模型切换成功</b>\n已切换到模型：<b>{model_name}</b>\n<i>（对话历史已保留）</i>"
                     )
                     # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置。
-                    # 【修复】快速连点时，本次点击的列表消息可能已被 delete_after
+                    # 快速连点时，本次点击的列表消息可能已被 delete_after
                     # 定时清理删除；reply 到已不存在的消息会被 Telegram 以 400
-                    # 拒绝，旧实现静默吞错，导致"模型已切换却没有任何反馈"。
-                    # 这里失败后去掉 reply 补发一次，确保切换结果总能送达。
+                    # 拒绝，若静默吞错会导致"模型已切换却没有任何反馈"。
+                    # 因此失败后去掉 reply 补发一次，确保切换结果总能送达。
                     sent_mid = await _send_via_send_message(chat_id, confirmation, reply_message_id=mid)
                     if not sent_mid:
                         await _send_via_send_message(chat_id, confirmation)
-                    # 【修复】仿照 /role：点击后不删除列表，而是就地给当前模型
+                    # 仿照 /role：点击后不删除列表，而是就地给当前模型
                     # 打 √，列表仍由发送时的 delete_after 定时清理。列表消失前
                     # 的每一次点击都会得到 "√ 移动 + ✅ 消息" 双重反馈。
                     try:
-                        # 【修复】get_user_role 内部已用 state._role_lock 保护，
-                        # 这里不需要再套一层进程级 global_lock。
+                        # get_user_role 内部已用 state._role_lock 保护，
+                        # 无需再套进程级锁。
                         current_role = await get_user_role(chat_id)
                         banner_html = ""
                         if current_role:

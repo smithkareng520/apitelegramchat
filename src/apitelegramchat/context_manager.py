@@ -130,7 +130,6 @@ def select_request_context(
         # 至少保留最后一个块（当前活跃轮），由尾部装配做单消息级
         # 截断——否则一条超大的新消息会被整块丢掉而不是被截断。
         digest_msg, blocks = split_history_blocks(supported)
-        digest_tokens = _message_token_count(digest_msg) if digest_msg is not None else 0
         block_tokens = [sum(_message_token_count(m) for m in block) for block in blocks]
 
         idx = 0

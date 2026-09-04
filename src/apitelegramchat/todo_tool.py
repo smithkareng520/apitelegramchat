@@ -17,7 +17,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 import uuid
 from pathlib import Path
 from apitelegramchat.workspace_paths import todo_state_file
@@ -266,11 +266,10 @@ def _op_list(store: dict, filter_: str, tag: Optional[str], priority: Optional[s
     def sort_key(t: dict):
         return (
             1 if t.get("done") else 0,
-            # 安全修复：PRIORITY_META.get(...) 默认 {} 在 store 含有
-            # 未经验证的 priority 字段（旧数据 / LLM typo / 手改 JSON）
-            # 时会触发 KeyError，让整个 execute_todo 工具直接抛异常。
-            # 改为 .get("weight", 2) 链式兜底，确保任何 priority 值都
-            # 能落到一个稳定排序权重上。
+            # 防御：priority 可能未经校验（旧数据 / LLM typo / 手改 JSON），
+            # PRIORITY_META.get(...) 裸取 "weight" 会因默认 {} 触发 KeyError、
+            # 让整个 execute_todo 工具直接抛异常；链式 .get("weight", 2)
+            # 确保任何 priority 值都能落到一个稳定排序权重上。
             -PRIORITY_META.get(t.get("priority", "medium"), {}).get("weight", 2),
             t.get("created_at", 0),
             t.get("id", ""),

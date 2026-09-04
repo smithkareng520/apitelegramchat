@@ -45,14 +45,14 @@ async def _request_modelscope_native_image(
     - 若先返回 task_id，则会自动轮询任务结果后再返回最终 JSON。
     """
     base_url = "https://api-inference.modelscope.cn/v1"
-    # 关键修复：ModelScope 的图生图（image-to-image）同样走 /images/generations 端点，
+    # 注意：ModelScope 的图生图（image-to-image）同样走 /images/generations 端点，
     # /images/edits 在 ModelScope API-Inference 上不存在（返回 404 page not found）。
     # 区分文生图与图生图的是 X-ModelScope-Task-Type 头部，而非 URL 路径。
     # 参考实现: https://github.com/hujuying/ComfyUI-ModelScope-API/blob/main/modelscope_image_node.py
     endpoint = "/images/generations"
     request_url = f"{base_url}{endpoint}"
 
-    # 关键修复：ModelScope 异步图像接口要求在 POST 与轮询 GET 上分别附带
+    # 注意：ModelScope 异步图像接口要求在 POST 与轮询 GET 上分别附带
     # X-ModelScope-Async-Mode / X-ModelScope-Task-Type 头部，否则任务虽然
     # 在 POST 时返回 task_id=SUCCEED，但 GET /tasks/{task_id} 会立即返回
     # {"errors":{"code":500,"message":"task not found"}, "task_status":"FAILED"}。
@@ -133,9 +133,9 @@ async def _request_modelscope_native_image(
             parsed = json.loads(body_text)
             return parsed if isinstance(parsed, dict) else None
         except json.JSONDecodeError as e:
-            # 仅在 debug 级别输出，避免噪声；但留下诊断痕迹，
-            # 此前是完全静默（except Exception: return None），
-            # 导致 200 响应体不是合法 JSON 时排查非常困难。
+            # 仅在 debug 级别输出，避免噪声；但留下诊断痕迹——
+            # 若完全静默（except Exception: return None），200 响应体
+            # 不是合法 JSON 时排查会非常困难。
             logger.debug(
                 "[NativeImage/ModelScope] JSON parse failed: %s; body_preview=%r",
                 e,
@@ -289,11 +289,10 @@ async def _request_modelscope_native_image(
                 task_status or 'UNKNOWN',
                 task_id,
             )
-            # SSRF 防御：task_id 来自上游 API 响应，必须严格白名单后再拼到 URL。
-            # 此前是直接 `f"{base_url}/tasks/{task_id}"`，若上游被攻陷或返回
-            # 包含 `../` / `?` / host 注入字符串的 task_id，会改写最终的
-            # poll_url，把 bot 引导到任意主机。这里要求 task_id 仅包含
-            # `[A-Za-z0-9_-]`，长度 1-128，其他一律拒绝并直接返回失败。
+            # SSRF 防御：task_id 来自上游 API 响应，必须严格白名单后再拼到
+            # URL：若 task_id 包含 `../` / `?` / host 注入字符串，会改写
+            # 最终的 poll_url，把 bot 引导到任意主机。这里要求 task_id
+            # 仅包含 `[A-Za-z0-9_-]`，长度 1-128，其他一律拒绝并直接返回失败。
             if not re.match(r'^[A-Za-z0-9_-]{1,128}$', task_id):
                 logger.warning(
                     "[NativeImage/ModelScope] rejected suspicious task_id=%r",

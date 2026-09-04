@@ -51,6 +51,7 @@ from apitelegramchat.ai.json_repair import (
     build_invalid_arguments_envelope,
     invalid_arguments_message,
 )
+# _INVALID_TOOL_ARGUMENTS_KEY 以 json_repair 为单一数据源。
 from apitelegramchat.ai.schema_validation import normalize_and_validate
 from apitelegramchat.ai.tool_summary import (
     _generate_action_description,
@@ -59,7 +60,6 @@ from apitelegramchat.ai.tool_summary import (
     _kind_of_value,
     _normalize_tool_arguments,
     _tool_result_is_failure,
-    _INVALID_TOOL_ARGUMENTS_KEY,
 )
 
 if TYPE_CHECKING:
@@ -259,11 +259,10 @@ async def _run_tool_calls_and_append(
             try:
                 fn_args = json.loads(tc["function"]["arguments"])
             except (json.JSONDecodeError, KeyError, TypeError):
-                # 未经过 _normalize_tool_call_arguments 的旁路路径（如
-                # Anthropic bridge 旧版直接拼接）：复用与主流路径完全
-                # 相同的规范化链（双引擎修复 → 诊断信封），保证旁路行为
-                # 不与主路径分叉；修复失败时信封会让模型收到带行列位置的
-                # 诊断反馈，而不是被静默容成 {} 执行后盲重试。
+                # 未经过 _normalize_tool_call_arguments 的旁路路径：复用
+                # 与主流路径完全相同的规范化链（双引擎修复 → 诊断信封），
+                # 保证旁路行为不与主路径分叉；修复失败时信封会让模型收到
+                # 带行列位置的诊断反馈，而不是被静默容成 {} 执行后盲重试。
                 try:
                     normalized, _was_corrected, _meta = _normalize_tool_arguments(
                         tc["function"].get("arguments", ""))
@@ -320,8 +319,6 @@ async def _run_tool_calls_and_append(
     # 草稿构建器的全局刷新循环会在静默超时后，对当前活跃草稿统一执行
     # force flush。工具批次无需另建心跳任务；图片、视频和普通工具均复用
     # 同一机制，状态变更仍由前面的普通 flush 立即推送。
-    # （旧实现此处还计算过 has_image_tool / has_bash_tool /
-    #  has_ask_user_tool 三个从未被读取的变量，属心跳任务删除后的残留。）
 
     async def run_one(fn_name, fn_args, tc_id):
         # 打断保全：工具真正执行完成时把结果登记到共享 dict。
@@ -534,11 +531,11 @@ async def _run_tool_calls_and_append(
             # 学习下次直接产出严格合法的 JSON。
             if repair_note and isinstance(result_str, str) and result_str and result_str != _TOOL_TIMEOUT_MARKER:
                 result_str = f"{result_str}\n\n{repair_note}"
-            # 修复：_truncate_tool_result / format_tool_result 处理的是工具的原始
+            # format_tool_result / _truncate_tool_result 处理的是工具的原始
             # 输出（可能是任意格式的字符串），二者内部有大量字符串切分/正则/索引
             # 操作，遇到非预期形状的内容时可能抛出未捕获异常（IndexError /
-            # KeyError / AttributeError 等）。此前这类异常会直接冒泡出
-            # run_one，被外层 asyncio.gather(return_exceptions=True) 捕获成
+            # KeyError / AttributeError 等）。这类异常若直接冒泡出
+            # run_one，会被外层 asyncio.gather(return_exceptions=True) 捕获成
             # 一个裸 Exception，导致该 tool_call_id 既没有配对的 tool 消息，
             # 也没有更新 builder 状态（UI 上表现为该折叠块永远停在"运行中"）。
             # 这里已经拿到了真实的工具执行结果 result_str，不应该因为格式化
@@ -596,11 +593,11 @@ async def _run_tool_calls_and_append(
     # ====== 串行化"消费者"工具：同批既含 producer（如 bash cp）又含
     # consumer（如 present_files）时，consumer 必须在 producer 落盘后才能
     # 正确读取 upload/。如果让它们一起进 asyncio.gather，consumer 会在
-    # producer 完成前看到空目录并报"file not found"——这是 2026-08-27
-    # 生产事故的直接原因（模型需要多花 2 轮补救）。
-    # 修复策略：把 tool_tasks 拆成 [producers..., consumers...] 两批，
-    # 顺序 gather。仅在两批都非空时启用串行化，否则走原来的单批并行路径，
-    # 不影响纯查询类多工具并发（如 多个 web_search）的性能。
+    # producer 完成前看到空目录并报"file not found"，模型需要多花
+    # 轮次补救。
+    # 处理方式：把 tool_tasks 拆成 [producers..., consumers...] 两批，
+    # 顺序 gather。仅在两批都非空时启用串行化，单批非空时等价于普通
+    # gather，不影响纯查询类多工具并发（如 多个 web_search）的性能。
     producer_indices = [
         i for i, (fn_name, _, _) in enumerate(tool_tasks) if fn_name not in CONSUMER_TOOLS
     ]
@@ -651,18 +648,18 @@ async def _run_tool_calls_and_append(
         )
         raise
 
-    # ===== 修改：根据结果标记状态 =====
+    # ===== 根据结果标记状态 =====
     # tool_tasks 与 results 顺序一一对应（asyncio.gather 保序），用于在
     # run_one 抛出未捕获异常时（如 format_tool_result 内部报错）仍能拿到
     # 原始 tc_id / fn_name，补齐 tool 消息与 builder 状态。
-    # 修复：此前这里对未捕获异常直接 log + continue，导致：
+    # 若对未捕获异常直接 log + continue，会：
     #   1) 该 tool_call_id 永远没有配对的 tool 消息 -> 下一轮请求里
     #      assistant.tool_calls 与 tool 消息数量不一致，多数供应商会
     #      直接 400，或者模型陷入重试/困惑的死循环；
     #   2) builder 里对应的工具条目 status 永远停在 "running"，UI 上
     #      表现为一个折叠块永远转圈、草稿只在无关地方微调 —— 也就是
     #      "刷新但没有新信息、后端却仍在跑" 的现象。
-    # 现在无论 run_one 是否抛出未捕获异常，都保证每个 tool_call 都会：
+    # 因此无论 run_one 是否抛出未捕获异常，都保证每个 tool_call 都会：
     #   a) 得到一次 builder.update_tool_item(..., status=...) 调用；
     #   b) 追加一条配对的 role=tool 消息回传给模型。
     for idx, res in enumerate(results):

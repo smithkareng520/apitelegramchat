@@ -2,7 +2,7 @@
 # 文本编辑器：仅支持 view、str_replace、create 和 insert 四个命令。
 # 行尾保真：所有读写按原始字节进行（CRLF 不会被 universal newlines
 # 静默翻译成 LF）；纯 CRLF 文件在匹配/写入时整体按 CRLF 空间处理，
-# 编辑后行尾风格保持不变（详见 TEXT_EDITOR_FIXES.md）。
+# 编辑后行尾风格保持不变。
 import asyncio
 import aiohttp
 import re
@@ -44,9 +44,9 @@ from apitelegramchat.workspace_paths import workspace_workdir, workspace_namespa
 # 视频）、地图工具族 find_location（见 chat_actions.py 白名单）。
 from apitelegramchat.chat_actions import chat_action_scope
 
-# 高德地图能力现已迁移到外部 MCP 服务 `amap-maps`（@amap/amap-maps on
-# ModelScope）。所有地理编码 / POI / 路径 / 距离 / IP 定位工具都通过
-# `call_mcp_tool("amap-maps", ...)` 调用该 MCP 的 maps_* 工具，不再保留任何
+# 高德地图能力由外部 MCP 服务 `amap-maps`（@amap/amap-maps on ModelScope）
+# 提供。所有地理编码 / POI / 路径 / 距离 / IP 定位工具都通过
+# `call_mcp_tool("amap-maps", ...)` 调用该 MCP 的 maps_* 工具，不保留
 # 直接调用高德 Web 服务 API 或 OSM/Nominatim/Overpass/OSRM 的本地实现。
 try:
     import qrcode  # type: ignore
@@ -579,10 +579,10 @@ async def execute_text_editor(
                 if not old_str:
                     return "Error: old_str must be non-empty for str_replace."
 
-                # 行尾策略（见 TEXT_EDITOR_FIXES.md）：
+                # 行尾策略：
                 # - 纯 CRLF 文件：在 LF 空间匹配（old_str/new_str 一并归一），
                 #   写回时统一还原成 CRLF —— 编辑后行尾风格保持不变；
-                # - 其他文件：按原始字节精确匹配（LF 文件行为与旧版一致）；
+                # - 其他文件：按原始字节精确匹配；
                 #   匹配失败且文件含 CR 时，再按 LF 归一化重试一次（混合
                 #   行尾文件），命中则写入归一化结果并在消息里明说，
                 #   不做静默改写。
@@ -2019,7 +2019,7 @@ async def execute_web_search(
       tbs:         时间筛选（如 qdr:d 当天 / qdr:w 一周 / qdr:m 一月 / qdr:y 一年）。
     """
     # ---- 参数归一化（唯一一份；缓存 key 与执行共用同一结果，
-    # 消除旧实现里两份归一化逻辑各自漂移、缓存 key 碎片化的问题） ----
+    # 避免两份归一化逻辑各自漂移、缓存 key 碎片化） ----
     modes = _normalize_modes(mode)
     requested = _normalize_requested_results(num_results)
     # offset 只对 search mode 生效（schema/docstring 均如此声明）。
@@ -2089,13 +2089,12 @@ async def _execute_web_search_uncached(
         return "❌ 以图搜图（lens）模式需要 image_url 参数。"
 
     # 各 mode 的结果数上限不同：search 多页聚合上限 50；images/videos/lens
-    # 单请求上限 100（与 schema 声明及 serper 文档一致；旧实现把所有 mode
-    # 一律钳到 50，与 schema 矛盾）。
+    # 单请求上限 100（与 schema 声明及 serper 文档一致）。
     def _num_for(m: str) -> int:
         return min(requested, _SEARCH_MAX_RESULTS if m == "search" else _SEARCH_MEDIA_MAX_RESULTS)
 
     # search mode 为弥补黑名单过滤造成的缺口，按配置倍率向上游多取候选，
-    # 过滤后再截断到请求数（旧实现从未接线该倍率，配置形同虚设）。
+    # 过滤后再截断到请求数。
     def _upstream_num_for(m: str) -> int:
         n = _num_for(m)
         return candidate_result_count(n) if m == "search" else n
@@ -2820,10 +2819,10 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
                 return payload
 
             # ---- 检测 JavaScript 重定向（含字符串拼接表达式）----
-            # 旧实现用单字面量正则匹配 `window.location.href = '...'`，遇到
+            # 单字面量正则匹配 `window.location.href = '...'` 在遇到
             # `'https://' + host + '/index/' + search` 这种拼接时会捕获到
             # `https://`，urljoin 再把它解析回原 URL，误判为"重定向到自身"
-            # 并直接报错——绕过下方根路径回退。新实现把拼接表达式里的字面量
+            # 并直接报错——绕过下方根路径回退。因此把拼接表达式里的字面量
             # 与已知 host / search 变量分别处理，且当目标不可用时返回空列表
             # 让流程继续往下走 Meta Refresh 与根路径回退。
             # 同一 if/else 中的多个分支会被全部收集，按文档顺序尝试——
@@ -3188,7 +3187,7 @@ async def execute_news(source: str = "bbc", limit: int = 5) -> str:
     limit = min(max(limit, 1), 10)
     source_key = source.lower()
     if source_key == "all":
-        # 8 个 RSS 源并行抓取（旧实现串行，总延迟为各源之和）。
+        # 8 个 RSS 源并行抓取，总延迟约等于最慢一个源。
         async def _fetch_feed(src: str, url: str) -> list[tuple[str, str, str]]:
             try:
                 feed = await asyncio.to_thread(feedparser.parse, url)
@@ -3238,7 +3237,7 @@ COIN_MAP = {
 }
 
 async def execute_crypto_price(coin: str, currency: str = "usd") -> str:
-    # 安全修复：coin / currency 直接来自 LLM 工具调用参数，若不 quote
+    # 安全：coin / currency 直接来自 LLM 工具调用参数，若不 quote
     # 就拼到 URL，LLM 可能传 "btc&ids=ethereum" 之类的字符串做参数注入。
     # 这里强制白名单（coin_id 只允许字母数字和连字符），currency 同理。
     coin_raw = (coin or "").lower().strip()
@@ -3855,13 +3854,6 @@ def _normalize_amap_coordinate(value: Any, field_name: str) -> str:
     if not (-90 <= lat <= 90):
         raise ValueError(f"{field_name} 的纬度必须在 -90 到 90 之间")
     return f"{lng:.6f},{lat:.6f}"
-
-
-# ---------------------------------------------------------------------------
-# 内部辅助：通过 amap-maps MCP 把地址转坐标
-# ---------------------------------------------------------------------------
-# _geocode_coords 已删除：全仓库无任何调用方（旧 amap_integration 集成期的
-# 遗留函数）。地址→坐标统一走 execute_geocode / maps_geo 工具链路。
 
 
 # ---------------------------------------------------------------------------

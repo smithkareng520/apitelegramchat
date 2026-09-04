@@ -88,12 +88,13 @@ executor 发送成功后调用 ``mark_reply_delivered`` 记录"本轮已经主�
 锁顺序约定（防 ABBA 死锁）
 ==========================
 
-- 注册表操作只短暂持有自己的 ``_registry_lock``，**不**在持锁期间获取
-  chat 锁；
-- 持久化路径（finalize / note_turn_persisted 的调用方）先释放注册表锁，
-  再获取 chat 锁写历史；
+- 注册表操作全部是同步原子操作（append / pop / filter，无 await 窗口），
+  **不**与 chat 锁交叉持有；
+- 持久化路径（finalize / note_turn_persisted 的调用方）先完成注册表
+  原子操作，再获取 chat 锁写历史；
 - ``update_conversation_and_ledger`` 持 chat 锁期间调用
-  ``note_turn_persisted``（只碰注册表锁），两个锁不同时跨路径持有。
+  ``note_turn_persisted``（只做注册表原子操作），两者不会形成
+  跨路径的锁等待。
 """
 from __future__ import annotations
 
@@ -350,9 +351,10 @@ async def _persist_one_entry(entry: _InFlightEntry, *, reason: str) -> list:
             await asyncio.wait_for(asyncio.shield(task), timeout=_FINALIZE_TASK_WAIT_SECONDS)
         except asyncio.CancelledError:
             # finalize 本身被取消（极端：两条用户消息背靠背到达）：
-            # 把登记放回去，让下一次 finalize 继续处理。
-            async with _registry_lock:
-                _inflight.setdefault(entry.chat_id, []).append(entry)
+            # 把登记放回去，让下一次 finalize 继续处理。append 是同步
+            # 原子操作（无 await 窗口），与 register_inflight_turn 同一
+            # 取消安全模式。
+            _inflight.setdefault(entry.chat_id, []).append(entry)
             raise
         except Exception:
             logger.debug("[turn-recovery] 等待旧轮次收尾失败（按当前快照保全）", exc_info=True)
@@ -540,7 +542,6 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
     if chat_id is None or not isinstance(user_message, dict):
         return False
     lock = await get_chat_lock(chat_id)
-    merged = False
     async with lock:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
@@ -548,7 +549,6 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
         if isinstance(last, dict) and last.get("role") == "user":
             # 打断发生在任何 assistant 输出之前：合并，避免连续两条 user。
             _merge_user_message(last, user_message)
-            merged = True
             logger.info(
                 "[turn-recovery] chat=%s 新 user 消息合并进上一条未回应的 user 消息",
                 chat_id,

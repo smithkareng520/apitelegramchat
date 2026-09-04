@@ -244,7 +244,6 @@ class RichMessageBuilder:
         # “已有 pending task”被吞掉；该标记保证当前帧结束后必补发最新状态。
         self._flush_dirty: bool = False
         self._stop_flush = False
-        self._thinking_removed: bool = False
         self._pending_reasoning_html: str = ""
         self._flush_lock = asyncio.Lock()
         self._rollover_lock = asyncio.Lock()
@@ -285,9 +284,10 @@ class RichMessageBuilder:
         """异步触发刷新，确保在途发送期间的新内容一定会补发。"""
         if self._stop_flush:
             return
-        # 无论是否已有在途 flush，只要状态发生变化，都记录为脏数据。旧逻辑在
-        # pending task 存在时直接 return，会把发送期间的新增工具状态/流式文本
-        # 合并掉；若之后没有新的 request_flush，用户便会看到草稿长时间不动。
+        # 无论是否已有在途 flush，只要状态发生变化，都记录为脏数据：若在
+        # pending task 存在时直接 return，发送期间的新增工具状态/流式文本
+        # 会被合并掉；之后没有新的 request_flush 时，用户便会看到草稿
+        # 长时间不动。
         self._flush_dirty = True
         self._flush_revision += 1
         if force:
@@ -532,14 +532,12 @@ class RichMessageBuilder:
             self.request_flush(force=False)
             return
 
-        # text_editor 不再声明 _description（意图）参数：折叠块进行时标题
+        # text_editor 不声明 _description（意图）参数：折叠块进行时标题
         # 与单工具块摘要保持完全一致，一律按「动作 + 文件名 + diff 统计」
         # 规范生成（Viewing/Creating/Editing file xxx.py +n -n）。模型即使
         # 惯性携带 _description 也不被采用，因此本分支必须位于 custom_desc
-        # 检查之前。旧的固定映射（"Replacing exact text"/"Inserting text"
-        # 等，无文件名、无统计、与单工具块措辞不一致）已废弃。参数流式
-        # 更新期间 update_tool_args 会反复调用本函数，折叠块标题因此随
-        # diff 统计动态刷新。
+        # 检查之前。参数流式更新期间 update_tool_args 会反复调用本函数，
+        # 折叠块标题因此随 diff 统计动态刷新。
         if t == "text_editor":
             group["outer_summary"] = _generate_initial_tool_summary("text_editor", fn_args)
             self.request_flush(force=False)
@@ -725,7 +723,6 @@ class RichMessageBuilder:
             new_types.append(t)
         self.blocks = new_blocks
         self.block_types = new_types
-        self._thinking_removed = True
         self.request_flush(force=False)
 
     def add_initial_thinking(self, text: str = "Thinking...") -> int:
@@ -935,8 +932,7 @@ class RichMessageBuilder:
                 continue
 
             else:
-                # text/html 及其他类型的块都按原样拼接（历史上三分支体相同）；
-                # "skip" 类型从未被写入，相关分支已移除。
+                # text/html 及其他类型的块都按原样拼接。
                 content = block
                 if i == self._stream_text_index:
                     content += self._stream_buffer
@@ -981,8 +977,7 @@ class RichMessageBuilder:
                 continue
 
             else:
-                # text/html 及其他类型的块都按原样拼接（历史上三分支体相同）；
-                # "skip" 类型从未被写入，相关分支已移除。
+                # text/html 及其他类型的块都按原样拼接。
                 content = block
                 if i == self._stream_text_index:
                     content += self._stream_buffer
@@ -1098,7 +1093,7 @@ class RichMessageBuilder:
 
         # 回合边界是唯一允许换草稿的时点，因此必须在这里重新统计真实容量。
         # 不能只依赖 flush 之前留下的 _rollover_pending：draft API 限流冷却、
-        # 刷新短路或未来调用路径遗漏 flush 时，旧实现会让已到 30k 的草稿跨越
+        # 刷新短路或未来调用路径遗漏 flush 时，已到 30k 的草稿会跨越
         # 多个工具回合仍不切换。先提交流式缓冲，确保本轮最后一段也参与统计。
         self._commit_stream_buffer()
         async with self._rollover_lock:
@@ -1389,9 +1384,9 @@ class RichMessageBuilder:
                     f"{self._rate_limited_until:.1f} (retry_after={e.retry_after}s)"
                 )
             except Exception as e:
-                # 修复：原代码用 "429" 子串判断 HTTP 429，对任何巧合
-                # 含 "429" 字符串的异常（如 request_id）会误报为 rate limit。
-                # 优先看异常的 status_code 属性，再回退到子串匹配。
+                # 优先看异常的 status_code 属性，再回退到子串匹配：
+                # 仅用 "429" 子串判断会对任何巧合含 "429" 的字符串
+                # （如 request_id）误报为 rate limit。
                 status_code = getattr(e, "status_code", None) or getattr(e, "status", None)
                 err_msg = str(e)
                 if status_code == 429 or "429" in err_msg:

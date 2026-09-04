@@ -1132,8 +1132,8 @@ async def _call_api(
 
 
 # ========== 向后兼容重导出 ==========
-# 以下符号原本定义在本文件中，现已拆分到 apitelegramchat.ai 子包。
-# 保留重导出，使 search_engine.py / app.py 等既有的
+# 以下符号定义在 apitelegramchat.ai 子包中；保留重导出，使
+# search_engine.py / app.py 等模块的
 # "from apitelegramchat.ai_handlers import X" 语句无需修改。
 from apitelegramchat.ai.media_generation import (  # noqa: F401
     _request_modelscope_native_image,

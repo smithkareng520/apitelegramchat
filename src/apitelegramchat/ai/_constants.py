@@ -31,7 +31,7 @@ OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 # 编辑操作只持久化被编辑的具体文件。
 #
 # deliver_reply（/show off 静默模式交付最终回复）：sendRichMessage 带重试
-# （最坏 ~45s+），45s 上限与之匹配。旧的 send_message_to_user 已移除。
+# （最坏 ~45s+），45s 上限与之匹配。
 LONG_RUNNING_TOOLS = {"web_search", "fetch_url", "text_editor", "deliver_reply"}
 LONG_TOOL_CALL_TIMEOUT = 45
 # bash 工具单独一档，比 LONG_RUNNING_TOOLS 更宽松：

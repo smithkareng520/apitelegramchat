@@ -150,9 +150,9 @@ def _build_servers() -> dict[str, MCPServerConfig]:
     from apitelegramchat import config
 
     servers: dict[str, MCPServerConfig] = {}
-    # Serper 搜索现已迁移到直连 google.serper.dev REST API（见
-    # serper_api.py / search_engine.execute_web_search），不再通过第三方
-    # MCP 中转，故不再注册 serper-search MCP server。
+    # Serper 搜索走直连 google.serper.dev REST API（见
+    # serper_api.py / search_engine.execute_web_search），不经第三方
+    # MCP 中转，因此这里不注册 serper-search MCP server。
     if config.GAODE_MCP_ENABLED and config.GAODE_MCP_URL and config.GAODE_MCP_TOKEN:
         try:
             servers["amap-maps"] = MCPServerConfig(
