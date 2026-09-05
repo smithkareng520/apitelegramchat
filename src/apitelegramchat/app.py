@@ -1484,57 +1484,65 @@ async def send_model_list(
 # ---------------------------------------------------------------------------
 @app.route('/webhook', methods=['GET', 'POST', 'HEAD'])
 async def webhook() -> tuple:
-    """Telegram webhook 快速确认入口。
+    """
+    极限快速 webhook 入口。
 
-    不在 HTTP 请求生命周期内执行 AI、工具、文件处理等长任务。
-    Telegram webhook 的职责只是确认 update 已收到；实际处理交给后台 task。
-    这样单个异常 update 不会阻塞 Telegram 投递链路。
+    原则:
+    1. 不等待 JSON 后面的业务逻辑
+    2. 不等待去重锁
+    3. 不等待 AI / tool / 文件 / 网络
+    4. Telegram update 必须先 ACK
+
+    任何慢逻辑全部进入后台 task。
     """
     if request.method in ('GET', 'HEAD'):
         return "OK - Webhook is alive", 200
 
+    # 第一行日志：如果这里没有出现，说明请求根本没有到 Quart
+    logger.info("TELEGRAM WEBHOOK ENTERED")
+
     try:
-        data = await request.json
+        data = await asyncio.wait_for(
+            request.get_json(force=True),
+            timeout=3
+        )
+    except asyncio.TimeoutError:
+        logger.error("Webhook body read timeout")
+        return "OK", 200
     except Exception:
-        logger.exception("Webhook JSON 解析失败")
+        logger.exception("Webhook JSON parse failed")
         return "OK", 200
 
-    # 快速鉴权（保留原逻辑）
-    token = request.args.get("token")
-    token_ok = False
-    if WEBHOOK_TOKEN:
-        if token and hmac.compare_digest(str(token), str(WEBHOOK_TOKEN)):
-            token_ok = True
-        else:
-            secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-            if secret_header and hmac.compare_digest(str(secret_header), str(WEBHOOK_TOKEN)):
-                token_ok = True
-    if not token_ok:
-        return "Forbidden", 403
-
-    uid = data.get("update_id")
-    if uid is None:
+    if not isinstance(data, dict):
+        logger.warning("Webhook invalid payload")
         return "OK", 200
 
-    # 原子去重，避免 Telegram 重试造成重复执行
-    if not await mark_update_processed_if_new(uid):
-        return "OK", 200
+    uid = data.get("update_id", "unknown")
 
-    task = asyncio.create_task(_process_webhook_update(data))
-    webhook_tasks[uid] = task
-
-    def _done(t: asyncio.Task):
-        webhook_tasks.pop(uid, None)
+    # 注意：
+    # 不在这里 await mark_update_processed_if_new()
+    # 该函数可能涉及锁/IO，不能阻塞 Telegram webhook。
+    async def runner():
         try:
-            t.result()
-        except asyncio.CancelledError:
-            pass
+            # 后台再做去重
+            if uid != "unknown":
+                try:
+                    if not await mark_update_processed_if_new(uid):
+                        logger.info("Duplicate update ignored %s", uid)
+                        return
+                except Exception:
+                    logger.exception("update dedup failed %s", uid)
+
+            await _process_webhook_update(data)
+
         except Exception:
-            logger.exception("后台 webhook task 异常 update=%s", uid)
+            logger.exception("Webhook worker crashed update=%s", uid)
 
-    task.add_done_callback(_done)
+    asyncio.create_task(runner())
 
-    logger.info("Webhook accepted update=%s (background)", uid)
+    logger.info("TELEGRAM WEBHOOK ACK update=%s", uid)
+
+    # 立即告诉 Telegram 收到了
     return "OK", 200
 
 
