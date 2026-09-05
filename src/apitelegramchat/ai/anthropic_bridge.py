@@ -66,34 +66,52 @@ logger = get_logger(__name__)
 # OpenAI: {"type": "function", "function": {"name", "description", "parameters"}}
 # Anthropic: {"name", "description", "input_schema"}
 def _sanitize_anthropic_tool_schema(schema):
-    """
-    Anthropic custom tool input_schema 顶层不接受 oneOf/allOf/anyOf。
-    OpenAI function schema 经常会把 union 放在根节点，直接透传会导致：
-    tools.0.custom.input_schema: input_schema does not support oneOf, allOf, or anyOf at the top level
+    """Normalize JSON schema for Anthropic custom tools.
 
-    这里仅做 Anthropic 适配层清洗，不修改原始 OpenAI schema：
-    - 根层 union 尝试选择 object 分支；
-    - 保留递归节点里的语义；
-    - 无法安全判断时降级为空 object，避免整轮请求失败。
+    Anthropic requires input_schema to be a valid JSON Schema object with a
+    top-level type. OpenAI schemas may contain top-level anyOf/oneOf/allOf or
+    branches without type, which must be normalized here only.
     """
     import copy
-    if not isinstance(schema, dict):
-        return {"type": "object", "properties": {}}
 
-    s = copy.deepcopy(schema)
-    for key in ("oneOf", "anyOf", "allOf"):
-        if key in s and key in ("oneOf", "anyOf", "allOf"):
-            variants = s.get(key)
-            if isinstance(variants, list):
-                for item in variants:
-                    if isinstance(item, dict) and item.get("type") == "object":
-                        base = {k: v for k, v in s.items() if k not in ("oneOf", "anyOf", "allOf")}
-                        base.update(item)
-                        return base
-                if variants and isinstance(variants[0], dict):
-                    return variants[0]
-            return {"type": "object", "properties": {}}
-    return s
+    def normalize(node):
+        if not isinstance(node, dict):
+            return node
+
+        node = copy.deepcopy(node)
+
+        for key in ("oneOf", "anyOf", "allOf"):
+            if key in node:
+                variants = node.get(key)
+                if isinstance(variants, list):
+                    for item in variants:
+                        if isinstance(item, dict) and item.get("type") == "object":
+                            base = {k:v for k,v in node.items() if k not in ("oneOf","anyOf","allOf")}
+                            base.update(item)
+                            node = base
+                            break
+                    else:
+                        if variants and isinstance(variants[0], dict):
+                            node = variants[0]
+                        else:
+                            node = {"type":"object", "properties":{}}
+                else:
+                    node = {"type":"object", "properties":{}}
+                break
+
+        if "type" not in node:
+            if "properties" in node:
+                node["type"] = "object"
+            else:
+                node["type"] = "object"
+                node.setdefault("properties", {})
+
+        return node
+
+    result = normalize(schema)
+    if not isinstance(result, dict):
+        return {"type":"object", "properties":{}}
+    return result
 
 
 def _convert_tools_to_anthropic(tools: Optional[list]) -> Optional[list]:
