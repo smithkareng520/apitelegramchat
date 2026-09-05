@@ -194,7 +194,7 @@ class ModelConfig:
     native_document: Optional[bool] = None
     native_video: Optional[bool] = None
     supports_sampling: Optional[bool] = None
-    supports_prompt_cache: Optional[bool] = None 
+    supports_prompt_cache: Optional[bool] = None
     max_output_tokens: Optional[int] = None
     max_context: Optional[int] = None  # <=== 【新增】最大上下文窗口
 
@@ -327,6 +327,15 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         # Anthropic 原生 prompt caching（cache_control 显式断点），由
         # _agentic_loop_anthropic 按 supports_prompt_cache 开启。
         supports_prompt_cache=True,
+    ),
+    "xxtf": ProviderConfig(
+        default_headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+        name="XXTF",
+        # 壳的默认端点按 OpenAI 协议填（gpt-5.6-sol 沿用这个默认值）；
+        # AsyncOpenAI 会自动拼接为 {base_url}/chat/completions
+        # -> https://xxtf.baby/v1/chat/completions。
+        base_url="https://xxtf.baby/v1",
+        api_key_env="XXTF_API_KEY",
     ),
 }
 
@@ -474,6 +483,24 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "max_output_tokens": 65536,
         "max_context": 200000,
     },
+    "xxtf": {
+        "vision": True,
+        "audio": False,
+        "video": False,
+        "supports_tools": True,
+        "native_image": False,
+        "native_document": True,
+        "native_video": False,
+        "supports_sampling": True,
+        "supports_prompt_cache": False,
+        "temperature": None,          # None -> 不发送，走供应商默认
+        "top_p": None,                # None -> 不发送，走供应商默认
+        "reasoning_enabled": None,    # None -> 不发送推理控制参数
+        "reasoning_effort": None,
+        "reasoning_max_tokens": None,
+        "max_output_tokens": 65536,
+        "max_context": 200000,
+    },
 }
 
 
@@ -610,7 +637,6 @@ def make_model_config(
             name="GPT 5.6 Sol",
         )
         SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
-            model_id="claude-opus-5",
             provider="my_relay",
             name="Claude Opus 5 (中转)",
             # 仅此模型覆盖：换协议 + 换子路径，key 仍沿用 my_relay 默认。
@@ -1013,17 +1039,8 @@ SUPPORTED_MODELS["agnes-video-v2.0"] = make_model_config(
 # 分别连到 Anthropic 原生入口和 OpenAI 兼容入口，互不干扰
 # （api_client.py 按 model_id 分别缓存客户端，见 APIClient.get_client_for_model）。
 # =============================================================================
-PROVIDERS["xxtf"] = ProviderConfig(
-    default_headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-    name="XXTF",
-    # 壳的默认端点按 OpenAI 协议填（gpt-5.6-sol 沿用这个默认值）；
-    # AsyncOpenAI 会自动拼接为 {base_url}/chat/completions
-    # -> https://xxtf.baby/v1/chat/completions。
-    base_url="https://xxtf.baby/v1",
-    api_key_env="XXTF_API_KEY",
-)
-
 SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
+    supports_tools=True,
     model_id="claude-opus-5",
     provider="xxtf",
     name="Claude Opus 5 (XXTF)",
@@ -1048,6 +1065,7 @@ SUPPORTED_MODELS["gpt-5.6-sol"] = make_model_config(
     name="GPT 5.6 Sol (XXTF)",
     vision=True,
     max_context=128000,
+    supports_tools=True,
     # 【已知风险，未验证】平台协议入口标注为 /v1/responses（OpenAI 新的
     # Responses API），与本项目现有 OpenAI 兼容循环使用的 Chat
     # Completions 协议（/v1/chat/completions）不是同一套协议——字段

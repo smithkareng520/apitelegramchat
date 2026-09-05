@@ -39,6 +39,8 @@ services:
         sync: false
       - key: GROQ_API_KEY
         sync: false
+      - key: XXTF_API_KEY
+        sync: false
       - key: R2_ENDPOINT
         sync: false
       - key: R2_ACCESS_KEY
