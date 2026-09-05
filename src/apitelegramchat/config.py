@@ -1085,7 +1085,6 @@ SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
     vision=True,
     native_document=True,
     supports_prompt_cache=True,
-    max_context=200000,
     # 平台标注协议为 anthropic：走 Anthropic 原生 Messages 专用循环。
     # 注意 base_url 不带 /v1——AsyncAnthropic SDK 会自动拼接
     # {base_url}/v1/messages -> https://xxtf.baby/v1/messages，
