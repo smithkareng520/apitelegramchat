@@ -697,7 +697,7 @@ async def _agentic_loop_openai_compat(
         # 每轮请求结束后立即打印本轮缓存命中统计：final_usage 每轮被覆盖，
         # 若只在循环外打印，多轮 agentic 循环中间轮次的命中情况不可观测。
         # final_usage 仍保留最后一轮的值供返回值（token 台账）使用。
-        _log_cache_usage(api_label, final_usage, cache_hint=usage_with_cache)
+        _log_cache_usage(api_label, final_usage, cache_hint=usage_with_cache, model_name=current_model)
         for idx, tc in enumerate(tool_calls_list):
             if not tc.get("id"):
                 tc["id"] = f"call_{_round}_{idx}_{uuid.uuid4().hex[:8]}"

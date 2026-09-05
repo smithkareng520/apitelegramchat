@@ -969,7 +969,7 @@ async def _agentic_loop_gemini_native(
         # 复用既有 _log_cache_usage（Gemini 隐式缓存字段一并呈现）。
         if usage_meta is not None:
             final_usage = _gemini_usage_to_openai(usage_meta)
-        _log_cache_usage(api_label, final_usage)
+        _log_cache_usage(api_label, final_usage, model_name=current_model)
 
         _normalize_tool_call_arguments(
             tool_calls_list, api_label, _round + 1,

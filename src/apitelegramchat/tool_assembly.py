@@ -12,7 +12,35 @@ def valid_tool_defs(tools: Iterable[Any] | None) -> list[dict]:
     """返回可发送的工具定义，只保留 dict，保持原始顺序。"""
     if not tools:
         return []
-    return [tool for tool in tools if isinstance(tool, dict)]
+    return [normalize_tool_schema(tool) for tool in tools if isinstance(tool, dict)]
+
+
+
+def normalize_tool_schema(tool: dict) -> dict:
+    """规范化发给模型的工具 schema。"""
+    import copy
+    tool = copy.deepcopy(tool)
+    try:
+        params = tool["function"]["parameters"]
+        props = params.get("properties")
+        if isinstance(props, dict):
+            if "_description" in props:
+                req = list(params.get("required") or [])
+                if "_description" not in req:
+                    req.insert(0, "_description")
+                params["required"] = req
+                params["properties"] = {
+                    "_description": props["_description"],
+                    **{k: v for k, v in props.items() if k != "_description"},
+                }
+            elif tool.get("function", {}).get("name") == "text_editor" and "command" in props:
+                params["properties"] = {
+                    "command": props["command"],
+                    **{k: v for k, v in props.items() if k != "command"},
+                }
+    except Exception:
+        pass
+    return tool
 
 
 def tool_name(tool: dict) -> str:

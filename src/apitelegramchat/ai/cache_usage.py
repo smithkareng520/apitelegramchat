@@ -127,7 +127,7 @@ def _extract_cache_usage(usage, cache_hint=None) -> dict:
     return stats
 
 
-def _log_cache_usage(api_label: str, usage, cache_hint=None) -> None:
+def _log_cache_usage(api_label: str, usage, cache_hint=None, model_name: str | None = None, provider: str | None = None) -> None:
     """每轮请求结束时打一行缓存命中摘要（无缓存字段时静默跳过）。"""
     try:
         stats = _extract_cache_usage(usage, cache_hint)
@@ -148,9 +148,9 @@ def _log_cache_usage(api_label: str, usage, cache_hint=None) -> None:
                 # 避免直接 dump dict 导致字符串值带引号、浮点数带多余位数。
                 logger.info(
                     "[%s] prompt cache usage: "
-                    "{'Input_tokens': %s, 'Output_tokens': %s, "
+                    "{'Provider': '%s', 'Model': '%s', 'Input_tokens': %s, 'Output_tokens': %s, "
                     "'Cached': %s, 'Hit_ratio': %.1f%%}",
-                    api_label,
+                    api_label, provider or api_label, model_name or '-',
                     stats.get("Input_tokens", "-"),
                     stats.get("Output_tokens", "-"),
                     stats.get("Cached", "-"),

@@ -698,7 +698,7 @@ async def _agentic_loop_anthropic(
         # completion_tokens 全部落 0 —— 表现为"XXTF 没有 usage"。
         # 归一化后的 dict 会成为下一轮返回值（token 台账 + 命中率统计）。
         final_usage = _anthropic_usage_to_openai(final_usage) or final_usage
-        _log_cache_usage(api_label, final_usage)
+        _log_cache_usage(api_label, final_usage, model_name=current_model)
 
         # 把这一轮的 tool_use 累积转换为 OpenAI 形状的 tool_calls，供
         # _run_tool_calls_and_append 复用（与另外两条循环完全同构）。
