@@ -29,6 +29,10 @@ AGNES_API_KEY = os.getenv("AGNES_API_KEY", "")
 # 互不影响；本 key 仅供 anthropic 厂商专用循环
 # （ai/agentic_loops._agentic_loop_anthropic）使用。
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# XXTF 中转（https://xxtf.baby）：claude-opus-5（Anthropic 原生协议）与
+# gpt-5.6-sol（OpenAI 协议）共用同一个 key，见下方 PROVIDERS["xxtf"] 与
+# SUPPORTED_MODELS 中的模型定义（"XXTF 中转"注释块）。
+XXTF_API_KEY = os.getenv("XXTF_API_KEY", "")
 
 
 # ---------- 高德地图 MCP 服务（@amap/amap-maps on ModelScope）----------
@@ -987,67 +991,65 @@ SUPPORTED_MODELS["agnes-video-v2.0"] = make_model_config(
 
 
 # =============================================================================
-# 【模板】中转/聚合端点，每模型独立配置 base_url / key / 协议
+# XXTF 中转（https://xxtf.baby）：同一模型名在该平台上有多种协议挂载方式，
+# 这里按"平台标注的协议"接入，而不是按模型名猜协议——
+#   claude-opus-5   平台标 anthropic -> 走 Anthropic 原生 Messages 协议
+#   gpt-5.6-sol     平台标 openai    -> 走 OpenAI 协议（但入口是 /v1/responses，
+#                                       项目目前只有 Chat Completions 循环，
+#                                       见下方模型定义处的风险说明）
+#
+# 两个模型共用同一个 provider="xxtf" 壳、同一份 XXTF_API_KEY，但各自按
+# 端点覆盖字段（base_url / use_dedicated_loop / dedicated_loop_kind）
+# 分别连到 Anthropic 原生入口和 OpenAI 兼容入口，互不干扰
+# （api_client.py 按 model_id 分别缓存客户端，见 APIClient.get_client_for_model）。
 # =============================================================================
-# 适用场景：你想接入的中转站（如问题里提到的 https://xxtf.baby/query/）
-# 对不同模型使用不同协议——比如 OpenAI 兼容模型走一个子路径，
-# Anthropic 系模型走另一个原生 Messages 子路径，混用会直接 502/404。
-# 以前的做法是"选供应商 = 选端点"，同一 provider 下所有模型被迫共用
-# 同一个 base_url，为此不同协议往往要拆成好几个 provider 分别维护。
-# 现在改为：provider 只负责提供"默认端点"，每个模型可以按需覆盖
-# base_url / api_key_env / default_headers / use_dedicated_loop /
-# dedicated_loop_kind / session_affinity / vision_prefer_url 中的任意
-# 字段——不填就沿用 provider 默认，填了就只对这一个模型生效。
-#
-# 使用步骤（照抄即可）：
-#   1) 在文件顶部"环境变量"区域加一行 key 声明，例如：
-#        XXTF_API_KEY = os.getenv("XXTF_API_KEY", "")
-#      并在 Render/部署环境里配置好同名环境变量。
-#   2) 在 PROVIDERS 里加一个壳（决定"默认"端点，通常填 OpenAI 兼容那部分）：
-#        PROVIDERS["xxtf"] = ProviderConfig(
-#            name="XXTF Relay",
-#            base_url="https://xxtf.baby/query/v1",   # OpenAI 兼容默认子路径
-#            api_key_env="XXTF_API_KEY",
-#        )
-#   3) 每个模型按需覆盖。协议不变、只是想换个模型名的，什么都不用覆盖；
-#      协议不同（比如这个模型必须走 Anthropic 原生 Messages），加
-#      use_dedicated_loop + dedicated_loop_kind + base_url 三个字段即可：
-#
-#        SUPPORTED_MODELS["gpt-5.6-sol"] = make_model_config(
-#            model_id="gpt-5.6-sol",
-#            provider="xxtf",
-#            name="GPT 5.6 Sol (XXTF)",
-#            vision=True,
-#            max_context=128000,
-#            # 未覆盖任何端点字段 -> 完全沿用 PROVIDERS["xxtf"] 的默认
-#            # base_url/api_key_env，走 OpenAI 兼容协议（_agentic_loop_openai_compat）。
-#        )
-#
-#        SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
-#            model_id="claude-opus-5",
-#            provider="xxtf",
-#            name="Claude Opus 5 (XXTF)",
-#            vision=True,
-#            native_document=True,
-#            supports_prompt_cache=True,
-#            max_context=200000,
-#            # 仅这一个模型覆盖：换协议 + 换子路径，key 仍沿用
-#            # PROVIDERS["xxtf"] 的 XXTF_API_KEY（如中转站对不同协议
-#            # 用不同 key，再额外传 api_key_env="XXTF_ANTHROPIC_API_KEY"
-#            # 即可，同样只对本模型生效）。
-#            use_dedicated_loop=True,
-#            dedicated_loop_kind="anthropic_native",
-#            base_url="https://xxtf.baby/query/anthropic",
-#            reasoning_enabled=True,
-#            temperature=1.0,
-#        )
-#
-# 两个模型共用同一个 provider="xxtf" 壳、同一份 key，但 api_client.py
-# 会按 model_id 分别缓存客户端（见 APIClient.get_client_for_model），
-# 各自连到各自的 base_url、走各自的协议循环，互不干扰。
-# 想验证某个模型实际会连去哪、走什么协议，可以直接调用：
-#   from apitelegramchat.config import get_effective_endpoint, SUPPORTED_MODELS
-#   print(get_effective_endpoint(SUPPORTED_MODELS["claude-opus-5"]))
+PROVIDERS["xxtf"] = ProviderConfig(
+    name="XXTF",
+    # 壳的默认端点按 OpenAI 协议填（gpt-5.6-sol 沿用这个默认值）；
+    # AsyncOpenAI 会自动拼接为 {base_url}/chat/completions
+    # -> https://xxtf.baby/v1/chat/completions。
+    base_url="https://xxtf.baby/v1",
+    api_key_env="XXTF_API_KEY",
+)
+
+SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
+    model_id="claude-opus-5",
+    provider="xxtf",
+    name="Claude Opus 5 (XXTF)",
+    vision=True,
+    native_document=True,
+    supports_prompt_cache=True,
+    max_context=200000,
+    # 平台标注协议为 anthropic：走 Anthropic 原生 Messages 专用循环。
+    # 注意 base_url 不带 /v1——AsyncAnthropic SDK 会自动拼接
+    # {base_url}/v1/messages -> https://xxtf.baby/v1/messages，
+    # 与项目截图中 claude-opus-5 / anthropic 协议那一行的入口一致。
+    use_dedicated_loop=True,
+    dedicated_loop_kind="anthropic_native",
+    base_url="https://xxtf.baby",
+    reasoning_enabled=True,
+    reasoning_effort="high",
+    temperature=1.0,
+)
+
+SUPPORTED_MODELS["gpt-5.6-sol"] = make_model_config(
+    model_id="gpt-5.6-sol",
+    provider="xxtf",
+    name="GPT 5.6 Sol (XXTF)",
+    vision=True,
+    max_context=128000,
+    # 【已知风险，未验证】平台协议入口标注为 /v1/responses（OpenAI 新的
+    # Responses API），与本项目现有 OpenAI 兼容循环使用的 Chat
+    # Completions 协议（/v1/chat/completions）不是同一套协议——字段
+    # 形状、流式事件、工具调用格式均不同，项目目前没有 Responses API
+    # 专用循环。这里先按 Chat Completions 协议接入（不覆盖 base_url，
+    # 沿用 PROVIDERS["xxtf"] 默认的 https://xxtf.baby/v1，实际会请求
+    # https://xxtf.baby/v1/chat/completions），如果该中转的
+    # /v1/responses 入口不接受 chat.completions 请求体/不在这个路径
+    # 提供服务，请求会直接报错（404 或 400），届时需要为 Responses API
+    # 单独实现一套专用循环（类似 anthropic_bridge.py / gemini_bridge.py
+    # 的边界转换模式）才能真正打通。
+)
 # =============================================================================
 
 
@@ -1167,6 +1169,7 @@ _SENSITIVE_EXACT = {
     "TELEGRAM_BOT_TOKEN", "GLM_API_KEY",
     "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY",
     "XAI_API_KEY", "GROQ_API_KEY", "MODELSCOPE_API_KEY", "AGNES_API_KEY",
+    "XXTF_API_KEY",
     "R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY",
     "R2_BUCKET_NAME", "R2_PUBLIC_URL", "R2_REGION",
     "SERPER_API_KEY", "GAODE_MCP_TOKEN",
