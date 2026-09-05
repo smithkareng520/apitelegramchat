@@ -25,6 +25,7 @@ from apitelegramchat.utils import (
     sticker_metadata_to_text,
     transcribe_audio_with_groq,
     _notify_chat_unreachable,
+    get_http_session,
 )
 from apitelegramchat.ai_handlers import get_ai_response, _get_cached_audio_data
 from apitelegramchat.config import (
@@ -187,6 +188,98 @@ active_tasks: dict[int, asyncio.Task] = {}
 active_tasks_lock = asyncio.Lock()
 # 消息去重已下沉到 state.mark_update_processed_if_new（原子检查+标记），
 # 这里不需要 app 级别的去重锁。
+# ==================== Webhook Fast-ACK 门面 + 后台分发 ====================
+# 旧版实现把全部业务（命令、Telegram API 调用、文件下载、音频转写）内联在
+# webhook 请求处理器里，存在两类互相放大的问题：
+#   1) 非 2xx 阻塞：缺少 update_id 的构造包返回 400、鉴权失败返回 403——
+#      Telegram 对非 2xx 投递按指数退避**无限重投**同一条 update，会把投递
+#      队列整个堵死（积压/阻塞的直接根因）；
+#   2) 慢响应重投：文档下载/Groq 转写/余额查询等耗时操作挂在请求路径上，
+#      响应超过 Telegram 投递超时后同样触发重投（去重挡住了重复处理，但
+#      重投流量与排队压力仍在）。
+# 重构后的分工：
+#   webhook()              —— Fast-ACK 门面：鉴权→大小防护→JSON 防护→去重→
+#                             排入后台，立即 200。任何 payload 都只得到 200。
+#   _dispatch_update()     —— 后台分发主干：全局信号量限并发，异常自隔离。
+#   _dispatch_update_inner() —— 原业务处理体（行为逐行兼容）。
+# 兼容性：路由 /webhook、鉴权方式、全部命令、消息处理语义、日志格式均保持
+# 不变；唯一变化是"何时返回 200"——从处理完毕提前到鉴权+去重之后。
+
+# 请求体大小上限：真实 Telegram update 一般 <100KB，2MB 已是极大冗余；
+# 超限的构造包不读入内存直接 200 丢弃（防 OOM；返回 413 同样会触发重试
+# 风暴，所以这里绝不返回 413）。
+WEBHOOK_MAX_BODY_BYTES = 2 * 1024 * 1024
+
+# 后台分发并发闸门：积压排干时避免瞬间起几百个分发任务打爆下游（Telegram
+# API / LLM API / 磁盘）。AI 长回合（_handle_* 等）在分发内再 create_task，
+# 不占闸门槽位；槽位只覆盖"路由决策 + 轻量状态操作 + 少量 API 调用"。
+DISPATCH_CONCURRENCY = 32
+_dispatch_semaphore = asyncio.Semaphore(DISPATCH_CONCURRENCY)
+
+# 强引用所有在飞后台任务（asyncio.create_task 只持弱引用，不持引用的
+# task 可能在执行中被 GC）。
+_bg_tasks: set = set()
+
+
+def _spawn_bg(coro) -> asyncio.Task:
+    """fire-and-forget 但保留强引用的后台任务生成器。"""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+
+async def _answer_callback(cb_id, text: str = "", show_alert: bool = False) -> None:
+    """answerCallbackQuery 统一封装：显式短超时 + 永不抛出。
+
+    旧代码在回调分支里手工 new ClientSession 且不带超时——Telegram 偶发
+    挂起时会把整条处理链路拖住几分钟（aiohttp 默认 total=300s）。统一走
+    共享连接池 + 8s 超时；签收失败只记日志，不影响业务结果。
+    """
+    if not cb_id:
+        return
+    try:
+        session = await get_http_session()
+        await session.post(
+            f"{BASE_URL}/answerCallbackQuery",
+            json={
+                "callback_query_id": cb_id,
+                "text": text or "",
+                "show_alert": bool(show_alert),
+            },
+            timeout=aiohttp.ClientTimeout(total=8, connect=4),
+        )
+    except Exception as e:
+        logger.warning(f"answerCallbackQuery 失败（忽略）: {e}")
+
+
+async def _dispatch_update(data: dict, request_id: str = "") -> None:
+    """单条 update 的后台分发主干（并发受 _dispatch_semaphore 限制）。
+
+    异常自隔离：任何异常都不外溢——webhook 已先行 200 签收，这里只补日志。
+    不加总死线：分发内的锁/网络等待与旧版行为一致，强行取消可能打断多步
+    状态变更（如 /clear 的清历史序列），风险大于收益。
+    """
+    _dt0 = time.monotonic()
+    if _dispatch_semaphore.locked():
+        logger.warning(
+            f"⏳ 后台分发并发已满({DISPATCH_CONCURRENCY})，任务排队: "
+            f"update_id={data.get('update_id')} req={request_id}"
+        )
+    async with _dispatch_semaphore:
+        try:
+            await _dispatch_update_inner(data, request_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("后台分发异常（webhook 已先行 200，不影响投递签收）")
+        finally:
+            logger.info(
+                f"后台分发完成: update_id={data.get('update_id')} "
+                f"耗时 {time.monotonic() - _dt0:.2f}s req={request_id}"
+            )
+
+
 
 # ==================== 打断旧轮次（保全进度 + 冻结旧草稿） ====================
 
@@ -1417,7 +1510,10 @@ async def _send_via_send_message(
         )
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post(f"{BASE_URL}/sendMessage", json=payload) as resp:
+            async with s.post(
+                f"{BASE_URL}/sendMessage", json=payload,
+                timeout=aiohttp.ClientTimeout(total=30, connect=10),
+            ) as resp:
                 if resp.status == 200:
                     res = await resp.json()
                     mid = res.get("result", {}).get("message_id")
@@ -1483,20 +1579,27 @@ async def send_model_list(
 # ---------------------------------------------------------------------------
 @app.route('/webhook', methods=['GET', 'POST', 'HEAD'])
 async def webhook() -> tuple:
+    """Fast-ACK 门面：只做安全与去重，立即 200，业务全部后台处理。
+
+    每一步防护的"为什么"：
+    - 鉴权失败也返回 200：403 会触发 Telegram 对该 update 无限重投，
+      token 配错时整个投递队列会被堵死。改为静默丢弃 + 醒目日志 + 启动
+      自愈注册保证 token 恒等（见 webhook_sync.py）。绝不把 query 打进
+      日志（内含 token）。
+    - 请求体 >2MB 直接 200 丢弃：不读入内存防 OOM；返回 413 同样触发
+      重试风暴。
+    - 非法 JSON / 非 dict / 缺 update_id / update_id 类型非法：一律 200
+      吞掉。真实 Telegram update 永远带整型 update_id，这类请求只会是
+      构造包；返回 400 只会让 Telegram 无限重投同一条"毒消息"。
+    """
     _t0 = time.monotonic()
     try:
         request_id = str(uuid.uuid4())[:8]
         set_request_id(request_id)
         logger.info(f"Received webhook request {request_id}")
 
+        # ── 1) 鉴权（query token 或 secret 头，恒定时间比较）──────────────
         token = request.args.get("token")
-        # 鉴权双路径（任一匹配即放行），均用 hmac.compare_digest 恒定时间比较防止时序攻击：
-        #  1) URL query ?token=…（历史注册方式，保持完全兼容）；
-        #  2) X-Telegram-Bot-Api-Secret-Token 请求头——当启动自愈以
-        #     secret_token 参数注册后（见 webhook_sync.py），Telegram 每次投递
-        #     都会携带该头。头路径让 token 不再出现在 URL/访问日志里。
-        # 头路径是加法式强化：若注册时未附带 secret_token，Telegram 不会发
-        # 该头，鉴权自然回落到 query token，既有投递不受任何影响。
         token_ok = False
         if WEBHOOK_TOKEN:
             if token and hmac.compare_digest(str(token), str(WEBHOOK_TOKEN)):
@@ -1506,336 +1609,424 @@ async def webhook() -> tuple:
                 if secret_header and hmac.compare_digest(str(secret_header), str(WEBHOOK_TOKEN)):
                     token_ok = True
         if not token_ok:
-            return "Forbidden", 403
+            logger.warning(
+                f"Webhook 鉴权失败，静默丢弃（返回200）: req={request_id}, "
+                f"method={request.method}, has_query_token={bool(token)}, "
+                f"has_secret_header={bool(request.headers.get('X-Telegram-Bot-Api-Secret-Token'))}"
+            )
+            return "OK", 200
         if request.method in ('GET', 'HEAD'):
             return "OK - Webhook is alive", 200
 
-        data = await request.json
+        # ── 2) 请求体大小防护（2MB）───────────────────────────────────────
+        content_length = request.content_length
+        if content_length is not None and content_length > WEBHOOK_MAX_BODY_BYTES:
+            logger.warning(
+                f"Webhook 请求体过大（{content_length}B > {WEBHOOK_MAX_BODY_BYTES}B），"
+                f"200 丢弃: req={request_id}"
+            )
+            return "OK", 200
+
+        # ── 3) JSON 解析防护（非法/非 dict/超限构造包一律 200 丢弃）───────
+        try:
+            data = await request.json
+        except Exception as e:
+            logger.warning(
+                f"Webhook 非法 JSON payload，200 丢弃: req={request_id}, err={type(e).__name__}"
+            )
+            return "OK", 200
+        if not isinstance(data, dict):
+            logger.warning(
+                f"Webhook 非 dict payload，200 丢弃: req={request_id}, type={type(data).__name__}"
+            )
+            return "OK", 200
+        # chunked 等无 Content-Length 请求的兜底：按序列化体积校验（罕见路径）
+        if content_length is None:
+            try:
+                if len(json.dumps(data, ensure_ascii=False, default=str)) > WEBHOOK_MAX_BODY_BYTES:
+                    logger.warning(f"Webhook payload 序列化后超限，200 丢弃: req={request_id}")
+                    return "OK", 200
+            except Exception:
+                pass
+
+        # ── 4) update_id 校验：缺失/非法一律 200 吞掉（防毒消息重投）──────
         uid = data.get('update_id')
-        # 缺少 update_id 的非法 payload 直接拒绝，避免污染去重集合
         if uid is None:
-            return "Bad Request", 400
+            logger.warning(
+                f"Webhook 缺少 update_id，200 丢弃: req={request_id}, "
+                f"keys={sorted(str(k) for k in data.keys())[:12]}"
+            )
+            return "OK", 200
+        if isinstance(uid, bool) or not isinstance(uid, (int, str)):
+            logger.warning(
+                f"Webhook update_id 类型非法({type(uid).__name__})，200 丢弃: req={request_id}"
+            )
+            return "OK", 200
 
         if LOG_LEVEL == "DEBUG" or LOG_TRUNCATE_LIMIT == 0:
             msg_debug = json.dumps(data, ensure_ascii=False, default=str)
             logger.debug(f"完整 Webhook 数据: {msg_debug}")
         else:
             _msg_obj = data.get("message") or {}
-            chat_id = _msg_obj.get("chat", {}).get("id")
-            update_id = data.get("update_id")
-            logger.info(f"Webhook: update_id={update_id}, chat_id={chat_id}")
+            chat_id = _msg_obj.get("chat", {}).get("id") if isinstance(_msg_obj, dict) else None
+            logger.info(f"Webhook: update_id={uid}, chat_id={chat_id}")
             if logger.isEnabledFor(logging.DEBUG):
                 msg_debug = json.dumps(data, ensure_ascii=False, default=str)
                 if len(msg_debug) > LOG_TRUNCATE_LIMIT:
                     msg_debug = msg_debug[:LOG_TRUNCATE_LIMIT] + "... (truncated)"
                 logger.debug(f"截断的 Webhook 数据: {msg_debug}")
 
-        # 使用 OrderedDict 保留插入顺序，超过 10000 条时按插入顺序淘汰
-        # 最早的 5000 条，保证淘汰的总是最早加入的 uid。
+        # ── 5) 去重：Telegram 超时重投的副本直接 200 跳过 ──────────────────
         # mark_update_processed_if_new 原子地"检查并标记"：若拆成先查后标
-        # 两段加锁，Telegram 超时重投 + webhook 并发会让同一 update 的两个
-        # 副本同时通过检查、被双重处理。
+        # 两段，重投 + webhook 并发会让同一 update 的两个副本同时通过
+        # 检查、被双重处理。
         if not await mark_update_processed_if_new(uid):
+            logger.info(f"Webhook: 重复 update_id={uid}，跳过")
             return "OK", 200
 
-        # ── 消息处理 ──────────────────────────────────────────────────────
-        if "message" in data and isinstance(data["message"], dict):
-            msg = data["message"]
-            chat_id = (msg.get("chat") or {}).get("id")
-            if chat_id is None:
-                logger.warning(f"Webhook: missing chat_id in message, update_id={uid}")
-                return "OK", 200
-            from_user = msg.get("from", {})
-            username, user_id = get_user_info(msg)
-            set_current_user_namespace(user_id or str(chat_id))
+        # ── 6) Fast-ACK：排入后台，立即 200 签收 ───────────────────────────
+        # 此后的一切（命令、Telegram API、下载、转写、AI 回合）都与本次
+        # HTTP 响应解耦；分发任务的 contextvars（含 request_id、当前用户
+        # 命名空间）从请求上下文复制继承，业务代码无感知。
+        _spawn_bg(_dispatch_update(data, request_id))
+        return "OK", 200
 
-            text = msg.get("text", "") or ""
-            is_admin_cmd = (_cmd_match(text, "/adduser") or _cmd_match(text, "/deluser")
-                            or _cmd_match(text, "/listusers") or _cmd_match(text, "/webhookinfo"))
-            if is_admin_cmd:
-                if not is_admin(username, user_id):
-                    await send_rich_html_message(chat_id, "❌ <b>权限不足</b>\n只有管理员可以执行此操作。", reply_parameters=_reply_params(msg["message_id"]))
-                    return "OK", 200
-                # 不用进程级锁包裹这三个命令：那会让白名单操作和其他用户
-                # 正在做的 /model /role 等命令排队等待，admin 命令之间也会
-                # 互相等待。白名单的读改写由 config.add_whitelist_user /
-                # remove_whitelist_user / snapshot_whitelist 内部的
-                # _whitelist_lock 原子完成（改内存集合 + 落盘在同一把锁内，
-                # 不会有裸读写竞态）。这把锁只保护白名单文件本身，不会阻塞
-                # 其他用户或其他命令。
-                if _cmd_match(text, "/adduser"):
-                    parts = text.split()
-                    if len(parts) != 2:
-                        await send_rich_html_message(chat_id, "❌ <b>用法错误</b>\n用法：<code>/adduser @username</code> 或 <code>/adduser 123456789</code>", reply_parameters=_reply_params(msg["message_id"]))
-                        return "OK", 200
-                    target = parts[1].strip().lstrip("@")
-                    if not target:
-                        await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
-                        return "OK", 200
-                    added = await add_whitelist_user(target)
-                    if added:
-                        await send_rich_html_message(chat_id, f"✅ <b>添加成功</b>\n已添加 <code>{target}</code> 到白名单。", reply_parameters=_reply_params(msg["message_id"]))
-                    else:
-                        await send_rich_html_message(chat_id, f"ℹ️ <b>无需操作</b>\n<code>{target}</code> 已在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
-                    return "OK", 200
-                elif _cmd_match(text, "/deluser"):
-                    parts = text.split()
-                    if len(parts) != 2:
-                        await send_rich_html_message(chat_id, "❌ <b>用法错误</b>\n用法：<code>/deluser @username</code> 或 <code>/deluser 123456789</code>", reply_parameters=_reply_params(msg["message_id"]))
-                        return "OK", 200
-                    target = parts[1].strip().lstrip("@")
-                    if not target:
-                        await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
-                        return "OK", 200
-                    removed = await remove_whitelist_user(target)
-                    if removed:
-                        await send_rich_html_message(chat_id, f"✅ <b>移除成功</b>\n已移除 <code>{target}</code>。", reply_parameters=_reply_params(msg["message_id"]))
-                    else:
-                        await send_rich_html_message(chat_id, f"❌ <b>用户不存在</b>\n<code>{target}</code> 不在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
-                    return "OK", 200
-                elif _cmd_match(text, "/listusers"):
-                    users = await snapshot_whitelist()
-                    if not users:
-                        await send_rich_html_message(chat_id, "📋 <b>白名单为空</b>", reply_parameters=_reply_params(msg["message_id"]))
-                    else:
-                        users_list = "".join(f"<li><code>{str(u)}</code></li>" for u in users)
-                        await send_rich_html_message(chat_id, f"📋 <b>当前白名单用户：</b>\n<ul>{users_list}</ul>", reply_parameters=_reply_params(msg["message_id"]))
-                    return "OK", 200
-                elif _cmd_match(text, "/webhookinfo"):
-                    # 观测命令：把 getWebhookInfo 的关键投递链路指标带回聊天，
-                    # 让"积压"（pending_update_count）与最近投递错误无需登服务器
-                    # 看日志即可发现。URL 先脱敏，token 不进聊天记录。
-                    info = await get_webhook_info()
-                    if not info:
-                        await send_rich_html_message(chat_id, "❌ <b>获取失败</b>\ngetWebhookInfo 请求失败，请查看服务端日志。", reply_parameters=_reply_params(msg["message_id"]))
-                        return "OK", 200
-                    pending = info.get("pending_update_count", 0)
-                    lines = [
-                        "🩺 <b>Webhook 投递链路状态</b>",
-                        "<blockquote>",
-                        f"注册 URL：<code>{mask_webhook_url(info.get('url') or '')}</code>",
-                        f"积压 update：<b>{pending}</b>",
-                        f"IP 地址：<code>{info.get('ip_address') or '—'}</code>",
-                        f"最大连接数：<code>{info.get('max_connections', '—')}</code>",
-                    ]
-                    last_err_date = info.get("last_error_date")
-                    last_err_msg = info.get("last_error_message")
-                    if last_err_msg:
-                        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_err_date)) if last_err_date else "未知时间"
-                        lines.append(f"最近投递错误：<code>{str(ts)} / {str(last_err_msg)[:200]}</code>")
-                    else:
-                        lines.append("最近投递错误：无 ✅")
-                    lines.append("</blockquote>")
-                    if pending:
-                        lines.append(
-                            "⚠️ 存在积压：应用健康运行并对重放返回 200 后，Telegram 会自动重放排干"
-                            "（bot 会迟到地回复这批消息）。若希望丢弃：设置 <code>DROP_PENDING_ON_STARTUP=true</code> "
-                            "后重启，或手动调用 <code>deleteWebhook?drop_pending_updates=true</code> 后重新 setWebhook。"
-                        )
-                    else:
-                        lines.append("✅ 无积压，投递链路正常。")
-                    await send_rich_html_message(chat_id, "\n".join(lines), reply_parameters=_reply_params(msg["message_id"]))
-                    return "OK", 200
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # 兜底：应用层任何异常都返回 200 而非 500——非 2xx 会触发 Telegram
+        # 无限重试同一条 poison update，是"积压阻塞"的根因。
+        logger.exception(f"Webhook 顶层异常: {e}")
+        return "OK", 200
+    finally:
+        _elapsed = time.monotonic() - _t0
+        if _elapsed > 0.5:
+            logger.warning(
+                f"⚠️ Webhook 签收耗时 {_elapsed:.2f}s（Fast-ACK 目标 <100ms，"
+                "请检查事件循环是否被同步代码阻塞）"
+            )
+        else:
+            logger.info(f"Webhook 签收耗时 {_elapsed:.3f}s")
 
-            if _cmd_match(text, "/start"):
-                authorized = is_authorized(username, user_id)
-                if authorized:
-                    welcome_msg = """
+
+async def _dispatch_update_inner(data: dict, request_id: str = "") -> None:
+    """按 update 类型执行业务处理（原 webhook 内联处理体的后台化版本）。
+
+    与旧版逐行对应、行为兼容；仅三类结构差异（见各处注释）：
+    1. 未授权回复改为后台任务，不占分发主干；
+    2. 非原生音频模型下的音频下载 + Groq 转写移入子任务；
+    3. 非原生文档模型下的文件下载移入子任务。
+    callback_query 分支另做了防御性加固（inline/过期消息不再 KeyError）。
+    """
+    uid = data.get('update_id')
+
+    # ── 消息处理 ──────────────────────────────────────────────────────
+    if "message" in data and isinstance(data["message"], dict):
+        msg = data["message"]
+        chat_id = (msg.get("chat") or {}).get("id")
+        if chat_id is None:
+            logger.warning(f"Webhook: missing chat_id in message, update_id={uid}")
+            return
+        from_user = msg.get("from", {})
+        username, user_id = get_user_info(msg)
+        set_current_user_namespace(user_id or str(chat_id))
+
+        text = msg.get("text", "") or ""
+        is_admin_cmd = (_cmd_match(text, "/adduser") or _cmd_match(text, "/deluser")
+                        or _cmd_match(text, "/listusers") or _cmd_match(text, "/webhookinfo"))
+        if is_admin_cmd:
+            if not is_admin(username, user_id):
+                await send_rich_html_message(chat_id, "❌ <b>权限不足</b>\n只有管理员可以执行此操作。", reply_parameters=_reply_params(msg["message_id"]))
+                return
+            # 不用进程级锁包裹这三个命令：那会让白名单操作和其他用户
+            # 正在做的 /model /role 等命令排队等待，admin 命令之间也会
+            # 互相等待。白名单的读改写由 config.add_whitelist_user /
+            # remove_whitelist_user / snapshot_whitelist 内部的
+            # _whitelist_lock 原子完成（改内存集合 + 落盘在同一把锁内，
+            # 不会有裸读写竞态）。这把锁只保护白名单文件本身，不会阻塞
+            # 其他用户或其他命令。
+            if _cmd_match(text, "/adduser"):
+                parts = text.split()
+                if len(parts) != 2:
+                    await send_rich_html_message(chat_id, "❌ <b>用法错误</b>\n用法：<code>/adduser @username</code> 或 <code>/adduser 123456789</code>", reply_parameters=_reply_params(msg["message_id"]))
+                    return
+                target = parts[1].strip().lstrip("@")
+                if not target:
+                    await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
+                    return
+                added = await add_whitelist_user(target)
+                if added:
+                    await send_rich_html_message(chat_id, f"✅ <b>添加成功</b>\n已添加 <code>{target}</code> 到白名单。", reply_parameters=_reply_params(msg["message_id"]))
+                else:
+                    await send_rich_html_message(chat_id, f"ℹ️ <b>无需操作</b>\n<code>{target}</code> 已在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
+                return
+            elif _cmd_match(text, "/deluser"):
+                parts = text.split()
+                if len(parts) != 2:
+                    await send_rich_html_message(chat_id, "❌ <b>用法错误</b>\n用法：<code>/deluser @username</code> 或 <code>/deluser 123456789</code>", reply_parameters=_reply_params(msg["message_id"]))
+                    return
+                target = parts[1].strip().lstrip("@")
+                if not target:
+                    await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
+                    return
+                removed = await remove_whitelist_user(target)
+                if removed:
+                    await send_rich_html_message(chat_id, f"✅ <b>移除成功</b>\n已移除 <code>{target}</code>。", reply_parameters=_reply_params(msg["message_id"]))
+                else:
+                    await send_rich_html_message(chat_id, f"❌ <b>用户不存在</b>\n<code>{target}</code> 不在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
+                return
+            elif _cmd_match(text, "/listusers"):
+                users = await snapshot_whitelist()
+                if not users:
+                    await send_rich_html_message(chat_id, "📋 <b>白名单为空</b>", reply_parameters=_reply_params(msg["message_id"]))
+                else:
+                    users_list = "".join(f"<li><code>{str(u)}</code></li>" for u in users)
+                    await send_rich_html_message(chat_id, f"📋 <b>当前白名单用户：</b>\n<ul>{users_list}</ul>", reply_parameters=_reply_params(msg["message_id"]))
+                return
+            elif _cmd_match(text, "/webhookinfo"):
+                # 观测命令：把 getWebhookInfo 的关键投递链路指标带回聊天，
+                # 让"积压"（pending_update_count）与最近投递错误无需登服务器
+                # 看日志即可发现。URL 先脱敏，token 不进聊天记录。
+                info = await get_webhook_info()
+                if not info:
+                    await send_rich_html_message(chat_id, "❌ <b>获取失败</b>\ngetWebhookInfo 请求失败，请查看服务端日志。", reply_parameters=_reply_params(msg["message_id"]))
+                    return
+                pending = info.get("pending_update_count", 0)
+                lines = [
+                    "🩺 <b>Webhook 投递链路状态</b>",
+                    "<blockquote>",
+                    f"注册 URL：<code>{mask_webhook_url(info.get('url') or '')}</code>",
+                    f"积压 update：<b>{pending}</b>",
+                    f"IP 地址：<code>{info.get('ip_address') or '—'}</code>",
+                    f"最大连接数：<code>{info.get('max_connections', '—')}</code>",
+                ]
+                last_err_date = info.get("last_error_date")
+                last_err_msg = info.get("last_error_message")
+                if last_err_msg:
+                    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_err_date)) if last_err_date else "未知时间"
+                    lines.append(f"最近投递错误：<code>{str(ts)} / {str(last_err_msg)[:200]}</code>")
+                else:
+                    lines.append("最近投递错误：无 ✅")
+                lines.append("</blockquote>")
+                if pending:
+                    lines.append(
+                        "⚠️ 存在积压：应用健康运行并对重放返回 200 后，Telegram 会自动重放排干"
+                        "（bot 会迟到地回复这批消息）。若希望丢弃：设置 <code>DROP_PENDING_ON_STARTUP=true</code> "
+                        "后重启，或手动调用 <code>deleteWebhook?drop_pending_updates=true</code> 后重新 setWebhook。"
+                    )
+                else:
+                    lines.append("✅ 无积压，投递链路正常。")
+                await send_rich_html_message(chat_id, "\n".join(lines), reply_parameters=_reply_params(msg["message_id"]))
+                return
+
+        if _cmd_match(text, "/start"):
+            authorized = is_authorized(username, user_id)
+            if authorized:
+                welcome_msg = """
 <b>🤖 欢迎使用 AI 助手！</b></br>
 ✅ 您已获得授权，可以直接发送消息与我对话。</br>
 <u>支持的功能：</u></br>
 <blockquote>
 <ul>
-    <li><b>📝 文本对话</b> - 自然语言交流</li>
-    <li><b>🖼️ 图片分析</b> - 图像识别与描述</li>
-    <li><b>📄 文档解析</b> - PDF、Word等文件处理</li>
-    <li><b>🔗 联网搜索</b> - 实时信息查询</li>
+<li><b>📝 文本对话</b> - 自然语言交流</li>
+<li><b>🖼️ 图片分析</b> - 图像识别与描述</li>
+<li><b>📄 文档解析</b> - PDF、Word等文件处理</li>
+<li><b>🔗 联网搜索</b> - 实时信息查询</li>
 </ul>
 </blockquote>
 </br>💡 <i>提示：如需帮助，请联系管理员 @dearella</i>
 """
-                else:
-                    welcome_msg = """
+            else:
+                welcome_msg = """
 <b>🤖 欢迎使用 AI 助手！</b></br>
 ⚠️ <b>注意</b>：此机器人启用了白名单机制。</br>
 请联系管理员 <b>@dearella</b></br> 申请白名单后，才能使用全部功能。
 """
-                await send_rich_html_message(chat_id, welcome_msg, reply_parameters=_reply_params(msg["message_id"]))
-                return "OK", 200
+            await send_rich_html_message(chat_id, welcome_msg, reply_parameters=_reply_params(msg["message_id"]))
+            return
 
-            if not is_authorized(username, user_id):
-                await reply_unauthorized(chat_id, msg.get("message_id"))
-                return "OK", 200
+        if not is_authorized(username, user_id):
+            # 未授权回复是 Telegram API 网络调用：移入后台任务，不占分发
+            # 主干槽位，也不阻塞同 chat 后续 update 的分发。
+            _spawn_bg(reply_unauthorized(chat_id, msg.get("message_id")))
+            return
 
-            lock = await get_chat_lock(chat_id)
-            async with lock:
-                ctx = get_or_init_context(chat_id)
-                ctx["username"] = (from_user.get("username") or from_user.get("first_name") or str(from_user.get("id", chat_id)))
-                user_models.setdefault(chat_id, DEFAULT_MODEL)
-            username = ctx["username"]
+        lock = await get_chat_lock(chat_id)
+        async with lock:
+            ctx = get_or_init_context(chat_id)
+            ctx["username"] = (from_user.get("username") or from_user.get("first_name") or str(from_user.get("id", chat_id)))
+            user_models.setdefault(chat_id, DEFAULT_MODEL)
+        username = ctx["username"]
 
-            # ── 统一事件源入口（USER）────────────────────────────────────
-            # 1) 记录用户活动：重置该 chat 的空闲计时（主动唤醒调度器据此
-            #    决定何时进入 agent 的"活动时间"）。仅私聊参与主动唤醒。
-            # 2) 打断进行中的 TIMER 主动唤醒回合：取消后台 agent 任务，并
-            #    通过 turn_recovery 保全该回合已完成的进度（补占位
-            #    tool_result 后沉淀进历史，全程静默，不显示"已停止"提示）。
-            # 该入口位于所有消息类型/命令分发之前，覆盖全部授权用户输入。
-            try:
-                await proactive.note_user_activity(
-                    chat_id,
-                    private=(msg.get("chat") or {}).get("type") == "private",
-                )
-            except Exception as e:
-                logger.warning(f"note_user_activity 异常: {e}")
-            try:
-                await proactive.interrupt_proactive_flow(chat_id)
-            except Exception as e:
-                logger.warning(f"interrupt_proactive_flow 异常: {e}")
+        # ── 统一事件源入口（USER）────────────────────────────────────
+        # 1) 记录用户活动：重置该 chat 的空闲计时（主动唤醒调度器据此
+        #    决定何时进入 agent 的"活动时间"）。仅私聊参与主动唤醒。
+        # 2) 打断进行中的 TIMER 主动唤醒回合：取消后台 agent 任务，并
+        #    通过 turn_recovery 保全该回合已完成的进度（补占位
+        #    tool_result 后沉淀进历史，全程静默，不显示"已停止"提示）。
+        # 该入口位于所有消息类型/命令分发之前，覆盖全部授权用户输入。
+        try:
+            await proactive.note_user_activity(
+                chat_id,
+                private=(msg.get("chat") or {}).get("type") == "private",
+            )
+        except Exception as e:
+            logger.warning(f"note_user_activity 异常: {e}")
+        try:
+            await proactive.interrupt_proactive_flow(chat_id)
+        except Exception as e:
+            logger.warning(f"interrupt_proactive_flow 异常: {e}")
 
-            # ── Telegram 原生 location（用户分享位置 / 实时位置） ───────
-            # 直接把坐标交给 LLM；如需反查中文地址，LLM 可在后续轮次调用
-            # amap-maps MCP 的 maps_regeocode 工具。
-            if "location" in msg and "text" not in msg:
-                loc = msg["location"]
-                lat = loc.get("latitude")
-                lon = loc.get("longitude")
-                if lat is None or lon is None:
-                    return "OK", 200
+        # ── Telegram 原生 location（用户分享位置 / 实时位置） ───────
+        # 直接把坐标交给 LLM；如需反查中文地址，LLM 可在后续轮次调用
+        # amap-maps MCP 的 maps_regeocode 工具。
+        if "location" in msg and "text" not in msg:
+            loc = msg["location"]
+            lat = loc.get("latitude")
+            lon = loc.get("longitude")
+            if lat is None or lon is None:
+                return
 
-                content_text = (
-                    f"📎 用户分享了当前位置\n"
-                    f"坐标：{lat:.6f}, {lon:.6f} (WGS-84)\n\n"
-                    f"如果用户问起『附近』『周边』等，请直接以此坐标作为中心点，"
-                    f"调用 search_poi / route / distance 等工具，无需再调用 geocode。"
-                    f"如需反查中文地址，请调用 amap-maps MCP 的 maps_regeocode 工具。"
-                )
-                user_message = {"role": "user", "content": content_text}
-                await _interrupt_active_generation(chat_id)
-                task = asyncio.create_task(
-                    _handle_text_message(chat_id, content_text, username, user_message)
-                )
-                async with active_tasks_lock:
-                    active_tasks[chat_id] = task
-                task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                return "OK", 200
+            content_text = (
+                f"📎 用户分享了当前位置\n"
+                f"坐标：{lat:.6f}, {lon:.6f} (WGS-84)\n\n"
+                f"如果用户问起『附近』『周边』等，请直接以此坐标作为中心点，"
+                f"调用 search_poi / route / distance 等工具，无需再调用 geocode。"
+                f"如需反查中文地址，请调用 amap-maps MCP 的 maps_regeocode 工具。"
+            )
+            user_message = {"role": "user", "content": content_text}
+            await _interrupt_active_generation(chat_id)
+            task = asyncio.create_task(
+                _handle_text_message(chat_id, content_text, username, user_message)
+            )
+            async with active_tasks_lock:
+                active_tasks[chat_id] = task
+            task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
+            return
 
-            # ── 媒体组（图片） ─────────────────────────────────
-            # 存储与任务 key 加 ":photo" 后缀：混合相册（photo+video 同
-            # media_group_id）里两类分片各占一个子组，互不争抢聚合存储。
-            if "media_group_id" in msg and "photo" in msg:
-                mg = msg["media_group_id"]
-                group_key = f"{mg}:photo"
-                await add_media_group_message(group_key, msg)
-                # 图片组存在聚合等待期；只在首个分片到达时中断旧草稿并登记任务。
-                # 同一组的后续分片不能取消正在等待自身完整内容的聚合任务。
-                # 混合相册：同组视频任务已在等待时不中断它，让两组各自完成。
-                if group_key not in _media_group_tasks:
-                    if f"{mg}:video" not in _video_group_tasks:
-                        await _interrupt_active_generation(chat_id)
-                    await _schedule_media_group(chat_id, group_key)
-                return "OK", 200
-
-            # ── 视频相册（聚合，对称图片组） ─────────────────────
-            # Telegram 相册可含多个视频分片（或 photo+video 混合）。聚合
-            # 等待期后合并为一条 type="video_group" 消息触发一轮 AI。
-            if "media_group_id" in msg and ("video" in msg or "video_note" in msg):
-                mg = msg["media_group_id"]
-                group_key = f"{mg}:video"
-                await add_media_group_message(group_key, msg)
-                if group_key not in _video_group_tasks:
-                    # 同一相册的图片组任务已在等待时不中断它（混合相册）
-                    if f"{mg}:photo" not in _media_group_tasks:
-                        await _interrupt_active_generation(chat_id)
-                    await _schedule_video_group(chat_id, group_key)
-                return "OK", 200
-
-            # ── 文档组 ─────────────────────────────────────────────────────
-            if "media_group_id" in msg and "document" in msg:
-                mg = msg["media_group_id"]
-                await add_media_group_message(mg, msg)
-                # 文档组同样只在首个分片时中断旧草稿；同组后续文件继续聚合。
-                if mg not in _document_group_tasks:
+        # ── 媒体组（图片） ─────────────────────────────────
+        # 存储与任务 key 加 ":photo" 后缀：混合相册（photo+video 同
+        # media_group_id）里两类分片各占一个子组，互不争抢聚合存储。
+        if "media_group_id" in msg and "photo" in msg:
+            mg = msg["media_group_id"]
+            group_key = f"{mg}:photo"
+            await add_media_group_message(group_key, msg)
+            # 图片组存在聚合等待期；只在首个分片到达时中断旧草稿并登记任务。
+            # 同一组的后续分片不能取消正在等待自身完整内容的聚合任务。
+            # 混合相册：同组视频任务已在等待时不中断它，让两组各自完成。
+            if group_key not in _media_group_tasks:
+                if f"{mg}:video" not in _video_group_tasks:
                     await _interrupt_active_generation(chat_id)
-                    await _schedule_document_group(chat_id, mg)
-                return "OK", 200
+                await _schedule_media_group(chat_id, group_key)
+            return
 
-            # ── 单张图片 ──────────────────────────────────────────────────
-            if "photo" in msg:
-                fid = msg["photo"][-1]["file_id"]
-                cap = msg.get("caption", "").strip()
-                context_prefix = _get_reply_context(msg)
-                if context_prefix:
-                    cap = context_prefix + cap
+        # ── 视频相册（聚合，对称图片组） ─────────────────────
+        # Telegram 相册可含多个视频分片（或 photo+video 混合）。聚合
+        # 等待期后合并为一条 type="video_group" 消息触发一轮 AI。
+        if "media_group_id" in msg and ("video" in msg or "video_note" in msg):
+            mg = msg["media_group_id"]
+            group_key = f"{mg}:video"
+            await add_media_group_message(group_key, msg)
+            if group_key not in _video_group_tasks:
+                # 同一相册的图片组任务已在等待时不中断它（混合相册）
+                if f"{mg}:photo" not in _media_group_tasks:
+                    await _interrupt_active_generation(chat_id)
+                await _schedule_video_group(chat_id, group_key)
+            return
 
-                file_name = f"photo_{fid[:8]}.jpg"
-                content_text = f"📎 用户上传了图片「{file_name}」"
+        # ── 文档组 ─────────────────────────────────────────────────────
+        if "media_group_id" in msg and "document" in msg:
+            mg = msg["media_group_id"]
+            await add_media_group_message(mg, msg)
+            # 文档组同样只在首个分片时中断旧草稿；同组后续文件继续聚合。
+            if mg not in _document_group_tasks:
+                await _interrupt_active_generation(chat_id)
+                await _schedule_document_group(chat_id, mg)
+            return
+
+        # ── 单张图片 ──────────────────────────────────────────────────
+        if "photo" in msg:
+            fid = msg["photo"][-1]["file_id"]
+            cap = msg.get("caption", "").strip()
+            context_prefix = _get_reply_context(msg)
+            if context_prefix:
+                cap = context_prefix + cap
+
+            file_name = f"photo_{fid[:8]}.jpg"
+            content_text = f"📎 用户上传了图片「{file_name}」"
+            if cap:
+                content_text += f"\n\n{cap}"
+            else:
+                content_text += "\n\n请描述这张图片的内容"
+
+            user_message = {
+                "role": "user",
+                "content": content_text,
+                "file_ids": [fid],
+                "file_names": [file_name],
+                "type": "photo_group",
+                "attachments": [
+                    {
+                        "kind": "photo",
+                        "file_id": fid,
+                        "file_name": file_name,
+                    }
+                ],
+            }
+
+            await _interrupt_active_generation(chat_id)
+            task = asyncio.create_task(_handle_photo_message(chat_id, user_message, username))
+            async with active_tasks_lock:
+                active_tasks[chat_id] = task
+            task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
+            return
+
+        # ── 单个文档 ──────────────────────────────────────────────────
+        if "document" in msg and "media_group_id" not in msg:
+            doc = msg["document"]
+            fid = doc["file_id"]
+            fname = doc.get("file_name") or f"document_{fid[:8]}.bin"
+            mime_type = doc.get("mime_type") or mimetypes.guess_type(fname)[0] or "application/pdf"
+            cap = msg.get("caption", "").strip()
+            context_prefix = _get_reply_context(msg)
+            if context_prefix:
+                cap = context_prefix + cap
+
+            async with lock:
+                cm = get_user_model(chat_id)
+                model_info = SUPPORTED_MODELS.get(cm)
+                supports_native_document = bool(model_info.native_document) if model_info else False
+
+            if supports_native_document:
+                content_text = f"📎 用户上传了文档「{fname}」"
                 if cap:
                     content_text += f"\n\n{cap}"
                 else:
-                    content_text += "\n\n请描述这张图片的内容"
-
+                    content_text += "\n\n请直接阅读并分析这个文档。"
                 user_message = {
                     "role": "user",
                     "content": content_text,
-                    "file_ids": [fid],
-                    "file_names": [file_name],
-                    "type": "photo_group",
+                    "file_id": fid,
+                    "file_name": fname,
+                    "mime_type": mime_type,
+                    "type": "document",
                     "attachments": [
                         {
-                            "kind": "photo",
+                            "kind": "document",
                             "file_id": fid,
-                            "file_name": file_name,
+                            "file_name": fname,
+                            "mime_type": mime_type,
                         }
                     ],
                 }
-
+            else:
+                # 非原生文档模型：先把文件下载到工作区再交给 agent。下载是
+                # 重负载网络 I/O（大文件可达数十秒），Fast-ACK 后移入子任务
+                # 执行，不再占用分发主干/信号量槽位。旧轮次打断先行（与
+                # 图片/视频分支一致），下载完直接启动新一轮。
                 await _interrupt_active_generation(chat_id)
-                task = asyncio.create_task(_handle_photo_message(chat_id, user_message, username))
-                async with active_tasks_lock:
-                    active_tasks[chat_id] = task
-                task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                return "OK", 200
 
-            # ── 单个文档 ──────────────────────────────────────────────────
-            if "document" in msg and "media_group_id" not in msg:
-                doc = msg["document"]
-                fid = doc["file_id"]
-                fname = doc.get("file_name") or f"document_{fid[:8]}.bin"
-                mime_type = doc.get("mime_type") or mimetypes.guess_type(fname)[0] or "application/pdf"
-                cap = msg.get("caption", "").strip()
-                context_prefix = _get_reply_context(msg)
-                if context_prefix:
-                    cap = context_prefix + cap
-
-                async with lock:
-                    cm = get_user_model(chat_id)
-                    model_info = SUPPORTED_MODELS.get(cm)
-                    supports_native_document = bool(model_info.native_document) if model_info else False
-
-                if supports_native_document:
-                    content_text = f"📎 用户上传了文档「{fname}」"
-                    if cap:
-                        content_text += f"\n\n{cap}"
-                    else:
-                        content_text += "\n\n请直接阅读并分析这个文档。"
-                    user_message = {
-                        "role": "user",
-                        "content": content_text,
-                        "file_id": fid,
-                        "file_name": fname,
-                        "mime_type": mime_type,
-                        "type": "document",
-                        "attachments": [
-                            {
-                                "kind": "document",
-                                "file_id": fid,
-                                "file_name": fname,
-                                "mime_type": mime_type,
-                            }
-                        ],
-                    }
-                else:
+                async def _download_then_handle_document():
                     workspace = workspace_download_root(chat_id)
                     workspace.mkdir(parents=True, exist_ok=True)
                     safe_fname = os.path.basename(fname)
@@ -1860,61 +2051,78 @@ async def webhook() -> tuple:
                             content_text = f"📎 用户上传了文档「{safe_fname}」，但下载失败，请稍后重试。"
 
                     user_message = {"role": "user", "content": content_text, "file_id": fid, "file_name": safe_fname, "mime_type": mime_type, "type": "document", "attachments": [{"kind": "document", "file_id": fid, "file_name": safe_fname, "mime_type": mime_type}]}
-
-                await _interrupt_active_generation(chat_id)
-                task = asyncio.create_task(_handle_document_message(chat_id, user_message, username))
-                async with active_tasks_lock:
-                    active_tasks[chat_id] = task
-                task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                return "OK", 200
-
-            # ── 语音 / 音频 ───────────────────────────────────────────────
-            if "voice" in msg or "audio" in msg:
-                media_key = "voice" if "voice" in msg else "audio"
-                media = msg[media_key]
-                fid = media["file_id"]
-                fname = media.get("file_name", f"{media_key}_{fid[:8]}.ogg")
-                cap = msg.get("caption", "").strip()
-                context_prefix = _get_reply_context(msg)
-                if context_prefix:
-                    cap = context_prefix + cap
-
-                async with lock:
-                    current_model = get_user_model(chat_id)
-                    model_info = SUPPORTED_MODELS.get(current_model)
-                    supports_audio = model_info.audio if model_info else False
-
-                if supports_audio:
-                    content_text = f"📎 用户上传了音频「{fname}」"
-                    if cap:
-                        content_text += f"\n\n{cap}"
-                    else:
-                        content_text += "\n\n请分析这段音频"
-                    user_message = {
-                        "role": "user",
-                        "content": content_text,
-                        "file_id": fid,
-                        "type": media_key,
-                        "attachments": [
-                            {
-                                "kind": media_key,
-                                "file_id": fid,
-                                "file_name": fname,
-                            }
-                        ],
-                    }
-                    await _interrupt_active_generation(chat_id)
-                    task = asyncio.create_task(_handle_audio_message(chat_id, user_message, username))
+                    task = asyncio.create_task(_handle_document_message(chat_id, user_message, username))
                     async with active_tasks_lock:
                         active_tasks[chat_id] = task
                     task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                    return "OK", 200
+
+                _spawn_bg(_download_then_handle_document())
+                return
+
+            await _interrupt_active_generation(chat_id)
+            task = asyncio.create_task(_handle_document_message(chat_id, user_message, username))
+            async with active_tasks_lock:
+                active_tasks[chat_id] = task
+            task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
+            return
+
+        # ── 语音 / 音频 ───────────────────────────────────────────────
+        if "voice" in msg or "audio" in msg:
+            media_key = "voice" if "voice" in msg else "audio"
+            media = msg[media_key]
+            fid = media["file_id"]
+            fname = media.get("file_name", f"{media_key}_{fid[:8]}.ogg")
+            cap = msg.get("caption", "").strip()
+            context_prefix = _get_reply_context(msg)
+            if context_prefix:
+                cap = context_prefix + cap
+
+            async with lock:
+                current_model = get_user_model(chat_id)
+                model_info = SUPPORTED_MODELS.get(current_model)
+                supports_audio = model_info.audio if model_info else False
+
+            if supports_audio:
+                content_text = f"📎 用户上传了音频「{fname}」"
+                if cap:
+                    content_text += f"\n\n{cap}"
                 else:
+                    content_text += "\n\n请分析这段音频"
+                user_message = {
+                    "role": "user",
+                    "content": content_text,
+                    "file_id": fid,
+                    "type": media_key,
+                    "attachments": [
+                        {
+                            "kind": media_key,
+                            "file_id": fid,
+                            "file_name": fname,
+                        }
+                    ],
+                }
+                await _interrupt_active_generation(chat_id)
+                task = asyncio.create_task(_handle_audio_message(chat_id, user_message, username))
+                async with active_tasks_lock:
+                    active_tasks[chat_id] = task
+                task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
+                return
+            else:
+                # 非原生音频模型：音频下载 + Groq 转写是重负载网络 I/O
+                # （数秒～数十秒），移入子任务执行，不再占用分发主干/
+                # 信号量槽位。旧轮次打断先行（与图片/视频分支一致）。
+                await _interrupt_active_generation(chat_id)
+
+                async def _transcribe_then_handle_audio():
                     content_text_parts = []
                     if cap:
                         content_text_parts.append(cap)
                     if GROQ_API_KEY:
-                        audio_bytes = await _get_cached_audio_data(chat_id, fid)
+                        try:
+                            audio_bytes = await _get_cached_audio_data(chat_id, fid)
+                        except Exception as e:
+                            logger.error(f"音频缓存读取失败: {e}")
+                            audio_bytes = None
                         if audio_bytes:
                             ext = os.path.splitext(fname)[1] or ".ogg"
                             try:
@@ -1940,544 +2148,544 @@ async def webhook() -> tuple:
                             }
                         ],
                     }
-                    await _interrupt_active_generation(chat_id)
                     task = asyncio.create_task(_handle_audio_message(chat_id, user_message, username))
                     async with active_tasks_lock:
                         active_tasks[chat_id] = task
                     task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                    return "OK", 200
-            # ── 视频 / 圆形视频（单发，无 media_group_id） ─────
-            # 相册里的视频分片已在上方"视频相册"分支聚合处理；到达这里的
-            # 一定是单独发送的视频。video_note（圆形视频）无 file_name /
-            # mime_type，给默认值。
-            if "video" in msg or "video_note" in msg:
-                is_video_note = "video_note" in msg and "video" not in msg
-                media = msg.get("video") or msg.get("video_note") or {}
-                fid = media.get("file_id", "")
-                if fid:
-                    mime_type = media.get("mime_type") or "video/mp4"
-                    if is_video_note:
-                        fname = f"video_note_{fid[:8]}.mp4"
-                    else:
-                        fname = media.get("file_name") or f"video_{fid[:8]}.mp4"
-                    cap = msg.get("caption", "").strip()
-                    context_prefix = _get_reply_context(msg)
-                    if context_prefix:
-                        cap = context_prefix + cap
 
-                    content_text = f"📎 用户上传了视频「{fname}」"
-                    if cap:
-                        content_text += f"\n\n{cap}"
-                    else:
-                        content_text += "\n\n请分析这段视频。"
-
-                    user_message = {
-                        "role": "user",
-                        "content": content_text,
-                        "file_id": fid,
-                        "file_name": fname,
-                        "mime_type": mime_type,
-                        "type": "video",
-                        "attachments": [
-                            {
-                                "kind": "video",
-                                "file_id": fid,
-                                "file_name": fname,
-                                "mime_type": mime_type,
-                            }
-                        ],
-                    }
-
-                    await _interrupt_active_generation(chat_id)
-                    task = asyncio.create_task(_handle_video_message(chat_id, user_message, username))
-                    async with active_tasks_lock:
-                        active_tasks[chat_id] = task
-                    task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                    return "OK", 200
-
-            # ── 贴纸（sticker）─────────────────────────────────────────────
-            # Sticker 本体（TGS / WebP / WebM）当前主流 LLM 不可直接识别，
-            # 但 Sticker 对象携带 emoji / emoji_list / type / set_name 等
-            # 可语义化字段，把它们的元数据拼成文本作为 user 消息发给模型；
-            # 不把 file_id 推为附件，避免 _resolve_multimodal_content 把
-            # 不可识别媒体推到模型 API 触发 400。
-            if "sticker" in msg:
-                sticker_obj = msg["sticker"] or {}
-                sticker_meta = extract_sticker_metadata(sticker_obj)
-                sticker_text = sticker_metadata_to_text(sticker_obj)
-
-                context_prefix = _get_reply_context(msg)
-
-                content_lines = ["📎 用户发送了贴纸"]
-                if sticker_text and sticker_text != "[贴纸]":
-                    content_lines.append(sticker_text)
+                _spawn_bg(_transcribe_then_handle_audio())
+                return
+        # ── 视频 / 圆形视频（单发，无 media_group_id） ─────
+        # 相册里的视频分片已在上方"视频相册"分支聚合处理；到达这里的
+        # 一定是单独发送的视频。video_note（圆形视频）无 file_name /
+        # mime_type，给默认值。
+        if "video" in msg or "video_note" in msg:
+            is_video_note = "video_note" in msg and "video" not in msg
+            media = msg.get("video") or msg.get("video_note") or {}
+            fid = media.get("file_id", "")
+            if fid:
+                mime_type = media.get("mime_type") or "video/mp4"
+                if is_video_note:
+                    fname = f"video_note_{fid[:8]}.mp4"
                 else:
-                    # 退化场景：Sticker 没有任何可读元数据时也至少给个
-                    # 占位，避免把空内容塞给模型。
-                    content_lines.append("[贴纸]（无可读元数据）")
+                    fname = media.get("file_name") or f"video_{fid[:8]}.mp4"
+                cap = msg.get("caption", "").strip()
+                context_prefix = _get_reply_context(msg)
                 if context_prefix:
-                    content_lines.append("")
-                    content_lines.append(context_prefix.rstrip())
-                content_text = "\n".join(l for l in content_lines if l is not None).strip()
+                    cap = context_prefix + cap
+
+                content_text = f"📎 用户上传了视频「{fname}」"
+                if cap:
+                    content_text += f"\n\n{cap}"
+                else:
+                    content_text += "\n\n请分析这段视频。"
 
                 user_message = {
                     "role": "user",
                     "content": content_text,
-                    "type": "sticker",
-                    # 保留 sticker 元数据快照，方便后续历史回看 / 工具调用
-                    # 引用，但不会出现在出站 LLM 消息里（_append_history_async
-                    # 已经过滤掉所有非 OpenAI 协议字段）。
-                    "sticker_meta": sticker_meta,
+                    "file_id": fid,
+                    "file_name": fname,
+                    "mime_type": mime_type,
+                    "type": "video",
+                    "attachments": [
+                        {
+                            "kind": "video",
+                            "file_id": fid,
+                            "file_name": fname,
+                            "mime_type": mime_type,
+                        }
+                    ],
                 }
 
                 await _interrupt_active_generation(chat_id)
-                task = asyncio.create_task(_handle_sticker_message(chat_id, user_message, username))
+                task = asyncio.create_task(_handle_video_message(chat_id, user_message, username))
                 async with active_tasks_lock:
                     active_tasks[chat_id] = task
                 task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                return "OK", 200
+                return
 
-            # ── 文本消息 ──────────────────────────────────────────────────
-            if "text" in msg:
-                user_input = msg["text"]
+        # ── 贴纸（sticker）─────────────────────────────────────────────
+        # Sticker 本体（TGS / WebP / WebM）当前主流 LLM 不可直接识别，
+        # 但 Sticker 对象携带 emoji / emoji_list / type / set_name 等
+        # 可语义化字段，把它们的元数据拼成文本作为 user 消息发给模型；
+        # 不把 file_id 推为附件，避免 _resolve_multimodal_content 把
+        # 不可识别媒体推到模型 API 触发 400。
+        if "sticker" in msg:
+            sticker_obj = msg["sticker"] or {}
+            sticker_meta = extract_sticker_metadata(sticker_obj)
+            sticker_text = sticker_metadata_to_text(sticker_obj)
 
-                # 若当前 message_user 正在等待回复，优先把这条消息交给原 agent turn，
-                # 不要启动新的 AI turn。命令仍保留为真正的 bot 指令入口。
-                # 提问卡与通知卡均适用：用户直接打字即视为回复
-                # （"用户回复了就是正常"），无需先点"自定义回答"按钮。
-                pending_ask = await get_pending_for_chat(chat_id)
-                if (
-                    pending_ask
-                    and not user_input.startswith("/")
-                    and await resolve_message_user_text(chat_id, user_input)
-                ):
-                    return "OK", 200
+            context_prefix = _get_reply_context(msg)
 
-                if _cmd_match(user_input, "/role"):
-                    cr = await get_user_role(chat_id)
-                    prev_mid = role_message_ids.get(chat_id)
-                    if not prev_mid or not await update_role_list(chat_id, prev_mid, SUPPORTED_ROLES, cr):
-                        mid = await send_role_list(chat_id, SUPPORTED_ROLES, cr, msg.get("message_id"))
-                        if mid:
-                            role_message_ids[chat_id] = mid
-                    return "OK", 200
+            content_lines = ["📎 用户发送了贴纸"]
+            if sticker_text and sticker_text != "[贴纸]":
+                content_lines.append(sticker_text)
+            else:
+                # 退化场景：Sticker 没有任何可读元数据时也至少给个
+                # 占位，避免把空内容塞给模型。
+                content_lines.append("[贴纸]（无可读元数据）")
+            if context_prefix:
+                content_lines.append("")
+                content_lines.append(context_prefix.rstrip())
+            content_text = "\n".join(l for l in content_lines if l is not None).strip()
 
-                if _cmd_match(user_input, "/balance"):
-                    parts = user_input.split(maxsplit=1)
-                    svc = parts[1].lower() if len(parts) > 1 else None
-                    msgs = []
-                    if not svc or svc == "all":
-                        b, u = await check_deepseek_balance()
-                        if b is not None:
-                            msgs.append(f"💰 <b>DeepSeek</b>: <code>{b} {u}</code>")
-                        else:
-                            msgs.append(f"⚠️ <b>DeepSeek</b>: 查询失败 <i>({u if u else '未知错误'})</i>")
-                        orb = await check_openrouter_balance()
-                        if orb is not None and orb >= 0:
-                            msgs.append(f"💰 <b>OpenRouter</b>: <code>${orb:.3f} USD</code>")
-                        else:
-                            msgs.append("⚠️ <b>OpenRouter</b>: 查询失败")
-                    elif svc in ("deepseek", "ds"):
-                        b, u = await check_deepseek_balance()
-                        if b is not None:
-                            msgs.append(f"💰 <b>DeepSeek</b>: <code>{b} {u}</code>")
-                        else:
-                            msgs.append(f"⚠️ <b>DeepSeek</b>: 查询失败 <i>({u if u else '未知错误'})</i>")
-                    elif svc in ("openrouter", "or"):
-                        orb = await check_openrouter_balance()
-                        if orb is not None and orb >= 0:
-                            msgs.append(f"💰 <b>OpenRouter</b>: <code>${orb:.3f} USD</code>")
-                        else:
-                            msgs.append("⚠️ <b>OpenRouter</b>: 查询失败")
+            user_message = {
+                "role": "user",
+                "content": content_text,
+                "type": "sticker",
+                # 保留 sticker 元数据快照，方便后续历史回看 / 工具调用
+                # 引用，但不会出现在出站 LLM 消息里（_append_history_async
+                # 已经过滤掉所有非 OpenAI 协议字段）。
+                "sticker_meta": sticker_meta,
+            }
+
+            await _interrupt_active_generation(chat_id)
+            task = asyncio.create_task(_handle_sticker_message(chat_id, user_message, username))
+            async with active_tasks_lock:
+                active_tasks[chat_id] = task
+            task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
+            return
+
+        # ── 文本消息 ──────────────────────────────────────────────────
+        if "text" in msg:
+            user_input = msg["text"]
+
+            # 若当前 message_user 正在等待回复，优先把这条消息交给原 agent turn，
+            # 不要启动新的 AI turn。命令仍保留为真正的 bot 指令入口。
+            # 提问卡与通知卡均适用：用户直接打字即视为回复
+            # （"用户回复了就是正常"），无需先点"自定义回答"按钮。
+            pending_ask = await get_pending_for_chat(chat_id)
+            if (
+                pending_ask
+                and not user_input.startswith("/")
+                and await resolve_message_user_text(chat_id, user_input)
+            ):
+                return
+
+            if _cmd_match(user_input, "/role"):
+                cr = await get_user_role(chat_id)
+                prev_mid = role_message_ids.get(chat_id)
+                if not prev_mid or not await update_role_list(chat_id, prev_mid, SUPPORTED_ROLES, cr):
+                    mid = await send_role_list(chat_id, SUPPORTED_ROLES, cr, msg.get("message_id"))
+                    if mid:
+                        role_message_ids[chat_id] = mid
+                return
+
+            if _cmd_match(user_input, "/balance"):
+                parts = user_input.split(maxsplit=1)
+                svc = parts[1].lower() if len(parts) > 1 else None
+                msgs = []
+                if not svc or svc == "all":
+                    b, u = await check_deepseek_balance()
+                    if b is not None:
+                        msgs.append(f"💰 <b>DeepSeek</b>: <code>{b} {u}</code>")
                     else:
-                        msgs.append("❌ 无效服务名，可用: <code>deepseek</code>, <code>openrouter</code>, <code>all</code>")
-                    # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置
+                        msgs.append(f"⚠️ <b>DeepSeek</b>: 查询失败 <i>({u if u else '未知错误'})</i>")
+                    orb = await check_openrouter_balance()
+                    if orb is not None and orb >= 0:
+                        msgs.append(f"💰 <b>OpenRouter</b>: <code>${orb:.3f} USD</code>")
+                    else:
+                        msgs.append("⚠️ <b>OpenRouter</b>: 查询失败")
+                elif svc in ("deepseek", "ds"):
+                    b, u = await check_deepseek_balance()
+                    if b is not None:
+                        msgs.append(f"💰 <b>DeepSeek</b>: <code>{b} {u}</code>")
+                    else:
+                        msgs.append(f"⚠️ <b>DeepSeek</b>: 查询失败 <i>({u if u else '未知错误'})</i>")
+                elif svc in ("openrouter", "or"):
+                    orb = await check_openrouter_balance()
+                    if orb is not None and orb >= 0:
+                        msgs.append(f"💰 <b>OpenRouter</b>: <code>${orb:.3f} USD</code>")
+                    else:
+                        msgs.append("⚠️ <b>OpenRouter</b>: 查询失败")
+                else:
+                    msgs.append("❌ 无效服务名，可用: <code>deepseek</code>, <code>openrouter</code>, <code>all</code>")
+                # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置
+                await _send_via_send_message(
+                    chat_id,
+                    "\n".join(msgs),
+                    reply_message_id=msg["message_id"],
+                )
+                return
+
+            if _cmd_match(user_input, "/model"):
+                if (msg.get("chat") or {}).get("type") != "private":
                     await _send_via_send_message(
                         chat_id,
-                        "\n".join(msgs),
+                        "❌ <b>操作受限</b>\n模型切换仅限私聊使用。",
                         reply_message_id=msg["message_id"],
                     )
-                    return "OK", 200
+                    return
+                # get_user_role 内部已用 state._role_lock 保护，无需再套
+                # 进程级锁——那会让 /model 命令等待其他用户正在做的
+                # /adduser 等操作释放锁。
+                current_role = await get_user_role(chat_id)
+                banner_html = ""
+                if current_role:
+                    banner_html = f"⚠️ <b>兼容性提示</b>\n当前角色「<b>{current_role}</b>」可能与新模型不兼容，请留意。"
+                await send_model_list(
+                    chat_id,
+                    list(SUPPORTED_MODELS.keys()),
+                    msg.get("message_id"),
+                    banner_html=banner_html,
+                )
+                return
 
-                if _cmd_match(user_input, "/model"):
-                    if (msg.get("chat") or {}).get("type") != "private":
-                        await _send_via_send_message(
-                            chat_id,
-                            "❌ <b>操作受限</b>\n模型切换仅限私聊使用。",
-                            reply_message_id=msg["message_id"],
-                        )
-                        return "OK", 200
-                    # get_user_role 内部已用 state._role_lock 保护，无需再套
-                    # 进程级锁——那会让 /model 命令等待其他用户正在做的
-                    # /adduser 等操作释放锁。
-                    current_role = await get_user_role(chat_id)
-                    banner_html = ""
-                    if current_role:
-                        banner_html = f"⚠️ <b>兼容性提示</b>\n当前角色「<b>{current_role}</b>」可能与新模型不兼容，请留意。"
-                    await send_model_list(
-                        chat_id,
-                        list(SUPPORTED_MODELS.keys()),
-                        msg.get("message_id"),
-                        banner_html=banner_html,
-                    )
-                    return "OK", 200
-
-                if _cmd_match(user_input, "/clear"):
-                    await _interrupt_active_generation(chat_id)
-                    await safe_clear_history(chat_id)
-                    await safe_clear_active_skill(chat_id)
-                    lock = await get_chat_lock(chat_id)
-                    async with lock:
-                        ctx = get_or_init_context(chat_id)
-                        ctx["last_prompt_tokens"] = 0
-                        ctx["last_completion_tokens"] = 0
-                        ctx["token_ledger"] = []
-                    # /clear 是语义边界：历史清空意味着重新开始，主动唤醒
-                    # timer 也重置为随机 5~20min 下一次。
-                    try:
-                        await proactive.reset_proactive_timer(chat_id)
-                    except Exception as e:
-                        logger.warning(f"reset_proactive_timer 异常: {e}")
-                    await send_rich_html_message(chat_id, "✅ <b>操作成功</b>\n对话历史已清空", reply_parameters=_reply_params(msg["message_id"]))
-                    return "OK", 200
-
-                # ── /show on|off：草稿预览开关（USER 与 TIMER 回合统一生效）──
-                if _cmd_match(user_input, "/show"):
-                    parts = user_input.split()
-                    arg = parts[1].strip().lower() if len(parts) > 1 else ""
-                    if arg in ("on", "开", "1", "true"):
-                        await set_show_drafts(chat_id, True)
-                        await _send_via_send_message(
-                            chat_id,
-                            "✅ <b>草稿预览已开启</b>\n"
-                            "你发送消息和后台主动巡检（TIMER）时，都会实时展示"
-                            "富文本草稿，最终回复自动送达。",
-                            reply_message_id=msg["message_id"],
-                        )
-                    elif arg in ("off", "关", "0", "false"):
-                        await set_show_drafts(chat_id, False)
-                        await _send_via_send_message(
-                            chat_id,
-                            "✅ <b>草稿预览已关闭（静默模式）</b>\n"
-                            "过程不再实时展示。交付规则分两种：\n"
-                            "①你主动发消息时<b>默认交付</b>——最后一条回复正文（不含"
-                            "中间过程）会在回合结束时自动发送给你（AI 也可主动提前发送；"
-                            "仅当 AI 明确选择不发送时本轮才完全静默）；\n"
-                            "②后台主动巡检（TIMER）时默认静默——AI 认为需要你看到"
-                            "结论时才会主动发送（deliver_reply，不经草稿），不发送则"
-                            "本轮完全静默。提问/留言走 message_user。",
-                            reply_message_id=msg["message_id"],
-                        )
-                    else:
-                        current_show = await get_show_drafts(chat_id)
-                        state_line = "开启（/show on）" if current_show else "关闭（/show off）"
-                        await _send_via_send_message(
-                            chat_id,
-                            f"ℹ️ 当前草稿预览：<b>{state_line}</b>\n"
-                            "用法：<code>/show on</code> 开启 · <code>/show off</code> 关闭",
-                            reply_message_id=msg["message_id"],
-                        )
-                    return "OK", 200
-
-                # 普通文本对话
-                context_prefix = _get_reply_context(msg)
-                # 先记录原始输入是否为空，再拼接引用上下文（避免上下文使空输入检查失效）
-                if context_prefix:
-                    user_input = context_prefix + user_input
-
-                reply_media = _get_reply_media(msg)
-
+            if _cmd_match(user_input, "/clear"):
+                await _interrupt_active_generation(chat_id)
+                await safe_clear_history(chat_id)
+                await safe_clear_active_skill(chat_id)
+                lock = await get_chat_lock(chat_id)
                 async with lock:
-                    cm = get_user_model(chat_id)
-                    model_info = SUPPORTED_MODELS.get(cm)
-                    supports_audio = model_info.audio if model_info else False
-                    supports_native_document = bool(model_info.native_document) if model_info else False
+                    ctx = get_or_init_context(chat_id)
+                    ctx["last_prompt_tokens"] = 0
+                    ctx["last_completion_tokens"] = 0
+                    ctx["token_ledger"] = []
+                # /clear 是语义边界：历史清空意味着重新开始，主动唤醒
+                # timer 也重置为随机 5~20min 下一次。
+                try:
+                    await proactive.reset_proactive_timer(chat_id)
+                except Exception as e:
+                    logger.warning(f"reset_proactive_timer 异常: {e}")
+                await send_rich_html_message(chat_id, "✅ <b>操作成功</b>\n对话历史已清空", reply_parameters=_reply_params(msg["message_id"]))
+                return
 
-                if reply_media:
-                    media_type = reply_media.get("type")
-                    file_name = reply_media.get("file_name", f"{media_type}_{reply_media.get('file_id', '')[:8]}")
+            # ── /show on|off：草稿预览开关（USER 与 TIMER 回合统一生效）──
+            if _cmd_match(user_input, "/show"):
+                parts = user_input.split()
+                arg = parts[1].strip().lower() if len(parts) > 1 else ""
+                if arg in ("on", "开", "1", "true"):
+                    await set_show_drafts(chat_id, True)
+                    await _send_via_send_message(
+                        chat_id,
+                        "✅ <b>草稿预览已开启</b>\n"
+                        "你发送消息和后台主动巡检（TIMER）时，都会实时展示"
+                        "富文本草稿，最终回复自动送达。",
+                        reply_message_id=msg["message_id"],
+                    )
+                elif arg in ("off", "关", "0", "false"):
+                    await set_show_drafts(chat_id, False)
+                    await _send_via_send_message(
+                        chat_id,
+                        "✅ <b>草稿预览已关闭（静默模式）</b>\n"
+                        "过程不再实时展示。交付规则分两种：\n"
+                        "①你主动发消息时<b>默认交付</b>——最后一条回复正文（不含"
+                        "中间过程）会在回合结束时自动发送给你（AI 也可主动提前发送；"
+                        "仅当 AI 明确选择不发送时本轮才完全静默）；\n"
+                        "②后台主动巡检（TIMER）时默认静默——AI 认为需要你看到"
+                        "结论时才会主动发送（deliver_reply，不经草稿），不发送则"
+                        "本轮完全静默。提问/留言走 message_user。",
+                        reply_message_id=msg["message_id"],
+                    )
+                else:
+                    current_show = await get_show_drafts(chat_id)
+                    state_line = "开启（/show on）" if current_show else "关闭（/show off）"
+                    await _send_via_send_message(
+                        chat_id,
+                        f"ℹ️ 当前草稿预览：<b>{state_line}</b>\n"
+                        "用法：<code>/show on</code> 开启 · <code>/show off</code> 关闭",
+                        reply_message_id=msg["message_id"],
+                    )
+                return
 
-                    if media_type == "photo":
-                        file_ids = reply_media.get("file_ids", [])
-                        content_text = f"📎 用户引用了图片「{file_name}」"
+            # 普通文本对话
+            context_prefix = _get_reply_context(msg)
+            # 先记录原始输入是否为空，再拼接引用上下文（避免上下文使空输入检查失效）
+            if context_prefix:
+                user_input = context_prefix + user_input
+
+            reply_media = _get_reply_media(msg)
+
+            async with lock:
+                cm = get_user_model(chat_id)
+                model_info = SUPPORTED_MODELS.get(cm)
+                supports_audio = model_info.audio if model_info else False
+                supports_native_document = bool(model_info.native_document) if model_info else False
+
+            if reply_media:
+                media_type = reply_media.get("type")
+                file_name = reply_media.get("file_name", f"{media_type}_{reply_media.get('file_id', '')[:8]}")
+
+                if media_type == "photo":
+                    file_ids = reply_media.get("file_ids", [])
+                    content_text = f"📎 用户引用了图片「{file_name}」"
+                    if user_input:
+                        content_text += f"\n\n{user_input}"
+                    else:
+                        content_text += "\n\n请分析这张图片"
+                    user_message = {
+                        "role": "user",
+                        "content": content_text,
+                        "file_ids": file_ids,
+                        "type": "photo_group",
+                        "attachments": [
+                            {
+                                "kind": "photo",
+                                "file_id": fid,
+                                "file_name": file_name,
+                            }
+                            for fid in file_ids
+                        ],
+                    }
+
+                elif media_type == "document":
+                    safe_fname = os.path.basename(file_name)
+                    mime_type = reply_media.get("mime_type") or mimetypes.guess_type(safe_fname)[0] or "application/pdf"
+
+                    if supports_native_document:
+                        content_text = f"📎 用户引用了文档「{safe_fname}」"
                         if user_input:
                             content_text += f"\n\n{user_input}"
                         else:
-                            content_text += "\n\n请分析这张图片"
+                            content_text += "\n\n请直接阅读并分析这个文档。"
                         user_message = {
                             "role": "user",
                             "content": content_text,
-                            "file_ids": file_ids,
-                            "type": "photo_group",
-                            "attachments": [
-                                {
-                                    "kind": "photo",
-                                    "file_id": fid,
-                                    "file_name": file_name,
-                                }
-                                for fid in file_ids
-                            ],
+                            "file_id": reply_media["file_id"],
+                            "file_name": safe_fname,
+                            "mime_type": mime_type,
+                            "type": "document",
                         }
-
-                    elif media_type == "document":
-                        safe_fname = os.path.basename(file_name)
-                        mime_type = reply_media.get("mime_type") or mimetypes.guess_type(safe_fname)[0] or "application/pdf"
-
-                        if supports_native_document:
-                            content_text = f"📎 用户引用了文档「{safe_fname}」"
-                            if user_input:
-                                content_text += f"\n\n{user_input}"
+                    else:
+                        workspace = workspace_download_root(chat_id)
+                        workspace.mkdir(parents=True, exist_ok=True)
+                        target_path = workspace / safe_fname
+                        workspace_lock = await _get_workspace_lock(chat_id)
+                        async with workspace_lock:
+                            # download_file 内部已经把字节缓存到 R2 的 telegram/{file_id} 前缀，
+                            # download/ 只是本地落地缓冲，不需要再往 R2 镜像一份。
+                            success = await download_file(reply_media["file_id"], str(target_path))
+                            if success:
+                                content_text = (
+                                    f"📎 用户引用了文档「{safe_fname}」，已保存在工作区根目录的 "
+                                    f"download/ 子目录，可直接访问（如 `cat download/{safe_fname}`）。"
+                                )
                             else:
-                                content_text += "\n\n请直接阅读并分析这个文档。"
-                            user_message = {
-                                "role": "user",
-                                "content": content_text,
-                                "file_id": reply_media["file_id"],
-                                "file_name": safe_fname,
-                                "mime_type": mime_type,
-                                "type": "document",
-                            }
-                        else:
-                            workspace = workspace_download_root(chat_id)
-                            workspace.mkdir(parents=True, exist_ok=True)
-                            target_path = workspace / safe_fname
-                            workspace_lock = await _get_workspace_lock(chat_id)
-                            async with workspace_lock:
-                                # download_file 内部已经把字节缓存到 R2 的 telegram/{file_id} 前缀，
-                                # download/ 只是本地落地缓冲，不需要再往 R2 镜像一份。
-                                success = await download_file(reply_media["file_id"], str(target_path))
-                                if success:
-                                    content_text = (
-                                        f"📎 用户引用了文档「{safe_fname}」，已保存在工作区根目录的 "
-                                        f"download/ 子目录，可直接访问（如 `cat download/{safe_fname}`）。"
-                                    )
-                                else:
-                                    content_text = f"📎 用户引用了文档「{safe_fname}」，但下载失败。"
-                                if user_input:
-                                    content_text += f"\n\n用户指令：{user_input}"
-                                else:
-                                    content_text += "\n\n请根据用户指令处理该文档。"
-                            user_message = {"role": "user", "content": content_text}
-
-                    elif media_type in ("audio", "voice"):
-                        if supports_audio:
-                            content_text = f"📎 用户引用了音频「{file_name}」"
+                                content_text = f"📎 用户引用了文档「{safe_fname}」，但下载失败。"
                             if user_input:
-                                content_text += f"\n\n{user_input}"
+                                content_text += f"\n\n用户指令：{user_input}"
                             else:
-                                content_text += "\n\n请分析这段音频"
-                            user_message = {
-                                "role": "user",
-                                "content": content_text,
-                                "file_id": reply_media["file_id"],
-                                "file_name": file_name,
-                                "type": media_type,
-                                "attachments": [
-                                    {
-                                        "kind": media_type,
-                                        "file_id": reply_media["file_id"],
-                                        "file_name": file_name,
-                                    }
-                                ],
-                            }
-                        else:
-                            content_text_parts = []
-                            if user_input:
-                                content_text_parts.append(user_input)
-                            if GROQ_API_KEY:
-                                audio_bytes = await _get_cached_audio_data(chat_id, reply_media["file_id"])
-                                if audio_bytes:
-                                    ext = os.path.splitext(file_name)[1] or ".ogg"
-                                    try:
-                                        transcribed_text = await transcribe_audio_with_groq(audio_bytes, ext)
-                                        if transcribed_text:
-                                            content_text_parts.append(transcribed_text)
-                                    except Exception as e:
-                                        logger.error(f"Groq 转录失败: {e}")
-                            if not content_text_parts:
-                                content_text_parts.append("请分析这段音频")
-                            content_text = "\n\n".join(content_text_parts)
-                            user_message = {
-                                "role": "user",
-                                "content": content_text,
-                                "file_id": reply_media["file_id"],
-                                "file_name": file_name,
-                                "type": media_type,
-                                "attachments": [
-                                    {
-                                        "kind": media_type,
-                                        "file_id": reply_media["file_id"],
-                                        "file_name": file_name,
-                                    }
-                                ],
-                            }
-                    elif media_type == "video":
-                        content_text = f"📎 用户引用了视频「{file_name}」"
+                                content_text += "\n\n请根据用户指令处理该文档。"
+                        user_message = {"role": "user", "content": content_text}
+
+                elif media_type in ("audio", "voice"):
+                    if supports_audio:
+                        content_text = f"📎 用户引用了音频「{file_name}」"
                         if user_input:
                             content_text += f"\n\n{user_input}"
                         else:
-                            content_text += "\n\n请分析这个视频"
+                            content_text += "\n\n请分析这段音频"
                         user_message = {
                             "role": "user",
                             "content": content_text,
                             "file_id": reply_media["file_id"],
                             "file_name": file_name,
-                            "mime_type": reply_media.get("mime_type", "video/mp4"),
-                            "type": "video",
+                            "type": media_type,
                             "attachments": [
                                 {
-                                    "kind": "video",
+                                    "kind": media_type,
                                     "file_id": reply_media["file_id"],
                                     "file_name": file_name,
-                                    "mime_type": reply_media.get("mime_type", "video/mp4"),
                                 }
                             ],
                         }
                     else:
-                        content_text = f"📎 用户引用了媒体「{file_name}」\n\n{user_input}" if user_input else f"📎 用户引用了媒体「{file_name}」"
-                        user_message = {"role": "user", "content": content_text}
+                        content_text_parts = []
+                        if user_input:
+                            content_text_parts.append(user_input)
+                        if GROQ_API_KEY:
+                            audio_bytes = await _get_cached_audio_data(chat_id, reply_media["file_id"])
+                            if audio_bytes:
+                                ext = os.path.splitext(file_name)[1] or ".ogg"
+                                try:
+                                    transcribed_text = await transcribe_audio_with_groq(audio_bytes, ext)
+                                    if transcribed_text:
+                                        content_text_parts.append(transcribed_text)
+                                except Exception as e:
+                                    logger.error(f"Groq 转录失败: {e}")
+                        if not content_text_parts:
+                            content_text_parts.append("请分析这段音频")
+                        content_text = "\n\n".join(content_text_parts)
+                        user_message = {
+                            "role": "user",
+                            "content": content_text,
+                            "file_id": reply_media["file_id"],
+                            "file_name": file_name,
+                            "type": media_type,
+                            "attachments": [
+                                {
+                                    "kind": media_type,
+                                    "file_id": reply_media["file_id"],
+                                    "file_name": file_name,
+                                }
+                            ],
+                        }
+                elif media_type == "video":
+                    content_text = f"📎 用户引用了视频「{file_name}」"
+                    if user_input:
+                        content_text += f"\n\n{user_input}"
+                    else:
+                        content_text += "\n\n请分析这个视频"
+                    user_message = {
+                        "role": "user",
+                        "content": content_text,
+                        "file_id": reply_media["file_id"],
+                        "file_name": file_name,
+                        "mime_type": reply_media.get("mime_type", "video/mp4"),
+                        "type": "video",
+                        "attachments": [
+                            {
+                                "kind": "video",
+                                "file_id": reply_media["file_id"],
+                                "file_name": file_name,
+                                "mime_type": reply_media.get("mime_type", "video/mp4"),
+                            }
+                        ],
+                    }
                 else:
-                    user_message = {"role": "user", "content": user_input}
+                    content_text = f"📎 用户引用了媒体「{file_name}」\n\n{user_input}" if user_input else f"📎 用户引用了媒体「{file_name}」"
+                    user_message = {"role": "user", "content": content_text}
+            else:
+                user_message = {"role": "user", "content": user_input}
 
-                logger.debug(f"最终 user_message 内容: {user_message.get('content', '')[:500]}")
+            logger.debug(f"最终 user_message 内容: {user_message.get('content', '')[:500]}")
 
-                await _interrupt_active_generation(chat_id)
-                task = asyncio.create_task(_handle_text_message(chat_id, user_input, username, user_message))
-                async with active_tasks_lock:
-                    active_tasks[chat_id] = task
-                task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                return "OK", 200
+            await _interrupt_active_generation(chat_id)
+            task = asyncio.create_task(_handle_text_message(chat_id, user_input, username, user_message))
+            async with active_tasks_lock:
+                active_tasks[chat_id] = task
+            task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
+            return
 
-        # ── 回调查询 ───────────────────────────────────────────────────────
-        if "callback_query" in data:
-            cb = data["callback_query"]
-            chat_id = cb["message"]["chat"]["id"]
-            uid = cb["from"]["id"]
-            mid = cb["message"]["message_id"]
-            sel = cb["data"]
+    # ── 回调查询 ───────────────────────────────────────────────────────
+    if "callback_query" in data:
+        cb = data.get("callback_query") or {}
+        cb_id = cb.get("id")
+        # 加固：Bot API 7.0+ 中按钮消息超过 48h 会变成 inaccessible_message，
+        # inline 模式回调甚至没有 message 字段；旧代码
+        # cb["message"]["chat"]["id"] 在这些场景直接 KeyError → 整条回调
+        # 被丢弃且按钮永远转圈。这里防御性解析，字段缺失只降级不炸。
+        cb_msg = cb.get("message") if isinstance(cb.get("message"), dict) else {}
+        chat_id = (cb_msg.get("chat") or {}).get("id")
+        mid = cb_msg.get("message_id")
+        cb_uid = (cb.get("from") or {}).get("id")
+        sel = cb.get("data")
 
-            if str(uid) != str(chat_id):
-                await _send_via_send_message(chat_id, "❌ <b>无权限</b>", reply_message_id=mid)
-                async with aiohttp.ClientSession() as s:
-                    await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "无权限"})
-                return "OK", 200
+        if chat_id is None:
+            # 无法定位会话（inline 回调 / 会话过期）：尽力签收回调避免转圈。
+            logger.warning(f"Callback: message/chat 缺失（inline 或会话过期），仅签收: cb_id={cb_id}")
+            await _answer_callback(cb_id, "该会话已失效，请重新发起操作")
+            return
 
-            # 按钮点击也是用户活动：重置主动唤醒的空闲计时
-            # （不打断 TIMER 回合——按钮交互不产生新的 USER 模型回合）
-            try:
-                await proactive.note_user_activity(chat_id, private=True)
-            except Exception as e:
-                logger.warning(f"note_user_activity(callback) 异常: {e}")
+        if str(cb_uid) != str(chat_id):
+            _spawn_bg(_send_via_send_message(chat_id, "❌ <b>无权限</b>", reply_message_id=mid))
+            await _answer_callback(cb_id, "无权限")
+            return
 
-            try:
-                if sel in SUPPORTED_ROLES:
-                    # 锁的粒度只到单个 chat："读角色→切换→回读→更新列表消息
-                    # （含 Telegram API 网络往返）"整个序列必须串行，保证
-                    # 同一个 chat 快速连点时序列不交叉；但若用进程级锁包住，
-                    # 网络往返时间会把锁一直占着，导致其他用户此刻的
-                    # /adduser /model /role 等操作全部排队等待。因此用按
-                    # chat_id 分片的 get_chat_lock，不影响其他 chat。
+        # 按钮点击也是用户活动：重置主动唤醒的空闲计时
+        # （不打断 TIMER 回合——按钮交互不产生新的 USER 模型回合）
+        try:
+            await proactive.note_user_activity(chat_id, private=True)
+        except Exception as e:
+            logger.warning(f"note_user_activity(callback) 异常: {e}")
+
+        answered = False
+        try:
+            if sel in SUPPORTED_ROLES:
+                # 锁的粒度只到单个 chat："读角色→切换→回读→更新列表消息
+                # （含 Telegram API 网络往返）"整个序列必须串行，保证
+                # 同一个 chat 快速连点时序列不交叉；但若用进程级锁包住，
+                # 网络往返时间会把锁一直占着，导致其他用户此刻的
+                # /adduser /model /role 等操作全部排队等待。因此用按
+                # chat_id 分片的 get_chat_lock，不影响其他 chat。
+                lock = await get_chat_lock(chat_id)
+                async with lock:
+                    prev = await get_user_role(chat_id)
+                    if prev == sel:
+                        await set_user_role(chat_id, None)
+                        notice = "已取消角色设定"
+                    else:
+                        await set_user_role(chat_id, sel)
+                        rn = {"china": "中国", "think": "思考", "neko_catgirl": "猫娘", "succubus": "魅魔", "isla": "Isla"}.get(sel, sel)
+                        notice = f"已切换到: <b>{rn}</b>"
+                    cr = await get_user_role(chat_id)
+                    if role_message_ids.get(chat_id) == mid:
+                        ok = await update_role_list(chat_id, mid, SUPPORTED_ROLES, cr)
+                    else:
+                        ok = False
+                    if not ok:
+                        nm = await send_role_list(chat_id, SUPPORTED_ROLES, cr, mid)
+                        if nm:
+                            role_message_ids[chat_id] = nm
+                # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置。
+                # 角色分支不显式 answer，由 finally 兜底签收（等价于旧版
+                # 掉出分支后的"已处理"，但不再依赖 fall-through 写法）。
+                await _send_via_send_message(chat_id, f"✅ <b>{notice}</b>", reply_message_id=mid)
+            elif sel in SUPPORTED_MODELS:
+                await _answer_callback(cb_id, f"切换到 {SUPPORTED_MODELS[sel].name}...")
+                answered = True
+                await safe_set_user_model(chat_id, sel)
+                model_name = SUPPORTED_MODELS[sel].name
+                confirmation = (
+                    f"✅ <b>模型切换成功</b>\n已切换到模型：<b>{model_name}</b>\n<i>（对话历史已保留）</i>"
+                )
+                # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置。
+                # 快速连点时，本次点击的列表消息可能已被 delete_after
+                # 定时清理删除；reply 到已不存在的消息会被 Telegram 以 400
+                # 拒绝，若静默吞错会导致"模型已切换却没有任何反馈"。
+                # 因此失败后去掉 reply 补发一次，确保切换结果总能送达。
+                sent_mid = await _send_via_send_message(chat_id, confirmation, reply_message_id=mid)
+                if not sent_mid:
+                    await _send_via_send_message(chat_id, confirmation)
+                # 仿照 /role：点击后不删除列表，而是就地给当前模型
+                # 打 √，列表仍由发送时的 delete_after 定时清理。列表消失前
+                # 的每一次点击都会得到 "√ 移动 + ✅ 消息" 双重反馈。
+                try:
+                    # get_user_role 内部已用 state._role_lock 保护，
+                    # 无需再套进程级锁。
+                    current_role = await get_user_role(chat_id)
+                    banner_html = ""
+                    if current_role:
+                        banner_html = f"⚠️ <b>兼容性提示</b>\n当前角色「<b>{current_role}</b>」可能与新模型不兼容，请留意。"
+                    # 读取当前模型与就地更新必须在同一把 chat 锁内完成：
+                    # 快速连点时多个回调并发执行，若读与编辑分离，后完成的
+                    # 编辑可能携带旧值，使列表上的 √ 停留在已被覆盖的模型上。
                     lock = await get_chat_lock(chat_id)
                     async with lock:
-                        prev = await get_user_role(chat_id)
-                        if prev == sel:
-                            await set_user_role(chat_id, None)
-                            notice = "已取消角色设定"
-                        else:
-                            await set_user_role(chat_id, sel)
-                            rn = {"china": "中国", "think": "思考", "neko_catgirl": "猫娘", "succubus": "魅魔", "isla": "Isla"}.get(sel, sel)
-                            notice = f"已切换到: <b>{rn}</b>"
-                        cr = await get_user_role(chat_id)
-                        if role_message_ids.get(chat_id) == mid:
-                            ok = await update_role_list(chat_id, mid, SUPPORTED_ROLES, cr)
-                        else:
-                            ok = False
-                        if not ok:
-                            nm = await send_role_list(chat_id, SUPPORTED_ROLES, cr, mid)
-                            if nm:
-                                role_message_ids[chat_id] = nm
-                    # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置
-                    await _send_via_send_message(chat_id, f"✅ <b>{notice}</b>", reply_message_id=mid)
-                elif sel in SUPPORTED_MODELS:
-                    async with aiohttp.ClientSession() as s:
-                        await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": f"切换到 {SUPPORTED_MODELS[sel].name}..."})
-                    await safe_set_user_model(chat_id, sel)
-                    model_name = SUPPORTED_MODELS[sel].name
-                    confirmation = (
-                        f"✅ <b>模型切换成功</b>\n已切换到模型：<b>{model_name}</b>\n<i>（对话历史已保留）</i>"
-                    )
-                    # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置。
-                    # 快速连点时，本次点击的列表消息可能已被 delete_after
-                    # 定时清理删除；reply 到已不存在的消息会被 Telegram 以 400
-                    # 拒绝，若静默吞错会导致"模型已切换却没有任何反馈"。
-                    # 因此失败后去掉 reply 补发一次，确保切换结果总能送达。
-                    sent_mid = await _send_via_send_message(chat_id, confirmation, reply_message_id=mid)
-                    if not sent_mid:
-                        await _send_via_send_message(chat_id, confirmation)
-                    # 仿照 /role：点击后不删除列表，而是就地给当前模型
-                    # 打 √，列表仍由发送时的 delete_after 定时清理。列表消失前
-                    # 的每一次点击都会得到 "√ 移动 + ✅ 消息" 双重反馈。
-                    try:
-                        # get_user_role 内部已用 state._role_lock 保护，
-                        # 无需再套进程级锁。
-                        current_role = await get_user_role(chat_id)
-                        banner_html = ""
-                        if current_role:
-                            banner_html = f"⚠️ <b>兼容性提示</b>\n当前角色「<b>{current_role}</b>」可能与新模型不兼容，请留意。"
-                        # 读取当前模型与就地更新必须在同一把 chat 锁内完成：
-                        # 快速连点时多个回调并发执行，若读与编辑分离，后完成的
-                        # 编辑可能携带旧值，使列表上的 √ 停留在已被覆盖的模型上。
-                        lock = await get_chat_lock(chat_id)
-                        async with lock:
-                            await update_model_list(
-                                chat_id, mid, list(SUPPORTED_MODELS.keys()),
-                                get_user_model(chat_id), banner_html,
-                            )
-                    except Exception as list_err:
-                        logger.warning(f"模型列表就地更新失败(可忽略): chat={chat_id} msg={mid} {list_err}")
-                    return "OK", 200
-                elif isinstance(sel, str) and sel.startswith("ask:"):
-                    parts = sel.split(":", 3)
-                    interaction_id = parts[1] if len(parts) > 1 else ""
-                    action = parts[2] if len(parts) > 2 else ""
-                    arg = parts[3] if len(parts) > 3 else ""
-                    ok, notice = await resolve_message_user_callback(
-                        chat_id, uid, interaction_id, action, arg
-                    )
-                    async with aiohttp.ClientSession() as s:
-                        await s.post(
-                            f"{BASE_URL}/answerCallbackQuery",
-                            json={
-                                "callback_query_id": cb["id"],
-                                "text": notice[:200],
-                                "show_alert": not ok,
-                            },
+                        await update_model_list(
+                            chat_id, mid, list(SUPPORTED_MODELS.keys()),
+                            get_user_model(chat_id), banner_html,
                         )
-                    return "OK", 200
-                else:
-                    async with aiohttp.ClientSession() as s:
-                        await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "未知操作"})
-                    return "OK", 200
-            except Exception as e:
-                logger.exception(f"Callback query error: {e}")
-                await _send_via_send_message(chat_id, f"❌ <b>操作失败</b>\n<code>{str(e)[:100]}</code>", reply_message_id=mid)
-                async with aiohttp.ClientSession() as s:
-                    await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "操作失败"})
-                return "OK", 200
-
-            async with aiohttp.ClientSession() as s:
-                await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "已处理"})
-            return "OK", 200
-
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        # 应用层异常返回 200 而非 500，避免 Telegram 无限重试同一条 poison update
-        logger.exception(f"Webhook 顶层异常: {e}")
-        return "OK", 200
-    finally:
-        _elapsed = time.monotonic() - _t0
-        if _elapsed > 1.0:
-            logger.warning(f"⚠️ Webhook 处理耗时 {_elapsed:.2f}s, 超过 1s 阈值（应当 < 500ms）")
-        else:
-            logger.info(f"Webhook 处理耗时 {_elapsed:.3f}s")
+                except Exception as list_err:
+                    logger.warning(f"模型列表就地更新失败(可忽略): chat={chat_id} msg={mid} {list_err}")
+                return
+            elif isinstance(sel, str) and sel.startswith("ask:"):
+                parts = sel.split(":", 3)
+                interaction_id = parts[1] if len(parts) > 1 else ""
+                action = parts[2] if len(parts) > 2 else ""
+                arg = parts[3] if len(parts) > 3 else ""
+                ok, notice = await resolve_message_user_callback(
+                    chat_id, cb_uid, interaction_id, action, arg
+                )
+                await _answer_callback(cb_id, notice[:200], show_alert=not ok)
+                answered = True
+                return
+            else:
+                await _answer_callback(cb_id, "未知操作")
+                answered = True
+                return
+        except Exception as e:
+            logger.exception(f"Callback query error: {e}")
+            try:
+                if mid is not None:
+                    await _send_via_send_message(chat_id, f"❌ <b>操作失败</b>\n<code>{str(e)[:100]}</code>", reply_message_id=mid)
+            except Exception:
+                pass
+            await _answer_callback(cb_id, "操作失败")
+            answered = True
+            return
+        finally:
+            # 兜底签收：无论走哪个分支/是否异常，按钮都必须收到
+            # answerCallbackQuery，不能永远转圈。
+            if not answered:
+                await _answer_callback(cb_id, "已处理")
