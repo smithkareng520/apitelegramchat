@@ -1511,9 +1511,20 @@ async def webhook() -> tuple:
             return "OK - Webhook is alive", 200
 
         data = await request.json
+        if not isinstance(data, dict):
+            logger.warning(
+                "Webhook 请求体不是 JSON object: type=%s value=%r",
+                type(data).__name__,
+                data,
+            )
+            return "Bad Request", 400
         uid = data.get('update_id')
         # 缺少 update_id 的非法 payload 直接拒绝，避免污染去重集合
         if uid is None:
+            logger.warning(
+                "Webhook 缺少 update_id: keys=%s",
+                list(data.keys())[:30],
+            )
             return "Bad Request", 400
 
         if LOG_LEVEL == "DEBUG" or LOG_TRUNCATE_LIMIT == 0:
@@ -1536,6 +1547,11 @@ async def webhook() -> tuple:
         # 两段加锁，Telegram 超时重投 + webhook 并发会让同一 update 的两个
         # 副本同时通过检查、被双重处理。
         if not await mark_update_processed_if_new(uid):
+            logger.warning(
+                "跳过重复 Telegram update: update_id=%r。若这是新消息，说明上游重复投递了旧 payload，"
+                "或应用进程内的去重状态/代理缓存存在问题。",
+                uid,
+            )
             return "OK", 200
 
         # ── 消息处理 ──────────────────────────────────────────────────────
@@ -2039,7 +2055,23 @@ async def webhook() -> tuple:
 
             # ── 文本消息 ──────────────────────────────────────────────────
             if "text" in msg:
-                user_input = msg["text"]
+                user_input = msg.get("text")
+                # Telegram 的 text 通常总是字符串，但这里仍做类型和空白校验。
+                # 空白消息不能形成有效的 AI 轮次：turn_recovery._merge_user_message
+                # 会把它从历史合并内容中丢弃，随后又因 early-persist 标记而不再
+                # 注入模型请求，表现为“webhook 收到了但 AI 没有消息”。
+                if not isinstance(user_input, str) or not user_input.strip():
+                    logger.info(
+                        "忽略空白 Telegram 文本: update_id=%s chat_id=%s",
+                        uid,
+                        chat_id,
+                    )
+                    await _send_via_send_message(
+                        chat_id,
+                        "⚠️ 不能处理空消息，请输入文字后再发送。",
+                        reply_message_id=msg.get("message_id"),
+                    )
+                    return "OK", 200
 
                 # 若当前 message_user 正在等待回复，优先把这条消息交给原 agent turn，
                 # 不要启动新的 AI turn。命令仍保留为真正的 bot 指令入口。
