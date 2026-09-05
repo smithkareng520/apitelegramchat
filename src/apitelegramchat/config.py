@@ -79,7 +79,7 @@ BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_T
 # -----------------------------------------------------------------------------
 # 必须在使用前定义（LOG_TRUNCATE_LIMIT / MAX_CONCURRENT_TOOLS 等都依赖）。
 # 合法推理努力档位（OpenAI gpt-5 / Gemini 3 / Claude / OpenRouter 通用口径）
-VALID_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "none"}
+VALID_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max", "minimal"}
 # 合法的协议循环标签（ProviderConfig.dedicated_loop_kind 默认值与
 # ModelConfig.dedicated_loop_kind 覆盖字段共用同一取值域）。
 # 单字段选择器："openai_compat" 为缺省协议（OpenAI 兼容 Chat Completions
@@ -221,8 +221,8 @@ class ModelConfig:
     # reasoning_enabled:  显式开/关思考（GLM thinking.type / ModelScope
     #                     enable_thinking / OpenRouter reasoning.enabled /
     #                     Gemini thinkingBudget=0 关闭）
-    # reasoning_effort:   努力档位 "minimal"/"low"/"medium"/"high"（"none" 仅
-    #                     部分模型支持，会透传）
+    # reasoning_effort:   努力档位 "none"/"low"/"medium"/"high"/"xhigh"/"max"
+    #                     （部分模型支持，会透传）
     # reasoning_max_tokens: 推理 token 预算（OpenRouter reasoning.max_tokens /
     #                     Gemini thinkingBudget / ModelScope thinking_budget）
     reasoning_enabled: Optional[bool] = None
