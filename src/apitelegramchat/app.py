@@ -1720,6 +1720,14 @@ async def process_update(data: dict) -> None:
         # 协程，这里的 set 不会泄漏到下一条 update）。
         set_request_id(str(uuid.uuid4())[:8])
 
+        # ----------------- 加在这里 -----------------
+        msg_obj = data.get("message") or {}
+        logger.info(
+            f"[DEBUG ENTITIES] text={repr(msg_obj.get('text'))} "
+            f"entities={msg_obj.get('entities')}"
+        )
+        # -------------------------------------------
+
         uid = data.get('update_id')
         # 防御：webhook 入口已拦截缺少 update_id 的非法 payload，这里再拦
         # 一层（防止其它调用路径把 None 塞进去重集合）。
