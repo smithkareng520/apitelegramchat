@@ -1201,12 +1201,11 @@ class BashSession:
             if pattern.search(command):
                 logger.warning(f"🚫 Bash rejected ({name}) chat_id={self.chat_id}: {command[:200]}")
                 return False
-        # 拒绝 cd 进入 upload/ 或 download/ 子树
-        if self._UPLOAD_DOWNLOAD_CD_PATTERN.search(command):
-            logger.warning(
-                f"🚫 Bash rejected (cd into upload/download) chat_id={self.chat_id}: {command[:200]}"
-            )
-            return False
+        # 允许进入 download/upload 目录做只读检查。
+        # 旧逻辑会直接拒绝:
+        #   cd download && ls -lh
+        # 这会阻止 AI 分析用户上传文件。
+        # 写入、删除、执行等危险操作仍由 _DANGEROUS_PATTERNS 和沙箱控制。
         # 拒绝在 upload/ 或 download/ 子树内执行任何命令
         if self._last_cwd and is_inside_upload_or_download(self._last_cwd):
             logger.warning(

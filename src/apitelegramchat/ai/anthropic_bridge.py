@@ -65,6 +65,37 @@ logger = get_logger(__name__)
 # =============================================================================
 # OpenAI: {"type": "function", "function": {"name", "description", "parameters"}}
 # Anthropic: {"name", "description", "input_schema"}
+def _sanitize_anthropic_tool_schema(schema):
+    """
+    Anthropic custom tool input_schema 顶层不接受 oneOf/allOf/anyOf。
+    OpenAI function schema 经常会把 union 放在根节点，直接透传会导致：
+    tools.0.custom.input_schema: input_schema does not support oneOf, allOf, or anyOf at the top level
+
+    这里仅做 Anthropic 适配层清洗，不修改原始 OpenAI schema：
+    - 根层 union 尝试选择 object 分支；
+    - 保留递归节点里的语义；
+    - 无法安全判断时降级为空 object，避免整轮请求失败。
+    """
+    import copy
+    if not isinstance(schema, dict):
+        return {"type": "object", "properties": {}}
+
+    s = copy.deepcopy(schema)
+    for key in ("oneOf", "anyOf", "allOf"):
+        if key in s and key in ("oneOf", "anyOf", "allOf"):
+            variants = s.get(key)
+            if isinstance(variants, list):
+                for item in variants:
+                    if isinstance(item, dict) and item.get("type") == "object":
+                        base = {k: v for k, v in s.items() if k not in ("oneOf", "anyOf", "allOf")}
+                        base.update(item)
+                        return base
+                if variants and isinstance(variants[0], dict):
+                    return variants[0]
+            return {"type": "object", "properties": {}}
+    return s
+
+
 def _convert_tools_to_anthropic(tools: Optional[list]) -> Optional[list]:
     if not tools:
         return None
@@ -77,7 +108,9 @@ def _convert_tools_to_anthropic(tools: Optional[list]) -> Optional[list]:
         converted.append({
             "name": name,
             "description": fn.get("description", "") or "",
-            "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
+            "input_schema": _sanitize_anthropic_tool_schema(
+                fn.get("parameters") or {"type": "object", "properties": {}}
+            ),
         })
     return converted or None
 
