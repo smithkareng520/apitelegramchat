@@ -57,7 +57,7 @@ services:
       # 侧积压 update（停机/部署窗口内的消息被永久丢弃）。默认 false：
       # 保留积压，由健康实例重放排干。
       - key: DROP_PENDING_ON_STARTUP
-        value: "false"
+        value: "true"
       - key: SERPER_API_KEY
         sync: false
       - key: GAODE_MCP_URL
