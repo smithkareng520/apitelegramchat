@@ -613,7 +613,7 @@ def make_model_config(
             # 仅此模型覆盖：换协议 + 换子路径，key 仍沿用 my_relay 默认。
             use_dedicated_loop=True,
             dedicated_loop_kind="anthropic_native",
-            base_url="https://xxtf.baby/query/anthropic",
+            base_url="https://xxtf.baby",
         )
     """
     endpoint_overrides = {
@@ -1022,11 +1022,11 @@ SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
     max_context=200000,
     # 平台标注协议为 anthropic：走 Anthropic 原生 Messages 专用循环。
     # 注意 base_url 不带 /v1——AsyncAnthropic SDK 会自动拼接
-    # {base_url}/v1/messages -> https://xxtf.baby/query/anthropic/v1/messages，
+    # {base_url}/v1/messages -> https://xxtf.baby/v1/messages，
     # 与项目截图中 claude-opus-5 / anthropic 协议那一行的入口一致。
     use_dedicated_loop=True,
     dedicated_loop_kind="anthropic_native",
-    base_url="https://xxtf.baby/query/anthropic",
+    base_url="https://xxtf.baby",
     reasoning_enabled=True,
     reasoning_effort="high",
     temperature=1.0,
