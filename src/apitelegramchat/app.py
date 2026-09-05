@@ -137,9 +137,23 @@ async def _startup_sync_webhook() -> None:
 
 @app.after_serving
 async def _shutdown_close_http_session() -> None:
-    """优雅关闭：先停掉主动唤醒调度器，再关掉所有持久 bash 沙箱进程，
-    最后关全局 aiohttp session。
+    """优雅关闭：先停 update worker 与主动唤醒调度器，再关掉所有持久
+    bash 沙箱进程，最后关全局 aiohttp session。
     """
+    # 1) 先停后台 worker：不再消费队列、不再派发新的业务任务，避免与
+    #    下面的清理逻辑产生新的并发工作。注意：队列中尚未处理的 update
+    #    会随进程退出丢失（Telegram 已收到 200 ACK 不会重投）——这与
+    #    旧版"webhook 处理到一半进程重启"的损耗同级，属可接受窗口。
+    global _telegram_worker_task
+    if _telegram_worker_task is not None:
+        _telegram_worker_task.cancel()
+        try:
+            await _telegram_worker_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.warning("telegram worker shutdown raised", exc_info=True)
+        _telegram_worker_task = None
     try:
         await proactive.stop_proactive_scheduler()
     except Exception:
@@ -1479,24 +1493,89 @@ async def send_model_list(
     )
 
 # ---------------------------------------------------------------------------
-# Webhook 路由
+# Webhook 入口（非阻塞）+ 后台 update worker
 # ---------------------------------------------------------------------------
+# 数据流（入口与业务彻底解耦）：
+#
+#   Telegram
+#     │  POST /webhook（Header: X-Telegram-Bot-Api-Secret-Token 或 ?token=）
+#     ▼
+#   webhook()：校验 token → 读 JSON → update_queue.put_nowait() → 立即 200
+#     │               （不做任何业务处理，绝不调 AI / 数据库 / 长网络 IO）
+#     ▼
+#   update_queue（有界队列；满时 429 把背压交还 Telegram）
+#     ▼
+#   telegram_worker()（后台串行消费）→ process_update()
+#     （解析 message / 去重 / chat lock / 命令分发 / AI 任务派发 / 回调查询）
+#
+# 关键收益：即使某条 update 把 AI 卡死，webhook 入口依然对后续投递秒回
+# 200，Telegram 不会因超时判定 webhook 挂掉（避免 504 → 重试风暴 → 死锁）。
+# 日志定位：只看到 "telegram webhook arrived" 没有 "accepted" → token 问题；
+# 有 "accepted" 没有 "telegram worker processing update" → queue/worker 问题；
+# 有 "worker processing" 之后的异常 → 业务/AI 问题。
+
+WEBHOOK_QUEUE_MAXSIZE = int(os.getenv("WEBHOOK_QUEUE_MAXSIZE", "1000"))
+# 模块级创建：Python>=3.10 的 asyncio.Queue 在首次使用时才绑定事件循环，
+# 导入期实例化是安全的（项目 requires-python >=3.10）。
+update_queue = asyncio.Queue(maxsize=WEBHOOK_QUEUE_MAXSIZE)
+_telegram_worker_task: asyncio.Task | None = None
+
+
+async def telegram_worker() -> None:
+    """后台 worker：串行消费 update 队列，执行全部业务逻辑。
+
+    - 串行消费天然保持 update 顺序；同 chat 的真正并发由既有
+      get_chat_lock / active_tasks 机制管理，AI 回合本身仍是
+      asyncio.create_task 派发，不在这里同步等待完成。
+    - 每条 update 用 create_task 包一层再 await：task 会拷贝当前
+      contextvars，process_update 内部的 set（request_id / 用户
+      namespace 等）不会泄漏到下一条 update，语义与旧版"每个 webhook
+      请求一个全新上下文"一致。
+    - 任何业务异常都在这里兜底记录，绝不杀死 worker 循环。
+    """
+    logger.info("telegram worker started")
+    while True:
+        update = await update_queue.get()
+        try:
+            uid = (update or {}).get("update_id")
+            logger.info(f"telegram worker processing update (update_id={uid})")
+            await asyncio.create_task(process_update(update))
+        except asyncio.CancelledError:
+            logger.warning("telegram worker cancelled (shutdown)")
+            raise
+        except Exception:
+            logger.exception("telegram update failed")
+        finally:
+            update_queue.task_done()
+
+
+@app.before_serving
+async def _startup_start_telegram_worker() -> None:
+    """启动后台 update 消费 worker（webhook 非阻塞化的另一半）。"""
+    global _telegram_worker_task
+    _telegram_worker_task = asyncio.create_task(telegram_worker(), name="telegram-worker")
+
+
 @app.route('/webhook', methods=['GET', 'POST', 'HEAD'])
 async def webhook() -> tuple:
+    """Telegram webhook 入口：只做 校验 → 读 JSON → 入队 → 立即 ACK。
+
+    这里绝不做业务处理（不解析 message、不拿 chat lock、不调 AI、不查
+    数据库）——所有可能慢的操作都在 telegram_worker / process_update。
+    """
     _t0 = time.monotonic()
     try:
         request_id = str(uuid.uuid4())[:8]
         set_request_id(request_id)
-        logger.info(f"Received webhook request {request_id}")
+        logger.info(f"telegram webhook arrived {request_id}")
 
+        # ── 1. Telegram secret 校验（双路径，任一匹配即放行）───────────────
+        #  a) URL query ?token=…（历史注册方式，保持完全兼容）；
+        #  b) X-Telegram-Bot-Api-Secret-Token 请求头——webhook_sync.py 启动
+        #     自愈以 secret_token=WEBHOOK_TOKEN 注册后，Telegram 每次投递都
+        #     会携带该头，token 不再出现在 URL/访问日志里。
+        #  两路均用 hmac.compare_digest 恒定时间比较防止时序攻击。
         token = request.args.get("token")
-        # 鉴权双路径（任一匹配即放行），均用 hmac.compare_digest 恒定时间比较防止时序攻击：
-        #  1) URL query ?token=…（历史注册方式，保持完全兼容）；
-        #  2) X-Telegram-Bot-Api-Secret-Token 请求头——当启动自愈以
-        #     secret_token 参数注册后（见 webhook_sync.py），Telegram 每次投递
-        #     都会携带该头。头路径让 token 不再出现在 URL/访问日志里。
-        # 头路径是加法式强化：若注册时未附带 secret_token，Telegram 不会发
-        # 该头，鉴权自然回落到 query token，既有投递不受任何影响。
         token_ok = False
         if WEBHOOK_TOKEN:
             if token and hmac.compare_digest(str(token), str(WEBHOOK_TOKEN)):
@@ -1506,15 +1585,76 @@ async def webhook() -> tuple:
                 if secret_header and hmac.compare_digest(str(secret_header), str(WEBHOOK_TOKEN)):
                     token_ok = True
         if not token_ok:
+            logger.warning("Invalid telegram webhook token")
             return "Forbidden", 403
+        logger.info("telegram webhook accepted")
+
         if request.method in ('GET', 'HEAD'):
             return "OK - Webhook is alive", 200
 
-        data = await request.json
+        # ── 2. 快速读取 update（只做入队前必要校验）────────────────────────
+        try:
+            data = await request.json
+        except Exception:
+            logger.exception("Invalid webhook json")
+            return "Bad Request", 400
+        if not data:
+            return "OK", 200
         uid = data.get('update_id')
-        # 缺少 update_id 的非法 payload 直接拒绝，避免污染去重集合
+        # 缺少 update_id 的非法 payload 直接 400 拒绝，避免污染 worker 侧去重集合
         if uid is None:
             return "Bad Request", 400
+
+        # ── 3. 丢队列（去重由 worker 侧 process_update 原子完成）────────────
+        try:
+            update_queue.put_nowait(data)
+        except asyncio.QueueFull:
+            # 队列满：429 把背压交还 Telegram（按指数退避重投），而不是
+            # 200 吞掉丢消息，也不是无限扩队列打爆内存。去重标记在
+            # worker 侧，此时尚未标记，Telegram 重投后可正常入队。
+            logger.error(
+                f"telegram webhook queue full (maxsize={WEBHOOK_QUEUE_MAXSIZE}), "
+                f"update_id={uid} rejected with 429, Telegram will retry"
+            )
+            return "Too Many Requests", 429
+
+        logger.info(f"telegram webhook queued update_id={uid}")
+        return "OK", 200
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # 入口意外异常返回 500 让 Telegram 重投：去重标记发生在 worker 侧，
+        # 此时该 update 一定尚未入队/未被标记，重投不会产生重复处理。
+        logger.exception(f"Webhook 入口顶层异常: {e}")
+        return "Internal Server Error", 500
+    finally:
+        _elapsed = time.monotonic() - _t0
+        if _elapsed > 0.5:
+            logger.warning(f"⚠️ Webhook 入口耗时 {_elapsed:.2f}s（只做校验+入队，正常应 <100ms）")
+        else:
+            logger.info(f"Webhook 入口耗时 {_elapsed:.3f}s")
+
+
+async def process_update(data: dict) -> None:
+    """原 webhook 的全部业务逻辑（telegram_worker 内执行）。
+
+    职责：解析 update → 去重 → 命令/媒体/文本分发 → 派发 AI 任务或处理
+    回调查询。运行在 worker 的独立 task 上下文中，不处于 Quart 请求
+    上下文——不得访问 request / g 等请求期对象。
+    """
+    _t0 = time.monotonic()
+    try:
+        # worker 复用同一 task 上下文循环消费；这里为本条 update 生成独立
+        # request_id 供日志串联（worker 已用 create_task 拷贝上下文执行本
+        # 协程，这里的 set 不会泄漏到下一条 update）。
+        set_request_id(str(uuid.uuid4())[:8])
+
+        uid = data.get('update_id')
+        # 防御：webhook 入口已拦截缺少 update_id 的非法 payload，这里再拦
+        # 一层（防止其它调用路径把 None 塞进去重集合）。
+        if uid is None:
+            logger.warning("telegram worker update missing update_id, skipped")
+            return
 
         if LOG_LEVEL == "DEBUG" or LOG_TRUNCATE_LIMIT == 0:
             msg_debug = json.dumps(data, ensure_ascii=False, default=str)
@@ -1530,13 +1670,13 @@ async def webhook() -> tuple:
                     msg_debug = msg_debug[:LOG_TRUNCATE_LIMIT] + "... (truncated)"
                 logger.debug(f"截断的 Webhook 数据: {msg_debug}")
 
-        # 使用 OrderedDict 保留插入顺序，超过 10000 条时按插入顺序淘汰
-        # 最早的 5000 条，保证淘汰的总是最早加入的 uid。
-        # mark_update_processed_if_new 原子地"检查并标记"：若拆成先查后标
-        # 两段加锁，Telegram 超时重投 + webhook 并发会让同一 update 的两个
-        # 副本同时通过检查、被双重处理。
+        # 去重（原子"检查并标记"，容量淘汰见 state._record_processed_unlocked）：
+        # 放在 worker 侧而非 webhook 入口——队满被 429 拒收的 update，
+        # Telegram 重投时不会被误判为重复；单一 worker 串行消费也天然
+        # 消除了旧版"webhook 并发双副本同时通过检查"的竞态。
         if not await mark_update_processed_if_new(uid):
-            return "OK", 200
+            logger.info(f"telegram worker duplicate update_id={uid}, skipped")
+            return
 
         # ── 消息处理 ──────────────────────────────────────────────────────
         if "message" in data and isinstance(data["message"], dict):
@@ -1544,7 +1684,7 @@ async def webhook() -> tuple:
             chat_id = (msg.get("chat") or {}).get("id")
             if chat_id is None:
                 logger.warning(f"Webhook: missing chat_id in message, update_id={uid}")
-                return "OK", 200
+                return
             from_user = msg.get("from", {})
             username, user_id = get_user_info(msg)
             set_current_user_namespace(user_id or str(chat_id))
@@ -1555,7 +1695,7 @@ async def webhook() -> tuple:
             if is_admin_cmd:
                 if not is_admin(username, user_id):
                     await send_rich_html_message(chat_id, "❌ <b>权限不足</b>\n只有管理员可以执行此操作。", reply_parameters=_reply_params(msg["message_id"]))
-                    return "OK", 200
+                    return
                 # 不用进程级锁包裹这三个命令：那会让白名单操作和其他用户
                 # 正在做的 /model /role 等命令排队等待，admin 命令之间也会
                 # 互相等待。白名单的读改写由 config.add_whitelist_user /
@@ -1567,32 +1707,32 @@ async def webhook() -> tuple:
                     parts = text.split()
                     if len(parts) != 2:
                         await send_rich_html_message(chat_id, "❌ <b>用法错误</b>\n用法：<code>/adduser @username</code> 或 <code>/adduser 123456789</code>", reply_parameters=_reply_params(msg["message_id"]))
-                        return "OK", 200
+                        return
                     target = parts[1].strip().lstrip("@")
                     if not target:
                         await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
-                        return "OK", 200
+                        return
                     added = await add_whitelist_user(target)
                     if added:
                         await send_rich_html_message(chat_id, f"✅ <b>添加成功</b>\n已添加 <code>{target}</code> 到白名单。", reply_parameters=_reply_params(msg["message_id"]))
                     else:
                         await send_rich_html_message(chat_id, f"ℹ️ <b>无需操作</b>\n<code>{target}</code> 已在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
-                    return "OK", 200
+                    return
                 elif _cmd_match(text, "/deluser"):
                     parts = text.split()
                     if len(parts) != 2:
                         await send_rich_html_message(chat_id, "❌ <b>用法错误</b>\n用法：<code>/deluser @username</code> 或 <code>/deluser 123456789</code>", reply_parameters=_reply_params(msg["message_id"]))
-                        return "OK", 200
+                        return
                     target = parts[1].strip().lstrip("@")
                     if not target:
                         await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
-                        return "OK", 200
+                        return
                     removed = await remove_whitelist_user(target)
                     if removed:
                         await send_rich_html_message(chat_id, f"✅ <b>移除成功</b>\n已移除 <code>{target}</code>。", reply_parameters=_reply_params(msg["message_id"]))
                     else:
                         await send_rich_html_message(chat_id, f"❌ <b>用户不存在</b>\n<code>{target}</code> 不在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
-                    return "OK", 200
+                    return
                 elif _cmd_match(text, "/listusers"):
                     users = await snapshot_whitelist()
                     if not users:
@@ -1600,7 +1740,7 @@ async def webhook() -> tuple:
                     else:
                         users_list = "".join(f"<li><code>{str(u)}</code></li>" for u in users)
                         await send_rich_html_message(chat_id, f"📋 <b>当前白名单用户：</b>\n<ul>{users_list}</ul>", reply_parameters=_reply_params(msg["message_id"]))
-                    return "OK", 200
+                    return
                 elif _cmd_match(text, "/webhookinfo"):
                     # 观测命令：把 getWebhookInfo 的关键投递链路指标带回聊天，
                     # 让"积压"（pending_update_count）与最近投递错误无需登服务器
@@ -1608,7 +1748,7 @@ async def webhook() -> tuple:
                     info = await get_webhook_info()
                     if not info:
                         await send_rich_html_message(chat_id, "❌ <b>获取失败</b>\ngetWebhookInfo 请求失败，请查看服务端日志。", reply_parameters=_reply_params(msg["message_id"]))
-                        return "OK", 200
+                        return
                     pending = info.get("pending_update_count", 0)
                     lines = [
                         "🩺 <b>Webhook 投递链路状态</b>",
@@ -1635,7 +1775,7 @@ async def webhook() -> tuple:
                     else:
                         lines.append("✅ 无积压，投递链路正常。")
                     await send_rich_html_message(chat_id, "\n".join(lines), reply_parameters=_reply_params(msg["message_id"]))
-                    return "OK", 200
+                    return
 
             if _cmd_match(text, "/start"):
                 authorized = is_authorized(username, user_id)
@@ -1661,11 +1801,11 @@ async def webhook() -> tuple:
 请联系管理员 <b>@dearella</b></br> 申请白名单后，才能使用全部功能。
 """
                 await send_rich_html_message(chat_id, welcome_msg, reply_parameters=_reply_params(msg["message_id"]))
-                return "OK", 200
+                return
 
             if not is_authorized(username, user_id):
                 await reply_unauthorized(chat_id, msg.get("message_id"))
-                return "OK", 200
+                return
 
             lock = await get_chat_lock(chat_id)
             async with lock:
@@ -1701,7 +1841,7 @@ async def webhook() -> tuple:
                 lat = loc.get("latitude")
                 lon = loc.get("longitude")
                 if lat is None or lon is None:
-                    return "OK", 200
+                    return
 
                 content_text = (
                     f"📎 用户分享了当前位置\n"
@@ -1718,7 +1858,7 @@ async def webhook() -> tuple:
                 async with active_tasks_lock:
                     active_tasks[chat_id] = task
                 task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                return "OK", 200
+                return
 
             # ── 媒体组（图片） ─────────────────────────────────
             # 存储与任务 key 加 ":photo" 后缀：混合相册（photo+video 同
@@ -1734,7 +1874,7 @@ async def webhook() -> tuple:
                     if f"{mg}:video" not in _video_group_tasks:
                         await _interrupt_active_generation(chat_id)
                     await _schedule_media_group(chat_id, group_key)
-                return "OK", 200
+                return
 
             # ── 视频相册（聚合，对称图片组） ─────────────────────
             # Telegram 相册可含多个视频分片（或 photo+video 混合）。聚合
@@ -1748,7 +1888,7 @@ async def webhook() -> tuple:
                     if f"{mg}:photo" not in _media_group_tasks:
                         await _interrupt_active_generation(chat_id)
                     await _schedule_video_group(chat_id, group_key)
-                return "OK", 200
+                return
 
             # ── 文档组 ─────────────────────────────────────────────────────
             if "media_group_id" in msg and "document" in msg:
@@ -1758,7 +1898,7 @@ async def webhook() -> tuple:
                 if mg not in _document_group_tasks:
                     await _interrupt_active_generation(chat_id)
                     await _schedule_document_group(chat_id, mg)
-                return "OK", 200
+                return
 
             # ── 单张图片 ──────────────────────────────────────────────────
             if "photo" in msg:
@@ -1795,7 +1935,7 @@ async def webhook() -> tuple:
                 async with active_tasks_lock:
                     active_tasks[chat_id] = task
                 task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                return "OK", 200
+                return
 
             # ── 单个文档 ──────────────────────────────────────────────────
             if "document" in msg and "media_group_id" not in msg:
@@ -1866,7 +2006,7 @@ async def webhook() -> tuple:
                 async with active_tasks_lock:
                     active_tasks[chat_id] = task
                 task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                return "OK", 200
+                return
 
             # ── 语音 / 音频 ───────────────────────────────────────────────
             if "voice" in msg or "audio" in msg:
@@ -1908,7 +2048,7 @@ async def webhook() -> tuple:
                     async with active_tasks_lock:
                         active_tasks[chat_id] = task
                     task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                    return "OK", 200
+                    return
                 else:
                     content_text_parts = []
                     if cap:
@@ -1945,7 +2085,7 @@ async def webhook() -> tuple:
                     async with active_tasks_lock:
                         active_tasks[chat_id] = task
                     task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                    return "OK", 200
+                    return
             # ── 视频 / 圆形视频（单发，无 media_group_id） ─────
             # 相册里的视频分片已在上方"视频相册"分支聚合处理；到达这里的
             # 一定是单独发送的视频。video_note（圆形视频）无 file_name /
@@ -1993,7 +2133,7 @@ async def webhook() -> tuple:
                     async with active_tasks_lock:
                         active_tasks[chat_id] = task
                     task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                    return "OK", 200
+                    return
 
             # ── 贴纸（sticker）─────────────────────────────────────────────
             # Sticker 本体（TGS / WebP / WebM）当前主流 LLM 不可直接识别，
@@ -2035,7 +2175,7 @@ async def webhook() -> tuple:
                 async with active_tasks_lock:
                     active_tasks[chat_id] = task
                 task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                return "OK", 200
+                return
 
             # ── 文本消息 ──────────────────────────────────────────────────
             if "text" in msg:
@@ -2051,7 +2191,7 @@ async def webhook() -> tuple:
                     and not user_input.startswith("/")
                     and await resolve_message_user_text(chat_id, user_input)
                 ):
-                    return "OK", 200
+                    return
 
                 if _cmd_match(user_input, "/role"):
                     cr = await get_user_role(chat_id)
@@ -2060,7 +2200,7 @@ async def webhook() -> tuple:
                         mid = await send_role_list(chat_id, SUPPORTED_ROLES, cr, msg.get("message_id"))
                         if mid:
                             role_message_ids[chat_id] = mid
-                    return "OK", 200
+                    return
 
                 if _cmd_match(user_input, "/balance"):
                     parts = user_input.split(maxsplit=1)
@@ -2097,7 +2237,7 @@ async def webhook() -> tuple:
                         "\n".join(msgs),
                         reply_message_id=msg["message_id"],
                     )
-                    return "OK", 200
+                    return
 
                 if _cmd_match(user_input, "/model"):
                     if (msg.get("chat") or {}).get("type") != "private":
@@ -2106,7 +2246,7 @@ async def webhook() -> tuple:
                             "❌ <b>操作受限</b>\n模型切换仅限私聊使用。",
                             reply_message_id=msg["message_id"],
                         )
-                        return "OK", 200
+                        return
                     # get_user_role 内部已用 state._role_lock 保护，无需再套
                     # 进程级锁——那会让 /model 命令等待其他用户正在做的
                     # /adduser 等操作释放锁。
@@ -2120,7 +2260,7 @@ async def webhook() -> tuple:
                         msg.get("message_id"),
                         banner_html=banner_html,
                     )
-                    return "OK", 200
+                    return
 
                 if _cmd_match(user_input, "/clear"):
                     await _interrupt_active_generation(chat_id)
@@ -2139,7 +2279,7 @@ async def webhook() -> tuple:
                     except Exception as e:
                         logger.warning(f"reset_proactive_timer 异常: {e}")
                     await send_rich_html_message(chat_id, "✅ <b>操作成功</b>\n对话历史已清空", reply_parameters=_reply_params(msg["message_id"]))
-                    return "OK", 200
+                    return
 
                 # ── /show on|off：草稿预览开关（USER 与 TIMER 回合统一生效）──
                 if _cmd_match(user_input, "/show"):
@@ -2177,7 +2317,7 @@ async def webhook() -> tuple:
                             "用法：<code>/show on</code> 开启 · <code>/show off</code> 关闭",
                             reply_message_id=msg["message_id"],
                         )
-                    return "OK", 200
+                    return
 
                 # 普通文本对话
                 context_prefix = _get_reply_context(msg)
@@ -2346,7 +2486,7 @@ async def webhook() -> tuple:
                 async with active_tasks_lock:
                     active_tasks[chat_id] = task
                 task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
-                return "OK", 200
+                return
 
         # ── 回调查询 ───────────────────────────────────────────────────────
         if "callback_query" in data:
@@ -2360,7 +2500,7 @@ async def webhook() -> tuple:
                 await _send_via_send_message(chat_id, "❌ <b>无权限</b>", reply_message_id=mid)
                 async with aiohttp.ClientSession() as s:
                     await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "无权限"})
-                return "OK", 200
+                return
 
             # 按钮点击也是用户活动：重置主动唤醒的空闲计时
             # （不打断 TIMER 回合——按钮交互不产生新的 USER 模型回合）
@@ -2435,7 +2575,7 @@ async def webhook() -> tuple:
                             )
                     except Exception as list_err:
                         logger.warning(f"模型列表就地更新失败(可忽略): chat={chat_id} msg={mid} {list_err}")
-                    return "OK", 200
+                    return
                 elif isinstance(sel, str) and sel.startswith("ask:"):
                     parts = sel.split(":", 3)
                     interaction_id = parts[1] if len(parts) > 1 else ""
@@ -2453,31 +2593,34 @@ async def webhook() -> tuple:
                                 "show_alert": not ok,
                             },
                         )
-                    return "OK", 200
+                    return
                 else:
                     async with aiohttp.ClientSession() as s:
                         await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "未知操作"})
-                    return "OK", 200
+                    return
             except Exception as e:
                 logger.exception(f"Callback query error: {e}")
                 await _send_via_send_message(chat_id, f"❌ <b>操作失败</b>\n<code>{str(e)[:100]}</code>", reply_message_id=mid)
                 async with aiohttp.ClientSession() as s:
                     await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "操作失败"})
-                return "OK", 200
+                return
 
             async with aiohttp.ClientSession() as s:
                 await s.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "已处理"})
-            return "OK", 200
+            return
 
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        # 应用层异常返回 200 而非 500，避免 Telegram 无限重试同一条 poison update
-        logger.exception(f"Webhook 顶层异常: {e}")
-        return "OK", 200
+        # worker 兜底吞掉业务异常：单条 poison update 最多浪费一次消费
+        # 循环，不再影响 webhook ACK（入口已立即 200），也不会触发
+        # Telegram 对这条消息的重试风暴。
+        logger.exception(f"process_update 顶层异常: {e}")
+        return
     finally:
         _elapsed = time.monotonic() - _t0
-        if _elapsed > 1.0:
-            logger.warning(f"⚠️ Webhook 处理耗时 {_elapsed:.2f}s, 超过 1s 阈值（应当 < 500ms）")
+        # worker 侧耗时不再影响 Telegram ACK；>30s 仅作为"疑似卡住"的观测告警
+        if _elapsed > 30:
+            logger.warning(f"⚠️ worker update 处理耗时 {_elapsed:.2f}s, 超过 30s（疑似 AI/下载卡住）")
         else:
-            logger.info(f"Webhook 处理耗时 {_elapsed:.3f}s")
+            logger.info(f"worker update 处理耗时 {_elapsed:.3f}s")
