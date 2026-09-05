@@ -1014,6 +1014,7 @@ SUPPORTED_MODELS["agnes-video-v2.0"] = make_model_config(
 # （api_client.py 按 model_id 分别缓存客户端，见 APIClient.get_client_for_model）。
 # =============================================================================
 PROVIDERS["xxtf"] = ProviderConfig(
+    default_headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
     name="XXTF",
     # 壳的默认端点按 OpenAI 协议填（gpt-5.6-sol 沿用这个默认值）；
     # AsyncOpenAI 会自动拼接为 {base_url}/chat/completions
