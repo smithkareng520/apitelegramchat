@@ -284,19 +284,27 @@ curl http://127.0.0.1:5000/health
 
 ### 4. Webhook
 
-应用启动后会使用：
+应用启动时会自动进行"自愈注册"（幂等）：
 
 ```text
 WEBHOOK_URL?token=WEBHOOK_TOKEN
 ```
 
-注册 Telegram Webhook。
+启动钩子（`webhook_sync.sync_webhook_on_startup`）会调用 `setWebhook` 把注册 URL 对齐到环境变量：
+
+- 若 `WEBHOOK_URL` 里残留了旧的 `token=` 参数，会被**替换**为环境变量 `WEBHOOK_TOKEN`，避免手工注册残留旧值导致全体 403 → 无限积压；
+- 显式声明 `allowed_updates=["message", "callback_query"]`（本 bot 实际消费的类型）；
+- `WEBHOOK_TOKEN` 满足 Telegram `secret_token` 字符集（`A-Za-z0-9_-`，1-256 位）时会附带 `secret_token` 参数注册，此后 Telegram 每次投递都携带 `X-Telegram-Bot-Api-Secret-Token` 请求头，鉴权双路径（query token 或 secret 头任一匹配即放行）；
+- 注册完成后拉取 `getWebhookInfo` 打观测日志（`pending_update_count`、`last_error_*`），积压启动即可见；
+- 注意：`setWebhook` 只修"未来的投递路由"，**不清理** Telegram 侧已积压的 update 队列。要清积压见 `DROP_PENDING_ON_STARTUP`。
+
+管理员可在聊天里发送 `/webhookinfo` 随时查看积压数、最近投递错误与注册 URL（token 已脱敏）。
 
 生产环境请确保：
 
-- `WEBHOOK_URL` 是 HTTPS；
+- `WEBHOOK_URL` 是 HTTPS（端口限 443/80/88/8443）；
 - `WEBHOOK_TOKEN` 足够随机；
-- 反向代理正确转发请求；
+- 反向代理正确转发请求与 `X-Telegram-Bot-Api-Secret-Token` 请求头；
 - `/health` 可供平台健康检查；
 - 不把 MCP stdio 端口暴露到公网。
 
@@ -311,6 +319,7 @@ WEBHOOK_URL?token=WEBHOOK_TOKEN
 | `TELEGRAM_BOT_TOKEN` | 是 | Telegram Bot API |
 | `WEBHOOK_URL` | 是 | Telegram Webhook URL |
 | `WEBHOOK_TOKEN` | 是 | Webhook 鉴权 token |
+| `DROP_PENDING_ON_STARTUP` | 可选 | `true` 时启动自愈注册附带 `drop_pending_updates=true`，重启即丢弃 Telegram 侧积压 update（停机/部署窗口内的消息被永久丢弃）。默认 `false`：保留积压，由健康实例重放排干 |
 | `OPENROUTER_API_KEY` | 是（严格模式） | 默认模型厂商/主要模型入口 |
 | `MODELSCOPE_API_KEY` | 可选 | ModelScope 模型 |
 | `GEMINI_API_KEY` | 可选 | Gemini |

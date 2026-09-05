@@ -84,6 +84,11 @@ from apitelegramchat.context_window import (
 )
 from apitelegramchat.tool_context_compaction import compact_older_tool_calls, _eligible_calls
 from apitelegramchat import proactive
+from apitelegramchat.webhook_sync import (
+    get_webhook_info,
+    mask_webhook_url,
+    run_sync_with_deadline,
+)
 
 app = Quart(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
@@ -114,6 +119,20 @@ async def _startup_load_whitelist() -> None:
         await proactive.start_proactive_scheduler()
     except Exception:
         logger.warning("startup proactive scheduler failed", exc_info=True)
+
+
+@app.before_serving
+async def _startup_sync_webhook() -> None:
+    """启动自愈：幂等重注册 Telegram webhook + getWebhookInfo 观测日志。
+
+    - 注册信息（URL/token）保存在 Telegram 服务器侧，不随进程重启消失；
+      这里幂等重注册的目的是把注册 URL 对齐到环境变量（修掉手工注册
+      残留的旧 token 导致的 403 积压），并非清积压——setWebhook 不触碰
+      存量队列，清队需 DROP_PENDING_ON_STARTUP=true（见 config.py）。
+    - fire-and-forget：不阻塞 /health 就绪；内部自带单请求超时与总死线，
+      任何失败都只降级为"沿用上一次注册"。
+    """
+    asyncio.create_task(run_sync_with_deadline())
 
 
 @app.after_serving
@@ -1471,8 +1490,22 @@ async def webhook() -> tuple:
         logger.info(f"Received webhook request {request_id}")
 
         token = request.args.get("token")
-        # 使用 hmac.compare_digest 进行恒定时间比较，防止时序攻击
-        if not token or not WEBHOOK_TOKEN or not hmac.compare_digest(str(token), str(WEBHOOK_TOKEN)):
+        # 鉴权双路径（任一匹配即放行），均用 hmac.compare_digest 恒定时间比较防止时序攻击：
+        #  1) URL query ?token=…（历史注册方式，保持完全兼容）；
+        #  2) X-Telegram-Bot-Api-Secret-Token 请求头——当启动自愈以
+        #     secret_token 参数注册后（见 webhook_sync.py），Telegram 每次投递
+        #     都会携带该头。头路径让 token 不再出现在 URL/访问日志里。
+        # 头路径是加法式强化：若注册时未附带 secret_token，Telegram 不会发
+        # 该头，鉴权自然回落到 query token，既有投递不受任何影响。
+        token_ok = False
+        if WEBHOOK_TOKEN:
+            if token and hmac.compare_digest(str(token), str(WEBHOOK_TOKEN)):
+                token_ok = True
+            else:
+                secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+                if secret_header and hmac.compare_digest(str(secret_header), str(WEBHOOK_TOKEN)):
+                    token_ok = True
+        if not token_ok:
             return "Forbidden", 403
         if request.method in ('GET', 'HEAD'):
             return "OK - Webhook is alive", 200
@@ -1518,7 +1551,7 @@ async def webhook() -> tuple:
 
             text = msg.get("text", "") or ""
             is_admin_cmd = (_cmd_match(text, "/adduser") or _cmd_match(text, "/deluser")
-                            or _cmd_match(text, "/listusers"))
+                            or _cmd_match(text, "/listusers") or _cmd_match(text, "/webhookinfo"))
             if is_admin_cmd:
                 if not is_admin(username, user_id):
                     await send_rich_html_message(chat_id, "❌ <b>权限不足</b>\n只有管理员可以执行此操作。", reply_parameters=_reply_params(msg["message_id"]))
@@ -1567,6 +1600,41 @@ async def webhook() -> tuple:
                     else:
                         users_list = "".join(f"<li><code>{str(u)}</code></li>" for u in users)
                         await send_rich_html_message(chat_id, f"📋 <b>当前白名单用户：</b>\n<ul>{users_list}</ul>", reply_parameters=_reply_params(msg["message_id"]))
+                    return "OK", 200
+                elif _cmd_match(text, "/webhookinfo"):
+                    # 观测命令：把 getWebhookInfo 的关键投递链路指标带回聊天，
+                    # 让"积压"（pending_update_count）与最近投递错误无需登服务器
+                    # 看日志即可发现。URL 先脱敏，token 不进聊天记录。
+                    info = await get_webhook_info()
+                    if not info:
+                        await send_rich_html_message(chat_id, "❌ <b>获取失败</b>\ngetWebhookInfo 请求失败，请查看服务端日志。", reply_parameters=_reply_params(msg["message_id"]))
+                        return "OK", 200
+                    pending = info.get("pending_update_count", 0)
+                    lines = [
+                        "🩺 <b>Webhook 投递链路状态</b>",
+                        "<blockquote>",
+                        f"注册 URL：<code>{mask_webhook_url(info.get('url') or '')}</code>",
+                        f"积压 update：<b>{pending}</b>",
+                        f"IP 地址：<code>{info.get('ip_address') or '—'}</code>",
+                        f"最大连接数：<code>{info.get('max_connections', '—')}</code>",
+                    ]
+                    last_err_date = info.get("last_error_date")
+                    last_err_msg = info.get("last_error_message")
+                    if last_err_msg:
+                        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_err_date)) if last_err_date else "未知时间"
+                        lines.append(f"最近投递错误：<code>{str(ts)} / {str(last_err_msg)[:200]}</code>")
+                    else:
+                        lines.append("最近投递错误：无 ✅")
+                    lines.append("</blockquote>")
+                    if pending:
+                        lines.append(
+                            "⚠️ 存在积压：应用健康运行并对重放返回 200 后，Telegram 会自动重放排干"
+                            "（bot 会迟到地回复这批消息）。若希望丢弃：设置 <code>DROP_PENDING_ON_STARTUP=true</code> "
+                            "后重启，或手动调用 <code>deleteWebhook?drop_pending_updates=true</code> 后重新 setWebhook。"
+                        )
+                    else:
+                        lines.append("✅ 无积压，投递链路正常。")
+                    await send_rich_html_message(chat_id, "\n".join(lines), reply_parameters=_reply_params(msg["message_id"]))
                     return "OK", 200
 
             if _cmd_match(text, "/start"):

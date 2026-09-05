@@ -49,8 +49,16 @@ SERPER_API_KEY = (os.getenv("SERPER_API_KEY", "") or "").strip()
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
 _RAW_WEBHOOK_URL = os.getenv("WEBHOOK_URL") or ""
-# Webhook 注册由部署平台/运维侧完成（setWebhook 时自行拼接 ?token=…），
-# 应用内只消费原始 WEBHOOK_URL（见 validate_runtime_config 与启动配置汇总）。
+# Webhook 注册采用"启动自愈"：应用启动时（app._startup_sync_webhook →
+# webhook_sync.sync_webhook_on_startup）用 WEBHOOK_URL?token=WEBHOOK_TOKEN
+# 幂等调用 setWebhook 重注册，并输出 getWebhookInfo 观测日志
+# （pending_update_count / last_error_*），让积压可被观测。
+# 注意：setWebhook 只修"未来的投递路由"，不影响 Telegram 侧已积压的
+# update 队列；唯一清队手段是 drop_pending_updates=true（见下）。
+# DROP_PENDING_ON_STARTUP=true 时，启动注册附带 drop_pending_updates=true，
+# 在自愈注册的同时清空 Telegram 侧积压队列——停机/部署窗口内收到的消息
+# 会被**永久丢弃**（不投递、不回复），仅当宁可丢消息也不愿迟到回复时开启。
+DROP_PENDING_ON_STARTUP = os.getenv("DROP_PENDING_ON_STARTUP", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 
