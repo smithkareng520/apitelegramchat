@@ -23,6 +23,7 @@ from apitelegramchat.s3_utils import (
     is_r2_configured,
 )
 import apitelegramchat.state as state
+from apitelegramchat.workspace_paths import workspace_download_root
 
 logger = get_logger(__name__)
 
@@ -497,6 +498,58 @@ async def _build_base64_document_file_part(
     }
 
 
+async def _materialize_document_to_workspace_download(
+        chat_id: int | None,
+        file_id: str,
+        file_name: str,
+) -> str:
+    """将用户上传文档落地到当前工作区 download/。
+
+    原生 Anthropic document URL 路径以前只上传 R2 给 Claude，
+    没有在 agent workspace 保留文件，因此 bash/text_editor 看不到。
+    这里补齐本地工作区副本，保证：
+      - Opus 原生 document 可读
+      - 工具链仍可通过 download/<name> 分析 zip/pdf 等文件
+    """
+    if chat_id is None:
+        return ""
+    data = await _get_cached_document_data(chat_id, file_id)
+    if not data:
+        return ""
+    safe_name = Path(file_name or f"document_{file_id[:8]}").name
+    target = workspace_download_root(chat_id) / safe_name
+    try:
+        target.write_bytes(data)
+        return str(target)
+    except Exception as exc:
+        logger.warning("[NativeDocument] 保存 download 失败: %s", exc)
+        return ""
+
+
+async def _ensure_document_download_available(chat_id: int | None, file_id: str, file_name: str) -> None:
+    """
+    所有文档统一保证 workspace/download 存在。
+
+    native document 模型：
+        download 文件 + Anthropic document block 双通道
+
+    非 native document 模型：
+        download 文件 + 文本/占位解析
+
+    不改变模型输入协议，只补齐 agent workspace 文件事实层。
+    """
+    try:
+        await _materialize_document_to_workspace_download(
+            chat_id, file_id, file_name
+        )
+    except Exception as exc:
+        logger.warning(
+            "[Document] download materialize failed file=%s err=%s",
+            file_id,
+            exc,
+        )
+
+
 async def _build_native_document_part(
         chat_id: int | None,
         file_id: str,
@@ -524,6 +577,10 @@ async def _build_native_document_part(
     safe_mime = _guess_document_mime_type(safe_name, mime_type)
 
     if _is_anthropic_native_model(model_info):
+        # 无论最终走 R2 URL 还是 base64，都先把用户文件保存在 workspace/download。
+        # 这样 Claude tool loop 后续可以用 bash/text_editor 访问。
+        await _materialize_document_to_workspace_download(chat_id, file_id, safe_name)
+
         if safe_mime != "application/pdf":
             logger.info(
                 "[NativeDocument] anthropic 原生协议仅支持 PDF document 块，"
@@ -879,6 +936,15 @@ async def _resolve_mixed_attachments(
             content_parts.append(resolved_part)
             continue
 
+        # 文档无论是否支持 native document，都先落地 workspace/download。
+        # native document 额外发送原生块，但文件事实层始终保留。
+        if kind == "document":
+            await _ensure_document_download_available(
+                chat_id,
+                fid,
+                fname or f"document_{fid[:8]}"
+            )
+
         # 该附件模态不被当前模型支持 / 解析失败：文本占位；视频顺带
         # 后台持久化，保证之后切换到支持的模型时不丢信息。
         if kind == "video":
@@ -1086,6 +1152,12 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                     return content_parts
                 return user_text
         elif doc_file_ids:
+            for idx, fid in enumerate(doc_file_ids):
+                await _ensure_document_download_available(
+                    chat_id,
+                    fid,
+                    doc_file_names[idx] if idx < len(doc_file_names) else f"document_{fid[:8]}"
+                )
             return await _build_attachment_fallback_text(
                 kind="document",
                 file_ids=doc_file_ids,
