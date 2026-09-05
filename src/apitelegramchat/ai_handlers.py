@@ -28,6 +28,7 @@ from apitelegramchat.config import (
     DEFAULT_MODEL,
     PROVIDERS,
     ModelConfig,
+    get_effective_endpoint,
 )
 from apitelegramchat.utils import (
     get_current_time,
@@ -664,7 +665,7 @@ async def get_ai_response(
                 current_model, messages, builder, chat_id, journal=journal
             )
         elif model_info.native_image:
-            client = api_client.get_client(model_info.provider)
+            client = api_client.get_client_for_model(model_info)
             raw_content, usage, new_msgs = await _agentic_loop_native_image(
                 client, current_model, messages, builder, chat_id, journal=journal
             )
@@ -1132,13 +1133,17 @@ async def _call_api(
     if api_type not in PROVIDERS:
         logger.error(f"未知的 api_type: {api_type}，降级到 openrouter")
         api_type = "openrouter"
+        model_info = SUPPORTED_MODELS.get(DEFAULT_MODEL, model_info)
 
-    provider_config = PROVIDERS.get(api_type)
-    use_dedicated_loop = provider_config.use_dedicated_loop if provider_config else False
-    dedicated_loop_kind = getattr(provider_config, "dedicated_loop_kind", "gemini_native")
+    # 有效端点：合并厂商默认值与该模型自己的端点覆盖（不同中转端点/协议）。
+    # use_dedicated_loop / dedicated_loop_kind 均以模型级覆盖优先，
+    # 因此同一个 provider 壳下的不同模型可以分别走不同协议循环。
+    endpoint = get_effective_endpoint(model_info)
+    use_dedicated_loop = endpoint.use_dedicated_loop
+    dedicated_loop_kind = endpoint.dedicated_loop_kind
 
     if use_dedicated_loop and dedicated_loop_kind == "anthropic_native":
-        client = api_client.get_client(api_type)
+        client = api_client.get_client_for_model(model_info)
         return await _agentic_loop_anthropic(
             client, current_model, messages, builder,
             tools=tools_to_pass, supports_tools=supports_tools, journal=journal,
@@ -1151,7 +1156,7 @@ async def _call_api(
             tools=tools_to_pass, supports_tools=supports_tools, journal=journal,
         )
     else:
-        client = api_client.get_client(api_type)
+        client = api_client.get_client_for_model(model_info)
         return await _agentic_loop_openai_compat(
             client, current_model, messages, api_type, builder,
             tools=tools_to_pass, supports_tools=supports_tools, journal=journal,

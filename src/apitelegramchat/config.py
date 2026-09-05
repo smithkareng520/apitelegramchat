@@ -66,6 +66,9 @@ BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_T
 # 必须在使用前定义（LOG_TRUNCATE_LIMIT / MAX_CONCURRENT_TOOLS 等都依赖）。
 # 合法推理努力档位（OpenAI gpt-5 / Gemini 3 / Claude / OpenRouter 通用口径）
 VALID_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "none"}
+# 合法的专用协议循环标签（与 ProviderConfig.dedicated_loop_kind /
+# ModelConfig.dedicated_loop_kind 覆盖字段共用同一取值域）。
+_VALID_DEDICATED_LOOP_KINDS = {"gemini_native", "anthropic_native"}
 
 
 def _positive_float_env(name: str, default: float, minimum: float) -> float:
@@ -204,6 +207,33 @@ class ModelConfig:
     # 数值 = 按模型覆盖。某模型完全不支持采样时用 supports_sampling=False。
     temperature: Optional[float] = None
     top_p: Optional[float] = None
+
+    # ===================== 端点覆盖（每模型独立中转/协议）=====================
+    # 背景：中转/聚合端点常见"同一 base_url 下不同模型协议不同"（如某端点
+    # 的 OpenAI 兼容模型走 /v1/chat/completions，Anthropic 系模型走原生
+    # Messages API，二者 502/404 互不兼容），或者"想用的模型分散在多个
+    # 中转站"。原先端点信息完全挂在 provider 级（PROVIDERS[provider]），
+    # 同一 provider 下所有模型被迫共用同一 base_url/key/协议，选完供应商
+    # 还要再确认这台端点这个模型走不走得通，配置心智负担很重。
+    #
+    # 以下字段全部可选，None = 沿用 provider（PROVIDERS[provider]）的默认值；
+    # 非 None = 仅对本模型生效的覆盖值，不影响同 provider 下的其它模型。
+    # provider 字段本身仍然决定"协议族"（即走哪套 agentic 循环、构造什么
+    # 形状的请求体/如何解析响应）——端点覆盖只改"连到哪、用哪个 key、
+    # 带什么请求头"，不改协议本身。换句话说：
+    #   - 想换端点但协议不变（同样是 OpenAI 兼容 / 同样是 Anthropic 原生）：
+    #     只填 base_url / api_key_env（可选 default_headers）。
+    #   - 想强制该模型走某种专用协议循环（如某中转的这个模型只认 Anthropic
+    #     原生 Messages 协议，即使 provider 挂在 openrouter 之类壳下）：
+    #     额外填 use_dedicated_loop / dedicated_loop_kind。
+    # 见 get_effective_endpoint() 获取合并后的有效端点配置。
+    base_url: Optional[str] = None
+    api_key_env: Optional[str] = None
+    default_headers: Optional[Dict[str, str]] = None
+    use_dedicated_loop: Optional[bool] = None
+    dedicated_loop_kind: Optional[str] = None
+    session_affinity: Optional[bool] = None
+    vision_prefer_url: Optional[bool] = None
 
     @property
     def api_type(self) -> str:
@@ -436,6 +466,76 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
 }
 
 
+@dataclass
+class EffectiveEndpoint:
+    """某个具体模型实际应该连接的端点信息（provider 默认值 + 模型覆盖 合并后的结果）。"""
+    provider: str                 # 协议族标签（决定走哪套 agentic 循环 / 请求体形状）
+    name: str                     # 展示名（沿用 provider 名，端点覆盖不改展示名）
+    base_url: str
+    api_key_env: str
+    default_headers: Dict[str, str]
+    use_dedicated_loop: bool
+    dedicated_loop_kind: str
+    supports_prompt_cache: bool
+    vision_prefer_url: bool
+    session_affinity: bool
+    # 是否存在模型级端点覆盖（仅用于日志/调试，不参与业务判断）。
+    is_override: bool = False
+
+
+def get_effective_endpoint(model_info) -> EffectiveEndpoint:
+    """
+    返回某个 ModelConfig 实际应使用的端点配置：
+    以 PROVIDERS[model_info.provider] 为默认值，逐字段用模型上非 None 的
+    覆盖字段（base_url / api_key_env / default_headers / use_dedicated_loop /
+    dedicated_loop_kind / session_affinity / vision_prefer_url）替换。
+
+    这是"每模型独立配置中转端点/协议"的唯一合并出口：api_client.py /
+    agentic_loops.py / attachment_content.py 等一切需要知道"这个模型到底
+    连哪、用哪个 key、走什么协议循环"的地方，都应改为调用本函数，而不是
+    直接 PROVIDERS.get(model_info.provider)。
+    """
+    provider_key = getattr(model_info, "provider", None)
+    base = PROVIDERS.get(provider_key)
+    if base is None:
+        raise ValueError(f"未知厂商: {provider_key!r}，请检查 config.py 中的 PROVIDERS")
+
+    def _pick(attr_name: str):
+        override = getattr(model_info, attr_name, None)
+        return override if override is not None else getattr(base, attr_name)
+
+    override_base_url = getattr(model_info, "base_url", None)
+    override_api_key_env = getattr(model_info, "api_key_env", None)
+    override_headers = getattr(model_info, "default_headers", None)
+    override_dedicated = getattr(model_info, "use_dedicated_loop", None)
+    override_loop_kind = getattr(model_info, "dedicated_loop_kind", None)
+    override_session_aff = getattr(model_info, "session_affinity", None)
+    override_vision_url = getattr(model_info, "vision_prefer_url", None)
+
+    is_override = any(
+        v is not None
+        for v in (
+            override_base_url, override_api_key_env, override_headers,
+            override_dedicated, override_loop_kind, override_session_aff,
+            override_vision_url,
+        )
+    )
+
+    return EffectiveEndpoint(
+        provider=provider_key,
+        name=base.name,
+        base_url=_pick("base_url"),
+        api_key_env=_pick("api_key_env"),
+        default_headers=(override_headers if override_headers is not None else (base.default_headers or {})),
+        use_dedicated_loop=bool(_pick("use_dedicated_loop")),
+        dedicated_loop_kind=_pick("dedicated_loop_kind"),
+        supports_prompt_cache=bool(getattr(model_info, "supports_prompt_cache", base.supports_prompt_cache)),
+        vision_prefer_url=bool(_pick("vision_prefer_url")),
+        session_affinity=bool(_pick("session_affinity")),
+        is_override=is_override,
+    )
+
+
 def _merge_with_defaults(provider: str, overrides: dict) -> dict:
     """合并厂商默认值和模型覆盖值"""
     defaults = _PROVIDER_DEFAULTS.get(provider, {})
@@ -457,13 +557,81 @@ def get_openrouter_provider_preferences() -> dict:
     return prefs
 
 
+# 端点覆盖字段：这些字段不参与 _PROVIDER_DEFAULTS 的能力合并（vision/
+# supports_tools 等走厂商默认继承的逻辑），而是"模型有填就用模型的，
+# 模型没填就是 None（=沿用 provider）"，直接原样落到 ModelConfig 上，
+# 由 get_effective_endpoint() 在使用时合并，因此这里先从 kwargs 中摘出、
+# 不参与 _merge_with_defaults。
+_ENDPOINT_OVERRIDE_FIELDS = (
+    "base_url",
+    "api_key_env",
+    "default_headers",
+    "use_dedicated_loop",
+    "dedicated_loop_kind",
+    "session_affinity",
+    "vision_prefer_url",
+)
+
+
 def make_model_config(
     model_id: str,
     provider: str,
     name: str,
     **kwargs
 ) -> ModelConfig:
-    """工厂函数：根据 provider 和覆盖项创建 ModelConfig"""
+    """
+    工厂函数：根据 provider 和覆盖项创建 ModelConfig。
+
+    除了原有的能力字段（vision/supports_tools/reasoning_* 等，走厂商
+    默认继承），还接受端点覆盖字段（见 _ENDPOINT_OVERRIDE_FIELDS）：
+    当某个中转端点对不同模型使用不同协议或不同子端点时，可以在具体
+    模型这里单独指定，无需为此新建一个 provider。
+
+    示例：假设 provider="my_relay" 的中转站里，
+    gpt-5.6-sol 走 OpenAI 兼容协议、claude-opus-5 走 Anthropic 原生协议，
+    但用的是同一个 base_url 与同一个 key：
+
+        PROVIDERS["my_relay"] = ProviderConfig(
+            name="MyRelay",
+            base_url="https://xxtf.baby/query/v1",   # OpenAI 兼容子路径
+            api_key_env="MY_RELAY_API_KEY",
+        )
+
+        SUPPORTED_MODELS["gpt-5.6-sol"] = make_model_config(
+            model_id="gpt-5.6-sol",
+            provider="my_relay",
+            name="GPT 5.6 Sol",
+        )
+        SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
+            model_id="claude-opus-5",
+            provider="my_relay",
+            name="Claude Opus 5 (中转)",
+            # 仅此模型覆盖：换协议 + 换子路径，key 仍沿用 my_relay 默认。
+            use_dedicated_loop=True,
+            dedicated_loop_kind="anthropic_native",
+            base_url="https://xxtf.baby/query/anthropic",
+        )
+    """
+    endpoint_overrides = {
+        field: kwargs.pop(field) for field in _ENDPOINT_OVERRIDE_FIELDS if field in kwargs
+    }
+
+    override_loop_kind = endpoint_overrides.get("dedicated_loop_kind")
+    if override_loop_kind is not None and override_loop_kind not in _VALID_DEDICATED_LOOP_KINDS:
+        raise ValueError(
+            f"模型 {model_id} 的 dedicated_loop_kind={override_loop_kind!r} 无效，"
+            f"合法值: {sorted(_VALID_DEDICATED_LOOP_KINDS)}"
+        )
+    override_api_key_env = endpoint_overrides.get("api_key_env")
+    if override_api_key_env is not None and not hasattr(sys.modules[__name__], override_api_key_env):
+        # 提前暴露拼写错误：真正的 key 变量必须在本模块顶部用
+        # os.getenv(...) 定义好，否则运行期 api_client._get_api_key
+        # 只会得到 None 并报"缺少 API Key"，定位起来更绕。
+        raise ValueError(
+            f"模型 {model_id} 的 api_key_env={override_api_key_env!r} 在 config.py 中未定义，"
+            f"请先在文件顶部加一行 {override_api_key_env} = os.getenv({override_api_key_env!r}, \"\")"
+        )
+
     merged = _merge_with_defaults(provider, kwargs)
 
     # 推理努力档位校验：拼错会在运行期被网关 400，尽早暴露。
@@ -507,6 +675,13 @@ def make_model_config(
         reasoning_max_tokens=(int(budget) if budget is not None else None),
         temperature=merged.get("temperature"),
         top_p=merged.get("top_p"),
+        base_url=endpoint_overrides.get("base_url"),
+        api_key_env=endpoint_overrides.get("api_key_env"),
+        default_headers=endpoint_overrides.get("default_headers"),
+        use_dedicated_loop=endpoint_overrides.get("use_dedicated_loop"),
+        dedicated_loop_kind=endpoint_overrides.get("dedicated_loop_kind"),
+        session_affinity=endpoint_overrides.get("session_affinity"),
+        vision_prefer_url=endpoint_overrides.get("vision_prefer_url"),
     )
 
 
@@ -809,6 +984,71 @@ SUPPORTED_MODELS["agnes-video-v2.0"] = make_model_config(
 )
 
 # ---------- Anthropic 官方模型（原生 Messages API，专用循环）----------
+
+
+# =============================================================================
+# 【模板】中转/聚合端点，每模型独立配置 base_url / key / 协议
+# =============================================================================
+# 适用场景：你想接入的中转站（如问题里提到的 https://xxtf.baby/query/）
+# 对不同模型使用不同协议——比如 OpenAI 兼容模型走一个子路径，
+# Anthropic 系模型走另一个原生 Messages 子路径，混用会直接 502/404。
+# 以前的做法是"选供应商 = 选端点"，同一 provider 下所有模型被迫共用
+# 同一个 base_url，为此不同协议往往要拆成好几个 provider 分别维护。
+# 现在改为：provider 只负责提供"默认端点"，每个模型可以按需覆盖
+# base_url / api_key_env / default_headers / use_dedicated_loop /
+# dedicated_loop_kind / session_affinity / vision_prefer_url 中的任意
+# 字段——不填就沿用 provider 默认，填了就只对这一个模型生效。
+#
+# 使用步骤（照抄即可）：
+#   1) 在文件顶部"环境变量"区域加一行 key 声明，例如：
+#        XXTF_API_KEY = os.getenv("XXTF_API_KEY", "")
+#      并在 Render/部署环境里配置好同名环境变量。
+#   2) 在 PROVIDERS 里加一个壳（决定"默认"端点，通常填 OpenAI 兼容那部分）：
+#        PROVIDERS["xxtf"] = ProviderConfig(
+#            name="XXTF Relay",
+#            base_url="https://xxtf.baby/query/v1",   # OpenAI 兼容默认子路径
+#            api_key_env="XXTF_API_KEY",
+#        )
+#   3) 每个模型按需覆盖。协议不变、只是想换个模型名的，什么都不用覆盖；
+#      协议不同（比如这个模型必须走 Anthropic 原生 Messages），加
+#      use_dedicated_loop + dedicated_loop_kind + base_url 三个字段即可：
+#
+#        SUPPORTED_MODELS["gpt-5.6-sol"] = make_model_config(
+#            model_id="gpt-5.6-sol",
+#            provider="xxtf",
+#            name="GPT 5.6 Sol (XXTF)",
+#            vision=True,
+#            max_context=128000,
+#            # 未覆盖任何端点字段 -> 完全沿用 PROVIDERS["xxtf"] 的默认
+#            # base_url/api_key_env，走 OpenAI 兼容协议（_agentic_loop_openai_compat）。
+#        )
+#
+#        SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
+#            model_id="claude-opus-5",
+#            provider="xxtf",
+#            name="Claude Opus 5 (XXTF)",
+#            vision=True,
+#            native_document=True,
+#            supports_prompt_cache=True,
+#            max_context=200000,
+#            # 仅这一个模型覆盖：换协议 + 换子路径，key 仍沿用
+#            # PROVIDERS["xxtf"] 的 XXTF_API_KEY（如中转站对不同协议
+#            # 用不同 key，再额外传 api_key_env="XXTF_ANTHROPIC_API_KEY"
+#            # 即可，同样只对本模型生效）。
+#            use_dedicated_loop=True,
+#            dedicated_loop_kind="anthropic_native",
+#            base_url="https://xxtf.baby/query/anthropic",
+#            reasoning_enabled=True,
+#            temperature=1.0,
+#        )
+#
+# 两个模型共用同一个 provider="xxtf" 壳、同一份 key，但 api_client.py
+# 会按 model_id 分别缓存客户端（见 APIClient.get_client_for_model），
+# 各自连到各自的 base_url、走各自的协议循环，互不干扰。
+# 想验证某个模型实际会连去哪、走什么协议，可以直接调用：
+#   from apitelegramchat.config import get_effective_endpoint, SUPPORTED_MODELS
+#   print(get_effective_endpoint(SUPPORTED_MODELS["claude-opus-5"]))
+# =============================================================================
 
 
 # ========== 默认模型 ==========

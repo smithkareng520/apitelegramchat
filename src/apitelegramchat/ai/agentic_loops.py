@@ -184,11 +184,27 @@ def _session_affinity_body(
     api_label: str,
     chat_id: object = None,
     session_key: Optional[str] = None,
+    model_info=None,
 ) -> dict:
-    """声明了 session_affinity 的网关返回 body 级亲和键，否则空 dict。"""
-    from apitelegramchat.config import PROVIDERS
-    cfg = PROVIDERS.get(api_label)
-    if not (cfg and getattr(cfg, "session_affinity", False)):
+    """声明了 session_affinity 的网关返回 body 级亲和键，否则空 dict。
+
+    优先读取 model_info 的"有效端点"（含模型级覆盖）；未传 model_info 时
+    退回按 api_label 直接查 PROVIDERS（旧调用路径兼容，此时看不到模型级
+    session_affinity 覆盖）。
+    """
+    session_affinity = False
+    if model_info is not None:
+        from apitelegramchat.config import get_effective_endpoint
+        try:
+            session_affinity = get_effective_endpoint(model_info).session_affinity
+        except ValueError:
+            session_affinity = False
+    else:
+        from apitelegramchat.config import PROVIDERS
+        cfg = PROVIDERS.get(api_label)
+        session_affinity = bool(cfg and getattr(cfg, "session_affinity", False))
+
+    if not session_affinity:
         return {}
     session = _session_affinity_key(chat_id, session_key)
     if not session:
@@ -200,13 +216,14 @@ def _session_affinity_headers(
     api_label: str,
     chat_id: object = None,
     session_key: Optional[str] = None,
+    model_info=None,
 ) -> Optional[dict]:
     """声明了 session_affinity 的网关返回请求头级亲和键，否则 None。
 
     OpenAI SDK 的 create(**params) 接受 extra_headers 逐请求透传，
-    不影响按 provider 缓存的 AsyncOpenAI 客户端实例。
+    不影响按 model_id 缓存的 AsyncOpenAI 客户端实例。
     """
-    body = _session_affinity_body(api_label, chat_id, session_key)
+    body = _session_affinity_body(api_label, chat_id, session_key, model_info=model_info)
     session = body.get("session_id")
     if not session:
         return None
@@ -219,6 +236,7 @@ def _merged_extra_body(
     chat_id: object = None,
     supports_prompt_cache: bool = False,
     session_key: Optional[str] = None,
+    model_info=None,
 ) -> Optional[dict]:
     """
     合并 OpenRouter 路由偏好 / 会话亲和键与推理控制字段，返回应传给
@@ -229,6 +247,9 @@ def _merged_extra_body(
       glm         -> {"thinking": {"type": "enabled"}}
       modelscope  -> {"enable_thinking": True}
     这些字段均不会与 provider 键冲突，直接字典合并即可。
+
+    model_info 若提供，session_affinity 判断走该模型的"有效端点"
+    （含模型级覆盖）；不提供则退回按 api_label 查厂商默认。
     """
     body = None
     if api_label == "openrouter":
@@ -240,7 +261,7 @@ def _merged_extra_body(
     else:
         # agnes 等声明了 session_affinity 的聚合网关：body 级会话亲和键
         # （多副本缓存隔离缓解，详见 _session_affinity_body 上方说明）。
-        affinity_body = _session_affinity_body(api_label, chat_id, session_key)
+        affinity_body = _session_affinity_body(api_label, chat_id, session_key, model_info=model_info)
         if affinity_body:
             body = affinity_body
     if reasoning_extra:
@@ -282,7 +303,7 @@ async def _agentic_loop_openai_compat(
     # 会话亲和请求头（agnes 等聚合网关多副本缓存隔离缓解）：声明了
     # session_affinity 的网关才非空。
     affinity_headers = _session_affinity_headers(
-        api_label, builder.chat_id, session_key=loop_session_key
+        api_label, builder.chat_id, session_key=loop_session_key, model_info=model_info
     )
 
     # L0 预防层（主流：OpenAI Structured Outputs）：对能安全规范化的工具
@@ -362,6 +383,7 @@ async def _agentic_loop_openai_compat(
                 chat_id=builder.chat_id,
                 supports_prompt_cache=prompt_cache_enabled,
                 session_key=loop_session_key,
+                model_info=model_info,
             )
             if extra_body is not None:
                 create_params["extra_body"] = extra_body
@@ -604,6 +626,7 @@ async def _agentic_loop_openai_compat(
                     chat_id=builder.chat_id,
                     supports_prompt_cache=prompt_cache_enabled,
                     session_key=loop_session_key,
+                    model_info=model_info,
                 )
                 if fallback_extra_body is not None:
                     fallback_params["extra_body"] = fallback_extra_body
@@ -783,6 +806,7 @@ async def _agentic_loop_openai_compat(
                 chat_id=builder.chat_id,
                 supports_prompt_cache=prompt_cache_enabled,
                 session_key=loop_session_key,
+                model_info=model_info,
             )
             if synth_extra_body is not None:
                 synth_params["extra_body"] = synth_extra_body

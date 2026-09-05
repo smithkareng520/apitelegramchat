@@ -11,7 +11,7 @@ from PIL import Image
 from typing import Optional
 import aiohttp
 
-from apitelegramchat.config import ModelConfig, TELEGRAM_BOT_TOKEN, PROVIDERS
+from apitelegramchat.config import ModelConfig, TELEGRAM_BOT_TOKEN, get_effective_endpoint
 from apitelegramchat.utils import get_logger, transcribe_audio_with_groq
 from apitelegramchat.file_handlers import get_file_path
 from apitelegramchat.s3_utils import (
@@ -793,8 +793,13 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
     supports_native_documents = bool(getattr(model_info, "native_document", False))
     # 部分网关（Agnes）只接受 image_url 里的公开 HTTP URL，不接受 data: base64。
     # 命中时优先用 R2 公开 URL；R2 不可用时回退 base64。
-    provider_cfg = PROVIDERS.get(model_info.provider)
-    vision_prefer_url = bool(getattr(provider_cfg, "vision_prefer_url", False)) if provider_cfg else False
+    # 走"有效端点"合并（provider 默认值 + 模型级覆盖），而非直接查
+    # PROVIDERS[model_info.provider]：否则某个模型若单独覆盖了
+    # vision_prefer_url，这里会读到厂商默认值而非模型自己的设置。
+    try:
+        vision_prefer_url = get_effective_endpoint(model_info).vision_prefer_url
+    except ValueError:
+        vision_prefer_url = False
     user_text = msg.get("content", "")
     if isinstance(user_text, str):
         user_text = _strip_reply_prefix(user_text)

@@ -555,9 +555,9 @@ async def execute_subagent(
         return json.dumps({"ok": False, "error": f"模型不可用：{chosen_model}", "code": "bad_model"},
                           ensure_ascii=False)
 
-    # 拿 client
+    # 拿 client（按模型自身的有效端点，自动应用该模型的端点覆盖）
     try:
-        client = api_client.get_client(model_info.provider)
+        client = api_client.get_client_for_model(model_info)
     except Exception as e:
         logger.debug("execute_subagent 内部忽略的异常", exc_info=True)
         return json.dumps({"ok": False, "error": f"API client 创建失败: {e}", "code": "no_client"},
