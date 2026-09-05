@@ -1232,6 +1232,42 @@ STREAM_SILENT_FORCE_FLUSH = _positive_float_env(
 # -----------------------------------------------------------------------------
 MAX_CONCURRENT_TOOLS = _positive_int_env("MAX_CONCURRENT_TOOLS", 16, 1)
 
+# -----------------------------------------------------------------------------
+# Telegram update 摄取通道（长轮询 / Webhook）
+# -----------------------------------------------------------------------------
+# INGEST_MODE 决定 update 从哪条链路进入 update_queue：
+#
+#   "polling"（默认，推荐）
+#       应用主动 getUpdates 长轮询。update 内容走**出站响应体**，不经过
+#       Render 边缘 Cloudflare WAF 的入站请求体检查，因此不会再出现
+#       "某些文本内容的消息永久 403、Telegram 队头阻塞、全 bot 卡死"。
+#
+#   "webhook"
+#       保持旧的 Telegram → POST /webhook 链路。仅在你已经把 WEBHOOK_URL
+#       指向自建反向代理 / Cloudflare Worker（对请求体做过 base64 包装，
+#       见 deploy/cloudflare-webhook-proxy.js）时才应使用。直连 Render 域名
+#       时该模式存在已知的 WAF 误杀缺陷。
+#
+#   "auto"
+#       配了 WEBHOOK_URL 就用 webhook，否则 polling（兼容旧部署的过渡值）。
+_RAW_INGEST_MODE = (os.getenv("INGEST_MODE", "polling") or "polling").strip().lower()
+if _RAW_INGEST_MODE not in {"polling", "webhook", "auto"}:
+    logger.warning(
+        "INGEST_MODE=%r 不是合法取值（polling/webhook/auto），已回退为 polling",
+        _RAW_INGEST_MODE,
+    )
+    _RAW_INGEST_MODE = "polling"
+if _RAW_INGEST_MODE == "auto":
+    INGEST_MODE = "webhook" if _RAW_WEBHOOK_URL else "polling"
+else:
+    INGEST_MODE = _RAW_INGEST_MODE
+
+# 单次 getUpdates 的服务端挂起时长（秒）。Telegram 建议 ≤50；25 与
+# aiohttp 请求超时（下方 +15s 余量）配合，既省请求数又能快速感知断链。
+TELEGRAM_POLL_TIMEOUT = _positive_int_env("TELEGRAM_POLL_TIMEOUT", 25, 1)
+# 单次 getUpdates 最多取回多少条 update（Telegram 上限 100）。
+TELEGRAM_POLL_LIMIT = min(_positive_int_env("TELEGRAM_POLL_LIMIT", 100, 1), 100)
+
 # =============================================================================
 # 安全补丁：读取后立即清洗敏感环境变量
 # =============================================================================

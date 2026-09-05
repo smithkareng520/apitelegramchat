@@ -40,6 +40,7 @@ from apitelegramchat.config import (
     GROQ_API_KEY,
     LOG_TRUNCATE_LIMIT,
     LOG_LEVEL,
+    INGEST_MODE,
 )
 from apitelegramchat.state import (
     user_contexts,
@@ -88,6 +89,7 @@ from apitelegramchat.webhook_sync import (
     mask_webhook_url,
     run_sync_with_deadline,
 )
+from apitelegramchat import telegram_polling
 
 app = Quart(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
@@ -122,15 +124,31 @@ async def _startup_load_whitelist() -> None:
 
 @app.before_serving
 async def _startup_sync_webhook() -> None:
-    """启动自愈：幂等重注册 Telegram webhook + getWebhookInfo 观测日志。
+    """启动摄取通道：polling 模式启动长轮询，webhook 模式做自愈注册。
 
-    - 注册信息（URL/token）保存在 Telegram 服务器侧，不随进程重启消失；
-      这里幂等重注册的目的是把注册 URL 对齐到环境变量（修掉手工注册
-      残留的旧 token 导致的 403 积压），并非清积压——setWebhook 不触碰
-      存量队列，清队需 DROP_PENDING_ON_STARTUP=true（见 config.py）。
-    - fire-and-forget：不阻塞 /health 就绪；内部自带单请求超时与总死线，
-      任何失败都只降级为"沿用上一次注册"。
+    ⚠️ 为什么默认是 polling（历史事故根因，勿轻易改回 webhook）：
+    Render 的服务位于其托管 Cloudflare 之后，用户**无法关闭该 WAF**。
+    托管规则 "Command Injection - Generic - body" 会检查入站请求体，
+    命中 `>`/反引号 紧邻 `curl`/`wget` 的 shell 注入特征时在边缘直接
+    403，请求根本到不了容器。而 Telegram webhook 是串行、需 2xx 签收
+    的投递模型：这条 update 不被签收就永远堵在队头无限重投，导致**后续
+    全部消息一起卡死**。改用 getUpdates 后 update 走出站响应体，不受
+    入站请求体检查影响，从根上消除该类误杀。
     """
+    if INGEST_MODE == "polling":
+        global _telegram_polling_task
+        _telegram_polling_task = await telegram_polling.start_polling(update_queue)
+        logger.info("摄取通道：getUpdates 长轮询（INGEST_MODE=polling）")
+        return
+
+    # webhook 模式：仅当 WEBHOOK_URL 指向能规避 WAF 的自建代理时才推荐。
+    logger.warning(
+        "摄取通道：webhook（INGEST_MODE=webhook）。若 WEBHOOK_URL 直连 Render 域名，"
+        "含 shell 注入特征的消息（如 '>curl -v \"\"'）会被边缘 WAF 403 拦截并堵死投递队列；"
+        "建议改用 INGEST_MODE=polling。"
+    )
+    # fire-and-forget：不阻塞 /health 就绪；内部自带单请求超时与总死线，
+    # 任何失败都只降级为"沿用上一次注册"。
     asyncio.create_task(run_sync_with_deadline())
 
 
@@ -139,10 +157,24 @@ async def _shutdown_close_http_session() -> None:
     """优雅关闭：先停 update worker 与主动唤醒调度器，再关掉所有持久
     bash 沙箱进程，最后关全局 aiohttp session。
     """
-    # 1) 先停后台 worker：不再消费队列、不再派发新的业务任务，避免与
-    #    下面的清理逻辑产生新的并发工作。注意：队列中尚未处理的 update
-    #    会随进程退出丢失（Telegram 已收到 200 ACK 不会重投）——这与
-    #    旧版"webhook 处理到一半进程重启"的损耗同级，属可接受窗口。
+    # 1) 先停摄取源（polling 模式）：轮询器停掉后不再有新 update 进队列。
+    #    polling 模式下未确认的 update 因 offset 未推进，会在下次启动时被
+    #    Telegram 重新投递，不会丢失（worker 侧去重保证不会重复处理）——
+    #    这比旧 webhook 模式（已 200 ACK 的队列内 update 随进程退出永久
+    #    丢失）更安全。
+    global _telegram_polling_task
+    if _telegram_polling_task is not None:
+        _telegram_polling_task.cancel()
+        try:
+            await _telegram_polling_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.warning("telegram polling shutdown raised", exc_info=True)
+        _telegram_polling_task = None
+
+    # 2) 再停后台 worker：不再消费队列、不再派发新的业务任务，避免与
+    #    下面的清理逻辑产生新的并发工作。
     global _telegram_worker_task
     if _telegram_worker_task is not None:
         _telegram_worker_task.cancel()
@@ -1528,6 +1560,8 @@ WEBHOOK_QUEUE_MAXSIZE = int(os.getenv("WEBHOOK_QUEUE_MAXSIZE", "1000"))
 # 导入期实例化是安全的（项目 requires-python >=3.10）。
 update_queue = asyncio.Queue(maxsize=WEBHOOK_QUEUE_MAXSIZE)
 _telegram_worker_task: asyncio.Task | None = None
+# INGEST_MODE=polling 时的 getUpdates 长轮询任务（webhook 模式下恒为 None）。
+_telegram_polling_task: asyncio.Task | None = None
 
 
 async def telegram_worker() -> None:
@@ -1662,6 +1696,17 @@ async def webhook() -> tuple:
         if request.method in ('GET', 'HEAD'):
             return "OK - Webhook is alive", 200
 
+        # polling 模式下本入口保持鉴权可探活，但不再接收业务 update：
+        # 两条摄取链路同时入队会造成同一 update 被处理两次（去重集合虽能
+        # 兜底，但 offset 与去重窗口的竞态没有必要引入）。返回 200 而非
+        # 错误码，避免任何残留的 webhook 注册触发 Telegram 重试风暴。
+        if INGEST_MODE == "polling":
+            logger.warning(
+                "收到 webhook 投递但当前 INGEST_MODE=polling，已忽略（说明 Telegram 侧仍有"
+                "残留 webhook 注册，重启会自动 deleteWebhook）"
+            )
+            return "OK - polling mode, webhook ignored", 200
+
         # ── 2. 快速读取 update（只做入队前必要校验）────────────────────────
         try:
             data = await request.json
@@ -1719,13 +1764,16 @@ async def process_update(data: dict) -> None:
         # 协程，这里的 set 不会泄漏到下一条 update）。
         set_request_id(str(uuid.uuid4())[:8])
 
-        # ----------------- 加在这里 -----------------
-        msg_obj = data.get("message") or {}
-        logger.info(
-            f"[DEBUG ENTITIES] text={repr(msg_obj.get('text'))} "
-            f"entities={msg_obj.get('entities')}"
-        )
-        # -------------------------------------------
+        # 排障期用于确认"消息是否真的进到了应用"的临时打点。根因已定位为
+        # 边缘 WAF 拦截（消息压根到不了这里），改用 polling 后不再需要无条件
+        # 打印用户原文——降级为 DEBUG，避免把消息内容长期写进生产日志。
+        if logger.isEnabledFor(logging.DEBUG):
+            _dbg = data.get("message") or {}
+            logger.debug(
+                "[ENTITIES] text=%r entities=%s",
+                _dbg.get("text"),
+                _dbg.get("entities"),
+            )
 
         uid = data.get('update_id')
         # 防御：webhook 入口已拦截缺少 update_id 的非法 payload，这里再拦
@@ -1828,6 +1876,29 @@ async def process_update(data: dict) -> None:
                         await send_rich_html_message(chat_id, "❌ <b>获取失败</b>\ngetWebhookInfo 请求失败，请查看服务端日志。", reply_parameters=_reply_params(msg["message_id"]))
                         return
                     pending = info.get("pending_update_count", 0)
+                    if INGEST_MODE == "polling":
+                        # 轮询模式下 url 应为空；若非空说明 deleteWebhook 没生效，
+                        # getUpdates 会持续 409，必须立刻暴露出来。
+                        registered = info.get("url") or ""
+                        lines = [
+                            "🩺 <b>投递链路状态（getUpdates 长轮询）</b>",
+                            "<blockquote>",
+                            "摄取模式：<code>polling</code>（不经过边缘 WAF，含 shell 特征的消息可正常送达）",
+                            f"轮询任务：<b>{'运行中 ✅' if (_telegram_polling_task and not _telegram_polling_task.done()) else '未运行 ❌'}</b>",
+                            f"队列水位：<code>{update_queue.qsize()}/{WEBHOOK_QUEUE_MAXSIZE}</code>",
+                            f"Telegram 侧积压：<b>{pending}</b>",
+                            f"webhook 注册：<code>{mask_webhook_url(registered) if registered else '已注销（正确）'}</code>",
+                            "</blockquote>",
+                        ]
+                        if registered:
+                            lines.append(
+                                "⚠️ webhook 仍处于注册状态，getUpdates 会返回 409 Conflict。"
+                                "重启服务会自动注销；或手动调用 <code>deleteWebhook</code>。"
+                            )
+                        else:
+                            lines.append("✅ 链路正常：消息经出站响应体拉取，不受 Cloudflare 入站请求体规则影响。")
+                        await send_rich_html_message(chat_id, "\n".join(lines), reply_parameters=_reply_params(msg["message_id"]))
+                        return
                     lines = [
                         "🩺 <b>Webhook 投递链路状态</b>",
                         "<blockquote>",

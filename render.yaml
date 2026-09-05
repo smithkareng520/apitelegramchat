@@ -55,6 +55,23 @@ services:
         value: auto
       - key: WEBHOOK_URL
         sync: false
+      # ⚠️ 必须为 polling（事故根因，勿改回 webhook）：
+      # Render 的服务位于其托管 Cloudflare 之后，且该 WAF **无法由用户关闭**
+      # （官方 feature request "Let us disable the Cloudflare WAF" 长期 open）。
+      # 托管规则 "Command Injection - Generic - body" 会检查**入站请求体**，
+      # 命中 `>` / 反引号 紧邻 curl/wget 的 shell 注入特征时在边缘直接 403，
+      # 请求根本到不了容器（日志里连 TCP 打印都没有）。
+      # 而 Telegram webhook 是串行、需 2xx 签收的投递模型：这条 update 永远
+      # 拿不到 200 就一直堵在队头无限重投，导致后续所有消息一起卡死——正是
+      # ">curl -v \"test\"" 之类消息把整个 bot 打挂的原因。
+      # polling 模式改用 getUpdates，update 走**出站响应体**，不受入站请求体
+      # 规则影响，从根上消除该类误杀。
+      - key: INGEST_MODE
+        value: polling
+      - key: TELEGRAM_POLL_TIMEOUT
+        value: "25"
+      - key: TELEGRAM_POLL_LIMIT
+        value: "100"
       # ⚠️ 必须为 false（代码默认值即 false，此处显式固化并修正历史误配）：
       # 设 true 时每次重启/部署/健康检查失败重启都会调用
       # setWebhook?drop_pending_updates=true，把 Telegram 侧积压的 update
