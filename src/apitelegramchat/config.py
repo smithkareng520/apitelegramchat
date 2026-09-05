@@ -1,15 +1,21 @@
+"""apitelegramchat 的集中式运行时配置。"""
+
 # config.py
-import os
-import sys
 import asyncio
 import logging
+import os
+import sys
 from dataclasses import dataclass
 from typing import Dict, Optional
 
-# ---------- 日志 ----------
+# -----------------------------------------------------------------------------
+# 日志
+# -----------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
 
-# ---------- 环境变量 ----------
+# -----------------------------------------------------------------------------
+# 环境变量
+# -----------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GLM_API_KEY = os.getenv("GLM_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
@@ -42,7 +48,9 @@ GAODE_MCP_ENABLED = os.getenv("GAODE_MCP_ENABLED", "true").strip().lower() in {"
 GAODE_MCP_URL = (os.getenv("GAODE_MCP_URL") or "").strip()
 GAODE_MCP_TOKEN = (os.getenv("GAODE_MCP_TOKEN") or "").strip()
 
-# ---------- 网页搜索：Serper 官方 REST API ----------
+# -----------------------------------------------------------------------------
+# 网页搜索：Serper 官方 REST API
+# -----------------------------------------------------------------------------
 # 直接调用 https://google.serper.dev/{search,images,videos,lens}，使用
 # X-API-KEY 头鉴权。Key 从 https://serper.dev 注册并获取，配置在
 # Render Environment 中作为 secret。一个 key 即可同时支持 4 种模式。
@@ -66,7 +74,9 @@ DROP_PENDING_ON_STARTUP = os.getenv("DROP_PENDING_ON_STARTUP", "false").strip().
 
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 
-# ---------- 公共：环境变量安全解析工具 ----------
+# -----------------------------------------------------------------------------
+# 公共：环境变量安全解析工具
+# -----------------------------------------------------------------------------
 # 必须在使用前定义（LOG_TRUNCATE_LIMIT / MAX_CONCURRENT_TOOLS 等都依赖）。
 # 合法推理努力档位（OpenAI gpt-5 / Gemini 3 / Claude / OpenRouter 通用口径）
 VALID_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "none"}
@@ -95,11 +105,15 @@ def _positive_int_env(name: str, default: int, minimum: int) -> int:
 SERPER_API_TIMEOUT = _positive_float_env("SERPER_API_TIMEOUT", 12.0, 1.0)
 
 
-# ---------- 日志截断配置 ----------
+# -----------------------------------------------------------------------------
+# 日志截断配置
+# -----------------------------------------------------------------------------
 LOG_TRUNCATE_LIMIT = _positive_int_env("LOG_TRUNCATE_LIMIT", 5000, 1)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# ---------- 必需环境变量检查 ----------
+# -----------------------------------------------------------------------------
+# 必需环境变量检查
+# -----------------------------------------------------------------------------
 def validate_runtime_config(*, strict: bool = False) -> None:
     """
     默认保持导入安全：MCP server、离线测试和单元测试可以在无 Telegram 环境变量时导入。
@@ -115,8 +129,9 @@ def validate_runtime_config(*, strict: bool = False) -> None:
     }
     missing = [k for k, v in required.items() if not v]
     if missing:
-        logger.error(f"缺少必需的环境变量: {', '.join(missing)}")
-        raise RuntimeError(f"缺少必需的环境变量: {', '.join(missing)}")
+        missing_text = ", ".join(missing)
+        logger.error("缺少必需的环境变量: %s", missing_text)
+        raise RuntimeError(f"缺少必需的环境变量: {missing_text}")
 
 if os.getenv("APITELEGRAMCHAT_REQUIRE_STRICT_CONFIG", "0") in {"1", "true", "yes", "on"}:
     try:
@@ -126,7 +141,9 @@ if os.getenv("APITELEGRAMCHAT_REQUIRE_STRICT_CONFIG", "0") in {"1", "true", "yes
         print(f"[apitelegramchat.config] {exc}", file=sys.stderr)
         raise
 
-# ---------- 角色相关 ----------
+# -----------------------------------------------------------------------------
+# 角色相关
+# -----------------------------------------------------------------------------
 SUPPORTED_ROLES = ["china", "think", "neko_catgirl", "succubus", "isla"]
 
 # =============================================================================
@@ -135,7 +152,7 @@ SUPPORTED_ROLES = ["china", "think", "neko_catgirl", "succubus", "isla"]
 
 @dataclass
 class ProviderConfig:
-    """厂商配置"""
+    """厂商级默认配置，包括端点、鉴权变量和协议能力。"""
     name: str
     base_url: str
     api_key_env: str
@@ -173,9 +190,10 @@ class ProviderConfig:
 
 @dataclass
 class ModelConfig:
-    """
-    模型配置，所有字段与原有保持一致，新增 provider 和 max_context 字段。
-    如果某些能力未显式指定，则从厂商默认值继承。
+    """单个模型的能力、推理参数以及可选端点覆盖。
+
+    能力字段未显式指定时继承厂商默认值；端点字段未显式指定时继承
+    ``PROVIDERS[provider]``。
     """
     model_id: str               # 完整的模型 ID，如 "google/gemini-2.5-flash"
     provider: str               # 对应 PROVIDERS 的 key
@@ -329,7 +347,13 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         supports_prompt_cache=True,
     ),
     "xxtf": ProviderConfig(
-        default_headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+        default_headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        },
         name="XXTF",
         # 壳的默认端点按 OpenAI 协议填（gpt-5.6-sol 沿用这个默认值）；
         # AsyncOpenAI 会自动拼接为 {base_url}/chat/completions
@@ -506,7 +530,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
 
 @dataclass
 class EffectiveEndpoint:
-    """某个具体模型实际应该连接的端点信息（provider 默认值 + 模型覆盖 合并后的结果）。"""
+    """某个模型合并后的最终端点配置。"""
     provider: str                 # 协议族标签（决定走哪套 agentic 循环 / 请求体形状）
     name: str                     # 展示名（沿用 provider 名，端点覆盖不改展示名）
     base_url: str
@@ -572,7 +596,7 @@ def get_effective_endpoint(model_info) -> EffectiveEndpoint:
 
 
 def _merge_with_defaults(provider: str, overrides: dict) -> dict:
-    """合并厂商默认值和模型覆盖值"""
+    """将非 None 的模型字段覆盖到厂商默认能力上。"""
     defaults = _PROVIDER_DEFAULTS.get(provider, {})
     merged = defaults.copy()
     for key, value in overrides.items():
@@ -853,13 +877,15 @@ def get_reasoning_request_fields(model_info, api_label: str = "") -> tuple:
 # =============================================================================
 SUPPORTED_MODELS: Dict[str, ModelConfig] = {}
 
-# ---------- OpenRouter 模型 ----------
+# -----------------------------------------------------------------------------
+# OpenRouter 模型
+# -----------------------------------------------------------------------------
 SUPPORTED_MODELS["z-ai/glm-5.2:free"] = make_model_config(
     model_id="z-ai/glm-5.2:free",
     provider="openrouter",
     name="Glm 5.2 Free",
     max_context=256000,
-    # 笔记型预览模型：不发送推理控制（预览期能力未知），采样不发送、走供应商默认。
+    # 预览模型能力未完全确认，不发送推理控制和采样参数，走供应商默认。
 )
 SUPPORTED_MODELS["minimax/minimax-m3:free"] = make_model_config(
     model_id="minimax/minimax-m3:free",
@@ -886,7 +912,9 @@ SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
     temperature=1.0,
 )
 
-# ---------- Agnes 免费模型 ----------
+# -----------------------------------------------------------------------------
+# Agnes 免费模型
+# -----------------------------------------------------------------------------
 # (duplicate gemma entry removed)
 SUPPORTED_MODELS["agnes-2.5-flash"] = make_model_config(
     model_id="agnes-2.5-flash",
@@ -898,7 +926,9 @@ SUPPORTED_MODELS["agnes-2.5-flash"] = make_model_config(
     # 完全走供应商默认。确认网关支持后可在此显式开启。
 )
 
-# ---------- ModelScope 免费模型 ----------
+# -----------------------------------------------------------------------------
+# ModelScope 免费模型
+# -----------------------------------------------------------------------------
 SUPPORTED_MODELS["deepseek-ai/DeepSeek-V4-Flash-0731"] = make_model_config(
     model_id="deepseek-ai/DeepSeek-V4-Flash-0731",
     provider="modelscope",
@@ -922,7 +952,9 @@ SUPPORTED_MODELS["ZhipuAI/GLM-5.2"] = make_model_config(
     temperature=0.6,
 )
 
-# ---------- Gemini 系列 ----------
+# -----------------------------------------------------------------------------
+# Gemini 系列
+# -----------------------------------------------------------------------------
 SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
     model_id="gemini-3.5-flash-lite",
     provider="gemini",
@@ -935,7 +967,9 @@ SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
     reasoning_effort="low",
     temperature=1.0,
 )
-# ---------- GLM 系列 ----------
+# -----------------------------------------------------------------------------
+# GLM 系列
+# -----------------------------------------------------------------------------
 SUPPORTED_MODELS["GLM-4.6V-Flash"] = make_model_config(
     model_id="GLM-4.6V-Flash",
     provider="glm",
@@ -959,7 +993,9 @@ SUPPORTED_MODELS["GLM-4.7-Flash"] = make_model_config(
     temperature=0.6,
 )
 
-# ---------- 图像生成模型 ----------
+# -----------------------------------------------------------------------------
+# 图像生成模型
+# -----------------------------------------------------------------------------
 SUPPORTED_MODELS["Qwen/Qwen-Image-Edit"] = make_model_config(
     model_id="Qwen/Qwen-Image-Edit",
     provider="modelscope",
@@ -1013,7 +1049,9 @@ SUPPORTED_MODELS["bytedance-seed/seedream-4.5"] = make_model_config(
     max_output_tokens=1024,
 )
 
-# ---------- 视频生成模型 ----------
+# -----------------------------------------------------------------------------
+# 视频生成模型
+# -----------------------------------------------------------------------------
 SUPPORTED_MODELS["agnes-video-v2.0"] = make_model_config(
     model_id="agnes-video-v2.0",
     provider="agnes",
@@ -1023,9 +1061,9 @@ SUPPORTED_MODELS["agnes-video-v2.0"] = make_model_config(
     max_output_tokens=4000,
 )
 
-# ---------- Anthropic 官方模型（原生 Messages API，专用循环）----------
-
-
+# -----------------------------------------------------------------------------
+# Anthropic 官方模型（原生 Messages API，专用循环）
+# -----------------------------------------------------------------------------
 # =============================================================================
 # XXTF 中转（https://xxtf.baby）：同一模型名在该平台上有多种协议挂载方式，
 # 这里按"平台标注的协议"接入，而不是按模型名猜协议——
@@ -1162,12 +1200,16 @@ async def snapshot_whitelist() -> list[str]:
     async with _whitelist_lock:
         return sorted(WHITELIST_USERS)
 
-# ---------- 缓存 TTL ----------
+# -----------------------------------------------------------------------------
+# 缓存 TTL
+# -----------------------------------------------------------------------------
 CACHE_TTL = _positive_int_env("CACHE_TTL", 300, 10)
 SEARCH_CACHE_TTL = _positive_int_env("SEARCH_CACHE_TTL", 300, 10)
 FETCH_CACHE_TTL = _positive_int_env("FETCH_CACHE_TTL", 3600, 10)
 
-# ---------- S3 / R2 配置 ----------
+# -----------------------------------------------------------------------------
+# S3 / R2 配置
+# -----------------------------------------------------------------------------
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
@@ -1175,7 +1217,9 @@ R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
 R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
 R2_REGION = os.getenv("R2_REGION", "auto")
 
-# ---------- 流式刷新阈值 ----------
+# -----------------------------------------------------------------------------
+# 流式刷新阈值
+# -----------------------------------------------------------------------------
 # 草稿是用户感知 Agent 正在工作的唯一实时界面。默认值优先保证首字与
 # 状态变更的可见性，同时仍低于 Telegram 草稿 API 的常规刷新频率。
 STREAM_FLUSH_INTERVAL = _positive_float_env("STREAM_FLUSH_INTERVAL", 0.65, 0.25)
@@ -1183,7 +1227,9 @@ STREAM_SILENT_FORCE_FLUSH = _positive_float_env(
     "STREAM_SILENT_FORCE_FLUSH", 2.0, STREAM_FLUSH_INTERVAL
 )
 
-# ---------- 工具调用并发数 ----------
+# -----------------------------------------------------------------------------
+# 工具调用并发数
+# -----------------------------------------------------------------------------
 MAX_CONCURRENT_TOOLS = _positive_int_env("MAX_CONCURRENT_TOOLS", 16, 1)
 
 # =============================================================================
@@ -1218,6 +1264,10 @@ def scrub_environment() -> None:
                 removed.append(key)
                 break
     if removed:
-        logger.info(f"🔒 Scrubbed {len(removed)} sensitive env vars: {', '.join(removed)}")
+        logger.info(
+            "Scrubbed %d sensitive environment variables: %s",
+            len(removed),
+            ", ".join(removed),
+        )
 
 scrub_environment()

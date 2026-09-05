@@ -16,8 +16,7 @@ from apitelegramchat.utils import (
     send_rich_html_message,
     delete_message,
     mark_draft_dead,
-    check_deepseek_balance,
-    check_openrouter_balance,
+    query_provider_balances,
     get_logger,
     set_request_id,
     extract_message_text,
@@ -2284,32 +2283,34 @@ async def process_update(data: dict) -> None:
                 if _cmd_match(user_input, "/balance"):
                     parts = user_input.split(maxsplit=1)
                     svc = parts[1].lower() if len(parts) > 1 else None
+                    if svc == "all":
+                        svc = None
+                    results = await query_provider_balances(svc)
                     msgs = []
-                    if not svc or svc == "all":
-                        b, u = await check_deepseek_balance()
-                        if b is not None:
-                            msgs.append(f"💰 <b>DeepSeek</b>: <code>{b} {u}</code>")
+                    for result in results:
+                        provider = result["provider"]
+                        if not result.get("ok"):
+                            msgs.append(
+                                f"⚠️ <b>{provider}</b>: 查询失败 "
+                                f"<i>({result.get('error', '未知错误')})</i>"
+                            )
+                            continue
+                        remaining = result.get("remaining")
+                        if result.get("unlimited"):
+                            value = "无限制"
+                        elif remaining is None:
+                            value = "未知"
                         else:
-                            msgs.append(f"⚠️ <b>DeepSeek</b>: 查询失败 <i>({u if u else '未知错误'})</i>")
-                        orb = await check_openrouter_balance()
-                        if orb is not None and orb >= 0:
-                            msgs.append(f"💰 <b>OpenRouter</b>: <code>${orb:.3f} USD</code>")
-                        else:
-                            msgs.append("⚠️ <b>OpenRouter</b>: 查询失败")
-                    elif svc in ("deepseek", "ds"):
-                        b, u = await check_deepseek_balance()
-                        if b is not None:
-                            msgs.append(f"💰 <b>DeepSeek</b>: <code>{b} {u}</code>")
-                        else:
-                            msgs.append(f"⚠️ <b>DeepSeek</b>: 查询失败 <i>({u if u else '未知错误'})</i>")
-                    elif svc in ("openrouter", "or"):
-                        orb = await check_openrouter_balance()
-                        if orb is not None and orb >= 0:
-                            msgs.append(f"💰 <b>OpenRouter</b>: <code>${orb:.3f} USD</code>")
-                        else:
-                            msgs.append("⚠️ <b>OpenRouter</b>: 查询失败")
-                    else:
-                        msgs.append("❌ 无效服务名，可用: <code>deepseek</code>, <code>openrouter</code>, <code>all</code>")
+                            value = f"{remaining} {result.get('currency', '')}".strip()
+                        details = []
+                        if result.get("usage") is not None:
+                            details.append(f"已用 {result['usage']:.3f} USD")
+                        if result.get("available") is False:
+                            details.append("当前不可用")
+                        suffix = f"（{'；'.join(details)}）" if details else ""
+                        msgs.append(f"💰 <b>{provider}</b>: <code>{value}</code>{suffix}")
+                    if not msgs:
+                        msgs.append("⚠️ 暂无可查询的提供商余额")
                     # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置
                     await _send_via_send_message(
                         chat_id,
