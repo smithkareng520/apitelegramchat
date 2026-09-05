@@ -357,7 +357,7 @@ WEBHOOK_URL?token=WEBHOOK_TOKEN
 
 | 厂商 | 机制 | 本项目的处理 |
 |---|---|---|
-| Anthropic（经 OpenRouter） | 显式 `cache_control` 断点（上限 4 个）+ 顶层自动缓存 | system 末尾 1 个 + 尾部 2 个显式断点（覆盖本轮新输入 / 最新 tool 结果 / 上一轮末尾，**agentic loop 每轮请求前重打**，见 `attachment_content._apply_cache_control`）；`extra_body.cache_control` 开启自动缓存（断点随对话自动前移），叠加后不超 4 断点上限 |
+| Anthropic（经 OpenRouter） | 显式 `cache_control` 断点（上限 4 个）+ 顶层自动缓存 | system 末尾 1 个（**1h TTL**：系统提示会话内不变，写入溢价 2x 只付一次，读取 0.1x 且命中即刷新 1h 时钟，避免低频对话下 5 分钟过期重写）+ 尾部 2 个显式断点（默认 5 分钟 TTL；覆盖本轮新输入 / 最新 tool 结果 / 上一轮末尾，**agentic loop 每轮请求前重打**，见 `attachment_content._apply_cache_control`）；`extra_body.cache_control` 开启自动缓存（断点随对话自动前移），叠加后不超 4 断点上限。Anthropic 原生路径的顶层 system 段同样打 1h TTL 断点（`anthropic_bridge`） |
 | OpenRouter（全部模型） | Provider 粘性路由 | 每个请求携带 `session_id`（`tg-chat-{chat_id}-{纪元token}`，见下文"会话亲和键"），粘性路由从第一次请求就生效，不随压缩事件漂移 |
 | DeepSeek / GLM / 智谱 | 服务端隐式缓存，无需标记 | 依赖前缀稳定：有界窗口 + 摊销式自动压缩 + 预签名 URL 记忆化 |
 | Gemini（直连） | 隐式缓存（2.5+ 自动）+ 显式 `cachedContent` | 系统提示时间戳放在末尾，保证主体前缀逐字节稳定；另有显式缓存管理器（`gemini_cache.py`） |

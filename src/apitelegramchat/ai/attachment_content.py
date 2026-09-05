@@ -1078,7 +1078,7 @@ def _track_task(coro):
     return t
 
 
-def _mark_last_content_block_cacheable(msg: dict) -> bool:
+def _mark_last_content_block_cacheable(msg: dict, ttl: Optional[str] = None) -> bool:
     """
     在 OpenAI 兼容协议（OpenRouter 等网关）下，cache_control 必须挂在
     content 数组里"某一个具体 content block"上，而不是消息对象本身；
@@ -1086,8 +1086,14 @@ def _mark_last_content_block_cacheable(msg: dict) -> bool:
 
     若 content 是字符串，先转成单元素的 text block 数组再打标记；
     若已经是数组（多模态消息），直接给最后一个 block 打标记。
+    ttl：可选缓存条目存活时间（Anthropic 支持 "1h"；缺省为服务端
+    默认的 5 分钟）。只有内容长期不变的段（system）才值得用长 TTL——
+    写入溢价（2x vs 1.25x）换一小时内免重写。
     返回是否成功打上标记。
     """
+    mark: dict = {"type": "ephemeral"}
+    if ttl:
+        mark["ttl"] = ttl
     content = msg.get("content")
     if content is None:
         return False
@@ -1095,13 +1101,13 @@ def _mark_last_content_block_cacheable(msg: dict) -> bool:
         if not content:
             return False
         msg["content"] = [
-            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+            {"type": "text", "text": content, "cache_control": dict(mark)}
         ]
         return True
     if isinstance(content, list) and content:
         last_block = content[-1]
         if isinstance(last_block, dict):
-            last_block["cache_control"] = {"type": "ephemeral"}
+            last_block["cache_control"] = dict(mark)
             return True
     return False
 
@@ -1111,6 +1117,15 @@ def _mark_last_content_block_cacheable(msg: dict) -> bool:
 # （agentic_loops._openrouter_extra_body 的 extra_body.cache_control）。
 _CACHE_MAX_EXPLICIT_MARKS = 3
 _CACHE_TAIL_MARKS = _CACHE_MAX_EXPLICIT_MARKS - 1
+# system 断点用 1 小时 TTL：系统提示在会话内不变，是最值得长期持有的
+# 缓存资产。Telegram 对话间隔经常超过默认 5 分钟，短 TTL 会让 system
+# 段反复过期、每轮按 1.25x 重写；1h TTL 写入溢价 2x 只付一次（读取仍
+# 0.1x，且每次命中会刷新 1h 时钟），低频长会话净省。尾部断点保持默认
+# 5 分钟：尾部内容每轮都在前进，条目本来就是每轮新写入，长 TTL 无意义。
+# （OpenRouter：ttl 显式断点在全部 Claude 供应商（Anthropic/Bedrock/
+# Vertex）均支持；本模块只在 supports_prompt_cache=True 的 Claude 系
+# 模型上被调用，字段不会发给其他厂商。）
+_CACHE_SYSTEM_TTL = "1h"
 # 可打断点的角色：user / assistant / tool。tool（工具结果）消息的负载
 # 往往是 agentic loop 中 token 的大头，把断点打在最新的 tool 结果上，
 # loop 内 2..N 轮可以直接命中到最新工具输出为止的完整前缀。
@@ -1145,7 +1160,8 @@ def _apply_cache_control(messages: list) -> None:
 
     断点策略（Anthropic 前缀缓存最佳实践）：
       1. system 消息末尾 —— 稳定不变的巨型系统提示（含技能目录）在每一轮
-         都能命中，这是收益最大、最稳定的缓存段；
+         都能命中，这是收益最大、最稳定的缓存段；打 1h TTL
+         （_CACHE_SYSTEM_TTL），避免低频对话下 5 分钟即过期重写；
       2. 尾部倒数第二条可标记消息 —— 把上一轮的完整内容（含工具调用
          中段与最终 assistant 回复）纳入缓存前缀。没有这个断点时，
          下一轮请求最多命中到更早的位置，上一轮的工具链负载（往往占
@@ -1168,9 +1184,11 @@ def _apply_cache_control(messages: list) -> None:
     """
     if not messages:
         return
-    # 断点 1：system 消息（幂等：已标记则保留，不重复计数）。
+    # 断点 1：system 消息（幂等：每轮重打同一标记，ttl 值恒定）。
+    # 长 TTL 只给 system：尾部断点的内容每轮前进，条目每轮都是新写入，
+    # 用默认 5 分钟即可（长 TTL 的 2x 写入溢价对它们是纯浪费）。
     if messages[0].get("role") == "system":
-        _mark_last_content_block_cacheable(messages[0])
+        _mark_last_content_block_cacheable(messages[0], ttl=_CACHE_SYSTEM_TTL)
     # 回收旧标记：system 以外的消息全部摘除后从尾部重新分配。这一步让
     # 函数变成"每轮重打"语义——跨回合/跨轮次的旧断点不会累积超限，
     # 也避免历史深处的陈旧断点占用尾部断点额度。

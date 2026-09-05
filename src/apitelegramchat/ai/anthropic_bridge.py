@@ -372,18 +372,34 @@ async def _agentic_loop_anthropic(
 
     for _round in range(MAX_TOOL_CALLS):
         system_prompt, anthropic_messages = _convert_messages_to_anthropic(loop_messages)
+        # 顶层 system 请求参数：默认 None（非缓存路径用纯字符串）。
+        request_system = None
 
         if prompt_cache_enabled and anthropic_messages:
             # Anthropic 多断点缓存策略（官方上限：单请求最多 4 个显式断点）
             # 断点应打在希望下一轮请求能复用的前缀末尾，按重要性排序：
-            # 1. system 消息末尾（最稳定，几乎每轮都命中）
+            # 0. 顶层 system 段末尾（最稳定，几乎每轮都命中；打 1h TTL——
+            #    系统提示会话内不变，Telegram 对话间隔经常超过默认 5 分钟，
+            #    短 TTL 会反复过期重写；1h 写入溢价 2x 只付一次，读取仍 0.1x）
+            # 1. 第一条 user 消息末尾（覆盖开场上下文注入）
             # 2. 倒数第二条 user/assistant 消息末尾（覆盖上一轮完整内容）
             # 3. 最后一条消息末尾（覆盖本轮新输入，loop 内多轮复用）
-            # 第 4 个断点额度保留给 agentic loop 内的动态追加
+            # 合计恰好 4 个，不超上限（本循环没有其他动态打标出口）。
             cache_points_applied = 0
-            MAX_CACHE_POINTS = 3  # 保留 1 个额度给 loop 内动态使用
-            
-            # 断点 1: system 消息
+            MAX_CACHE_POINTS = 3  # 断点 1..3（不含顶层 system 段）
+
+            # 断点 0: 顶层 system 段（1h TTL）。Anthropic 的 system 参数
+            # 接受字符串或块列表；转成块列表才能挂 cache_control。
+            if system_prompt:
+                request_system = [{
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }]
+            else:
+                request_system = None
+
+            # 断点 1: 第一条 user 消息
             if system_prompt and anthropic_messages:
                 first_msg = anthropic_messages[0]
                 if first_msg.get("role") == "user" and first_msg.get("content"):
@@ -415,7 +431,9 @@ async def _agentic_loop_anthropic(
 
         request_kwargs: dict = {
             "model": current_model,
-            "system": system_prompt or "You are a helpful assistant.",
+            # 缓存开启时 system 为带断点的块列表（1h TTL）；否则退回
+            # 纯字符串形态，与旧行为一致。
+            "system": request_system or (system_prompt or "You are a helpful assistant."),
             "messages": anthropic_messages,
             "max_tokens": max_tokens,
         }
