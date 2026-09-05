@@ -184,6 +184,7 @@ MEDIA_GROUP_TIMEOUT = 5
 REPLY_MARKER = "💡 引用回复:"
 
 active_tasks: dict[int, asyncio.Task] = {}
+webhook_tasks: dict[int, asyncio.Task] = {}
 active_tasks_lock = asyncio.Lock()
 # 消息去重已下沉到 state.mark_update_processed_if_new（原子检查+标记），
 # 这里不需要 app 级别的去重锁。
@@ -1483,49 +1484,70 @@ async def send_model_list(
 # ---------------------------------------------------------------------------
 @app.route('/webhook', methods=['GET', 'POST', 'HEAD'])
 async def webhook() -> tuple:
+    """Telegram webhook 快速确认入口。
+
+    不在 HTTP 请求生命周期内执行 AI、工具、文件处理等长任务。
+    Telegram webhook 的职责只是确认 update 已收到；实际处理交给后台 task。
+    这样单个异常 update 不会阻塞 Telegram 投递链路。
+    """
+    if request.method in ('GET', 'HEAD'):
+        return "OK - Webhook is alive", 200
+
+    try:
+        data = await request.json
+    except Exception:
+        logger.exception("Webhook JSON 解析失败")
+        return "OK", 200
+
+    # 快速鉴权（保留原逻辑）
+    token = request.args.get("token")
+    token_ok = False
+    if WEBHOOK_TOKEN:
+        if token and hmac.compare_digest(str(token), str(WEBHOOK_TOKEN)):
+            token_ok = True
+        else:
+            secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+            if secret_header and hmac.compare_digest(str(secret_header), str(WEBHOOK_TOKEN)):
+                token_ok = True
+    if not token_ok:
+        return "Forbidden", 403
+
+    uid = data.get("update_id")
+    if uid is None:
+        return "OK", 200
+
+    # 原子去重，避免 Telegram 重试造成重复执行
+    if not await mark_update_processed_if_new(uid):
+        return "OK", 200
+
+    task = asyncio.create_task(_process_webhook_update(data))
+    webhook_tasks[uid] = task
+
+    def _done(t: asyncio.Task):
+        webhook_tasks.pop(uid, None)
+        try:
+            t.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("后台 webhook task 异常 update=%s", uid)
+
+    task.add_done_callback(_done)
+
+    logger.info("Webhook accepted update=%s (background)", uid)
+    return "OK", 200
+
+
+async def _process_webhook_update(data: dict) -> tuple:
     _t0 = time.monotonic()
     try:
         request_id = str(uuid.uuid4())[:8]
         set_request_id(request_id)
         logger.info(f"Received webhook request {request_id}")
 
-        token = request.args.get("token")
-        # 鉴权双路径（任一匹配即放行），均用 hmac.compare_digest 恒定时间比较防止时序攻击：
-        #  1) URL query ?token=…（历史注册方式，保持完全兼容）；
-        #  2) X-Telegram-Bot-Api-Secret-Token 请求头——当启动自愈以
-        #     secret_token 参数注册后（见 webhook_sync.py），Telegram 每次投递
-        #     都会携带该头。头路径让 token 不再出现在 URL/访问日志里。
-        # 头路径是加法式强化：若注册时未附带 secret_token，Telegram 不会发
-        # 该头，鉴权自然回落到 query token，既有投递不受任何影响。
-        token_ok = False
-        if WEBHOOK_TOKEN:
-            if token and hmac.compare_digest(str(token), str(WEBHOOK_TOKEN)):
-                token_ok = True
-            else:
-                secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-                if secret_header and hmac.compare_digest(str(secret_header), str(WEBHOOK_TOKEN)):
-                    token_ok = True
-        if not token_ok:
-            return "Forbidden", 403
-        if request.method in ('GET', 'HEAD'):
-            return "OK - Webhook is alive", 200
-
-        data = await request.json
-        if not isinstance(data, dict):
-            logger.warning(
-                "Webhook 请求体不是 JSON object: type=%s value=%r",
-                type(data).__name__,
-                data,
-            )
-            return "Bad Request", 400
-        uid = data.get('update_id')
-        # 缺少 update_id 的非法 payload 直接拒绝，避免污染去重集合
+        uid = data.get("update_id")
         if uid is None:
-            logger.warning(
-                "Webhook 缺少 update_id: keys=%s",
-                list(data.keys())[:30],
-            )
-            return "Bad Request", 400
+            return "OK", 200
 
         if LOG_LEVEL == "DEBUG" or LOG_TRUNCATE_LIMIT == 0:
             msg_debug = json.dumps(data, ensure_ascii=False, default=str)
@@ -1533,26 +1555,7 @@ async def webhook() -> tuple:
         else:
             _msg_obj = data.get("message") or {}
             chat_id = _msg_obj.get("chat", {}).get("id")
-            update_id = data.get("update_id")
-            logger.info(f"Webhook: update_id={update_id}, chat_id={chat_id}")
-            if logger.isEnabledFor(logging.DEBUG):
-                msg_debug = json.dumps(data, ensure_ascii=False, default=str)
-                if len(msg_debug) > LOG_TRUNCATE_LIMIT:
-                    msg_debug = msg_debug[:LOG_TRUNCATE_LIMIT] + "... (truncated)"
-                logger.debug(f"截断的 Webhook 数据: {msg_debug}")
-
-        # 使用 OrderedDict 保留插入顺序，超过 10000 条时按插入顺序淘汰
-        # 最早的 5000 条，保证淘汰的总是最早加入的 uid。
-        # mark_update_processed_if_new 原子地"检查并标记"：若拆成先查后标
-        # 两段加锁，Telegram 超时重投 + webhook 并发会让同一 update 的两个
-        # 副本同时通过检查、被双重处理。
-        if not await mark_update_processed_if_new(uid):
-            logger.warning(
-                "跳过重复 Telegram update: update_id=%r。若这是新消息，说明上游重复投递了旧 payload，"
-                "或应用进程内的去重状态/代理缓存存在问题。",
-                uid,
-            )
-            return "OK", 200
+            logger.info(f"Webhook processing: update_id={uid}, chat_id={chat_id}")
 
         # ── 消息处理 ──────────────────────────────────────────────────────
         if "message" in data and isinstance(data["message"], dict):
@@ -2055,23 +2058,7 @@ async def webhook() -> tuple:
 
             # ── 文本消息 ──────────────────────────────────────────────────
             if "text" in msg:
-                user_input = msg.get("text")
-                # Telegram 的 text 通常总是字符串，但这里仍做类型和空白校验。
-                # 空白消息不能形成有效的 AI 轮次：turn_recovery._merge_user_message
-                # 会把它从历史合并内容中丢弃，随后又因 early-persist 标记而不再
-                # 注入模型请求，表现为“webhook 收到了但 AI 没有消息”。
-                if not isinstance(user_input, str) or not user_input.strip():
-                    logger.info(
-                        "忽略空白 Telegram 文本: update_id=%s chat_id=%s",
-                        uid,
-                        chat_id,
-                    )
-                    await _send_via_send_message(
-                        chat_id,
-                        "⚠️ 不能处理空消息，请输入文字后再发送。",
-                        reply_message_id=msg.get("message_id"),
-                    )
-                    return "OK", 200
+                user_input = msg["text"]
 
                 # 若当前 message_user 正在等待回复，优先把这条消息交给原 agent turn，
                 # 不要启动新的 AI turn。命令仍保留为真正的 bot 指令入口。
