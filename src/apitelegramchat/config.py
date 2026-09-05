@@ -1103,6 +1103,8 @@ SUPPORTED_MODELS["gpt-5.6-sol"] = make_model_config(
     name="GPT 5.6 Sol (XXTF)",
     vision=True,
     max_context=1000000,
+    reasoning_enabled=True,
+    reasoning_effort="max"
     supports_tools=True,
     # 【已知风险，未验证】平台协议入口标注为 /v1/responses（OpenAI 新的
     # Responses API），与本项目现有 OpenAI 兼容循环使用的 Chat
