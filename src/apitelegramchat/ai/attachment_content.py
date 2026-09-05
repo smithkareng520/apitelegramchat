@@ -332,6 +332,53 @@ async def _resolve_r2_public_url_for_video(file_id: str, mime_type: str = "video
     return result
 
 
+async def _resolve_r2_public_url_for_document(file_id: str, mime_type: str = "application/pdf") -> str:
+    """为文档原生输入解析公开可访问的 HTTP URL（对称视频版
+    _resolve_r2_public_url_for_video）。
+
+    Anthropic 原生 document 块的 URL source
+    （{"type": "document", "source": {"type": "url", "url": ...}}）要求
+    该 URL 可被 Anthropic 服务端公开抓取（与图片 Agnes 路径同一要求）。
+    解析顺序与视频版完全一致：
+
+      1. R2 未配置 → 空串，调用方降级 base64 / 文本占位。
+      2. R2 已有对象 → 直接返回公开 URL（自定义域 / r2.dev）或预签名
+         URL（1h 有效，每轮重解析时重新签发——Anthropic 在请求时即时
+         抓取，1h 足够；切换模型的热路径不重复上传）。
+      3. R2 未有对象 → 同步从 Telegram 拉字节 → 同步上传 R2 → 返回 URL。
+
+    冷路径复用 _get_cached_document_data：它只做 Telegram 下载 + 内存
+    TTLCache，不触发 R2 上传，与本函数"唯一上传出口"的约定一致
+    （同 _resolve_r2_public_url_for_vision 的设计注释）。
+    返回值绝不包含 bot token：Telegram 直链会泄露 token 给第三方 API。
+    """
+    fid = str(file_id or "").strip()
+    if not fid:
+        return ""
+
+    if not is_r2_configured():
+        return ""
+
+    r2_key = _get_r2_key(fid)
+
+    if await file_exists_in_r2(r2_key):
+        url = await public_url_for_existing_key(r2_key)
+        if url:
+            return url
+        return ""
+
+    # 冷路径：同步拉取 + 同步上传（首次访问 anthropic 原生文档路径时
+    # 触发一次，之后切换模型直接命中路径 2）。
+    doc_bytes = await _get_cached_document_data(None, fid)
+    if not doc_bytes:
+        return ""
+
+    result = await upload_bytes_to_r2(doc_bytes, r2_key, mime_type or "application/pdf")
+    if result is None or result.startswith("file://"):
+        return ""
+    return result
+
+
 async def _ensure_video_persisted(file_id: str, mime_type: str = "video/mp4"):
     """后台把视频持久化到 R2（fire-and-forget，不阻塞响应）。
 
@@ -409,26 +456,100 @@ def _guess_document_mime_type(file_name: str = "", explicit_mime: str = "") -> s
     return guessed or "application/pdf"
 
 
+def _is_anthropic_native_model(model_info: Optional[ModelConfig]) -> bool:
+    """判断模型是否走 Anthropic 原生 Messages 协议循环。
+
+    与 _resolve_multimodal_content 里 vision_prefer_url 的取法同口径：
+    走"有效端点"合并（模型级 dedicated_loop_kind 覆盖优先），未知厂商
+    返回 False。
+    """
+    if model_info is None:
+        return False
+    try:
+        return get_effective_endpoint(model_info).dedicated_loop_kind == "anthropic_native"
+    except ValueError:
+        return False
+
+
+async def _build_base64_document_file_part(
+        chat_id: int | None,
+        file_id: str,
+        file_name: str,
+        mime_type: str,
+) -> Optional[dict]:
+    """构造 OpenAI Chat Completions 形状的 file content part（data: URI）。
+
+    - OpenAI 兼容循环：直接按此形状出站。
+    - Anthropic 原生循环：anthropic_bridge._openai_content_to_anthropic_blocks
+      会把该 part 转换成 base64 source 的 document 块（仅 PDF）。
+    """
+    data = await _get_cached_document_data(chat_id, file_id)
+    if not data:
+        return None
+
+    b64_data = base64.b64encode(data).decode()
+    return {
+        "type": "file",
+        "file": {
+            "filename": file_name,
+            "file_data": f"data:{mime_type};base64,{b64_data}",
+        },
+    }
+
+
 async def _build_native_document_part(
         chat_id: int | None,
         file_id: str,
         file_name: str = "",
         mime_type: str = "",
+        model_info: Optional[ModelConfig] = None,
 ):
-    data = await _get_cached_document_data(chat_id, file_id)
-    if not data:
-        return None
+    """把文档附件解析为"原生文档"content part（按当前模型的协议分流）。
 
+    - anthropic_native（如 XXTF 的 claude-opus-5）：
+      Anthropic Messages API 的 document 块 URL source
+      （{"type": "document", "source": {"type": "url", ...}}）。
+      官方限制：URL / base64 source 的 document 块**仅接受 PDF**
+      （docx/xlsx 等二进制格式不被 document 块支持，官方要求先转成
+      文本或 PDF）。因此：
+        * PDF      → 优先 R2 公开 URL（与图片 Agnes 路径同一套解析），
+                      URL 不可用时退回 base64 file part（bridge 转换）；
+        * 非 PDF   → 返回 None，调用方走文本占位（链接 + file_id，
+                      模型可用工具读取），绝不静默内联一个错误形状。
+      URL 方案的好处：不再把整份 PDF 拉进内存转 base64（base64 膨胀
+      33% 且每轮请求体都带上全量字节），R2 上传一次后每轮只传 URL。
+    - OpenAI 兼容协议：维持原有 base64 file part 形状（file_data data: URI）。
+    """
     safe_name = file_name or f"document_{file_id[:8]}.pdf"
     safe_mime = _guess_document_mime_type(safe_name, mime_type)
-    b64_data = base64.b64encode(data).decode()
-    return {
-        "type": "file",
-        "file": {
-            "filename": safe_name,
-            "file_data": f"data:{safe_mime};base64,{b64_data}",
-        },
-    }
+
+    if _is_anthropic_native_model(model_info):
+        if safe_mime != "application/pdf":
+            logger.info(
+                "[NativeDocument] anthropic 原生协议仅支持 PDF document 块，"
+                "非 PDF 文档走文本占位: %s (mime=%s)",
+                str(safe_name)[:40], safe_mime,
+            )
+            return None
+
+        url = await _resolve_r2_public_url_for_document(file_id, safe_mime)
+        if url:
+            return {
+                "type": "document",
+                "source": {"type": "url", "url": url},
+                "title": safe_name,
+            }
+
+        # R2 未配置 / 上传失败：PDF 退回 base64（bridge 会转成
+        # base64 source document 块），避免有 R2 时明明能原生读却读不到。
+        logger.info(
+            "[NativeDocument] R2 URL 不可用，PDF 降级 base64 内联: %s",
+            str(safe_name)[:40],
+        )
+        part = await _build_base64_document_file_part(chat_id, file_id, safe_name, safe_mime)
+        return part
+
+    return await _build_base64_document_file_part(chat_id, file_id, safe_name, safe_mime)
 
 
 def _attachment_label(kind: str) -> str:
@@ -751,6 +872,7 @@ async def _resolve_mixed_attachments(
                 fid,
                 file_name=fname or f"document_{fid[:8]}.pdf",
                 mime_type=mime,
+                model_info=model_info,
             )
 
         if resolved_part is not None:
@@ -925,6 +1047,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
         if supports_native_documents:
             if doc_file_ids:
                 content_parts = []
+                fallback_texts = []
                 if user_text:
                     content_parts.append({"type": "text", "text": user_text})
                 else:
@@ -934,9 +1057,30 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                 for idx, fid in enumerate(doc_file_ids):
                     file_name = doc_file_names[idx] if idx < len(doc_file_names) else f"document_{fid[:8]}.pdf"
                     mime_type = doc_mime_types[idx] if idx < len(doc_mime_types) else ""
-                    part = await _build_native_document_part(chat_id, fid, file_name=file_name, mime_type=mime_type)
+                    part = await _build_native_document_part(
+                        chat_id, fid,
+                        file_name=file_name,
+                        mime_type=mime_type,
+                        model_info=model_info,
+                    )
                     if part:
                         content_parts.append(part)
+                        continue
+                    # 原生解析失败（anthropic document 块不收非 PDF /
+                    # 字节获取失败）：逐个构造文本占位（链接 + file_id），
+                    # 绝不静默丢文档——旧版这里 part 为 None 时文档直接
+                    # 消失且无任何提示。
+                    fallback_texts.append(await _build_attachment_fallback_text(
+                        kind="document",
+                        file_ids=[fid],
+                        user_text="",
+                        chat_id=chat_id,
+                        file_names=[file_name],
+                        mime_types=[mime_type],
+                    ))
+
+                if fallback_texts:
+                    content_parts.append({"type": "text", "text": "\n\n".join(fallback_texts)})
 
                 if len(content_parts) > 1:
                     return content_parts

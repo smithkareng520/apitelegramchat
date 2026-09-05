@@ -51,6 +51,7 @@ from apitelegramchat.ai.tool_summary import (
     _tool_limit_summary,
 )
 from apitelegramchat.ai.tool_call_loop import _run_tool_calls_and_append
+from apitelegramchat.ai.cache_usage import _log_cache_usage
 
 if TYPE_CHECKING:
     from apitelegramchat.ai.rich_message_builder import RichMessageBuilder
@@ -88,8 +89,22 @@ def _convert_tools_to_anthropic(tools: Optional[list]) -> Optional[list]:
 # =============================================================================
 def _openai_content_to_anthropic_blocks(content) -> list:
     """把 OpenAI 的 content（str 或 content-parts 列表）转换成 Anthropic
-    content 块列表。仅支持 text 与 image_url（含 data:base64 内联和公开
-    URL 两种），未识别的 part 类型退化为文本占位，不中断请求。
+    content 块列表。支持 text、image_url（data:base64 内联 / 公开 URL）、
+    原生文档（document 直通与 file→document 转换），未识别的 part 类型
+    静默跳过，不中断请求。
+
+    文档块说明（Anthropic 官方限制）：
+      - document 块的 url / base64 source 仅接受 PDF（media_type=
+        application/pdf）；docx/xlsx 等二进制格式不被 document 块支持，
+        官方要求先转成文本或 PDF，因此这里遇到非 PDF 一律跳过
+        （attachment 层已保证 anthropic 模型非 PDF 走文本占位）。
+      - {"type": "document", ...} 直通：attachment_content 为
+        anthropic_native 模型构造的 URL source 文档块
+        （{"type": "document", "source": {"type": "url", ...}}）原样
+        传递，Anthropic 服务端在请求时自行抓取该 URL。
+      - {"type": "file", ...}（OpenAI 形状 data: URI）→ base64 source
+        document 块：兜底兼容历史消息 / OpenAI 形状入参里出现的
+        内联 PDF。
     """
     if content is None:
         return []
@@ -122,6 +137,51 @@ def _openai_content_to_anthropic_blocks(content) -> list:
             elif url:
                 # Anthropic 支持公开可访问 URL 直接引用，无需先下载转 base64。
                 blocks.append({"type": "image", "source": {"type": "url", "url": url}})
+        elif ptype == "document":
+            # Anthropic 原生 document 块直通（URL / base64 source 均可）。
+            # 旧版本这里会静默跳过，导致 anthropic_native 模型的
+            # native_document=True 形同虚设——文档整个丢失。
+            source = part.get("source")
+            if isinstance(source, dict) and source.get("type") in ("url", "base64"):
+                block = {"type": "document", "source": source}
+                if part.get("title"):
+                    block["title"] = part["title"]
+                blocks.append(block)
+            else:
+                logger.info(
+                    "anthropic 转换：document part 缺少合法 source（%s），已跳过",
+                    type(source).__name__,
+                )
+        elif ptype == "file":
+            # OpenAI 形状 file part（data: URI）→ base64 document 块。
+            # 仅 PDF；非 PDF 无法被 document 块表达，跳过（上游已降级
+            # 为文本占位）。
+            fobj = part.get("file") or {}
+            file_data = fobj.get("file_data") or ""
+            if isinstance(file_data, str) and file_data.startswith("data:"):
+                try:
+                    header, b64data = file_data.split(",", 1)
+                    media_type = header.split(";")[0].split(":", 1)[1] or "application/pdf"
+                except (ValueError, IndexError):
+                    media_type, b64data = "application/pdf", ""
+                if media_type == "application/pdf" and b64data:
+                    block = {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": b64data,
+                        },
+                    }
+                    if fobj.get("filename"):
+                        block["title"] = fobj["filename"]
+                    blocks.append(block)
+                else:
+                    logger.info(
+                        "anthropic 转换：file part 非 PDF（media_type=%s），"
+                        "无法转为 document 块，已跳过",
+                        media_type,
+                    )
         # 其它 part 类型（audio/video 等）Anthropic Messages API 暂不支持，
         # 静默跳过而不是抛错中断整轮请求。
     return blocks
@@ -328,6 +388,62 @@ async def anthropic_chat_completions_create(
 
 
 # =============================================================================
+# usage 归一：Anthropic Usage -> OpenAI 形状 dict
+# =============================================================================
+# 目的：让 _log_cache_usage / app.update_conversation_and_ledger 的既有
+# OpenAI 形状消费方无需分支处理（与 gemini_bridge._gemini_usage_to_openai
+# 同一边界转换模式）。
+#
+# 背景（bug 根因）：Anthropic SDK 的 Usage 字段是
+#   input_tokens / output_tokens / cache_read_input_tokens /
+#   cache_creation_input_tokens
+# 而 update_conversation_and_ledger 只读 prompt_tokens /
+# completion_tokens —— 不归一化的话台账全部落 0，表现为
+# "XXTF 没有返回 usage 字段"。
+#
+# 口径：Anthropic 的 cache_read / cache_creation token 同样是本次请求
+# 实际处理的输入 token（OpenAI 的 prompt_tokens 也包含 cached 子集），
+# 因此并入 prompt_tokens，否则上下文水位会低估、台账差分失真。
+def _anthropic_usage_to_openai(usage) -> Optional[dict]:
+    if usage is None:
+        return None
+    try:
+        if hasattr(usage, "model_dump"):
+            d = usage.model_dump()
+        elif isinstance(usage, dict):
+            d = dict(usage)
+        else:
+            d = {
+                "input_tokens": getattr(usage, "input_tokens", None),
+                "output_tokens": getattr(usage, "output_tokens", None),
+                "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", None),
+                "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", None),
+            }
+    except Exception:
+        logger.debug("_anthropic_usage_to_openai 归一化失败，丢弃 usage", exc_info=True)
+        return None
+
+    def _num(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0
+        return int(value)
+
+    prompt = (_num(d.get("input_tokens"))
+              + _num(d.get("cache_read_input_tokens"))
+              + _num(d.get("cache_creation_input_tokens")))
+    completion = _num(d.get("output_tokens"))
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        # 保留缓存明细：cache_usage._extract_cache_usage 可直接读取，
+        # anthropic 原生循环的缓存命中率从此可观测。
+        "cache_read_input_tokens": _num(d.get("cache_read_input_tokens")),
+        "cache_creation_input_tokens": _num(d.get("cache_creation_input_tokens")),
+    }
+
+
+# =============================================================================
 # 原生 agentic 循环
 # =============================================================================
 async def _agentic_loop_anthropic(
@@ -524,6 +640,14 @@ async def _agentic_loop_anthropic(
             await stop_chat_action(builder.chat_id, "typing")
 
         builder.end_stream()
+
+        # usage 归一化 + 缓存命中观测（每轮覆盖，与 openai/gemini 循环
+        # 同口径）：Anthropic 原生 Usage 不转形状的话，
+        # app.update_conversation_and_ledger 读 prompt_tokens /
+        # completion_tokens 全部落 0 —— 表现为"XXTF 没有 usage"。
+        # 归一化后的 dict 会成为下一轮返回值（token 台账 + 命中率统计）。
+        final_usage = _anthropic_usage_to_openai(final_usage) or final_usage
+        _log_cache_usage(api_label, final_usage)
 
         # 把这一轮的 tool_use 累积转换为 OpenAI 形状的 tool_calls，供
         # _run_tool_calls_and_append 复用（与另外两条循环完全同构）。
