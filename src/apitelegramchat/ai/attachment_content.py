@@ -1106,11 +1106,38 @@ def _mark_last_content_block_cacheable(msg: dict) -> bool:
     return False
 
 
+# 显式 cache_control 断点预算：system 消息 1 个固定 + 尾部最多 2 个动态。
+# Anthropic 单请求上限 4 个断点，剩余 1 个额度留给顶层自动缓存
+# （agentic_loops._openrouter_extra_body 的 extra_body.cache_control）。
+_CACHE_MAX_EXPLICIT_MARKS = 3
+_CACHE_TAIL_MARKS = _CACHE_MAX_EXPLICIT_MARKS - 1
+# 可打断点的角色：user / assistant / tool。tool（工具结果）消息的负载
+# 往往是 agentic loop 中 token 的大头，把断点打在最新的 tool 结果上，
+# loop 内 2..N 轮可以直接命中到最新工具输出为止的完整前缀。
+_CACHE_MARKABLE_ROLES = ("user", "assistant", "tool")
+
+
+def _remove_message_cache_marks(msg: dict) -> None:
+    """摘除一条消息 content block 上的 cache_control 标记（元数据回收）。
+
+    只删除标记键本身，不改写任何文本字节——断点位置的调整不会使已有
+    缓存前缀失效（缓存条目按"断点处的内容前缀"建键，旧条目在其 TTL
+    内仍然可被更早的断点命中）。用于每轮重打断点前的旧标记回收。
+    """
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return
+    for part in content:
+        if isinstance(part, dict) and "cache_control" in part:
+            part.pop("cache_control", None)
+
+
 def _apply_cache_control(messages: list) -> None:
     """
-    为系统消息、上一轮对话末尾、最后一条消息添加 cache_control 标记。
-    最多添加三个显式标记（Anthropic 单请求上限 4 个断点，剩余 1 个额度
-    留给 agentic loop 的顶层自动缓存，见 agentic_loops._openrouter_extra_body）。
+    为系统消息与尾部消息添加 cache_control 显式断点（OpenRouter 上
+    Anthropic 系模型的手动缓存标记）。显式断点总量恒定 ≤3
+    （system 1 个 + 尾部最多 2 个），与顶层自动缓存叠加后不超过
+    Anthropic 4 断点上限。
 
     注意：cache_control 必须打在 content block 上（见
     _mark_last_content_block_cacheable），打在消息顶层对 OpenRouter/
@@ -1119,43 +1146,45 @@ def _apply_cache_control(messages: list) -> None:
     断点策略（Anthropic 前缀缓存最佳实践）：
       1. system 消息末尾 —— 稳定不变的巨型系统提示（含技能目录）在每一轮
          都能命中，这是收益最大、最稳定的缓存段；
-      2. 上一轮对话的最后一条可标记消息（倒数第二条区域）—— 把上一轮的
-         完整内容（含最终 assistant 回复）纳入缓存前缀。没有这个断点时，
-         下一轮请求最多命中到"上一轮的 user 消息"，上一轮的工具调用
-         中段（往往占一轮 token 的大头）全部按原价重算；
-      3. 最后一条消息（通常是本轮新 user 消息）—— 断点越靠后，缓存覆盖
-         的前缀越长；agentic loop 的第 2..N 轮请求（追加了 tool 结果）
-         可以直接命中到这里。
+      2. 尾部倒数第二条可标记消息 —— 把上一轮的完整内容（含工具调用
+         中段与最终 assistant 回复）纳入缓存前缀。没有这个断点时，
+         下一轮请求最多命中到更早的位置，上一轮的工具链负载（往往占
+         一轮 token 的大头）全部按原价重算；
+      3. 最后一条可标记消息（本轮新 user 消息，或 loop 内最新的 tool
+         结果）—— 断点越靠后，缓存覆盖的前缀越长；agentic loop 的
+         第 2..N 轮请求（追加了 tool 结果）可以直接命中到这里。
+
+    幂等性与断点回收（再平衡）：本函数会被 agentic loop 的每一轮重复
+    调用（以及跨回合在共享历史副本上再次调用）。每次调用先摘除 system
+    之外的全部旧标记，再从尾部重新分配 2 个断点——与 anthropic_bridge
+    "每轮重建消息后重打断点"的语义对齐，保证：
+      - 标记总数恒定 ≤3，绝不随轮次/回合累积（否则超过 Anthropic
+        4 断点上限会被 400 拒绝）；
+      - 断点始终打在最有利于命中的位置（尾部最新内容）；
+      - 已有缓存前缀不受影响（摘除标记不改写字节，见上方说明）。
     本函数必须在"全部消息（含本轮新 user 消息）就位之后"调用，
     供 agentic loop 的每一轮请求复用：loop 内追加的 tool 消息位于
     断点之后，不影响断点之前的前缀命中。
     """
     if not messages:
         return
-    # 为系统消息添加标记（断点 1）
+    # 断点 1：system 消息（幂等：已标记则保留，不重复计数）。
     if messages[0].get("role") == "system":
         _mark_last_content_block_cacheable(messages[0])
-    # 断点 2 + 3：从最后一条消息往前找两条 user/assistant 消息。
-    # 最末一条覆盖"本轮新 user 消息"（loop 内多轮复用）；再往前一条
-    # 覆盖"上一轮对话末尾"（跨轮命中）。已带标记的消息同样占用断点
-    # 额度，因此统一计数，保证总数不超过 3。
-    remaining_markers = 2
+    # 回收旧标记：system 以外的消息全部摘除后从尾部重新分配。这一步让
+    # 函数变成"每轮重打"语义——跨回合/跨轮次的旧断点不会累积超限，
+    # 也避免历史深处的陈旧断点占用尾部断点额度。
+    for msg in messages[1:]:
+        _remove_message_cache_marks(msg)
+    # 断点 2 + 3：从最后一条消息往前找两条可标记（user/assistant/tool）
+    # 消息。最末一条覆盖"本轮新输入 / 最新 tool 结果"（loop 内多轮复用）；
+    # 再往前一条覆盖"上一轮对话末尾"（跨轮命中）。
+    remaining_markers = _CACHE_TAIL_MARKS
     for i in range(len(messages) - 1, 0, -1):
         if remaining_markers <= 0:
             break
         msg = messages[i]
-        role = msg.get("role")
-        if role not in ("user", "assistant"):
-            continue
-        content = msg.get("content")
-        already_marked = (
-            isinstance(content, list)
-            and content
-            and isinstance(content[-1], dict)
-            and "cache_control" in content[-1]
-        )
-        if already_marked:
-            remaining_markers -= 1
+        if msg.get("role") not in _CACHE_MARKABLE_ROLES:
             continue
         if _mark_last_content_block_cacheable(msg):
             remaining_markers -= 1

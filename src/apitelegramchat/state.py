@@ -2,6 +2,7 @@
 import asyncio
 import contextvars
 import time
+import uuid
 from collections import OrderedDict
 from apitelegramchat.config import DEFAULT_MODEL
 
@@ -127,12 +128,71 @@ async def safe_set_user_model(chat_id: int, model: str) -> None:
     async with lock:
         user_models[chat_id] = model
 
+# ---------- LLM 会话亲和键（session_id）管理 ----------
+# 语义（与 OpenRouter body.session_id / agnes 会话亲和键共用）：
+#   - 同一个对话窗口（chat）内的所有任务——主 agent 循环、子 agent、
+#     TIMER 主动唤醒——共用同一个 session_id（同一对话 = 同一会话，
+#     让网关从第一个请求起粘住同一推理副本，前缀缓存跨轮次/跨任务命中）。
+#   - 用户点击"清空对话"（/clear，safe_clear_history）视为新建会话：
+#     轮换会话纪元 token，生成全新的 session_id，避免旧会话的路由亲和
+#     （sticky session / 副本粘性）以及旧前缀缓存干扰新对话。
+# 键格式：tg-chat-{chat_id}-{纪元 token}（总长 ≤256 字符，与 OpenRouter
+# 上限一致）。token 为 12 位 hex 随机串，惰性生成、重启后自然轮换
+# （进程重启时对话历史也在内存中清零，语义上同样属于新会话）。
+_SESSION_TOKEN_LEN = 12  # uuid4().hex 截取长度：碰撞概率可忽略，键更短
+
+
+def _new_session_token() -> str:
+    return uuid.uuid4().hex[:_SESSION_TOKEN_LEN]
+
+
+def get_llm_session_token(chat_id: int) -> str:
+    """读取（惰性生成）该 chat 当前的会话纪元 token。"""
+    ctx = get_or_init_context(chat_id)
+    token = ctx.get("llm_session_token")
+    if not token:
+        token = _new_session_token()
+        ctx["llm_session_token"] = token
+    return token
+
+
+def rotate_llm_session_token(chat_id: int) -> str:
+    """轮换该 chat 的会话纪元 token（清空对话/新建会话时调用），返回新 token。
+
+    必须在持有该 chat 锁的上下文中调用（当前唯一调用方 safe_clear_history
+    已持有），保证与历史清空同原子：新历史与新 session_id 同步生效。
+    正在进行中的旧请求继续用旧键完成本轮，不受影响（键只在 loop 开始时
+    解析一次）。
+    """
+    ctx = get_or_init_context(chat_id)
+    token = _new_session_token()
+    ctx["llm_session_token"] = token
+    return token
+
+
+def get_llm_session_key(chat_id) -> str:
+    """LLM 网关会话亲和键：tg-chat-{chat_id}-{纪元 token}（≤256 字符）。
+
+    - 同一对话窗口/同一任务内的全部请求（主循环全部轮次、子 agent、
+      TIMER 回合）共用同一键：粘性路由与前缀缓存跨轮次稳定。
+    - 清空对话（safe_clear_history）后键自动轮换，旧亲和性不再干扰新对话。
+    - chat_id 为 None（无法定位会话）返回空串，调用方按"无键"处理。
+    """
+    if chat_id is None:
+        return ""
+    key = f"tg-chat-{chat_id}-{get_llm_session_token(chat_id)}".strip()
+    return key[:256]
+
+
 # ---------- 安全读写历史 ----------
 async def safe_clear_history(chat_id: int) -> None:
     lock = await get_chat_lock(chat_id)
     async with lock:
         ctx = get_or_init_context(chat_id)
         ctx["conversation_history"] = []
+        # 清空对话 = 新建会话：同步轮换 LLM 会话亲和键，旧会话的路由
+        # 亲和性（OpenRouter 粘性路由 / agnes 副本粘性）不再作用于新对话。
+        rotate_llm_session_token(chat_id)
 
 
 # ---------- 草稿预览开关（/show on|off，USER 与 TIMER 回合统一生效） ----------

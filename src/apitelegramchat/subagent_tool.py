@@ -51,6 +51,7 @@ from apitelegramchat.config import (
     get_sampling_params,
     get_reasoning_request_fields,
 )
+from apitelegramchat.state import get_llm_session_key
 from apitelegramchat.token_budget import count_tokens, truncate_to_token_budget
 # Anthropic 原生厂商的非流式调用桥接（仅当 model_info.provider == "anthropic"
 # 时使用；其余厂商的 client.chat.completions.create 调用路径完全不变）。
@@ -288,6 +289,12 @@ async def _subagent_agentic_loop(
     model_info = SUPPORTED_MODELS.get(model)
     supports_tools = bool(model_info and model_info.supports_tools and tools)
 
+    # 会话亲和键：与主 agent 同源同语义（state.get_llm_session_key），
+    # 整个子 agent 运行期内只解析一次（多轮循环共用同一 session_id，
+    # 粘性路由与前缀缓存跨轮稳定）；父/子请求同模型时落在同一 provider
+    # （粘性按 (model, session) 粒度跟踪）。清空对话后键随纪元轮换。
+    subagent_session_key = get_llm_session_key(chat_id)
+
     # 用于工具结果回填
     loop_messages = list(messages)
 
@@ -308,6 +315,17 @@ async def _subagent_agentic_loop(
 
         await _report(f"第 {rounds}/{MAX_SUBAGENT_ROUNDS} 轮：LLM 思考中…（已耗时 {elapsed:.0f}s）")
 
+        provider_label = (model_info.provider if model_info else "") or ""
+        subagent_supports_cache = bool(model_info and model_info.supports_prompt_cache)
+        # 手动缓存（OpenRouter 上 Anthropic 系模型）：每轮请求前重打显式
+        # cache_control 断点（函数内部回收旧标记再从尾部重新分配，总量
+        # 恒 ≤3，幂等）。子 agent 的多轮工具循环里，最新工具结果直接进入
+        # 显式缓存覆盖；与顶层自动断点（extra_body.cache_control，第 4 个）
+        # 叠加后不超过 Anthropic 4 断点上限。
+        if provider_label == "openrouter" and subagent_supports_cache:
+            from apitelegramchat.ai.attachment_content import _apply_cache_control
+            _apply_cache_control(loop_messages)
+
         try:
             create_params = {
                 "model": model,
@@ -323,23 +341,34 @@ async def _subagent_agentic_loop(
             )
             if reasoning_top:
                 create_params.update(reasoning_top)
-            # OpenRouter：附带 session_id（粘性路由，从第一次请求就生效，
-            # 多轮工具循环的前缀缓存不因路由漂移而失效）与 Anthropic 系
-            # 模型的顶层自动 cache_control（断点随消息增长自动前移，
-            # 子 agent 多轮循环中每轮的工具结果都能被下一轮命中）。
-            # 与主 agent 共用同一个 per-chat 会话键：粘性按 (model, session)
-            # 粒度跟踪，同模型的父子请求落在同一 provider 上。
-            provider_label = (model_info.provider if model_info else "") or ""
-            if provider_label == "openrouter":
-                existing_extra = dict(create_params.get("extra_body") or {})
-                existing_extra.setdefault("session_id", f"tg-chat-{chat_id}"[:256])
-                if model_info and model_info.supports_prompt_cache:
-                    existing_extra.setdefault("cache_control", {"type": "ephemeral"})
-                create_params["extra_body"] = existing_extra
-            if reasoning_extra:
-                existing_extra = dict(create_params.get("extra_body") or {})
-                existing_extra.update(reasoning_extra)
-                create_params["extra_body"] = existing_extra
+            # 会话亲和 + 手动/自动缓存与主 agent 统一（_merged_extra_body）：
+            # - OpenRouter：provider 路由偏好 + body.session_id 粘性路由
+            #   （从第一次请求就生效，多轮工具循环的前缀缓存不因路由漂移
+            #   而失效）+ Anthropic 系模型的顶层自动 cache_control（断点
+            #   随消息增长自动前移，每轮的工具结果都能被下一轮命中）。
+            # - agnes 等声明 session_affinity 的网关：body.session_id +
+            #   X-Session-Id 请求头（与主 agent 同键，副本粘性）。
+            # - 其余厂商：仅透传 reasoning_extra（与旧行为一致）。
+            # 延迟导入避免模块级循环（agentic_loops -> tool_call_loop ->
+            # tool_executors -> subagent_tool，见文件头同型注释）。
+            from apitelegramchat.ai.agentic_loops import (
+                _merged_extra_body,
+                _session_affinity_headers,
+            )
+            extra_body = _merged_extra_body(
+                provider_label,
+                reasoning_extra,
+                chat_id=chat_id,
+                supports_prompt_cache=subagent_supports_cache,
+                session_key=subagent_session_key,
+            )
+            if extra_body is not None:
+                create_params["extra_body"] = extra_body
+            affinity_headers = _session_affinity_headers(
+                provider_label, chat_id, session_key=subagent_session_key
+            )
+            if affinity_headers:
+                create_params["extra_headers"] = affinity_headers
             if supports_tools:
                 create_params["tools"] = tools
                 create_params["tool_choice"] = "auto"

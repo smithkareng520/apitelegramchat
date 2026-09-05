@@ -138,7 +138,8 @@ class ProviderConfig:
     # 内联 base64 会被静默忽略甚至报 4xx。开启后，会在 _resolve_multimodal_content
     # 里优先用 R2 公开 URL（不泄露 Telegram bot token），R2 不可用时回退 base64。
     vision_prefer_url: bool = False
-    # 是否向该网关下发"会话亲和键"（session_id / X-Session-Id，按 chat 稳定）。
+    # 是否向该网关下发"会话亲和键"（session_id / X-Session-Id，同一对话
+    # 窗口/同一任务共用，清空对话时轮换，见 state.get_llm_session_key）。
     # 背景：OpenRouter 官方支持 body.session_id 粘性路由（见
     # agentic_loops._openrouter_extra_body）；而 Agnes 这类聚合网关
     # （Cloudflare -> new-api -> LiteLLM -> 多上游推理副本）按请求随机分发、

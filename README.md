@@ -357,11 +357,32 @@ WEBHOOK_URL?token=WEBHOOK_TOKEN
 
 | 厂商 | 机制 | 本项目的处理 |
 |---|---|---|
-| Anthropic（经 OpenRouter） | 显式 `cache_control` 断点（上限 4 个）+ 顶层自动缓存 | 系统提示末尾 / 上一轮末尾 / 本轮 user 消息共 3 个显式断点；`extra_body.cache_control` 开启自动缓存（断点随对话自动前移） |
-| OpenRouter（全部模型） | Provider 粘性路由 | 每个请求携带 `session_id`（`tg-chat-{chat_id}`），粘性路由从第一次请求就生效，不随压缩事件漂移 |
+| Anthropic（经 OpenRouter） | 显式 `cache_control` 断点（上限 4 个）+ 顶层自动缓存 | system 末尾 1 个 + 尾部 2 个显式断点（覆盖本轮新输入 / 最新 tool 结果 / 上一轮末尾，**agentic loop 每轮请求前重打**，见 `attachment_content._apply_cache_control`）；`extra_body.cache_control` 开启自动缓存（断点随对话自动前移），叠加后不超 4 断点上限 |
+| OpenRouter（全部模型） | Provider 粘性路由 | 每个请求携带 `session_id`（`tg-chat-{chat_id}-{纪元token}`，见下文"会话亲和键"），粘性路由从第一次请求就生效，不随压缩事件漂移 |
 | DeepSeek / GLM / 智谱 | 服务端隐式缓存，无需标记 | 依赖前缀稳定：有界窗口 + 摊销式自动压缩 + 预签名 URL 记忆化 |
-| Gemini（直连） | 隐式缓存（2.5+ 自动） | 系统提示时间戳放在末尾，保证主体前缀逐字节稳定 |
+| Gemini（直连） | 隐式缓存（2.5+ 自动）+ 显式 `cachedContent` | 系统提示时间戳放在末尾，保证主体前缀逐字节稳定；另有显式缓存管理器（`gemini_cache.py`） |
 | OpenAI 系 | 自动（>1024 token） | 同上，靠前缀稳定 |
+
+##### 会话亲和键（session_id）
+
+OpenAI 兼容网关的会话亲和键统一由 `state.get_llm_session_key(chat_id)` 生成，
+语义如下：
+
+- **同一个对话窗口 / 同一个任务共用一个 session_id**：主 agent 循环（含
+  loop 内全部轮次与合成兜底请求）、子 agent、TIMER 主动唤醒回合，都使用
+  同一个键（键在整个 loop 运行期内只解析一次，中途不漂移）。
+- **用户点击"清空对话"（/clear）= 新建会话**：`safe_clear_history` 在清空
+  历史的同一把锁内轮换会话纪元 token，生成全新的 session_id，旧会话的路由
+  亲和性（sticky session / 副本粘性）与旧前缀缓存不再干扰新对话。进行中的
+  旧请求用旧键自然完成，不受影响。
+- 键格式：`tg-chat-{chat_id}-{12位hex纪元token}`（≤256 字符）；进程重启时
+  历史同样清零，token 重新生成，语义上等同新会话。
+- **下发范围**：
+  | 路径 | 形式 |
+  |---|---|
+  | OpenRouter（主循环 / 子 agent） | `extra_body.session_id`（官方粘性路由） |
+  | Agnes 聚合网关（多副本缓存隔离缓解） | `extra_body.session_id` + `X-Session-Id` 请求头（best-effort，双保险） |
+  | Gemini 原生 / Anthropic 原生 / DeepSeek / GLM / ModelScope / Grok | 不使用 session_id：Gemini 走显式 `cachedContent` + 隐式缓存；Anthropic 走显式 `cache_control` 断点（单端点直连，无多副本路由问题）；其余为服务端隐式缓存，无会话概念 |
 
 为保持前缀稳定，系统做了四件事：
 

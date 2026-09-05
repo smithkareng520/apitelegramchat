@@ -24,6 +24,7 @@ from apitelegramchat.config import (
     get_sampling_params,
     get_reasoning_request_fields,
 )
+from apitelegramchat.state import get_llm_session_key
 from apitelegramchat.utils import get_logger, escape_html, send_rich_html_message
 from apitelegramchat.chat_actions import (
     chat_action_scope,
@@ -68,6 +69,7 @@ from apitelegramchat.ai.tool_summary import (
     _tool_limit_summary,
 )
 from apitelegramchat.ai.tool_call_loop import _run_tool_calls_and_append
+from apitelegramchat.ai.attachment_content import _apply_cache_control
 from apitelegramchat.ai.strict_tools import (
     looks_like_strict_tool_rejection,
     mark_strict_tools_rejected,
@@ -114,30 +116,38 @@ def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict):
 
 
 def _openrouter_session_id(chat_id: object) -> str:
-    """为 OpenRouter 生成稳定的 per-chat 粘性路由键（≤256 字符）。
+    """返回当前会话的 LLM 网关亲和键（≤256 字符，按 chat 稳定、可轮换）。
 
-    背景：OpenRouter 的默认会话识别靠"首条 system + 首条非 system 消息"
-    哈希。本项目的上下文窗口虽然只在自动压缩事件中收缩（事件之间前缀
-    字节稳定，见 context_window.py），但事件发生时历史仍会被重写
-    （滚动摘要合并、工具负载归档为指针）。显式传 session_id 后：粘性
-    路由从第一次请求就生效（无需先观察到缓存命中），且不随压缩事件
-    漂移；对经 OpenRouter 转发的 Z.AI/GLM 还会作为会话亲和键下发，
-    进一步提升缓存命中。
+    键格式：tg-chat-{chat_id}-{纪元 token}（见 state.get_llm_session_key）：
+    - 同一对话窗口内的所有任务（主循环、子 agent、TIMER 回合）共用同一键：
+      OpenRouter 的默认会话识别靠"首条 system + 首条非 system 消息"哈希，
+      本项目的上下文窗口虽然只在自动压缩事件中收缩（事件之间前缀字节
+      稳定，见 context_window.py），但事件发生时历史仍会被重写（滚动摘要
+      合并、工具负载归档为指针）。显式传 session_id 后：粘性路由从第一次
+      请求就生效（无需先观察到缓存命中），且不随压缩事件漂移；对经
+      OpenRouter 转发的 Z.AI/GLM 还会作为会话亲和键下发，进一步提升缓存
+      命中。
+    - 用户清空对话（/clear）后纪元 token 轮换，产生全新 session_id，
+      避免旧会话的路由亲和性与旧前缀缓存干扰新对话（见
+      state.safe_clear_history）。
     """
     if chat_id is None:
         return ""
-    key = f"tg-chat-{chat_id}".strip()
-    return key[:256]
+    return get_llm_session_key(chat_id)
 
 
 def _openrouter_extra_body(
     chat_id: object = None,
     supports_prompt_cache: bool = False,
+    session_key: Optional[str] = None,
 ) -> dict:
     body: dict = {"provider": OPENROUTER_PROVIDER_PREFERENCES.copy()}
-    session_key = _openrouter_session_id(chat_id)
-    if session_key:
-        body["session_id"] = session_key
+    # session_key 由调用方在 loop 开始时解析一次传入（保证同一 loop 内
+    # 全部轮次共用同一键）；未传入时按 chat_id 现场解析（子 agent 等
+    # 调用方兼容路径）。
+    key = session_key or _openrouter_session_id(chat_id)
+    if key:
+        body["session_id"] = key
     # Anthropic 系模型的"自动缓存"：顶层 cache_control 由网关翻译成打在
     # 最后一个可缓存块上的断点，并随对话增长自动前移。这让 agentic loop
     # 的每一轮（含 tool 结果之后的内容）都能作为缓存前缀被下一轮命中，
@@ -165,34 +175,42 @@ def _openrouter_extra_body(
 #   支持任一形式即可从第一个请求起粘住同一副本；都不支持时未知字段
 #   /请求头被安全忽略，零副作用（已实测带 session_id 的请求 HTTP 200）。
 # =====================================================================
-def _session_affinity_key(chat_id: object = None) -> str:
-    """会话亲和键：与 OpenRouter 的 session_id 同格式（tg-chat-{chat_id}）。"""
-    return _openrouter_session_id(chat_id)
+def _session_affinity_key(chat_id: object = None, session_key: Optional[str] = None) -> str:
+    """会话亲和键：与 OpenRouter 的 session_id 同源同格式（可轮换）。"""
+    return session_key or _openrouter_session_id(chat_id)
 
 
-def _session_affinity_body(api_label: str, chat_id: object = None) -> dict:
+def _session_affinity_body(
+    api_label: str,
+    chat_id: object = None,
+    session_key: Optional[str] = None,
+) -> dict:
     """声明了 session_affinity 的网关返回 body 级亲和键，否则空 dict。"""
     from apitelegramchat.config import PROVIDERS
     cfg = PROVIDERS.get(api_label)
     if not (cfg and getattr(cfg, "session_affinity", False)):
         return {}
-    session_key = _session_affinity_key(chat_id)
-    if not session_key:
+    session = _session_affinity_key(chat_id, session_key)
+    if not session:
         return {}
-    return {"session_id": session_key}
+    return {"session_id": session}
 
 
-def _session_affinity_headers(api_label: str, chat_id: object = None) -> Optional[dict]:
+def _session_affinity_headers(
+    api_label: str,
+    chat_id: object = None,
+    session_key: Optional[str] = None,
+) -> Optional[dict]:
     """声明了 session_affinity 的网关返回请求头级亲和键，否则 None。
 
     OpenAI SDK 的 create(**params) 接受 extra_headers 逐请求透传，
     不影响按 provider 缓存的 AsyncOpenAI 客户端实例。
     """
-    body = _session_affinity_body(api_label, chat_id)
-    session_key = body.get("session_id")
-    if not session_key:
+    body = _session_affinity_body(api_label, chat_id, session_key)
+    session = body.get("session_id")
+    if not session:
         return None
-    return {"X-Session-Id": session_key}
+    return {"X-Session-Id": session}
 
 
 def _merged_extra_body(
@@ -200,10 +218,11 @@ def _merged_extra_body(
     reasoning_extra: Optional[dict],
     chat_id: object = None,
     supports_prompt_cache: bool = False,
+    session_key: Optional[str] = None,
 ) -> Optional[dict]:
     """
-    合并 OpenRouter 路由偏好与推理控制字段，返回应传给 create() 的
-    extra_body；两个来源都为空时返回 None（不发送 extra_body）。
+    合并 OpenRouter 路由偏好 / 会话亲和键与推理控制字段，返回应传给
+    create() 的 extra_body；两个来源都为空时返回 None（不发送 extra_body）。
 
     reasoning_extra 来自 config.get_reasoning_request_fields()，例如：
       openrouter  -> {"reasoning": {"enabled": True, "effort": "high"}}
@@ -216,11 +235,12 @@ def _merged_extra_body(
         body = _openrouter_extra_body(
             chat_id=chat_id,
             supports_prompt_cache=supports_prompt_cache,
+            session_key=session_key,
         )
     else:
         # agnes 等声明了 session_affinity 的聚合网关：body 级会话亲和键
         # （多副本缓存隔离缓解，详见 _session_affinity_body 上方说明）。
-        affinity_body = _session_affinity_body(api_label, chat_id)
+        affinity_body = _session_affinity_body(api_label, chat_id, session_key)
         if affinity_body:
             body = affinity_body
     if reasoning_extra:
@@ -255,10 +275,15 @@ async def _agentic_loop_openai_compat(
     sampling_params = get_sampling_params(model_info)
     reasoning_top, reasoning_extra = get_reasoning_request_fields(model_info, api_label)
     prompt_cache_enabled = bool(model_info and model_info.supports_prompt_cache)
-    # 会话亲和请求头（agnes 等聚合网关多副本缓存隔离缓解）：chat_id 在
-    # 整个 loop 内不变，算一次即可，三个请求出口（主流式/非流式兑底/
-    # over-limit 合成）共用。声明了 session_affinity 的网关才非空。
-    affinity_headers = _session_affinity_headers(api_label, builder.chat_id)
+    # 会话亲和键在整个 loop 内只解析一次：loop 内全部轮次（含工具追加轮）
+    # 共用同一 session_id，保证粘性路由与前缀缓存不因中途轮换漂移；
+    # 三个请求出口（主流式/非流式兑底/over-limit 合成）共用。
+    loop_session_key = _openrouter_session_id(builder.chat_id)
+    # 会话亲和请求头（agnes 等聚合网关多副本缓存隔离缓解）：声明了
+    # session_affinity 的网关才非空。
+    affinity_headers = _session_affinity_headers(
+        api_label, builder.chat_id, session_key=loop_session_key
+    )
 
     # L0 预防层（主流：OpenAI Structured Outputs）：对能安全规范化的工具
     # 注入 strict:true + 递归 schema 规范化（全部必填 + additionalProperties:false
@@ -276,6 +301,18 @@ async def _agentic_loop_openai_compat(
         # 第一片增量到达时就上屏，id/名称到达后再原地改绑/回填。
         stream_item_ids: dict = {}
         stream_item_names: dict = {}
+
+        # OpenAI 兼容路径的手动缓存（OpenRouter 上 Anthropic 系模型）：
+        # 每轮请求前重打显式 cache_control 断点（函数内部先回收旧标记再
+        # 从尾部重新分配，总量恒 ≤3，幂等）。仅靠入口处（get_ai_response
+        # 预处理）一次性打标的话，loop 内追加的 tool 结果与 assistant
+        # (tool_calls) 消息会落在全部显式断点之外；每轮重打让最新的
+        # 工具输出进入显式缓存覆盖，loop 内 2..N 轮直接命中到最新工具
+        # 结果为止的完整前缀。与 extra_body 顶层自动断点（第 4 个）叠加。
+        # 非流式兜底与 over-limit 合成路径复用同一份 loop_messages，
+        # 无需重复打标。
+        if prompt_cache_enabled:
+            _apply_cache_control(loop_messages)
 
         content_acc = ""
         reasoning_acc = ""
@@ -324,6 +361,7 @@ async def _agentic_loop_openai_compat(
                 api_label, reasoning_extra,
                 chat_id=builder.chat_id,
                 supports_prompt_cache=prompt_cache_enabled,
+                session_key=loop_session_key,
             )
             if extra_body is not None:
                 create_params["extra_body"] = extra_body
@@ -565,6 +603,7 @@ async def _agentic_loop_openai_compat(
                     api_label, reasoning_extra,
                     chat_id=builder.chat_id,
                     supports_prompt_cache=prompt_cache_enabled,
+                    session_key=loop_session_key,
                 )
                 if fallback_extra_body is not None:
                     fallback_params["extra_body"] = fallback_extra_body
@@ -743,6 +782,7 @@ async def _agentic_loop_openai_compat(
                 api_label, reasoning_extra,
                 chat_id=builder.chat_id,
                 supports_prompt_cache=prompt_cache_enabled,
+                session_key=loop_session_key,
             )
             if synth_extra_body is not None:
                 synth_params["extra_body"] = synth_extra_body
