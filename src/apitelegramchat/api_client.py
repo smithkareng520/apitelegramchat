@@ -173,7 +173,6 @@ class APIClient:
                 base_url=base.base_url,
                 api_key_env=base.api_key_env,
                 default_headers=base.default_headers or {},
-                use_dedicated_loop=base.use_dedicated_loop,
                 dedicated_loop_kind=base.dedicated_loop_kind,
                 supports_prompt_cache=base.supports_prompt_cache,
                 vision_prefer_url=base.vision_prefer_url,

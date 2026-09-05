@@ -1136,19 +1136,21 @@ async def _call_api(
         model_info = SUPPORTED_MODELS.get(DEFAULT_MODEL, model_info)
 
     # 有效端点：合并厂商默认值与该模型自己的端点覆盖（不同中转端点/协议）。
-    # use_dedicated_loop / dedicated_loop_kind 均以模型级覆盖优先，
+    # dedicated_loop_kind 以模型级覆盖优先（单字段协议选择器，
+    # None=继承厂商默认，"openai_compat"=显式走兼容循环），
     # 因此同一个 provider 壳下的不同模型可以分别走不同协议循环。
+    # 注意：与 api_client._build_client 同口径——只看这一个字段，
+    # 不存在"开关没开导致客户端/循环错配"的半开状态。
     endpoint = get_effective_endpoint(model_info)
-    use_dedicated_loop = endpoint.use_dedicated_loop
     dedicated_loop_kind = endpoint.dedicated_loop_kind
 
-    if use_dedicated_loop and dedicated_loop_kind == "anthropic_native":
+    if dedicated_loop_kind == "anthropic_native":
         client = api_client.get_client_for_model(model_info)
         return await _agentic_loop_anthropic(
             client, current_model, messages, builder,
             tools=tools_to_pass, supports_tools=supports_tools, journal=journal,
         )
-    elif use_dedicated_loop and dedicated_loop_kind == "gemini_native":
+    elif dedicated_loop_kind == "gemini_native":
         # Gemini 原生流式桥接：aiohttp 直连原生 REST（v1beta
         # streamGenerateContent?alt=sse），不经过 OpenAI 兼容客户端。
         return await _agentic_loop_gemini_native(
