@@ -184,7 +184,6 @@ MEDIA_GROUP_TIMEOUT = 5
 REPLY_MARKER = "💡 引用回复:"
 
 active_tasks: dict[int, asyncio.Task] = {}
-webhook_tasks: dict[int, asyncio.Task] = {}
 active_tasks_lock = asyncio.Lock()
 # 消息去重已下沉到 state.mark_update_processed_if_new（原子检查+标记），
 # 这里不需要 app 级别的去重锁。
@@ -1484,78 +1483,38 @@ async def send_model_list(
 # ---------------------------------------------------------------------------
 @app.route('/webhook', methods=['GET', 'POST', 'HEAD'])
 async def webhook() -> tuple:
-    """
-    极限快速 webhook 入口。
-
-    原则:
-    1. 不等待 JSON 后面的业务逻辑
-    2. 不等待去重锁
-    3. 不等待 AI / tool / 文件 / 网络
-    4. Telegram update 必须先 ACK
-
-    任何慢逻辑全部进入后台 task。
-    """
-    if request.method in ('GET', 'HEAD'):
-        return "OK - Webhook is alive", 200
-
-    # 第一行日志：如果这里没有出现，说明请求根本没有到 Quart
-    logger.info("TELEGRAM WEBHOOK ENTERED")
-
-    try:
-        data = await asyncio.wait_for(
-            request.get_json(force=True),
-            timeout=3
-        )
-    except asyncio.TimeoutError:
-        logger.error("Webhook body read timeout")
-        return "OK", 200
-    except Exception:
-        logger.exception("Webhook JSON parse failed")
-        return "OK", 200
-
-    if not isinstance(data, dict):
-        logger.warning("Webhook invalid payload")
-        return "OK", 200
-
-    uid = data.get("update_id", "unknown")
-
-    # 注意：
-    # 不在这里 await mark_update_processed_if_new()
-    # 该函数可能涉及锁/IO，不能阻塞 Telegram webhook。
-    async def runner():
-        try:
-            # 后台再做去重
-            if uid != "unknown":
-                try:
-                    if not await mark_update_processed_if_new(uid):
-                        logger.info("Duplicate update ignored %s", uid)
-                        return
-                except Exception:
-                    logger.exception("update dedup failed %s", uid)
-
-            await _process_webhook_update(data)
-
-        except Exception:
-            logger.exception("Webhook worker crashed update=%s", uid)
-
-    asyncio.create_task(runner())
-
-    logger.info("TELEGRAM WEBHOOK ACK update=%s", uid)
-
-    # 立即告诉 Telegram 收到了
-    return "OK", 200
-
-
-async def _process_webhook_update(data: dict) -> tuple:
     _t0 = time.monotonic()
     try:
         request_id = str(uuid.uuid4())[:8]
         set_request_id(request_id)
         logger.info(f"Received webhook request {request_id}")
 
-        uid = data.get("update_id")
+        token = request.args.get("token")
+        # 鉴权双路径（任一匹配即放行），均用 hmac.compare_digest 恒定时间比较防止时序攻击：
+        #  1) URL query ?token=…（历史注册方式，保持完全兼容）；
+        #  2) X-Telegram-Bot-Api-Secret-Token 请求头——当启动自愈以
+        #     secret_token 参数注册后（见 webhook_sync.py），Telegram 每次投递
+        #     都会携带该头。头路径让 token 不再出现在 URL/访问日志里。
+        # 头路径是加法式强化：若注册时未附带 secret_token，Telegram 不会发
+        # 该头，鉴权自然回落到 query token，既有投递不受任何影响。
+        token_ok = False
+        if WEBHOOK_TOKEN:
+            if token and hmac.compare_digest(str(token), str(WEBHOOK_TOKEN)):
+                token_ok = True
+            else:
+                secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+                if secret_header and hmac.compare_digest(str(secret_header), str(WEBHOOK_TOKEN)):
+                    token_ok = True
+        if not token_ok:
+            return "Forbidden", 403
+        if request.method in ('GET', 'HEAD'):
+            return "OK - Webhook is alive", 200
+
+        data = await request.json
+        uid = data.get('update_id')
+        # 缺少 update_id 的非法 payload 直接拒绝，避免污染去重集合
         if uid is None:
-            return "OK", 200
+            return "Bad Request", 400
 
         if LOG_LEVEL == "DEBUG" or LOG_TRUNCATE_LIMIT == 0:
             msg_debug = json.dumps(data, ensure_ascii=False, default=str)
@@ -1563,7 +1522,21 @@ async def _process_webhook_update(data: dict) -> tuple:
         else:
             _msg_obj = data.get("message") or {}
             chat_id = _msg_obj.get("chat", {}).get("id")
-            logger.info(f"Webhook processing: update_id={uid}, chat_id={chat_id}")
+            update_id = data.get("update_id")
+            logger.info(f"Webhook: update_id={update_id}, chat_id={chat_id}")
+            if logger.isEnabledFor(logging.DEBUG):
+                msg_debug = json.dumps(data, ensure_ascii=False, default=str)
+                if len(msg_debug) > LOG_TRUNCATE_LIMIT:
+                    msg_debug = msg_debug[:LOG_TRUNCATE_LIMIT] + "... (truncated)"
+                logger.debug(f"截断的 Webhook 数据: {msg_debug}")
+
+        # 使用 OrderedDict 保留插入顺序，超过 10000 条时按插入顺序淘汰
+        # 最早的 5000 条，保证淘汰的总是最早加入的 uid。
+        # mark_update_processed_if_new 原子地"检查并标记"：若拆成先查后标
+        # 两段加锁，Telegram 超时重投 + webhook 并发会让同一 update 的两个
+        # 副本同时通过检查、被双重处理。
+        if not await mark_update_processed_if_new(uid):
+            return "OK", 200
 
         # ── 消息处理 ──────────────────────────────────────────────────────
         if "message" in data and isinstance(data["message"], dict):
