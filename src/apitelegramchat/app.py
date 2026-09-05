@@ -154,6 +154,16 @@ async def _shutdown_close_http_session() -> None:
         except Exception:
             logger.warning("telegram worker shutdown raised", exc_info=True)
         _telegram_worker_task = None
+    global _loop_watchdog_task
+    if _loop_watchdog_task is not None:
+        _loop_watchdog_task.cancel()
+        try:
+            await _loop_watchdog_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.warning("loop watchdog shutdown raised", exc_info=True)
+        _loop_watchdog_task = None
     try:
         await proactive.stop_proactive_scheduler()
     except Exception:
@@ -1556,6 +1566,61 @@ async def _startup_start_telegram_worker() -> None:
     _telegram_worker_task = asyncio.create_task(telegram_worker(), name="telegram-worker")
 
 
+# ---------------------------------------------------------------------------
+# Event loop watchdog（循环健康心跳）
+# ---------------------------------------------------------------------------
+# 目的：把"消息没有任何日志"这类事故在事后日志里 10 秒定位。单进程单 loop
+# 架构下（quart run = 1 worker），任何同步阻塞 / CPU 密集任务都会冻结整个
+# loop：期间 webhook 无法 ACK、日志无法写出、/health 无法响应——表现恰好
+# 是"Render 没新日志"。watchdog 用 sleep 前后单调时钟差直接测量 loop 实际
+# 响应延迟，并把队列/任务水位写进周期心跳，三种故障一目了然：
+#
+#   a) heartbeat 出现 ≥阈值 gap（本该 10s 一条却隔了几十秒）→ loop 被冻结；
+#   b) gap 正常、queue 深度持续增长、"arrived" 有而 "worker processing" 停
+#      滞 → telegram_worker 被某条 update 卡死；
+#   c) gap 正常、queue=0、完全没有 "arrived" → Telegram 侧未投递（此时再
+#      用 /webhookinfo 查 pending/last_error）。
+LOOP_WATCHDOG_INTERVAL_S = float(os.getenv("LOOP_WATCHDOG_INTERVAL_S", "10"))
+LOOP_LAG_WARN_S = float(os.getenv("LOOP_LAG_WARN_S", "5"))
+_loop_watchdog_task: asyncio.Task | None = None
+
+
+async def _loop_watchdog() -> None:
+    """每 LOOP_WATCHDOG_INTERVAL_S 醒一次，报告 loop lag 与队列水位。"""
+    interval = LOOP_WATCHDOG_INTERVAL_S
+    tick = 0
+    while True:
+        start = time.monotonic()
+        await asyncio.sleep(interval)
+        # loop 实际多睡了多久 = 本 tick 内被同步/CPU 任务占死的时间
+        lag = time.monotonic() - start - interval
+        tick += 1
+        if lag >= LOOP_LAG_WARN_S:
+            logger.critical(
+                f"🚨 EVENT LOOP BLOCKED: 期望休眠 {interval:.1f}s 实际 {lag + interval:.1f}s "
+                f"(lag={lag:.2f}s) —— 该窗口内 webhook/日志/健康检查全部不可调度，"
+                f"Render 健康检查连续失败会触发重启"
+            )
+        # 常规水位：每 6 tick（默认 1 分钟）打一条，事故时留时间线证据
+        if tick % 6 == 0 or lag >= LOOP_LAG_WARN_S:
+            try:
+                logger.info(
+                    f"heartbeat: loop_lag={lag:.2f}s "
+                    f"queue={update_queue.qsize()}/{WEBHOOK_QUEUE_MAXSIZE} "
+                    f"active_tasks={len(active_tasks)} tasks={len(asyncio.all_tasks())}"
+                )
+            except Exception:
+                # watchdog 自身绝不能死：水位统计失败只降级为纯 lag 心跳
+                logger.info(f"heartbeat: loop_lag={lag:.2f}s (stats unavailable)")
+
+
+@app.before_serving
+async def _startup_start_loop_watchdog() -> None:
+    """启动 event loop watchdog（与 telegram_worker 互不干扰）。"""
+    global _loop_watchdog_task
+    _loop_watchdog_task = asyncio.create_task(_loop_watchdog(), name="loop-watchdog")
+
+
 @app.route('/webhook', methods=['GET', 'POST', 'HEAD'])
 async def webhook() -> tuple:
     """Telegram webhook 入口：只做 校验 → 读 JSON → 入队 → 立即 ACK。
@@ -1566,6 +1631,12 @@ async def webhook() -> tuple:
     _t0 = time.monotonic()
     try:
         request_id = str(uuid.uuid4())[:8]
+        # 最外层 TCP 级心跳：print 直写 stdout（PYTHONUNBUFFERED=1 立即刷出），
+        # 完全绕过 logging 管线，排除"logger 被配置过滤/handler 异常"的干扰。
+        # 判读：本行有、下方 "telegram webhook arrived" 无 → logging 管线问题；
+        #       两行都无 → 请求根本没进 Quart（Telegram 未投递，或 event loop
+        #       被同步/CPU 任务冻结——配合 loop watchdog 心跳 gap 即可区分）。
+        print(f">>> WEBHOOK TCP ARRIVED id={request_id}", flush=True)
         set_request_id(request_id)
         logger.info(f"telegram webhook arrived {request_id}")
 

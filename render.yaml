@@ -53,11 +53,14 @@ services:
         value: auto
       - key: WEBHOOK_URL
         sync: false
-      # 启动自愈注册附带 drop_pending_updates=true 时，重启即丢弃 Telegram
-      # 侧积压 update（停机/部署窗口内的消息被永久丢弃）。默认 false：
-      # 保留积压，由健康实例重放排干。
+      # ⚠️ 必须为 false（代码默认值即 false，此处显式固化并修正历史误配）：
+      # 设 true 时每次重启/部署/健康检查失败重启都会调用
+      # setWebhook?drop_pending_updates=true，把 Telegram 侧积压的 update
+      # 永久丢弃——停机窗口内的消息不投递、不回复、日志里也永远不出现，
+      # 正是"消息凭空消失、没有任何新日志"假象的元凶之一。
+      # false 时由健康实例自动重放排干积压（bot 会迟到回复，但不丢消息）。
       - key: DROP_PENDING_ON_STARTUP
-        value: "true"
+        value: "false"
       - key: SERPER_API_KEY
         sync: false
       - key: GAODE_MCP_URL
