@@ -379,14 +379,36 @@ def _render_media_failure_quote(error_notice: str) -> str:
     与 ``tool_executors._render_editor_quote`` 保持同一形态：``<pre><code>``
     而非 ``<blockquote>``。上游报错常带缩进的 JSON / traceback，引用块会把
     空白折叠掉、用比例字体排版，导致结构不可读；``<pre>`` 逐字保留空白。
+
+    截断策略与 ``tool_executors._truncate_ui_lines`` 对齐：行数（20 行）之外
+    再做单行宽度裁剪——上游错误 JSON 常被压成单行，几万字符的一行同样会把
+    <pre> 块（Rich Message 不可分割块）与整条草稿撑爆，导致消息被迫滚动
+    分裂。此处不 import tool_executors（该模块被更底层引用，避免循环导入），
+    用同语义的局部实现。
     """
+    _MAX_LINES = 20
+    _MAX_LINE_CHARS = 240
+
+    def _clip_line(line: str) -> str:
+        if len(line) <= _MAX_LINE_CHARS:
+            return line
+        head_len = (_MAX_LINE_CHARS * 2) // 3
+        tail_len = _MAX_LINE_CHARS - head_len
+        omitted = len(line) - head_len - tail_len
+        return f"{line[:head_len]}…（本行过长，省略 {omitted} 字符）…{line[-tail_len:]}"
+
     raw = html.unescape(str(error_notice or ""))
     visible_text = strip_html_tags(raw).strip()
     if not visible_text:
         visible_text = "媒体生成未完成，请稍后重试。"
     lines = visible_text.splitlines()
-    if len(lines) > 20:
-        visible_text = "\n".join(lines[:20]) + f"\n…（已截断，共 {len(lines)} 行，仅显示前 20 行）"
+    if len(lines) > _MAX_LINES:
+        visible_text = (
+            "\n".join(_clip_line(line) for line in lines[:_MAX_LINES])
+            + f"\n…（已截断，共 {len(lines)} 行，仅显示前 {_MAX_LINES} 行）"
+        )
+    else:
+        visible_text = "\n".join(_clip_line(line) for line in lines)
     # 严格转义（& 无条件转义）：这是程序原始输出，不是 HTML 片段。
     body = visible_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return f"<p><b>Result</b></p><pre><code>{body}</code></pre>"

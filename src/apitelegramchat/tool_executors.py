@@ -281,6 +281,9 @@ def _numbered_text(text: str, *, max_lines: int = _UI_TAIL_LINES) -> str:
     lines, first_line, total = _tail_text_lines(text, max_lines)
     if not lines:
         return "(无输出)"
+    # 单行宽度裁剪：行号 gutter 之外，超宽行同样会把预览面板/整条草稿撑爆。
+    # 裁剪放在编号之前，保证“行号 │ 行首…行尾”结构完整。
+    lines = [_clip_ui_line(line) for line in lines]
     width = len(str(max(total, first_line + len(lines) - 1)))
     prefix = "…\n" if first_line > 1 else ""
     body = "\n".join(
@@ -300,7 +303,7 @@ def _render_code_panel(
         display = _numbered_text(text, max_lines=max_lines)
     else:
         lines, _, _ = _tail_text_lines(text, max_lines)
-        display = "\n".join(lines) if lines else "(无输出)"
+        display = "\n".join(_clip_ui_line(line) for line in lines) if lines else "(无输出)"
     # 不带 style 属性：Telegram Rich Message 只认标签语义，内联 CSS
     # （background/font-family/white-space…）会被整体丢弃，留着只是噪音。
     # 等宽与空白保留由 <pre> 标签本身保证。转义用严格策略（& 无条件转义），
@@ -745,15 +748,55 @@ def _render_structured_payload(result_str: str, *, map_tool: str) -> str | None:
 # 所有工具的完成态展示统一走 text_editor 风格的 Input/Output 引用块；
 # Input 或 Output 任一超过这个行数都做截断，避免长内容把消息撑爆。
 _TOOL_UI_MAX_LINES = 20
+# 单行宽度上限。只有行数预算是不够的：minified JS / 单行 JSON / base64 /
+# `jq -c` 这类“无换行大文本”一行就能有几万字符，20 行预算形同虚设；
+# 而超宽行进入 <pre><code> 后成为 Rich Message 里不可分割的单块
+# （rollover 只能在块边界切分），最终把草稿撑到超过滚动预算，消息被
+# 迫分裂成多条。因此在垂直（行数）之外再设水平（单行宽度）预算。
+_TOOL_UI_MAX_LINE_CHARS = max(80, int(os.getenv("TOOL_UI_MAX_LINE_CHARS", "240")))
+# <pre> 块的最终总量兑底（原始字符数，转义前）。正常路径远达不到：工具卡片
+# 已被行数×行宽双重钳住；此值只拦截直接把大文本塞进 <pre> 的旁路调用。
+_PRE_BLOCK_MAX_CHARS = max(_TOOL_UI_MAX_LINE_CHARS * 4, int(os.getenv("PRE_BLOCK_MAX_CHARS", "8000")))
+
+
+def _clip_ui_line(line: str, max_chars: int | None = None) -> str:
+    """超宽行保头保尾：关键信息可能在一行的任意位置。
+
+    行内的报错片段（长 traceback 行末尾的异常消息、断言 diff 行的
+    ``+ expected - actual``）经常位于行尾，纯头部截断同样会丢掉它；
+    因此与 bash 输出同级地采取“头 2/3 + 尾 1/3”，中间以说明替代。
+    """
+    limit = _TOOL_UI_MAX_LINE_CHARS if max_chars is None else max_chars
+    if len(line) <= limit:
+        return line
+    head_len = max(1, (limit * 2) // 3)
+    tail_len = max(1, limit - head_len)
+    omitted = len(line) - head_len - tail_len
+    return f"{line[:head_len]}…（本行过长，省略 {omitted} 字符）…{line[-tail_len:]}"
+
+
+def _clip_ui_lines(text: str) -> str:
+    """对一段已定稿的多行文本逐行做宽度裁剪（行数不再变动）。"""
+    if not text:
+        return text
+    if len(text) <= _TOOL_UI_MAX_LINE_CHARS:
+        return text  # 快路径：整体都不超宽，无需逐行
+    return "\n".join(_clip_ui_line(line) for line in text.splitlines())
 
 
 def _truncate_ui_lines(text: str, max_lines: int = _TOOL_UI_MAX_LINES) -> str:
-    """Keep only the first max_lines lines; append a truncation note if cut."""
+    """Keep only the first max_lines lines; append a truncation note if cut.
+
+    行数截断后再对**保留的行**做单行宽度裁剪（先选窗口、后裁剪，被丢弃
+    的行不做无用功）。行数 × 行宽给出硬上界：单个卡片最坏约
+    ``max_lines × (_TOOL_UI_MAX_LINE_CHARS + 说明开销)`` 字符，不再可能
+    出现“一行拖垮整条草稿”的情况。
+    """
     text = text if isinstance(text, str) else str(text or "")
     lines = text.splitlines()
     if len(lines) <= max_lines:
-        return text
-    kept = "\n".join(lines[:max_lines])
+        return _clip_ui_lines(text)
+    kept = "\n".join(_clip_ui_line(line) for line in lines[:max_lines])
     return f"{kept}\n…（已截断，共 {len(lines)} 行，仅显示前 {max_lines} 行）"
 
 
@@ -761,17 +804,18 @@ def _truncate_ui_lines_head_tail(text: str, max_lines: int = _TOOL_UI_MAX_LINES)
     """Keep the first ~60% and the last ~40% lines; note the omitted middle.
 
     Bash 输出的报错/摘要几乎总在结尾，纯头部截断会让用户在卡片里看不到
-    失败原因；这里保头也保尾，中间以说明行代替。
+    失败原因；这里保头也保尾，中间以说明行代替。保留的行同样做单行宽度
+    裁剪（与 :func:`_truncate_ui_lines` 相同的水平预算）。
     """
     text = text if isinstance(text, str) else str(text or "")
     lines = text.splitlines()
     if len(lines) <= max_lines:
-        return text
+        return _clip_ui_lines(text)
     head_lines = max(1, int(max_lines * 0.6))
     tail_lines = max(1, max_lines - head_lines - 1)  # 预留 1 行给省略说明
     omitted = len(lines) - head_lines - tail_lines
-    head = "\n".join(lines[:head_lines])
-    tail = "\n".join(lines[-tail_lines:])
+    head = "\n".join(_clip_ui_line(line) for line in lines[:head_lines])
+    tail = "\n".join(_clip_ui_line(line) for line in lines[-tail_lines:])
     return f"{head}\n…（已截断，共 {len(lines)} 行，省略中间 {omitted} 行）\n{tail}"
 
 
@@ -802,8 +846,24 @@ def _render_code_text(text: str) -> str:
 
     ``<pre>`` 内不能再用 ``<br/>`` 换行——换行符本身即换行；插入 ``<br/>``
     反而会多出一个空行。
+
+    总量兜底：``<pre>`` 是 Rich Message 里不可分割的块（rollover 只能在块
+    边界切分），任何调用路径都不该往里塞超大文本。上层的
+    ``_truncate_ui_lines*`` 已对工具卡片做了行数×行宽预算，但仍有旁路
+    （如 weather 失败时 ``result_str[:60000]`` 直通此处），这里做最后一道
+    防线。注意必须在**转义前**对原文裁剪：若对转义后的文本下刀，可能切在
+    ``&amp;`` 实体中间，产生裸 ``&`` 打坏 Telegram 的 HTML 解析。
     """
-    body = _escape_code_text(text)
+    raw = text if isinstance(text, str) else str(text or "")
+    if len(raw) > _PRE_BLOCK_MAX_CHARS:
+        head_len = (_PRE_BLOCK_MAX_CHARS * 2) // 3
+        tail_len = _PRE_BLOCK_MAX_CHARS - head_len
+        omitted = len(raw) - head_len - tail_len
+        raw = (
+            f"{raw[:head_len]}\n…[内容过长，中间约 {omitted} 字符已省略]…\n"
+            f"{raw[-tail_len:]}"
+        )
+    body = _escape_code_text(raw)
     return f"<pre><code>{body}</code></pre>"
 
 
@@ -1845,7 +1905,8 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 summary = "🌤️ 天气查询失败"
                 # 上游错误文本必须转义：未转义时其中的 < > & 会打坏
                 # Rich Message 结构（旧实现直接内插，属注入面）。
-                details_html = f"<pre><code>{_escape_code_text(str(error_msg))}</code></pre>"
+                # 走 _render_code_text 复用总量兑底，错误信息也可能很长。
+                details_html = _render_code_text(str(error_msg))
                 return summary, details_html
 
             city = weather_data.get("city", "未知")
@@ -1972,10 +2033,10 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             return summary, details_html
 
         except json.JSONDecodeError:
-            # 严格转义原始响应（& 无条件转义）：这是上游返回的原始文本。
-            safe_log = _escape_code_text(result_str[:60000])
+            # 严格转义 + <pre> 总量兑底：_render_code_text 内部先裁剪后转义，
+            # 避免单行 60KB 的错误响应把块与整条草稿撑爆，也不会切断实体。
             summary = "🌤️ 天气数据"
-            details_html = f"<pre><code>{safe_log}</code></pre>"
+            details_html = _render_code_text(result_str[:60000])
             return summary, details_html
 
     elif fn_name == "wikipedia":

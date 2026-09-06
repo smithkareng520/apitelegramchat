@@ -1040,6 +1040,51 @@ async def _agentic_loop_native_image(
                 journal.extend(new_entries)
             return final_content, usage, new_entries
 
+        # ---- XXTF 图像生成（OpenAI 兼容 /v1/images/generations） ----
+        if provider == "xxtf":
+            try:
+                from openai import AsyncOpenAI
+                xxtf_client = AsyncOpenAI(
+                    base_url="https://xxtf.baby/v1",
+                    api_key=os.getenv("XXTF_API_KEY", ""),
+                )
+                image_response = await xxtf_client.images.generate(
+                    model=current_model,
+                    prompt=clean_prompt,
+                    n=1,
+                    size="1024x1024",
+                )
+                if image_response.data and len(image_response.data) > 0:
+                    img_url = image_response.data[0].url
+                    if img_url:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(img_url, timeout=60) as resp:
+                                if resp.status == 200:
+                                    img_bytes = await resp.read()
+                                    key = f"generated/{uuid.uuid4().hex}.png"
+                                    upload_url = await upload_bytes_to_r2(img_bytes, key, "image/png")
+                                    if upload_url:
+                                        rich_html = f'<figure><img src="{upload_url}"/></figure>'
+                                        await send_rich_html_message(chat_id, rich_html)
+                                        final_notice = f"图片已生成 ({current_model})"
+                                        history_content = f"[图片已生成] 指令: {clean_prompt or prompt_text or '(无)'}"
+                                        new_entries = [{"role": "assistant", "content": history_content}]
+                                        if journal is not None:
+                                            journal.extend(new_entries)
+                                        return f"IMAGE_SENT:{final_notice}", None, new_entries
+            except Exception as e:
+                logger.exception(f"[NativeImage/XXTF] 请求失败: {e}")
+                error_notice = await get_error_notification_message(
+                    chat_id,
+                    error_code=getattr(e, "status_code", getattr(e, "status", 500)),
+                    error_message=str(e),
+                    api_name="XXTF 图像接口",
+                    exception=e,
+                    endpoint="/v1/images/generations",
+                    model=current_model,
+                )
+                return f"IMAGE_ERROR:{error_notice}", None, []
+
         # ---- 非 ModelScope 的其他提供商（OpenRouter 等） ----
         try:
             response = await client.chat.completions.create(

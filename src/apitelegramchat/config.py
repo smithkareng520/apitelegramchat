@@ -1054,6 +1054,14 @@ SUPPORTED_MODELS["bytedance-seed/seedream-4.5"] = make_model_config(
     max_context=4000,
     max_output_tokens=1024,
 )
+SUPPORTED_MODELS["gpt-image-2"] = make_model_config(
+    model_id="gpt-image-2",
+    provider="xxtf",
+    name="GPT Image 2 (XXTF)",
+    native_image=True,
+    max_context=32768,
+    max_output_tokens=4000,
+)
 
 # -----------------------------------------------------------------------------
 # 视频生成模型
