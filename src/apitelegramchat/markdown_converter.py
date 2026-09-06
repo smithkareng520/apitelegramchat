@@ -8,6 +8,28 @@ import html as html_lib
 from typing import List, Tuple
 
 
+# 只匹配「不是合法 HTML 实体开头」的裸 & ——即后面没有紧跟
+# `name;` / `#123;` / `#x1F;` 形式的分号结尾序列。
+# 用于避免把模型已经正确转义的 &amp; / &lt; / &#39; 二次转义成
+# &amp;amp;（用户侧会看到字面量 "&amp;" 而不是 "&"）。
+_BARE_AMP_RE = re.compile(r'&(?![A-Za-z][A-Za-z0-9]*;|#[0-9]+;|#[xX][0-9A-Fa-f]+;)')
+
+
+def _escape_prose(text: str) -> str:
+    """转义正文中裸露的 `<`、`>`、`&`，但保留已有的 HTML 实体。
+
+    与 ``html.escape`` 的区别只在 ``&``：``html.escape`` 会把已经转义好的
+    ``&amp;`` 再转成 ``&amp;amp;``。Telegram 不像浏览器那样对多余的实体
+    「宽容还原」，它会忠实地把 ``&amp;amp;`` 渲染成可见的字面量
+    ``&amp;``——正是用户报告的现象。这里改为只转义裸 ``&``，保证
+    「转一次」和「转两次」结果一致（幂等）。
+    """
+    if not text:
+        return text
+    text = _BARE_AMP_RE.sub('&amp;', text)
+    return text.replace('<', '&lt;').replace('>', '&gt;')
+
+
 def convert_markdown_to_telegram_html(text: str) -> str:
     """将 Markdown 语法转换为 Telegram Rich Message HTML。
     
@@ -360,8 +382,10 @@ def _convert_inline(text: str) -> str:
         text,
     )
 
-    # 5) 剩下的是纯文本：转义裸露的 < > &，避免 "a < b" 被当成标签
-    text = html_lib.escape(text, quote=False)
+    # 5) 剩下的是纯文本：转义裸露的 < > &，避免 "a < b" 被当成标签。
+    #    用 _escape_prose 而非 html.escape：模型按提示词输出的正文里
+    #    已包含合法实体（&amp;、&lt;、&#39;），二次转义会让用户看到字面量。
+    text = _escape_prose(text)
 
     # 6) 强调符号（此时已无代码/URL 干扰）
     text = re.sub(r'\*\*\*([^*]+)\*\*\*', r'<b><i>\1</i></b>', text)
