@@ -1054,18 +1054,25 @@ SUPPORTED_MODELS["bytedance-seed/seedream-4.5"] = make_model_config(
     max_context=4000,
     max_output_tokens=1024,
 )
-# XXTF 中转的图像模型：走 OpenAI Images 标准端点
-# https://xxtf.baby/v1/images/generations（text-to-image 与 image-to-image
-# 同一端点，编辑时 payload 携带 image 字段），由 media_generation 的统一
-# 图像请求出口（_request_images_generations -> _request_openai_compat_image）
-# 发送：鉴权沿用 XXTF_API_KEY，请求头沿用 PROVIDERS["xxtf"] 的浏览器 UA。
+# XXTF 中转的图像模型：走 OpenAI Images 标准端点（https://xxtf.baby/v1/...），
+# 按 OpenAI 官方语义分端点（见 developers.openai.com "Create image"/"Create image edit"）：
+#   - 文生图 -> JSON /v1/images/generations
+#   - 带参考图编辑 -> 官方规范 /v1/images/edits（multipart/form-data，
+#     image[] 字段逐张上传）；中转站未实现该路由时由 media_generation
+#     自动回退 JSON /v1/images/generations + image 字段的兼容形状
+# 请求由 media_generation 的统一图像请求出口（_request_images_generations ->
+# _request_openai_compat_image）发送：鉴权沿用 XXTF_API_KEY，请求头沿用
+# PROVIDERS["xxtf"] 的浏览器 UA。
 SUPPORTED_MODELS["gpt-image-2"] = make_model_config(
     model_id="gpt-image-2",
     provider="xxtf",
     name="GPT Image 2 (XXTF)",
     native_image=True,
     # 支持参考图编辑（图生图）：vision=True 使其进入 edit_image_with_reference
-    # 的可选模型列表；文生图（generate_image_from_text）同样可用。
+    # 的可选模型列表（vision 在图像模型上表示"可接受图像输入"，即具备
+    # 图生图/编辑能力，与聊天模型的"看图"能力共用同一能力位）；实际编辑
+    # 请求走 /v1/images/edits（见 _request_openai_compat_image）。
+    # 文生图（generate_image_from_text）同样可用。
     vision=True,
     supports_tools=False,
     max_context=32768,

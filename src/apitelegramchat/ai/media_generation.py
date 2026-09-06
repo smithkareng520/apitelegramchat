@@ -2,12 +2,13 @@
 
 从 ai_handlers.py 拆分而来，逻辑未做改动。
 
-图像生成统一入口（/v1/images/generations）：
+图像生成统一入口（OpenAI Images 协议）：
 所有走 OpenAI Images 协议的提供商（ModelScope / XXTF 等）共用
-:func:`_request_images_generations` 一个请求出口——端点、鉴权、
+:func:`_request_images_generations` 一个请求出口——端点选择、鉴权、
 请求头、payload 构造、参考图下载、响应解析全部在此合并；厂商差异
-（ModelScope 的异步任务轮询）作为该出口内部的分支处理，调用方
-（agentic 原生图像循环 / 工具图像生成）不再按提供商各写一套。
+（ModelScope 的异步任务轮询、xxtf 的官方 /images/edits multipart 形状）
+作为该出口内部的分支处理，调用方（agentic 原生图像循环 / 工具图像
+生成）不再按提供商各写一套。
 """
 import asyncio
 import json
@@ -33,12 +34,18 @@ from apitelegramchat.ai.error_formatting import _extract_error_details
 logger = get_logger(__name__)
 
 # =============================================================================
-# 统一图像请求（OpenAI Images 协议 /v1/images/generations）
+# 统一图像请求（OpenAI Images 协议 /v1/images/{generations,edits}）
 # -----------------------------------------------------------------------------
-# 走统一 /v1/images/generations 出口的提供商集合。判定依据是"该提供商
-# 的图像模型支持 OpenAI Images 兼容端点"，而不是按模型逐个判断：
-#   - modelscope: /images/generations（异步任务轮询，见专用函数）
-#   - xxtf:       中转站标准 OpenAI Images 端点（gpt-image-2 等）
+# 走统一 Images 协议出口的提供商集合。判定依据是"该提供商的图像模型
+# 支持 OpenAI Images 兼容端点"，而不是按模型逐个判断：
+#   - modelscope: 文生图与图生图共用 /images/generations（用
+#     X-ModelScope-Task-Type 头区分；ModelScope 无 /images/edits 端点）
+#   - xxtf:       中转站标准 OpenAI Images 端点（gpt-image-2 等），按官方
+#     语义分端点：文生图 -> JSON /images/generations；带参考图的编辑 ->
+#     官方规范 /images/edits（multipart/form-data，image[] 字段，见
+#     developers.openai.com "Create image edit"），中转站未实现该路由时
+#     回退 JSON /images/generations + image 字段的兼容形状
+#     （详见 _request_openai_compat_image）
 # 其它提供商（如 openrouter 的 gemini 图像模型）继续走
 # chat/completions + modalities 路径，行为不变。
 # =============================================================================
@@ -494,6 +501,100 @@ async def _request_modelscope_native_image(
         return response_json, endpoint, '', 200, request_id
 
 
+# ---- 通用 OpenAI 兼容实现的共享辅助（edits multipart / generations JSON 两路共用）----
+
+# data URL 的 MIME -> multipart 文件名扩展名（官方示例用 .png / .jpg / .webp）
+_MIME_TO_EXT = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+
+# /images/edits 路由级失败 -> 可回退 /images/generations 的状态码。
+# 只覆盖"中转站没实现/网关没转发该路由"类错误；鉴权(401/403)、限流(429)、
+# 内容安全(400 moderation)等语义性错误不回退，避免重复计费或掩盖真实原因。
+_EDITS_FALLBACK_STATUSES = frozenset({404, 405, 501, 502, 503})
+# 400 状态下命中这些字样视为"路由/参数未实现"（各家中转报错措辞不一，宽松收集）
+_EDITS_FALLBACK_BODY_HINTS = (
+    "unknown parameter",
+    "unrecognized request argument",
+    "unrecognized field",
+    "unexpected field",
+    "extra fields not permitted",
+    "extra_forbidden",
+    "invalid field",
+    "does not support",
+    "not supported",
+    "no such endpoint",
+    "unknown request",
+    "invalid url",
+    "page not found",
+    "not found",
+)
+
+
+def _should_fallback_to_generations(status_code: int, error_detail: str) -> bool:
+    """判定 /images/edits 失败后是否回退 /images/generations JSON 形状。
+
+    仅对"路由未实现 / 参数不识别"类失败回退；内容安全、鉴权、计费类
+    错误原样返回给调用方（回退也无法解决，反而多打一次计费请求）。
+    """
+    if status_code in _EDITS_FALLBACK_STATUSES:
+        return True
+    if status_code == 400:
+        body = (error_detail or "").lower()
+        return any(hint in body for hint in _EDITS_FALLBACK_BODY_HINTS)
+    return False
+
+
+def _data_url_to_bytes(data_url: str) -> tuple[bytes, str] | None:
+    """把 data:image/... URL 解码为 (字节, mime)；失败返回 None。"""
+    if not data_url or not data_url.startswith("data:image/"):
+        return None
+    try:
+        header, b64_data = data_url.split(",", 1)
+        mime = "image/png"
+        m = re.match(r"data:([^;,]+)", header)
+        if m and m.group(1).strip():
+            mime = m.group(1).strip().lower()
+        return base64.b64decode(b64_data), mime
+    except Exception as e:
+        logger.warning("[NativeImage/OpenAICompat] data URL 解码失败: %s", e)
+        return None
+
+
+async def _finalize_images_response(
+        resp: aiohttp.ClientResponse,
+        endpoint: str,
+        log_prefix: str,
+) -> tuple[dict | None, str, str, int, str]:
+    """Images 协议两种 POST（JSON / multipart）共用的响应处理。
+
+    返回: (response_json, endpoint, error_detail, status_code, request_id)
+    """
+    body_text = await resp.text()
+    logger.debug(
+        "%s POST response: status=%s content_type=%s body_preview=%r",
+        log_prefix,
+        resp.status,
+        resp.headers.get("Content-Type", ""),
+        body_text[:800],
+    )
+    if resp.status != 200:
+        detail, req_id = _extract_error_details(body_text)
+        logger.warning(
+            "%s POST failed: status=%s detail=%s",
+            log_prefix, resp.status, (detail or body_text)[:300],
+        )
+        return None, endpoint, detail or body_text[:500], resp.status, req_id or ''
+    parsed = _safe_json_parse_dict(body_text)
+    if parsed is None:
+        return None, endpoint, body_text[:500], resp.status, ''
+    return parsed, endpoint, '', resp.status, ''
+
+
 async def _request_openai_compat_image(
         model_info,
         *,
@@ -505,93 +606,155 @@ async def _request_openai_compat_image(
 ) -> tuple[dict | None, str, str, int, str]:
     """通用 OpenAI Images 兼容实现（XXTF 等中转站走这里）。
 
-    与 ModelScope 专用分支共用同一返回形状与参考图预处理；差别仅在于
-    本实现是"同步返回"的纯 REST 调用（无任务轮询）：
+    端点选择对齐 OpenAI 官方 Images API 语义（developers.openai.com
+    api/reference/resources/images/methods/{generate,edit}，2026-09 现场核实）：
 
-    - 端点：``{有效 base_url}/images/generations``。base_url 沿用
-      provider/模型端点覆盖的合并结果（XXTF 默认 ``https://xxtf.baby/v1``，
-      即最终请求 ``https://xxtf.baby/v1/images/generations``）。
+    - 无参考图（文生图）: POST JSON ``{base_url}/images/generations``
+      （官方 "Create image"，仅接受文本 prompt，无 image 参数）。
+    - 有参考图（图生图/编辑）: 官方是独立端点 "Create image edit"
+      ``{base_url}/images/edits``，且必须是 multipart/form-data——参考图以
+      重复的 ``image[]`` 文件字段逐张上传（gpt-image 系列支持多张），
+      文本字段为 model / prompt / n [/ size]：
+
+          curl https://api.openai.com/v1/images/edits \\
+            -F "model=gpt-image-1.5" -F "image[]=@a.png" -F "image[]=@b.png" \\
+            -F 'prompt=...'
+
+      历史实现曾把参考图塞进 JSON 发到 /images/generations——官方端点
+      并不接受 image 参数，只是部分中转站自行兼容。现在按以下顺序：
+        1. 先按官方规范 POST multipart /images/edits；
+        2. 仅当中转站返回"路由未实现/参数不识别"类错误（见
+           :func:`_should_fallback_to_generations`）才回退旧行为:
+           POST JSON /images/generations 并携带 image 字段（单张字符串、
+           多张数组）。鉴权/内容安全等语义错误不回退、原样返回。
+
+    - base_url 沿用 provider/模型端点覆盖的合并结果（XXTF 默认
+      ``https://xxtf.baby/v1``，即最终请求 ``https://xxtf.baby/v1/images/edits``
+      等真实路径）。
     - 鉴权：``Bearer {api_key_env 解析出的 key}``；provider 级
-      default_headers（如 XXTF 的浏览器 UA）一并下发。
-    - payload：文生图 ``{model, prompt, n[, size]}``；图生图/编辑额外带
-      ``image`` 字段（单张为字符串、多张为数组，统一 data URL——与
-      OpenAI gpt-image 系列在各中转站普遍接受的 JSON 形状一致）。
-    - 响应：OpenAI 标准 ``{data: [{url} | {b64_json}]}``，图片提取复用
-      :func:`_extract_image_items`（gpt-image 系列固定回 b64_json，同样覆盖）。
+      default_headers（如 XXTF 的浏览器 UA）一并下发。multipart 请求
+      不手动设置 Content-Type（aiohttp 自动生成带 boundary 的头）。
+    - 响应：两个端点同为 OpenAI 标准 ``{data: [{url} | {b64_json}]}``，
+      图片提取复用 :func:`_extract_image_items`（gpt-image 系列固定回
+      b64_json，同样覆盖）。
 
     返回: (response_json, endpoint, error_detail, status_code, request_id)
+    endpoint 为实际使用的相对路径（"/images/edits" 或 "/images/generations"），
+    调用方拼 /v1 前缀用于展示。
     """
-    endpoint = "/images/generations"
+    gen_endpoint = "/images/generations"
+    edits_endpoint = "/images/edits"
+    log_prefix = "[NativeImage/OpenAICompat]"
     ep = get_effective_endpoint(model_info)
     base_url = (getattr(ep, "base_url", "") or "").rstrip("/")
     api_key_env = getattr(ep, "api_key_env", "") or ""
     api_key = _resolve_provider_api_key(api_key_env)
     if not base_url:
-        return None, endpoint, f"提供商 {ep.name!r} 未配置 base_url", 400, ""
+        return None, gen_endpoint, f"提供商 {ep.name!r} 未配置 base_url", 400, ""
     if not api_key:
-        return None, endpoint, f"缺少 API Key: {api_key_env}，请设置环境变量", 401, ""
+        return None, gen_endpoint, f"缺少 API Key: {api_key_env}，请设置环境变量", 401, ""
 
-    headers = {
+    auth_headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
         **(getattr(ep, "default_headers", None) or {}),
     }
+    json_headers = {**auth_headers, "Content-Type": "application/json"}
     timeout = aiohttp.ClientTimeout(total=300, connect=10, sock_read=180)
 
     clean_prompt = _clean_prompt_for_image_model(prompt)
-    logger.debug(
-        "[NativeImage/OpenAICompat] request prepared: provider=%s endpoint=%s model=%s prompt_len=%s(cleaned, raw=%s) image_count=%s prompt_preview=%r",
-        ep.name,
-        endpoint,
-        model,
-        len(clean_prompt or ""),
-        len(prompt or ""),
-        len(image_urls or []),
-        (clean_prompt or "")[:240],
-    )
-
-    payload: dict[str, Any] = {
-        "model": model,
-        "prompt": clean_prompt or "请生成一张图片。",
-        "n": max(1, min(num_images, 4)),
-    }
     size = _aspect_ratio_to_openai_size(aspect_ratio)
-    if size:
-        payload["size"] = size
+    n = max(1, min(num_images, 4))
+
+    def _payload_base(prompt_text: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": model,
+            "prompt": prompt_text,
+            "n": n,
+        }
+        if size:
+            payload["size"] = size
+        return payload
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            if image_urls:
-                # 参考图预处理与 ModelScope 分支共用（下载失败跳过，全失败由下方拦截）
-                image_data_urls = await _image_urls_to_data_urls(session, image_urls)
-                if not image_data_urls:
-                    return None, endpoint, "未能读取参考图片", 400, ""
-                payload["image"] = image_data_urls[0] if len(image_data_urls) == 1 else image_data_urls
-
-            async with session.post(f"{base_url}{endpoint}", headers=headers, json=payload) as resp:
-                body_text = await resp.text()
+            # ---------------- 文生图：JSON /images/generations ----------------
+            if not image_urls:
+                endpoint = gen_endpoint
+                payload = _payload_base(clean_prompt or "请生成一张图片。")
                 logger.debug(
-                    "[NativeImage/OpenAICompat] POST response: status=%s content_type=%s body_preview=%r",
-                    resp.status,
-                    resp.headers.get("Content-Type", ""),
-                    body_text[:800],
+                    "%s request prepared: provider=%s endpoint=%s model=%s prompt_len=%s(cleaned, raw=%s) prompt_preview=%r",
+                    log_prefix, ep.name, endpoint, model,
+                    len(clean_prompt or ""), len(prompt or ""),
+                    (clean_prompt or "")[:240],
                 )
-                if resp.status != 200:
-                    detail, req_id = _extract_error_details(body_text)
-                    logger.warning(
-                        "[NativeImage/OpenAICompat] POST failed: status=%s detail=%s",
-                        resp.status, (detail or body_text)[:300],
-                    )
-                    return None, endpoint, detail or body_text[:500], resp.status, req_id or ''
-                parsed = _safe_json_parse_dict(body_text)
-                if parsed is None:
-                    return None, endpoint, body_text[:500], resp.status, ''
-                return parsed, endpoint, '', resp.status, ''
+                async with session.post(
+                    f"{base_url}{endpoint}", headers=json_headers, json=payload
+                ) as resp:
+                    return await _finalize_images_response(resp, endpoint, log_prefix)
+
+            # ------------- 图生图/编辑：官方 /images/edits multipart -------------
+            endpoint = edits_endpoint
+            image_data_urls = await _image_urls_to_data_urls(session, image_urls)
+            if not image_data_urls:
+                return None, endpoint, "未能读取参考图片", 400, ""
+
+            logger.debug(
+                "%s request prepared: provider=%s endpoint=%s model=%s prompt_len=%s(cleaned, raw=%s) image_count=%s prompt_preview=%r",
+                log_prefix, ep.name, endpoint, model,
+                len(clean_prompt or ""), len(prompt or ""),
+                len(image_data_urls), (clean_prompt or "")[:240],
+            )
+            form = aiohttp.FormData()
+            form.add_field("model", str(model))
+            form.add_field("prompt", clean_prompt or "请根据参考图进行编辑。")
+            form.add_field("n", str(n))
+            if size:
+                form.add_field("size", str(size))
+            added_parts = 0
+            for idx, data_url in enumerate(image_data_urls):
+                decoded = _data_url_to_bytes(data_url)
+                if not decoded:
+                    continue
+                img_bytes, mime = decoded
+                ext = _MIME_TO_EXT.get(mime, "png")
+                # 官方形状：多张参考图以重复的 image[] 字段上传
+                form.add_field(
+                    "image[]", img_bytes,
+                    filename=f"reference_{idx}.{ext}", content_type=mime,
+                )
+                added_parts += 1
+            if not added_parts:
+                return None, endpoint, "未能读取参考图片", 400, ""
+
+            async with session.post(
+                f"{base_url}{endpoint}", headers=auth_headers, data=form
+            ) as resp:
+                parsed, used_endpoint, detail, status_code, req_id = (
+                    await _finalize_images_response(resp, endpoint, log_prefix)
+                )
+                if parsed is not None:
+                    return parsed, used_endpoint, '', status_code, req_id
+                if not _should_fallback_to_generations(status_code, detail):
+                    return None, used_endpoint, detail, status_code, req_id
+
+            # ------- 回退：中转站未实现 /images/edits 时的兼容 JSON 形状 -------
+            fallback_payload = _payload_base(clean_prompt or "请根据参考图进行编辑。")
+            fallback_payload["image"] = (
+                image_data_urls[0] if len(image_data_urls) == 1 else image_data_urls
+            )
+            logger.warning(
+                "%s /images/edits 不可用 (status=%s detail=%r)，回退 %s JSON+image 形状",
+                log_prefix, status_code, (detail or '')[:160], gen_endpoint,
+            )
+            async with session.post(
+                f"{base_url}{gen_endpoint}", headers=json_headers, json=fallback_payload
+            ) as resp:
+                return await _finalize_images_response(resp, gen_endpoint, log_prefix)
     except asyncio.TimeoutError:
-        logger.warning("[NativeImage/OpenAICompat] request timeout after %ss", timeout.total)
+        logger.warning("%s request timeout after %ss", log_prefix, timeout.total)
         return None, endpoint, "图像请求超时", 504, ""
     except Exception as e:
-        logger.exception("[NativeImage/OpenAICompat] request exception")
+        logger.exception("%s request exception", log_prefix)
         return None, endpoint, str(e)[:500], 500, ""
 
 
@@ -610,10 +773,13 @@ async def _request_images_generations(
     提供商各写一套请求逻辑，只拿到统一形状的返回值后做各自的呈现：
 
     - modelscope -> _request_modelscope_native_image（异步任务轮询特化）
-    - 其它（xxtf 等中转站）-> _request_openai_compat_image（标准同步 REST）
+    - 其它（xxtf 等中转站）-> _request_openai_compat_image（标准同步 REST；
+      文生图走 JSON /images/generations，带参考图的编辑优先走官方
+      multipart /images/edits，路由未实现时回退 JSON 形状）
 
     返回: (response_json, endpoint, error_detail, status_code, request_id)
-    endpoint 为相对路径（"/images/generations"），调用方拼 /v1 前缀用于展示。
+    endpoint 为实际使用的相对路径（"/images/generations" 或
+    "/images/edits"），调用方拼 /v1 前缀用于展示。
     """
     provider = (getattr(model_info, "provider", "") or "").strip().lower()
     if provider == "modelscope":
