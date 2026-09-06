@@ -44,8 +44,10 @@ logger = get_logger(__name__)
 #     语义分端点：文生图 -> JSON /images/generations；带参考图的编辑 ->
 #     官方规范 /images/edits（multipart/form-data，image[] 字段，见
 #     developers.openai.com "Create image edit"），中转站未实现该路由时
-#     回退 JSON /images/generations + image 字段的兼容形状
-#     （详见 _request_openai_compat_image）
+#     回退 JSON /images/generations + image 字段的兼容形状。另有生产
+#     鲁棒性三件套：edits 路由级 404/405 按 base_url 短期缓存（免得每次
+#     白打一趟必败请求）、"请求体未完整/请重试"类瞬态 400 同形状自动
+#     重试、超大参考图先降采样再上传（详见 _request_openai_compat_image）
 # 其它提供商（如 openrouter 的 gemini 图像模型）继续走
 # chat/completions + modalities 路径，行为不变。
 # =============================================================================
@@ -549,6 +551,192 @@ def _should_fallback_to_generations(status_code: int, error_detail: str) -> bool
     return False
 
 
+# ---- 生产鲁棒性辅助：edits 路由能力缓存 / 瞬态 400 重试 / 超大参考图压缩 ----
+
+# /images/edits 返回 404/405（路由级"确实没有该路径"，如生产实测 xxtf
+# 中转站）后按 base_url 记忆一段时间：TTL 内带参考图的请求直接走兼容
+# JSON 形状，省去一次必然失败的 RTT。501/502/503 等其它回退状态不缓存
+# ——可能是瞬态网关故障，下次仍先按官方语义尝试 edits。
+_EDITS_UNSUPPORTED_TTL_SECONDS = 3600.0
+_edits_unsupported_until: dict[str, float] = {}
+
+
+def _mark_edits_unsupported(base_url: str) -> None:
+    """记录"该 base_url 未实现 /images/edits"（TTL 内跳过 multipart 尝试）。"""
+    if base_url:
+        _edits_unsupported_until[base_url] = time.time() + _EDITS_UNSUPPORTED_TTL_SECONDS
+
+
+def _edits_known_unsupported(base_url: str) -> bool:
+    if not base_url:
+        return False
+    expire_at = _edits_unsupported_until.get(base_url)
+    if expire_at is None:
+        return False
+    if time.time() >= expire_at:
+        _edits_unsupported_until.pop(base_url, None)
+        return False
+    return True
+
+
+# 瞬态 400：中转站明确提示"请求体未完整/请重试"类传输层错误（生产实测
+# xxtf 返回 400 INCOMPLETE_REQUEST_BODY "请求体未完整到达，请重试"，同一
+# 请求稍后重试即成功）。这类错误属于 invalid_request_error 且请求未被
+# 服务端受理（无计费），同形状重试一次是安全的；内容安全/鉴权类 400
+# 不在此列。
+_TRANSIENT_400_HINTS = (
+    "incomplete_request_body",
+    "请求体未完整",
+    "请重试",
+    "please retry",
+    "please try again",
+    "try again later",
+)
+_TRANSIENT_RETRY_BACKOFF_SECONDS = 1.5
+
+
+def _is_transient_400(status_code: int, error_detail: str) -> bool:
+    """判定是否为"中转站明确要求重试"类瞬态 400（非参数/安全语义错误）。"""
+    if status_code != 400:
+        return False
+    body = (error_detail or "").lower()
+    return any(hint in body for hint in _TRANSIENT_400_HINTS)
+
+
+async def _post_images_with_retry(
+        session: aiohttp.ClientSession,
+        url: str,
+        *,
+        endpoint: str,
+        log_prefix: str,
+        headers: dict | None = None,
+        json_payload: dict | None = None,
+        form_factory=None,
+) -> tuple[dict | None, str, str, int, str]:
+    """Images 协议 POST 共用出口：响应处理 + 瞬态 400 同形状重试一次。
+
+    json_payload（JSON 形状）与 form_factory（multipart 形状，传入返回
+    新建 :class:`aiohttp.FormData` 的可调用对象）二选一。multipart 重试
+    必须重建 FormData——bytes 字段的流游标消费后不可复用。
+    返回形状与 :func:`_finalize_images_response` 一致。
+    """
+    result: tuple[dict | None, str, str, int, str] = (None, endpoint, "", 0, "")
+    form = form_factory() if form_factory is not None else None
+    for attempt in (1, 2):
+        async with session.post(
+            url, headers=headers, json=json_payload, data=form
+        ) as resp:
+            result = await _finalize_images_response(resp, endpoint, log_prefix)
+        parsed, _, detail, status_code, _req_id = result
+        if parsed is not None or not _is_transient_400(status_code, detail):
+            return result
+        if attempt == 1:
+            logger.warning(
+                "%s %s 瞬态失败 (status=%s detail=%r)，%.1fs 后同形状重试一次",
+                log_prefix, endpoint, status_code, (detail or "")[:120],
+                _TRANSIENT_RETRY_BACKOFF_SECONDS,
+            )
+            await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SECONDS)
+            form = form_factory() if form_factory is not None else None
+    return result
+
+
+# 超大参考图压缩：参考图塞进 multipart（edits）或 JSON（回退形状）时，
+# 数 MB 的原图会造出巨大请求体，部分中转站读不满直接 400"请求体未完整
+# 到达"。参考图对 gpt-image 系列只是编辑依据，长边 <=2048 / ~3MB 已足够
+# （官方输出分辨率本身集中在 1024/1536 档）。
+_REF_IMAGE_MAX_BYTES = 3 * 1024 * 1024
+_REF_IMAGE_MAX_SIDE = 2048
+# JPEG 降档兜底：极端高熵图（如噪声/密集纹理）在 2048/q88 下仍可能超阈值，
+# 依次降质量，仍未达标则长边降到 1536 再压。
+_REF_IMAGE_JPEG_QUALITIES = (88, 72, 56)
+_REF_IMAGE_FALLBACK_SIDE = 1536
+
+
+def _encode_jpeg_bytes(img, quality: int) -> bytes:
+    from io import BytesIO
+    buf = BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
+def _shrink_reference_bytes(img_bytes: bytes, mime: str) -> tuple[bytes, str]:
+    """超过 3MB 的参考图降采样（长边 2048；有 alpha 先保 PNG，仍过大则白底转 JPEG）。
+
+    JPEG 质量降档 88 -> 72 -> 56，仍未达标则长边再降到 1536。
+    Pillow 不可用 / 图片解码失败 / 压缩无收益时原样返回，绝不阻断主流程。
+    """
+    if len(img_bytes) <= _REF_IMAGE_MAX_BYTES:
+        return img_bytes, mime
+    try:
+        from io import BytesIO
+        from PIL import Image  # Pillow 已在 requirements.txt（Pillow==11.1.0）
+        img = Image.open(BytesIO(img_bytes))
+        img.load()
+        width, height = img.size
+        scale = max(width, height) / _REF_IMAGE_MAX_SIDE
+        if scale > 1:
+            img = img.resize(
+                (max(1, round(width / scale)), max(1, round(height / scale))),
+                Image.LANCZOS,
+            )
+        has_alpha = img.mode in ("RGBA", "LA", "PA") or (
+            img.mode == "P" and "transparency" in img.info
+        )
+        if has_alpha:
+            png_buf = BytesIO()
+            img.save(png_buf, format="PNG", optimize=True)
+            if png_buf.tell() <= _REF_IMAGE_MAX_BYTES:
+                out_bytes = png_buf.getvalue()
+                if len(out_bytes) < len(img_bytes):
+                    logger.info(
+                        "[NativeImage/OpenAICompat] 超大参考图已压缩: %d -> %d bytes (%s)",
+                        len(img_bytes), len(out_bytes), "image/png",
+                    )
+                    return out_bytes, "image/png"
+            # PNG 仍过大：白底合成 alpha 后转入 JPEG 降档
+            rgba = img.convert("RGBA")
+            flattened = Image.new("RGB", rgba.size, (255, 255, 255))
+            flattened.paste(rgba, mask=rgba.split()[-1])
+            img = flattened
+        out_bytes = b""
+        for quality in _REF_IMAGE_JPEG_QUALITIES:
+            out_bytes = _encode_jpeg_bytes(img, quality)
+            if len(out_bytes) <= _REF_IMAGE_MAX_BYTES:
+                break
+        if len(out_bytes) > _REF_IMAGE_MAX_BYTES and max(img.size) > _REF_IMAGE_FALLBACK_SIDE:
+            w, h = img.size
+            scale2 = max(w, h) / _REF_IMAGE_FALLBACK_SIDE
+            img2 = img.resize(
+                (max(1, round(w / scale2)), max(1, round(h / scale2))),
+                Image.LANCZOS,
+            )
+            out_bytes = _encode_jpeg_bytes(img2, _REF_IMAGE_JPEG_QUALITIES[-1])
+        if out_bytes and len(out_bytes) < len(img_bytes):
+            logger.info(
+                "[NativeImage/OpenAICompat] 超大参考图已压缩: %d -> %d bytes (%s)",
+                len(img_bytes), len(out_bytes), "image/jpeg",
+            )
+            return out_bytes, "image/jpeg"
+    except Exception as e:  # Pillow 缺失 / 图片损坏等：原样返回，不阻断主流程
+        logger.debug("[NativeImage/OpenAICompat] 参考图压缩跳过: %s", e)
+    return img_bytes, mime
+
+
+def _shrink_data_url(data_url: str) -> str:
+    """对单张 data URL 参考图应用 :func:`_shrink_reference_bytes`。"""
+    decoded = _data_url_to_bytes(data_url)
+    if not decoded:
+        return data_url
+    img_bytes, mime = decoded
+    new_bytes, new_mime = _shrink_reference_bytes(img_bytes, mime)
+    if new_bytes is img_bytes:
+        return data_url
+    return "data:{};base64,{}".format(
+        new_mime, base64.b64encode(new_bytes).decode("ascii")
+    )
+
+
 def _data_url_to_bytes(data_url: str) -> tuple[bytes, str] | None:
     """把 data:image/... URL 解码为 (字节, mime)；失败返回 None。"""
     if not data_url or not data_url.startswith("data:image/"):
@@ -584,6 +772,11 @@ async def _finalize_images_response(
     )
     if resp.status != 200:
         detail, req_id = _extract_error_details(body_text)
+        candidate = detail or body_text
+        if candidate.lstrip().startswith("<"):
+            # 网关/中转的 HTML 错误页（如 Python http.server 默认 404 页）：
+            # 提取纯文本摘要，避免整页 HTML 进入错误提示与日志
+            detail = re.sub(r"\s+", " ", strip_html_tags(candidate)).strip()[:300]
         logger.warning(
             "%s POST failed: status=%s detail=%s",
             log_prefix, resp.status, (detail or body_text)[:300],
@@ -627,6 +820,10 @@ async def _request_openai_compat_image(
            :func:`_should_fallback_to_generations`）才回退旧行为:
            POST JSON /images/generations 并携带 image 字段（单张字符串、
            多张数组）。鉴权/内容安全等语义错误不回退、原样返回。
+        3. 鲁棒性（生产日志反馈迭代）：/images/edits 收到路由级 404/405 后
+           按 base_url 缓存（TTL 内直接回退，省一次必败 RTT）；"请求体
+           未完整/请重试"类瞬态 400 同形状自动重试一次；超大参考图
+           （>3MB）先降采样再上传，避免中转站读不满请求体。
 
     - base_url 沿用 provider/模型端点覆盖的合并结果（XXTF 默认
       ``https://xxtf.baby/v1``，即最终请求 ``https://xxtf.baby/v1/images/edits``
@@ -687,16 +884,20 @@ async def _request_openai_compat_image(
                     len(clean_prompt or ""), len(prompt or ""),
                     (clean_prompt or "")[:240],
                 )
-                async with session.post(
-                    f"{base_url}{endpoint}", headers=json_headers, json=payload
-                ) as resp:
-                    return await _finalize_images_response(resp, endpoint, log_prefix)
+                return await _post_images_with_retry(
+                    session, f"{base_url}{endpoint}",
+                    endpoint=endpoint, log_prefix=log_prefix,
+                    headers=json_headers, json_payload=payload,
+                )
 
             # ------------- 图生图/编辑：官方 /images/edits multipart -------------
             endpoint = edits_endpoint
             image_data_urls = await _image_urls_to_data_urls(session, image_urls)
             if not image_data_urls:
                 return None, endpoint, "未能读取参考图片", 400, ""
+            # 超大参考图先降采样：数 MB 的 body 塞进 multipart/JSON 会被部分
+            # 中转站截断（生产实测 xxtf 400 INCOMPLETE_REQUEST_BODY）
+            image_data_urls = [_shrink_data_url(u) for u in image_data_urls]
 
             logger.debug(
                 "%s request prepared: provider=%s endpoint=%s model=%s prompt_len=%s(cleaned, raw=%s) image_count=%s prompt_preview=%r",
@@ -704,38 +905,57 @@ async def _request_openai_compat_image(
                 len(clean_prompt or ""), len(prompt or ""),
                 len(image_data_urls), (clean_prompt or "")[:240],
             )
-            form = aiohttp.FormData()
-            form.add_field("model", str(model))
-            form.add_field("prompt", clean_prompt or "请根据参考图进行编辑。")
-            form.add_field("n", str(n))
-            if size:
-                form.add_field("size", str(size))
-            added_parts = 0
+            # 预解码参考图（一次解码，multipart 构造可重复执行——瞬态重试
+            # 时需重建 FormData，bytes 字段的流游标不可复用）
+            decoded_refs: list[tuple[int, bytes, str, str]] = []
             for idx, data_url in enumerate(image_data_urls):
                 decoded = _data_url_to_bytes(data_url)
                 if not decoded:
                     continue
                 img_bytes, mime = decoded
-                ext = _MIME_TO_EXT.get(mime, "png")
-                # 官方形状：多张参考图以重复的 image[] 字段上传
-                form.add_field(
-                    "image[]", img_bytes,
-                    filename=f"reference_{idx}.{ext}", content_type=mime,
-                )
-                added_parts += 1
-            if not added_parts:
+                decoded_refs.append((idx, img_bytes, mime, _MIME_TO_EXT.get(mime, "png")))
+            if not decoded_refs:
                 return None, endpoint, "未能读取参考图片", 400, ""
 
-            async with session.post(
-                f"{base_url}{endpoint}", headers=auth_headers, data=form
-            ) as resp:
+            def _build_edits_form() -> aiohttp.FormData:
+                """官方形状：多张参考图以重复的 image[] 字段上传。"""
+                form = aiohttp.FormData()
+                form.add_field("model", str(model))
+                form.add_field("prompt", clean_prompt or "请根据参考图进行编辑。")
+                form.add_field("n", str(n))
+                if size:
+                    form.add_field("size", str(size))
+                for idx, img_bytes, mime, ext in decoded_refs:
+                    form.add_field(
+                        "image[]", img_bytes,
+                        filename=f"reference_{idx}.{ext}", content_type=mime,
+                    )
+                return form
+
+            edits_skipped = _edits_known_unsupported(base_url)
+            if edits_skipped:
+                logger.info(
+                    "%s %s 近期 /images/edits 404/405 已缓存，跳过直接走 %s 兼容形状",
+                    log_prefix, base_url, gen_endpoint,
+                )
+            if not edits_skipped:
                 parsed, used_endpoint, detail, status_code, req_id = (
-                    await _finalize_images_response(resp, endpoint, log_prefix)
+                    await _post_images_with_retry(
+                        session, f"{base_url}{endpoint}",
+                        endpoint=endpoint, log_prefix=log_prefix,
+                        headers=auth_headers, form_factory=_build_edits_form,
+                    )
                 )
                 if parsed is not None:
                     return parsed, used_endpoint, '', status_code, req_id
                 if not _should_fallback_to_generations(status_code, detail):
                     return None, used_endpoint, detail, status_code, req_id
+                if status_code in (404, 405):
+                    # 路由级"确实没有该路径" -> 按 base_url 短期缓存，
+                    # TTL 内后续请求不再白打这一趟
+                    _mark_edits_unsupported(base_url)
+            else:
+                used_endpoint, status_code, detail, req_id = endpoint, 404, "", ''
 
             # ------- 回退：中转站未实现 /images/edits 时的兼容 JSON 形状 -------
             fallback_payload = _payload_base(clean_prompt or "请根据参考图进行编辑。")
@@ -746,10 +966,11 @@ async def _request_openai_compat_image(
                 "%s /images/edits 不可用 (status=%s detail=%r)，回退 %s JSON+image 形状",
                 log_prefix, status_code, (detail or '')[:160], gen_endpoint,
             )
-            async with session.post(
-                f"{base_url}{gen_endpoint}", headers=json_headers, json=fallback_payload
-            ) as resp:
-                return await _finalize_images_response(resp, gen_endpoint, log_prefix)
+            return await _post_images_with_retry(
+                session, f"{base_url}{gen_endpoint}",
+                endpoint=gen_endpoint, log_prefix=log_prefix,
+                headers=json_headers, json_payload=fallback_payload,
+            )
     except asyncio.TimeoutError:
         logger.warning("%s request timeout after %ss", log_prefix, timeout.total)
         return None, endpoint, "图像请求超时", 504, ""
