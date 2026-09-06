@@ -12,9 +12,9 @@
 删除文本块结束后的过早 `rollover_at_turn_boundary` 调用，只在工具批次完全执行完毕后再检查是否需要切换草稿。
 
 ### 修改文件
-1. `src/apitelegramchat/ai/anthropic_bridge.py` (第 872-877 行)
-2. `src/apitelegramchat/ai/agentic_loops.py` (第 739-744 行)
-3. `src/apitelegramchat/ai/gemini_bridge.py` (第 987-992 行)
+1. `src/ai/anthropic_bridge.py` (第 872-877 行)
+2. `src/ai/agentic_loops.py` (第 739-744 行)
+3. `src/ai/gemini_bridge.py` (第 987-992 行)
 
 修改前：
 ```python
@@ -57,7 +57,7 @@ await builder.flush()
 - `cd /absolute/path/to/workspace` (绝对路径)
 
 ### 修改文件
-`src/apitelegramchat/tool_executors.py` (第 1247-1271 行)
+`src/tool_executors.py` (第 1247-1271 行)
 
 修改前：
 ```python
@@ -150,10 +150,10 @@ image[] 形式重复上传 N 次，请求越积越大。
    - 打断合并链（无失败标记）行为完全不变。
 
 ### 修改文件
-- `src/apitelegramchat/turn_recovery.py`：新增标记 / `mark_failed_unanswered_user` /
+- `src/turn_recovery.py`：新增标记 / `mark_failed_unanswered_user` /
   `_replace_failed_user_message` / `_apply_attachment_entries`，替换分支接入
   `persist_user_message_entry`
-- `src/apitelegramchat/ai_handlers.py`：5 个失败返回路径打标
+- `src/ai_handlers.py`：5 个失败返回路径打标
 
 ## 问题 2：gpt image 2 原生图片模型失败后重试，只发文本、参考图丢失
 
@@ -175,7 +175,7 @@ gpt-image-2（Images 协议原生图像模型）带参考图生成失败后，�
 行为不变；从未有过图片时回溯结果为空（纯文生图不受影响）。
 
 ### 修改文件
-- `src/apitelegramchat/ai/agentic_loops.py`：新增
+- `src/ai/agentic_loops.py`：新增
   `_extract_native_image_urls_from_user_message` /
   `_extract_image_prompt_and_reference_urls`，原嵌套函数移除
 

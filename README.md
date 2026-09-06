@@ -164,7 +164,7 @@ MCP Server 与 Telegram Runtime 共用业务能力，但**不是把 Telegram Run
 │             ├── model provider                                   │
 │             ├── tool calling                                     │
 │             ├── context compaction                                │
-│             └── subagent / ask-user                              │
+│             └── subagent / message_user                           │
 │             │                                                    │
 │             ▼                                                    │
 │  tool_executors.py / search_engine.py / file handlers             │
@@ -264,7 +264,7 @@ export OPENROUTER_API_KEY="你的 OpenRouter API Key"
 ```bash
 PYTHONPATH=src \
 python -m quart \
-  --app apitelegramchat.app:app \
+  --app app:app \
   run \
   --host 0.0.0.0 \
   --port 5000
@@ -350,7 +350,7 @@ WEBHOOK_URL?token=WEBHOOK_TOKEN
 | `PROACTIVE_MAX_IDLE_SECONDS` | `7200` | 用户连续多久没发消息 → 进入慢节奏（2h） |
 | `PROACTIVE_REST_SECONDS` | `3600` | 慢节奏暂停时长：暂停 1h 再触发一次，用户仍无回应则继续（每 1h 看一眼） |
 | `PROACTIVE_WATCH_DELAY` | `2` | 用户事件后的观望窗口（秒）：纯命令/按钮输入在窗口后没有 agent 回合接管时直接布置下一次唤醒 |
-| `TOOL_VISIBILITY_FILTER` | `true` | 按事件源的工具可见性过滤器总开关。USER 回合把历史中 `send_message_to_user` 的调用痕迹折叠成普通文本摘要（保留语义、消除调用形状），从根源上防止模型在用户主动发消息时模仿调用该工具；TIMER 回合不受影响。设为 `false` 恢复旧行为。规则注册表见 `src/apitelegramchat/tool_visibility.py` |
+| `TOOL_VISIBILITY_FILTER` | `true` | 按事件源的工具可见性过滤器总开关。USER 回合把历史中 `send_message_to_user` 的调用痕迹折叠成普通文本摘要（保留语义、消除调用形状），从根源上防止模型在用户主动发消息时模仿调用该工具；TIMER 回合不受影响。设为 `false` 恢复旧行为。规则注册表见 `src/tool_visibility.py` |
 
 说明：仅**私聊**参与主动唤醒；bot 被用户屏蔽（sendMessage 403）时会自动停用
 该会话的调度；进程重启后调度重新开始（chat 在首次用户活动时重新被跟踪，
@@ -468,7 +468,7 @@ export APITELEGRAMCHAT_REQUIRE_STRICT_CONFIG=true
 模型配置集中在：
 
 ```text
-src/apitelegramchat/config.py
+src/config.py
 ```
 
 项目将“厂商能力”和“模型能力”分离。
@@ -707,7 +707,7 @@ generate_video
 具体路径由：
 
 ```text
-src/apitelegramchat/workspace_paths.py
+src/workspace_paths.py
 ```
 
 统一管理。
@@ -910,7 +910,7 @@ export GAODE_MCP_ALLOWED_HOSTS="mcp.api-inference.modelscope.net"
 配置文件：
 
 ```text
-src/apitelegramchat/web_search_settings.py
+src/web_search_settings.py
 ```
 
 黑名单规则支持三种形式：
@@ -1473,31 +1473,30 @@ GAODE_MCP_TOKEN
 
 ## 测试
 
-运行完整单元测试：
+使用 pytest 运行全部单元测试与集成测试（`tests/conftest.py` 会自动把 `src/` 加入 `sys.path`）：
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests -v
+python -m pytest tests/ -v                 # 全部测试
+python -m pytest tests/unit -v             # 仅单元测试
+python -m pytest tests/integration -v      # 仅集成测试
 ```
 
-当前测试覆盖包括：
+单元测试覆盖（`tests/unit/`，关键路径纯逻辑层）：
 
-- MCP scope 强制；
-- 私有目录权限；
-- MCP 默认最小权限工具表；
-- workspace 符号链接边界；
-- 资源不泄露绝对 workspace 路径；
-- 外部 MCP endpoint allowlist；
-- MCP SDK 请求处理器注册；
-- Web 搜索黑名单域名匹配；
-- 搜索结果最终过滤；
-- URL 根路径回退。
+- `test_markdown_converter.py` — Markdown → Telegram Rich HTML 转换（标题/强调/代码块/表格/引用/列表/链接图片/HTML 实体幂等）；
+- `test_token_budget.py` — token 计数与截断预算（严格不超预算、头尾保留截断、边界与异常值）；
+- `test_context_window.py` — 上下文窗口核心（轮块划分/淘汰规划/受保护轮次/滚动摘要确定性/预算解析与水位）；
+- `test_tool_result_condense.py` — 工具返回模型视图精简（weather hours 参数/subagent 字段清理/amap 源头清洗/错误文本逐字保留）；
+- `test_web_search_filter.py` — 搜索域名黑名单（规则解析/[*.] 通配/子域名匹配/结果过滤/候选数量计算）。
 
-脚本级回归测试（无额外依赖，直接运行）：
+集成测试覆盖（`tests/integration/`）：
+
+- `test_app_endpoints.py` — 真实 Quart 应用实例：`/health` 健康检查、`/webhook` 鉴权（缺 token/错误 token/正确 token、恒定时间比较路径、polling 模式忽略投递）。
+
+白名单 R2 同步全量回归（独立脚本，兼容 pytest 收集，也可直接运行）：
 
 ```bash
-PYTHONPATH=src python scripts/test_text_editor.py         # text_editor 回归（含 CRLF 行尾保真 / 路径安全 / 输出上限，见 TEXT_EDITOR_FIXES.md）
-PYTHONPATH=src python scripts/test_tool_args_pipeline.py  # 工具参数四层管线（strict/repair/validate/信封）
-PYTHONPATH=src python scripts/test_run_one_gate.py        # 执行闸门集成（缺必填不执行、类型错误回传等）
+python tests/test_whitelist_r2.py          # 归一化/解析健壮性/本地与 R2 模式/授权边界
 ```
 
 ---
@@ -1507,45 +1506,47 @@ PYTHONPATH=src python scripts/test_run_one_gate.py        # 执行闸门集成�
 ```text
 .
 ├── src/
-│   └── apitelegramchat/
-│       ├── app.py                    # Quart Webhook / Telegram Runtime
-│       ├── config.py                 # Provider / Model / runtime config
-│       ├── state.py                  # 会话状态
-│       ├── context_manager.py        # 请求侧上下文守卫（预算内全量透传，超预算按块裁剪出站视图）
-│       ├── context_window.py         # 上下文窗口核心：预算解析/双水位/淘汰规划/滚动摘要
-│       ├── token_budget.py            # token 预算
-│       ├── workspace_paths.py        # workspace 路径边界
-│       ├── workspace_utils.py        # workspace 操作
-│       ├── sandbox.py                 # Landlock + rlimit + watchdog
-│       ├── tool_executors.py         # 工具执行与结果渲染
-│       ├── search_engine.py          # Web / 信息 / 地图 / 生成能力
-│       ├── fetch_rich_content.py     # HTML → Telegram Rich HTML
-│       ├── fetch_url_fallback.py     # URL 回退
-│       ├── file_handlers.py          # Telegram 文件处理
-│       ├── s3_utils.py               # S3/R2
-│       ├── skills.py                 # Skill discovery/runtime
-│       ├── memory_tool.py            # Memory
-│       ├── todo_tool.py              # Todo
-│       ├── subagent_tool.py          # Subagent
-│       ├── message_user_tool.py      # message_user 工具（提问/给用户发消息）
-│       ├── ai/
-│       │   ├── agentic_loops.py      # Agent loop
-│       │   ├── tool_call_loop.py     # Tool call orchestration
-│       │   ├── rich_message_builder.py
-│       │   ├── attachment_content.py
-│       │   ├── media_generation.py
-│       │   ├── tool_summary.py
-│       │   └── ...
-│       ├── mcp/
-│       │   ├── registry.py           # MCP Tool Registry
-│       │   ├── context.py            # MCP scope context
-│       │   ├── resources.py          # MCP resources
-│       │   └── server.py              # stdio MCP server
-│       ├── mcp_client.py             # 外部 MCP client
-│       └── entrypoints/
-│           └── mcp_server.py         # console entrypoint
+│   ├── app.py                        # Quart Webhook / Telegram Runtime
+│   ├── config.py                     # Provider / Model / runtime config
+│   ├── state.py                      # 会话状态
+│   ├── context_manager.py            # 请求侧上下文守卫（预算内全量透传，超预算按块裁剪出站视图）
+│   ├── context_window.py             # 上下文窗口核心：预算解析/双水位/淘汰规划/滚动摘要
+│   ├── token_budget.py               # token 预算
+│   ├── workspace_paths.py            # workspace 路径边界
+│   ├── workspace_utils.py            # workspace 操作
+│   ├── sandbox.py                    # Landlock + rlimit + watchdog
+│   ├── tool_executors.py             # 工具执行与结果渲染
+│   ├── search_engine.py              # Web / 信息 / 地图 / 生成能力
+│   ├── fetch_rich_content.py         # HTML → Telegram Rich HTML
+│   ├── fetch_url_fallback.py         # URL 回退
+│   ├── file_handlers.py              # Telegram 文件处理
+│   ├── s3_utils.py                   # S3/R2
+│   ├── skills.py                     # Skill discovery/runtime
+│   ├── memory_tool.py                # Memory
+│   ├── todo_tool.py                  # Todo
+│   ├── subagent_tool.py              # Subagent
+│   ├── message_user_tool.py          # message_user 工具（提问/给用户发消息）
+│   ├── ai/
+│   │   ├── agentic_loops.py          # Agent loop
+│   │   ├── tool_call_loop.py         # Tool call orchestration
+│   │   ├── rich_message_builder.py
+│   │   ├── attachment_content.py
+│   │   ├── media_generation.py
+│   │   ├── tool_summary.py
+│   │   └── ...
+│   ├── mcpserver/                    # （原 mcp/：改名以避免与官方 mcp SDK 冲突）
+│   │   ├── registry.py               # MCP Tool Registry
+│   │   ├── context.py                # MCP scope context
+│   │   ├── resources.py              # MCP resources
+│   │   └── server.py                 # stdio MCP server
+│   ├── mcp_client.py                 # 外部 MCP client
+│   └── entrypoints/
+│       └── mcp_server.py             # console entrypoint
 │
 ├── tests/
+│   ├── unit/                         # 单元测试（pytest）
+│   ├── integration/                  # 集成测试（pytest）
+│   └── test_whitelist_r2.py          # 白名单 R2 同步回归（可直接运行）
 ├── .claude/
 │   └── skills/                       # bundled Skills
 ├── Dockerfile
@@ -1693,7 +1694,7 @@ export APITELEGRAMCHAT_MCP_ENABLE_MUTATIONS=true
 主要修改：
 
 ```text
-src/apitelegramchat/config.py
+src/config.py
 ```
 
 为模型声明正确的：
@@ -1718,14 +1719,14 @@ max_output_tokens
 Telegram Runtime 工具主要位于：
 
 ```text
-src/apitelegramchat/search_engine.py
-src/apitelegramchat/tool_executors.py
+src/search_engine.py
+src/tool_executors.py
 ```
 
 如果希望 MCP 也暴露该能力，需要同时考虑：
 
 ```text
-src/apitelegramchat/mcp/registry.py
+src/mcp/registry.py
 ```
 
 并明确它属于：
@@ -1766,7 +1767,7 @@ sandbox.py
 核心组件：
 
 ```text
-src/apitelegramchat/ai/rich_message_builder.py
+src/ai/rich_message_builder.py
 ```
 
 涉及草稿生命周期时，应优先保持：

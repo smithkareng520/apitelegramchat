@@ -29,7 +29,7 @@ os.environ["APITELEGRAMCHAT_DATA_DIR"] = str(_TEST_ROOT / "data")
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
-from apitelegramchat import config, s3_utils  # noqa: E402
+import config, s3_utils  # noqa: E402
 
 PASS, FAIL = 0, 0
 _failures = []
@@ -390,7 +390,7 @@ async def t_f_r2key_guard():
     section("F. R2 key 环境变量安全防护（子进程验证）")
     code = (
         "import sys; sys.path.insert(0, {src!r});"
-        "from apitelegramchat import config;"
+        "import config;"
         "print(config.WHITELIST_R2_KEY)"
     ).format(src=str(_PROJECT_ROOT / "src"))
     for env_key, expect in [

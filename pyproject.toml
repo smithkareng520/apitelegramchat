@@ -36,11 +36,58 @@ dependencies = [
 ]
 
 [project.scripts]
-apitelegramchat-mcp = "apitelegramchat.entrypoints.mcp_server:main"
+apitelegramchat-mcp = "entrypoints.mcp_server:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+py-modules = [
+  "ai_handlers",
+  "api_client",
+  "app",
+  "chat_actions",
+  "config",
+  "context_manager",
+  "context_window",
+  "fetch_rich_content",
+  "fetch_url_fallback",
+  "file_handlers",
+  "markdown_converter",
+  "mcp_client",
+  "memory_tool",
+  "message_user_tool",
+  "net_shims",
+  "proactive",
+  "s3_utils",
+  "sandbox",
+  "search_engine",
+  "serper_api",
+  "skills",
+  "state",
+  "subagent_tool",
+  "telegram_polling",
+  "todo_tool",
+  "token_budget",
+  "tool_assembly",
+  "tool_context_compaction",
+  "tool_executors",
+  "tool_result_condense",
+  "tool_visibility",
+  "turn_recovery",
+  "utils",
+  "verify_security",
+  "version",
+  "web_search_filter",
+  "web_search_settings",
+  "webhook_sync",
+  "workspace_paths",
+  "workspace_utils",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["apitelegramchat*"]
+include = ["ai*", "entrypoints*", "mcpserver*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
