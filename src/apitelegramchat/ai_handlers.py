@@ -409,9 +409,13 @@ async def get_ai_response(
     路径补齐占位 tool_result 后沉淀进历史——进度不再因打断而丢失。
 
     USER 回合的新 user 消息在本入口提前持久化（persist_user_message_entry）：
-    历史末尾若仍是上一条未获回应的 user 消息则合并，避免连续两条 user；
-    update_conversation_and_ledger 依据 early-persisted 标记跳过重复写入。
-    TIMER 的合成唤醒消息不写历史，仍按原逻辑单独注入请求。
+    历史末尾是上一条未获回应的 user 消息时分两种情况——上一轮被打断
+    （无失败标记）则合并，避免连续两条 user；上一轮**请求失败**（本入口
+    各失败路径已调用 turn_recovery.mark_failed_unanswered_user 打标）则
+    整体替换而不合并，重试不会叠加上一轮的文本与图片（新消息不带媒体时
+    搬移旧媒体一份，参考图不丢）。update_conversation_and_ledger 依据
+    early-persisted 标记跳过重复写入。TIMER 的合成唤醒消息不写历史，
+    仍按原逻辑单独注入请求。
     """
     builder = None
     new_msgs = []
@@ -741,6 +745,12 @@ async def get_ai_response(
                     logger.debug(f"IMAGE_ERROR 路径删除草稿失败: {e}")
             # ⚠️ 前缀让 app 层的失败守卫（startswith(("⚠️", "❌"))）能识别，
             # 避免失败的媒体轮次被当作成功写入历史（产生 user-user 相邻）。
+            # 失败轮标记：历史末尾仍是未获回应的 user 消息，下一条消息
+            # 替换而非合并（重试不叠加上一轮文本/图片，见 turn_recovery）。
+            try:
+                await turn_recovery.mark_failed_unanswered_user(chat_id)
+            except Exception:
+                logger.debug("mark_failed_unanswered_user 失败（可忽略）", exc_info=True)
             return "⚠️ " + strip_html_tags(error_html), "", [], usage
 
         if raw_content and isinstance(raw_content, str) and raw_content.startswith("IMAGE_SENT"):
@@ -748,6 +758,14 @@ async def get_ai_response(
                 actual_content = raw_content.split(":", 1)[1].strip()
             else:
                 actual_content = "（已生成图片）"
+            # ⚠️/❌ 前缀的 IMAGE_SENT（安全拒绝等）与 IMAGE_ERROR 同义：
+            # app 层失败守卫会拦截，历史不会写入任何 assistant 消息，
+            # 同样需要打失败轮标记。
+            if actual_content.startswith(("⚠️", "❌")):
+                try:
+                    await turn_recovery.mark_failed_unanswered_user(chat_id)
+                except Exception:
+                    logger.debug("mark_failed_unanswered_user 失败（可忽略）", exc_info=True)
             if new_msgs and new_msgs[-1].get("role") == "assistant":
                 history_summary = str(new_msgs[-1].get("content") or "")
                 logger.debug("[NativeImage] 保存到对话历史的完整 assistant 消息:\n%s", history_summary)
@@ -776,6 +794,11 @@ async def get_ai_response(
                         await delete_message(chat_id, builder.draft_message_id)
                 except Exception as e:
                     logger.debug(f"VIDEO_ERROR 路径删除草稿失败: {e}")
+            # 失败轮标记（与 IMAGE_ERROR 同理：下一条消息替换而非合并）。
+            try:
+                await turn_recovery.mark_failed_unanswered_user(chat_id)
+            except Exception:
+                logger.debug("mark_failed_unanswered_user 失败（可忽略）", exc_info=True)
             return "⚠️ " + strip_html_tags(error_html), "", [], usage
 
         if raw_content and isinstance(raw_content, str) and raw_content.startswith("VIDEO_SENT"):
@@ -821,6 +844,11 @@ async def get_ai_response(
                         await delete_message(chat_id, builder.draft_message_id)
                 except Exception as e:
                     logger.debug(f"空内容路径删除草稿失败: {e}")
+            # 空响应同样是失败轮：打标记让下一条消息替换而非合并。
+            try:
+                await turn_recovery.mark_failed_unanswered_user(chat_id)
+            except Exception:
+                logger.debug("mark_failed_unanswered_user 失败（可忽略）", exc_info=True)
             return fallback, "", [], usage
 
         # 若末段恰好在滚动边界结束，所有内容已由此前的滚动永久化；此处不能
@@ -1052,6 +1080,14 @@ async def get_ai_response(
             )
         except Exception:
             logger.debug("异常路径轮次保全失败（可忽略）", exc_info=True)
+        # 失败轮标记：历史末尾若仍是本轮未获回应的 user 消息（journal 为空、
+        # 无任何进度可保全），下一条 user 消息将替换而非合并——请求失败后
+        # 的重试不叠加上一轮的文本与图片。若已有部分进度被 salvage（末尾
+        # 是 tool/assistant 消息），本函数自动无操作。
+        try:
+            await turn_recovery.mark_failed_unanswered_user(chat_id)
+        except Exception:
+            logger.debug("mark_failed_unanswered_user 失败（可忽略）", exc_info=True)
         if is_timer:
             # TIMER：后台回合失败不打扰用户，只记日志；下一个唤醒间隔自动重试
             logger.warning(
