@@ -301,12 +301,13 @@ def _render_code_panel(
     else:
         lines, _, _ = _tail_text_lines(text, max_lines)
         display = "\n".join(lines) if lines else "(无输出)"
+    # 不带 style 属性：Telegram Rich Message 只认标签语义，内联 CSS
+    # （background/font-family/white-space…）会被整体丢弃，留着只是噪音。
+    # 等宽与空白保留由 <pre> 标签本身保证。转义用严格策略（& 无条件转义），
+    # 因为这里承载的是程序原始输出而非 HTML 片段。
     return (
         f"<details open><summary>{escape_html(title)}</summary>"
-        "<pre style=\"margin:6px 0 0;padding:10px 12px;background:#111827;color:#e5e7eb;"
-        "border-radius:8px;white-space:pre;overflow:auto;font-family:ui-monospace,SFMono-Regular,"
-        "Menlo,Monaco,Consolas,monospace;font-size:12px;line-height:1.55;\"><code>"
-        f"{escape_html(display)}</code></pre></details>"
+        f"<pre><code>{_escape_code_text(display)}</code></pre></details>"
     )
 
 
@@ -774,15 +775,51 @@ def _truncate_ui_lines_head_tail(text: str, max_lines: int = _TOOL_UI_MAX_LINES)
     return f"{head}\n…（已截断，共 {len(lines)} 行，省略中间 {omitted} 行）\n{tail}"
 
 
+def _escape_code_text(text: str) -> str:
+    """严格转义代码/终端文本中的 HTML 特殊字符（``&``、``<``、``>`` 一律转义）。
+
+    与 ``utils.escape_html`` 的「智能 ampersand」策略不同：那里为了不破坏
+    调用方自己拼的 ``&amp;``/``&#39;`` 实体，会跳过看起来像实体的 ``&``。
+    但工具结果是**程序的原始输出**，不是 HTML 片段——命令若打印了字面量
+    ``&amp;lt;`` 或 ``&amp;amp;``，智能策略会放行、Telegram 再解析回 ``<``/``&``，
+    用户看到的就不是命令真实的输出。因此这里对 ``&`` 无条件转义，保证
+    终端输出逐字节可见。
+    """
+    if not text:
+        return ""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _render_code_text(text: str) -> str:
+    """把纯文本渲染为**保留缩进与空白**的等宽代码块。
+
+    为什么必须是 ``<pre><code>`` 而不是 ``<blockquote>``：
+    Telegram Rich Message 的 ``blockquote`` 是 RichText 容器，按普通 HTML
+    文本流排版——连续空格会被折叠成一个、行首缩进被吃掉，且使用比例字体
+    （每个字符宽度不同）。因此即使把换行显式转成 ``<br/>``，代码的缩进层级
+    和列对齐仍然全部丢失。``<pre>`` 是预格式化块：空白逐字保留、等宽字体
+    渲染，是唯一能正确承载终端输出、diff、源码与行号的容器。
+
+    ``<pre>`` 内不能再用 ``<br/>`` 换行——换行符本身即换行；插入 ``<br/>``
+    反而会多出一个空行。
+    """
+    body = _escape_code_text(text)
+    return f"<pre><code>{body}</code></pre>"
+
+
 def _render_editor_quote(label: str, value: str, truncator=_truncate_ui_lines) -> str:
-    """Render a tool's input or output as a plain quoted text block, truncated to _TOOL_UI_MAX_LINES lines."""
+    """Render a tool's input or output as a monospace code block that preserves indentation.
+
+    截断到 ``_TOOL_UI_MAX_LINES`` 行后放进 ``<pre><code>``：文件摘录、终端
+    回放、diff 与行号 gutter（``12 │ code``）都依赖等宽字体和逐字保留的
+    空白才能对齐，旧实现用 ``<blockquote>`` + ``<br/>`` 会把缩进折叠掉。
+    """
     text = value if isinstance(value, str) else str(value or "")
     if not text:
         text = "(empty)"
     else:
         text = truncator(text)
-    quoted_text = escape_html(text).replace("\n", "<br/>")
-    return f"<p><b>{escape_html(label)}</b></p><blockquote>{quoted_text}</blockquote>"
+    return f"<p><b>{escape_html(label)}</b></p>{_render_code_text(text)}"
 
 
 def _render_media_failure_result(result_str: str, fallback: str) -> str:
@@ -1787,7 +1824,9 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             if "error" in weather_data:
                 error_msg = weather_data["error"]
                 summary = "🌤️ 天气查询失败"
-                details_html = f"<pre><code>{error_msg}</code></pre>"
+                # 上游错误文本必须转义：未转义时其中的 < > & 会打坏
+                # Rich Message 结构（旧实现直接内插，属注入面）。
+                details_html = f"<pre><code>{_escape_code_text(str(error_msg))}</code></pre>"
                 return summary, details_html
 
             city = weather_data.get("city", "未知")
@@ -1914,7 +1953,8 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             return summary, details_html
 
         except json.JSONDecodeError:
-            safe_log = escape_html(result_str[:60000])
+            # 严格转义原始响应（& 无条件转义）：这是上游返回的原始文本。
+            safe_log = _escape_code_text(result_str[:60000])
             summary = "🌤️ 天气数据"
             details_html = f"<pre><code>{safe_log}</code></pre>"
             return summary, details_html

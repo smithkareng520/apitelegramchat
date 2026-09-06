@@ -326,7 +326,12 @@ def _format_image_safety_notice(detail: str = "", model: str = "") -> str:
 
 
 def _render_media_failure_quote(error_notice: str) -> str:
-    """把原生媒体模型的失败通知渲染成与 text_editor 相同的引用结果块。"""
+    """把原生媒体模型的失败通知渲染成与 text_editor 相同的等宽结果块。
+
+    与 ``tool_executors._render_editor_quote`` 保持同一形态：``<pre><code>``
+    而非 ``<blockquote>``。上游报错常带缩进的 JSON / traceback，引用块会把
+    空白折叠掉、用比例字体排版，导致结构不可读；``<pre>`` 逐字保留空白。
+    """
     raw = html.unescape(str(error_notice or ""))
     visible_text = strip_html_tags(raw).strip()
     if not visible_text:
@@ -334,10 +339,9 @@ def _render_media_failure_quote(error_notice: str) -> str:
     lines = visible_text.splitlines()
     if len(lines) > 20:
         visible_text = "\n".join(lines[:20]) + f"\n…（已截断，共 {len(lines)} 行，仅显示前 20 行）"
-    return (
-        "<p><b>Result</b></p>"
-        f"<blockquote>{escape_html(visible_text).replace(chr(10), '<br/>')}</blockquote>"
-    )
+    # 严格转义（& 无条件转义）：这是程序原始输出，不是 HTML 片段。
+    body = visible_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"<p><b>Result</b></p><pre><code>{body}</code></pre>"
 
 
 def _short_model_name(model: str) -> str:
