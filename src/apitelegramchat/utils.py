@@ -540,7 +540,7 @@ def _demote_watch_page_videos(html_content: str) -> str:
             figcaption_text = re.sub(r'<[^>]+>', '', figm.group(1)).strip()
 
         if not figcaption_text:
-            domain = _domain_of(src)
+            domain = _media_url_domain(src)
             figcaption_text = "🎬 观看视频" + (f" · {domain}" if domain else "")
 
         # 把 video 块和 figcaption 都从 inner 里去掉，剩余内容（少见）追加在链接后
@@ -576,10 +576,6 @@ def _demote_watch_page_videos(html_content: str) -> str:
         bare = re.sub(r'\s+', ' ', bare).strip()
         return bare[:80] if bare else ""
 
-    def _domain_of(url: str) -> str:
-        m = re.match(r'https?://([^/\s]+)', url or "")
-        return m.group(1) if m else ""
-
     result = figure_video_re.sub(_replace_figure, html_content)
 
     # 再处理"裸" video（不在 <figure> 里的，或 figure 已经被上面处理过
@@ -599,7 +595,7 @@ def _demote_watch_page_videos(html_content: str) -> str:
         # 退化 caption：取 video 块内文本，再不行就用 domain
         caption = _extract_caption_from_inner(block)
         if not caption:
-            domain = _domain_of(src)
+            domain = _media_url_domain(src)
             caption = "🎬 观看视频" + (f" · {domain}" if domain else "")
         return f'<a href="{escape_media_url_attr(src)}"><b>{escape_html(caption)}</b></a>'
 
@@ -670,17 +666,40 @@ def _escape_media_url_text(url: str) -> str:
             .replace('>', '&gt;'))
 
 
-def _build_demoted_anchor(url: str) -> str:
-    """构造媒体降级锚点：``<a href="完整带参数 URL">完整带参数 URL</a>``。
+def _media_url_domain(url: str) -> str:
+    """提取 URL 的域名（netloc，含端口），无法解析时返回空串。
 
-    链接文本必须与 href 一致，是**完整原始 URL（含全部查询参数）**：
-    降级意味着内嵌展示已经失败，用户唯一的恢复手段就是拿到原始 URL
-    自行打开。旧的 ``🖼 查看图片 · 域名`` 样式只显示域名——R2 presigned
-    URL 的签名参数无法手工还原，点开域名路径必然 403，等于把媒体彻底
-    丢给用户，已废弃。
+    先 ``html.unescape`` 归一化（容忍上游 src 已做过 ``&``→``&amp;``
+    转义的情况），再取 ``scheme://`` 之后的 authority 部分；极罕见的
+    ``user:pass@host`` 形态会去掉 userinfo 只留 host。
+    """
+    u = html.unescape((url or "").strip())
+    m = re.match(r'^[A-Za-z][A-Za-z0-9+.\-]*://([^/?#\s]+)', u)
+    if not m:
+        return ""
+    netloc = m.group(1)
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[-1]
+    return netloc
+
+
+def _build_demoted_anchor(url: str) -> str:
+    """构造媒体降级锚点：``<a href="完整带参数 URL">域名</a>``。
+
+    href 必须是**完整原始 URL（含全部查询参数）**：降级意味着内嵌展示
+    已经失败，用户点按 / 长按复制时拿到的必须是可直接打开的完整 URL——
+    R2 presigned URL 缺失签名参数会被服务端以 403 拒绝。
+
+    链接可见文本则只显示**域名**（2026-09-06 用户要求）：R2 presigned
+    URL 动辄数百字符，整串铺在消息里会把对话刷得很长；Telegram 渲染
+    ``<a>`` 时点按跳转走 href、长按菜单复制的也是 href，可见文本用域名
+    即可保持消息整洁且不丢失任何恢复能力。旧的两种样式均已废弃——
+    ``🖼 查看图片 · 域名``（文案噪声）与「文本=完整 URL」（太长）。
+    域名解析失败（畸形 URL）时退回显示完整 URL，保证文本不空白。
     """
     href = escape_media_url_attr(url)
-    text = _escape_media_url_text(url)
+    domain = _media_url_domain(url)
+    text = _escape_media_url_text(domain if domain else url)
     return f'<a href="{href}">{text}</a>'
 
 
@@ -715,7 +734,7 @@ def _unwrap_slideshow_inner(inner: str) -> str:
 def _demote_specific_media_url(html_content: str, media_kind: str, target_url: str) -> str:
     """只降级指定 URL 的媒体，保留其他媒体不变。
     
-    降级产物是 ``<a href="完整带参数 URL">完整带参数 URL</a>``（见
+    降级产物是 ``<a href="完整带参数 URL">域名</a>``（见
     ``_build_demoted_anchor``）。若目标媒体位于 ``<tg-slideshow>`` 轮播
     容器内，锚点会移到容器外面——容器内只认裸 ``<img>``，锚点留在
     里面会被渲染器吞掉。
@@ -803,7 +822,9 @@ def _demote_specific_media_url(html_content: str, media_kind: str, target_url: s
         else:
             # 容器内已无任何媒体：解包，避免空轮播被服务端拒绝
             body = _unwrap_slideshow_inner(new_inner)
-        return body + "".join(removed_anchors)
+        # 多个锚点用 <br/> 分行：可见文本都是域名时，紧挨着会粘成
+        # 一串无法分辨的重复域名（br 在 Rich Message 白名单内）。
+        return body + "<br/>".join(removed_anchors)
     
     result = _TG_SLIDESHOW_RE.sub(_replace_slideshow, result)
     
@@ -932,10 +953,9 @@ def _demote_all_media_to_links(
 
     降级规则（锚点统一由 ``_build_demoted_anchor`` 构造）：
 
-      * 任何 ``<img>/<video>/<audio>`` → ``<a href="完整带参数 URL">完整带
-        参数 URL</a>``——链接文本就是完整原始 URL（含全部查询参数），
-        用户可见、可复制、可打开；不再使用 ``🖼 查看图片 · 域名`` 这种
-        拿不回真实 URL 的样式；
+      * 任何 ``<img>/<video>/<audio>`` → ``<a href="完整带参数 URL">域名</a>``
+        ——href 保留完整原始 URL（含全部查询参数，点按/复制均可用），
+        可见文本只显示域名保持消息整洁（完整 URL 铺在消息里太长）；
       * ``<tg-slideshow>`` 轮播容器内的媒体：从容器内移除，锚点放到容器
         外面（容器内只认裸 ``<img>``，锚点留在里面会被渲染器吞掉）；
         容器内媒体全部降级后解包容器，避免空轮播被服务端拒绝；
@@ -1016,7 +1036,9 @@ def _demote_all_media_to_links(
             body = f"{open_tag}{new_inner}{close_tag}"
         else:
             body = _unwrap_slideshow_inner(new_inner)
-        return body + "".join(anchors)
+        # 多个锚点用 <br/> 分行：可见文本都是域名时，紧挨着会粘成
+        # 一串无法分辨的重复域名（br 在 Rich Message 白名单内）。
+        return body + "<br/>".join(anchors)
 
     result = _TG_SLIDESHOW_RE.sub(_replace_slideshow, html_content)
 
