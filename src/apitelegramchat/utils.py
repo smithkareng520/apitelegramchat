@@ -547,7 +547,9 @@ def _demote_watch_page_videos(html_content: str) -> str:
         rest = video_in_figure_re.sub("", inner)
         rest = figcaption_re.sub("", rest).strip()
 
-        anchor = f'<a href="{src}"><b>{figcaption_text}</b></a>'
+        # href 走属性转义：观看页 URL 一般干净，但上游可能已做过一次转义，
+        # escape_media_url_attr 会归一化后统一转义，避免双重转义/裸 &
+        anchor = f'<a href="{escape_media_url_attr(src)}"><b>{escape_html(figcaption_text)}</b></a>'
         if not rest:
             return anchor
         return f"{anchor} {rest}"
@@ -599,7 +601,7 @@ def _demote_watch_page_videos(html_content: str) -> str:
         if not caption:
             domain = _domain_of(src)
             caption = "🎬 观看视频" + (f" · {domain}" if domain else "")
-        return f'<a href="{src}"><b>{caption}</b></a>'
+        return f'<a href="{escape_media_url_attr(src)}"><b>{escape_html(caption)}</b></a>'
 
     result = bare_video_re.sub(_replace_bare_video, result)
     return result
@@ -633,12 +635,90 @@ def _extract_media_urls(html_content: str, media_kind: str) -> list[str]:
             src = (src_match.group(2) or src_match.group(3) or src_match.group(4) or "").strip()
             if src:
                 urls.append(src)
-    
+
     return urls
+
+
+# ---------- 媒体 URL 转义与降级锚点构造 ----------
+def escape_media_url_attr(url: str) -> str:
+    """URL 写入 href/src 等 HTML 属性前的转义（公开给其他模块复用）。
+
+    先 ``html.unescape`` 归一化（容忍上游 src 已做过一次 ``&``→``&amp;``
+    转义的情况），再统一转义 ``& < > "``。这保证两件事：
+
+      1. 不会出现 ``&amp;amp;`` 双重转义（渲染出的 URL 里混进字面量
+         ``&amp;``，链接直接失效）；
+      2. 属性值里不会残留裸 ``&``——Telegram 的 HTML 解析器会把
+         ``&X-Amz-Credential`` 之类的片段当作实体名起点，导致 URL 在
+         属性值里被截断；而 R2 presigned URL 一旦缺失
+         ``X-Amz-Signature`` 等签名参数，服务端会以 403 拒绝。
+    """
+    normalized = html.unescape(url or "")
+    return (normalized
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('"', '&quot;'))
+
+
+def _escape_media_url_text(url: str) -> str:
+    """URL 作为 ``<a>`` 可见文本前的转义（属性引号无需转义）。"""
+    normalized = html.unescape(url or "")
+    return (normalized
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;'))
+
+
+def _build_demoted_anchor(url: str) -> str:
+    """构造媒体降级锚点：``<a href="完整带参数 URL">完整带参数 URL</a>``。
+
+    链接文本必须与 href 一致，是**完整原始 URL（含全部查询参数）**：
+    降级意味着内嵌展示已经失败，用户唯一的恢复手段就是拿到原始 URL
+    自行打开。旧的 ``🖼 查看图片 · 域名`` 样式只显示域名——R2 presigned
+    URL 的签名参数无法手工还原，点开域名路径必然 403，等于把媒体彻底
+    丢给用户，已废弃。
+    """
+    href = escape_media_url_attr(url)
+    text = _escape_media_url_text(url)
+    return f'<a href="{href}">{text}</a>'
+
+
+# <tg-slideshow> 轮播容器。项目规范（fetch_rich_content.py）："tg-slideshow
+# 内只放裸 <img src>"，渲染器不认其他元素——降级产生的 <a> 锚点若留在
+# 容器内部会被直接吞掉（用户看到"图片没了、链接也没有"）。因此凡降级
+# 容器内媒体，锚点必须移到容器外面。
+_TG_SLIDESHOW_RE = re.compile(
+    r'(<tg-slideshow\b[^>]*>)(.*?)(</tg-slideshow\s*>)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _slideshow_inner_has_media(inner: str) -> bool:
+    return bool(re.search(r'<(?:img|video|audio)\b', inner or "", re.IGNORECASE))
+
+
+def _unwrap_slideshow_inner(inner: str) -> str:
+    """轮播容器内媒体已全部降级时的解包：剥掉残留的 figcaption 标签只留
+    文本（figcaption 离开媒体容器不再合法），避免空 <tg-slideshow> 被服务端
+    以"无媒体"拒绝。"""
+    text = re.sub(
+        r'<figcaption\b[^>]*>(.*?)</figcaption\s*>',
+        lambda m: m.group(1),
+        inner or "",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(r'</?figcaption\s*>', '', text, flags=re.IGNORECASE)
+    return text.strip()
 
 
 def _demote_specific_media_url(html_content: str, media_kind: str, target_url: str) -> str:
     """只降级指定 URL 的媒体，保留其他媒体不变。
+    
+    降级产物是 ``<a href="完整带参数 URL">完整带参数 URL</a>``（见
+    ``_build_demoted_anchor``）。若目标媒体位于 ``<tg-slideshow>`` 轮播
+    容器内，锚点会移到容器外面——容器内只认裸 ``<img>``，锚点留在
+    里面会被渲染器吞掉。
     
     Args:
         html_content: HTML 内容
@@ -657,25 +737,9 @@ def _demote_specific_media_url(html_content: str, media_kind: str, target_url: s
             return ""
         return (m.group(2) or m.group(3) or m.group(4) or "").strip()
     
-    def _domain_of(url: str) -> str:
-        m = re.match(r'https?://([^/\s]+)', url or "")
-        return m.group(1) if m else ""
-    
-    def _figcaption_text(inner: str) -> str:
-        m = re.search(r'<figcaption\b[^>]*>(.*?)</figcaption\s*>', inner, re.IGNORECASE | re.DOTALL)
-        if not m:
-            return ""
-        return re.sub(r'<[^>]+>', '', m.group(1)).strip()
-    
-    def _build_anchor(src: str, caption: str, kind: str) -> str:
-        if not caption:
-            domain = _domain_of(src)
-            label_map = {"video": "🎬 观看视频", "audio": "🎵 收听音频", "img": "🖼 查看图片"}
-            caption = label_map.get(kind, "🔗 查看链接")
-            if domain:
-                caption = f"{caption} · {domain}"
-        safe_caption = caption.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        return f'<a href="{src}"><b>{safe_caption}</b></a>'
+    def _norm_url(url: str) -> str:
+        # 归一化后比较：容忍上游 src 已做 & → &amp; 转义导致的形式差异
+        return html.unescape((url or "").strip())
     
     # 1) 处理 <figure> 内的目标媒体
     figure_re = re.compile(r'<figure\b[^>]*>(.*?)</figure\s*>', re.IGNORECASE | re.DOTALL)
@@ -694,11 +758,10 @@ def _demote_specific_media_url(html_content: str, media_kind: str, target_url: s
         src = _extract_src(block)
         
         # 只处理目标 URL
-        if src != target_url:
+        if _norm_url(src) != _norm_url(target_url):
             return m.group(0)
         
-        cap_text = _figcaption_text(inner)
-        anchor = _build_anchor(src, cap_text, media_kind)
+        anchor = _build_demoted_anchor(src)
         
         # 移除媒体块和 figcaption，保留其他内容
         rest = inner.replace(block, "")
@@ -711,7 +774,40 @@ def _demote_specific_media_url(html_content: str, media_kind: str, target_url: s
     
     result = figure_re.sub(_replace_figure, html_content)
     
-    # 2) 处理裸媒体（不在 <figure> 中的）
+    # 1.5) 处理 <tg-slideshow> 轮播容器内的目标媒体：从容器内移除该媒体，
+    #      <a> 锚点放到容器外（容器内只认裸 <img>，锚点留在里面会被
+    #      渲染器吞掉，用户只会看到剩下的 <img> 而拿不到链接）。
+    media_block_re = re.compile(
+        rf'<{media_kind}\b[^>]*?/?>.*?</{media_kind}\s*>|<{media_kind}\b[^>]*/>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    
+    def _replace_slideshow(m: re.Match) -> str:
+        open_tag, inner, close_tag = m.group(1), m.group(2) or "", m.group(3)
+        removed_anchors: list[str] = []
+        
+        def _check(mm: re.Match) -> str:
+            block = mm.group(0)
+            src = _extract_src(block)
+            if src and _norm_url(src) == _norm_url(target_url):
+                removed_anchors.append(_build_demoted_anchor(src))
+                return ""  # 从容器内移除
+            return block
+        
+        new_inner = media_block_re.sub(_check, inner)
+        if not removed_anchors:
+            return m.group(0)
+        
+        if _slideshow_inner_has_media(new_inner):
+            body = f"{open_tag}{new_inner}{close_tag}"
+        else:
+            # 容器内已无任何媒体：解包，避免空轮播被服务端拒绝
+            body = _unwrap_slideshow_inner(new_inner)
+        return body + "".join(removed_anchors)
+    
+    result = _TG_SLIDESHOW_RE.sub(_replace_slideshow, result)
+    
+    # 2) 处理裸媒体（不在 <figure>/<tg-slideshow> 中的）
     bare_media_re = re.compile(
         rf'<{media_kind}\b[^>]*>.*?</{media_kind}\s*>|<{media_kind}\b[^>]*/>',
         re.IGNORECASE | re.DOTALL,
@@ -722,15 +818,10 @@ def _demote_specific_media_url(html_content: str, media_kind: str, target_url: s
         src = _extract_src(block)
         
         # 只处理目标 URL
-        if src != target_url:
+        if _norm_url(src) != _norm_url(target_url):
             return block
         
-        caption = _figcaption_text(block)
-        if not caption:
-            bare = re.sub(r'<[^>]+>', ' ', block)
-            caption = re.sub(r'\s+', ' ', bare).strip()[:80]
-        
-        return _build_anchor(src, caption, media_kind)
+        return _build_demoted_anchor(src)
     
     result = bare_media_re.sub(_replace_bare, result)
     
@@ -839,17 +930,17 @@ def _demote_all_media_to_links(
     之后才触发，因此激进策略是安全的：宁可丢失"内嵌播放器"也不可丢失
     整条用户可见的回复。
 
-    降级规则：
+    降级规则（锚点统一由 ``_build_demoted_anchor`` 构造）：
 
-      * ``<figure><video src="URL"></video><figcaption>CAP</figcaption></figure>``
-        → ``<a href="URL"><b>🎬 CAP</b></a>``（保留 figcaption 文本，让用户
-        仍能点击跳转到原媒体页）；
-      * 裸 ``<video src="URL"></video>`` 或自闭合 ``<video src="URL"/>``
-        → ``<a href="URL"><b>🎬 观看视频 · {domain}</b></a>``；
-      * ``<figure><img src="URL"/><figcaption>CAP</figcaption></figure>``
-        → ``<a href="URL"><b>🖼 CAP</b></a>``；
-      * 裸 ``<img src="URL"/>`` → ``<a href="URL"><b>🖼 {domain}</b></a>``；
-      * ``<audio>`` 同理用 🎵 前缀；
+      * 任何 ``<img>/<video>/<audio>`` → ``<a href="完整带参数 URL">完整带
+        参数 URL</a>``——链接文本就是完整原始 URL（含全部查询参数），
+        用户可见、可复制、可打开；不再使用 ``🖼 查看图片 · 域名`` 这种
+        拿不回真实 URL 的样式；
+      * ``<tg-slideshow>`` 轮播容器内的媒体：从容器内移除，锚点放到容器
+        外面（容器内只认裸 ``<img>``，锚点留在里面会被渲染器吞掉）；
+        容器内媒体全部降级后解包容器，避免空轮播被服务端拒绝；
+      * ``<figure>`` 内的媒体连同 figcaption 一起被锚点替换，figure 里的
+        其他可见文本保留；
       * ``src`` 非法（非 http(s):// 开头）的媒体块直接整块删除——这种
         URL 在 ``_strip_invalid_media_urls`` 阶段也已被处理，这里是冗余
         兜底。
@@ -869,10 +960,6 @@ def _demote_all_media_to_links(
     def _is_valid_url(url: str) -> bool:
         u = (url or "").strip().lower()
         return bool(u) and u.startswith(("http://", "https://"))
-
-    def _domain_of(url: str) -> str:
-        m = re.match(r'https?://([^/\s]+)', url or "")
-        return m.group(1) if m else ""
 
     def _strip_inner_tags(inner: str) -> str:
         """去掉 inner 里所有 <video>/<audio>/<img>/<figcaption> 标签，
@@ -898,17 +985,40 @@ def _demote_all_media_to_links(
         text = re.sub(r'<[^>]+>', '', m.group(1)).strip()
         return text
 
-    def _build_anchor(src: str, caption: str, kind: str) -> str:
-        """构造降级后的 <a> 锚点。src 必须合法；caption 为空时按 kind 兜底。"""
-        if not caption:
-            domain = _domain_of(src)
-            label_map = {"video": "🎬 观看视频", "audio": "🎵 收听音频", "image": "🖼 查看图片"}
-            caption = label_map.get(kind, "🔗 查看链接")
-            if domain:
-                caption = f"{caption} · {domain}"
-        # 转义 caption 中的 < > & 防止破坏 HTML 结构
-        safe_caption = caption.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        return f'<a href="{src}"><b>{safe_caption}</b></a>'
+    # 0) 处理 <tg-slideshow> 轮播容器：容器内只认裸 <img>（项目规范，
+    #    见 fetch_rich_content.py），降级产生的 <a> 锚点必须移出容器——
+    #    锚点留在容器内会被渲染器直接吞掉，用户只看到剩余 <img> 而拿不到
+    #    链接。匹配类型的媒体全部移除后若容器内不再有任何媒体，解包容器。
+    all_media_re = re.compile(
+        r'<(video|audio)\b[^>]*>.*?</\1\s*>|<(video|audio|img)\b[^>]*/>',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def _replace_slideshow(m: re.Match) -> str:
+        open_tag, inner, close_tag = m.group(1), m.group(2) or "", m.group(3)
+        anchors: list[str] = []
+
+        def _check(mm: re.Match) -> str:
+            block = mm.group(0)
+            kind = (mm.group(1) or mm.group(2) or "").lower()
+            if media_kinds is not None and kind not in media_kinds:
+                return block
+            src = _extract_src(block)
+            if not src or not _is_valid_url(src):
+                return ""  # 非法 src：整块删除（冗余兜底）
+            anchors.append(_build_demoted_anchor(src))
+            return ""
+
+        new_inner = all_media_re.sub(_check, inner)
+        if not anchors:
+            return m.group(0)
+        if _slideshow_inner_has_media(new_inner):
+            body = f"{open_tag}{new_inner}{close_tag}"
+        else:
+            body = _unwrap_slideshow_inner(new_inner)
+        return body + "".join(anchors)
+
+    result = _TG_SLIDESHOW_RE.sub(_replace_slideshow, html_content)
 
     # 1) 处理 <figure>...</figure> 内的媒体（含 figcaption）
     figure_re = re.compile(
@@ -941,16 +1051,16 @@ def _demote_all_media_to_links(
             if cap_text:
                 rest = f"{cap_text} {rest}".strip() if rest else cap_text
             return rest or ""
-        anchor = _build_anchor(src, cap_text, kind)
+        anchor = _build_demoted_anchor(src)
         # 把 media 块和 figcaption 都从 inner 里去掉，剩余文本追加在后
         rest = _strip_inner_tags(inner.replace(block, "")).strip()
         if rest:
             return f"{anchor} {rest}"
         return anchor
 
-    result = figure_re.sub(_replace_figure, html_content)
+    result = figure_re.sub(_replace_figure, result)
 
-    # 2) 处理裸 media（不在 <figure> 里的）
+    # 2) 处理裸 media（不在 <figure>/<tg-slideshow> 里的）
     bare_media_re = re.compile(
         r'<(video|audio)\b[^>]*>.*?</\1\s*>|<(video|audio|img)\b[^>]*/>',
         re.IGNORECASE | re.DOTALL,
@@ -964,13 +1074,7 @@ def _demote_all_media_to_links(
             return block
         if not src or not _is_valid_url(src):
             return ""  # 非法 src：整块删除
-        # 从 block 内部提取可能的 figcaption / 裸文本作为 caption
-        caption = _figcaption_text(block)
-        if not caption:
-            bare = re.sub(r'<[^>]+>', ' ', block)
-            bare = re.sub(r'\s+', ' ', bare).strip()
-            caption = bare[:80] if bare else ""
-        return _build_anchor(src, caption, kind)
+        return _build_demoted_anchor(src)
 
     result = bare_media_re.sub(_replace_bare_media, result)
 

@@ -25,7 +25,7 @@ from apitelegramchat.config import (
     get_reasoning_request_fields,
 )
 from apitelegramchat.state import get_llm_session_key
-from apitelegramchat.utils import get_logger, escape_html, send_rich_html_message
+from apitelegramchat.utils import get_logger, escape_html, send_rich_html_message, escape_media_url_attr
 from apitelegramchat.chat_actions import (
     chat_action_scope,
     start_chat_action,
@@ -1019,7 +1019,9 @@ async def _agentic_loop_native_image(
             uploaded_urls = await _upload_generated_images_to_r2(image_bytes_list)
 
             if uploaded_urls:
-                img_tags = "".join(f'<img src="{u}"/>' for u in uploaded_urls)
+                # src 属性走 URL 属性转义：R2 presigned URL 含 & 参数，
+                # 不转义会被 Telegram HTML 解析器当作实体名起点截断
+                img_tags = "".join(f'<img src="{escape_media_url_attr(u)}"/>' for u in uploaded_urls)
                 caption_text = _format_image_metadata_caption(image_bytes_list[0],
                                                               current_model) if image_bytes_list else "Generated image"
                 # 单图用 <figure>，多图用 <tg-slideshow> 轮播
@@ -1140,7 +1142,8 @@ async def _agentic_loop_native_image(
     uploaded_urls = await _upload_generated_images_to_r2(image_bytes_list)
 
     if uploaded_urls:
-        img_tags = "".join(f'<img src="{u}"/>' for u in uploaded_urls)
+        # src 属性走 URL 属性转义（与 Images 协议路径一致）
+        img_tags = "".join(f'<img src="{escape_media_url_attr(u)}"/>' for u in uploaded_urls)
         caption_text = _format_image_metadata_caption(image_bytes_list[0],
                                                       current_model) if image_bytes_list else "Generated image"
         # 单图用 <figure>，多图用 <tg-slideshow> 轮播
@@ -1314,7 +1317,7 @@ async def _agentic_loop_native_video(
         meta=video_meta if isinstance(video_meta, dict) else None,
     )
     video_html = (
-        f'<figure><video src="{final_video_url}"></video>'
+        f'<figure><video src="{escape_media_url_attr(final_video_url)}"></video>'
         f'<figcaption>{escape_html(caption_text)}</figcaption></figure>'
     )
     send_ok = await send_rich_html_message(chat_id, video_html)

@@ -914,9 +914,12 @@ def _format_image_generation_result(
         if urls:
             count = len(urls)
             summary = f"🎨 {operation_en} {count} image" + ("" if count == 1 else "s")
-            img_tags = "".join(f'<img src="{url}"/>' for url in urls)
+            # R2 presigned URL 含 & 查询参数，HTML 属性值里必须转义，否则
+            # Telegram 解析器可能把 &X-Amz-... 当实体名起点截断 URL（缺
+            # 签名参数会被 R2 以 403 拒绝）。先 escape 再内插。
+            img_tags = "".join(f'<img src="{html.escape(url, quote=True)}"/>' for url in urls)
             link_items = "".join(
-                f'<li><a href="{url}">图片 {index + 1}</a></li>'
+                f'<li><a href="{html.escape(url, quote=True)}">图片 {index + 1}</a></li>'
                 for index, url in enumerate(urls)
             )
             caption = f"{operation_zh} {count} 张图片：<ul>{link_items}</ul>"
@@ -2144,17 +2147,20 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 # X-Amz-Signature 等），HTML 属性值中未转义的 & 会被 Telegram HTML
                 # 解析器当作实体名起点，导致 URL 被截断 → RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND。
                 # 必须用 escape_html 转义（与 _agentic_loop_native_video 路径一致）。
+                # 修复：旧实现注释声称已转义但 f-string 直接内插原始 URL，转义
+                # 实际从未发生；现在真正落到 html.escape（含引号，供属性值使用）。
                 video_url = url_match.group(1).strip()
                 duration_str = ""
                 m = re.search(r'(\d+)\s*秒', fn_args.get("prompt", "") or "")
                 if m:
                     duration_str = f" · {m.group(1)}s"
                 summary = f"🎬 Video generated{duration_str}"
+                video_url_attr = html.escape(video_url, quote=True)
                 # <figure><video> 是一个独立 media block，可以与其他 block 同消息发送；
                 # 附带简短文本链接 caption，避免裸 R2 presigned URL 刷屏
                 details_html = (
-                    f'<figure><video src="{video_url}"></video>'
-                    f'<figcaption><a href="{video_url}">下载 / 查看视频</a></figcaption>'
+                    f'<figure><video src="{video_url_attr}"></video>'
+                    f'<figcaption><a href="{video_url_attr}">下载 / 查看视频</a></figcaption>'
                     f'</figure>'
                 )
                 return summary, details_html
