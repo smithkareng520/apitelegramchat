@@ -884,6 +884,8 @@ SUPPORTED_MODELS["z-ai/glm-5.2:free"] = make_model_config(
     model_id="z-ai/glm-5.2:free",
     provider="openrouter",
     name="Glm 5.2 Free",
+    reasoning_enabled=True,
+    reasoning_effort="high",
     max_context=256000,
     # 预览模型能力未完全确认，不发送推理控制和采样参数，走供应商默认。
 )
@@ -893,6 +895,8 @@ SUPPORTED_MODELS["minimax/minimax-m3:free"] = make_model_config(
     name="Minimax M3 Free",
     vision=True,
     video=True,
+    reasoning_enabled=True,
+    reasoning_effort="high",
     max_context=1000000,
     # 代码模型，免费档：不发送推理控制与采样参数，走供应商默认。
 )
@@ -920,6 +924,8 @@ SUPPORTED_MODELS["agnes-2.5-flash"] = make_model_config(
     model_id="agnes-2.5-flash",
     provider="agnes",
     name="Agnes 2.5 Flash",
+    reasoning_enabled=True,
+    reasoning_effort="high",
     max_context=512000,
     vision=True,
     # 默认主力模型：网关对推理/采样参数的支持未公开，保守起见两者都不发送，
@@ -934,10 +940,8 @@ SUPPORTED_MODELS["deepseek-ai/DeepSeek-V4-Flash-0731"] = make_model_config(
     provider="modelscope",
     name="Deepseek V4 Flash",
     max_context=1000000,
-    # 混合推理模型：开启思考（DashScope 风格 enable_thinking）。
-    # DeepSeek 思考模式建议 temperature 0.5-0.7，取 0.6；官方文档指出思考
-    # 模式下 top_p 影响很小，不发送 top_p 走供应商默认。
     reasoning_enabled=True,
+    reasoning_effort="high",
     temperature=0.6,
 )
 
@@ -946,6 +950,7 @@ SUPPORTED_MODELS["ZhipuAI/GLM-5.2"] = make_model_config(
     provider="modelscope",
     name="GLM 5.2",
     max_context=1000000,
+    reasoning_effort="high",
     # GLM 混合思考：ModelScope 通道开启思考，智谱官方建议思考模式
     # temperature=0.6；如需关闭改 reasoning_enabled=False。
     reasoning_enabled=True,
@@ -964,7 +969,8 @@ SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
     # Flash-Lite 定位轻快：思考限制在低档，避免响应变慢。
     # Google 建议不调整 temperature（默认 1.0）；top_p 不配置即不发送。
     # 如需精确控制可改用 reasoning_max_tokens（映射 thinkingBudget）。
-    reasoning_effort="low",
+    reasoning_enabled=True,
+    reasoning_effort="high",
     temperature=1.0,
 )
 # -----------------------------------------------------------------------------
@@ -1093,7 +1099,7 @@ SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
     base_url="https://xxtf.baby",
     reasoning_enabled=True,
     max_context=1000000,
-    reasoning_effort="high",
+    reasoning_effort="Max",
     temperature=1.0,
 )
 
