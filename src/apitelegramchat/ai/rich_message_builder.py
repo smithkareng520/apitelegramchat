@@ -274,8 +274,8 @@ class RichMessageBuilder:
         self._rollover_lock = asyncio.Lock()
         self._rate_limited_until: float = 0.0
         self._force_flush_requested: bool = False
-        # 容量预警与实际切换严格分离：flush 只能置位 pending，只有完成一整轮
-        # 模型返回/工具批次后才能 await rollover_at_turn_boundary()。
+        # 容量预警与实际切换严格分离：扫描器只置位 pending；只有安全闭合点
+        #（工具返回完成/文本块结束/思考块结束）才能执行 draft swap。
         self._rollover_pending = False
         self._rollover_in_progress = False
         # 防御性兜底：理论上回合边界期间不再有模型增量；若调用方违约，增量进入
@@ -1140,28 +1140,16 @@ class RichMessageBuilder:
         if self._has_pending_tool_group():
             return False
 
-        # 回合边界是唯一允许换草稿的时点，因此必须在这里重新统计真实容量。
-        # 不能只依赖 flush 之前留下的 _rollover_pending：draft API 限流冷却、
-        # 刷新短路或未来调用路径遗漏 flush 时，已到 30k 的草稿会跨越
-        # 多个工具回合仍不切换。先提交流式缓冲，确保本轮最后一段也参与统计。
+        # 容量扫描器已经在流式过程中完成预警。这里不再重新扫描容量，
+        # 只消费 pending 标记：切换只由安全闭合点触发。
         self._commit_stream_buffer()
         async with self._rollover_lock:
             if self._stop_flush or self._rollover_in_progress:
                 return False
+            if not self._rollover_pending:
+                return False
             current_html = self._build_html_no_thinking()
             cut_at, visible_tokens, block_count = self._pick_rollover_boundary(current_html)
-            rollover_due = (
-                visible_tokens >= RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET
-                or block_count >= RICH_DRAFT_INTERACTIVE_BLOCKS
-            )
-            if not rollover_due:
-                return False
-
-            # 交互性能预警就是下一次完整工具回合边界的实际切换阈值。这样一旦
-            # 草稿增长到可能拖慢客户端重绘的体量，紧随其后的工具批次收束后便会
-            # 完成永久化和新草稿首帧，再发起下一次模型请求，绝不继续堆积数轮。
-            # 即使此前的 flush 未运行或被限流跳过，也必须在本次边界切换。
-            self._rollover_pending = True
 
             used_fallback = False
             if cut_at is not None:
