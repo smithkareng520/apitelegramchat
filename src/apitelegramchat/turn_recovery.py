@@ -45,14 +45,6 @@ user 消息落位（OpenAI 格式）
   该消息（content 以空行拼接；媒体附件按 kind 归一——同类升级为
   photo_group / video_group / document_group 数组，混合 kind / 多音频
   保留 attachments 列表由解析器逐个解析），避免连续两条 user；
-- 上一轮**请求失败**（异常 / IMAGE_ERROR / VIDEO_ERROR / 空响应等，
-  历史末尾残留未获回应的 user 消息且被打上 TURN_FAILED_FLAG）：新
-  user 消息**整体替换**该失败轮消息而不合并——重试语义下每条文本、
-  每张图片只保留新消息的一份，绝不随重试次数叠加（旧实现把重发内容
-  反复合并进同一条 user 消息，文本越拼越长、同一张参考图重复出现，
-  "越积攒越多"）。新消息不带媒体时，把失败轮的媒体原样搬移一份过来
-  （不带旧文本），保证用户上传的图片/文档不因一次请求失败从历史中
-  消失，原生图像模型的重试也仍能拿到参考图；
 - 打断发生在 tool_call 之后：占位 tool 消息补齐配对，新 user 消息直接
   追加在 tool 消息之后（OpenAI 允许 tool 后跟 user，tool 角色不破坏
   user 交替）；
@@ -122,7 +114,6 @@ logger = get_logger(__name__)
 __all__ = [
     "INTERRUPTED_TOOL_PLACEHOLDER",
     "EARLY_PERSIST_FLAG",
-    "TURN_FAILED_FLAG",
     "register_inflight_turn",
     "note_turn_persisted",
     "finalize_interrupted_turn",
@@ -130,7 +121,6 @@ __all__ = [
     "drain_completed_turns",
     "persist_salvaged_journal",
     "persist_user_message_entry",
-    "mark_failed_unanswered_user",
     "reset_turn_delivery_state",
     "default_send_value",
     "mark_reply_delivered",
@@ -144,14 +134,6 @@ INTERRUPTED_TOOL_PLACEHOLDER = "用户打断，未执行"
 
 # user 消息提前持久化标记：update_conversation_and_ledger 见到此标记跳过 append。
 EARLY_PERSIST_FLAG = "__apitc_early_persisted__"
-
-# 请求失败标记：轮次以异常/媒体错误/空响应告终（无任何 assistant 输出）时，
-# 由 get_ai_response 的失败路径打在历史末尾那条未获回应的 user 消息上。
-# 下一条 user 消息到来时 persist_user_message_entry 看到该标记走
-# "替换"而不是"合并"——重试不与上一轮的文本/图片叠加。
-# 标记在读取时被 pop 消费；历史中部的陈旧标记永远不会被读到（只在
-# 历史末尾 role=user 时才检查），无副作用。
-TURN_FAILED_FLAG = "__apitc_turn_failed__"
 
 # 打断后等待旧任务收尾的上限（旧任务在 _cancel_old_task 里已等过 2~3s，
 # 这里只是兜底；超时则按当前 journal 快照保全）。
@@ -550,98 +532,12 @@ def _merge_user_message(old: dict, new: dict) -> None:
         old["mime_type"] = new["mime_type"]
 
 
-def _apply_attachment_entries(msg: dict, entries: list[dict]) -> None:
-    """把附件条目写到消息上（归一化规则与 _merge_user_message 保持一致）。
-
-    失败轮替换时搬运旧媒体用：形状对齐 _resolve_multimodal_content 的
-    各路由分支——同类多图/多视频/多文档写组形态，单视频/文档/音频写
-    单数字段，混合 kind / 多音频保留 attachments 列表交给解析器混合分支。
-    """
-    if not entries:
-        return
-    kinds = {str(a.get("kind") or "").strip().lower() for a in entries}
-    mixed = len(kinds) > 1 or (bool(kinds) and kinds <= {"audio", "voice"})
-    if mixed and len(entries) >= 2:
-        # 混合 kind 或多音频：attachments 列表形态（解析器混合分支）。
-        msg["attachments"] = entries
-        for key in ("file_id", "file_ids", "file_name", "file_names",
-                    "mime_type", "mime_types"):
-            msg.pop(key, None)
-        return
-    if len(kinds) == 1:
-        kind = kinds.pop()
-        group_type = _KIND_GROUP_TYPE.get(kind)
-        if group_type and len(entries) >= 2:
-            msg["type"] = group_type
-            msg["file_ids"] = [a["file_id"] for a in entries]
-            if kind == "photo":
-                msg["file_names"] = [
-                    a.get("file_name") or f"photo_{str(a['file_id'])[:8]}.jpg"
-                    for a in entries
-                ]
-            else:
-                msg["file_names"] = [a.get("file_name") or "" for a in entries]
-                msg["mime_types"] = [a.get("mime_type") or "" for a in entries]
-            msg["attachments"] = entries
-            return
-        # 单附件：写单数字段（photo 用组形态，与 app 生产者一致）。
-        entry = entries[0]
-        if group_type and kind == "photo":
-            msg["type"] = "photo_group"
-            msg["file_ids"] = [entry["file_id"]]
-            msg["file_names"] = [entry.get("file_name") or f"photo_{str(entry['file_id'])[:8]}.jpg"]
-        else:
-            msg["type"] = kind
-            msg["file_id"] = entry["file_id"]
-            if entry.get("file_name"):
-                msg["file_name"] = entry["file_name"]
-            if entry.get("mime_type"):
-                msg["mime_type"] = entry["mime_type"]
-        msg["attachments"] = entries
-        return
-
-
-def _replace_failed_user_message(old: dict, new: dict) -> None:
-    """用新 user 消息整体替换失败轮的 user 消息（原地修改 old，保持槽位身份）。
-
-    重试语义：新消息的文本与媒体完全接管该历史槽位，不与旧内容拼接——
-    每次重试后请求里每段文本、每张图片恰好一份，绝不随重试次数叠加。
-
-    唯一例外：新消息**不带任何媒体**而失败轮带了（用户只回了一句
-    "再试一次"）：把失败轮的媒体原样搬移一份过来（不搬旧文本），
-    否则用户上传的图片会因一次请求失败从历史中彻底消失，原生图像
-    模型的重试也会退化成不带参考图的文生图。
-    """
-    carried_media = _attachment_entries(old) if not _attachment_entries(new) else []
-    if len(carried_media) == 1:
-        # 兼容历史遗留消息：attachments 条目缺 file_name/mime_type 但单数
-        # 字段上有的，回填进条目再搬运（仅单附件时无歧义）。
-        entry = carried_media[0]
-        if not entry.get("file_name") and old.get("file_name"):
-            entry["file_name"] = old["file_name"]
-        if (not entry.get("mime_type") and old.get("mime_type")
-                and str(entry.get("kind") or "").lower() == str(old.get("type") or "").lower()):
-            entry["mime_type"] = old["mime_type"]
-    old.clear()
-    for key, value in new.items():
-        if key != EARLY_PERSIST_FLAG:
-            old[key] = value
-    if carried_media:
-        _apply_attachment_entries(old, carried_media)
-
-
 async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
-    """轮次开始时把新 user 消息写入持久历史（必要时合并/替换上一条 user）。
+    """轮次开始时把新 user 消息写入持久历史（必要时合并进上一条 user）。
 
     返回 True 表示已持久化（get_ai_response 无需再单独 append 到请求，
     update_conversation_and_ledger 也会跳过重复写入）。TIMER 合成唤醒
     消息不经过本函数（不写历史）。
-
-    历史末尾是上一条未获回应的 user 消息时分两种情况：
-    - 带 TURN_FAILED_FLAG（上一轮请求失败）：整体替换，不合并（重试不
-      叠加旧文本/旧图片；新消息无媒体时搬移旧媒体一份）；
-    - 无标记（上一轮被新消息打断、尚无任何输出）：合并（快速连发的
-      合并链，保持原设计）。
     """
     if chat_id is None or not isinstance(user_message, dict):
         return False
@@ -651,54 +547,16 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
         history = ctx.setdefault("conversation_history", [])
         last = history[-1] if history else None
         if isinstance(last, dict) and last.get("role") == "user":
-            if last.pop(TURN_FAILED_FLAG, None):
-                # 上一轮请求失败：替换而非合并（重试语义，见函数 docstring）。
-                _replace_failed_user_message(last, user_message)
-                logger.info(
-                    "[turn-recovery] chat=%s 上一轮请求失败：新 user 消息替换失败轮消息"
-                    "（不合并旧文本/图片，媒体仅在新消息为空时搬移一份）",
-                    chat_id,
-                )
-            else:
-                # 打断发生在任何 assistant 输出之前：合并，避免连续两条 user。
-                _merge_user_message(last, user_message)
-                logger.info(
-                    "[turn-recovery] chat=%s 新 user 消息合并进上一条未回应的 user 消息",
-                    chat_id,
-                )
+            # 打断发生在任何 assistant 输出之前：合并，避免连续两条 user。
+            _merge_user_message(last, user_message)
+            logger.info(
+                "[turn-recovery] chat=%s 新 user 消息合并进上一条未回应的 user 消息",
+                chat_id,
+            )
         else:
             history.append(user_message)
     user_message[EARLY_PERSIST_FLAG] = True
     return True
-
-
-async def mark_failed_unanswered_user(chat_id: int) -> None:
-    """轮次失败收尾时调用：给历史末尾未获回应的 user 消息打失败标记。
-
-    调用时机：get_ai_response 的各失败路径（顶层异常 / IMAGE_ERROR /
-    VIDEO_ERROR / 空响应 / ⚠️ 前缀的 IMAGE_SENT 拒绝等）——这些路径
-    都不会写入任何 assistant 消息，历史末尾保持为本轮的 user 消息。
-    打上标记后，下一次 persist_user_message_entry 会走"替换"而不是
-    "合并"，请求失败后的重试不再叠加上一轮的文本与图片。
-
-    - 历史末尾不是 user 消息（轮次已有部分进度被 salvage 落历史）时
-      无操作——此时下一条 user 消息本来就按新消息追加，不存在合并。
-    - 只改末尾一条，绝不扫描/改写更早的历史。
-    """
-    if chat_id is None:
-        return
-    lock = await get_chat_lock(chat_id)
-    async with lock:
-        ctx = get_or_init_context(chat_id)
-        history = ctx.get("conversation_history") or []
-        last = history[-1] if history else None
-        if isinstance(last, dict) and last.get("role") == "user":
-            last[TURN_FAILED_FLAG] = True
-            logger.info(
-                "[turn-recovery] chat=%s 轮次失败：已标记末尾未回应的 user 消息"
-                "（下一条消息将替换而非合并）",
-                chat_id,
-            )
 
 
 # =====================================================================

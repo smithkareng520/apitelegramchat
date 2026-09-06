@@ -898,89 +898,6 @@ async def _agentic_loop_openai_compat(
     return final_content, final_usage, new_history_entries
 
 
-# =====================================================================
-# 原生图像循环的 prompt / 参考图提取
-# =====================================================================
-def _extract_native_image_urls_from_user_message(msg: dict) -> list[str]:
-    """从单条 user 消息的（已解析）content 中提取全部参考图 URL。"""
-    content = msg.get("content")
-    urls: list[str] = []
-    if not isinstance(content, list):
-        return urls
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        if part.get("type") in ("image_url", "image"):
-            image_url = ""
-            if isinstance(part.get("image_url"), dict):
-                image_url = str(part["image_url"].get("url") or "").strip()
-            else:
-                image_url = str(part.get("url") or "").strip()
-            if image_url:
-                urls.append(image_url)
-    return urls
-
-
-def _extract_image_prompt_and_reference_urls(msgs: list) -> tuple[str, list[str]]:
-    """从（已解析的）请求消息中提取图像模型的 prompt 与参考图 URL 列表。
-
-    prompt 一律取最后一条 user 消息（本轮最新指令）；参考图优先取同一
-    条消息里的 image_url 部分。
-
-    参考图回溯：最后一条 user 消息不带图时，向前找最近一条带图的 user
-    消息沿用其参考图。
-
-    背景（gpt-image-2 等 Images 协议模型只见"最后一条 user 消息"）：
-    图像轮以"模型仅返回文本"的方式失败时（网关 200 + 纯文本回复、非
-    ⚠️ 前缀的提示文案），该提示会作为普通 assistant 消息写入历史；用户
-    随后发的重试消息（往往是纯文本"再试一次"）追加在其后成为最后一
-    条 user 消息——旧实现此时提取不到任何参考图，请求退化为不带参考
-    图的文生图（"失败后只发了文本，没把图片发给 AI"）。回溯最近一条
-    带图 user 消息即可让重试继续拿到参考图（图生图/编辑语义保持）。
-    """
-    last_user_msg = None
-    for item in reversed(msgs):
-        if item.get("role") == "user":
-            last_user_msg = item
-            break
-
-    if not last_user_msg:
-        return "", []
-
-    content = last_user_msg.get("content")
-    prompt_parts: list[str] = []
-
-    if isinstance(content, list):
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") == "text":
-                text = str(part.get("text") or "").strip()
-                if text:
-                    prompt_parts.append(text)
-    elif isinstance(content, str):
-        prompt_parts.append(content.strip())
-
-    image_urls = _extract_native_image_urls_from_user_message(last_user_msg)
-
-    if not image_urls:
-        for item in reversed(msgs):
-            if item is last_user_msg or item.get("role") != "user":
-                continue
-            carried = _extract_native_image_urls_from_user_message(item)
-            if carried:
-                image_urls = carried
-                logger.info(
-                    "[NativeImage] 本轮 user 消息未带参考图，回溯沿用最近一条带图"
-                    " user 消息的 %s 张参考图（重试/追问场景保持图生图输入）",
-                    len(carried),
-                )
-                break
-
-    prompt = "\n".join(p for p in prompt_parts if p).strip()
-    return prompt, image_urls
-
-
 async def _agentic_loop_native_image(
         client: AsyncOpenAI,
         current_model: str,
@@ -992,11 +909,48 @@ async def _agentic_loop_native_image(
     model_info = SUPPORTED_MODELS.get(current_model)
     provider = model_info.provider if model_info else ""  # <-- 新增 provider
 
+    def _extract_prompt_and_image_urls_from_messages(msgs: list) -> tuple[str, list[str]]:
+        last_user_msg = None
+        for item in reversed(msgs):
+            if item.get("role") == "user":
+                last_user_msg = item
+                break
+
+        if not last_user_msg:
+            return "", []
+
+        content = last_user_msg.get("content")
+        prompt_parts: list[str] = []
+        image_urls: list[str] = []
+
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type == "text":
+                    text = str(part.get("text") or "").strip()
+                    if text:
+                        prompt_parts.append(text)
+                elif part_type in ("image_url", "image"):
+                    image_url = ""
+                    if isinstance(part.get("image_url"), dict):
+                        image_url = str(part["image_url"].get("url") or "").strip()
+                    else:
+                        image_url = str(part.get("url") or "").strip()
+                    if image_url:
+                        image_urls.append(image_url)
+        elif isinstance(content, str):
+            prompt_parts.append(content.strip())
+
+        prompt = "\n".join(p for p in prompt_parts if p).strip()
+        return prompt, image_urls
+
     max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
     # 图像模型采样参数同样从 config 读取（默认不发送、走供应商默认）；
     # 推理控制不适用于图像生成端点，不发送。
     sampling_params = get_sampling_params(model_info)
-    prompt_text, image_urls = _extract_image_prompt_and_reference_urls(messages)
+    prompt_text, image_urls = _extract_prompt_and_image_urls_from_messages(messages)
 
     clean_prompt = _clean_prompt_for_image_model(prompt_text)
 
