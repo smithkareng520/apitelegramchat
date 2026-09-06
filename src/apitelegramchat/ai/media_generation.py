@@ -1,6 +1,13 @@
 """原生图片/视频生成模型的请求与响应解析。
 
 从 ai_handlers.py 拆分而来，逻辑未做改动。
+
+图像生成统一入口（/v1/images/generations）：
+所有走 OpenAI Images 协议的提供商（ModelScope / XXTF 等）共用
+:func:`_request_images_generations` 一个请求出口——端点、鉴权、
+请求头、payload 构造、参考图下载、响应解析全部在此合并；厂商差异
+（ModelScope 的异步任务轮询）作为该出口内部的分支处理，调用方
+（agentic 原生图像循环 / 工具图像生成）不再按提供商各写一套。
 """
 import asyncio
 import json
@@ -9,18 +16,175 @@ import base64
 import re
 import mimetypes
 import time
+import uuid
 from typing import Optional, Any
 
 from apitelegramchat.config import (
     OPENROUTER_API_KEY,
     AGNES_API_KEY,
     MODELSCOPE_API_KEY,
+    PROVIDERS,
+    get_effective_endpoint,
 )
 from apitelegramchat.utils import get_logger, strip_html_tags
 from apitelegramchat.ai._constants import OPENROUTER_PROVIDER_PREFERENCES
 from apitelegramchat.ai.error_formatting import _extract_error_details
 
 logger = get_logger(__name__)
+
+# =============================================================================
+# 统一图像请求（OpenAI Images 协议 /v1/images/generations）
+# -----------------------------------------------------------------------------
+# 走统一 /v1/images/generations 出口的提供商集合。判定依据是"该提供商
+# 的图像模型支持 OpenAI Images 兼容端点"，而不是按模型逐个判断：
+#   - modelscope: /images/generations（异步任务轮询，见专用函数）
+#   - xxtf:       中转站标准 OpenAI Images 端点（gpt-image-2 等）
+# 其它提供商（如 openrouter 的 gemini 图像模型）继续走
+# chat/completions + modalities 路径，行为不变。
+# =============================================================================
+IMAGES_API_PROVIDERS = frozenset({"modelscope", "xxtf"})
+
+
+def _get_images_api_display_name(model_info) -> str:
+    """返回提供商展示名（如 "ModelScope" / "XXTF"），用于错误提示文案。"""
+    provider_key = getattr(model_info, "provider", "") or ""
+    base = PROVIDERS.get(provider_key)
+    return (getattr(base, "name", "") or provider_key or "图像").strip()
+
+
+def _resolve_provider_api_key(api_key_env: str) -> str:
+    """从 config 模块解析提供商 API Key（与 api_client._get_api_key 同语义）。
+
+    从 config 模块变量（而非 os.environ）读取：scrub_environment() 清洗
+    环境变量后应用仍能拿到 key。
+    """
+    if not api_key_env:
+        return ""
+    from apitelegramchat import config as app_config
+    return str(getattr(app_config, api_key_env, "") or "")
+
+
+def _normalize_image_url(image_url: str) -> str:
+    return str(image_url or '').strip()
+
+
+async def _download_reference_image_bytes(session: aiohttp.ClientSession, image_url: str) -> bytes | None:
+    """下载参考图字节；data: URL 直接解码，http(s) 下载，其余返回 None。"""
+    if not image_url:
+        return None
+    if image_url.startswith("data:image"):
+        try:
+            _, base64_data = image_url.split(",", 1)
+            return base64.b64decode(base64_data)
+        except Exception as e:
+            logger.warning(f"[NativeImage] data URL 解码失败: {e}")
+            return None
+    try:
+        async with session.get(image_url, timeout=30) as resp:
+            if resp.status == 200:
+                return await resp.read()
+            logger.warning(f"[NativeImage] 下载参考图失败 {resp.status}: {image_url[:120]}")
+    except Exception as e:
+        logger.warning(f"[NativeImage] 下载参考图异常: {e}")
+    return None
+
+
+def _bytes_to_data_url(img_bytes: bytes, source_url: str = '') -> str:
+    """把图片字节转换为 data URL（用于图像编辑接口的参考图字段）。
+
+    - 若 source_url 本身就是 data:image/... URL，则直接返回（已是正确格式）。
+    - 否则根据 source_url 的扩展名推断 MIME，缺省 image/jpeg，再用 base64 包装。
+    """
+    if source_url.startswith('data:image/'):
+        return source_url
+    mime = 'image/jpeg'
+    if source_url:
+        guess, _ = mimetypes.guess_type(source_url.split('?', 1)[0])
+        if guess and guess.startswith('image/'):
+            mime = guess
+    b64 = base64.b64encode(img_bytes).decode('ascii')
+    return f"data:{mime};base64,{b64}"
+
+
+async def _image_urls_to_data_urls(session: aiohttp.ClientSession, image_urls: list[str]) -> list[str]:
+    """把调用方给的参考图（data URL / 公网 URL）统一转成 data URL 列表。
+
+    ModelScope 与通用 OpenAI 兼容图像端点的参考图预处理共用本函数：
+    下载失败的参考图跳过（全部失败时由调用方返回 400）。
+    """
+    image_data_urls: list[str] = []
+    for image_url in image_urls or []:
+        normalized = _normalize_image_url(image_url)
+        if not normalized:
+            continue
+        if normalized.startswith('data:image/'):
+            image_data_urls.append(normalized)
+        elif normalized.startswith(('http://', 'https://')):
+            img_bytes = await _download_reference_image_bytes(session, normalized)
+            if img_bytes:
+                image_data_urls.append(_bytes_to_data_url(img_bytes, normalized))
+            else:
+                logger.warning("[NativeImage] 下载参考图失败，跳过: %s", normalized[:80])
+        else:
+            logger.warning("[NativeImage] 无法识别的 image_url 格式，跳过: %s", normalized[:80])
+    return image_data_urls
+
+
+def _safe_json_parse_dict(body_text: str) -> dict | None:
+    """把响应体解析为 dict；非 JSON / 非 dict 返回 None（debug 日志留痕）。"""
+    try:
+        parsed = json.loads(body_text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError as e:
+        logger.debug(
+            "[NativeImage] JSON parse failed: %s; body_preview=%r",
+            e,
+            (body_text or "")[:200],
+        )
+        return None
+    except Exception:
+        logger.debug("_safe_json_parse_dict 内部忽略的异常", exc_info=True)
+        return None
+
+
+# OpenAI Images 的 size 参数只认固定档位；把工具侧宽高比映射过去，
+# 映射不到的（21:9 / 4:5 / 5:4）返回 None = 不发送，走提供商默认（auto）。
+_OPENAI_SIZE_BY_ASPECT_RATIO = {
+    "1:1": "1024x1024",
+    "3:2": "1536x1024",
+    "4:3": "1536x1024",
+    "16:9": "1536x1024",
+    "2:3": "1024x1536",
+    "3:4": "1024x1536",
+    "9:16": "1024x1536",
+}
+
+
+def _aspect_ratio_to_openai_size(aspect_ratio: str | None) -> str | None:
+    if not aspect_ratio:
+        return None
+    return _OPENAI_SIZE_BY_ASPECT_RATIO.get(str(aspect_ratio).strip())
+
+
+async def _upload_generated_images_to_r2(image_bytes_list: list[bytes]) -> list[str]:
+    """统一后处理：把生成图片逐张上传 R2，返回成功上传的公网 URL 列表。
+
+    agentic 原生图像循环与工具图像生成（execute_generate_image）此前各写
+    一份相同的上传循环，这里合并为单一实现；部分失败不抛异常，由调用方
+    根据"上传数 < 生成数"自行决定提示文案。
+    """
+    # 局部导入避免与 s3_utils 的初始化顺序耦合（s3_utils 依赖 config/R2 配置）
+    from apitelegramchat.s3_utils import upload_bytes_to_r2
+    uploaded_urls: list[str] = []
+    for idx, img_bytes in enumerate(image_bytes_list or []):
+        key = f"generated/{uuid.uuid4().hex}_{idx}.png"
+        url = await upload_bytes_to_r2(img_bytes, key, "image/png")
+        if url:
+            uploaded_urls.append(url)
+        else:
+            logger.warning("[NativeImage] 一张图片上传 R2 失败")
+    return uploaded_urls
+
 
 def _clean_prompt_for_image_model(prompt: str) -> str:
     """Strip UI metadata from prompts before image generation."""
@@ -40,6 +204,11 @@ async def _request_modelscope_native_image(
         model: str = "",
 ) -> tuple[dict | None, str, str, int, str]:
     """
+    ModelScope 专用分支（由统一出口 _request_images_generations 调度）：
+    与通用 OpenAI 兼容实现共享端点形状（/images/generations）、参考图
+    预处理（_image_urls_to_data_urls）与 JSON 解析（_safe_json_parse_dict），
+    仅保留 ModelScope 特有的异步任务头与 /tasks/{task_id} 轮询。
+
     返回: (response_json, endpoint, error_detail, status_code, request_id)
     - 若服务直接返回图片结果，则 response_json 为最终结果。
     - 若先返回 task_id，则会自动轮询任务结果后再返回最终 JSON。
@@ -86,65 +255,9 @@ async def _request_modelscope_native_image(
         (pre_clean_prompt or "")[:240],
     )
 
-    async def _download_image_bytes_from_url(session: aiohttp.ClientSession, image_url: str) -> bytes | None:
-        if not image_url:
-            return None
-        if image_url.startswith("data:image"):
-            try:
-                _, base64_data = image_url.split(",", 1)
-                return base64.b64decode(base64_data)
-            except Exception as e:
-                logger.warning(f"[NativeImage] data URL 解码失败: {e}")
-                return None
-        try:
-            async with session.get(image_url, timeout=30) as resp:
-                if resp.status == 200:
-                    return await resp.read()
-                logger.warning(f"[NativeImage] 下载参考图失败 {resp.status}: {image_url[:120]}")
-        except Exception as e:
-            logger.warning(f"[NativeImage] 下载参考图异常: {e}")
-        return None
-
-    def _normalize_image_url(image_url: str) -> str:
-        return str(image_url or '').strip()
-
-    def _bytes_to_data_url(img_bytes: bytes, source_url: str = '') -> str:
-        """把图片字节转换为 data URL（用于 ModelScope 图生图接口的 `image` 字段）。
-
-        - 若 source_url 本身就是 data:image/... URL，则直接返回（已是正确格式）。
-        - 否则根据 source_url 的扩展名推断 MIME，缺省 image/jpeg，再用 base64 包装。
-        """
-        if source_url.startswith('data:image/'):
-            return source_url
-        mime = 'image/jpeg'
-        if source_url:
-            guess, _ = mimetypes.guess_type(source_url.split('?', 1)[0])
-            if guess and guess.startswith('image/'):
-                mime = guess
-        b64 = base64.b64encode(img_bytes).decode('ascii')
-        return f"data:{mime};base64,{b64}"
-
     def _body_preview(body_text: str, limit: int = 3000) -> str:
         body_text = body_text or ""
         return body_text[:limit]
-
-    def _safe_json_parse(body_text: str) -> dict | None:
-        try:
-            parsed = json.loads(body_text)
-            return parsed if isinstance(parsed, dict) else None
-        except json.JSONDecodeError as e:
-            # 仅在 debug 级别输出，避免噪声；但留下诊断痕迹——
-            # 若完全静默（except Exception: return None），200 响应体
-            # 不是合法 JSON 时排查会非常困难。
-            logger.debug(
-                "[NativeImage/ModelScope] JSON parse failed: %s; body_preview=%r",
-                e,
-                (body_text or "")[:200],
-            )
-            return None
-        except Exception:
-            logger.debug("_safe_json_parse 内部忽略的异常", exc_info=True)
-            return None
 
     async def _post_or_get_json(
             session: aiohttp.ClientSession,
@@ -179,7 +292,7 @@ async def _request_modelscope_native_image(
                 _body_preview(body_text),
             )
         request_id = ''
-        parsed = _safe_json_parse(body_text)
+        parsed = _safe_json_parse_dict(body_text)
         if parsed and isinstance(parsed, dict):
             request_id = str(parsed.get('request_id') or parsed.get('requestId') or '').strip()
         if resp.status != 200:
@@ -209,21 +322,9 @@ async def _request_modelscope_native_image(
     async with aiohttp.ClientSession(timeout=timeout) as session:
         clean_prompt = pre_clean_prompt
         if image_urls:
-            image_data_urls: list[str] = []
-            for image_url in image_urls:
-                normalized = _normalize_image_url(image_url)
-                if not normalized:
-                    continue
-                if normalized.startswith('data:image/'):
-                    image_data_urls.append(normalized)
-                elif normalized.startswith(('http://', 'https://')):
-                    img_bytes = await _download_image_bytes_from_url(session, normalized)
-                    if img_bytes:
-                        image_data_urls.append(_bytes_to_data_url(img_bytes, normalized))
-                    else:
-                        logger.warning("[NativeImage/ModelScope] 下载参考图失败，跳过: %s", normalized[:80])
-                else:
-                    logger.warning("[NativeImage/ModelScope] 无法识别的 image_url 格式，跳过: %s", normalized[:80])
+            # 参考图预处理与通用 OpenAI 兼容端点共用同一实现
+            # （data URL 直通，http(s) 下载后转 data URL，失败跳过）
+            image_data_urls = await _image_urls_to_data_urls(session, image_urls)
             if not image_data_urls:
                 return None, endpoint, "未能读取参考图片", 400, ""
 
@@ -391,6 +492,145 @@ async def _request_modelscope_native_image(
             return last_poll_json, endpoint, '', 200, request_id
 
         return response_json, endpoint, '', 200, request_id
+
+
+async def _request_openai_compat_image(
+        model_info,
+        *,
+        prompt: str,
+        image_urls: list[str],
+        num_images: int = 1,
+        model: str = "",
+        aspect_ratio: str | None = None,
+) -> tuple[dict | None, str, str, int, str]:
+    """通用 OpenAI Images 兼容实现（XXTF 等中转站走这里）。
+
+    与 ModelScope 专用分支共用同一返回形状与参考图预处理；差别仅在于
+    本实现是"同步返回"的纯 REST 调用（无任务轮询）：
+
+    - 端点：``{有效 base_url}/images/generations``。base_url 沿用
+      provider/模型端点覆盖的合并结果（XXTF 默认 ``https://xxtf.baby/v1``，
+      即最终请求 ``https://xxtf.baby/v1/images/generations``）。
+    - 鉴权：``Bearer {api_key_env 解析出的 key}``；provider 级
+      default_headers（如 XXTF 的浏览器 UA）一并下发。
+    - payload：文生图 ``{model, prompt, n[, size]}``；图生图/编辑额外带
+      ``image`` 字段（单张为字符串、多张为数组，统一 data URL——与
+      OpenAI gpt-image 系列在各中转站普遍接受的 JSON 形状一致）。
+    - 响应：OpenAI 标准 ``{data: [{url} | {b64_json}]}``，图片提取复用
+      :func:`_extract_image_items`（gpt-image 系列固定回 b64_json，同样覆盖）。
+
+    返回: (response_json, endpoint, error_detail, status_code, request_id)
+    """
+    endpoint = "/images/generations"
+    ep = get_effective_endpoint(model_info)
+    base_url = (getattr(ep, "base_url", "") or "").rstrip("/")
+    api_key_env = getattr(ep, "api_key_env", "") or ""
+    api_key = _resolve_provider_api_key(api_key_env)
+    if not base_url:
+        return None, endpoint, f"提供商 {ep.name!r} 未配置 base_url", 400, ""
+    if not api_key:
+        return None, endpoint, f"缺少 API Key: {api_key_env}，请设置环境变量", 401, ""
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        **(getattr(ep, "default_headers", None) or {}),
+    }
+    timeout = aiohttp.ClientTimeout(total=300, connect=10, sock_read=180)
+
+    clean_prompt = _clean_prompt_for_image_model(prompt)
+    logger.debug(
+        "[NativeImage/OpenAICompat] request prepared: provider=%s endpoint=%s model=%s prompt_len=%s(cleaned, raw=%s) image_count=%s prompt_preview=%r",
+        ep.name,
+        endpoint,
+        model,
+        len(clean_prompt or ""),
+        len(prompt or ""),
+        len(image_urls or []),
+        (clean_prompt or "")[:240],
+    )
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": clean_prompt or "请生成一张图片。",
+        "n": max(1, min(num_images, 4)),
+    }
+    size = _aspect_ratio_to_openai_size(aspect_ratio)
+    if size:
+        payload["size"] = size
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            if image_urls:
+                # 参考图预处理与 ModelScope 分支共用（下载失败跳过，全失败由下方拦截）
+                image_data_urls = await _image_urls_to_data_urls(session, image_urls)
+                if not image_data_urls:
+                    return None, endpoint, "未能读取参考图片", 400, ""
+                payload["image"] = image_data_urls[0] if len(image_data_urls) == 1 else image_data_urls
+
+            async with session.post(f"{base_url}{endpoint}", headers=headers, json=payload) as resp:
+                body_text = await resp.text()
+                logger.debug(
+                    "[NativeImage/OpenAICompat] POST response: status=%s content_type=%s body_preview=%r",
+                    resp.status,
+                    resp.headers.get("Content-Type", ""),
+                    body_text[:800],
+                )
+                if resp.status != 200:
+                    detail, req_id = _extract_error_details(body_text)
+                    logger.warning(
+                        "[NativeImage/OpenAICompat] POST failed: status=%s detail=%s",
+                        resp.status, (detail or body_text)[:300],
+                    )
+                    return None, endpoint, detail or body_text[:500], resp.status, req_id or ''
+                parsed = _safe_json_parse_dict(body_text)
+                if parsed is None:
+                    return None, endpoint, body_text[:500], resp.status, ''
+                return parsed, endpoint, '', resp.status, ''
+    except asyncio.TimeoutError:
+        logger.warning("[NativeImage/OpenAICompat] request timeout after %ss", timeout.total)
+        return None, endpoint, "图像请求超时", 504, ""
+    except Exception as e:
+        logger.exception("[NativeImage/OpenAICompat] request exception")
+        return None, endpoint, str(e)[:500], 500, ""
+
+
+async def _request_images_generations(
+        model_info,
+        *,
+        prompt: str,
+        image_urls: list[str],
+        num_images: int = 1,
+        model: str = "",
+        aspect_ratio: str | None = None,
+) -> tuple[dict | None, str, str, int, str]:
+    """统一图像请求出口：所有 OpenAI Images 协议提供商共用这一个函数。
+
+    调用方（_agentic_loop_native_image / execute_generate_image）不再按
+    提供商各写一套请求逻辑，只拿到统一形状的返回值后做各自的呈现：
+
+    - modelscope -> _request_modelscope_native_image（异步任务轮询特化）
+    - 其它（xxtf 等中转站）-> _request_openai_compat_image（标准同步 REST）
+
+    返回: (response_json, endpoint, error_detail, status_code, request_id)
+    endpoint 为相对路径（"/images/generations"），调用方拼 /v1 前缀用于展示。
+    """
+    provider = (getattr(model_info, "provider", "") or "").strip().lower()
+    if provider == "modelscope":
+        return await _request_modelscope_native_image(
+            prompt=prompt,
+            image_urls=image_urls,
+            num_images=num_images,
+            model=model,
+        )
+    return await _request_openai_compat_image(
+        model_info,
+        prompt=prompt,
+        image_urls=image_urls,
+        num_images=num_images,
+        model=model,
+        aspect_ratio=aspect_ratio,
+    )
 
 
 def _extract_image_items(response_json: dict) -> list[dict]:

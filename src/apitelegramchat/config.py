@@ -1054,11 +1054,20 @@ SUPPORTED_MODELS["bytedance-seed/seedream-4.5"] = make_model_config(
     max_context=4000,
     max_output_tokens=1024,
 )
+# XXTF 中转的图像模型：走 OpenAI Images 标准端点
+# https://xxtf.baby/v1/images/generations（text-to-image 与 image-to-image
+# 同一端点，编辑时 payload 携带 image 字段），由 media_generation 的统一
+# 图像请求出口（_request_images_generations -> _request_openai_compat_image）
+# 发送：鉴权沿用 XXTF_API_KEY，请求头沿用 PROVIDERS["xxtf"] 的浏览器 UA。
 SUPPORTED_MODELS["gpt-image-2"] = make_model_config(
     model_id="gpt-image-2",
     provider="xxtf",
     name="GPT Image 2 (XXTF)",
     native_image=True,
+    # 支持参考图编辑（图生图）：vision=True 使其进入 edit_image_with_reference
+    # 的可选模型列表；文生图（generate_image_from_text）同样可用。
+    vision=True,
+    supports_tools=False,
     max_context=32768,
     max_output_tokens=4000,
 )

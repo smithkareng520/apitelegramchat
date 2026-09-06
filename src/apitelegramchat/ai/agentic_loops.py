@@ -54,10 +54,13 @@ from apitelegramchat.ai.media_generation import (
     _extract_native_message_text,
     _extract_native_refusal_text,
     _format_native_image_notice,
+    _get_images_api_display_name,
     _request_agnes_video,
-    _request_modelscope_native_image,
+    _request_images_generations,
     _request_openrouter_video,
     _response_items_to_bytes,
+    _upload_generated_images_to_r2,
+    IMAGES_API_PROVIDERS,
 )
 from apitelegramchat.ai.tool_summary import (
     _contains_textual_tool_call,
@@ -955,12 +958,19 @@ async def _agentic_loop_native_image(
         response = None
         used_endpoint = "/v1/chat/completions"
 
-        if provider == "modelscope":
-            response_json, endpoint, error_detail, status_code, request_id = await _request_modelscope_native_image(
-                # 修复 BUG：clean_prompt 已计算但未传入 _request_modelscope_native_image，
-                # 后者实际收到的是原始 prompt_text。结果是 _clean_prompt_for_image_model
-                # 想要剥离的 UI 元数据（chat history 标记、reasoning marker 等）会
-                # 原样泄漏到图像生成模型，可能被当作 prompt 的一部分影响生成结果。
+        if provider in IMAGES_API_PROVIDERS:
+            # ---- 统一 OpenAI Images 协议提供商（ModelScope / XXTF 等）----
+            # 请求统一走 _request_images_generations（端点/鉴权/payload/
+            # 参考图预处理/轮询差异全部收敛在 media_generation 内部），
+            # 这里只处理与提供商无关的"响应 -> 图片 -> R2 -> 富媒体消息"。
+            api_display_name = _get_images_api_display_name(model_info)
+            response_json, endpoint, error_detail, status_code, request_id = await _request_images_generations(
+                model_info,
+                # 修复 BUG：clean_prompt 已计算但旧实现未把清理后的 prompt
+                # 传入请求函数，结果是 _clean_prompt_for_image_model 想要
+                # 剥离的 UI 元数据（chat history 标记、reasoning marker 等）
+                # 会原样泄漏到图像生成模型，可能被当作 prompt 的一部分影响
+                # 生成结果。这里统一传 clean_prompt。
                 prompt=clean_prompt,
                 image_urls=image_urls,
                 num_images=1,
@@ -973,7 +983,7 @@ async def _agentic_loop_native_image(
                     error_notice = _format_image_safety_notice(detail=error_detail, model=current_model)
                 else:
                     error_notice = _format_api_error_notice(
-                        api_name="ModelScope 图像接口",
+                        api_name=f"{api_display_name} 图像接口",
                         error_code=status_code,
                         endpoint=used_endpoint,
                         model=current_model,
@@ -993,11 +1003,12 @@ async def _agentic_loop_native_image(
                     logger.debug("_agentic_loop_native_image 内部忽略的异常", exc_info=True)
                     json_preview = str(response_json)
                 logger.debug(
-                    "[NativeImage/ModelScope] no image bytes extracted, raw response preview=%r",
+                    "[NativeImage/%s] no image bytes extracted, raw response preview=%r",
+                    api_display_name,
                     json_preview[:5000],
                 )
                 error_notice = _format_api_error_notice(
-                    api_name="ModelScope 图像接口",
+                    api_name=f"{api_display_name} 图像接口",
                     error_code=200,
                     endpoint=used_endpoint,
                     model=current_model,
@@ -1005,12 +1016,7 @@ async def _agentic_loop_native_image(
                 )
                 return f"IMAGE_ERROR:{error_notice}", None, []
 
-            uploaded_urls = []
-            for idx, img_bytes in enumerate(image_bytes_list):
-                key = f"generated/{uuid.uuid4().hex}_{idx}.png"
-                url = await upload_bytes_to_r2(img_bytes, key, "image/png")
-                if url:
-                    uploaded_urls.append(url)
+            uploaded_urls = await _upload_generated_images_to_r2(image_bytes_list)
 
             if uploaded_urls:
                 img_tags = "".join(f'<img src="{u}"/>' for u in uploaded_urls)
@@ -1025,7 +1031,7 @@ async def _agentic_loop_native_image(
                 final_notice = caption_text
             else:
                 error_notice = _format_api_error_notice(
-                    api_name="ModelScope 图像接口",
+                    api_name=f"{api_display_name} 图像接口",
                     error_code=200,
                     endpoint=used_endpoint,
                     model=current_model,
@@ -1039,51 +1045,6 @@ async def _agentic_loop_native_image(
             if journal is not None:
                 journal.extend(new_entries)
             return final_content, usage, new_entries
-
-        # ---- XXTF 图像生成（OpenAI 兼容 /v1/images/generations） ----
-        if provider == "xxtf":
-            try:
-                from openai import AsyncOpenAI
-                xxtf_client = AsyncOpenAI(
-                    base_url="https://xxtf.baby/v1",
-                    api_key=os.getenv("XXTF_API_KEY", ""),
-                )
-                image_response = await xxtf_client.images.generate(
-                    model=current_model,
-                    prompt=clean_prompt,
-                    n=1,
-                    size="1024x1024",
-                )
-                if image_response.data and len(image_response.data) > 0:
-                    img_url = image_response.data[0].url
-                    if img_url:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(img_url, timeout=60) as resp:
-                                if resp.status == 200:
-                                    img_bytes = await resp.read()
-                                    key = f"generated/{uuid.uuid4().hex}.png"
-                                    upload_url = await upload_bytes_to_r2(img_bytes, key, "image/png")
-                                    if upload_url:
-                                        rich_html = f'<figure><img src="{upload_url}"/></figure>'
-                                        await send_rich_html_message(chat_id, rich_html)
-                                        final_notice = f"图片已生成 ({current_model})"
-                                        history_content = f"[图片已生成] 指令: {clean_prompt or prompt_text or '(无)'}"
-                                        new_entries = [{"role": "assistant", "content": history_content}]
-                                        if journal is not None:
-                                            journal.extend(new_entries)
-                                        return f"IMAGE_SENT:{final_notice}", None, new_entries
-            except Exception as e:
-                logger.exception(f"[NativeImage/XXTF] 请求失败: {e}")
-                error_notice = await get_error_notification_message(
-                    chat_id,
-                    error_code=getattr(e, "status_code", getattr(e, "status", 500)),
-                    error_message=str(e),
-                    api_name="XXTF 图像接口",
-                    exception=e,
-                    endpoint="/v1/images/generations",
-                    model=current_model,
-                )
-                return f"IMAGE_ERROR:{error_notice}", None, []
 
         # ---- 非 ModelScope 的其他提供商（OpenRouter 等） ----
         try:
@@ -1175,12 +1136,8 @@ async def _agentic_loop_native_image(
             except Exception as e:
                 logger.error(f"Download image {img_url} error: {e}")
 
-    uploaded_urls = []
-    for idx, img_bytes in enumerate(image_bytes_list):
-        key = f"generated/{uuid.uuid4().hex}_{idx}.png"
-        url = await upload_bytes_to_r2(img_bytes, key, "image/png")
-        if url:
-            uploaded_urls.append(url)
+    # 与 Images 协议路径共用同一 R2 上传实现（generated/<uuid>_<idx>.png）
+    uploaded_urls = await _upload_generated_images_to_r2(image_bytes_list)
 
     if uploaded_urls:
         img_tags = "".join(f'<img src="{u}"/>' for u in uploaded_urls)

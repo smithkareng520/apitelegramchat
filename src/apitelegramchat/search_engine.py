@@ -727,19 +727,19 @@ def _get_title_from_html(html_content: str) -> str:
 def _get_image_models_by_capability():
     """
     返回两个列表：
-    - text_only_models: 仅支持文生图（native_image=True, vision=False）
+    - text_models: 支持文生图的全部模型（native_image=True；vision=True 的
+      模型同样能纯文生图，一并列入，如 gpt-image-2 / gemini 图像模型）
     - edit_models: 支持图生图/编辑（native_image=True, vision=True）
     """
-    text_only = []
+    text_models = []
     edit_models = []
     for model_id, cfg in SUPPORTED_MODELS.items():
         if not cfg.native_image:
             continue
+        text_models.append(model_id)
         if cfg.vision:
             edit_models.append(model_id)
-        else:
-            text_only.append(model_id)
-    return text_only, edit_models
+    return text_models, edit_models
 
 # ----- 工具 1：纯文生图 -----
 TEXT_ONLY_MODELS, EDIT_MODELS = _get_image_models_by_capability()
@@ -3293,130 +3293,10 @@ async def execute_qr_code(text: str) -> str:
 
 
 # --------------------- image API helpers ---------------------
-def _looks_like_image_payload(value: str) -> bool:
-    """检查字符串是否可能是图片 URL 或 base64 data URL"""
-    if not value:
-        return False
-    value = value.strip()
-    return value.startswith(('http://', 'https://', 'data:image/'))
-
-async def _download_image_bytes(session: aiohttp.ClientSession, image_url: str) -> bytes | None:
-    if not image_url:
-        return None
-    if image_url.startswith("data:image"):
-        try:
-            _, b64 = image_url.split(",", 1)
-            return base64.b64decode(b64)
-        except Exception:
-            logger.debug("_download_image_bytes 内部忽略的异常", exc_info=True)
-            return None
-    try:
-        async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=30), headers={"User-Agent": "Mozilla/5.0"}) as resp:
-            if resp.status == 200:
-                return await resp.read()
-    except Exception:
-        logger.debug("_download_image_bytes 内部忽略的异常", exc_info=True)
-        return None
-    return None
-
-
-def _extract_image_items(response_json: dict) -> list[dict]:
-    if not isinstance(response_json, dict):
-        return []
-
-    items = []
-    seen = set()
-
-    def add_url(url):
-        if url and url not in seen:
-            seen.add(url)
-            items.append({"image_url": {"url": url}})
-
-    def add_b64(b64):
-        if b64 and b64 not in seen:
-            seen.add(b64)
-            items.append({"b64_json": b64})
-
-    # 顶层直接字段
-    for key in ('data', 'choices', 'output', 'results', 'images', 'output_images', 'outputs'):
-        val = response_json.get(key)
-        if not val:
-            continue
-        if isinstance(val, list):
-            for elem in val:
-                if isinstance(elem, str):
-                    add_url(elem)
-                elif isinstance(elem, dict):
-                    url = elem.get('url') or elem.get('image_url')
-                    if url:
-                        add_url(url)
-                    b64 = elem.get('b64_json') or elem.get('base64')
-                    if b64:
-                        add_b64(b64)
-                    if isinstance(elem.get('image_url'), dict):
-                        add_url(elem['image_url'].get('url'))
-        elif isinstance(val, dict):
-            url = val.get('url') or val.get('image_url')
-            if url:
-                add_url(url)
-            b64 = val.get('b64_json') or val.get('base64')
-            if b64:
-                add_b64(b64)
-            if isinstance(val.get('image_url'), dict):
-                add_url(val['image_url'].get('url'))
-        elif isinstance(val, str):
-            add_url(val)
-
-    # choices[0].message.images/content（OpenAI 格式）
-    choices = response_json.get('choices')
-    if isinstance(choices, list) and choices:
-        msg = choices[0].get('message')
-        if isinstance(msg, dict):
-            images = msg.get('images')
-            if isinstance(images, list):
-                for img in images:
-                    if isinstance(img, dict):
-                        add_url(img.get('image_url', {}).get('url'))
-                        add_b64(img.get('b64_json'))
-                    elif isinstance(img, str):
-                        add_url(img)
-            content = msg.get('content')
-            if isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get('type') == 'image_url':
-                        add_url(part.get('image_url', {}).get('url'))
-
-    # 顶层 b64_json / url
-    add_b64(response_json.get('b64_json'))
-    add_url(response_json.get('url'))
-    if isinstance(response_json.get('image_url'), dict):
-        add_url(response_json['image_url'].get('url'))
-    elif isinstance(response_json.get('image_url'), str):
-        add_url(response_json['image_url'])
-
-    return items
-
-async def _images_response_to_bytes(data: dict) -> list[bytes]:
-    image_bytes_list: list[bytes] = []
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
-        for item in _extract_image_items(data):   # ← 修正函数名
-            img_url = ""
-            if isinstance(item.get("image_url"), dict):
-                img_url = str(item["image_url"].get("url") or "").strip()
-            img_url = img_url or str(item.get("url") or "").strip()
-            b64_json = str(item.get("b64_json") or "").strip()
-            if b64_json:
-                try:
-                    image_bytes_list.append(base64.b64decode(b64_json))
-                    continue
-                except Exception:
-                    logger.debug("_images_response_to_bytes 内部忽略的异常", exc_info=True)
-                    pass
-            if img_url:
-                img_bytes = await _download_image_bytes(session, img_url)
-                if img_bytes:
-                    image_bytes_list.append(img_bytes)
-    return image_bytes_list
+# 图片响应解析 / 下载 / 转字节（_extract_image_items、_response_items_to_bytes）
+# 与生成图上传 R2（_upload_generated_images_to_r2）已统一收敛到
+# apitelegramchat.ai.media_generation，供 agentic 原生图像循环与本文件的
+# execute_generate_image 共用，此处不再保留各写一套的副本。
 
 
 def _format_image_api_error(api_name: str, status_code: int, detail: str = "", request_id: str = "", endpoint: str = "", model: str = "") -> str:
@@ -3445,7 +3325,21 @@ async def execute_generate_image(
     num_images: int = 1,
     image_url: Optional[str] = None,
 ) -> str:
-    from apitelegramchat.ai_handlers import _request_modelscope_native_image
+    # 统一图像生成入口：OpenAI Images 协议提供商（ModelScope / XXTF 等，
+    # 见 media_generation.IMAGES_API_PROVIDERS）共用 _request_images_generations
+    # 一个请求出口（端点 /v1/images/generations、鉴权、payload、参考图下载、
+    # 任务轮询差异全部在 media_generation 内部处理）；本函数只负责调用 +
+    # "响应 -> 图片字节 -> R2 -> 链接文本" 的通用后处理。
+    # 其它提供商（openrouter 的 gemini 图像模型等）保留 chat/completions +
+    # modalities 的原有逻辑。
+    # 局部导入避免与 ai_handlers 的模块级循环依赖。
+    from apitelegramchat.ai_handlers import (
+        _get_images_api_display_name,
+        _request_images_generations,
+        _response_items_to_bytes,
+        _upload_generated_images_to_r2,
+        IMAGES_API_PROVIDERS,
+    )
     MODEL_ALIAS_MAP = {
         "flux-schnell": "black-forest-labs/flux-schnell",
         "flux-1.1-pro": "black-forest-labs/flux-1.1-pro",
@@ -3459,59 +3353,61 @@ async def execute_generate_image(
     provider = model_info.provider if model_info else "openrouter"
     num_images = min(max(num_images, 1), 4)
 
-    # ModelScope：走专门的 /v1/images/generations，避免误打到 chat/completions
-    if provider == "modelscope":
-        response_json, endpoint, error_detail, status_code, request_id = await _request_modelscope_native_image(
+    def _format_success_links(uploaded_urls: list[str], total_count: int) -> str:
+        """生成图上传 R2 后的统一成功文案（部分上传失败时如实说明）。"""
+        links = "\n".join(uploaded_urls)
+        if len(uploaded_urls) == total_count:
+            return f"✅ 已生成 {total_count} 张图片。\n图片链接：\n{links}"
+        return f"✅ 已生成 {total_count} 张图片（部分图片上传失败）。\n图片链接：\n{links}"
+
+    # OpenAI Images 协议提供商：统一走 /v1/images/generations（不再按提供商各写一套）
+    if model_info is not None and provider in IMAGES_API_PROVIDERS:
+        api_display_name = _get_images_api_display_name(model_info)
+        response_json, endpoint, error_detail, status_code, request_id = await _request_images_generations(
+            model_info,
             prompt=prompt,
             image_urls=[image_url] if image_url else [],
             num_images=num_images,
             model=model,
+            aspect_ratio=aspect_ratio,
         )
+        used_endpoint = f"/v1{endpoint}"
         if response_json is None:
             return _format_image_api_error(
-                api_name="ModelScope 图像接口",
+                api_name=f"{api_display_name} 图像接口",
                 status_code=status_code,
                 detail=error_detail,
                 request_id=request_id,
-                endpoint=endpoint,
+                endpoint=used_endpoint,
                 model=model,
             )
         try:
-            image_bytes_list = await _images_response_to_bytes(response_json)
+            image_bytes_list = await _response_items_to_bytes(response_json)
             if not image_bytes_list:
                 return _format_image_api_error(
-                    api_name="ModelScope 图像接口",
+                    api_name=f"{api_display_name} 图像接口",
                     status_code=200,
                     detail="接口返回成功，但未找到可下载的图片数据。",
-                    endpoint="/v1/images/generations",
+                    endpoint=used_endpoint,
                     model=model,
                 )
-            uploaded_urls = []
-            for idx, img_bytes in enumerate(image_bytes_list):
-                key = f"generated/{uuid.uuid4().hex}_{idx}.png"
-                img_url = await upload_bytes_to_r2(img_bytes, key, "image/png")
-                if img_url:
-                    uploaded_urls.append(img_url)
+            uploaded_urls = await _upload_generated_images_to_r2(image_bytes_list)
             if not uploaded_urls:
                 return _format_image_api_error(
-                    api_name="ModelScope 图像接口",
+                    api_name=f"{api_display_name} 图像接口",
                     status_code=200,
                     detail="图片已生成，但上传 R2 全部失败。",
-                    endpoint="/v1/images/generations",
+                    endpoint=used_endpoint,
                     model=model,
                 )
-            links = "\n".join(uploaded_urls)
-            count = len(uploaded_urls)
-            if count == len(image_bytes_list):
-                return f"✅ 已生成 {count} 张图片。\n图片链接：\n{links}"
-            return f"✅ 已生成 {count} 张图片（部分图片上传失败）。\n图片链接：\n{links}"
+            return _format_success_links(uploaded_urls, len(image_bytes_list))
         except Exception as e:
-            logger.exception(f"ModelScope generate_image 异常: {e}")
+            logger.exception(f"{api_display_name} generate_image 异常: {e}")
             return _format_image_api_error(
-                api_name="ModelScope 图像接口",
+                api_name=f"{api_display_name} 图像接口",
                 status_code=getattr(e, "status", getattr(e, "status_code", 500)),
                 detail=str(e),
-                endpoint="/v1/images/generations",
+                endpoint=used_endpoint,
                 model=model,
             )
 
@@ -3613,24 +3509,13 @@ async def execute_generate_image(
                 if not image_bytes_list:
                     return f"⚠️ 图片生成成功，但下载全部失败。失败项: {', '.join(download_errors)}"
 
-                uploaded_urls = []
-                for idx, img_bytes in enumerate(image_bytes_list):
-                    key = f"generated/{uuid.uuid4().hex}_{idx}.png"
-                    url = await upload_bytes_to_r2(img_bytes, key, "image/png")
-                    if url:
-                        uploaded_urls.append(url)
-                    else:
-                        logger.warning("一张图片上传 R2 失败")
+                # 与 Images 协议分支共用同一 R2 上传实现
+                uploaded_urls = await _upload_generated_images_to_r2(image_bytes_list)
 
                 if not uploaded_urls:
                     return "❌ 图片生成成功，但 R2 上传全部失败，请稍后重试。"
 
-                links = "\n".join(uploaded_urls)
-                count = len(uploaded_urls)
-                if count == len(image_bytes_list):
-                    return f"✅ 已生成 {count} 张图片。\n图片链接：\n{links}"
-                else:
-                    return f"✅ 已生成 {count} 张图片（部分图片上传失败）。\n图片链接：\n{links}"
+                return _format_success_links(uploaded_urls, len(image_bytes_list))
 
     except Exception as e:
         logger.error(f"execute_generate_image 异常: {e}", exc_info=True)

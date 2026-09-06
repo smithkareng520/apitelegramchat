@@ -1160,6 +1160,15 @@ from apitelegramchat.ai.media_generation import (  # noqa: F401
     _request_modelscope_native_image,
     _request_agnes_video,
     _request_openrouter_video,
+    # 统一图像请求出口（/v1/images/generations）及其公共辅助函数：
+    # search_engine.execute_generate_image 等模块通过本模块延迟导入使用。
+    _request_images_generations,
+    _request_openai_compat_image,
+    _response_items_to_bytes,
+    _extract_image_items,
+    _upload_generated_images_to_r2,
+    _get_images_api_display_name,
+    IMAGES_API_PROVIDERS,
 )
 from apitelegramchat.ai.attachment_content import (  # noqa: F401
     _get_cached_audio_data,
