@@ -286,10 +286,10 @@ async def _clear_pending(interaction: AskUserInteraction) -> None:
         await _clear_pending_unlocked(interaction)
 
 
-async def _set_markup(message_id: int, chat_id: int, markup: dict | None) -> None:
+async def _set_markup(message_id: int | None, chat_id: int, markup: dict | None) -> None:
     if not message_id:
         return
-    payload = {"chat_id": chat_id, "message_id": message_id}
+    payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id}
     if markup is not None:
         payload["reply_markup"] = markup
     else:
@@ -465,6 +465,8 @@ async def resolve_text(chat_id: int, text: str) -> bool:
 
 
 async def wait_for_answer(interaction: AskUserInteraction) -> dict[str, Any]:
+    # 唯一构造点 create_ask_user_interaction 必然已创建 future。
+    assert interaction.future is not None
     try:
         return await asyncio.wait_for(interaction.future, timeout=INTERACTION_TIMEOUT)
     except asyncio.TimeoutError:

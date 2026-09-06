@@ -49,6 +49,7 @@ import hashlib
 import json
 import os
 import time
+from collections.abc import Coroutine
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -202,7 +203,7 @@ def _canonical(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _parse_expire_to_monotonic(expire_time: str) -> Optional[float]:
+def _parse_expire_to_monotonic(expire_time: Optional[str]) -> Optional[float]:
     """RFC3339 expireTime -> monotonic 时间戳；解析失败返回 None。"""
     if not expire_time or not isinstance(expire_time, str):
         return None
@@ -226,7 +227,7 @@ class GeminiCacheHandle:
                  "chat_id", "model")
 
     def __init__(self, name: str, key: str, prefix_len: int,
-                 suffix_messages: list, chat_id, model: str):
+                 suffix_messages: list, chat_id: int, model: str) -> None:
         self.name = name
         self.key = key
         self.prefix_len = prefix_len
@@ -239,8 +240,9 @@ class _Entry:
     __slots__ = ("key", "name", "chat_id", "model", "tools_hash", "prefix",
                  "expire_at", "created_at", "last_used", "base_url", "headers")
 
-    def __init__(self, key, name, chat_id, model, tools_hash, prefix,
-                 expire_at, base_url, headers):
+    def __init__(self, key: str, name: str, chat_id: int, model: str,
+                 tools_hash: str, prefix: list, expire_at: float,
+                 base_url: str, headers: dict) -> None:
         self.key = key
         self.name = name
         self.chat_id = chat_id
@@ -260,7 +262,7 @@ class GeminiExplicitCacheManager:
     所有后台任务的异常都被吞掉（仅日志），绝不影响主流程。
     """
 
-    def __init__(self, enabled: bool = None):
+    def __init__(self, enabled: Optional[bool] = None) -> None:
         self._enabled = _ENABLED if enabled is None else enabled
         self._entries: dict = {}                       # key -> _Entry
         self._inflight: dict = {}                      # chat_id -> {key: Task}
@@ -272,7 +274,7 @@ class GeminiExplicitCacheManager:
     # ------------------------------------------------------------------
     # 对外主入口
     # ------------------------------------------------------------------
-    async def acquire(self, chat_id, model: str, messages: list,
+    async def acquire(self, chat_id: int, model: str, messages: list,
                       gemini_tools: Optional[list],
                       convert_fn: Callable, base_url: str, headers: dict,
                       ) -> Optional[GeminiCacheHandle]:
@@ -296,8 +298,10 @@ class GeminiExplicitCacheManager:
                          exc_info=True)
             return None
 
-    async def _acquire_inner(self, chat_id, model, messages, gemini_tools,
-                             convert_fn, base_url, headers):
+    async def _acquire_inner(self, chat_id: int, model: str, messages: list,
+                             gemini_tools: Optional[list], convert_fn: Callable,
+                             base_url: str, headers: dict,
+                             ) -> Optional[GeminiCacheHandle]:
         tools_hash = _canonical(gemini_tools) if gemini_tools else "none"
         handle = self._find_handle(chat_id, model, tools_hash, messages)
 
@@ -350,7 +354,8 @@ class GeminiExplicitCacheManager:
         return hashlib.sha1(
             _canonical([model, tools_hash, prefix]).encode("utf-8")).hexdigest()
 
-    def _find_handle(self, chat_id, model, tools_hash, messages):
+    def _find_handle(self, chat_id: int, model: str, tools_hash: str,
+                     messages: list) -> Optional[GeminiCacheHandle]:
         now = time.monotonic()
         best: Optional[_Entry] = None
         for entry in list(self._entries.values()):
@@ -371,19 +376,20 @@ class GeminiExplicitCacheManager:
             suffix_messages=messages[len(best.prefix):],
             chat_id=chat_id, model=model)
 
-    def _creation_allowed(self, chat_id) -> bool:
+    def _creation_allowed(self, chat_id: int) -> bool:
         return time.monotonic() >= self._chat_fail_until.get(chat_id or 0, 0.0)
 
-    def _start_creation(self, chat_id, model, tools_hash, prefix, key,
-                        est_tokens, convert_fn, base_url, headers,
-                        gemini_tools) -> None:
+    def _start_creation(self, chat_id: int, model: str, tools_hash: str,
+                        prefix: list, key: str, est_tokens: int,
+                        convert_fn: Callable, base_url: str, headers: dict,
+                        gemini_tools: Optional[list]) -> None:
         task = asyncio.ensure_future(self._create_entry(
             chat_id, model, tools_hash, prefix, key, est_tokens,
             convert_fn, base_url, headers, gemini_tools))
         self._inflight.setdefault(chat_id or 0, {})[key] = task
         self._background.add(task)
 
-        def _done(t, chat_id=chat_id, key=key):
+        def _done(t: asyncio.Task, chat_id: int = chat_id, key: str = key) -> None:
             self._background.discard(t)
             bucket = self._inflight.get(chat_id)
             if bucket is not None:
@@ -391,9 +397,10 @@ class GeminiExplicitCacheManager:
 
         task.add_done_callback(_done)
 
-    async def _create_entry(self, chat_id, model, tools_hash, prefix, key,
-                            est_tokens, convert_fn, base_url, headers,
-                            gemini_tools) -> None:
+    async def _create_entry(self, chat_id: int, model: str, tools_hash: str,
+                            prefix: list, key: str, est_tokens: int,
+                            convert_fn: Callable, base_url: str, headers: dict,
+                            gemini_tools: Optional[list]) -> None:
         display_name = f"atc-{chat_id or 0}-{key[:10]}"
         try:
             has_non_system = any(
@@ -447,7 +454,7 @@ class GeminiExplicitCacheManager:
             self._register_failure(chat_id, 0, "exception")
             logger.debug("gemini 显式缓存创建异常", exc_info=True)
 
-    def _register_failure(self, chat_id, status: int, err: str) -> None:
+    def _register_failure(self, chat_id: int, status: int, err: str) -> None:
         streak = self._chat_fail_streak.get(chat_id or 0, 0) + 1
         self._chat_fail_streak[chat_id or 0] = streak
         backoff = min(3600.0, 300.0 * (2 ** (streak - 1)))
@@ -467,7 +474,7 @@ class GeminiExplicitCacheManager:
             victim = self._entries.pop(oldest_key)
             self._spawn(self._delete_entry(victim))
 
-    def _evict_for(self, chat_id, keep_key: str) -> None:
+    def _evict_for(self, chat_id: int, keep_key: str) -> None:
         """同一 chat 只保留最新前缀的条目（旧前缀必然不再命中）。"""
         for k, e in list(self._entries.items()):
             if e.chat_id == chat_id and k != keep_key:
@@ -505,7 +512,7 @@ class GeminiExplicitCacheManager:
         except Exception:
             logger.debug("gemini 显式缓存删除失败（TTL 兜底）", exc_info=True)
 
-    def _spawn(self, coro) -> None:
+    def _spawn(self, coro: Coroutine[Any, Any, Any]) -> None:
         task = asyncio.ensure_future(coro)
         self._background.add(task)
         task.add_done_callback(lambda t: self._background.discard(t))

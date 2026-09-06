@@ -18,7 +18,7 @@ DEFAULT_ENCODING_NAME = os.getenv("TOKEN_BUDGET_ENCODING", "o200k_base")
 
 
 @lru_cache(maxsize=4)
-def _get_encoding(name: str):
+def _get_encoding(name: str) -> tiktoken.Encoding:
     """Return a configured tokenizer, falling back to a broadly supported one."""
     try:
         return tiktoken.get_encoding(name)

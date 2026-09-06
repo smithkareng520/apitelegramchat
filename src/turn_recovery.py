@@ -197,7 +197,7 @@ def _current_task() -> Optional[asyncio.Task]:
         return None
 
 
-def _pop_registry_entries(chat_id: int, *, expect_task=None, only_done: bool = False) -> list:
+def _pop_registry_entries(chat_id: int, *, expect_task: Optional[asyncio.Task] = None, only_done: bool = False) -> list[_InFlightEntry]:
     """同步弹出符合条件的登记条目（无 await，天然原子，取消安全）。
 
     - expect_task 给定：只弹该任务对应的条目；

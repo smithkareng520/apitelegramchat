@@ -6,7 +6,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 # -----------------------------------------------------------------------------
 # 日志
@@ -268,7 +268,7 @@ class ModelConfig:
     def api_type(self) -> str:
         return self.provider
 
-    def get(self, key, default=None):
+    def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
 
 
@@ -544,7 +544,7 @@ class EffectiveEndpoint:
     is_override: bool = False
 
 
-def get_effective_endpoint(model_info) -> EffectiveEndpoint:
+def get_effective_endpoint(model_info: Optional[ModelConfig]) -> EffectiveEndpoint:
     """
     返回某个 ModelConfig 实际应使用的端点配置：
     以 PROVIDERS[model_info.provider] 为默认值，逐字段用模型上非 None 的
@@ -556,12 +556,13 @@ def get_effective_endpoint(model_info) -> EffectiveEndpoint:
     连哪、用哪个 key、走什么协议循环"的地方，都应改为调用本函数，而不是
     直接 PROVIDERS.get(model_info.provider)。
     """
-    provider_key = getattr(model_info, "provider", None)
+    # getattr 任意属性：运行时是 ModelConfig.provider（str），静态上按 Any 处理。
+    provider_key: Any = getattr(model_info, "provider", None)
     base = PROVIDERS.get(provider_key)
     if base is None:
         raise ValueError(f"未知厂商: {provider_key!r}，请检查 config.py 中的 PROVIDERS")
 
-    def _pick(attr_name: str):
+    def _pick(attr_name: str) -> Any:
         override = getattr(model_info, attr_name, None)
         return override if override is not None else getattr(base, attr_name)
 
@@ -635,7 +636,7 @@ def make_model_config(
     model_id: str,
     provider: str,
     name: str,
-    **kwargs
+    **kwargs: Any
 ) -> ModelConfig:
     """
     工厂函数：根据 provider 和覆盖项创建 ModelConfig。
@@ -753,7 +754,7 @@ def make_model_config(
 # 统一参数出口：所有 agentic 循环（主循环 / subagent / 回退 / 总结请求）
 # 一律通过这两个函数获取采样与推理参数，禁止在循环内硬编码。
 # =============================================================================
-def get_sampling_params(model_info) -> dict:
+def get_sampling_params(model_info: Optional[ModelConfig]) -> Dict[str, float]:
     """
     返回应并入 chat.completions.create 的采样参数（temperature / top_p）。
 
@@ -774,10 +775,12 @@ def get_sampling_params(model_info) -> dict:
     return params
 
 
-_REASONING_NOOP = ({}, {})
+_REASONING_NOOP: tuple[Dict[str, object], Dict[str, object]] = ({}, {})
 
 
-def get_reasoning_request_fields(model_info, api_label: str = "") -> tuple:
+def get_reasoning_request_fields(
+    model_info: Optional[ModelConfig], api_label: str = ""
+) -> tuple[Dict[str, object], Dict[str, object]]:
     """
     根据模型配置与厂商，返回推理控制（思考开关/努力档位/推理预算）参数。
 
@@ -1196,8 +1199,70 @@ del _raw_whitelist_r2_key
 WHITELIST_CONTENT_TYPE = "text/plain; charset=utf-8"
 
 ADMIN_USERS = ["dearella"]
-WHITELIST_USERS = set()
-_whitelist_lock = asyncio.Lock()
+
+
+class WhitelistStore:
+    """用户白名单的内存权威状态：唯一可变 set + 一把 asyncio.Lock。
+
+    并发模型说明（为什么不用 contextvars / 为什么不做全量依赖注入）：
+    - 白名单是「进程级、跨任务共享」的权限状态，生命周期与事件循环相同。
+      contextvars 的语义是「每任务/每请求隔离」（state.py 的用户命名空间
+      用它才是对的）；若把白名单放进 ContextVar，后台任务/TIMER 回合会
+      看到各自的副本，权限判断直接失真——语义正好相反，故不采用。
+    - 全量依赖注入要求把 store 穿透 app/tool_executors/verify_security
+      等几十条调用链，改动面大、收益低。这里采用「类封装 + 模块级单例」
+      的折中：可变状态收拢到唯一实例，所有变更必须在 store.lock 内通过
+      本类方法完成；后续若要切换为显式注入，只需替换 whitelist_store 的
+      构造来源，调用方代码不变。
+
+    线程/协程安全性：所有读写都发生在 asyncio 单线程事件循环内；set 的
+    单个原生操作（in/add/discard）在 CPython 下是原子的，因此只读查询
+    （contains/users/snapshot）不持锁也不会读到"撕裂"状态；凡涉及
+    「检查 + 变更」的复合操作必须持 store.lock（本模块的 add/remove/
+    load/save 均已保证）。
+    """
+
+    def __init__(self) -> None:
+        self._users: set[str] = set()
+        self.lock: asyncio.Lock = asyncio.Lock()
+
+    @property
+    def users(self) -> set[str]:
+        """内部 set 的直接引用（与历史 `WHITELIST_USERS` 导入方共享同一对象）。
+
+        只读用途（membership / 迭代 / 真值判断）安全；禁止在 store.lock
+        之外调用 add/clear/update 等变更方法——复合变更请走本类方法。
+        """
+        return self._users
+
+    def contains(self, entry: str) -> bool:
+        """单条目成员判断（原生原子操作，无需持锁）。"""
+        return entry in self._users
+
+    def snapshot(self) -> list[str]:
+        """排序后的白名单快照（返回新列表，外部改动不影响内部状态）。"""
+        return sorted(self._users)
+
+    def add_one(self, entry: str) -> None:
+        """单条目新增；调用方必须已持有 store.lock。"""
+        self._users.add(entry)
+
+    def discard_one(self, entry: str) -> None:
+        """单条目移除；调用方必须已持有 store.lock。"""
+        self._users.discard(entry)
+
+    def replace_all(self, entries: set[str]) -> None:
+        """原地整体替换（clear + update），保持 set 对象引用恒定；
+        调用方必须已持有 store.lock。"""
+        self._users.clear()
+        self._users.update(entries)
+
+
+whitelist_store = WhitelistStore()
+# 历史兼容别名：指向 whitelist_store 内部的同一个 set 对象（引用恒定，
+# 见 tests/test_whitelist_r2.py E6「内存 set 引用恒定（原地更新）」回归）。
+# 新代码请优先使用 whitelist_store 的方法，而非直接操作该 set。
+WHITELIST_USERS: set[str] = whitelist_store.users
 
 
 def _normalize_target(target: str) -> str:
@@ -1262,11 +1327,11 @@ def is_whitelisted_identity(username: str = "", user_id: str = "") -> bool:
     （app.is_authorized 先查管理员再查白名单）。
     """
     uid = str(user_id or "").strip()
-    if uid and uid in WHITELIST_USERS:
+    if uid and whitelist_store.contains(uid):
         return True
     if username:
         u = _normalize_target(username)
-        if u and u in WHITELIST_USERS:
+        if u and whitelist_store.contains(u):
             return True
     return False
 
@@ -1313,11 +1378,11 @@ def _resolve_whitelist_path() -> str:
 
 def _serialize_whitelist_bytes() -> bytes:
     """把当前内存白名单序列化为文件字节（排序后每行一个，UTF-8）。"""
-    return ("".join(user + "\n" for user in sorted(WHITELIST_USERS))).encode("utf-8")
+    return ("".join(user + "\n" for user in whitelist_store.snapshot())).encode("utf-8")
 
 
 def _save_whitelist_unlocked() -> None:
-    """在已持有 _whitelist_lock 的前提下把 WHITELIST_USERS 写入本地缓存文件。
+    """在已持有 whitelist_store.lock 的前提下把白名单写入本地缓存文件。
 
     先写临时文件再原子 replace：进程在写入中途崩溃也不会留下残缺的
     白名单文件（残缺文件会在下次启动回退时变成"部分用户丢失"）。
@@ -1329,7 +1394,7 @@ def _save_whitelist_unlocked() -> None:
         parent.mkdir(parents=True, exist_ok=True)
         tmp_path = f"{path}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
-            f.writelines(user + "\n" for user in sorted(WHITELIST_USERS))
+            f.writelines(user + "\n" for user in whitelist_store.snapshot())
         os.replace(tmp_path, path)
     except OSError:
         logger.warning("save_whitelist failed: %s", path, exc_info=True)
@@ -1362,14 +1427,14 @@ async def _push_whitelist_to_r2_unlocked() -> bool:
         return False
 
 
-async def load_whitelist():
+async def load_whitelist() -> None:
     """启动/部署时加载白名单：R2 优先（权威），本地文件回退（缓存）。
 
-    全程持有 _whitelist_lock，与增删操作互斥；内存 set 原地更新（clear
-    + update），保证 "from config import WHITELIST_USERS" 拿到的引用
-    始终指向同一个 set 对象、永远能看到最新内容。
+    全程持有 whitelist_store.lock，与增删操作互斥；内存 set 原地整体替换
+    （replace_all 内部为 clear + update），保证 "from config import
+    WHITELIST_USERS" 拿到的引用始终指向同一个 set 对象、永远能看到最新内容。
     """
-    async with _whitelist_lock:
+    async with whitelist_store.lock:
         r2_configured = await _r2_configured_async()
         remote_data: bytes | None = None
         if r2_configured:
@@ -1382,8 +1447,7 @@ async def load_whitelist():
         if remote_data is not None:
             loaded = _parse_whitelist_bytes(remote_data)
             logger.info("白名单已从 R2 加载：%d 个用户（key=%s）", len(loaded), WHITELIST_R2_KEY)
-            WHITELIST_USERS.clear()
-            WHITELIST_USERS.update(loaded)
+            whitelist_store.replace_all(loaded)
             # 回写本地缓存文件：R2 是权威，本地缓存必须与之一致，
             # 供下一次 R2 故障时离线回退。
             _save_whitelist_unlocked()
@@ -1394,11 +1458,10 @@ async def load_whitelist():
         try:
             with open(_resolve_whitelist_path(), "rb") as f:
                 loaded = _parse_whitelist_bytes(f.read())
-            WHITELIST_USERS.clear()
-            WHITELIST_USERS.update(loaded)
+            whitelist_store.replace_all(loaded)
             logger.info("白名单已从本地文件加载：%d 个用户（%s）", len(loaded), _resolve_whitelist_path())
         except FileNotFoundError:
-            WHITELIST_USERS.clear()
+            whitelist_store.replace_all(set())
         except OSError:
             # 读失败时保留当前内存状态（可能是热重载场景），不清空。
             logger.warning("load_whitelist failed: %s", _resolve_whitelist_path(), exc_info=True)
@@ -1409,7 +1472,7 @@ async def load_whitelist():
         if r2_configured and remote_data is None:
             try:
                 from s3_utils import file_exists_in_r2
-                if not await file_exists_in_r2(WHITELIST_R2_KEY) and WHITELIST_USERS:
+                if not await file_exists_in_r2(WHITELIST_R2_KEY) and whitelist_store.users:
                     pushed = await _push_whitelist_to_r2_unlocked()
                     logger.info("白名单本地种子已推送 R2（key=%s）：%s", WHITELIST_R2_KEY, pushed)
             except Exception:
@@ -1425,9 +1488,9 @@ async def _r2_configured_async() -> bool:
         return False
 
 
-async def save_whitelist():
+async def save_whitelist() -> None:
     """把当前白名单写入本地文件并推送 R2（增删函数已自带，一般无需手动调用）。"""
-    async with _whitelist_lock:
+    async with whitelist_store.lock:
         _save_whitelist_unlocked()
         await _push_whitelist_to_r2_unlocked()
 
@@ -1447,7 +1510,7 @@ async def add_whitelist_user(target: str) -> str:
     """原子地把 target 加入白名单：改内存 → 写本地文件 → 推送 R2。
 
     返回 ADD_* 状态字符串。"改内存集合 + 写本地 + 推 R2" 整体在
-    _whitelist_lock 内完成，与 load_whitelist/save_whitelist 互斥：
+    whitelist_store.lock 内完成，与 load_whitelist/save_whitelist 互斥：
     并发 /adduser 不会互相覆盖，R2 收到的推送顺序与操作顺序一致，
     权威存储不会出现旧状态覆盖新状态。
     """
@@ -1460,10 +1523,10 @@ async def add_whitelist_user(target: str) -> str:
         # 管理员本来就始终拥有全部权限，加进来只会混淆权限模型。
         logger.info("拒绝把管理员 %r 加入用户白名单", normalized)
         return ADD_ADMIN_REJECTED
-    async with _whitelist_lock:
-        if normalized in WHITELIST_USERS:
+    async with whitelist_store.lock:
+        if whitelist_store.contains(normalized):
             return ADD_EXISTS
-        WHITELIST_USERS.add(normalized)
+        whitelist_store.add_one(normalized)
         _save_whitelist_unlocked()
         sync_ok = await _push_whitelist_to_r2_unlocked()
         return ADD_ADDED if sync_ok else ADD_SYNC_FAILED
@@ -1481,10 +1544,10 @@ async def remove_whitelist_user(target: str) -> str:
     if _is_admin_target(normalized):
         logger.info("拒绝从用户白名单删除管理员 %r", normalized)
         return REMOVE_ADMIN_REJECTED
-    async with _whitelist_lock:
-        if normalized not in WHITELIST_USERS:
+    async with whitelist_store.lock:
+        if not whitelist_store.contains(normalized):
             return REMOVE_MISSING
-        WHITELIST_USERS.discard(normalized)
+        whitelist_store.discard_one(normalized)
         _save_whitelist_unlocked()
         sync_ok = await _push_whitelist_to_r2_unlocked()
         return REMOVE_REMOVED if sync_ok else REMOVE_SYNC_FAILED
@@ -1492,8 +1555,8 @@ async def remove_whitelist_user(target: str) -> str:
 
 async def snapshot_whitelist() -> list[str]:
     """加锁读取白名单快照（排序后的列表），避免与并发的增删操作交叉读到中间态。"""
-    async with _whitelist_lock:
-        return sorted(WHITELIST_USERS)
+    async with whitelist_store.lock:
+        return whitelist_store.snapshot()
 
 # -----------------------------------------------------------------------------
 # 缓存 TTL

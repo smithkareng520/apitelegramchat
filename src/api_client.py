@@ -12,7 +12,7 @@ config.get_effective_endpoint()。
 import logging
 import os
 import httpx
-from typing import Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, cast
 from openai import AsyncOpenAI
 
 try:
@@ -20,10 +20,10 @@ try:
     # 只有实际请求 anthropic 客户端时才会报错（而不是在导入期整体失败）。
     from anthropic import AsyncAnthropic
 except ImportError:  # pragma: no cover - 依赖缺失时的降级路径
-    AsyncAnthropic = None
+    AsyncAnthropic = None  # type: ignore[misc,assignment]
 
 # 从 config 导入厂商配置、端点合并函数以及所有 API Key 变量
-from config import PROVIDERS, get_effective_endpoint, EffectiveEndpoint
+from config import PROVIDERS, get_effective_endpoint, EffectiveEndpoint, ModelConfig
 import config as app_config
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ class APIClient:
     调用里加端点覆盖参数即可，无需修改本文件。
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._clients: Dict[str, Union[AsyncOpenAI, "AsyncAnthropic"]] = {}
         self._providers = PROVIDERS  # 引用配置（仍供 fallback/未知厂商场景使用）
 
@@ -88,7 +88,7 @@ class APIClient:
             if not api_key:
                 raise ValueError(f"缺少 API Key: {endpoint.api_key_env}，请设置环境变量")
             logger.debug(f"创建 {endpoint.name} 原生客户端 base_url={endpoint.base_url}")
-            kwargs = {}
+            kwargs: dict[str, Any] = {}
             # 仅当端点覆盖了 base_url 且不同于 Anthropic 官方默认时才显式传入，
             # 否则沿用 AsyncAnthropic SDK 自带的官方默认值，行为与此前完全一致。
             if endpoint.base_url and endpoint.base_url != "https://api.anthropic.com":
@@ -99,7 +99,9 @@ class APIClient:
                 api_key=api_key,
                 # 与 OpenAI 兼容客户端保持相近的超时预算：连接短、流读取
                 # 放宽到 300s（agentic 多轮工具调用后首个事件可能较晚）。
-                timeout=httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=60.0),
+                # cast：SDK 存根引用的 httpx 类型对象与本环境安装的 httpx
+                # 不同源（httpx2），运行时传入的是同一个 httpx.Timeout 实例。
+                timeout=cast(Any, httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=60.0)),
                 **kwargs,
             )
         raise ValueError(f"未知的原生 SDK 协议: {endpoint.dedicated_loop_kind}")
@@ -136,11 +138,13 @@ class APIClient:
             max_retries=sdk_max_retries,
             # Agent 在多轮工具调用后，下一轮 SSE 的首个事件可能显著晚于普通聊天。
             # 使用分项超时：连接保持短，流读取允许 300 秒，避免 90 秒默认值中断长任务。
-            timeout=httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=60.0),
+            # cast：SDK 存根引用的 httpx 类型对象与本环境安装的 httpx 不同源，
+            # 运行时传入的就是标准 httpx.Timeout 实例。
+            timeout=cast(Any, httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=60.0)),
             default_headers=headers,
         )
 
-    def get_client_for_model(self, model_info) -> Union[AsyncOpenAI, "AsyncAnthropic"]:
+    def get_client_for_model(self, model_info: ModelConfig) -> Union[AsyncOpenAI, "AsyncAnthropic"]:
         """
         【推荐入口】根据具体的 ModelConfig 返回对应客户端实例（按 model_id 缓存）。
         自动合并该模型的端点覆盖（base_url/api_key_env/协议等，见

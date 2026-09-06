@@ -18,25 +18,25 @@ import uuid
 import tempfile
 import mimetypes
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
-from typing import Any, Optional
+from typing import Any, Optional, cast
 try:
-    import trafilatura  # type: ignore
-    from trafilatura.settings import use_config  # type: ignore
+    import trafilatura
+    from trafilatura.settings import use_config
 except Exception:  # pragma: no cover - optional dependency fallback
-    trafilatura = None
-    def use_config():  # type: ignore
+    trafilatura = None  # type: ignore[assignment]
+    def use_config() -> None:  # type: ignore
         return None
 try:
-    from curl_cffi.requests import AsyncSession  # type: ignore
+    from curl_cffi.requests import AsyncSession
 except Exception:  # pragma: no cover - optional dependency fallback
     AsyncSession = None  # type: ignore
 try:
-    import feedparser  # type: ignore
+    import feedparser
 except Exception:  # pragma: no cover - optional dependency fallback
     class _FeedParserStub:
-        def parse(self, *args, **kwargs):
+        def parse(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
             return {"entries": []}
-    feedparser = _FeedParserStub()  # type: ignore
+    feedparser = _FeedParserStub()
 from pathlib import Path
 from workspace_paths import workspace_workdir, workspace_namespace
 # chat action 状态指示：generate_video 生成期 record_video（其下载/上传
@@ -49,15 +49,15 @@ from chat_actions import chat_action_scope
 # `call_mcp_tool("amap-maps", ...)` 调用该 MCP 的 maps_* 工具，不保留
 # 直接调用高德 Web 服务 API 或 OSM/Nominatim/Overpass/OSRM 的本地实现。
 try:
-    import qrcode  # type: ignore
+    import qrcode
 except Exception:  # pragma: no cover - optional dependency fallback
-    qrcode = None  # type: ignore
+    qrcode = None
 from io import BytesIO
 from cachetools import TTLCache
 try:
-    from lxml import html as lxml_html  # type: ignore
+    from lxml import html as lxml_html
 except Exception:  # pragma: no cover - optional dependency fallback
-    lxml_html = None  # type: ignore
+    lxml_html = None
 
 from config import (
     OPENROUTER_API_KEY,
@@ -98,9 +98,9 @@ from workspace_utils import (
 from todo_tool import TODO_TOOL
 from memory_tool import MEMORY_TOOL
 try:
-    from subagent_tool import SUBAGENT_TOOL  # type: ignore
+    from subagent_tool import SUBAGENT_TOOL
 except Exception:  # pragma: no cover - optional dependency fallback
-    SUBAGENT_TOOL = []
+    SUBAGENT_TOOL = []  # type: ignore[assignment]
 logger = logging.getLogger(__name__)
 
 FETCH_CONTENT_TOKEN_BUDGET = 20_000
@@ -187,7 +187,7 @@ async def _persist_edited_file(
     delete: bool = False,
     namespace: str | None = None,
     content_bytes: bytes | None = None,
-):
+) -> None:
     """Persist only the file explicitly changed through text_editor.
 
     ``content_bytes``：调用方传入本次编辑**实际写入**的字节。后台任务
@@ -639,6 +639,8 @@ async def execute_text_editor(
             actual_insert_text = insert_text if insert_text is not None else new_str
             if not _is_plain_int(insert_line) or not isinstance(actual_insert_text, str):
                 return "Error: insert_line must be an integer between 0 and the file's line count, and insert_text (or new_str) must be a string."
+            # _is_plain_int 守卫已排除 None/bool；cast 仅为让 mypy 收窄（运行时无操作）
+            insert_line = cast(int, insert_line)
             crlf = _is_pure_crlf(content)
             work = content.replace("\r\n", "\n") if crlf else content
             text_to_insert = actual_insert_text.replace("\r\n", "\n") if crlf else actual_insert_text
@@ -685,11 +687,11 @@ async def execute_text_editor(
 
 
 # ========== 缓存函数 ==========
-def get_fetch_cache(url: str):
+def get_fetch_cache(url: str) -> str | None:
     return _fetch_cache.get(_normalize_fetch_cache_key(url))
 
 
-def set_fetch_cache(url: str, content: str):
+def set_fetch_cache(url: str, content: str) -> None:
     """写入 fetch 缓存。
 
     重要安全修复：此前所有失败结果（以 ``失败：`` 开头的字符串）也被写
@@ -724,7 +726,7 @@ def _get_title_from_html(html_content: str) -> str:
     return "无标题"
 
 
-def _get_image_models_by_capability():
+def _get_image_models_by_capability() -> tuple[list[str], list[str]]:
     """
     返回两个列表：
     - text_models: 支持文生图的全部模型（native_image=True；vision=True 的
@@ -2193,12 +2195,12 @@ async def _execute_web_search_uncached(
     outcomes = await asyncio.gather(*(_run_one(m) for m in modes))
     sections: list[str] = []
     errors: list[tuple[str, str]] = []
-    for m, text, exc in outcomes:
-        if exc is not None:
-            if isinstance(exc, SerperError):
-                errors.append((m, exc.user_message(f"{m} 搜索")))
+    for m, text, run_exc in outcomes:
+        if run_exc is not None:
+            if isinstance(run_exc, SerperError):
+                errors.append((m, run_exc.user_message(f"{m} 搜索")))
             else:
-                errors.append((m, f"❌ {m} 搜索失败：{exc}"))
+                errors.append((m, f"❌ {m} 搜索失败：{run_exc}"))
             continue
         if text:
             sections.append(text)
@@ -2275,7 +2277,7 @@ def _detect_html_encoding(raw: bytes, http_encoding: str | None) -> str:
             return _normalize_encoding_name(enc)
     # 4) chardet / charset_normalizer 兜底
     try:
-        import chardet  # type: ignore
+        import chardet
         guess = chardet.detect(raw[:32768])
         if isinstance(guess, dict):
             enc = (guess.get("encoding") or "").strip().lower()
@@ -2287,7 +2289,7 @@ def _detect_html_encoding(raw: bytes, http_encoding: str | None) -> str:
         pass
     try:
         # charset_normalizer 是 requests / chardet 的常见替代品
-        from charset_normalizer import from_bytes  # type: ignore
+        from charset_normalizer import from_bytes
         best = from_bytes(raw[:32768]).best()
         if best is not None:
             enc = (best.encoding or "").strip().lower()
@@ -2500,7 +2502,8 @@ async def _is_safe_url_to_fetch(url: str) -> tuple[bool, str]:
         return False, f"DNS 解析异常: {e}"
     for _family, _stype, _proto, _canon, sockaddr in infos:
         ip_str = sockaddr[0]
-        ok, reason = _check_ip_safe(ip_str)
+        # getaddrinfo 的 sockaddr[0] 对 AF_INET/AF_INET6 恒为 IP 字符串（typeshed 宽化为 str | int）
+        ok, reason = _check_ip_safe(cast(str, ip_str))
         if not ok:
             return False, reason
     return True, ""
@@ -2757,7 +2760,7 @@ async def _try_root_url_fallback(
     return None
 
 
-async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float = None) -> str:
+async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float | None = None) -> str:
     # 先检查缓存（避免 SSRF 校验浪费），再做 SSRF 校验
     cached = get_fetch_cache(url)
     if cached is not None:
@@ -2911,7 +2914,7 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
         from fetch_rich_content import build_model_facing_html
     except Exception as e:
         logger.error(f"[wikipedia] fetch_rich_content 导入失败: {e}")
-        build_model_facing_html = None
+        build_model_facing_html = None  # type: ignore[assignment]
 
     for l in [lang, "en"]:
         try:
@@ -2970,7 +2973,7 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
                     continue
                 page_data = page_resp.json()
                 pages = page_data.get("query", {}).get("pages", {})
-                page = next(iter(pages.values()), {})
+                page: dict[str, Any] = next(iter(pages.values()), {})
                 title = page.get("title", results[0].get("title", query))
                 extract = page.get("extract", "").strip()
                 if not extract:
@@ -2985,7 +2988,7 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
 
 
 # --------------------- exchange_rate ---------------------
-async def execute_exchange_rate(base: str, target: str = None) -> str:
+async def execute_exchange_rate(base: str, target: str | None = None) -> str:
     base = base.upper().strip()
     try:
         async with aiohttp.ClientSession() as session:
@@ -3418,7 +3421,7 @@ async def execute_generate_image(
         "Content-Type": "application/json"
     }
     if image_url:
-        content_part = [
+        content_part: Any = [
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": image_url}}
         ]
@@ -3586,12 +3589,14 @@ async def execute_generate_video(
     #   因此该路径保留 upload_video。
     # chat_id 可能为 None（极端调用路径）：chat_action_scope 会静默降级。
     if provider == "agnes":
-        async with chat_action_scope(chat_id, "record_video"):
+        # chat_action_scope 运行时容忍 None（_validate 静默降级），cast 仅为对齐其 int 签名
+        async with chat_action_scope(cast(int, chat_id), "record_video"):
             video_url, error, video_meta = await _request_agnes_video(
                 prompt=prompt, duration=duration, model=model,
             )
     elif provider == "openrouter":
-        async with chat_action_scope(chat_id, "record_video"):
+        # chat_action_scope 运行时容忍 None（_validate 静默降级），cast 仅为对齐其 int 签名
+        async with chat_action_scope(cast(int, chat_id), "record_video"):
             video_url, error, video_meta = await _request_openrouter_video(
                 prompt=prompt, duration=duration, model=model,
             )

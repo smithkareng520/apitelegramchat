@@ -14,7 +14,8 @@ from workspace_paths import (
 import re
 import html
 import logging
-from typing import Optional, List
+from typing import Any, List, Optional, cast
+from collections.abc import Awaitable, Callable
 from urllib.parse import urlparse
 from workspace_utils import (
     _get_workspace_lock,
@@ -38,7 +39,7 @@ _TOOL_TIMEOUT_MARKER = "__TOOL_TIMEOUT__"
 # =====================================================================
 # bash 结果信封（终端回放式）
 # =====================================================================
-def _format_bash_envelope(prompt_cwd: str, command: str, exit_code, output: str) -> str:
+def _format_bash_envelope(prompt_cwd: str, command: str, exit_code: int | str, output: str) -> str:
     """把一次 bash 执行渲染成终端回放式结果信封。
 
     形如::
@@ -158,7 +159,7 @@ class _BashOutputBuffer:
 
     __slots__ = ("keep", "head_ratio", "_head", "_tail", "_kept", "_dropped", "_capped", "_total")
 
-    def __init__(self, keep_chars: int = SANDBOX_OUTPUT_MAX_CHARS, head_ratio: float = 0.7):
+    def __init__(self, keep_chars: int = SANDBOX_OUTPUT_MAX_CHARS, head_ratio: float = 0.7) -> None:
         # 下限 200 仅防退化输入（负数/极小值）；0 视为不限制。
         self.keep = max(200, int(keep_chars)) if keep_chars else 10**12
         self.head_ratio = min(max(head_ratio, 0.1), 0.9)
@@ -867,7 +868,7 @@ def _render_code_text(text: str) -> str:
     return f"<pre><code>{body}</code></pre>"
 
 
-def _render_editor_quote(label: str, value: str, truncator=_truncate_ui_lines) -> str:
+def _render_editor_quote(label: str, value: str, truncator: Callable[[str], str] = _truncate_ui_lines) -> str:
     """Render a tool's input or output as a monospace code block that preserves indentation.
 
     截断到 ``_TOOL_UI_MAX_LINES`` 行后放进 ``<pre><code>``：文件摘录、终端
@@ -931,7 +932,7 @@ def _format_image_generation_result(
     return failure_summary, _render_media_failure_result(result_str, failure_fallback)
 
 
-def _parse_bash_envelope(result_str: str):
+def _parse_bash_envelope(result_str: str) -> tuple[str, str, str] | None:
     """解析终端回放式信封 → ``(command, exit_code, output)``；非信封返回 None。
 
     新格式::
@@ -1137,7 +1138,7 @@ def _prepare_runtime_once(
 # BashSession —— 每会话独立沙箱
 # =====================================================================
 class BashSession:
-    def __init__(self, chat_id: int, namespace: str | None = None):
+    def __init__(self, chat_id: int, namespace: str | None = None) -> None:
         self.chat_id = chat_id
         self.namespace = workspace_namespace(chat_id, namespace)
         self.proc: Optional[asyncio.subprocess.Process] = None
@@ -1160,12 +1161,12 @@ class BashSession:
         # 运行的目录，不会被子 shell 的 cd 污染。
         self._persistent_cwd: Optional[str] = str(self.workdir.absolute())
 
-    async def start(self):
+    async def start(self) -> None:
         """启动 bash 进程，套上 Landlock 沙箱 + rlimit + no-new-privs"""
         async with self._start_lock:
             return await self._start_locked()
 
-    async def _start_locked(self):
+    async def _start_locked(self) -> None:
         """start() 的实际实现；调用方必须已持有 self._start_lock。"""
         if self.proc is not None and self.proc.returncode is None:
             return
@@ -1429,6 +1430,8 @@ class BashSession:
         output_buffer = _BashOutputBuffer()
 
         try:
+            # stdout=PIPE 由上方 create_subprocess_exec 调用保证；仅作类型收窄。
+            assert proc.stdout is not None
             while True:
                 chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=timeout)
                 if not chunk:
@@ -1597,6 +1600,10 @@ class BashSession:
                 f"echo '{marker}' \"${rc_var}\"\n"
             )
 
+            # start() 已保证 proc 非空且 stdin=PIPE（见 _start_locked）；
+            # 以下断言仅用于类型收窄，不改变运行时行为。
+            assert self.proc is not None and self.proc.stdin is not None
+            pending = ""  # 仅供超时兑底里的防御性 locals() 检查（历史行为保持：恒为空，不追加尾部输出）
             try:
                 self.proc.stdin.write(full_cmd.encode('utf-8'))
                 await self.proc.stdin.drain()
@@ -1604,8 +1611,10 @@ class BashSession:
                 output_buffer = _BashOutputBuffer()
                 exit_code = "unknown"
 
-                async def read_until_marker():
+                async def read_until_marker() -> None:
                     nonlocal exit_code
+                    # stdout=PIPE 由 _start_locked 保证；仅作类型收窄。
+                    assert self.proc is not None and self.proc.stdout is not None
                     # marker 可能跨 chunk 被拆开，因此只保留一个很小的尾部用于跨 chunk 匹配；
                     # 已经确定不可能包含 marker 的前缀立即写入输出缓冲，避免每次都 O(n) 拼接。
                     pending = ""
@@ -1686,6 +1695,8 @@ class BashSession:
                 except Exception:
                     pass
                 try:
+                    # 同上：start() 保证会话进程存在，仅作类型收窄。
+                    assert self.proc is not None
                     os.killpg(os.getpgid(self.proc.pid), 9)
                 except ProcessLookupError:
                     pass
@@ -1701,7 +1712,7 @@ class BashSession:
                 return f"Error: {str(e)}"
 
     # ===================== 关闭会话 =====================
-    async def close(self):
+    async def close(self) -> None:
         # 取消看门狗
         if self._watchdog_task and not self._watchdog_task.done():
             self._watchdog_task.cancel()
@@ -1742,8 +1753,8 @@ class BashSession:
 # BashSessionManager —— 多 chat 共享管理
 # =====================================================================
 class BashSessionManager:
-    def __init__(self):
-        self._sessions: dict = {}
+    def __init__(self) -> None:
+        self._sessions: dict[tuple[int, str], BashSession] = {}
         self._lock = asyncio.Lock()
 
     async def get_session(self, chat_id: int, namespace: str | None = None) -> BashSession:
@@ -1774,7 +1785,7 @@ class BashSessionManager:
             self._sessions[key] = new_session
             return "Bash session restarted (sandbox=landlock)"
 
-    async def cleanup_all(self):
+    async def cleanup_all(self) -> None:
         """优雅关闭所有会话（应用退出时调用）"""
         async with self._lock:
             for s in self._sessions.values():
@@ -2610,7 +2621,7 @@ _REMOVED_TOOL_HINTS = {
 }
 
 # ---------- 工具分发 ----------
-async def execute_deliver_reply(chat_id: int, content) -> str:
+async def execute_deliver_reply(chat_id: int, content: Any) -> str:
     """deliver_reply：静默模式（/show off）下交付最终回复给用户。
 
     语义：发送的是 agent 轮次最后一条助手消息的 content 字段本身——由
@@ -2667,7 +2678,7 @@ async def execute_deliver_reply(chat_id: int, content) -> str:
     return "失败：消息发送失败（网络或 Telegram 错误），可稍后重试。"
 
 
-async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_callback=None) -> str:
+async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_callback: Callable[[str], Awaitable[None]] | None = None) -> str:
     if chat_id is None:
         # 早期失败：避免创建 ./workspace/None 造成跨会话数据泄漏
         return json.dumps({"error": "chat_id is required for tool dispatch"})
@@ -2709,8 +2720,8 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             return await execute_qr_code(arguments.get("text", ""))
         elif name == "generate_image_from_text":
             return await execute_generate_image(
-                prompt=arguments.get("prompt"),
-                model=arguments.get("model"),
+                prompt=cast(str, arguments.get("prompt")),
+                model=cast(str, arguments.get("model")),
                 aspect_ratio=arguments.get("aspect_ratio", "1:1"),
                 image_size=arguments.get("image_size", "1K"),
                 num_images=arguments.get("num_images", 1),
@@ -2718,8 +2729,8 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             )
         elif name == "edit_image_with_reference":
             return await execute_generate_image(
-                prompt=arguments.get("prompt"),
-                model=arguments.get("model"),
+                prompt=cast(str, arguments.get("prompt")),
+                model=cast(str, arguments.get("model")),
                 aspect_ratio=arguments.get("aspect_ratio", "1:1"),
                 image_size=arguments.get("image_size", "1K"),
                 num_images=arguments.get("num_images", 1),
@@ -2727,8 +2738,8 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             )
         elif name == "generate_video":
             return await execute_generate_video(
-                prompt=arguments.get("prompt"),
-                model=arguments.get("model"),
+                prompt=cast(str, arguments.get("prompt")),
+                model=cast(str, arguments.get("model")),
                 duration=arguments.get("duration", 5),
                 chat_id=chat_id,
             )

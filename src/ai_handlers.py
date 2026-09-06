@@ -21,7 +21,7 @@ import asyncio
 import json
 import re
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 from config import (
     SUPPORTED_MODELS,
@@ -67,6 +67,13 @@ from ai.agentic_loops import (
 # chat action 状态指示：回合开始时清场（防止上一回合被取消时残留的
 # 后台重发任务跨回合存活）、收尾时兑底熄灭（正常/异常/取消路径均生效）。
 from chat_actions import reset_chat_actions, stop_all_chat_actions
+
+if TYPE_CHECKING:
+    # 仅供 cast("AsyncOpenAI"/"AsyncAnthropic", client) 类型收窄使用：
+    # 运行时客户端由 api_client.get_client_for_model 按协议分发，
+    # cast 不产生任何运行时开销（避免模块级重复导入 SDK）。
+    from anthropic import AsyncAnthropic
+    from openai import AsyncOpenAI
 
 logger = get_logger(__name__)
 # 修复 BUG：此前这里硬性 setLevel(DEBUG)，无论 config.LOG_LEVEL 是 INFO
@@ -350,7 +357,9 @@ async def build_system_prompt(
         # Isla 是唯一含用户名变量的角色，单独走函数构造
         extra = _build_isla_prompt(username)
     else:
-        extra = _STATIC_ROLE_PROMPTS.get(selected_role, "")
+        # selected_role 为 None（chat_id 为空）时 dict.get 本就返回默认值 ""；
+        # or "" 仅把键归一为 str，查询结果不变（无空字符串键）。
+        extra = _STATIC_ROLE_PROMPTS.get(selected_role or "", "")
 
     # 时间戳放在整个 system prompt 的最末尾追加：它是唯一"每天必变"的
     # 内容，放在末尾可以让前面所有稳定内容作为一个完整、逐字节一致的
@@ -376,7 +385,7 @@ async def get_ai_response(
         user_models: dict,
         user_contexts: dict,
         username: str,
-        user_message: dict = None,
+        user_message: Optional[dict[str, Any]] = None,
         event_source: str = "USER",
 ) -> tuple[str, str, list, Optional[dict]]:
     """统一调度入口：USER / TIMER 走同一套草稿与交付流程，由 /show 控制。
@@ -417,9 +426,12 @@ async def get_ai_response(
     early-persisted 标记跳过重复写入。TIMER 的合成唤醒消息不写历史，
     仍按原逻辑单独注入请求。
     """
-    builder = None
-    new_msgs = []
-    usage = None
+    # SilentMessageBuilder 是 RichMessageBuilder 的子类；两个分支各自
+    # 赋值后 builder 恒非 None，首绑处声明 Optional 供 try 前的异常路径使用。
+    builder: RichMessageBuilder | None = None
+    new_msgs: list[dict[str, Any]] = []
+    # usage 形状动态（SDK pydantic 对象 / JSON dict / None），按 Any 标注。
+    usage: Any = None
     is_timer = (event_source == "TIMER")
     # chat action 清场：新回合开始意味着旧回合已彻底结束（app 的打断
     # 机制会先等待旧任务退出）。若旧回合被二次取消打断了作用域收尾，
@@ -537,7 +549,7 @@ async def get_ai_response(
                 model_max_output=getattr(model_info, "max_output_tokens", None),
             )
             history = context_snapshot.messages
-            supports_tools = model_info.supports_tools
+            supports_tools = bool(model_info.supports_tools)  # Optional[bool] 归一：None 与 False 同为真值假，仅用于真值判断
         _log_stage("获取chat_lock+上下文快照完成")
 
         # 按事件源改写历史中"回合专属工具"的调用痕迹，并对静默专属工具做
@@ -578,7 +590,7 @@ async def get_ai_response(
             # 历史快照，这里不再重复 append（否则同一条消息会出现两次）。
             builder.set_thinking_status("Thinking...")
             await builder.flush(force=False)
-            out_msg = {"role": "user"}
+            out_msg: dict[str, Any] = {"role": "user"}
             resolved = await _resolve_multimodal_content(user_message, model_info, chat_id=chat_id)
             _log_stage("多模态内容解析完成")
             out_msg["content"] = resolved
@@ -655,7 +667,7 @@ async def get_ai_response(
         elif model_info.native_image:
             client = api_client.get_client_for_model(model_info)
             raw_content, usage, new_msgs = await _agentic_loop_native_image(
-                client, current_model, messages, builder, chat_id, journal=journal
+                cast("AsyncOpenAI", client), current_model, messages, builder, chat_id, journal=journal
             )
         elif is_timer:
             # TIMER 使用"安全主动工具面"，而不是完整 USER 工具面。
@@ -867,7 +879,8 @@ async def get_ai_response(
                 # 静默 TIMER 回合（旧行为不变）：最终内容一律不自动送达，
                 # 也没有兜底直发——是否交付完全由模型的 deliver_reply(send=true)
                 # 调用决定；模型没有调用，本轮对用户保持完全静默。
-                success = True
+                # send_rich_html_message 声明返回 int | bool，success 仅按真值使用。
+                success: bool | int = True
                 logger.info(
                     "[%s] 静默 TIMER 回合完成：最终内容不自动推送（delivered=%s，长度=%s，前 500 字）：\n%s",
                     chat_id, delivered_this_turn, len(cleaned_content), cleaned_content[:500],
@@ -1134,9 +1147,9 @@ async def _call_api(
         messages: list,
         chat_id: int,
         builder: "RichMessageBuilder",
-        tools: list = None,
-        journal: list = None,
-        extra_tools: list = None,
+        tools: Optional[list[Any]] = None,
+        journal: Optional[list[Any]] = None,
+        extra_tools: Optional[list[Any]] = None,
 ) -> tuple[str | None, object | None, list]:
     if tools is None:
         from search_engine import SEARCH_TOOLS
@@ -1149,7 +1162,7 @@ async def _call_api(
         tools = tools + valid_tool_defs(extra_tools)
 
     api_type = model_info.provider
-    supports_tools = model_info.supports_tools
+    supports_tools = bool(model_info.supports_tools)  # Optional[bool] 归一：None 与 False 同为真值假，仅用于真值判断
     tools_to_pass = tools if supports_tools else None
 
     if api_type not in PROVIDERS:
@@ -1169,7 +1182,7 @@ async def _call_api(
     if dedicated_loop_kind == "anthropic_native":
         client = api_client.get_client_for_model(model_info)
         return await _agentic_loop_anthropic(
-            client, current_model, messages, builder,
+            cast("AsyncAnthropic", client), current_model, messages, builder,
             tools=tools_to_pass, supports_tools=supports_tools, journal=journal,
         )
     elif dedicated_loop_kind == "gemini_native":
@@ -1182,7 +1195,7 @@ async def _call_api(
     else:
         client = api_client.get_client_for_model(model_info)
         return await _agentic_loop_openai_compat(
-            client, current_model, messages, api_type, builder,
+            cast("AsyncOpenAI", client), current_model, messages, api_type, builder,
             tools=tools_to_pass, supports_tools=supports_tools, journal=journal,
         )
 

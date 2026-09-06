@@ -18,12 +18,14 @@ import re
 import mimetypes
 import time
 import uuid
-from typing import Optional, Any
+from typing import Optional, Any, cast
+from collections.abc import Callable
 
 from config import (
     OPENROUTER_API_KEY,
     AGNES_API_KEY,
     MODELSCOPE_API_KEY,
+    ModelConfig,
     PROVIDERS,
     get_effective_endpoint,
 )
@@ -54,7 +56,7 @@ logger = get_logger(__name__)
 IMAGES_API_PROVIDERS = frozenset({"modelscope", "xxtf"})
 
 
-def _get_images_api_display_name(model_info) -> str:
+def _get_images_api_display_name(model_info: Optional[ModelConfig]) -> str:
     """返回提供商展示名（如 "ModelScope" / "XXTF"），用于错误提示文案。"""
     provider_key = getattr(model_info, "provider", "") or ""
     base = PROVIDERS.get(provider_key)
@@ -273,8 +275,8 @@ async def _request_modelscope_native_image(
             method: str,
             url: str,
             *,
-            data=None,
-            json_payload=None,
+            data: Any = None,
+            json_payload: dict | None = None,
             request_headers: dict | None = None,
             quiet: bool = False,
     ) -> tuple[dict | None, int, str, str]:
@@ -288,7 +290,7 @@ async def _request_modelscope_native_image(
             async with session.request(method, url, headers=effective_headers, data=data) as resp:
                 return await _finalize_response(resp, method, url, quiet)
 
-    async def _finalize_response(resp, method: str, url: str, quiet: bool) -> tuple[dict | None, int, str, str]:
+    async def _finalize_response(resp: aiohttp.ClientResponse, method: str, url: str, quiet: bool) -> tuple[dict | None, int, str, str]:
         """Common response handling extracted from _post_or_get_json for clarity."""
         body_text = await resp.text()
         if not quiet:
@@ -611,7 +613,7 @@ async def _post_images_with_retry(
         log_prefix: str,
         headers: dict | None = None,
         json_payload: dict | None = None,
-        form_factory=None,
+        form_factory: Callable[[], aiohttp.FormData] | None = None,
 ) -> tuple[dict | None, str, str, int, str]:
     """Images 协议 POST 共用出口：响应处理 + 瞬态 400 同形状重试一次。
 
@@ -653,7 +655,7 @@ _REF_IMAGE_JPEG_QUALITIES = (88, 72, 56)
 _REF_IMAGE_FALLBACK_SIDE = 1536
 
 
-def _encode_jpeg_bytes(img, quality: int) -> bytes:
+def _encode_jpeg_bytes(img: Any, quality: int) -> bytes:
     from io import BytesIO
     buf = BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=quality)
@@ -671,14 +673,14 @@ def _shrink_reference_bytes(img_bytes: bytes, mime: str) -> tuple[bytes, str]:
     try:
         from io import BytesIO
         from PIL import Image  # Pillow 已在 requirements.txt（Pillow==11.1.0）
-        img = Image.open(BytesIO(img_bytes))
+        img: Image.Image = Image.open(BytesIO(img_bytes))
         img.load()
         width, height = img.size
         scale = max(width, height) / _REF_IMAGE_MAX_SIDE
         if scale > 1:
             img = img.resize(
                 (max(1, round(width / scale)), max(1, round(height / scale))),
-                Image.LANCZOS,
+                Image.LANCZOS,  # type: ignore[attr-defined]  # Pillow 以 setattr 动态挂载的兼容别名，运行时存在
             )
         has_alpha = img.mode in ("RGBA", "LA", "PA") or (
             img.mode == "P" and "transparency" in img.info
@@ -709,7 +711,7 @@ def _shrink_reference_bytes(img_bytes: bytes, mime: str) -> tuple[bytes, str]:
             scale2 = max(w, h) / _REF_IMAGE_FALLBACK_SIDE
             img2 = img.resize(
                 (max(1, round(w / scale2)), max(1, round(h / scale2))),
-                Image.LANCZOS,
+                Image.LANCZOS,  # type: ignore[attr-defined]  # Pillow 以 setattr 动态挂载的兼容别名，运行时存在
             )
             out_bytes = _encode_jpeg_bytes(img2, _REF_IMAGE_JPEG_QUALITIES[-1])
         if out_bytes and len(out_bytes) < len(img_bytes):
@@ -789,7 +791,7 @@ async def _finalize_images_response(
 
 
 async def _request_openai_compat_image(
-        model_info,
+        model_info: Optional[ModelConfig],
         *,
         prompt: str,
         image_urls: list[str],
@@ -980,7 +982,7 @@ async def _request_openai_compat_image(
 
 
 async def _request_images_generations(
-        model_info,
+        model_info: Optional[ModelConfig],
         *,
         prompt: str,
         image_urls: list[str],
@@ -1037,7 +1039,7 @@ def _extract_image_items(response_json: dict) -> list[dict]:
         value = value.strip()
         return value.startswith(('http://', 'https://', 'data:image/'))
 
-    def _push_item(item):
+    def _push_item(item: Any) -> None:
         if item is None:
             return
         if isinstance(item, str):
@@ -1054,7 +1056,7 @@ def _extract_image_items(response_json: dict) -> list[dict]:
                 seen.add(sig)
                 items.append(item)
 
-    def _walk(obj, path='root'):
+    def _walk(obj: Any, path: str = 'root') -> None:
         if len(items) >= 20:
             return
         if isinstance(obj, dict):
@@ -1146,7 +1148,7 @@ def _extract_native_message_text(content: Any) -> str:
         parts: list[str] = []
         for item in content:
             if isinstance(item, str):
-                piece = item.strip()
+                piece: Any = item.strip()
                 if piece:
                     parts.append(piece)
                 continue
@@ -1157,8 +1159,8 @@ def _extract_native_message_text(content: Any) -> str:
                 piece = item.get("text") or item.get("output_text") or item.get("content")
                 if isinstance(piece, str) and piece.strip():
                     parts.append(piece.strip())
-            elif isinstance(item.get("text"), str) and item.get("text").strip():
-                parts.append(item.get("text").strip())
+            elif isinstance(item.get("text"), str) and cast(str, item.get("text")).strip():
+                parts.append(cast(str, item.get("text")).strip())
         return "\n".join(parts).strip()
     return str(content).strip()
 

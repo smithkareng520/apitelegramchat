@@ -48,12 +48,14 @@ import asyncio
 import copy
 import json
 import uuid
-from typing import TYPE_CHECKING, Optional
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING, Any, Optional
 
 import aiohttp
 
 from config import (
     GEMINI_API_KEY,
+    ModelConfig,
     SUPPORTED_MODELS,
     get_sampling_params,
     get_reasoning_request_fields,
@@ -147,7 +149,7 @@ def _split_union_type(schema: dict, depth: int) -> dict:
             sub["nullable"] = True
         return sub
 
-    out: dict = {}
+    out = {}
     if schema.get("description"):
         out["description"] = schema["description"]
     # default 提升到包装层（拆分后的任一子 schema 都不携带语义冲突的默认值）。
@@ -211,7 +213,7 @@ def _repair_anyof_branch_required(sub: dict, parent_raw_props: Optional[dict],
     return sub
 
 
-def _clean_schema_for_gemini(schema, depth: int = 0) -> dict:
+def _clean_schema_for_gemini(schema: Any, depth: int = 0) -> dict:
     """递归清洗一个 JSON Schema 片段为 Gemini 原生 Schema 子集。
 
     清洗结果保证 Gemini 两条硬校验不变式在任意层级成立（违反即整请求
@@ -387,7 +389,7 @@ def _data_url_to_inline_data(url: str) -> Optional[dict]:
     return {"inlineData": {"mimeType": mime, "data": b64}}
 
 
-def _openai_content_to_gemini_parts(content) -> list:
+def _openai_content_to_gemini_parts(content: Any) -> list:
     """把 OpenAI 的 content（str 或 content-parts 列表）转换成 Gemini
     原生 parts 列表。支持的 part 类型：text / image_url（data:base64
     内联与 http(s) 公开 URL）/ video_url / input_audio；未识别的类型
@@ -398,7 +400,7 @@ def _openai_content_to_gemini_parts(content) -> list:
     if isinstance(content, str):
         return [{"text": content}] if content else []
 
-    parts = []
+    parts: list[dict[str, Any]] = []
     for part in content:
         if not isinstance(part, dict):
             continue
@@ -491,7 +493,7 @@ def _convert_messages_to_gemini(messages: list) -> tuple:
     contents: list = []
     pending_function_responses: list = []
 
-    def _flush_function_responses():
+    def _flush_function_responses() -> None:
         if pending_function_responses:
             contents.append({"role": "user", "parts": list(pending_function_responses)})
             pending_function_responses.clear()
@@ -578,7 +580,7 @@ def _convert_messages_to_gemini(messages: list) -> tuple:
 #   enabled=False         -> thinkingBudget=0（显式关闭思考）
 #   reasoning_max_tokens  -> thinkingBudget
 #   其余                  -> 不发送 thinkingConfig（跟随供应商默认）
-def _gemini_thinking_config(model_info) -> Optional[dict]:
+def _gemini_thinking_config(model_info: Optional[ModelConfig]) -> Optional[dict]:
     if not model_info:
         return None
     reasoning_top, reasoning_extra = get_reasoning_request_fields(model_info, "gemini")
@@ -611,11 +613,11 @@ def _gemini_thinking_config(model_info) -> Optional[dict]:
 # 目的：让 _log_cache_usage / update_conversation_and_ledger 的既有
 # token 台账与缓存命中率观测（Gemini 隐式缓存 cachedContentTokenCount）
 # 在原生路径上继续工作，且返回值形状与旧兼容循环一致（dict）。
-def _gemini_usage_to_openai(usage_meta) -> Optional[dict]:
+def _gemini_usage_to_openai(usage_meta: Any) -> Optional[dict]:
     if not isinstance(usage_meta, dict):
         return None
 
-    def _num(value) -> int:
+    def _num(value: Any) -> int:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return 0
         return int(value)
@@ -643,7 +645,7 @@ def _gemini_usage_to_openai(usage_meta) -> Optional[dict]:
 # part 为完整对象（无跨 chunk 参数增量）；同响应可有多个 functionCall
 # part（并行工具调用）；thought=true 的 text part 是思考摘要；末尾
 # chunk 带 finishReason 与 usageMetadata。
-async def _iter_gemini_stream_events(resp):
+async def _iter_gemini_stream_events(resp: aiohttp.ClientResponse) -> AsyncIterator[dict[str, Any]]:
     async for raw_line in resp.content:
         line = raw_line.decode("utf-8", errors="replace").strip()
         if not line.startswith("data:"):
@@ -719,7 +721,7 @@ def _build_gemini_request_body(
 
 
 async def _post_gemini_stream(session: "aiohttp.ClientSession", url: str,
-                              headers: dict, body: dict):
+                              headers: dict, body: dict) -> aiohttp.ClientResponse:
     """发起 SSE 流式 POST；非 200 抛 ClientResponseError（带响应体摘要，
     与旧兼容循环的错误路径一致，由上层 get_ai_response 统一格式化）。"""
     resp = await session.post(url, headers=headers, json=body)
@@ -744,9 +746,9 @@ async def _agentic_loop_gemini_native(
         current_model: str,
         messages: list,
         builder: "RichMessageBuilder",
-        tools: list = None,
+        tools: list | None = None,
         supports_tools: bool = True,
-        journal: list = None,
+        journal: list | None = None,
 ) -> tuple[str | None, object | None, list]:
     """Gemini 原生 API 专用循环（streamGenerateContent SSE + 原生 function calling）。
 
@@ -796,7 +798,7 @@ async def _agentic_loop_gemini_native(
         received_any = False
         current_stream = None
 
-        async def switch_stream(target: str):
+        async def switch_stream(target: str) -> None:
             nonlocal current_stream
             if current_stream == target:
                 return

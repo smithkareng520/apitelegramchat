@@ -12,7 +12,9 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from config import BASE_URL, DEEPSEEK_API_KEY, OPENROUTER_API_KEY, LOG_LEVEL
-from typing import Optional, Dict, Union
+from typing import Any, Callable, Dict, Optional, Tuple, TypeVar, Union, cast
+from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
 import sys
 from config import GROQ_API_KEY
@@ -217,27 +219,30 @@ async def _notify_chat_unreachable(chat_id: int, status: int, body: str) -> bool
 import contextvars
 _request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="unknown")
 
-def set_request_id(request_id: str):
+def set_request_id(request_id: str) -> None:
     _request_id_var.set(request_id)
 
 def get_request_id() -> str:
     return _request_id_var.get()
 
 class RequestIdAdapter(logging.LoggerAdapter):
-    def process(self, msg, kwargs):
+    def process(self, msg: Any, kwargs: Any) -> tuple[str, Any]:
         rid = get_request_id()
         return f"[{rid}] {msg}", kwargs
 
-def get_logger(name):
+def get_logger(name: str) -> RequestIdAdapter:
     return RequestIdAdapter(logging.getLogger(name), {})
 
 # ---------- 工具函数 ----------
 _SMART_AMP_PATTERN = re.compile(r'&(?![a-zA-Z0-9#]+;)')
 
-def retry_async(max_retries: int = 3, delay: float = 1.0, backoff: float = 3.0, exceptions: tuple = (Exception,)):
-    def decorator(func):
+# 可重试异步函数的类型变量：保持装饰后函数的参数/返回类型签名。
+_F = TypeVar("_F", bound="Callable[..., Awaitable[Any]]")
+
+def retry_async(max_retries: int = 3, delay: float = 1.0, backoff: float = 3.0, exceptions: tuple[type[BaseException], ...] = (Exception,)) -> Callable[[_F], _F]:
+    def decorator(func: _F) -> _F:
         @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
             current_delay = delay
             for attempt in range(max_retries):
                 try:
@@ -253,7 +258,7 @@ def retry_async(max_retries: int = 3, delay: float = 1.0, backoff: float = 3.0, 
                     await asyncio.sleep(current_delay)
                     current_delay *= backoff
             return None
-        return wrapper
+        return cast(_F, wrapper)
     return decorator
 
 def get_current_time() -> str:
@@ -263,7 +268,7 @@ def get_current_time() -> str:
               "July", "August", "September", "October", "November", "December"]
     return f"{days[now.weekday()]}, {months[now.month - 1]} {now.day}, {now.year}"
 
-def escape_html(text) -> str:
+def escape_html(text: Optional[str]) -> str:
     """转义 HTML 特殊字符（<、>、&）。
 
     历史 BUG：此函数曾是一个 no-op（`return text`），导致 60+ 处调用点
@@ -1140,7 +1145,7 @@ class BalanceResult(dict):
     """统一的余额查询结果，兼容字典访问。"""
 
 
-async def _fetch_json(session: aiohttp.ClientSession, url: str, api_key: str) -> tuple[int, dict | None, str | None]:
+async def _fetch_json(session: aiohttp.ClientSession, url: str, api_key: str) -> tuple[int, Any, str | None]:
     """发送一次余额请求并返回 HTTP 状态码、JSON 和错误信息。"""
     if not api_key:
         return 0, None, "未配置 API Key"
@@ -1236,7 +1241,7 @@ async def query_provider_balances(provider: str | None = None) -> list[BalanceRe
 
 
 class RateLimitError(Exception):
-    def __init__(self, retry_after: int):
+    def __init__(self, retry_after: int) -> None:
         self.retry_after = retry_after
         super().__init__(f"Rate limited, retry after {retry_after}s")
 
@@ -1332,13 +1337,33 @@ async def delete_message_fast(chat_id: int, message_id: int) -> bool:
         return False
 
 # ==================== Rich Message 支持 ====================
-_last_sent_draft_cache = {}
-_draft_send_locks: dict = {}
-_draft_failure_counts: dict = {}
-_dead_draft_ids: set = set()
+# 草稿发送侧状态曾以 4 个平行的 module-level dict 存储
+# （_last_sent_draft_cache / _draft_send_locks / _draft_failure_counts /
+# _draft_last_send_time），键一致但锁语义分散：注册表的增删由注册表锁
+# 保护，而值的读写依赖「持有该 draft 的 send lock」这一隐式约定，
+# 后续改动容易顾此失彼（改了 A dict 忘了 B dict）。现合并为每个
+# (chat_id, draft_id) 一个 _DraftSendState 对象：
+#   - 注册表 _draft_states 的条目增删由 _draft_states_lock 保护；
+#   - 同一 draft 的字段值只在持有该 draft 的 state.lock（即原 send
+#     lock）的协程里读写，不变量收敛到单一对象上。
+# 并发模型说明（为什么不用 contextvars）：草稿状态按 (chat_id, draft_id)
+# 跨任务共享——发送循环、serialize_with_active_draft、mark_draft_dead
+# 等 caller 分属不同 asyncio Task，必须看到同一份状态；contextvars 的
+# 「每任务隔离」语义正好相反，故不采用。
+@dataclass
+class _DraftSendState:
+    """单个 (chat_id, draft_id) 草稿的全部发送侧可变状态。"""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    last_html: Optional[str] = None   # 最近一次成功发送（或降级重发）的草稿 HTML
+    failures: int = 0                 # 连续发送失败计数（达到阈值判死）
+    last_send_time: float = 0.0       # 最近一次发送时刻（time.monotonic()）
+
+
+_draft_states: Dict[Tuple[int, int], _DraftSendState] = {}
+_draft_states_lock = asyncio.Lock()
+_dead_draft_ids: set[int] = set()
 _dead_draft_ids_lock = asyncio.Lock()
-_draft_locks_lock = asyncio.Lock()
-_draft_last_send_time: dict = {}
 _DRAFT_MIN_INTERVAL = 0.25
 # 草稿是可被后续完整状态替代的瞬态 UI；不能像永久消息一样在发送锁中
 # 连续执行长超时重试，否则一帧网络抖动会让所有后续 Agent 状态长时间排队。
@@ -1347,45 +1372,50 @@ _DRAFT_CONNECT_TIMEOUT = 2.5
 _DRAFT_MAX_ATTEMPTS = 2
 _DRAFT_RETRY_DELAY = 0.25
 
-async def _get_draft_send_lock(chat_id: int, draft_id: int) -> asyncio.Lock:
+async def _get_draft_state(chat_id: int, draft_id: int) -> _DraftSendState:
+    """原子地取 (chat_id, draft_id) 的发送侧状态，不存在则创建。"""
     key = (chat_id, draft_id)
-    async with _draft_locks_lock:
-        lock = _draft_send_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _draft_send_locks[key] = lock
-        return lock
+    async with _draft_states_lock:
+        state = _draft_states.get(key)
+        if state is None:
+            state = _DraftSendState()
+            _draft_states[key] = state
+        return state
+
+
+async def _peek_draft_state(chat_id: int, draft_id: int) -> Optional[_DraftSendState]:
+    """只读查找，不创建（用于保活路径，避免为已回收的草稿复活注册表条目）。"""
+    async with _draft_states_lock:
+        return _draft_states.get((chat_id, draft_id))
+
+
+async def _get_draft_send_lock(chat_id: int, draft_id: int) -> asyncio.Lock:
+    return (await _get_draft_state(chat_id, draft_id)).lock
 
 async def _reset_draft_failure(chat_id: int, draft_id: int) -> None:
-    async with _draft_locks_lock:
-        _draft_failure_counts.pop((chat_id, draft_id), None)
+    state = await _get_draft_state(chat_id, draft_id)
+    state.failures = 0
 
 async def _bump_draft_failure(chat_id: int, draft_id: int) -> int:
-    key = (chat_id, draft_id)
-    async with _draft_locks_lock:
-        _draft_failure_counts[key] = _draft_failure_counts.get(key, 0) + 1
-        return _draft_failure_counts[key]
+    state = await _get_draft_state(chat_id, draft_id)
+    state.failures += 1
+    return state.failures
 
 async def _cleanup_dead_draft_state(chat_id: int, draft_id: int) -> None:
-    """草稿生命周期结束后，主动清理所有相关缓存项。
+    """草稿生命周期结束后，主动清理其发送侧状态（注册表条目整体移除）。
 
-    此前 _last_sent_draft_cache / _draft_send_locks / _draft_failure_counts /
-    _draft_last_send_time 这 4 个 module-level dict 没有清理路径，长时间运行
-    会让每个草稿的元数据永久驻留，造成内存泄漏。这里在 mark_draft_dead 之后
-    统一回收。
+    此前 4 个 module-level dict 没有清理路径，长时间运行会让每个草稿的
+    元数据永久驻留，造成内存泄漏。这里在 mark_draft_dead 之后统一回收。
     """
     if not isinstance(chat_id, int) or not isinstance(draft_id, int):
         return
     key = (chat_id, draft_id)
-    async with _draft_locks_lock:
-        _last_sent_draft_cache.pop(key, None)
-        _draft_send_locks.pop(key, None)
-        _draft_failure_counts.pop(key, None)
-        _draft_last_send_time.pop(key, None)
+    async with _draft_states_lock:
+        _draft_states.pop(key, None)
 
-async def mark_draft_dead(draft_id) -> None:
+async def mark_draft_dead(draft_id: int | str | None) -> None:
     try:
-        draft_id_int = int(draft_id)
+        draft_id_int = int(draft_id)  # type: ignore[arg-type]
     except (ValueError, TypeError):
         return
     async with _dead_draft_ids_lock:
@@ -1393,23 +1423,23 @@ async def mark_draft_dead(draft_id) -> None:
     logger.info(f"Draft {draft_id_int} marked as dead")
     # 顺手清理可能仍持有的草稿状态。chat_id 在 mark 阶段无法可靠得到，
     # 我们只能扫描所有 (chat_id, draft_id_int) 键，但数量通常很小。
-    async with _draft_locks_lock:
-        stale_keys = [k for k in _last_sent_draft_cache if isinstance(k, tuple) and len(k) == 2 and k[1] == draft_id_int]
+    async with _draft_states_lock:
+        stale_keys = [k for k in _draft_states if k[1] == draft_id_int]
     for key in stale_keys:
         await _cleanup_dead_draft_state(key[0], draft_id_int)
 
-async def is_draft_dead(draft_id) -> bool:
+async def is_draft_dead(draft_id: int | str | None) -> bool:
     try:
-        draft_id_int = int(draft_id)
+        draft_id_int = int(draft_id)  # type: ignore[arg-type]
     except (ValueError, TypeError):
         return True
     async with _dead_draft_ids_lock:
         return draft_id_int in _dead_draft_ids
 
-async def _is_current_active_draft(chat_id: int, draft_id) -> bool:
+async def _is_current_active_draft(chat_id: int, draft_id: int | str | None) -> bool:
     """只有当前仍然是活跃草稿时才允许继续刷新。"""
     try:
-        draft_id_int = int(draft_id)
+        draft_id_int = int(draft_id)  # type: ignore[arg-type]
     except (ValueError, TypeError):
         return False
     try:
@@ -1442,10 +1472,12 @@ async def _reassert_active_draft_content(chat_id: int, draft_id: int) -> None:
             return
         if not await _is_current_active_draft(chat_id, draft_id):
             return
-        cache_key = (chat_id, draft_id)
-        html_content = _last_sent_draft_cache.get(cache_key)
+        state = await _peek_draft_state(chat_id, draft_id)
+        html_content = state.last_html if state is not None else None
         if not html_content or not str(html_content).strip():
             return
+        # html_content 非空蕴含 state 非 None（last_html 只存在 state 里）。
+        assert state is not None
 
         payload = {
             "chat_id": chat_id,
@@ -1460,7 +1492,7 @@ async def _reassert_active_draft_content(chat_id: int, draft_id: int) -> None:
             timeout=aiohttp.ClientTimeout(total=4, connect=2),
         ) as resp:
                 if resp.status == 200:
-                    _draft_last_send_time[cache_key] = time.monotonic()
+                    state.last_send_time = time.monotonic()
                     try:
                         data = await resp.json()
                         msg_id = (data.get("result") or {}).get("message_id")
@@ -1487,7 +1519,7 @@ async def _reassert_active_draft_content(chat_id: int, draft_id: int) -> None:
 
 
 @asynccontextmanager
-async def serialize_with_active_draft(chat_id: int, *, reassert: bool = True):
+async def serialize_with_active_draft(chat_id: int, *, reassert: bool = True) -> AsyncIterator[None]:
     """
     将永久 bot 消息与当前活跃草稿的刷新串行化。
 
@@ -1533,7 +1565,7 @@ async def serialize_with_active_draft(chat_id: int, *, reassert: bool = True):
 # ---------- 常规草稿发送（带锁） ----------
 async def send_rich_message_draft(
     chat_id: int,
-    draft_id,
+    draft_id: int | str | None,
     html_content: str,
     message_thread_id: Optional[int] = None,
     force: bool = False,
@@ -1551,7 +1583,7 @@ async def send_rich_message_draft(
         logger.debug(f"send_rich_message_draft: skip empty-after-strip content (len={len(html_content)})")
         return 0
     try:
-        draft_id_int = int(draft_id)
+        draft_id_int = int(draft_id)  # type: ignore[arg-type]
         if draft_id_int == 0:
             raise ValueError("draft_id must be non-zero")
     except (ValueError, TypeError) as e:
@@ -1565,13 +1597,13 @@ async def send_rich_message_draft(
         if not await _is_current_active_draft(chat_id, draft_id_int):
             return 0
 
-        cache_key = (chat_id, draft_id_int)
-        last_sent = _last_sent_draft_cache.get(cache_key)
+        state = await _get_draft_state(chat_id, draft_id_int)
+        last_sent = state.last_html
         if not force and last_sent == html_content:
             return 0
 
         if not force:
-            last_time = _draft_last_send_time.get(cache_key, 0.0)
+            last_time = state.last_send_time
             wait_for_slot = _DRAFT_MIN_INTERVAL - (time.monotonic() - last_time)
             if wait_for_slot > 0:
                 # 不直接丢弃这次新状态。等待至多 250ms 后发送，避免 builder 把
@@ -1581,7 +1613,7 @@ async def send_rich_message_draft(
                     return 0
                 if not await _is_current_active_draft(chat_id, draft_id_int):
                     return 0
-                if _last_sent_draft_cache.get(cache_key) == html_content:
+                if state.last_html == html_content:
                     return 0
 
         payload = {
@@ -1614,8 +1646,8 @@ async def send_rich_message_draft(
                                 body = ""
 
                         if resp.status == 200:
-                            _draft_last_send_time[cache_key] = time.monotonic()
-                            _last_sent_draft_cache[cache_key] = html_content
+                            state.last_send_time = time.monotonic()
+                            state.last_html = html_content
                             await _reset_draft_failure(chat_id, draft_id_int)
                             try:
                                 data = await resp.json()
@@ -1647,7 +1679,7 @@ async def send_rich_message_draft(
                         )
 
                         if not_modified:
-                            _last_sent_draft_cache[cache_key] = html_content
+                            state.last_html = html_content
                             await _reset_draft_failure(chat_id, draft_id_int)
                             return 0
 
@@ -1699,8 +1731,8 @@ async def send_rich_message_draft(
                                         ),
                                     ) as demoted_resp:
                                         if demoted_resp.status == 200:
-                                            _draft_last_send_time[cache_key] = time.monotonic()
-                                            _last_sent_draft_cache[cache_key] = demoted
+                                            state.last_send_time = time.monotonic()
+                                            state.last_html = demoted
                                             await _reset_draft_failure(chat_id, draft_id_int)
                                             try:
                                                 demoted_data = await demoted_resp.json()
@@ -1783,7 +1815,7 @@ _VIDEO_TAG_RE = re.compile(r"<video[\s/>]", re.IGNORECASE)
 def _rich_html_contains_video(html_content: Optional[str]) -> bool:
     """永久富文本是否携带 <video> 媒体块（用于触发 upload_video 状态）。"""
     try:
-        return bool(html_content) and bool(_VIDEO_TAG_RE.search(html_content))
+        return bool(html_content) and bool(_VIDEO_TAG_RE.search(cast(str, html_content)))
     except Exception:
         logger.debug("_rich_html_contains_video 内部忽略的异常", exc_info=True)
         return False
@@ -1833,7 +1865,7 @@ async def send_rich_html_message(
         )
     html_content = html_content.strip()
 
-    payload = {
+    payload: dict[str, Any] = {
         "chat_id": chat_id,
         "rich_message": _rich_message_html_payload(html_content),
         "disable_notification": False,
@@ -1868,7 +1900,7 @@ async def send_rich_html_message(
     # 超时 5s，三次重试封顶约 45~90s（含 1s/4s/7s 退避），同时仍然给
     # 网络抖动足够的恢复空间。
     @retry_async(max_retries=3, delay=1, backoff=3, exceptions=(aiohttp.ClientError, asyncio.TimeoutError))
-    async def _send_inner():
+    async def _send_inner() -> int:
         timeout = aiohttp.ClientTimeout(total=15, connect=5)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -2193,7 +2225,7 @@ def _rich_message_to_text(rich_content: str) -> str:
     if not rich_content:
         return ""
     text = rich_content.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-    def replace_table(match):
+    def replace_table(match: re.Match[str]) -> str:
         table_html = match.group(0)
         rows = re.findall(r'<tr>(.*?)</tr>', table_html, re.DOTALL)
         lines = []
@@ -2203,7 +2235,7 @@ def _rich_message_to_text(rich_content: str) -> str:
             lines.append("| " + " | ".join(cell_texts) + " |")
         return "\n".join(lines)
     text = re.sub(r'<table[^>]*>.*?</table>', replace_table, text, flags=re.DOTALL)
-    def replace_list(match):
+    def replace_list(match: re.Match[str]) -> str:
         list_html = match.group(0)
         if '<ol' in list_html:
             items = re.findall(r'<li>(.*?)</li>', list_html, re.DOTALL)
@@ -2214,7 +2246,7 @@ def _rich_message_to_text(rich_content: str) -> str:
             bulleted = [f"• {re.sub(r'<[^>]+>', '', item).strip()}" for item in items]
             return "\n".join(bulleted)
     text = re.sub(r'<(ul|ol)[^>]*>.*?</\1>', replace_list, text, flags=re.DOTALL)
-    def replace_details(match):
+    def replace_details(match: re.Match[str]) -> str:
         details = match.group(0)
         summary = re.search(r'<summary>(.*?)</summary>', details, re.DOTALL)
         summary_text = re.sub(r'<[^>]+>', '', summary.group(1)).strip() if summary else "详情"

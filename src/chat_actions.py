@@ -46,6 +46,7 @@ upload_photo / upload_voice / upload_document / upload_video 的做法全部
 """
 
 import asyncio
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -74,7 +75,7 @@ class _ChatActionState:
 
     __slots__ = ("chat_id", "_refs", "_task", "_shown", "_lock")
 
-    def __init__(self, chat_id: int):
+    def __init__(self, chat_id: int) -> None:
         self.chat_id = chat_id
         # action -> 活跃作用域计数。dict 保持插入序：计数归零再重启时
         # 重新插入尾部，使“同计数时后开始的优先”自然成立。
@@ -175,7 +176,7 @@ def _get_state(chat_id: int) -> _ChatActionState:
     return state
 
 
-def _validate(chat_id, action: str) -> bool:
+def _validate(chat_id: Optional[int], action: str) -> bool:
     if chat_id is None:
         return False
     if action not in VALID_CHAT_ACTIONS:
@@ -245,7 +246,7 @@ async def reset_chat_actions(chat_id: int) -> None:
 
 
 @asynccontextmanager
-async def chat_action_scope(chat_id: int, action: str):
+async def chat_action_scope(chat_id: int, action: str) -> AsyncIterator[None]:
     """以 async with 语法包裹一段“bot 正在做某动作”的操作。
 
     用法::

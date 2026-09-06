@@ -32,7 +32,7 @@ import html as _html
 import logging
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional, cast
 from urllib.parse import parse_qs, urljoin, urlparse, urlsplit, urlunsplit
 
 from token_budget import count_tokens, truncate_to_token_budget
@@ -129,14 +129,14 @@ _EMBED_HOST_LABELS = [
 ]
 
 
-def esc(text) -> str:
+def esc(text: Optional[str]) -> str:
     """转义文本节点的 < > &（lxml 已把实体解码为纯文本，标准转义即可）。"""
     if text is None:
         return ""
     return _html.escape(str(text), quote=False)
 
 
-def esc_attr(value) -> str:
+def esc_attr(value: Optional[str]) -> str:
     """转义将写入 href/src 等属性的值。"""
     if value is None:
         return ""
@@ -238,7 +238,7 @@ class DomMedia:
     boilerplate: bool = False  # 位于 nav/footer/aside 等样板区域内
 
 
-def _parse_dom(html_text: str):
+def _parse_dom(html_text: str) -> Optional[Any]:
     """解析原始 HTML 为 lxml 树（容错：utf-8 recover → 裸 fromstring → None）。"""
     if _lxml_html is None or not html_text:
         return None
@@ -253,7 +253,7 @@ def _parse_dom(html_text: str):
             return None
 
 
-def _meta_content(tree, names: set[str]) -> str:
+def _meta_content(tree: Any, names: set[str]) -> str:
     for meta in tree.iter("meta"):
         key = (meta.get("property") or meta.get("name") or meta.get("itemprop") or "").strip().lower()
         if key in names:
@@ -284,10 +284,10 @@ def _canonicalize_embed(raw_url: str, base_url: str) -> Optional[tuple[str, str]
             return build(m), label
         if label == "Bilibili":
             qs = parse_qs(parts.query)
-            bvid = (qs.get("bvid") or qs.get("BV") or [None])[0]
+            bvid = cast("list[str | None]", qs.get("bvid") or qs.get("BV") or [None])[0]
             if bvid:
                 return f"https://www.bilibili.com/video/{bvid}", "Bilibili"
-            aid = (qs.get("aid") or [None])[0]
+            aid = cast("list[str | None]", qs.get("aid") or [None])[0]
             if aid:
                 return f"https://www.bilibili.com/video/av{aid}", "Bilibili"
     # 无规则匹配：已知社交/媒体站点或一般 http(s) iframe，原样作为外链。
@@ -304,7 +304,7 @@ _CAROUSEL_HINT_RE = re.compile(
 )
 
 
-def _is_hidden_element(el) -> bool:
+def _is_hidden_element(el: Any) -> bool:
     """过滤隐藏 / 零尺寸的跟踪型媒体元素。"""
     style = (el.get("style") or "").replace(" ", "").lower()
     if "display:none" in style or "visibility:hidden" in style:
@@ -316,7 +316,7 @@ def _is_hidden_element(el) -> bool:
     return el.get("width") == "0" or el.get("height") == "0"
 
 
-def _find_carousel_ancestor(el) -> Optional[str]:
+def _find_carousel_ancestor(el: Any) -> Optional[str]:
     """返回轮播容器的 XPath。
 
     取 body 以下【最外层】的轮播特征祖先：swiper 结构中每个 .swiper-slide
@@ -351,7 +351,7 @@ _IMG_LAZY_ATTRS = (
 _MEDIA_KIND_CAPS = {"video": MAX_VIDEOS, "audio": MAX_AUDIOS, "embed": MAX_EMBEDS, "image": MAX_IMAGES}
 
 
-def _collect_dom_media(tree, base_url: str) -> list[DomMedia]:
+def _collect_dom_media(tree: Any, base_url: str) -> list[DomMedia]:
     """单次文档序遍历收集全部媒体，携带 order_idx/path/carousel 位置信息。
 
     覆盖：内嵌 <video>/<source>、<audio>/<source>、<iframe>/<embed> 播放器
@@ -443,7 +443,7 @@ def _collect_dom_media(tree, base_url: str) -> list[DomMedia]:
 _BOILERPLATE_TAGS = frozenset({"nav", "footer", "aside"})
 
 
-def _in_boilerplate(el) -> bool:
+def _in_boilerplate(el: Any) -> bool:
     """媒体元素是否位于 nav/footer/aside 样板容器内。
 
     注意 header 不算样板：文章内的 <header> 常包含标题与题图，
@@ -495,19 +495,19 @@ def _rend_to_tags(rend: Optional[str]) -> list[str]:
 
 
 class _ConvertContext:
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str) -> None:
         self.base_url = base_url
         self.used_media_urls: set[str] = set()
 
 
-def _local_name(el) -> str:
+def _local_name(el: Any) -> str:
     name = getattr(el, "tag", "")
     if not isinstance(name, str):
         return ""
     return name.rsplit("}", 1)[-1].lower()
 
 
-def _convert_inline_element(el, ctx: "_ConvertContext") -> tuple[str, list[str]]:
+def _convert_inline_element(el: Any, ctx: "_ConvertContext") -> tuple[str, list[str]]:
     """转换单个行内元素（含其标签）。返回 (行内 HTML, 需提升的媒体块列表)。"""
     tag = _local_name(el)
     inner, media_blocks = _convert_inline_content(el, ctx)
@@ -546,7 +546,7 @@ def _convert_inline_element(el, ctx: "_ConvertContext") -> tuple[str, list[str]]
     return inner, media_blocks
 
 
-def _convert_inline_content(el, ctx: "_ConvertContext") -> tuple[str, list[str]]:
+def _convert_inline_content(el: Any, ctx: "_ConvertContext") -> tuple[str, list[str]]:
     """转换元素的混合内容（el.text + 子元素 + 各 tail）。"""
     parts: list[str] = []
     media_blocks: list[str] = []
@@ -562,7 +562,7 @@ def _convert_inline_content(el, ctx: "_ConvertContext") -> tuple[str, list[str]]
     return "".join(parts), media_blocks
 
 
-def _render_media_element(el, ctx: "_ConvertContext") -> Optional[str]:
+def _render_media_element(el: Any, ctx: "_ConvertContext") -> Optional[str]:
     """<graphic>/<media> → <img/> 或 <video/>/<audio/> 独立块。"""
     tag = _local_name(el)
     raw_src = el.get("src") or el.get("target") or el.get("url")
@@ -605,7 +605,7 @@ def _is_punct_only(text: str) -> bool:
     return bool(_PUNCT_ONLY_RE.match(text))
 
 
-def _render_table(el, ctx: "_ConvertContext") -> str:
+def _render_table(el: Any, ctx: "_ConvertContext") -> str:
     rows_html: list[str] = []
     has_visible_text = False
     for row in el:
@@ -638,7 +638,7 @@ def _render_table(el, ctx: "_ConvertContext") -> str:
     return f'<table bordered striped>{"".join(rows_html)}</table>'
 
 
-def _render_list(el, ctx: "_ConvertContext") -> tuple[str, list[str]]:
+def _render_list(el: Any, ctx: "_ConvertContext") -> tuple[str, list[str]]:
     """渲染 <list>。<li> 仅承载行内内容；嵌套列表与媒体提升为列表之后的兄弟块。"""
     rend = (el.get("rend") or "ul").strip().lower()
     outer = "ol" if rend in ("ol", "ol#", "ordered") else "ul"
@@ -683,7 +683,7 @@ _CONTAINER_BLOCK_CHILDREN = frozenset({
 })
 
 
-def _render_container(el, ctx: "_ConvertContext") -> list[str]:
+def _render_container(el: Any, ctx: "_ConvertContext") -> list[str]:
     """渲染容器元素：块级子元素逐个输出，行内子元素与尾巴合并为段落。"""
     out: list[str] = []
     if el.text and el.text.strip():
@@ -691,7 +691,7 @@ def _render_container(el, ctx: "_ConvertContext") -> list[str]:
 
     inline_acc: list[str] = []
 
-    def _flush_inline():
+    def _flush_inline() -> None:
         text = "".join(inline_acc).strip()
         if text and not _is_punct_only(re.sub(r"<[^>]+>", "", text)):
             out.append(f"<p>{text}</p>")
@@ -713,7 +713,7 @@ def _render_container(el, ctx: "_ConvertContext") -> list[str]:
     return out
 
 
-def _render_block(el, ctx: "_ConvertContext") -> list[str]:
+def _render_block(el: Any, ctx: "_ConvertContext") -> list[str]:
     """把 trafilatura XML 的块级元素渲染为 Telegram HTML 块列表。"""
     tag = _local_name(el)
     out: list[str] = []
@@ -844,7 +844,7 @@ def _collapse_table_text(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
 
 
-def _table_cell_text(cell) -> str:
+def _table_cell_text(cell: Any) -> str:
     """Extract only visible text from one DOM cell; never retain source HTML."""
     texts: list[str] = []
     try:
@@ -862,7 +862,7 @@ def _table_cell_text(cell) -> str:
     return _collapse_table_text(" ".join(texts))
 
 
-def _table_rows_from_dom(table) -> list[list[dict[str, object]]]:
+def _table_rows_from_dom(table: Any) -> list[list[dict[str, object]]]:
     """Read direct rows/cells from one table, excluding rows of nested tables."""
     rows: list[list[dict[str, object]]] = []
     try:
@@ -936,7 +936,7 @@ def _render_safe_dom_table(rows: list[list[dict[str, object]]]) -> str:
     for row_index, row in enumerate(rows):
         cells: list[str] = []
         for cell in row:
-            attrs = cell["attrs"] if isinstance(cell.get("attrs"), dict) else {}
+            attrs = cast("dict[Any, Any]", cell["attrs"]) if isinstance(cell.get("attrs"), dict) else {}
             attr_text = "".join(
                 f' {name}="{int(value)}"'
                 for name, value in attrs.items()
@@ -1045,7 +1045,8 @@ def extract_body_blocks(html_text: str, base_url: str = "") -> list[str]:
     except Exception:
         logger.debug("extract_body_blocks 内部忽略的异常", exc_info=True)
         return []
-    kwargs = {
+    # trafilatura.extract 的 **kwargs 解包需 dict[str, Any]（dict[str, object] 不匹配其签名）
+    kwargs: dict[str, Any] = {
         "output_format": "xml",
         "include_comments": False,
         "include_tables": True,
@@ -1144,7 +1145,7 @@ def _anchor_text_match(block_text: str, cand_text: str) -> bool:
     return len(block_text) >= 8 and cand_text.startswith(block_text)
 
 
-def _anchor_entries(entries: list[dict], tree, media: list[DomMedia]) -> list[dict]:
+def _anchor_entries(entries: list[dict], tree: Any, media: list[DomMedia]) -> list[dict]:
     """为每个正文块确定 DOM 锚点（order/path）。
 
     策略：
@@ -1210,7 +1211,7 @@ def _group_carousel_runs(entries: list[dict], url_to_carousel: dict[str, str]) -
     out: list[dict] = []
     run: list[dict] = []
 
-    def _flush():
+    def _flush() -> None:
         nonlocal run
         if len(run) >= 2:
             imgs = []
@@ -1341,7 +1342,7 @@ def _demote_same_origin_links(blocks: list[str], base_url: str) -> list[str]:
     if not origin:
         return blocks
 
-    def _demote(m: "re.Match") -> str:
+    def _demote(m: re.Match[str]) -> str:
         href = m.group(1)
         host = (urlparse(href).netloc or "").lower()
         # netloc 不受 HTML 实体转义影响（&amp; 只出现在 query 里）。

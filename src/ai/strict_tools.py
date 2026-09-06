@@ -38,7 +38,7 @@ agnes 等转发厂商行为各异），因此配套**运行时自动降级**：
 """
 import copy
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from utils import get_logger
 
@@ -113,7 +113,7 @@ def looks_like_strict_tool_rejection(error_text: str) -> bool:
 # 递归规范化
 # ---------------------------------------------------------------------------
 
-def _unsupported_for_strict(schema, depth: int = 0) -> bool:
+def _unsupported_for_strict(schema: Optional[dict], depth: int = 0) -> bool:
     """递归判定 schema 是否含 strict 模式无法安全表达的构造。
 
     保守判定（宁可少注入一个工具，也不能改变 schema 语义）：
@@ -210,7 +210,7 @@ def _normalize_for_strict(schema: dict, *, root: bool, depth: int = 0) -> dict:
     return out
 
 
-def _strictify_tool(tool) -> Optional[dict]:
+def _strictify_tool(tool: Any) -> Optional[dict]:
     """尝试把一个 OpenAI 形状的工具定义规范化为 strict 版本。
 
     返回带 ``strict: true`` 的**深拷贝**；工具不适合 strict（schema 含

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -26,19 +27,19 @@ def create_server(context: MCPRequestContext) -> Server:
     server = Server(SERVER_NAME, version=SERVER_VERSION)
 
     @server.list_tools()
-    async def list_tools():
+    async def list_tools() -> Any:
         return await tools.list_tools()
 
     @server.call_tool(validate_input=True)
-    async def call_tool(name: str, arguments: dict):
+    async def call_tool(name: str, arguments: dict) -> Any:
         return await tools.call(name, arguments)
 
     @server.list_resources()
-    async def list_resources():
+    async def list_resources() -> Any:
         return await resources.list_resources()
 
     @server.read_resource()
-    async def read_resource(uri):
+    async def read_resource(uri: Any) -> Any:
         return await resources.read_resource(str(uri))
 
     return server

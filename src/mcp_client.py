@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
@@ -20,7 +21,7 @@ try:
     from mcp.shared._httpx_utils import create_mcp_http_client
     _MCP_SDK_AVAILABLE = True
 except Exception as exc:  # pragma: no cover - optional deployment dependency
-    ClientSession = None  # type: ignore[assignment]
+    ClientSession = None  # type: ignore[misc,assignment]
     streamablehttp_client = None  # type: ignore[assignment]
     create_mcp_http_client = None  # type: ignore[assignment]
     _MCP_SDK_AVAILABLE = False
@@ -191,7 +192,7 @@ class _MCPHTTPTrace:
             self.status_code = status_code
 
 
-def _tracing_http_client_factory(trace: _MCPHTTPTrace):
+def _tracing_http_client_factory(trace: _MCPHTTPTrace) -> Callable[..., Any]:
     """在保留 SDK 推荐 HTTP 客户端配置的前提下附加响应观察钩子。"""
     def factory(*args: Any, **kwargs: Any) -> Any:
         if create_mcp_http_client is None:  # pragma: no cover - SDK 可用时必然存在

@@ -31,7 +31,7 @@
 同风格的可操作修复指引。
 """
 import json
-from typing import Optional
+from typing import Any, Optional
 
 from utils import get_logger
 
@@ -70,7 +70,7 @@ def find_tool_schema(fn_name: str, tools: Optional[list]) -> Optional[dict]:
     return None
 
 
-def _coerce_property(value, prop_schema: Optional[dict]):
+def _coerce_property(value: Any, prop_schema: Optional[dict]) -> Any:
     """对单个属性做无损矫正（仅在 schema 声明与实际类型不一致时生效）。"""
     if not isinstance(prop_schema, dict) or not isinstance(value, str):
         return value
@@ -112,7 +112,7 @@ def coerce_common_slops(fn_args: dict, schema: Optional[dict]) -> dict:
 # 校验器：jsonschema 优先，内置兜底
 # ---------------------------------------------------------------------------
 
-def _try_import_jsonschema():
+def _try_import_jsonschema() -> Any:
     try:
         import jsonschema  # noqa: F401
         return jsonschema
@@ -253,7 +253,8 @@ def _summarize_params(schema: dict) -> tuple:
     props = schema.get("properties")
     props = props if isinstance(props, dict) else {}
     required = set(schema.get("required") or [])
-    req_list, opt_list = [], []
+    req_list: list[str] = []
+    opt_list: list[str] = []
     for key, prop in props.items():
         if not isinstance(prop, dict):
             continue

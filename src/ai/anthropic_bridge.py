@@ -31,7 +31,7 @@
 import asyncio
 import json
 import uuid
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from config import SUPPORTED_MODELS, get_sampling_params
 from utils import get_logger
@@ -65,7 +65,7 @@ logger = get_logger(__name__)
 # =============================================================================
 # OpenAI: {"type": "function", "function": {"name", "description", "parameters"}}
 # Anthropic: {"name", "description", "input_schema"}
-def _sanitize_anthropic_tool_schema(schema):
+def _sanitize_anthropic_tool_schema(schema: Any) -> dict[str, Any]:
     """Normalize JSON schema for Anthropic custom tools.
 
     Anthropic requires input_schema to be a valid JSON Schema object with a
@@ -74,7 +74,7 @@ def _sanitize_anthropic_tool_schema(schema):
     """
     import copy
 
-    def normalize(node):
+    def normalize(node: Any) -> Any:
         if not isinstance(node, dict):
             return node
 
@@ -138,7 +138,7 @@ def _convert_tools_to_anthropic(tools: Optional[list]) -> Optional[list]:
 #             -> Anthropic 形状（顶层 system 字符串 + messages: user/assistant，
 #                                 tool 结果作为 user 消息里的 tool_result 块）
 # =============================================================================
-def _openai_content_to_anthropic_blocks(content) -> list:
+def _openai_content_to_anthropic_blocks(content: Any) -> list:
     """把 OpenAI 的 content（str 或 content-parts 列表）转换成 Anthropic
     content 块列表。支持 text、image_url（data:base64 内联 / 公开 URL）、
     原生文档（document 直通与 file→document 转换），未识别的 part 类型
@@ -254,7 +254,7 @@ def _convert_messages_to_anthropic(messages: list) -> tuple[str, list]:
     anthropic_messages: list[dict] = []
     pending_tool_results: list[dict] = []
 
-    def _flush_pending_tool_results():
+    def _flush_pending_tool_results() -> None:
         if pending_tool_results:
             anthropic_messages.append({"role": "user", "content": list(pending_tool_results)})
             pending_tool_results.clear()
@@ -325,13 +325,13 @@ def _convert_messages_to_anthropic(messages: list) -> tuple[str, list]:
 # 流式增量，与其原有 "普通 chat.completions.create" 语义对齐）。
 # =============================================================================
 class _SimpleFunctionCall:
-    def __init__(self, name: str, arguments: str):
+    def __init__(self, name: str, arguments: str) -> None:
         self.name = name
         self.arguments = arguments
 
 
 class _SimpleToolCall:
-    def __init__(self, id_: str, name: str, arguments: str):
+    def __init__(self, id_: str, name: str, arguments: str) -> None:
         self.id = id_
         self.function = _SimpleFunctionCall(name, arguments)
 
@@ -341,18 +341,18 @@ class _SimpleMessage:
     实际读取的 .content / .tool_calls 两个属性），让调用方无需分支处理
     Anthropic 响应即可复用现有解析代码。
     """
-    def __init__(self, content: str, tool_calls: list):
+    def __init__(self, content: str, tool_calls: list) -> None:
         self.content = content
         self.tool_calls = tool_calls
 
 
 class _SimpleChoice:
-    def __init__(self, message: "_SimpleMessage"):
+    def __init__(self, message: "_SimpleMessage") -> None:
         self.message = message
 
 
 class _SimpleResponse:
-    def __init__(self, choices: list, usage=None):
+    def __init__(self, choices: list, usage: Any = None) -> None:
         self.choices = choices
         self.usage = usage
 
@@ -368,7 +368,7 @@ async def anthropic_chat_completions_create(
         tools: Optional[list] = None,
         thinking: Optional[dict] = None,
         supports_prompt_cache: bool = False,
-        **_ignored,
+        **_ignored: Any,
 ) -> _SimpleResponse:
     """非流式调用 Anthropic Messages API，返回值形状模拟
     `await client.chat.completions.create(...)` 的返回对象
@@ -455,7 +455,7 @@ async def anthropic_chat_completions_create(
 # 口径：Anthropic 的 cache_read / cache_creation token 同样是本次请求
 # 实际处理的输入 token（OpenAI 的 prompt_tokens 也包含 cached 子集），
 # 因此并入 prompt_tokens，否则上下文水位会低估、台账差分失真。
-def _anthropic_usage_to_openai(usage) -> Optional[dict]:
+def _anthropic_usage_to_openai(usage: Any) -> Optional[dict]:
     if usage is None:
         return None
     try:
@@ -474,7 +474,7 @@ def _anthropic_usage_to_openai(usage) -> Optional[dict]:
         logger.debug("_anthropic_usage_to_openai 归一化失败，丢弃 usage", exc_info=True)
         return None
 
-    def _num(value):
+    def _num(value: Any) -> int:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return 0
         return int(value)
@@ -548,7 +548,7 @@ def _extract_retry_after_seconds(e: Exception) -> Optional[float]:
     网关错误元数据形如 metadata.retry_after_seconds=1 /
     retry_after_ms=1000；个别网关也会带标准 Retry-After 响应头。
     """
-    def _scan(obj) -> Optional[float]:
+    def _scan(obj: Any) -> Optional[float]:
         if not isinstance(obj, dict):
             return None
         for key in ("retry_after_seconds", "retryAfterSeconds", "retry-after-seconds"):
@@ -593,9 +593,9 @@ async def _agentic_loop_anthropic(
         current_model: str,
         messages: list,
         builder: "RichMessageBuilder",
-        tools: list = None,
+        tools: list | None = None,
         supports_tools: bool = True,
-        journal: list = None,
+        journal: list | None = None,
 ) -> tuple[str | None, object | None, list]:
     """Anthropic 原生 Messages API 专用循环。
 
@@ -711,7 +711,7 @@ async def _agentic_loop_anthropic(
         # v2.5：Anthropic 流结束原因（max_tokens / end_turn / tool_use…）。
         stop_reason = ""
 
-        async def switch_stream(target: str):
+        async def switch_stream(target: str) -> None:
             nonlocal current_stream
             if current_stream == target:
                 return
@@ -753,7 +753,7 @@ async def _agentic_loop_anthropic(
                                     tool_use_blocks[event.index] = {
                                         "id": block.id, "name": block.name, "args_json": "",
                                     }
-                                    fn_args = {}
+                                    fn_args: dict[str, Any] = {}
                                     summary = _generate_initial_tool_summary(block.name, fn_args)
                                     action_desc = _generate_action_description(block.name, fn_args)
                                     builder.add_tool_item(
@@ -854,7 +854,8 @@ async def _agentic_loop_anthropic(
             except json.JSONDecodeError:
                 repaired, repair_info = repair_json_arguments(args_str)
                 if isinstance(repaired, dict):
-                    note = repair_note_for_result(repair_info.get("fixes"))
+                    # info["fixes"] 可能缺失（None）；函数体本就按 or [] 兜底，语义不变。
+                    note = repair_note_for_result(repair_info.get("fixes") or [])
                     if note:
                         repaired[_JSON_REPAIR_NOTE_KEY] = note
                     args_str = json.dumps(

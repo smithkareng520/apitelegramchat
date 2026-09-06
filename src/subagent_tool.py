@@ -43,8 +43,9 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from html.parser import HTMLParser
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from api_client import api_client
 from config import (
@@ -52,6 +53,7 @@ from config import (
     DEFAULT_MODEL,
     get_sampling_params,
     get_reasoning_request_fields,
+    ModelConfig,
 )
 from state import get_llm_session_key
 from token_budget import count_tokens, truncate_to_token_budget
@@ -163,7 +165,7 @@ def _filter_tools(allowed: Optional[list[str]]) -> list[dict]:
         return []
     if allowed is None:
         # 用默认白名单
-        names = DEFAULT_ALLOWED_TOOLS
+        names: list[str] | set[str] = DEFAULT_ALLOWED_TOOLS
     else:
         # 调用方指定；过滤掉禁止的工具
         names = set()
@@ -178,7 +180,10 @@ def _filter_tools(allowed: Optional[list[str]]) -> list[dict]:
             logger.debug("_filter_tools 忽略非 dict 工具定义: %r", t)
             continue
         try:
-            fn_name = t.get("function", {}).get("name", "")
+            # SEARCH_TOOLS 元素是异构嵌套 dict 字面量，mypy 对其 join 值类型
+            # （含 list 字面量成员）推断不出 .get；"function" 运行时恒为
+            # dict，用 cast 表达该不变量（cast 为恒等调用，零行为变化）。
+            fn_name = cast(dict[str, Any], t.get("function", {})).get("name", "")
         except Exception:
             logger.debug("_filter_tools 内部忽略的异常", exc_info=True)
             continue
@@ -238,7 +243,7 @@ async def _execute_tool_for_subagent(
         return f"Error: tool '{name}' failed: {str(e)[:200]}"
 
 
-async def _create_chat_completion(client, model_info, create_params: dict):
+async def _create_chat_completion(client: Any, model_info: Optional[ModelConfig], create_params: dict) -> Any:
     """按厂商分流的一次性（非流式）补全调用。
 
     - model_info.provider == "anthropic"：走原生 Messages API
@@ -266,13 +271,13 @@ async def _create_chat_completion(client, model_info, create_params: dict):
 
 
 async def _subagent_agentic_loop(
-    client,
+    client: Any,
     model: str,
     messages: list,
     tools: list,
     chat_id: int,
     timeout_overall: float,
-    progress_callback=None,
+    progress_callback: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> dict:
     """
     最小化的 OpenAI 兼容 agentic loop。
@@ -286,7 +291,7 @@ async def _subagent_agentic_loop(
     total_tool_calls = 0
     last_error = None
 
-    async def _report(status_text: str):
+    async def _report(status_text: str) -> None:
         if progress_callback:
             try:
                 await progress_callback(status_text)
@@ -503,7 +508,7 @@ async def _subagent_agentic_loop(
                     "content": f"Error: tool execution failed: {r}",
                 })
                 continue
-            tc_id, result_str = r
+            tc_id, result_str = cast(tuple[str, str], r)
             loop_messages.append({
                 "role": "tool",
                 "tool_call_id": tc_id,
@@ -530,7 +535,7 @@ async def execute_subagent(
     model: Optional[str] = None,
     allowed_tools: Optional[list[str]] = None,
     timeout: Optional[int] = None,
-    progress_callback=None,
+    progress_callback: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> str:
     """
     subagent 工具主入口。返回 JSON 字符串供父 agent 阅读。
@@ -646,7 +651,7 @@ _HTML_VOID_TAGS = {
 class _HTMLPreviewTruncator(HTMLParser):
     """Keep a structurally valid HTML preview within an exact token budget."""
 
-    def __init__(self, token_budget: int):
+    def __init__(self, token_budget: int) -> None:
         super().__init__(convert_charrefs=False)
         self.token_budget = max(1, int(token_budget))
         self.parts: list[str] = []

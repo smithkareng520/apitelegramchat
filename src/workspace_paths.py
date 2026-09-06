@@ -4,6 +4,7 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
+from typing import cast
 
 
 _NAMESPACE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -169,7 +170,7 @@ def is_inside_upload_or_download(path: object) -> bool:
     绕过安全边界。
     """
     try:
-        resolved = Path(path).expanduser().resolve() if path is not None else None
+        resolved = Path(cast(str, path)).expanduser().resolve() if path is not None else None
     except Exception:
         # 解析失败：保守地视为"在 staging 内"，让 sandbox 拒绝执行。
         return True

@@ -53,7 +53,7 @@ media_groups: dict = {}
 # 给 media_groups 单独加锁，避免和 get_chat_lock 抢同一把全局锁造成阻塞。
 media_groups_lock = asyncio.Lock()
 
-async def add_media_group_message(media_group_id: str, msg: dict):
+async def add_media_group_message(media_group_id: str, msg: dict) -> None:
     async with media_groups_lock:
         if media_group_id not in media_groups:
             media_groups[media_group_id] = []
@@ -101,7 +101,7 @@ async def is_protected_message(message_id: int) -> bool:
 _image_cache_r2_attempted: set = set()
 _image_cache_r2_attempted_lock = asyncio.Lock()
 
-async def mark_r2_attempted(file_id: str):
+async def mark_r2_attempted(file_id: str) -> None:
     async with _image_cache_r2_attempted_lock:
         _image_cache_r2_attempted.add(file_id)
 
@@ -173,7 +173,7 @@ def rotate_llm_session_token(chat_id: int) -> str:
     return token
 
 
-def get_llm_session_key(chat_id) -> str:
+def get_llm_session_key(chat_id: int | None) -> str:
     """LLM 网关会话亲和键：tg-chat-{chat_id}-{纪元 token}（≤256 字符）。
 
     - 同一对话窗口/同一任务内的全部请求（主循环全部轮次、子 agent、
@@ -256,11 +256,11 @@ async def set_active_draft(chat_id: int, draft_id: int, message_id: int) -> None
     async with _active_drafts_lock:
         _active_drafts[chat_id] = (draft_id, message_id)
 
-async def get_active_draft_info(chat_id: int) -> tuple:
+async def get_active_draft_info(chat_id: int) -> tuple[int, int] | None:
     async with _active_drafts_lock:
         return _active_drafts.get(chat_id)
 
-async def clear_active_draft(chat_id: int, draft_id: int = None) -> None:
+async def clear_active_draft(chat_id: int, draft_id: int | None = None) -> None:
     async with _active_drafts_lock:
         info = _active_drafts.get(chat_id)
         if info is None:

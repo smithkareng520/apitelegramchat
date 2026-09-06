@@ -137,7 +137,7 @@ def _coerce_error_payload(payload_text: str) -> Any:
 def _extract_detail_lines_from_payload(payload: Any) -> list[str]:
     lines: list[str] = []
 
-    def _push(label: str, value: Any):
+    def _push(label: str, value: Any) -> None:
         if value is None:
             return
         if isinstance(value, str):
@@ -146,7 +146,7 @@ def _extract_detail_lines_from_payload(payload: Any) -> list[str]:
             return
         lines.append(f"{label}：{value}")
 
-    def _walk(obj: Any):
+    def _walk(obj: Any) -> None:
         if obj is None:
             return
         if isinstance(obj, list):

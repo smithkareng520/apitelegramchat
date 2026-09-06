@@ -7,7 +7,7 @@
 """
 import json
 import re
-from typing import Optional, Any
+from typing import Any, Optional, cast
 
 from utils import get_logger
 from tool_executors import _TOOL_TIMEOUT_MARKER
@@ -341,7 +341,7 @@ def _generate_pending_tool_summary(fn_args: dict) -> str:
     return "Preparing tool call..."
 
 
-def _generate_action_description(fn_name: str, fn_args: dict = None) -> str:
+def _generate_action_description(fn_name: str, fn_args: Optional[dict] = None) -> str:
     """生成动作描述（用于 fallback）"""
     fn_args = fn_args or {}
 
@@ -536,7 +536,8 @@ def _normalize_tool_arguments(
     # 畸形 JSON：先尝试保守自动修复（截断不猜测补全，安全优先）。
     repaired, repair_info = repair_json_arguments(raw, allow_close_truncated=False)
     if isinstance(repaired, dict):
-        note = repair_note_for_result(repair_info.get("fixes"))
+        # repair_info 形状由 repair_json_arguments 保证："fixes" 恒为 list。
+        note = repair_note_for_result(cast(list, repair_info.get("fixes")))
         if note:
             repaired[_JSON_REPAIR_NOTE_KEY] = note
         meta = {"kind": "repaired", "fixes": repair_info.get("fixes", [])}

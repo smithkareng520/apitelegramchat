@@ -37,6 +37,7 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from workspace_paths import memory_state_file
 from token_budget import truncate_to_token_budget
@@ -119,7 +120,7 @@ def _save_local(chat_id: int, store: dict) -> None:
     os.replace(tmp, path)
 
 
-def _find_memory(memories: list, mid: str) -> tuple[int, dict] | None:
+def _find_memory(memories: list, mid: Optional[str]) -> tuple[int, dict] | None:
     if not mid:
         return None
     target = str(mid).lstrip("#")
@@ -169,13 +170,13 @@ def _normalize_category(value: Optional[str]) -> str:
 
 # ---------- 业务逻辑 ----------
 class _MemoryError(Exception):
-    def __init__(self, message: str, code: str = "memory_error"):
+    def __init__(self, message: str, code: str = "memory_error") -> None:
         super().__init__(message)
         self.message = message
         self.code = code
 
 
-async def _read_store(chat_id: int, fn) -> dict:
+async def _read_store(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> dict:
     """
     读取型操作：先从 R2 拉取最新内容到本地，再执行读取，不回写 store。
     """
@@ -193,7 +194,7 @@ async def _read_store(chat_id: int, fn) -> dict:
         return payload
 
 
-async def _mutate(chat_id: int, fn) -> dict:
+async def _mutate(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> dict:
     """
     写入型操作：R2 → 本地 → 修改 → 保存 → 回传 R2。
     """
@@ -216,8 +217,8 @@ async def _mutate(chat_id: int, fn) -> dict:
         return payload
 
 
-def _op_add(store: dict, content: str, category: str, tags: list[str],
-            importance: str, source: str) -> dict:
+def _op_add(store: dict, content: Optional[str], category: str, tags: list[str],
+            importance: str, source: str) -> tuple[dict, dict]:
     content = (content or "").strip()
     if not content:
         raise _MemoryError("content 不能为空", "empty_content")
@@ -245,7 +246,7 @@ def _op_add(store: dict, content: str, category: str, tags: list[str],
     }
 
 
-def _op_get(store: dict, mid: str) -> dict:
+def _op_get(store: dict, mid: Optional[str]) -> tuple[dict, dict]:
     found = _find_memory(store["memories"], mid)
     if not found:
         raise _MemoryError(f"找不到 id 为 {mid} 的记忆", "not_found")
@@ -255,7 +256,7 @@ def _op_get(store: dict, mid: str) -> dict:
 
 
 def _op_list(store: dict, category: Optional[str], tag: Any,
-             importance: Optional[str], limit: int) -> dict:
+             importance: Optional[str], limit: int) -> tuple[dict, dict]:
     memories = store["memories"]
     # 默认排序：重要性降序，再按创建时间倒序（新的在前）
     weight = {"high": 3, "medium": 2, "low": 1}
@@ -296,7 +297,7 @@ def _op_list(store: dict, category: Optional[str], tag: Any,
     }
 
 
-def _op_search(store: dict, query: str, limit: int) -> dict:
+def _op_search(store: dict, query: str, limit: int) -> tuple[dict, dict]:
     q = (query or "").strip().lower()
     if not q:
         raise _MemoryError("search query 不能为空", "empty_query")
@@ -329,8 +330,8 @@ def _op_search(store: dict, query: str, limit: int) -> dict:
     }
 
 
-def _op_update(store: dict, mid: str, content: Optional[str],
-               category: Optional[str], tags: Any, importance: Optional[str]) -> dict:
+def _op_update(store: dict, mid: Optional[str], content: Optional[str],
+               category: Optional[str], tags: Any, importance: Optional[str]) -> tuple[dict, dict]:
     found = _find_memory(store["memories"], mid)
     if not found:
         raise _MemoryError(f"找不到 id 为 {mid} 的记忆", "not_found")
@@ -362,7 +363,7 @@ def _op_update(store: dict, mid: str, content: Optional[str],
     }
 
 
-def _op_delete(store: dict, mid: str) -> dict:
+def _op_delete(store: dict, mid: Optional[str]) -> tuple[dict, dict]:
     found = _find_memory(store["memories"], mid)
     if not found:
         raise _MemoryError(f"找不到 id 为 {mid} 的记忆", "not_found")
@@ -376,7 +377,7 @@ def _op_delete(store: dict, mid: str) -> dict:
     }
 
 
-def _op_clear(store: dict, scope: str) -> dict:
+def _op_clear(store: dict, scope: str) -> tuple[dict, dict]:
     """scope = all / category:<name> / tag:<name>"""
     before = len(store["memories"])
     if scope == "all":

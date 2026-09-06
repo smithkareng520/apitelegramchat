@@ -31,7 +31,7 @@ async def _get_download_lock(file_id: str) -> asyncio.Lock:
         return _download_locks[file_id]
 
 # ========== 获取文件路径 ==========
-async def get_file_path(file_id: str) -> str:
+async def get_file_path(file_id: str) -> str | None:
     """通过 Telegram API 获取文件的下载路径"""
     try:
         # 对 file_id 进行 URL 编码，防止异常字符破坏 URL
@@ -122,7 +122,7 @@ async def download_file(file_id: str, file_path: str) -> bool:
                 return False
         return False
 
-async def _upload_to_r2_after_download(file_id: str, file_path: str):
+async def _upload_to_r2_after_download(file_id: str, file_path: str) -> None:
     """异步上传文件到 R2，供后台调用"""
     try:
         with open(file_path, "rb") as f:

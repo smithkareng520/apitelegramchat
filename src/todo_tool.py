@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from datetime import datetime
 import uuid
 from pathlib import Path
@@ -43,7 +44,7 @@ TODO_NOTE_TOKEN_BUDGET = 500
 MAX_TODOS = 500  # 单 chat 上限，防止失控增长
 MAX_TAGS = 8
 
-PRIORITY_META = {
+PRIORITY_META: dict[str, dict[str, Any]] = {
     "high":   {"emoji": "🔴", "label": "高", "weight": 3},
     "medium": {"emoji": "🟡", "label": "中", "weight": 2},
     "low":    {"emoji": "🟢", "label": "低", "weight": 1},
@@ -94,7 +95,7 @@ def _save_local(chat_id: int, store: dict) -> None:
     os.replace(tmp, path)
 
 
-def _find_todo(todos: list, todo_id: str) -> tuple[int, dict] | None:
+def _find_todo(todos: list, todo_id: Optional[str]) -> tuple[int, dict] | None:
     """返回 (index, todo) 或 None。"""
     if not todo_id:
         return None
@@ -140,7 +141,7 @@ def _normalize_tags(tags: Any) -> list[str]:
 
 
 # ---------- 业务逻辑 ----------
-async def _read_store(chat_id: int, fn) -> dict:
+async def _read_store(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> dict:
     """
     读取型操作：先从 R2 拉取最新内容到本地，再执行读取，不回写 store。
     """
@@ -158,7 +159,7 @@ async def _read_store(chat_id: int, fn) -> dict:
         return payload
 
 
-async def _mutate(chat_id: int, fn) -> dict:
+async def _mutate(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> dict:
     """
     在 workspace 锁保护下：从 R2 同步 → 加载 → 调用 fn(store) → 保存 → 同步回 R2。
     fn 返回 (store, payload)，payload 是返回给调用方的结构化结果。
@@ -189,7 +190,7 @@ async def _mutate(chat_id: int, fn) -> dict:
 class _TodoError(Exception):
     """业务级错误，会被 _mutate 捕获并转成结构化 error。"""
 
-    def __init__(self, message: str, code: str = "todo_error"):
+    def __init__(self, message: str, code: str = "todo_error") -> None:
         super().__init__(message)
         self.message = message
         self.code = code
@@ -228,7 +229,7 @@ def _due_status(due_at: Optional[str]) -> str:
         return "unknown"
 
 
-def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optional[str], due_at: Optional[str]) -> dict:
+def _op_add(store: dict, title: Optional[str], priority: str, tags: list[str], note: Optional[str], due_at: Optional[str]) -> tuple[dict, dict]:
     title = (title or "").strip()
     if not title:
         raise _TodoError("title 不能为空", "empty_title")
@@ -259,11 +260,11 @@ def _op_add(store: dict, title: str, priority: str, tags: list[str], note: Optio
     return store, payload
 
 
-def _op_list(store: dict, filter_: str, tag: Optional[str], priority: Optional[str]) -> dict:
+def _op_list(store: dict, filter_: str, tag: Optional[str], priority: Optional[str]) -> tuple[dict, dict]:
     todos = store["todos"]
     # 默认排序：未完成在前，再按优先级降序，再按创建时间升序。
     # 展示顺序完全由 created_at + id 决定，不依赖可见编号。
-    def sort_key(t: dict):
+    def sort_key(t: dict) -> tuple[int, int, Any, Any]:
         return (
             1 if t.get("done") else 0,
             # 防御：priority 可能未经校验（旧数据 / LLM typo / 手改 JSON），
@@ -302,7 +303,7 @@ def _op_list(store: dict, filter_: str, tag: Optional[str], priority: Optional[s
     return store, payload
 
 
-def _op_toggle(store: dict, todo_id: str, force: Optional[bool]) -> dict:
+def _op_toggle(store: dict, todo_id: Optional[str], force: Optional[bool]) -> tuple[dict, dict]:
     found = _find_todo(store["todos"], todo_id)
     if not found:
         raise _TodoError(f"找不到 id 为 {todo_id} 的待办", "not_found")
@@ -330,7 +331,7 @@ def _op_toggle(store: dict, todo_id: str, force: Optional[bool]) -> dict:
     }
 
 
-def _op_delete(store: dict, todo_id: str) -> dict:
+def _op_delete(store: dict, todo_id: Optional[str]) -> tuple[dict, dict]:
     found = _find_todo(store["todos"], todo_id)
     if not found:
         raise _TodoError(f"找不到 id 为 {todo_id} 的待办", "not_found")
@@ -345,7 +346,7 @@ def _op_delete(store: dict, todo_id: str) -> dict:
     }
 
 
-def _op_clear(store: dict, filter_: str) -> dict:
+def _op_clear(store: dict, filter_: str) -> tuple[dict, dict]:
     """清空：done=只清已完成；all=清全部。"""
     if filter_ == "done":
         before = len(store["todos"])
@@ -369,9 +370,9 @@ def _op_clear(store: dict, filter_: str) -> dict:
     }
 
 
-def _op_edit(store: dict, todo_id: str, title: Optional[str],
+def _op_edit(store: dict, todo_id: Optional[str], title: Optional[str],
              priority: Optional[str], tags: Any, note: Optional[str],
-             due_at: Optional[str]) -> dict:
+             due_at: Optional[str]) -> tuple[dict, dict]:
     found = _find_todo(store["todos"], todo_id)
     if not found:
         raise _TodoError(f"找不到 id 为 {todo_id} 的待办", "not_found")

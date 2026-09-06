@@ -10,6 +10,7 @@ import os
 import time
 import hmac
 import mimetypes
+from typing import Any, cast
 from workspace_paths import workspace_download_root
 from token_budget import count_tokens
 
@@ -240,7 +241,9 @@ def _cmd_match(t: str, name: str) -> bool:
 
 def _reply_params(message_id: int | None) -> dict | None:
     try:
-        mid = int(message_id)
+        # message_id 为 None 时 int(None) 抛 TypeError，由下方 except 统一
+        # 返回 None（即"无 reply 目标"）；cast 仅为类型标注，不改运行时行为。
+        mid = int(cast(int, message_id))
     except (TypeError, ValueError):
         return None
     if mid <= 0:
@@ -342,7 +345,7 @@ async def _interrupt_active_generation(chat_id: int) -> None:
 
 
 @app.route('/health', methods=['GET'])
-async def health_check():
+async def health_check() -> tuple[dict[str, str], int]:
     # 健康检查端点对外可访问，不应暴露内部统计信息（白名单数量、活跃任务数）。
     # 这些信息可能被探测方用于侧信道推断。
     return {
@@ -369,7 +372,7 @@ def is_authorized(username: str, user_id: str) -> bool:
         return True
     return is_whitelisted_identity(username, user_id)
 
-async def reply_unauthorized(chat_id: int, reply_message_id: int | None = None):
+async def reply_unauthorized(chat_id: int, reply_message_id: int | None = None) -> None:
     await send_rich_html_message(
         chat_id,
         """
@@ -443,7 +446,7 @@ def estimate_tokens(text: str) -> int:
     """Return the exact tokenizer count for model-facing text."""
     return count_tokens(text)
 
-def _estimate_content_tokens(content) -> int:
+def _estimate_content_tokens(content: Any) -> int:
     if content is None:
         return 0
     if isinstance(content, str):
@@ -636,7 +639,7 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
             )
         return True
 
-async def update_conversation_and_ledger(chat_id: int, user_message: dict | None, new_msgs: list, usage: dict = None) -> None:
+async def update_conversation_and_ledger(chat_id: int, user_message: dict | None, new_msgs: list, usage: dict[str, Any] | None = None) -> None:
     """将本轮对话写入持久历史并维护 token 台账。
 
     user_message 为 None 时（TIMER 主动唤醒回合）：不写入唤醒用的合成
@@ -696,7 +699,7 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
 # ---------------------------------------------------------------------------
 # 业务处理
 # ---------------------------------------------------------------------------
-async def _cancel_old_task(chat_id: int):
+async def _cancel_old_task(chat_id: int) -> None:
     async with active_tasks_lock:
         task = active_tasks.pop(chat_id, None)
     if task is not None and not task.done():
@@ -724,7 +727,7 @@ async def _log_task_cancel(task: "asyncio.Task", chat_id: int) -> None:
     except Exception as e:
         logger.warning(f"旧任务清理异常: chat_id={chat_id} {e}")
 
-async def _cleanup_task(chat_id: int, task: asyncio.Task):
+async def _cleanup_task(chat_id: int, task: asyncio.Task) -> None:
     async with active_tasks_lock:
         is_current = chat_id in active_tasks and active_tasks.get(chat_id) == task
         if is_current:
@@ -743,7 +746,7 @@ async def _cleanup_task(chat_id: int, task: asyncio.Task):
 # 正在做的动作，用户上传媒体时回发这些动作会被客户端渲染成“bot 正在
 # 上传照片/语音/…”，语义完全相反；typing 也只在模型流式输出期间才有
 # 意义（见 chat_actions.py 与 ai/agentic_loops.py 的实现）。
-async def _handle_text_message(chat_id: int, user_input: str, username: str, user_message: dict):
+async def _handle_text_message(chat_id: int, user_input: str, username: str, user_message: dict) -> None:
     # 后台预初始化 workspace：与模型生成响应并行，避免第一个工具调用
     # 是 no-op。
     asyncio.create_task(init_workspace(chat_id))
@@ -764,7 +767,7 @@ async def _handle_text_message(chat_id: int, user_input: str, username: str, use
         logger.exception(f"_handle_text_message 异常: {e}")
         await send_rich_html_message(chat_id, f"❌ <b>处理消息时出错</b>\n<code>{str(e)[:100]}</code>")
 
-async def _handle_photo_message(chat_id: int, user_message: dict, username: str):
+async def _handle_photo_message(chat_id: int, user_message: dict, username: str) -> None:
     asyncio.create_task(init_workspace(chat_id))
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
@@ -783,7 +786,7 @@ async def _handle_photo_message(chat_id: int, user_message: dict, username: str)
         logger.exception(f"_handle_photo_message 异常: {e}")
         await send_rich_html_message(chat_id, f"❌ <b>处理图片时出错</b>\n<code>{str(e)[:100]}</code>")
 
-async def _handle_document_message(chat_id: int, user_message: dict, username: str):
+async def _handle_document_message(chat_id: int, user_message: dict, username: str) -> None:
     asyncio.create_task(init_workspace(chat_id))
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
@@ -802,7 +805,7 @@ async def _handle_document_message(chat_id: int, user_message: dict, username: s
         logger.exception(f"_handle_document_message 异常: {e}")
         await send_rich_html_message(chat_id, f"❌ <b>处理文档时出错</b>\n<code>{str(e)[:100]}</code>")
 
-async def _handle_audio_message(chat_id: int, user_message: dict, username: str):
+async def _handle_audio_message(chat_id: int, user_message: dict, username: str) -> None:
     # 用户上传语音时回发 upload_voice 是错误语义（那是“bot 正在上传语音”
     # 的指示）——用户上传的内容与 chat action 无关，这里不发送任何动作。
     asyncio.create_task(init_workspace(chat_id))
@@ -823,7 +826,7 @@ async def _handle_audio_message(chat_id: int, user_message: dict, username: str)
         logger.exception(f"_handle_audio_message 异常: {e}")
         await send_rich_html_message(chat_id, f"❌ <b>处理音频时出错</b>\n<code>{str(e)[:100]}</code>")
 
-async def _handle_video_message(chat_id: int, user_message: dict, username: str):
+async def _handle_video_message(chat_id: int, user_message: dict, username: str) -> None:
     """处理直接上传的视频 / 圆形视频消息（video_note）。
 
     与图片消息对称：user_message 携带 file_id / mime_type 等元数据存入
@@ -849,7 +852,7 @@ async def _handle_video_message(chat_id: int, user_message: dict, username: str)
         logger.exception(f"_handle_video_message 异常: {e}")
         await send_rich_html_message(chat_id, f"❌ <b>处理视频时出错</b>\n<code>{str(e)[:100]}</code>")
 
-async def _handle_sticker_message(chat_id: int, user_message: dict, username: str):
+async def _handle_sticker_message(chat_id: int, user_message: dict, username: str) -> None:
     """处理用户发送的贴纸（sticker）。
 
     贴纸本体（TGS / WebP / WebM）目前主流 LLM 不可直接识别，因此只把
@@ -936,7 +939,7 @@ def _is_media_model_active(chat_id: int) -> bool:
     )
 
 
-async def _handle_timer_wakeup(chat_id: int):
+async def _handle_timer_wakeup(chat_id: int) -> None:
     """TIMER 事件源回合：系统后台唤醒 agent 的“自己的活动时间”。
 
     与用户回合共用同一份会话历史（统一上下文），并走**同一套草稿与交付
@@ -1349,7 +1352,9 @@ async def _process_document_group_inner(chat_id: int, media_group_id: str) -> No
         ctx = get_or_init_context(chat_id)
         ctx["username"] = username or f"User_{chat_id}"
         ctx["tg_username"] = (username or "").strip()
-    await _handle_text_message(chat_id, user_message.get("content", ""), username, user_message)
+    # 两个分支的 content 均由 str 类型的 content_text 构造，cast 仅用于
+    # 消除 dict 联合推断带来的宽化，运行时值恒为 str。
+    await _handle_text_message(chat_id, cast(str, user_message.get("content", "")), username, user_message)
 
 async def _schedule_document_group(chat_id: int, media_group_id: str) -> None:
     """将文档组的等待/处理任务作为当前 chat 的可取消生成任务登记。"""
@@ -1370,7 +1375,7 @@ async def _schedule_document_group(chat_id: int, media_group_id: str) -> None:
 # ---------------------------------------------------------------------------
 # 角色与模型列表 UI
 # ---------------------------------------------------------------------------
-async def update_role_list(chat_id: int, message_id: int, role_list: list, current_role: str) -> bool:
+async def update_role_list(chat_id: int, message_id: int, role_list: list, current_role: str | None) -> bool:
     formatted = [f"{r} √" if r == current_role else r for r in role_list]
     keyboard = {"inline_keyboard": [[{"text": t, "callback_data": r}] for t, r in zip(formatted, role_list)]}
     payload = {
@@ -1432,7 +1437,7 @@ async def update_model_list(
         return False
 
 
-async def _del_after(chat_id, msg_id, delay):
+async def _del_after(chat_id: int, msg_id: int, delay: float) -> None:
     await asyncio.sleep(delay)
     await delete_message(chat_id, msg_id)
 
@@ -1513,7 +1518,7 @@ async def _send_via_send_message(
     return 0
 
 
-async def send_role_list(chat_id: int, role_list: list, current_role: str, reply_message_id: int | None = None) -> int:
+async def send_role_list(chat_id: int, role_list: list, current_role: str | None, reply_message_id: int | None = None) -> int:
     formatted = [f"{r} √" if r == current_role else r for r in role_list]
     keyboard = {"inline_keyboard": [[{"text": t, "callback_data": r}] for t, r in zip(formatted, role_list)]}
     content = "选择角色设定 (再次点击取消):"
@@ -1577,7 +1582,8 @@ async def send_model_list(
 WEBHOOK_QUEUE_MAXSIZE = int(os.getenv("WEBHOOK_QUEUE_MAXSIZE", "1000"))
 # 模块级创建：Python>=3.10 的 asyncio.Queue 在首次使用时才绑定事件循环，
 # 导入期实例化是安全的（项目 requires-python >=3.10）。
-update_queue = asyncio.Queue(maxsize=WEBHOOK_QUEUE_MAXSIZE)
+# 队列元素为 Telegram update dict（webhook 解析后的 JSON 对象）。
+update_queue: "asyncio.Queue[dict[str, Any]]" = asyncio.Queue(maxsize=WEBHOOK_QUEUE_MAXSIZE)
 _telegram_worker_task: asyncio.Task | None = None
 # INGEST_MODE=polling 时的 getUpdates 长轮询任务（webhook 模式下恒为 None）。
 _telegram_polling_task: asyncio.Task | None = None
@@ -1857,7 +1863,10 @@ async def process_update(data: dict) -> None:
                     if not target:
                         await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
                         return
-                    result = await add_whitelist_user(target)
+                    # result 在本函数多个分支被复用（/adduser、/deluser 的
+                    # str 状态码与 /balance 的 BalanceResult 遍历），形状异构，
+                    # 首次绑定处标注 Any 以如实反映用法。
+                    result: Any = await add_whitelist_user(target)
                     target_html = html.escape(target)
                     if result == ADD_ADDED:
                         reply = f"✅ <b>添加成功</b>\n已添加 <code>{target_html}</code> 到白名单，并已同步到 R2。"
@@ -2038,7 +2047,9 @@ async def process_update(data: dict) -> None:
                     f"调用 search_poi / route / distance 等工具，无需再调用 geocode。"
                     f"如需反查中文地址，请调用 amap-maps MCP 的 maps_regeocode 工具。"
                 )
-                user_message = {"role": "user", "content": content_text}
+                # 首次绑定即标注 dict[str, Any]：后续媒体分支会写入 list/dict
+                # 值（file_ids/attachments/sticker_meta 等 Telegram 载荷）。
+                user_message: dict[str, Any] = {"role": "user", "content": content_text}
                 await _interrupt_active_generation(chat_id)
                 task = asyncio.create_task(
                     _handle_text_message(chat_id, content_text, username, user_message)

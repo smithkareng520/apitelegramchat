@@ -19,7 +19,7 @@ import logging
 import os
 import signal
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from workspace_paths import workspace_workdir, runtime_cache_root
 from net_shims import ensure_network_shims
@@ -34,6 +34,9 @@ SANDBOX_MAX_OPEN_FILES = int(os.getenv("SANDBOX_MAX_OPEN_FILES", "256"))
 SANDBOX_TIMEOUT_SEC = int(os.getenv("SANDBOX_TIMEOUT_SEC", "300"))
 
 # ---------- libc ----------
+# Any：_libc 加载失败时为 None，各调用点各自判空；若声明为 ctypes.CDLL | None，
+# _apply_landlock 内未判空直接 syscall 的既有调用点会级联报错，Any 最小且不失真。
+_libc: Any
 try:
     _libc = ctypes.CDLL("libc.so.6", use_errno=True)
 except OSError:
@@ -272,7 +275,7 @@ def _apply_landlock(workspace_path: str) -> bool:
 # =====================================================================
 # preexec_fn —— fork 后 exec 前调用
 # =====================================================================
-def _preexec_sandbox(workspace_path: str):
+def _preexec_sandbox(workspace_path: str) -> None:
     """Install all mandatory child restrictions before exec("bash")."""
     import resource
 
@@ -408,7 +411,7 @@ def build_sandbox_env(
 # =====================================================================
 def _count_descendants(root_pid: int) -> int:
     """通过 /proc 统计进程树大小"""
-    children_map = {}
+    children_map: dict[int, list[int]] = {}
     try:
         for entry in os.listdir("/proc"):
             if not entry.isdigit():

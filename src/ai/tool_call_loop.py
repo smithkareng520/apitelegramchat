@@ -11,7 +11,7 @@ import json
 import re
 import time
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional
 
 from utils import get_logger, escape_html
 from token_budget import truncate_to_token_budget
@@ -227,10 +227,10 @@ async def _run_tool_calls_and_append(
         tool_call_count_ref: list,
         api_label: str,
         builder: "RichMessageBuilder",
-        chat_id: int = None,
-        tools: list = None,
+        chat_id: Optional[int] = None,
+        tools: Optional[list] = None,
 ) -> str:
-    valid_tool_calls = []
+    valid_tool_calls: list[Any] = []
     skipped_tool_calls = []
     remaining_budget = max(0, MAX_TOOL_CALLS - tool_call_count_ref[0])
     for tc in tool_calls:
@@ -320,7 +320,7 @@ async def _run_tool_calls_and_append(
     # force flush。工具批次无需另建心跳任务；图片、视频和普通工具均复用
     # 同一机制，状态变更仍由前面的普通 flush 立即推送。
 
-    async def run_one(fn_name, fn_args, tc_id):
+    async def run_one(fn_name: str, fn_args: dict, tc_id: str) -> tuple[str, str, str, str, str, dict, str]:
         # 打断保全：工具真正执行完成时把结果登记到共享 dict。
         # 批次被取消时（asyncio.gather 抛 CancelledError），已完成的工具
         # 结果由 _salvage_interrupted_batch 回填真实 tool 消息，未完成的
@@ -383,10 +383,10 @@ async def _run_tool_calls_and_append(
                 _emit_ref = [0.0]
 
                 async def tool_progress_callback(status_text: str,
-                                                  _tc_id=tc_id,
-                                                  _label=label,
-                                                  _phase_ref=_phase_ref,
-                                                  _emit_ref=_emit_ref):
+                                                  _tc_id: str = tc_id,
+                                                  _label: str = label,
+                                                  _phase_ref: list = _phase_ref,
+                                                  _emit_ref: list[float] = _emit_ref) -> None:
                     try:
                         now = time.monotonic()
                         phase = _subagent_progress_phase(status_text)
@@ -621,7 +621,7 @@ async def _run_tool_calls_and_append(
             )
             # 按 tool_tasks 的原始位置重组 results，后续的状态写入和
             # tool_msg 配对逻辑都基于原始顺序，不需要改动。
-            results = [None] * len(tool_tasks)
+            results: list[Any] = [None] * len(tool_tasks)
             for i, r in zip(producer_indices, phase1_results):
                 results[i] = r
             for i, r in zip(consumer_indices, phase2_results):
@@ -754,7 +754,7 @@ async def _run_tool_calls_and_append(
         logger.warning(f"[{api_label}] 工具调用超限 ({MAX_TOOL_CALLS})")
         return "over_limit"
 
-    error_msgs = []
+    error_msgs: list[str] = []
     for res in results:
         if isinstance(res, tuple) and len(res) >= 5:
             llm_content = res[4]

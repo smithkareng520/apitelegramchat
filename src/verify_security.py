@@ -30,10 +30,10 @@ FAIL = _color(31, "[FAIL]")
 WARN = _color(33, "[WARN]")
 INFO = _color(36, "[INFO]")
 
-results = []
+results: list[tuple[str, bool]] = []
 
 
-def report(name: str, ok: bool, detail: str = ""):
+def report(name: str, ok: bool, detail: str = "") -> None:
     status = PASS if ok else FAIL
     line = f"{status} {name}"
     if detail:
@@ -42,25 +42,25 @@ def report(name: str, ok: bool, detail: str = ""):
     results.append((name, ok))
 
 
-def warn(name: str, detail: str):
+def warn(name: str, detail: str) -> None:
     print(f"{WARN} {name} — {detail}")
     results.append((name, True))  # warn 不算 fail
 
 
-def info(name: str, detail: str):
+def info(name: str, detail: str) -> None:
     print(f"{INFO} {name} — {detail}")
 
 
 # ----------------------------------------------------------------------
 # 1. 容器身份检查
 # ----------------------------------------------------------------------
-def check_user():
+def check_user() -> bool:
     uid = os.getuid()
     report("1.1 非 root 运行", uid != 0, f"uid={uid}")
     return uid != 0
 
 
-def check_no_sudo():
+def check_no_sudo() -> None:
     has_sudo = shutil.which("sudo") is not None
     has_su = shutil.which("su") is not None
     report("1.2 sudo/su 不可用", not (has_sudo or has_su),
@@ -70,7 +70,7 @@ def check_no_sudo():
 # ----------------------------------------------------------------------
 # 2. 敏感环境变量检查
 # ----------------------------------------------------------------------
-def check_env_scrubbed():
+def check_env_scrubbed() -> None:
     """检查 os.environ 中是否还有敏感变量。
 
     安全修复：此前直接把残留变量名打印到 stdout / 日志，这本身
@@ -99,7 +99,7 @@ def check_env_scrubbed():
 # ----------------------------------------------------------------------
 # 3. Landlock 沙箱可用性
 # ----------------------------------------------------------------------
-def check_landlock():
+def check_landlock() -> bool:
     from sandbox import _landlock_supported
     ok = _landlock_supported()
     report("3.1 Landlock 内核支持", ok,
@@ -110,7 +110,7 @@ def check_landlock():
 # ----------------------------------------------------------------------
 # 4. 沙箱内隔离测试
 # ----------------------------------------------------------------------
-async def check_sandbox_isolation(landlock_ok: bool):
+async def check_sandbox_isolation(landlock_ok: bool) -> None:
     """Run independent commands and assert filesystem confinement."""
     if not landlock_ok:
         report("4.0 Landlock sandbox available", False, "Landlock unavailable: sandbox cannot be considered safe")
@@ -212,7 +212,7 @@ async def check_sandbox_isolation(landlock_ok: bool):
 # ----------------------------------------------------------------------
 # 5. 资源限制检查
 # ----------------------------------------------------------------------
-def check_resource_limits():
+def check_resource_limits() -> None:
     import resource
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
@@ -234,7 +234,7 @@ def check_resource_limits():
 # ----------------------------------------------------------------------
 # 6. Workspace 权限检查
 # ----------------------------------------------------------------------
-def check_workspace_perms():
+def check_workspace_perms() -> None:
     # 用真实 data_root 路径而非硬编码 /app，否则非 /app 部署永远跳过检查。
     try:
         from workspace_paths import data_root
@@ -257,7 +257,7 @@ def check_workspace_perms():
 # ----------------------------------------------------------------------
 # 7. setuid 检查
 # ----------------------------------------------------------------------
-def check_setuid():
+def check_setuid() -> None:
     """扫描 /usr /bin 下的 setuid 二进制"""
     found = []
     for root_dir in ["/usr/bin", "/usr/local/bin", "/bin", "/sbin"]:
@@ -282,7 +282,7 @@ def check_setuid():
 # ----------------------------------------------------------------------
 # 主流程
 # ----------------------------------------------------------------------
-async def main():
+async def main() -> None:
     print("=" * 70)
     print(" Bash 沙箱安全自检")
     print("=" * 70)

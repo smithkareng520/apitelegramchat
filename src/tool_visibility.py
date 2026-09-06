@@ -107,7 +107,7 @@ class ToolVisibilityRule:
         default=_default_shadow_note
     )
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         for label, mode in (("user_turn", self.user_turn), ("timer_turn", self.timer_turn)):
             if mode not in _VALID_MODES:
                 raise ValueError(
@@ -143,7 +143,7 @@ def _call_tool_name(tool_call: dict) -> Optional[str]:
         return None
 
 
-def _merge_note_into_content(content, note: str):
+def _merge_note_into_content(content: str | list | None, note: str) -> str | list:
     """把 shadow 摘要并入 assistant content（兼容 str / None / 多模态 list）。"""
     if content is None or content == "":
         return note
@@ -183,6 +183,8 @@ def apply_tool_visibility(
         if mode != VISIBILITY_KEEP:
             active_rules[rule.tool_name] = (rule, mode)
     # 开关维度插拔：hidden_tools 一律按 DROP 处理，两个事件源方向相同。
+    # 显式 Optional[str]：与下方重新绑定的 _call_tool_name() 返回类型共用一个绑定。
+    name: Optional[str]
     for name in (hidden_tools or ()):
         if isinstance(name, str) and name and name not in active_rules:
             active_rules[name] = (

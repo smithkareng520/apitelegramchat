@@ -70,8 +70,9 @@ def _parse_arguments(raw: object) -> dict[str, Any]:
 def _minimal_arguments(name: str, raw: object) -> str:
     """Keep only the stable locator fields needed to repeat a compacted call."""
     parsed = _parse_arguments(raw)
+    # 各分支的 key 集合不同，统一放宽为 dict[str, Any]（与 _parse_arguments 的返回类型一致）
     if name == "wikipedia":
-        compact = {key: parsed[key] for key in ("query", "lang") if key in parsed}
+        compact: dict[str, Any] = {key: parsed[key] for key in ("query", "lang") if key in parsed}
     elif name == "fetch_url":
         compact = {key: parsed[key] for key in ("url",) if key in parsed}
     elif name == "text_editor":

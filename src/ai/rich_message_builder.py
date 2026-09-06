@@ -9,7 +9,7 @@ import random
 import html
 import os
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from config import STREAM_FLUSH_INTERVAL, STREAM_SILENT_FORCE_FLUSH
 from utils import (
@@ -246,7 +246,7 @@ async def _swallow_flush_task(t: "asyncio.Task", name: str, draft_id: int) -> No
 
 
 class RichMessageBuilder:
-    def __init__(self, chat_id: int):
+    def __init__(self, chat_id: int) -> None:
         self.chat_id = chat_id
         # draft_id 必须在 2^53 (9007199254740992) 以内，否则 JSON 双精度浮点解析会丢失精度，
         # 导致服务端把同一次请求视为不同草稿，出现两个草稿同时更新的 bug。
@@ -254,7 +254,7 @@ class RichMessageBuilder:
         self.draft_message_id: Optional[int] = None
         self.blocks: List[str] = []
         self.block_types: List[str] = []
-        self._tool_groups = []
+        self._tool_groups: List[dict[str, Any]] = []
         self._current_group_idx = -1
         self._stream_buffer: str = ""
         self._stream_text_index: int = -1
@@ -320,7 +320,7 @@ class RichMessageBuilder:
         if self._pending_flush_task and not self._pending_flush_task.done():
             return
 
-        async def _runner():
+        async def _runner() -> None:
             try:
                 while not self._stop_flush:
                     force_now = self._force_flush_requested
@@ -375,7 +375,7 @@ class RichMessageBuilder:
         self.request_flush(force=False)
         return self._current_group_idx
 
-    def _get_current_group(self):
+    def _get_current_group(self) -> int:
         for idx in range(len(self._tool_groups) - 1, -1, -1):
             if not self._tool_groups[idx].get("finished", False):
                 self._current_group_idx = idx
@@ -383,9 +383,9 @@ class RichMessageBuilder:
         return self.start_new_tool_group()
 
     def add_tool_item(self, tool_id: str, tool_type: str, summary: str,
-                      action_description: str = None,
-                      search_query: str = None, domain: str = None,
-                      fn_args: dict = None):
+                      action_description: str | None = None,
+                      search_query: str | None = None, domain: str | None = None,
+                      fn_args: dict | None = None) -> None:
         group_idx = self._get_current_group()
         group = self._tool_groups[group_idx]
 
@@ -429,8 +429,8 @@ class RichMessageBuilder:
         self._refresh_outer_summary(group)
         self.request_flush(force=False)
 
-    def attach_stream_tool_identity(self, item_id: str, new_id: str = None,
-                                    tool_type: str = None) -> bool:
+    def attach_stream_tool_identity(self, item_id: str, new_id: str | None = None,
+                                    tool_type: str | None = None) -> bool:
         """流式占位工具条目的身份补全（原地改绑，绝不新建条目）。
 
         流式增量里 tool_call 的 id/函数名可能晚于参数增量到达（部分聚合
@@ -470,7 +470,7 @@ class RichMessageBuilder:
                 return True
         return False
 
-    def update_tool_item(self, tool_id: str, summary: str, details_html: str, status: str = "done"):
+    def update_tool_item(self, tool_id: str, summary: str, details_html: str, status: str = "done") -> None:
         for group in self._tool_groups:
             for item in group["items"]:
                 if item["id"] == tool_id:
@@ -481,7 +481,7 @@ class RichMessageBuilder:
                     self.request_flush(force=False)
                     return
 
-    def update_tool_preview(self, tool_id: str, preview_html: str, summary: str = None):
+    def update_tool_preview(self, tool_id: str, preview_html: str, summary: str | None = None) -> None:
         for group in self._tool_groups:
             for item in group["items"]:
                 if item["id"] == tool_id:
@@ -492,7 +492,7 @@ class RichMessageBuilder:
                     self.request_flush(force=False)
                     return
 
-    def update_tool_args(self, tool_id: str, fn_args: dict):
+    def update_tool_args(self, tool_id: str, fn_args: dict) -> None:
         """流式接收工具参数期间更新条目参数，并即时刷新可见摘要。
 
         模型提交的简短描述（``_description``/``_summary``）一旦能从（可能
@@ -518,7 +518,7 @@ class RichMessageBuilder:
                     self._refresh_outer_summary(group)
                 return
 
-    def append_to_current_tool_group_text(self, text: str):
+    def append_to_current_tool_group_text(self, text: str) -> None:
         if self._handoff_text is not None:
             self._handoff_text.append(text)
             return
@@ -530,7 +530,7 @@ class RichMessageBuilder:
         self.request_flush(force=False)
 
     # ---- 修改点3：_refresh_outer_summary（工具组进行时，规范第二部分） ----
-    def _refresh_outer_summary(self, group: dict):
+    def _refresh_outer_summary(self, group: dict) -> None:
         """
         刷新工具组的外部摘要（进行时状态）
         优先使用自定义 _description，否则使用规范中的进行时固定文本。
@@ -720,7 +720,7 @@ class RichMessageBuilder:
         return ", ".join(descs)
 
     # ---- 修改点5：finish_group 增加默认标题 ----
-    def finish_group(self, group_idx: int = None):
+    def finish_group(self, group_idx: int | None = None) -> None:
         if group_idx is None:
             group_idx = len(self._tool_groups) - 1
         if group_idx < 0 or group_idx >= len(self._tool_groups):
@@ -771,7 +771,7 @@ class RichMessageBuilder:
                 return True
         return False
 
-    def add_text(self, text: str):
+    def add_text(self, text: str) -> None:
         if not text or not text.strip():
             return
         if self._handoff_text is not None:
@@ -816,7 +816,7 @@ class RichMessageBuilder:
         return False
 
     # ---------- 流式管理 ----------
-    def begin_stream(self, stream_type: str = "text"):
+    def begin_stream(self, stream_type: str = "text") -> None:
         self._commit_stream_buffer()
         self.blocks.append("")
         self.block_types.append(stream_type)
@@ -824,13 +824,13 @@ class RichMessageBuilder:
         self._stream_buffer = ""
         self.request_flush(force=False)
 
-    def begin_stream_text(self):
+    def begin_stream_text(self) -> None:
         self.begin_stream("text")
 
-    def begin_stream_reasoning(self):
+    def begin_stream_reasoning(self) -> None:
         self.begin_stream("reasoning")
 
-    def append_stream_delta(self, delta: str):
+    def append_stream_delta(self, delta: str) -> None:
         if not delta:
             return
         if self._handoff_text is not None:
@@ -842,7 +842,7 @@ class RichMessageBuilder:
         self._flush_dirty = True
         self._flush_revision += 1
 
-    def _commit_stream_buffer(self):
+    def _commit_stream_buffer(self) -> None:
         if self._stream_buffer and self._stream_text_index >= 0:
             self.blocks[self._stream_text_index] += self._stream_buffer
             self._stream_buffer = ""
@@ -863,7 +863,7 @@ class RichMessageBuilder:
     def end_stream_text(self) -> str:
         return self.end_stream()
 
-    def finalize_reasoning_block(self):
+    def finalize_reasoning_block(self) -> None:
         self._commit_stream_buffer()
 
     def _build_tool_group_html(self, group: dict) -> str:
@@ -1257,7 +1257,7 @@ class RichMessageBuilder:
                 )
 
             if old_draft_message_id:
-                async def _cleanup_old_preview():
+                async def _cleanup_old_preview() -> None:
                     deleted = await delete_message_fast(self.chat_id, old_draft_message_id)
                     if not deleted:
                         logger.debug(
@@ -1368,7 +1368,7 @@ class RichMessageBuilder:
             raise
 
     # ---------- 刷新与清理 ----------
-    async def flush(self, force: bool = False):
+    async def flush(self, force: bool = False) -> None:
         now = time.monotonic()
         if now < self._rate_limited_until:
             logger.debug(
@@ -1436,7 +1436,7 @@ class RichMessageBuilder:
                 else:
                     logger.warning(f"Flush failed: {e}")
 
-    async def _stream_flush_loop(self):
+    async def _stream_flush_loop(self) -> None:
         while not self._stop_flush:
             now = time.monotonic()
             if now < self._rate_limited_until:
@@ -1478,12 +1478,12 @@ class RichMessageBuilder:
                 # 严格等于 STREAM_SILENT_FORCE_FLUSH。
                 self._last_flush_time = time.monotonic()
 
-    def start_flush_loop(self):
+    def start_flush_loop(self) -> None:
         if self._flush_task is None or self._flush_task.done():
             self._stop_flush = False
             self._flush_task = asyncio.create_task(self._stream_flush_loop())
 
-    async def stop_flush_loop(self):
+    async def stop_flush_loop(self) -> None:
         """停止并限时等待草稿刷新子任务；回合边界滚动不再存在后台任务。"""
         self._stop_flush = True
         self._rollover_pending = False
@@ -1528,7 +1528,7 @@ class SilentMessageBuilder(RichMessageBuilder):
     ``getattr(builder, "silent", False)`` 做静默分支判断。
     """
 
-    def __init__(self, chat_id: int):
+    def __init__(self, chat_id: int) -> None:
         super().__init__(chat_id)
         self.silent = True
 
@@ -1538,16 +1538,16 @@ class SilentMessageBuilder(RichMessageBuilder):
         # 静默回合没有草稿，无需合并/补发任何帧
         return
 
-    async def flush(self, force: bool = False):
+    async def flush(self, force: bool = False) -> None:
         # 永不发送草稿帧；draft_message_id 保持 None，
         # 上层据此自然跳过所有"删除草稿气泡"的分支。
         return
 
-    def start_flush_loop(self):
+    def start_flush_loop(self) -> None:
         # 没有需要驱动的刷新循环
         return
 
-    async def stop_flush_loop(self):
+    async def stop_flush_loop(self) -> None:
         # 从未启动任何后台任务，直接返回
         return
 

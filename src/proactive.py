@@ -191,7 +191,7 @@ class _ChatSchedule:
 
     __slots__ = ("chat_id", "last_user_message", "timer_task", "watch_task")
 
-    def __init__(self, chat_id: int):
+    def __init__(self, chat_id: int) -> None:
         self.chat_id = chat_id
         self.last_user_message = time.monotonic()
         self.timer_task: Optional[asyncio.Task] = None

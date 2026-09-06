@@ -8,7 +8,8 @@ import mimetypes
 import io
 from pathlib import Path
 from PIL import Image
-from typing import Optional
+from typing import Any, Optional
+from collections.abc import Coroutine
 import aiohttp
 
 from config import ModelConfig, TELEGRAM_BOT_TOKEN, get_effective_endpoint
@@ -147,7 +148,7 @@ async def _fetch_from_telegram_and_cache(file_id: str) -> Optional[bytes]:
     return None
 
 
-async def _upload_and_mark(file_id: str, data: bytes, r2_key: str):
+async def _upload_and_mark(file_id: str, data: bytes, r2_key: str) -> None:
     """Upload image bytes to R2 / local cache in the background.
 
     IMPORTANT: `state.mark_r2_attempted` is a *permanent failure* marker used by
@@ -277,7 +278,7 @@ async def _fetch_video_from_telegram_and_cache(file_id: str) -> Optional[bytes]:
     return None
 
 
-async def _upload_video_and_mark(file_id: str, data: bytes, r2_key: str, mime_type: str = "video/mp4"):
+async def _upload_video_and_mark(file_id: str, data: bytes, r2_key: str, mime_type: str = "video/mp4") -> None:
     """后台上传视频字节到 R2（与 _upload_and_mark 对称，但用真实 mime）。
 
     同样遵守"只在失败时 mark_r2_attempted"的约束，防止上传成功后
@@ -380,7 +381,7 @@ async def _resolve_r2_public_url_for_document(file_id: str, mime_type: str = "ap
     return result
 
 
-async def _ensure_video_persisted(file_id: str, mime_type: str = "video/mp4"):
+async def _ensure_video_persisted(file_id: str, mime_type: str = "video/mp4") -> None:
     """后台把视频持久化到 R2（fire-and-forget，不阻塞响应）。
 
     使用场景：当前模型不支持视频输入，走了文本降级路径。此时仍要把
@@ -556,7 +557,7 @@ async def _build_native_document_part(
         file_name: str = "",
         mime_type: str = "",
         model_info: Optional[ModelConfig] = None,
-):
+) -> Optional[dict]:
     """把文档附件解析为"原生文档"content part（按当前模型的协议分流）。
 
     - anthropic_native（如 XXTF 的 claude-opus-5）：
@@ -867,7 +868,7 @@ async def _resolve_mixed_attachments(
     chat_id: int | None,
     user_text: str,
     vision_prefer_url: bool,
-):
+) -> list[dict] | str:
     """逐条解析混合 kind / 多音频附件（打断合并产物，无单一 type 可路由）。
 
     每个附件独立判断当前模型能力：支持的模态生成对应原生 content part
@@ -969,7 +970,7 @@ async def _resolve_mixed_attachments(
     return user_text
 
 
-async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_id: int | None = None):
+async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_id: int | None = None) -> list[dict] | str:
     supports_vision = model_info.vision
     supports_audio = model_info.audio
     # 视频输入模态：默认由 provider 能力决定，模型必须显式设置 video=True 才开启。
@@ -1056,7 +1057,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
         vg_file_names = list(msg.get("file_names") or [])
         vg_mime_types = list(msg.get("mime_types") or [])
         if vg_file_ids and supports_video:
-            async def process_video_one(idx: int, fid: str):
+            async def process_video_one(idx: int, fid: str) -> dict | None:
                 mime = ""
                 if idx < len(vg_mime_types):
                     mime = str(vg_mime_types[idx] or "").strip()
@@ -1285,13 +1286,13 @@ async def _append_history_async(messages: list, history: list, model_info: Model
             messages.append(out_msg)
 
 
-def _strip_reply_prefix(content):
+def _strip_reply_prefix(content: str) -> str:
     if isinstance(content, str) and "💡 引用回复:" in content:
         return content.split("💡 引用回复:")[-1].strip()
     return content
 
 
-def _track_task(coro):
+def _track_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
     """启动一个后台任务并保留强引用，避免被 GC 提前回收。"""
     t = asyncio.create_task(coro)
     _background_tasks.add(t)

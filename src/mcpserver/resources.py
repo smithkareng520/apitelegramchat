@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, cast
 
 import mcp.types as types
 from mcp.server.lowlevel.helper_types import ReadResourceContents
@@ -56,18 +56,18 @@ class ResourceService:
 
     async def list_resources(self) -> list[types.Resource]:
         resources = [
-            types.Resource(uri="workspace://current/todos", name="todos.json", mimeType="application/json"),
-            types.Resource(uri="workspace://current/memories", name="memories.json", mimeType="application/json"),
-            types.Resource(uri="workspace://current/skills", name="skills.json", mimeType="application/json"),
-            types.Resource(uri="workspace://current/files", name="files.json", mimeType="application/json"),
-            types.Resource(uri="workspace://current/upload", name="upload.json", mimeType="application/json"),
-            types.Resource(uri="workspace://current/download", name="download.json", mimeType="application/json"),
-            types.Resource(uri="workspace://current/manifest", name="manifest.json", mimeType="application/json"),
+            types.Resource(uri=cast(types.AnyUrl, "workspace://current/todos"), name="todos.json", mimeType="application/json"),
+            types.Resource(uri=cast(types.AnyUrl, "workspace://current/memories"), name="memories.json", mimeType="application/json"),
+            types.Resource(uri=cast(types.AnyUrl, "workspace://current/skills"), name="skills.json", mimeType="application/json"),
+            types.Resource(uri=cast(types.AnyUrl, "workspace://current/files"), name="files.json", mimeType="application/json"),
+            types.Resource(uri=cast(types.AnyUrl, "workspace://current/upload"), name="upload.json", mimeType="application/json"),
+            types.Resource(uri=cast(types.AnyUrl, "workspace://current/download"), name="download.json", mimeType="application/json"),
+            types.Resource(uri=cast(types.AnyUrl, "workspace://current/manifest"), name="manifest.json", mimeType="application/json"),
         ]
         for record in load_skill_records():
             resources.append(
                 types.Resource(
-                    uri=f"workspace://current/skills/{record.skill_id}",
+                    uri=cast(types.AnyUrl, f"workspace://current/skills/{record.skill_id}"),
                     name=f"{record.skill_id}.json",
                     mimeType="application/json",
                 )

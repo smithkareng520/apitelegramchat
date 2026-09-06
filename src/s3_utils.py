@@ -6,9 +6,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 try:
-    import aioboto3  # type: ignore
-    from botocore.exceptions import ClientError  # type: ignore
-    from botocore.config import Config  # type: ignore
+    import aioboto3
+    from botocore.exceptions import ClientError
+    from botocore.config import Config
 except Exception:  # pragma: no cover - optional dependency fallback
     aioboto3 = None
     ClientError = Exception
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 try:
     from cachetools import TTLCache
 except Exception:  # pragma: no cover - cachetools 是硬依赖，仅为防御性回退
-    TTLCache = None  # type: ignore
+    TTLCache = None
 
 # =====================================================================
 # 预签名 URL 记忆化（prompt cache 关键路径）
@@ -136,6 +136,9 @@ async def upload_bytes_to_r2(
             logger.exception("Local R2 cache write failed")
             return None
 
+    # is_r2_configured() 为真 ⇒ aioboto3 已加载 ⇒ 模块级 session 必非 None
+    # （mypy 无法跨函数沿 is_r2_configured 收窄，这里显式声明该既有不变量）。
+    assert session is not None
     # 修复 BUG：max_attempts=1 让 for 循环只跑一次，下面的重试分支
     # （if attempt < max_attempts - 1）永远进不去。要么改成 >1 的实际重试
     # 次数，要么删掉循环结构。这里改成 3 次重试 + 指数退避，让短暂
@@ -181,11 +184,15 @@ async def generate_presigned_url(
     if not is_r2_configured():
         return _local_public_url(key)
 
+    # is_r2_configured() 为真 ⇒ session 必非 None（同 upload_bytes_to_r2 的不变量）
+    assert session is not None
     # 仅对默认 1h 有效期做记忆化：TTLCache 的 ttl 是 cache 级参数，
     # 自定义 expires_in 走原路径直接签名。TTLCache 不可用时禁用记忆化，
     # 避免无过期时间的普通 dict 越积越多。
     memoizable = expires_in == _PRESIGN_DEFAULT_EXPIRES and TTLCache is not None
     if memoizable:
+        # memoizable 为真 ⇒ TTLCache 可用 ⇒ _presigned_url_cache 必已初始化（非 None）
+        assert _presigned_url_cache is not None
         cached_url = _presigned_url_cache.get(key)
         if cached_url:
             return cached_url
@@ -193,6 +200,7 @@ async def generate_presigned_url(
     async with _presign_lock:
         if memoizable:
             # double-check：等锁期间可能已有并发请求完成签名
+            assert _presigned_url_cache is not None
             cached_url = _presigned_url_cache.get(key)
             if cached_url:
                 return cached_url
@@ -210,6 +218,7 @@ async def generate_presigned_url(
                 ExpiresIn=expires_in,
             )
         if memoizable and url:
+            assert _presigned_url_cache is not None
             _presigned_url_cache[key] = url
         return url
 
@@ -251,6 +260,8 @@ async def file_exists_in_r2(key: str) -> bool:
     if not is_r2_configured():
         return _safe_local_key_path(key).exists()
 
+    # is_r2_configured() 为真 ⇒ session 必非 None（同 upload_bytes_to_r2 的不变量）
+    assert session is not None
     try:
         async with session.client(
             "s3",
@@ -283,6 +294,8 @@ async def download_from_r2(key: str) -> bytes | None:
                 logger.warning("Local R2 cache read failed: %s", e)
         return None
 
+    # is_r2_configured() 为真 ⇒ session 必非 None（同 upload_bytes_to_r2 的不变量）
+    assert session is not None
     try:
         async with session.client(
             "s3",
@@ -310,6 +323,8 @@ async def delete_r2_object(key: str) -> bool:
             logger.warning("Local R2 cache delete failed: %s", e)
             return False
 
+    # is_r2_configured() 为真 ⇒ session 必非 None（同 upload_bytes_to_r2 的不变量）
+    assert session is not None
     try:
         async with session.client(
             "s3",

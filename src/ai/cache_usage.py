@@ -22,19 +22,21 @@
   降为 DEBUG 不计入命中率统计，并用本轮最近一份带缓存字段的 usage
   快照（cache_hint）尽力补齐，避免把真实命中记成假 0。
 """
+from typing import Any
+
 from utils import get_logger
 
 logger = get_logger(__name__)
 
 
-def _cached_from_usage(usage):
+def _cached_from_usage(usage: Any) -> int | None:
     """从 usage（dict 或 pydantic 对象）中只提取缓存命中数字。
 
     兼容三种字段形态：OpenAI prompt_tokens_details.cached_tokens /
     Anthropic 风格 cache_read_input_tokens / DeepSeek 风格
     prompt_cache_hit_tokens。取不到返回 None（=网关未上报）。
     """
-    def _num(value):
+    def _num(value: Any) -> int | None:
         if isinstance(value, bool):
             return None
         if isinstance(value, (int, float)):
@@ -67,11 +69,11 @@ def _cached_from_usage(usage):
     return num
 
 
-def _extract_cache_usage(usage, cache_hint=None) -> dict:
+def _extract_cache_usage(usage: Any, cache_hint: Any = None) -> dict:
     if usage is None:
         return {}
 
-    def _num(value):
+    def _num(value: Any) -> int | None:
         if isinstance(value, bool):
             return None
         if isinstance(value, (int, float)):
@@ -127,7 +129,7 @@ def _extract_cache_usage(usage, cache_hint=None) -> dict:
     return stats
 
 
-def _log_cache_usage(api_label: str, usage, cache_hint=None, model_name: str | None = None, provider: str | None = None) -> None:
+def _log_cache_usage(api_label: str, usage: Any, cache_hint: Any = None, model_name: str | None = None, provider: str | None = None) -> None:
     """每轮请求结束时打一行缓存命中摘要（无缓存字段时静默跳过）。"""
     try:
         stats = _extract_cache_usage(usage, cache_hint)

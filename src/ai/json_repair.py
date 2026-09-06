@@ -37,7 +37,7 @@
 """
 import json
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from utils import get_logger
 
@@ -497,7 +497,7 @@ def repair_json_arguments(
 
     任何内部异常都兜底返回 ``(None, info)``。
     """
-    info = {"fixes": [], "truncated": False, "note": ""}
+    info: dict[str, Any] = {"fixes": [], "truncated": False, "note": ""}
     try:
         if not isinstance(raw, str) or not raw.strip():
             info["note"] = "arguments were empty"
@@ -641,7 +641,7 @@ def build_invalid_arguments_envelope(
         # 复用修复器的重写扫描来收集病因（不需要修复成功）
         candidate, _ = _extract_jsonish(raw)
         _, rewrite_fixes, truncated = _rewrite_jsonish(candidate, allow_close=False)
-        issues: list = []
+        issues = []
         for f in rewrite_fixes:
             if f not in issues:
                 issues.append(f)

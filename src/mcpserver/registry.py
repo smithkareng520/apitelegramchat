@@ -10,7 +10,7 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, cast
 
 import mcp.types as types
 
@@ -259,7 +259,9 @@ class ToolRegistry:
             return self._error(f"Unknown or disabled tool: {name}")
         try:
             with self._context.activate():
-                text = await spec.handler(self._context, arguments)
+                # 注册表内的 handler 均为 async def（返回 Awaitable[str]）；cast 消解联合类型中
+                # 从未出现的 str 分支，运行时无操作。
+                text = await cast(Awaitable[str], spec.handler(self._context, arguments))
             return types.CallToolResult(content=[types.TextContent(type="text", text=text)], isError=False)
         except Exception as exc:
             logger.exception("MCP tool execution failed: %s", name)

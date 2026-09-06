@@ -18,30 +18,53 @@ logger = logging.getLogger(__name__)
 
 # R2 持久化只发生在明确选择的用户文件上；运行时树永不进行全量同步。
 
+
+class _LockRegistry:
+    """按需创建、按 key 复用的 asyncio.Lock 注册表。
+
+    把此前暴露为模块级全局变量的两组 "dict + 注册表锁 + get-or-create"
+    （_workspace_locks/_workspace_locks_lock、_workspace_init_locks/
+    _workspace_init_locks_lock）收拢进类：可变 dict 不再可被任意导入方
+    绕过锁直接改写，get_or_create 在注册表锁内原子完成。
+
+    并发模型说明（为什么不用 contextvars）：这里的锁按 workspace key
+    全局共享——同一个 workspace 的所有并发协程必须互斥，属于「跨任务
+    共享」状态；contextvars 是「每任务/每请求隔离」，语义正好相反。
+    锁实例的使用（async with）发生在注册表锁之外，不存在嵌套持锁，
+    因此不会死锁。锁数量与 workspace 数量同阶（每 namespace 一把），
+    有界且生命周期与进程相同，无需淘汰。
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._registry_lock = asyncio.Lock()
+
+    async def get_or_create(self, key: str) -> asyncio.Lock:
+        """原子地取 key 对应的锁，不存在则创建。"""
+        async with self._registry_lock:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[key] = lock
+            return lock
+
+
 # workspace 访问锁：保护同一聊天的本地文件操作，避免并发修改。
-_workspace_locks = {}
-_workspace_locks_lock = asyncio.Lock()
+_workspace_file_locks = _LockRegistry()
 
 _workspace_initialized: set[str] = set()
-_workspace_init_locks = {}
-_workspace_init_locks_lock = asyncio.Lock()
+# workspace 初始化专用锁；与文件操作锁分离，避免嵌套死锁。
+_workspace_init_lock_registry = _LockRegistry()
 
 
 async def _get_workspace_lock(chat_id: int, namespace: str | None = None) -> asyncio.Lock:
     """获取或创建该用户/作用域的 workspace 锁。"""
-    key = workspace_namespace(chat_id, namespace)
-    async with _workspace_locks_lock:
-        if key not in _workspace_locks:
-            _workspace_locks[key] = asyncio.Lock()
-        return _workspace_locks[key]
+    return await _workspace_file_locks.get_or_create(workspace_namespace(chat_id, namespace))
 
 
 async def _get_workspace_init_lock(key: str) -> asyncio.Lock:
     """获取 workspace 初始化专用锁；与文件操作锁分离，避免嵌套死锁。"""
-    async with _workspace_init_locks_lock:
-        if key not in _workspace_init_locks:
-            _workspace_init_locks[key] = asyncio.Lock()
-        return _workspace_init_locks[key]
+    return await _workspace_init_lock_registry.get_or_create(key)
 
 
 async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) -> None:
@@ -169,7 +192,7 @@ async def _sync_named_file_to_r2(chat_id: int, local_path: Path, remote_name: st
 
 # ========== 可选：初始化工作区（后台执行） ==========
 
-async def init_workspace(chat_id: int, namespace: str | None = None):
+async def init_workspace(chat_id: int, namespace: str | None = None) -> None:
     """Initialize the workspace and packaged skills once for this workspace."""
     try:
         await _ensure_workspace_initialized(chat_id, namespace)

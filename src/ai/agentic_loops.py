@@ -16,13 +16,14 @@ import httpx
 import base64
 import re
 import uuid
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from openai import AsyncOpenAI, BadRequestError
 
 from config import (
     SUPPORTED_MODELS,
     get_sampling_params,
     get_reasoning_request_fields,
+    ModelConfig,
 )
 from state import get_llm_session_key
 from utils import get_logger, escape_html, send_rich_html_message, escape_media_url_attr
@@ -106,7 +107,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict):
+def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict) -> None:
     if index not in accumulator:
         accumulator[index] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
     entry = accumulator[index]
@@ -119,7 +120,7 @@ def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict):
         entry["function"]["arguments"] += fn["arguments"]
 
 
-def _openrouter_session_id(chat_id: object) -> str:
+def _openrouter_session_id(chat_id: Optional[int]) -> str:
     """返回当前会话的 LLM 网关亲和键（≤256 字符，按 chat 稳定、可轮换）。
 
     键格式：tg-chat-{chat_id}-{纪元 token}（见 state.get_llm_session_key）：
@@ -141,7 +142,7 @@ def _openrouter_session_id(chat_id: object) -> str:
 
 
 def _openrouter_extra_body(
-    chat_id: object = None,
+    chat_id: Optional[int] = None,
     supports_prompt_cache: bool = False,
     session_key: Optional[str] = None,
 ) -> dict:
@@ -179,16 +180,16 @@ def _openrouter_extra_body(
 #   支持任一形式即可从第一个请求起粘住同一副本；都不支持时未知字段
 #   /请求头被安全忽略，零副作用（已实测带 session_id 的请求 HTTP 200）。
 # =====================================================================
-def _session_affinity_key(chat_id: object = None, session_key: Optional[str] = None) -> str:
+def _session_affinity_key(chat_id: Optional[int] = None, session_key: Optional[str] = None) -> str:
     """会话亲和键：与 OpenRouter 的 session_id 同源同格式（可轮换）。"""
     return session_key or _openrouter_session_id(chat_id)
 
 
 def _session_affinity_body(
     api_label: str,
-    chat_id: object = None,
+    chat_id: Optional[int] = None,
     session_key: Optional[str] = None,
-    model_info=None,
+    model_info: Optional[ModelConfig] = None,
 ) -> dict:
     """声明了 session_affinity 的网关返回 body 级亲和键，否则空 dict。
 
@@ -218,9 +219,9 @@ def _session_affinity_body(
 
 def _session_affinity_headers(
     api_label: str,
-    chat_id: object = None,
+    chat_id: Optional[int] = None,
     session_key: Optional[str] = None,
-    model_info=None,
+    model_info: Optional[ModelConfig] = None,
 ) -> Optional[dict]:
     """声明了 session_affinity 的网关返回请求头级亲和键，否则 None。
 
@@ -237,10 +238,10 @@ def _session_affinity_headers(
 def _merged_extra_body(
     api_label: str,
     reasoning_extra: Optional[dict],
-    chat_id: object = None,
+    chat_id: Optional[int] = None,
     supports_prompt_cache: bool = False,
     session_key: Optional[str] = None,
-    model_info=None,
+    model_info: Optional[ModelConfig] = None,
 ) -> Optional[dict]:
     """
     合并 OpenRouter 路由偏好 / 会话亲和键与推理控制字段，返回应传给
@@ -275,8 +276,8 @@ def _merged_extra_body(
 
 async def _agentic_loop_openai_compat(
         client: AsyncOpenAI, current_model: str, messages: list, api_label: str,
-        builder: "RichMessageBuilder", tools: list = None, supports_tools: bool = True,
-        journal: list = None,
+        builder: "RichMessageBuilder", tools: Optional[list[dict[str, Any]]] = None, supports_tools: bool = True,
+        journal: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str | None, object | None, list]:
     if tools is None:
         from search_engine import SEARCH_TOOLS
@@ -319,7 +320,7 @@ async def _agentic_loop_openai_compat(
 
     for _round in range(MAX_TOOL_CALLS):
         added_tool_indices = set()
-        last_arg_len = {}
+        last_arg_len: dict[int, int] = {}
         # 每个 tool_call 索引当前使用的 UI 条目
         # id（占位阶段为 pending_* id）与已确认的函数名。部分网关会先流式
         # 传输参数增量、把 id/函数名拖到很晚才补发；占位条目保证工具块在
@@ -357,7 +358,7 @@ async def _agentic_loop_openai_compat(
         # 只有第一次出现时才据此决定是否要关闭上一个未闭合的工具块，之后不再重复判断。
         round_leading_kind = None
 
-        async def switch_stream(target: str):
+        async def switch_stream(target: str) -> None:
             nonlocal current_stream
             if current_stream == target:
                 return
@@ -379,7 +380,9 @@ async def _agentic_loop_openai_compat(
             current_stream = target
 
         try:
-            create_params = {
+            # SDK create() 重载不接受 dict[str, object] 的 ** 解包；
+            # 请求载荷本就是动态 JSON 形状，按 Any 标注。
+            create_params: dict[str, Any] = {
                 "model": current_model,
                 "messages": loop_messages,
                 "stream": True,
@@ -623,7 +626,8 @@ async def _agentic_loop_openai_compat(
         if not received_any or (not content_acc and not tool_calls_acc):
             logger.warning(f"[{api_label}] 流式无有效内容，回退到非流式请求")
             try:
-                fallback_params = {
+                # 与上方 create_params 同理：** 解包需 Any 值类型。
+                fallback_params: dict[str, Any] = {
                     "model": current_model,
                     "messages": loop_messages,
                     "stream": False,
@@ -823,7 +827,8 @@ async def _agentic_loop_openai_compat(
 
         # ===== FIX: 只对 over_limit 做强制总结并退出 =====
         if status == "over_limit":
-            synth_params = {
+            # 与上方 create_params 同理：** 解包需 Any 值类型。
+            synth_params: dict[str, Any] = {
                 "model": current_model,
                 "messages": loop_messages + [{"role": "user",
                                               "content": f"System: Maximum tool calls ({MAX_TOOL_CALLS}) reached for this turn. Tool usage is now DISABLED. Please immediately summarize what you have successfully done so far, explicitly state what failed or what is left to do, and ask the user if they want to continue the operation in the next turn."}],
@@ -987,7 +992,7 @@ async def _agentic_loop_native_image(
         messages: list,
         builder: "RichMessageBuilder",
         chat_id: int,
-        journal: list = None,
+        journal: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str | None, object | None, list]:
     model_info = SUPPORTED_MODELS.get(current_model)
     provider = model_info.provider if model_info else ""  # <-- 新增 provider
@@ -995,7 +1000,8 @@ async def _agentic_loop_native_image(
     max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
     # 图像模型采样参数同样从 config 读取（默认不发送、走供应商默认）；
     # 推理控制不适用于图像生成端点，不发送。
-    sampling_params = get_sampling_params(model_info)
+    # 采样参数值域为 float，但 ** 解包进 SDK create() 重载需要 Any 值类型。
+    sampling_params: dict[str, Any] = get_sampling_params(model_info)
     prompt_text, image_urls = _extract_image_prompt_and_reference_urls(messages)
 
     clean_prompt = _clean_prompt_for_image_model(prompt_text)
@@ -1224,7 +1230,7 @@ async def _agentic_loop_native_video(
         messages: list,
         builder: "RichMessageBuilder",
         chat_id: int,
-        journal: list = None,
+        journal: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str | None, object | None, list]:
     """
     处理视频生成模型。
