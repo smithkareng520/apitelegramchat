@@ -45,6 +45,7 @@ from apitelegramchat.ai.error_formatting import (
     _format_image_safety_notice,
     _format_video_metadata_caption,
     _is_content_safety_error,
+    extract_error_body_text,
     get_error_notification_message,
 )
 from apitelegramchat.ai.media_generation import (
@@ -1045,13 +1046,14 @@ async def _agentic_loop_native_image(
             )
     except Exception as e:
         logger.exception(f"Native image model request failed: {e}")
-        if hasattr(e, "response") and hasattr(e.response, "text"):
-            try:
-                body = await e.response.text()
-                logger.error(f"Response body: {body[:1000]}")
-            except Exception:
-                logger.debug("_agentic_loop_native_image 内部忽略的异常", exc_info=True)
-                pass
+        # 修复：旧写法 hasattr(e, "response") and hasattr(e.response, "text")
+        # 在流式响应未读取时会抛 httpx.ResponseNotRead（hasattr 只吞
+        # AttributeError），且旧代码 `await e.response.text()` 对同步
+        # str 属性 await 必抛 TypeError——两处都会让错误日志提取
+        # 静默失效甚至二次崩溃。改用安全的 extract_error_body_text。
+        _err_body = extract_error_body_text(e)
+        if _err_body:
+            logger.error(f"Response body: {_err_body[:1000]}")
         err_str = str(e)
         if _is_content_safety_error(err_str):
             logger.info("[NativeImage] 请求被内容安全策略拦截（异常路径）: %s", err_str[:200])

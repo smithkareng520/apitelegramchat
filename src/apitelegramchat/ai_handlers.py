@@ -48,6 +48,7 @@ import apitelegramchat.state as state
 
 from apitelegramchat.ai.error_formatting import (
     _render_media_failure_quote,
+    extract_error_body_text,
     get_error_notification_message,
 )
 from apitelegramchat.ai.attachment_content import (
@@ -1002,34 +1003,36 @@ async def get_ai_response(
         # （request URL、Authorization、内部 trace 等）。
         # 外部只看到简短原因 + error_id。
         error_msg_for_user = f"内部错误 (error_id={error_id})"
-        if hasattr(e, "response") and hasattr(e.response, "text"):
+        # 修复（2026-09 生产事故）：旧写法
+        #   hasattr(e, "response") and hasattr(e.response, "text")
+        # 在流式请求抛出的 APIStatusError 上必炸：e.response 是未读取的
+        # httpx 流式 Response，访问 .text 属性抛 httpx.ResponseNotRead，
+        # 而 hasattr() 只吞 AttributeError——二次异常从错误处理器逃逸，
+        # 把真正的上游错误（如 503 overloaded）完全掩盖，用户只看到
+        # "Attempted to access streaming response content..."。
+        # 现改用安全提取函数：优先取 SDK 已解析的 e.body，
+        # httpx response.text 仅在已读时生效，永不抛异常。
+        body = extract_error_body_text(e)
+        if body:
             try:
-                # httpx Response.text 是同步 str 属性；旧写法 `await ...text()`
-                # 必然抛 TypeError 并被下面的 except 吞掉，导致上游错误详情
-                # 提取从未生效。
-                body = e.response.text
-                try:
-                    body_json = json.loads(body)
-                    if isinstance(body_json, dict):
-                        # error 字段可能是 dict（OpenAI 风格）或字符串
-                        err = body_json.get("error")
-                        if isinstance(err, dict):
-                            err_msg = err.get("message")
-                            if isinstance(err_msg, str) and err_msg:
-                                # 上游错误消息可能含敏感字段，只保留前 200 字符
-                                error_msg_for_user = f"{err_msg[:200]} (error_id={error_id})"
-                        elif isinstance(err, str) and err:
-                            error_msg_for_user = f"{err[:200]} (error_id={error_id})"
-                except Exception:
-                    # body 非 JSON：不直接把原始 body 回传给用户，
-                    # 上游 body 可能含 request_id、API key（如果网关回显）等。
-                    # 只在日志里保留，对用户只暴露 error_id。
-                    logger.warning(
-                        f"get_ai_response 上游错误 body 非 JSON (error_id={error_id}, status={code}): {body[:300]}"
-                    )
+                body_json = json.loads(body)
+                if isinstance(body_json, dict):
+                    # error 字段可能是 dict（OpenAI 风格）或字符串
+                    err = body_json.get("error")
+                    if isinstance(err, dict):
+                        err_msg = err.get("message")
+                        if isinstance(err_msg, str) and err_msg:
+                            # 上游错误消息可能含敏感字段，只保留前 200 字符
+                            error_msg_for_user = f"{err_msg[:200]} (error_id={error_id})"
+                    elif isinstance(err, str) and err:
+                        error_msg_for_user = f"{err[:200]} (error_id={error_id})"
             except Exception:
-                logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
-                pass
+                # body 非 JSON：不直接把原始 body 回传给用户，
+                # 上游 body 可能含 request_id、API key（如果网关回显）等。
+                # 只在日志里保留，对用户只暴露 error_id。
+                logger.warning(
+                    f"get_ai_response 上游错误 body 非 JSON (error_id={error_id}, status={code}): {body[:300]}"
+                )
 
         error_msg = await get_error_notification_message(
             chat_id,

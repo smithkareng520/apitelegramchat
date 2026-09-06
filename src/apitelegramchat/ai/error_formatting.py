@@ -54,6 +54,54 @@ def _strip_prefix_error_message(text: str) -> str:
     return cleaned
 
 
+def extract_error_body_text(exception: Exception) -> str:
+    """从异常对象中安全提取上游响应 body 文本；任何情况下都不抛异常。
+
+    背景（2026-09 生产事故）：anthropic / openai SDK 抛出的
+    APIStatusError 携带的 e.response 是 httpx.Response。流式请求场景下
+    响应体尚未被读取，直接访问 ``e.response.text`` 属性会抛
+    httpx.ResponseNotRead——而 Python 的 ``hasattr()`` 只吞
+    AttributeError，导致该异常从「错误处理代码」本身逃逸，
+    把真正的上游错误（如 503 overloaded）完全掩盖，用户只能看到
+    "Attempted to access streaming response content..." 这句废话。
+
+    提取优先级：
+    1. ``e.body``：SDK 已经解析好的响应体（dict / str），首选，
+       完全不依赖 httpx 的读取状态；dict 形态转回 JSON 文本。
+    2. ``e.response.text``：仅对已读取的非流式响应有效（openai SDK
+       在构造状态错误前会 aread()，此路径可用）；流式未读时抛
+       ResponseNotRead，此处用 try/except 兜住，静默放弃。
+    3. 都取不到时返回 ""，调用方自行回退到 str(e)。
+    """
+    if exception is None:
+        return ""
+
+    # ---- 优先级 1：SDK 解析好的 body ----
+    body_obj = getattr(exception, "body", None)
+    if isinstance(body_obj, str) and body_obj.strip():
+        return body_obj
+    if body_obj is not None:
+        try:
+            return json.dumps(body_obj, ensure_ascii=False)
+        except Exception:
+            logger.debug("extract_error_body_text: body 序列化失败", exc_info=True)
+
+    # ---- 优先级 2：httpx 响应文本（仅已读取时可用） ----
+    response = getattr(exception, "response", None)
+    if response is not None:
+        try:
+            text = response.text  # 流式未读时此处抛 ResponseNotRead
+            if isinstance(text, str):
+                return text
+        except Exception:
+            logger.debug(
+                "extract_error_body_text: response.text 不可读（流式响应未消费），跳过",
+                exc_info=True,
+            )
+
+    return ""
+
+
 def _coerce_error_payload(payload_text: str) -> Any:
     """尽量把错误文本还原成 dict/list，便于抽取关键信息。"""
     if not payload_text:

@@ -495,6 +495,97 @@ def _anthropic_usage_to_openai(usage) -> Optional[dict]:
 
 
 # =============================================================================
+# 流式请求瞬时故障重试（503 overloaded / 429 / 5xx / 连接抖动）
+# =============================================================================
+# 背景（2026-09 生产事故）：上游网关过载时返回 503 overloaded_error，
+# 错误元数据明确标注 retryable=True / safe_to_auto_retry=True /
+# max_retry_attempts=2 / retry_after_seconds=1，但 anthropic SDK 对流式
+# 请求不会自动代劳重试——异常直接抛进 _agentic_loop_anthropic，整轮
+# 对话即告失败。在「零输出」阶段（尚未向用户流出任何内容）重试完全
+# 安全，这里补上应用层重试；一旦有任何增量已推给 builder 则绝不重试，
+# 避免用户看到重复内容。
+_ANTHROPIC_STREAM_MAX_RETRIES = 2
+# 可重试 HTTP 状态码：请求超时/冲突/早数据/限流/上游服务端错误/过载。
+# 529 是 Anthropic 官方的 overloaded 状态码；网关层常见 503 同义。
+_RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
+# 错误体 error.type 兜底识别（兼容网关改写状态码为 200 的场景）
+_RETRYABLE_ERROR_TYPES = frozenset({"overloaded_error", "api_error", "timeout_error"})
+
+
+def _is_retryable_stream_error(e: Exception) -> bool:
+    """判定流式请求异常是否值得重试（仅用于零输出阶段的快速失败）。"""
+    # 取消异常绝不重试（外层已单独 raise，这里防御兜底）
+    if isinstance(e, asyncio.CancelledError):
+        return False
+
+    # 1) 状态码判定（anthropic SDK 的 APIStatusError 一定带 status_code）
+    status = getattr(e, "status_code", None)
+    if status is None:
+        status = getattr(e, "status", None)
+    if status is not None:
+        try:
+            return int(status) in _RETRYABLE_STATUS_CODES
+        except (TypeError, ValueError):
+            pass
+
+    # 2) 连接层异常（APITimeoutError / APIConnectionError，无状态码）：
+    #    按类名判定而非 isinstance，避免在运行时硬依赖 anthropic 导入。
+    if type(e).__name__ in ("APIConnectionError", "APITimeoutError"):
+        return True
+
+    # 3) 错误体 error.type 兜底判定
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and err.get("type") in _RETRYABLE_ERROR_TYPES:
+            return True
+    return False
+
+
+def _extract_retry_after_seconds(e: Exception) -> Optional[float]:
+    """从错误体/响应头提取上游建议的重试等待秒数；取不到返回 None。
+
+    网关错误元数据形如 metadata.retry_after_seconds=1 /
+    retry_after_ms=1000；个别网关也会带标准 Retry-After 响应头。
+    """
+    def _scan(obj) -> Optional[float]:
+        if not isinstance(obj, dict):
+            return None
+        for key in ("retry_after_seconds", "retryAfterSeconds", "retry-after-seconds"):
+            v = obj.get(key)
+            if isinstance(v, (int, float)) and v >= 0:
+                return float(v)
+        for key in ("retry_after_ms", "retryAfterMs"):
+            v = obj.get(key)
+            if isinstance(v, (int, float)) and v >= 0:
+                return float(v) / 1000.0
+        return None
+
+    # 1) e.body：网关错误体
+    #    （{'error': {...}, 'metadata': {'retry_after_seconds': 1, ...}}）
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        metadata = body.get("metadata")
+        found = _scan(metadata) if isinstance(metadata, dict) else None
+        if found is None:
+            found = _scan(body)
+        if found is not None:
+            return found
+
+    # 2) 标准 Retry-After 响应头
+    response = getattr(e, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            raw = headers.get("retry-after")
+            if raw:
+                return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+# =============================================================================
 # 原生 agentic 循环
 # =============================================================================
 async def _agentic_loop_anthropic(
@@ -633,59 +724,95 @@ async def _agentic_loop_anthropic(
 
         try:
             await start_chat_action(builder.chat_id, "typing")
-            async with client.messages.stream(**request_kwargs) as stream:
-                async for event in stream:
-                    etype = getattr(event, "type", None)
-                    if etype == "content_block_start":
-                        block = event.content_block
-                        if getattr(block, "type", None) == "tool_use":
-                            tool_use_blocks[event.index] = {
-                                "id": block.id, "name": block.name, "args_json": "",
-                            }
-                            fn_args = {}
-                            summary = _generate_initial_tool_summary(block.name, fn_args)
-                            action_desc = _generate_action_description(block.name, fn_args)
-                            builder.add_tool_item(
-                                block.id, block.name, summary,
-                                action_description=action_desc, fn_args=fn_args,
-                            )
-                            builder.request_flush(force=False)
-                    elif etype == "content_block_delta":
-                        delta = event.delta
-                        dtype = getattr(delta, "type", None)
-                        if dtype == "text_delta":
-                            text = delta.text or ""
-                            if text:
-                                content_acc += text
-                                switch_stream("content")
-                                builder.append_stream_delta(text)
-                        elif dtype == "thinking_delta":
-                            text = getattr(delta, "thinking", "") or ""
-                            if text:
-                                reasoning_acc += text
-                                switch_stream("reasoning")
-                                builder.append_stream_delta(text)
-                        elif dtype == "input_json_delta":
-                            entry = tool_use_blocks.get(event.index)
-                            if entry is not None:
-                                entry["args_json"] += getattr(delta, "partial_json", "") or ""
-                                if len(entry["args_json"]) % 40 < 4:
-                                    parsed_args = _safe_parse_args(entry["args_json"])
-                                    builder.update_tool_args(entry["id"], parsed_args)
-                    elif etype == "message_delta":
-                        usage = getattr(event, "usage", None)
-                        if usage is not None:
-                            final_usage = usage
-                final_message = await stream.get_final_message()
-                if getattr(final_message, "usage", None):
-                    final_usage = final_message.usage
-                # v2.5：捕获流结束原因（max_tokens = 输出上限切断），
-                # 供下方参数诊断信封定性「参数被切断」的根因。
-                stop_reason = str(getattr(final_message, "stop_reason", "") or "")
+            # v2.6：上游瞬时故障应用层重试（503 overloaded / 429 / 5xx /
+            # 连接抖动）。网关错误元数据会给出 retryable=True /
+            # safe_to_auto_retry=True / max_retry_attempts=2，但 SDK 对流式
+            # 请求不代劳重试，此前一次瞬时 503 就把整轮对话炸掉。
+            # 安全前提：仅在本轮「零输出」（content_acc / reasoning_acc /
+            # tool_use_blocks 全空，未向 builder 流出任何内容）时重试，
+            # 一旦有 partial output 立即放弃，杜绝重复内容。
+            stream_attempts = 0
+            while True:
+                try:
+                    async with client.messages.stream(**request_kwargs) as stream:
+                        async for event in stream:
+                            etype = getattr(event, "type", None)
+                            if etype == "content_block_start":
+                                block = event.content_block
+                                if getattr(block, "type", None) == "tool_use":
+                                    tool_use_blocks[event.index] = {
+                                        "id": block.id, "name": block.name, "args_json": "",
+                                    }
+                                    fn_args = {}
+                                    summary = _generate_initial_tool_summary(block.name, fn_args)
+                                    action_desc = _generate_action_description(block.name, fn_args)
+                                    builder.add_tool_item(
+                                        block.id, block.name, summary,
+                                        action_description=action_desc, fn_args=fn_args,
+                                    )
+                                    builder.request_flush(force=False)
+                            elif etype == "content_block_delta":
+                                delta = event.delta
+                                dtype = getattr(delta, "type", None)
+                                if dtype == "text_delta":
+                                    text = delta.text or ""
+                                    if text:
+                                        content_acc += text
+                                        switch_stream("content")
+                                        builder.append_stream_delta(text)
+                                elif dtype == "thinking_delta":
+                                    text = getattr(delta, "thinking", "") or ""
+                                    if text:
+                                        reasoning_acc += text
+                                        switch_stream("reasoning")
+                                        builder.append_stream_delta(text)
+                                elif dtype == "input_json_delta":
+                                    entry = tool_use_blocks.get(event.index)
+                                    if entry is not None:
+                                        entry["args_json"] += getattr(delta, "partial_json", "") or ""
+                                        if len(entry["args_json"]) % 40 < 4:
+                                            parsed_args = _safe_parse_args(entry["args_json"])
+                                            builder.update_tool_args(entry["id"], parsed_args)
+                            elif etype == "message_delta":
+                                usage = getattr(event, "usage", None)
+                                if usage is not None:
+                                    final_usage = usage
+                    final_message = await stream.get_final_message()
+                    if getattr(final_message, "usage", None):
+                        final_usage = final_message.usage
+                    # v2.5：捕获流结束原因（max_tokens = 输出上限切断），
+                    # 供下方参数诊断信封定性「参数被切断」的根因。
+                    stop_reason = str(getattr(final_message, "stop_reason", "") or "")
+                    break  # 成功：退出重试循环
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    has_partial_output = bool(content_acc or reasoning_acc or tool_use_blocks)
+                    if (
+                        stream_attempts < _ANTHROPIC_STREAM_MAX_RETRIES
+                        and not has_partial_output
+                        and _is_retryable_stream_error(e)
+                    ):
+                        stream_attempts += 1
+                        wait_s = _extract_retry_after_seconds(e)
+                        if wait_s is None:
+                            # 无上游提示时指数退避：1s → 2s（封顶 8s）
+                            wait_s = min(2 ** stream_attempts, 8.0)
+                        logger.warning(
+                            f"[{api_label}] stream 可重试错误（零输出，{wait_s:.1f}s 后第 "
+                            f"{stream_attempts}/{_ANTHROPIC_STREAM_MAX_RETRIES} 次重试）: {e}"
+                        )
+                        # 重置本轮累积状态（零输出前提下本应全空，双保险）
+                        content_acc = ""
+                        reasoning_acc = ""
+                        tool_use_blocks = {}
+                        stop_reason = ""
+                        current_stream = None
+                        await asyncio.sleep(wait_s)
+                        continue
+                    logger.exception(f"[{api_label}] stream error: {e}")
+                    raise
         except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.exception(f"[{api_label}] stream error: {e}")
             raise
         finally:
             await stop_chat_action(builder.chat_id, "typing")
