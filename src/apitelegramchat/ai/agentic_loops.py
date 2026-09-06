@@ -354,11 +354,21 @@ async def _agentic_loop_openai_compat(
         # 只有第一次出现时才据此决定是否要关闭上一个未闭合的工具块，之后不再重复判断。
         round_leading_kind = None
 
-        def switch_stream(target: str):
+        async def switch_stream(target: str):
             nonlocal current_stream
             if current_stream == target:
                 return
+            ended = current_stream
             builder.end_stream()
+            # 块边界换草稿检查点①②：一个思考块或文本块刚刚闭合、下一个块
+            # 尚未开启，此刻 HTML 正好停在完整外层块边界上，是回合中途最
+            # 安全的切换时机（不必再等整批工具结果回来）。
+            # 真正是否切换仍由 rollover_at_turn_boundary 内的容量阈值决定；
+            # 未达阈值时立即返回 False，热路径无额外开销。
+            # 若本轮已有未收束的工具组，函数内的守卫会拒绝滚动，
+            # 从而不会把工具卡片拆散（历史问题1）。
+            if ended is not None:
+                await builder.rollover_at_turn_boundary(start_next_draft=True)
             if target == "reasoning":
                 builder.begin_stream_reasoning()
             elif target == "content":
@@ -432,7 +442,7 @@ async def _agentic_loop_openai_compat(
                                     builder.finish_group(len(builder._tool_groups) - 1)
                                     # ★ 强制刷新，确保总结先于思考内容显示 ★
                                     await builder.flush(force=True)
-                            switch_stream("reasoning")
+                            await switch_stream("reasoning")
                             reasoning_acc += r_delta
                             builder.append_stream_delta(r_delta)
 
@@ -454,16 +464,16 @@ async def _agentic_loop_openai_compat(
                                     in_reasoning = True
                                     before, _, rest = c_delta.partition("<think>")
                                     if before:
-                                        switch_stream("content")
+                                        await switch_stream("content")
                                         builder.append_stream_delta(before)
-                                    switch_stream("reasoning")
+                                    await switch_stream("reasoning")
                                     if "</think>" in rest:
                                         think_part, _, after = rest.partition("</think>")
                                         reasoning_acc += think_part
                                         builder.append_stream_delta(think_part)
                                         in_reasoning = False
                                         if after:
-                                            switch_stream("content")
+                                            await switch_stream("content")
                                             builder.append_stream_delta(after)
                                         else:
                                             current_stream = None
@@ -477,7 +487,7 @@ async def _agentic_loop_openai_compat(
                                         builder.append_stream_delta(think_part)
                                         in_reasoning = False
                                         if after:
-                                            switch_stream("content")
+                                            await switch_stream("content")
                                             builder.append_stream_delta(after)
                                         else:
                                             current_stream = None
@@ -485,7 +495,7 @@ async def _agentic_loop_openai_compat(
                                         reasoning_acc += c_delta
                                         builder.append_stream_delta(c_delta)
                                 else:
-                                    switch_stream("content")
+                                    await switch_stream("content")
                                     builder.append_stream_delta(c_delta)
 
                         for tc_delta in (getattr(delta, "tool_calls", None) or []):
@@ -738,10 +748,15 @@ async def _agentic_loop_openai_compat(
 
         if reasoning_acc:
             builder.finalize_reasoning_block()
-        
-        # 修复问题1：不在文本块结束后立即 rollover，而是等待工具执行完毕。
-        # 否则工具的流式输出（如 "Viewing file utils.py"）会被拆分到新草稿。
-        await builder.flush()
+
+        # 块边界换草稿检查点①②（本轮最后一个块）：流已结束，最后一个思考块
+        # 或文本块在此闭合，switch_stream 不会再被触发，故在此补一次检查。
+        # 历史问题1（工具流式输出被拆到新草稿）已由
+        # rollover_at_turn_boundary 内的 _has_pending_tool_group 守卫兜住：
+        # 本轮若已建工具条目而未收束，这里不会滚动，工具批次结束后的
+        # 回合边界仍会照常滚动。
+        if not await builder.rollover_at_turn_boundary(start_next_draft=True):
+            await builder.flush()
 
         assistant_msg: dict = {"role": "assistant", "content": content_acc or None}
         if tool_calls_list:

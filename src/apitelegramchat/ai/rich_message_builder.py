@@ -1094,6 +1094,24 @@ class RichMessageBuilder:
         )
         return True
 
+    def _has_pending_tool_group(self) -> bool:
+        """本轮是否还有"已建条目但尚未收束"的工具组。
+
+        滚动会经 ``_replace_with_rollover_remainder`` 清空 ``_tool_groups``。
+        若此时某个组的工具还没拿到最终状态（流式阶段已 add_tool_item、
+        但 _run_tool_calls_and_append 尚未 update_tool_item/finish_group），
+        清空后这些条目的 id 就再也匹配不上，``update_tool_item`` 会静默
+        跳过——表现为工具卡片永远停在 "Running..."，且工具输出被拆散到
+        前后两个草稿（历史问题1）。因此这是滚动的硬性安全前提。
+
+        空组（``_get_current_group`` 惰性创建、尚未加入条目）不算待收束，
+        否则会把正常的回合边界滚动一并挡掉。
+        """
+        for group in self._tool_groups:
+            if group.get("items") and not group.get("finished", False):
+                return True
+        return False
+
     def _restore_handoff_text(self) -> None:
         """将异常退出的交接缓冲恢复到当前构建器，避免任何流式增量丢失。"""
         if self._handoff_text is None:
@@ -1114,6 +1132,12 @@ class RichMessageBuilder:
         对终局文本传入假值时，函数只结束旧草稿，保留尾段给统一最终发送路径提交。
         """
         if self._stop_flush or self._rollover_in_progress:
+            return False
+
+        # 关键守卫：若还有未收束的工具组，绝不滚动。一旦滚动，_tool_groups
+        # 会被清空（_replace_with_rollover_remainder），流式已建条目的后续
+        # update_tool_item 就无法匹配 id、工具卡片永远停在 "Running..."。
+        if self._has_pending_tool_group():
             return False
 
         # 回合边界是唯一允许换草稿的时点，因此必须在这里重新统计真实容量。
