@@ -115,6 +115,9 @@ def get_or_init_context(chat_id: int) -> dict:
         user_contexts[chat_id] = {
             "conversation_history": [],
             "username": f"User_{chat_id}",
+            # 真实 Telegram 用户名（可能为空）：授权路径专用，与展示用的
+            # "username"（无 username 时回退 first_name/ID）严格分离。
+            "tg_username": "",
             "active_skill": None,
         }
     return user_contexts[chat_id]

@@ -1134,11 +1134,144 @@ assert DEFAULT_MODEL in SUPPORTED_MODELS, f"默认模型 {DEFAULT_MODEL} 未定�
 
 # =============================================================================
 # 白名单管理
+# -----------------------------------------------------------------------------
+# 存储模型（R2 权威 + 本地缓存）：
+#   - R2 对象（默认 key: config/whitelist.txt，可用
+#     APITELEGRAMCHAT_WHITELIST_R2_KEY 覆盖）是唯一权威数据源。
+#     R2 PutObject 允许对同 key 覆盖写（"编辑"该文件），因此每次
+#     /adduser、/deluser 修改后都把全量白名单重新推送到 R2。
+#   - 本地文件（WHITELIST_FILE）只是缓存 / 离线回退：R2 网络故障时
+#     保证权限判断不中断。
+#   - 启动/部署时 load_whitelist() 优先从 R2 拉取全量白名单（把运维
+#     直接编辑过的 R2 文件批量加载进白名单）；R2 未配置或拉取失败时
+#     回退本地文件；R2 上没有对象但本地有数据时，把本地数据作为种子
+#     推送上 R2（完成本地 → R2 的首次迁移）。
+# 管理员保护：
+#   ADMIN_USERS 是管理员名单，与"用户白名单"完全独立。管理员：
+#   - 不能被 /adduser 加进用户白名单（add_whitelist_user 返回 admin）；
+#   - 不能被 /deluser 从用户白名单删除（remove_whitelist_user 返回
+#     admin——管理员根本不属于用户白名单，且显式拒绝而非提示不存在）；
+#   - 加载本地文件 / R2 内容时会过滤掉管理员条目（防止手改数据绕过）。
+#   管理员的授权走 is_admin_identity，不依赖白名单。
+# 大小写语义：
+#   Telegram 用户名大小写不敏感（@Alice 与 alice 是同一账号），因此
+#   用户名条目统一归一化为小写存储与比较；纯数字 user_id 按精确字符串
+#   比较。这保证 /adduser @Alice 后，实际用户名为 alice 的用户能通过
+#   权限校验，不会出现"加了大写、小写进不来"的隐藏 bug。
 # =============================================================================
+
 WHITELIST_FILE = os.getenv("APITELEGRAMCHAT_WHITELIST_FILE") or "whitelist.txt"
+# R2 白名单对象 key。R2 是扁平对象命名空间，key 里的 "/" 只是前缀约定；
+# 但本地缓存回退会把 key 映射为磁盘路径，因此拒绝 ".." 段防路径穿越。
+_raw_whitelist_r2_key = (os.getenv("APITELEGRAMCHAT_WHITELIST_R2_KEY") or "config/whitelist.txt").strip().strip("/")
+if not _raw_whitelist_r2_key or any(part == ".." for part in _raw_whitelist_r2_key.split("/")):
+    logger.warning("APITELEGRAMCHAT_WHITELIST_R2_KEY 不安全（%r），回退默认 config/whitelist.txt", _raw_whitelist_r2_key)
+    _raw_whitelist_r2_key = "config/whitelist.txt"
+WHITELIST_R2_KEY = _raw_whitelist_r2_key
+del _raw_whitelist_r2_key
+WHITELIST_CONTENT_TYPE = "text/plain; charset=utf-8"
+
 ADMIN_USERS = ["dearella"]
 WHITELIST_USERS = set()
 _whitelist_lock = asyncio.Lock()
+
+
+def _normalize_target(target: str) -> str:
+    """归一化白名单/管理员条目：去空白、去 @ 前缀；用户名转小写，纯数字 ID 保持原样。"""
+    t = str(target or "").strip().lstrip("@")
+    if not t:
+        return ""
+    if t.isdigit():
+        return t
+    return t.lower()
+
+
+def _build_admin_sets() -> tuple[set[str], set[str]]:
+    """把 ADMIN_USERS 拆成（用户名小写集合, 数字ID集合），供大小写不敏感匹配。"""
+    names: set[str] = set()
+    ids: set[str] = set()
+    for admin in ADMIN_USERS:
+        a = _normalize_target(admin)
+        if not a:
+            continue
+        if a.isdigit():
+            ids.add(a)
+        else:
+            names.add(a)
+    return names, ids
+
+
+_ADMIN_NAME_SET, _ADMIN_ID_SET = _build_admin_sets()
+
+
+def _is_admin_target(target: str) -> bool:
+    """target（用户名或数字 ID）是否指向管理员。用户名比较大小写不敏感。"""
+    t = _normalize_target(target)
+    if not t:
+        return False
+    if t.isdigit():
+        return t in _ADMIN_ID_SET
+    return t in _ADMIN_NAME_SET
+
+
+def is_admin_identity(username: str = "", user_id: str = "") -> bool:
+    """按 Telegram 身份（用户名 / 数字 ID）判断是否管理员。
+
+    app.is_admin 委托本函数，保证整个代码库的管理员判断语义一致：
+    用户名大小写不敏感，数字 ID 精确匹配。
+    """
+    uid = str(user_id or "").strip()
+    if uid and uid in _ADMIN_ID_SET:
+        return True
+    if username:
+        u = _normalize_target(username)
+        if u and u in _ADMIN_NAME_SET:
+            return True
+    return False
+
+
+def is_whitelisted_identity(username: str = "", user_id: str = "") -> bool:
+    """按 Telegram 身份（用户名 / 数字 ID）判断是否在用户白名单内。
+
+    与白名单存储同源归一化：用户名小写比较，数字 ID 精确比较。
+    注意：本函数只查"用户白名单"；管理员授权由 is_admin_identity 负责
+    （app.is_authorized 先查管理员再查白名单）。
+    """
+    uid = str(user_id or "").strip()
+    if uid and uid in WHITELIST_USERS:
+        return True
+    if username:
+        u = _normalize_target(username)
+        if u and u in WHITELIST_USERS:
+            return True
+    return False
+
+
+def _parse_whitelist_bytes(data: bytes) -> set[str]:
+    """解析白名单文件内容（UTF-8，容忍 BOM / CRLF），归一化并过滤管理员条目。
+
+    防御性过滤：即使有人手改 R2 / 本地文件把管理员塞进用户白名单，
+    加载时也会剔除——管理员权限走 is_admin_identity，与白名单无关。
+    含内部空白（空格/制表符等）的条目不可能是合法的用户名或 ID，直接丢弃。
+    """
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = data.decode("utf-8", errors="replace")
+    entries: set[str] = set()
+    for raw in text.splitlines():
+        entry = _normalize_target(raw)
+        if not entry:
+            continue
+        if any(ch.isspace() for ch in entry):
+            logger.warning("白名单包含非法条目（含空白字符），已忽略：%r", raw)
+            continue
+        if _is_admin_target(entry):
+            logger.warning("白名单中发现管理员条目 %r，已忽略（管理员不进入用户白名单）", entry)
+            continue
+        entries.add(entry)
+    return entries
+
 
 def _resolve_whitelist_path() -> str:
     """返回白名单文件路径，优先使用绝对路径，否则挂到 data_root 下。"""
@@ -1153,68 +1286,184 @@ def _resolve_whitelist_path() -> str:
         data_dir = os.getenv("APITELEGRAMCHAT_DATA_DIR", "/tmp/apitelegramchat_data")
         return os.path.join(data_dir, WHITELIST_FILE)
 
-async def load_whitelist():
-    """从文件加载白名单，使用原地更新而非重新赋值，避免 from-import 引用失效。"""
-    async with _whitelist_lock:
-        try:
-            with open(_resolve_whitelist_path(), "r", encoding="utf-8") as f:
-                loaded = {line.strip() for line in f if line.strip()}
-            # 关键修复：原地更新 set，而不是 global 重新赋值。
-            # app.py 中的 "from config import WHITELIST_USERS" 引用的是启动时的 set 对象，
-            # 如果这里用 "WHITELIST_USERS = loaded" 重新绑定，app.py 仍会看到旧的空 set。
-            WHITELIST_USERS.clear()
-            WHITELIST_USERS.update(loaded)
-        except FileNotFoundError:
-            # 文件不存在时清空集合（初始化为空白名单）
-            WHITELIST_USERS.clear()
-        except OSError:
-            logger.warning("load_whitelist failed: %s", _resolve_whitelist_path(), exc_info=True)
 
-async def save_whitelist():
-    async with _whitelist_lock:
-        _save_whitelist_unlocked()
+def _serialize_whitelist_bytes() -> bytes:
+    """把当前内存白名单序列化为文件字节（排序后每行一个，UTF-8）。"""
+    return ("".join(user + "\n" for user in sorted(WHITELIST_USERS))).encode("utf-8")
 
 
 def _save_whitelist_unlocked() -> None:
-    """在已持有 _whitelist_lock 的前提下把 WHITELIST_USERS 写入磁盘。"""
+    """在已持有 _whitelist_lock 的前提下把 WHITELIST_USERS 写入本地缓存文件。
+
+    先写临时文件再原子 replace：进程在写入中途崩溃也不会留下残缺的
+    白名单文件（残缺文件会在下次启动回退时变成"部分用户丢失"）。
+    """
+    path = _resolve_whitelist_path()
     try:
-        path = _resolve_whitelist_path()
-        # 确保父目录存在
-        import os
         from pathlib import Path
         parent = Path(path).parent
         parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             f.writelines(user + "\n" for user in sorted(WHITELIST_USERS))
+        os.replace(tmp_path, path)
     except OSError:
-        logger.warning("save_whitelist failed: %s", _resolve_whitelist_path(), exc_info=True)
+        logger.warning("save_whitelist failed: %s", path, exc_info=True)
 
 
-async def add_whitelist_user(target: str) -> bool:
-    """原子地把 target 加入白名单并落盘。
+async def _push_whitelist_to_r2_unlocked() -> bool:
+    """在已持有 _whitelist_lock 的前提下，把当前白名单全量推送到 R2。
 
-    "改内存集合 + 写文件" 整体在 _whitelist_lock 内完成，与
-    load_whitelist/save_whitelist 互斥，避免裸读写 WHITELIST_USERS
-    与落盘之间出现竞态窗口（例如两个管理员并发 /adduser 时互相覆盖）。
-    这把锁只保护白名单文件本身，不影响其他用户的对话/命令处理。
-    返回 True 表示确实发生了新增（此前不在白名单中）。
+    - R2 未配置：upload_bytes_to_r2 自动落到本地 r2_cache 镜像并返回
+      file:// URL，语义上等同"同步成功"（本地模式没有远端可推）。
+    - 推送失败（网络/权限/超时）：返回 False 交给调用方决定是否提示
+      管理员。本地文件已经写入，此后任何一次成功推送都是全量内容，
+      会自动把之前没同步成功的变更一并补齐（自愈）。
+    延迟导入 s3_utils：s3_utils 顶层反向依赖本模块的 R2_* 常量，模块
+    顶层导入会构成循环导入。
+    """
+    try:
+        from apitelegramchat.s3_utils import upload_bytes_to_r2
+        url = await upload_bytes_to_r2(
+            _serialize_whitelist_bytes(),
+            WHITELIST_R2_KEY,
+            WHITELIST_CONTENT_TYPE,
+        )
+        if url is None:
+            logger.warning("白名单推送 R2 失败（key=%s）", WHITELIST_R2_KEY)
+            return False
+        return True
+    except Exception:
+        logger.warning("白名单推送 R2 异常（key=%s）", WHITELIST_R2_KEY, exc_info=True)
+        return False
+
+
+async def load_whitelist():
+    """启动/部署时加载白名单：R2 优先（权威），本地文件回退（缓存）。
+
+    全程持有 _whitelist_lock，与增删操作互斥；内存 set 原地更新（clear
+    + update），保证 "from config import WHITELIST_USERS" 拿到的引用
+    始终指向同一个 set 对象、永远能看到最新内容。
     """
     async with _whitelist_lock:
-        if target in WHITELIST_USERS:
-            return False
-        WHITELIST_USERS.add(target)
-        _save_whitelist_unlocked()
-        return True
+        r2_configured = await _r2_configured_async()
+        remote_data: bytes | None = None
+        if r2_configured:
+            try:
+                from apitelegramchat.s3_utils import download_from_r2
+                remote_data = await download_from_r2(WHITELIST_R2_KEY)
+            except Exception:
+                logger.warning("白名单 R2 拉取异常，将回退本地文件（key=%s）", WHITELIST_R2_KEY, exc_info=True)
+
+        if remote_data is not None:
+            loaded = _parse_whitelist_bytes(remote_data)
+            logger.info("白名单已从 R2 加载：%d 个用户（key=%s）", len(loaded), WHITELIST_R2_KEY)
+            WHITELIST_USERS.clear()
+            WHITELIST_USERS.update(loaded)
+            # 回写本地缓存文件：R2 是权威，本地缓存必须与之一致，
+            # 供下一次 R2 故障时离线回退。
+            _save_whitelist_unlocked()
+            return
+
+        # R2 未配置 / 对象不存在 / 网络故障：本地文件回退（本地模式下
+        # whitelist.txt 就是直接数据源），绝不因 R2 故障清空白名单。
+        try:
+            with open(_resolve_whitelist_path(), "rb") as f:
+                loaded = _parse_whitelist_bytes(f.read())
+            WHITELIST_USERS.clear()
+            WHITELIST_USERS.update(loaded)
+            logger.info("白名单已从本地文件加载：%d 个用户（%s）", len(loaded), _resolve_whitelist_path())
+        except FileNotFoundError:
+            WHITELIST_USERS.clear()
+        except OSError:
+            # 读失败时保留当前内存状态（可能是热重载场景），不清空。
+            logger.warning("load_whitelist failed: %s", _resolve_whitelist_path(), exc_info=True)
+
+        # R2 已配置但对象不存在（首次部署 / 换 key）：把本地数据作为种子
+        # 推送上 R2，完成本地 → R2 迁移。file_exists_in_r2 在网络故障时
+        # 也返回 False，但那时播种上传同样会失败，不会误覆盖远端已有数据。
+        if r2_configured and remote_data is None:
+            try:
+                from apitelegramchat.s3_utils import file_exists_in_r2
+                if not await file_exists_in_r2(WHITELIST_R2_KEY) and WHITELIST_USERS:
+                    pushed = await _push_whitelist_to_r2_unlocked()
+                    logger.info("白名单本地种子已推送 R2（key=%s）：%s", WHITELIST_R2_KEY, pushed)
+            except Exception:
+                logger.warning("白名单 R2 播种检查失败（key=%s）", WHITELIST_R2_KEY, exc_info=True)
 
 
-async def remove_whitelist_user(target: str) -> bool:
-    """原子地把 target 从白名单移除并落盘。返回 True 表示确实存在并被移除。"""
+async def _r2_configured_async() -> bool:
+    """R2 是否已配置（延迟导入，避免循环依赖）。"""
+    try:
+        from apitelegramchat.s3_utils import is_r2_configured
+        return bool(is_r2_configured())
+    except Exception:
+        return False
+
+
+async def save_whitelist():
+    """把当前白名单写入本地文件并推送 R2（增删函数已自带，一般无需手动调用）。"""
     async with _whitelist_lock:
-        if target not in WHITELIST_USERS:
-            return False
-        WHITELIST_USERS.discard(target)
         _save_whitelist_unlocked()
-        return True
+        await _push_whitelist_to_r2_unlocked()
+
+
+# add/remove 状态常量：app.py 据此生成 Telegram 回复，测试据此断言。
+ADD_ADDED = "added"                       # 确实新增
+ADD_EXISTS = "exists"                     # 目标已在白名单中
+ADD_ADMIN_REJECTED = "admin"              # 目标是管理员，拒绝加入用户白名单
+ADD_SYNC_FAILED = "added_sync_failed"     # 已加入并写本地，但推送 R2 失败
+REMOVE_REMOVED = "removed"                # 确实移除
+REMOVE_MISSING = "missing"                # 目标不在白名单中
+REMOVE_ADMIN_REJECTED = "admin"           # 目标是管理员，用户白名单无权删除
+REMOVE_SYNC_FAILED = "removed_sync_failed"  # 已移除并写本地，但推送 R2 失败
+
+
+async def add_whitelist_user(target: str) -> str:
+    """原子地把 target 加入白名单：改内存 → 写本地文件 → 推送 R2。
+
+    返回 ADD_* 状态字符串。"改内存集合 + 写本地 + 推 R2" 整体在
+    _whitelist_lock 内完成，与 load_whitelist/save_whitelist 互斥：
+    并发 /adduser 不会互相覆盖，R2 收到的推送顺序与操作顺序一致，
+    权威存储不会出现旧状态覆盖新状态。
+    """
+    normalized = _normalize_target(target)
+    if not normalized:
+        # 空目标无意义。app 入口已拦截，这里防御性返回"无需操作"。
+        return ADD_EXISTS
+    if _is_admin_target(normalized):
+        # 管理员不能加入用户白名单：这是用户白名单，不是管理员名单；
+        # 管理员本来就始终拥有全部权限，加进来只会混淆权限模型。
+        logger.info("拒绝把管理员 %r 加入用户白名单", normalized)
+        return ADD_ADMIN_REJECTED
+    async with _whitelist_lock:
+        if normalized in WHITELIST_USERS:
+            return ADD_EXISTS
+        WHITELIST_USERS.add(normalized)
+        _save_whitelist_unlocked()
+        sync_ok = await _push_whitelist_to_r2_unlocked()
+        return ADD_ADDED if sync_ok else ADD_SYNC_FAILED
+
+
+async def remove_whitelist_user(target: str) -> str:
+    """原子地把 target 从白名单移除：改内存 → 写本地文件 → 推送 R2。
+
+    返回 REMOVE_* 状态字符串。管理员不可删除（管理员不属于用户白名单，
+    且显式拒绝而不是伪装成"不存在"，让管理员明确知道权限边界）。
+    """
+    normalized = _normalize_target(target)
+    if not normalized:
+        return REMOVE_MISSING
+    if _is_admin_target(normalized):
+        logger.info("拒绝从用户白名单删除管理员 %r", normalized)
+        return REMOVE_ADMIN_REJECTED
+    async with _whitelist_lock:
+        if normalized not in WHITELIST_USERS:
+            return REMOVE_MISSING
+        WHITELIST_USERS.discard(normalized)
+        _save_whitelist_unlocked()
+        sync_ok = await _push_whitelist_to_r2_unlocked()
+        return REMOVE_REMOVED if sync_ok else REMOVE_SYNC_FAILED
 
 
 async def snapshot_whitelist() -> list[str]:

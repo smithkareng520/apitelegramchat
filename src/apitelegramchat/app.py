@@ -2,6 +2,7 @@
 from quart import Quart, request
 import asyncio
 import aiohttp
+import html
 import json
 import logging
 import uuid
@@ -32,11 +33,19 @@ from apitelegramchat.config import (
     SUPPORTED_ROLES,
     WEBHOOK_TOKEN,
     DEFAULT_MODEL,
-    WHITELIST_USERS,
-    ADMIN_USERS,
+    is_admin_identity,
+    is_whitelisted_identity,
     add_whitelist_user,
     remove_whitelist_user,
     snapshot_whitelist,
+    ADD_ADDED,
+    ADD_EXISTS,
+    ADD_ADMIN_REJECTED,
+    ADD_SYNC_FAILED,
+    REMOVE_REMOVED,
+    REMOVE_MISSING,
+    REMOVE_ADMIN_REJECTED,
+    REMOVE_SYNC_FAILED,
     GROQ_API_KEY,
     LOG_TRUNCATE_LIMIT,
     LOG_LEVEL,
@@ -99,7 +108,14 @@ logger = get_logger(__name__)
 
 @app.before_serving
 async def _startup_load_whitelist() -> None:
-    """启动时加载白名单。之前没人调过 load_whitelist，导致默认是空 set。"""
+    """启动/部署时加载白名单。
+
+    load_whitelist() 内部：R2（权威源，key 见 config.WHITELIST_R2_KEY）
+    优先拉取全量白名单——管理员在 R2 控制台手动编辑过的名单也会在此
+    批量生效；R2 未配置或拉取失败时回退本地缓存文件；R2 有配置但对象
+    不存在时把本地数据播种上 R2。内存 set 原地更新，from-import 引用
+    永远有效。
+    """
     try:
         from apitelegramchat.config import load_whitelist
         await load_whitelist()
@@ -336,23 +352,22 @@ async def health_check():
 # ---------- 权限辅助 ----------
 def get_user_info(msg: dict) -> tuple[str, str]:
     from_user = msg.get("from", {})
-    username = from_user.get("username", "").strip()
+    username = (from_user.get("username") or "").strip()
     user_id = str(from_user.get("id", ""))
     return username, user_id
 
 def is_admin(username: str, user_id: str) -> bool:
-    return bool(
-        (username and username in ADMIN_USERS)
-        or (user_id and user_id in ADMIN_USERS)
-    )
+    # 委托 config.is_admin_identity：管理员判断集中在一处，用户名大小写
+    # 不敏感（Telegram 用户名语义），数字 ID 精确匹配。
+    return is_admin_identity(username, user_id)
 
 def is_authorized(username: str, user_id: str) -> bool:
+    # 管理员始终授权（与用户白名单无关）；普通用户查用户白名单
+    # （config.is_whitelisted_identity 内部做大小写归一化，与
+    # /adduser 存储时同源，避免大小写不一致导致的授权失败）。
     if is_admin(username, user_id):
         return True
-    return bool(
-        (username and username in WHITELIST_USERS)
-        or (user_id and user_id in WHITELIST_USERS)
-    )
+    return is_whitelisted_identity(username, user_id)
 
 async def reply_unauthorized(chat_id: int, reply_message_id: int | None = None):
     await send_rich_html_message(
@@ -886,14 +901,17 @@ def _is_chat_authorized(chat_id: int) -> bool:
     被误创建 timer 进而收到 TIMER 主动消息。
     """
     uid = str(chat_id)
-    if uid in ADMIN_USERS or uid in WHITELIST_USERS:
+    if is_admin_identity(user_id=uid) or is_whitelisted_identity(user_id=uid):
         return True
     try:
         ctx = get_or_init_context(chat_id)
-        username = (ctx.get("username") or "").strip()
+        # 只用真实的 Telegram 用户名做白名单匹配（tg_username），绝不使用
+        # ctx["username"]——后者在用户无 username 时会回退成 first_name，
+        # 而 first_name 不唯一，用它匹配白名单可能把同名陌生人误判为授权。
+        username = (ctx.get("tg_username") or "").strip()
     except Exception:
         username = ""
-    if username and (username in ADMIN_USERS or username in WHITELIST_USERS):
+    if username and (is_admin_identity(username=username) or is_whitelisted_identity(username=username)):
         return True
     return False
 
@@ -1330,6 +1348,7 @@ async def _process_document_group_inner(chat_id: int, media_group_id: str) -> No
     async with lock:
         ctx = get_or_init_context(chat_id)
         ctx["username"] = username or f"User_{chat_id}"
+        ctx["tg_username"] = (username or "").strip()
     await _handle_text_message(chat_id, user_message.get("content", ""), username, user_message)
 
 async def _schedule_document_group(chat_id: int, media_group_id: str) -> None:
@@ -1838,11 +1857,19 @@ async def process_update(data: dict) -> None:
                     if not target:
                         await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
                         return
-                    added = await add_whitelist_user(target)
-                    if added:
-                        await send_rich_html_message(chat_id, f"✅ <b>添加成功</b>\n已添加 <code>{target}</code> 到白名单。", reply_parameters=_reply_params(msg["message_id"]))
-                    else:
-                        await send_rich_html_message(chat_id, f"ℹ️ <b>无需操作</b>\n<code>{target}</code> 已在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
+                    result = await add_whitelist_user(target)
+                    target_html = html.escape(target)
+                    if result == ADD_ADDED:
+                        reply = f"✅ <b>添加成功</b>\n已添加 <code>{target_html}</code> 到白名单，并已同步到 R2。"
+                    elif result == ADD_SYNC_FAILED:
+                        reply = (f"✅ <b>已添加（本地）</b>\n<code>{target_html}</code> 已加入白名单并写入本地文件。\n"
+                                 f"⚠️ 推送到 R2 失败：重启后该添加可能丢失，请检查 R2 配置后重试，或重新执行 /adduser。")
+                    elif result == ADD_ADMIN_REJECTED:
+                        reply = (f"❌ <b>拒绝操作</b>\n<code>{target_html}</code> 是管理员，不能加入用户白名单。\n"
+                                 f"管理员始终拥有全部权限，无需加入白名单（这也是用户白名单与管理员名单的区别）。")
+                    else:  # ADD_EXISTS
+                        reply = f"ℹ️ <b>无需操作</b>\n<code>{target_html}</code> 已在白名单中。"
+                    await send_rich_html_message(chat_id, reply, reply_parameters=_reply_params(msg["message_id"]))
                     return
                 elif _cmd_match(text, "/deluser"):
                     parts = text.split()
@@ -1853,11 +1880,19 @@ async def process_update(data: dict) -> None:
                     if not target:
                         await send_rich_html_message(chat_id, "❌ <b>输入无效</b>\n请输入有效的用户名或ID。", reply_parameters=_reply_params(msg["message_id"]))
                         return
-                    removed = await remove_whitelist_user(target)
-                    if removed:
-                        await send_rich_html_message(chat_id, f"✅ <b>移除成功</b>\n已移除 <code>{target}</code>。", reply_parameters=_reply_params(msg["message_id"]))
-                    else:
-                        await send_rich_html_message(chat_id, f"❌ <b>用户不存在</b>\n<code>{target}</code> 不在白名单中。", reply_parameters=_reply_params(msg["message_id"]))
+                    result = await remove_whitelist_user(target)
+                    target_html = html.escape(target)
+                    if result == REMOVE_REMOVED:
+                        reply = f"✅ <b>移除成功</b>\n已移除 <code>{target_html}</code>，并已同步到 R2。"
+                    elif result == REMOVE_SYNC_FAILED:
+                        reply = (f"✅ <b>已移除（本地）</b>\n<code>{target_html}</code> 已从白名单移除并写入本地文件。\n"
+                                 f"⚠️ 推送到 R2 失败：重启后该用户可能恢复访问，请检查 R2 配置后重试，或重新执行 /deluser。")
+                    elif result == REMOVE_ADMIN_REJECTED:
+                        reply = (f"❌ <b>拒绝操作</b>\n<code>{target_html}</code> 是管理员，不能从用户白名单删除。\n"
+                                 f"管理员不属于用户白名单，其权限不通过 /deluser 管理。")
+                    else:  # REMOVE_MISSING
+                        reply = f"❌ <b>用户不存在</b>\n<code>{target_html}</code> 不在白名单中。"
+                    await send_rich_html_message(chat_id, reply, reply_parameters=_reply_params(msg["message_id"]))
                     return
                 elif _cmd_match(text, "/listusers"):
                     users = await snapshot_whitelist()
@@ -1960,6 +1995,10 @@ async def process_update(data: dict) -> None:
             async with lock:
                 ctx = get_or_init_context(chat_id)
                 ctx["username"] = (from_user.get("username") or from_user.get("first_name") or str(from_user.get("id", chat_id)))
+                # tg_username 只存真实 Telegram 用户名（可能为空），专供
+                # _is_chat_authorized 等授权路径使用；ctx["username"] 的
+                # first_name/ID 回退仅用于展示，不参与白名单匹配。
+                ctx["tg_username"] = (from_user.get("username") or "").strip()
                 user_models.setdefault(chat_id, DEFAULT_MODEL)
             username = ctx["username"]
 
