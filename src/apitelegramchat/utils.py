@@ -16,6 +16,7 @@ from typing import Optional, Dict, Union
 from contextlib import asynccontextmanager
 import sys
 from apitelegramchat.config import GROQ_API_KEY
+from apitelegramchat.markdown_converter import convert_markdown_to_telegram_html
 
 # ---------- 配置日志 ----------
 # 日志文件路径可由环境变量 LOG_FILE 覆盖；默认 /tmp/app.log 仅在可写时启用。
@@ -298,13 +299,27 @@ def _rich_message_html_payload(html_content: str) -> dict:
        页面，以 ``RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND`` 拒绝整条消息。
        降级后保留模型生成的 figcaption 文本，让用户仍可点击跳转观看页。
     """
-    cleaned = _strip_invalid_media_urls(html_content)
+    # 0. Markdown → Telegram HTML 兜底转换。必须排在媒体清理之前：
+    #    Markdown 图片 ![alt](url) 此时才会变成 <img src>，从而同样接受
+    #    下面两道 URL 合法性检查；若放在之后，伪 URL 图片会绕过校验并
+    #    导致整条消息被 Telegram 拒绝。
+    #    模型已按提示词输出纯 HTML 时，转换是幂等 no-op。
+    normalized = convert_markdown_to_telegram_html(html_content)
+    if normalized != html_content:
+        logger.info(
+            "sendRichMessage 兜底转换：检测到 Markdown 语法，已转为 Telegram HTML。"
+            "原始长度=%s，转换后长度=%s",
+            len(html_content),
+            len(normalized),
+        )
+
+    cleaned = _strip_invalid_media_urls(normalized)
     demoted = _demote_watch_page_videos(cleaned)
-    if demoted != html_content:
+    if demoted != normalized:
         logger.warning(
             "sendRichMessage 兜底清理：检测到伪 URL 或观看页 URL 媒体块，"
             "已剥离/降级以保证消息送达。原始长度=%s，清理后长度=%s",
-            len(html_content),
+            len(normalized),
             len(demoted),
         )
     return {
