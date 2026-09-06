@@ -986,6 +986,13 @@ async def _agentic_loop_gemini_native(
 
         if reasoning_acc:
             builder.finalize_reasoning_block()
+            # 思考块结束时检查是否需要切换草稿
+            await builder.rollover_at_turn_boundary(start_next_draft=True)
+        
+        # 文本块结束时检查是否需要切换草稿
+        if content_acc:
+            await builder.rollover_at_turn_boundary(start_next_draft=True)
+        
         await builder.flush()
 
         assistant_msg: dict = {"role": "assistant", "content": content_acc or None}
@@ -1043,6 +1050,9 @@ async def _agentic_loop_gemini_native(
                                 synth_text += event["text"]
                                 builder.append_stream_delta(event["text"])
                 raw_synth_content = builder.end_stream_text() or synth_text
+                # 文本块结束时检查是否需要切换草稿
+                if raw_synth_content:
+                    await builder.rollover_at_turn_boundary(start_next_draft=False)
                 final_content = _strip_textual_tool_calls(raw_synth_content)
                 if final_content != raw_synth_content:
                     builder.replace_trailing_text(raw_synth_content, final_content)

@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "prepared": true,
+  "cache_root": "/tmp/apitelegramchat_data/workspaces/7162243624/runtime",
+  "tools": {
+    "python3": {
+      "path": "/usr/bin/python3",
+      "version": "Python 3.11.2"
+    },
+    "gcc": {
+      "path": "/usr/bin/gcc",
+      "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0"
+    },
+    "g++": {
+      "path": "/usr/bin/g++",
+      "version": "g++ (Debian 12.2.0-14+deb12u1) 12.2.0"
+    },
+    "clang": {
+      "path": null,
+      "version": null
+    },
+    "clang++": {
+      "path": null,
+      "version": null
+    },
+    "make": {
+      "path": "/usr/bin/make",
+      "version": "GNU Make 4.3"
+    },
+    "cmake": {
+      "path": "/usr/bin/cmake",
+      "version": "cmake version 3.25.1"
+    },
+    "ccache": {
+      "path": "/usr/bin/ccache",
+      "version": "ccache version 4.7.5"
+    }
+  }
+}

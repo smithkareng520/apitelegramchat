@@ -744,6 +744,13 @@ async def _agentic_loop_anthropic(
 
         if reasoning_acc:
             builder.finalize_reasoning_block()
+            # 思考块结束时检查是否需要切换草稿
+            await builder.rollover_at_turn_boundary(start_next_draft=True)
+        
+        # 文本块结束时检查是否需要切换草稿
+        if content_acc:
+            await builder.rollover_at_turn_boundary(start_next_draft=True)
+        
         await builder.flush()
 
         assistant_msg: dict = {"role": "assistant", "content": content_acc or None}
@@ -798,6 +805,9 @@ async def _agentic_loop_anthropic(
                                     synth_text += text
                                     builder.append_stream_delta(text)
                 final_content = builder.end_stream_text() or synth_text
+                # 文本块结束时检查是否需要切换草稿
+                if final_content:
+                    await builder.rollover_at_turn_boundary(start_next_draft=False)
                 if not final_content:
                     final_content = _tool_limit_summary()
                     builder.add_text(final_content)
