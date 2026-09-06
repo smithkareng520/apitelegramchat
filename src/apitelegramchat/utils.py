@@ -602,6 +602,215 @@ def _demote_watch_page_videos(html_content: str) -> str:
     return result
 
 
+def _extract_media_urls(html_content: str, media_kind: str) -> list[str]:
+    """提取指定类型媒体的所有 src URL。
+    
+    Args:
+        html_content: HTML 内容
+        media_kind: 媒体类型，可以是 "img", "video", "audio"
+    
+    Returns:
+        该类型所有媒体的 src URL 列表（按出现顺序）
+    """
+    if not html_content or not media_kind:
+        return []
+    
+    urls = []
+    # 匹配该类型的所有标签（包括自闭合和容器形式）
+    pattern = re.compile(
+        rf'<{media_kind}\b[^>]*>.*?</{media_kind}\s*>|<{media_kind}\b[^>]*/>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    
+    for match in pattern.finditer(html_content):
+        tag = match.group(0)
+        # 提取 src 属性
+        src_match = re.search(r'\bsrc\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))', tag, re.IGNORECASE)
+        if src_match:
+            src = (src_match.group(2) or src_match.group(3) or src_match.group(4) or "").strip()
+            if src:
+                urls.append(src)
+    
+    return urls
+
+
+def _demote_specific_media_url(html_content: str, media_kind: str, target_url: str) -> str:
+    """只降级指定 URL 的媒体，保留其他媒体不变。
+    
+    Args:
+        html_content: HTML 内容
+        media_kind: 媒体类型 ("img", "video", "audio")
+        target_url: 要降级的目标 URL
+    
+    Returns:
+        处理后的 HTML（只有目标 URL 的媒体被降级为链接）
+    """
+    if not html_content or not target_url:
+        return html_content
+    
+    def _extract_src(tag_text: str) -> str:
+        m = re.search(r'\bsrc\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))', tag_text, re.IGNORECASE)
+        if not m:
+            return ""
+        return (m.group(2) or m.group(3) or m.group(4) or "").strip()
+    
+    def _domain_of(url: str) -> str:
+        m = re.match(r'https?://([^/\s]+)', url or "")
+        return m.group(1) if m else ""
+    
+    def _figcaption_text(inner: str) -> str:
+        m = re.search(r'<figcaption\b[^>]*>(.*?)</figcaption\s*>', inner, re.IGNORECASE | re.DOTALL)
+        if not m:
+            return ""
+        return re.sub(r'<[^>]+>', '', m.group(1)).strip()
+    
+    def _build_anchor(src: str, caption: str, kind: str) -> str:
+        if not caption:
+            domain = _domain_of(src)
+            label_map = {"video": "🎬 观看视频", "audio": "🎵 收听音频", "img": "🖼 查看图片"}
+            caption = label_map.get(kind, "🔗 查看链接")
+            if domain:
+                caption = f"{caption} · {domain}"
+        safe_caption = caption.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return f'<a href="{src}"><b>{safe_caption}</b></a>'
+    
+    # 1) 处理 <figure> 内的目标媒体
+    figure_re = re.compile(r'<figure\b[^>]*>(.*?)</figure\s*>', re.IGNORECASE | re.DOTALL)
+    media_in_figure_re = re.compile(
+        rf'<{media_kind}\b[^>]*?/?>.*?</{media_kind}\s*>|<{media_kind}\b[^>]*/>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    
+    def _replace_figure(m: re.Match) -> str:
+        inner = m.group(1) or ""
+        mm = media_in_figure_re.search(inner)
+        if not mm:
+            return m.group(0)
+        
+        block = mm.group(0)
+        src = _extract_src(block)
+        
+        # 只处理目标 URL
+        if src != target_url:
+            return m.group(0)
+        
+        cap_text = _figcaption_text(inner)
+        anchor = _build_anchor(src, cap_text, media_kind)
+        
+        # 移除媒体块和 figcaption，保留其他内容
+        rest = inner.replace(block, "")
+        rest = re.sub(r'<figcaption\b[^>]*>.*?</figcaption\s*>', '', rest, flags=re.IGNORECASE | re.DOTALL)
+        rest = rest.strip()
+        
+        if rest:
+            return f"{anchor} {rest}"
+        return anchor
+    
+    result = figure_re.sub(_replace_figure, html_content)
+    
+    # 2) 处理裸媒体（不在 <figure> 中的）
+    bare_media_re = re.compile(
+        rf'<{media_kind}\b[^>]*>.*?</{media_kind}\s*>|<{media_kind}\b[^>]*/>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    
+    def _replace_bare(m: re.Match) -> str:
+        block = m.group(0)
+        src = _extract_src(block)
+        
+        # 只处理目标 URL
+        if src != target_url:
+            return block
+        
+        caption = _figcaption_text(block)
+        if not caption:
+            bare = re.sub(r'<[^>]+>', ' ', block)
+            caption = re.sub(r'\s+', ' ', bare).strip()[:80]
+        
+        return _build_anchor(src, caption, media_kind)
+    
+    result = bare_media_re.sub(_replace_bare, result)
+    
+    return result
+
+
+async def _selective_media_fallback(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    original_payload: dict,
+    html_content: str,
+    media_kinds: set[str],
+) -> Optional[int]:
+    """逐个排查有问题的媒体，只降级有问题的那个，保留其他正常媒体。
+    
+    策略：
+    1. 对每个报错的媒体类型，提取所有该类型的媒体 URL
+    2. 逐个尝试只降级其中一个 URL，测试消息能否发送成功
+    3. 找到有问题的 URL 后，返回成功的消息 ID
+    4. 如果逐个都试完了还是失败，返回 None（让调用方执行全部降级兜底）
+    
+    Args:
+        session: aiohttp 会话
+        base_url: Telegram API base URL
+        original_payload: 原始请求 payload
+        html_content: 原始 HTML 内容
+        media_kinds: 报错的媒体类型集合 (如 {"img", "video"})
+    
+    Returns:
+        成功时返回 message_id (int)，失败返回 None
+    """
+    logger.info(
+        "开始逐个排查有问题的媒体，类型: %s",
+        sorted(media_kinds),
+    )
+    
+    # 对每个媒体类型，提取所有 URL
+    for kind in sorted(media_kinds):
+        urls = _extract_media_urls(html_content, kind)
+        if not urls:
+            continue
+        
+        logger.debug("媒体类型 %s 共有 %d 个实例: %s", kind, len(urls), urls[:3])
+        
+        # 逐个尝试只降级其中一个
+        for idx, url in enumerate(urls):
+            test_html = _demote_specific_media_url(html_content, kind, url)
+            if test_html == html_content:
+                continue  # 没有变化，跳过
+            
+            test_payload = {
+                **original_payload,
+                "rich_message": _rich_message_html_payload(test_html),
+            }
+            
+            logger.debug(
+                "测试降级第 %d/%d 个 %s: %s",
+                idx + 1, len(urls), kind, url[:80],
+            )
+            
+            try:
+                async with session.post(f"{base_url}/sendRichMessage", json=test_payload) as resp:
+                    if resp.status == 200:
+                        try:
+                            data = await resp.json()
+                            msg_id = (data.get("result") or {}).get("message_id")
+                            if isinstance(msg_id, int) and msg_id > 0:
+                                logger.info(
+                                    "成功定位有问题的媒体并只降级它: kind=%s url=%s",
+                                    kind, url[:100],
+                                )
+                                return msg_id
+                        except Exception as e:
+                            logger.debug("解析响应失败: %s", e)
+                        return True  # 成功但无法解析 message_id
+            except Exception as e:
+                logger.debug("测试请求异常: %s", e)
+                continue
+    
+    logger.info("逐个排查完成，未找到单一问题媒体，将执行全部降级兜底")
+    return None
+
+
 def _demote_all_media_to_links(
     html_content: str,
     media_kinds: Optional[set[str]] = None,
@@ -1568,10 +1777,17 @@ async def send_rich_html_message(
                     if "rich_message_audio_" in body_lower or "rich_message_audio_url_invalid" in body_lower:
                         media_kinds.add("audio")
 
-                    # ---------- 第 2 次尝试：只降级服务端明确报错的媒体类型 ----------
-                    # image/video/audio 映射到实际 HTML 标签名，避免 photo 失败时把
-                    # 同一条消息中本来正常的视频和音频也一并变成链接。
+                    # ---------- 第 2 次尝试：逐个排查有问题的媒体 ----------
+                    # 不再一次性降级所有同类型媒体，而是逐个尝试找出有问题的那个。
+                    # 策略：对每个媒体类型，提取所有该类型的媒体，逐个降级测试。
                     if media_kinds:
+                        success_result = await _selective_media_fallback(
+                            session, BASE_URL, payload, html_content, media_kinds
+                        )
+                        if success_result:
+                            return success_result
+                        
+                        # 逐个排查失败，最后兜底：降级该类型所有媒体
                         media_demoted = _demote_all_media_to_links(
                             html_content,
                             media_kinds,
@@ -1582,7 +1798,7 @@ async def send_rich_html_message(
                                 "rich_message": _rich_message_html_payload(media_demoted),
                             }
                             logger.warning(
-                                "sendRichHtmlMessage retrying with affected media demoted to <a> links "
+                                "sendRichHtmlMessage retrying with ALL affected media demoted (last resort) "
                                 "(kinds=%s, orig_len=%s, demoted_len=%s)",
                                 sorted(media_kinds), len(html_content), len(media_demoted),
                             )
@@ -1598,7 +1814,7 @@ async def send_rich_html_message(
                                     return True
                                 fb_body = await fb_resp.text()
                                 logger.warning(
-                                    "sendRichHtmlMessage selective media fallback failed: %s %s",
+                                    "sendRichHtmlMessage all-media fallback failed: %s %s",
                                     fb_resp.status, fb_body[:200],
                                 )
                                 return False
