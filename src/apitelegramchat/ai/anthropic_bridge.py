@@ -888,7 +888,15 @@ async def _agentic_loop_anthropic(
         # rollover_at_turn_boundary 内的 _has_pending_tool_group 守卫兜住：
         # 本轮若已建工具条目而未收束，这里不会滚动，工具批次结束后的
         # 回合边界仍会照常滚动。
-        if not await builder.rollover_at_turn_boundary(start_next_draft=True):
+        # 终局轮修复：此处 tool_calls_list 已定型（本循环无伪工具调用纠正
+        # 重试路径）。仅当本轮之后仍会请求模型（工具批次待执行）才允许滚动
+        # 创建新草稿；纯文本终局轮必须传 False，把"只永久化旧段、不创建
+        # 新草稿"留给下方终局分支完成。否则容量预警标志会在终局轮被本检查
+        # 点以 start_next_draft=True 抢先消费——创建一个永远无人写入、只
+        # 显示 "Thinking..." 的幽灵草稿，随后被 get_ai_response 收尾
+        # mark_dead + 删除（表现为回复交付后闪现的 Thinking 气泡）。
+        will_request_again = bool(tool_calls_list)
+        if not await builder.rollover_at_turn_boundary(start_next_draft=will_request_again):
             await builder.flush()
 
         assistant_msg: dict = {"role": "assistant", "content": content_acc or None}

@@ -1003,7 +1003,16 @@ async def _agentic_loop_gemini_native(
         # rollover_at_turn_boundary 内的 _has_pending_tool_group 守卫兜住：
         # 本轮若已建工具条目而未收束，这里不会滚动，工具批次结束后的
         # 回合边界仍会照常滚动。
-        if not await builder.rollover_at_turn_boundary(start_next_draft=True):
+        # 终局轮修复：此处 tool_calls_list 已定型。本循环对伪工具调用文本
+        # 只做剥离、不重试（剥离后即终局，见下方 not tool_calls_list 分支），
+        # 故无需把 textual_tool_call 计入继续条件。仅当工具批次待执行时才
+        # 允许滚动创建新草稿；纯文本终局轮必须传 False，把"只永久化旧段、
+        # 不创建新草稿"留给下方终局分支完成。否则容量预警标志会在终局轮被
+        # 本检查点以 start_next_draft=True 抢先消费——创建一个永远无人写入、
+        # 只显示 "Thinking..." 的幽灵草稿，随后被 get_ai_response 收尾
+        # mark_dead + 删除（表现为回复交付后闪现的 Thinking 气泡）。
+        will_request_again = bool(tool_calls_list)
+        if not await builder.rollover_at_turn_boundary(start_next_draft=will_request_again):
             await builder.flush()
 
         assistant_msg: dict = {"role": "assistant", "content": content_acc or None}
