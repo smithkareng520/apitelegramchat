@@ -165,13 +165,36 @@ def _scan_rich_html_boundaries(
     block_count = 0
     cursor = 0
 
+    # 性能修复（EVENT LOOP BLOCKED 根因）：原实现在每个块边界都对
+    # "累计到此处的全部可见文本" 做一次 tiktoken 全量编码，复杂度是
+    # O(块数 × 全文长度)。一个 120 块 / 6.6KB 的草稿单次扫描就要 ~290ms，
+    # 而 flush 每帧调用两次（_arm_rollover_if_needed + DEBUG 扫描），
+    # 0.65s 一帧 => 事件循环被同步 CPU 占死 ~90%，进而出现
+    # "期望休眠 10.0s 实际 20.2s" 的 lag 与健康检查失败。
+    #
+    # 改为增量累加：只对"自上个边界以来新增的片段"编码一次，累加得到
+    # 边界处的 token 数，复杂度降为 O(全文长度)。token 化不是严格可加的
+    # （跨片段的 BPE 合并会有 ±个位数偏差），但这些数值仅用于容量阈值
+    # 判断（3000/6000 token 预算），偏差远小于阈值裕度；末尾返回的总量
+    # 仍按全文精确编码一次，保证对外口径准确。
+    tokens_acc = 0          # 已计入边界的累计 token
+    units_acc = 0           # 已计入边界的累计可见字符数
+    pending_parts: list[str] = []   # 自上个边界以来新增、尚未计量的片段
+
     def add_visible(fragment: str) -> None:
         if fragment:
-            visible_parts.append(html.unescape(fragment))
+            unescaped = html.unescape(fragment)
+            visible_parts.append(unescaped)
+            pending_parts.append(unescaped)
 
     def append_boundary(source_end: int) -> None:
-        visible_text = "".join(visible_parts)
-        boundaries.append((source_end, count_tokens(visible_text), block_count, len(visible_text)))
+        nonlocal tokens_acc, units_acc
+        if pending_parts:
+            delta = "".join(pending_parts)
+            pending_parts.clear()
+            tokens_acc += count_tokens(delta)
+            units_acc += len(delta)
+        boundaries.append((source_end, tokens_acc, block_count, units_acc))
 
     for match in _RICH_HTML_TAG_RE.finditer(content):
         add_visible(content[cursor:match.start()])
@@ -205,9 +228,11 @@ def _scan_rich_html_boundaries(
 
     add_visible(content[cursor:])
     visible_text = "".join(visible_parts)
+    # 全文总量精确编码一次（O(全文)），作为对外返回的权威口径。
+    total_tokens = count_tokens(visible_text)
     if not open_tags and content.strip() and (not boundaries or boundaries[-1][0] != len(content)):
-        boundaries.append((len(content), count_tokens(visible_text), max(1, block_count), len(visible_text)))
-    return boundaries, count_tokens(visible_text), block_count, len(visible_text)
+        boundaries.append((len(content), total_tokens, max(1, block_count), len(visible_text)))
+    return boundaries, total_tokens, block_count, len(visible_text)
 
 
 async def _swallow_flush_task(t: "asyncio.Task", name: str, draft_id: int) -> None:
@@ -1340,9 +1365,9 @@ class RichMessageBuilder:
             )
             return
 
-        html_content = self._build_html()
-        self._arm_rollover_if_needed(html_content)
-
+        # 性能修复：锁外这次 _build_html + 容量扫描是纯浪费——拿到锁后
+        # 内容会重新构建、下面还要再扫一次。热路径上每帧多一次 O(全文)
+        # 的同步 CPU 工作，直接叠加到事件循环 lag 上。改为只在锁内做一次。
         async with self._flush_lock:
             now = time.monotonic()
             if now < self._rate_limited_until:
@@ -1351,6 +1376,7 @@ class RichMessageBuilder:
             html_content = self._build_html()
             if not html_content.strip():
                 html_content = "<p>Working...</p>"
+            self._arm_rollover_if_needed(html_content)
 
             # 边界扫描会对全部块做逐块 token 编码（O(块数×全文)），其结果
             # 只用于 DEBUG 日志；生产（INFO 级别）跳过，流式热路径不再
@@ -1427,8 +1453,18 @@ class RichMessageBuilder:
             if should_flush:
                 self._commit_stream_buffer()
                 await self.flush(force=silent_too_long)
-                if not silent_too_long:
-                    self._last_flush_time = now
+                # 修复：原来 silent_too_long 分支**不更新** _last_flush_time，
+                # 依赖 flush() 内部成功时的赋值。正常路径确实会更新（所以线上
+                # 观察到的保活节奏是 ~2.3s，而非失控的 0.1s），但存在真实的
+                # 漏更新路径：flush 在 RateLimitError / 通用异常分支直接返回，
+                # 以及被 _rate_limited_until 冷却短路时，都不会更新时间戳。
+                # 那些情形下 time_elapsed 会持续 >= 阈值，循环退化成每 0.1s
+                # 尝试一次 force=True 全帧重发（force 绕过"内容相同"短路与
+                # 250ms 最小间隔），与真正携带新内容的帧争抢 _flush_lock 和
+                # 每 chat 的 draft 发送锁，正是"最后一条消息迟迟刷不出来"的
+                # 竞态来源之一。这里统一兜底更新，使保活节奏在任何分支下都
+                # 严格等于 STREAM_SILENT_FORCE_FLUSH。
+                self._last_flush_time = time.monotonic()
 
     def start_flush_loop(self):
         if self._flush_task is None or self._flush_task.done():

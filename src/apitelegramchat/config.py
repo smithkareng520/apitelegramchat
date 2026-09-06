@@ -1148,17 +1148,25 @@ def _resolve_whitelist_path() -> str:
         from apitelegramchat.workspace_paths import data_root
         return str(data_root() / WHITELIST_FILE)
     except Exception:
-        logger.debug("_resolve_whitelist_path 内部忽略的异常", exc_info=True)
-        return WHITELIST_FILE
+        logger.warning("_resolve_whitelist_path 失败，使用回退路径", exc_info=True)
+        # 回退到环境变量指定的数据目录
+        data_dir = os.getenv("APITELEGRAMCHAT_DATA_DIR", "/tmp/apitelegramchat_data")
+        return os.path.join(data_dir, WHITELIST_FILE)
 
 async def load_whitelist():
-    global WHITELIST_USERS
+    """从文件加载白名单，使用原地更新而非重新赋值，避免 from-import 引用失效。"""
     async with _whitelist_lock:
         try:
             with open(_resolve_whitelist_path(), "r", encoding="utf-8") as f:
-                WHITELIST_USERS = {line.strip() for line in f if line.strip()}
+                loaded = {line.strip() for line in f if line.strip()}
+            # 关键修复：原地更新 set，而不是 global 重新赋值。
+            # app.py 中的 "from config import WHITELIST_USERS" 引用的是启动时的 set 对象，
+            # 如果这里用 "WHITELIST_USERS = loaded" 重新绑定，app.py 仍会看到旧的空 set。
+            WHITELIST_USERS.clear()
+            WHITELIST_USERS.update(loaded)
         except FileNotFoundError:
-            WHITELIST_USERS = set()
+            # 文件不存在时清空集合（初始化为空白名单）
+            WHITELIST_USERS.clear()
         except OSError:
             logger.warning("load_whitelist failed: %s", _resolve_whitelist_path(), exc_info=True)
 
@@ -1170,7 +1178,13 @@ async def save_whitelist():
 def _save_whitelist_unlocked() -> None:
     """在已持有 _whitelist_lock 的前提下把 WHITELIST_USERS 写入磁盘。"""
     try:
-        with open(_resolve_whitelist_path(), "w", encoding="utf-8") as f:
+        path = _resolve_whitelist_path()
+        # 确保父目录存在
+        import os
+        from pathlib import Path
+        parent = Path(path).parent
+        parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
             f.writelines(user + "\n" for user in sorted(WHITELIST_USERS))
     except OSError:
         logger.warning("save_whitelist failed: %s", _resolve_whitelist_path(), exc_info=True)

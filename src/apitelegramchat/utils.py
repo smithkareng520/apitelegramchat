@@ -306,7 +306,10 @@ def _rich_message_html_payload(html_content: str) -> dict:
     #    模型已按提示词输出纯 HTML 时，转换是幂等 no-op。
     normalized = convert_markdown_to_telegram_html(html_content)
     if normalized != html_content:
-        logger.info(
+        # 该转换在流式草稿路径上每帧都会命中（同一条草稿每 0.65s 刷一次），
+        # 用 INFO 记录会产生日志刷屏——真实日志里同一行重复了数十次，既淹没
+        # 了有效信息，也让 logging 本身成为热路径开销。降级为 DEBUG。
+        logger.debug(
             "sendRichMessage 兜底转换：检测到 Markdown 语法，已转为 Telegram HTML。"
             "原始长度=%s，转换后长度=%s",
             len(html_content),
@@ -1896,8 +1899,21 @@ async def send_chat_action(chat_id: int, action: str) -> None:
                     #（幂等，仅标记 + 停调度，不影响本调用返回）。
                     await _notify_chat_unreachable(chat_id, resp.status, body)
                     logger.warning(f"sendChatAction failed: {body[:200]}")
+    except asyncio.CancelledError:
+        # chat_actions 的保活循环在任务收尾时会 cancel 本协程。CancelledError
+        # 是协作式取消信号，不是错误：必须原样向上传播，否则取消语义被吞掉，
+        # 调用方的 await task 会挂到超时。日志里那条空的
+        # "sendChatAction exception: " 正是它——CancelledError 的 str() 为空串。
+        raise
     except Exception as e:
-        logger.warning(f"sendChatAction exception: {e}")
+        # 同样避免空日志：aiohttp 的多个异常（ServerTimeoutError、
+        # ClientOSError 等）str() 常为空，只打 {e} 会得到无信息的一行。
+        # 补上异常类型名，必要时还能看到 repr。
+        detail = str(e) or repr(e)
+        logger.warning(
+            "sendChatAction exception: chat=%s action=%s %s: %s",
+            chat_id, action, type(e).__name__, detail,
+        )
 
 # ========== 富消息文本提取 ==========
 def _extract_rich_message_text(rich_obj: Union[dict, list, str]) -> str:
