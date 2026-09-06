@@ -986,13 +986,9 @@ async def _agentic_loop_gemini_native(
 
         if reasoning_acc:
             builder.finalize_reasoning_block()
-            # 思考块结束时检查是否需要切换草稿
-            await builder.rollover_at_turn_boundary(start_next_draft=True)
         
-        # 文本块结束时检查是否需要切换草稿
-        if content_acc:
-            await builder.rollover_at_turn_boundary(start_next_draft=True)
-        
+        # 修复问题1：不在文本块结束后立即 rollover，而是等待工具执行完毕。
+        # 否则工具的流式输出（如 "Viewing file utils.py"）会被拆分到新草稿。
         await builder.flush()
 
         assistant_msg: dict = {"role": "assistant", "content": content_acc or None}

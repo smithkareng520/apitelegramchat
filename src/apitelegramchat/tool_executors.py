@@ -1245,6 +1245,25 @@ class BashSession:
         # 写入、删除、执行等危险操作仍由 _DANGEROUS_PATTERNS 和沙箱控制。
         # 拒绝在 upload/ 或 download/ 子树内执行任何命令
         if self._last_cwd and is_inside_upload_or_download(self._last_cwd):
+            # 修复问题2：如果当前在 upload/download 内，但命令是返回工作目录的 cd 命令，
+            # 则允许执行，让模型能够逃离陷阱。检测模式：
+            # - cd $WORKSPACE
+            # - cd /path/to/workspace
+            # - cd (不带参数，返回 HOME，但沙箱中 HOME=WORKSPACE)
+            # - cd .. (可能需要多次才能离开，但至少允许尝试)
+            cmd_stripped = command.strip()
+            if re.match(r'^cd(\s+\$WORKSPACE|\s+\$HOME|\s*$|\s+\.\.(/\.\.)*)(\s*[;&|]|$)', cmd_stripped):
+                logger.info(
+                    f"✓ Bash allowed escape-cd from upload/download chat_id={self.chat_id} cwd={self._last_cwd} cmd={command[:100]}"
+                )
+                return True
+            # 也允许绝对路径 cd 到工作目录
+            workspace_path = str(self.workdir.absolute())
+            if re.match(rf'^cd\s+["\']?{re.escape(workspace_path)}["\']?(\s*[;&|]|$)', cmd_stripped):
+                logger.info(
+                    f"✓ Bash allowed escape-cd (absolute) from upload/download chat_id={self.chat_id} cwd={self._last_cwd}"
+                )
+                return True
             logger.warning(
                 f"🚫 Bash rejected (cwd inside upload/download) chat_id={self.chat_id} cwd={self._last_cwd}"
             )
