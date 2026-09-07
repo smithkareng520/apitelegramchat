@@ -14,7 +14,8 @@ agentic 循环在「回合骨架」上完全同构——循环初始化、assist
 保持 OpenAI 形状（见 agentic_loops.py 的边界转换约定）。
 """
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Optional
 
 from config import SUPPORTED_MODELS, get_sampling_params
 from utils import get_logger
@@ -23,6 +24,10 @@ from chat_actions import start_chat_action, stop_chat_action
 from ai._constants import MAX_TOOL_CALLS
 from ai.tool_summary import _tool_limit_summary
 from ai.tool_call_loop import _run_tool_calls_and_append
+
+if TYPE_CHECKING:
+    # 仅供类型注解使用；运行时由 get_ai_response 统一包装后传入。
+    from ai.draft_manager import DraftManager
 
 logger = get_logger(__name__)
 
@@ -68,13 +73,20 @@ def init_bridge_loop_state(messages: list, journal: list | None, current_model: 
     )
 
 
-def make_switch_stream(builder, cell: list):
+def make_switch_stream(builder: "DraftManager", cell: list) -> "Callable[[str], Awaitable[None]]":
     """草稿流切换状态机（原两 bridge 循环内逐字相同的 switch_stream 闭包）。
 
     ``cell`` 是单元素列表（[None] 或 [当前流类型]），代替闭包的
     nonlocal 变量；返回的协程函数语义与原实现完全一致：同一流类型
     幂等返回；切换前结束当前流，并在"此前确有流"时触发回合中途的
     块边界换草稿检查点。
+
+    解耦改造：检查点为非阻塞事件（``on_stream_block_closed``）——
+    真正是否切换仍由 DraftManager 内的容量阈值决定；未达阈值时无
+    额外开销；满容量时由后台任务执行滚动，Agent 不等待 UI（§8）；
+    滚动换血期间到达的事件经 DraftEventBuffer 缓冲后回放（§9）。
+    若本轮已有未收束的工具组，安全点守卫会推迟滚动到 tool.end，
+    从而不会把工具卡片拆散（历史问题1）。
     """
 
     async def switch_stream(target: str) -> None:
@@ -82,15 +94,11 @@ def make_switch_stream(builder, cell: list):
             return
         ended = cell[0]
         builder.end_stream()
-        # 块边界换草稿检查点①②：一个思考块或文本块刚刚闭合、下一个块
-        # 尚未开启，此刻 HTML 正好停在完整外层块边界上，是回合中途最
-        # 安全的切换时机（不必再等整批工具结果回来）。
-        # 真正是否切换仍由 rollover_at_turn_boundary 内的容量阈值决定；
-        # 未达阈值时立即返回 False，热路径无额外开销。
-        # 若本轮已有未收束的工具组，函数内的守卫会拒绝滚动，
-        # 从而不会把工具卡片拆散（历史问题1）。
+        # 块边界换草稿检查点①②（非阻塞事件）：一个思考块或文本块刚刚
+        # 闭合、下一个块尚未开启，此刻 HTML 正好停在完整外层块边界上，
+        # 是回合中途最安全的切换时机（不必再等整批工具结果回来）。
         if ended is not None:
-            await builder.rollover_at_turn_boundary(start_next_draft=True)
+            builder.on_stream_block_closed(ended)
         if target == "reasoning":
             builder.begin_stream_reasoning()
         elif target == "content":
@@ -100,7 +108,7 @@ def make_switch_stream(builder, cell: list):
     return switch_stream
 
 
-def finish_open_tool_group(builder) -> None:
+def finish_open_tool_group(builder: "DraftManager") -> None:
     """若最后一个工具组尚未收束则 finish_group（原两循环共 6 处守卫）。"""
     if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
         builder.finish_group(len(builder._tool_groups) - 1)
@@ -125,7 +133,7 @@ def append_assistant_message(
 
 
 async def run_tool_batch(
-    builder,
+    builder: "DraftManager",
     tool_calls_list: list,
     loop_messages: list,
     new_history_entries: list,
@@ -133,18 +141,23 @@ async def run_tool_batch(
     api_label: str,
     tools: list,
 ) -> str:
-    """执行工具批次，随后滚动创建新草稿（工具批次后仍会继续请求模型）。"""
+    """执行工具批次，随后触发 tool.end 安全点（非阻塞）。
+
+    解耦改造（§8）：工具结果已全部写入 loop_messages / 历史（即已进入
+    conversation context），调用方立即发起下一轮 LLM 请求；满容量时
+    草稿滚动由 DraftManager 在 tool.end 安全点后台执行，不再阻塞 Agent。
+    """
     status = await _run_tool_calls_and_append(
         tool_calls_list, loop_messages, new_history_entries,
         tool_call_count_ref, api_label, builder, chat_id=builder.chat_id,
         tools=tools,
     )
-    await builder.rollover_at_turn_boundary(start_next_draft=True)
+    builder.on_tool_batch_end()
     return status
 
 
 async def over_limit_final_summary(
-    builder,
+    builder: "DraftManager",
     new_history_entries: list,
     *,
     api_label: str,
@@ -174,9 +187,9 @@ async def over_limit_final_summary(
         synth_text += await stream_synth(build_synth_request(
             {"role": "user", "content": MAX_TOOL_CALLS_SYNTH_PROMPT}))
         raw_synth_content = builder.end_stream_text() or synth_text
-        # 文本块结束时检查是否需要切换草稿
+        # 文本块结束时检查是否需要切换草稿（终局：同步收束旧段）
         if raw_synth_content:
-            await builder.rollover_at_turn_boundary(start_next_draft=False)
+            await builder.finalize_turn()
         final_content = postprocess(raw_synth_content) if postprocess is not None else raw_synth_content
         if postprocess is not None and final_content != raw_synth_content:
             builder.replace_trailing_text(raw_synth_content, final_content)
@@ -195,18 +208,18 @@ async def over_limit_final_summary(
         await stop_chat_action(builder.chat_id, "typing")
     new_history_entries.append({"role": "assistant", "content": final_content or ""})
     finish_open_tool_group(builder)
-    # 工具上限总结是终局回复；结束旧草稿，不创建新草稿。
-    await builder.rollover_at_turn_boundary(start_next_draft=False)
+    # 工具上限总结是终局回复；同步结束旧草稿，不创建新草稿。
+    await builder.finalize_turn()
     return final_content
 
 
-async def ensure_final_content(builder, new_history_entries: list, final_content: Optional[str]) -> str:
+async def ensure_final_content(builder: "DraftManager", new_history_entries: list, final_content: Optional[str]) -> str:
     """轮次耗尽 / 空终局兜底：写入 _tool_limit_summary 并收束（逐字共用）。"""
     if final_content is None:
         final_content = _tool_limit_summary()
         builder.add_text(final_content)
         new_history_entries.append({"role": "assistant", "content": final_content})
         finish_open_tool_group(builder)
-        # 轮次数耗尽后的兜底文本没有后续轮次：结束旧草稿，但不创建新草稿。
-        await builder.rollover_at_turn_boundary(start_next_draft=False)
+        # 轮次数耗尽后的兜底文本没有后续轮次：同步结束旧草稿，不创建新草稿。
+        await builder.finalize_turn()
     return final_content

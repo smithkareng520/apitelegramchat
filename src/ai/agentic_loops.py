@@ -103,7 +103,7 @@ from ai.cache_usage import (  # noqa: F401
 
 if TYPE_CHECKING:
     # 仅供类型注解使用；运行时由调用方传入，避免运行时循环导入。
-    from ai.rich_message_builder import RichMessageBuilder
+    from ai.draft_manager import DraftManager
 
 logger = get_logger(__name__)
 
@@ -276,7 +276,7 @@ def _merged_extra_body(
 
 async def _agentic_loop_openai_compat(
         client: AsyncOpenAI, current_model: str, messages: list, api_label: str,
-        builder: "RichMessageBuilder", tools: Optional[list[dict[str, Any]]] = None, supports_tools: bool = True,
+        builder: "DraftManager", tools: Optional[list[dict[str, Any]]] = None, supports_tools: bool = True,
         journal: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str | None, object | None, list]:
     if tools is None:
@@ -364,15 +364,17 @@ async def _agentic_loop_openai_compat(
                 return
             ended = current_stream
             builder.end_stream()
-            # 块边界换草稿检查点①②：一个思考块或文本块刚刚闭合、下一个块
-            # 尚未开启，此刻 HTML 正好停在完整外层块边界上，是回合中途最
-            # 安全的切换时机（不必再等整批工具结果回来）。
-            # 真正是否切换仍由 rollover_at_turn_boundary 内的容量阈值决定；
-            # 未达阈值时立即返回 False，热路径无额外开销。
-            # 若本轮已有未收束的工具组，函数内的守卫会拒绝滚动，
+            # 块边界换草稿检查点①②（解耦改造后为非阻塞事件）：一个思考块
+            # 或文本块刚刚闭合、下一个块尚未开启，此刻 HTML 正好停在完整
+            # 外层块边界上，是回合中途最安全的切换时机（不必再等整批工具
+            # 结果回来）。是否切换仍由 DraftManager 内的容量阈值决定；
+            # 未达阈值时无任何开销；满容量时由后台任务执行滚动，Agent
+            # 不等待 UI（§8）。滚动换血期间到达的事件由 DraftEventBuffer
+            # 缓冲、滚动完成后回放进新草稿（§9）。
+            # 若本轮已有未收束的工具组，安全点守卫会推迟滚动到 tool.end，
             # 从而不会把工具卡片拆散（历史问题1）。
             if ended is not None:
-                await builder.rollover_at_turn_boundary(start_next_draft=True)
+                builder.on_stream_block_closed(ended)
             if target == "reasoning":
                 builder.begin_stream_reasoning()
             elif target == "content":
@@ -447,7 +449,8 @@ async def _agentic_loop_openai_compat(
                                 if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                                     builder.finish_group(len(builder._tool_groups) - 1)
                                     # ★ 强制刷新，确保总结先于思考内容显示 ★
-                                    await builder.flush(force=True)
+                                    # （非阻塞：request_flush 由后台合并循环发送）
+                                    builder.request_flush(force=True)
                             await switch_stream("reasoning")
                             reasoning_acc += r_delta
                             builder.append_stream_delta(r_delta)
@@ -459,7 +462,8 @@ async def _agentic_loop_openai_compat(
                                 if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                                     builder.finish_group(len(builder._tool_groups) - 1)
                                     # ★ 强制刷新，确保总结先于文本内容显示 ★
-                                    await builder.flush(force=True)
+                                    # （非阻塞：request_flush 由后台合并循环发送）
+                                    builder.request_flush(force=True)
                             if round_leading_kind == "tool" and builder._tool_groups and not builder._tool_groups[-1].get(
                                     "finished", False):
                                 # 本轮先出现了工具调用，这段文字是同一轮里紧跟在工具调用之后的说明文字，
@@ -758,21 +762,25 @@ async def _agentic_loop_openai_compat(
 
         # 块边界换草稿检查点①②（本轮最后一个块）：流已结束，最后一个思考块
         # 或文本块在此闭合，switch_stream 不会再被触发，故在此补一次检查。
-        # 历史问题1（工具流式输出被拆到新草稿）已由
-        # rollover_at_turn_boundary 内的 _has_pending_tool_group 守卫兜住：
-        # 本轮若已建工具条目而未收束，这里不会滚动，工具批次结束后的
-        # 回合边界仍会照常滚动。
+        # 历史问题1（工具流式输出被拆到新草稿）已由安全点判定内的
+        # _has_pending_tool_group 守卫兜住：本轮若已建工具条目而未收束，
+        # 这里不会滚动，工具批次结束后的 tool.end 安全点仍会照常触发。
         # 终局轮修复：此处 tool_calls_list / textual_tool_call 均已定型。
-        # 仅当本轮之后仍会请求模型（工具批次待执行，或伪工具调用文本还需
-        # 纠正重试）才允许滚动创建新草稿；纯文本终局轮必须传 False，把
-        # "只永久化旧段、不创建新草稿"留给下方终局分支完成。否则容量预警
-        # 标志会在终局轮被本检查点以 start_next_draft=True 抢先消费——
-        # 创建一个永远无人写入、只显示 "Thinking..." 的幽灵草稿，随后被
-        # get_ai_response 收尾 mark_dead + 删除（表现为回复交付后闪现的
-        # Thinking 气泡，删除遇 429 重试时可见数秒）。
+        # 解耦改造：中途安全点（还会继续请求模型时）只发射事件，满容量
+        # 时由 DraftManager 在后台滚动，Agent 立即继续（§8）；终局轮
+        # （无后续请求）必须走 finalize_turn 同步收束——把"只永久化旧段、
+        # 不创建新草稿"留给终局分支完成，避免容量预警被以
+        # start_next_draft=True 抢先消费——创建一个永远无人写入、只显示
+        # "Thinking..." 的幽灵草稿，随后被 get_ai_response 收尾
+        # mark_dead + 删除（表现为回复交付后闪现的 Thinking 气泡）。
         will_request_again = bool(tool_calls_list) or bool(textual_tool_call)
-        if not await builder.rollover_at_turn_boundary(start_next_draft=will_request_again):
-            await builder.flush()
+        if will_request_again:
+            # 非阻塞安全点：满容量时后台滚动；工具批次/纠错重试立即开始。
+            builder.on_round_boundary()
+            builder.request_flush()
+        elif not await builder.finalize_turn():
+            # 终局：等待旧段永久化（不开新草稿）；未滚动时保底刷一帧。
+            builder.request_flush()
 
         assistant_msg: dict = {"role": "assistant", "content": content_acc or None}
         if tool_calls_list:
@@ -802,8 +810,9 @@ async def _agentic_loop_openai_compat(
                             "Use the standard tool_calls API only. Do not emit <tool_call> XML as user-visible text."
                         )
                     })
-                    # 这是一次完整但需要纠正的模型返回；还会重试下一请求，因此创建新草稿。
-                    await builder.rollover_at_turn_boundary(start_next_draft=True)
+                    # 这是一次完整但需要纠正的模型返回；还会重试下一请求。
+                    # 解耦：非阻塞安全点，满容量时后台滚动，重试立即开始。
+                    builder.on_round_boundary()
                     continue
                 final_content = content_acc or (
                     "工具调用格式连续异常，未继续执行额外操作。请重新描述需求或换一个模型后重试。"
@@ -814,16 +823,18 @@ async def _agentic_loop_openai_compat(
                 final_content = content_acc
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
-            # 终局也统一进入滚动函数；函数只永久化旧段，不创建新草稿。
-            await builder.rollover_at_turn_boundary(start_next_draft=False)
+            # 终局：同步收束旧段（只永久化、不创建新草稿）。
+            await builder.finalize_turn()
             break
         status = await _run_tool_calls_and_append(
             tool_calls_list, loop_messages, new_history_entries,
             tool_call_count_ref, api_label, builder, chat_id=builder.chat_id,
             tools=tools,
         )
-        # 工具批次已完整收束；后续仍会请求模型，因此在函数内创建新草稿。
-        await builder.rollover_at_turn_boundary(start_next_draft=True)
+        # ★ 解耦关键点（§8）：工具结果已全部进入 conversation context，
+        # 下一轮 LLM 请求立即发出；满容量时草稿滚动由 DraftManager 在
+        # tool.end 安全点后台执行，Agent 不再等待草稿切换。
+        builder.on_tool_batch_end()
 
         # ===== FIX: 只对 over_limit 做强制总结并退出 =====
         if status == "over_limit":
@@ -861,9 +872,9 @@ async def _agentic_loop_openai_compat(
                             synth_text += c_delta
                             builder.append_stream_delta(c_delta)
                 raw_synth_content = builder.end_stream_text() or synth_text
-                # 文本块结束时检查是否需要切换草稿
+                # 文本块结束时检查是否需要切换草稿（终局：同步收束旧段）
                 if raw_synth_content:
-                    await builder.rollover_at_turn_boundary(start_next_draft=False)
+                    await builder.finalize_turn()
                 final_content = _strip_textual_tool_calls(raw_synth_content)
                 if final_content != raw_synth_content:
                     builder.replace_trailing_text(raw_synth_content, final_content)
@@ -885,8 +896,8 @@ async def _agentic_loop_openai_compat(
             new_history_entries.append({"role": "assistant", "content": final_content})
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
-            # 工具上限总结是终局回复；统一结束旧草稿，但不创建新草稿。
-            await builder.rollover_at_turn_boundary(start_next_draft=False)
+            # 工具上限总结是终局回复；同步结束旧草稿，不创建新草稿。
+            await builder.finalize_turn()
             break
         # 如果 status == "continue"（包括之前熔断返回的），循环自然继续
 
@@ -898,8 +909,8 @@ async def _agentic_loop_openai_compat(
         new_history_entries.append({"role": "assistant", "content": final_content})
         if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
             builder.finish_group(len(builder._tool_groups) - 1)
-        # 轮次数耗尽后的兜底文本同样是终局内容：结束旧草稿，不创建下一段。
-        await builder.rollover_at_turn_boundary(start_next_draft=False)
+        # 轮次数耗尽后的兜底文本同样是终局内容：同步结束旧草稿，不创建下一段。
+        await builder.finalize_turn()
     return final_content, final_usage, new_history_entries
 
 
@@ -990,7 +1001,7 @@ async def _agentic_loop_native_image(
         client: AsyncOpenAI,
         current_model: str,
         messages: list,
-        builder: "RichMessageBuilder",
+        builder: "DraftManager",
         chat_id: int,
         journal: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str | None, object | None, list]:
@@ -1228,7 +1239,7 @@ async def _agentic_loop_native_image(
 async def _agentic_loop_native_video(
         current_model: str,
         messages: list,
-        builder: "RichMessageBuilder",
+        builder: "DraftManager",
         chat_id: int,
         journal: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str | None, object | None, list]:

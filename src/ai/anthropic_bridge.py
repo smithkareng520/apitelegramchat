@@ -60,7 +60,7 @@ from ai.bridge_common import (
 from ai.cache_usage import _log_cache_usage
 
 if TYPE_CHECKING:
-    from ai.rich_message_builder import RichMessageBuilder
+    from ai.draft_manager import DraftManager
     from anthropic import AsyncAnthropic
 
 logger = get_logger(__name__)
@@ -598,7 +598,7 @@ async def _agentic_loop_anthropic(
         client: "AsyncAnthropic",
         current_model: str,
         messages: list,
-        builder: "RichMessageBuilder",
+        builder: "DraftManager",
         tools: list | None = None,
         supports_tools: bool = True,
         journal: list | None = None,
@@ -872,20 +872,25 @@ async def _agentic_loop_anthropic(
 
         # 块边界换草稿检查点①②（本轮最后一个块）：流已结束，最后一个思考块
         # 或文本块在此闭合，switch_stream 不会再被触发，故在此补一次检查。
-        # 历史问题1（工具流式输出被拆到新草稿）已由
-        # rollover_at_turn_boundary 内的 _has_pending_tool_group 守卫兜住：
-        # 本轮若已建工具条目而未收束，这里不会滚动，工具批次结束后的
-        # 回合边界仍会照常滚动。
+        # 历史问题1（工具流式输出被拆到新草稿）已由安全点判定内的
+        # _has_pending_tool_group 守卫兜住：本轮若已建工具条目而未收束，
+        # 这里不会滚动，工具批次结束后的 tool.end 安全点仍会照常触发。
         # 终局轮修复：此处 tool_calls_list 已定型（本循环无伪工具调用纠正
-        # 重试路径）。仅当本轮之后仍会请求模型（工具批次待执行）才允许滚动
-        # 创建新草稿；纯文本终局轮必须传 False，把"只永久化旧段、不创建
-        # 新草稿"留给下方终局分支完成。否则容量预警标志会在终局轮被本检查
-        # 点以 start_next_draft=True 抢先消费——创建一个永远无人写入、只
-        # 显示 "Thinking..." 的幽灵草稿，随后被 get_ai_response 收尾
+        # 重试路径）。解耦改造：中途安全点（工具批次待执行）只发射事件，
+        # 满容量时由 DraftManager 在后台滚动，Agent 立即继续（§8）；纯文本
+        # 终局轮必须走 finalize_turn 同步收束，把"只永久化旧段、不创建
+        # 新草稿"留给终局分支完成。否则容量预警标志会在终局轮被本检查
+        # 点以 start_next_draft=True 抢先消费——创建一个永远无人写入、
+        # 只显示 "Thinking..." 的幽灵草稿，随后被 get_ai_response 收尾
         # mark_dead + 删除（表现为回复交付后闪现的 Thinking 气泡）。
         will_request_again = bool(tool_calls_list)
-        if not await builder.rollover_at_turn_boundary(start_next_draft=will_request_again):
-            await builder.flush()
+        if will_request_again:
+            # 非阻塞安全点：满容量时后台滚动；工具批次立即开始。
+            builder.on_round_boundary()
+            builder.request_flush()
+        elif not await builder.finalize_turn():
+            # 终局：等待旧段永久化（不开新草稿）；未滚动时保底刷一帧。
+            builder.request_flush()
 
         append_assistant_message(loop_messages, new_history_entries, content_acc,
                                  tool_calls_list, reasoning_acc)
@@ -893,7 +898,8 @@ async def _agentic_loop_anthropic(
         if not tool_calls_list:
             final_content = content_acc
             finish_open_tool_group(builder)
-            await builder.rollover_at_turn_boundary(start_next_draft=False)
+            # 终局：同步收束旧段（只永久化、不创建新草稿）。
+            await builder.finalize_turn()
             break
 
         status = await run_tool_batch(builder, tool_calls_list, loop_messages,

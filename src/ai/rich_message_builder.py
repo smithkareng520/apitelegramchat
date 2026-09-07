@@ -382,6 +382,19 @@ class RichMessageBuilder:
                 return self._current_group_idx
         return self.start_new_tool_group()
 
+    # ---------- 工具批次句柄（与 ai/draft_manager.py 同语义的裸实现） ----------
+    # DraftManager 覆盖了这两个方法以提供滚动安全语义；裸 builder 路径
+    # （未来可能的未包装调用方）退化为直接建组/收束，行为与改造前一致。
+    def begin_tool_batch(self) -> int:
+        """工具批次开始：确保存在当前组并返回批次组句柄。"""
+        return self._get_current_group()
+
+    def finish_tool_batch(self, token: int) -> None:
+        """工具批次结束：收束批次组（-1 表示空批次，无操作）。"""
+        if token == -1:
+            return
+        self.finish_group(token)
+
     def add_tool_item(self, tool_id: str, tool_type: str, summary: str,
                       action_description: str | None = None,
                       search_query: str | None = None, domain: str | None = None,

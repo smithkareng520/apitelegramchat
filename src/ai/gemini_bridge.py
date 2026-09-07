@@ -82,7 +82,7 @@ from ai.bridge_common import (
 from ai.gemini_cache import manager as _gemini_cache_manager
 
 if TYPE_CHECKING:
-    from ai.rich_message_builder import RichMessageBuilder
+    from ai.draft_manager import DraftManager
 
 logger = get_logger(__name__)
 
@@ -750,7 +750,7 @@ async def _post_gemini_stream(session: "aiohttp.ClientSession", url: str,
 async def _agentic_loop_gemini_native(
         current_model: str,
         messages: list,
-        builder: "RichMessageBuilder",
+        builder: "DraftManager",
         tools: list | None = None,
         supports_tools: bool = True,
         journal: list | None = None,
@@ -986,21 +986,27 @@ async def _agentic_loop_gemini_native(
 
         # 块边界换草稿检查点①②（本轮最后一个块）：流已结束，最后一个思考块
         # 或文本块在此闭合，switch_stream 不会再被触发，故在此补一次检查。
-        # 历史问题1（工具流式输出被拆到新草稿）已由
-        # rollover_at_turn_boundary 内的 _has_pending_tool_group 守卫兜住：
-        # 本轮若已建工具条目而未收束，这里不会滚动，工具批次结束后的
-        # 回合边界仍会照常滚动。
+        # 历史问题1（工具流式输出被拆到新草稿）已由安全点判定内的
+        # _has_pending_tool_group 守卫兜住：本轮若已建工具条目而未收束，
+        # 这里不会滚动，工具批次结束后的 tool.end 安全点仍会照常触发。
         # 终局轮修复：此处 tool_calls_list 已定型。本循环对伪工具调用文本
         # 只做剥离、不重试（剥离后即终局，见下方 not tool_calls_list 分支），
-        # 故无需把 textual_tool_call 计入继续条件。仅当工具批次待执行时才
-        # 允许滚动创建新草稿；纯文本终局轮必须传 False，把"只永久化旧段、
-        # 不创建新草稿"留给下方终局分支完成。否则容量预警标志会在终局轮被
-        # 本检查点以 start_next_draft=True 抢先消费——创建一个永远无人写入、
-        # 只显示 "Thinking..." 的幽灵草稿，随后被 get_ai_response 收尾
-        # mark_dead + 删除（表现为回复交付后闪现的 Thinking 气泡）。
+        # 故无需把 textual_tool_call 计入继续条件。解耦改造：中途安全点
+        # （工具批次待执行）只发射事件，满容量时由 DraftManager 在后台
+        # 滚动，Agent 立即继续（§8）；纯文本终局轮必须走 finalize_turn
+        # 同步收束，把"只永久化旧段、不创建新草稿"留给终局分支完成。
+        # 否则容量预警标志会在终局轮被本检查点以 start_next_draft=True
+        # 抢先消费——创建一个永远无人写入、只显示 "Thinking..." 的幽灵
+        # 草稿，随后被 get_ai_response 收尾 mark_dead + 删除（表现为回复
+        # 交付后闪现的 Thinking 气泡）。
         will_request_again = bool(tool_calls_list)
-        if not await builder.rollover_at_turn_boundary(start_next_draft=will_request_again):
-            await builder.flush()
+        if will_request_again:
+            # 非阻塞安全点：满容量时后台滚动；工具批次立即开始。
+            builder.on_round_boundary()
+            builder.request_flush()
+        elif not await builder.finalize_turn():
+            # 终局：等待旧段永久化（不开新草稿）；未滚动时保底刷一帧。
+            builder.request_flush()
 
         append_assistant_message(loop_messages, new_history_entries, content_acc,
                                  tool_calls_list, reasoning_acc)
@@ -1008,8 +1014,8 @@ async def _agentic_loop_gemini_native(
         if not tool_calls_list:
             final_content = content_acc
             finish_open_tool_group(builder)
-            # 无工具调用即为终局响应；统一结束旧草稿，不额外开新草稿。
-            await builder.rollover_at_turn_boundary(start_next_draft=False)
+            # 无工具调用即为终局响应；同步结束旧草稿，不额外开新草稿。
+            await builder.finalize_turn()
             break
 
         status = await run_tool_batch(builder, tool_calls_list, loop_messages,

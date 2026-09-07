@@ -64,7 +64,7 @@ from ai.tool_summary import (
 
 if TYPE_CHECKING:
     # 仅供类型注解使用；运行时由调用方传入，避免运行时循环导入。
-    from ai.rich_message_builder import RichMessageBuilder
+    from ai.draft_manager import DraftManager
 
 logger = get_logger(__name__)
 
@@ -226,7 +226,7 @@ async def _run_tool_calls_and_append(
         new_history_entries: list,
         tool_call_count_ref: list,
         api_label: str,
-        builder: "RichMessageBuilder",
+        builder: "DraftManager",
         chat_id: Optional[int] = None,
         tools: Optional[list] = None,
 ) -> str:
@@ -245,12 +245,15 @@ async def _run_tool_calls_and_append(
         # 影响 UI 草稿滚动边界。
         if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
             builder.finish_group(len(builder._tool_groups) - 1)
-        await builder.flush()
+        # 解耦：非阻塞刷新（后台合并循环发送），不阻塞 Agent。
+        builder.request_flush()
         return "continue"
 
     tool_call_count_ref[0] += len(valid_tool_calls)
 
-    group_idx = builder._get_current_group() if valid_tool_calls else -1
+    # 批次组句柄：DraftManager 语境下滚动已调度时绝不在旧草稿建组，
+    # 返回待定句柄，由 finish_tool_batch 在回放时收束批次实际落住的组。
+    group_idx = builder.begin_tool_batch() if valid_tool_calls else -1
 
     tool_tasks = []
     for tc in valid_tool_calls:
@@ -314,11 +317,8 @@ async def _run_tool_calls_and_append(
         )
         tool_tasks.append((fn_name, fn_args, tc_id))
 
-    await builder.flush(force=False)
-
-    # 草稿构建器的全局刷新循环会在静默超时后，对当前活跃草稿统一执行
-    # force flush。工具批次无需另建心跳任务；图片、视频和普通工具均复用
-    # 同一机制，状态变更仍由前面的普通 flush 立即推送。
+    # 解耦：非阻塞刷新——工具卡片立即排队上屏，工具执行不等草稿帧发送。
+    builder.request_flush()
 
     async def run_one(fn_name: str, fn_args: dict, tc_id: str) -> tuple[str, str, str, str, str, dict, str]:
         # 打断保全：工具真正执行完成时把结果登记到共享 dict。
@@ -454,7 +454,7 @@ async def _run_tool_calls_and_append(
                         f"<p>{escape_html(truncate_to_token_budget(str(question), 64, suffix='…'))}</p>",
                         status="waiting",
                     )
-                    await builder.flush(force=True)
+                    builder.request_flush(force=True)
                     answer = await wait_for_answer(interaction)
                     result_str = answer_to_tool_result(answer)
                 elif fn_name == "deliver_reply":
@@ -746,9 +746,11 @@ async def _run_tool_calls_and_append(
             api_label, tool_call_count_ref[0], len(skipped_tool_calls), MAX_TOOL_CALLS,
         )
     # 一个模型返回中声明的全部工具已得到最终状态；这才是允许草稿切换的原子边界。
-    if group_idx >= 0:
-        builder.finish_group(group_idx)
-    await builder.flush()
+    # tool.end 事件会触发安全点检查：满容量时由 DraftManager 后台滚动，
+    # Agent 不等待（§8）。finish_tool_batch(-1)（空批次）在两种实现中均为无操作。
+    builder.finish_tool_batch(group_idx)
+    # 解耦：非阻塞刷新（后台合并循环发送）。
+    builder.request_flush()
 
     if tool_call_count_ref[0] >= MAX_TOOL_CALLS:
         logger.warning(f"[{api_label}] 工具调用超限 ({MAX_TOOL_CALLS})")

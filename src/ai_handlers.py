@@ -57,6 +57,7 @@ from ai.attachment_content import (
     _resolve_multimodal_content,
 )
 from ai.rich_message_builder import RichMessageBuilder
+from ai.draft_manager import DraftManager
 from ai.agentic_loops import (
     _agentic_loop_anthropic,
     _agentic_loop_gemini_native,
@@ -426,9 +427,11 @@ async def get_ai_response(
     early-persisted 标记跳过重复写入。TIMER 的合成唤醒消息不写历史，
     仍按原逻辑单独注入请求。
     """
-    # SilentMessageBuilder 是 RichMessageBuilder 的子类；两个分支各自
-    # 赋值后 builder 恒非 None，首绑处声明 Optional 供 try 前的异常路径使用。
-    builder: RichMessageBuilder | None = None
+    # 两个分支统一构建 DraftManager（§5）：此后本函数与全部 agentic
+    # 循环拿到的是事件消费入口——Agent 只发事件、不等待 UI；builder
+    # 本体的属性经 DraftManager 透传（duck typing），读写无需区分。
+    # 首绑处声明 Optional 供 try 前的异常路径使用。
+    builder: DraftManager | None = None
     new_msgs: list[dict[str, Any]] = []
     # usage 形状动态（SDK pydantic 对象 / JSON dict / None），按 Any 标注。
     usage: Any = None
@@ -500,13 +503,13 @@ async def get_ai_response(
             # 首帧。交付渠道 = deliver_reply / message_user；send 缺省值按
             # 事件源区分（USER 默认 true、TIMER 默认 false，见开头重置）。
             from ai.rich_message_builder import SilentMessageBuilder
-            builder = SilentMessageBuilder(chat_id)
+            builder = DraftManager(SilentMessageBuilder(chat_id))
             builder.add_initial_thinking("Thinking...")
         else:
             # 草稿模式（/show on，USER 与 TIMER 统一）：富文本草稿实时展示。
             # 草稿首帧必须先于系统提示词、历史归档和多模态解析出现。这些准备操作在
             # 文件、图片或长历史场景下可能耗时数秒；旧顺序会让用户误以为 Agent 卡死。
-            builder = RichMessageBuilder(chat_id)
+            builder = DraftManager(RichMessageBuilder(chat_id))
             builder.add_initial_thinking("Thinking...")
             # 先登记为当前活跃草稿，让首帧和后续流式刷新都能通过 active 校验。
             # message_id 先占位为 0，等首帧真正发出后再回填真实 message_id。
@@ -1146,7 +1149,7 @@ async def _call_api(
         model_info: ModelConfig,
         messages: list,
         chat_id: int,
-        builder: "RichMessageBuilder",
+        builder: "DraftManager",
         tools: Optional[list[Any]] = None,
         journal: Optional[list[Any]] = None,
         extra_tools: Optional[list[Any]] = None,
