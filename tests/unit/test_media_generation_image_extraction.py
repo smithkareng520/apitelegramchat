@@ -52,3 +52,11 @@ def test_response_items_to_bytes_accepts_one_real_image_and_respects_limit():
     result = asyncio.run(_response_items_to_bytes(payload, max_images=1))
     assert len(result) == 1
     assert result[0] == PNG_1X1
+
+def test_validate_image_bytes_is_legacy_exported_from_ai_handlers():
+    # Avoid importing the whole application in this focused unit test (it pulls
+    # optional runtime dependencies such as tiktoken). Verify the compatibility
+    # re-export directly from the module source.
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[2] / "src" / "ai_handlers.py").read_text()
+    assert "    _validate_image_bytes," in source

@@ -1232,6 +1232,7 @@ from ai.media_generation import (  # noqa: F401
     _extract_image_items,
     _upload_generated_images_to_r2,
     _get_images_api_display_name,
+    _validate_image_bytes,
     IMAGES_API_PROVIDERS,
 )
 from ai.attachment_content import (  # noqa: F401
