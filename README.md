@@ -553,6 +553,16 @@ Lifecycle（`ai/rich_message_builder.py` + `core/telegram_messaging.py`
 tool_result 后沉淀进持久历史（打断保全，`turn_recovery.py`），
 新回合从断点继续。
 
+### 工具折叠块显示文案
+
+工具组折叠块与单工具折叠块在进行时 / 完成态 / 失败态的标题文案、
+todo / memory 等动作型工具按 `action` 细分规则、`(failed n)` 失败
+计数与大小写规范，统一记录在
+**[`docs/tool-ui-summaries.md`](docs/tool-ui-summaries.md)**
+（三张对照表：运行时 vs 运行后、失败与特殊状态、通用规则）。
+修改摘要文案时请同步更新该文档并跑
+`tests/unit/test_tool_ui_fixes.py` 回归。
+
 ---
 
 ## 部署
@@ -646,6 +656,8 @@ python tests/test_whitelist_r2.py          # 白名单 R2 同步回归（可独�
 │   ├── mcp_client.py                 # 外部 Streamable HTTP MCP client
 │   └── entrypoints/mcp_server.py     # console entrypoint
 ├── tests/                            # unit / integration / whitelist 回归
+├── docs/
+│   └── tool-ui-summaries.md          # 工具折叠块显示文案对照表（3 张：运行时/失败/通用规则）
 ├── .claude/skills/                   # bundled Skills
 ├── Dockerfile / render.yaml / pyproject.toml / requirements.txt
 └── README.md

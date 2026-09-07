@@ -683,6 +683,21 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
         details_html = "<br/>".join(details_parts)
         return summary, details_html
+
+    elif fn_name == "deliver_reply":
+        # deliver_reply 的终态摘要由 _generate_tool_summary_done 按实际
+        # 结果生成（Delivered / Skipped the final reply）；这里的
+        # formatted_summary 只在失败路径（"失败："前缀 → status=error）
+        # 被采用，给出与 text_editor「❌ 文件操作未完成」同风格的标题。
+        text = str(result_str or "")
+        if text.startswith("未发送"):
+            # send=false / TIMER 回合缺省 false：静默是正常终态，
+            # 展示摘要走完成态分支，此处仅渲染 Output 面板备用。
+            summary = "💬 已跳过交付"
+        else:
+            summary = "❌ 最终回复未交付"
+        details_html = _render_editor_quote("Output", text)
+        return summary, details_html
     else:
         # 未知工具的通用分支：返回原文一律渲染为等宽代码面板，与
         # bash / text_editor 的卡片形态保持一致，同时避免上游文本中的

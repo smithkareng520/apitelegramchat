@@ -473,6 +473,10 @@ class RichMessageBuilder:
                         args = item.get("fn_args") or {}
                         if item.get("type"):
                             new_summary = _generate_initial_tool_summary(item["type"], args)
+                            # 动作描述随参数一并刷新，工具组进行态标题
+                            # （todo/memory 等按动作细分）才能跟着参数走。
+                            item["action_description"] = _generate_action_description(
+                                item["type"], args)
                         else:
                             new_summary = _generate_pending_tool_summary(args)
                         if new_summary and new_summary != item["summary"]:
@@ -523,6 +527,9 @@ class RichMessageBuilder:
                 if item.get("status") in ("running", "waiting"):
                     if item.get("type"):
                         new_summary = _generate_initial_tool_summary(item.get("type", ""), args)
+                        # 动作描述随参数一并刷新（工具组进行态标题依赖）。
+                        item["action_description"] = _generate_action_description(
+                            item.get("type", ""), args)
                     else:
                         # 占位条目（函数名尚未到达）：按参数形状推断进行态摘要。
                         new_summary = _generate_pending_tool_summary(args)
@@ -689,19 +696,29 @@ class RichMessageBuilder:
         "ask_user": ("Asked you a question", "Asked you questions"),
         "message_user": ("Messaged you", "Messaged you"),
         "deliver_reply": ("Delivered the final reply", "Delivered the final reply"),
-        "todo": ("Todo", "Todo ×{n}"),
-        "memory": ("Memory", "Memory ×{n}"),
+        "deliver_reply_silent": ("Skipped the final reply", "Skipped the final reply"),
+        "todo_list": ("Listed todos", "Listed todos"),
+        "todo_add": ("Added a todo", "Added {n} todos"),
+        "todo_done": ("Completed a todo", "Completed {n} todos"),
+        "todo_undone": ("Reopened a todo", "Reopened {n} todos"),
+        "todo_edit": ("Updated a todo", "Updated {n} todos"),
+        "todo_delete": ("Deleted a todo", "Deleted {n} todos"),
+        "todo_clear": ("Cleared the todo list", "Cleared the todo list"),
+        "memory_list": ("Listed memories", "Listed memories"),
+        "memory_search": ("Searched memories", "Searched memories"),
+        "memory_add": ("Saved a memory", "Saved {n} memories"),
+        "memory_get": ("Retrieved a memory", "Retrieved {n} memories"),
+        "memory_update": ("Updated a memory", "Updated {n} memories"),
+        "memory_delete": ("Deleted a memory", "Deleted {n} memories"),
+        "memory_clear": ("Cleared memories", "Cleared memories"),
         "subagent": ("Ran a subagent", "Ran {n} subagents"),
     }
 
-    # 名词型组摘要模板：完成态拼接时豁免「非首位描述首字母小写」的动词
-    # 短语规范，保持 Todo / Memory 的固定大写形态。
-    _NOUN_STYLE_GROUP_TEMPLATES = frozenset({"todo", "memory"})
-
     def _get_group_type_for_item(self, item: dict) -> str:
         t = item.get("type", "unknown")
+        fn_args = item.get("fn_args") or {}
         if t == "text_editor":
-            command = item.get("fn_args", {}).get("command", "")
+            command = str(fn_args.get("command") or "")
             if command == "view":
                 return "text_editor_view"
             if command == "create":
@@ -709,6 +726,42 @@ class RichMessageBuilder:
             if command == "delete":
                 return "text_editor_delete"
             return "text_editor_edit"
+        if t == "todo":
+            # 按请求动作细分（对标 text_editor 按 command 细分）。
+            action = str(fn_args.get("action") or "list").strip().lower()
+            if action == "add":
+                return "todo_add"
+            if action == "done":
+                return "todo_done"
+            if action == "undone":
+                return "todo_undone"
+            if action == "toggle":
+                # toggle 的实际方向（完成/重开）已由 update_tool_item 写入
+                # 条目最终摘要（先于 finish_group），从摘要前缀回推。
+                summary = str(item.get("summary") or "")
+                return "todo_undone" if summary.startswith("Reopened") else "todo_done"
+            if action == "delete":
+                return "todo_delete"
+            if action == "clear":
+                return "todo_clear"
+            if action == "edit":
+                return "todo_edit"
+            return "todo_list"
+        if t == "memory":
+            action = str(fn_args.get("action") or "list").strip().lower()
+            if action in ("add", "get", "search", "update", "delete", "clear"):
+                return f"memory_{action}"
+            return "memory_list"
+        if t == "deliver_reply":
+            send = fn_args.get("send")
+            if send is False:
+                return "deliver_reply_silent"
+            if send is True:
+                return "deliver_reply"
+            # send 未填：缺省值按回合类型（USER=true / TIMER=false），
+            # 条目最终摘要已按实际结果写好，从摘要前缀回推。
+            summary = str(item.get("summary") or "")
+            return "deliver_reply_silent" if summary.startswith("Skipped") else "deliver_reply"
         return t
 
     def _generate_group_summary(self, group: dict) -> str:
@@ -751,9 +804,9 @@ class RichMessageBuilder:
         for j in range(1, len(descs)):
             if not descs[j]:
                 continue
-            # 名词型标题（Todo / Memory）与失败计数段不做首字母小写，
-            # 保持用户可见的固定形态；动词短语仍按规范小写。
-            if desc_types[j] in self._NOUN_STYLE_GROUP_TEMPLATES or desc_types[j] is None:
+            # 失败计数段不做首字母小写；其余描述统一按规范小写首字母
+            # （todo / memory 已改为动词短语模板，不再豁免）。
+            if desc_types[j] is None:
                 continue
             descs[j] = descs[j][:1].lower() + descs[j][1:]
         return ", ".join(descs)

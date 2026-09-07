@@ -195,6 +195,89 @@ def _coerce_positive_int(value: Any, default: int = 1) -> int:
         return default
 
 
+def _requested_action(fn_args: dict) -> str:
+    """todo / memory 等动作型工具的请求动作（fn_args.action，缺省 list）。"""
+    return str((fn_args or {}).get("action") or "list").strip().lower()
+
+
+def _short_label(text: Any, limit: int = 24) -> str:
+    """单行截短的对象名（todo 标题 / memory 内容摘要）：压缩空白后按字符截断。"""
+    s = " ".join(str(text or "").split())
+    if not s:
+        return ""
+    return s[:limit] + "…" if len(s) > limit else s
+
+
+def _json_payload(result_content: Any) -> dict:
+    """尽力把工具结果解析成 dict（todo / memory / subagent 的结果都是 JSON 信封）。"""
+    try:
+        parsed = json.loads(str(result_content or ""))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _todo_summary_done(fn_args: dict, payload: dict) -> str:
+    """todo 完成态摘要：「动作 + 待办标题」，无标题退化为基础文案。
+
+    done/undone 在执行器里都走 _op_toggle（结果 action 统一为 toggle），
+    实际结果方向以 payload.todo.done 为准；payload 缺失时按请求意图兜底。
+    """
+    action = _requested_action(fn_args)
+    todo = payload.get("todo") if isinstance(payload.get("todo"), dict) else {}
+    label = _short_label(todo.get("title"))
+    obj = f" todo {label}" if label else " a todo"
+    if action == "add":
+        return f"Added{obj}"
+    if action == "done":
+        return f"Completed{obj}"
+    if action == "undone":
+        return f"Reopened{obj}"
+    if action == "toggle":
+        done_flag = todo.get("done")
+        if done_flag is True:
+            return f"Completed{obj}"
+        if done_flag is False:
+            return f"Reopened{obj}"
+        return f"Updated{obj}"
+    if action == "edit":
+        return f"Updated{obj}"
+    if action == "delete":
+        return f"Deleted{obj}"
+    if action == "clear":
+        try:
+            removed = int(payload.get("removed"))
+        except (TypeError, ValueError):
+            removed = 0
+        return f"Cleared {removed} todos" if removed > 0 else "Cleared the todo list"
+    return "Listed todos"
+
+
+def _memory_summary_done(fn_args: dict, payload: dict) -> str:
+    """memory 完成态摘要：「动作 + 记忆内容摘要」，无内容退化为基础文案。"""
+    action = _requested_action(fn_args)
+    mem = payload.get("memory") if isinstance(payload.get("memory"), dict) else {}
+    label = _short_label(mem.get("content"))
+    obj = f" memory: {label}" if label else " a memory"
+    if action == "add":
+        return f"Saved{obj}"
+    if action == "get":
+        return f"Retrieved{obj}"
+    if action == "update":
+        return f"Updated{obj}"
+    if action == "delete":
+        return f"Deleted{obj}"
+    if action == "clear":
+        try:
+            removed = int(payload.get("removed"))
+        except (TypeError, ValueError):
+            removed = 0
+        return f"Cleared {removed} memories" if removed > 0 else "Cleared memories"
+    if action == "search":
+        return "Searched memories"
+    return "Listed memories"
+
+
 def _extract_web_search_result_count(result_content: Any) -> Optional[int]:
     """Extract the authoritative successful-result count from the search envelope."""
     if result_content is None:
@@ -262,6 +345,48 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
         if command in ("str_replace", "insert"):
             return f"Editing file {name}{suffix}" if name else "Editing file"
         return f"Editing file {name}" if name else "Editing file"
+
+    # ---------- todo / memory / subagent / deliver_reply ----------
+    # 与 text_editor 同规范：这些工具不声明 _description（意图）参数，
+    # 进行态摘要一律按「动作 + 对象」规范生成，模型即使惯性带上
+    # _description 也不被采用（因此本分支必须位于 custom_desc 检查之前）。
+    if fn_name == "todo":
+        action = _requested_action(fn_args)
+        if action == "add":
+            return "Adding a todo"
+        if action == "done":
+            return "Completing a todo"
+        if action == "undone":
+            return "Reopening a todo"
+        if action in ("toggle", "edit"):
+            return "Updating a todo"
+        if action == "delete":
+            return "Deleting a todo"
+        if action == "clear":
+            return "Clearing the todo list"
+        return "Listing todos"
+
+    if fn_name == "memory":
+        action = _requested_action(fn_args)
+        if action == "add":
+            return "Saving a memory"
+        if action == "search":
+            return "Searching memories"
+        if action == "get":
+            return "Retrieving a memory"
+        if action == "update":
+            return "Updating a memory"
+        if action == "delete":
+            return "Deleting a memory"
+        if action == "clear":
+            return "Clearing memories"
+        return "Listing memories"
+
+    if fn_name == "subagent":
+        return "Running a subagent"
+
+    if fn_name == "deliver_reply":
+        return "Delivering the final reply"
 
     custom_desc = _get_tool_description_from_args(fn_args)
     if custom_desc:
@@ -350,6 +475,39 @@ def _generate_action_description(fn_name: str, fn_args: Optional[dict] = None) -
         # 返回空串，让调用方落到各自的通用进行态文本。
         return ""
 
+    # ---------- todo / memory / subagent / deliver_reply ----------
+    # 与 text_editor 同规范：不声明 _description，动作描述一律按
+    # 「动作 + 对象」生成；本分支位于 custom_desc 检查之前，模型惯性
+    # 携带的意图字段不被采用。工具组进行态标题由本描述首字母大写而来。
+    if fn_name == "todo":
+        action = _requested_action(fn_args)
+        return {
+            "add": "adding a todo",
+            "done": "completing a todo",
+            "undone": "reopening a todo",
+            "toggle": "updating a todo",
+            "edit": "updating a todo",
+            "delete": "deleting a todo",
+            "clear": "clearing the todo list",
+        }.get(action, "listing todos")
+
+    if fn_name == "memory":
+        action = _requested_action(fn_args)
+        return {
+            "add": "saving a memory",
+            "get": "retrieving a memory",
+            "update": "updating a memory",
+            "delete": "deleting a memory",
+            "clear": "clearing memories",
+            "search": "searching memories",
+        }.get(action, "listing memories")
+
+    if fn_name == "subagent":
+        return "delegating to a subagent"
+
+    if fn_name == "deliver_reply":
+        return "delivering the final reply"
+
     custom_desc = _get_tool_description_from_args(fn_args)
     if custom_desc:
         return custom_desc
@@ -384,10 +542,6 @@ def _generate_action_description(fn_name: str, fn_args: Optional[dict] = None) -
         "present_files": "presented files",
         "ask_user": "asked for your input",
         "message_user": "messaged you",
-        "deliver_reply": "delivered the final reply",
-        "todo": "updating todos",
-        "memory": "updating memory",
-        "subagent": "delegating to a subagent",
     }
     return mapping.get(fn_name, f"ran {fn_name}")
 
@@ -686,6 +840,26 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         if command in ("str_replace", "insert"):
             return f"Edited file {name}{suffix}" if name else f"Edited a file{suffix}"
         return f"Edited file {name}" if name else "Edited a file"
+
+    # ---------- todo / memory / subagent / deliver_reply ----------
+    # 与 text_editor 同规范：完成态摘要按「动作 + 对象」生成，不再退化为
+    # 笼统的 "Ran an action"（本分支位于 custom_desc 检查之前）。
+    if fn_name == "todo":
+        return _todo_summary_done(fn_args, _json_payload(result_content))
+
+    if fn_name == "memory":
+        return _memory_summary_done(fn_args, _json_payload(result_content))
+
+    if fn_name == "subagent":
+        # 成功只有一种形态；模型名/轮数/工具数/耗时等细节在展开卡片里展示。
+        return "Ran a subagent"
+
+    if fn_name == "deliver_reply":
+        # send=false（或 TIMER 回合缺省 false）时结果是「未发送：…」；
+        # 真正失败（"失败："前缀）走 error 路径，不会进入本函数。
+        if str(result_content or "").startswith("未发送"):
+            return "Skipped the final reply"
+        return "Delivered the final reply"
 
     custom_desc = _get_tool_description_from_args(fn_args)
     if custom_desc:
