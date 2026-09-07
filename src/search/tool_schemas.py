@@ -222,10 +222,6 @@ SEARCH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：搜索2024年诺贝尔奖"
-                    },
                     "query": {
                         "type": "string",
                         "description": "搜索关键词。search/images/videos 模式必填；lens 模式可选（用作文字约束）。",
@@ -340,10 +336,6 @@ SEARCH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：查询美元兑人民币汇率"
-                    },
                     "base": {"type": "string", "description": "基础货币代码（如 USD、CNY）"},
                     "target": {"type": "string", "description": "目标货币（可选）"}
                 },
@@ -359,10 +351,6 @@ SEARCH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：查找三体作者"
-                    },
                     "query": {"type": "string", "description": "书名、作者或 ISBN"}
                 },
                 "required": ["query"]
@@ -384,10 +372,6 @@ SEARCH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：查询北京今日天气"
-                    },
                     "city": {"type": "string", "description": "城市名（如 Beijing、Shanghai）"},
                     "unit": {"type": "string", "enum": ["c", "f"], "default": "c"},
                     "hours": {"type": "integer", "default": 6, "description": "返回的逐时预报条数（1-24，默认 6）。需要更长展望时传大值。"}
@@ -422,10 +406,6 @@ SEARCH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {
-                        "type": "string",
-                        "description": "简述本次操作目的（≤60字）。示例：查询比特币价格"
-                    },
                     "coin": {"type": "string", "description": "币种符号（btc、eth、doge 等）"},
                     "currency": {"type": "string", "default": "usd", "description": "计价货币"}
                 },
@@ -456,7 +436,6 @@ SEARCH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
                     "address": {"type": "string", "description": "地址或地名，如“北京市海淀区中关村”。"}
                 },
                 "required": ["address"]
@@ -471,7 +450,6 @@ SEARCH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
                     "origin": {"type": "string", "description": "起点经纬度，格式为“经度,纬度”，例如“116.397128,39.916527”。"},
                     "destination": {"type": "string", "description": "终点经纬度，格式为“经度,纬度”。"},
                     "mode": {"type": "string", "enum": ["cycling", "walking", "driving", "transit"], "default": "driving", "description": "骑行、步行、驾车或公交。"},
@@ -494,7 +472,6 @@ SEARCH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
                     "origin": {"type": "string", "description": "起点经纬度，格式“经度,纬度”。"},
                     "destination": {"type": "string", "description": "终点经纬度，格式“经度,纬度”。"}
                 },
@@ -510,7 +487,6 @@ SEARCH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
                     "keywords": {"type": "string", "description": "搜索关键词，如“故宫博物院”。"},
                     "city": {"type": "string", "description": "可选的查询城市，如“北京”。"}
                 },
@@ -526,7 +502,6 @@ SEARCH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
                     "keywords": {"type": "string", "description": "搜索关键词，如“咖啡馆”。"},
                     "location": {"type": "string", "description": "中心点经纬度，格式“经度,纬度”。"},
                     "radius": {"type": "integer", "description": "半径，单位米，范围 1–50000，默认 1000。"}
@@ -543,7 +518,6 @@ SEARCH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
                     "id": {"type": "string", "description": "关键词搜索或周边搜索返回的 POI ID。"}
                 },
                 "required": ["id"]
@@ -749,7 +723,6 @@ SEARCH_TOOLS = [
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
                         "prompt": {"type": "string", "description": "详细的图片描述"},
                         "model": {
                             "type": "string",
@@ -791,7 +764,6 @@ SEARCH_TOOLS = [
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
                         "prompt": {"type": "string", "description": "编辑指令（如 '改成水彩画风格'）"},
                         "image_url": {
                             "type": "string",
@@ -837,7 +809,6 @@ SEARCH_TOOLS = [
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "_description": {"type": "string", "description": "简述本次操作目的（≤60字）。"},
                         "prompt": {
                             "type": "string",
                             "description": "视频场景详细描述（主体、运动、镜头、风格等）。"

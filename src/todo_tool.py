@@ -649,10 +649,6 @@ TODO_TOOL = {
         "parameters": {
             "type": "object",
             "properties": {
-                "_description": {
-                    "type": "string",
-                    "description": "简述本次操作目的（≤60字）。示例：添加一条买菜的待办"
-                },
                 "action": {
                     "type": "string",
                     "enum": ["add", "list", "done", "undone", "toggle", "delete", "clear", "edit"],

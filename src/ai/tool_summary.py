@@ -385,6 +385,9 @@ def _generate_action_description(fn_name: str, fn_args: Optional[dict] = None) -
         "ask_user": "asked for your input",
         "message_user": "messaged you",
         "deliver_reply": "delivered the final reply",
+        "todo": "updating todos",
+        "memory": "updating memory",
+        "subagent": "delegating to a subagent",
     }
     return mapping.get(fn_name, f"ran {fn_name}")
 

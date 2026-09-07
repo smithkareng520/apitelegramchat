@@ -642,10 +642,6 @@ MEMORY_TOOL = {
         "parameters": {
             "type": "object",
             "properties": {
-                "_description": {
-                    "type": "string",
-                    "description": "简述本次操作目的（≤60字）。示例：保存用户偏好：喜欢清淡口味"
-                },
                 "action": {
                     "type": "string",
                     "enum": ["add", "get", "list", "search", "update", "delete", "clear"],

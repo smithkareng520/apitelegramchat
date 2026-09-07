@@ -19,6 +19,7 @@ from tool_ui_render import (
     _render_bash_result,
     _render_code_panel,
     _render_code_text,
+    _render_editor_quote,
     _render_editor_result,
     _render_media_failure_result,
     _render_structured_payload,
@@ -286,30 +287,53 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = f'<a href="{wiki_url}">{escape_html(title)}</a>'
         return summary, details_html
 
-    elif fn_name == "exchange_rate":
-        base = fn_args.get('base', 'USD')
-        summary = f"💱 {escape_html(base)} 汇率"
-        # result_str 可能是成功 HTML，也可能是以 "失败：" 开头的错误文本。
-        # 后者含上游错误消息，需要 escape 以免打坏 Telegram 渲染。
-        details_html = result_str if not result_str.startswith("失败：") else escape_html(result_str)
+    # ===================== 信息类工具统一 Output 代码面板 =====================
+    # exchange_rate / book_lookup / news / crypto_price 的返回是面向模型的
+    # 纯文本信封（成功数据或「失败：…」错误文本），不是 Telegram 富 HTML。
+    # 旧实现把 result_str 直接铺进卡片：成功时未转义（上游若含 < > & 会
+    # 打坏 Rich Message 结构），失败时虽然转义了但也只是裸段落。现在与
+    # bash / text_editor 一致，统一渲染为 <pre><code> 等宽 Output 面板。
+    elif fn_name in ("exchange_rate", "book_lookup", "news", "crypto_price"):
+        if fn_name == "exchange_rate":
+            base = fn_args.get('base', 'USD')
+            summary = f"💱 {escape_html(base)} 汇率"
+        elif fn_name == "book_lookup":
+            query = fn_args.get('query', '')
+            summary = f"📖 {escape_html(query)}"
+        elif fn_name == "news":
+            source = fn_args.get('source', 'news')
+            summary = f"📰 {escape_html(source.upper())} 新闻"
+        else:
+            coin = fn_args.get('coin', '')
+            summary = f"💰 {escape_html(coin.upper())} 价格"
+        details_html = _render_editor_quote("Output", result_str)
         return summary, details_html
 
-    elif fn_name == "book_lookup":
-        query = fn_args.get('query', '')
-        summary = f"📖 {escape_html(query)}"
-        details_html = result_str if not result_str.startswith("失败：") else escape_html(result_str)
-        return summary, details_html
-
-    elif fn_name == "news":
-        source = fn_args.get('source', 'news')
-        summary = f"📰 {escape_html(source.upper())} 新闻"
-        details_html = result_str if not result_str.startswith("失败：") else escape_html(result_str)
-        return summary, details_html
-
-    elif fn_name == "crypto_price":
-        coin = fn_args.get('coin', '')
-        summary = f"💰 {escape_html(coin.upper())} 价格"
-        details_html = result_str if not result_str.startswith("失败：") else escape_html(result_str)
+    elif fn_name == "message_user" or fn_name == "ask_user":
+        # message_user（原 ask_user）返回的是给模型阅读的 JSON 结果信封
+        #（{"type":"choice",...} / {"type":"custom",...} /
+        # {"type":"expired"} / {"type":"cancelled"}）。旧实现走默认分支
+        # 直接铺开转义文本。现在与 bash / text_editor 一致：Input 展示
+        # 发出的提问/消息正文（含选项），Output 以等宽代码面板展示返回。
+        question = str(fn_args.get('question', '') or "")
+        options = fn_args.get('options')
+        input_lines = [question] if question else []
+        if isinstance(options, list) and options:
+            labels = []
+            for opt in options[:8]:
+                if isinstance(opt, dict):
+                    label = str(opt.get('label', '') or '').strip()
+                    if label:
+                        labels.append(label)
+                elif isinstance(opt, str) and opt.strip():
+                    labels.append(opt.strip())
+            if labels:
+                input_lines.append("options: " + " | ".join(labels))
+        summary = "💬 Messaged you"
+        details_html = ""
+        if input_lines:
+            details_html += _render_editor_quote("Input", "\n".join(input_lines))
+        details_html += _render_editor_quote("Output", result_str)
         return summary, details_html
 
     elif fn_name == "qr_code":
@@ -328,7 +352,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 )
                 return summary, details_html
         summary = "📱 二维码"
-        details_html = escape_html(result_str)
+        details_html = _render_editor_quote("Output", result_str)
         return summary, details_html
 
     elif fn_name == "generate_image_from_text":
@@ -452,7 +476,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             payload = None
         if not isinstance(payload, dict):
             summary = "📋 待办操作"
-            details_html = escape_html(result_str)
+            details_html = _render_editor_quote("Output", result_str)
             return summary, details_html
 
         if not payload.get("ok"):
@@ -505,7 +529,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             payload = None
         if not isinstance(payload, dict):
             summary = "🧠 记忆操作"
-            details_html = escape_html(result_str)
+            details_html = _render_editor_quote("Output", result_str)
             return summary, details_html
         if not payload.get("ok"):
             summary = f"❌ 记忆操作失败：{payload.get('code', '')}"
@@ -547,7 +571,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             payload = None
         if not isinstance(payload, dict):
             summary = "🤖 子 agent"
-            details_html = escape_html(result_str)
+            details_html = _render_editor_quote("Output", result_str)
             return summary, details_html
         ok = payload.get("ok", False)
         model_name = payload.get("model_name") or payload.get("model") or "?"
@@ -618,7 +642,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             # from dispatch_tool_call's top-level exception handler). Render
             # it as escaped plain text so we never break the UI.
             summary = "📂 Presenting files"
-            details_html = escape_html(result_str) or "<i>No files were processed.</i>"
+            details_html = _render_editor_quote("Output", result_str) or "<i>No files were processed.</i>"
             return summary, details_html
 
         sent = data.get("sent") or []
@@ -660,6 +684,9 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = "<br/>".join(details_parts)
         return summary, details_html
     else:
+        # 未知工具的通用分支：返回原文一律渲染为等宽代码面板，与
+        # bash / text_editor 的卡片形态保持一致，同时避免上游文本中的
+        # < > & 打坏 Rich Message 结构。
         summary = f"🔧 {fn_name}"
-        details_html = escape_html(result_str)
+        details_html = _render_editor_quote("Output", result_str)
         return summary, details_html

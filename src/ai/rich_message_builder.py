@@ -685,10 +685,18 @@ class RichMessageBuilder:
         "qr_code": ("Generated a QR code", "Generated {n} QR codes"),
         "generate_image_from_text": ("Generated an image", "Generated {n} images"),
         "edit_image_with_reference": ("Edited an image", "Edited {n} images"),
+        "generate_video": ("Generated a video", "Generated {n} videos"),
         "ask_user": ("Asked you a question", "Asked you questions"),
         "message_user": ("Messaged you", "Messaged you"),
         "deliver_reply": ("Delivered the final reply", "Delivered the final reply"),
+        "todo": ("Todo", "Todo ×{n}"),
+        "memory": ("Memory", "Memory ×{n}"),
+        "subagent": ("Ran a subagent", "Ran {n} subagents"),
     }
+
+    # 名词型组摘要模板：完成态拼接时豁免「非首位描述首字母小写」的动词
+    # 短语规范，保持 Todo / Memory 的固定大写形态。
+    _NOUN_STYLE_GROUP_TEMPLATES = frozenset({"todo", "memory"})
 
     def _get_group_type_for_item(self, item: dict) -> str:
         t = item.get("type", "unknown")
@@ -704,14 +712,17 @@ class RichMessageBuilder:
         return t
 
     def _generate_group_summary(self, group: dict) -> str:
-        """完成态工具组摘要：只统计成功工具；同类工具只展示一次，顺序按首次成功调用。
+        """完成态工具组摘要：成功工具按类型展示，失败工具计入末尾 ``(failed n)``。
 
         按规范只有第一个描述的首字母大写，后续描述保持小写，例如
-        ``Searched the web, fetched news, fetched hacker news``。
+        ``Searched the web, fetched news, fetched hacker news``；
+        部分失败时在末尾追加失败计数，如
+        ``Ran a command, Fetched 2 pages, (failed 1)``；全部失败时
+        只显示 ``(failed n)``（不再退化为笼统的 ``Tools failed``）。
         """
-        done_items = [it for it in group.get("items", []) if it.get("status") == "done"]
-        if not done_items:
-            return ""
+        items = group.get("items", [])
+        done_items = [it for it in items if it.get("status") == "done"]
+        failed_count = sum(1 for it in items if it.get("status") == "error")
         type_order = []
         type_counts = {}
         for item in done_items:
@@ -721,15 +732,30 @@ class RichMessageBuilder:
                 type_counts[gtype] = 0
             type_counts[gtype] += 1
         descs = []
+        desc_types = []  # 与 descs 一一对应；失败计数段为 None
         for gtype in type_order:
             count = type_counts[gtype]
             singular, plural = self._GROUP_SUMMARY_TEMPLATES.get(gtype, ("Ran an action", "Ran {n} actions"))
             descs.append(singular if count == 1 else plural.format(n=count))
+            desc_types.append(gtype)
+        # 失败工具不再从摘要中静默消失：与成功描述并列追加计数，
+        # 用户在最外层折叠块标题上就能看到「有几个没成功」。
+        if failed_count:
+            descs.append(f"(failed {failed_count})")
+            desc_types.append(None)
+        if not descs:
+            # 无成功也无失败（如条目仍处于 running/waiting 的异常路径）。
+            return ""
         if descs and descs[0]:
             descs[0] = descs[0][:1].upper() + descs[0][1:]
         for j in range(1, len(descs)):
-            if descs[j]:
-                descs[j] = descs[j][:1].lower() + descs[j][1:]
+            if not descs[j]:
+                continue
+            # 名词型标题（Todo / Memory）与失败计数段不做首字母小写，
+            # 保持用户可见的固定形态；动词短语仍按规范小写。
+            if desc_types[j] in self._NOUN_STYLE_GROUP_TEMPLATES or desc_types[j] is None:
+                continue
+            descs[j] = descs[j][:1].lower() + descs[j][1:]
         return ", ".join(descs)
 
     # ---- 修改点5：finish_group 增加默认标题 ----
@@ -744,7 +770,8 @@ class RichMessageBuilder:
         group["finished"] = True
         self._commit_stream_buffer()
         group["outer_summary"] = self._generate_group_summary(group)
-        # 若所有工具均失败，设置一个默认标题
+        # 防御性兑底：正常情况下全部失败也会得到 "(failed n)"；仅当组内
+        # 既无成功也无失败条目（异常路径）时才落到通用默认标题。
         if not group["outer_summary"]:
             group["outer_summary"] = "Tools failed"
         self.request_flush(force=False)
