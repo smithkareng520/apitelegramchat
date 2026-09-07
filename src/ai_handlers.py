@@ -82,7 +82,7 @@ logger = get_logger(__name__)
 # 在生产环境输出大量 debug 噪声。删除该行，让模块日志遵循 root logger
 # 的级别（由 utils.setup_logging 应用 LOG_LEVEL）。
 
-def _workspace_guide_html(chat_id: int | None) -> str:
+def _workspace_guide_html(chat_id: int | None, workspace_namespace_value: str | None = None) -> str:
     """系统提示词的「工作区与文件目录」章节（含该 chat 的工作区绝对路径）。
 
     背景：模型此前只知道"工作区根目录是 bash 起始目录"，但既不知道绝对
@@ -97,7 +97,7 @@ def _workspace_guide_html(chat_id: int | None) -> str:
     try:
         if chat_id is not None:
             from workspace_paths import workspace_workdir
-            ws_path = str(workspace_workdir(chat_id))
+            ws_path = str(workspace_workdir(chat_id, workspace_namespace_value))
     except Exception:
         logger.debug("_workspace_guide_html 内部忽略的异常", exc_info=True)
         ws_path = ""
@@ -334,6 +334,7 @@ async def build_system_prompt(
     username: str = "用户",
     supports_tools: bool = True,
     skill_catalog_text: str | None = None,
+    workspace_namespace_value: str | None = None,
 ) -> str:
     """组装完整 system prompt。
 
@@ -347,7 +348,7 @@ async def build_system_prompt(
     if supports_tools:
         catalog_text = skill_catalog_text or skill_catalog_brief()
         base_prompt += _TOOLS_SECTION.format(
-            workspace_guide=_workspace_guide_html(chat_id),
+            workspace_guide=_workspace_guide_html(chat_id, workspace_namespace_value),
             catalog_text=catalog_text,
         )
     else:
@@ -388,6 +389,7 @@ async def get_ai_response(
         username: str,
         user_message: Optional[dict[str, Any]] = None,
         event_source: str = "USER",
+        workspace_namespace_value: str | None = None,
 ) -> tuple[str, str, list, Optional[dict]]:
     """统一调度入口：USER / TIMER 走同一套草稿与交付流程，由 /show 控制。
 
@@ -433,6 +435,14 @@ async def get_ai_response(
     # 首绑处声明 Optional 供 try 前的异常路径使用。
     builder: DraftManager | None = None
     new_msgs: list[dict[str, Any]] = []
+    # 显式捕获本回合的 workspace namespace，避免后续异步任务依赖
+    # ContextVar 的隐式继承。USER/TIMER 均沿用入口已经绑定的 Telegram user_id；
+    # 若调用方显式提供，则以显式值为准。
+    if workspace_namespace_value is None:
+        try:
+            workspace_namespace_value = state.get_current_user_namespace()
+        except Exception:
+            workspace_namespace_value = None
     # usage 形状动态（SDK pydantic 对象 / JSON dict / None），按 Any 标注。
     usage: Any = None
     is_timer = (event_source == "TIMER")
@@ -582,6 +592,7 @@ async def get_ai_response(
             username,
             supports_tools=supports_tools,
             skill_catalog_text=skill_catalog_brief(),
+            workspace_namespace_value=workspace_namespace_value,
         )
         messages = _build_initial_messages(system_prompt)
         _log_stage("system_prompt构建完成")
