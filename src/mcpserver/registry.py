@@ -110,11 +110,6 @@ async def weather(_: MCPRequestContext, args: JsonObject) -> str:
     return await invoke(execute_weather, args["city"], args.get("unit", "c"), args.get("hours", 6))
 
 
-async def crypto(_: MCPRequestContext, args: JsonObject) -> str:
-    from search_engine import execute_crypto_price
-    return await invoke(execute_crypto_price, args["coin"], args.get("currency", "usd"))
-
-
 async def geocode(_: MCPRequestContext, args: JsonObject) -> str:
     from search_engine import execute_geocode
     return await invoke(execute_geocode, args["address"])
@@ -208,7 +203,6 @@ READ_ONLY_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("search.wikipedia", "Wikipedia", "Query Wikipedia.", object_schema({"query": text_field("Article query.", 1), "lang": {"type": "string", "enum": ["zh", "en"]}}, ("query",)), wikipedia),
     ToolSpec("search.exchange_rate", "Exchange rate", "Look up an exchange rate.", object_schema({"base": text_field("Base ISO currency.", 3), "target": text_field("Optional target ISO currency.", 3)}, ("base",)), exchange_rate),
     ToolSpec("search.weather", "Weather", "Retrieve current weather and forecast for a city. Returns current conditions, up to 24 hours of hourly forecast, and up to 5 days of daily forecast. Use unit='c' for Celsius (default) or 'f' for Fahrenheit.", object_schema({"city": text_field("City or location.", 1), "unit": {"type": "string", "enum": ["c", "f"]}, "hours": int_field("Forecast hours.", 1, 24)}, ("city",)), weather),
-    ToolSpec("search.crypto_price", "Crypto price", "Retrieve a cryptocurrency price.", object_schema({"coin": text_field("Coin name or symbol.", 1), "currency": text_field("Quote currency.", 3)}, ("coin",)), crypto),
     ToolSpec("geo.geocode", "Geocode", "Convert an address to coordinates.", object_schema({"address": text_field("Address.", 1)}, ("address",)), geocode),
     ToolSpec("geo.route", "Route", "Plan a route between longitude,latitude coordinates.", object_schema({"origin": text_field("Origin longitude,latitude.", 3), "destination": text_field("Destination longitude,latitude.", 3), "mode": {"type": "string", "enum": ["cycling", "walking", "driving", "transit"]}, "city": text_field("Optional origin city."), "cityd": text_field("Optional destination city.")}, ("origin", "destination")), route),
     ToolSpec("geo.distance", "Distance", "Measure straight-line coordinate distance.", object_schema({"origin": text_field("Origin longitude,latitude.", 3), "destination": text_field("Destination longitude,latitude.", 3)}, ("origin", "destination")), distance),

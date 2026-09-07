@@ -373,21 +373,6 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "crypto_price",
-            "description": "Get the current spot price of a cryptocurrency (btc / eth / doge / etc.) in the requested currency.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "coin": {"type": "string", "description": "币种符号（btc、eth、doge 等）"},
-                    "currency": {"type": "string", "default": "usd", "description": "计价货币"}
-                },
-                "required": ["coin"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "qr_code",
             "description": "Generate a QR code image from text or URL and return its public URL.",
             "parameters": {

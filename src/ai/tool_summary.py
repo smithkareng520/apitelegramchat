@@ -436,7 +436,6 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
         "poi_nearby_search": "Searching nearby POI",
         "poi_details": "Fetching POI details",
         "exchange_rate": "Checking exchange rates",
-        "crypto_price": "Fetching crypto prices",
         "weather": "Fetching weather",
         "qr_code": "Generating QR code",
     }
@@ -525,7 +524,6 @@ def _generate_action_description(fn_name: str, fn_args: Optional[dict] = None) -
         "wikipedia": "looked up Wikipedia",
         "exchange_rate": "checked exchange rates",
         "weather": "fetched weather",
-        "crypto_price": "checked crypto prices",
         "qr_code": "generated a QR code",
         "generate_video": "generated a video",
         "geocode": "geocoded an address",
@@ -955,7 +953,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         "poi_nearby_search": "Searched nearby POIs",
         "poi_details": "Fetched POI details",
         "exchange_rate": "Checked exchange rates",
-        "crypto_price": "Fetched crypto prices",
         "public_holidays": "Looked up holidays",
         "weather": "Fetched weather",
         "convert": "Calculated a result",

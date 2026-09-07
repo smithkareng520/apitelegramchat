@@ -692,7 +692,7 @@ async def get_ai_response(
             from tool_assembly import prioritize_tool_defs, restrict_tool_defs
             _PROACTIVE_ALLOWED_TOOLS = {
                 "web_search", "fetch_url", "wikipedia",
-                "exchange_rate", "weather", "crypto_price",
+                "exchange_rate", "weather",
                 "qr_code",
                 "geocode", "route", "distance",
                 "poi_keyword_search", "poi_nearby_search", "poi_details",

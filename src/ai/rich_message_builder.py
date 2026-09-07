@@ -640,8 +640,6 @@ class RichMessageBuilder:
             group["outer_summary"] = "Fetching POI details"
         elif t == "exchange_rate":
             group["outer_summary"] = "Checking exchange rates"
-        elif t == "crypto_price":
-            group["outer_summary"] = "Fetching crypto prices"
         elif t == "weather":
             group["outer_summary"] = "Fetching weather"
         elif t == "qr_code":
@@ -686,7 +684,6 @@ class RichMessageBuilder:
         "poi_nearby_search": ("Searched nearby POIs", "Searched nearby POIs"),
         "poi_details": ("Fetched POI details", "Fetched details for {n} POIs"),
         "exchange_rate": ("Checked exchange rates", "Checked exchange rates"),
-        "crypto_price": ("Fetched crypto prices", "Fetched price for {n} coins"),
         "public_holidays": ("Looked up holidays", "Looked up holidays for {n} countries"),
         "weather": ("Fetched weather", "Fetched weather for {n} cities"),
         "convert": ("Calculated a result", "Ran {n} calculations"),

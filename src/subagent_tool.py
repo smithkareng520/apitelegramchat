@@ -121,7 +121,7 @@ SUBAGENT_TOOL_TIMEOUT = _env_int("SUBAGENT_TOOL_TIMEOUT", 120, min_value=5, max_
 # prompt cache 失效。用 list + sort 保证稳定顺序。
 DEFAULT_ALLOWED_TOOLS = sorted([
     "web_search", "fetch_url", "wikipedia", "exchange_rate",
-    "weather", "crypto_price", "qr_code",
+    "weather", "qr_code",
     "geocode", "route", "distance", "poi_keyword_search",
     "poi_nearby_search", "poi_details",
     "bash", "text_editor", "todo",
@@ -143,7 +143,7 @@ SUBAGENT_SYSTEM_PROMPT_TEMPLATE = """\
 - 你只看到本任务描述和给定的上下文，看不到父对话历史。
 - 专心完成本任务，不要扩展话题。
 - 可以调用提供的工具来获取信息或操作文件。
-- 工具参数中声明了 _description 的工具（bash、route、weather、exchange_rate、crypto_price、distance、POI 检索、todo 等），每次调用都必须填写该参数：一句话（≤60字）说明本次操作目的，它会作为执行进度展示给用户。bash 的 _description 为必填，漏填或留空会被参数校验拒绝，需补上后重新发起。text_editor、fetch_url、wikipedia、qr_code、present_files 不声明该参数，无需填写。
+- 工具参数中声明了 _description 的工具（bash、route、weather、exchange_rate、distance、POI 检索、todo 等），每次调用都必须填写该参数：一句话（≤60字）说明本次操作目的，它会作为执行进度展示给用户。bash 的 _description 为必填，漏填或留空会被参数校验拒绝，需补上后重新发起。text_editor、fetch_url、wikipedia、qr_code、present_files 不声明该参数，无需填写。
 - 如果有多个彼此独立的检索、查询或操作目标，请在同一轮中一次性发出多个工具调用，不要拆成串行多轮。
 - 禁止调用 subagent 工具（不能递归派生子 agent），也不能调用 message_user / memory（人工交互与跨会话记忆必须由父 agent 负责，最终答复统一由父 agent 交付用户）。
 - 完成后用一段简洁的中文答复给父 agent，长度不超过 2000 字。

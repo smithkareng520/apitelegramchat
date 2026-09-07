@@ -1,4 +1,4 @@
-"""生活查询工具：wikipedia / exchange_rate / weather / crypto / qr_code（自 search_engine.py 拆出）。"""
+"""生活查询工具：wikipedia / exchange_rate / weather / qr_code（自 search_engine.py 拆出）。"""
 
 import asyncio
 import hashlib
@@ -276,46 +276,6 @@ async def execute_weather(city: str, unit: str = "c", hours: int = 6) -> str:
     except Exception as e:
         logger.debug("execute_weather 内部忽略的异常", exc_info=True)
         return json.dumps({"error": f"天气查询异常：{str(e)[:100]}"}, ensure_ascii=False)
-
-
-# --------------------- crypto_price ---------------------
-COIN_MAP = {
-    "btc": "bitcoin", "eth": "ethereum", "doge": "dogecoin",
-    "sol": "solana", "xrp": "ripple", "ada": "cardano",
-    "dot": "polkadot", "ltc": "litecoin", "bch": "bitcoin-cash",
-    "matic": "matic-network", "avax": "avalanche-2", "uni": "uniswap"
-}
-
-async def execute_crypto_price(coin: str, currency: str = "usd") -> str:
-    # 安全：coin / currency 直接来自 LLM 工具调用参数，若不 quote
-    # 就拼到 URL，LLM 可能传 "btc&ids=ethereum" 之类的字符串做参数注入。
-    # 这里强制白名单（coin_id 只允许字母数字和连字符），currency 同理。
-    coin_raw = (coin or "").lower().strip()
-    currency_raw = (currency or "usd").lower().strip() or "usd"
-    if not re.match(r'^[a-z0-9-]+$', coin_raw):
-        return f"失败：币种标识 {coin!r} 包含非法字符。"
-    if not re.match(r'^[a-z]{3}$', currency_raw):
-        return f"失败：货币代码 {currency!r} 必须是 3 个小写字母。"
-    coin_id = COIN_MAP.get(coin_raw, coin_raw)
-    url = (
-        "https://api.coingecko.com/api/v3/simple/price"
-        f"?ids={quote(coin_id, safe='')}&vs_currencies={quote(currency_raw, safe='')}"
-    )
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=HTTP_TIMEOUT_SHORT) as resp:
-                if resp.status != 200:
-                    return f"失败：无法获取 {coin} 的价格（HTTP {resp.status}）。"
-                data = await resp.json()
-    except Exception as e:
-        logger.debug("execute_crypto_price 内部忽略的异常", exc_info=True)
-        return f"失败：价格查询失败：{str(e)[:100]}"
-    if coin_id not in data:
-        return f"失败：未找到加密货币：{coin}。支持：{', '.join(COIN_MAP.keys())}"
-    price = data[coin_id].get(currency)
-    if price is None:
-        return f"失败：不支持的目标货币：{currency}"
-    return f"<b>{coin.upper()} 当前价格</b><br/>{price} {currency.upper()}"
 
 
 # --------------------- qr_code ---------------------

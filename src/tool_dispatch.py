@@ -16,7 +16,6 @@ from search_engine import (
     execute_wikipedia,
     execute_exchange_rate,
     execute_weather,
-    execute_crypto_price,
     execute_geocode,
     execute_qr_code,
     execute_generate_image,
@@ -160,8 +159,6 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
         elif name == "weather":
             return await execute_weather(arguments.get("city", ""), arguments.get("unit", "c"),
                                          arguments.get("hours", 6))
-        elif name == "crypto_price":
-            return await execute_crypto_price(arguments.get("coin", ""), arguments.get("currency", "usd"))
         elif name == "qr_code":
             return await execute_qr_code(arguments.get("text", ""))
         elif name == "generate_image_from_text":
