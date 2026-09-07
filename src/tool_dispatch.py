@@ -15,9 +15,7 @@ from search_engine import (
     execute_fetch_url,
     execute_wikipedia,
     execute_exchange_rate,
-    execute_book_lookup,
     execute_weather,
-    execute_news,
     execute_crypto_price,
     execute_geocode,
     execute_qr_code,
@@ -159,13 +157,9 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             return await execute_wikipedia(arguments.get("query", ""), arguments.get("lang", "zh"))
         elif name == "exchange_rate":
             return await execute_exchange_rate(arguments.get("base", "USD"), arguments.get("target"))
-        elif name == "book_lookup":
-            return await execute_book_lookup(arguments.get("query", ""))
         elif name == "weather":
             return await execute_weather(arguments.get("city", ""), arguments.get("unit", "c"),
                                          arguments.get("hours", 6))
-        elif name == "news":
-            return await execute_news(arguments.get("source", "bbc"), arguments.get("limit", 5))
         elif name == "crypto_price":
             return await execute_crypto_price(arguments.get("coin", ""), arguments.get("currency", "usd"))
         elif name == "qr_code":

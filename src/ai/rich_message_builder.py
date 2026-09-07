@@ -626,10 +626,6 @@ class RichMessageBuilder:
             group["outer_summary"] = "Waiting for your answer"
         elif t == "wikipedia":
             group["outer_summary"] = "Looking up on Wikipedia"
-        elif t == "news":
-            group["outer_summary"] = "Fetching news"
-        elif t == "book_lookup":
-            group["outer_summary"] = "Looking up a book"
         elif t == "geocode":
             group["outer_summary"] = "Geocoding address"
         elif t == "route":
@@ -681,9 +677,7 @@ class RichMessageBuilder:
         "text_editor_delete": ("Deleted a file", "Deleted {n} files"),
         "present_files": ("Presented a file", "Presented {n} files"),
         "wikipedia": ("Looked up on Wikipedia", "Looked up on Wikipedia"),
-        "news": ("Fetched news", "Fetched news from {n} sources"),
         "fetch_url": ("Fetched a page", "Fetched {n} pages"),
-        "book_lookup": ("Looked up a book", "Looked up {n} books"),
         "geocode": ("Geocoded an address", "Geocoded {n} addresses"),
         "nearby_search": ("Searched nearby", "Searched nearby for {n} categories"),
         "route": ("Planned a route", "Planned {n} routes"),
@@ -775,7 +769,7 @@ class RichMessageBuilder:
         """完成态工具组摘要：成功工具按类型展示，失败工具计入末尾 ``(failed n)``。
 
         按规范只有第一个描述的首字母大写，后续描述保持小写，例如
-        ``Searched the web, fetched news, fetched hacker news``；
+        ``Searched the web, fetched a page, fetched hacker news``；
         部分失败时在末尾追加失败计数，如
         ``Ran a command, Fetched 2 pages, (failed 1)``；全部失败时
         只显示 ``(failed n)``（不再退化为笼统的 ``Tools failed``）。

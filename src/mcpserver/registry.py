@@ -105,19 +105,9 @@ async def exchange_rate(_: MCPRequestContext, args: JsonObject) -> str:
     return await invoke(execute_exchange_rate, args["base"], args.get("target"))
 
 
-async def book_lookup(_: MCPRequestContext, args: JsonObject) -> str:
-    from search_engine import execute_book_lookup
-    return await invoke(execute_book_lookup, args["query"])
-
-
 async def weather(_: MCPRequestContext, args: JsonObject) -> str:
     from search_engine import execute_weather
     return await invoke(execute_weather, args["city"], args.get("unit", "c"), args.get("hours", 6))
-
-
-async def news(_: MCPRequestContext, args: JsonObject) -> str:
-    from search_engine import execute_news
-    return await invoke(execute_news, args.get("source", "bbc"), args.get("limit", 5))
 
 
 async def crypto(_: MCPRequestContext, args: JsonObject) -> str:
@@ -217,9 +207,7 @@ READ_ONLY_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("search.fetch", "Fetch URL", "Fetch and extract a public HTTP(S) URL.", object_schema({"url": text_field("HTTP(S) URL.", 8)}, ("url",)), fetch_url),
     ToolSpec("search.wikipedia", "Wikipedia", "Query Wikipedia.", object_schema({"query": text_field("Article query.", 1), "lang": {"type": "string", "enum": ["zh", "en"]}}, ("query",)), wikipedia),
     ToolSpec("search.exchange_rate", "Exchange rate", "Look up an exchange rate.", object_schema({"base": text_field("Base ISO currency.", 3), "target": text_field("Optional target ISO currency.", 3)}, ("base",)), exchange_rate),
-    ToolSpec("search.book_lookup", "Book lookup", "Look up published books.", object_schema({"query": text_field("Book query.", 1)}, ("query",)), book_lookup),
     ToolSpec("search.weather", "Weather", "Retrieve current weather and forecast for a city. Returns current conditions, up to 24 hours of hourly forecast, and up to 5 days of daily forecast. Use unit='c' for Celsius (default) or 'f' for Fahrenheit.", object_schema({"city": text_field("City or location.", 1), "unit": {"type": "string", "enum": ["c", "f"]}, "hours": int_field("Forecast hours.", 1, 24)}, ("city",)), weather),
-    ToolSpec("search.news", "News", "Retrieve news summaries.", object_schema({"source": text_field("Optional source identifier."), "limit": int_field("Maximum result count.", 1, 10)}), news),
     ToolSpec("search.crypto_price", "Crypto price", "Retrieve a cryptocurrency price.", object_schema({"coin": text_field("Coin name or symbol.", 1), "currency": text_field("Quote currency.", 3)}, ("coin",)), crypto),
     ToolSpec("geo.geocode", "Geocode", "Convert an address to coordinates.", object_schema({"address": text_field("Address.", 1)}, ("address",)), geocode),
     ToolSpec("geo.route", "Route", "Plan a route between longitude,latitude coordinates.", object_schema({"origin": text_field("Origin longitude,latitude.", 3), "destination": text_field("Destination longitude,latitude.", 3), "mode": {"type": "string", "enum": ["cycling", "walking", "driving", "transit"]}, "city": text_field("Optional origin city."), "cityd": text_field("Optional destination city.")}, ("origin", "destination")), route),

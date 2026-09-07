@@ -75,11 +75,8 @@ from search.fetch_url import (  # noqa: F401
 )
 from search.quick_lookup import (  # noqa: F401
     COIN_MAP,
-    NEWS_FEEDS,
-    execute_book_lookup,
     execute_crypto_price,
     execute_exchange_rate,
-    execute_news,
     execute_qr_code,
     execute_weather,
     execute_wikipedia,

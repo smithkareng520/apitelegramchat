@@ -22,10 +22,8 @@
 | text_editor · delete | Editing file {文件名} | 同左 | Deleted a file / Deleted {n} files | Edited file {文件名} |
 | fetch_url | Fetching from {域名} | 同左 | Fetched a page / Fetched {n} pages | Fetched: {页面标题}（退化 Fetched: {域名}） |
 | wikipedia | Looking up on Wikipedia | 同左 | Looked up on Wikipedia（单复同形） | Looked up: {词条标题} |
-| news | Fetching news | 同左 | Fetched news / Fetched news from {n} sources | Fetched news |
 | weather | Fetching weather | 同左 | Fetched weather / Fetched weather for {n} cities | Fetched weather |
 | exchange_rate | Checking exchange rates | 同左 | Checked exchange rates（单复同形） | Checked exchange rates |
-| book_lookup | Looking up a book | 同左 | Looked up a book / Looked up {n} books | Looked up a book |
 | crypto_price | Fetching crypto prices | 同左 | Fetched crypto prices / Fetched price for {n} coins | Fetched crypto prices |
 | qr_code | Generating QR code | 同左 | Generated a QR code / Generated {n} QR codes | Generated a QR code |
 | geocode | Geocoding address | 同左 | Geocoded an address / Geocoded {n} addresses | Geocoded an address |
@@ -67,7 +65,7 @@
 | 部分失败（如 4 中 1 败） | 各失败块显示自己的失败标题 | Ran a command, fetched 2 pages, **(failed 1)** |
 | 全部失败（如 2 中 2 败） | 同上 | 只显示 **(failed 2)** |
 | 无成功也无失败（异常兜底） | — | Tools failed |
-| 工具超时 | ⏱️ {label} timed out（label：Web search / Page fetch / Wikipedia lookup / Weather fetch / News fetch / File presentation 等，其余用工具名） | 计入 (failed n) |
+| 工具超时 | ⏱️ {label} timed out（label：Web search / Page fetch / Wikipedia lookup / Weather fetch / File presentation 等，其余用工具名） | 计入 (failed n) |
 | bash 退出码≠0 | ❌ Bash 执行失败 | 计入 (failed n) |
 | bash 复合命令部分成功（127） | Ran a command (partial success) | **算成功**，不计 failed |
 | web_search 失败 | Search failed | 计入 (failed n) |
@@ -97,4 +95,4 @@
 | `_description` 优先 | 参数带 `_description/_summary` 时，组标题与工具标题（运行时+完成后）优先显示它；现仅 bash 声明；web_search / text_editor / todo / memory / subagent / deliver_reply 始终按规范文案生成 |
 | 单复数 | 组内同类工具 ≥2 时切复数模板；不可数对象的动作（Listed todos / Searched memories 等）单复同形 |
 | "Ran an action" 兜底 | 仅当未知工具名漏过所有分支时出现；当前全部已声明工具均有专属文案 |
-| 展开正文形态 | bash / text_editor / web_search / message_user / exchange_rate / book_lookup / news / crypto_price / deliver_reply 等为 `pre/code` 等宽面板；todo / memory / subagent / weather 为富文本卡片；qr_code / 图片 / 视频为媒体卡片 |
+| 展开正文形态 | bash / text_editor / web_search / message_user / exchange_rate / crypto_price / deliver_reply 等为 `pre/code` 等宽面板；todo / memory / subagent / weather 为富文本卡片；qr_code / 图片 / 视频为媒体卡片 |

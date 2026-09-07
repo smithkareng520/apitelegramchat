@@ -1,4 +1,4 @@
-"""生活查询工具：wikipedia / exchange_rate / book_lookup / weather / news / crypto / qr_code（自 search_engine.py 拆出）。"""
+"""生活查询工具：wikipedia / exchange_rate / weather / crypto / qr_code（自 search_engine.py 拆出）。"""
 
 import asyncio
 import hashlib
@@ -13,13 +13,6 @@ try:
     from curl_cffi.requests import AsyncSession
 except Exception:  # pragma: no cover - optional dependency fallback
     AsyncSession = None  # type: ignore
-try:
-    import feedparser
-except Exception:  # pragma: no cover - optional dependency fallback
-    class _FeedParserStub:
-        def parse(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-            return {"entries": []}
-    feedparser = _FeedParserStub()
 try:
     import qrcode
 except Exception:  # pragma: no cover - optional dependency fallback
@@ -161,34 +154,6 @@ async def execute_exchange_rate(base: str, target: str | None = None) -> str:
         return f"失败：汇率查询出错：{str(e)[:100]}"
 
 
-# --------------------- book_lookup ---------------------
-async def execute_book_lookup(query: str) -> str:
-    headers = {"User-Agent": "TelegramAIAssistant/1.0"}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://openlibrary.org/search.json", params={"q": query, "limit": 5, "fields": "*"}, headers=headers, timeout=HTTP_TIMEOUT_SHORT) as resp:
-                if resp.status != 200:
-                    return f"失败：书籍查询失败（HTTP {resp.status}）"
-                data = await resp.json()
-        docs = data.get("docs", [])
-        if not docs:
-            return f"失败：未找到与「{query}」相关的书籍"
-        lines = [f"<b>书籍查询结果：「{escape_html(query)}」</b><br/>"]
-        for i, doc in enumerate(docs[:5], 1):
-            title = escape_html(doc.get("title", "无标题"))
-            authors = escape_html("、".join(doc.get("author_name", ["未知作者"])[:3]))
-            year = escape_html(str(doc.get("first_publish_year", "未知")))
-            subjects = escape_html("、".join(doc.get("subject", [])[:3]))
-            key = doc.get("key", "")
-            ol_url = f"https://openlibrary.org{key}" if key else ""
-            ol_url_html = escape_html(ol_url) if ol_url else ""
-            lines.append(f"{i}. 《{title}》<br/>   作者：{authors}<br/>   首次出版：{year} 年<br/>" + (f"   主题：{subjects}<br/>" if subjects else "") + (f"   详情：{ol_url_html}<br/>" if ol_url_html else ""))
-        return "<br/>".join(lines)
-    except Exception as e:
-        logger.debug("execute_book_lookup 内部忽略的异常", exc_info=True)
-        return f"失败：书籍查询出错：{str(e)[:100]}"
-
-
 # --------------------- weather ---------------------
 async def execute_weather(city: str, unit: str = "c", hours: int = 6) -> str:
     """查询 wttr.in 天气并打包为 JSON。
@@ -311,63 +276,6 @@ async def execute_weather(city: str, unit: str = "c", hours: int = 6) -> str:
     except Exception as e:
         logger.debug("execute_weather 内部忽略的异常", exc_info=True)
         return json.dumps({"error": f"天气查询异常：{str(e)[:100]}"}, ensure_ascii=False)
-
-
-# --------------------- news ---------------------
-NEWS_FEEDS = {
-    "bbc": "https://feeds.bbci.co.uk/zhongwen/simp/rss.xml",
-    "reuters": "https://www.reutersagency.com/feed/?taxonomy=best-sectors&post_type=best",
-    "cna": "https://www.cna.com.tw/rss/cna/rnews.xml",
-    "cnn": "http://rss.cnn.com/rss/edition.rss",
-    "nytimes": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
-    "guardian": "https://www.theguardian.com/world/rss",
-    "zaobao": "https://www.zaobao.com.sg/rss.xml",
-    "xinhua": "http://www.xinhuanet.com/english/rss/world.xml",
-}
-
-async def execute_news(source: str = "bbc", limit: int = 5) -> str:
-    limit = min(max(limit, 1), 10)
-    source_key = source.lower()
-    if source_key == "all":
-        # 8 个 RSS 源并行抓取，总延迟约等于最慢一个源。
-        async def _fetch_feed(src: str, url: str) -> list[tuple[str, str, str]]:
-            try:
-                feed = await asyncio.to_thread(feedparser.parse, url)
-                if not feed.bozo:
-                    return [(src, item.title, item.link) for item in feed.entries[:min(2, limit)]]
-            except Exception as exc:
-                logger.warning("news 源抓取失败 src=%s: %s", src, exc)
-            return []
-
-        feed_results = await asyncio.gather(
-            *(_fetch_feed(src, url) for src, url in NEWS_FEEDS.items())
-        )
-        all_items = [entry for entries in feed_results for entry in entries]
-        if not all_items:
-            return "失败：无法获取任何新闻源。"
-        lines = ["<ul>"]
-        for src, title, link in all_items[:limit*2]:
-            lines.append(f'<li><b>{escape_html(title)}</b> (<i>{escape_html(src.upper())}</i>) <a href="{escape_html(link)}">🔗 阅读原文</a></li>')
-        lines.append("</ul>")
-        return "\n".join(lines)
-    url = NEWS_FEEDS.get(source_key)
-    if not url:
-        return f"失败：不支持的新闻源：{source}。可用：{', '.join(NEWS_FEEDS.keys())} 或 all。"
-    try:
-        feed = await asyncio.to_thread(feedparser.parse, url)
-        if feed.bozo:
-            return f"失败：解析新闻源 {source} 失败。"
-        items = feed.entries[:limit]
-        if not items:
-            return f"失败：未找到 {source} 的新闻。"
-        lines = ["<ul>"]
-        for item in items:
-            lines.append(f'<li><b>{escape_html(item.title)}</b> <a href="{escape_html(item.link)}">🔗 阅读原文</a></li>')
-        lines.append("</ul>")
-        return "\n".join(lines)
-    except Exception as e:
-        logger.debug("execute_news 内部忽略的异常", exc_info=True)
-        return f"失败：新闻获取失败：{str(e)[:100]}"
 
 
 # --------------------- crypto_price ---------------------

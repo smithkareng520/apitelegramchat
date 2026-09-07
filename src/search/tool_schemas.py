@@ -346,20 +346,6 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "book_lookup",
-            "description": "Look up book metadata (title, author, cover, rating, abstract) by title, author, or ISBN.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "书名、作者或 ISBN"}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "weather",
             "description": (
                 "Get weather conditions and forecasts for a city. Returns current conditions, "
@@ -382,20 +368,6 @@ SEARCH_TOOLS = [
                 {"city": "Beijing", "unit": "c", "hours": 12},
                 {"city": "New York", "unit": "f"}
             ]
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "news",
-            "description": "Get latest headlines from major news sources (bbc / reuters / cna / cnn / nytimes / guardian / zaobao / xinhua / all).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "source": {"type": "string", "enum": ["bbc", "reuters", "cna", "cnn", "nytimes", "guardian", "zaobao", "xinhua", "all"], "default": "bbc"},
-                    "limit": {"type": "integer", "default": 5, "description": "返回条数（1-10）"}
-                }
-            }
         }
     },
     {

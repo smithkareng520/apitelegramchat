@@ -429,8 +429,6 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     mapping = {
         "present_files": "Presenting file(s)",
         "wikipedia": "Looking up on Wikipedia",
-        "news": "Fetching news",
-        "book_lookup": "Looking up a book",
         "geocode": "Geocoding address",
         "route": "Planning route",
         "distance": "Measuring distance",
@@ -526,9 +524,7 @@ def _generate_action_description(fn_name: str, fn_args: Optional[dict] = None) -
         "fetch_url": "fetched a page",
         "wikipedia": "looked up Wikipedia",
         "exchange_rate": "checked exchange rates",
-        "book_lookup": "looked up a book",
         "weather": "fetched weather",
-        "news": "fetched news",
         "crypto_price": "checked crypto prices",
         "qr_code": "generated a QR code",
         "generate_video": "generated a video",
@@ -951,8 +947,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
 
     mapping = {
         "wikipedia": "Looked up on Wikipedia",
-        "news": "Fetched news",
-        "book_lookup": "Looked up a book",
         "geocode": "Geocoded an address",
         "nearby_search": "Searched nearby",
         "route": "Planned a route",

@@ -90,7 +90,7 @@ Telegram Runtime 共用业务能力，但**不把 Runtime 能力原样暴露**�
 | 多模型 | OpenRouter、ModelScope、Gemini、Grok、DeepSeek、GLM、Agnes |
 | Tool Calling | 并行工具调用、工具状态、结果压缩、错误恢复 |
 | Web | 搜索（search/images/videos/lens 四合一）+ 深度抓取 + Wikipedia |
-| 信息工具 | 天气、汇率、新闻、书籍、Crypto、二维码 |
+| 信息工具 | 天气、汇率、Crypto、二维码 |
 | 地图 | 地理编码、POI、路线、距离（经 amap-maps MCP） |
 | 文件 | Telegram 上传、workspace 编辑、文件发送 |
 | Bash | 持久 Shell + Landlock + rlimit + fork bomb watchdog |
@@ -362,7 +362,7 @@ Anthropic（Claude）模型经 OpenRouter 接入即可使用；Anthropic 原生 
 ```text
 web_search    # 4-in-1: search / images / videos / lens（mode 参数选择）
 fetch_url     # 深度抓取：编码检测 / SSRF 防护 / JS·meta 重定向追踪 / 根路径回退
-wikipedia / exchange_rate / book_lookup / weather / news / crypto_price / qr_code
+wikipedia / exchange_rate / weather / crypto_price / qr_code
 ```
 
 ### 地图
@@ -626,7 +626,7 @@ python tests/test_whitelist_r2.py          # 白名单 R2 同步回归（可独�
 │   │   ├── tool_schemas.py           # SEARCH_TOOLS 等工具 schema 数据底座
 │   │   ├── serper.py                 # Serper 搜索客户端（4 mode）
 │   │   ├── fetch_url.py              # 网页抓取 / SSRF / 重定向追踪
-│   │   ├── quick_lookup.py           # wikipedia / weather / news / crypto / qr 等
+│   │   ├── quick_lookup.py           # wikipedia / weather / crypto / qr 等
 │   │   ├── media_tools.py            # 图像/视频生成
 │   │   ├── map_tools.py              # 高德地图 MCP 委托
 │   │   └── text_editor.py            # 文本编辑器 + R2 持久化

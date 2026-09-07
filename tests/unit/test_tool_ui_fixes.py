@@ -1,10 +1,10 @@
 """针对 4 项 UI / Schema 修复的回归测试。
 
 覆盖：
-1. web_search 与信息类工具（exchange_rate / book_lookup / news /
-   crypto_price）结果用富文本卡片展示（标题链接 + 来源徽标 + 斜体摘要，
-   自旧版恢复）；message_user 及其他纯文本返回的工具，统一用
-   ``<pre><code>`` 等宽代码面板展示（与 bash / text_editor 同规范）；
+1. web_search 与信息类工具（exchange_rate / crypto_price）结果用富文本卡片
+   展示（标题链接 + 来源徽标 + 斜体摘要，自旧版恢复）；message_user 及其他
+   纯文本返回的工具，统一用 ``<pre><code>`` 等宽代码面板展示（与 bash /
+   text_editor 同规范）；
 2. ``_description`` 不再被 normalize_tool_schema 强制注入 required，
    且只有 bash 声明该字段；web_search 不带 _description 可通过校验；
 3. memory / todo / subagent / deliver_reply 完成态摘要按「动作 + 对象」
@@ -71,8 +71,6 @@ def test_message_user_result_uses_code_panels():
 
 @pytest.mark.parametrize("fn_name,args", [
     ("exchange_rate", {"base": "USD"}),
-    ("book_lookup", {"query": "三体"}),
-    ("news", {"source": "bbc"}),
     ("crypto_price", {"coin": "btc"}),
 ])
 def test_info_tools_result_rich_passthrough(fn_name, args):
@@ -139,7 +137,7 @@ def test_search_tool_schemas_description_only_on_bash():
     assert "_description" in bash_params["properties"]
     assert bash_params["required"] == ["_description", "command"]
 
-    for name in ("weather", "exchange_rate", "book_lookup", "crypto_price",
+    for name in ("weather", "exchange_rate", "crypto_price",
                  "geocode", "route", "distance", "poi_keyword_search",
                  "poi_nearby_search", "poi_details"):
         assert "_description" not in by_name[name]["function"]["parameters"]["properties"], name

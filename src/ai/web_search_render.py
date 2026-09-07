@@ -5,7 +5,7 @@
 
 - 解析 ``execute_web_search`` 返回的多 section envelope（search / images
   / videos / lens）为结构化字典；
-- 用与 fetch_url / wikipedia / news 一致的视觉语言（``<b>`` 标题、
+- 用与 fetch_url / wikipedia 一致的视觉语言（``<b>`` 标题、
   ``<code>`` 来源徽标、``<i>`` 摘要、``<a>`` 带 emoji 前缀的链接）渲染
   每个 section；
 - 失败 / 旧格式 / 空 envelope 各自兜底，保证总能拿到合法 HTML。
@@ -394,7 +394,7 @@ def format_web_search_result(fn_args: dict, result_str: str) -> tuple[str, str]:
     - parses the multi-mode envelope into structured sections,
     - renders each mode (search / images / videos / lens) with a
       mode-appropriate layout that mirrors the visual language used by
-      fetch_url / wikipedia / news,
+      fetch_url / wikipedia,
     - falls back to escaped raw text when the envelope cannot be parsed.
     """
     query = (fn_args or {}).get("query", "") or ""
