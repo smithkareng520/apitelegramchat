@@ -205,6 +205,10 @@ async def _handle_admin_commands(chat_id: int, msg: dict, text: str, username: s
 
 async def _handle_start_command(chat_id: int, msg: dict, text: str, username: str, user_id: str) -> bool:
     """处理 /start 欢迎语。返回 True 表示 update 已处理。"""
+    # 只拦截 Telegram 的 /start 命令，普通文本必须继续进入 AI 对话流程。
+    if not text.strip().startswith("/start"):
+        return False
+
     authorized = is_authorized(username, user_id)
     if authorized:
         welcome_msg = """
