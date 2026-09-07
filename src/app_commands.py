@@ -73,8 +73,16 @@ async def _answer_callback_query(callback_query_id: str, text: str, show_alert: 
         logger.debug(f"answerCallbackQuery 失败(可忽略): {e}")
 
 
+_ADMIN_COMMANDS = ("/adduser", "/deluser", "/listusers", "/webhookinfo")
+
+
 async def _handle_admin_commands(chat_id: int, msg: dict, text: str, username: str, user_id: str) -> bool:
     """管理员命令分发。返回 True 表示 update 已处理（含权限拒绝）。"""
+    # 门控：只有消息确实是管理员命令时才进入权限校验/分发；普通聊天
+    # 与其他命令直接放行（返回 False）。否则非管理员用户的每一条消息
+    # 都会被误回复"权限不足"，白名单用户将永远无法对话。
+    if not any(_cmd_match(text, cmd) for cmd in _ADMIN_COMMANDS):
+        return False
     if not is_admin(username, user_id):
         await send_rich_html_message(chat_id, "❌ <b>权限不足</b>\n只有管理员可以执行此操作。", reply_parameters=_reply_params(msg["message_id"]))
         return True
@@ -205,6 +213,12 @@ async def _handle_admin_commands(chat_id: int, msg: dict, text: str, username: s
 
 async def _handle_start_command(chat_id: int, msg: dict, text: str, username: str, user_id: str) -> bool:
     """处理 /start 欢迎语。返回 True 表示 update 已处理。"""
+    # 门控：仅当消息确实是 /start（兼容 /start@botname）时才回复欢迎语。
+    # 此函数位于 process_update 分发链最上游，若不检查文本内容，任何
+    # 消息（包括普通聊天、媒体消息）都会被欢迎语拦截并 return True，
+    # 导致消息永远到不了 AI 对话分支。
+    if not _cmd_match(text, "/start"):
+        return False
     authorized = is_authorized(username, user_id)
     if authorized:
         welcome_msg = """
