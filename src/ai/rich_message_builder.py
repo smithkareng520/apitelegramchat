@@ -32,6 +32,7 @@ from ai.tool_summary import (
     _generate_pending_tool_summary,
     _get_tool_description_from_args,
 )
+from markdown_converter import convert_markdown_to_telegram_html
 
 logger = get_logger(__name__)
 
@@ -135,18 +136,24 @@ def _escape_reasoning_text(text: str) -> str:
 def _render_reasoning_html(content: str) -> str:
     """把思考原文渲染为可安全嵌入 ``<details>`` 的块级 HTML 片段。
 
-    思考内容一律按纯文本处理：先整体严格转义——模型思考中出现的加粗、
-    标签或任何 HTML 片段都只会按字面显示，不会再被 Telegram 当作富文本
-    解析，也不会破坏外层折叠块的结构；随后把换行转换为 ``<br/>``，保留
-    思考本身的分行排版。空内容返回空串：调用方（``_build_html*``）对
-    空思考块整块跳过，等首个字符到达后再渲染折叠块，不再输出
-    “思考中…”占位。
+    思考内容通过 Markdown 转换器处理，将 Markdown 语法（**粗体**、`代码`等）
+    转换为 Telegram HTML 标签。转换器内部会正确转义 HTML 代码示例，不会破坏
+    外层折叠块的结构。空内容返回空串：调用方（``_build_html*``）对空思考块
+    整块跳过，等首个字符到达后再渲染折叠块，不再输出"思考中…"占位。
     """
     text = (content or "").strip()
     if not text:
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    return f"<p>{_escape_reasoning_text(text).replace(chr(10), '<br/>')}</p>"
+    
+    # 使用 Markdown 转换器处理思考内容
+    converted = convert_markdown_to_telegram_html(text)
+    
+    # 如果转换结果是纯文本（不包含块级标签），用 <p> 包裹并保留换行
+    if not converted.strip().startswith(('<p>', '<h', '<ul>', '<ol>', '<pre>', '<blockquote>', '<table>')):
+        return f"<p>{converted.replace(chr(10), '<br/>')}</p>"
+    
+    return converted
 
 
 def _scan_rich_html_boundaries(
@@ -303,7 +310,7 @@ class RichMessageBuilder:
             return ""
         if len(plain) > 30:
             plain = plain[:30].rstrip() + "…"
-        return _escape_reasoning_text(plain)
+        return escape_html(plain)
 
     def request_flush(self, force: bool = False) -> None:
         """异步触发刷新，确保在途发送期间的新内容一定会补发。"""

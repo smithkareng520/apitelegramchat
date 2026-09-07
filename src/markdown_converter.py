@@ -356,19 +356,20 @@ def _convert_inline(text: str) -> str:
         shelf.append(fragment)
         return f'\x00{len(shelf) - 1}\x00'
 
-    # 1) 既有 HTML 标签原样保留（支持 HTML/Markdown 混排）。
-    #    要求真实标签形状（<字母/!/开头），避免把行内代码里的比较表达式
-    #    （如 `a < b && c > d`）误认成标签而存入保护区——一旦误存，占位符
-    #    会被整体嵌进 code 片段，回填时嵌套占位符不会被二次解析，
-    #    最终输出会泄漏原始 \x00 字节导致 Telegram API 拒绝消息。
-    text = re.sub(r'<[a-zA-Z!/][^>]*>', lambda m: _park(m.group(0)), text)
-
-    # 2) 行内代码：内容整体转义并保护，内部星号/下划线不再参与解析
+    # 1) 行内代码：必须先处理，内容整体转义并保护，内部星号/下划线/HTML 标签不再参与解析
+    #    如果后处理，代码中的 `<b>` 会被第 2 步误认为真实标签而保护，导致无法转义
     text = re.sub(
         r'`([^`]+)`',
         lambda m: _park(f'<code>{html_lib.escape(m.group(1))}</code>'),
         text,
     )
+
+    # 2) 既有 HTML 标签原样保留（支持 HTML/Markdown 混排）。
+    #    要求真实标签形状（<字母/!/开头），避免把比较表达式
+    #    （如 `a < b && c > d`）误认成标签。
+    #    注意：此时行内代码已被保护，代码中的 `<b>` 已转义为 &lt;b&gt; 并存入保护区，
+    #    不会被此规则再次匹配。
+    text = re.sub(r'<[a-zA-Z!/][^>]*>', lambda m: _park(m.group(0)), text)
 
     # 3) 图片（须先于链接，否则 ![]() 的 [] 会被链接规则吃掉）
     text = re.sub(
