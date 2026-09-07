@@ -1,7 +1,9 @@
 """针对 4 项 UI / Schema 修复的回归测试。
 
 覆盖：
-1. web_search / message_user 及其他直接铺开返回的工具，结果统一用
+1. web_search 与信息类工具（exchange_rate / book_lookup / news /
+   crypto_price）结果用富文本卡片展示（标题链接 + 来源徽标 + 斜体摘要，
+   自旧版恢复）；message_user 及其他纯文本返回的工具，统一用
    ``<pre><code>`` 等宽代码面板展示（与 bash / text_editor 同规范）；
 2. ``_description`` 不再被 normalize_tool_schema 强制注入 required，
    且只有 bash 声明该字段；web_search 不带 _description 可通过校验；
@@ -23,10 +25,11 @@ from tool_result_format import format_tool_result
 
 
 # =========================================================================
-# 问题 1：工具返回统一 <pre><code> 面板
+# 问题 1：message_user 等纯文本返回统一 <pre><code> 面板；
+#         web_search / 信息类工具保留富文本卡片展示（从旧版恢复）
 # =========================================================================
 
-def test_web_search_result_wrapped_in_code_panels():
+def test_web_search_result_rich_cards():
     envelope = (
         "🔍 [成功: Serper / Google] 搜索「np」的结果（1/1）：\n"
         "1. 标题：某标题\n"
@@ -35,19 +38,25 @@ def test_web_search_result_wrapped_in_code_panels():
     )
     summary, details = format_web_search_result({"query": "np"}, envelope)
     assert summary == "np 1 result"
-    assert "<pre><code>" in details and "</code></pre>" in details
-    assert ">Input</b>" in details and "query: np" in details
-    assert ">Output</b>" in details
-    assert "标题：某标题" in details
+    # 富文本卡片：section 头 + <ol> 列表 + 标题链接 + 来源徽标 + 斜体摘要
+    assert "<b>🔍 「np」</b>" in details
+    assert "Serper / Google" in details and "1/1 条" in details
+    assert "<ol>" in details and "</ol>" in details
+    assert '<b><a href="https://example.com/a">某标题</a></b>' in details
+    assert "<code>example.com</code>" in details
+    assert "<i>某摘要</i>" in details
+    # 不再使用等宽代码面板
+    assert "<pre><code>" not in details
 
 
-def test_web_search_error_wrapped_in_code_panel():
+def test_web_search_error_rich_fallback():
     summary, details = format_web_search_result(
         {"query": "球球大作战"}, "❌ 搜索失败：配额不足\n第二行"
     )
     assert summary == "Search failed"
-    assert "<pre><code>" in details
-    assert "搜索失败" in details
+    assert "<b>❌ 搜索失败</b>" in details
+    assert "配额不足" in details
+    assert "<pre><code>" not in details
 
 
 def test_message_user_result_uses_code_panels():
@@ -66,13 +75,20 @@ def test_message_user_result_uses_code_panels():
     ("news", {"source": "bbc"}),
     ("crypto_price", {"coin": "btc"}),
 ])
-def test_info_tools_output_wrapped_in_code_panel(fn_name, args):
+def test_info_tools_result_rich_passthrough(fn_name, args):
+    """信息类工具成功结果按富 HTML 原样透传进卡片（自旧版恢复）。"""
+    rich = '<b>USD</b> 汇率 <code>7.12</code> CNY <a href="https://x.com/a">来源</a>'
+    summary, details = asyncio.run(format_tool_result(fn_name, args, rich))
+    assert details == rich                      # 成功结果原样透传，保留富文本排版
+    assert "<pre><code>" not in details
+
+    # 失败文本（"失败："前缀）：转义后展示，防止上游错误消息打坏 Rich Message
     summary, details = asyncio.run(
-        format_tool_result(fn_name, args, "正文 <含> 标签 & 实体")
+        format_tool_result(fn_name, args, "失败：上游 <api> 超时 & 重试失败")
     )
-    assert "<pre><code>" in details
-    # 严格转义：原始尖括号不得原样出现
-    assert "正文 &lt;含&gt; 标签 &amp; 实体" in details
+    assert "<pre><code>" not in details
+    assert "失败：" in details
+    assert "&lt;api&gt;" in details and "&amp;" in details
 
 
 def test_unknown_tool_output_wrapped_in_code_panel():

@@ -287,26 +287,33 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = f'<a href="{wiki_url}">{escape_html(title)}</a>'
         return summary, details_html
 
-    # ===================== 信息类工具统一 Output 代码面板 =====================
-    # exchange_rate / book_lookup / news / crypto_price 的返回是面向模型的
-    # 纯文本信封（成功数据或「失败：…」错误文本），不是 Telegram 富 HTML。
-    # 旧实现把 result_str 直接铺进卡片：成功时未转义（上游若含 < > & 会
-    # 打坏 Rich Message 结构），失败时虽然转义了但也只是裸段落。现在与
-    # bash / text_editor 一致，统一渲染为 <pre><code> 等宽 Output 面板。
-    elif fn_name in ("exchange_rate", "book_lookup", "news", "crypto_price"):
-        if fn_name == "exchange_rate":
-            base = fn_args.get('base', 'USD')
-            summary = f"💱 {escape_html(base)} 汇率"
-        elif fn_name == "book_lookup":
-            query = fn_args.get('query', '')
-            summary = f"📖 {escape_html(query)}"
-        elif fn_name == "news":
-            source = fn_args.get('source', 'news')
-            summary = f"📰 {escape_html(source.upper())} 新闻"
-        else:
-            coin = fn_args.get('coin', '')
-            summary = f"💰 {escape_html(coin.upper())} 价格"
-        details_html = _render_editor_quote("Output", result_str)
+    # ===================== 信息类工具富文本卡片（自旧版恢复） =====================
+    # exchange_rate / book_lookup / news / crypto_price 成功时返回的就是
+    # Telegram Rich HTML（加粗字段、来源徽标、链接列表），直接透传进卡片，
+    # 保持与旧版一致的丰富排版；"失败："开头的错误文本转义后展示，
+    # 避免上游错误消息里的 < > & 打坏 Rich Message 结构。
+    elif fn_name == "exchange_rate":
+        base = fn_args.get('base', 'USD')
+        summary = f"💱 {escape_html(base)} 汇率"
+        details_html = result_str if not result_str.startswith("失败：") else escape_html(result_str)
+        return summary, details_html
+
+    elif fn_name == "book_lookup":
+        query = fn_args.get('query', '')
+        summary = f"📖 {escape_html(query)}"
+        details_html = result_str if not result_str.startswith("失败：") else escape_html(result_str)
+        return summary, details_html
+
+    elif fn_name == "news":
+        source = fn_args.get('source', 'news')
+        summary = f"📰 {escape_html(source.upper())} 新闻"
+        details_html = result_str if not result_str.startswith("失败：") else escape_html(result_str)
+        return summary, details_html
+
+    elif fn_name == "crypto_price":
+        coin = fn_args.get('coin', '')
+        summary = f"💰 {escape_html(coin.upper())} 价格"
+        details_html = result_str if not result_str.startswith("失败：") else escape_html(result_str)
         return summary, details_html
 
     elif fn_name == "message_user" or fn_name == "ask_user":
