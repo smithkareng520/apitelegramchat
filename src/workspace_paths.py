@@ -4,7 +4,6 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import cast
 
 
 _NAMESPACE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -125,15 +124,13 @@ def workspace_skills_root(chat_id: object, namespace: object | None = None) -> P
 def workspace_upload_root(chat_id: object, namespace: object | None = None) -> Path:
     """Staging area for files the model wants to send to the user.
 
-    This directory is the sole source for `present_files`. The model stages
-    artifacts here via bash (e.g. `cp out.txt upload/out.txt`) before they
-    can be attached to a chat message.
+    present_files only accepts paths under this directory; stage outputs
+    here first via bash (e.g. `cp out.txt upload/out.txt`), then present
+    them with `present_files(["upload/out.txt"])`.
 
     upload/ is a subdirectory of the workspace root, so bash and text_editor
-    can read and write files here through relative paths. The sandbox only
-    refuses to `cd` into this tree or execute any command while the cwd is
-    inside it. This prevents package managers / build tools from polluting
-    the staging area.
+    can read and write files here through relative paths like any other
+    workspace directory.
     """
     return _secure_directory(workspace_root(chat_id, namespace) / _UPLOAD_DIR_NAME)
 
@@ -144,53 +141,7 @@ def workspace_download_root(chat_id: object, namespace: object | None = None) ->
     When a user sends a document and the active model does not support
     native document input, the file is saved here (not into files/).
     download/ is a subdirectory of the workspace root, so the model can
-    read files directly (bash `cat download/<name>`, text_editor
+    read and edit files directly (bash `cat download/<name>`, text_editor
     `view download/<name>`, `ls download/`).
-
-    Bash is allowed to read and write files here (`download/<name>`), but
-    the sandbox refuses to `cd` into this tree or execute any command while
-    the cwd is inside it. This keeps user-supplied files immutable from
-    the model's execution perspective.
     """
     return _secure_directory(workspace_root(chat_id, namespace) / _DOWNLOAD_DIR_NAME)
-
-
-def is_inside_upload_or_download(path: object) -> bool:
-    """Return True if *path* resolves inside any chat's upload/ or download/ tree.
-
-    Used by the bash sandbox to refuse execution while cwd is inside one
-    of these staging directories. The check is intentionally conservative:
-    it walks the parent chain looking for a directory whose name matches
-    the upload/download dir name AND whose parent looks like a workspace
-    root (i.e. lives under data_root()/workspaces).
-
-    失败方向：FAIL CLOSED。任何路径解析异常都返回 True（视为"在
-    staging 内"），让 bash sandbox 拒绝执行——此前是 fail-open
-    返回 False，会让 cwd 解析失败时仍允许执行 staging 内的命令，
-    绕过安全边界。
-    """
-    try:
-        resolved = Path(cast(str, path)).expanduser().resolve() if path is not None else None
-    except Exception:
-        # 解析失败：保守地视为"在 staging 内"，让 sandbox 拒绝执行。
-        return True
-    if resolved is None:
-        return True
-    try:
-        ws_root = data_root() / "workspaces"
-        ws_resolved = ws_root.resolve()
-    except Exception:
-        return True
-    # Walk up: if any ancestor is named upload/ or download/ AND that
-    # ancestor's parent is itself under workspaces/, we're inside.
-    target_names = {_UPLOAD_DIR_NAME, _DOWNLOAD_DIR_NAME}
-    current = resolved
-    for _ in range(32):  # bounded climb to avoid pathological loops
-        if current.name in target_names:
-            parent = current.parent
-            if parent == ws_resolved or ws_resolved in parent.parents:
-                return True
-        if current == current.parent:
-            break
-        current = current.parent
-    return False

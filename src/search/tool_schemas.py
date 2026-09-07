@@ -633,15 +633,12 @@ SEARCH_TOOLS = [
                 "UPLOAD & DOWNLOAD DIRECTORIES (inside your workspace root):\n"
                 "- download/ holds files the user has sent you (uploaded documents etc.).\n"
                 "  Read them directly from your cwd: `ls download/`, `cat download/brief.pdf`.\n"
-                "- upload/ is the staging area for outgoing files. To send a file to the\n"
-                "  user, copy it here first (`cp report.pdf upload/report.pdf`), then call\n"
-                "  present_files with the workspace-relative path `upload/report.pdf`.\n"
-                "- Both directories live at the root of your workspace (your starting cwd).\n"
-                "  You MAY freely read and write files inside them via relative paths.\n"
-                "- You MAY NOT `cd` into upload/ or download/, and you MAY NOT execute any\n"
-                "  command while your cwd is inside either of them. The sandbox rejects\n"
-                "  `cd upload/...` and any subsequent command; if a command is rejected,\n"
-                "  `cd` back to your workdir first, then operate via relative paths.\n"
+                "- upload/ is the staging area for outgoing files: present_files only\n"
+                "  sends files that live under upload/. Stage a file there first\n"
+                "  (`cp report.pdf upload/report.pdf`), then present it with\n"
+                "  `present_files([\"upload/report.pdf\"])`.\n"
+                "- Both directories live at the root of your workspace (your starting cwd);\n"
+                "  use relative paths from your cwd to read and write files in them.\n"
                 "\n"
                 "To read a skill's instructions, `cd skills/<skill_id>` from your cwd."
             ),
@@ -692,11 +689,11 @@ SEARCH_TOOLS = [
         "function": {
             "name": "present_files",
             "description": (
-                "Send one or more files from upload/ to the chat as attachments. Files MUST already be "
-                "staged under upload/ via bash (e.g. `cp out.txt upload/out.txt`). Pass "
-                "workspace-relative paths, including the `upload/` prefix (e.g. "
-                "`upload/out.txt` or `upload/reports/report.pdf`). Absolute paths inside "
-                "the per-chat workspace are also accepted. Wildcards are not supported."
+                "Send one or more files from the upload/ staging directory to the chat "
+                "as attachments. Pass workspace-relative paths under upload/ (e.g. "
+                "`upload/out.txt`). Files outside upload/ are rejected — stage them "
+                "first with bash (`cp out.txt upload/out.txt`). Absolute paths are "
+                "accepted only when they resolve inside upload/. Wildcards are not supported."
             ),
             "parameters": {
                 "type": "object",
@@ -704,7 +701,7 @@ SEARCH_TOOLS = [
                     "paths": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "要发送的文件路径列表（相对于 workspace 根目录；待发送文件必须位于 upload/ 下，例如 upload/report.pdf）。"
+                        "description": "要发送的文件路径列表，必须位于 upload/ 暂存区内（如 upload/report.pdf）。其他位置的文件请先用 bash 复制到 upload/ 再发送。"
                     }
                 },
                 "required": ["paths"]

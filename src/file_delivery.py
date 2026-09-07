@@ -1,4 +1,4 @@
-"""execute_present_files：把 workspace 文件作为附件发送到聊天（自 tool_executors.py 拆出）。"""
+"""execute_present_files：把 upload/ 暂存区文件作为附件发送到聊天（自 tool_executors.py 拆出）。"""
 
 import os
 import json
@@ -10,7 +10,8 @@ import aiohttp
 
 from config import BASE_URL
 from workspace_paths import (
-    workspace_upload_root, workspace_workdir,
+    workspace_upload_root,
+    workspace_workdir,
 )
 from workspace_utils import _get_workspace_lock, _ensure_runtime_workspace
 from chat_actions import chat_action_scope
@@ -21,20 +22,19 @@ logger = logging.getLogger(__name__)
 
 
 async def execute_present_files(chat_id: int, paths: List[str], namespace: str | None = None) -> str:
-    """Send staged files from the workspace to the chat as attachments.
+    """Send files from the ``upload/`` staging directory to the chat.
 
-    Paths are workspace-relative. Files MUST be staged under ``upload/``
-    first, for example ``cp out.txt upload/out.txt``; the corresponding call
-    is ``present_files([\"upload/out.txt\"])``. Absolute paths are accepted
-    only when they resolve inside this chat's workspace. The final resolved
-    file must remain inside ``upload/``. This keeps Bash, file tools, and file
-    presentation in one path namespace.
+    Only files under this chat's ``upload/`` directory can be presented.
+    Stage outputs there first via bash (e.g. ``cp out.txt upload/out.txt``),
+    then pass workspace-relative paths such as ``upload/out.txt``. Absolute
+    paths are accepted only when they resolve inside ``upload/``. This keeps
+    Bash, file tools, and file presentation in one path namespace.
     """
     if not paths:
         return json.dumps({
             "sent": [],
             "failed": [],
-            "error": "No paths provided. Files must be staged under upload/ first.",
+            "error": "No paths provided.",
         })
     # ★ init 在 workspace lock 外面执行（同 bash / text_editor）。
     # 显式接收 namespace：与 bash/text_editor 一致，避免依赖 ContextVar
@@ -43,7 +43,6 @@ async def execute_present_files(chat_id: int, paths: List[str], namespace: str |
 
     lock = await _get_workspace_lock(chat_id)
     async with lock:
-        upload_root = workspace_upload_root(chat_id, namespace)
         sent = []
         failed = []
         # 文件大小上限：50MB，防止 OOM
@@ -53,12 +52,6 @@ async def execute_present_files(chat_id: int, paths: List[str], namespace: str |
         # （BASE_URL 里嵌了 bot token），截断 + 脱敏后再写入 failed 列表，
         # 否则这个 list 会被 LLM 看到从而泄露 token。
         timeout = aiohttp.ClientTimeout(total=60)
-        # 在循环外解析一次 upload_root，避免每个文件都重新 resolve。
-        try:
-            upload_resolved = upload_root.resolve()
-        except Exception:
-            logger.debug("execute_present_files 内部忽略的异常", exc_info=True)
-            upload_resolved = upload_root
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for path in paths:
                 if not isinstance(path, str) or not path:
@@ -70,8 +63,7 @@ async def execute_present_files(chat_id: int, paths: List[str], namespace: str |
                     continue
 
                 # ----- 统一 workspace-relative 路径解析 -----
-                # 所有相对路径都相对于唯一 workspace 根目录解析；不再把
-                # present_files 的参数解释成相对于 upload/ 的第二套命名空间。
+                # 所有相对路径都相对于唯一 workspace 根目录解析。
                 raw_path = path.strip()
                 while raw_path.startswith("./"):
                     raw_path = raw_path[2:]
@@ -90,19 +82,23 @@ async def execute_present_files(chat_id: int, paths: List[str], namespace: str |
                 except (OSError, ValueError):
                     failed.append(f"{path} (invalid workspace-relative path)")
                     continue
-                if resolved != upload_resolved and upload_resolved not in resolved.parents:
+                # 工作区边界：解析后必须仍位于本 chat 的 workspace 内
+                # （与 bash / text_editor 的 Landlock 边界一致）。
+                if resolved != workspace and workspace not in resolved.parents:
+                    failed.append(f"{path} (path escapes workspace)")
+                    continue
+                # 发送边界：present_files 只发送 upload/ 暂存区里的文件。
+                # 其他位置的文件一律拒绝，并提示先把文件复制进 upload/。
+                upload_root = workspace_upload_root(chat_id, namespace).resolve()
+                if resolved != upload_root and upload_root not in resolved.parents:
                     failed.append(
-                        f"{path} (not staged: workspace-relative path must be under "
-                        f"upload/, for example upload/{Path(display_path).name})"
+                        f"{path} (not under upload/: stage it first, e.g. `cp {display_path} upload/`)"
                     )
                     continue
 
                 if not resolved.is_file():
                     failed.append(
-                        f"{path} (file not found at workspace path {display_path!r}; "
-                        f"stage it from workspace root with `cp {display_path} "
-                        f"upload/{Path(display_path).name}` and call present_files with "
-                        f"the workspace-relative path `upload/{Path(display_path).name}`)"
+                        f"{path} (file not found at workspace path {display_path!r})"
                     )
                     continue
                 try:

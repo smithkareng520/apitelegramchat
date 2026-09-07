@@ -110,11 +110,10 @@ def _workspace_guide_html(chat_id: int | None, workspace_namespace_value: str | 
 <p>bash 与 text_editor 运行在你专属的工作区中，工作区根目录{path_html}就是 bash 会话的起始目录，也是<b>整个环境里唯一可写的位置</b>：Landlock 沙箱只放行这一棵目录树，<code>/tmp</code>、<code>/home</code>、<code>/</code> 等其他路径一律不可写（多数连读都被拒绝）——在那里写文件会得到 <code>curl</code> exit code 23、Python <code>PermissionError</code>。根目录下有两个特殊子目录，直接用相对路径读写：</p>
 <ul>
   <li><code>download/</code>：用户上传文件（文档等）的落地目录。直接读取即可，如 <code>bash</code> 执行 <code>cat download/报告.pdf</code>，或 <code>text_editor</code> 的 path 填 <code>download/报告.pdf</code>。</li>
-  <li><code>upload/</code>：发送文件给用户的暂存区。所有相对路径都相对于工作区根目录解析。要发送产物时，先用 bash 复制进来（如 <code>cp 结果.docx upload/结果.docx</code>），再调用 <code>present_files</code>，参数必须写工作区相对路径 <code>upload/结果.docx</code>。</li>
+  <li><code>upload/</code>：发送文件给用户的暂存区。要把文件发给用户，先用 bash 把文件复制进去（如 <code>cp 结果.docx upload/结果.docx</code>），再调用 <code>present_files</code>，参数只接受 <code>upload/</code> 下的路径（如 <code>upload/结果.docx</code>）。</li>
 </ul>
 <ul>
   <li>临时文件：<code>TMPDIR</code> 已指向沙箱内可写缓存，mktemp / Python tempfile 开箱即用。</li>
-  <li>不要在upload/ 或 download/其中执行命令；沙箱会拒绝，</li>
 </ul>
 """
 

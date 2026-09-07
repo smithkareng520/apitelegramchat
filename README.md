@@ -379,7 +379,7 @@ amap-maps MCP 委托，不保留本地高德 API 实现。
 ```text
 text_editor      # view / str_replace / create / insert / list，行尾保真 + R2 持久化
 bash             # 持久沙箱会话
-present_files    # 发送 workspace 文件到聊天
+present_files    # 发送 upload/ 暂存区文件到聊天
 ```
 
 ### 生成
@@ -424,9 +424,6 @@ LLM 上下文（只要高价值字段）。`tool_result_condense.py` 统一承�
 ```text
 Telegram 上传 → download/ → Agent/Bash 编辑 → upload/ → present_files → Telegram
 ```
-
-Bash **禁止把 upload/download 作为工作目录执行命令**，避免待发送文件
-或产物 staging 区被运行时文件污染。
 
 ---
 

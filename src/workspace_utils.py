@@ -181,7 +181,7 @@ async def _sync_named_file_to_r2(chat_id: int, local_path: Path, remote_name: st
 # ========== upload/ & download/ 说明 ==========
 # upload/ 与 download/ 是 workspace 根目录的两棵子树：
 #   - download/：用户上传文档的本地落地缓冲（Telegram → R2 缓存 → 本地）；
-#   - upload/：待发送产物的暂存区（present_files 只从这里读取）。
+#   - upload/：待发送产物的暂存区（present_files 只接受 upload/ 下的文件）。
 # bash 本就能直接读写这两棵子树（相对路径即可），无需跨边界原语：
 # 模型直接使用 bash：`cat download/x.pdf`、`cp out.txt upload/out.txt`。
 #

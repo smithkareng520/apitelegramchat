@@ -18,7 +18,6 @@ from sandbox import (
 from workspace_paths import (
     workspace_root, workspace_workdir, runtime_cache_root, workspace_namespace,
     workspace_upload_root, workspace_download_root,
-    is_inside_upload_or_download,
 )
 from workspace_utils import _get_workspace_lock, _ensure_runtime_workspace
 from tool_ui_render import _strip_ansi
@@ -248,8 +247,8 @@ class BashSession:
         self._runtime_prepare_lock = asyncio.Lock()
         # cwd 必须由模型通过 `cd` 自己控制；选择使用 skill 后可进入
         # `skills/<skill_id>`，persistent bash 会保持当前目录与 shell 状态。
-        # 跟踪上一次命令结束后的真实 PWD，用于在 upload/ 或 download/ 子树内
-        # 拒绝执行下一条命令。None 表示尚未执行过命令，假定位于 workdir。
+        # 跟踪上一次命令结束后的真实 PWD：结果信封的提示符与隔离执行的
+        # 起始 cwd 都依赖它。None 表示尚未执行过命令，假定位于 workdir。
         self._last_cwd: Optional[str] = str(self.workdir.absolute())
         # persistent shell 自身的 cwd（隔离/heredoc 执行不回写该值）。
         # 结果信封的提示符用它：保证模型看到的 ``path$`` 永远是命令真正
@@ -287,8 +286,8 @@ class BashSession:
         workspace_upload_root(self.chat_id, self.namespace)
         workspace_download_root(self.chat_id, self.namespace)
 
-        # 新进程的 cwd 必然是 workdir；重置 _last_cwd，避免上一次会话
-        # 残留的 cwd 状态误拒下一条命令。
+        # 新进程的 cwd 必然是 workdir；重置 _last_cwd，让信封提示符从
+        # 工作区根目录重新开始。
         self._last_cwd = str(self.workdir.absolute())
         self._persistent_cwd = str(self.workdir.absolute())
 
@@ -366,29 +365,6 @@ class BashSession:
          "anonymous fork function"),
     ]
 
-    # ===================== upload/ & download/ 子树保护 =====================
-    # 这两棵子树是“产物暂存区”和“用户上传落地”，不允许 bash 在其中执行命令。
-    # 主要威胁：模型 cd 进 upload/ 之后跑 `pip install`，会把整个依赖树装进
-    # upload/，污染即将发给用户的产物；同理 download/ 也不允许被执行污染。
-    #
-    # 检测策略：
-    #   1. 命令字符串里的 `cd` 目标若指向 upload/ 或 download/（任意前缀形式：
-    #      `upload/`, `./upload/`, `../upload/`, `../upload/sub`, 绝对路径等）
-    #      直接拒绝。
-    #   2. 每次执行前检查 _last_cwd；若已经在 upload/ 或 download/ 内，拒绝执行
-    #      并提示模型先 `cd` 回 workdir。
-    _UPLOAD_DOWNLOAD_CD_PATTERN = re.compile(
-        r"""(?:^|[\s;&|`(])       # 命令起始或分隔符
-            cd\s+                 # cd 命令
-            (?:['"]?)             # 可选引号
-            (?:\./)?              # 可选 ./
-            (?:\.\./)*            # 任意数量的 ../
-            (?:upload|download)   # 目标目录名
-            (?:/|['"]|\s|$)       # 后续分隔
-        """,
-        re.VERBOSE,
-    )
-
     def _is_safe(self, command: str) -> bool:
         """最小黑名单，仅拦极端操作；其余靠沙箱"""
         if not command or not command.strip():
@@ -397,36 +373,6 @@ class BashSession:
             if pattern.search(command):
                 logger.warning(f"🚫 Bash rejected ({name}) chat_id={self.chat_id}: {command[:200]}")
                 return False
-        # 允许进入 download/upload 目录做只读检查。
-        # 旧逻辑会直接拒绝:
-        #   cd download && ls -lh
-        # 这会阻止 AI 分析用户上传文件。
-        # 写入、删除、执行等危险操作仍由 _DANGEROUS_PATTERNS 和沙箱控制。
-        # 拒绝在 upload/ 或 download/ 子树内执行任何命令
-        if self._last_cwd and is_inside_upload_or_download(self._last_cwd):
-            # 修复问题2：如果当前在 upload/download 内，但命令是返回工作目录的 cd 命令，
-            # 则允许执行，让模型能够逃离陷阱。检测模式：
-            # - cd $WORKSPACE
-            # - cd /path/to/workspace
-            # - cd (不带参数，返回 HOME，但沙箱中 HOME=WORKSPACE)
-            # - cd .. (可能需要多次才能离开，但至少允许尝试)
-            cmd_stripped = command.strip()
-            if re.match(r'^cd(\s+\$WORKSPACE|\s+\$HOME|\s*$|\s+\.\.(/\.\.)*)(\s*[;&|]|$)', cmd_stripped):
-                logger.info(
-                    f"✓ Bash allowed escape-cd from upload/download chat_id={self.chat_id} cwd={self._last_cwd} cmd={command[:100]}"
-                )
-                return True
-            # 也允许绝对路径 cd 到工作目录
-            workspace_path = str(self.workdir.absolute())
-            if re.match(rf'^cd\s+["\']?{re.escape(workspace_path)}["\']?(\s*[;&|]|$)', cmd_stripped):
-                logger.info(
-                    f"✓ Bash allowed escape-cd (absolute) from upload/download chat_id={self.chat_id} cwd={self._last_cwd}"
-                )
-                return True
-            logger.warning(
-                f"🚫 Bash rejected (cwd inside upload/download) chat_id={self.chat_id} cwd={self._last_cwd}"
-            )
-            return False
         return True
 
     @staticmethod
@@ -619,24 +565,6 @@ class BashSession:
 
             if not self._is_safe(command):
                 # 给出更可操作的错误信息，让模型知道为什么被拒、该怎么做。
-                if self._last_cwd and is_inside_upload_or_download(self._last_cwd):
-                    return (
-                        f"Error: Command rejected — current shell cwd is inside an "
-                        f"upload/ or download/ staging tree ({self._last_cwd}). "
-                        f"These directories are read/write data buffers, not execution "
-                        f"roots: running commands here (e.g. pip install) would pollute "
-                        f"the staging area. Run `cd` to return to your workdir first, "
-                        f"then re-issue the command."
-                    )
-                if self._UPLOAD_DOWNLOAD_CD_PATTERN.search(command):
-                    return (
-                        "Error: Command rejected — `cd` into upload/ or download/ is "
-                        "not allowed. These directories are data buffers directly inside "
-                        "your workspace root: read and write files in them via relative "
-                        "paths from your workdir (e.g. `cp out.txt upload/out.txt`, "
-                        "`cat download/doc.pdf`), but never execute commands from "
-                        "inside them."
-                    )
                 return f"Error: Command rejected for security reasons: {command}"
 
             # Any command containing a heredoc, OR any command bash would
@@ -753,9 +681,7 @@ class BashSession:
                     actual_cwd = cwd_match.group(1).strip()
                     output = re.sub(r'(?m)^' + re.escape(cwd_marker) + r' .*$\n?', '', output)
 
-                # 记录最新 cwd，下一次 _is_safe 会据此拒绝在 upload/ 或 download/
-                # 子树内继续执行命令。即便 cd 进入被拒，模型也可能通过 pushd /
-                # 子 shell 等方式间接进入，这里再做一次防御性检查。
+                # 记录最新 cwd：结果信封提示符与隔离执行起始目录都依赖它。
                 self._last_cwd = actual_cwd
                 self._persistent_cwd = actual_cwd
 
