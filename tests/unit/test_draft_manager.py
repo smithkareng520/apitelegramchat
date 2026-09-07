@@ -219,7 +219,52 @@ def test_2_long_content_rolls_at_complete_markdown_block(env):
 #   Agent 侧：tool result 立即进入上下文、下一轮立即开始（不等待 UI）
 #   UI 侧：tool call + tool result 完整落在同一草稿
 # ---------------------------------------------------------------------
-def test_3_tool_group_intact_and_agent_not_blocked(env):
+def test_tool_batch_end_consumes_newly_armed_rollover_without_waiting_for_next_round(env):
+    """回归：tool.result 后才越过预警阈值时，tool.end 就是最近安全点。
+
+    旧实现的问题是 _rollover_pending 只在异步 flush() 中 arm；TOOL_END 先
+    检查 pending，往往读到 False，随后下一轮 reasoning 的 flush 才把 pending
+    置上，导致必须等 reasoning.end 才 rollover。现在 safe boundary 会同步补做
+    一次容量扫描，因此完整工具批次收束后即可调度滚动。
+    """
+    async def scenario():
+        builder, manager, sends = env["builder"], env["manager"], env["sends"]
+        old_draft_id = builder.draft_id
+
+        manager.add_tool_item(
+            "call_regression", "web_search", "Searching the web",
+            search_query="large result", fn_args={"query": "large result"},
+        )
+        token = manager.begin_tool_batch()
+
+        # 最后的工具结果本身把当前草稿推过交互预警阈值；不显式调用 flush，
+        # 模拟生产中的“异步 flush 尚未来得及 arm”窗口。
+        huge_result = "<p>" + ("工具返回内容。" * 1200) + "</p>"
+        manager.update_tool_item(
+            "call_regression", "Search complete", huge_result, status="done")
+        assert builder._rollover_pending is False
+
+        manager.finish_tool_batch(token)
+
+        # tool.end 本身就是完整工具批次的最近退出点；这里必须已经调度，
+        # 而不是等下一轮 reasoning.end。
+        assert manager._swap_scheduled is True
+        assert builder._rollover_pending is True
+
+        await _await_swap(manager)
+
+        assert sends.permanent_count == 1
+        assert old_draft_id in sends.dead
+        assert builder.draft_id != old_draft_id
+        permanent_html = sends.permanent[0]
+        assert "Search complete" in permanent_html
+        assert "工具返回内容" in permanent_html
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------
+# Test 3（场景三）：tool call + result + 下一轮回答
     async def scenario():
         builder, manager, sends = env["builder"], env["manager"], env["sends"]
         old_draft_id = builder.draft_id

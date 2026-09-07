@@ -570,9 +570,17 @@ class DraftManager:
     def _handle_safe_boundary(self) -> None:
         """安全切换点统一入口（非阻塞）。
 
-        条件全部满足才调度后台滚动：容量预警已置位（§6）、无未收束
-        工具组（§7 场景三守卫）、没有已在排队/执行的滚动。工具组未
-        收束时进入 WAIT_SAFE_POINT，由随后的 tool.end 再触发。
+        设计为“预警状态 + 最近安全边界”：
+
+        1. 预警通常由异步 flush 发现并置位；
+        2. 到达任一安全边界时，再同步补做一次容量扫描，避免“内容已经
+           超阈值，但异步 flush 尚未来得及 arm”而错过最近退出点；
+        3. 一旦预警成立，就在当前安全边界兑现。
+
+        对工具批次尤其重要：最后一个 tool result 已写入 builder 后，
+        ``tool.end`` 本身就是这一轮完整工具批次的最近安全退出点。
+        此处必须先补做预警扫描，再判断是否需要 rollover，否则会把切换
+        错过到下一轮 reasoning.end / content.end。
         """
         builder = self._builder
         if getattr(builder, "silent", False):
@@ -582,6 +590,24 @@ class DraftManager:
             self._rollover_task is not None and not self._rollover_task.done()
         ):
             return  # 幂等：已有滚动在排队/执行
+
+        # 关键修复：不要只读取旧的 _rollover_pending。
+        # 容量预警通常在异步 flush() 中 arm，但 tool.end / text.end /
+        # reasoning.end 是“最近退出点”，如果这里不立即补扫，就会错过
+        # 这个安全边界，直到下一次 flush 才把 pending 置上，最终只能等
+        # 更晚的 reasoning.end / content.end。
+        try:
+            builder._arm_rollover_if_needed()
+        except Exception:
+            # 安全点不应因为诊断性的容量扫描异常而阻断 Agent；保留原有
+            # pending 状态，下一次 flush / 安全点仍可继续尝试。
+            logger.debug(
+                "安全边界容量预警扫描失败: chat=%s draft=%s",
+                getattr(builder, "chat_id", None),
+                getattr(builder, "draft_id", None),
+                exc_info=True,
+            )
+
         if not getattr(builder, "_rollover_pending", False):
             return
         if builder._has_pending_tool_group():
