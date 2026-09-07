@@ -61,6 +61,7 @@ from ai.media_generation import (
     _request_openrouter_video,
     _response_items_to_bytes,
     _upload_generated_images_to_r2,
+    _validate_image_bytes,
     IMAGES_API_PROVIDERS,
 )
 from ai.tool_summary import (
@@ -1057,7 +1058,7 @@ async def _agentic_loop_native_image(
 
             # 响应里下游只读取 usage；直接取值即可。
             usage = response_json.get("usage")
-            image_bytes_list = await _response_items_to_bytes(response_json)
+            image_bytes_list = await _response_items_to_bytes(response_json, max_images=1)
 
             if not image_bytes_list:
                 try:
@@ -1185,8 +1186,10 @@ async def _agentic_loop_native_image(
         if img_url.startswith("data:image"):
             try:
                 _, base64_data = img_url.split(",", 1)
-                img_bytes = base64.b64decode(base64_data)
-                image_bytes_list.append(img_bytes)
+                img_bytes = base64.b64decode(base64_data, validate=True)
+                validated = _validate_image_bytes(img_bytes, source="agentic_data_url")
+                if validated is not None:
+                    image_bytes_list.append(validated)
             except Exception as e:
                 logger.error(f"Base64 decode failed: {e}")
         elif img_url.startswith("http"):
@@ -1194,8 +1197,14 @@ async def _agentic_loop_native_image(
                 async with aiohttp.ClientSession() as session:
                     async with session.get(img_url, timeout=30) as resp:
                         if resp.status == 200:
+                            content_type = str(resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                            if content_type and not content_type.startswith("image/"):
+                                logger.warning("[NativeImage] agentic 远端响应不是图片 Content-Type=%s: %s", content_type or "-", img_url[:120])
+                                continue
                             img_bytes = await resp.read()
-                            image_bytes_list.append(img_bytes)
+                            validated = _validate_image_bytes(img_bytes, source=img_url)
+                            if validated is not None:
+                                image_bytes_list.append(validated)
                         else:
                             logger.warning(f"Download image {img_url} failed: {resp.status}")
             except Exception as e:

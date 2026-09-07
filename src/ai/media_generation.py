@@ -12,6 +12,7 @@
 """
 import asyncio
 import json
+import io
 import aiohttp
 import base64
 import re
@@ -19,6 +20,7 @@ import mimetypes
 import time
 import uuid
 from typing import Optional, Any, cast
+from PIL import Image, UnidentifiedImageError
 from collections.abc import Callable
 
 from config import (
@@ -178,18 +180,19 @@ def _aspect_ratio_to_openai_size(aspect_ratio: str | None) -> str | None:
 
 
 async def _upload_generated_images_to_r2(image_bytes_list: list[bytes]) -> list[str]:
-    """统一后处理：把生成图片逐张上传 R2，返回成功上传的公网 URL 列表。
-
-    agentic 原生图像循环与工具图像生成（execute_generate_image）此前各写
-    一份相同的上传循环，这里合并为单一实现；部分失败不抛异常，由调用方
-    根据"上传数 < 生成数"自行决定提示文案。
-    """
-    # 局部导入避免与 s3_utils 的初始化顺序耦合（s3_utils 依赖 config/R2 配置）
+    """统一后处理：验证真实图片后上传 R2，并使用正确的扩展名/MIME。"""
     from s3_utils import upload_bytes_to_r2
     uploaded_urls: list[str] = []
     for idx, img_bytes in enumerate(image_bytes_list or []):
-        key = f"generated/{uuid.uuid4().hex}_{idx}.png"
-        url = await upload_bytes_to_r2(img_bytes, key, "image/png")
+        validated = _validate_image_bytes(img_bytes, source=f'r2_upload[{idx}]')
+        if validated is None:
+            continue
+        mime_ext = _detect_valid_image(validated)
+        if mime_ext is None:
+            continue
+        mime, ext = mime_ext
+        key = f"generated/{uuid.uuid4().hex}_{idx}.{ext}"
+        url = await upload_bytes_to_r2(validated, key, mime)
         if url:
             uploaded_urls.append(url)
         else:
@@ -1022,120 +1025,147 @@ async def _request_images_generations(
     )
 
 
-def _extract_image_items(response_json: dict) -> list[dict]:
-    """
-    从 ModelScope / OpenRouter 等响应中提取图片 URL 或 base64。
-    支持递归遍历，处理 output_images, images, results, data, choices 等字段。
+def _extract_image_items(response_json: dict, max_items: int = 4) -> list[dict]:
+    """严格从图像结果字段提取图片 URL/base64，避免把普通 URL 当成图片。
+
+    只信任显式的图片承载字段：data/output_images/images/results/choices/output、
+    message.images，以及 content 中 type=image/image_url 的部分；不会再对整个
+    response 做“发现 https URL 就当图片”的全量递归。
     """
     if not isinstance(response_json, dict):
         return []
 
-    items = []
-    seen = set()
+    limit = max(1, min(int(max_items or 1), 20))
+    items: list[dict] = []
+    seen: set[tuple[str, str]] = set()
 
-    def _looks_like_image_payload(value: str) -> bool:
+    def _push_url(url: str) -> None:
+        value = str(url or '').strip()
+        if not value or not value.startswith(('http://', 'https://', 'data:image/')):
+            return
+        sig = ('url', value)
+        if sig not in seen and len(items) < limit:
+            seen.add(sig)
+            items.append({'image_url': {'url': value}})
+
+    def _push_b64(value: str) -> None:
+        value = str(value or '').strip()
         if not value:
+            return
+        sig = ('b64', value)
+        if sig not in seen and len(items) < limit:
+            seen.add(sig)
+            items.append({'b64_json': value})
+
+    def _extract_explicit_image_fields(obj: Any, allow_bare_url: bool = False) -> bool:
+        """处理一个 dict 自身明确声明的图片字段；返回是否命中过。"""
+        if not isinstance(obj, dict) or len(items) >= limit:
             return False
-        value = value.strip()
-        return value.startswith(('http://', 'https://', 'data:image/'))
+        found = False
 
-    def _push_item(item: Any) -> None:
-        if item is None:
-            return
-        if isinstance(item, str):
-            value = item.strip()
-            if value and _looks_like_image_payload(value):
-                sig = ('url', value)
-                if sig not in seen:
-                    seen.add(sig)
-                    items.append({'image_url': {'url': value}})
-            return
-        if isinstance(item, dict):
-            sig = ('dict', json.dumps(item, sort_keys=True, ensure_ascii=False, default=str))
-            if sig not in seen:
-                seen.add(sig)
-                items.append(item)
+        for key in ('b64_json', 'base64', 'image_base64'):
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                _push_b64(value)
+                found = True
 
-    def _walk(obj: Any, path: str = 'root') -> None:
-        if len(items) >= 20:
+        for key in ('image_url', 'output_image', 'image_uri'):
+            value = obj.get(key)
+            if isinstance(value, dict):
+                url = value.get('url') or value.get('href') or value.get('link')
+                if isinstance(url, str) and url.strip():
+                    _push_url(url)
+                    found = True
+            elif isinstance(value, str) and value.strip():
+                _push_url(value)
+                found = True
+
+        # 某些 Images API 直接使用 {"url": "..."}。
+        url_value = obj.get('url')
+        if isinstance(url_value, str) and url_value.strip() and (allow_bare_url or 'b64_json' in obj or 'image_url' in obj or obj.get('type') in {'image', 'image_url'}):
+            _push_url(url_value)
+            found = True
+
+        return found
+
+    def _walk_image_container(value: Any) -> None:
+        if len(items) >= limit:
             return
-        if isinstance(obj, dict):
-            # 显式处理常见图片字段的字符串列表
-            for key in ('output_images', 'images', 'results', 'data', 'choices', 'output'):
-                value = obj.get(key)
-                if isinstance(value, list):
-                    for idx, elem in enumerate(value):
-                        if isinstance(elem, str):
-                            _push_item(elem)
+        if isinstance(value, list):
+            for elem in value:
+                if len(items) >= limit:
+                    break
+                if isinstance(elem, str):
+                    # 仅在已知图片容器（如 data/images）内接受裸 URL。
+                    _push_url(elem)
+                elif isinstance(elem, dict):
+                    explicit = _extract_explicit_image_fields(elem, allow_bare_url=True)
+                    # 允许继续进入“消息/内容/图片数组”等已知图片容器，
+                    # 但不扫描错误、元数据、debug 等任意字段。
+                    for key in ('images', 'output_images', 'data', 'results', 'choices', 'output', 'message', 'content'):
+                        if key not in elem or len(items) >= limit:
+                            continue
+                        child = elem.get(key)
+                        if key == 'content' and isinstance(child, list):
+                            for part in child:
+                                if not isinstance(part, dict):
+                                    continue
+                                ptype = str(part.get('type') or '').lower()
+                                if ptype in {'image', 'image_url'}:
+                                    _extract_explicit_image_fields(part)
                         else:
-                            _walk(elem, f'{path}.{key}[{idx}]')
-                elif isinstance(value, dict):
-                    _walk(value, f'{path}.{key}')
+                            _walk_image_container(child)
+        elif isinstance(value, dict):
+            _extract_explicit_image_fields(value, allow_bare_url=True)
+            for key in ('images', 'output_images', 'data', 'results', 'choices', 'output', 'message', 'content'):
+                if key in value and len(items) < limit:
+                    child = value.get(key)
+                    if key == 'content' and isinstance(child, list):
+                        for part in child:
+                            if isinstance(part, dict) and str(part.get('type') or '').lower() in {'image', 'image_url'}:
+                                _extract_explicit_image_fields(part)
+                    else:
+                        _walk_image_container(child)
 
-            # 处理 base64 字段
-            for key in ('b64_json', 'base64', 'image_base64'):
-                value = obj.get(key)
-                if isinstance(value, str) and value.strip():
-                    _push_item({'b64_json': value.strip()})
+    for key in ('data', 'output_images', 'images', 'results', 'choices', 'output'):
+        if key in response_json and len(items) < limit:
+            _walk_image_container(response_json.get(key))
 
-            # 处理 URL 字段
-            for key in ('url', 'image_url', 'output_image', 'image_uri'):
-                value = obj.get(key)
-                if isinstance(value, dict):
-                    url = str(value.get('url') or value.get('href') or value.get('link') or '').strip()
-                    if url:
-                        _push_item({'image_url': {'url': url}})
-                elif isinstance(value, str):
-                    value = value.strip()
-                    if _looks_like_image_payload(value):
-                        _push_item({'image_url': {'url': value}})
-
-            # 递归其他嵌套字段（跳过已处理的）
-            for key, value in obj.items():
-                if key in {'output_images', 'images', 'results', 'data', 'choices', 'content',
-                           'url', 'image_url', 'output_image', 'image_uri',
-                           'b64_json', 'base64', 'image_base64'}:
-                    continue
-                if isinstance(value, (dict, list)):
-                    _walk(value, f'{path}.{key}')
-
-            # 处理 content 列表（OpenAI 格式）
-            content = obj.get('content')
-            if isinstance(content, list):
-                for idx, part in enumerate(content):
-                    if isinstance(part, dict):
-                        ptype = str(part.get('type') or '').lower()
-                        if ptype in ('image_url', 'image', 'file'):
-                            if isinstance(part.get('image_url'), dict):
-                                url = str(part['image_url'].get('url') or '').strip()
-                                if url:
-                                    _push_item({'image_url': {'url': url}})
-                            elif isinstance(part.get('image_url'), str):
-                                url = part['image_url'].strip()
-                                if url:
-                                    _push_item({'image_url': {'url': url}})
-                            elif isinstance(part.get('url'), str):
-                                url = part['url'].strip()
-                                if url:
-                                    _push_item({'image_url': {'url': url}})
-
-        elif isinstance(obj, list):
-            for idx, item in enumerate(obj):
-                _walk(item, f'{path}[{idx}]')
-        elif isinstance(obj, str):
-            _push_item(obj)
-
-    # 先处理顶层常见字段
-    for key in ('data', 'choices', 'output', 'results', 'images', 'output_images'):
-        value = response_json.get(key)
-        if isinstance(value, (dict, list)):
-            _walk(value, f'root.{key}')
-        elif isinstance(value, str):
-            _push_item(value)
-
-    # 全量递归（兜底）
-    _walk(response_json)
+    # 兼容某些 provider 把最终图片直接放在顶层，但仍要求字段本身明确是图片字段。
+    _extract_explicit_image_fields(response_json)
     return items
+
+
+def _detect_valid_image(bytes_data: bytes) -> tuple[str, str] | None:
+    """验证字节确实是一张可解析的栅格图片，并返回 (mime, extension)。"""
+    if not isinstance(bytes_data, (bytes, bytearray)) or not bytes_data:
+        return None
+    try:
+        with Image.open(io.BytesIO(bytes(bytes_data))) as image:
+            image.verify()
+            fmt = (image.format or '').upper()
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
+    except Exception:
+        logger.debug('[NativeImage] 图片内容验证异常', exc_info=True)
+        return None
+
+    format_map = {
+        'PNG': ('image/png', 'png'),
+        'JPEG': ('image/jpeg', 'jpg'),
+        'WEBP': ('image/webp', 'webp'),
+        'GIF': ('image/gif', 'gif'),
+    }
+    return format_map.get(fmt)
+
+
+def _validate_image_bytes(bytes_data: bytes, source: str = '') -> bytes | None:
+    """只允许真正可解析的图片字节进入 R2。"""
+    detected = _detect_valid_image(bytes_data)
+    if detected is None:
+        logger.warning('[NativeImage] rejected non-image payload: source=%s size=%s', source[:160], len(bytes_data or b''))
+        return None
+    return bytes(bytes_data)
 
 
 def _extract_native_message_text(content: Any) -> str:
@@ -1213,9 +1243,10 @@ def _format_native_image_notice(
     return "⚠️ 图片生成失败，请稍后重试。"
 
 
-async def _response_items_to_bytes(response_json: dict) -> list[bytes]:
+async def _response_items_to_bytes(response_json: dict, max_images: int = 4) -> list[bytes]:
     image_bytes_list: list[bytes] = []
-    items = _extract_image_items(response_json)
+    limit = max(1, min(int(max_images or 1), 4))
+    items = _extract_image_items(response_json, max_items=limit)
     logger.debug("[NativeImage/ModelScope] extracted image item count=%s", len(items))
     # 防止恶意/失控的上游用超大 base64 串触发 OOM：
     # 单张图片的 base64 串超过 25 MB 时直接拒绝解码。
@@ -1238,7 +1269,12 @@ async def _response_items_to_bytes(response_json: dict) -> list[bytes]:
                     )
                     continue
                 try:
-                    image_bytes_list.append(base64.b64decode(b64_json))
+                    decoded = base64.b64decode(b64_json, validate=True)
+                    validated = _validate_image_bytes(decoded, source='b64_json')
+                    if validated is not None:
+                        image_bytes_list.append(validated)
+                    if len(image_bytes_list) >= limit:
+                        break
                     continue
                 except Exception as e:
                     logger.warning(f"[NativeImage] Base64 图片解码失败: {e}")
@@ -1252,7 +1288,12 @@ async def _response_items_to_bytes(response_json: dict) -> list[bytes]:
                             len(base64_data), MAX_BASE64_ENCODED_BYTES,
                         )
                         continue
-                    image_bytes_list.append(base64.b64decode(base64_data))
+                    decoded = base64.b64decode(base64_data, validate=True)
+                    validated = _validate_image_bytes(decoded, source='data_url')
+                    if validated is not None:
+                        image_bytes_list.append(validated)
+                    if len(image_bytes_list) >= limit:
+                        break
                     continue
                 except Exception as e:
                     logger.warning(f"[NativeImage] data URL 解码失败: {e}")
@@ -1271,7 +1312,15 @@ async def _response_items_to_bytes(response_json: dict) -> list[bytes]:
                                     max_remote, img_url[:120],
                                 )
                                 continue
-                            image_bytes_list.append(image_bytes)
+                            content_type = str(resp.headers.get('Content-Type') or '').split(';', 1)[0].strip().lower()
+                            if content_type and not content_type.startswith('image/'):
+                                logger.warning('[NativeImage] 远端响应不是图片，跳过: content_type=%s url=%s', content_type or '-', img_url[:120])
+                                continue
+                            validated = _validate_image_bytes(image_bytes, source=img_url)
+                            if validated is not None:
+                                image_bytes_list.append(validated)
+                            if len(image_bytes_list) >= limit:
+                                break
                         else:
                             logger.warning(f"[NativeImage] 下载生成图片失败 {resp.status}: {img_url[:120]}")
                 except Exception as e:

@@ -65,6 +65,7 @@ async def execute_generate_image(
         _request_images_generations,
         _response_items_to_bytes,
         _upload_generated_images_to_r2,
+        _validate_image_bytes,
         IMAGES_API_PROVIDERS,
     )
     MODEL_ALIAS_MAP = {
@@ -109,7 +110,7 @@ async def execute_generate_image(
                 model=model,
             )
         try:
-            image_bytes_list = await _response_items_to_bytes(response_json)
+            image_bytes_list = await _response_items_to_bytes(response_json, max_images=num_images)
             if not image_bytes_list:
                 return _format_image_api_error(
                     api_name=f"{api_display_name} 图像接口",
@@ -203,8 +204,10 @@ async def execute_generate_image(
                     if img_url.startswith("data:image"):
                         try:
                             _, base64_data = img_url.split(",", 1)
-                            img_bytes = base64.b64decode(base64_data)
-                            image_bytes_list.append(img_bytes)
+                            img_bytes = base64.b64decode(base64_data, validate=True)
+                            validated = _validate_image_bytes(img_bytes, source="tool_data_url")
+                            if validated is not None:
+                                image_bytes_list.append(validated)
                             continue
                         except Exception as e:
                             logger.error(f"Base64 解码失败: {e}")
@@ -221,10 +224,16 @@ async def execute_generate_image(
                                     headers={"User-Agent": "Mozilla/5.0"}
                                 ) as img_resp:
                                     if img_resp.status == 200:
+                                        content_type = str(img_resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                                        if content_type and not content_type.startswith("image/"):
+                                            logger.warning("图像 URL 返回非图片 Content-Type=%s: %s", content_type or "-", img_url[:120])
+                                            break
                                         img_bytes = await img_resp.read()
-                                        image_bytes_list.append(img_bytes)
-                                        downloaded = True
-                                        break
+                                        validated = _validate_image_bytes(img_bytes, source=img_url)
+                                        if validated is not None:
+                                            image_bytes_list.append(validated)
+                                            downloaded = True
+                                            break
                             except Exception as e:
                                 logger.warning(f"下载图片 {img_url} 异常: {e}")
                             await asyncio.sleep(1 + attempt)
@@ -237,6 +246,7 @@ async def execute_generate_image(
                     return f"⚠️ 图片生成成功，但下载全部失败。失败项: {', '.join(download_errors)}"
 
                 # 与 Images 协议分支共用同一 R2 上传实现
+                image_bytes_list = image_bytes_list[:num_images]
                 uploaded_urls = await _upload_generated_images_to_r2(image_bytes_list)
 
                 if not uploaded_urls:
