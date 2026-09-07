@@ -84,6 +84,11 @@ from ai.gemini_cache import manager as _gemini_cache_manager
 if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
 
+from core.messages import (
+    AudioBlock, DocumentBlock, ImageBlock, Message, TextBlock, ToolCallBlock,
+    ToolResultBlock,
+)
+
 logger = get_logger(__name__)
 
 # Gemini 原生 API 基址（v1beta generateContent 协议；非 OpenAI 兼容层）。
@@ -394,29 +399,20 @@ def _data_url_to_inline_data(url: str) -> Optional[dict]:
     return {"inlineData": {"mimeType": mime, "data": b64}}
 
 
-def _openai_content_to_gemini_parts(content: Any) -> list:
-    """把 OpenAI 的 content（str 或 content-parts 列表）转换成 Gemini
-    原生 parts 列表。支持的 part 类型：text / image_url（data:base64
-    内联与 http(s) 公开 URL）/ video_url / input_audio；未识别的类型
-    退化为文本占位，不中断请求。
-    """
-    if content is None:
-        return []
-    if isinstance(content, str):
-        return [{"text": content}] if content else []
+def _blocks_to_gemini_parts(blocks: list) -> list:
+    """把内部内容块列表转换成 Gemini 原生 parts。
 
+    支持的块：TextBlock / ImageBlock（data:base64 内联与 http(s) 公开
+    URL）/ VideoBlock / AudioBlock；DocumentBlock 当前模型未开启该能力，
+    防御性降级为文本占位；未识别的块退化为文本占位，不中断请求。
+    """
     parts: list[dict[str, Any]] = []
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        ptype = part.get("type")
-        if ptype == "text":
-            text = str(part.get("text") or "")
-            if text:
-                parts.append({"text": text})
-        elif ptype == "image_url":
-            url_obj = part.get("image_url") or {}
-            url = url_obj.get("url", "") if isinstance(url_obj, dict) else str(url_obj)
+    for block in blocks:
+        if isinstance(block, TextBlock):
+            if block.text:
+                parts.append({"text": block.text})
+        elif isinstance(block, ImageBlock):
+            url = block.url or ""
             if url.startswith("data:"):
                 inline = _data_url_to_inline_data(url)
                 if inline:
@@ -428,18 +424,16 @@ def _openai_content_to_gemini_parts(content: Any) -> list:
                     "fileUri": url,
                     "mimeType": _guess_mime_from_url(url, "image/jpeg"),
                 }})
-        elif ptype == "video_url":
-            url_obj = part.get("video_url") or {}
-            url = url_obj.get("url", "") if isinstance(url_obj, dict) else str(url_obj)
+        elif isinstance(block, VideoBlock):
+            url = block.url or ""
             if url:
                 parts.append({"fileData": {
                     "fileUri": url,
                     "mimeType": _guess_mime_from_url(url, "video/mp4"),
                 }})
-        elif ptype == "input_audio":
-            audio = part.get("input_audio") or {}
-            data = str(audio.get("data") or "")
-            fmt = str(audio.get("format") or "ogg").lower().lstrip(".")
+        elif isinstance(block, AudioBlock):
+            data = str(block.data or "")
+            fmt = str(block.format or "ogg").lower().lstrip(".")
             if fmt == "oga":
                 fmt = "ogg"
             if data:
@@ -447,12 +441,12 @@ def _openai_content_to_gemini_parts(content: Any) -> list:
                     "mimeType": f"audio/{fmt}",
                     "data": data,
                 }})
-        elif ptype == "file":
-            # 原生文档 part 仅 Anthropic（native_document=True）启用；
+        elif isinstance(block, DocumentBlock):
+            # 原生文档块仅 Anthropic（native_document=True）启用；
             # Gemini 当前模型未开启该能力，防御性降级为文本占位。
             parts.append({"text": "[收到一个文档附件，当前模型不支持原生文档输入]"})
         else:
-            parts.append({"text": f"[不支持的内容类型: {ptype or 'unknown'}]"})
+            parts.append({"text": f"[不支持的内容类型: {getattr(block, 'kind', lambda: type(block).__name__)()}]"})
     return parts
 
 
@@ -461,13 +455,11 @@ def _tool_name_for_call_id(messages: list, tool_call_id: str) -> str:
     必须与 functionCall.name 一致，否则 Gemini 拒绝配对）。"""
     if not tool_call_id:
         return ""
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        for tc in (msg.get("tool_calls") or []):
-            if isinstance(tc, dict) and tc.get("id") == tool_call_id:
-                fn = tc.get("function") or {}
-                return str(fn.get("name") or "")
+    for raw in messages:
+        msg = raw if isinstance(raw, Message) else Message.from_openai_dict(raw)
+        for tc in msg.tool_calls():
+            if tc.id == tool_call_id:
+                return str(tc.name or "")
     return ""
 
 
@@ -487,8 +479,28 @@ def _merge_consecutive_contents(contents: list) -> list:
     return merged
 
 
+def _thought_signature_for(tc: "ToolCallBlock") -> str:
+    """从 ToolCallBlock.extra 提取 thoughtSignature（双存储格式兼容）。
+
+    旧 Gemini 兼容循环把签名写进 wire tool_call 的两个键：
+      - thought_signature: "<sig>"
+      - extra_content: {"google": {"thought_signature": "<sig>"}}
+    Message.assistant_with_tool_calls 会把这两个键原样收进 extra。
+    """
+    extra = tc.extra or {}
+    sig = extra.get("thought_signature")
+    if sig:
+        return str(sig)
+    extra_content = extra.get("extra_content")
+    if isinstance(extra_content, dict):
+        google = extra_content.get("google")
+        if isinstance(google, dict) and google.get("thought_signature"):
+            return str(google["thought_signature"])
+    return ""
+
+
 def _convert_messages_to_gemini(messages: list) -> tuple:
-    """把 OpenAI 形状的消息列表转换成 Gemini 的
+    """把内部消息（Message）列表转换成 Gemini 的
     (system_instruction_text, contents)。
 
     contents 保证：user/model 角色严格交替、至少一条 content、结尾为
@@ -498,30 +510,31 @@ def _convert_messages_to_gemini(messages: list) -> tuple:
     contents: list = []
     pending_function_responses: list = []
 
+    def _as_message(raw: Any) -> Message:
+        return raw if isinstance(raw, Message) else Message.from_openai_dict(raw)
+
     def _flush_function_responses() -> None:
         if pending_function_responses:
             contents.append({"role": "user", "parts": list(pending_function_responses)})
             pending_function_responses.clear()
 
-    for msg in messages:
-        role = msg.get("role")
+    for raw in messages:
+        msg = _as_message(raw)
+        role = msg.role
         if role == "system":
-            c = msg.get("content")
-            if isinstance(c, str) and c:
-                system_parts.append(c)
-            elif isinstance(c, list):
-                for part in c:
-                    if (isinstance(part, dict) and part.get("type") == "text"
-                            and part.get("text")):
-                        system_parts.append(part["text"])
+            text = msg.text()
+            if text:
+                system_parts.append(text)
             continue
 
         if role == "tool":
-            name = str(msg.get("name") or "") or _tool_name_for_call_id(
-                messages, msg.get("tool_call_id", ""))
-            content = msg.get("content", "")
-            text = content if isinstance(content, str) else json.dumps(
-                content, ensure_ascii=False)
+            tr = msg.tool_result_block()
+            if tr is None:
+                continue
+            name = str(tr.name or "") or msg.name or _tool_name_for_call_id(
+                messages, tr.tool_call_id)
+            text = tr.content if isinstance(tr.content, str) else json.dumps(
+                tr.content, ensure_ascii=False)
             # response 必须是 JSON 对象：统一包一层 result（官方示例口径）。
             pending_function_responses.append({
                 "functionResponse": {
@@ -534,28 +547,24 @@ def _convert_messages_to_gemini(messages: list) -> tuple:
         _flush_function_responses()
 
         if role == "user":
-            parts = _openai_content_to_gemini_parts(msg.get("content"))
+            parts = _blocks_to_gemini_parts(msg.blocks)
             if parts:
                 contents.append({"role": "user", "parts": parts})
             continue
 
         if role == "assistant":
-            parts = []
-            text_content = msg.get("content")
-            if isinstance(text_content, str) and text_content:
+            parts: list[dict[str, Any]] = []
+            text_content = msg.text()
+            if text_content:
                 parts.append({"text": text_content})
-            for tc in (msg.get("tool_calls") or []):
-                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-                try:
-                    call_args = json.loads(fn.get("arguments") or "{}")
-                except (json.JSONDecodeError, TypeError):
-                    call_args = {}
+            for tc in msg.tool_calls():
+                call_args = tc.arguments if isinstance(tc.arguments, dict) else {}
                 if not isinstance(call_args, dict):
                     call_args = {"value": call_args}
                 call_part: dict = {
-                    "functionCall": {"name": fn.get("name", ""), "args": call_args}
+                    "functionCall": {"name": tc.name, "args": call_args}
                 }
-                sig = _extract_thought_signature(tc)
+                sig = _thought_signature_for(tc)
                 if sig:
                     call_part["thoughtSignature"] = sig
                 parts.append(call_part)
@@ -758,8 +767,9 @@ async def _agentic_loop_gemini_native(
     """Gemini 原生 API 专用循环（streamGenerateContent SSE + 原生 function calling）。
 
     对外契约与 _agentic_loop_openai_compat / _agentic_loop_anthropic
-    完全一致：入参/出参（messages、返回的 new_history_entries）都是
-    OpenAI 形状，只在请求 Gemini 原生 API 前后做边界转换（见模块头注释）。
+    完全一致：入参/出参（messages、返回的 new_history_entries）统一为
+    内部 Message（core/messages），只在请求 Gemini 原生 API 前做内部 ->
+    原生协议的边界转换（见模块头注释）。
     """
     api_label = "gemini"
     if tools is None:

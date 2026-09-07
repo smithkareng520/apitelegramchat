@@ -47,6 +47,7 @@ from __future__ import annotations
 import copy
 import os
 from dataclasses import dataclass, field
+from core.messages import Message, TextBlock, ToolCallBlock
 from typing import Callable, Iterable, Optional
 
 __all__ = [
@@ -162,11 +163,11 @@ def apply_tool_visibility(
     event_source: str = "USER",
     hidden_tools: Optional[Iterable[str]] = None,
 ) -> list:
-    """按事件源 + 开关改写出站消息列表。
+    """按事件源 + 开关改写出站消息列表（内部 Message 原生）。
 
-    纯函数：返回新列表；未被改写的消息原样引用（零拷贝），被改写的一律
-    深拷贝——绝不污染调用方持有的持久历史。无活跃规则且无 hidden_tools
-    时直接返回原列表（零开销直通路径）。
+    纯函数：返回新列表；未被改写的消息原样引用（零拷贝），被改写的
+    一律重建新 Message——绝不污染调用方持有的持久历史。无活跃规则且
+    无 hidden_tools 时直接返回原列表（零开销直通路径）。
 
     ``hidden_tools``：与事件源无关、一律 DROP 的工具名集合（如非静默
     回合的 ``SILENT_ONLY_TOOLS``）。被拔除的 tool_call 与其配对的 tool
@@ -183,8 +184,6 @@ def apply_tool_visibility(
         if mode != VISIBILITY_KEEP:
             active_rules[rule.tool_name] = (rule, mode)
     # 开关维度插拔：hidden_tools 一律按 DROP 处理，两个事件源方向相同。
-    # 显式 Optional[str]：与下方重新绑定的 _call_tool_name() 返回类型共用一个绑定。
-    name: Optional[str]
     for name in (hidden_tools or ()):
         if isinstance(name, str) and name and name not in active_rules:
             active_rules[name] = (
@@ -198,86 +197,82 @@ def apply_tool_visibility(
     if not active_rules:
         return messages
 
-    # 预索引：tool_call_id -> 配对 tool 结果消息（shadow 摘要要用，
-    # 例如从 "已发送（message_id=123）" 里恢复 message_id）。
-    tool_results_by_id: dict[str, dict] = {}
+    # 预索引：tool_call_id -> 配对 tool 结果消息（shadow 摘要用）。
+    tool_results_by_id: dict[str, Message] = {}
     for msg in messages:
-        if (
-            isinstance(msg, dict)
-            and msg.get("role") == "tool"
-            and isinstance(msg.get("tool_call_id"), str)
-        ):
-            tool_results_by_id[msg["tool_call_id"]] = msg
+        if isinstance(msg, Message) and msg.role == "tool":
+            tr = msg.tool_result_block()
+            if tr is not None and tr.tool_call_id:
+                tool_results_by_id[tr.tool_call_id] = msg
+
+    def _shadow_note(rule: ToolVisibilityRule, tc: ToolCallBlock) -> str:
+        paired = tool_results_by_id.get(tc.id)
+        paired_dict = None
+        if paired is not None:
+            tr = paired.tool_result_block()
+            paired_dict = {"tool_call_id": tr.tool_call_id, "content": tr.content} if tr else None
+        tc_dict = {"function": {"name": tc.name}}
+        return rule.shadow_note_builder(tc_dict, paired_dict)
 
     # Pass 1：改写含目标工具调用的 assistant 消息，登记被隐藏的 tool_call_id。
     rewritten: list = []
     hidden_call_ids: set[str] = set()
     for msg in messages:
-        if not isinstance(msg, dict):
+        if not isinstance(msg, Message):
             rewritten.append(msg)
             continue
-        tool_calls = msg.get("tool_calls")
-        if msg.get("role") != "assistant" or not isinstance(tool_calls, list) or not tool_calls:
+        calls = msg.tool_calls()
+        if msg.role != "assistant" or not calls:
             rewritten.append(msg)
             continue
 
-        kept_calls: list = []
-        shadow_specs: list[tuple[ToolVisibilityRule, dict]] = []
+        kept_calls: list[ToolCallBlock] = []
+        shadow_specs: list[tuple[ToolVisibilityRule, ToolCallBlock]] = []
         touched = False
-        for tc in tool_calls:
-            if not isinstance(tc, dict):
-                kept_calls.append(tc)
-                continue
-            name = _call_tool_name(tc)
-            entry = active_rules.get(name) if name else None
+        for tc in calls:
+            entry = active_rules.get(tc.name) if tc.name else None
             if entry is None:
                 kept_calls.append(tc)
                 continue
             rule, mode = entry
-            tc_id = tc.get("id")
-            if isinstance(tc_id, str) and tc_id:
-                hidden_call_ids.add(tc_id)
+            if tc.id:
+                hidden_call_ids.add(tc.id)
             touched = True
             if mode == VISIBILITY_DROP:
                 continue
-            shadow_specs.append((rule, tc))  # shadow：折叠为文本摘要
+            shadow_specs.append((rule, tc))
 
         if not touched:
             rewritten.append(msg)
             continue
 
-        # 深拷贝后再改写：tool_calls 与存储共享引用，禁止原地改动。
-        new_msg = copy.deepcopy({k: v for k, v in msg.items() if k != "tool_calls"})
-        if kept_calls:
-            new_msg["tool_calls"] = copy.deepcopy(kept_calls)
+        # 重建新 Message（绝不原地改动持久历史对象）。
+        new_msg = Message(role=msg.role, blocks=list(kept_calls) + [
+            b for b in msg.blocks if not isinstance(b, ToolCallBlock)
+        ], name=msg.name, meta=dict(msg.meta))
         if shadow_specs:
-            notes = [
-                rule.shadow_note_builder(
-                    tc, tool_results_by_id.get(tc.get("id") or "")
-                )
-                for rule, tc in shadow_specs
-            ]
-            new_msg["content"] = _merge_note_into_content(
-                new_msg.get("content"), "\n".join(notes)
-            )
+            notes = [_shadow_note(rule, tc) for rule, tc in shadow_specs]
+            note = "\n".join(notes)
+            new_msg.blocks.append(TextBlock(note))
 
         # 整条消息折叠后既无文本也无剩余调用：丢弃空壳，避免产生
         # content=None 且无 tool_calls 的非法 assistant 消息。
-        if not new_msg.get("tool_calls"):
-            content = new_msg.get("content")
-            if content is None or content == "" or content == []:
+        if not new_msg.tool_calls():
+            has_text = any(
+                isinstance(b, TextBlock) and b.text for b in new_msg.blocks
+            )
+            if not has_text:
                 continue
         rewritten.append(new_msg)
 
     # Pass 2：移除与被隐藏调用配对的 tool 结果消息，保证配对完整性。
     if not hidden_call_ids:
         return rewritten
-    return [
-        m
-        for m in rewritten
-        if not (
-            isinstance(m, dict)
-            and m.get("role") == "tool"
-            and m.get("tool_call_id") in hidden_call_ids
-        )
-    ]
+    out: list = []
+    for m in rewritten:
+        if isinstance(m, Message) and m.role == "tool":
+            tr = m.tool_result_block()
+            if tr is not None and tr.tool_call_id in hidden_call_ids:
+                continue
+        out.append(m)
+    return out

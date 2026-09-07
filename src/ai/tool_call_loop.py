@@ -14,6 +14,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
 from utils import get_logger, escape_html
+from core.messages import Message
 from token_budget import truncate_to_token_budget
 from tool_result_condense import condense_for_model
 from tool_executors import (
@@ -212,6 +213,13 @@ def _last_assistant_text(journal: list) -> str:
     if not isinstance(journal, list):
         return ""
     for msg in reversed(journal):
+        if isinstance(msg, Message):
+            if msg.role != "assistant":
+                continue
+            content = msg.text()
+            if content.strip():
+                return content
+            continue
         if not (isinstance(msg, dict) and msg.get("role") == "assistant"):
             continue
         content = msg.get("content")
@@ -637,7 +645,7 @@ async def _run_tool_calls_and_append(
         for fn_name, fn_args, tc_id in tool_tasks:
             real_content = _batch_completed_results.get(tc_id)
             content = real_content if isinstance(real_content, str) and real_content else INTERRUPTED_TOOL_PLACEHOLDER
-            tool_msg = {"role": "tool", "tool_call_id": tc_id, "name": fn_name, "content": content}
+            tool_msg = Message.tool_result(tc_id, fn_name, content)
             loop_messages.append(tool_msg)
             new_history_entries.append(tool_msg)
         logger.info(
@@ -676,7 +684,7 @@ async def _run_tool_calls_and_append(
             final_summary = f"⚠️ {fn_name} failed"
             details_html = f"<p>{escape_html(err_text)}</p>"
             builder.update_tool_item(tc_id, final_summary, details_html, status="error")
-            tool_msg = {"role": "tool", "tool_call_id": tc_id, "name": fn_name, "content": err_text}
+            tool_msg = Message.tool_result(tc_id, fn_name, err_text)
             loop_messages.append(tool_msg)
             new_history_entries.append(tool_msg)
             continue
@@ -708,7 +716,7 @@ async def _run_tool_calls_and_append(
         # condense_for_model 剔除无价值字段，再进入本轮请求与持久化历史。
         # UI 侧的 details_html / 失败判定 / bash 退出码检查仍基于完整
         # safe_content（见上方各处），二者互不影响。
-        tool_msg = {"role": "tool", "tool_call_id": tc_id, "name": fn_name, "content": llm_content}
+        tool_msg = Message.tool_result(tc_id, fn_name, llm_content)
         loop_messages.append(tool_msg)
         new_history_entries.append(tool_msg)
     # 对本批因预算而跳过的调用补齐标准 tool 消息，保证后续无工具总结请求的
@@ -725,10 +733,7 @@ async def _run_tool_calls_and_append(
                 f"Not executed: the per-turn tool-call budget of {MAX_TOOL_CALLS} was reached. "
                 "Do not retry this call in this turn; provide a final status summary instead."
             )
-            tool_msg = {
-                "role": "tool", "tool_call_id": skipped_id,
-                "name": skipped_name, "content": skipped_content,
-            }
+            tool_msg = Message.tool_result(skipped_id, skipped_name, skipped_content)
             loop_messages.append(tool_msg)
             new_history_entries.append(tool_msg)
             # 流式路径已为全部 tool call 建过 UI 条目；被跳过的调用若不
@@ -775,15 +780,12 @@ async def _run_tool_calls_and_append(
             logger.warning(
                 f"[{api_label}] 检测到工具连续相同错误熔断: {error_msgs[0]!r} x{curr}"
             )
-            loop_messages.append({
-                "role": "user",
-                "content": (
-                    f"System: tool '{error_msgs[0]}' has failed {curr} times in a row with the same error. "
-                    "STOP retrying the same operation. Switch strategy (use str_replace to edit, "
-                    "or view first, or give up and explain to the user). Do NOT call the same "
-                    "tool with the same arguments again."
-                )
-            })
+            loop_messages.append(Message.user_text(
+                f"System: tool '{error_msgs[0]}' has failed {curr} times in a row with the same error. "
+                "STOP retrying the same operation. Switch strategy (use str_replace to edit, "
+                "or view first, or give up and explain to the user). Do NOT call the same "
+                "tool with the same arguments again."
+            ))
             setattr(builder, key, 0)
             return "continue"
     else:

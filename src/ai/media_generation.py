@@ -15,6 +15,7 @@ import json
 import io
 import aiohttp
 import base64
+from openai import AsyncOpenAI
 import re
 import mimetypes
 import time
@@ -30,10 +31,13 @@ from config import (
     ModelConfig,
     PROVIDERS,
     get_effective_endpoint,
+    get_sampling_params,
 )
 from utils import get_logger, strip_html_tags
 from ai._constants import OPENROUTER_PROVIDER_PREFERENCES
 from ai.error_formatting import _extract_error_details
+from core.images import ImageRequestError, ImageTask, ImageTaskResult
+from core.messages import ImageBlock, Message, TextBlock
 
 logger = get_logger(__name__)
 
@@ -1731,3 +1735,186 @@ async def _request_openrouter_video(
     return None, f"OpenRouter 轮询超时 ({max_wait} 秒)", None
 
 
+
+
+# =============================================================================
+# ImageTask 统一请求出口（protocols/images.py 的两个适配器落在这里）
+# -----------------------------------------------------------------------------
+# 重构说明（ImageTask）：图像任务的"操作"（generate/edit/variation）是任务的
+# 一等字段（core/images.ImageTask.operation），由任务构造方显式声明；
+# 以下两个出口只按任务与模型协议发请求并解析，不再做任何
+# "看到参考图 = edit"式的端点猜测。
+#   - _request_openai_images_task        -> /images/{generations,edits}
+#     （operation=edit/variation 且带参考图 -> 官方 multipart /images/edits，
+#      路由未实现时按既有鲁棒性回退 JSON /images/generations + image 字段；
+#      operation=generate -> /images/generations；ModelScope 一律
+#      /images/generations + 异步任务轮询，无 /images/edits 端点）
+#   - _request_chat_modalities_image_task -> chat.completions + modalities
+#     （OpenRouter 图像模型；参考图作为消息内容输入）
+# =============================================================================
+
+
+async def _request_openai_images_task(task: "ImageTask") -> "ImageTaskResult":
+    """OpenAI Images 协议出口：ImageTask -> /v1/images/{generations,edits}。
+
+    端点选择由任务操作 + 提供商能力决定（与历史行为逐字节兼容）：
+      - generate            -> JSON /images/generations
+      - edit / variation    -> multipart /images/edits（XXTF 等标准端点），
+                               未实现时回退 JSON /images/generations 兼容形状
+      - modelscope          -> 一律 /images/generations（X-ModelScope-Task-Type
+                               头区分文生图/图生图；该厂商不存在 /images/edits）
+    """
+    model_info = SUPPORTED_MODELS.get(task.model)
+    if model_info is None:
+        raise ImageRequestError(f"未知图像模型: {task.model!r}", endpoint="/images/generations")
+
+    response_json, endpoint, error_detail, status_code, request_id = await _request_images_generations(
+        model_info,
+        prompt=task.effective_prompt,
+        image_urls=list(task.input_images),
+        num_images=max(1, min(int(task.num_images or 1), 4)),
+        model=task.model,
+        aspect_ratio=task.aspect_ratio,
+    )
+    if response_json is None:
+        raise ImageRequestError(
+            error_detail or "图像接口请求失败",
+            status_code=status_code or 500,
+            endpoint=f"/v1{endpoint}",
+            request_id=request_id,
+        )
+    image_bytes_list = await _response_items_to_bytes(response_json, max_images=task.num_images or 1)
+    usage = response_json.get("usage") if isinstance(response_json, dict) else None
+    return ImageTaskResult(images=image_bytes_list, endpoint=f"/v1{endpoint}", usage=usage)
+
+
+async def _request_chat_modalities_image_task(task: "ImageTask") -> "ImageTaskResult":
+    """Chat Completions + modalities 图像出口（OpenRouter 图像模型等）。
+
+    语义映射：
+      - generate            -> 纯文本 prompt（modalities=["image","text"]）
+      - edit / variation    -> prompt + 参考图 image_url 内容
+                               （图生图；prompt 为空时 variation 补默认指令）
+    网关不支持 image+text 输出时按既有行为自动降级重试 image-only。
+    未注册到 SUPPORTED_MODELS 的模型按 OpenRouter 兼容直连（保持旧
+    execute_generate_image 对 flux 等别名的可达性）。
+    """
+    model_info = SUPPORTED_MODELS.get(task.model)
+
+    # ---------- 组装消息（内部 Message -> wire，同一套渲染出口） ----------
+    content_blocks: list[Any] = []
+    if task.effective_prompt:
+        content_blocks.append(TextBlock(task.effective_prompt))
+    for url in task.input_images:
+        if url:
+            content_blocks.append(ImageBlock(url=url))
+    wire_messages: list[dict]
+    if len(content_blocks) == 1 and isinstance(content_blocks[0], TextBlock):
+        wire_messages = [{"role": "user", "content": task.effective_prompt}]
+    elif content_blocks:
+        wire_messages = [Message.user(content_blocks).to_openai_dict()]
+    else:
+        raise ImageRequestError("图像任务缺少 prompt 与参考图", endpoint="/chat/completions")
+
+    # ---------- 客户端与鉴权 ----------
+    if model_info is not None:
+        from api_client import api_client as _api_client
+        client = _api_client.get_client_for_model(model_info)
+        sampling = get_sampling_params(model_info)
+    else:
+        # 未注册模型（flux 等历史别名）：按 OpenRouter 兼容直连。
+        client = AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY,
+            max_retries=0,
+        )
+        sampling = {}
+
+    extra_body: dict[str, Any] = {"modalities": ["image", "text"],
+                                  "provider": OPENROUTER_PROVIDER_PREFERENCES}
+    if task.meta.get("image_config"):
+        extra_body["image_config"] = task.meta["image_config"]
+    if int(task.num_images or 1) > 1:
+        extra_body["n"] = max(1, min(int(task.num_images), 4))
+
+    max_tokens = (model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192)
+
+    try:
+        response = await client.chat.completions.create(
+            model=task.model,
+            messages=wire_messages,
+            max_tokens=max_tokens,
+            extra_body=extra_body,
+            stream=False,
+            **sampling,
+        )
+    except Exception as e:
+        err_text = str(e)
+        # "output modalities" 含子串 "modalities"，前一条件恒被后者包含。
+        if "modalities" not in err_text:
+            raise
+        logger.warning(f"Native image model does not support image+text output, retrying image-only: {e}")
+        response = await client.chat.completions.create(
+            model=task.model,
+            messages=wire_messages,
+            max_tokens=max_tokens,
+            extra_body={"modalities": ["image"], "provider": OPENROUTER_PROVIDER_PREFERENCES},
+            stream=False,
+            **sampling,
+        )
+
+    # ---------- 解析响应（与旧 chat modalities 路径一致） ----------
+    choice = response.choices[0]
+    finish_reason = str(getattr(choice, "finish_reason", "") or "")
+    text = _extract_native_message_text(getattr(choice.message, "content", ""))
+    refusal = _extract_native_refusal_text(choice.message)
+
+    try:
+        msg_dump = choice.message.model_dump()
+        images = _extract_image_items(msg_dump)
+        if not images:
+            images = getattr(choice.message, "images", []) or []
+    except Exception:
+        logger.debug("_request_chat_modalities_image_task 内部忽略的异常", exc_info=True)
+        images = []
+
+    image_bytes_list: list[bytes] = []
+    for img_data in images:
+        img_url = (img_data.get("image_url", {}) or {}).get("url") if isinstance(img_data, dict) else None
+        if not img_url:
+            continue
+        if img_url.startswith("data:image"):
+            try:
+                _, base64_data = img_url.split(",", 1)
+                img_bytes = base64.b64decode(base64_data, validate=True)
+                validated = _validate_image_bytes(img_bytes, source="modalities_data_url")
+                if validated is not None:
+                    image_bytes_list.append(validated)
+            except Exception as e:
+                logger.error(f"Base64 decode failed: {e}")
+        elif img_url.startswith("http"):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(img_url, timeout=30) as resp:
+                        if resp.status == 200:
+                            content_type = str(resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                            if content_type and not content_type.startswith("image/"):
+                                logger.warning("[NativeImage] 远端响应不是图片 Content-Type=%s: %s", content_type or "-", img_url[:120])
+                                continue
+                            img_bytes = await resp.read()
+                            validated = _validate_image_bytes(img_bytes, source=img_url)
+                            if validated is not None:
+                                image_bytes_list.append(validated)
+                        else:
+                            logger.warning(f"Download image {img_url} failed: {resp.status}")
+            except Exception as e:
+                logger.error(f"Download image {img_url} error: {e}")
+
+    return ImageTaskResult(
+        images=image_bytes_list,
+        text=text,
+        refusal=refusal,
+        finish_reason=finish_reason,
+        endpoint="/chat/completions",
+        usage=getattr(response, "usage", None),
+    )

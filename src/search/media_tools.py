@@ -14,6 +14,9 @@ from chat_actions import chat_action_scope
 
 OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 
+from core.images import ImageTask, ImageRequestError
+from protocols.images import dispatch_image_task
+
 import logging
 
 logger = logging.getLogger(__name__)
@@ -52,22 +55,16 @@ async def execute_generate_image(
     num_images: int = 1,
     image_url: Optional[str] = None,
 ) -> str:
-    # 统一图像生成入口：OpenAI Images 协议提供商（ModelScope / XXTF 等，
-    # 见 media_generation.IMAGES_API_PROVIDERS）共用 _request_images_generations
-    # 一个请求出口（端点 /v1/images/generations、鉴权、payload、参考图下载、
-    # 任务轮询差异全部在 media_generation 内部处理）；本函数只负责调用 +
-    # "响应 -> 图片字节 -> R2 -> 链接文本" 的通用后处理。
-    # 其它提供商（openrouter 的 gemini 图像模型等）保留 chat/completions +
-    # modalities 的原有逻辑。
-    # 局部导入避免与 ai_handlers 的模块级循环依赖。
-    from ai_handlers import (
-        _get_images_api_display_name,
-        _request_images_generations,
-        _response_items_to_bytes,
-        _upload_generated_images_to_r2,
-        _validate_image_bytes,
-        IMAGES_API_PROVIDERS,
-    )
+    """图像生成工具的统一入口（ImageTask 驱动）。
+
+    重构说明（ImageTask）：本函数只负责**显式构造任务**与后处理——
+      - 无参考图  -> ImageTask.generate（文生图）
+      - 带参考图  -> ImageTask.edit（图生图/编辑；不再由请求层"看图猜端点"）
+    请求经 protocols.images.dispatch_image_task 按模型协议分发：
+      openai_images -> /images/{generations,edits}（ModelScope/XXTF 等）
+      openai_chat   -> chat.completions + modalities（OpenRouter 图像模型；
+                       未注册的 flux 等别名按 OpenRouter 兼容直连）
+    """
     MODEL_ALIAS_MAP = {
         "flux-schnell": "black-forest-labs/flux-schnell",
         "flux-1.1-pro": "black-forest-labs/flux-1.1-pro",
@@ -78,8 +75,12 @@ async def execute_generate_image(
         model = MODEL_ALIAS_MAP[model]
 
     model_info = SUPPORTED_MODELS.get(model)
-    provider = model_info.provider if model_info else "openrouter"
     num_images = min(max(num_images, 1), 4)
+    _protocol = _effective_image_protocol(model_info)
+    used_endpoint = (
+        ("/v1/images/edits" if image_url else "/v1/images/generations")
+        if _protocol == "openai_images" else "/v1/chat/completions"
+    )
 
     def _format_success_links(uploaded_urls: list[str], total_count: int) -> str:
         """生成图上传 R2 后的统一成功文案（部分上传失败时如实说明）。"""
@@ -88,178 +89,73 @@ async def execute_generate_image(
             return f"✅ 已生成 {total_count} 张图片。\n图片链接：\n{links}"
         return f"✅ 已生成 {total_count} 张图片（部分图片上传失败）。\n图片链接：\n{links}"
 
-    # OpenAI Images 协议提供商：统一走 /v1/images/generations（不再按提供商各写一套）
-    if model_info is not None and provider in IMAGES_API_PROVIDERS:
-        api_display_name = _get_images_api_display_name(model_info)
-        response_json, endpoint, error_detail, status_code, request_id = await _request_images_generations(
-            model_info,
-            prompt=prompt,
-            image_urls=[image_url] if image_url else [],
-            num_images=num_images,
-            model=model,
-            aspect_ratio=aspect_ratio,
-        )
-        used_endpoint = f"/v1{endpoint}"
-        if response_json is None:
-            return _format_image_api_error(
-                api_name=f"{api_display_name} 图像接口",
-                status_code=status_code,
-                detail=error_detail,
-                request_id=request_id,
-                endpoint=used_endpoint,
-                model=model,
-            )
-        try:
-            image_bytes_list = await _response_items_to_bytes(response_json, max_images=num_images)
-            if not image_bytes_list:
-                return _format_image_api_error(
-                    api_name=f"{api_display_name} 图像接口",
-                    status_code=200,
-                    detail="接口返回成功，但未找到可下载的图片数据。",
-                    endpoint=used_endpoint,
-                    model=model,
-                )
-            uploaded_urls = await _upload_generated_images_to_r2(image_bytes_list)
-            if not uploaded_urls:
-                return _format_image_api_error(
-                    api_name=f"{api_display_name} 图像接口",
-                    status_code=200,
-                    detail="图片已生成，但上传 R2 全部失败。",
-                    endpoint=used_endpoint,
-                    model=model,
-                )
-            return _format_success_links(uploaded_urls, len(image_bytes_list))
-        except Exception as e:
-            logger.exception(f"{api_display_name} generate_image 异常: {e}")
-            return _format_image_api_error(
-                api_name=f"{api_display_name} 图像接口",
-                status_code=getattr(e, "status", getattr(e, "status_code", 500)),
-                detail=str(e),
-                endpoint=used_endpoint,
-                model=model,
-            )
-
-    # 其他厂商：保留原有 OpenRouter 兼容逻辑
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    # ---- 显式构造 ImageTask：操作类型由调用入参决定，不再隐式推断 ----
     if image_url:
-        content_part: Any = [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": image_url}}
-        ]
+        task = ImageTask.edit(prompt, [image_url], model=model,
+                              num_images=1, aspect_ratio=aspect_ratio, image_size=image_size,
+                              meta={"image_config": {"aspect_ratio": aspect_ratio, "image_size": image_size}})
     else:
-        content_part = prompt
+        task = ImageTask.generate(prompt, model=model,
+                                  num_images=num_images, aspect_ratio=aspect_ratio, image_size=image_size,
+                                  meta={"image_config": {"aspect_ratio": aspect_ratio, "image_size": image_size}})
 
-    payload = {
-        "model": model,
-        "modalities": ["image", "text"],
-        "messages": [{"role": "user", "content": content_part}],
-        "image_config": {
-            "aspect_ratio": aspect_ratio,
-            "image_size": image_size,
-        },
-        "n": num_images,
-        "provider": OPENROUTER_PROVIDER_PREFERENCES,
-    }
-
+    _api_name = f"{_get_images_api_display_name(model_info)} 图像接口" if model_info else "图像接口"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                if resp.status != 200:
-                    err_text = await resp.text()
-                    if "not a valid model ID" in err_text and model != "google/gemini-2.5-flash-image":
-                        logger.warning(f"模型 {model} 无效，回退到默认模型 google/gemini-2.5-flash-image")
-                        return await execute_generate_image(
-                            prompt=prompt,
-                            model="google/gemini-2.5-flash-image",
-                            aspect_ratio=aspect_ratio,
-                            image_size=image_size,
-                            num_images=num_images,
-                            image_url=image_url,
-                        )
-                    return f"❌ 图像生成失败 (HTTP {resp.status}): {err_text[:200]}"
-
-                data = await resp.json()
-                msg = data.get("choices", [{}])[0].get("message", {})
-                images = msg.get("images", [])
-
-                if not images:
-                    content = msg.get("content", "")
-                    urls = re.findall(r'https?://[^\s]+\.(?:png|jpg|jpeg|gif)', content)
-                    if urls:
-                        images = [{"image_url": {"url": u}} for u in urls]
-
-                if not images:
-                    return "⚠️ 生成的响应中未找到图片。"
-
-                image_bytes_list = []
-                download_errors = []
-                for idx, img_data in enumerate(images):
-                    img_url = img_data.get("image_url", {}).get("url")
-                    if not img_url:
-                        continue
-                    if img_url.startswith("data:image"):
-                        try:
-                            _, base64_data = img_url.split(",", 1)
-                            img_bytes = base64.b64decode(base64_data, validate=True)
-                            validated = _validate_image_bytes(img_bytes, source="tool_data_url")
-                            if validated is not None:
-                                image_bytes_list.append(validated)
-                            continue
-                        except Exception as e:
-                            logger.error(f"Base64 解码失败: {e}")
-                            download_errors.append(f"图片 {idx+1} (Base64 解码失败)")
-                            continue
-                    elif img_url.startswith("http"):
-                        max_retries = 3
-                        downloaded = False
-                        for attempt in range(max_retries):
-                            try:
-                                async with session.get(
-                                    img_url,
-                                    timeout=aiohttp.ClientTimeout(total=30),
-                                    headers={"User-Agent": "Mozilla/5.0"}
-                                ) as img_resp:
-                                    if img_resp.status == 200:
-                                        content_type = str(img_resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-                                        if content_type and not content_type.startswith("image/"):
-                                            logger.warning("图像 URL 返回非图片 Content-Type=%s: %s", content_type or "-", img_url[:120])
-                                            break
-                                        img_bytes = await img_resp.read()
-                                        validated = _validate_image_bytes(img_bytes, source=img_url)
-                                        if validated is not None:
-                                            image_bytes_list.append(validated)
-                                            downloaded = True
-                                            break
-                            except Exception as e:
-                                logger.warning(f"下载图片 {img_url} 异常: {e}")
-                            await asyncio.sleep(1 + attempt)
-                        if not downloaded:
-                            download_errors.append(f"图片 {idx+1}")
-                    else:
-                        download_errors.append(f"图片 {idx+1} (不支持的 URL 格式)")
-
-                if not image_bytes_list:
-                    return f"⚠️ 图片生成成功，但下载全部失败。失败项: {', '.join(download_errors)}"
-
-                # 与 Images 协议分支共用同一 R2 上传实现
-                image_bytes_list = image_bytes_list[:num_images]
-                uploaded_urls = await _upload_generated_images_to_r2(image_bytes_list)
-
-                if not uploaded_urls:
-                    return "❌ 图片生成成功，但 R2 上传全部失败，请稍后重试。"
-
-                return _format_success_links(uploaded_urls, len(image_bytes_list))
-
+        result = await dispatch_image_task(task)
+    except ImageRequestError as exc:
+        return _format_image_api_error(
+            api_name=_api_name,
+            status_code=exc.status_code,
+            detail=exc.detail,
+            request_id=exc.request_id,
+            endpoint=exc.endpoint or used_endpoint,
+            model=model,
+        )
     except Exception as e:
-        logger.error(f"execute_generate_image 异常: {e}", exc_info=True)
-        return f"❌ 图像生成异常: {str(e)[:150]}"
+        logger.exception(f"execute_generate_image 异常: {e}")
+        return _format_image_api_error(
+            api_name=_api_name,
+            status_code=getattr(e, "status", getattr(e, "status_code", 500)),
+            detail=str(e),
+            endpoint=used_endpoint,
+            model=model,
+        )
+
+    if not result.images:
+        if result.text or result.refusal:
+            detail = result.refusal or result.text
+            return f"⚠️ 模型未返回图片：{str(detail)[:200]}"
+        return _format_image_api_error(
+            api_name=_api_name,
+            status_code=200,
+            detail="接口返回成功，但未找到可下载的图片数据。",
+            endpoint=result.endpoint or used_endpoint,
+            model=model,
+        )
+
+    uploaded_urls = await _upload_generated_images_to_r2(result.images[:num_images])
+    if not uploaded_urls:
+        return "❌ 图片生成成功，但 R2 上传全部失败，请稍后重试。"
+    return _format_success_links(uploaded_urls, len(result.images[:num_images]))
 
 
-# ========== 视频生成（工具版本） ==========
+def _effective_image_protocol(model_info) -> str:
+    """模型的有效图像协议（openai_images / openai_chat），未知厂商回落 openai_chat。"""
+    if model_info is None:
+        return "openai_chat"
+    try:
+        from config import get_effective_endpoint
+        return get_effective_endpoint(model_info).protocol
+    except Exception:
+        return "openai_chat"
+
+
+def _get_images_api_display_name(model_info) -> str:
+    """提供商展示名（ModelScope / XXTF ...），用于错误提示文案。"""
+    provider_key = (getattr(model_info, "provider", "") or "") if model_info else ""
+    return provider_key or "图像"
+
+
 async def execute_generate_video(
     prompt: str,
     model: str,

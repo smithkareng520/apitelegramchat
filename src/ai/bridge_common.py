@@ -20,6 +20,7 @@ from typing import Any, Awaitable, Callable, Optional
 from config import SUPPORTED_MODELS, get_sampling_params
 from utils import get_logger
 from chat_actions import start_chat_action, stop_chat_action
+from core.messages import Message
 
 from ai._constants import MAX_TOOL_CALLS
 from ai.tool_summary import _tool_limit_summary
@@ -58,7 +59,7 @@ class BridgeLoopState:
 
 def init_bridge_loop_state(messages: list, journal: list | None, current_model: str) -> BridgeLoopState:
     """两条原生循环共用的初始化段（原 anthropic/gemini 各一份逐字相同）。"""
-    loop_messages = list(messages)  # OpenAI 形状，供 _run_tool_calls_and_append 复用
+    loop_messages = list(messages)  # 内部 Message 列表，供 _run_tool_calls_and_append 复用
     new_history_entries = journal if journal is not None else []
     model_info = SUPPORTED_MODELS.get(current_model)
     max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
@@ -120,13 +121,18 @@ def append_assistant_message(
     content_acc: str,
     tool_calls_list: list,
     reasoning_acc: str,
-) -> dict:
-    """把本轮 assistant 消息组装为 OpenAI 形状，写入请求消息与历史双列表。"""
-    assistant_msg: dict = {"role": "assistant", "content": content_acc or None}
-    if tool_calls_list:
-        assistant_msg["tool_calls"] = tool_calls_list
-    if reasoning_acc:
-        assistant_msg["reasoning_content"] = reasoning_acc
+) -> Message:
+    """把本轮 assistant 消息组装为内部 Message，写入请求消息与历史双列表。
+
+    重构说明：旧版组装 OpenAI 形状 dict（含 reasoning_content / tool_calls
+    wire 字段）；现在组装为内部 Message（TextBlock / ReasoningBlock /
+    ToolCallBlock），协议形状由各适配器在出站时渲染。tool_calls_list 仍是
+    流式累积产出的 OpenAI wire 形状（由 Message.assistant_with_tool_calls
+    解析为结构化 ToolCallBlock）。
+    """
+    assistant_msg = Message.assistant_with_tool_calls(
+        content_acc or "", tool_calls_list, reasoning_acc,
+    )
     loop_messages.append(assistant_msg)
     new_history_entries.append(assistant_msg)
     return assistant_msg
@@ -185,7 +191,7 @@ async def over_limit_final_summary(
         builder.begin_stream_text()
         synth_text = ""
         synth_text += await stream_synth(build_synth_request(
-            {"role": "user", "content": MAX_TOOL_CALLS_SYNTH_PROMPT}))
+            Message.user_text(MAX_TOOL_CALLS_SYNTH_PROMPT)))
         raw_synth_content = builder.end_stream_text() or synth_text
         # 文本块结束时检查是否需要切换草稿（终局：同步收束旧段）
         if raw_synth_content:
@@ -206,7 +212,7 @@ async def over_limit_final_summary(
         builder.add_text(final_content)
     finally:
         await stop_chat_action(builder.chat_id, "typing")
-    new_history_entries.append({"role": "assistant", "content": final_content or ""})
+    new_history_entries.append(Message.assistant_text(final_content or ""))
     finish_open_tool_group(builder)
     # 工具上限总结是终局回复；同步结束旧草稿，不创建新草稿。
     await builder.finalize_turn()
@@ -218,7 +224,7 @@ async def ensure_final_content(builder: "DraftManager", new_history_entries: lis
     if final_content is None:
         final_content = _tool_limit_summary()
         builder.add_text(final_content)
-        new_history_entries.append({"role": "assistant", "content": final_content})
+        new_history_entries.append(Message.assistant_text(final_content))
         finish_open_tool_group(builder)
         # 轮次数耗尽后的兜底文本没有后续轮次：同步结束旧草稿，不创建新草稿。
         await builder.finalize_turn()

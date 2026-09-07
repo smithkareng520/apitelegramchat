@@ -39,6 +39,35 @@ from token_budget import (
     json_token_count,
     truncate_to_token_budget,
 )
+from core.messages import Message
+
+
+def _msg_role(message: Any) -> Optional[str]:
+    """双形状取角色：Message.role / dict["role"]。"""
+    if isinstance(message, Message):
+        return message.role
+    if isinstance(message, dict):
+        role = message.get("role")
+        return role if isinstance(role, str) else None
+    return None
+
+
+def _msg_text(message: Any) -> str:
+    """双形状取文本（Message 取 TextBlock 拼接；dict 取 content）。"""
+    if isinstance(message, Message):
+        return message.text()
+    if isinstance(message, dict):
+        content = message.get("content")
+        return content if isinstance(content, str) else ""
+    return ""
+
+
+def _msg_has_tool_calls(message: Any) -> bool:
+    if isinstance(message, Message):
+        return bool(message.tool_calls())
+    if isinstance(message, dict):
+        return bool(message.get("tool_calls"))
+    return False
 
 
 def _env_int(name: str, default: int) -> int:
@@ -131,7 +160,12 @@ def compact_watermarks(budget: int) -> tuple[int, int]:
 # 结构：摘要槽位 + 用户轮块
 # ---------------------------------------------------------------------------
 def is_digest_message(message: object) -> bool:
-    """识别滚动摘要消息（role=system 且正文以稳定标记开头）。"""
+    """识别滚动摘要消息（role=system 且正文以稳定标记开头）。
+
+    同时接受内部 Message 与旧 dict 形状（历史兼容 / 单元测试直通）。
+    """
+    if isinstance(message, Message):
+        return message.role == "system" and message.text().startswith(DIGEST_MARKER)
     return (
         isinstance(message, dict)
         and message.get("role") == "system"
@@ -141,8 +175,8 @@ def is_digest_message(message: object) -> bool:
 
 
 def split_history_blocks(
-    messages: list[dict[str, Any]],
-) -> tuple[Optional[dict[str, Any]], list[list[dict[str, Any]]]]:
+    messages: list[Any],
+) -> tuple[Optional[Any], list[list[Any]]]:
     """把历史拆成 (摘要消息, 用户轮块列表)。
 
     块语义与旧 _drop_oldest_non_system_block 一致：
@@ -158,10 +192,10 @@ def split_history_blocks(
         digest_msg = messages[0]
         rest = messages[1:]
 
-    blocks: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
+    blocks: list[list[Any]] = []
+    current: list[Any] = []
     for message in rest:
-        if message.get("role") == "user" and current:
+        if _msg_role(message) == "user" and current:
             blocks.append(current)
             current = [message]
         else:
@@ -171,7 +205,7 @@ def split_history_blocks(
     return digest_msg, blocks
 
 
-def _flatten(blocks: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+def _flatten(blocks: list[list[Any]]) -> list[Any]:
     return [message for block in blocks for message in block]
 
 
@@ -182,9 +216,9 @@ def _flatten(blocks: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
 class EvictionPlan:
     """一次结构性淘汰的确定性计划（不修改入参）。"""
 
-    digest_message: Optional[dict[str, Any]] = None
-    evicted_blocks: list[list[dict[str, Any]]] = field(default_factory=list)
-    kept_blocks: list[list[dict[str, Any]]] = field(default_factory=list)
+    digest_message: Optional[Any] = None
+    evicted_blocks: list[list[Any]] = field(default_factory=list)
+    kept_blocks: list[list[Any]] = field(default_factory=list)
     digest_tokens: int = 0
     evicted_tokens: int = 0
     kept_tokens: int = 0
@@ -202,11 +236,11 @@ class EvictionPlan:
 
 
 def plan_turn_eviction(
-    messages: list[dict[str, Any]],
+    messages: list[Any],
     *,
     target_tokens: int,
     protected_turns: int = CONTEXT_PROTECTED_TURNS,
-    token_fn: Optional[Callable[[dict[str, Any]], int]] = None,
+    token_fn: Optional[Callable[[Any], int]] = None,
 ) -> EvictionPlan:
     """规划"从最老的用户轮块开始淘汰，直到 ≤ target_tokens"。
 
@@ -244,43 +278,52 @@ def plan_turn_eviction(
 
 
 def apply_eviction_plan(
-    history: list[dict[str, Any]],
+    history: list[Any],
     plan: EvictionPlan,
     digest_text: str,
 ) -> None:
     """把计划落到持久历史（原地 splice）：新摘要 + 保留块。
 
     只在压缩事件中调用；两次调用之间历史只会在尾部增长。
+    摘要消息的形状随历史形状：全 dict 历史（旧测试/兼容路径）产 dict，
+    Message 历史产 Message——保证 splice 后列表形状一致。
     """
-    new_digest = make_digest_message(digest_text)
-    history[:] = [new_digest] + plan.kept_messages
+    # 摘要形状跟随保留块的形状：全 dict（旧测试/兼容路径）产 dict，
+    # 全 Message（生产路径）产 Message；空历史按 Message（生产默认）。
+    kept = plan.kept_messages
+    if kept and all(isinstance(m, dict) for m in kept):
+        new_digest: Any = {"role": "system", "content": digest_text}
+    else:
+        new_digest = make_digest_message(digest_text)
+    history[:] = [new_digest] + kept
 
 
-def make_digest_message(digest_text: str) -> dict[str, Any]:
-    return {"role": "system", "content": digest_text}
+def make_digest_message(digest_text: str) -> Message:
+    """构造摘要消息（生产路径：内部 Message；meta 为空）。"""
+    return Message.system(digest_text)
 
 
 # ---------------------------------------------------------------------------
 # 滚动摘要（确定性纯函数）
 # ---------------------------------------------------------------------------
-def _first_user_text(block: list[dict[str, Any]]) -> str:
+def _first_user_text(block: list[Any]) -> str:
     for message in block:
-        if message.get("role") != "user":
+        if _msg_role(message) != "user":
             continue
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
+        text = _msg_text(message)
+        if text.strip():
+            return text.strip()
         return "[多模态消息：图片/文件/语音等]"
     return ""
 
 
-def _last_assistant_text(block: list[dict[str, Any]]) -> str:
+def _last_assistant_text(block: list[Any]) -> str:
     text = ""
     for message in block:
-        if message.get("role") == "assistant":
-            content = message.get("content")
-            if isinstance(content, str) and content.strip():
-                text = content.strip()
+        if _msg_role(message) == "assistant":
+            candidate = _msg_text(message)
+            if candidate.strip():
+                text = candidate.strip()
     return text
 
 
@@ -311,14 +354,22 @@ def _locator(name: str, raw_args: object) -> str:
 _ARCHIVED_POINTER_RE = re.compile(r"archived at (\S+\.json)")
 
 
-def _tool_lines(block: list[dict[str, Any]]) -> list[str]:
+def _tool_lines(block: list[Any]) -> list[str]:
     """块内工具调用骨架行：名称 + 定位参数 + 归档指针（如有）。"""
     archived_by_id: dict[str, str] = {}
     for message in block:
-        if message.get("role") != "tool":
+        if _msg_role(message) != "tool":
             continue
-        call_id = message.get("tool_call_id")
-        content = message.get("content")
+        if isinstance(message, Message):
+            tr = message.tool_result_block()
+            if tr is None:
+                continue
+            call_id, content = tr.tool_call_id, tr.content
+        elif isinstance(message, dict):
+            call_id = message.get("tool_call_id")
+            content = message.get("content")
+        else:
+            continue
         if isinstance(call_id, str) and isinstance(content, str):
             match = _ARCHIVED_POINTER_RE.search(content)
             if match:
@@ -326,12 +377,19 @@ def _tool_lines(block: list[dict[str, Any]]) -> list[str]:
 
     lines: list[str] = []
     for message in block:
-        if message.get("role") != "assistant":
+        if _msg_role(message) != "assistant":
             continue
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
+        if isinstance(message, Message):
+            calls = [
+                {"id": tc.id, "function": {"name": tc.name, "arguments": tc.arguments}}
+                for tc in message.tool_calls()
+            ]
+        elif isinstance(message, dict):
+            calls = message.get("tool_calls")
+            calls = calls if isinstance(calls, list) else []
+        else:
             continue
-        for tool_call in tool_calls:
+        for tool_call in calls:
             if not isinstance(tool_call, dict):
                 continue
             function = tool_call.get("function")
@@ -349,7 +407,7 @@ def _tool_lines(block: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
-def _skeleton_lines(block: list[dict[str, Any]]) -> list[str]:
+def _skeleton_lines(block: list[Any]) -> list[str]:
     """单个被淘汰轮的摘要骨架（2-4 行，全部确定性生成）。"""
     lines: list[str] = []
     user_text = _first_user_text(block)
@@ -377,7 +435,7 @@ def _parse_prev_digest(prev_text: Optional[str]) -> tuple[int, list[str]]:
 
 def build_digest_text(
     prev_text: Optional[str],
-    evicted_blocks: list[list[dict[str, Any]]],
+    evicted_blocks: list[list[Any]],
     *,
     budget_tokens: int,
 ) -> str:
@@ -422,8 +480,8 @@ def build_digest_text(
 # 杂项
 # ---------------------------------------------------------------------------
 def count_history_tokens(
-    history: list[dict[str, Any]],
-    token_fn: Optional[Callable[[dict[str, Any]], int]] = None,
+    history: list[Any],
+    token_fn: Optional[Callable[[Any], int]] = None,
 ) -> int:
     token_fn = token_fn or json_token_count
     return sum(token_fn(message) for message in history)

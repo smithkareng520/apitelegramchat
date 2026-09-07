@@ -63,6 +63,10 @@ if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
     from anthropic import AsyncAnthropic
 
+from core.messages import (
+    DocumentBlock, ImageBlock, Message, TextBlock, ToolCallBlock, ToolResultBlock,
+)
+
 logger = get_logger(__name__)
 
 
@@ -144,42 +148,29 @@ def _convert_tools_to_anthropic(tools: Optional[list]) -> Optional[list]:
 #             -> Anthropic 形状（顶层 system 字符串 + messages: user/assistant，
 #                                 tool 结果作为 user 消息里的 tool_result 块）
 # =============================================================================
-def _openai_content_to_anthropic_blocks(content: Any) -> list:
-    """把 OpenAI 的 content（str 或 content-parts 列表）转换成 Anthropic
-    content 块列表。支持 text、image_url（data:base64 内联 / 公开 URL）、
-    原生文档（document 直通与 file→document 转换），未识别的 part 类型
-    静默跳过，不中断请求。
+def _blocks_to_anthropic_content(blocks: list) -> list:
+    """把内部内容块列表转换成 Anthropic content 块列表。
+
+    支持 text、ImageBlock（data:base64 内联 / 公开 URL）、DocumentBlock
+    （URL source 直通与 base64 source），未识别的块类型静默跳过，不中断
+    请求。
 
     文档块说明（Anthropic 官方限制）：
       - document 块的 url / base64 source 仅接受 PDF（media_type=
         application/pdf）；docx/xlsx 等二进制格式不被 document 块支持，
         官方要求先转成文本或 PDF，因此这里遇到非 PDF 一律跳过
-        （attachment 层已保证 anthropic 模型非 PDF 走文本占位）。
-      - {"type": "document", ...} 直通：attachment_content 为
-        anthropic_native 模型构造的 URL source 文档块
-        （{"type": "document", "source": {"type": "url", ...}}）原样
-        传递，Anthropic 服务端在请求时自行抓取该 URL。
-      - {"type": "file", ...}（OpenAI 形状 data: URI）→ base64 source
-        document 块：兜底兼容历史消息 / OpenAI 形状入参里出现的
-        内联 PDF。
+        （attachment 层已保证 anthropic_messages 模型非 PDF 走文本占位）。
+      - DocumentBlock(url=...) 直通为 URL source：Anthropic 服务端在请求
+        时自行抓取该 URL。
+      - DocumentBlock(data_url=...)（data: URI）→ base64 source document 块。
     """
-    if content is None:
-        return []
-    if isinstance(content, str):
-        return [{"type": "text", "text": content}] if content else []
-
-    blocks = []
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        ptype = part.get("type")
-        if ptype == "text":
-            text = part.get("text", "")
-            if text:
-                blocks.append({"type": "text", "text": text})
-        elif ptype == "image_url":
-            url_obj = part.get("image_url") or {}
-            url = url_obj.get("url", "") if isinstance(url_obj, dict) else str(url_obj)
+    out_blocks: list[dict] = []
+    for block in blocks:
+        if isinstance(block, TextBlock):
+            if block.text:
+                out_blocks.append({"type": "text", "text": block.text})
+        elif isinstance(block, ImageBlock):
+            url = block.url or ""
             if url.startswith("data:"):
                 try:
                     header, b64data = url.split(",", 1)
@@ -187,42 +178,30 @@ def _openai_content_to_anthropic_blocks(content: Any) -> list:
                 except (ValueError, IndexError):
                     media_type, b64data = "image/png", ""
                 if b64data:
-                    blocks.append({
+                    out_blocks.append({
                         "type": "image",
                         "source": {"type": "base64", "media_type": media_type, "data": b64data},
                     })
             elif url:
                 # Anthropic 支持公开可访问 URL 直接引用，无需先下载转 base64。
-                blocks.append({"type": "image", "source": {"type": "url", "url": url}})
-        elif ptype == "document":
-            # Anthropic 原生 document 块直通（URL / base64 source 均可）。
-            # 旧版本这里会静默跳过，导致 anthropic_native 模型的
-            # native_document=True 形同虚设——文档整个丢失。
-            source = part.get("source")
-            if isinstance(source, dict) and source.get("type") in ("url", "base64"):
-                block = {"type": "document", "source": source}
-                if part.get("title"):
-                    block["title"] = part["title"]
-                blocks.append(block)
-            else:
-                logger.info(
-                    "anthropic 转换：document part 缺少合法 source（%s），已跳过",
-                    type(source).__name__,
-                )
-        elif ptype == "file":
-            # OpenAI 形状 file part（data: URI）→ base64 document 块。
-            # 仅 PDF；非 PDF 无法被 document 块表达，跳过（上游已降级
-            # 为文本占位）。
-            fobj = part.get("file") or {}
-            file_data = fobj.get("file_data") or ""
-            if isinstance(file_data, str) and file_data.startswith("data:"):
+                out_blocks.append({"type": "image", "source": {"type": "url", "url": url}})
+        elif isinstance(block, DocumentBlock):
+            if block.url:
+                block_out: dict = {
+                    "type": "document",
+                    "source": {"type": "url", "url": block.url},
+                }
+                if block.filename:
+                    block_out["title"] = block.filename
+                out_blocks.append(block_out)
+            elif block.data_url:
                 try:
-                    header, b64data = file_data.split(",", 1)
+                    header, b64data = block.data_url.split(",", 1)
                     media_type = header.split(";")[0].split(":", 1)[1] or "application/pdf"
                 except (ValueError, IndexError):
                     media_type, b64data = "application/pdf", ""
                 if media_type == "application/pdf" and b64data:
-                    block = {
+                    doc = {
                         "type": "document",
                         "source": {
                             "type": "base64",
@@ -230,31 +209,31 @@ def _openai_content_to_anthropic_blocks(content: Any) -> list:
                             "data": b64data,
                         },
                     }
-                    if fobj.get("filename"):
-                        block["title"] = fobj["filename"]
-                    blocks.append(block)
+                    if block.filename:
+                        doc["title"] = block.filename
+                    out_blocks.append(doc)
                 else:
                     logger.info(
-                        "anthropic 转换：file part 非 PDF（media_type=%s），"
+                        "anthropic 转换：内联文档非 PDF（media_type=%s），"
                         "无法转为 document 块，已跳过",
                         media_type,
                     )
-        # 其它 part 类型（audio/video 等）Anthropic Messages API 暂不支持，
+        # 其它块类型（audio/video 等）Anthropic Messages API 暂不支持，
         # 静默跳过而不是抛错中断整轮请求。
-    return blocks
+    return out_blocks
 
 
 def _convert_messages_to_anthropic(messages: list) -> tuple[str, list]:
-    """把 OpenAI 形状的消息列表转换成 Anthropic 的 (system_prompt, messages)。
+    """把内部消息（Message）列表转换成 Anthropic 的 (system_prompt, messages)。
 
     规则：
       - role=system -> 拼接进顶层 system 字符串（Anthropic 无 system 角色消息）
-      - role=user   -> Anthropic user 消息（content 转换为块列表）
-      - role=assistant -> Anthropic assistant 消息；若含 tool_calls，追加
-        对应的 tool_use 块（每个 tool_call 一个块，input 为解析后的 JSON）
-      - role=tool   -> 追加/合并进下一个 Anthropic user 消息的 tool_result
-        块（Anthropic 要求 tool_result 必须放在 user 消息里，且通常紧跟
-        在触发它的 assistant tool_use 消息之后）
+      - role=user   -> Anthropic user 消息（blocks 转换为块列表）
+      - role=assistant -> Anthropic assistant 消息；ToolCallBlock 渲染为
+        tool_use 块（input 为结构化 dict）
+      - role=tool   -> ToolResultBlock 追加/合并进下一个 Anthropic user
+        消息的 tool_result 块（Anthropic 要求 tool_result 必须放在 user
+        消息里，且通常紧跟在触发它的 assistant tool_use 消息之后）
     """
     system_parts: list[str] = []
     anthropic_messages: list[dict] = []
@@ -265,27 +244,28 @@ def _convert_messages_to_anthropic(messages: list) -> tuple[str, list]:
             anthropic_messages.append({"role": "user", "content": list(pending_tool_results)})
             pending_tool_results.clear()
 
-    for msg in messages:
-        role = msg.get("role")
+    def _as_message(msg: Any) -> Message:
+        return msg if isinstance(msg, Message) else Message.from_openai_dict(msg)
+
+    for raw in messages:
+        msg = _as_message(raw)
+        role = msg.role
         if role == "system":
-            c = msg.get("content")
-            if isinstance(c, str) and c:
-                system_parts.append(c)
-            elif isinstance(c, list):
-                for part in c:
-                    if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
-                        system_parts.append(part["text"])
+            text = msg.text()
+            if text:
+                system_parts.append(text)
             continue
 
         if role == "tool":
             # tool 结果必须归入下一条 user 消息；先攒着，遇到下一个非 tool
             # 消息（或结尾）时统一 flush。
-            tc_id = msg.get("tool_call_id", "")
-            content = msg.get("content", "")
-            text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            tr = msg.tool_result_block()
+            if tr is None:
+                continue
+            text = tr.content if isinstance(tr.content, str) else json.dumps(tr.content, ensure_ascii=False)
             pending_tool_results.append({
                 "type": "tool_result",
-                "tool_use_id": tc_id,
+                "tool_use_id": tr.tool_call_id,
                 "content": [{"type": "text", "text": text}],
             })
             continue
@@ -294,27 +274,22 @@ def _convert_messages_to_anthropic(messages: list) -> tuple[str, list]:
         _flush_pending_tool_results()
 
         if role == "user":
-            blocks = _openai_content_to_anthropic_blocks(msg.get("content"))
+            blocks = _blocks_to_anthropic_content(msg.blocks)
             if blocks:
                 anthropic_messages.append({"role": "user", "content": blocks})
             continue
 
         if role == "assistant":
-            blocks = []
-            text_content = msg.get("content")
-            if isinstance(text_content, str) and text_content:
+            blocks: list[dict] = []
+            text_content = msg.text()
+            if text_content:
                 blocks.append({"type": "text", "text": text_content})
-            for tc in (msg.get("tool_calls") or []):
-                fn = tc.get("function", {})
-                try:
-                    tool_input = json.loads(fn.get("arguments") or "{}")
-                except (json.JSONDecodeError, TypeError):
-                    tool_input = {}
+            for tc in msg.tool_calls():
                 blocks.append({
                     "type": "tool_use",
-                    "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
-                    "name": fn.get("name", ""),
-                    "input": tool_input,
+                    "id": tc.id or f"toolu_{uuid.uuid4().hex[:24]}",
+                    "name": tc.name,
+                    "input": tc.arguments if isinstance(tc.arguments, dict) else {},
                 })
             if blocks:
                 anthropic_messages.append({"role": "assistant", "content": blocks})
@@ -382,9 +357,9 @@ async def anthropic_chat_completions_create(
     subagent_tool.py 之类只需要"一次性拿完整结果"的调用方直接复用，
     无需为 Anthropic 单独写一套解析逻辑。
 
-    入参 messages 为 OpenAI 形状（含 role=system/tool），本函数内部
+    入参 messages 为内部 Message 列表（含 role=system/tool），本函数内部
     完成到 Anthropic {system, messages} 形状的转换；返回值同样转换回
-    OpenAI 形状，调用方感知不到协议差异。
+    OpenAI SDK 形状，调用方感知不到协议差异。
     """
     system_prompt, anthropic_messages = _convert_messages_to_anthropic(messages)
     if supports_prompt_cache and anthropic_messages:
@@ -606,8 +581,9 @@ async def _agentic_loop_anthropic(
     """Anthropic 原生 Messages API 专用循环。
 
     对外契约与 _agentic_loop_openai_compat / _agentic_loop_gemini_native
-    完全一致：入参/出参（messages、返回的 new_history_entries）都是 OpenAI
-    形状，只在请求 Anthropic API 前后做边界转换（见模块头注释）。
+    完全一致：入参/出参（messages、返回的 new_history_entries）统一为内部
+    Message（core/messages），只在请求 Anthropic API 前做内部 -> 原生协议
+    的边界转换（见模块头注释）。
     """
     api_label = "anthropic"
     if tools is None:

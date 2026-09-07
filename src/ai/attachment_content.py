@@ -14,6 +14,15 @@ import aiohttp
 
 from config import ModelConfig, TELEGRAM_BOT_TOKEN, get_effective_endpoint
 from utils import get_logger, transcribe_audio_with_groq
+from core.messages import (
+    AudioBlock,
+    Block,
+    DocumentBlock,
+    ImageBlock,
+    Message,
+    TextBlock,
+    VideoBlock,
+)
 from file_handlers import get_file_path
 from s3_utils import (
     upload_bytes_to_r2,
@@ -459,44 +468,41 @@ def _guess_document_mime_type(file_name: str = "", explicit_mime: str = "") -> s
 
 
 def _is_anthropic_native_model(model_info: Optional[ModelConfig]) -> bool:
-    """判断模型是否走 Anthropic 原生 Messages 协议循环。
+    """判断模型是否走 Anthropic 原生 Messages 协议（anthropic_messages）。
 
     与 _resolve_multimodal_content 里 vision_prefer_url 的取法同口径：
-    走"有效端点"合并（模型级 dedicated_loop_kind 覆盖优先），未知厂商
-    返回 False。
+    走"有效端点"合并（模型级 protocol 覆盖优先），未知厂商返回 False。
     """
     if model_info is None:
         return False
     try:
-        return get_effective_endpoint(model_info).dedicated_loop_kind == "anthropic_native"
+        return get_effective_endpoint(model_info).protocol == "anthropic_messages"
     except ValueError:
         return False
 
 
-async def _build_base64_document_file_part(
+async def _build_base64_document_block(
         chat_id: int | None,
         file_id: str,
         file_name: str,
         mime_type: str,
-) -> Optional[dict]:
-    """构造 OpenAI Chat Completions 形状的 file content part（data: URI）。
+) -> Optional[DocumentBlock]:
+    """构造内联文档块（DocumentBlock，data: URI 形式）。
 
-    - OpenAI 兼容循环：直接按此形状出站。
-    - Anthropic 原生循环：anthropic_bridge._openai_content_to_anthropic_blocks
-      会把该 part 转换成 base64 source 的 document 块（仅 PDF）。
+    - OpenAI 兼容循环：渲染为 file content part（file_data data: URI）。
+    - Anthropic 原生循环：anthropic_bridge 会把该块转换成 base64 source
+      的 document 块（仅 PDF）。
     """
     data = await _get_cached_document_data(chat_id, file_id)
     if not data:
         return None
 
     b64_data = base64.b64encode(data).decode()
-    return {
-        "type": "file",
-        "file": {
-            "filename": file_name,
-            "file_data": f"data:{mime_type};base64,{b64_data}",
-        },
-    }
+    return DocumentBlock(
+        data_url=f"data:{mime_type};base64,{b64_data}",
+        filename=file_name,
+        mime=mime_type,
+    )
 
 
 async def _materialize_document_to_workspace_download(
@@ -551,28 +557,29 @@ async def _ensure_document_download_available(chat_id: int | None, file_id: str,
         )
 
 
-async def _build_native_document_part(
+async def _build_native_document_block(
         chat_id: int | None,
         file_id: str,
         file_name: str = "",
         mime_type: str = "",
         model_info: Optional[ModelConfig] = None,
-) -> Optional[dict]:
-    """把文档附件解析为"原生文档"content part（按当前模型的协议分流）。
+) -> Optional[DocumentBlock]:
+    """把文档附件解析为"原生文档"块（按当前模型的协议分流）。
 
-    - anthropic_native（如 XXTF 的 claude-opus-5）：
+    - anthropic_messages（如 XXTF 的 claude-opus-5）：
       Anthropic Messages API 的 document 块 URL source
-      （{"type": "document", "source": {"type": "url", ...}}）。
+      （DocumentBlock(url=...)，由 anthropic_bridge 渲染为
+      {"type": "document", "source": {"type": "url", ...}}）。
       官方限制：URL / base64 source 的 document 块**仅接受 PDF**
       （docx/xlsx 等二进制格式不被 document 块支持，官方要求先转成
       文本或 PDF）。因此：
         * PDF      → 优先 R2 公开 URL（与图片 Agnes 路径同一套解析），
-                      URL 不可用时退回 base64 file part（bridge 转换）；
+                      URL 不可用时退回 base64 内联；
         * 非 PDF   → 返回 None，调用方走文本占位（链接 + file_id，
                       模型可用工具读取），绝不静默内联一个错误形状。
       URL 方案的好处：不再把整份 PDF 拉进内存转 base64（base64 膨胀
       33% 且每轮请求体都带上全量字节），R2 上传一次后每轮只传 URL。
-    - OpenAI 兼容协议：维持原有 base64 file part 形状（file_data data: URI）。
+    - OpenAI 兼容协议：维持原有 base64 内联形状（DocumentBlock.data_url）。
     """
     safe_name = file_name or f"document_{file_id[:8]}.pdf"
     safe_mime = _guess_document_mime_type(safe_name, mime_type)
@@ -592,22 +599,18 @@ async def _build_native_document_part(
 
         url = await _resolve_r2_public_url_for_document(file_id, safe_mime)
         if url:
-            return {
-                "type": "document",
-                "source": {"type": "url", "url": url},
-                "title": safe_name,
-            }
+            return DocumentBlock(url=url, filename=safe_name, mime=safe_mime)
 
-        # R2 未配置 / 上传失败：PDF 退回 base64（bridge 会转成
-        # base64 source document 块），避免有 R2 时明明能原生读却读不到。
+        # R2 未配置 / 上传失败：PDF 退回 base64（避免有 R2 时明明能
+        # 原生读却读不到）。
         logger.info(
             "[NativeDocument] R2 URL 不可用，PDF 降级 base64 内联: %s",
             str(safe_name)[:40],
         )
-        part = await _build_base64_document_file_part(chat_id, file_id, safe_name, safe_mime)
-        return part
+        block = await _build_base64_document_block(chat_id, file_id, safe_name, safe_mime)
+        return block
 
-    return await _build_base64_document_file_part(chat_id, file_id, safe_name, safe_mime)
+    return await _build_base64_document_block(chat_id, file_id, safe_name, safe_mime)
 
 
 def _attachment_label(kind: str) -> str:
@@ -798,10 +801,10 @@ async def _build_audio_fallback_text(
     return "\n\n".join(parts) if parts else (user_text or "请分析这段音频")
 
 
-async def _build_image_content_part(
+async def _build_image_block(
     chat_id: int | None, file_id: str, vision_prefer_url: bool
-) -> Optional[dict]:
-    """把单个图片 file_id 解析为 image_url content part（失败返回 None）。
+) -> Optional[ImageBlock]:
+    """把单个图片 file_id 解析为 ImageBlock（失败返回 None）。
 
     从 photo_group 分支抽出的公共逻辑，混合附件分支复用：
     vision_prefer_url 网关（Agnes）优先 R2 公开 URL，失败回退 base64；
@@ -812,10 +815,7 @@ async def _build_image_content_part(
     if vision_prefer_url:
         public_url = await _resolve_r2_public_url_for_vision(file_id)
         if public_url:
-            return {
-                "type": "image_url",
-                "image_url": {"url": public_url, "detail": "high"},
-            }
+            return ImageBlock(url=public_url, detail="high")
         # R2 不可用，回退到 base64（仍然好过完全没图）。
         logger.debug(
             f"vision_prefer_url=True 但 R2 URL 不可用，回退 base64: {file_id[:12]}"
@@ -853,10 +853,7 @@ async def _build_image_content_part(
                     buf = io.BytesIO()
                     img_rgb.save(buf, format=fmt.upper())
                     b64 = base64.b64encode(buf.getvalue()).decode()
-            return {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/{fmt};base64,{b64}", "detail": "high"}
-            }
+            return ImageBlock(url=f"data:image/{fmt};base64,{b64}", detail="high")
     except Exception as e:
         logger.exception(f"处理图片 {file_id} 失败: {e}")
         return None
@@ -868,20 +865,20 @@ async def _resolve_mixed_attachments(
     chat_id: int | None,
     user_text: str,
     vision_prefer_url: bool,
-) -> list[dict] | str:
+) -> list[Block]:
     """逐条解析混合 kind / 多音频附件（打断合并产物，无单一 type 可路由）。
 
-    每个附件独立判断当前模型能力：支持的模态生成对应原生 content part
-    （image_url / video_url / input_audio / file），不支持或解析失败的
-    降级为文本占位（音频走转录降级，视频顺带后台持久化，保证切换模型
-    后可恢复）。返回 content parts 列表；全部失败时返回占位文本。
+    每个附件独立判断当前模型能力：支持的模态生成对应内部块
+    （ImageBlock / VideoBlock / AudioBlock / DocumentBlock），不支持或解析
+    失败的降级为文本占位（音频走转录降级，视频顺带后台持久化，保证切换
+    模型后可恢复）。返回 Block 列表；全部失败时返回占位文本块。
     """
     supports_vision = model_info.vision
     supports_audio = model_info.audio
     supports_video = bool(getattr(model_info, "video", False))
     supports_native_documents = bool(getattr(model_info, "native_document", False))
 
-    content_parts: list[dict] = []
+    blocks: list[Block] = []
     fallback_texts: list[str] = []
 
     for entry in entries:
@@ -892,13 +889,13 @@ async def _resolve_mixed_attachments(
         fname = str(entry.get("file_name") or "").strip()
         mime = str(entry.get("mime_type") or "").strip()
 
-        resolved_part = None
+        resolved_block: Optional[Block] = None
         if kind == "photo" and supports_vision:
-            resolved_part = await _build_image_content_part(chat_id, fid, vision_prefer_url)
+            resolved_block = await _build_image_block(chat_id, fid, vision_prefer_url)
         elif kind == "video" and supports_video:
             public_url = await _resolve_r2_public_url_for_video(fid, mime or "video/mp4")
             if public_url:
-                resolved_part = {"type": "video_url", "video_url": {"url": public_url}}
+                resolved_block = VideoBlock(url=public_url)
             else:
                 # URL 不可用（R2 未配置/上传失败）：后台持久化，
                 # 万一 R2 稍后恢复，下一轮可重新解析为原生视频。
@@ -911,11 +908,8 @@ async def _resolve_mixed_attachments(
                     audio_format = (Path(fname).suffix.lstrip(".") or "ogg").lower()
                     if audio_format == "oga":
                         audio_format = "ogg"
-                    resolved_part = {
-                        "type": "input_audio",
-                        "input_audio": {"data": b64_data, "format": audio_format},
-                    }
-            if resolved_part is None:
+                    resolved_block = AudioBlock(data=b64_data, format=audio_format)
+            if resolved_block is None:
                 # 模型不支持音频 / 字节获取失败：转录降级（与单音频路径一致）。
                 fallback_texts.append(await _build_audio_fallback_text(
                     chat_id=chat_id,
@@ -925,7 +919,7 @@ async def _resolve_mixed_attachments(
                 ))
                 continue
         elif kind == "document" and supports_native_documents:
-            resolved_part = await _build_native_document_part(
+            resolved_block = await _build_native_document_block(
                 chat_id,
                 fid,
                 file_name=fname or f"document_{fid[:8]}.pdf",
@@ -933,8 +927,8 @@ async def _resolve_mixed_attachments(
                 model_info=model_info,
             )
 
-        if resolved_part is not None:
-            content_parts.append(resolved_part)
+        if resolved_block is not None:
+            blocks.append(resolved_block)
             continue
 
         # 文档无论是否支持 native document，都先落地 workspace/download。
@@ -964,13 +958,18 @@ async def _resolve_mixed_attachments(
     if user_text and str(user_text).strip():
         text_bits.append(str(user_text))
     if text_bits:
-        content_parts.append({"type": "text", "text": "\n\n".join(text_bits)})
-    if content_parts:
-        return content_parts
-    return user_text
+        blocks.append(TextBlock("\n\n".join(text_bits)))
+    return blocks
 
 
-async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_id: int | None = None) -> list[dict] | str:
+async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_id: int | None = None) -> list[Block]:
+    """把 Telegram 侧消息信封（文本 + 附件元数据）解析为内部内容块列表。
+
+    重构说明：旧版返回 OpenAI content parts 列表（或纯字符串），现在统一
+    返回内部块（Block）；协议形状由各适配器在出站时渲染。支持的模态产生
+    对应块（ImageBlock / AudioBlock / VideoBlock / DocumentBlock），不支持
+    或解析失败时降级为文本占位块——调用方拿到的永远是合法的块列表。
+    """
     supports_vision = model_info.vision
     supports_audio = model_info.audio
     # 视频输入模态：默认由 provider 能力决定，模型必须显式设置 video=True 才开启。
@@ -1015,10 +1014,10 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
         file_ids = list(msg.get("file_ids") or [])
         if supports_vision:
             results = await asyncio.gather(
-                *[_build_image_content_part(chat_id, fid, vision_prefer_url) for fid in file_ids]
+                *[_build_image_block(chat_id, fid, vision_prefer_url) for fid in file_ids]
             )
-            content_parts = [r for r in results if r is not None]
-            if content_parts:
+            content_blocks: list[Block] = [r for r in results if r is not None]
+            if content_blocks:
                 # 即使当前模型支持视觉输入，也额外注入附件临时 URL。
                 # 该 URL 与非多模态 fallback 使用同一套解析逻辑，
                 # 便于图片编辑工具调用，以及后续模型切换后继续复用。
@@ -1032,13 +1031,10 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                     if temp_url:
                         url_lines.append(f"原始图片 URL: {temp_url}")
                 if url_lines:
-                    content_parts.append({
-                        "type": "text",
-                        "text": "\n".join(url_lines),
-                    })
-                content_parts.append({"type": "text", "text": user_text})
-                return content_parts
-            return user_text
+                    content_blocks.append(TextBlock("\n".join(url_lines)))
+                content_blocks.append(TextBlock(user_text))
+                return content_blocks
+            return [TextBlock(user_text)] if user_text else []
 
         file_names = list(msg.get("file_names") or [])
         mime_types = list(msg.get("mime_types") or [])
@@ -1057,45 +1053,42 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
         vg_file_names = list(msg.get("file_names") or [])
         vg_mime_types = list(msg.get("mime_types") or [])
         if vg_file_ids and supports_video:
-            async def process_video_one(idx: int, fid: str) -> dict | None:
+            async def process_video_one(idx: int, fid: str) -> VideoBlock | None:
                 mime = ""
                 if idx < len(vg_mime_types):
                     mime = str(vg_mime_types[idx] or "").strip()
                 public_url = await _resolve_r2_public_url_for_video(fid, mime or "video/mp4")
                 if public_url:
-                    return {
-                        "type": "video_url",
-                        "video_url": {"url": public_url},
-                    }
+                    return VideoBlock(url=public_url)
                 return None
 
             results = await asyncio.gather(
                 *[process_video_one(i, fid) for i, fid in enumerate(vg_file_ids)]
             )
-            content_parts = [r for r in results if r is not None]
+            content_blocks = [r for r in results if r is not None]
             # 无论整体走原生还是降级，解析失败的视频都触发后台持久化，
             # 保证之后切换模型/下一轮重试时仍有机会恢复。
             failed_indices = [i for i, r in enumerate(results) if r is None]
             for i in failed_indices:
                 mime = vg_mime_types[i] if i < len(vg_mime_types) else ""
                 _track_task(_ensure_video_persisted(vg_file_ids[i], mime or "video/mp4"))
-            if content_parts:
-                content_parts.append({"type": "text", "text": user_text})
-                return content_parts
+            if content_blocks:
+                content_blocks.append(TextBlock(user_text))
+                return content_blocks
         elif vg_file_ids:
             # 模型不支持视频输入：后台持久化全部，保证切换模型不丢信息
             for i, fid in enumerate(vg_file_ids):
                 mime = vg_mime_types[i] if i < len(vg_mime_types) else ""
                 _track_task(_ensure_video_persisted(fid, mime or "video/mp4"))
 
-        return await _build_attachment_fallback_text(
+        return [TextBlock(await _build_attachment_fallback_text(
             kind="video",
             file_ids=vg_file_ids,
             user_text=user_text,
             chat_id=chat_id,
             file_names=vg_file_names,
             mime_types=vg_mime_types,
-        )
+        ))]
 
     # ---------- 原生文档 / 文档组 ----------
     doc_file_ids = []
@@ -1113,25 +1106,25 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
 
         if supports_native_documents:
             if doc_file_ids:
-                content_parts = []
+                content_blocks = []
                 fallback_texts = []
                 if user_text:
-                    content_parts.append({"type": "text", "text": user_text})
+                    content_blocks.append(TextBlock(user_text))
                 else:
-                    content_parts.append(
-                        {"type": "text", "text": "请分析这些文档。" if len(doc_file_ids) > 1 else "请分析这个文档。"})
+                    content_blocks.append(
+                        TextBlock("请分析这些文档。" if len(doc_file_ids) > 1 else "请分析这个文档。"))
 
                 for idx, fid in enumerate(doc_file_ids):
                     file_name = doc_file_names[idx] if idx < len(doc_file_names) else f"document_{fid[:8]}.pdf"
                     mime_type = doc_mime_types[idx] if idx < len(doc_mime_types) else ""
-                    part = await _build_native_document_part(
+                    block = await _build_native_document_block(
                         chat_id, fid,
                         file_name=file_name,
                         mime_type=mime_type,
                         model_info=model_info,
                     )
-                    if part:
-                        content_parts.append(part)
+                    if block:
+                        content_blocks.append(block)
                         continue
                     # 原生解析失败（anthropic document 块不收非 PDF /
                     # 字节获取失败）：逐个构造文本占位（链接 + file_id），
@@ -1147,11 +1140,9 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                     ))
 
                 if fallback_texts:
-                    content_parts.append({"type": "text", "text": "\n\n".join(fallback_texts)})
+                    content_blocks.append(TextBlock("\n\n".join(fallback_texts)))
 
-                if len(content_parts) > 1:
-                    return content_parts
-                return user_text
+                return content_blocks
         elif doc_file_ids:
             for idx, fid in enumerate(doc_file_ids):
                 await _ensure_document_download_available(
@@ -1159,14 +1150,14 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                     fid,
                     doc_file_names[idx] if idx < len(doc_file_names) else f"document_{fid[:8]}"
                 )
-            return await _build_attachment_fallback_text(
+            return [TextBlock(await _build_attachment_fallback_text(
                 kind="document",
                 file_ids=doc_file_ids,
                 user_text=user_text,
                 chat_id=chat_id,
                 file_names=doc_file_names,
                 mime_types=doc_mime_types,
-            )
+            ))]
 
     # ---------- 单文件回退（音频 / 其他） ----------
     if "file_id" in msg:
@@ -1183,15 +1174,15 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                     if audio_format == "oga":
                         audio_format = "ogg"
                     return [
-                        {"type": "input_audio", "input_audio": {"data": b64_data, "format": audio_format}},
-                        {"type": "text", "text": user_text or "请分析这段音频"}
+                        AudioBlock(data=b64_data, format=audio_format),
+                        TextBlock(user_text or "请分析这段音频"),
                     ]
-            return await _build_audio_fallback_text(
+            return [TextBlock(await _build_audio_fallback_text(
                 chat_id=chat_id,
                 file_id=fid,
                 file_name=file_name,
                 user_text=user_text,
-            )
+            ))]
 
         if file_type == "video":
             file_name = msg.get("file_name", f"{file_type}_{fid[:8]}")
@@ -1205,11 +1196,8 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                 public_url = await _resolve_r2_public_url_for_video(fid, mime_type or "video/mp4")
                 if public_url:
                     return [
-                        {
-                            "type": "video_url",
-                            "video_url": {"url": public_url},
-                        },
-                        {"type": "text", "text": user_text or "请分析这段视频。"},
+                        VideoBlock(url=public_url),
+                        TextBlock(user_text or "请分析这段视频。"),
                     ]
                 # URL 不可用（R2 未配置 / 上传失败）：降级为文本占位。
                 # 同时后台尝试持久化，万一 R2 稍后恢复/配置上，下一轮可
@@ -1244,46 +1232,53 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                     "说明：当前模型支持视频输入，但视频 URL 不可用（R2 未配置或上传失败），"
                     "已降级为文本占位；配置 R2 后新上传的视频可直接解析。"
                 )
-            return "\n".join(lines)
+            return [TextBlock("\n".join(lines))]
 
         # 说明：document / document_group 在上方"原生文档"分支已全路径
         # 处理（supports_native_documents 与降级文本均返回），此处不可能
         # 再收到该类型，无需再降级。
 
-    return user_text
+    return [TextBlock(user_text)] if user_text else []
 
 
 async def _append_history_async(messages: list, history: list, model_info: ModelConfig, chat_id: int | None = None) -> None:
-    """把历史消息格式化后追加到 ``messages``。
+    """把历史消息（Message 列表）按当前模型能力重新解析后追加到 ``messages``。
 
-    重要：发给模型 API 的消息体只允许包含 OpenAI 兼容协议认可的字段
-    （``role``、``content``、``tool_calls``、``tool_call_id``、``name``、
-    ``reasoning_content``）。Telegram 侧的附件元数据（``file_id``、
-    ``file_ids``、``file_name`` 等）属于内部存储字段，**不能**写到
-    出站消息里——否则部分网关（OpenAI / Anthropic / Gemini）会因未声
-    明字段直接 400。此前版本在这里把附件元数据一起拷进了 out_msg，
-    是一个静默导致请求失败的 BUG。
+    重构说明（Internal Message 全链路）：历史存储统一为 Message 对象。
+    user 消息携带 Telegram 侧附件元数据（保存在 ``Message.meta``），每轮
+    按当前模型能力重新解析为内部块（支持多模态的模型得到原生块，不支持
+    的得到文本占位）；其余角色原样透传（仅对文本做引用回复前缀剥除）。
+
+    重要：Telegram 侧的附件元数据（``file_id``、``file_ids``、``file_name``
+    等）保存在 ``Message.meta``，渲染出站时**永不**写入请求体（协议适配器
+    只读 blocks），否则部分网关（OpenAI / Anthropic / Gemini）会因未声明
+    字段直接 400。此前版本靠出站前手工剔除字段，是一个静默导致请求失败
+    的 BUG 根源；现在由 Message.to_openai_dict 的结构性保证替代。
     """
     for msg in history:
-        if msg.get("role") in ("user", "assistant", "tool", "system"):
-            out_msg = {"role": msg["role"]}
-            if msg.get("role") == "user":
-                resolved = await _resolve_multimodal_content(dict(msg), model_info, chat_id=chat_id)
-                out_msg["content"] = resolved
-                # 注意：不要把 file_id / file_ids / file_name / mime_type /
-                # type / attachments 等附件元数据写到出站消息里，部分
-                # 模型 API 会因此返回 400。
+        m = msg if isinstance(msg, Message) else Message.from_openai_dict(msg)
+        if m.role not in ("user", "assistant", "tool", "system"):
+            continue
+        if m.role == "user":
+            # 携带附件元数据的历史 user 消息：按当前模型能力重新解析。
+            if m.meta:
+                envelope = dict(m.meta)
+                envelope["content"] = m.text()
+                resolved = await _resolve_multimodal_content(envelope, model_info, chat_id=chat_id)
             else:
-                if "content" in msg:
-                    content = msg["content"]
-                    if isinstance(content, str):
-                        out_msg["content"] = _strip_reply_prefix(content)
-                    else:
-                        out_msg["content"] = content
-            for key in ["tool_calls", "tool_call_id", "name", "reasoning_content"]:
-                if key in msg:
-                    out_msg[key] = msg[key]
+                resolved = [TextBlock(_strip_reply_prefix(b.text)) if "💡 引用回复:" in b.text else b
+                            for b in m.blocks]
+            out_msg = Message.user(resolved, **m.meta)
             messages.append(out_msg)
+        else:
+            # assistant / tool / system：文本剥引用前缀后原样透传。
+            out_blocks = []
+            for b in m.blocks:
+                if isinstance(b, TextBlock) and "💡 引用回复:" in b.text:
+                    out_blocks.append(TextBlock(_strip_reply_prefix(b.text)))
+                else:
+                    out_blocks.append(b)
+            messages.append(Message(role=m.role, blocks=out_blocks, name=m.name))
 
 
 def _strip_reply_prefix(content: str) -> str:

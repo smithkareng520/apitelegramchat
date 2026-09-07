@@ -116,6 +116,7 @@ from state import (
     get_or_init_context,
 )
 from utils import get_logger
+from core.messages import Message
 
 logger = get_logger(__name__)
 
@@ -299,17 +300,39 @@ async def drain_completed_turns(chat_id: int) -> None:
 # 补齐结构与持久化
 # =====================================================================
 def _unpaired_tool_calls(journal: list) -> list[tuple[str, str]]:
-    """找出 journal 中没有配对 tool 消息的 (tool_call_id, name) 列表。"""
+    """找出 journal 中没有配对 tool 消息的 (tool_call_id, name) 列表。
+
+    重构说明（Internal Message）：journal 统一为 Message 列表（兼容旧
+    dict 直通），assistant 消息经 tool_calls() 读取结构化 ToolCallBlock。
+    """
+    def _role(m):
+        return m.role if isinstance(m, Message) else m.get("role")
+
     paired: set[str] = set()
     for msg in journal:
-        if isinstance(msg, dict) and msg.get("role") == "tool":
+        if _role(msg) != "tool":
+            continue
+        if isinstance(msg, Message):
+            tr = msg.tool_result_block()
+            if tr is not None and tr.tool_call_id:
+                paired.add(tr.tool_call_id)
+        elif isinstance(msg, dict):
             tc_id = msg.get("tool_call_id")
             if isinstance(tc_id, str) and tc_id:
                 paired.add(tc_id)
     unpaired: list[tuple[str, str]] = []
     seen: set[str] = set()
     for msg in journal:
-        if not (isinstance(msg, dict) and msg.get("role") == "assistant"):
+        if _role(msg) != "assistant":
+            continue
+        if isinstance(msg, Message):
+            for tc in msg.tool_calls():
+                if not tc.id or tc.id in paired or tc.id in seen:
+                    continue
+                seen.add(tc.id)
+                unpaired.append((tc.id, str(tc.name or "unknown")))
+            continue
+        if not isinstance(msg, dict):
             continue
         tool_calls = msg.get("tool_calls")
         if not isinstance(tool_calls, list):
@@ -333,12 +356,7 @@ def _normalize_journal(journal: list) -> list:
     """返回补齐占位 tool 消息后的 journal 副本（原列表不被修改）。"""
     normalized = list(journal)
     placeholders = [
-        {
-            "role": "tool",
-            "tool_call_id": tc_id,
-            "name": name,
-            "content": INTERRUPTED_TOOL_PLACEHOLDER,
-        }
+        Message.tool_result(tc_id, name, INTERRUPTED_TOOL_PLACEHOLDER)
         for tc_id, name in _unpaired_tool_calls(normalized)
     ]
     if placeholders:
@@ -645,15 +663,32 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
     """
     if chat_id is None or not isinstance(user_message, dict):
         return False
+
+    def _envelope_of(msg: Message) -> dict:
+        """把存储的 user Message 投影回信封 dict（meta + content），复用
+        旧版纯 dict 的合并/替换算法。"""
+        env = dict(msg.meta)
+        env["content"] = msg.text()
+        return env
+
+    def _wrap_envelope(env: dict) -> Message:
+        """信封 dict -> 存储 Message（文本进 blocks，其余进 meta）。"""
+        env = dict(env)
+        content = env.pop("content", "")
+        return Message.user_text(str(content or ""), **env)
+
     lock = await get_chat_lock(chat_id)
     async with lock:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
         last = history[-1] if history else None
-        if isinstance(last, dict) and last.get("role") == "user":
-            if last.pop(TURN_FAILED_FLAG, None):
+        last_is_user = isinstance(last, Message) and last.role == "user"
+        if last_is_user:
+            last_env = _envelope_of(last)
+            if last_env.pop(TURN_FAILED_FLAG, None):
                 # 上一轮请求失败：替换而非合并（重试语义，见函数 docstring）。
-                _replace_failed_user_message(last, user_message)
+                _replace_failed_user_message(last_env, user_message)
+                history[-1] = _wrap_envelope(last_env)
                 logger.info(
                     "[turn-recovery] chat=%s 上一轮请求失败：新 user 消息替换失败轮消息"
                     "（不合并旧文本/图片，媒体仅在新消息为空时搬移一份）",
@@ -661,13 +696,14 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
                 )
             else:
                 # 打断发生在任何 assistant 输出之前：合并，避免连续两条 user。
-                _merge_user_message(last, user_message)
+                _merge_user_message(last_env, user_message)
+                history[-1] = _wrap_envelope(last_env)
                 logger.info(
                     "[turn-recovery] chat=%s 新 user 消息合并进上一条未回应的 user 消息",
                     chat_id,
                 )
         else:
-            history.append(user_message)
+            history.append(_wrap_envelope(user_message))
     user_message[EARLY_PERSIST_FLAG] = True
     return True
 
@@ -692,8 +728,8 @@ async def mark_failed_unanswered_user(chat_id: int) -> None:
         ctx = get_or_init_context(chat_id)
         history = ctx.get("conversation_history") or []
         last = history[-1] if history else None
-        if isinstance(last, dict) and last.get("role") == "user":
-            last[TURN_FAILED_FLAG] = True
+        if isinstance(last, Message) and last.role == "user":
+            last.meta[TURN_FAILED_FLAG] = True
             logger.info(
                 "[turn-recovery] chat=%s 轮次失败：已标记末尾未回应的 user 消息"
                 "（下一条消息将替换而非合并）",

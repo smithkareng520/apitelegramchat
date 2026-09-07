@@ -57,6 +57,8 @@ import aiohttp
 
 from utils import get_logger
 
+from core.messages import Message
+
 logger = get_logger(__name__)
 
 
@@ -123,7 +125,10 @@ def _last_turn_boundary(messages: list) -> Optional[int]:
     """当前回合起始下标 = 最后一条 user 消息的位置；无 user 返回 None。"""
     for i in range(len(messages) - 1, -1, -1):
         m = messages[i]
-        if isinstance(m, dict) and m.get("role") == "user":
+        if isinstance(m, Message):
+            if m.role == "user":
+                return i
+        elif isinstance(m, dict) and m.get("role") == "user":
             return i
     return None
 
@@ -137,14 +142,22 @@ def _prefix_cache_safe(prefix: list) -> bool:
       * assistant+tool_calls 结尾 -> functionCall 之后必须紧跟
         functionResponse，不能从缓存续传。
     """
+    def _role(x):
+        return x.role if isinstance(x, Message) else x.get("role")
+
+    def _has_tool_calls(x):
+        if isinstance(x, Message):
+            return bool(x.tool_calls())
+        return bool(x.get("tool_calls"))
+
     non_system = [m for m in prefix
-                  if isinstance(m, dict) and m.get("role") != "system"]
+                  if (_role(m) if isinstance(m, (Message, dict)) else None) != "system"]
     if not non_system:
         return True
     last = non_system[-1]
-    if last.get("role") != "assistant":
+    if _role(last) != "assistant":
         return False
-    if last.get("tool_calls"):
+    if _has_tool_calls(last):
         return False
     return True
 
@@ -181,6 +194,14 @@ def _estimate_tokens(messages: list) -> int:
         from token_budget import count_tokens
         chunks: list[str] = []
         for m in messages:
+            if isinstance(m, Message):
+                chunks.append(m.text())
+                calls = m.tool_calls()
+                if calls:
+                    chunks.append(json.dumps(
+                        [{"name": c.name, "arguments": c.arguments} for c in calls],
+                        ensure_ascii=False))
+                continue
             if not isinstance(m, dict):
                 continue
             content = m.get("content")
@@ -194,7 +215,9 @@ def _estimate_tokens(messages: list) -> int:
     except Exception:
         total = 0
         for m in messages:
-            if isinstance(m, dict):
+            if isinstance(m, Message):
+                total += len(m.text())
+            elif isinstance(m, dict):
                 total += len(str(m.get("content") or ""))
         return total // 4
 

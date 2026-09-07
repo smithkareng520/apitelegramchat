@@ -1,9 +1,16 @@
 # api_client.py
 """
-统一 API 客户端工厂（配置驱动）
+统一 API 客户端工厂（协议驱动）
 支持通过 config.py 中的 PROVIDERS 字典动态添加新厂商，也支持每个模型
 单独覆盖端点（base_url / api_key_env / 协议），详见
 config.get_effective_endpoint()。
+
+客户端构造按"协议"分流（protocol -> SDK client）：
+  - anthropic_messages -> AsyncAnthropic
+  - 其它协议（openai_chat 及一切带 base_url 的兼容端点）-> AsyncOpenAI
+  - gemini_native / openai_images 的主链路不经过 SDK 客户端
+    （协议适配器内直连 aiohttp），但 subagent 等兼容层调用方仍可拿到
+    AsyncOpenAI 客户端访问同一厂商的 OpenAI 兼容端点。
 
 安全改进：所有 API Key 从 config 模块的变量中读取（而非 os.environ），
 配合 config.py 的 scrub_environment() 实现环境变量完全清洗。
@@ -16,7 +23,7 @@ from typing import Any, Dict, Optional, Union, cast
 from openai import AsyncOpenAI
 
 try:
-    # 可选依赖：仅 anthropic 协议需要。未安装时其余协议完全不受影响，
+    # 可选依赖：仅 anthropic_messages 协议需要。未安装时其余协议完全不受影响，
     # 只有实际请求 anthropic 客户端时才会报错（而不是在导入期整体失败）。
     from anthropic import AsyncAnthropic
 except ImportError:  # pragma: no cover - 依赖缺失时的降级路径
@@ -29,12 +36,12 @@ import config as app_config
 logger = logging.getLogger(__name__)
 
 # 使用原生 SDK（而非 AsyncOpenAI）的协议集合。新增协议只需加进这里 +
-# config.py 的 ProviderConfig/ModelConfig 的 dedicated_loop_kind，
+# config.py 的 ProviderConfig/ModelConfig 的 protocol 字段，
 # _build_client 会自动分流，其余协议的构造逻辑不受影响。
-# 注意：这里判断的是"有效协议"（dedicated_loop_kind），而不是 provider
+# 注意：这里判断的是"有效协议"（protocol），而不是 provider
 # 名字——同一个 provider 壳下的不同模型可能通过端点覆盖各自声明不同的
-# dedicated_loop_kind（见 get_effective_endpoint）。
-_NATIVE_SDK_LOOP_KINDS = {"anthropic_native"}
+# protocol（见 get_effective_endpoint）。
+_NATIVE_SDK_PROTOCOLS = {"anthropic_messages"}
 
 
 class APIClient:
@@ -43,7 +50,7 @@ class APIClient:
     根据"有效端点"（EffectiveEndpoint，由 provider 默认值与模型级覆盖
     合并得到）动态创建并缓存客户端实例：
       - 默认协议：AsyncOpenAI（OpenAI 兼容协议，逻辑与之前完全一致）
-      - dedicated_loop_kind="anthropic_native" 的端点：AsyncAnthropic
+      - protocol="anthropic_messages" 的端点：AsyncAnthropic
 
     客户端按"模型 ID"缓存（而非按 provider 缓存）：因为现在允许同一个
     provider 下的不同模型分别覆盖 base_url/api_key_env/协议，若仍按
@@ -75,10 +82,10 @@ class APIClient:
 
     def _build_native_client(self, endpoint: EffectiveEndpoint) -> "AsyncAnthropic":
         """
-        构建原生 SDK 客户端（目前仅 anthropic_native）。与 _build_client 的
+        构建原生 SDK 客户端（目前仅 anthropic_messages）。与 _build_client 的
         AsyncOpenAI 分支完全独立，互不影响。
         """
-        if endpoint.dedicated_loop_kind == "anthropic_native":
+        if endpoint.protocol == "anthropic_messages":
             if AsyncAnthropic is None:
                 raise ValueError(
                     "未安装 anthropic 包，无法创建 Anthropic 客户端。"
@@ -104,15 +111,15 @@ class APIClient:
                 timeout=cast(Any, httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=60.0)),
                 **kwargs,
             )
-        raise ValueError(f"未知的原生 SDK 协议: {endpoint.dedicated_loop_kind}")
+        raise ValueError(f"未知的原生 SDK 协议: {endpoint.protocol}")
 
     def _build_client(self, endpoint: EffectiveEndpoint) -> Union[AsyncOpenAI, "AsyncAnthropic"]:
         """
         根据"有效端点"配置构建客户端。如果配置缺失或 API Key 为空，抛出 ValueError。
         """
-        # anthropic_native 等原生 SDK 协议走独立分支，完全不影响以下
+        # anthropic_messages 等原生 SDK 协议走独立分支，完全不影响以下
         # AsyncOpenAI 构造逻辑（现有厂商行为零变化）。
-        if endpoint.dedicated_loop_kind in _NATIVE_SDK_LOOP_KINDS:
+        if endpoint.protocol in _NATIVE_SDK_PROTOCOLS:
             return self._build_native_client(endpoint)
 
         api_key = self._get_api_key(endpoint.api_key_env)
@@ -177,7 +184,7 @@ class APIClient:
                 base_url=base.base_url,
                 api_key_env=base.api_key_env,
                 default_headers=base.default_headers or {},
-                dedicated_loop_kind=base.dedicated_loop_kind,
+                protocol=base.protocol,
                 supports_prompt_cache=base.supports_prompt_cache,
                 vision_prefer_url=base.vision_prefer_url,
                 session_affinity=base.session_affinity,

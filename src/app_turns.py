@@ -29,6 +29,7 @@ from state import (
     clear_active_draft,
     mark_preserved_draft,
 )
+from core.messages import Message
 import turn_recovery
 import proactive
 from context_window import (
@@ -282,7 +283,24 @@ def _estimate_content_tokens(content: Any) -> int:
         return total
     return estimate_tokens(str(content))
 
-def _estimate_message_tokens(message: dict) -> int:
+def _estimate_message_tokens(message) -> int:
+    """单消息 token 估算（内部 Message 与旧 dict 双形状）。"""
+    if isinstance(message, Message):
+        tokens = _MESSAGE_WRAPPER_TOKENS
+        text = message.text()
+        tokens += _estimate_content_tokens(text) if text else 0
+        if message.name:
+            tokens += estimate_tokens(str(message.name))
+        calls = message.tool_calls()
+        if calls:
+            try:
+                tokens += estimate_tokens(json.dumps(
+                    [{"name": c.name, "arguments": c.arguments} for c in calls],
+                    ensure_ascii=False))
+            except Exception:
+                logger.debug("_estimate_message_tokens 内部忽略的异常", exc_info=True)
+                tokens += _MEDIA_TOKEN_OVERHEAD * len(calls)
+        return tokens
     tokens = _MESSAGE_WRAPPER_TOKENS
     tokens += _estimate_content_tokens(message.get("content", ""))
     if message.get("name"):
@@ -296,7 +314,7 @@ def _estimate_message_tokens(message: dict) -> int:
             tokens += _MEDIA_TOKEN_OVERHEAD * len(tool_calls)
     return tokens
 
-def _estimate_history_tokens(history: list[dict]) -> int:
+def _estimate_history_tokens(history: list) -> int:
     """按请求侧同一口径估算当前持久历史的 token 量。
 
     旧版经由 select_request_context 生成快照再估算（每轮产生整份浅拷贝
@@ -407,10 +425,13 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
                     token_fn=_estimate_message_tokens,
                 )
             if plan.evicted_blocks:
-                prev_digest_text = (
-                    plan.digest_message.get("content")
-                    if plan.digest_message is not None else None
-                )
+                prev_digest_text = None
+                if plan.digest_message is not None:
+                    _dm = plan.digest_message
+                    prev_digest_text = (
+                        _dm.text() if isinstance(_dm, Message)
+                        else _dm.get("content")
+                    )
                 digest_text = build_digest_text(
                     prev_digest_text,
                     plan.evicted_blocks,
@@ -466,12 +487,21 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
             block_content = user_message.get("content", "")
             if isinstance(block_content, str) and REPLY_MARKER in block_content:
                 user_message["content"] = block_content.split(REPLY_MARKER)[-1].strip()
-            history.append(user_message)
+            # 历史统一存 Message：信封 dict 的其余键（附件元数据/内部标记）
+            # 归入 meta，出站渲染时结构性剔除。
+            history.append(Message.user_text(str(block_content or ""), **{
+                k: v for k, v in user_message.items() if k != "content"
+            }))
         # 历史标记清理：早持久化的消息进入历史时去掉内部标记。
         if isinstance(user_message, dict):
             user_message.pop(turn_recovery.EARLY_PERSIST_FLAG, None)
         for msg in new_msgs:
-            if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
+            if isinstance(msg, Message):
+                if msg.role == "assistant":
+                    text = msg.text()
+                    if text and text != text.strip():
+                        msg.set_text(text.strip())
+            elif isinstance(msg, dict) and msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
                 msg["content"] = msg["content"].strip()
             history.append(msg)
         # 消息已落历史：立即注销该轮的 in-flight 登记（在释放 chat 锁前）。

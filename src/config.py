@@ -80,11 +80,20 @@ BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_T
 # 必须在使用前定义（LOG_TRUNCATE_LIMIT / MAX_CONCURRENT_TOOLS 等都依赖）。
 # 合法推理努力档位（OpenAI gpt-5 / Gemini 3 / Claude / OpenRouter 通用口径）
 VALID_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max", "minimal"}
-# 合法的协议循环标签（ProviderConfig.dedicated_loop_kind 默认值与
-# ModelConfig.dedicated_loop_kind 覆盖字段共用同一取值域）。
-# 单字段选择器："openai_compat" 为缺省协议（OpenAI 兼容 Chat Completions
-# 循环），原生协议按需显式声明。
-_VALID_DEDICATED_LOOP_KINDS = {"openai_compat", "gemini_native", "anthropic_native"}
+# 合法的协议标签（ProviderConfig.protocol 默认值与
+# ModelConfig.protocol 覆盖字段共用同一取值域）。
+# 协议选择器（Model -> Protocol，而非 Provider -> Protocol）：
+#   - "openai_chat"        OpenAI 兼容 Chat Completions（/chat/completions）
+#   - "anthropic_messages" Anthropic 原生 Messages（/v1/messages）
+#   - "gemini_native"      Gemini 原生 streamGenerateContent
+#   - "openai_images"      OpenAI Images（/images/generations、/images/edits）
+# 未显式声明的模型一律回落 "openai_chat"（99% 兼容模型的默认路径）。
+_VALID_PROTOCOLS = {"openai_chat", "anthropic_messages", "gemini_native", "openai_images"}
+#: 缺省协议：无特殊声明时所有模型默认走 OpenAI 兼容 Chat Completions。
+DEFAULT_PROTOCOL = "openai_chat"
+# 历史注：本字段曾名 dedicated_loop_kind（取值 openai_compat /
+# gemini_native / anthropic_native），v3 协议层重构时一次性硬切为
+# protocol + 新命名；旧字段名与旧取值不再被接受。
 
 
 def _positive_float_env(name: str, default: float, minimum: float) -> float:
@@ -157,17 +166,17 @@ class ProviderConfig:
     base_url: str
     api_key_env: str
     default_headers: Optional[Dict[str, str]] = None
-    # 协议循环选择器（单字段）：该厂商默认走哪套 agentic 循环。
-    # "openai_compat"   （OpenAI 兼容 Chat Completions，缺省）-> _agentic_loop_openai_compat
-    # "gemini_native"   （Gemini 原生 API 流式桥接）          -> _agentic_loop_gemini_native
-    # "anthropic_native"（Anthropic 原生 Messages）           -> _agentic_loop_anthropic
+    # 协议选择器（单字段）：该厂商默认走哪种 API 协议。填该厂商
+    # "广泛支持的 API 类型"；个别模型可经 ModelConfig.protocol 覆盖为
+    # 任意协议（含中转端点的协议覆盖）。
+    #   "openai_chat"        （缺省）OpenAI 兼容 Chat Completions
+    #   "gemini_native"      Gemini 原生 API 流式桥接
+    #   "anthropic_messages" Anthropic 原生 Messages
+    #   "openai_images"      OpenAI Images（图像生成）
     # 旧值 "gemini_openai_compat"（OpenAI 兼容层非流式循环）已随 v2.6
-    # Gemini 原生流式改造移除；未识别的标签回落主流 OpenAI 兼容循环。
-    # 历史注：早期版本曾是 use_dedicated_loop(bool) + kind 两字段（kind 仅在
-    # bool=True 时生效）。单字段化后"不声明 = OpenAI 兼容"，消除了
-    # "kind 已声明但开关忘开"的半开状态——该状态下 api_client 按 kind 建
-    # 原生客户端、循环层按 bool&&kind 路由进兼容循环，运行期会错配崩溃。
-    dedicated_loop_kind: str = "openai_compat"
+    # Gemini 原生流式改造移除；未识别的标签在 make_model_config /
+    # get_effective_endpoint 处直接报错。
+    protocol: str = DEFAULT_PROTOCOL
     # 是否支持 Prompt Caching（仅部分厂商需要显式标记）
     supports_prompt_cache: bool = False
     # 视觉输入是否需要"公开可访问 HTTP URL"而非 data:image/...;base64,... 内联格式。
@@ -245,22 +254,24 @@ class ModelConfig:
     #
     # 以下字段全部可选，None = 沿用 provider（PROVIDERS[provider]）的默认值；
     # 非 None = 仅对本模型生效的覆盖值，不影响同 provider 下的其它模型。
-    # 端点覆盖改三件事："连到哪、用哪个 key、带什么请求头"，以及协议循环
-    # 本身（dedicated_loop_kind，单字段选择器，None=继承厂商默认）。换句话说：
+    # 端点覆盖改三件事："连到哪、用哪个 key、带什么请求头"，以及协议
+    # 本身（protocol，单字段选择器，None=继承厂商默认）。换句话说：
     #   - 想换端点但协议不变（同样是 OpenAI 兼容 / 同样是 Anthropic 原生）：
     #     只填 base_url / api_key_env（可选 default_headers）。
-    #   - 想强制该模型走某种协议循环（如某中转的这个模型只认 Anthropic
+    #   - 想强制该模型走某种协议（如某中转的这个模型只认 Anthropic
     #     原生 Messages 协议，即使 provider 挂在 openrouter 之类壳下）：
-    #     填 dedicated_loop_kind="anthropic_native"。
+    #     填 protocol="anthropic_messages"。
     #   - 反向需求（provider 默认走原生、某模型想回 OpenAI 兼容）：
-    #     显式填 dedicated_loop_kind="openai_compat" 覆盖。
+    #     显式填 protocol="openai_chat" 覆盖。
+    #   - 图像模型：填 protocol="openai_images"（OpenAI Images 协议）或
+    #     保持 "openai_chat"（经 chat.completions + modalities 出图）。
     # 见 get_effective_endpoint() 获取合并后的有效端点配置。
     base_url: Optional[str] = None
     api_key_env: Optional[str] = None
     default_headers: Optional[Dict[str, str]] = None
-    # 协议循环选择器（单字段，取值域同 ProviderConfig.dedicated_loop_kind）：
+    # 协议选择器（单字段，取值域同 ProviderConfig.protocol）：
     # None = 继承厂商默认；显式声明即覆盖，无独立开关字段。
-    dedicated_loop_kind: Optional[str] = None
+    protocol: Optional[str] = None
     session_affinity: Optional[bool] = None
     vision_prefer_url: Optional[bool] = None
 
@@ -291,14 +302,15 @@ PROVIDERS: Dict[str, ProviderConfig] = {
     "gemini": ProviderConfig(
         name="Gemini",
         # base_url 仅供 subagent 的一次性非流式补全调用继续使用
-        # （subagent_tool._create_chat_completion 的 OpenAI 兼容客户端）；
-        # 主 Agent Loop 已切换为原生 API 流式桥接（ai/gemini_bridge.py，
-        # streamGenerateContent?alt=sse + 原生 function calling），
-        # 不再经过该兼容端点。
+        # （subagent_tool 的 OpenAI 兼容客户端）；主 Agent Loop 走
+        # gemini_native 协议适配器（protocols/gemini_native.py ->
+        # ai/gemini_bridge.py，streamGenerateContent?alt=sse + 原生
+        # function calling），不经过该兼容端点。
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         api_key_env="GEMINI_API_KEY",
-        # Gemini 使用原生流式专用循环（单字段协议选择器）
-        dedicated_loop_kind="gemini_native",
+        # Gemini 官方 API 广泛支持的是原生协议：厂商默认 gemini_native；
+        # 个别兼容层模型可在模型侧覆盖 protocol="openai_chat"。
+        protocol="gemini_native",
         supports_prompt_cache=False,  # Gemini 隐式缓存，无需标记
     ),
     "grok": ProviderConfig(
@@ -336,14 +348,15 @@ PROVIDERS: Dict[str, ProviderConfig] = {
     "anthropic": ProviderConfig(
         name="Anthropic",
         # base_url 仅为占位（保持 ProviderConfig 结构一致），api_client 对
-        # anthropic 厂商不会用它构造 AsyncOpenAI 客户端，而是构造原生
-        # AsyncAnthropic 客户端（见 api_client.py）。
+        # anthropic_messages 协议不会用它构造 AsyncOpenAI 客户端，而是
+        # 构造原生 AsyncAnthropic 客户端（见 api_client.py）。
         base_url="https://api.anthropic.com",
         api_key_env="ANTHROPIC_API_KEY",
-        # Anthropic 原生 Messages 协议专用循环（单字段协议选择器）
-        dedicated_loop_kind="anthropic_native",
+        # Anthropic 官方 API 广泛支持的是原生 Messages 协议：厂商默认
+        # anthropic_messages（协议适配器见 protocols/anthropic_messages.py）。
+        protocol="anthropic_messages",
         # Anthropic 原生 prompt caching（cache_control 显式断点），由
-        # _agentic_loop_anthropic 按 supports_prompt_cache 开启。
+        # anthropic 协议适配器按 supports_prompt_cache 开启。
         supports_prompt_cache=True,
     ),
     "xxtf": ProviderConfig(
@@ -531,12 +544,12 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
 @dataclass
 class EffectiveEndpoint:
     """某个模型合并后的最终端点配置。"""
-    provider: str                 # 协议族标签（决定走哪套 agentic 循环 / 请求体形状）
+    provider: str                 # 厂商标签（鉴权/日志/展示用途）
     name: str                     # 展示名（沿用 provider 名，端点覆盖不改展示名）
     base_url: str
     api_key_env: str
     default_headers: Dict[str, str]
-    dedicated_loop_kind: str
+    protocol: str                 # 协议标签（决定走哪个协议适配器 / 请求体形状）
     supports_prompt_cache: bool
     vision_prefer_url: bool
     session_affinity: bool
@@ -548,7 +561,7 @@ def get_effective_endpoint(model_info: Optional[ModelConfig]) -> EffectiveEndpoi
     """
     返回某个 ModelConfig 实际应使用的端点配置：
     以 PROVIDERS[model_info.provider] 为默认值，逐字段用模型上非 None 的
-    覆盖字段（base_url / api_key_env / default_headers / dedicated_loop_kind /
+    覆盖字段（base_url / api_key_env / default_headers / protocol /
     session_affinity / vision_prefer_url）替换。
 
     这是"每模型独立配置中转端点/协议"的唯一合并出口：api_client.py /
@@ -569,7 +582,7 @@ def get_effective_endpoint(model_info: Optional[ModelConfig]) -> EffectiveEndpoi
     override_base_url = getattr(model_info, "base_url", None)
     override_api_key_env = getattr(model_info, "api_key_env", None)
     override_headers = getattr(model_info, "default_headers", None)
-    override_loop_kind = getattr(model_info, "dedicated_loop_kind", None)
+    override_protocol = getattr(model_info, "protocol", None)
     override_session_aff = getattr(model_info, "session_affinity", None)
     override_vision_url = getattr(model_info, "vision_prefer_url", None)
 
@@ -577,7 +590,7 @@ def get_effective_endpoint(model_info: Optional[ModelConfig]) -> EffectiveEndpoi
         v is not None
         for v in (
             override_base_url, override_api_key_env, override_headers,
-            override_loop_kind, override_session_aff,
+            override_protocol, override_session_aff,
             override_vision_url,
         )
     )
@@ -588,7 +601,7 @@ def get_effective_endpoint(model_info: Optional[ModelConfig]) -> EffectiveEndpoi
         base_url=_pick("base_url"),
         api_key_env=_pick("api_key_env"),
         default_headers=(override_headers if override_headers is not None else (base.default_headers or {})),
-        dedicated_loop_kind=_pick("dedicated_loop_kind"),
+        protocol=_pick("protocol"),
         supports_prompt_cache=bool(getattr(model_info, "supports_prompt_cache", base.supports_prompt_cache)),
         vision_prefer_url=bool(_pick("vision_prefer_url")),
         session_affinity=bool(_pick("session_affinity")),
@@ -626,7 +639,7 @@ _ENDPOINT_OVERRIDE_FIELDS = (
     "base_url",
     "api_key_env",
     "default_headers",
-    "dedicated_loop_kind",
+    "protocol",
     "session_affinity",
     "vision_prefer_url",
 )
@@ -644,7 +657,7 @@ def make_model_config(
     除了原有的能力字段（vision/supports_tools/reasoning_* 等，走厂商
     默认继承），还接受端点覆盖字段（见 _ENDPOINT_OVERRIDE_FIELDS）：
     当某个中转端点对不同模型使用不同协议或不同子端点时，可以在具体
-    模型这里单独指定，无需为此新建一个 provider。
+    模型这里单独指定（protocol=...），无需为此新建一个 provider。
 
     示例：假设 provider="my_relay" 的中转站里，
     gpt-5.6-sol 走 OpenAI 兼容协议、claude-opus-5 走 Anthropic 原生协议，
@@ -665,7 +678,7 @@ def make_model_config(
             provider="my_relay",
             name="Claude Opus 5 (中转)",
             # 仅此模型覆盖：换协议 + 换子路径，key 仍沿用 my_relay 默认。
-            dedicated_loop_kind="anthropic_native",
+            protocol="anthropic_messages",
             base_url="https://xxtf.baby",
         )
     """
@@ -673,20 +686,21 @@ def make_model_config(
         field: kwargs.pop(field) for field in _ENDPOINT_OVERRIDE_FIELDS if field in kwargs
     }
 
-    # 迁移守卫：协议循环已单字段化（dedicated_loop_kind），旧的两字段写法
-    # 直接报错暴露，避免旧配置被静默吞掉后行为与预期不符。
-    if "use_dedicated_loop" in kwargs:
-        raise ValueError(
-            f"模型 {model_id} 传入了已移除的字段 use_dedicated_loop："
-            "协议循环已单字段化，请改用 dedicated_loop_kind"
-            f"（合法值: {sorted(_VALID_DEDICATED_LOOP_KINDS)}，不填=继承厂商默认）。"
-        )
+    # 迁移守卫：协议字段已硬切为 protocol（新命名），旧字段写法直接报错
+    # 暴露，避免旧配置被静默吞掉后行为与预期不符。
+    for _legacy_field in ("use_dedicated_loop", "dedicated_loop_kind"):
+        if _legacy_field in kwargs:
+            raise ValueError(
+                f"模型 {model_id} 传入了已移除的字段 {_legacy_field}："
+                "协议字段已硬切为 protocol，请改用 protocol"
+                f"（合法值: {sorted(_VALID_PROTOCOLS)}，不填=继承厂商默认）。"
+            )
 
-    override_loop_kind = endpoint_overrides.get("dedicated_loop_kind")
-    if override_loop_kind is not None and override_loop_kind not in _VALID_DEDICATED_LOOP_KINDS:
+    override_protocol = endpoint_overrides.get("protocol")
+    if override_protocol is not None and override_protocol not in _VALID_PROTOCOLS:
         raise ValueError(
-            f"模型 {model_id} 的 dedicated_loop_kind={override_loop_kind!r} 无效，"
-            f"合法值: {sorted(_VALID_DEDICATED_LOOP_KINDS)}"
+            f"模型 {model_id} 的 protocol={override_protocol!r} 无效，"
+            f"合法值: {sorted(_VALID_PROTOCOLS)}"
         )
     override_api_key_env = endpoint_overrides.get("api_key_env")
     if override_api_key_env is not None and not hasattr(sys.modules[__name__], override_api_key_env):
@@ -744,7 +758,7 @@ def make_model_config(
         base_url=endpoint_overrides.get("base_url"),
         api_key_env=endpoint_overrides.get("api_key_env"),
         default_headers=endpoint_overrides.get("default_headers"),
-        dedicated_loop_kind=endpoint_overrides.get("dedicated_loop_kind"),
+        protocol=endpoint_overrides.get("protocol"),
         session_affinity=endpoint_overrides.get("session_affinity"),
         vision_prefer_url=endpoint_overrides.get("vision_prefer_url"),
     )
@@ -1011,6 +1025,8 @@ SUPPORTED_MODELS["Qwen/Qwen-Image-Edit"] = make_model_config(
     name="Qwen Image Edit",
     vision=True,
     native_image=True,
+    # 图像模型显式声明 OpenAI Images 协议（ModelScope 图像端点）。
+    protocol="openai_images",
     max_context=32768,
     max_output_tokens=4000,
 )
@@ -1026,6 +1042,8 @@ SUPPORTED_MODELS["Tongyi-MAI/Z-Image-Turbo"] = make_model_config(
     provider="modelscope",
     name="Z Image Turbo",
     native_image=True,
+    # 同上：ModelScope 图像端点走 OpenAI Images 协议。
+    protocol="openai_images",
     max_context=32768,
     max_output_tokens=4000,
 )
@@ -1071,6 +1089,10 @@ SUPPORTED_MODELS["gpt-image-2"] = make_model_config(
     provider="xxtf",
     name="GPT Image 2 (XXTF)",
     native_image=True,
+    # XXTF 的图像端点同样按 OpenAI Images 协议接入（文生图 ->
+    # /v1/images/generations，编辑 -> /v1/images/edits multipart，见
+    # protocols/images.py 与 media_generation 的端点语义说明）。
+    protocol="openai_images",
     # 支持参考图编辑（图生图）：vision=True 使其进入 edit_image_with_reference
     # 的可选模型列表（vision 在图像模型上表示"可接受图像输入"，即具备
     # 图生图/编辑能力，与聊天模型的"看图"能力共用同一能力位）；实际编辑
@@ -1106,7 +1128,7 @@ SUPPORTED_MODELS["agnes-video-v2.0"] = make_model_config(
 #                                       见下方模型定义处的风险说明）
 #
 # 两个模型共用同一个 provider="xxtf" 壳、同一份 XXTF_API_KEY，但各自按
-# 端点覆盖字段（base_url / dedicated_loop_kind）
+# 端点覆盖字段（base_url / protocol）
 # 分别连到 Anthropic 原生入口和 OpenAI 兼容入口，互不干扰
 # （api_client.py 按 model_id 分别缓存客户端，见 APIClient.get_client_for_model）。
 # =============================================================================
@@ -1118,11 +1140,11 @@ SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
     vision=True,
     native_document=True,
     supports_prompt_cache=True,
-    # 平台标注协议为 anthropic：走 Anthropic 原生 Messages 专用循环。
+    # 平台标注协议为 anthropic：走 Anthropic 原生 Messages 协议适配器。
     # 注意 base_url 不带 /v1——AsyncAnthropic SDK 会自动拼接
     # {base_url}/v1/messages -> https://xxtf.baby/v1/messages，
     # 与项目截图中 claude-opus-5 / anthropic 协议那一行的入口一致。
-    dedicated_loop_kind="anthropic_native",
+    protocol="anthropic_messages",
     base_url="https://xxtf.baby",
     reasoning_enabled=True,
     max_context=1000000,

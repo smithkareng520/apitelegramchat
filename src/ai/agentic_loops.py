@@ -23,6 +23,7 @@ from config import (
     SUPPORTED_MODELS,
     get_sampling_params,
     get_reasoning_request_fields,
+    get_effective_endpoint,
     ModelConfig,
 )
 from state import get_llm_session_key
@@ -81,6 +82,9 @@ from ai.strict_tools import (
     mark_strict_tools_rejected,
     strict_tools_for_request,
 )
+from core.images import ImageTask
+from core.messages import Message, TextBlock, ImageBlock, render_openai_messages
+from protocols.images import dispatch_image_task
 
 # Anthropic 原生 Messages API 专用循环：独立实现，位于 anthropic_bridge.py
 # （职责分离 + 避免本已很大的文件继续膨胀）。此处重导出保持调用方
@@ -280,6 +284,14 @@ async def _agentic_loop_openai_compat(
         builder: "DraftManager", tools: Optional[list[dict[str, Any]]] = None, supports_tools: bool = True,
         journal: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str | None, object | None, list]:
+    """OpenAI 兼容 Chat Completions 流式循环（内部消息 -> 协议渲染）。
+
+    重构说明：本循环与其它协议循环共用内部消息（core.messages.Message），
+    每轮请求前统一经 render_openai_messages 渲染为 OpenAI wire JSON；
+    prompt cache 断点打在渲染后的 wire dict 上（缓存标记是纯出站装饰，
+    不进入内部消息）。循环内追加的 assistant / tool / 纠错消息全部为
+    Message 对象。
+    """
     if tools is None:
         from search_engine import SEARCH_TOOLS
         tools = SEARCH_TOOLS
@@ -338,8 +350,12 @@ async def _agentic_loop_openai_compat(
         # 结果为止的完整前缀。与 extra_body 顶层自动断点（第 4 个）叠加。
         # 非流式兜底与 over-limit 合成路径复用同一份 loop_messages，
         # 无需重复打标。
+        # 重构说明（Internal Message）：断点打在渲染后的 wire dict 上
+        # （每轮重新渲染，天然无旧标记残留）；内部 Message 不携带任何
+        # 缓存装饰——cache_control 是纯出站协议装饰。
+        wire_messages = render_openai_messages(loop_messages)
         if prompt_cache_enabled:
-            _apply_cache_control(loop_messages)
+            _apply_cache_control(wire_messages)
 
         content_acc = ""
         reasoning_acc = ""
@@ -387,7 +403,7 @@ async def _agentic_loop_openai_compat(
             # 请求载荷本就是动态 JSON 形状，按 Any 标注。
             create_params: dict[str, Any] = {
                 "model": current_model,
-                "messages": loop_messages,
+                "messages": wire_messages,
                 "stream": True,
                 "max_tokens": max_tokens,
                 "stream_options": {"include_usage": True},
@@ -634,7 +650,7 @@ async def _agentic_loop_openai_compat(
                 # 与上方 create_params 同理：** 解包需 Any 值类型。
                 fallback_params: dict[str, Any] = {
                     "model": current_model,
-                    "messages": loop_messages,
+                    "messages": wire_messages,
                     "stream": False,
                     "max_tokens": max_tokens,
                 }
@@ -783,14 +799,9 @@ async def _agentic_loop_openai_compat(
             # 终局：等待旧段永久化（不开新草稿）；未滚动时保底刷一帧。
             builder.request_flush()
 
-        assistant_msg: dict = {"role": "assistant", "content": content_acc or None}
-        if tool_calls_list:
-            assistant_msg["tool_calls"] = [{"id": tc["id"], "type": "function",
-                                            "function": {"name": tc["function"]["name"],
-                                                         "arguments": tc["function"]["arguments"]}} for tc in
-                                           tool_calls_list]
-        if reasoning_acc:
-            assistant_msg["reasoning_content"] = reasoning_acc
+        assistant_msg = Message.assistant_with_tool_calls(
+            content_acc or "", tool_calls_list, reasoning_acc,
+        )
         loop_messages.append(assistant_msg)
         new_history_entries.append(assistant_msg)
 
@@ -804,13 +815,10 @@ async def _agentic_loop_openai_compat(
                     api_label, plain_text_tool_attempts, MAX_PLAIN_TEXT_TOOL_CALL_RETRIES,
                 )
                 if plain_text_tool_attempts < MAX_PLAIN_TEXT_TOOL_CALL_RETRIES:
-                    loop_messages.append({
-                        "role": "user",
-                        "content": (
-                            "System: Your last response attempted a tool call as plain text. "
-                            "Use the standard tool_calls API only. Do not emit <tool_call> XML as user-visible text."
-                        )
-                    })
+                    loop_messages.append(Message.user_text(
+                        "System: Your last response attempted a tool call as plain text. "
+                        "Use the standard tool_calls API only. Do not emit  XML as user-visible text."
+                    ))
                     # 这是一次完整但需要纠正的模型返回；还会重试下一请求。
                     # 解耦：非阻塞安全点，满容量时后台滚动，重试立即开始。
                     builder.on_round_boundary()
@@ -842,7 +850,7 @@ async def _agentic_loop_openai_compat(
             # 与上方 create_params 同理：** 解包需 Any 值类型。
             synth_params: dict[str, Any] = {
                 "model": current_model,
-                "messages": loop_messages + [{"role": "user",
+                "messages": render_openai_messages(loop_messages) + [{"role": "user",
                                               "content": f"System: Maximum tool calls ({MAX_TOOL_CALLS}) reached for this turn. Tool usage is now DISABLED. Please immediately summarize what you have successfully done so far, explicitly state what failed or what is left to do, and ask the user if they want to continue the operation in the next turn."}],
                 "stream": True,
                 "max_tokens": max_tokens,
@@ -894,7 +902,7 @@ async def _agentic_loop_openai_compat(
                 builder.add_text(final_content)
             finally:
                 await stop_chat_action(builder.chat_id, "typing")
-            new_history_entries.append({"role": "assistant", "content": final_content})
+            new_history_entries.append(Message.assistant_text(final_content))
             if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
                 builder.finish_group(len(builder._tool_groups) - 1)
             # 工具上限总结是终局回复；同步结束旧草稿，不创建新草稿。
@@ -907,7 +915,7 @@ async def _agentic_loop_openai_compat(
     if final_content is None:
         final_content = _tool_limit_summary()
         builder.add_text(final_content)
-        new_history_entries.append({"role": "assistant", "content": final_content})
+        new_history_entries.append(Message.assistant_text(final_content))
         if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
             builder.finish_group(len(builder._tool_groups) - 1)
         # 轮次数耗尽后的兜底文本同样是终局内容：同步结束旧草稿，不创建下一段。
@@ -916,75 +924,57 @@ async def _agentic_loop_openai_compat(
 
 
 # =====================================================================
-# 原生图像循环的 prompt / 参考图提取
+# 原生图像循环的 prompt / 参考图提取（Internal Message 原生）
 # =====================================================================
-def _extract_native_image_urls_from_user_message(msg: dict) -> list[str]:
-    """从单条 user 消息的（已解析）content 中提取全部参考图 URL。"""
-    content = msg.get("content")
+def _extract_native_image_urls_from_user_message(msg: Message) -> list[str]:
+    """从单条 user 消息（内部 Message）中提取全部参考图 URL。"""
     urls: list[str] = []
-    if not isinstance(content, list):
-        return urls
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        if part.get("type") in ("image_url", "image"):
-            image_url = ""
-            if isinstance(part.get("image_url"), dict):
-                image_url = str(part["image_url"].get("url") or "").strip()
-            else:
-                image_url = str(part.get("url") or "").strip()
-            if image_url:
-                urls.append(image_url)
+    for block in msg.blocks:
+        if isinstance(block, ImageBlock) and block.url:
+            urls.append(block.url)
     return urls
 
 
 def _extract_image_prompt_and_reference_urls(msgs: list) -> tuple[str, list[str]]:
-    """从（已解析的）请求消息中提取图像模型的 prompt 与参考图 URL 列表。
+    """从（内部 Message 列表）请求消息中提取图像模型的 prompt 与参考图 URL 列表。
 
     prompt 一律取最后一条 user 消息（本轮最新指令）；参考图优先取同一
-    条消息里的 image_url 部分。
+    条消息里的 ImageBlock。
 
     参考图回溯：最后一条 user 消息不带图时，向前找最近一条带图的 user
     消息沿用其参考图。
 
     背景（gpt-image-2 等 Images 协议模型只见"最后一条 user 消息"）：
     图像轮以"模型仅返回文本"的方式失败时（网关 200 + 纯文本回复、非
-    ⚠️ 前缀的提示文案），该提示会作为普通 assistant 消息写入历史；用户
+    嚗 前缀的提示文案），该提示会作为普通 assistant 消息写入历史；用户
     随后发的重试消息（往往是纯文本"再试一次"）追加在其后成为最后一
     条 user 消息——旧实现此时提取不到任何参考图，请求退化为不带参考
     图的文生图（"失败后只发了文本，没把图片发给 AI"）。回溯最近一条
     带图 user 消息即可让重试继续拿到参考图（图生图/编辑语义保持）。
     """
-    last_user_msg = None
+    last_user_msg: Optional[Message] = None
     for item in reversed(msgs):
-        if item.get("role") == "user":
-            last_user_msg = item
+        m = item if isinstance(item, Message) else Message.from_openai_dict(item)
+        if m.role == "user":
+            last_user_msg = m
             break
 
     if not last_user_msg:
         return "", []
 
-    content = last_user_msg.get("content")
-    prompt_parts: list[str] = []
-
-    if isinstance(content, list):
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") == "text":
-                text = str(part.get("text") or "").strip()
-                if text:
-                    prompt_parts.append(text)
-    elif isinstance(content, str):
-        prompt_parts.append(content.strip())
+    prompt = "\n".join(
+        t for t in (b.text.strip() for b in last_user_msg.blocks
+                    if isinstance(b, TextBlock)) if t
+    ).strip()
 
     image_urls = _extract_native_image_urls_from_user_message(last_user_msg)
 
     if not image_urls:
         for item in reversed(msgs):
-            if item is last_user_msg or item.get("role") != "user":
+            m = item if isinstance(item, Message) else Message.from_openai_dict(item)
+            if m is last_user_msg or m.role != "user":
                 continue
-            carried = _extract_native_image_urls_from_user_message(item)
+            carried = _extract_native_image_urls_from_user_message(m)
             if carried:
                 image_urls = carried
                 logger.info(
@@ -994,10 +984,12 @@ def _extract_image_prompt_and_reference_urls(msgs: list) -> tuple[str, list[str]
                 )
                 break
 
-    prompt = "\n".join(p for p in prompt_parts if p).strip()
     return prompt, image_urls
 
 
+# =====================================================================
+# 原生图像循环（ImageTask 驱动：任务显式声明操作，协议适配器决定端点）
+# =====================================================================
 async def _agentic_loop_native_image(
         client: AsyncOpenAI,
         current_model: str,
@@ -1006,98 +998,92 @@ async def _agentic_loop_native_image(
         chat_id: int,
         journal: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str | None, object | None, list]:
-    model_info = SUPPORTED_MODELS.get(current_model)
-    provider = model_info.provider if model_info else ""  # <-- 新增 provider
+    """原生图像模型回合：prompt/参考图提取 -> ImageTask -> 协议分发 ->
+    R2 上传 -> 富媒体消息。
 
-    max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
-    # 图像模型采样参数同样从 config 读取（默认不发送、走供应商默认）；
+    重构说明（ImageTask）：旧版把参考图列表直接塞给请求函数，由其按
+    "有没有图"猜端点；现在先显式构造 ImageTask（operation=edit/generate），
+    经 protocols.images.dispatch_image_task 按**模型协议**分发——
+    openai_images（ModelScope/XXTF）与 openai_chat modalities
+    （OpenRouter 图像模型）两条链路共用同一任务模型与后处理。
+    """
+    model_info = SUPPORTED_MODELS.get(current_model)
+
+    # 采样参数由图像协议适配器按 model_info 自取（get_sampling_params）；
     # 推理控制不适用于图像生成端点，不发送。
-    # 采样参数值域为 float，但 ** 解包进 SDK create() 重载需要 Any 值类型。
-    sampling_params: dict[str, Any] = get_sampling_params(model_info)
     prompt_text, image_urls = _extract_image_prompt_and_reference_urls(messages)
 
     clean_prompt = _clean_prompt_for_image_model(prompt_text)
 
+    # ---- 显式构造图像任务：带参考图 = edit，否则 generate（任务构造层
+    # 的唯一推断点；进入适配器后不再有任何"看图猜端点"逻辑）。----
+    if image_urls:
+        task = ImageTask.edit(clean_prompt or prompt_text, image_urls, model=current_model)
+    else:
+        task = ImageTask.generate(clean_prompt or prompt_text, model=current_model)
+
     try:
-        response = None
-        used_endpoint = "/v1/chat/completions"
+        # ---- 协议分发：openai_images -> /images/{generations,edits}；
+        # openai_chat -> chat.completions + modalities。----
+        model_info = SUPPORTED_MODELS.get(current_model)
+        if model_info is None:
+            return f"IMAGE_ERROR:未知图像模型 {current_model}", None, []
 
-        if provider in IMAGES_API_PROVIDERS:
-            # ---- 统一 OpenAI Images 协议提供商（ModelScope / XXTF 等）----
-            # 请求统一走 _request_images_generations（端点/鉴权/payload/
-            # 参考图预处理/轮询差异全部收敛在 media_generation 内部），
-            # 这里只处理与提供商无关的"响应 -> 图片 -> R2 -> 富媒体消息"。
-            api_display_name = _get_images_api_display_name(model_info)
-            response_json, endpoint, error_detail, status_code, request_id = await _request_images_generations(
-                model_info,
-                # 修复 BUG：clean_prompt 已计算但旧实现未把清理后的 prompt
-                # 传入请求函数，结果是 _clean_prompt_for_image_model 想要
-                # 剥离的 UI 元数据（chat history 标记、reasoning marker 等）
-                # 会原样泄漏到图像生成模型，可能被当作 prompt 的一部分影响
-                # 生成结果。这里统一传 clean_prompt。
-                prompt=clean_prompt,
-                image_urls=image_urls,
-                num_images=1,
-                model=current_model,  # 传入当前模型 ID
+        result = await dispatch_image_task(task)
+        used_endpoint = result.endpoint or "/images/generations"
+
+        if result.images:
+            image_bytes_list = result.images
+        else:
+            # 无图片字节：chat modalities 路径可能返回纯文本/拒绝说明；
+            # images 路径视为"返回成功但未找到图片数据"。
+            if result.text or result.refusal:
+                final_notice = _format_native_image_notice(
+                    content_text=result.text,
+                    refusal_text=result.refusal,
+                    finish_reason=result.finish_reason,
+                )
+                safe_notice_html = escape_html(final_notice).replace("\n", "<br/>")
+                await send_rich_html_message(chat_id, safe_notice_html)
+                final_content = "IMAGE_SENT"
+                new_entries = [Message.assistant_text(final_notice or "（已生成图片）")]
+                if journal is not None:
+                    journal.extend(new_entries)
+                return final_content, result.usage, new_entries
+            error_notice = _format_api_error_notice(
+                api_name=f"{_get_images_api_display_name(model_info)} 图像接口",
+                error_code=200,
+                endpoint=used_endpoint,
+                model=current_model,
+                detail="接口返回成功，但未找到可用图片数据。",
             )
-            used_endpoint = f"/v1{endpoint}"
-            if response_json is None:
-                if _is_content_safety_error(error_detail):
-                    logger.info("[NativeImage] 请求被内容安全策略拦截: %s", error_detail[:200])
-                    error_notice = _format_image_safety_notice(detail=error_detail, model=current_model)
-                else:
-                    error_notice = _format_api_error_notice(
-                        api_name=f"{api_display_name} 图像接口",
-                        error_code=status_code,
-                        endpoint=used_endpoint,
-                        model=current_model,
-                        detail=error_detail,
-                        request_id=request_id,
-                    )
-                return f"IMAGE_ERROR:{error_notice}", None, []
+            return f"IMAGE_ERROR:{error_notice}", None, []
 
-            # 响应里下游只读取 usage；直接取值即可。
-            usage = response_json.get("usage")
-            image_bytes_list = await _response_items_to_bytes(response_json, max_images=1)
+        uploaded_urls = await _upload_generated_images_to_r2(image_bytes_list)
 
-            if not image_bytes_list:
-                try:
-                    json_preview = json.dumps(response_json, ensure_ascii=False, indent=2)
-                except Exception:
-                    logger.debug("_agentic_loop_native_image 内部忽略的异常", exc_info=True)
-                    json_preview = str(response_json)
-                logger.debug(
-                    "[NativeImage/%s] no image bytes extracted, raw response preview=%r",
-                    api_display_name,
-                    json_preview[:5000],
+        if uploaded_urls:
+            # src 属性走 URL 属性转义：R2 presigned URL 含 & 参数，
+            # 不转义会被 Telegram HTML 解析器当作实体名起点截断
+            img_tags = "".join(f'<img src="{escape_media_url_attr(u)}"/>' for u in uploaded_urls)
+            caption_text = _format_image_metadata_caption(image_bytes_list[0],
+                                                          current_model) if image_bytes_list else "Generated image"
+            # 单图用 <figure>，多图用 <tg-slideshow> 轮播
+            if len(uploaded_urls) == 1:
+                rich_html = f'<figure>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></figure>'
+            else:
+                rich_html = f'<tg-slideshow>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></tg-slideshow>'
+            await send_rich_html_message(chat_id, rich_html)
+            final_notice = caption_text or (result.text[:200] if result.text else "")
+        else:
+            if result.text or result.refusal:
+                final_notice = _format_native_image_notice(
+                    content_text=result.text,
+                    refusal_text=result.refusal,
+                    finish_reason=result.finish_reason,
                 )
-                error_notice = _format_api_error_notice(
-                    api_name=f"{api_display_name} 图像接口",
-                    error_code=200,
-                    endpoint=used_endpoint,
-                    model=current_model,
-                    detail="接口返回成功，但未找到可用图片数据。",
-                )
-                return f"IMAGE_ERROR:{error_notice}", None, []
-
-            uploaded_urls = await _upload_generated_images_to_r2(image_bytes_list)
-
-            if uploaded_urls:
-                # src 属性走 URL 属性转义：R2 presigned URL 含 & 参数，
-                # 不转义会被 Telegram HTML 解析器当作实体名起点截断
-                img_tags = "".join(f'<img src="{escape_media_url_attr(u)}"/>' for u in uploaded_urls)
-                caption_text = _format_image_metadata_caption(image_bytes_list[0],
-                                                              current_model) if image_bytes_list else "Generated image"
-                # 单图用 <figure>，多图用 <tg-slideshow> 轮播
-                if len(uploaded_urls) == 1:
-                    rich_html = f'<figure>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></figure>'
-                else:
-                    rich_html = f'<tg-slideshow>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></tg-slideshow>'
-                await send_rich_html_message(chat_id, rich_html)
-                final_notice = caption_text
             else:
                 error_notice = _format_api_error_notice(
-                    api_name=f"{api_display_name} 图像接口",
+                    api_name=f"{_get_images_api_display_name(model_info)} 图像接口",
                     error_code=200,
                     endpoint=used_endpoint,
                     model=current_model,
@@ -1105,37 +1091,16 @@ async def _agentic_loop_native_image(
                 )
                 return f"IMAGE_ERROR:{error_notice}", None, []
 
-            final_content = f"IMAGE_SENT:{final_notice}" if final_notice else "IMAGE_SENT"
-            history_content = f"[图片已生成] 指令: {clean_prompt or prompt_text or '(无)'} | {caption_text}"
-            new_entries = [{"role": "assistant", "content": history_content}]
-            if journal is not None:
-                journal.extend(new_entries)
-            return final_content, usage, new_entries
+        final_content = f"IMAGE_SENT:{final_notice}" if final_notice else "IMAGE_SENT"
+        if uploaded_urls:
+            history_content = f"[图片已生成] 指令: {clean_prompt or '(无)'} | {final_notice}".strip(" |")
+        else:
+            history_content = final_notice or "（已生成图片）"
+        new_entries = [Message.assistant_text(history_content)]
+        if journal is not None:
+            journal.extend(new_entries)
+        return final_content, result.usage, new_entries
 
-        # ---- 非 ModelScope 的其他提供商（OpenRouter 等） ----
-        try:
-            response = await client.chat.completions.create(
-                model=current_model,
-                messages=messages,
-                max_tokens=max_tokens,
-                extra_body={"modalities": ["image", "text"], "provider": OPENROUTER_PROVIDER_PREFERENCES},
-                stream=False,
-                **sampling_params,
-            )
-        except Exception as e:
-            err_text = str(e)
-            # "output modalities" 含子串 "modalities"，前一条件恒被后者包含。
-            if "modalities" not in err_text:
-                raise
-            logger.warning(f"Native image model does not support image+text output, retrying image-only: {e}")
-            response = await client.chat.completions.create(
-                model=current_model,
-                messages=messages,
-                max_tokens=max_tokens,
-                extra_body={"modalities": ["image"], "provider": OPENROUTER_PROVIDER_PREFERENCES},
-                stream=False,
-                **sampling_params,
-            )
     except Exception as e:
         logger.exception(f"Native image model request failed: {e}")
         # 修复：旧写法 hasattr(e, "response") and hasattr(e.response, "text")
@@ -1151,98 +1116,20 @@ async def _agentic_loop_native_image(
             logger.info("[NativeImage] 请求被内容安全策略拦截（异常路径）: %s", err_str[:200])
             error_notice = _format_image_safety_notice(detail=err_str, model=current_model)
         else:
+            _ep_is_images = (
+                SUPPORTED_MODELS.get(current_model)
+                and get_effective_endpoint(SUPPORTED_MODELS[current_model]).protocol == "openai_images"
+            )
             error_notice = await get_error_notification_message(
                 chat_id,
                 error_code=getattr(e, "status_code", getattr(e, "status", 500)),
                 error_message=err_str,
                 api_name="图像请求",
                 exception=e,
-                endpoint="/v1/images/generations" if image_urls else "/v1/chat/completions",
+                endpoint="/v1/images/generations" if _ep_is_images else "/v1/chat/completions",
                 model=current_model,
             )
         return f"IMAGE_ERROR:{error_notice}", None, []
-
-    choice = response.choices[0]
-    finish_reason = str(getattr(choice, "finish_reason", "") or "")
-    content = _extract_native_message_text(getattr(choice.message, "content", ""))
-    refusal_text = _extract_native_refusal_text(choice.message)
-
-    # 使用统一的 _extract_image_items 提取图片
-    try:
-        msg_dump = choice.message.model_dump()
-        images = _extract_image_items(msg_dump)
-        # 如果返回空，尝试直接从 images 字段读取（兼容旧方式）
-        if not images:
-            images = getattr(choice.message, "images", []) or []
-    except Exception:
-        logger.debug("_agentic_loop_native_image 内部忽略的异常", exc_info=True)
-        images = []
-
-    image_bytes_list = []
-    for img_data in images:
-        img_url = img_data.get("image_url", {}).get("url")
-        if not img_url:
-            continue
-        if img_url.startswith("data:image"):
-            try:
-                _, base64_data = img_url.split(",", 1)
-                img_bytes = base64.b64decode(base64_data, validate=True)
-                validated = _validate_image_bytes(img_bytes, source="agentic_data_url")
-                if validated is not None:
-                    image_bytes_list.append(validated)
-            except Exception as e:
-                logger.error(f"Base64 decode failed: {e}")
-        elif img_url.startswith("http"):
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(img_url, timeout=30) as resp:
-                        if resp.status == 200:
-                            content_type = str(resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-                            if content_type and not content_type.startswith("image/"):
-                                logger.warning("[NativeImage] agentic 远端响应不是图片 Content-Type=%s: %s", content_type or "-", img_url[:120])
-                                continue
-                            img_bytes = await resp.read()
-                            validated = _validate_image_bytes(img_bytes, source=img_url)
-                            if validated is not None:
-                                image_bytes_list.append(validated)
-                        else:
-                            logger.warning(f"Download image {img_url} failed: {resp.status}")
-            except Exception as e:
-                logger.error(f"Download image {img_url} error: {e}")
-
-    # 与 Images 协议路径共用同一 R2 上传实现（generated/<uuid>_<idx>.png）
-    uploaded_urls = await _upload_generated_images_to_r2(image_bytes_list)
-
-    if uploaded_urls:
-        # src 属性走 URL 属性转义（与 Images 协议路径一致）
-        img_tags = "".join(f'<img src="{escape_media_url_attr(u)}"/>' for u in uploaded_urls)
-        caption_text = _format_image_metadata_caption(image_bytes_list[0],
-                                                      current_model) if image_bytes_list else "Generated image"
-        # 单图用 <figure>，多图用 <tg-slideshow> 轮播
-        if len(uploaded_urls) == 1:
-            rich_html = f'<figure>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></figure>'
-        else:
-            rich_html = f'<tg-slideshow>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></tg-slideshow>'
-        await send_rich_html_message(chat_id, rich_html)
-        final_notice = caption_text
-    else:
-        final_notice = _format_native_image_notice(
-            content_text=content,
-            refusal_text=refusal_text,
-            finish_reason=finish_reason,
-        )
-        safe_notice_html = escape_html(final_notice).replace("\n", "<br/>")
-        await send_rich_html_message(chat_id, safe_notice_html)
-
-    final_content = f"IMAGE_SENT:{final_notice}" if final_notice else "IMAGE_SENT"
-    if uploaded_urls:
-        history_content = f"[图片已生成] {content[:200] if content else ''} | {caption_text}".strip(' |')
-    else:
-        history_content = final_notice or "（已生成图片）"
-    new_entries = [{"role": "assistant", "content": history_content}]
-    if journal is not None:
-        journal.extend(new_entries)
-    return final_content, getattr(response, "usage", None), new_entries
 
 
 async def _agentic_loop_native_video(
@@ -1256,16 +1143,12 @@ async def _agentic_loop_native_video(
     处理视频生成模型。
     目前支持 Agnes 和 OpenRouter。
     """
-    # 提取 prompt
+    # 提取 prompt（最后一条 user 消息的文本块）
     prompt = ""
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content")
-            if isinstance(content, str):
-                prompt = content
-            elif isinstance(content, list):
-                texts = [part.get("text") for part in content if part.get("type") == "text"]
-                prompt = " ".join(texts)
+    for item in reversed(messages):
+        m = item if isinstance(item, Message) else Message.from_openai_dict(item)
+        if m.role == "user":
+            prompt = m.text().strip()
             break
     if not prompt:
         return "VIDEO_ERROR:未提供提示词", None, []
@@ -1294,15 +1177,10 @@ async def _agentic_loop_native_video(
     video_meta: Optional[dict] = None
 
     # chat action 语义（与 chat_actions.py 的白名单约定一致）：
-    # - 生成阶段（调用生视频模型的轮询/生成）→ record_video（bot 正在
-    #   “录制”视频），每 4 秒循环重发，覆盖动辄数十秒到数分钟的生成过程；
+    # - 生成阶段（调用生视频模型的轮询/生成）-> record_video（bot 正在
+    #   "录制"视频），每 4 秒循环重发，覆盖动辄数十秒到数分钟的生成过程；
     # - 发送阶段（视频下载 / R2 上传 / sendRichMessage 携带 <video>）
-    #   → upload_video（bot 正在发送视频）。
-    #   注意与 generate_video 工具路径的区别：原生视频模型的输出就是
-    #   最终要发给用户的视频，不存在「工具结果返回给模型」的中间环节，
-    #   因此下载 / R2 上传全程属于发送动作；而工具路径的同类下载 / 上传
-    #   属于 AI 接收信息，不触发 upload_video（见 search_engine.
-    #   execute_generate_video 的注释）。
+    #   -> upload_video（bot 正在发送视频）。
     if provider == "agnes":
         async with chat_action_scope(chat_id, "record_video"):
             video_url, error, video_meta = await _request_agnes_video(prompt, duration, current_model)
@@ -1322,24 +1200,16 @@ async def _agentic_loop_native_video(
     # 与图片路径一样：先把视频字节下载下来，上传到 R2 并带正确的 Content-Type: video/mp4，
     # 再用 R2 URL 拼 <figure><video src=...></video><figcaption>...</figcaption></figure>
     # 通过 sendRichMessage 发送。这样可保证 Telegram 能拿到合法的 video MIME，
-    # 不会触发 400 RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND（该错误并非来自 HTML 标签格式，
-    # 而是来自 Telegram 拉取不到匹配 MIME 的媒体）。
+    # 不会触发 400 RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND。
     final_video_url = video_url
     video_bytes_len = 0
-    # upload_video 状态：从下载视频字节、上传 R2（bot 上传视频）直到
-    # 发送完成，全程显示“正在发送视频”。下载/上传可能耗时数十秒，
-    # 4 秒循环重发保证指示不闪断；最终 sendRichMessage 携带 <video>
-    # 时，utils.send_rich_html_message 内部会再次确保 upload_video 激活
-    # （同一动作引用计数，不会重复发送状态）。
     await start_chat_action(chat_id, "upload_video")
     try:
         timeout = aiohttp.ClientTimeout(total=180)
         async with aiohttp.ClientSession(timeout=timeout) as dl_session:
             async with dl_session.get(video_url) as dl_resp:
                 if dl_resp.status == 200:
-                    # 修复 OOM 风险：此前直接 await dl_resp.read() 把整个视频字节读进
-                    # 内存，没有大小上限。一个失控/恶意的上游返回 1GB+ 的"视频"会把
-                    # 进程拖垮。这里限制为 200MB（足够任何合理的 720p 视频片段），
+                    # 修复 OOM 风险：限制为 200MB（足够任何合理的 720p 视频片段），
                     # 超限则拒绝并回退到原始 URL。
                     _MAX_VIDEO_BYTES = 200 * 1024 * 1024
                     video_bytes = await dl_resp.content.read(_MAX_VIDEO_BYTES + 1)
@@ -1378,7 +1248,7 @@ async def _agentic_loop_native_video(
         await stop_chat_action(chat_id, "upload_video")
 
     # 构造富文本：用 <figure>+<video>+<figcaption> 的文档推荐写法（视频只能作为独立 media block）
-    # caption 走与图片一致的“元数据”风格（分辨率/帧率/帧数/大小/模型），不再附提示词。
+    # caption 走与图片一致的"元数据"风格（分辨率/帧率/帧数/大小/模型），不再附提示词。
     if video_bytes_len == 0 and video_meta:
         # 下载失败时退而用 Agnes 报告的 perf_output_size 作为大小估算
         out_size = video_meta.get("perf_output_size") if isinstance(video_meta, dict) else None
@@ -1402,11 +1272,9 @@ async def _agentic_loop_native_video(
 
     # 生成历史记录
     history_content = f"[视频已生成] 提示词: {prompt[:200]}" if prompt else "[视频已生成]"
-    new_entries = [{"role": "assistant", "content": history_content}]
+    new_entries = [Message.assistant_text(history_content)]
     if journal is not None:
         journal.extend(new_entries)
 
     final_content = f"VIDEO_SENT:{prompt[:100]}"  # 用于上游判断
     return final_content, None, new_entries
-
-

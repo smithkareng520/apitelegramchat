@@ -48,6 +48,7 @@ from html.parser import HTMLParser
 from typing import Any, Optional, cast
 
 from api_client import api_client
+from core.messages import Message, render_openai_messages
 from config import (
     SUPPORTED_MODELS,
     DEFAULT_MODEL,
@@ -246,13 +247,21 @@ async def _execute_tool_for_subagent(
 async def _create_chat_completion(client: Any, model_info: Optional[ModelConfig], create_params: dict) -> Any:
     """按厂商分流的一次性（非流式）补全调用。
 
-    - model_info.provider == "anthropic"：走原生 Messages API
+    - 协议为 anthropic_messages（provider=="anthropic" 或模型覆盖声明）：
+      走原生 Messages API
       （anthropic_chat_completions_create，返回值形状模拟
       OpenAI 的 resp.choices[0].message，下游解析代码零改动）。
     - 其余厂商：完全不变，原样调用 client.chat.completions.create。
     """
     provider = getattr(model_info, "provider", "") if model_info else ""
-    if provider == "anthropic":
+    protocol = ""
+    if model_info is not None:
+        try:
+            from config import get_effective_endpoint
+            protocol = get_effective_endpoint(model_info).protocol
+        except Exception:
+            protocol = ""
+    if provider == "anthropic" or protocol == "anthropic_messages":
         from ai.anthropic_bridge import anthropic_chat_completions_create
         return await anthropic_chat_completions_create(
             client,
@@ -336,14 +345,16 @@ async def _subagent_agentic_loop(
         # 恒 ≤3，幂等）。子 agent 的多轮工具循环里，最新工具结果直接进入
         # 显式缓存覆盖；与顶层自动断点（extra_body.cache_control，第 4 个）
         # 叠加后不超过 Anthropic 4 断点上限。
+        # 手动缓存标记打在渲染后的 wire 上（内部 Message 不携带装饰）。
+        wire_for_cache = render_openai_messages(loop_messages)
         if provider_label == "openrouter" and subagent_supports_cache:
             from ai.attachment_content import _apply_cache_control
-            _apply_cache_control(loop_messages)
+            _apply_cache_control(wire_for_cache)
 
         try:
             create_params = {
                 "model": model,
-                "messages": loop_messages,
+                "messages": wire_for_cache,
                 "stream": False,
                 "max_tokens": (model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192),
             }
@@ -449,7 +460,6 @@ async def _subagent_agentic_loop(
 
         # 有 tool_calls → 把 assistant 消息塞回去，然后并发执行所有工具
         # 构造 assistant message（OpenAI 格式）
-        assistant_msg: dict = {"role": "assistant", "content": content or ""}
         tc_list: list[dict] = []
         # tool_calls 需要保留原结构供 API 识别
         try:
@@ -462,11 +472,10 @@ async def _subagent_agentic_loop(
                     "type": "function",
                     "function": {"name": fn, "arguments": args_raw},
                 })
-            if tc_list:
-                assistant_msg["tool_calls"] = tc_list
         except Exception:
             logger.debug("_subagent_agentic_loop 内部忽略的异常", exc_info=True)
             pass
+        assistant_msg = Message.assistant_with_tool_calls(content or "", tc_list)
         loop_messages.append(assistant_msg)
 
         # 报告即将执行的工具
@@ -502,18 +511,12 @@ async def _subagent_agentic_loop(
                 # assistant 消息入列，缺配对的 tool 结果会让下一轮 LLM
                 # 调用直接 400。
                 logger.exception(f"subagent: tool exec returned exception: {r}")
-                loop_messages.append({
-                    "role": "tool",
-                    "tool_call_id": getattr(getattr(r, "tc_entry", None), "id", "") or "call_unknown",
-                    "content": f"Error: tool execution failed: {r}",
-                })
+                loop_messages.append(Message.tool_result(
+                    "call_unknown", "", f"Error: tool execution failed: {r}",
+                ))
                 continue
             tc_id, result_str = cast(tuple[str, str], r)
-            loop_messages.append({
-                "role": "tool",
-                "tool_call_id": tc_id,
-                "content": result_str,
-            })
+            loop_messages.append(Message.tool_result(tc_id, "", result_str))
             total_tool_calls += 1
 
     # 跑出循环仍未拿到最终答复
@@ -588,8 +591,8 @@ async def execute_subagent(
     user_content = "".join(user_content_parts)
 
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
+        Message.system(system_prompt),
+        Message.user_text(user_content),
     ]
 
     # 工具白名单

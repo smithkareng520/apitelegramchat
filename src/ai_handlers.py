@@ -59,12 +59,12 @@ from ai.attachment_content import (
 from ai.rich_message_builder import RichMessageBuilder
 from ai.draft_manager import DraftManager
 from ai.agentic_loops import (
-    _agentic_loop_anthropic,
-    _agentic_loop_gemini_native,
     _agentic_loop_native_image,
     _agentic_loop_native_video,
-    _agentic_loop_openai_compat,
 )
+# 协议路由（Model -> Protocol -> Adapter）：聊天协议的唯一分发出口。
+from protocols import resolve_chat_adapter
+from core.messages import Message
 # chat action 状态指示：回合开始时清场（防止上一回合被取消时残留的
 # 后台重发任务跨回合存活）、收尾时兑底熄灭（正常/异常/取消路径均生效）。
 from chat_actions import reset_chat_actions, stop_all_chat_actions
@@ -378,7 +378,7 @@ def clean_ai_content(content: str) -> str:
 
 
 def _build_initial_messages(system_prompt: str) -> list:
-    return [{"role": "system", "content": system_prompt}]
+    return [Message.system(system_prompt)]
 
 
 async def get_ai_response(
@@ -433,7 +433,7 @@ async def get_ai_response(
     # 本体的属性经 DraftManager 透传（duck typing），读写无需区分。
     # 首绑处声明 Optional 供 try 前的异常路径使用。
     builder: DraftManager | None = None
-    new_msgs: list[dict[str, Any]] = []
+    new_msgs: list[Any] = []
     # 显式捕获本回合的 workspace namespace，避免后续异步任务依赖
     # ContextVar 的隐式继承。USER/TIMER 均沿用入口已经绑定的 Telegram user_id；
     # 若调用方显式提供，则以显式值为准。
@@ -603,11 +603,11 @@ async def get_ai_response(
             # 历史快照，这里不再重复 append（否则同一条消息会出现两次）。
             builder.set_thinking_status("Thinking...")
             await builder.flush(force=False)
-            out_msg: dict[str, Any] = {"role": "user"}
             resolved = await _resolve_multimodal_content(user_message, model_info, chat_id=chat_id)
             _log_stage("多模态内容解析完成")
-            out_msg["content"] = resolved
-            messages.append(out_msg)
+            messages.append(Message.user(resolved, **{
+                k: v for k, v in user_message.items() if k != "content"
+            }))
 
         # 静默模式（/show off）运行时告知：流式输出不实时展示，交付语义按
         # 事件源分叉——USER 回合默认交付（收尾有兜底，显式 send=false 才
@@ -615,9 +615,7 @@ async def get_ai_response(
         # 模型会误以为自己的正文用户能看到，或把两类回合的默认值弄混。
         if silent_mode:
             if is_timer:
-                messages.append({
-                    "role": "system",
-                    "content": (
+                messages.append(Message.system(
                         "当前会话已关闭草稿预览（静默模式，/show off），且本轮是 TIMER 后台"
                         "主动巡检回合：你的流式输出与本轮最终回复不会自动送达用户，系统也不会"
                         "兜底发送。若需要用户看到本轮内容，必须先把完整、自包含的最终回复直接"
@@ -632,13 +630,9 @@ async def get_ai_response(
                         "只会造成冗余消息。需要提问或留言可用 message_user（其超时表示用户"
                         "不在，不是错误）。若整轮无需用户知晓，可以不调用任何交付工具，保持"
                         "静默。注意：用户主动发消息的静默回合里 send 缺省值是 true，与本回合"
-                        "不同。"
-                    ),
-                })
+                        "不同。"))
             else:
-                messages.append({
-                    "role": "system",
-                    "content": (
+                messages.append(Message.system(
                         "当前会话已关闭草稿预览（静默模式，/show off），本轮是用户主动发来的"
                         "消息：默认交付——你的流式输出不会实时展示，你在工具调用之间输出的"
                         "中间正文用户也看不到；回合结束时，系统会把本轮**最后一条非空助手"
@@ -655,23 +649,20 @@ async def get_ai_response(
                         "效果——必须通过 tool_calls API 真正发起调用。交付成功后不要再调用 "
                         "deliver_reply，也不要输出\"已发送/已确认\"之类的确认正文——用户已经"
                         "收到，重复确认只会造成冗余消息。需要提问或留言可用 message_user"
-                        "（其超时表示用户不在，不是错误）。"
-                    ),
-                })
+                        "（其超时表示用户不在，不是错误）。"))
 
-        # 缓存标记必须在所有消息（含本轮新 user 消息）就位之后再打：
-        # Anthropic 前缀缓存断点越靠后，能复用的前缀越长。此前在 user
-        # 消息 append 之前打标记，断点落在历史消息上，本轮新输入
-        # 无法进入缓存覆盖范围，多轮对话缓存命中率偏低。
-        if model_info.supports_prompt_cache:
-            _apply_cache_control(messages)
+        # 缓存断点改由协议循环在每轮"渲染后的 wire dict"上统一打
+        # （openai_chat: agentic_loops 每轮重打；anthropic_messages:
+        # anthropic_bridge 4 断点策略）——内部 Message 不携带任何
+        # 出站缓存装饰，本入口不再预处理。
 
         builder.set_thinking_status("Thinking...")
         await builder.flush(force=False)
         _log_stage("预处理全部完成，开始模型请求")
 
         logger.debug("发送给 %s (api=%s): %s", current_model, api_type,
-                     json.dumps(messages, ensure_ascii=False, indent=2)[:1000])
+                     json.dumps([m.to_openai_dict() for m in messages],
+                                ensure_ascii=False, default=str)[:1000])
 
         if model_info.native_video:
             raw_content, usage, new_msgs = await _agentic_loop_native_video(
@@ -712,17 +703,13 @@ async def get_ai_response(
                 timer_tools = timer_tools + [build_deliver_reply_tool(default_send=False)]
             # TIMER 回合说明：统一草稿流后，/show on 时过程与最终回复对用户
             # 可见；/show off 时静默，交付渠道是 deliver_reply / message_user。
-            messages.append({
-                "role": "system",
-                "content": (
+            messages.append(Message.system(
                     "TIMER 是主动巡检回合，不是普通问答。先检查 Todo，再结合最近上下文判断："
                     "有具体价值就自然地告知或推进；没有合理行动就保持简短，不要为了完成回合"
                     "而寒暄，也不要输出“我会等待”等等待式文本。需要用户回应时用 message_user；"
                     "静默模式下需要用户看到结论时，把结论写成消息正文并调用 deliver_reply"
                     "（显式 send=true，系统会把该正文直接发送给用户；TIMER 回合不填 send 默认"
-                    "false 即不发送，交付后不要再重复确认）。"
-                ),
-            })
+                    "false 即不发送，交付后不要再重复确认）。"))
             raw_content, usage, new_msgs = await _call_api(
                 current_model, model_info, messages, chat_id, builder,
                 tools=timer_tools, journal=journal,
@@ -791,8 +778,8 @@ async def get_ai_response(
                     await turn_recovery.mark_failed_unanswered_user(chat_id)
                 except Exception:
                     logger.debug("mark_failed_unanswered_user 失败（可忽略）", exc_info=True)
-            if new_msgs and new_msgs[-1].get("role") == "assistant":
-                history_summary = str(new_msgs[-1].get("content") or "")
+            if new_msgs and isinstance(new_msgs[-1], Message) and new_msgs[-1].role == "assistant":
+                history_summary = new_msgs[-1].text()
                 logger.debug("[NativeImage] 保存到对话历史的完整 assistant 消息:\n%s", history_summary)
             # 图片路径通常已发过永久消息；仍尝试清理草稿气泡
             if builder.draft_message_id:
@@ -833,8 +820,8 @@ async def get_ai_response(
                 actual_content = raw_content.split(":", 1)[1].strip()
             else:
                 actual_content = "（已生成视频）"
-            if new_msgs and new_msgs[-1].get("role") == "assistant":
-                history_summary = str(new_msgs[-1].get("content") or "")
+            if new_msgs and isinstance(new_msgs[-1], Message) and new_msgs[-1].role == "assistant":
+                history_summary = new_msgs[-1].text()
                 logger.debug("[NativeVideo] 保存到对话历史的完整 assistant 消息:\n%s", history_summary)
             if builder.draft_message_id:
                 try:
@@ -985,8 +972,9 @@ async def get_ai_response(
             except Exception as e:
                 logger.debug(f"正常路径删除草稿失败: {e}")
 
-        if new_msgs and new_msgs[-1].get("role") == "assistant" and not new_msgs[-1].get("tool_calls"):
-            new_msgs[-1]["content"] = cleaned_content
+        if (new_msgs and isinstance(new_msgs[-1], Message)
+                and new_msgs[-1].role == "assistant" and not new_msgs[-1].tool_calls()):
+            new_msgs[-1] = Message.assistant_text(cleaned_content, new_msgs[-1].reasoning())
 
         # 保留模型返回的原文和本轮实际提交给 Telegram 的最终 HTML；两者均不得截断。
         logger.info(
@@ -1183,34 +1171,20 @@ async def _call_api(
         api_type = "openrouter"
         model_info = SUPPORTED_MODELS.get(DEFAULT_MODEL, model_info)
 
-    # 有效端点：合并厂商默认值与该模型自己的端点覆盖（不同中转端点/协议）。
-    # dedicated_loop_kind 以模型级覆盖优先（单字段协议选择器，
-    # None=继承厂商默认，"openai_compat"=显式走兼容循环），
-    # 因此同一个 provider 壳下的不同模型可以分别走不同协议循环。
-    # 注意：与 api_client._build_client 同口径——只看这一个字段，
-    # 不存在"开关没开导致客户端/循环错配"的半开状态。
-    endpoint = get_effective_endpoint(model_info)
-    dedicated_loop_kind = endpoint.dedicated_loop_kind
-
-    if dedicated_loop_kind == "anthropic_native":
-        client = api_client.get_client_for_model(model_info)
-        return await _agentic_loop_anthropic(
-            cast("AsyncAnthropic", client), current_model, messages, builder,
-            tools=tools_to_pass, supports_tools=supports_tools, journal=journal,
-        )
-    elif dedicated_loop_kind == "gemini_native":
-        # Gemini 原生流式桥接：aiohttp 直连原生 REST（v1beta
-        # streamGenerateContent?alt=sse），不经过 OpenAI 兼容客户端。
-        return await _agentic_loop_gemini_native(
-            current_model, messages, builder,
-            tools=tools_to_pass, supports_tools=supports_tools, journal=journal,
-        )
-    else:
-        client = api_client.get_client_for_model(model_info)
-        return await _agentic_loop_openai_compat(
-            cast("AsyncOpenAI", client), current_model, messages, api_type, builder,
-            tools=tools_to_pass, supports_tools=supports_tools, journal=journal,
-        )
+    # 协议路由（Model -> Protocol -> Adapter）：按模型的有效协议取
+    # 适配器，替代旧版 if anthropic / elif gemini / else openai 的
+    # 硬编码分支。适配器内部负责客户端获取与循环转发；新增协议只需
+    # 在 protocols/registry 注册，本函数零改动。
+    adapter = resolve_chat_adapter(model_info)
+    return await adapter.run_agent_loop(
+        current_model=current_model,
+        model_info=model_info,
+        messages=messages,
+        builder=builder,
+        tools=tools_to_pass,
+        supports_tools=supports_tools,
+        journal=journal,
+    )
 
 
 

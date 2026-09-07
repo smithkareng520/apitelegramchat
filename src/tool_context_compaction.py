@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from core.messages import Message, ToolResultBlock
 from workspace_paths import workspace_workdir
 from workspace_utils import _ensure_runtime_workspace, _get_workspace_lock
 
@@ -121,8 +122,14 @@ def _archive_payload(
             "function": dict(tool_call.get("function") or {}),
         },
         "tool_result": {
-            "tool_call_id": tool_result.get("tool_call_id", ""),
-            "content": tool_result.get("content", ""),
+            "tool_call_id": (
+                tool_result.tool_call_id if isinstance(tool_result, ToolResultBlock)
+                else tool_result.get("tool_call_id", "")
+            ),
+            "content": (
+                tool_result.content if isinstance(tool_result, ToolResultBlock)
+                else tool_result.get("content", "")
+            ),
         },
         "retrieval": {
             "path": relative_path,
@@ -132,30 +139,61 @@ def _archive_payload(
     return (json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n").encode("utf-8")
 
 
-def _eligible_calls(history: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any], dict[str, Any]]]:
-    """Return unarchived target tool-call/result pairs in chronological order."""
-    results_by_id: dict[str, dict[str, Any]] = {}
+def _eligible_calls(history: list[Any]) -> list[tuple[int, dict[str, Any], dict[str, Any]]]:
+    """Return unarchived target tool-call/result pairs in chronological order.
+
+    重构说明（Internal Message）：生产历史为 Message 列表；这里把
+    ToolCallBlock / ToolResultBlock 投影为旧 dict 形状后再复用统一的
+    归档与改写逻辑（改写通过引用写回 block 字段）。
+    """
+    results_by_id: dict[str, tuple[dict[str, Any], ToolResultBlock]] = {}
     for message in history:
-        if message.get("role") != "tool":
-            continue
-        call_id = message.get("tool_call_id")
-        if isinstance(call_id, str) and call_id and not _is_archived_pointer(message.get("content")):
-            results_by_id[call_id] = message
+        if isinstance(message, Message):
+            if message.role != "tool":
+                continue
+            tr = message.tool_result_block()
+            if tr is None:
+                continue
+            if tr.tool_call_id and not _is_archived_pointer(tr.content):
+                results_by_id[tr.tool_call_id] = (
+                    {"tool_call_id": tr.tool_call_id, "content": tr.content}, tr,
+                )
+        elif isinstance(message, dict):
+            if message.get("role") != "tool":
+                continue
+            call_id = message.get("tool_call_id")
+            if isinstance(call_id, str) and call_id and not _is_archived_pointer(message.get("content")):
+                results_by_id[call_id] = (message, None)  # type: ignore[assignment]
 
     calls: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
     for index, message in enumerate(history):
-        if message.get("role") != "assistant":
-            continue
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            continue
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
+        if isinstance(message, Message):
+            if message.role != "assistant":
                 continue
-            name = _tool_name(tool_call)
-            result = results_by_id.get(_tool_call_id(tool_call))
-            if name in TARGET_TOOLS and result is not None:
-                calls.append((index, tool_call, result))
+            for tc in message.tool_calls():
+                tool_call = {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.name, "arguments": tc.arguments},
+                }
+                name = _tool_name(tool_call)
+                entry = results_by_id.get(_tool_call_id(tool_call))
+                if name in TARGET_TOOLS and entry is not None:
+                    # 用 block 引用承载 result：改写 content 直接生效。
+                    calls.append((index, tool_call, entry[1] if entry[1] is not None else entry[0]))
+        elif isinstance(message, dict):
+            if message.get("role") != "assistant":
+                continue
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                name = _tool_name(tool_call)
+                result = results_by_id.get(_tool_call_id(tool_call))
+                if name in TARGET_TOOLS and result is not None:
+                    calls.append((index, tool_call, result[0]))
     return calls
 
 
@@ -221,7 +259,11 @@ async def compact_older_tool_calls(
                 if not isinstance(function, dict):
                     continue
                 function["arguments"] = _minimal_arguments(name, function.get("arguments"))
-                tool_result["content"] = _pointer_text(name, relative_path)
+                if isinstance(tool_result, ToolResultBlock):
+                    # Message 历史路径：直接改写块字段（历史对象引用共享）。
+                    tool_result.content = _pointer_text(name, relative_path)
+                else:
+                    tool_result["content"] = _pointer_text(name, relative_path)
                 compacted_calls += 1
                 archived_bytes += len(payload)
 

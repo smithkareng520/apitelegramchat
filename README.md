@@ -127,9 +127,14 @@ Telegram Runtime 共用业务能力，但**不把 Runtime 能力原样暴露**�
 │    ├── app_lists.py         role/model 列表 UI                     │
 │    ├── state.py / config.py / proactive.py / turn_recovery.py     │
 │    ▼                                                              │
-│  ai_handlers.py / ai/agentic_loops.py（Agent 循环）                │
-│    ├── ai/anthropic_bridge.py  Anthropic 原生桥接                  │
-│    ├── ai/gemini_bridge.py     Gemini 原生桥接                     │
+│  ai_handlers.py（调度） → protocols/（协议路由：Model→Protocol）    │
+│    ├── openai_chat.py        OpenAI 兼容（缺省协议）               │
+│    ├── anthropic_messages.py Anthropic 原生 Messages               │
+│    ├── gemini_native.py      Gemini 原生 streamGenerateContent     │
+│    ├── images.py             ImageTask → 图像协议分发              │
+│    ▼                                                              │
+│  ai/agentic_loops.py / ai/*_bridge.py（协议 agentic 循环）          │
+│    ├── core/messages.py        内部消息（Message/blocks）           │
 │    ├── ai/bridge_common.py     两桥共享的循环骨架                   │
 │    ├── 上下文压缩 / 工具调用编排 / 草稿流 / subagent                │
 │    ▼                                                              │
@@ -311,6 +316,25 @@ export OPENROUTER_REQUIRE_PARAMETERS=false   # 是否要求 provider 满足请�
 ---
 
 ## 模型与厂商
+
+### 协议路由（Model → Protocol）
+
+模型经 `ModelConfig.protocol` 声明走哪种 API 协议；未声明时回落
+`openai_chat`（OpenAI 兼容 Chat Completions）。厂商默认协议填该厂商
+广泛支持的 API 类型（`ProviderConfig.protocol`），同一厂商下的个别
+模型可用模型级 `protocol` 覆盖为任意协议（含中转端点协议覆盖）。
+
+| protocol | 含义 | 典型模型 |
+|---|---|---|
+| `openai_chat` | OpenAI 兼容 Chat Completions（缺省） | OpenRouter / ModelScope / GLM / DeepSeek / Agnes / Grok 全部兼容模型 |
+| `anthropic_messages` | Anthropic 原生 Messages | `claude-opus-5`（官方 / XXTF 中转） |
+| `gemini_native` | Gemini 原生 streamGenerateContent | `gemini-3.5-flash-lite` |
+| `openai_images` | OpenAI Images（generations / edits） | `gpt-image-2`、`Qwen/Qwen-Image-Edit`、`Z-Image-Turbo` |
+
+路由唯一出口：`protocols/registry.get_chat_adapter(protocol)`；图像任务
+经 `protocols/images.dispatch_image_task(ImageTask)` 分发，操作类型
+（generate / edit / variation）由任务显式声明，端点选择收敛在适配器内。
+详见 `REFACTOR_PROTOCOL.md`。
 
 模型配置集中在 `src/config.py`，"厂商能力"与"模型能力"分离。
 

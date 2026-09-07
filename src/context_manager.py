@@ -16,6 +16,10 @@ select_request_context 退化为守卫，只在两种情况下工作：
    出站视图（不改写摘要、不触碰持久历史），保证发出去的请求永远
    合法；单条消息自身超预算时按 token 预算截断该消息。
    下一次压缩事件会把持久历史收敛回预算内，兜底路径随之消失。
+
+重构说明（Internal Message）：历史统一为 Message 对象；本模块的纯逻辑
+同时接受 Message 与旧 dict（双形状过渡），token 估算基于出站投影
+（Message.to_openai_dict()），与真实请求载荷同源。
 """
 from __future__ import annotations
 
@@ -24,57 +28,74 @@ from typing import Any, Optional
 
 from context_window import resolve_history_budget, split_history_blocks
 from token_budget import json_token_count, truncate_to_token_budget
+from core.messages import Message, TextBlock
 
 
 @dataclass(frozen=True)
 class ContextSnapshot:
-    messages: list[dict[str, Any]]
+    messages: list[Any]
     dropped_messages: int
     estimated_tokens: int
 
 
-def _message_token_count(message: dict[str, Any]) -> int:
+def _as_message(message: Any) -> Message:
+    return message if isinstance(message, Message) else Message.from_openai_dict(message)
+
+
+def _message_token_count(message: Any) -> int:
+    # token 估算与出站载荷同源：Message 按其 OpenAI 投影计数
+    # （meta 附件元数据不进请求体，也就不计入请求 token）。
+    if isinstance(message, Message):
+        return json_token_count(message.to_openai_dict())
     return json_token_count(message)
 
 
 def _is_supported(message: object) -> bool:
+    if isinstance(message, Message):
+        return message.role in {"user", "assistant", "tool", "system"}
     return isinstance(message, dict) and message.get("role") in {
         "user", "assistant", "tool", "system"
     }
 
 
-def _fit_message_to_token_budget(message: dict[str, Any], token_budget: int) -> dict[str, Any] | None:
+def _fit_message_to_token_budget(message: Any, token_budget: int) -> Any:
     """Trim an oversized plain-text message so the selected context stays bounded."""
-    candidate = message.copy()
-    if _message_token_count(candidate) <= token_budget:
-        return candidate
+    if token_budget <= 0:
+        return None
+    if _message_token_count(message) <= token_budget:
+        return message
 
-    content = candidate.get("content")
-    if not isinstance(content, str) or not content or token_budget <= 0:
+    m = _as_message(message)
+    # 仅纯文本（单 TextBlock）消息可无损截断；多模态/结构化消息无法
+    # 在块语义内安全裁剪，放弃该消息（与旧版 content 非字符串时一致）。
+    text_blocks = [b for b in m.blocks if isinstance(b, TextBlock)]
+    if len(m.blocks) != 1 or len(text_blocks) != 1:
         return None
 
-    empty_content = candidate.copy()
-    empty_content["content"] = ""
-    available = token_budget - _message_token_count(empty_content)
+    original = text_blocks[0].text
+    empty = Message(role=m.role, blocks=[], name=m.name)
+    available = token_budget - _message_token_count(empty)
     if available <= 0:
         return None
 
-    candidate["content"] = truncate_to_token_budget(content, available, suffix="…")
-    while available > 0 and _message_token_count(candidate) > token_budget:
+    candidate_text = original
+    candidate_text = truncate_to_token_budget(original, available, suffix="…")
+    while available > 0 and _message_token_count(
+        Message(role=m.role, blocks=[TextBlock(candidate_text)], name=m.name)
+    ) > token_budget:
         available -= 1
-        candidate["content"] = truncate_to_token_budget(content, available, suffix="…")
+        candidate_text = truncate_to_token_budget(original, available, suffix="…")
 
-    return candidate if _message_token_count(candidate) <= token_budget else None
+    fitted = Message(role=m.role, blocks=[TextBlock(candidate_text)], name=m.name)
+    return fitted if _message_token_count(fitted) <= token_budget else None
 
 
-def _tail_fit_messages(
-    messages: list[dict[str, Any]], max_tokens: int
-) -> tuple[list[dict[str, Any]], int]:
+def _tail_fit_messages(messages: list, max_tokens: int) -> tuple[list, int]:
     """尾部装配兜底：从末尾回退累积，塞不下时按预算截断首条入选消息。
 
     仅在"单块消息自身超预算"的退化场景被调用（守卫的最后一道防线）。
     """
-    selected_reversed: list[dict[str, Any]] = []
+    selected_reversed: list = []
     used_tokens = 0
 
     for idx in range(len(messages) - 1, -1, -1):
@@ -93,14 +114,14 @@ def _tail_fit_messages(
             used_tokens += _message_token_count(fitted)
             continue
 
-        selected_reversed.append(message.copy())
+        selected_reversed.append(message)
         used_tokens += message_tokens
 
     return list(reversed(selected_reversed)), used_tokens
 
 
 def select_request_context(
-    history: list[dict[str, Any]],
+    history: list,
     *,
     max_tokens: int | None = None,
     model_max_context: Optional[int] = None,
@@ -108,9 +129,10 @@ def select_request_context(
 ) -> ContextSnapshot:
     """返回合法且受 token 预算约束的请求上下文（守卫语义）。
 
-    - 预算内：返回全部历史（浅拷贝）。前缀字节稳定是本函数的第一目标
-      （prompt cache 命中的前提），因此不做任何"顺手"修剪；
-    - 超预算：按用户轮块从最老开始淘汰出站视图（摘要槽位保留），
+    - 预算内：返回全部历史（引用透传，Message 不可变约定由调用方保证）。
+      前缀字节稳定是本函数的第一目标（prompt cache 命中的前提），因此
+      不做任何"顺手"修剪；
+    - 超预算：按用户轮块从最老开始淘汰出站视图（摘要保留在头部稳定槽位），
       持久历史不受影响；单条消息超预算时退化为尾部装配 + 截断。
     """
     if max_tokens is not None and max_tokens > 0:
@@ -122,8 +144,10 @@ def select_request_context(
     total_tokens = sum(_message_token_count(message) for message in supported)
 
     if total_tokens <= budget:
-        # 快路径：全量透传（浅拷贝，防止出站改写污染持久历史）。
-        selected = [message.copy() for message in supported]
+        # 快路径：全量透传。Message 是不可变使用约定（历史追加-only），
+        # 旧版"浅拷贝防污染"针对 dict 原地改写；Message 化后出站装饰
+        # （cache_control）只落在渲染产物上，持久对象不再被触碰。
+        selected = list(supported)
         used_tokens = total_tokens
     else:
         # 兜底路径：先按块淘汰出站视图（摘要保留在头部稳定槽位）。
@@ -145,8 +169,13 @@ def select_request_context(
         selected, used_tokens = _tail_fit_messages(remaining, budget)
 
     # Never start a request with an orphaned tool result.
-    while selected and selected[0].get("role") == "tool":
-        selected.pop(0)
+    while selected:
+        first = selected[0]
+        first_role = first.role if isinstance(first, Message) else first.get("role")
+        if first_role == "tool":
+            selected.pop(0)
+        else:
+            break
 
     return ContextSnapshot(
         messages=selected,
