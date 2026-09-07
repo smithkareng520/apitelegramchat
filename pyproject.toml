@@ -85,7 +85,7 @@ py-modules = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["ai*", "entrypoints*", "mcpserver*"]
+include = ["ai*", "core*", "entrypoints*", "mcpserver*", "search*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -56,8 +56,6 @@ import aiohttp
 from config import (
     GEMINI_API_KEY,
     ModelConfig,
-    SUPPORTED_MODELS,
-    get_sampling_params,
     get_reasoning_request_fields,
 )
 from utils import get_logger
@@ -71,9 +69,16 @@ from ai.tool_summary import (
     _generate_initial_tool_summary,
     _normalize_tool_call_arguments,
     _strip_textual_tool_calls,
-    _tool_limit_summary,
 )
-from ai.tool_call_loop import _run_tool_calls_and_append
+from ai.bridge_common import (
+    append_assistant_message,
+    ensure_final_content,
+    finish_open_tool_group,
+    init_bridge_loop_state,
+    make_switch_stream,
+    over_limit_final_summary,
+    run_tool_batch,
+)
 from ai.gemini_cache import manager as _gemini_cache_manager
 
 if TYPE_CHECKING:
@@ -775,16 +780,15 @@ async def _agentic_loop_gemini_native(
         f":streamGenerateContent?alt=sse"
     )
 
-    loop_messages = list(messages)  # OpenAI 形状，供 _run_tool_calls_and_append 复用
-    final_content: str | None = None
-    final_usage = None
-    tool_call_count_ref = [0]
-    new_history_entries = journal if journal is not None else []
-
-    model_info = SUPPORTED_MODELS.get(current_model)
-    max_tokens = model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192
-    # 采样与推理控制统一来自 config.py（含 per-model 覆盖），禁止在此硬编码。
-    sampling_params = get_sampling_params(model_info)
+    state = init_bridge_loop_state(messages, journal, current_model)
+    loop_messages = state.loop_messages
+    new_history_entries = state.new_history_entries
+    tool_call_count_ref = state.tool_call_count_ref
+    final_content: str | None = state.final_content
+    final_usage = state.final_usage
+    model_info = state.model_info
+    max_tokens = state.max_tokens
+    sampling_params = state.sampling_params
     thinking_config = _gemini_thinking_config(model_info)
 
     for _round in range(MAX_TOOL_CALLS):
@@ -796,28 +800,9 @@ async def _agentic_loop_gemini_native(
         finish_reason: Optional[str] = None
         usage_meta: Optional[dict] = None
         received_any = False
-        current_stream = None
+        current_stream_cell = [None]
 
-        async def switch_stream(target: str) -> None:
-            nonlocal current_stream
-            if current_stream == target:
-                return
-            ended = current_stream
-            builder.end_stream()
-            # 块边界换草稿检查点①②：一个思考块或文本块刚刚闭合、下一个块
-            # 尚未开启，此刻 HTML 正好停在完整外层块边界上，是回合中途最
-            # 安全的切换时机（不必再等整批工具结果回来）。
-            # 真正是否切换仍由 rollover_at_turn_boundary 内的容量阈值决定；
-            # 未达阈值时立即返回 False，热路径无额外开销。
-            # 若本轮已有未收束的工具组，函数内的守卫会拒绝滚动，
-            # 从而不会把工具卡片拆散（历史问题1）。
-            if ended is not None:
-                await builder.rollover_at_turn_boundary(start_next_draft=True)
-            if target == "reasoning":
-                builder.begin_stream_reasoning()
-            elif target == "content":
-                builder.begin_stream_text()
-            current_stream = target
+        switch_stream = make_switch_stream(builder, current_stream_cell)
 
         # 显式缓存（cachedContent API）：可用则只发送“当前回合后缀”并引用
         # 缓存（systemInstruction / 前缀 contents 由缓存提供）；不可用则
@@ -1017,52 +1002,23 @@ async def _agentic_loop_gemini_native(
         if not await builder.rollover_at_turn_boundary(start_next_draft=will_request_again):
             await builder.flush()
 
-        assistant_msg: dict = {"role": "assistant", "content": content_acc or None}
-        if tool_calls_list:
-            assistant_msg["tool_calls"] = tool_calls_list
-        if reasoning_acc:
-            assistant_msg["reasoning_content"] = reasoning_acc
-        loop_messages.append(assistant_msg)
-        new_history_entries.append(assistant_msg)
+        append_assistant_message(loop_messages, new_history_entries, content_acc,
+                                 tool_calls_list, reasoning_acc)
 
         if not tool_calls_list:
             final_content = content_acc
-            if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-                builder.finish_group(len(builder._tool_groups) - 1)
+            finish_open_tool_group(builder)
             # 无工具调用即为终局响应；统一结束旧草稿，不额外开新草稿。
             await builder.rollover_at_turn_boundary(start_next_draft=False)
             break
 
-        status = await _run_tool_calls_and_append(
-            tool_calls_list, loop_messages, new_history_entries,
-            tool_call_count_ref, api_label, builder, chat_id=builder.chat_id,
-            tools=tools,
-        )
-        # 工具批次后仍会继续请求模型，因此在函数内创建新草稿。
-        await builder.rollover_at_turn_boundary(start_next_draft=True)
+        status = await run_tool_batch(builder, tool_calls_list, loop_messages,
+                                      new_history_entries, tool_call_count_ref,
+                                      api_label, tools)
 
         if status == "over_limit":
-            # 强制总结：与其它两条循环同语义——追加系统指令、禁用工具面、
-            # 流式输出最终总结（原生路径下同样实时可见）。
-            synth_body = _build_gemini_request_body(
-                loop_messages + [{
-                    "role": "user",
-                    "content": (
-                        f"System: Maximum tool calls ({MAX_TOOL_CALLS}) reached for this turn. "
-                        "Tool usage is now DISABLED. Please immediately summarize what you have "
-                        "successfully done so far, explicitly state what failed or what is left "
-                        "to do, and ask the user if they want to continue the operation in the "
-                        "next turn."
-                    ),
-                }],
-                max_tokens=max_tokens,
-                sampling_params=sampling_params,
-                thinking_config=thinking_config,
-                gemini_tools=None,
-            )
-            try:
-                await start_chat_action(builder.chat_id, "typing")
-                builder.begin_stream_text()
+
+            async def _synth_stream(synth_body: dict) -> str:
                 synth_text = ""
                 async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
                     async with await _post_gemini_stream(
@@ -1071,41 +1027,24 @@ async def _agentic_loop_gemini_native(
                             if event["kind"] == "text":
                                 synth_text += event["text"]
                                 builder.append_stream_delta(event["text"])
-                raw_synth_content = builder.end_stream_text() or synth_text
-                # 文本块结束时检查是否需要切换草稿
-                if raw_synth_content:
-                    await builder.rollover_at_turn_boundary(start_next_draft=False)
-                final_content = _strip_textual_tool_calls(raw_synth_content)
-                if final_content != raw_synth_content:
-                    builder.replace_trailing_text(raw_synth_content, final_content)
-                if not final_content:
-                    final_content = _tool_limit_summary()
-                    builder.add_text(final_content)
-            except Exception as synth_err:
-                logger.warning(f"[{api_label}] 合成流失败: {synth_err}")
-                try:
-                    builder.end_stream_text()
-                except Exception:
-                    logger.debug("_agentic_loop_gemini_native 内部忽略的异常", exc_info=True)
-                final_content = _tool_limit_summary()
-                builder.add_text(final_content)
-            finally:
-                await stop_chat_action(builder.chat_id, "typing")
-            new_history_entries.append({"role": "assistant", "content": final_content or ""})
-            if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-                builder.finish_group(len(builder._tool_groups) - 1)
-            # 工具上限总结是终局回复；结束旧草稿，不创建新草稿。
-            await builder.rollover_at_turn_boundary(start_next_draft=False)
+                return synth_text
+
+            final_content = await over_limit_final_summary(
+                builder, new_history_entries,
+                api_label=api_label, loop_name="_agentic_loop_gemini_native",
+                build_synth_request=lambda extra: _build_gemini_request_body(
+                    loop_messages + [extra],
+                    max_tokens=max_tokens,
+                    sampling_params=sampling_params,
+                    thinking_config=thinking_config,
+                    gemini_tools=None,
+                ),
+                stream_synth=_synth_stream,
+                postprocess=_strip_textual_tool_calls,
+            )
             break
         # status == "continue"：循环自然继续
 
-    if final_content is None:
-        final_content = _tool_limit_summary()
-        builder.add_text(final_content)
-        new_history_entries.append({"role": "assistant", "content": final_content})
-        if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-            builder.finish_group(len(builder._tool_groups) - 1)
-        # 轮次数耗尽后的兜底文本没有后续轮次：结束旧草稿，但不创建新草稿。
-        await builder.rollover_at_turn_boundary(start_next_draft=False)
+    final_content = await ensure_final_content(builder, new_history_entries, final_content)
 
     return final_content, final_usage, new_history_entries
