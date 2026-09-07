@@ -74,7 +74,20 @@ async def _answer_callback_query(callback_query_id: str, text: str, show_alert: 
 
 
 async def _handle_admin_commands(chat_id: int, msg: dict, text: str, username: str, user_id: str) -> bool:
-    """管理员命令分发。返回 True 表示 update 已处理（含权限拒绝）。"""
+    """管理员命令分发。返回 True 表示 update 已处理（含权限拒绝）。
+
+    注意：普通用户（包括白名单用户）的聊天消息不能被这里拦截。
+    只有真正的管理员命令才进行管理员权限检查。
+    """
+    is_admin_command = any(_cmd_match(text, cmd) for cmd in (
+        "/adduser",
+        "/deluser",
+        "/listusers",
+        "/webhookinfo",
+    ))
+    if not is_admin_command:
+        return False
+
     if not is_admin(username, user_id):
         await send_rich_html_message(chat_id, "❌ <b>权限不足</b>\n只有管理员可以执行此操作。", reply_parameters=_reply_params(msg["message_id"]))
         return True
