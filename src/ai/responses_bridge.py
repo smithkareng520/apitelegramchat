@@ -426,7 +426,9 @@ async def openai_responses_chat_completions_create(
     if top_p is not None:
         request_kwargs["top_p"] = top_p
     if reasoning:
-        request_kwargs["reasoning"] = reasoning
+        reasoning_request = dict(reasoning)
+        reasoning_request.setdefault("summary", "auto")
+        request_kwargs["reasoning"] = reasoning_request
     if responses_tools:
         request_kwargs["tools"] = responses_tools
 
@@ -582,7 +584,12 @@ async def _agentic_loop_openai_responses(
         if sampling_params.get("top_p") is not None:
             request_kwargs["top_p"] = sampling_params["top_p"]
         if reasoning_param:
-            request_kwargs["reasoning"] = reasoning_param
+            # Responses API 默认不会返回可展示的 reasoning summary；
+            # 明确 opt-in。当前 API 已将 generate_summary 标记为 deprecated，
+            # 使用 reasoning.summary="auto" 请求模型提供可展示摘要。
+            reasoning_request = dict(reasoning_param)
+            reasoning_request.setdefault("summary", "auto")
+            request_kwargs["reasoning"] = reasoning_request
         if responses_tools:
             request_kwargs["tools"] = responses_tools
             request_kwargs["tool_choice"] = "auto"
@@ -653,6 +660,26 @@ async def _agentic_loop_openai_responses(
                         # （delta 事件缺失或不完整时），用它覆盖累积值。
                         entry["args_json"] = full_args
 
+                elif etype == "response.reasoning_summary_text.delta":
+                    # Responses streaming 会把 reasoning summary 以独立事件流出。
+                    # 原实现只等待 response.output_item.done，导致 summary 已经
+                    # 在流中返回，却没有进入 builder / 最终 Message。
+                    summary_delta = getattr(event, "delta", "") or ""
+                    if summary_delta:
+                        reasoning_acc += summary_delta
+                        await switch_stream("reasoning")
+                        builder.append_stream_delta(summary_delta)
+
+                elif etype == "response.reasoning_summary_text.done":
+                    # done 事件通常不携带增量之外的新内容；保留分支用于兼容
+                    # 一些网关只发送 done 的 text 字段。若它提供完整文本且当前
+                    # 尚未累积，则补进去。
+                    summary_text = getattr(event, "text", "") or ""
+                    if summary_text and not reasoning_acc:
+                        reasoning_acc = summary_text
+                        await switch_stream("reasoning")
+                        builder.append_stream_delta(summary_text)
+
                 elif etype == "response.output_item.done":
                     item = getattr(event, "item", None)
                     itype = getattr(item, "type", None) if item is not None else None
@@ -661,8 +688,8 @@ async def _agentic_loop_openai_responses(
                         summary_text = "\n".join(
                             getattr(s, "text", "") or "" for s in summary_list if getattr(s, "text", "")
                         )
-                        if summary_text:
-                            reasoning_acc += summary_text
+                        if summary_text and not reasoning_acc:
+                            reasoning_acc = summary_text
                             await switch_stream("reasoning")
                             builder.append_stream_delta(summary_text)
                     elif itype == "function_call":
