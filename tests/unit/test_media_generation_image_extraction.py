@@ -1,7 +1,14 @@
 import base64
 import asyncio
 
-from ai.media_generation import _extract_image_items, _response_items_to_bytes, _detect_valid_image
+from ai.media_generation import (
+    _extract_image_items,
+    _response_items_to_bytes,
+    _detect_valid_image,
+    _request_openai_images_task,
+    _request_chat_modalities_image_task,
+)
+from core.images import ImageTask
 
 
 # 1x1 transparent PNG.
@@ -60,3 +67,47 @@ def test_validate_image_bytes_is_legacy_exported_from_ai_handlers():
     from pathlib import Path
     source = (Path(__file__).resolve().parents[2] / "src" / "ai_handlers.py").read_text()
     assert "    _validate_image_bytes," in source
+
+
+def test_openai_images_task_resolves_registered_model_without_name_error(monkeypatch):
+    async def fake_request(*args, **kwargs):
+        return {"data": []}, "/images/generations", "", 200, "req-test"
+
+    monkeypatch.setattr("ai.media_generation._request_images_generations", fake_request)
+    task = ImageTask.generate("test", model="google/gemini-3-pro-image-preview")
+    result = asyncio.run(_request_openai_images_task(task))
+    assert result.images == []
+    assert result.endpoint == "/v1/images/generations"
+
+
+def test_openrouter_chat_image_task_resolves_registered_model_without_name_error(monkeypatch):
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            class FakeMessage:
+                content = ""
+                images = []
+
+                def model_dump(self):
+                    return {"content": "", "images": []}
+
+            class FakeChoice:
+                finish_reason = "stop"
+                message = FakeMessage()
+
+            class FakeResponse:
+                choices = [FakeChoice()]
+                usage = None
+
+            return FakeResponse()
+
+    class FakeClient:
+        def __init__(self):
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    monkeypatch.setattr("api_client.api_client.get_client_for_model", lambda model_info: FakeClient())
+    monkeypatch.setattr("ai.media_generation.get_sampling_params", lambda model_info: {})
+
+    task = ImageTask.generate("test", model="google/gemini-3-pro-image-preview")
+    result = asyncio.run(_request_chat_modalities_image_task(task))
+    assert result.images == []
+    assert result.endpoint == "/chat/completions"

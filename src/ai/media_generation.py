@@ -30,6 +30,7 @@ from config import (
     MODELSCOPE_API_KEY,
     ModelConfig,
     PROVIDERS,
+    SUPPORTED_MODELS,
     get_effective_endpoint,
     get_sampling_params,
 )
