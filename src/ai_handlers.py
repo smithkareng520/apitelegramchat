@@ -257,7 +257,7 @@ _BASE_PROMPT = """
 <p>GIF 属于<b>图片</b>资源。URL 路径以 <code>.gif</code> 结尾时必须使用 <code><img src="URL"/></code>；需要图注时用 <code><figure><img src="URL"/><figcaption>…</figcaption></figure></code>。<b>严禁用 <code><video></code> 包裹 GIF。</b></p>
 
 <h3>2.4 图片生成工具的结果处理</h3>
-<p>当 <code>generate_image_from_text</code> / <code>edit_image_with_reference</code> 成功返回 <code>图片链接：URL</code>（可能多行，每行一个 URL）时：</p>
+<p>当 <code>generate_image</code>（统一图像工具；旧名 <code>generate_image_from_text</code> / <code>edit_image_with_reference</code> 同样有效）成功返回 <code>图片链接：URL</code>（可能多行，每行一个 URL）时：</p>
 <ul>
   <li><b>单张：</b>用 <code><img src="URL"/></code> 输出。</li>
   <li><b>多张（≥2）：</b>用 <code><tg-slideshow><img src="URL1"/><img src="URL2"/></tg-slideshow></code> 输出。</li>

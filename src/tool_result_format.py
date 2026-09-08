@@ -74,7 +74,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         label = _TOOL_TIMEOUT_LABELS.get(fn_name, fn_name)
         summary = f"⏱️ {label} timed out"
         timeout_message = "Execution exceeded the timeout limit. Please refine your request or try again later."
-        if fn_name in {"generate_image_from_text", "edit_image_with_reference", "generate_video"}:
+        if fn_name in {"generate_image", "generate_image_from_text", "edit_image_with_reference", "generate_video"}:
             details_html = _render_media_failure_result(timeout_message, timeout_message)
         else:
             details_html = timeout_message
@@ -341,22 +341,28 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = _render_editor_quote("Output", result_str)
         return summary, details_html
 
-    elif fn_name == "generate_image_from_text":
+    elif fn_name in ("generate_image", "generate_image_from_text", "edit_image_with_reference"):
+        # 统一图像工具（含旧名别名）：按 image_url 是否携带判断本次
+        # 是生成还是编辑，结果折叠块标题显示对应操作。
+        is_edit = (
+            bool(str(fn_args.get("image_url") or "").strip())
+            if fn_name != "generate_image_from_text"
+            else False  # 旧名历史语义：强制文生图
+        )
+        if is_edit:
+            return _format_image_generation_result(
+                result_str,
+                operation_en="Edited",
+                operation_zh="已编辑",
+                failure_summary="🎨 图片编辑失败",
+                failure_fallback="图片编辑未完成，请稍后重试。",
+            )
         return _format_image_generation_result(
             result_str,
             operation_en="Generated",
             operation_zh="已生成",
             failure_summary="🎨 图片生成失败",
             failure_fallback="图片生成未完成，请稍后重试。",
-        )
-
-    elif fn_name == "edit_image_with_reference":
-        return _format_image_generation_result(
-            result_str,
-            operation_en="Edited",
-            operation_zh="已编辑",
-            failure_summary="🎨 图片编辑失败",
-            failure_fallback="图片编辑未完成，请稍后重试。",
         )
 
     elif fn_name == "generate_video":

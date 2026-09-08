@@ -129,8 +129,9 @@ DEFAULT_ALLOWED_TOOLS = sorted([
     # upload/download 是 workspace 根目录的子目录，bash 可直接读写，
     # 无需显式跨边界工具（用 `ls -la upload/`）。
     "present_files",
-    # 不含 generate_image_from_text / edit_image_with_reference /
-    # generate_video（生成耗时长、易超时，结果也难以由子 agent 直接交付），
+    # 不含 generate_image（统一图像工具，原 generate_image_from_text /
+    # edit_image_with_reference 已合并）/ generate_video（生成耗时长、
+    # 易超时，结果也难以由子 agent 直接交付），
     # 以及 subagent / memory / message_user / deliver_reply（见 FORBIDDEN_TOOLS）。
     # 注：elevation / traffic / isochrone 能力不存在（amap-maps MCP 无等价
     # 工具；MCP 仅作为 geocode/route 等 Maps 工具的底层实现，不单独暴露），

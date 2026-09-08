@@ -650,12 +650,19 @@ class RichMessageBuilder:
                 group["outer_summary"] = "Generating an image"
             else:
                 group["outer_summary"] = f"Generating {num_images} images"
-        elif t == "edit_image_with_reference":
-            num_images = _coerce_positive_int(fn_args.get("num_images"), 1)
-            if num_images == 1:
+        elif t in ("generate_image", "edit_image_with_reference"):
+            # 统一图像工具：按 image_url 是否携带实时判断生成/编辑，
+            # 工具组折叠块进行态标题显示对应操作（参数流到达即可区分，
+            # 无需等工具执行结果）。
+            is_edit = bool(str(fn_args.get("image_url") or "").strip())
+            if is_edit:
                 group["outer_summary"] = "Editing an image"
             else:
-                group["outer_summary"] = f"Editing {num_images} images"
+                num_images = _coerce_positive_int(fn_args.get("num_images"), 1)
+                if num_images == 1:
+                    group["outer_summary"] = "Generating an image"
+                else:
+                    group["outer_summary"] = f"Generating {num_images} images"
         else:
             action = target.get("action_description") or _generate_action_description(t, fn_args)
             group["outer_summary"] = action.capitalize() + "..." if action else "Running..."
@@ -690,6 +697,11 @@ class RichMessageBuilder:
         "qr_code": ("Generated a QR code", "Generated {n} QR codes"),
         "generate_image_from_text": ("Generated an image", "Generated {n} images"),
         "edit_image_with_reference": ("Edited an image", "Edited {n} images"),
+        # 统一图像工具 generate_image：组类型按 image_url 是否携带派生为
+        # image_generate / image_edit（见 _get_group_type_for_item），
+        # 完成态组摘要据此分别聚合 "Generated" / "Edited"。
+        "image_generate": ("Generated an image", "Generated {n} images"),
+        "image_edit": ("Edited an image", "Edited {n} images"),
         "generate_video": ("Generated a video", "Generated {n} videos"),
         "ask_user": ("Asked you a question", "Asked you questions"),
         "message_user": ("Messaged you", "Messaged you"),
@@ -715,6 +727,14 @@ class RichMessageBuilder:
     def _get_group_type_for_item(self, item: dict) -> str:
         t = item.get("type", "unknown")
         fn_args = item.get("fn_args") or {}
+        if t in ("generate_image", "generate_image_from_text", "edit_image_with_reference"):
+            # 统一图像工具（含两个旧名兼容别名）：按 image_url 是否携带
+            # 派生组类型，完成态组摘要分别聚合 "Generated an image" /
+            # "Edited an image"（对标 text_editor 按 command 派生）。
+            # 旧名 generate_image_from_text 历史语义强制文生图，直接按
+            # 参数判断与其语义一致（该名分发时 image_url 已被丢弃）。
+            has_ref = bool(str(fn_args.get("image_url") or "").strip())
+            return "image_edit" if has_ref else "image_generate"
         if t == "text_editor":
             command = str(fn_args.get("command") or "")
             if command == "view":

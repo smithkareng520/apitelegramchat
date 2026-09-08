@@ -1,8 +1,9 @@
 """工具 schema 数据底座：SEARCH_TOOLS 与 message_user/deliver_reply（自 search_engine.py 拆出）。
 
-含图像/视频模型目录（TEXT_ONLY_MODELS 等，由 SUPPORTED_MODELS
-按能力推导）——SEARCH_TOOLS 内 generate_image/edit_image 的 enum
-直接引用这些列表。
+含图像/视频模型目录（TEXT_ONLY_MODELS / EDIT_MODELS /
+GENERATE_ONLY_MODELS 等，由 SUPPORTED_MODELS 按能力推导）——
+SEARCH_TOOLS 内统一图像工具 generate_image 的 model enum 与
+"什么模型可编辑/仅能生成"的能力说明直接引用这些列表。
 """
 
 
@@ -41,7 +42,7 @@ def _get_image_models_by_capability() -> tuple[list[str], list[str]]:
             edit_models.append(model_id)
     return text_models, edit_models
 
-# ----- 工具 1：纯文生图 -----
+# ----- 图像模型能力目录（统一图像工具 generate_image 用）-----
 TEXT_ONLY_MODELS, EDIT_MODELS = _get_image_models_by_capability()
 
 
@@ -50,8 +51,12 @@ def _get_video_models() -> list[str]:
     return [model_id for model_id, cfg in SUPPORTED_MODELS.items() if cfg.native_video]
 
 
-# ----- 工具 2：视频生成 -----
+# ----- 视频生成模型目录 -----
 VIDEO_MODELS = _get_video_models()
+
+# 仅支持文生图（不可携带参考图编辑）的图像模型 = 全部图像模型 - 可编辑模型。
+# generate_image 的工具描述据此向模型说明"什么模型可以编辑、什么只能生成"。
+GENERATE_ONLY_MODELS = [m for m in TEXT_ONLY_MODELS if m not in EDIT_MODELS]
 
 # ---------- 工具定义 ----------
 # message_user（原 ask_user）：双用途人类交互工具。
@@ -669,19 +674,36 @@ SEARCH_TOOLS = [
         [{
             "type": "function",
             "function": {
-                "name": "generate_image_from_text",
+                # 统一图像工具（原 generate_image_from_text / edit_image_with_reference
+                # 合并）：操作语义由 image_url 是否提供决定——省略 = 文生图，
+                # 提供 = 以该图为底编辑（图生图）。旧工具名仍可分发（别名
+                # 兼容，见 tool_dispatch），但不再进入工具清单。
+                "name": "generate_image",
                 "description": (
-                    "Generate a new image from a text prompt only (no reference image). Use when the user wants to create an image from scratch. "
-                    f"Available models: {', '.join(TEXT_ONLY_MODELS)}"
+                    "Unified image tool: generate OR edit, decided by whether `image_url` is provided. "
+                    "CREATE — omit `image_url`: generates a brand-new image from the text prompt. "
+                    "EDIT — provide `image_url` (an image URL from earlier tool results, a user-upload URL, or a base64 data URL): "
+                    "modifies that exact image according to the prompt (style change, object add/remove, background, angle...) "
+                    "while keeping the rest of the scene unchanged. "
+                    f"Edit-capable models (accept image_url): {', '.join(EDIT_MODELS) if EDIT_MODELS else '(none)'}. "
+                    f"Generate-only models (text-to-image; do NOT pass image_url): {', '.join(GENERATE_ONLY_MODELS) if GENERATE_ONLY_MODELS else '(none)'}. "
+                    "Pick a model that matches the intended operation."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "prompt": {"type": "string", "description": "详细的图片描述"},
+                        "prompt": {
+                            "type": "string",
+                            "description": "生成时：详细的图片描述。编辑时：明确的修改指令（如 '改成水彩画风格'、'移除所有行人，保持其他内容不变'）。"
+                        },
                         "model": {
                             "type": "string",
                             "enum": TEXT_ONLY_MODELS,
-                            "description": "选择一个支持文生图的模型。"
+                            "description": "图像模型。带 image_url 编辑时必须从支持编辑的模型中选择（见工具描述中的 Edit-capable models）；纯文生图可选任意模型。"
+                        },
+                        "image_url": {
+                            "type": "string",
+                            "description": "可选。参考图 URL 或 base64 数据。省略 = 文生图；提供 = 编辑/图生图（以该图为底修改）。用户上传过图片或要求基于已有图片修改时才提供。"
                         },
                         "aspect_ratio": {
                             "type": "string",
@@ -697,11 +719,20 @@ SEARCH_TOOLS = [
                             "type": "integer",
                             "default": 1,
                             "minimum": 1,
-                            "maximum": 4
+                            "maximum": 4,
+                            "description": "一次生成的图片数量（仅文生图模式；编辑模式固定为 1 张，忽略本参数）。"
                         }
                     },
                     "required": ["prompt", "model"]
-                }
+                },
+                "input_examples": [
+                    {"prompt": "一只在月球上骑自行车的橘猫，赛博朋克风格", "model": TEXT_ONLY_MODELS[0] if TEXT_ONLY_MODELS else ""},
+                    {
+                        "prompt": "移除场景中所有行人，保持其他内容完全不变",
+                        "model": EDIT_MODELS[0] if EDIT_MODELS else "",
+                        "image_url": "https://example.com/previous-image.png"
+                    }
+                ]
             }
         }]
         if TEXT_ONLY_MODELS else []
@@ -710,54 +741,9 @@ SEARCH_TOOLS = [
         [{
             "type": "function",
             "function": {
-                "name": "edit_image_with_reference",
-                "description": (
-                    "Edit an existing image using a reference image + a text prompt. Use when the user provides an image and wants to change something (style, object, background, angle, etc.). "
-                    f"Available models: {', '.join(EDIT_MODELS)}"
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "prompt": {"type": "string", "description": "编辑指令（如 '改成水彩画风格'）"},
-                        "image_url": {
-                            "type": "string",
-                            "description": "参考图的 URL 或 base64 数据。用户上传过图片时必填。"
-                        },
-                        "model": {
-                            "type": "string",
-                            "enum": EDIT_MODELS,
-                            "description": "选择一个支持图生图编辑的模型。"
-                        },
-                        "aspect_ratio": {
-                            "type": "string",
-                            "enum": ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
-                            "default": "1:1"
-                        },
-                        "image_size": {
-                            "type": "string",
-                            "enum": ["1K", "2K", "4K"],
-                            "default": "1K"
-                        },
-                        "num_images": {
-                            "type": "integer",
-                            "default": 1,
-                            "minimum": 1,
-                            "maximum": 4
-                        }
-                    },
-                    "required": ["prompt", "image_url", "model"]
-                }
-            }
-        }]
-        if EDIT_MODELS else []
-    ),
-    *(
-        [{
-            "type": "function",
-            "function": {
                 "name": "generate_video",
                 "description": (
-                    "Generate a short video from a text prompt. Use when the user explicitly asks to create / generate / make a video. Do NOT use for animated images or GIFs (use generate_image_from_text instead). Generation is async and may take 1-5 minutes. On success, it returns a stable HTTPS URL in the exact form `视频链接：https://...`, just like image-generation tools return image URLs. In your next final response, embed that exact URL as a separate rich-media block: <figure><video src=\"URL\"></video><figcaption>已生成视频</figcaption></figure>; never send only a bare URL or ordinary hyperlink. "
+                    "Generate a short video from a text prompt. Use when the user explicitly asks to create / generate / make a video. Do NOT use for animated images or GIFs (use generate_image instead). Generation is async and may take 1-5 minutes. On success, it returns a stable HTTPS URL in the exact form `视频链接：https://...`, just like image-generation tools return image URLs. In your next final response, embed that exact URL as a separate rich-media block: <figure><video src=\"URL\"></video><figcaption>已生成视频</figcaption></figure>; never send only a bare URL or ordinary hyperlink. "
                     f"Available models: {', '.join(VIDEO_MODELS) if VIDEO_MODELS else '(none configured)'}"
                 ),
                 "parameters": {

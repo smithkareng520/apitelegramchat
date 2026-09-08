@@ -407,17 +407,23 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
         return "Running command"
 
     # ---------- 图片类 ----------
+    # 统一图像工具 generate_image：按 image_url 是否携带判断生成/编辑，
+    # 折叠块标题显示对应操作；旧工具名保留各自历史语义（generate=
+    # 文生图、edit=编辑）作为兼容路径。
     if fn_name == "generate_image_from_text":
         num_images = _coerce_positive_int(fn_args.get("num_images"), 1)
         if num_images == 1:
             return "Generating an image"
         return f"Generating {num_images} images"
 
-    if fn_name == "edit_image_with_reference":
+    if fn_name in ("generate_image", "edit_image_with_reference"):
+        is_edit = bool(str(fn_args.get("image_url") or "").strip())
+        if is_edit:
+            return "Editing an image"
         num_images = _coerce_positive_int(fn_args.get("num_images"), 1)
         if num_images == 1:
-            return "Editing an image"
-        return f"Editing {num_images} images"
+            return "Generating an image"
+        return f"Generating {num_images} images"
 
     if fn_name == "generate_video":
         return "Generating a video"
@@ -935,9 +941,14 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
     if fn_name == "generate_image_from_text":
         n = _coerce_positive_int(fn_args.get("num_images"), 1)
         return "Generated an image" if n == 1 else f"Generated {n} images"
-    if fn_name == "edit_image_with_reference":
+    # 统一图像工具：按 image_url 是否携带区分生成/编辑完成态文案
+    # （旧名 edit_image_with_reference 语义固定为编辑，同样走 image_url 判断）。
+    if fn_name in ("generate_image", "edit_image_with_reference"):
+        is_edit = bool(str(fn_args.get("image_url") or "").strip())
+        if is_edit:
+            return "Edited an image"
         n = _coerce_positive_int(fn_args.get("num_images"), 1)
-        return "Edited an image" if n == 1 else f"Edited {n} images"
+        return "Generated an image" if n == 1 else f"Generated {n} images"
     if fn_name == "generate_video":
         return "Generated a video"
     if fn_name == "qr_code":

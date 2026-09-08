@@ -53,6 +53,15 @@ LOCATION_LOOKUP_TOOLS = frozenset({
     "poi_details",
 })
 
+# 统一图像工具（generate_image）的旧名兼容别名（2026-09-08 工具合并前
+# 的两个入口）。它们不再出现在 SEARCH_TOOLS 中，但 dispatch 仍接受：
+# 历史会话上下文里的旧 tool_call 重放、以及模型偶发的旧名幻觉调用，
+# 都能被正确路由到统一实现，而不是报"未知工具"。
+_IMAGE_TOOL_LEGACY_ALIASES = frozenset({
+    "generate_image_from_text",
+    "edit_image_with_reference",
+})
+
 TOOL_RESPONSE_TOKEN_BUDGET = int(os.getenv("TOOL_RESPONSE_TOKEN_BUDGET", "20000"))
 def _truncate_tool_result(result: str, fn_name: str | None = None) -> str:
     """Bound every model-facing tool result by an exact 20k-token budget.
@@ -161,23 +170,24 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                                          arguments.get("hours", 6))
         elif name == "qr_code":
             return await execute_qr_code(arguments.get("text", ""))
-        elif name == "generate_image_from_text":
+        elif name == "generate_image" or name in _IMAGE_TOOL_LEGACY_ALIASES:
+            # 统一图像工具（原 generate_image_from_text / edit_image_with_reference
+            # 合并）：image_url 缺省 -> 文生图；提供 -> 编辑/图生图。
+            # 旧工具名保留为隐藏别名（不再进入 SEARCH_TOOLS）：历史会话
+            # 上下文中的旧调用仍然有效，模型偶尔幻觉出旧名时也能正常执行，
+            # 不会得到"未知工具"而空转。
+            # 旧名 generate_image_from_text 的历史语义是"强制无参考图"，
+            # 别名分发时保持该语义（忽略误带的 image_url）。
+            image_url = arguments.get("image_url")
+            if name == "generate_image_from_text":
+                image_url = None
             return await execute_generate_image(
                 prompt=cast(str, arguments.get("prompt")),
                 model=cast(str, arguments.get("model")),
                 aspect_ratio=arguments.get("aspect_ratio", "1:1"),
                 image_size=arguments.get("image_size", "1K"),
                 num_images=arguments.get("num_images", 1),
-                image_url=None  # 强制无参考图
-            )
-        elif name == "edit_image_with_reference":
-            return await execute_generate_image(
-                prompt=cast(str, arguments.get("prompt")),
-                model=cast(str, arguments.get("model")),
-                aspect_ratio=arguments.get("aspect_ratio", "1:1"),
-                image_size=arguments.get("image_size", "1K"),
-                num_images=arguments.get("num_images", 1),
-                image_url=arguments.get("image_url")  # 带参考图
+                image_url=image_url
             )
         elif name == "generate_video":
             return await execute_generate_video(

@@ -54,7 +54,14 @@ CONSUMER_TOOLS = {"present_files"}
 # 默认 900s，用户可配到 1800s。外层必须给足够长的超时，否则主工具层会提前杀掉它。
 SUBAGENT_TOOLS = {"subagent"}
 SUBAGENT_OUTER_TIMEOUT = _positive_env_int("SUBAGENT_OUTER_TIMEOUT", 930, minimum=1)  # 900s 子 agent 上限 + 30s 缓冲
-IMAGE_GEN_TOOLS = {"generate_image_from_text", "edit_image_with_reference"}
+# 统一图像工具 generate_image（image_url 缺省=文生图，提供=编辑）；
+# 两个旧名（generate_image_from_text / edit_image_with_reference）保留为
+# dispatch 层隐藏别名（历史会话旧调用仍可执行），同样纳入超时豁免。
+IMAGE_GEN_TOOLS = {
+    "generate_image",
+    "generate_image_from_text",
+    "edit_image_with_reference",
+}
 # 视频生成工具：内部已有 5 分钟轮询超时，外层 wait_for 必须不设超时，
 # 否则会被 TOOL_CALL_TIMEOUT=10 秒杀掉（与 IMAGE_GEN_TOOLS 同样的处理）。
 VIDEO_GEN_TOOLS = {"generate_video"}

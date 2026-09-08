@@ -1079,8 +1079,9 @@ SUPPORTED_MODELS["bytedance-seed/seedream-4.5"] = make_model_config(
 # 按 OpenAI 官方语义分端点（见 developers.openai.com "Create image"/"Create image edit"）：
 #   - 文生图 -> JSON /v1/images/generations
 #   - 带参考图编辑 -> 官方规范 /v1/images/edits（multipart/form-data，
-#     image[] 字段逐张上传）；中转站未实现该路由时由 media_generation
-#     自动回退 JSON /v1/images/generations + image 字段的兼容形状
+#     image[] 字段逐张上传）；中转站未实现该路由时编辑请求明确报错，
+#     绝不降级 JSON /v1/images/generations + image 字段（降级会被中转站
+#     当纯文生图执行，产生"参考图未生效"的假成功，见 HOTFIX_2026-09-08_EDIT_FALLBACK.md）
 # 请求由 media_generation 的统一图像请求出口（_request_images_generations ->
 # _request_openai_compat_image）发送：鉴权沿用 XXTF_API_KEY，请求头沿用
 # PROVIDERS["xxtf"] 的浏览器 UA。
@@ -1093,11 +1094,12 @@ SUPPORTED_MODELS["gpt-image-2"] = make_model_config(
     # /v1/images/generations，编辑 -> /v1/images/edits multipart，见
     # protocols/images.py 与 media_generation 的端点语义说明）。
     protocol="openai_images",
-    # 支持参考图编辑（图生图）：vision=True 使其进入 edit_image_with_reference
-    # 的可选模型列表（vision 在图像模型上表示"可接受图像输入"，即具备
-    # 图生图/编辑能力，与聊天模型的"看图"能力共用同一能力位）；实际编辑
-    # 请求走 /v1/images/edits（见 _request_openai_compat_image）。
-    # 文生图（generate_image_from_text）同样可用。
+    # 支持参考图编辑（图生图）：vision=True 使其进入统一图像工具
+    # generate_image 的可编辑模型列表 EDIT_MODELS（vision 在图像模型上
+    # 表示"可接受图像输入"，即具备图生图/编辑能力，与聊天模型的"看图"
+    # 能力共用同一能力位）；实际编辑请求走 /v1/images/edits（见
+    # _request_openai_compat_image）。文生图（generate_image 不带
+    # image_url）同样可用。
     vision=True,
     supports_tools=False,
     max_context=32768,

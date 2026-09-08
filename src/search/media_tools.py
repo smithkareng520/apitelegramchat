@@ -1,4 +1,4 @@
-"""媒体生成工具：generate_image_from_text / edit_image_with_reference / generate_video（自 search_engine.py 拆出）。"""
+"""媒体生成工具：generate_image（统一生成/编辑）/ generate_video（自 search_engine.py 拆出）。"""
 
 import asyncio
 import base64
@@ -105,15 +105,18 @@ async def execute_generate_image(
     num_images: int = 1,
     image_url: Optional[str] = None,
 ) -> str:
-    """图像生成工具的统一入口（ImageTask 驱动）。
+    """统一图像工具入口（原 generate_image_from_text / edit_image_with_reference 合并）。
 
-    重构说明（ImageTask）：本函数只负责**显式构造任务**与后处理——
+    操作语义由 ``image_url`` 是否提供显式决定（不再按端点/模型猜测）：
       - 无参考图  -> ImageTask.generate（文生图）
-      - 带参考图  -> ImageTask.edit（图生图/编辑；不再由请求层"看图猜端点"）
+      - 带参考图  -> ImageTask.edit（图生图/编辑；请求层严格走 multipart
+        /images/edits，失败明确报错，绝不降级成文生图"假成功"）
     请求经 protocols.images.dispatch_image_task 按模型协议分发：
       openai_images -> /images/{generations,edits}（ModelScope/XXTF 等）
       openai_chat   -> chat.completions + modalities（OpenRouter 图像模型；
                        未注册的 flux 等别名按 OpenRouter 兼容直连）
+    能力硬校验：带参考图时若模型仅支持文生图（vision=False），直接返回
+    可操作错误并列出支持编辑的模型，而不是让请求在上游莫名失败。
     """
     MODEL_ALIAS_MAP = {
         "flux-schnell": "black-forest-labs/flux-schnell",
@@ -126,6 +129,20 @@ async def execute_generate_image(
 
     model_info = SUPPORTED_MODELS.get(model)
     num_images = min(max(num_images, 1), 4)
+
+    # ---- 能力硬校验：生成专用模型不可携带参考图 ----
+    # 统一工具后 image_url 由模型自行决定是否携带；选错模型（只支持
+    # 文生图却带了 image_url）时给出可操作错误，引导其改选编辑模型，
+    # 而不是把注定失败的请求发往上游。
+    if image_url and model_info is not None and not getattr(model_info, "vision", False):
+        from search.tool_schemas import EDIT_MODELS  # 局部导入避免循环依赖
+        edit_list = ", ".join(EDIT_MODELS) if EDIT_MODELS else "(未配置)"
+        return (
+            f"❌ 模型 {model} 仅支持文生图，不支持参考图编辑（image_url）。"
+            f"请改用支持编辑的模型：{edit_list}；"
+            f"或去掉 image_url 改为纯文生图。请勿用同一参数组合重试。"
+        )
+
     _protocol = _effective_image_protocol(model_info)
     used_endpoint = (
         ("/v1/images/edits" if image_url else "/v1/images/generations")

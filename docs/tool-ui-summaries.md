@@ -31,8 +31,8 @@
 | poi_keyword_search | Searching POI by keyword | 同左 | Searched POIs by keyword（单复同形） | Searched POIs by keyword |
 | poi_nearby_search | Searching nearby POI | 同左 | Searched nearby POIs（单复同形） | Searched nearby POIs |
 | poi_details | Fetching POI details | 同左 | Fetched POI details / Fetched details for {n} POIs | Fetched POI details |
-| generate_image_from_text | Generating an image / Generating {n} images | 同左 | Generated an image / Generated {n} images | 同组标题 |
-| edit_image_with_reference | Editing an image / Editing {n} images | 同左 | Edited an image / Edited {n} images | 同组标题 |
+| generate_image · 不带 image_url（文生图） | Generating an image / Generating {n} images | 同左 | Generated an image / Generated {n} images | 同组标题 |
+| generate_image · 带 image_url（编辑） | Editing an image | 同左 | Edited an image | 同组标题 |
 | generate_video | Generating a video | 同左 | Generated a video / Generated {n} videos | Generated a video |
 | message_user | Waiting for your answer | Waiting for your answer | Messaged you（单复同形） | Selected: {选项…} / User provided a custom answer / User cancelled / User is away (no reply) / User answered |
 | present_files | Presenting file(s) | 同左 | Presented a file / Presented {n} files | Presented file（≤1）/ Presented {n} files |
@@ -90,7 +90,8 @@
 | 组标题跟随进度 | 运行时组标题取组内**最后一个活跃工具**的文案，批量执行时随进度切换 |
 | 动作型工具实时刷新 | todo / memory 的进行态标题随参数流中的 `action` 实时变化（如 Adding a todo... → Clearing the todo list...） |
 | 完成态大小写 | 组内第一条描述首字母大写，后续全部小写（如 `Ran a command, saved a memory, added a todo`）；无任何豁免 |
-| 完成态聚合 | 成功工具按「组类型」聚合计数；todo / memory 按 action 派生组类型（对标 text_editor 按 command 派生），toggle 方向与 deliver_reply 是否静默从单块最终摘要回推 |
+| 完成态聚合 | 成功工具按「组类型」聚合计数；todo / memory 按 action 派生组类型，generate_image 按 image_url 是否携带派生（image_generate / image_edit，对标 text_editor 按 command 派生），toggle 方向与 deliver_reply 是否静默从单块最终摘要回推 |
+| 统一图像工具新旧名 | generate_image 为统一入口（image_url 缺省=文生图、提供=编辑）；旧名 generate_image_from_text / edit_image_with_reference 仍可分发但不再进入工具清单，折叠块文案按各自语义（文生图/编辑）显示，与同名新工具一致 |
 | `_description` 优先 | 参数带 `_description/_summary` 时，组标题与工具标题（运行时+完成后）优先显示它；现仅 bash 声明；web_search / text_editor / todo / memory / subagent / deliver_reply 始终按规范文案生成 |
 | 单复数 | 组内同类工具 ≥2 时切复数模板；不可数对象的动作（Listed todos / Searched memories 等）单复同形 |
 | "Ran an action" 兜底 | 仅当未知工具名漏过所有分支时出现；当前全部已声明工具均有专属文案 |

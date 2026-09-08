@@ -739,7 +739,7 @@ async def _build_attachment_fallback_text(
         if url:
             parts.append(f"链接：{url}")
             if safe_kind == "图片":
-                parts.append("可直接把该链接传给 edit_image_with_reference.image_url")
+                parts.append("可直接把该链接作为统一图像工具 generate_image 的 image_url 参数传回（携带 image_url 即为编辑/图生图模式）")
         lines.append(" | ".join(parts))
 
     if user_text:
