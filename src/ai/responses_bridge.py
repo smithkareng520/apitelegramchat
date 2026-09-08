@@ -41,6 +41,7 @@ Responses API 与 Chat Completions 虽同属 OpenAI，但线上协议形状完�
 把这些差异塞进 _agentic_loop_openai_compat 会让该函数的分支判断进一步
 膨胀；按项目既有的原生协议桥接惯例单独实现一份，改动面清晰、互不干扰。
 """
+import hashlib
 import json
 import uuid
 from typing import TYPE_CHECKING, Any, Optional
@@ -70,6 +71,7 @@ from ai.bridge_common import (
     run_tool_batch,
 )
 from ai.cache_usage import _log_cache_usage
+from state import get_llm_session_key
 
 if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
@@ -252,6 +254,51 @@ def _convert_messages_to_responses_input(messages: list) -> tuple[str, list]:
 
 
 # =============================================================================
+# Responses Prompt Cache：稳定 key + GPT-5.6 原生缓存选项
+# =============================================================================
+def _responses_prompt_cache_key(api_label: str, model: str, chat_id: Any) -> str:
+    """返回与项目现有 LLM session_id 完全相同的 Responses cache key。
+
+    这里不再额外 hash / 改写 session：同一 Telegram 会话使用完全相同的
+    ``tg-chat-{chat_id}-{epoch}`` 字符串，同时用于 OpenAI/OpenAI-compatible
+    网关的 ``session_id`` 与 Responses API 的 ``prompt_cache_key``。
+
+    ``api_label`` / ``model`` 参数保留在签名中，兼容旧调用点；故意不把它们
+    拼进 key，避免模型切换破坏同一会话的缓存桶，也保证与 session_id 一致。
+    """
+    del api_label, model
+    session_key = get_llm_session_key(chat_id if chat_id is not None else None)
+    if session_key:
+        # 当前 state.py 生成的 session key 远低于 Responses prompt_cache_key
+        # 的长度限制；保留最后一道防线，防止未来格式演进导致请求被网关拒绝。
+        return session_key[:64]
+    return "tg-global"
+
+
+def _add_responses_cache_options(
+    request_kwargs: dict[str, Any],
+    *,
+    api_label: str,
+    model: str,
+    chat_id: Any,
+    enabled: bool = True,
+) -> None:
+    """给 Responses 请求注入稳定的 prompt_cache_key。
+
+    GPT-5.6+ 的 Responses API 默认启用 implicit prompt caching；稳定 key
+    用于把同一会话的相似请求稳定分桶。这里不强制发送 TTL/options，避免
+    OpenAI 兼容中转对新缓存字段支持不完整时把正常请求打成 400。
+    """
+    if not enabled:
+        return
+    request_kwargs["prompt_cache_key"] = _responses_prompt_cache_key(
+        api_label, model, chat_id
+    )
+    # GPT-5.6+ 的 Responses API 默认启用 implicit prompt caching；这里只显式
+    # 指定稳定 cache key，避免给兼容中转额外发送可能尚未支持的 TTL 字段。
+
+
+# =============================================================================
 # 非流式一次性调用：供 subagent_tool.py 复用（与
 # anthropic_bridge.anthropic_chat_completions_create 同一角色）。
 # =============================================================================
@@ -315,6 +362,9 @@ async def openai_responses_chat_completions_create(
         "input": input_items,
         "max_output_tokens": max_tokens,
     }
+    _add_responses_cache_options(
+        request_kwargs, api_label="responses", model=model, chat_id=None, enabled=True
+    )
     if instructions:
         request_kwargs["instructions"] = instructions
     if temperature is not None:
@@ -383,7 +433,14 @@ def _responses_usage_to_openai(usage: Any) -> Optional[dict]:
         return int(value)
 
     input_details = d.get("input_tokens_details") or {}
-    cached = _num(input_details.get("cached_tokens")) if isinstance(input_details, dict) else 0
+    cached = None
+    cache_write = None
+    if isinstance(input_details, dict):
+        if "cached_tokens" in input_details:
+            cache_val = _num(input_details.get("cached_tokens"))
+            cached = cache_val
+        if "cache_write_tokens" in input_details:
+            cache_write = _num(input_details.get("cache_write_tokens"))
     prompt = _num(d.get("input_tokens"))
     completion = _num(d.get("output_tokens"))
     out: dict[str, Any] = {
@@ -391,11 +448,15 @@ def _responses_usage_to_openai(usage: Any) -> Optional[dict]:
         "completion_tokens": completion,
         "total_tokens": _num(d.get("total_tokens")) or (prompt + completion),
     }
-    if cached:
-        # 归入 cache_usage._extract_cache_usage 认识的字段名
-        # （与 OpenAI Chat Completions 的 prompt_tokens_details.cached_tokens
-        # 同义），让 Responses API 的缓存命中率同样可观测。
-        out["prompt_tokens_details"] = {"cached_tokens": cached}
+    if cached is not None or cache_write is not None:
+        # 归一化给旧有 cache_usage 模块：cached_tokens 是 Responses
+        # input_tokens_details.cached_tokens 的同义字段；保留 0，避免把
+        # “明确上报了 0”误判成“网关完全没上报缓存字段”。
+        out["prompt_tokens_details"] = {}
+        if cached is not None:
+            out["prompt_tokens_details"]["cached_tokens"] = cached
+        if cache_write is not None:
+            out["prompt_tokens_details"]["cache_write_tokens"] = cache_write
     return out
 
 
@@ -435,6 +496,7 @@ async def _agentic_loop_openai_responses(
     sampling_params = state.sampling_params
 
     reasoning_param: Optional[dict] = None
+    prompt_cache_enabled = bool(model_info and getattr(model_info, "supports_prompt_cache", False))
     effort = getattr(model_info, "reasoning_effort", None) if model_info else None
     if effort:
         # Responses API 顶层 reasoning={"effort": ...}（o-series / gpt-5
@@ -451,6 +513,13 @@ async def _agentic_loop_openai_responses(
             "stream": True,
             "max_output_tokens": max_tokens,
         }
+        _add_responses_cache_options(
+            request_kwargs,
+            api_label=api_label,
+            model=current_model,
+            chat_id=builder.chat_id,
+            enabled=prompt_cache_enabled,
+        )
         if instructions:
             request_kwargs["instructions"] = instructions
         if sampling_params.get("temperature") is not None:
@@ -595,6 +664,29 @@ async def _agentic_loop_openai_responses(
         final_usage = _responses_usage_to_openai(final_usage) or final_usage
         _log_cache_usage(api_label, final_usage, model_name=current_model)
 
+        # Responses API 的缓存字段在不同网关版本里可能出现在 usage
+        # 或 response 本体；把诊断信息单独留下，便于排查“请求开了缓存但
+        # 中转没有回传 cached_tokens”的情况。
+        if final_usage is not None:
+            try:
+                if hasattr(final_usage, "model_dump"):
+                    usage_dump = final_usage.model_dump()
+                elif isinstance(final_usage, dict):
+                    usage_dump = dict(final_usage)
+                else:
+                    usage_dump = {}
+                details = usage_dump.get("input_tokens_details") or {}
+                cached = details.get("cached_tokens") if isinstance(details, dict) else None
+                if cached is not None:
+                    logger.debug(
+                        "[%s] responses prompt cache: key=%s cached_tokens=%s",
+                        api_label,
+                        _responses_prompt_cache_key(api_label, current_model, builder.chat_id),
+                        cached,
+                    )
+            except Exception:
+                logger.debug("Responses prompt cache diagnostics logging failed", exc_info=True)
+
         # 把这一轮的 function_call 累积转换为 OpenAI Chat Completions 形状
         # 的 tool_calls，供 _run_tool_calls_and_append 复用（与另外两条
         # 原生桥接完全同构）。
@@ -666,6 +758,13 @@ async def _agentic_loop_openai_responses(
                     "stream": True,
                     "max_output_tokens": max_tokens,
                 }
+                _add_responses_cache_options(
+                    synth_kwargs,
+                    api_label=api_label,
+                    model=current_model,
+                    chat_id=builder.chat_id,
+                    enabled=prompt_cache_enabled,
+                )
                 if synth_instructions:
                     synth_kwargs["instructions"] = synth_instructions
                 synth_stream = await client.responses.create(**synth_kwargs)

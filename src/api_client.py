@@ -19,6 +19,7 @@ config.get_effective_endpoint()。
 import logging
 import os
 import httpx
+import httpx2
 from typing import Any, Dict, Optional, Union, cast
 from openai import AsyncOpenAI
 
@@ -107,7 +108,7 @@ class APIClient:
                 # 与 OpenAI 兼容客户端保持相近的超时预算：连接短、流读取
                 # 放宽到 300s（agentic 多轮工具调用后首个事件可能较晚）。
                 # cast：SDK 存根引用的 httpx 类型对象与本环境安装的 httpx
-                # 不同源（httpx2），运行时传入的是同一个 httpx.Timeout 实例。
+                # Anthropic 使用旧版 httpx；这里保留其原生 SDK 所需的 timeout 类型。
                 timeout=cast(Any, httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=60.0)),
                 **kwargs,
             )
@@ -145,9 +146,8 @@ class APIClient:
             max_retries=sdk_max_retries,
             # Agent 在多轮工具调用后，下一轮 SSE 的首个事件可能显著晚于普通聊天。
             # 使用分项超时：连接保持短，流读取允许 300 秒，避免 90 秒默认值中断长任务。
-            # cast：SDK 存根引用的 httpx 类型对象与本环境安装的 httpx 不同源，
-            # 运行时传入的就是标准 httpx.Timeout 实例。
-            timeout=cast(Any, httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=60.0)),
+            # cast：OpenAI SDK 3.x 使用 HTTPX2；必须传入 httpx2.Timeout。
+            timeout=cast(Any, httpx2.Timeout(connect=10.0, read=300.0, write=60.0, pool=60.0)),
             default_headers=headers,
         )
 

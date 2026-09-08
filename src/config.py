@@ -535,7 +535,9 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "native_document": True,
         "native_video": False,
         "supports_sampling": True,
-        "supports_prompt_cache": False,
+        # GPT-5.6 Sol 的 Responses API 支持原生 Prompt Caching；由
+        # ai.responses_bridge 为每个会话稳定注入 prompt_cache_key。
+        "supports_prompt_cache": True,
         "temperature": None,          # None -> 不发送，走供应商默认
         "top_p": None,                # None -> 不发送，走供应商默认
         "reasoning_enabled": None,    # None -> 不发送推理控制参数
