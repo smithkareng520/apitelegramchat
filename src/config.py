@@ -86,9 +86,15 @@ VALID_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max", "min
 #   - "openai_chat"        OpenAI 兼容 Chat Completions（/chat/completions）
 #   - "anthropic_messages" Anthropic 原生 Messages（/v1/messages）
 #   - "gemini_native"      Gemini 原生 streamGenerateContent
+#   - "openai_responses"   OpenAI 原生 Responses API（/v1/responses，专用
+#                          循环见 ai/responses_bridge.py + 协议适配器见
+#                          protocols/openai_responses.py）
 #   - "openai_images"      OpenAI Images（/images/generations、/images/edits）
 # 未显式声明的模型一律回落 "openai_chat"（99% 兼容模型的默认路径）。
-_VALID_PROTOCOLS = {"openai_chat", "anthropic_messages", "gemini_native", "openai_images"}
+_VALID_PROTOCOLS = {
+    "openai_chat", "anthropic_messages", "gemini_native",
+    "openai_responses", "openai_images",
+}
 #: 缺省协议：无特殊声明时所有模型默认走 OpenAI 兼容 Chat Completions。
 DEFAULT_PROTOCOL = "openai_chat"
 # 历史注：本字段曾名 dedicated_loop_kind（取值 openai_compat /
@@ -1125,14 +1131,16 @@ SUPPORTED_MODELS["agnes-video-v2.0"] = make_model_config(
 # XXTF 中转（https://xxtf.baby）：同一模型名在该平台上有多种协议挂载方式，
 # 这里按"平台标注的协议"接入，而不是按模型名猜协议——
 #   claude-opus-5   平台标 anthropic -> 走 Anthropic 原生 Messages 协议
-#   gpt-5.6-sol     平台标 openai    -> 走 OpenAI 协议（但入口是 /v1/responses，
-#                                       项目目前只有 Chat Completions 循环，
-#                                       见下方模型定义处的风险说明）
+#   gpt-5.6-sol     平台标 openai    -> 走 OpenAI 原生 Responses API
+#                                       （入口 /v1/responses，专用循环见
+#                                       ai/responses_bridge.py）
 #
 # 两个模型共用同一个 provider="xxtf" 壳、同一份 XXTF_API_KEY，但各自按
 # 端点覆盖字段（base_url / protocol）
-# 分别连到 Anthropic 原生入口和 OpenAI 兼容入口，互不干扰
-# （api_client.py 按 model_id 分别缓存客户端，见 APIClient.get_client_for_model）。
+# 分别连到 Anthropic 原生入口和 OpenAI Responses 入口，互不干扰
+# （api_client.py 按 model_id 分别缓存客户端，见 APIClient.get_client_for_model；
+# Responses API 复用同一个 AsyncOpenAI SDK 客户端，无需新增原生 SDK 依赖，
+# 走 client.responses.create 而不是 client.chat.completions.create）。
 # =============================================================================
 SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
     supports_tools=True,
@@ -1163,17 +1171,19 @@ SUPPORTED_MODELS["gpt-5.6-sol"] = make_model_config(
     reasoning_enabled=True,
     reasoning_effort="max",
     supports_tools=True,
-    # 【已知风险，未验证】平台协议入口标注为 /v1/responses（OpenAI 新的
-    # Responses API），与本项目现有 OpenAI 兼容循环使用的 Chat
-    # Completions 协议（/v1/chat/completions）不是同一套协议——字段
-    # 形状、流式事件、工具调用格式均不同，项目目前没有 Responses API
-    # 专用循环。这里先按 Chat Completions 协议接入（不覆盖 base_url，
-    # 沿用 PROVIDERS["xxtf"] 默认的 https://xxtf.baby/v1，实际会请求
-    # https://xxtf.baby/v1/chat/completions），如果该中转的
-    # /v1/responses 入口不接受 chat.completions 请求体/不在这个路径
-    # 提供服务，请求会直接报错（404 或 400），届时需要为 Responses API
-    # 单独实现一套专用循环（类似 anthropic_bridge.py / gemini_bridge.py
-    # 的边界转换模式）才能真正打通。
+    # 平台协议入口标注为 /v1/responses（OpenAI 原生 Responses API），
+    # 与本项目 openai_chat 循环使用的 Chat Completions 协议
+    # （/v1/chat/completions）不是同一套协议——字段形状、流式事件、
+    # 工具调用格式均不同。现走专用的 openai_responses 协议适配器
+    # （protocols/openai_responses.py -> ai/responses_bridge.py，原生
+    # Responses SSE 流式事件 + function_call item 累积，边界转换模式
+    # 与 anthropic_messages / gemini_native 同构）。
+    # 不覆盖 base_url：沿用 PROVIDERS["xxtf"] 默认的
+    # https://xxtf.baby/v1（AsyncOpenAI SDK 不会自动拼接 /v1，必须显式
+    # 带上——与 claude-opus-5 用的 AsyncAnthropic SDK 行为不同，那个 SDK
+    # 才会自动拼接 /v1/messages）。协议适配器调用 client.responses.create(...)，
+    # SDK 内部据此请求 {base_url}/responses -> https://xxtf.baby/v1/responses。
+    protocol="openai_responses",
 )
 # =============================================================================
 

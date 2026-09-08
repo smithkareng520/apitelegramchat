@@ -18,6 +18,7 @@ from protocols.base import ChatProtocolAdapter
 from protocols.anthropic_messages import AnthropicMessagesAdapter
 from protocols.gemini_native import GeminiNativeAdapter
 from protocols.openai_chat import OpenAIChatAdapter
+from protocols.openai_responses import OpenAIResponsesAdapter
 
 if TYPE_CHECKING:
     from config import ModelConfig
@@ -27,6 +28,7 @@ CHAT_PROTOCOLS: Dict[str, ChatProtocolAdapter] = {
     "openai_chat": OpenAIChatAdapter(),
     "anthropic_messages": AnthropicMessagesAdapter(),
     "gemini_native": GeminiNativeAdapter(),
+    "openai_responses": OpenAIResponsesAdapter(),
 }
 
 

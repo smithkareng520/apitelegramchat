@@ -277,6 +277,18 @@ async def _create_chat_completion(client: Any, model_info: Optional[ModelConfig]
                 model_info and model_info.supports_prompt_cache
             ),
         )
+    if protocol == "openai_responses":
+        from ai.responses_bridge import openai_responses_chat_completions_create
+        return await openai_responses_chat_completions_create(
+            client,
+            model=create_params["model"],
+            messages=create_params["messages"],
+            max_tokens=create_params.get("max_tokens", 8192),
+            temperature=create_params.get("temperature"),
+            top_p=create_params.get("top_p"),
+            tools=create_params.get("tools"),
+            reasoning=create_params.get("reasoning"),
+        )
     return await client.chat.completions.create(**create_params)
 
 
