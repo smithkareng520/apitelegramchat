@@ -11,6 +11,7 @@ import aiohttp
 from config import OPENROUTER_API_KEY, SUPPORTED_MODELS, get_openrouter_provider_preferences
 from s3_utils import upload_bytes_to_r2
 from chat_actions import chat_action_scope
+from ai.media_generation import _upload_generated_images_to_r2
 
 OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 
@@ -27,6 +28,50 @@ logger = logging.getLogger(__name__)
 # 与生成图上传 R2（_upload_generated_images_to_r2）已统一收敛到
 # ai.media_generation，供 agentic 原生图像循环与本文件的
 # execute_generate_image 共用，此处不再保留各写一套的副本。
+# ⚠️ 收敛后必须显式从 ai.media_generation 导入 _upload_generated_images_to_r2
+# （曾因只写注释未加 import 导致 NameError：图片已生成成功，却在 R2 上传
+# 环节崩溃，整次生成结果丢失——历史事故见 2026-09 生产日志）。
+
+
+# 鉴权 / 配额类错误：这类错误重试永远不会成功（密钥无效/余额耗尽），
+# 必须在工具结果里明确告诉模型“请勿重试”，否则模型会像遭遇临时故障
+# 一样连续重试（生产日志实测：403 Key limit exceeded 后同一轮又连发
+# 3 次无效调用，白白浪费工具轮次与上下文）。
+_NON_RETRYABLE_STATUSES = frozenset({401, 402, 403})
+_NON_RETRYABLE_KEYWORDS = (
+    "key limit exceeded",
+    "monthly limit",
+    "quota exceeded",
+    "insufficient",
+    "credit balance",
+    "billing",
+    "invalid api key",
+    "unauthorized",
+    "permission denied",
+    "payment required",
+)
+
+
+def _non_retryable_hint(status_code: int, detail: str) -> str:
+    """按状态码 + 错误详情判定非重试类错误，返回附加提示（无需提示返回空串）。"""
+    text = str(detail or "").lower()
+    if status_code in _NON_RETRYABLE_STATUSES or any(kw in text for kw in _NON_RETRYABLE_KEYWORDS):
+        return (
+            "该错误由 API 密钥或配额导致，重试不会成功。请勿再次调用本工具；"
+            "请直接向用户说明情况（如：图像 API 余额不足或密钥无效，需要充值或更换密钥）。"
+        )
+    if status_code == 429 or "rate limit" in text:
+        return (
+            "请求触发限流或短期配额限制。请勿立即重试；如确需重试，请稍后单独调用一次，"
+            "或改用其他可用图像模型。"
+        )
+    if status_code == 404 and ("modalit" in text or "no endpoints" in text):
+        # 走到这里说明内部 image-only 降级重试也失败了：同一模型继续重试无意义。
+        return (
+            "该模型或网关不支持当前图像输出模式。请勿用同一模型重试，"
+            "请改用其他受支持的图像模型。"
+        )
+    return ""
 
 
 def _format_image_api_error(api_name: str, status_code: int, detail: str = "", request_id: str = "", endpoint: str = "", model: str = "") -> str:
@@ -44,6 +89,11 @@ def _format_image_api_error(api_name: str, status_code: int, detail: str = "", r
         if len(clean) > 800:
             clean = clean[:800] + "…"
         parts.append(f"详情：{clean}")
+    # 非重试类错误（鉴权/配额/限流/能力不支持）附加明确处置指令，
+    # 避免模型把临时故障与永久失败混为一谈而反复重试。
+    hint = _non_retryable_hint(status_code, detail)
+    if hint:
+        parts.append(f"⚠️ {hint}")
     return "<br/>".join(parts)
 
 

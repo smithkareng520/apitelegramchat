@@ -1852,17 +1852,44 @@ async def _request_chat_modalities_image_task(task: "ImageTask") -> "ImageTaskRe
     except Exception as e:
         err_text = str(e)
         # "output modalities" 含子串 "modalities"，前一条件恒被后者包含。
-        if "modalities" not in err_text:
+        # 鉴权/配额/限流类错误（401/402/403/429）即使错误文本碰巧提到
+        # "modalities" 也绝不是能力不支持问题——重试只会再次失败（甚至
+        # 再次计费），必须直接上抛，由上层按配额/鉴权错误呈现。
+        _status = getattr(e, "status_code", None) or getattr(e, "status", None)
+        if "modalities" not in err_text or _status in (401, 402, 403, 429):
             raise
         logger.warning(f"Native image model does not support image+text output, retrying image-only: {e}")
-        response = await client.chat.completions.create(
-            model=task.model,
-            messages=wire_messages,
-            max_tokens=max_tokens,
-            extra_body={"modalities": ["image"], "provider": OPENROUTER_PROVIDER_PREFERENCES},
-            stream=False,
-            **sampling,
-        )
+        # 降级重试保持与首次请求一致的 n 参数（num_images>1 时首次请求带 n，
+        # 旧代码重试时丢失 n 导致多图请求静默退化为单图）。
+        retry_extra: dict[str, Any] = {"modalities": ["image"],
+                                       "provider": OPENROUTER_PROVIDER_PREFERENCES}
+        if int(task.num_images or 1) > 1:
+            retry_extra["n"] = max(1, min(int(task.num_images), 4))
+        try:
+            response = await client.chat.completions.create(
+                model=task.model,
+                messages=wire_messages,
+                max_tokens=max_tokens,
+                extra_body=retry_extra,
+                stream=False,
+                **sampling,
+            )
+        except Exception as retry_err:
+            # 降级重试也失败：合并两次错误抛 ImageRequestError，让上层
+            # （execute_generate_image / 原生图像循环）按统一格式呈现，
+            # 而不是把 SDK 原始异常裸抛（裸抛会丢失"已降级重试过"的上下文，
+            # 模型无法判断该换模型还是该停止重试）。
+            _retry_status = getattr(retry_err, "status_code", None) or getattr(retry_err, "status", None)
+            _retry_status_code = _retry_status if isinstance(_retry_status, int) else 500
+            logger.error(
+                "[NativeImage] image-only 降级重试同样失败: status=%s err=%s（首次: status=%s）",
+                _retry_status_code, str(retry_err)[:300], _status,
+            )
+            raise ImageRequestError(
+                f"{err_text} ｜ 降级为 image-only 重试后仍失败: {retry_err}",
+                status_code=_retry_status_code,
+                endpoint="/chat/completions",
+            ) from retry_err
 
     # ---------- 解析响应（与旧 chat modalities 路径一致） ----------
     choice = response.choices[0]

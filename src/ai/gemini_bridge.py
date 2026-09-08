@@ -86,7 +86,7 @@ if TYPE_CHECKING:
 
 from core.messages import (
     AudioBlock, DocumentBlock, ImageBlock, Message, TextBlock, ToolCallBlock,
-    ToolResultBlock,
+    ToolResultBlock, VideoBlock,
 )
 
 logger = get_logger(__name__)
