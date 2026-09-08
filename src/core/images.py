@@ -10,8 +10,9 @@
 端点选择从"任务 + 模型协议"推导，收敛在 protocols/images.py 的
 适配器里：
     ImageTask(openai_images 模型, operation=edit)
-        -> /images/edits（官方 multipart；中转站未实现时回退
-           /images/generations + image 字段兼容形状）
+        -> /images/edits（官方 multipart；失败即报错，绝不回退
+           /images/generations——该端点不接受 image 参数，回退等于
+           把编辑降级成文生图"假成功"，2026-09-08 生产事故）
     ImageTask(openai_images 模型, operation=generate)
         -> /images/generations
     ImageTask(openai_chat 模型, ...)

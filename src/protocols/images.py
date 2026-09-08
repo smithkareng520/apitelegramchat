@@ -34,12 +34,12 @@ class OpenAIImagesAdapter(ImageProtocolAdapter):
     """OpenAI Images 协议（/images/generations、/images/edits）。
 
     请求出口复用 media_generation 的统一实现（鉴权、payload、参考图
-    下载/降采样、ModelScope 异步任务轮询、XXTF edits 路由级 404/405
-    回退缓存等鲁棒性逻辑全部留在原处）。端点选择按 ImageTask.operation
-    显式映射：
+    下载/真实图片校验/降采样、ModelScope 异步任务轮询、瞬态 400 重试
+    等鲁棒性逻辑全部留在原处）。端点选择按 ImageTask.operation 显式映射：
         generate   -> /images/generations（JSON）
-        edit       -> /images/edits（multipart），不可用时回退
-                      /images/generations + image 字段兼容形状
+        edit       -> /images/edits（multipart），失败即报错；
+                      绝不回退 /images/generations（该端点不接受 image
+                      参数，回退等于把编辑降级成文生图"假成功"）
         variation  -> 同 edit（ModelScope / XXTF 均无 /variations 端点）
     """
 

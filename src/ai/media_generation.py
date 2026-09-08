@@ -15,6 +15,7 @@ import json
 import io
 import aiohttp
 import base64
+import hashlib
 from openai import AsyncOpenAI
 import re
 import mimetypes
@@ -52,11 +53,13 @@ logger = get_logger(__name__)
 #   - xxtf:       中转站标准 OpenAI Images 端点（gpt-image-2 等），按官方
 #     语义分端点：文生图 -> JSON /images/generations；带参考图的编辑 ->
 #     官方规范 /images/edits（multipart/form-data，image[] 字段，见
-#     developers.openai.com "Create image edit"），中转站未实现该路由时
-#     回退 JSON /images/generations + image 字段的兼容形状。另有生产
-#     鲁棒性三件套：edits 路由级 404/405 按 base_url 短期缓存（免得每次
-#     白打一趟必败请求）、"请求体未完整/请重试"类瞬态 400 同形状自动
-#     重试、超大参考图先降采样再上传（详见 _request_openai_compat_image）
+#     developers.openai.com "Create image edit"）。编辑请求绝不回退
+#     /images/generations——官方 generations 端点不接受 image 参数，
+#     中转站忽略该字段后编辑就变成纯文生图，HTTP 200 "假成功"但产出
+#     一张与原图无关的新图（2026-09-08 生产事故）。edits 失败时明确
+#     报错，绝不降级。另有生产鲁棒性：超大参考图先降采样再上传、
+#     "请求体未完整/请重试"类瞬态 400 同形状自动重试
+#     （详见 _request_openai_compat_image）
 # 其它提供商（如 openrouter 的 gemini 图像模型）继续走
 # chat/completions + modalities 路径，行为不变。
 # =============================================================================
@@ -87,48 +90,85 @@ def _normalize_image_url(image_url: str) -> str:
 
 
 async def _download_reference_image_bytes(session: aiohttp.ClientSession, image_url: str) -> bytes | None:
-    """下载参考图字节；data: URL 直接解码，http(s) 下载，其余返回 None。"""
+    """下载并验证参考图字节；非真实图片（HTML 错误页等）绝不进入后续请求。
+
+    - data: URL 解码后必须通过 Pillow 校验才返回。
+    - http(s) 下载后检查 Content-Type 并用 Pillow 验证 magic bytes：
+      HTTP 200 + text/html 的错误页曾经会伪装成 image/jpeg 进入编辑
+      请求（参考图从未真正送达模型），这里从源头堵住。
+    """
     if not image_url:
         return None
     if image_url.startswith("data:image"):
         try:
             _, base64_data = image_url.split(",", 1)
-            return base64.b64decode(base64_data)
+            raw = base64.b64decode(base64_data, validate=True)
+            if _detect_valid_image(raw) is None:
+                logger.warning("[NativeImage] data URL 内容不是可解析图片")
+                return None
+            return raw
         except Exception as e:
-            logger.warning(f"[NativeImage] data URL 解码失败: {e}")
+            logger.warning(f"[NativeImage] data URL 解码/校验失败: {e}")
             return None
     try:
         async with session.get(image_url, timeout=30) as resp:
-            if resp.status == 200:
-                return await resp.read()
-            logger.warning(f"[NativeImage] 下载参考图失败 {resp.status}: {image_url[:120]}")
+            if resp.status != 200:
+                logger.warning(f"[NativeImage] 下载参考图失败 {resp.status}: {image_url[:120]}")
+                return None
+            content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            raw = await resp.read()
+            detected = _detect_valid_image(raw)
+            if detected is None:
+                logger.warning(
+                    "[NativeImage] 参考 URL 返回的内容不是可解析图片: "
+                    "content_type=%s bytes=%s url=%s",
+                    content_type or "-", len(raw), image_url[:120],
+                )
+                return None
+            detected_mime, _ext = detected
+            if content_type and not content_type.startswith("image/"):
+                # 内容能解析成图片但 header 不符：放行但留痕（部分对象存储
+                # 会给 application/octet-stream，内容正确即可用）。
+                logger.warning(
+                    "[NativeImage] 参考 URL Content-Type 异常但内容可解析为 %s: "
+                    "header=%s url=%s",
+                    detected_mime, content_type, image_url[:120],
+                )
+            logger.debug(
+                "[NativeImage] reference downloaded: bytes=%s mime=%s url=%s",
+                len(raw), detected_mime, image_url[:120],
+            )
+            return raw
     except Exception as e:
         logger.warning(f"[NativeImage] 下载参考图异常: {e}")
     return None
 
 
 def _bytes_to_data_url(img_bytes: bytes, source_url: str = '') -> str:
-    """把图片字节转换为 data URL（用于图像编辑接口的参考图字段）。
+    """把真实图片字节转换成 data URL，MIME 以实际图片格式（magic bytes）为准。
 
-    - 若 source_url 本身就是 data:image/... URL，则直接返回（已是正确格式）。
-    - 否则根据 source_url 的扩展名推断 MIME，缺省 image/jpeg，再用 base64 包装。
+    Pillow 能识别格式时以识别结果为准；识别失败才按 source_url 扩展名
+    猜测（缺省 image/jpeg）。避免把 PNG 字节标成 image/jpeg 之类错配。
     """
-    if source_url.startswith('data:image/'):
-        return source_url
-    mime = 'image/jpeg'
-    if source_url:
-        guess, _ = mimetypes.guess_type(source_url.split('?', 1)[0])
-        if guess and guess.startswith('image/'):
-            mime = guess
+    detected = _detect_valid_image(img_bytes)
+    if detected is not None:
+        mime, _ext = detected
+    else:
+        mime = 'image/jpeg'
+        if source_url:
+            guess, _ = mimetypes.guess_type(source_url.split('?', 1)[0])
+            if guess and guess.startswith('image/'):
+                mime = guess
     b64 = base64.b64encode(img_bytes).decode('ascii')
     return f"data:{mime};base64,{b64}"
 
 
 async def _image_urls_to_data_urls(session: aiohttp.ClientSession, image_urls: list[str]) -> list[str]:
-    """把调用方给的参考图（data URL / 公网 URL）统一转成 data URL 列表。
+    """把调用方给的参考图（data URL / 公网 URL）统一转成已验证的 data URL 列表。
 
     ModelScope 与通用 OpenAI 兼容图像端点的参考图预处理共用本函数：
-    下载失败的参考图跳过（全部失败时由调用方返回 400）。
+    下载失败 / 内容不是真实图片的参考图一律跳过（全部失败时由调用方
+    返回 400），绝不把 HTML 错误页之类伪装成参考图送进编辑请求。
     """
     image_data_urls: list[str] = []
     for image_url in image_urls or []:
@@ -136,7 +176,17 @@ async def _image_urls_to_data_urls(session: aiohttp.ClientSession, image_urls: l
         if not normalized:
             continue
         if normalized.startswith('data:image/'):
-            image_data_urls.append(normalized)
+            try:
+                decoded = _data_url_to_bytes(normalized)
+                if not decoded:
+                    logger.warning("[NativeImage] data URL 解码失败，跳过")
+                    continue
+                if _detect_valid_image(decoded[0]) is None:
+                    logger.warning("[NativeImage] data URL 内容不是有效图片，跳过")
+                    continue
+                image_data_urls.append(normalized)
+            except Exception as e:
+                logger.warning("[NativeImage] data URL 验证失败: %s", e)
         elif normalized.startswith(('http://', 'https://')):
             img_bytes = await _download_reference_image_bytes(session, normalized)
             if img_bytes:
@@ -515,78 +565,15 @@ async def _request_modelscope_native_image(
 
 # ---- 通用 OpenAI 兼容实现的共享辅助（edits multipart / generations JSON 两路共用）----
 
-# data URL 的 MIME -> multipart 文件名扩展名（官方示例用 .png / .jpg / .webp）
-_MIME_TO_EXT = {
-    "image/png": "png",
-    "image/jpeg": "jpg",
-    "image/jpg": "jpg",
-    "image/webp": "webp",
-    "image/gif": "gif",
-}
-
-# /images/edits 路由级失败 -> 可回退 /images/generations 的状态码。
-# 只覆盖"中转站没实现/网关没转发该路由"类错误；鉴权(401/403)、限流(429)、
-# 内容安全(400 moderation)等语义性错误不回退，避免重复计费或掩盖真实原因。
-_EDITS_FALLBACK_STATUSES = frozenset({404, 405, 501, 502, 503})
-# 400 状态下命中这些字样视为"路由/参数未实现"（各家中转报错措辞不一，宽松收集）
-_EDITS_FALLBACK_BODY_HINTS = (
-    "unknown parameter",
-    "unrecognized request argument",
-    "unrecognized field",
-    "unexpected field",
-    "extra fields not permitted",
-    "extra_forbidden",
-    "invalid field",
-    "does not support",
-    "not supported",
-    "no such endpoint",
-    "unknown request",
-    "invalid url",
-    "page not found",
-    "not found",
-)
-
-
-def _should_fallback_to_generations(status_code: int, error_detail: str) -> bool:
-    """判定 /images/edits 失败后是否回退 /images/generations JSON 形状。
-
-    仅对"路由未实现 / 参数不识别"类失败回退；内容安全、鉴权、计费类
-    错误原样返回给调用方（回退也无法解决，反而多打一次计费请求）。
-    """
-    if status_code in _EDITS_FALLBACK_STATUSES:
-        return True
-    if status_code == 400:
-        body = (error_detail or "").lower()
-        return any(hint in body for hint in _EDITS_FALLBACK_BODY_HINTS)
-    return False
-
-
-# ---- 生产鲁棒性辅助：edits 路由能力缓存 / 瞬态 400 重试 / 超大参考图压缩 ----
-
-# /images/edits 返回 404/405（路由级"确实没有该路径"，如生产实测 xxtf
-# 中转站）后按 base_url 记忆一段时间：TTL 内带参考图的请求直接走兼容
-# JSON 形状，省去一次必然失败的 RTT。501/502/503 等其它回退状态不缓存
-# ——可能是瞬态网关故障，下次仍先按官方语义尝试 edits。
-_EDITS_UNSUPPORTED_TTL_SECONDS = 3600.0
-_edits_unsupported_until: dict[str, float] = {}
-
-
-def _mark_edits_unsupported(base_url: str) -> None:
-    """记录"该 base_url 未实现 /images/edits"（TTL 内跳过 multipart 尝试）。"""
-    if base_url:
-        _edits_unsupported_until[base_url] = time.time() + _EDITS_UNSUPPORTED_TTL_SECONDS
-
-
-def _edits_known_unsupported(base_url: str) -> bool:
-    if not base_url:
-        return False
-    expire_at = _edits_unsupported_until.get(base_url)
-    if expire_at is None:
-        return False
-    if time.time() >= expire_at:
-        _edits_unsupported_until.pop(base_url, None)
-        return False
-    return True
+# ---- 生产鲁棒性辅助：瞬态 400 重试 / 超大参考图压缩 ----
+#
+# 历史教训（2026-09-08 生产事故）：本文件曾有"/images/edits 失败后回退
+# /images/generations + image 字段""路由级 404/405 按 base_url 缓存 TTL"
+# 的兼容逻辑。官方 generations 端点不接受 image 参数，中转站忽略该字段
+# 后编辑请求被当纯文生图执行——HTTP 200 "成功"，实际产出一张与原图
+# 无关的全新图片（用户要求"移除行人"，结果场景/风格整体重绘）。该
+# fallback 及其路由能力缓存已彻底删除：编辑请求宁可明确失败，也绝不
+# 假成功。
 
 
 # 瞬态 400：中转站明确提示"请求体未完整/请重试"类传输层错误（生产实测
@@ -809,8 +796,8 @@ async def _request_openai_compat_image(
 ) -> tuple[dict | None, str, str, int, str]:
     """通用 OpenAI Images 兼容实现（XXTF 等中转站走这里）。
 
-    端点选择对齐 OpenAI 官方 Images API 语义（developers.openai.com
-    api/reference/resources/images/methods/{generate,edit}，2026-09 现场核实）：
+    端点选择严格对齐 OpenAI 官方 Images API 语义（developers.openai.com
+    api/reference/resources/images/methods/{generate,edit}）：
 
     - 无参考图（文生图）: POST JSON ``{base_url}/images/generations``
       （官方 "Create image"，仅接受文本 prompt，无 image 参数）。
@@ -823,17 +810,16 @@ async def _request_openai_compat_image(
             -F "model=gpt-image-1.5" -F "image[]=@a.png" -F "image[]=@b.png" \\
             -F 'prompt=...'
 
-      历史实现曾把参考图塞进 JSON 发到 /images/generations——官方端点
-      并不接受 image 参数，只是部分中转站自行兼容。现在按以下顺序：
-        1. 先按官方规范 POST multipart /images/edits；
-        2. 仅当中转站返回"路由未实现/参数不识别"类错误（见
-           :func:`_should_fallback_to_generations`）才回退旧行为:
-           POST JSON /images/generations 并携带 image 字段（单张字符串、
-           多张数组）。鉴权/内容安全等语义错误不回退、原样返回。
-        3. 鲁棒性（生产日志反馈迭代）：/images/edits 收到路由级 404/405 后
-           按 base_url 缓存（TTL 内直接回退，省一次必败 RTT）；"请求体
-           未完整/请重试"类瞬态 400 同形状自动重试一次；超大参考图
-           （>3MB）先降采样再上传，避免中转站读不满请求体。
+      ⚠️ 编辑请求绝不回退 ``/images/generations``：官方 generations 端点
+      并不接受 image 参数，把参考图塞进 JSON 发给 generations 只会被部分
+      中转站静默忽略——上游返回 200，实际执行的是纯文生图，用户看到的
+      "编辑结果"与原图毫无关系（2026-09-08 生产事故：要求"移除行人"，
+      结果场景/风格整体重绘）。因此按以下顺序：
+        1. 参考图先经真实图片校验（Pillow magic bytes），不合法直接 400；
+        2. 严格 POST multipart /images/edits；
+        3. edits 失败（含 404/405 路由未实现）→ 明确报错，绝不降级。
+      鲁棒性保留："请求体未完整/请重试"类瞬态 400 同形状自动重试一次；
+      超大参考图（>3MB）先降采样再上传，避免中转站读不满请求体。
 
     - base_url 沿用 provider/模型端点覆盖的合并结果（XXTF 默认
       ``https://xxtf.baby/v1``，即最终请求 ``https://xxtf.baby/v1/images/edits``
@@ -900,12 +886,21 @@ async def _request_openai_compat_image(
                     headers=json_headers, json_payload=payload,
                 )
 
-            # ------------- 图生图/编辑：官方 /images/edits multipart -------------
+            # ------------- 图生图/编辑：严格使用官方 /images/edits -------------
+            #
+            # 重要：/images/generations + {"image": ...} 并不等价于官方
+            # /images/edits 协议。中转站很可能直接忽略未知字段，把编辑请求
+            # 当成纯文生图执行——用户要求"只删行人"，结果场景/风格整体
+            # 重绘（2026-09-08 生产事故：HTTP 200 "假成功"，原图从未送达
+            # 模型）。因此：
+            #   有参考图 -> 只能 POST /images/edits multipart；
+            #   edits 失败 -> 明确报错；
+            #   绝不 fallback 到 /images/generations（宁可失败，不假成功）。
             endpoint = edits_endpoint
             image_data_urls = await _image_urls_to_data_urls(session, image_urls)
             if not image_data_urls:
                 return None, endpoint, "未能读取参考图片", 400, ""
-            # 超大参考图先降采样：数 MB 的 body 塞进 multipart/JSON 会被部分
+            # 超大参考图先降采样：数 MB 的 body 塞进 multipart 会被部分
             # 中转站截断（生产实测 xxtf 400 INCOMPLETE_REQUEST_BODY）
             image_data_urls = [_shrink_data_url(u) for u in image_data_urls]
 
@@ -916,19 +911,28 @@ async def _request_openai_compat_image(
                 len(image_data_urls), (clean_prompt or "")[:240],
             )
             # 预解码参考图（一次解码，multipart 构造可重复执行——瞬态重试
-            # 时需重建 FormData，bytes 字段的流游标不可复用）
+            # 时需重建 FormData，bytes 字段的流游标不可复用）；每张都过
+            # Pillow 校验，非真实图片拒绝发送。
             decoded_refs: list[tuple[int, bytes, str, str]] = []
             for idx, data_url in enumerate(image_data_urls):
                 decoded = _data_url_to_bytes(data_url)
                 if not decoded:
                     continue
                 img_bytes, mime = decoded
-                decoded_refs.append((idx, img_bytes, mime, _MIME_TO_EXT.get(mime, "png")))
+                detected = _detect_valid_image(img_bytes)
+                if detected is None:
+                    logger.warning(
+                        "%s reference[%s] 不是有效图片，拒绝发送",
+                        log_prefix, idx,
+                    )
+                    continue
+                detected_mime, ext = detected
+                decoded_refs.append((idx, img_bytes, detected_mime, ext))
             if not decoded_refs:
                 return None, endpoint, "未能读取参考图片", 400, ""
 
             def _build_edits_form() -> aiohttp.FormData:
-                """官方形状：多张参考图以重复的 image[] 字段上传。"""
+                """严格构造 OpenAI Images Edit multipart 请求（官方形状）。"""
                 form = aiohttp.FormData()
                 form.add_field("model", str(model))
                 form.add_field("prompt", clean_prompt or "请根据参考图进行编辑。")
@@ -940,46 +944,58 @@ async def _request_openai_compat_image(
                         "image[]", img_bytes,
                         filename=f"reference_{idx}.{ext}", content_type=mime,
                     )
+                # 不泄露图片内容的调试留痕：证明"HTTP 请求 body 里真的有
+                # 图"，而不只是"程序准备了一张图"（bytes/sha256 可逐张核对）。
+                logger.debug(
+                    "%s multipart prepared: endpoint=%s model=%s prompt_len=%s "
+                    "reference_count=%s refs=%s",
+                    log_prefix, edits_endpoint, model,
+                    len(clean_prompt or ""),
+                    len(decoded_refs),
+                    [
+                        {
+                            "index": idx,
+                            "bytes": len(img_bytes),
+                            "mime": mime,
+                            "sha256": hashlib.sha256(img_bytes).hexdigest()[:16],
+                        }
+                        for idx, img_bytes, mime, _ext in decoded_refs
+                    ],
+                )
                 return form
 
-            edits_skipped = _edits_known_unsupported(base_url)
-            if edits_skipped:
+            parsed, used_endpoint, detail, status_code, req_id = (
+                await _post_images_with_retry(
+                    session, f"{base_url}{endpoint}",
+                    endpoint=endpoint, log_prefix=log_prefix,
+                    headers=auth_headers, form_factory=_build_edits_form,
+                )
+            )
+            if parsed is not None:
                 logger.info(
-                    "%s %s 近期 /images/edits 404/405 已缓存，跳过直接走 %s 兼容形状",
-                    log_prefix, base_url, gen_endpoint,
+                    "%s edit accepted: endpoint=%s model=%s reference_count=%s",
+                    log_prefix, used_endpoint, model, len(decoded_refs),
                 )
-            if not edits_skipped:
-                parsed, used_endpoint, detail, status_code, req_id = (
-                    await _post_images_with_retry(
-                        session, f"{base_url}{endpoint}",
-                        endpoint=endpoint, log_prefix=log_prefix,
-                        headers=auth_headers, form_factory=_build_edits_form,
-                    )
-                )
-                if parsed is not None:
-                    return parsed, used_endpoint, '', status_code, req_id
-                if not _should_fallback_to_generations(status_code, detail):
-                    return None, used_endpoint, detail, status_code, req_id
-                if status_code in (404, 405):
-                    # 路由级"确实没有该路径" -> 按 base_url 短期缓存，
-                    # TTL 内后续请求不再白打这一趟
-                    _mark_edits_unsupported(base_url)
-            else:
-                used_endpoint, status_code, detail, req_id = endpoint, 404, "", ''
+                return parsed, used_endpoint, '', status_code, req_id
 
-            # ------- 回退：中转站未实现 /images/edits 时的兼容 JSON 形状 -------
-            fallback_payload = _payload_base(clean_prompt or "请根据参考图进行编辑。")
-            fallback_payload["image"] = (
-                image_data_urls[0] if len(image_data_urls) == 1 else image_data_urls
+            # 编辑失败绝不能伪装成文生图成功。特别是 404/405/501 只代表
+            # 上游没有实现 /images/edits，并不代表 /images/generations 可以
+            # 完成编辑——把编辑降级成文生图会产生最恶劣的"假成功"。
+            logger.error(
+                "%s edit rejected: endpoint=%s status=%s detail=%r; NO fallback to /images/generations",
+                log_prefix, used_endpoint, status_code, (detail or "")[:300],
             )
-            logger.warning(
-                "%s /images/edits 不可用 (status=%s detail=%r)，回退 %s JSON+image 形状",
-                log_prefix, status_code, (detail or '')[:160], gen_endpoint,
-            )
-            return await _post_images_with_retry(
-                session, f"{base_url}{gen_endpoint}",
-                endpoint=gen_endpoint, log_prefix=log_prefix,
-                headers=json_headers, json_payload=fallback_payload,
+            return (
+                None,
+                used_endpoint,
+                (
+                    f"图像编辑端点 {base_url}{edits_endpoint} 不可用或拒绝请求；"
+                    "为避免把编辑误降级成全新图片生成，程序不会回退到 "
+                    f"/images/generations。上游状态={status_code}，"
+                    f"详情={(detail or '无').strip()[:240]}"
+                ),
+                status_code,
+                req_id,
             )
     except asyncio.TimeoutError:
         logger.warning("%s request timeout after %ss", log_prefix, timeout.total)
@@ -1005,8 +1021,8 @@ async def _request_images_generations(
 
     - modelscope -> _request_modelscope_native_image（异步任务轮询特化）
     - 其它（xxtf 等中转站）-> _request_openai_compat_image（标准同步 REST；
-      文生图走 JSON /images/generations，带参考图的编辑优先走官方
-      multipart /images/edits，路由未实现时回退 JSON 形状）
+      文生图走 JSON /images/generations，带参考图的编辑只走官方
+      multipart /images/edits，失败即报错，绝不回退 generations 形状）
 
     返回: (response_json, endpoint, error_detail, status_code, request_id)
     endpoint 为实际使用的相对路径（"/images/generations" 或
@@ -1758,10 +1774,11 @@ async def _request_openrouter_video(
 async def _request_openai_images_task(task: "ImageTask") -> "ImageTaskResult":
     """OpenAI Images 协议出口：ImageTask -> /v1/images/{generations,edits}。
 
-    端点选择由任务操作 + 提供商能力决定（与历史行为逐字节兼容）：
+    端点选择由任务操作 + 提供商能力决定：
       - generate            -> JSON /images/generations
       - edit / variation    -> multipart /images/edits（XXTF 等标准端点），
-                               未实现时回退 JSON /images/generations 兼容形状
+                               失败即报错；绝不回退 /images/generations
+                               （该端点不接受 image 参数，回退 = 文生图假成功）
       - modelscope          -> 一律 /images/generations（X-ModelScope-Task-Type
                                头区分文生图/图生图；该厂商不存在 /images/edits）
     """

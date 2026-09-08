@@ -111,3 +111,113 @@ def test_openrouter_chat_image_task_resolves_registered_model_without_name_error
     result = asyncio.run(_request_chat_modalities_image_task(task))
     assert result.images == []
     assert result.endpoint == "/chat/completions"
+
+
+# ---------------------------------------------------------------------------
+# 回归测试（2026-09-08 生产事故）：/images/edits 失败后绝不能回退
+# /images/generations —— 中转站会忽略非官方 image 字段，把编辑请求当
+# 纯文生图执行，HTTP 200 "假成功"但产出一张与原图无关的新图。
+# ---------------------------------------------------------------------------
+
+def test_openai_compat_edit_never_falls_back_to_generations(monkeypatch):
+    """编辑端点失败时绝不能伪装成文生图成功。"""
+    from types import SimpleNamespace
+    import ai.media_generation as mg
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    calls = []
+
+    async def fake_image_urls_to_data_urls(session, image_urls):
+        return [
+            "data:image/png;base64,"
+            + base64.b64encode(PNG_1X1).decode("ascii")
+        ]
+
+    async def fake_post(session, url, **kwargs):
+        calls.append(url)
+        if url.endswith("/images/edits"):
+            return (
+                None,
+                "/images/edits",
+                "page not found",
+                404,
+                "req-edit-404",
+            )
+        raise AssertionError(
+            "edit failure must never call /images/generations"
+        )
+
+    monkeypatch.setattr(mg.aiohttp, "ClientSession", lambda **kwargs: FakeSession())
+    monkeypatch.setattr(mg, "_resolve_provider_api_key", lambda env: "test-key")
+    monkeypatch.setattr(mg, "_image_urls_to_data_urls", fake_image_urls_to_data_urls)
+    monkeypatch.setattr(mg, "_post_images_with_retry", fake_post)
+    monkeypatch.setattr(mg, "_data_url_to_bytes", lambda _: (PNG_1X1, "image/png"))
+
+    model_info = SimpleNamespace(provider="xxtf", name="XXTF")
+
+    result = asyncio.run(
+        mg._request_openai_compat_image(
+            model_info,
+            prompt="remove pedestrians and keep everything else unchanged",
+            image_urls=["https://example.test/original.png"],
+            num_images=1,
+            model="gpt-image-2",
+            aspect_ratio="1:1",
+        )
+    )
+
+    response, endpoint, detail, status, request_id = result
+
+    assert response is None
+    assert endpoint == "/images/edits"
+    assert status == 404
+    assert request_id == "req-edit-404"
+    # 明确告诉模型/用户：不会降级成文生图。
+    assert "不会回退" in detail
+    # 只打过 /images/edits 一趟，绝不出现第二次 generations 请求。
+    assert calls == ["https://xxtf.baby/v1/images/edits"]
+
+
+def test_image_task_edit_requires_reference_image():
+    """edit/variation 没有参考图必须直接失败，而不是偷偷变成文生图。"""
+    try:
+        ImageTask.edit("edit this", [], model="gpt-image-2")
+    except ValueError as exc:
+        assert "至少需要一张参考图" in str(exc)
+    else:
+        raise AssertionError(
+            "ImageTask.edit must reject empty reference images"
+        )
+
+
+def test_image_urls_to_data_urls_skips_html_payload():
+    """参考 URL 返回 HTML 错误页时必须跳过，绝不伪装成参考图送进请求。"""
+    import ai.media_generation as mg
+
+    class FakeResp:
+        status = 200
+        headers = {"Content-Type": "text/html"}
+
+        async def read(self):
+            return b"<html><body>error page</body></html>"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class FakeSession:
+        def get(self, url, **kwargs):
+            return FakeResp()
+
+    result = asyncio.run(
+        mg._image_urls_to_data_urls(FakeSession(), ["https://example.test/broken.png"])
+    )
+    assert result == []
