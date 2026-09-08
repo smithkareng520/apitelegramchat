@@ -5,7 +5,7 @@ import re
 import time
 import ipaddress
 import socket
-from typing import cast
+from typing import Any, cast
 from urllib.parse import urljoin, urlsplit
 
 try:
@@ -41,6 +41,10 @@ FETCH_TITLE_TOKEN_BUDGET = 64
 TRAFILATURA_TIMEOUT = 10
 HTTP_TIMEOUT_SHORT = 10
 CURL_TIMEOUT = 20
+# 单次抓取的响应体上限。fetch 输出本就只有 20k token 预算，8MB 远超所需；
+# 无上限时恶意/异常页面（数 GB）会在下载缓冲 + lxml huge_tree 解析两处
+# 造成内存与 CPU 压力，拖慢线程池里的其他工具。
+CONTENT_MAX_BYTES = 8 * 1024 * 1024
 
 _TRAFILATURA_CONFIG = use_config()
 if _TRAFILATURA_CONFIG is not None:
@@ -175,25 +179,99 @@ def _decode_html_bytes(raw: bytes | None, http_encoding: str | None) -> str | No
         return raw.decode("utf-8", errors="replace")
 
 
-async def _fetch_html_with_curl(url: str) -> str | None:
+async def _read_response_capped(response: Any, cap: int) -> bytes:
+    """流式读取响应体并在超过 cap 字节处截断。
+
+    curl_cffi 的 stream 响应用 aiter_content 分块读取；流式路径异常时逐级
+    退回 acontent() / 同步 content 属性。截断只影响超长页面的尾部（本就远
+    超 20k token 输出预算），换来下载与解析内存可控。
+    """
+    aiter = getattr(response, "aiter_content", None)
+    if aiter is not None:
+        try:
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in aiter(65536):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= cap:
+                    break
+            if total:
+                return b"".join(chunks)[:cap]
+        except Exception:
+            logger.debug("[fetch_url] 流式读取失败，退回整包读取", exc_info=True)
+    acontent = getattr(response, "acontent", None)
+    if acontent is not None:
+        try:
+            raw = await acontent()
+            return (raw or b"")[:cap]
+        except Exception:
+            logger.debug("[fetch_url] acontent 读取失败", exc_info=True)
+            return b""
+    return (getattr(response, "content", None) or b"")[:cap]
+
+
+async def _aclose_response(response: Any) -> None:
+    """尽力关闭 curl_cffi 流式响应，释放底层连接。"""
+    aclose = getattr(response, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception:
+        logger.debug("关闭 curl_cffi 响应失败（忽略）", exc_info=True)
+
+
+async def _fetch_html_with_curl(url: str) -> tuple[str | None, int | None]:
+    """curl_cffi 抓取 HTML，返回 (html, http_status)；失败时 html 为 None。
+
+    status 不为 None 表示拿到了 HTTP 响应（含 4xx/5xx），调用方据此区分
+    "网络层失败"（None）与"服务端明确拒绝"（403/404 等），用于跳过无意义
+    重试并在失败文案中携带状态码。重定向仍由 libcurl 自动跟随（保持既有
+    行为：splash 页跳转 / 首页重定向都能落地）。
+    """
     try:
         async with AsyncSession() as session:
-            response = await session.get(url, timeout=CURL_TIMEOUT, impersonate="chrome120",
-                                         headers={"Accept": "text/html,application/xhtml+xml,*/*", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
-            if response.status_code != 200:
-                return None
-            # 优先按 HTTP 头 + meta + chardet 检测的编码解码，避免 GBK 站点被
-            # 错误地按 UTF-8 解析产生馊字标题。
-            raw = response.content
-            http_enc = getattr(response, "encoding", None)
-            decoded = _decode_html_bytes(raw, http_enc)
-            if decoded is not None:
-                return decoded
-            # 兜底：让 curl_cffi 自己用 .text（HTTP 头声明的编码）解码。
-            return response.text
+            response = await session.get(
+                url,
+                timeout=CURL_TIMEOUT,
+                impersonate="chrome120",
+                stream=True,
+                headers={"Accept": "text/html,application/xhtml+xml,*/*",
+                         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+            )
+            try:
+                status = int(getattr(response, "status_code", 0) or 0)
+                if status != 200:
+                    return None, status
+                # Content-Length 预检：超限直接放弃，不读响应体。
+                try:
+                    declared = int(response.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    declared = 0
+                if declared > CONTENT_MAX_BYTES:
+                    logger.warning(
+                        "[fetch_url] 响应体超限（%s bytes > %s），放弃：%s",
+                        declared, CONTENT_MAX_BYTES, url,
+                    )
+                    return None, status
+                raw = await _read_response_capped(response, CONTENT_MAX_BYTES)
+                if not raw:
+                    return None, status
+                # 优先按 HTTP 头 + meta + chardet 检测的编码解码，避免 GBK 站点被
+                # 错误地按 UTF-8 解析产生馊字标题。
+                http_enc = getattr(response, "encoding", None)
+                decoded = _decode_html_bytes(raw, http_enc)
+                if decoded is not None:
+                    return decoded, status
+                return (response.text or None), status
+            finally:
+                await _aclose_response(response)
     except Exception as e:
         logger.error(f"curl_cffi 请求异常: {e}, URL: {url}")
-        return None
+        return None, None
 
 
 async def _download_html_with_trafilatura(url: str) -> str | None:
@@ -206,6 +284,10 @@ async def _download_html_with_trafilatura(url: str) -> str | None:
         return None
     try:
         downloaded = await asyncio.to_thread(trafilatura.fetch_url, url)
+        if downloaded and len(downloaded) > CONTENT_MAX_BYTES:
+            # 兕底下载器无内建大小上限；字符长度近似截断，仅丢弃尾部
+            # （本就远超 20k token 输出预算），避免超大页面拖垮解析。
+            downloaded = downloaded[:CONTENT_MAX_BYTES]
         return downloaded or None
     except Exception as e:
         logger.debug(f"trafilatura 下载失败: {url}: {e}")
@@ -629,27 +711,37 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
     original_url = url
 
     # ---- 重试循环：最多尝试2次 ----
+    last_http_status: int | None = None
     for attempt in range(2):
         try:
-            # 先用 curl_cffi 获取 HTML
-            html = await _fetch_html_with_curl(url)
-            if not html:
+            # 先用 curl_cffi 获取 HTML（返回 (html, status)，status 用于区分
+            # 网络层失败与确定性 4xx）
+            html, http_status = await _fetch_html_with_curl(url)
+            if http_status is not None:
+                last_http_status = http_status
+            # 4xx（除 429）是确定性失败：重试与 trafilatura 兜底都不会改变
+            # 结果，直接走失败路径（下方 JS/Meta/根路径回退仍会尝试）。
+            deterministic_4xx = (
+                http_status is not None
+                and 400 <= http_status < 500
+                and http_status != 429
+            )
+            if not html and not deterministic_4xx:
                 # curl 失败：trafilatura 自带下载器兜底（拿到 HTML 后仍走富 HTML 提取）
                 html = await _download_html_with_trafilatura(url)
             if not html:
-                # 第一次尝试失败，等待后重试
-                if attempt == 0:
+                if attempt == 0 and not deterministic_4xx:
                     logger.warning(f"fetch_url attempt {attempt+1} failed for {url}, retrying...")
                     await asyncio.sleep(1)
                     continue
-                else:
-                    fallback_result = await _try_root_url_fallback(
-                        url, redirect_depth, start_time,
-                    )
-                    if fallback_result is not None:
-                        return fallback_result
-                    result = f"失败：无法获取页面内容：{url}"
-                    return result
+                fallback_result = await _try_root_url_fallback(
+                    url, redirect_depth, start_time,
+                )
+                if fallback_result is not None:
+                    return fallback_result
+                status_note = f"（HTTP {last_http_status}）" if last_http_status else ""
+                result = f"失败：无法获取页面内容{status_note}：{url}"
+                return result
 
             # 获取标题（用于失败提示与展示兜底）
             title = _get_title_from_html(html)

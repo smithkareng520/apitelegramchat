@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
-from typing import Any
+from typing import Any, Optional
 
 import tiktoken
 
@@ -77,6 +77,7 @@ def truncate_to_token_budget_head_tail(
     *,
     head_ratio: float = 0.7,
     encoding_name: str = DEFAULT_ENCODING_NAME,
+    suffix: Optional[str] = None,
 ) -> str:
     """Truncate text keeping BOTH the head and the tail within the budget.
 
@@ -85,6 +86,9 @@ def truncate_to_token_budget_head_tail(
     while a plain head-truncation silently discards it. This helper keeps
     ``head_ratio`` of the budget for the beginning and the remainder for the
     end, inserting a human/model-readable note that states what happened.
+
+    ``suffix`` lets callers replace the built-in bash-oriented note (fetch
+    用它替换为面向网页内容的说明）；默认 None 保持原有动态文案。
     """
     if token_budget < 0:
         raise ValueError("token_budget must be non-negative")
@@ -109,15 +113,18 @@ def truncate_to_token_budget_head_tail(
         head_tokens = max(1, int(usable * head_ratio))
         tail_tokens = max(1, usable - head_tokens)
         omitted = max(0, len(encoded) - head_tokens - tail_tokens)
-        suffix = (
-            f"\n…[输出超过 token 预算：已保留开头 {head_tokens} 与结尾 {tail_tokens} 个 token，"
-            f"中间约 {omitted} 个 token 已省略；如需完整内容请将输出重定向到文件后用 grep/text_editor 查看]\n"
-        )
-        encoded_suffix = encoding.encode(suffix, disallowed_special=())
+        if suffix is None:
+            note = (
+                f"\n…[输出超过 token 预算：已保留开头 {head_tokens} 与结尾 {tail_tokens} 个 token，"
+                f"中间约 {omitted} 个 token 已省略；如需完整内容请将输出重定向到文件后用 grep/text_editor 查看]\n"
+            )
+        else:
+            note = suffix
+        encoded_suffix = encoding.encode(note, disallowed_special=())
         if head_tokens + tail_tokens + len(encoded_suffix) <= token_budget:
             head_text = encoding.decode(encoded[:head_tokens])
             tail_text = encoding.decode(encoded[-tail_tokens:])
-            return head_text + suffix + tail_text
+            return head_text + note + tail_text
         usable = max(1, token_budget - len(encoded_suffix))
     # 预算极小时退化为普通截断，保证输出永远合法。
     return encoding.decode(encoded[:token_budget])

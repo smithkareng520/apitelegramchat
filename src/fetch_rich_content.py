@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import Any, Optional, cast
 from urllib.parse import parse_qs, urljoin, urlparse, urlsplit, urlunsplit
 
-from token_budget import count_tokens, truncate_to_token_budget
+from token_budget import count_tokens, truncate_to_token_budget, truncate_to_token_budget_head_tail
 
 try:
     from lxml import etree as _etree
@@ -55,8 +55,9 @@ FETCH_RESPONSE_TOKEN_BUDGET = 20_000
 FETCH_BODY_TOKEN_BUDGET = 19_000
 FETCH_TRUNCATION_NOTICE = "<p>…（内容过长，已按 token 预算截断）</p>"
 
-# 媒体数量上限：防止图库/相册类页面把工具结果塞满 <img>。
-MAX_IMAGES = 8
+# 媒体数量上限：视频/播放器/音频仍然限量，防止播放器列表淹没正文；
+# 图片不再限量——图库/相册类页面按原始结构全量呈现（仅受 token 预算
+# 自然约束，超出预算的尾部块由 _truncate_blocks 整块裁剪）。
 MAX_VIDEOS = 4
 MAX_EMBEDS = 5
 MAX_AUDIOS = 2
@@ -304,16 +305,35 @@ _CAROUSEL_HINT_RE = re.compile(
 )
 
 
+def _zero_measure(value: Optional[str]) -> bool:
+    """width/height 属性是否表示零尺寸（兼容 0 / 0px / 0% 等写法）。"""
+    if not value:
+        return False
+    v = value.strip().lower()
+    return v in {"0", "0px", "0%", "0.0", "0em", "0rem", "0pt", "0vh", "0vw"}
+
+
 def _is_hidden_element(el: Any) -> bool:
-    """过滤隐藏 / 零尺寸的跟踪型媒体元素。"""
+    """过滤隐藏 / 零尺寸的跟踪型媒体元素。
+
+    class 按空白分词后精确匹配（hidden / hidden-xs 等），避免子串匹配
+    误杀 hidden-print（仅打印时隐藏）或 not-hidden 这类类名。
+    """
     style = (el.get("style") or "").replace(" ", "").lower()
     if "display:none" in style or "visibility:hidden" in style:
         return True
     if (el.get("aria-hidden") or "").strip().lower() == "true":
         return True
-    if "hidden" in (el.get("class") or "").lower():
+    class_tokens = set((el.get("class") or "").lower().split())
+    if "hidden" in class_tokens:
         return True
-    return el.get("width") == "0" or el.get("height") == "0"
+    # hidden-* 响应式工具类：除 hidden-print（仅打印隐藏，屏幕可见）外
+    # 在部分断点不可见，视为不可靠媒体源。
+    if any(t.startswith("hidden-") and t != "hidden-print" for t in class_tokens):
+        return True
+    if _zero_measure(el.get("width")) or _zero_measure(el.get("height")):
+        return True
+    return bool(re.search(r"(?:width|height):0(?:px|%|em|rem|pt|vh|vw)?(?:;|$)", style))
 
 
 def _find_carousel_ancestor(el: Any) -> Optional[str]:
@@ -348,7 +368,7 @@ _IMG_LAZY_ATTRS = (
     "data-echo", "data-url", "data-image", "data-original-src",
 )
 
-_MEDIA_KIND_CAPS = {"video": MAX_VIDEOS, "audio": MAX_AUDIOS, "embed": MAX_EMBEDS, "image": MAX_IMAGES}
+_MEDIA_KIND_CAPS = {"video": MAX_VIDEOS, "audio": MAX_AUDIOS, "embed": MAX_EMBEDS}
 
 
 def _collect_dom_media(tree: Any, base_url: str) -> list[DomMedia]:
@@ -422,7 +442,8 @@ def _collect_dom_media(tree: Any, base_url: str) -> list[DomMedia]:
             continue
         if _is_hidden_element(el):
             continue
-        if counts[kind] >= _MEDIA_KIND_CAPS[kind]:
+        cap = _MEDIA_KIND_CAPS.get(kind)
+        if cap is not None and counts[kind] >= cap:
             continue
         seen.add(url)
         counts[kind] += 1
@@ -1103,18 +1124,50 @@ def _normalize_heading_text(text: str) -> str:
     return re.sub(r"\s+", "", _TAG_TEXT_RE.sub("", text or "")).lower()
 
 
+def _squeeze_oversized_block(block: str, token_budget: int) -> str:
+    """单个块超出整个预算时的兑底：提取可见文本做头尾截断。
+
+    结构化截断（保标签完整）在此场景下等价于整块丢弃——块比全部预算还大，
+    过去会导致整页一个字都拿不到。退化为纯文本头尾截断会丢失标签结构
+    （表格→文本流），但保住了内容本体；对超预算的巨型表格/超长段落，
+    这比"标题+链接+截断提示"有价值得多。
+    """
+    visible = _html.unescape(_TAG_TEXT_RE.sub(" ", block))
+    visible = re.sub(r"[ \t\r\f\v]+", " ", visible).strip()
+    if not visible:
+        return ""
+    # 预留 <p></p> 包裹标签的 token 开销，保证最终块严格不超预算。
+    squeezed = truncate_to_token_budget_head_tail(
+        visible,
+        max(token_budget - 5, 1),
+        suffix="…[此块超长，已头尾截断]",
+    )
+    return f"<p>{esc(squeezed)}</p>"
+
+
 def _truncate_blocks(blocks: list[str], token_budget: int) -> tuple[list[str], bool]:
-    """Keep complete top-level HTML blocks within an exact token budget."""
+    """Keep complete top-level HTML blocks within an exact token budget.
+
+    单个块放不进剩余预算时整块丢弃（保持"不截断在标签中间"约束）；但若
+    第一个块就放不下（kept 为空），整页会一个字都不剩——此时对该块做
+    头尾截断兑底，保证超长页面至少能给出主要内容概貌。
+    """
     kept: list[str] = []
     used_tokens = 0
+    truncated = False
     for block in blocks:
         block_tokens = count_tokens(block) + 1  # Separator between top-level blocks.
         if used_tokens + block_tokens <= token_budget:
             kept.append(block)
             used_tokens += block_tokens
-        else:
-            break
-    return kept, len(kept) < len(blocks)
+            continue
+        truncated = True
+        if not kept:
+            squeezed = _squeeze_oversized_block(block, token_budget)
+            if squeezed:
+                kept.append(squeezed)
+        break
+    return kept, truncated or len(kept) < len(blocks)
 
 
 def _norm_text(text: str) -> str:
@@ -1145,6 +1198,19 @@ def _anchor_text_match(block_text: str, cand_text: str) -> bool:
     return len(block_text) >= 8 and cand_text.startswith(block_text)
 
 
+def _media_url_key(url: str) -> tuple[str, str]:
+    """图片锚定的宽松匹配键：host + path（丢弃 query/fragment）。
+
+    懒加载图经 srcset/data-src 重选后，CDN 裁剪参数（?w=880、?x-oss-process=…）
+    常与 trafilatura 记录的原始 src 不同，但 host+path 一致——仍视为同一张图。
+    """
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return ("", url)
+    return ((parts.hostname or "").lower(), parts.path or "/")
+
+
 def _anchor_entries(entries: list[dict], tree: Any, media: list[DomMedia]) -> list[dict]:
     """为每个正文块确定 DOM 锚点（order/path）。
 
@@ -1156,8 +1222,10 @@ def _anchor_entries(entries: list[dict], tree: Any, media: list[DomMedia]) -> li
       3. 都失败：锚点为 None（交错时沿用上一个块的锚点）。
     """
     url_pos: dict[str, tuple[int, str]] = {}
+    host_path_pos: dict[tuple[str, str], tuple[int, str]] = {}
     for m in media:
         url_pos.setdefault(m.url, (m.order_idx, m.path))
+        host_path_pos.setdefault(_media_url_key(m.url), (m.order_idx, m.path))
 
     cands: list[tuple[int, str, str]] = []
     try:
@@ -1189,8 +1257,14 @@ def _anchor_entries(entries: list[dict], tree: Any, media: list[DomMedia]) -> li
                     break
         if anchor is None:
             for src in _block_media_srcs(entry["html"]):
-                if src in url_pos:
-                    anchor = url_pos[src]
+                hit = url_pos.get(src)
+                if hit is None:
+                    # 宽松匹配：懒加载图重选尺寸后 query 变化但 host+path 不变，
+                    # 仍锚定到它的 DOM 位置，避免图片块失去锚点后沿继承位置
+                    # 挤到正文末尾。
+                    hit = host_path_pos.get(_media_url_key(src))
+                if hit is not None:
+                    anchor = hit
                     break
         if anchor is not None:
             entry["order"], entry["path"] = anchor
@@ -1271,6 +1345,21 @@ def _render_dom_media_block(m: DomMedia) -> str:
     return f'<img src="{esc_attr(m.url)}"/>'
 
 
+def _assign_proportional_anchor_orders(entries: list[dict], media: list[DomMedia]) -> None:
+    """零锚点退路：把正文块按序均匀映射到 DOM 媒体序号区间上。
+
+    仅在所有块都未锚定（无任何位置信息）时调用。正文块本来就按文档顺序
+    产出，均匀铺设的合成 order 保序不改变块顺序，只是给 _interleave 提供
+    位置参考，使 dropped 媒体按原始文档位置穿插进正文，而不是全部堆到尾部。
+    """
+    if not entries or not media:
+        return
+    max_order = max(m.order_idx for m in media)
+    n = len(entries)
+    for i, entry in enumerate(entries):
+        entry["order"] = int(max_order * (i + 1) / (n + 1))
+
+
 def _sort_entries_by_anchor(entries: list[dict]) -> list[dict]:
     """按锚点 order 稳定排序正文块，使块本身回到 DOM 文档顺序。
 
@@ -1292,7 +1381,13 @@ def _sort_entries_by_anchor(entries: list[dict]) -> list[dict]:
 
 
 def _interleave(entries: list[dict], dropped: list[tuple[int, str]]) -> list[str]:
-    """按锚点顺序把 dropped 媒体块插入正文块流。"""
+    """按锚点顺序把 dropped 媒体块插入正文块流。
+
+    插入条件为媒体 order <= 当前块 order：真实锚定场景中媒体与文本元素的
+    order_idx 不会相等（不同 DOM 元素），等号只在零锚点比例兑底的合成
+    order 上出现——此时媒体应落在其比例位置所在的块之前，而不是被严格
+    小于条件挤到尾部。
+    """
     result: list[str] = []
     pending = sorted(dropped, key=lambda t: t[0])
     pi = 0
@@ -1303,7 +1398,7 @@ def _interleave(entries: list[dict], dropped: list[tuple[int, str]]) -> list[str
         if order is not None:
             last_order = order
         if cur is not None:
-            while pi < len(pending) and pending[pi][0] < cur:
+            while pi < len(pending) and pending[pi][0] <= cur:
                 result.append(pending[pi][1])
                 pi += 1
         result.append(entry["html"])
@@ -1404,6 +1499,11 @@ def build_model_facing_html(
             media = _collect_dom_media(tree, url)
             # 1) 锚定正文块位置，并按锚点恢复 DOM 文档顺序。
             entries = _anchor_entries(entries, tree, media)
+            # 1.5) 全部块都没锚上（JS 重组页/中文匹配失败页）：媒体若直接
+            # 走 _interleave 会全部堆到尾部。按块序均匀铺设合成锚点，
+            # 让媒体依 DOM 顺序穿插在正文之间。
+            if media and all(e.get("order") is None for e in entries):
+                _assign_proportional_anchor_orders(entries, media)
             entries = _sort_entries_by_anchor(entries)
             # 2) 轮播处理。
             entries, dropped = _apply_carousels(entries, media)
@@ -1540,6 +1640,33 @@ def extract_title_from_html(html_text: str) -> str:
     return ""
 
 
+# 兜底文本（无结构化正文时）的样板区剔除：nav/footer/aside 容器，以及
+# cookie 弹窗/订阅框/推广位等常见噪音容器（class/id/role 特征词）。
+_FALLBACK_BOILERPLATE_TAGS = frozenset({"nav", "footer", "aside"})
+_FALLBACK_NOISE_HINT_RE = re.compile(
+    r"(cookie|consent|banner|newsletter|subscribe|promo|sponsor|advert|"
+    r"sidebar|footer|nav|contentinfo|social|share)",
+    re.IGNORECASE,
+)
+
+
+def _in_fallback_boilerplate(el: Any) -> bool:
+    """兜底文本段落是否位于样板/噪音容器内。"""
+    try:
+        for anc in el.iterancestors():
+            if _local_name(anc) in _FALLBACK_BOILERPLATE_TAGS:
+                return True
+            hint = " ".join(filter(None, (
+                anc.get("class"), anc.get("id"), anc.get("role"),
+            )))
+            if hint and _FALLBACK_NOISE_HINT_RE.search(hint):
+                return True
+    except Exception:
+        logger.debug("_in_fallback_boilerplate 内部忽略的异常", exc_info=True)
+        return False
+    return False
+
+
 def build_fallback_text_from_html(html_text: str, token_budget: int = FALLBACK_TOTAL_TOKEN_BUDGET) -> str:
     """提取不到结构化正文时的纯文本兜底（meta description + 段落文本）。"""
     if _lxml_html is None or not html_text:
@@ -1558,6 +1685,8 @@ def build_fallback_text_from_html(html_text: str, token_budget: int = FALLBACK_T
     # join + 编码（O(n^2)，大页面数百段时是数百次全量重编码）。
     total_tokens = count_tokens(desc.strip()) if desc else 0
     for el in tree.iter("p"):
+        if _in_fallback_boilerplate(el):
+            continue
         text = re.sub(r"\s+", " ", "".join(el.itertext())).strip()
         # 阈值 10 字符：中文段落信息密度高，12 个汉字已是完整句子；
         # 按 20 英文词校准的阈值会把中文正文全部过滤掉。

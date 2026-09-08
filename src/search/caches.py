@@ -1,7 +1,7 @@
 """web_search / fetch_url 结果的双 TTL 缓存（自 search_engine.py 拆出）。"""
 
 import json
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from cachetools import TTLCache
 
@@ -10,6 +10,15 @@ from config import FETCH_CACHE_TTL, SEARCH_CACHE_TTL
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+# fetch 缓存键中要剥离的常见跟踪参数：同一页面挂不同 utm/fbclid 等参数
+# 时视为同一份内容，避免重复抓取与缓存条目膨胀。只影响缓存键——实际
+# 抓取仍使用原始 URL。
+_TRACKING_QUERY_PARAMS = frozenset({
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "fbclid", "gclid", "yclid", "msclkid", "spm", "scm", "from",
+})
 
 
 # ---------- 缓存 ----------
@@ -59,10 +68,18 @@ def _is_cacheable_search_result(value: object) -> bool:
 
 
 def _normalize_fetch_cache_key(url: str) -> str:
-    """Drop fragment so the same page maps to one cache entry."""
+    """Drop fragment 与常见跟踪参数，让同一页面映射到同一条缓存。"""
     try:
         parts = urlsplit(url)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
+        query = parts.query
+        if query:
+            kept = [
+                (k, v)
+                for k, v in parse_qsl(query, keep_blank_values=True)
+                if k.lower() not in _TRACKING_QUERY_PARAMS
+            ]
+            query = urlencode(kept)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
     except Exception:
         logger.debug("_normalize_fetch_cache_key 内部忽略的异常", exc_info=True)
         return url
