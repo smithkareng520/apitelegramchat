@@ -910,25 +910,22 @@ SUPPORTED_MODELS: Dict[str, ModelConfig] = {}
 # -----------------------------------------------------------------------------
 # OpenRouter 模型
 # -----------------------------------------------------------------------------
-SUPPORTED_MODELS["z-ai/glm-5.2:free"] = make_model_config(
-    model_id="z-ai/glm-5.2:free",
+SUPPORTED_MODELS["nex-agi/nex-n2.5-pro:free"] = make_model_config(
+    model_id="nex-agi/nex-n2.5-pro:free",
     provider="openrouter",
-    name="Glm 5.2 Free",
-    reasoning_enabled=True,
-    reasoning_effort="high",
-    max_context=256000,
-    # 预览模型能力未完全确认，不发送推理控制和采样参数，走供应商默认。
-)
-SUPPORTED_MODELS["minimax/minimax-m3:free"] = make_model_config(
-    model_id="minimax/minimax-m3:free",
-    provider="openrouter",
-    name="Minimax M3 Free",
+    name="Nex N2.5 Pro Free",
     vision=True,
-    video=True,
     reasoning_enabled=True,
     reasoning_effort="high",
-    max_context=1000000,
-    # 代码模型，免费档：不发送推理控制与采样参数，走供应商默认。
+    max_context=262000,
+)
+SUPPORTED_MODELS["poolside/laguna-s-2.1:free"] = make_model_config(
+    model_id="poolside/laguna-s-2.1:free",
+    provider="openrouter",
+    name="Laguna S 2.1 Free",
+    reasoning_enabled=True,
+    reasoning_effort="high",
+    max_context=262000,
 )
 SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
     model_id="anthropic/claude-sonnet-5",
