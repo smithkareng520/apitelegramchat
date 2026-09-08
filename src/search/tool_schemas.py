@@ -551,7 +551,7 @@ SEARCH_TOOLS = [
             "name": "bash",
             "description": (
                 "Execute bash commands inside the user's per-session workspace. "
-                "IMPORTANT: every call MUST fill the _description parameter with one short "
+                "IMPORTANT: every call MUST fill the description parameter with one short "
                 "sentence (≤60 chars, same language as the user) saying what this command is "
                 "for — it is shown to the user as live execution progress; calls missing it "
                 "will be rejected by argument validation. "
@@ -607,7 +607,7 @@ SEARCH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {
+                    "description": {
                         "type": "string",
                         "minLength": 1,
                         "description": (
@@ -629,20 +629,20 @@ SEARCH_TOOLS = [
                 # 显式声明后，L2 schema 校验层能把「缺 command」以可操作
                 # 错误回传模型自纠，strict 规范化也会正确将其保持为
                 # 非可空必填，而不是被当作可选字段。
-                # _description 同样显式声明为必填：草稿消息（rich draft 的
+                # description 同样显式声明为必填：草稿消息（rich draft 的
                 # 工具组/单工具块进行态摘要）依赖它展示命令意图；漏填时
-                # L2 会拒绝并回传「补 _description」的可操作错误，模型一
+                # L2 会拒绝并回传「补 description」的可操作错误，模型一
                 # 轮自纠即可；strict 模式下保持非可空 string，不会被模型
                 # 用 null 糊弄过去（null 会在 strip_null_arguments 后变成
                 # 缺键，同样被 L2 拦截）。
-                "required": ["_description", "command"]
+                "required": ["description", "command"]
             },
             "input_examples": [
-                {"_description": "查看项目文件列表", "command": "ls -la"},
-                {"_description": "安装依赖并运行测试", "command": "pip install --user pytest && python3 -m pytest -q"},
-                {"_description": "读取用户上传的文档", "command": "head -c 2000 download/brief.pdf | strings | head -40"},
-                {"_description": "把报告放入发送暂存区", "command": "cp report.pdf upload/report.pdf"},
-                {"_description": "重启卡死的会话", "restart": True}
+                {"description": "查看项目文件列表", "command": "ls -la"},
+                {"description": "安装依赖并运行测试", "command": "pip install --user pytest && python3 -m pytest -q"},
+                {"description": "读取用户上传的文档", "command": "head -c 2000 download/brief.pdf | strings | head -40"},
+                {"description": "把报告放入发送暂存区", "command": "cp report.pdf upload/report.pdf"},
+                {"description": "重启卡死的会话", "restart": True}
             ]
         }
     },

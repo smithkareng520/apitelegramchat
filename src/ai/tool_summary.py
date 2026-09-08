@@ -116,10 +116,10 @@ def _bash_cmdnotfound_is_partial(result_text: str, fn_args: dict) -> bool:
     return all(name != leading for name in missing)
 
 def _get_tool_description_from_args(fn_args: dict) -> Optional[str]:
-    """从工具参数中获取简短描述（优先使用 _description，其次 _summary）"""
+    """从工具参数中获取简短描述（优先使用 description，其次 _summary）"""
     if not fn_args:
         return None
-    desc = fn_args.get("_description") or fn_args.get("_summary")
+    desc = fn_args.get("description") or fn_args.get("_summary")
     if desc and isinstance(desc, str):
         desc = desc.strip()
         if len(desc) > 80:
@@ -320,7 +320,7 @@ def _extract_web_search_result_count(result_content: Any) -> Optional[int]:
 def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     """
     生成单个工具进行时的摘要（执行中）。
-    优先使用自定义 _description，否则按照规范显示固定进行时文本。
+    优先使用自定义 description，否则按照规范显示固定进行时文本。
     """
     fn_args = fn_args or {}
 
@@ -331,8 +331,8 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
         return query if query else "Searching the web"
 
     # ---------- text_editor ----------
-    # 注意：text_editor 不再声明 _description（意图）参数，摘要一律按
-    # 「动作 + 文件名 + 行数差异」规范生成，模型即使惯性带上 _description
+    # 注意：text_editor 不再声明 description（意图）参数，摘要一律按
+    # 「动作 + 文件名 + 行数差异」规范生成，模型即使惯性带上 description
     # 也不被采用（因此本分支必须位于 custom_desc 检查之前）。
     if fn_name == "text_editor":
         command = str(fn_args.get("command") or "")
@@ -347,9 +347,9 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
         return f"Editing file {name}" if name else "Editing file"
 
     # ---------- todo / memory / subagent / deliver_reply ----------
-    # 与 text_editor 同规范：这些工具不声明 _description（意图）参数，
+    # 与 text_editor 同规范：这些工具不声明 description（意图）参数，
     # 进行态摘要一律按「动作 + 对象」规范生成，模型即使惯性带上
-    # _description 也不被采用（因此本分支必须位于 custom_desc 检查之前）。
+    # description 也不被采用（因此本分支必须位于 custom_desc 检查之前）。
     if fn_name == "todo":
         action = _requested_action(fn_args)
         if action == "add":
@@ -479,7 +479,7 @@ def _generate_action_description(fn_name: str, fn_args: Optional[dict] = None) -
         return ""
 
     # ---------- todo / memory / subagent / deliver_reply ----------
-    # 与 text_editor 同规范：不声明 _description，动作描述一律按
+    # 与 text_editor 同规范：不声明 description，动作描述一律按
     # 「动作 + 对象」生成；本分支位于 custom_desc 检查之前，模型惯性
     # 携带的意图字段不被采用。工具组进行态标题由本描述首字母大写而来。
     if fn_name == "todo":
@@ -564,13 +564,13 @@ def _tool_limit_summary() -> str:
     )
 
 
-# 有界快速字段扫描：只看头部前 4KB。command/path/query/url/_description
+# 有界快速字段扫描：只看头部前 4KB。command/path/query/url/description
 # 等控制字段在参数对象的最前面（大体积负载如 file_text / new_str 排在其
 # 后），因此即使参数超过修复器的尺寸闸门、或 JSON 尚未闭合，也能拿到
 # 进行态摘要所需的关键字段。
 _FAST_SCAN_PREFIX_LEN = 4096
 _FAST_FIELD_RE = re.compile(
-    r'"(command|path|query|url|_description|_summary)"\s*:\s*"((?:[^"\\]|\\.)*)"'
+    r'"(command|path|query|url|description|_summary)"\s*:\s*"((?:[^"\\]|\\.)*)"'
 )
 
 
@@ -579,7 +579,7 @@ def _fast_scan_fields(args_str: str) -> dict:
 
     只匹配未转义的真实字段键——字符串值内部的引号在 JSON 里必然被
     转义（\\"），不会被误认成字段边界。同一字段取首次出现，反转义
-    优先按 JSON 字符串字面量解析（与旧 _description 正则相同的策略，
+    优先按 JSON 字符串字面量解析（与旧 description 正则相同的策略，
     可正确处理 \\uXXXX、\\\\ 等全部转义序列）。
     """
     fields: dict = {}
@@ -826,9 +826,9 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         return "Searched the web"
 
     # ---------- text_editor ----------
-    # text_editor 不再声明 _description（意图）参数：完成态摘要一律按
+    # text_editor 不再声明 description（意图）参数：完成态摘要一律按
     # 「动作 + 文件名 + 行数差异」规范生成（本分支位于 custom_desc 检查
-    # 之前，模型惯性携带的 _description 不会被采用）。
+    # 之前，模型惯性携带的 description 不会被采用）。
     if fn_name == "text_editor":
         command = str(fn_args.get("command") or "")
         name = _editor_target_name(fn_args)

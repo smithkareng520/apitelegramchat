@@ -580,7 +580,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
     # ===================== Bash 工具格式化 =====================
     elif fn_name == "bash":
-        # 优先展示模型提供的意图描述（_description/_summary），让用户一眼
+        # 优先展示模型提供的意图描述（description/_summary），让用户一眼
         # 看到命令目的；未提供时退化为命令首行摘要。意图文本直接原样展示、
         # 不加符号，与进行时摘要（tool_summary._generate_initial_tool_summary、
         # rich_message_builder._refresh_outer_summary 的 custom_desc 规范）一致，

@@ -22,7 +22,7 @@
    - 库缺失时退回内置轻量校验器（required / type / enum /
      items / anyOf 必填二选一），核心能力不依赖第三方包；
    - **对未知多余键宽容**（额外属性不算错误）：本项目约定模型可在
-     参数里携带 ``_description`` / ``_summary`` 等展示性键，且
+     参数里携带 ``description`` / ``_summary`` 等展示性键，且
      各家 provider 对 additionalProperties 的支持不一，按主流
      实践只校验「声明的字段是否符合声明」，不惩罚额外字段。
 
@@ -133,7 +133,7 @@ def _iter_jsonschema_errors(args: dict, schema: dict) -> list:
         validator = cls(schema)
         for err in validator.iter_errors(args):
             if err.validator == "additionalProperties":
-                # 未知额外键：本项目约定模型可带 _description 等展示键，
+                # 未知额外键：本项目约定模型可带 description 等展示键，
                 # 主流实践也只校验「声明的字段是否符合声明」，不惩罚额外字段。
                 continue
             if err.validator in ("anyOf", "oneOf") and err.context:

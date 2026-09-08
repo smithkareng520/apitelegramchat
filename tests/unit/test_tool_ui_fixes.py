@@ -5,8 +5,8 @@
    （标题链接 + 来源徽标 + 斜体摘要，自旧版恢复）；message_user 及其他
    纯文本返回的工具，统一用 ``<pre><code>`` 等宽代码面板展示（与 bash /
    text_editor 同规范）；
-2. ``_description`` 不再被 normalize_tool_schema 强制注入 required，
-   且只有 bash 声明该字段；web_search 不带 _description 可通过校验；
+2. ``description`` 不再被 normalize_tool_schema 强制注入 required，
+   且只有 bash 声明该字段；web_search 不带 description 可通过校验；
 3. memory / todo / subagent / deliver_reply 完成态摘要按「动作 + 对象」
    生成（与 text_editor 同规范），不再退化为默认的 "Ran an action"；
    组摘要同步按动作细分并改为动词短语，不再豁免首字母小写规范；
@@ -95,7 +95,7 @@ def test_unknown_tool_output_wrapped_in_code_panel():
 
 
 # =========================================================================
-# 问题 2：_description 仅 bash 声明且必填
+# 问题 2：description 仅 bash 声明且必填
 # =========================================================================
 
 def test_normalize_tool_schema_does_not_inject_required_description():
@@ -106,7 +106,7 @@ def test_normalize_tool_schema_does_not_inject_required_description():
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "_description": {"type": "string"},
+                    "description": {"type": "string"},
                     "query": {"type": "string"},
                 },
                 "required": [],
@@ -116,7 +116,7 @@ def test_normalize_tool_schema_does_not_inject_required_description():
     norm = normalize_tool_schema(tool)
     assert norm["function"]["parameters"]["required"] == []
     # 字段仍排在 properties 首位（展示顺序规范化保留）
-    assert list(norm["function"]["parameters"]["properties"])[0] == "_description"
+    assert list(norm["function"]["parameters"]["properties"])[0] == "description"
     # 深拷贝：原对象不被修改
     assert tool["function"]["parameters"]["required"] == []
 
@@ -129,24 +129,24 @@ def test_search_tool_schemas_description_only_on_bash():
     by_name = {t["function"]["name"]: t for t in tools}
     assert "web_search" in by_name
     ws_props = by_name["web_search"]["function"]["parameters"]["properties"]
-    assert "_description" not in ws_props
-    assert "_description" not in (by_name["web_search"]["function"]["parameters"].get("required") or [])
+    assert "description" not in ws_props
+    assert "description" not in (by_name["web_search"]["function"]["parameters"].get("required") or [])
 
     bash_params = by_name["bash"]["function"]["parameters"]
-    assert "_description" in bash_params["properties"]
-    assert bash_params["required"] == ["_description", "command"]
+    assert "description" in bash_params["properties"]
+    assert bash_params["required"] == ["description", "command"]
 
     for name in ("weather", "exchange_rate",
                  "geocode", "route", "distance", "poi_keyword_search",
                  "poi_nearby_search", "poi_details"):
-        assert "_description" not in by_name[name]["function"]["parameters"]["properties"], name
+        assert "description" not in by_name[name]["function"]["parameters"]["properties"], name
 
 
 def test_memory_todo_schemas_have_no_description():
     from memory_tool import MEMORY_TOOL
     from todo_tool import TODO_TOOL
-    assert "_description" not in MEMORY_TOOL["function"]["parameters"]["properties"]
-    assert "_description" not in TODO_TOOL["function"]["parameters"]["properties"]
+    assert "description" not in MEMORY_TOOL["function"]["parameters"]["properties"]
+    assert "description" not in TODO_TOOL["function"]["parameters"]["properties"]
 
 
 def test_web_search_without_description_passes_validation():
@@ -207,8 +207,8 @@ def test_action_description_for_memory_todo():
     assert _generate_action_description("memory", {}) == "listing memories"
     assert _generate_action_description("todo", {}) == "listing todos"
     assert _generate_action_description("todo", {"action": "add"}) == "adding a todo"
-    # 惯性携带的 _description 不被采用（位于 custom_desc 检查之前）
-    assert _generate_action_description("todo", {"action": "add", "_description": "写待办"}) == "adding a todo"
+    # 惯性携带的 description 不被采用（位于 custom_desc 检查之前）
+    assert _generate_action_description("todo", {"action": "add", "description": "写待办"}) == "adding a todo"
 
 
 def test_single_block_done_summaries_todo():

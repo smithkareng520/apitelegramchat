@@ -15,7 +15,7 @@
 | 工具 | 运行时·工具组折叠块 | 运行时·工具折叠块 | 运行后·工具组折叠块（成功） | 运行后·工具折叠块（成功） |
 |---|---|---|---|---|
 | web_search | Searching the web | 搜索词本身（如 `球球大作战 最新活动`） | Searched the web（单复同形） | `搜索词 N results`（解析不出数量时 Searched the web） |
-| bash | 命令前 30 字符（带 `_description` 时显示意图文本） | 同左 | Ran a command / Ran {n} commands | `_description` 文本（必填通常有）；无则 Ran a command；复合命令部分成功为 Ran a command (partial success) |
+| bash | 命令前 30 字符（带 `description` 时显示意图文本） | 同左 | Ran a command / Ran {n} commands | `description` 文本（必填通常有）；无则 Ran a command；复合命令部分成功为 Ran a command (partial success) |
 | text_editor · view | Viewing file {文件名} | 同左 | Viewed a file / Viewed {n} files | Viewed file {文件名} |
 | text_editor · create | Creating file {文件名} +n | 同左 | Created a file / Created {n} files | Created file {文件名} +n |
 | text_editor · str_replace / insert | Editing file {文件名} +n -n | 同左 | Edited a file / Edited {n} files | Edited file {文件名} +n -n |
@@ -92,7 +92,7 @@
 | 完成态大小写 | 组内第一条描述首字母大写，后续全部小写（如 `Ran a command, saved a memory, added a todo`）；无任何豁免 |
 | 完成态聚合 | 成功工具按「组类型」聚合计数；todo / memory 按 action 派生组类型，generate_image 按 image_url 是否携带派生（image_generate / image_edit，对标 text_editor 按 command 派生），toggle 方向与 deliver_reply 是否静默从单块最终摘要回推 |
 | 统一图像工具新旧名 | generate_image 为统一入口（image_url 缺省=文生图、提供=编辑）；旧名 generate_image_from_text / edit_image_with_reference 仍可分发但不再进入工具清单，折叠块文案按各自语义（文生图/编辑）显示，与同名新工具一致 |
-| `_description` 优先 | 参数带 `_description/_summary` 时，组标题与工具标题（运行时+完成后）优先显示它；现仅 bash 声明；web_search / text_editor / todo / memory / subagent / deliver_reply 始终按规范文案生成 |
+| `description` 优先 | 参数带 `description/_summary` 时，组标题与工具标题（运行时+完成后）优先显示它；现仅 bash 声明；web_search / text_editor / todo / memory / subagent / deliver_reply 始终按规范文案生成 |
 | 单复数 | 组内同类工具 ≥2 时切复数模板；不可数对象的动作（Listed todos / Searched memories 等）单复同形 |
 | "Ran an action" 兜底 | 仅当未知工具名漏过所有分支时出现；当前全部已声明工具均有专属文案 |
 | 展开正文形态 | bash / text_editor / web_search / message_user / exchange_rate / deliver_reply 等为 `pre/code` 等宽面板；todo / memory / subagent / weather 为富文本卡片；qr_code / 图片 / 视频为媒体卡片 |

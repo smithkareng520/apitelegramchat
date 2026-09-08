@@ -596,7 +596,7 @@ async def _agentic_loop_openai_compat(
                             if idx in added_tool_indices:
                                 # 工具调用参数在流式接收过程中不再实时渲染预览；
                                 # 最终结果会在工具执行完成后按统一的 Input/Output 格式一次性展示。
-                                # 但参数中一旦解析出模型提交的简短描述（_description/_summary），
+                                # 但参数中一旦解析出模型提交的简短描述（description/_summary），
                                 # 或完整 JSON 解析出 query/command/url 等字段，就立即更新摘要上屏，
                                 # 不再等到整段参数流结束后才由工具批次补写。
                                 # 更新一律按条目当前 id（占位或真实）寻址，占位条目同样

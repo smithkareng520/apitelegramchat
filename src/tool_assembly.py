@@ -19,14 +19,14 @@ def valid_tool_defs(tools: Iterable[Any] | None) -> list[dict]:
 def normalize_tool_schema(tool: dict) -> dict:
     """规范化发给模型的工具 schema。
 
-    历史行为（已移除）：曾把 ``_description`` 强制注入每个声明了该字段的
+    历史行为（已移除）：曾把 ``description`` 强制注入每个声明了该字段的
     工具的 ``required``——这会让 web_search 等用不到该字段的工具因「缺
-    _description」被参数校验整单拒绝。现在工具是否声明/必填
-    ``_description`` 完全以 schema 源码声明为准（当前只有 bash 声明且
+    description」被参数校验整单拒绝。现在工具是否声明/必填
+    ``description`` 完全以 schema 源码声明为准（当前只有 bash 声明且
     必填，其余工具一律不声明该字段）。
 
     保留的规范化：
-    - 声明了 ``_description`` 的工具（即 bash）把该字段排到 properties
+    - 声明了 ``description`` 的工具（即 bash）把该字段排到 properties
       首位，让模型在长参数（command 等）之前先看到意图描述；
     - text_editor 把 ``command`` 排到首位（封闭枚举，便于流式推断）。
     """
@@ -36,10 +36,10 @@ def normalize_tool_schema(tool: dict) -> dict:
         params = tool["function"]["parameters"]
         props = params.get("properties")
         if isinstance(props, dict):
-            if "_description" in props:
+            if "description" in props:
                 params["properties"] = {
-                    "_description": props["_description"],
-                    **{k: v for k, v in props.items() if k != "_description"},
+                    "description": props["description"],
+                    **{k: v for k, v in props.items() if k != "description"},
                 }
             elif tool.get("function", {}).get("name") == "text_editor" and "command" in props:
                 params["properties"] = {

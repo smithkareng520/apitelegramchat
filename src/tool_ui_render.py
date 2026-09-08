@@ -764,7 +764,7 @@ def _render_bash_result(result_str: str, fn_args: dict | None = None) -> str:
     第一行 —— 用户在草稿富文本里看到 Input 显示成 ``python3 -c "`` 的截断
     假象就来自这里（并非被过滤，而是解析丢了后续行）。
 
-    Input 块只展示实际输入（命令本身）；模型提供的意图描述（_description）
+    Input 块只展示实际输入（命令本身）；模型提供的意图描述（description）
     由卡片摘要行（``🖥 意图``）单独呈现，不混入 Input，避免重复与语义混淆。
 
     信封格式现为终端回放式（``/abs/cwd$ cmd`` + ``Exit code:`` + 输出）；
@@ -807,7 +807,7 @@ def _render_editor_result(command: str, path: str, result_str: str, arguments: d
     """Render text-editor calls as explicit, quote-formatted Input and Output."""
     arguments = arguments or {}
     if command == "view":
-        # text_editor 不声明 _description（意图）参数：Input 直接展示实际
+        # text_editor 不声明 description（意图）参数：Input 直接展示实际
         # 输入（目标路径 + 可选行范围），与写操作展示真实参数的策略一致。
         view_input = str(path or "").strip()
         view_range = arguments.get("view_range")

@@ -523,7 +523,7 @@ class RichMessageBuilder:
     def update_tool_args(self, tool_id: str, fn_args: dict) -> None:
         """流式接收工具参数期间更新条目参数，并即时刷新可见摘要。
 
-        模型提交的简短描述（``_description``/``_summary``）一旦能从（可能
+        模型提交的简短描述（``description``/``_summary``）一旦能从（可能
         还不完整的）参数中解析出来，就直接作为条目摘要与工具组外部摘要
         上屏，而不是先停留在通用进行态文本、等整段参数流结束后才更新；
         完整 JSON 中途解析成功时，query/command/url 等字段同样按进行态
@@ -564,7 +564,7 @@ class RichMessageBuilder:
     def _refresh_outer_summary(self, group: dict) -> None:
         """
         刷新工具组的外部摘要（进行时状态）
-        优先使用自定义 _description，否则使用规范中的进行时固定文本。
+        优先使用自定义 description，否则使用规范中的进行时固定文本。
         """
         if group.get("finished", False):
             group["outer_summary"] = self._generate_group_summary(group)
@@ -588,10 +588,10 @@ class RichMessageBuilder:
             self.request_flush(force=False)
             return
 
-        # text_editor 不声明 _description（意图）参数：折叠块进行时标题
+        # text_editor 不声明 description（意图）参数：折叠块进行时标题
         # 与单工具块摘要保持完全一致，一律按「动作 + 文件名 + diff 统计」
         # 规范生成（Viewing/Creating/Editing file xxx.py +n -n）。模型即使
-        # 惯性携带 _description 也不被采用，因此本分支必须位于 custom_desc
+        # 惯性携带 description 也不被采用，因此本分支必须位于 custom_desc
         # 检查之前。参数流式更新期间 update_tool_args 会反复调用本函数，
         # 折叠块标题因此随 diff 统计动态刷新。
         if t == "text_editor":
