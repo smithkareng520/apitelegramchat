@@ -14,6 +14,19 @@ from typing import List, Tuple
 # &amp;amp;（用户侧会看到字面量 "&amp;" 而不是 "&"）。
 _BARE_AMP_RE = re.compile(r'&(?![A-Za-z][A-Za-z0-9]*;|#[0-9]+;|#[xX][0-9A-Fa-f]+;)')
 
+# 块级标签切分：把「文字 + 块级标签混排」的转换产物按块切开。
+# 非贪婪匹配 + DOTALL（<pre> 的代码内容可跨多行）。
+# <hr/> 为自闭合标签，单独列出（<p> 内出现 <hr/> 同样属于非法嵌套）。
+_RICH_BLOCK_SPLIT_RE = re.compile(
+    r'(<details>.*?</details>|<ul>.*?</ul>|<ol>.*?</ol>|<pre>.*?</pre>'
+    r'|<blockquote>.*?</blockquote>|<table>.*?</table>'
+    r'|<h[1-6]>.*?</h[1-6]>|<hr\s*/?>)',
+    re.DOTALL | re.IGNORECASE,
+)
+
+# 视为「已是块级/段落结构」的前缀。'<h' 同时覆盖 <h1>..<h6> 与 <hr/>。
+_BLOCK_START_PREFIXES = ('<p>', '<details', '<h', '<ul>', '<ol>', '<pre>', '<blockquote>', '<table>')
+
 
 def _escape_prose(text: str) -> str:
     """转义正文中裸露的 `<`、`>`、`&`，但保留已有的 HTML 实体。
@@ -198,9 +211,12 @@ def _extract_code_block(lines: List[str]) -> Tuple[str, int]:
         code_lines.append(lines[i])
         i += 1
     
-    # 转义代码内容
+    # 转义代码内容。用 _escape_prose 而非 html_lib.escape：后者对
+    # 「已按提示词输出合法实体」的代码（如 &lt;、&amp;）会二次转义成
+    # &amp;lt;，Telegram 会把字面量 &amp;lt; 原样画给用户。
+    # _escape_prose 只转义裸 &，对已转义实体幂等。
     code_content = '\n'.join(code_lines)
-    escaped_code = html_lib.escape(code_content)
+    escaped_code = _escape_prose(code_content)
     
     if lang:
         html = f'<pre><code class="language-{html_lib.escape(lang)}">{escaped_code}</code></pre>'
@@ -358,9 +374,14 @@ def _convert_inline(text: str) -> str:
 
     # 1) 行内代码：必须先处理，内容整体转义并保护，内部星号/下划线/HTML 标签不再参与解析
     #    如果后处理，代码中的 `<b>` 会被第 2 步误认为真实标签而保护，导致无法转义
+    #    用 _escape_prose 而非 html_lib.escape：sendRichMessage 在发送前会对
+    #    已转换 HTML 再跑一遍本转换器（_rich_message_html_payload 第 0 步），
+    #    此时行内代码内容往往已含第一遍转义出的实体（&lt; 等），
+    #    html.escape 会二次转义成 &amp;lt;（用户看到字面量 "&lt;"）。
+    #    _escape_prose 对已有实体幂等，两遍转换结果一致。
     text = re.sub(
         r'`([^`]+)`',
-        lambda m: _park(f'<code>{html_lib.escape(m.group(1))}</code>'),
+        lambda m: _park(f'<code>{_escape_prose(m.group(1))}</code>'),
         text,
     )
 
@@ -417,3 +438,38 @@ def _convert_inline(text: str) -> str:
 def _escape_attr(url: str) -> str:
     """转义要写入 href/src 属性的 URL。"""
     return html_lib.escape(url, quote=True)
+
+
+def wrap_mixed_content_as_blocks(converted: str) -> str:
+    """把 Markdown 转换产物整理为 Telegram Rich Message 合法的块级序列。
+
+    ``convert_markdown_to_telegram_html`` 的产物有三种形态：
+
+    1. 纯行内文本（无块级标签）——包一个 ``<p>``（换行转 ``<br/>``）；
+    2. 块级标签与文字混排（如"说明文字 + Markdown 列表"被转换成
+       ``<ul>``）——绝不能整体包进单个 ``<p>``，否则产出
+       ``<p>…<ul>…</ul>…</p>`` 非法嵌套。Telegram Rich Message
+       解析器结构校验严格，会以 400（rich_message 结构类错误）拒绝
+       整条消息，触发 plain-text fallback 后用户看到的是整条退化为
+       无格式纯文本。这里按块级标签切段：块级段原样保留，纯文本段
+       分别包 ``<p>``。
+    3. 以块级标签开头但尾部带文字——同样按段切开，避免顶部块之后
+       残留裸文本节点。
+
+    本函数假定输入已经过 HTML 转义或为转换器产物，不再做转义。
+    """
+    stripped = (converted or "").strip()
+    if not stripped:
+        return ""
+    segments: List[str] = []
+    for part in _RICH_BLOCK_SPLIT_RE.split(converted):
+        if not part or not part.strip():
+            continue
+        if part.lstrip().startswith(_BLOCK_START_PREFIXES):
+            segments.append(part.strip())
+        else:
+            segments.append(f"<p>{part.strip().replace(chr(10), '<br/>')}</p>")
+    if not segments:
+        # 正常不会走到（空串已在上面返回）；防御性回退为单段落。
+        return f"<p>{stripped.replace(chr(10), '<br/>')}</p>"
+    return ''.join(segments)

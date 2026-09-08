@@ -36,6 +36,8 @@ import aiohttp
 
 from config import BASE_URL
 from utils import send_rich_html_message, escape_html
+from markdown_converter import convert_markdown_to_telegram_html, wrap_mixed_content_as_blocks
+from core.rich_media import _rich_message_html_payload
 from token_budget import truncate_to_token_budget
 
 logger = logging.getLogger(__name__)
@@ -159,23 +161,51 @@ def _build_keyboard(interaction: AskUserInteraction) -> dict:
     return {"inline_keyboard": rows}
 
 
+def _question_rich_text(question: str) -> str:
+    """把 LLM 提供的 question 文本渲染为块级安全的富文本正文。
+
+    此前整条链路只做 ``escape_html``：markdown 语法（**粗体**、`代码`、
+    列表等）原样留在 HTML 里。初始卡片发送时还能靠 sendRichMessage
+    发送前的兜底转换（``_rich_message_html_payload`` 第 0 步）补救，
+    但回答/超时后的 ``editMessageText`` 路径完全不经过任何转换，
+    用户会看到字面量 "**xx**" 与反引号——即 message 工具的富文本
+    "没有进行 markdown to telegram html 转换" 的现象。
+
+    现在在构造时统一渲染，发送与编辑两个路径渲染结果一致：
+
+    1. 先 ``escape_html``：question 来自 LLM 工具参数，若直接进转换器，
+       形如 ``<script>`` / ``<img onerror=...>`` 的内容会被转换器当
+       "既有 HTML 标签"原样保留（转换器的 HTML/Markdown 混排支持），
+       形成注入。先转义再转换，既保留 markdown 语法（**、`、列表
+       不受转义影响），又让 HTML 特殊字符按字面展示；
+    2. 再 ``convert_markdown_to_telegram_html``（配合转换器的幂等
+       转义修复，已转义实体不会被二次转义）；
+    3. 最后 ``wrap_mixed_content_as_blocks``：question 里的 markdown
+       列表等块级产物单独成块，避免被包进 ``<p>`` 产生非法嵌套。
+    """
+    escaped = escape_html(str(question or ""))
+    if not escaped:
+        return ""
+    return wrap_mixed_content_as_blocks(convert_markdown_to_telegram_html(escaped))
+
+
 def _question_html(interaction: AskUserInteraction) -> str:
     """构造 message_user 消息卡片 HTML。
 
     安全修复：question / label / description 均来自 LLM 工具调用参数，
     若不转义，LLM 一旦输出含 ``<script>`` 或 ``<img onerror=...>`` 的
     文本，就会作为原始 HTML 渲染在用户的客户端。所有插值必须经
-    escape_html 转义。
+    escape_html 转义。question 的 markdown 渲染见 _question_rich_text。
     """
-    question = escape_html(interaction.question)
+    question = _question_rich_text(interaction.question)
     if not interaction.options:
         # 发消息模式（给用户发消息）：无需选择，用户直接回复文本即可。
         # 超时后本卡片会被编辑成只剩纯文本正文（见 wait_for_answer）。
         return (
-            f"<p>📨 <b>助手消息</b></p><p>{question}</p>"
+            f"<p>📨 <b>助手消息</b></p>{question}"
             f"<p><i>直接回复文本即可；长时间不回复本消息会自动过期。</i></p>"
         )
-    lines = [f"<p>🤔 <b>需要你的确认</b></p><p>{question}</p>"]
+    lines = [f"<p>🤔 <b>需要你的确认</b></p>{question}"]
     lines.append("<ul>")
     for option in interaction.options:
         label = escape_html(option.get("label", ""))
@@ -306,13 +336,13 @@ async def _set_markup(message_id: int | None, chat_id: int, markup: dict | None)
 async def _edit_question_message(interaction: AskUserInteraction, body_html: str) -> None:
     if not interaction.message_id:
         return
+    # 与所有其他发送路径一致：经 _rich_message_html_payload 构造 payload，
+    # 补上此前缺失的 markdown 兜底转换与媒体清理。此前的裸
+    # {"content", "html"} payload 是 message 工具富文本唯一未走转换的路径。
     payload = {
         "chat_id": interaction.chat_id,
         "message_id": interaction.message_id,
-        "rich_message": {
-            "content": body_html,
-            "html": body_html,
-        },
+        "rich_message": _rich_message_html_payload(body_html),
         "reply_markup": {"inline_keyboard": []},
     }
     try:
@@ -331,22 +361,22 @@ def _answered_html(interaction: AskUserInteraction, answer: dict[str, Any]) -> s
     custom 的 value 是用户自由文本——都必须 escape，否则任意一方包含
     HTML 字符都会注入到用户客户端的渲染上下文。
     """
-    q = escape_html(interaction.question)
+    q = _question_rich_text(interaction.question)
     kind = answer.get("type")
     if kind == "choice":
         selected = answer.get("selected") or []
         labels = [str(item.get("label", "")) for item in selected if isinstance(item, dict)]
         chosen_raw = "、".join(x for x in labels if x) or "已选择"
         chosen = escape_html(chosen_raw)
-        return f"<p>✅ <b>已收到你的选择</b></p><p>{q}</p><p><b>{chosen}</b></p>"
+        return f"<p>✅ <b>已收到你的选择</b></p>{q}<p><b>{chosen}</b></p>"
     if kind == "custom":
         value = truncate_to_token_budget(str(answer.get("value", "")), ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET, suffix="…")
-        return f"<p>✅ <b>已收到你的回答</b></p><p>{q}</p><p><blockquote>{escape_html(value)}</blockquote></p>"
+        return f"<p>✅ <b>已收到你的回答</b></p>{q}<p><blockquote>{escape_html(value)}</blockquote></p>"
     if kind == "cancelled":
-        return f"<p>✖️ <b>已取消</b></p><p>{q}</p>"
+        return f"<p>✖️ <b>已取消</b></p>{q}"
     if kind == "expired":
-        return f"<p>⌛ <b>用户未回复</b>（可能不在线）</p><p>{q}</p>"
-    return f"<p>✅ <b>已收到回答</b></p><p>{q}</p>"
+        return f"<p>⌛ <b>用户未回复</b>（可能不在线）</p>{q}"
+    return f"<p>✅ <b>已收到回答</b></p>{q}"
 
 
 async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: str, action: str, arg: str = "") -> tuple[bool, str]:
@@ -483,7 +513,7 @@ async def wait_for_answer(interaction: AskUserInteraction) -> dict[str, Any]:
             # 没人回，消息本身安静地留在聊天记录里就够了。
             await _edit_question_message(
                 interaction,
-                f"<p>{escape_html(interaction.question)}</p>",
+                _question_rich_text(interaction.question),
             )
         await _clear_pending(interaction)
         return {"type": "expired"}

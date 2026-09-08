@@ -74,7 +74,9 @@ def test_blockquote_with_inline_format():
 
 def test_code_block_with_language_and_escaping():
     text = "```python\nprint('hi')\nprint('line2')\n```"
-    expected_code = html_lib.escape("print('hi')\nprint('line2')")
+    # 代码内容转义与 _escape_prose 同语义：只转义裸 &、<、>；
+    # pre/code 文本内容中的引号是普通字符，无需也不应转义为 &#x27;。
+    expected_code = _escape_prose("print('hi')\nprint('line2')")
     assert convert(text) == (
         f'<pre><code class="language-python">{expected_code}</code></pre>'
     )
@@ -82,7 +84,7 @@ def test_code_block_with_language_and_escaping():
 
 def test_code_block_without_language():
     text = "```\nplain <code>\n```"
-    assert convert(text) == f"<pre><code>{html_lib.escape('plain <code>')}</code></pre>"
+    assert convert(text) == f"<pre><code>{_escape_prose('plain <code>')}</code></pre>"
 
 
 def test_unterminated_code_block_passthrough():
@@ -136,10 +138,24 @@ def test_code_span_with_pseudo_tag_no_placeholder_leak():
 
 
 def test_code_span_with_real_tag_nested_unpark():
-    # 行内代码内含真实 HTML 标签：占位符嵌套必须全部回填，无 \x00 残留
+    # 行内代码内含真实 HTML 标签：占位符嵌套必须全部回填，无 \x00 残留；
+    # 标签按字面转义展示（&lt;b&gt;），不参与外层 HTML 解析。
+    # （原断言 "<b>" in out 写反了：转义后的输出不可能含裸 <b>。）
     out = convert("用 `<b>` 与 `</b>` 包裹")
     assert "\x00" not in out
-    assert "<code>" in out and "<b>" in out
+    assert "<code>" in out and "&lt;b&gt;" in out and "&lt;/b&gt;" in out
+
+
+def test_inline_code_and_code_block_idempotent_under_second_pass():
+    # 回归（sendRichMessage 双重转换）：_rich_message_html_payload 在发送前
+    # 会对已转换 HTML 再跑一遍转换器。行内代码/代码块内容若用
+    # html.escape 转义，已有实体 &lt; 会被二次转义成 &amp;lt;（用户看到
+    # 字面量 "&lt;"）。修复后两遍转换结果必须完全一致。
+    once = convert("<details><summary>使用 `&lt;tg-time&gt;` 标签</summary></details>")
+    twice = convert(once)
+    assert once == twice
+    assert "&amp;lt;" not in twice
+    assert "<code>&lt;tg-time&gt;</code>" in twice
 
 
 def test_inline_code_escapes_and_protects_content():

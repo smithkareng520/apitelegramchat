@@ -32,7 +32,7 @@ from ai.tool_summary import (
     _generate_pending_tool_summary,
     _get_tool_description_from_args,
 )
-from markdown_converter import convert_markdown_to_telegram_html
+from markdown_converter import convert_markdown_to_telegram_html, wrap_mixed_content_as_blocks
 
 logger = get_logger(__name__)
 
@@ -140,6 +140,13 @@ def _render_reasoning_html(content: str) -> str:
     转换为 Telegram HTML 标签。转换器内部会正确转义 HTML 代码示例，不会破坏
     外层折叠块的结构。空内容返回空串：调用方（``_build_html*``）对空思考块
     整块跳过，等首个字符到达后再渲染折叠块，不再输出"思考中…"占位。
+
+    结构安全：转换产物经 ``wrap_mixed_content_as_blocks`` 整理。此前这里
+    对「不以块级标签开头」的产物一律整体包单个 ``<p>``，当思考内容是
+    「文字 + Markdown 列表」混排时（模型思考中极其常见），列表转换出的
+    ``<ul>`` 会被吞进段落里，产出 ``<p>…<ul>…</ul>…</p>`` 非法嵌套，
+    Telegram 以 400 rich_message 结构类错误拒绝整条消息，触发
+    plain-text fallback——用户看到整条回复退化为无格式纯文本。
     """
     text = (content or "").strip()
     if not text:
@@ -149,11 +156,8 @@ def _render_reasoning_html(content: str) -> str:
     # 使用 Markdown 转换器处理思考内容
     converted = convert_markdown_to_telegram_html(text)
     
-    # 如果转换结果是纯文本（不包含块级标签），用 <p> 包裹并保留换行
-    if not converted.strip().startswith(('<p>', '<h', '<ul>', '<ol>', '<pre>', '<blockquote>', '<table>')):
-        return f"<p>{converted.replace(chr(10), '<br/>')}</p>"
-    
-    return converted
+    # 按块级标签切段后包 <p>：混排内容不再整体塞进单个 <p>。
+    return wrap_mixed_content_as_blocks(converted)
 
 
 def _scan_rich_html_boundaries(

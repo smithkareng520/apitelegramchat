@@ -211,7 +211,7 @@ _BASE_PROMPT = """
   <tr><td><code>t</code></td><td>短时间</td><td>22:45</td></tr>
   <tr><td><code>T</code></td><td>长时间</td><td>22:45:00</td></tr>
 </table>
-<p>除 <code>r</code> 外，其余字符可自由组合，例如 <code>format="wDT"</code> 渲染为“星期二，2022 年 3 月 17 日 22:45:00”。</p>
+<p>除 <code>r</code> 外，其余字符可自由组合，例如 <code>format="wDT"</code> 渲染为“星期二，2022 年 3 月 17 日 22:45:00”。<b>format 值中不得包含空格或其他分隔符</b>（要短时间用 <code>t</code>，直接写 <code>wDTt</code>，不要写 <code>wDT t</code>）。</p>
 
 <h3>1.6 按钮 <code><tg-button></code></h3>
 <p>写法：<code><tg-button type="url" url="https://example.com" style="success">按钮显示文本</tg-button></code>。标签内文本即按钮上的文字；按钮须作为<b>独立块级元素</b>输出，不要塞进段落、列表或表格里。</p>
