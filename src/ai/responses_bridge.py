@@ -44,7 +44,7 @@ Responses API 与 Chat Completions 虽同属 OpenAI，但线上协议形状完�
 import hashlib
 import json
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from utils import get_logger
 from chat_actions import start_chat_action, stop_chat_action
@@ -71,6 +71,7 @@ from ai.bridge_common import (
     run_tool_batch,
 )
 from ai.cache_usage import _log_cache_usage
+from config import SUPPORTED_MODELS, explicit_cache_breakpoints_enabled
 from state import get_llm_session_key
 
 if TYPE_CHECKING:
@@ -255,6 +256,16 @@ def _convert_messages_to_responses_input(messages: list) -> tuple[str, list]:
 
 # =============================================================================
 # Responses Prompt Cache：稳定 key + GPT-5.6 原生缓存选项
+# -----------------------------------------------------------------------------
+# 缓存层级策略（与 anthropic_bridge 的 Claude 断点策略对齐）：
+#   - 默认所有请求只走自动断点：prompt_cache_options.mode="implicit" 保留
+#     1 个网关自动断点，请求里不出现任何 prompt_cache_breakpoint 字段
+#     （当前网关不支持手动断点对象，下发即 400）。
+#   - 显式断点为可选增益：仅当 explicit_cache_breakpoints_enabled() 为 True
+#     （模型字段 explicit_cache_breakpoints /
+#     RESPONSES_EXPLICIT_CACHE_BREAKPOINTS 环境变量开启）时，在自动断点
+#     之外额外下发 3 个显式断点（前部 1 固定 + 尾部 2 滚动，位置复刻
+#     Claude 策略），合计 3 显式 + 1 自动，不超每请求 4 个的上限。
 # =============================================================================
 def _responses_prompt_cache_key(api_label: str, model: str, chat_id: Any) -> str:
     """返回与项目现有 LLM session_id 完全相同的 Responses cache key。
@@ -279,135 +290,31 @@ _RESPONSES_EXPLICIT_CACHE_MARKS = 3
 _RESPONSES_TTL = "30m"
 
 
-# -----------------------------------------------------------------------------
-# 缓存参数运行时能力表（2026-09-09 bugfix）
-# -----------------------------------------------------------------------------
-# 背景：线上 xxtf 网关对 gpt-5.6-sol 返回过
-#   "prompt_cache_breakpoint is not supported on this model"
-# 静态配置（_PROVIDER_DEFAULTS["xxtf"].supports_prompt_cache=True）只能表达
-# "该厂商设计上走缓存"，无法表达"该网关当前具体接受哪些缓存字段"——同一
-# 模型名在不同网关/上游副本上对 prompt_cache_breakpoint /
-# prompt_cache_options / prompt_cache_key 的支持度可能各不相同。
-#
-# 因此这里维护一个进程级能力表：一旦网关对某 (model, base_url) 明确拒绝
-# 某个缓存字段，就把它记为 False，后续请求直接按降级后的参数集发送，
-# 避免每回合都浪费一次失败往返；正在失败的当次请求则通过"剥离该字段
-# 立即重试"保证用户回合不中断（见 _agentic_loop_openai_responses 内的
-# 降级重试循环，以及 openai_responses_chat_completions_create 的同款逻辑）。
-#
-# key 为 "模型名@网关base_url"：同一模型名在不同网关的能力互不影响。
-# 字段名即 Responses 请求里的参数名，便于与错误文本直接对应。
-_RESPONSES_CACHE_CAPABILITIES: Dict[str, Dict[str, bool]] = {}
-_CACHE_FIELD_NAMES = (
-    "prompt_cache_breakpoint",   # content block 上的显式断点对象
-    "prompt_cache_options",      # 请求级 {"mode","ttl"} 选项对象
-    "prompt_cache_key",          # 请求级会话缓存键（官方长期字段，列此仅为完备）
-)
-
-# 网关拒绝缓存字段时的错误文本特征（小写匹配）。只匹配"不支持/未识别"
-# 类措辞，不匹配纯形状错误（如 expected an object but got a boolean）——
-# 形状错误属于代码 bug，应当修代码而不是静默降级绕过缓存能力。
-_CACHE_UNSUPPORTED_MARKERS = (
-    "not supported",
-    "unsupported",
-    "does not support",
-    "unknown parameter",
-    "unrecognized",
-    "unexpected",
-)
-
-
-def _responses_cache_capability_key(client: Any, model: str) -> str:
-    """能力表条目 key：模型名 + 网关 base_url。"""
-    base_url = str(getattr(client, "base_url", "") or "")
-    return f"{model}@{base_url}"
-
-
-def _responses_cache_capabilities(client: Any, model: str) -> Dict[str, bool]:
-    """取某 (model, base_url) 的缓存字段能力表（无则初始化为全支持）。"""
-    key = _responses_cache_capability_key(client, model)
-    caps = _RESPONSES_CACHE_CAPABILITIES.get(key)
-    if caps is None:
-        caps = {field: True for field in _CACHE_FIELD_NAMES}
-        _RESPONSES_CACHE_CAPABILITIES[key] = caps
-    return caps
-
-
-def _cache_field_unsupported_in_error(error_text: Any) -> Optional[str]:
-    """从网关错误文本中识别被拒的缓存字段名；识别不出返回 None。
-
-    例："[xxtf] Responses API error: prompt_cache_breakpoint is not
-    supported on this model" -> "prompt_cache_breakpoint"。
-    兼容 SDK 异常（BadRequestError 等，str(exc) 含响应体）与流内 error
-    事件两种来源。识别不出（包括形状类错误）返回 None，交由原有错误
-    处理路径抛出。
-    """
-    text = str(error_text or "").lower()
-    if not text:
-        return None
-    for field in _CACHE_FIELD_NAMES:
-        if field in text and any(marker in text for marker in _CACHE_UNSUPPORTED_MARKERS):
-            return field
-    return None
-
-
-class _ResponsesCacheFieldRejected(Exception):
-    """网关明确拒绝某个缓存字段（不支持该模型）——触发降级重试的内部信号。
-
-    仅在 _agentic_loop_openai_responses 内部用作控制流：当且仅当本轮零
-    输出（零文本 / 零思考 / 零工具调用，对用户界面零副作用）且错误文本
-    指向某个缓存字段时抛出，由轮次级 except 捕获后把该字段记入进程级
-    能力表、剥离并重试同一轮。"""
-
-    def __init__(self, field: str, detail: str = "") -> None:
-        super().__init__(f"{field} is not supported on this model: {detail}")
-        self.field = field
-        self.detail = detail
-
-
 def _is_responses_text_content(part: Any) -> bool:
     """显式缓存断点只挂在 Responses 支持 breakpoint 的文本 content block 上。"""
     return isinstance(part, dict) and part.get("type") == "input_text"
 
 
-def _apply_responses_cache_breakpoints(input_items: list[dict], *, enabled: bool = True) -> int:
-    """硬编码 3 个显式断点，并保留 Responses 的第 4 个 implicit 断点。
+def _apply_responses_cache_breakpoints(input_items: list[dict]) -> int:
+    """在 input 上额外下发最多 3 个显式断点（网关自动断点之外）。
 
-    复刻项目原 Anthropic 显式缓存策略的结构：
-      1) 前部 1 个固定断点：稳定锚点，优先覆盖 system/instructions 之后的
-         第一段长期不变内容；
-      2) 尾部 2 个滚动断点：贴近最近的会话内容/工具回填，支持 agentic loop
-         中连续轮次缓存最近前缀。
+    ⚠️ 只应在 explicit_cache_breakpoints_enabled() 为 True 时调用（默认
+    关闭）：网关不支持手动断点对象时，请求里出现 prompt_cache_breakpoint
+    字段即 400，因此默认请求绝不携带该字段。
 
-    注意：Responses API 当前的 prompt_cache_options.ttl 对整次请求统一为
-    30m，不能逐断点设置不同 TTL。因此“前长后短”只能通过断点位置复刻
-    原策略的缓存层次，不能在同一 request 内真正设置 1h + 5m + 5m。
+    位置复刻 anthropic_bridge 的 Claude 显式缓存策略（断点 1..3，不含
+    顶层 system 段——Responses 的 instructions 是纯字符串参数，无法挂
+    breakpoint，该层由保留的 implicit 自动断点兜底）：
+      1) 前部 1 个固定断点：输入中第一个可用文本块（稳定锚点，覆盖
+         开场上下文注入，对应 Claude 断点 1“第一条 user 消息末尾”）；
+      2) 尾部 2 个滚动断点：输入中最后两个可用文本块（贴近最近的会话
+         内容，支持连续轮次缓存最近前缀，对应 Claude 断点 2&3“倒数
+         第二条 / 最后一条消息末尾”）。
+
+    合计层级与 Claude 一致：3 个显式 + 1 个自动（implicit）。ttl 由
+    prompt_cache_options 统一为 30m，不能逐断点区分长短。
     返回实际添加的显式断点数。
-
-    enabled=False 用于降级重试（2026-09-09 bugfix）：网关已明确拒绝
-    prompt_cache_breakpoint 时，把同一份 input_items 上此前打上的标记
-    全部剥掉后原样重发（同一轮内的重试复用同一份已打标的 item dict，
-    因此必须支持撤销），返回 0。
     """
-    if not enabled:
-        stripped = 0
-        for item in input_items:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content")
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if isinstance(part, dict) and "prompt_cache_breakpoint" in part:
-                    part.pop("prompt_cache_breakpoint", None)
-                    stripped += 1
-        if stripped:
-            logger.debug(
-                "Responses 缓存降级：已剥离 %d 个 prompt_cache_breakpoint 标记",
-                stripped,
-            )
-        return 0
-
     candidates: list[tuple[int, int]] = []
     for item_index, item in enumerate(input_items):
         if not isinstance(item, dict):
@@ -446,31 +353,22 @@ def _add_responses_cache_options(
     model: str,
     chat_id: Any,
     enabled: bool = True,
-    include_options: bool = True,
-    include_key: bool = True,
 ) -> None:
-    """给 Responses 请求注入稳定 key、3 个显式断点 + 1 个 implicit 断点。
-
-    include_options / include_key 供缓存参数降级重试使用（2026-09-09
-    bugfix）：网关对某模型拒绝 prompt_cache_options / prompt_cache_key
-    时逐项剥离后重发。显式断点（content block 上的
-    prompt_cache_breakpoint）挂在 input 上，不在这里，由
-    _apply_responses_cache_breakpoints 单独控制。
-    """
+    """给 Responses 请求注入稳定 key + 网关自动断点（默认唯一缓存层）。"""
     if not enabled:
         return
-    if include_key:
-        request_kwargs["prompt_cache_key"] = _responses_prompt_cache_key(
-            api_label, model, chat_id
-        )
-    if include_options:
-        # gpt-5.6+ 当前默认启用 1 个 implicit breakpoint；同时显式写入最多 3 个
-        # breakpoint，使总缓存层级稳定为：前部固定 1 + 尾部滚动 2 + 自动 1。
-        # ttl 当前只有 30m 这一档，不能逐 breakpoint 区分长短。
-        request_kwargs["prompt_cache_options"] = {
-            "mode": "implicit",
-            "ttl": _RESPONSES_TTL,
-        }
+    request_kwargs["prompt_cache_key"] = _responses_prompt_cache_key(
+        api_label, model, chat_id
+    )
+    # 默认（所有 API）：implicit 模式保留 1 个网关自动断点，是请求里
+    # 唯一的缓存层级，请求体不出现任何 prompt_cache_breakpoint 字段。
+    # 显式断点由调用方在开关开启后另行叠加（最多 3 个，见
+    # _apply_responses_cache_breakpoints），合计不超每请求 4 个上限。
+    # ttl 当前只有 30m 这一档，不能逐 breakpoint 区分长短。
+    request_kwargs["prompt_cache_options"] = {
+        "mode": "implicit",
+        "ttl": _RESPONSES_TTL,
+    }
 
 
 # =============================================================================
@@ -532,58 +430,38 @@ async def openai_responses_chat_completions_create(
     instructions, input_items = _convert_messages_to_responses_input(messages)
     responses_tools = _convert_tools_to_responses(tools) if tools else None
 
-    # ---- 缓存参数降级重试（2026-09-09 bugfix，与流式主循环同策略）----
-    # 网关对当前模型拒绝某个缓存字段（SDK 直接抛 4xx）时：把该字段记入
-    # 进程级能力表、剥离后立即重试。本路径不挂 content block 断点，通常
-    # 只会被 prompt_cache_options / prompt_cache_key 点名。
-    caps = _responses_cache_capabilities(client, model)
-    resp = None
-    for _cache_attempt in range(1 + len(_CACHE_FIELD_NAMES)):
-        request_kwargs: dict[str, Any] = {
-            "model": model,
-            "input": input_items,
-            "max_output_tokens": max_tokens,
-        }
-        _add_responses_cache_options(
-            request_kwargs,
-            api_label="responses",
-            model=model,
-            chat_id=None,
-            enabled=True,
-            include_options=caps["prompt_cache_options"],
-            include_key=caps["prompt_cache_key"],
-        )
-        if instructions:
-            request_kwargs["instructions"] = instructions
-        if temperature is not None:
-            request_kwargs["temperature"] = temperature
-        if top_p is not None:
-            request_kwargs["top_p"] = top_p
-        if reasoning:
-            request_kwargs["reasoning"] = reasoning
-        if responses_tools:
-            request_kwargs["tools"] = responses_tools
+    # 缓存层级与主循环同一策略：默认只走自动断点（implicit），请求零
+    # 显式断点字段；仅当该模型/环境变量开启 explicit_cache_breakpoints
+    # 时才额外叠加 3 个显式断点。未知模型保守视为缓存可用（保持既有
+    # enabled=True 行为），但绝不下发显式断点。
+    nonstream_model_info = SUPPORTED_MODELS.get(model)
+    cache_enabled = (
+        True if nonstream_model_info is None
+        else bool(getattr(nonstream_model_info, "supports_prompt_cache", True))
+    )
+    if cache_enabled and explicit_cache_breakpoints_enabled(nonstream_model_info):
+        _apply_responses_cache_breakpoints(input_items)
 
-        try:
-            resp = await client.responses.create(**request_kwargs)
-            break
-        except Exception as exc:
-            field = _cache_field_unsupported_in_error(
-                f"{getattr(exc, 'message', '') or ''} {exc}"
-            )
-            if field is None or not caps.get(field, False):
-                # 非缓存字段拒绝（或该字段本就未随请求发送）：照原样抛出。
-                raise
-            caps[field] = False
-            logger.warning(
-                "[responses] 网关拒绝模型 %s 的缓存字段 %s，已剥离该参数自动重试"
-                "（subagent 非流式路径）；本进程内该模型后续请求将直接跳过该字段",
-                model, field,
-            )
-    else:
-        # 降级次数耗尽仍未成功（理论不可达，同流式循环的兜底）：按缓存
-        # 错误抛出，避免 resp 为 None 时在下方解析处爆出难排查的异常。
-        raise RuntimeError("[responses] Responses API 缓存参数降级重试耗尽")
+    request_kwargs: dict[str, Any] = {
+        "model": model,
+        "input": input_items,
+        "max_output_tokens": max_tokens,
+    }
+    _add_responses_cache_options(
+        request_kwargs, api_label="responses", model=model, chat_id=None, enabled=cache_enabled
+    )
+    if instructions:
+        request_kwargs["instructions"] = instructions
+    if temperature is not None:
+        request_kwargs["temperature"] = temperature
+    if top_p is not None:
+        request_kwargs["top_p"] = top_p
+    if reasoning:
+        request_kwargs["reasoning"] = reasoning
+    if responses_tools:
+        request_kwargs["tools"] = responses_tools
+
+    resp = await client.responses.create(**request_kwargs)
 
     content_text = ""
     tool_calls: list[_SimpleToolCall] = []
@@ -704,6 +582,10 @@ async def _agentic_loop_openai_responses(
 
     reasoning_param: Optional[dict] = None
     prompt_cache_enabled = bool(model_info and getattr(model_info, "supports_prompt_cache", False))
+    # 显式断点默认关闭（所有 API 默认只走自动断点）；经模型字段
+    # explicit_cache_breakpoints 或环境变量开启后，才在自动断点之外
+    # 额外下发 3 个显式断点（位置复刻 Claude 策略）。
+    explicit_breakpoints = prompt_cache_enabled and explicit_cache_breakpoints_enabled(model_info)
     effort = getattr(model_info, "reasoning_effort", None) if model_info else None
     if effort:
         # Responses API 顶层 reasoning={"effort": ...}（o-series / gpt-5
@@ -711,91 +593,128 @@ async def _agentic_loop_openai_responses(
         # reasoning_effort 字段语义相同，形状不同。
         reasoning_param = {"effort": str(effort).lower()}
 
-    # ---- 缓存参数运行时能力表（2026-09-09 bugfix）----
-    # 同一模型名在不同网关/上游副本上对 prompt_cache_breakpoint /
-    # prompt_cache_options 的支持度可能不同（线上 xxtf 的 gpt-5.6-sol
-    # 返回过 "prompt_cache_breakpoint is not supported on this model"）。
-    # 本循环按能力表决定随请求发送哪些缓存字段：网关一旦明确拒绝某个
-    # 字段（本轮零输出、对用户界面零副作用时），由轮次级 except 把该
-    # 字段记入进程级能力表并原地重试同一轮，用户回合不中断；后续请求
-    # 直接按降级后的参数集发送，不再浪费失败往返。
-    caps = _responses_cache_capabilities(client, current_model)
-    _round = 0
-    while _round < MAX_TOOL_CALLS:
+    for _round in range(MAX_TOOL_CALLS):
+        instructions, input_items = _convert_messages_to_responses_input(loop_messages)
+        # 默认请求零显式断点字段；开关开启后才叠加（自动断点仍在）。
+        if explicit_breakpoints:
+            _apply_responses_cache_breakpoints(input_items)
+
+        request_kwargs: dict[str, Any] = {
+            "model": current_model,
+            "input": input_items,
+            "stream": True,
+            "max_output_tokens": max_tokens,
+        }
+        _add_responses_cache_options(
+            request_kwargs,
+            api_label=api_label,
+            model=current_model,
+            chat_id=builder.chat_id,
+            enabled=prompt_cache_enabled,
+        )
+        if instructions:
+            request_kwargs["instructions"] = instructions
+        if sampling_params.get("temperature") is not None:
+            request_kwargs["temperature"] = sampling_params["temperature"]
+        if sampling_params.get("top_p") is not None:
+            request_kwargs["top_p"] = sampling_params["top_p"]
+        if reasoning_param:
+            request_kwargs["reasoning"] = reasoning_param
+        if responses_tools:
+            request_kwargs["tools"] = responses_tools
+            request_kwargs["tool_choice"] = "auto"
+            request_kwargs["parallel_tool_calls"] = True
+
+        content_acc = ""
+        reasoning_acc = ""
+        # output_index -> {"call_id","name","args_json"}（function_call
+        # 累积；键用 output_index 而非 item_id，因为 arguments.delta 事件
+        # 用 item_id 关联，两者在同一 item 生命周期内一一对应，用哪个做
+        # 累积表的 key 都可以，这里统一用 item_id 便于跟 delta 事件直接
+        # 命中，output_index 仅用于日志排序）。
+        tool_call_items: dict[str, dict] = {}
+        current_stream_cell = [None]
+        response_status: str = ""
+        response_error_text: str = ""
+
+        switch_stream = make_switch_stream(builder, current_stream_cell)
+
         try:
-            instructions, input_items = _convert_messages_to_responses_input(loop_messages)
-            # 断点打标受运行时能力表控制：已被网关拒绝 prompt_cache_breakpoint
-            # 的模型（caps 为 False）跳过打标，直接按降级后的参数集发送。
-            _apply_responses_cache_breakpoints(
-                input_items, enabled=caps["prompt_cache_breakpoint"]
-            )
+            await start_chat_action(builder.chat_id, "typing")
+            stream = await client.responses.create(**request_kwargs)
+            async for event in stream:
+                etype = getattr(event, "type", None)
 
-            request_kwargs: dict[str, Any] = {
-                "model": current_model,
-                "input": input_items,
-                "stream": True,
-                "max_output_tokens": max_tokens,
-            }
-            _add_responses_cache_options(
-                request_kwargs,
-                api_label=api_label,
-                model=current_model,
-                chat_id=builder.chat_id,
-                enabled=prompt_cache_enabled,
-                include_options=caps["prompt_cache_options"],
-                include_key=caps["prompt_cache_key"],
-            )
-            if instructions:
-                request_kwargs["instructions"] = instructions
-            if sampling_params.get("temperature") is not None:
-                request_kwargs["temperature"] = sampling_params["temperature"]
-            if sampling_params.get("top_p") is not None:
-                request_kwargs["top_p"] = sampling_params["top_p"]
-            if reasoning_param:
-                request_kwargs["reasoning"] = reasoning_param
-            if responses_tools:
-                request_kwargs["tools"] = responses_tools
-                request_kwargs["tool_choice"] = "auto"
-                request_kwargs["parallel_tool_calls"] = True
+                if etype == "response.output_text.delta":
+                    text = getattr(event, "delta", "") or ""
+                    if text:
+                        content_acc += text
+                        await switch_stream("content")
+                        builder.append_stream_delta(text)
 
-            content_acc = ""
-            reasoning_acc = ""
-            # output_index -> {"call_id","name","args_json"}（function_call
-            # 累积；键用 output_index 而非 item_id，因为 arguments.delta 事件
-            # 用 item_id 关联，两者在同一 item 生命周期内一一对应，用哪个做
-            # 累积表的 key 都可以，这里统一用 item_id 便于跟 delta 事件直接
-            # 命中，output_index 仅用于日志排序）。
-            tool_call_items: dict[str, dict] = {}
-            current_stream_cell = [None]
-            response_status: str = ""
-            response_error_text: str = ""
+                elif etype == "response.output_item.added":
+                    item = getattr(event, "item", None)
+                    itype = getattr(item, "type", None) if item is not None else None
+                    if itype == "function_call":
+                        item_id = getattr(item, "id", "") or f"fc_{uuid.uuid4().hex[:24]}"
+                        call_id = getattr(item, "call_id", "") or item_id
+                        name = getattr(item, "name", "") or ""
+                        tool_call_items[item_id] = {
+                            "call_id": call_id, "name": name, "args_json": "",
+                        }
+                        fn_args: dict[str, Any] = {}
+                        summary = _generate_initial_tool_summary(name, fn_args)
+                        action_desc = _generate_action_description(name, fn_args)
+                        builder.add_tool_item(
+                            call_id, name, summary,
+                            action_description=action_desc, fn_args=fn_args,
+                        )
+                        builder.request_flush(force=False)
 
-            switch_stream = make_switch_stream(builder, current_stream_cell)
+                elif etype == "response.function_call_arguments.delta":
+                    item_id = getattr(event, "item_id", "") or ""
+                    delta_text = getattr(event, "delta", "") or ""
+                    entry = tool_call_items.get(item_id)
+                    if entry is not None and delta_text:
+                        entry["args_json"] += delta_text
+                        if len(entry["args_json"]) % 40 < 4:
+                            parsed_args = _safe_parse_args(entry["args_json"])
+                            builder.update_tool_args(entry["call_id"], parsed_args)
 
-            try:
-                await start_chat_action(builder.chat_id, "typing")
-                stream = await client.responses.create(**request_kwargs)
-                async for event in stream:
-                    etype = getattr(event, "type", None)
+                elif etype == "response.function_call_arguments.done":
+                    item_id = getattr(event, "item_id", "") or ""
+                    full_args = getattr(event, "arguments", "") or ""
+                    entry = tool_call_items.get(item_id)
+                    if entry is not None and full_args:
+                        # 权威兜底：某些网关只在 .done 事件里给出完整参数
+                        # （delta 事件缺失或不完整时），用它覆盖累积值。
+                        entry["args_json"] = full_args
 
-                    if etype == "response.output_text.delta":
-                        text = getattr(event, "delta", "") or ""
-                        if text:
-                            content_acc += text
-                            await switch_stream("content")
-                            builder.append_stream_delta(text)
-
-                    elif etype == "response.output_item.added":
-                        item = getattr(event, "item", None)
-                        itype = getattr(item, "type", None) if item is not None else None
-                        if itype == "function_call":
-                            item_id = getattr(item, "id", "") or f"fc_{uuid.uuid4().hex[:24]}"
+                elif etype == "response.output_item.done":
+                    item = getattr(event, "item", None)
+                    itype = getattr(item, "type", None) if item is not None else None
+                    if itype == "reasoning":
+                        summary_list = getattr(item, "summary", None) or []
+                        summary_text = "\n".join(
+                            getattr(s, "text", "") or "" for s in summary_list if getattr(s, "text", "")
+                        )
+                        if summary_text:
+                            reasoning_acc += summary_text
+                            await switch_stream("reasoning")
+                            builder.append_stream_delta(summary_text)
+                    elif itype == "function_call":
+                        # 兜底：若前面 .added / .delta 事件因网关差异未触发
+                        # （个别兼容层只在 .done 里一次性给出完整 item），
+                        # 在这里补建累积表条目，避免该工具调用被漏收。
+                        item_id = getattr(item, "id", "") or ""
+                        if item_id and item_id not in tool_call_items:
                             call_id = getattr(item, "call_id", "") or item_id
                             name = getattr(item, "name", "") or ""
+                            args_json = getattr(item, "arguments", "") or ""
                             tool_call_items[item_id] = {
-                                "call_id": call_id, "name": name, "args_json": "",
+                                "call_id": call_id, "name": name, "args_json": args_json,
                             }
-                            fn_args: dict[str, Any] = {}
+                            fn_args = _safe_parse_args(args_json)
                             summary = _generate_initial_tool_summary(name, fn_args)
                             action_desc = _generate_action_description(name, fn_args)
                             builder.add_tool_item(
@@ -804,248 +723,163 @@ async def _agentic_loop_openai_responses(
                             )
                             builder.request_flush(force=False)
 
-                    elif etype == "response.function_call_arguments.delta":
-                        item_id = getattr(event, "item_id", "") or ""
-                        delta_text = getattr(event, "delta", "") or ""
-                        entry = tool_call_items.get(item_id)
-                        if entry is not None and delta_text:
-                            entry["args_json"] += delta_text
-                            if len(entry["args_json"]) % 40 < 4:
-                                parsed_args = _safe_parse_args(entry["args_json"])
-                                builder.update_tool_args(entry["call_id"], parsed_args)
+                elif etype == "response.completed":
+                    resp_obj = getattr(event, "response", None)
+                    if resp_obj is not None and getattr(resp_obj, "usage", None):
+                        final_usage = resp_obj.usage
+                    response_status = "completed"
 
-                    elif etype == "response.function_call_arguments.done":
-                        item_id = getattr(event, "item_id", "") or ""
-                        full_args = getattr(event, "arguments", "") or ""
-                        entry = tool_call_items.get(item_id)
-                        if entry is not None and full_args:
-                            # 权威兜底：某些网关只在 .done 事件里给出完整参数
-                            # （delta 事件缺失或不完整时），用它覆盖累积值。
-                            entry["args_json"] = full_args
+                elif etype in ("response.failed", "response.incomplete"):
+                    resp_obj = getattr(event, "response", None)
+                    response_status = etype.rsplit(".", 1)[-1]
+                    err = getattr(resp_obj, "error", None) if resp_obj is not None else None
+                    if err is not None:
+                        response_error_text = getattr(err, "message", "") or str(err)
 
-                    elif etype == "response.output_item.done":
-                        item = getattr(event, "item", None)
-                        itype = getattr(item, "type", None) if item is not None else None
-                        if itype == "reasoning":
-                            summary_list = getattr(item, "summary", None) or []
-                            summary_text = "\n".join(
-                                getattr(s, "text", "") or "" for s in summary_list if getattr(s, "text", "")
-                            )
-                            if summary_text:
-                                reasoning_acc += summary_text
-                                await switch_stream("reasoning")
-                                builder.append_stream_delta(summary_text)
-                        elif itype == "function_call":
-                            # 兜底：若前面 .added / .delta 事件因网关差异未触发
-                            # （个别兼容层只在 .done 里一次性给出完整 item），
-                            # 在这里补建累积表条目，避免该工具调用被漏收。
-                            item_id = getattr(item, "id", "") or ""
-                            if item_id and item_id not in tool_call_items:
-                                call_id = getattr(item, "call_id", "") or item_id
-                                name = getattr(item, "name", "") or ""
-                                args_json = getattr(item, "arguments", "") or ""
-                                tool_call_items[item_id] = {
-                                    "call_id": call_id, "name": name, "args_json": args_json,
-                                }
-                                fn_args = _safe_parse_args(args_json)
-                                summary = _generate_initial_tool_summary(name, fn_args)
-                                action_desc = _generate_action_description(name, fn_args)
-                                builder.add_tool_item(
-                                    call_id, name, summary,
-                                    action_description=action_desc, fn_args=fn_args,
-                                )
-                                builder.request_flush(force=False)
+                elif etype == "error":
+                    response_error_text = getattr(event, "message", "") or "unknown error"
 
-                    elif etype == "response.completed":
-                        resp_obj = getattr(event, "response", None)
-                        if resp_obj is not None and getattr(resp_obj, "usage", None):
-                            final_usage = resp_obj.usage
-                        response_status = "completed"
+        except Exception:
+            raise
+        finally:
+            await stop_chat_action(builder.chat_id, "typing")
 
-                    elif etype in ("response.failed", "response.incomplete"):
-                        resp_obj = getattr(event, "response", None)
-                        response_status = etype.rsplit(".", 1)[-1]
-                        err = getattr(resp_obj, "error", None) if resp_obj is not None else None
-                        if err is not None:
-                            response_error_text = getattr(err, "message", "") or str(err)
+        if response_error_text and not content_acc and not reasoning_acc and not tool_call_items:
+            # 零输出即失败：直接抛出，交由上层统一的错误提示 / 重试策略
+            # 处理（与 openai_compat 循环里网关 4xx/5xx 的处理方式一致，
+            # 本桥接不做应用层自动重试——Responses API 网关的瞬时故障重试
+            # 语义尚不如 Anthropic 官方文档清晰，保守起见不引入误重试）。
+            raise RuntimeError(f"[{api_label}] Responses API error: {response_error_text}")
 
-                    elif etype == "error":
-                        response_error_text = getattr(event, "message", "") or "unknown error"
+        builder.end_stream()
 
-            except Exception as exc:
-                # 网关直接回 4xx/5xx（SDK 异常）而非流内 error 事件时，
-                # 同样走缓存字段降级判定（2026-09-09 bugfix）：仅当本轮
-                # 零输出（对用户界面零副作用）且错误文本指向某个缓存字段
-                # 时，抛内部信号触发降级重试；其余异常照原样抛出。
-                if not content_acc and not reasoning_acc and not tool_call_items:
-                    field = _cache_field_unsupported_in_error(
-                        f"{getattr(exc, 'message', '') or ''} {exc}"
+        final_usage = _responses_usage_to_openai(final_usage) or final_usage
+        _log_cache_usage(api_label, final_usage, model_name=current_model)
+
+        # Responses API 的缓存字段在不同网关版本里可能出现在 usage
+        # 或 response 本体；把诊断信息单独留下，便于排查“请求开了缓存但
+        # 中转没有回传 cached_tokens”的情况。
+        if final_usage is not None:
+            try:
+                if hasattr(final_usage, "model_dump"):
+                    usage_dump = final_usage.model_dump()
+                elif isinstance(final_usage, dict):
+                    usage_dump = dict(final_usage)
+                else:
+                    usage_dump = {}
+                details = usage_dump.get("input_tokens_details") or {}
+                cached = details.get("cached_tokens") if isinstance(details, dict) else None
+                if cached is not None:
+                    logger.debug(
+                        "[%s] responses prompt cache: key=%s cached_tokens=%s",
+                        api_label,
+                        _responses_prompt_cache_key(api_label, current_model, builder.chat_id),
+                        cached,
                     )
-                    if field and caps.get(field, False):
-                        raise _ResponsesCacheFieldRejected(field, str(exc)) from exc
-                raise
-            finally:
-                await stop_chat_action(builder.chat_id, "typing")
+            except Exception:
+                logger.debug("Responses prompt cache diagnostics logging failed", exc_info=True)
 
-            if response_error_text and not content_acc and not reasoning_acc and not tool_call_items:
-                # 零输出即失败。先判定是否为“网关拒绝缓存字段”（如
-                # "prompt_cache_breakpoint is not supported on this model"）：
-                # 是则抛内部信号，交由轮次级 except 把该字段记入能力表、
-                # 剥离并重试本轮（2026-09-09 bugfix，用户回合不中断）；其
-                # 余错误维持原行为直接抛出，交由上层统一的错误提示 / 重试
-                # 策略处理（与 openai_compat 循环里网关 4xx/5xx 的处理方式
-                # 一致，本桥接对非缓存类错误不做应用层自动重试——Responses
-                # API 网关的瞬时故障重试语义尚不如 Anthropic 官方文档清晰，
-                # 保守起见不引入误重试）。
-                field = _cache_field_unsupported_in_error(response_error_text)
-                if field and caps.get(field, False):
-                    raise _ResponsesCacheFieldRejected(field, response_error_text)
-                raise RuntimeError(f"[{api_label}] Responses API error: {response_error_text}")
-
-            builder.end_stream()
-
-            final_usage = _responses_usage_to_openai(final_usage) or final_usage
-            _log_cache_usage(api_label, final_usage, model_name=current_model)
-
-            # Responses API 的缓存字段在不同网关版本里可能出现在 usage
-            # 或 response 本体；把诊断信息单独留下，便于排查“请求开了缓存但
-            # 中转没有回传 cached_tokens”的情况。
-            if final_usage is not None:
-                try:
-                    if hasattr(final_usage, "model_dump"):
-                        usage_dump = final_usage.model_dump()
-                    elif isinstance(final_usage, dict):
-                        usage_dump = dict(final_usage)
-                    else:
-                        usage_dump = {}
-                    details = usage_dump.get("input_tokens_details") or {}
-                    cached = details.get("cached_tokens") if isinstance(details, dict) else None
-                    if cached is not None:
-                        logger.debug(
-                            "[%s] responses prompt cache: key=%s cached_tokens=%s",
-                            api_label,
-                            _responses_prompt_cache_key(api_label, current_model, builder.chat_id),
-                            cached,
-                        )
-                except Exception:
-                    logger.debug("Responses prompt cache diagnostics logging failed", exc_info=True)
-
-            # 把这一轮的 function_call 累积转换为 OpenAI Chat Completions 形状
-            # 的 tool_calls，供 _run_tool_calls_and_append 复用（与另外两条
-            # 原生桥接完全同构）。
-            tool_calls_list: list[dict] = []
-            for item_id in sorted(tool_call_items.keys()):
-                entry = tool_call_items[item_id]
-                args_str = entry["args_json"] or "{}"
-                try:
-                    json.loads(args_str)
-                except json.JSONDecodeError:
-                    repaired, repair_info = repair_json_arguments(args_str)
-                    if isinstance(repaired, dict):
-                        note = repair_note_for_result(repair_info.get("fixes") or [])
-                        if note:
-                            repaired[_JSON_REPAIR_NOTE_KEY] = note
-                        args_str = json.dumps(
-                            repaired, ensure_ascii=False, separators=(",", ":"))
-                        logger.info(
-                            "[openai_responses] 工具 %s 参数 JSON 已自动修复（直接用修复后参数执行）",
-                            entry["name"],
-                        )
-                    else:
-                        args_str = json.dumps(
-                            build_invalid_arguments_envelope(
-                                args_str, stream_finish_reason=(response_status or None)),
-                            ensure_ascii=False, separators=(",", ":"),
-                        )
-                        logger.warning(
-                            "[openai_responses] 工具 %s 参数 JSON 非法且无法自动修复，已写入带诊断的可恢复错误"
-                            "（响应状态 status=%r）",
-                            entry["name"], response_status,
-                        )
-                tool_calls_list.append({
-                    "id": entry["call_id"], "type": "function",
-                    "function": {"name": entry["name"], "arguments": args_str},
-                })
-
-            if reasoning_acc:
-                builder.finalize_reasoning_block()
-
-            will_request_again = bool(tool_calls_list)
-            if will_request_again:
-                builder.on_round_boundary()
-                builder.request_flush()
-            elif not await builder.finalize_turn():
-                builder.request_flush()
-
-            append_assistant_message(loop_messages, new_history_entries, content_acc,
-                                     tool_calls_list, reasoning_acc)
-
-            if not tool_calls_list:
-                final_content = content_acc
-                finish_open_tool_group(builder)
-                await builder.finalize_turn()
-                break
-
-            status = await run_tool_batch(builder, tool_calls_list, loop_messages,
-                                          new_history_entries, tool_call_count_ref,
-                                          api_label, tools)
-
-            if status == "over_limit":
-
-                async def _synth_stream(req: tuple) -> str:
-                    synth_instructions, synth_input = req
-                    synth_text = ""
-                    synth_kwargs: dict[str, Any] = {
-                        "model": current_model,
-                        "input": synth_input,
-                        "stream": True,
-                        "max_output_tokens": max_tokens,
-                    }
-                    _add_responses_cache_options(
-                        synth_kwargs,
-                        api_label=api_label,
-                        model=current_model,
-                        chat_id=builder.chat_id,
-                        enabled=prompt_cache_enabled,
-                        include_options=caps["prompt_cache_options"],
-                        include_key=caps["prompt_cache_key"],
+        # 把这一轮的 function_call 累积转换为 OpenAI Chat Completions 形状
+        # 的 tool_calls，供 _run_tool_calls_and_append 复用（与另外两条
+        # 原生桥接完全同构）。
+        tool_calls_list: list[dict] = []
+        for item_id in sorted(tool_call_items.keys()):
+            entry = tool_call_items[item_id]
+            args_str = entry["args_json"] or "{}"
+            try:
+                json.loads(args_str)
+            except json.JSONDecodeError:
+                repaired, repair_info = repair_json_arguments(args_str)
+                if isinstance(repaired, dict):
+                    note = repair_note_for_result(repair_info.get("fixes") or [])
+                    if note:
+                        repaired[_JSON_REPAIR_NOTE_KEY] = note
+                    args_str = json.dumps(
+                        repaired, ensure_ascii=False, separators=(",", ":"))
+                    logger.info(
+                        "[openai_responses] 工具 %s 参数 JSON 已自动修复（直接用修复后参数执行）",
+                        entry["name"],
                     )
-                    if synth_instructions:
-                        synth_kwargs["instructions"] = synth_instructions
-                    synth_stream = await client.responses.create(**synth_kwargs)
-                    async for ev in synth_stream:
-                        if getattr(ev, "type", None) == "response.output_text.delta":
-                            text = getattr(ev, "delta", "") or ""
-                            if text:
-                                synth_text += text
-                                builder.append_stream_delta(text)
-                    return synth_text
+                else:
+                    args_str = json.dumps(
+                        build_invalid_arguments_envelope(
+                            args_str, stream_finish_reason=(response_status or None)),
+                        ensure_ascii=False, separators=(",", ":"),
+                    )
+                    logger.warning(
+                        "[openai_responses] 工具 %s 参数 JSON 非法且无法自动修复，已写入带诊断的可恢复错误"
+                        "（响应状态 status=%r）",
+                        entry["name"], response_status,
+                    )
+            tool_calls_list.append({
+                "id": entry["call_id"], "type": "function",
+                "function": {"name": entry["name"], "arguments": args_str},
+            })
 
-                final_content = await over_limit_final_summary(
-                    builder, new_history_entries,
-                    api_label=api_label, loop_name="_agentic_loop_openai_responses",
-                    build_synth_request=lambda extra: _convert_messages_to_responses_input(
-                        loop_messages + [extra]),
-                    stream_synth=_synth_stream,
+        if reasoning_acc:
+            builder.finalize_reasoning_block()
+
+        will_request_again = bool(tool_calls_list)
+        if will_request_again:
+            builder.on_round_boundary()
+            builder.request_flush()
+        elif not await builder.finalize_turn():
+            builder.request_flush()
+
+        append_assistant_message(loop_messages, new_history_entries, content_acc,
+                                 tool_calls_list, reasoning_acc)
+
+        if not tool_calls_list:
+            final_content = content_acc
+            finish_open_tool_group(builder)
+            await builder.finalize_turn()
+            break
+
+        status = await run_tool_batch(builder, tool_calls_list, loop_messages,
+                                      new_history_entries, tool_call_count_ref,
+                                      api_label, tools)
+
+        if status == "over_limit":
+
+            async def _synth_stream(req: tuple) -> str:
+                synth_instructions, synth_input = req
+                # 超限合成请求与主循环同一缓存层级策略：默认只走自动断点。
+                if explicit_breakpoints:
+                    _apply_responses_cache_breakpoints(synth_input)
+                synth_text = ""
+                synth_kwargs: dict[str, Any] = {
+                    "model": current_model,
+                    "input": synth_input,
+                    "stream": True,
+                    "max_output_tokens": max_tokens,
+                }
+                _add_responses_cache_options(
+                    synth_kwargs,
+                    api_label=api_label,
+                    model=current_model,
+                    chat_id=builder.chat_id,
+                    enabled=prompt_cache_enabled,
                 )
-                break
-            # status == "continue"：循环自然继续
+                if synth_instructions:
+                    synth_kwargs["instructions"] = synth_instructions
+                synth_stream = await client.responses.create(**synth_kwargs)
+                async for ev in synth_stream:
+                    if getattr(ev, "type", None) == "response.output_text.delta":
+                        text = getattr(ev, "delta", "") or ""
+                        if text:
+                            synth_text += text
+                            builder.append_stream_delta(text)
+                return synth_text
 
-        except _ResponsesCacheFieldRejected as rejected:
-            # 缓存参数降级重试（2026-09-09 bugfix）：把被拒字段记入进程级
-            # 能力表后原地重试同一轮（不消耗 MAX_TOOL_CALLS 轮次预算）。
-            # 重试是安全的：仅当本轮零输出时才会走到这里（见两处抛出点），
-            # loop_messages / builder / 工具执行状态均未被本轮修改。
-            # 重试上界：每个字段至多触发一次（caps 置 False 后同字段不再
-            # 走降级分支），全程最多 len(_CACHE_FIELD_NAMES) 次。
-            caps[rejected.field] = False
-            logger.warning(
-                "[%s] 网关拒绝模型 %s 的缓存字段 %s（%s），已剥离该参数自动重试本轮；"
-                "本进程内该模型后续请求将直接跳过该字段",
-                api_label, current_model, rejected.field, (rejected.detail or "")[:200],
+            final_content = await over_limit_final_summary(
+                builder, new_history_entries,
+                api_label=api_label, loop_name="_agentic_loop_openai_responses",
+                build_synth_request=lambda extra: _convert_messages_to_responses_input(
+                    loop_messages + [extra]),
+                stream_synth=_synth_stream,
             )
-            continue
-        _round += 1
+            break
+        # status == "continue"：循环自然继续
 
     final_content = await ensure_final_content(builder, new_history_entries, final_content)
 

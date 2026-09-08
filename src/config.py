@@ -185,6 +185,18 @@ class ProviderConfig:
     protocol: str = DEFAULT_PROTOCOL
     # 是否支持 Prompt Caching（仅部分厂商需要显式标记）
     supports_prompt_cache: bool = False
+    # （仅 openai_responses 协议生效）是否在网关自动断点之外额外下发 3 个
+    # 显式缓存断点（content part 上的 prompt_cache_breakpoint={"mode":
+    # "explicit"} 对象，见 ai/responses_bridge）。默认 False：所有 API
+    # 默认只走自动断点（prompt_cache_options.mode="implicit"），请求里
+    # 绝不出现显式断点字段——当前 XXTF 网关尚未支持手动断点对象，贸然
+    # 下发会被 400。网关就绪后两种开启方式：
+    #   a) 环境变量 RESPONSES_EXPLICIT_CACHE_BREAKPOINTS=1 全局强制开启
+    #      （三态开关，=0 可反向强制关闭，见 explicit_cache_breakpoints_enabled）；
+    #   b) 或具体模型 make_model_config(..., explicit_cache_breakpoints=True)。
+    # 显式断点位置复刻 Anthropic 桥接的 Claude 断点策略（前部 1 固定 +
+    # 尾部 2 滚动），合计 3 显式 + 1 自动，不超每请求 4 个上限。
+    explicit_cache_breakpoints: bool = False
     # 视觉输入是否需要"公开可访问 HTTP URL"而非 data:image/...;base64,... 内联格式。
     # 部分 OpenAI 兼容网关（如 Agnes）官方文档明确只接受 image_url 中的公开 URL，
     # 内联 base64 会被静默忽略甚至报 4xx。开启后，会在 _resolve_multimodal_content
@@ -228,6 +240,11 @@ class ModelConfig:
     native_video: Optional[bool] = None
     supports_sampling: Optional[bool] = None
     supports_prompt_cache: Optional[bool] = None
+    # （仅 openai_responses 协议生效）是否在自动断点之外额外下发 3 个显式
+    # 缓存断点。None = 继承厂商默认（ProviderConfig.explicit_cache_breakpoints，
+    # 默认 False = 只走自动断点）；环境变量 RESPONSES_EXPLICIT_CACHE_
+    # BREAKPOINTS 可三态强制覆盖（见 explicit_cache_breakpoints_enabled）。
+    explicit_cache_breakpoints: Optional[bool] = None
     max_output_tokens: Optional[int] = None
     max_context: Optional[int] = None  # <=== 【新增】最大上下文窗口
 
@@ -538,6 +555,10 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         # GPT-5.6 Sol 的 Responses API 支持原生 Prompt Caching；由
         # ai.responses_bridge 为每个会话稳定注入 prompt_cache_key。
         "supports_prompt_cache": True,
+        # 默认只走网关自动断点（当前 XXTF 尚未支持手动断点对象，下发显式
+        # 断点会 400）。网关就绪后经模型字段 explicit_cache_breakpoints
+        # 或环境变量 RESPONSES_EXPLICIT_CACHE_BREAKPOINTS=1 开启。
+        "explicit_cache_breakpoints": False,
         "temperature": None,          # None -> 不发送，走供应商默认
         "top_p": None,                # None -> 不发送，走供应商默认
         "reasoning_enabled": None,    # None -> 不发送推理控制参数
@@ -756,6 +777,7 @@ def make_model_config(
         native_video=merged.get("native_video"),
         supports_sampling=merged.get("supports_sampling"),
         supports_prompt_cache=merged.get("supports_prompt_cache"),
+        explicit_cache_breakpoints=merged.get("explicit_cache_breakpoints"),
         max_output_tokens=merged.get("max_output_tokens", 8192),
         max_context=merged.get("max_context", 128000),
         reasoning_enabled=merged.get("reasoning_enabled"),
@@ -770,6 +792,47 @@ def make_model_config(
         session_affinity=endpoint_overrides.get("session_affinity"),
         vision_prefer_url=endpoint_overrides.get("vision_prefer_url"),
     )
+
+
+# =============================================================================
+# Responses 显式缓存断点总开关（默认关 = 所有 API 只走自动断点）
+# -----------------------------------------------------------------------------
+# 背景：GPT-5.6 Responses API 支持在 content part 上挂
+# prompt_cache_breakpoint={"mode":"explicit"} 显式断点（每请求上限 4 个），
+# 且 prompt_cache_options.mode="implicit" 时额外保留 1 个网关自动断点。
+# 但当前 XXTF 网关尚未支持手动断点对象——显式断点字段一旦下发就会被 400
+# （此前 "prompt_cache_breakpoint": true 的布尔形状即因此在网关侧暴露）。
+# 因此缓存层级策略定为：
+#   - 默认（所有 API）：请求只带 prompt_cache_key +
+#     prompt_cache_options.mode="implicit"，断点完全由网关自动管理；
+#   - 显式断点 = 可选增益：必须通过参数开启后才额外下发 3 个
+#     （前部 1 固定 + 尾部 2 滚动，位置复刻 Claude 断点策略，见
+#     ai/responses_bridge._apply_responses_cache_breakpoints），
+#     合计 3 显式 + 1 自动，不超每请求 4 个上限。
+# =============================================================================
+def _env_flag_tri_state(env_name: str) -> Optional[bool]:
+    """三态环境变量：未设置/无法识别 -> None（不强制）；真值 -> True；假值 -> False。"""
+    raw = (os.getenv(env_name, "") or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def explicit_cache_breakpoints_enabled(model_info: Optional[ModelConfig]) -> bool:
+    """Responses API 是否应在自动断点之外额外下发 3 个显式缓存断点。
+
+    优先级（高 -> 低）：
+      1. 环境变量 RESPONSES_EXPLICIT_CACHE_BREAKPOINTS（三态强制开关，
+         调用时读取而非 import 时固化，便于部署环境不换代码直接切换）；
+      2. 模型字段 explicit_cache_breakpoints（None = 继承厂商默认）；
+      3. 默认 False（只走自动断点，请求零显式断点字段）。
+    """
+    forced = _env_flag_tri_state("RESPONSES_EXPLICIT_CACHE_BREAKPOINTS")
+    if forced is not None:
+        return forced
+    return bool(getattr(model_info, "explicit_cache_breakpoints", False))
 
 
 # =============================================================================
