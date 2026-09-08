@@ -1,22 +1,8 @@
-# Responses API breakpoint 修复 — 2026-09-09
+# Responses API breakpoint 修复与可选策略 — 2026-09-09
 
-## 问题
+## 兼容性问题
 
-上一版把内容块上的 `prompt_cache_breakpoint` 序列化成了布尔值：
-
-```json
-"prompt_cache_breakpoint": true
-```
-
-GPT-5.6 Responses API 当前要求它是对象，因此 xxtf 返回：
-
-```text
-Invalid type for 'input[0].content[0].prompt_cache_breakpoint': expected an object, but got a boolean instead.
-```
-
-## 修复
-
-现在改为：
+内容块上的 `prompt_cache_breakpoint` 必须使用对象形式，而不是布尔值：
 
 ```json
 "prompt_cache_breakpoint": {
@@ -24,7 +10,9 @@ Invalid type for 'input[0].content[0].prompt_cache_breakpoint': expected an obje
 }
 ```
 
-请求级别仍然保持：
+## 当前策略
+
+项目现在默认只使用 Responses API 的自动缓存：
 
 ```json
 "prompt_cache_options": {
@@ -33,6 +21,12 @@ Invalid type for 'input[0].content[0].prompt_cache_breakpoint': expected an obje
 }
 ```
 
-因此仍然是项目目标的结构：3 个显式 breakpoint + 1 个 implicit 自动 breakpoint。
+默认不会向内容块写入 `prompt_cache_breakpoint`，以兼容只支持自动缓存的中转服务。
 
-OpenAI 当前 Responses API 文档说明，GPT-5.6 及以后支持在 content block 上添加 `prompt_cache_breakpoint`，每次请求最多写 4 个 breakpoint；保持 `mode="implicit"` 时会额外保留 1 个自动 breakpoint。当前 `ttl` 支持 `30m`。
+如需启用原有显式策略，设置环境变量：
+
+```text
+RESPONSES_EXPLICIT_CACHE_ENABLED=true
+```
+
+开启后，最多添加 3 个显式断点，同时保留 1 个自动断点，即 **自动 1 个 + 手动最多 3 个**。可用文本块少于 3 个时，显式断点数量会相应减少。

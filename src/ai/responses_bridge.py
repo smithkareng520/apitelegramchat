@@ -71,7 +71,7 @@ from ai.bridge_common import (
     run_tool_batch,
 )
 from ai.cache_usage import _log_cache_usage
-from config import SUPPORTED_MODELS, explicit_cache_breakpoints_enabled
+from config import RESPONSES_EXPLICIT_CACHE_ENABLED
 from state import get_llm_session_key
 
 if TYPE_CHECKING:
@@ -256,16 +256,6 @@ def _convert_messages_to_responses_input(messages: list) -> tuple[str, list]:
 
 # =============================================================================
 # Responses Prompt Cache：稳定 key + GPT-5.6 原生缓存选项
-# -----------------------------------------------------------------------------
-# 缓存层级策略（与 anthropic_bridge 的 Claude 断点策略对齐）：
-#   - 默认所有请求只走自动断点：prompt_cache_options.mode="implicit" 保留
-#     1 个网关自动断点，请求里不出现任何 prompt_cache_breakpoint 字段
-#     （当前网关不支持手动断点对象，下发即 400）。
-#   - 显式断点为可选增益：仅当 explicit_cache_breakpoints_enabled() 为 True
-#     （模型字段 explicit_cache_breakpoints /
-#     RESPONSES_EXPLICIT_CACHE_BREAKPOINTS 环境变量开启）时，在自动断点
-#     之外额外下发 3 个显式断点（前部 1 固定 + 尾部 2 滚动，位置复刻
-#     Claude 策略），合计 3 显式 + 1 自动，不超每请求 4 个的上限。
 # =============================================================================
 def _responses_prompt_cache_key(api_label: str, model: str, chat_id: Any) -> str:
     """返回与项目现有 LLM session_id 完全相同的 Responses cache key。
@@ -296,23 +286,17 @@ def _is_responses_text_content(part: Any) -> bool:
 
 
 def _apply_responses_cache_breakpoints(input_items: list[dict]) -> int:
-    """在 input 上额外下发最多 3 个显式断点（网关自动断点之外）。
+    """硬编码 3 个显式断点，并保留 Responses 的第 4 个 implicit 断点。
 
-    ⚠️ 只应在 explicit_cache_breakpoints_enabled() 为 True 时调用（默认
-    关闭）：网关不支持手动断点对象时，请求里出现 prompt_cache_breakpoint
-    字段即 400，因此默认请求绝不携带该字段。
+    复刻项目原 Anthropic 显式缓存策略的结构：
+      1) 前部 1 个固定断点：稳定锚点，优先覆盖 system/instructions 之后的
+         第一段长期不变内容；
+      2) 尾部 2 个滚动断点：贴近最近的会话内容/工具回填，支持 agentic loop
+         中连续轮次缓存最近前缀。
 
-    位置复刻 anthropic_bridge 的 Claude 显式缓存策略（断点 1..3，不含
-    顶层 system 段——Responses 的 instructions 是纯字符串参数，无法挂
-    breakpoint，该层由保留的 implicit 自动断点兜底）：
-      1) 前部 1 个固定断点：输入中第一个可用文本块（稳定锚点，覆盖
-         开场上下文注入，对应 Claude 断点 1“第一条 user 消息末尾”）；
-      2) 尾部 2 个滚动断点：输入中最后两个可用文本块（贴近最近的会话
-         内容，支持连续轮次缓存最近前缀，对应 Claude 断点 2&3“倒数
-         第二条 / 最后一条消息末尾”）。
-
-    合计层级与 Claude 一致：3 个显式 + 1 个自动（implicit）。ttl 由
-    prompt_cache_options 统一为 30m，不能逐断点区分长短。
+    注意：Responses API 当前的 prompt_cache_options.ttl 对整次请求统一为
+    30m，不能逐断点设置不同 TTL。因此“前长后短”只能通过断点位置复刻
+    原策略的缓存层次，不能在同一 request 内真正设置 1h + 5m + 5m。
     返回实际添加的显式断点数。
     """
     candidates: list[tuple[int, int]] = []
@@ -354,16 +338,18 @@ def _add_responses_cache_options(
     chat_id: Any,
     enabled: bool = True,
 ) -> None:
-    """给 Responses 请求注入稳定 key + 网关自动断点（默认唯一缓存层）。"""
+    """注入稳定 key 和自动缓存；按开关可附加最多 3 个显式断点。
+
+    默认模式只发送 ``mode=implicit``，兼容只支持自动缓存的中转。
+    显式模式仍保持 ``implicit + 3 explicit`` 的原策略。
+    """
     if not enabled:
         return
     request_kwargs["prompt_cache_key"] = _responses_prompt_cache_key(
         api_label, model, chat_id
     )
-    # 默认（所有 API）：implicit 模式保留 1 个网关自动断点，是请求里
-    # 唯一的缓存层级，请求体不出现任何 prompt_cache_breakpoint 字段。
-    # 显式断点由调用方在开关开启后另行叠加（最多 3 个，见
-    # _apply_responses_cache_breakpoints），合计不超每请求 4 个上限。
+    # 默认保留 1 个 implicit 自动断点；若开关打开，调用方会另外写入最多 3 个
+    # explicit breakpoint，使总缓存层级为：自动 1 + 手动最多 3。
     # ttl 当前只有 30m 这一档，不能逐 breakpoint 区分长短。
     request_kwargs["prompt_cache_options"] = {
         "mode": "implicit",
@@ -430,25 +416,13 @@ async def openai_responses_chat_completions_create(
     instructions, input_items = _convert_messages_to_responses_input(messages)
     responses_tools = _convert_tools_to_responses(tools) if tools else None
 
-    # 缓存层级与主循环同一策略：默认只走自动断点（implicit），请求零
-    # 显式断点字段；仅当该模型/环境变量开启 explicit_cache_breakpoints
-    # 时才额外叠加 3 个显式断点。未知模型保守视为缓存可用（保持既有
-    # enabled=True 行为），但绝不下发显式断点。
-    nonstream_model_info = SUPPORTED_MODELS.get(model)
-    cache_enabled = (
-        True if nonstream_model_info is None
-        else bool(getattr(nonstream_model_info, "supports_prompt_cache", True))
-    )
-    if cache_enabled and explicit_cache_breakpoints_enabled(nonstream_model_info):
-        _apply_responses_cache_breakpoints(input_items)
-
     request_kwargs: dict[str, Any] = {
         "model": model,
         "input": input_items,
         "max_output_tokens": max_tokens,
     }
     _add_responses_cache_options(
-        request_kwargs, api_label="responses", model=model, chat_id=None, enabled=cache_enabled
+        request_kwargs, api_label="responses", model=model, chat_id=None, enabled=True
     )
     if instructions:
         request_kwargs["instructions"] = instructions
@@ -582,10 +556,6 @@ async def _agentic_loop_openai_responses(
 
     reasoning_param: Optional[dict] = None
     prompt_cache_enabled = bool(model_info and getattr(model_info, "supports_prompt_cache", False))
-    # 显式断点默认关闭（所有 API 默认只走自动断点）；经模型字段
-    # explicit_cache_breakpoints 或环境变量开启后，才在自动断点之外
-    # 额外下发 3 个显式断点（位置复刻 Claude 策略）。
-    explicit_breakpoints = prompt_cache_enabled and explicit_cache_breakpoints_enabled(model_info)
     effort = getattr(model_info, "reasoning_effort", None) if model_info else None
     if effort:
         # Responses API 顶层 reasoning={"effort": ...}（o-series / gpt-5
@@ -595,8 +565,7 @@ async def _agentic_loop_openai_responses(
 
     for _round in range(MAX_TOOL_CALLS):
         instructions, input_items = _convert_messages_to_responses_input(loop_messages)
-        # 默认请求零显式断点字段；开关开启后才叠加（自动断点仍在）。
-        if explicit_breakpoints:
+        if RESPONSES_EXPLICIT_CACHE_ENABLED:
             _apply_responses_cache_breakpoints(input_items)
 
         request_kwargs: dict[str, Any] = {
@@ -843,9 +812,6 @@ async def _agentic_loop_openai_responses(
 
             async def _synth_stream(req: tuple) -> str:
                 synth_instructions, synth_input = req
-                # 超限合成请求与主循环同一缓存层级策略：默认只走自动断点。
-                if explicit_breakpoints:
-                    _apply_responses_cache_breakpoints(synth_input)
                 synth_text = ""
                 synth_kwargs: dict[str, Any] = {
                     "model": current_model,
