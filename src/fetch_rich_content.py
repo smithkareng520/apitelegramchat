@@ -31,6 +31,7 @@ from __future__ import annotations
 import html as _html
 import logging
 import re
+import time as _time
 from dataclasses import dataclass
 from typing import Any, Optional, cast
 from urllib.parse import parse_qs, urljoin, urlparse, urlsplit, urlunsplit
@@ -1448,25 +1449,70 @@ def _demote_same_origin_links(blocks: list[str], base_url: str) -> list[str]:
     return [_SAME_ORIGIN_LINK_RE.sub(_demote, b) for b in blocks]
 
 
+def _build_source_meta_block(
+    url: str,
+    domain: str,
+    clean_title: str,
+    fetched_at: Optional[float],
+) -> str:
+    """构造 fetch_url 输出头部的折叠元数据块。
+
+    使用系统提示词白名单里的 <details>/<summary>/<tg-time>，不引入新标签：
+      <details open><summary>标题（无标题时用域名兜底）</summary>
+        <p>🔗 <a href="来源URL">域名</a></p>
+        <p>🕓 抓取于 <tg-time unix="..." format="wDT">降级文本</tg-time></p>
+      </details>
+    <tg-time> 的标签内文本是渲染失败时的降级显示，必须是人类可读的绝对时间，
+    因此用 UTC 时间格式化好再填入，而不是留空或复述 unix 数字。
+    """
+    ts = fetched_at if fetched_at is not None else _time.time()
+    try:
+        unix_ts = int(ts)
+    except (TypeError, ValueError):
+        unix_ts = int(_time.time())
+    fallback_dt = _time.strftime("%Y-%m-%d %H:%M:%S UTC", _time.gmtime(unix_ts))
+
+    summary_text = clean_title if clean_title else esc(domain)
+    source_line = f'<p>🔗 <a href="{esc_attr(url)}">{esc(domain)}</a></p>'
+    time_line = (
+        '<p>🕓 抓取于 '
+        f'<tg-time unix="{unix_ts}" format="wDT">{esc(fallback_dt)}</tg-time>'
+        '</p>'
+    )
+    return (
+        f"<details open><summary>{summary_text}</summary>\n"
+        f"{source_line}\n"
+        f"{time_line}\n"
+        "</details>"
+    )
+
+
 def build_model_facing_html(
     url: str,
     html_text: str,
     body_blocks: Optional[list[str]] = None,
     title: str = "",
     fallback_text: str = "",
+    fetched_at: Optional[float] = None,
 ) -> Optional[str]:
     """组装 fetch_url 返回给模型的 Telegram HTML（忠实于原页面文档顺序）。
 
     结构：
-      <h3>标题</h3>
+      <details open><summary>标题</summary>
       <p>🔗 来源链接</p>
+      <p>🕓 抓取时间 <tg-time .../></p>
+      </details>
       正文块……（图片/视频/播放器/音频在它们的原始位置；轮播图为 slideshow）
-    不存在任何"集中的媒体区"。
+    不存在任何"集中的媒体区"。头部折叠面板遵循系统提示词里的富文本白名单
+    （<details>/<summary>/<tg-time>），不是本模块自创标签。
 
     参数：
       body_blocks: 已转换的正文块（None 时内部用 trafilatura 提取）。
       title: 页面标题（og:title 优先，调用方提取）。
       fallback_text: trafilatura 提取失败时的纯文本兜底。
+      fetched_at: 本次抓取发生的 Unix 时间戳（秒）。None 时退化为当前时间——
+        仅用于兜底，调用方（execute_fetch_url）应在拿到 HTML 的那一刻记录
+        真实时间并透传，让 <tg-time> 反映"页面实际是何时被抓取的"。
     """
     if _lxml_html is None or not html_text:
         return None
@@ -1478,11 +1524,8 @@ def build_model_facing_html(
         blocks = _fallback_paragraph_blocks(fallback_text)
 
     domain = urlparse(url).netloc or url
-    header_parts: list[str] = []
     clean_title = esc(truncate_to_token_budget((title or "").strip(), TITLE_TOKEN_BUDGET, suffix="…"))
-    if clean_title:
-        header_parts.append(f"<h3>{clean_title}</h3>")
-    header_parts.append(f'<p>🔗 <a href="{esc_attr(url)}">{esc(domain)}</a></p>')
+    header_parts: list[str] = [_build_source_meta_block(url, domain, clean_title, fetched_at)]
 
     # 首个正文标题与页面标题重复时去掉，避免连续两个相同标题。
     if blocks and clean_title:

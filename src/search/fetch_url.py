@@ -294,7 +294,7 @@ async def _download_html_with_trafilatura(url: str) -> str | None:
         return None
 
 
-def _build_rich_fetch_payload(url: str, html: str) -> str | None:
+def _build_rich_fetch_payload(url: str, html: str, fetched_at: float | None = None) -> str | None:
     """把原始 HTML 转换为【返回给模型】的 Telegram Rich HTML（同步、CPU 密集）。
 
     提取链路（结果忠实于原页面文档顺序，媒体原位呈现，无聚合媒体区）：
@@ -304,6 +304,9 @@ def _build_rich_fetch_payload(url: str, html: str) -> str | None:
     注意：本函数的返回值只进入模型上下文；Telegram 工具 UI 的展示由
     tool_executors.format_tool_result 单独负责（保持历史简单样式）。
     返回 None 表示完全提不出内容（调用方继续走重定向检测/失败路径）。
+
+    fetched_at: 拿到 HTML 那一刻的 Unix 时间戳，用于头部 <tg-time> 抓取时间
+    标注；调用方（execute_fetch_url）在成功拿到 html 后立即记录并透传。
     """
     if not html:
         return None
@@ -332,12 +335,13 @@ def _build_rich_fetch_payload(url: str, html: str) -> str | None:
         if not fallback_text.strip():
             # 连兜底文本都没有：若 DOM 也完全没有媒体则直接失败；
             # 有媒体时仍交给 build_model_facing_html 产出媒体型结果。
-            probe = build_model_facing_html(url, html, body_blocks=[], title=title)
+            probe = build_model_facing_html(url, html, body_blocks=[], title=title, fetched_at=fetched_at)
             if not probe:
                 return None
 
     result = build_model_facing_html(
         url, html, body_blocks=body_blocks, title=title, fallback_text=fallback_text,
+        fetched_at=fetched_at,
     )
     if not result:
         return None
@@ -746,9 +750,14 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
             # 获取标题（用于失败提示与展示兜底）
             title = _get_title_from_html(html)
 
+            # 记录"拿到 HTML 那一刻"的时间戳，用于头部 <tg-time> 抓取时间
+            # 标注——要反映页面实际被抓取的时刻，而非后续 CPU 密集转换
+            # 结束后的时间，两者在慢速站点上可能相差数秒。
+            fetched_at = time.time()
+
             # 转 Telegram Rich HTML（CPU 密集，放线程池避免阻塞事件循环）。
             # 内容 + 内嵌视频/播放器/音频/图片 都在这一步提取。
-            payload = await asyncio.to_thread(_build_rich_fetch_payload, url, html)
+            payload = await asyncio.to_thread(_build_rich_fetch_payload, url, html, fetched_at)
             if payload:
                 set_fetch_cache(url, payload)
                 return payload
