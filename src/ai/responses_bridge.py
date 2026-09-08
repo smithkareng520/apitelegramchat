@@ -275,6 +275,60 @@ def _responses_prompt_cache_key(api_label: str, model: str, chat_id: Any) -> str
     return "tg-global"
 
 
+_RESPONSES_EXPLICIT_CACHE_MARKS = 3
+_RESPONSES_TTL = "30m"
+
+
+def _is_responses_text_content(part: Any) -> bool:
+    """显式缓存断点只挂在 Responses 支持 breakpoint 的文本 content block 上。"""
+    return isinstance(part, dict) and part.get("type") == "input_text"
+
+
+def _apply_responses_cache_breakpoints(input_items: list[dict]) -> int:
+    """硬编码 3 个显式断点，并保留 Responses 的第 4 个 implicit 断点。
+
+    复刻项目原 Anthropic 显式缓存策略的结构：
+      1) 前部 1 个固定断点：稳定锚点，优先覆盖 system/instructions 之后的
+         第一段长期不变内容；
+      2) 尾部 2 个滚动断点：贴近最近的会话内容/工具回填，支持 agentic loop
+         中连续轮次缓存最近前缀。
+
+    注意：Responses API 当前的 prompt_cache_options.ttl 对整次请求统一为
+    30m，不能逐断点设置不同 TTL。因此“前长后短”只能通过断点位置复刻
+    原策略的缓存层次，不能在同一 request 内真正设置 1h + 5m + 5m。
+    返回实际添加的显式断点数。
+    """
+    candidates: list[tuple[int, int]] = []
+    for item_index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part_index, part in enumerate(content):
+            if _is_responses_text_content(part):
+                candidates.append((item_index, part_index))
+
+    if not candidates:
+        return 0
+
+    # 第一处：固定在最前面的可用文本 block。
+    selected: list[tuple[int, int]] = [candidates[0]]
+
+    # 最后两处：从尾部向前取，避免与第一处重复。
+    for candidate in reversed(candidates):
+        if candidate in selected:
+            continue
+        selected.append(candidate)
+        if len(selected) >= _RESPONSES_EXPLICIT_CACHE_MARKS:
+            break
+
+    for item_index, part_index in selected:
+        input_items[item_index]["content"][part_index]["prompt_cache_breakpoint"] = True
+
+    return len(selected)
+
+
 def _add_responses_cache_options(
     request_kwargs: dict[str, Any],
     *,
@@ -283,19 +337,19 @@ def _add_responses_cache_options(
     chat_id: Any,
     enabled: bool = True,
 ) -> None:
-    """给 Responses 请求注入稳定的 prompt_cache_key。
-
-    GPT-5.6+ 的 Responses API 默认启用 implicit prompt caching；稳定 key
-    用于把同一会话的相似请求稳定分桶。这里不强制发送 TTL/options，避免
-    OpenAI 兼容中转对新缓存字段支持不完整时把正常请求打成 400。
-    """
+    """给 Responses 请求注入稳定 key、3 个显式断点 + 1 个 implicit 断点。"""
     if not enabled:
         return
     request_kwargs["prompt_cache_key"] = _responses_prompt_cache_key(
         api_label, model, chat_id
     )
-    # GPT-5.6+ 的 Responses API 默认启用 implicit prompt caching；这里只显式
-    # 指定稳定 cache key，避免给兼容中转额外发送可能尚未支持的 TTL 字段。
+    # gpt-5.6+ 当前默认启用 1 个 implicit breakpoint；同时显式写入最多 3 个
+    # breakpoint，使总缓存层级稳定为：前部固定 1 + 尾部滚动 2 + 自动 1。
+    # ttl 当前只有 30m 这一档，不能逐 breakpoint 区分长短。
+    request_kwargs["prompt_cache_options"] = {
+        "mode": "implicit",
+        "ttl": _RESPONSES_TTL,
+    }
 
 
 # =============================================================================
@@ -506,6 +560,7 @@ async def _agentic_loop_openai_responses(
 
     for _round in range(MAX_TOOL_CALLS):
         instructions, input_items = _convert_messages_to_responses_input(loop_messages)
+        _apply_responses_cache_breakpoints(input_items)
 
         request_kwargs: dict[str, Any] = {
             "model": current_model,
