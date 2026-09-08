@@ -1,5 +1,5 @@
 # tool_visibility.py
-"""按事件源（USER / TIMER）控制历史中工具调用的可见性——可拔插的出站消息过滤器。
+"""按事件源（USER / TIMER）与模型能力控制历史中工具调用的可见性——可拔插的出站消息过滤器。
 
 现状（本轮重构）
 ================
@@ -20,6 +20,26 @@
 
 事件源维度的可拔插机制保留，供未来需要按事件源隐藏某个工具时使用：
 在 ``TOOL_VISIBILITY_RULES`` 加一行规则即可。
+
+能力维度（strip_tool_traces）
+=============================
+
+``supports_tools=False`` 的模型（图像模型等）切进一个充满工具痕迹的
+对话时，出站历史里的 assistant tool_calls 与 role=tool 消息原样透传
+会出问题：严格网关（Anthropic 原生等，要求消息含 tool_use/tool_result
+块时请求必须声明 tools）直接 400；宽松网关（OpenAI 官方等）虽然接受
+（校验的是配对结构而非是否声明 tools），但痕迹照常占上下文并诱导
+模型模仿输出文本形态的工具调用（且与 _NO_TOOLS_SECTION 的系统提示
+自相矛盾）。``strip_tool_traces`` 在请求出口把这些痕迹整体 DROP：
+
+  - assistant 消息剔除全部 ToolCallBlock（文本保留）；
+  - role=tool 消息整条移除；
+  - 剔除后既无文本也无剩余调用的 assistant 空壳整条丢弃。
+
+持久历史从不被改动——切回支持工具的模型时完整痕迹自动恢复。
+注入点：ai_handlers.get_ai_response（apply_tool_visibility 之后、
+_append_history_async 之前），三条协议路径（openai_chat /
+anthropic_messages / gemini_native）共用该入口，一处清理全覆盖。
 
 三条硬性保证（机制不变）
 ========================
@@ -58,6 +78,7 @@ __all__ = [
     "TOOL_VISIBILITY_RULES",
     "SILENT_ONLY_TOOLS",
     "apply_tool_visibility",
+    "strip_tool_traces",
 ]
 
 
@@ -275,4 +296,111 @@ def apply_tool_visibility(
             if tr is not None and tr.tool_call_id in hidden_call_ids:
                 continue
         out.append(m)
+    return out
+
+
+# =====================================================================
+# 能力维度：supports_tools=False 时拔除全部工具痕迹（纯 DROP 模式）
+# =====================================================================
+def _assistant_dict_without_tool_calls(msg: dict) -> Optional[dict]:
+    """旧 dict 形状的 assistant 消息：剔除 tool_calls 键后的出站副本。
+
+    content 为空（None / ""）且原本只有 tool_calls 时返回 None（空壳
+    丢弃，避免产生 content=None 且无 tool_calls 的非法 assistant 消息）。
+    浅拷贝重建，绝不改写入参 dict。
+    """
+    clean = {k: v for k, v in msg.items() if k != "tool_calls"}
+    content = clean.get("content")
+    has_text = isinstance(content, str) and content.strip()
+    if not has_text:
+        # content 为 None/""/其他空值：剔除 tool_calls 后无任何正文，
+        # 整条丢弃（与 Message 路径的空壳保护同语义）。
+        return None
+    return clean
+
+
+def strip_tool_traces(messages: list) -> list:
+    """把出站消息列表中的全部工具调用痕迹 DROP（能力维度过滤）。
+
+    适用场景：本轮模型 ``supports_tools=False``（图像模型等）。历史里
+    的 assistant tool_calls 与配对 role=tool 消息若原样出站，严格网关
+    （Anthropic 原生：tool_use/tool_result 块要求请求声明 tools）直接
+    400，宽松网关也会诱导模型模仿调用并占上下文。本函数在请求出口把
+    痕迹整体拔除：
+
+      - assistant 消息剔除全部 ToolCallBlock，正文（含思考块外的文本）
+        保留；
+      - role=tool 消息整条移除（无论是否与某条 tool_call 配对——本轮
+        不提供工具，一切结果消息都失去依附对象）；
+      - 剔除后既无文本也无剩余调用的 assistant 空壳整条丢弃，杜绝
+        content=None 且无 tool_calls 的非法 assistant 消息。
+
+    纯函数：返回新列表；未被改写的消息原样引用（零拷贝），被改写的
+    一律重建新 Message / 新 dict——绝不污染调用方持有的持久历史。无
+    工具痕迹时直接返回原列表（零开销直通路径）。改写是确定性的（同一
+    输入逐字节同输出），隐式前缀缓存不因本函数额外退化。
+
+    与 ``apply_tool_visibility`` 的分工：后者按"工具名"做事件源/开关
+    维度的选择性插拔；本函数按"模型能力"做全量清除。调用顺序：先
+    apply_tool_visibility（选择性），后 strip_tool_traces（全量，直接
+    覆盖前者的结果，语义上后者包含前者）。
+    """
+    if not messages:
+        return messages
+
+    # 预扫描：是否存在工具痕迹（零开销直通路径）。
+    has_traces = False
+    for m in messages:
+        if isinstance(m, Message):
+            if m.role == "tool" or (m.role == "assistant" and m.tool_calls()):
+                has_traces = True
+                break
+        elif isinstance(m, dict):
+            if m.get("role") == "tool" or (m.get("role") == "assistant" and m.get("tool_calls")):
+                has_traces = True
+                break
+    if not has_traces:
+        return messages
+
+    out: list = []
+    for m in messages:
+        if isinstance(m, Message):
+            if m.role == "tool":
+                # role=tool 整条移除（结果随依附的 tool_call 一起消失）。
+                continue
+            if m.role == "assistant" and m.tool_calls():
+                # 重建不含 ToolCallBlock 的 assistant（保留文本/多模态/
+                # 思考块）；meta 原样保留（内部标记永不进出站，由渲染
+                # 层结构性保证）。
+                kept_blocks = [
+                    b for b in m.blocks if not isinstance(b, ToolCallBlock)
+                ]
+                has_text = any(
+                    isinstance(b, TextBlock) and b.text for b in kept_blocks
+                )
+                if not has_text:
+                    # 只有工具调用没有正文：剔除后是空壳，整条丢弃。
+                    continue
+                out.append(Message(
+                    role="assistant",
+                    blocks=kept_blocks,
+                    name=m.name,
+                    meta=dict(m.meta),
+                ))
+                continue
+            out.append(m)
+        elif isinstance(m, dict):
+            # 旧 dict 形状（双形状过渡期兼容），与 Message 路径同语义。
+            role = m.get("role")
+            if role == "tool":
+                continue
+            if role == "assistant" and m.get("tool_calls"):
+                clean = _assistant_dict_without_tool_calls(m)
+                if clean is not None:
+                    out.append(clean)
+                continue
+            out.append(m)
+        else:
+            # 未知形状：原样透传（与 apply_tool_visibility 同策略）。
+            out.append(m)
     return out

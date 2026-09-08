@@ -41,7 +41,7 @@ from utils import (
 )
 from skills import skill_catalog_brief
 from context_manager import select_request_context
-from tool_visibility import apply_tool_visibility, SILENT_ONLY_TOOLS
+from tool_visibility import apply_tool_visibility, strip_tool_traces, SILENT_ONLY_TOOLS
 from api_client import api_client
 import turn_recovery
 import state as state
@@ -574,6 +574,18 @@ async def get_ai_response(
             history, event_source,
             hidden_tools=None if silent_mode else SILENT_ONLY_TOOLS,
         )
+
+        # 能力维度全量清除（strip_tool_traces）：本轮模型不支持工具时，
+        # 出站历史里的 assistant tool_calls 与 role=tool 消息必须整体
+        # 拔除——严格网关（Anthropic 原生：tool_use/tool_result 块要求
+        # 请求声明 tools）直接 400；宽松网关也会照常计 token 并诱导
+        # 模型模仿输出文本形态的工具调用，与 _NO_TOOLS_SECTION 的系统
+        # 提示自相矛盾。只改出站副本（纯函数），持久历史不动——切回
+        # 支持工具的模型时完整痕迹自动恢复。注入点在三条协议路径共用
+        # 的入口上，openai_chat / anthropic_messages / gemini_native
+        # 一处清理全覆盖。
+        if not supports_tools:
+            history = strip_tool_traces(history)
 
         if context_snapshot.dropped_messages:
             logger.info(
