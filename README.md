@@ -505,7 +505,9 @@ fail-closed 拒绝启动受保护 Bash 子进程（见 FAQ）。
 Skill 包含 `SKILL.md` / `scripts/` / `assets/` / `references/`，runtime
 负责扫描、解析 frontmatter、建立 catalog、按需读取与资产同步；用户
 workspace 中的 skills 按用户 namespace 持久化，服务重启后自动恢复。
-Skill 不是普通 Python import，更接近 Agent 按需加载的"操作手册 + 工具资源"。
+当前用户 workspace 中的同名 Skill 优先于项目内置 Skill，其他用户的
+workspace 不会被扫描。Skill 不是普通 Python import，更接近 Agent 按需
+加载的"操作手册 + 工具资源"。
 
 **外部 MCP**：使用 Streamable HTTP MCP Client 调用外部服务（当前仅保留
 高德地图 `amap-maps`，见 `src/mcp_client.py`）。

@@ -437,7 +437,9 @@ async def build_system_prompt(
     """
     base_prompt = _BASE_PROMPT
     if supports_tools:
-        catalog_text = skill_catalog_text or skill_catalog_brief()
+        catalog_text = skill_catalog_text or skill_catalog_brief(
+            chat_id, workspace_namespace_value
+        )
         base_prompt += _TOOLS_SECTION.format(
             workspace_guide=_workspace_guide_html(chat_id, workspace_namespace_value),
             catalog_text=catalog_text,
@@ -534,6 +536,14 @@ async def get_ai_response(
             workspace_namespace_value = state.get_current_user_namespace()
         except Exception:
             workspace_namespace_value = None
+    # 技能目录可能需要从 R2 恢复；不能只依赖 app 层的后台预初始化，
+    # 否则首个回合构建 system prompt 时会漏掉用户技能。
+    try:
+        from workspace_utils import init_workspace
+
+        await init_workspace(chat_id, workspace_namespace_value)
+    except Exception:
+        logger.warning("回合内技能 workspace 初始化失败，继续使用可见本地技能", exc_info=True)
     # usage 形状动态（SDK pydantic 对象 / JSON dict / None），按 Any 标注。
     usage: Any = None
     is_timer = (event_source == "TIMER")
@@ -694,7 +704,9 @@ async def get_ai_response(
             chat_id,
             username,
             supports_tools=supports_tools,
-            skill_catalog_text=skill_catalog_brief(),
+            skill_catalog_text=skill_catalog_brief(
+                chat_id, workspace_namespace_value
+            ),
             workspace_namespace_value=workspace_namespace_value,
         )
         messages = _build_initial_messages(system_prompt)

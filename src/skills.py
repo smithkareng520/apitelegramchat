@@ -5,7 +5,6 @@ import logging
 import os
 import re
 import shutil
-from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -102,7 +101,7 @@ def _read_skill_header(skill_md: Path) -> dict[str, Any]:
         return {}
 
 
-def _candidate_skill_roots() -> list[Path]:
+def _packaged_skill_roots() -> list[Path]:
     roots: list[Path] = []
     env = os.getenv("APITELEGRAMCHAT_SKILLS_DIR", "").strip()
     if env:
@@ -132,12 +131,55 @@ def _candidate_skill_roots() -> list[Path]:
     return out
 
 
-def discover_skill_roots() -> list[Path]:
-    return [root for root in _candidate_skill_roots() if root.exists() and root.is_dir()]
+def _workspace_skill_root(chat_id: object | None = None, namespace: object | None = None) -> Path | None:
+    """Return the current user's runtime skill directory when a scope exists."""
+    try:
+        from workspace_paths import workspace_skills_root
+
+        if chat_id is None and namespace is None:
+            from state import get_current_user_namespace
+
+            namespace = get_current_user_namespace()
+        if chat_id is None and namespace is None:
+            return None
+        return workspace_skills_root(chat_id or 0, namespace)
+    except Exception:
+        logger.debug("无法解析当前用户 workspace skills", exc_info=True)
+        return None
 
 
-def _iter_skill_files() -> Iterable[tuple[Path, Path]]:
-    for root in discover_skill_roots():
+def _candidate_skill_roots(
+    chat_id: object | None = None, namespace: object | None = None
+) -> list[Path]:
+    roots: list[Path] = []
+    workspace_root = _workspace_skill_root(chat_id, namespace)
+    if workspace_root is not None:
+        roots.append(workspace_root)
+    roots.extend(_packaged_skill_roots())
+    seen: set[str] = set()
+    out: list[Path] = []
+    for root in roots:
+        try:
+            resolved = root.expanduser().resolve()
+        except Exception:
+            continue
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            out.append(resolved)
+    return out
+
+
+def discover_skill_roots(
+    chat_id: object | None = None, namespace: object | None = None
+) -> list[Path]:
+    return [root for root in _candidate_skill_roots(chat_id, namespace) if root.exists() and root.is_dir()]
+
+
+def _iter_skill_files(
+    chat_id: object | None = None, namespace: object | None = None
+) -> Iterable[tuple[Path, Path]]:
+    for root in discover_skill_roots(chat_id, namespace):
         for child in sorted(root.iterdir()):
             if not child.is_dir():
                 continue
@@ -169,10 +211,12 @@ class SkillRecord:
         }
 
 
-def load_skill_records() -> list[SkillRecord]:
+def load_skill_records(
+    chat_id: object | None = None, namespace: object | None = None
+) -> list[SkillRecord]:
     records: list[SkillRecord] = []
     seen_skill_ids: set[str] = set()
-    for root, skill_md in _iter_skill_files():
+    for root, skill_md in _iter_skill_files(chat_id, namespace):
         skill_id = skill_md.parent.name
         # 多个 skill root 里出现同名目录时，只取先发现的一份（roots 按优先级排列），
         # 避免同一个 skill 在目录/系统提示里重复出现。
@@ -220,32 +264,33 @@ def _read_full_skill(skill_path: Path) -> tuple[dict[str, Any], str]:
 
 
 
-@lru_cache(maxsize=1)
-def _cached_skill_catalog_text() -> str:
-    return catalog_text()
-
-
-def skill_catalog_brief() -> str:
+def skill_catalog_brief(
+    chat_id: object | None = None, namespace: object | None = None
+) -> str:
     """给系统提示用的精简技能目录。"""
-    return _cached_skill_catalog_text()
+    return catalog_text(chat_id, namespace)
 
 
-def get_skill_catalog() -> dict[str, Any]:
-    records = load_skill_records()
+def get_skill_catalog(
+    chat_id: object | None = None, namespace: object | None = None
+) -> dict[str, Any]:
+    records = load_skill_records(chat_id, namespace)
     featured = next((rec.skill_id for rec in records if rec.priority > 0), None)
     return {
-        "roots": [str(root) for root in discover_skill_roots()],
+        "roots": [str(root) for root in discover_skill_roots(chat_id, namespace)],
         "count": len(records),
         "featured": featured,
         "skills": [rec.to_catalog_item() for rec in records],
     }
 
 
-def read_skill(skill_id: str) -> dict[str, Any]:
+def read_skill(
+    skill_id: str, chat_id: object | None = None, namespace: object | None = None
+) -> dict[str, Any]:
     skill_id = str(skill_id or "").strip()
     if not skill_id:
         return {"error": "Missing skill_id"}
-    for rec in load_skill_records():
+    for rec in load_skill_records(chat_id, namespace):
         if rec.skill_id == skill_id or rec.name == skill_id:
             skill_path = Path(rec.root) / rec.skill_id / "SKILL.md"
             meta, body = _read_full_skill(skill_path)
@@ -270,7 +315,7 @@ def _project_skill_source_root() -> Path | None:
     The packaged tree is only the initial source for populating a workspace.
     ``workspace/skills`` remains runtime-owned after initialization.
     """
-    for root in _candidate_skill_roots():
+    for root in _packaged_skill_roots():
         try:
             root = root.resolve()
         except Exception:
@@ -340,9 +385,11 @@ def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
     return summary
 
 
-def catalog_text() -> str:
+def catalog_text(
+    chat_id: object | None = None, namespace: object | None = None
+) -> str:
     """生成系统提示词用的 skill 目录，每行格式：name - description。"""
-    records = load_skill_records()
+    records = load_skill_records(chat_id, namespace)
     lines = []
     for rec in records:
         desc = rec.description.strip() if rec.description else "(no description)"
@@ -350,8 +397,10 @@ def catalog_text() -> str:
     return "\n".join(lines)
 
 
-def read_skill_text(skill_id: str) -> str:
-    data = read_skill(skill_id)
+def read_skill_text(
+    skill_id: str, chat_id: object | None = None, namespace: object | None = None
+) -> str:
+    data = read_skill(skill_id, chat_id, namespace)
     if "error" in data:
         return data["error"]
     payload = {
