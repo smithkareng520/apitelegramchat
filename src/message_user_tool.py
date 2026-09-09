@@ -35,7 +35,7 @@ from typing import Any
 import aiohttp
 
 from config import BASE_URL
-from utils import send_rich_html_message, escape_html
+from utils import send_rich_html_message
 from markdown_converter import convert_markdown_to_telegram_html, wrap_mixed_content_as_blocks
 from core.rich_media import _rich_message_html_payload
 from token_budget import truncate_to_token_budget
@@ -164,38 +164,49 @@ def _build_keyboard(interaction: AskUserInteraction) -> dict:
 def _question_rich_text(question: str) -> str:
     """把 LLM 提供的 question 文本渲染为块级安全的富文本正文。
 
-    此前整条链路只做 ``escape_html``：markdown 语法（**粗体**、`代码`、
-    列表等）原样留在 HTML 里。初始卡片发送时还能靠 sendRichMessage
-    发送前的兜底转换（``_rich_message_html_payload`` 第 0 步）补救，
-    但回答/超时后的 ``editMessageText`` 路径完全不经过任何转换，
-    用户会看到字面量 "**xx**" 与反引号——即 message 工具的富文本
-    "没有进行 markdown to telegram html 转换" 的现象。
+    此前整条链路只做纯字符转义（旧的 escape_html）：markdown 语法
+    （**粗体**、`代码`、列表等）原样留在 HTML 里。初始卡片发送时还能靠
+    sendRichMessage 发送前的兜底转换（``_rich_message_html_payload``
+    第 0 步）补救，但回答/超时后的 ``editMessageText`` 路径完全不经过
+    任何转换，用户会看到字面量 "**xx**" 与反引号——即 message 工具的
+    富文本"没有进行 markdown to telegram html 转换" 的现象。
 
     现在在构造时统一渲染，发送与编辑两个路径渲染结果一致：
 
-    1. 先 ``escape_html``：question 来自 LLM 工具参数，若直接进转换器，
-       形如 ``<script>`` / ``<img onerror=...>`` 的内容会被转换器当
-       "既有 HTML 标签"原样保留（转换器的 HTML/Markdown 混排支持），
-       形成注入。先转义再转换，既保留 markdown 语法（**、`、列表
-       不受转义影响），又让 HTML 特殊字符按字面展示；
-    2. 再 ``convert_markdown_to_telegram_html``（配合转换器的幂等
-       转义修复，已转义实体不会被二次转义）；
-    3. 最后 ``wrap_mixed_content_as_blocks``：question 里的 markdown
-       列表等块级产物单独成块，避免被包进 ``<p>`` 产生非法嵌套。
+    直接交给 ``convert_markdown_to_telegram_html``（配合
+    ``wrap_mixed_content_as_blocks`` 把 markdown 列表等块级产物单独
+    成块，避免被包进 ``<p>`` 产生非法嵌套）。
+
+    注意：这里不对 question 预先做逐字符转义。转换器的
+    ``_convert_inline`` 自己就会：识别形如 ``<tag ...>`` 的既有 HTML/
+    Telegram 富文本标签（如 ``<tg-button>``）并原样保留，其余裸露的
+    ``<``、``>``、``&`` 一律转义为实体（前提是文本里含有 markdown
+    语法特征，否则整段直接短路透传，见函数返回前的说明）。若先对
+    整段文本做一次无差别转义，``<tg-button ...>`` 会变成
+    ``&lt;tg-button ...&gt;``，转换器就检测不到"已有标签"，导致按钮
+    之类的富文本标签无法渲染，只能看到转义后的字面量——这正是之前
+    的问题所在。
     """
-    escaped = escape_html(str(question or ""))
-    if not escaped:
+    text = str(question or "")
+    if not text:
         return ""
-    return wrap_mixed_content_as_blocks(convert_markdown_to_telegram_html(escaped))
+    return wrap_mixed_content_as_blocks(convert_markdown_to_telegram_html(text))
 
 
 def _question_html(interaction: AskUserInteraction) -> str:
     """构造 message_user 消息卡片 HTML。
 
     安全修复：question / label / description 均来自 LLM 工具调用参数，
-    若不转义，LLM 一旦输出含 ``<script>`` 或 ``<img onerror=...>`` 的
-    文本，就会作为原始 HTML 渲染在用户的客户端。所有插值必须经
-    escape_html 转义。question 的 markdown 渲染见 _question_rich_text。
+    不能直接拼进 HTML。三者现在统一走
+    convert_markdown_to_telegram_html：question 走
+    _question_rich_text 的富文本渲染；label / description 是纯文本
+    插值，同样交给该转换器处理裸露的 ``<``、``>``、``&`` 与既有标签。
+
+    已知行为差异（项目已删除独立的 escape_html 转义函数，改为全部
+    复用 markdown 转换器）：若 label/description 恰好不含任何 markdown
+    语法特征，转换器会短路直接原样返回，不转义裸露的 ``<``/``>``/``&``；
+    若其中出现形似 ``<tag>`` 的片段，也会被当作"已有 HTML 标签"保留
+    而非转义。这与旧版 escape_html 逐字符转义的行为不同。
     """
     question = _question_rich_text(interaction.question)
     if not interaction.options:
@@ -208,10 +219,10 @@ def _question_html(interaction: AskUserInteraction) -> str:
     lines = [f"<p>🤔 <b>需要你的确认</b></p>{question}"]
     lines.append("<ul>")
     for option in interaction.options:
-        label = escape_html(option.get("label", ""))
+        label = convert_markdown_to_telegram_html(option.get("label", ""))
         desc = option.get("description") or ""
         if desc:
-            lines.append(f"<li><b>{label}</b>：{escape_html(desc)}</li>")
+            lines.append(f"<li><b>{label}</b>：{convert_markdown_to_telegram_html(desc)}</li>")
         else:
             lines.append(f"<li><b>{label}</b></li>")
     lines.append("</ul>")
@@ -367,11 +378,11 @@ def _answered_html(interaction: AskUserInteraction, answer: dict[str, Any]) -> s
         selected = answer.get("selected") or []
         labels = [str(item.get("label", "")) for item in selected if isinstance(item, dict)]
         chosen_raw = "、".join(x for x in labels if x) or "已选择"
-        chosen = escape_html(chosen_raw)
+        chosen = convert_markdown_to_telegram_html(chosen_raw)
         return f"<p>✅ <b>已收到你的选择</b></p>{q}<p><b>{chosen}</b></p>"
     if kind == "custom":
         value = truncate_to_token_budget(str(answer.get("value", "")), ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET, suffix="…")
-        return f"<p>✅ <b>已收到你的回答</b></p>{q}<p><blockquote>{escape_html(value)}</blockquote></p>"
+        return f"<p>✅ <b>已收到你的回答</b></p>{q}<p><blockquote>{convert_markdown_to_telegram_html(value)}</blockquote></p>"
     if kind == "cancelled":
         return f"<p>✖️ <b>已取消</b></p>{q}"
     if kind == "expired":

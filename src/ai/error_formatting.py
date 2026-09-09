@@ -11,7 +11,8 @@ from typing import Optional, Any
 from urllib.parse import urlparse
 from PIL import Image
 
-from utils import strip_html_tags, escape_html, get_logger
+from utils import strip_html_tags, get_logger
+from markdown_converter import convert_markdown_to_telegram_html
 
 logger = get_logger(__name__)
 
@@ -305,14 +306,14 @@ def _format_error_detail_for_display(detail: str) -> str:
     if payload is not None:
         lines = _extract_detail_lines_from_payload(payload)
         if lines:
-            return "<br/>".join(escape_html(line) for line in lines)
+            return "<br/>".join(convert_markdown_to_telegram_html(line) for line in lines)
 
     # fallback：按行输出，先把转义序列恢复成可读文本
     clean = clean.replace("\\r\\n", "\\n").replace("\\r", "\\n").replace("\\n", "\n")
     lines = [line.strip() for line in clean.splitlines() if line.strip()]
     if not lines:
         return ""
-    return "<br/>".join(escape_html(line) for line in lines)
+    return "<br/>".join(convert_markdown_to_telegram_html(line) for line in lines)
 
 
 def _format_api_error_notice(
@@ -324,13 +325,13 @@ def _format_api_error_notice(
         detail: str = "",
         request_id: str = "",
 ) -> str:
-    parts = [f"⚠️ <b>{escape_html(api_name)} 请求失败</b>"]
+    parts = [f"⚠️ <b>{convert_markdown_to_telegram_html(api_name)} 请求失败</b>"]
     if error_code:
         parts.append(f"HTTP 状态：{error_code}")
     if model:
-        parts.append(f"模型：{escape_html(model)}")
+        parts.append(f"模型：{convert_markdown_to_telegram_html(model)}")
     if request_id:
-        parts.append(f"Request ID：{escape_html(request_id)}")
+        parts.append(f"Request ID：{convert_markdown_to_telegram_html(request_id)}")
     if detail:
         formatted_detail = _format_error_detail_for_display(detail)
         if formatted_detail:
@@ -365,11 +366,11 @@ def _format_image_safety_notice(detail: str = "", model: str = "") -> str:
     parts.append("模型检测到提示词或生成结果可能包含不当内容。")
     parts.append("请修改描述后重试，或换一个更中性的表达。")
     if model:
-        parts.append(f"模型：{escape_html(_short_model_name(model))}")
+        parts.append(f"模型：{convert_markdown_to_telegram_html(_short_model_name(model))}")
     if detail:
         clean_detail = strip_html_tags(detail).strip()
         if clean_detail and len(clean_detail) < 500:
-            parts.append(f"<i>详情：{escape_html(clean_detail)}</i>")
+            parts.append(f"<i>详情：{convert_markdown_to_telegram_html(clean_detail)}</i>")
     return "<br/>".join(parts)
 
 

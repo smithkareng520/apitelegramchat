@@ -13,7 +13,8 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
-from utils import get_logger, escape_html
+from utils import get_logger
+from markdown_converter import convert_markdown_to_telegram_html
 from core.messages import Message
 from token_budget import truncate_to_token_budget
 from tool_result_condense import condense_for_model
@@ -117,8 +118,8 @@ def _format_subagent_progress_html(status_text: str) -> str:
     """把子 agent 的中文状态短句渲染成结构化富文本卡片。
 
     返回的 HTML 片段由若干 ``<p>`` 块级元素组成，可直接嵌入工具卡片的
-    ``<details>``。所有外露文本均经 ``escape_html`` 转义，避免模型或
-    子 agent 控制的字符串破坏 Rich Message 结构。
+    ``<details>``。所有外露文本均经 ``convert_markdown_to_telegram_html``
+    处理，避免模型或子 agent 控制的字符串破坏 Rich Message 结构。
     """
     text = status_text or "正在执行…"
     phase = _subagent_progress_phase(text)
@@ -143,14 +144,14 @@ def _format_subagent_progress_html(status_text: str) -> str:
 
     rows = []
     if model_match:
-        rows.append(f"<b>模型</b>：{escape_html(model_match.group(1).strip())}")
+        rows.append(f"<b>模型</b>：{convert_markdown_to_telegram_html(model_match.group(1).strip())}")
     if round_match:
         rows.append(
-            f"<b>轮次</b>：{escape_html(round_match.group(1))} / "
-            f"{escape_html(round_match.group(2))}"
+            f"<b>轮次</b>：{convert_markdown_to_telegram_html(round_match.group(1))} / "
+            f"{convert_markdown_to_telegram_html(round_match.group(2))}"
         )
     elif plain_round_match and phase not in ("done", "terminal"):
-        rows.append(f"<b>轮次</b>：{escape_html(plain_round_match.group(1))}")
+        rows.append(f"<b>轮次</b>：{convert_markdown_to_telegram_html(plain_round_match.group(1))}")
     if tool_names_match:
         # 子 agent 推送的 status_text 在工具名后追加了「…」，原样展示会
         # 把省略号当成工具名一部分。统一去除尾部省略号 / 点号。
@@ -160,11 +161,11 @@ def _format_subagent_progress_html(status_text: str) -> str:
             tool_display = " + ".join(tool_list[:6]) + f" 等 {len(tool_list)} 个"
         else:
             tool_display = " + ".join(tool_list)
-        rows.append(f"<b>调用工具</b>：{escape_html(tool_display)}")
+        rows.append(f"<b>调用工具</b>：{convert_markdown_to_telegram_html(tool_display)}")
     if total_match:
-        rounds_s = escape_html(total_match.group(1))
-        tool_calls_s = escape_html(total_match.group(2))
-        seconds_s = escape_html(total_match.group(3)) if total_match.group(3) else None
+        rounds_s = convert_markdown_to_telegram_html(total_match.group(1))
+        tool_calls_s = convert_markdown_to_telegram_html(total_match.group(2))
+        seconds_s = convert_markdown_to_telegram_html(total_match.group(3)) if total_match.group(3) else None
         if phase == "done":
             label = "完成"
         elif phase == "terminal":
@@ -183,14 +184,14 @@ def _format_subagent_progress_html(status_text: str) -> str:
                 f"{tool_calls_s} 次工具调用"
             )
     elif elapsed_match:
-        rows.append(f"<b>已耗时</b>：{escape_html(elapsed_match.group(1))}s")
+        rows.append(f"<b>已耗时</b>：{convert_markdown_to_telegram_html(elapsed_match.group(1))}s")
 
-    header = f"<p>{icon} <b>{escape_html(phase_label)}</b></p>"
+    header = f"<p>{icon} <b>{convert_markdown_to_telegram_html(phase_label)}</b></p>"
     if rows:
         body = "<p>" + " · ".join(rows) + "</p>"
     else:
         # 兜底：状态文本本身已结构化失败，原样展示但截断到合理长度。
-        safe = escape_html(text[:160])
+        safe = convert_markdown_to_telegram_html(text[:160])
         body = f"<p><i>{safe}</i></p>"
     return header + body
 
@@ -473,7 +474,7 @@ async def _run_tool_calls_and_append(
                     builder.update_tool_item(
                         tc_id,
                         "Waiting for your answer",
-                        f"<p>{escape_html(truncate_to_token_budget(str(question), 64, suffix='…'))}</p>",
+                        f"<p>{convert_markdown_to_telegram_html(truncate_to_token_budget(str(question), 64, suffix='…'))}</p>",
                         status="waiting",
                     )
                     builder.request_flush(force=True)
@@ -578,7 +579,7 @@ async def _run_tool_calls_and_append(
             except Exception as e:
                 logger.exception(f"[tool] {fn_name} format_tool_result 失败: {e}")
                 formatted_summary = f"{fn_name} completed (formatting failed)"
-                details_html = f"<p>{escape_html(truncate_to_token_budget(str(safe_content), 256, suffix='…'))}</p>"
+                details_html = f"<p>{convert_markdown_to_telegram_html(truncate_to_token_budget(str(safe_content), 256, suffix='…'))}</p>"
             if safe_content == _TOOL_TIMEOUT_MARKER:
                 llm_content = f"Error: tool {fn_name} timed out. Please try again or refine the request."
             else:
@@ -696,7 +697,7 @@ async def _run_tool_calls_and_append(
                 fn_name, fn_args, tc_id = "unknown", {}, f"call_error_{uuid.uuid4().hex[:8]}"
             err_text = f"Exception: tool {fn_name} failed - {str(res)[:200]}"
             final_summary = f"⚠️ {fn_name} failed"
-            details_html = f"<p>{escape_html(err_text)}</p>"
+            details_html = f"<p>{convert_markdown_to_telegram_html(err_text)}</p>"
             builder.update_tool_item(tc_id, final_summary, details_html, status="error")
             tool_msg = Message.tool_result(tc_id, fn_name, err_text)
             loop_messages.append(tool_msg)
@@ -757,7 +758,7 @@ async def _run_tool_calls_and_append(
             builder.update_tool_item(
                 skipped_id,
                 "Not executed (budget)",
-                f"<p>{escape_html(skipped_content)}</p>",
+                f"<p>{convert_markdown_to_telegram_html(skipped_content)}</p>",
                 status="error",
             )
         logger.warning(

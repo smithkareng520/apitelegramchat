@@ -18,7 +18,6 @@ try:
 except Exception:  # pragma: no cover - optional dependency fallback
     qrcode = None
 
-from utils import escape_html
 from s3_utils import upload_bytes_to_r2
 from search.fetch_url import CURL_TIMEOUT, HTTP_TIMEOUT_SHORT, _truncate
 

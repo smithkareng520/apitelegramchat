@@ -7,7 +7,7 @@ from typing import List
 
 from tool_dispatch import _TOOL_TIMEOUT_MARKER
 
-from utils import escape_html
+from markdown_converter import convert_markdown_to_telegram_html
 from todo_tool import render_todo_card
 from memory_tool import render_memory_card
 from subagent_tool import render_subagent_card
@@ -64,9 +64,8 @@ _TOOL_TIMEOUT_LABELS = {
 
 
 async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tuple[str, str]:
-    # 统一用 utils.escape_html 做转义（它做了智能 ampersand 处理，
-    # 不会重复转义）；不要在本地另写简化版 escape_text——对已经合法的
-    # 实体再做一次 `&` -> `&amp;` 转换会导致双重转义。
+    # 统一用 markdown_converter.convert_markdown_to_telegram_html 做转义/
+    # 渲染；不要在本地另写简化版 escape_text，避免转义策略不一致。
     # ---- Intercept timeout magic marker BEFORE any other branch ----
     # The raw exception (with TOOL_CALL_TIMEOUT seconds) is kept in
     # logger.error on the backend; the UI only sees the friendly version.
@@ -280,8 +279,8 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         else:
             m = re.search(r"https://[^\s<>\"']+wikipedia\.org[^\s<>\"']*", text)
             wiki_url = m.group(0) if m else f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(query)}"
-        summary = f"📚 {escape_html(title)}"
-        details_html = f'<a href="{wiki_url}">{escape_html(title)}</a>'
+        summary = f"📚 {convert_markdown_to_telegram_html(title)}"
+        details_html = f'<a href="{wiki_url}">{convert_markdown_to_telegram_html(title)}</a>'
         return summary, details_html
 
     # ===================== 信息类工具富文本卡片（自旧版恢复） =====================
@@ -291,8 +290,8 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
     # 避免上游错误消息里的 < > & 打坏 Rich Message 结构。
     elif fn_name == "exchange_rate":
         base = fn_args.get('base', 'USD')
-        summary = f"💱 {escape_html(base)} 汇率"
-        details_html = result_str if not result_str.startswith("失败：") else escape_html(result_str)
+        summary = f"💱 {convert_markdown_to_telegram_html(base)} 汇率"
+        details_html = result_str if not result_str.startswith("失败：") else convert_markdown_to_telegram_html(result_str)
         return summary, details_html
 
     elif fn_name == "message_user" or fn_name == "ask_user":
@@ -333,7 +332,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 details_html = (
                     f'<img src="{img_url}"/><br/>'
                     f'<b>✅ 二维码生成成功</b><br/>'
-                    f'<b>内容：</b>{escape_html(content_text)}<br/>'
+                    f'<b>内容：</b>{convert_markdown_to_telegram_html(content_text)}<br/>'
                     f'<b>链接：</b><a href="{img_url}">📷 点击查看 / 下载二维码</a>'
                 )
                 return summary, details_html
@@ -377,7 +376,10 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 # ⚠️ R2 presigned URL 含大量 & 查询参数（X-Amz-Algorithm、X-Amz-Credential、
                 # X-Amz-Signature 等），HTML 属性值中未转义的 & 会被 Telegram HTML
                 # 解析器当作实体名起点，导致 URL 被截断 → RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND。
-                # 必须用 escape_html 转义（与 _agentic_loop_native_video 路径一致）。
+                # 必须转义（与 _agentic_loop_native_video 路径一致）。此处特意用
+                # html.escape 而非 convert_markdown_to_telegram_html：后者是
+                # markdown 转换器，会把 URL 里的 *_[]` 等字符误解析成标签，同样
+                # 会打坏这个 href/src 属性值。
                 # 修复：旧实现注释声称已转义但 f-string 直接内插原始 URL，转义
                 # 实际从未发生；现在真正落到 html.escape（含引号，供属性值使用）。
                 video_url = url_match.group(1).strip()
@@ -426,7 +428,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         if isinstance(data, dict) and data.get("status") == "error":
             message = data.get("message") or result_str
             summary = f"❌ {base_label}失败"
-            details_html = escape_html(str(message))
+            details_html = convert_markdown_to_telegram_html(str(message))
             return summary, details_html
 
         summary = base_label
@@ -473,7 +475,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
         if not payload.get("ok"):
             summary = f"❌ 待办操作失败：{payload.get('code', '')}"
-            details_html = f"<p>{escape_html(payload.get('error', '未知错误'))}</p>"
+            details_html = f"<p>{convert_markdown_to_telegram_html(payload.get('error', '未知错误'))}</p>"
             return summary, details_html
 
         action = payload.get("action", "list")
@@ -525,7 +527,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             return summary, details_html
         if not payload.get("ok"):
             summary = f"❌ 记忆操作失败：{payload.get('code', '')}"
-            details_html = f"<p>{escape_html(payload.get('error', '未知错误'))}</p>"
+            details_html = f"<p>{convert_markdown_to_telegram_html(payload.get('error', '未知错误'))}</p>"
             return summary, details_html
         action = payload.get("action", "list")
         if action == "list":
@@ -660,15 +662,15 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         # ---- Details: HTML list of successes and failures ----
         details_parts: List[str] = []
         if sent:
-            items = "".join(f"<li>{escape_html(str(f))}</li>" for f in sent)
+            items = "".join(f"<li>{convert_markdown_to_telegram_html(str(f))}</li>" for f in sent)
             label = "file" if sent_count == 1 else "files"
             details_parts.append(f"<b>✅ Sent ({sent_count} {label})</b><ul>{items}</ul>")
         if failed:
-            items = "".join(f"<li>{escape_html(str(f))}</li>" for f in failed)
+            items = "".join(f"<li>{convert_markdown_to_telegram_html(str(f))}</li>" for f in failed)
             label = "file" if failed_count == 1 else "files"
             details_parts.append(f"<b>❌ Failed ({failed_count} {label})</b><ul>{items}</ul>")
         if error:
-            details_parts.append(f"<i>{escape_html(str(error))}</i>")
+            details_parts.append(f"<i>{convert_markdown_to_telegram_html(str(error))}</i>")
 
         if not details_parts:
             details_parts.append("<i>No files were processed.</i>")

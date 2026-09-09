@@ -5,7 +5,7 @@ import functools
 import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Any, Awaitable, Callable, Optional, TypeVar, cast
+from typing import Any, Awaitable, Callable, TypeVar, cast
 
 import logging
 
@@ -47,20 +47,12 @@ def get_current_time() -> str:
               "July", "August", "September", "October", "November", "December"]
     return f"{days[now.weekday()]}, {months[now.month - 1]} {now.day}, {now.year}"
 
-def escape_html(text: Optional[str]) -> str:
-    """转义 HTML 特殊字符（<、>、&）。
-
-    历史 BUG：此函数曾是一个 no-op（`return text`），导致 60+ 处调用点
-    实际上未做任何转义，存在 HTML 注入风险。现做智能 ampersand 处理
-    （避免对已有的 &amp;/&#39; 实体二次转义）。
-    非字符串输入会被先转换为 str。
-    """
-    if text is None:
-        return ""
-    if not isinstance(text, str):
-        text = str(text)
-    if not text:
-        return ""
-    text = _SMART_AMP_PATTERN.sub('&amp;', text)
-    text = text.replace('<', '&lt;').replace('>', '&gt;')
-    return text
+# escape_html() 已删除：项目内所有 HTML 转义统一改为调用
+# markdown_converter.convert_markdown_to_telegram_html()，不再保留独立
+# 的纯转义函数。
+#
+# 注意（迁移后的行为差异）：convert_markdown_to_telegram_html 对完全不
+# 含 markdown 语法的文本会直接原样返回（短路优化），不会转义裸露的
+# <、>、&。这与原 escape_html 逐字符转义的行为不同——原调用点里若
+# 文本恰好不含任何 markdown 特征（*、`、#、列表符号等）又带有裸露的
+# <、>、& ，转换后将不再被转义。

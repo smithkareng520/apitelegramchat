@@ -27,7 +27,6 @@ from core.chat_guard import (  # noqa: F401
 from core.text_utils import (  # noqa: F401
     _F,
     _SMART_AMP_PATTERN,
-    escape_html,
     get_current_time,
     retry_async,
 )

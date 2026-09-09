@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 
-from utils import escape_html
+from markdown_converter import convert_markdown_to_telegram_html
 
 
 # ---------- 正则与常量 ----------
@@ -168,13 +168,23 @@ def _domain_of(url: str) -> str:
 def _href(url: str) -> str:
     """Escape a URL for safe embedding into an href attribute.
 
-    ``escape_html`` smart-escapes bare ``&`` -> ``&amp;`` so query strings
-    like ``?a=1&b=2`` remain valid in HTML attributes. We also guard
-    against the (rare) case of a literal ``"`` inside the URL.
+    KNOWN RISK: this now routes through
+    ``convert_markdown_to_telegram_html`` (the project's HTML-escaping
+    utility ``escape_html`` was removed and all call sites were switched
+    to the markdown converter). That converter is designed to parse
+    markdown syntax and to preserve pre-existing HTML-looking tags, not
+    to safely escape an arbitrary attribute value. A URL containing
+    ``*``, ``_``, `` ` ``, or a ``[text](url)``-shaped fragment can be
+    rewritten into real ``<i>``/``<b>``/``<a>`` tags, corrupting the
+    ``href="..."`` attribute (unescaped ``<`` / stray ``"``) and
+    potentially causing Telegram to reject the whole message. If URLs
+    start breaking or messages start failing to send, this function is
+    the first place to check — restoring a plain, non-markdown escaper
+    here for URLs specifically would fix it.
     """
     if not url:
         return ""
-    safe = escape_html(url)
+    safe = convert_markdown_to_telegram_html(url)
     if '"' in safe:
         safe = safe.replace('"', '&quot;')
     return safe
@@ -193,13 +203,13 @@ def _section_header(section: dict) -> str:
     if mode == "lens":
         parts.append("以图搜图</b>")
     elif query:
-        parts.append(f"「{escape_html(query)}」</b>")
+        parts.append(f"「{convert_markdown_to_telegram_html(query)}」</b>")
     else:
         parts.append("搜索结果</b>")
 
     meta: list[str] = []
     if engine:
-        meta.append(escape_html(engine))
+        meta.append(convert_markdown_to_telegram_html(engine))
     if success or requested:
         meta.append(f"{success}/{requested} 条")
     if meta:
@@ -212,14 +222,14 @@ def _render_search_items(items: list[dict]) -> str:
     """search 模式：ol 卡片，标题链接 + 域名徽标 + 时间/评分徽标 + 斜体摘要。"""
     parts: list[str] = ["<ol>"]
     for it in items:
-        title = escape_html(it.get("title") or "无标题")
+        title = convert_markdown_to_telegram_html(it.get("title") or "无标题")
         link = it.get("link") or ""
-        snippet = escape_html(it.get("snippet") or "")
+        snippet = convert_markdown_to_telegram_html(it.get("snippet") or "")
         domain = _domain_of(link)
         date = it.get("date") or ""
         rating = it.get("rating") or ""
         # rating 行原始文本形如 `4.3 ⭐ (30740 评价)`，直接转义即可保留装饰
-        rating_disp = escape_html(rating) if rating else ""
+        rating_disp = convert_markdown_to_telegram_html(rating) if rating else ""
         card = "<li>"
         if link:
             card += f'<b><a href="{_href(link)}">{title}</a></b>'
@@ -227,9 +237,9 @@ def _render_search_items(items: list[dict]) -> str:
             card += f"<b>{title}</b>"
         meta_bits: list[str] = []
         if domain:
-            meta_bits.append(escape_html(domain))
+            meta_bits.append(convert_markdown_to_telegram_html(domain))
         if date:
-            meta_bits.append(escape_html(date))
+            meta_bits.append(convert_markdown_to_telegram_html(date))
         if rating_disp:
             meta_bits.append(rating_disp)
         if meta_bits:
@@ -248,8 +258,8 @@ def _render_images_items(items: list[dict]) -> str:
         "<tr><th>#</th><th>标题</th><th>来源</th><th>图片</th></tr>",
     ]
     for idx, it in enumerate(items, 1):
-        title = escape_html(it.get("title") or "无标题")
-        source = escape_html(it.get("source") or "")
+        title = convert_markdown_to_telegram_html(it.get("title") or "无标题")
+        source = convert_markdown_to_telegram_html(it.get("source") or "")
         img = it.get("image_url") or ""
         page = it.get("link") or it.get("page_link") or ""
         row = "<tr>"
@@ -279,14 +289,14 @@ def _render_videos_items(items: list[dict]) -> str:
     """
     parts: list[str] = ["<ol>"]
     for it in items:
-        title = escape_html(it.get("title") or "无标题")
+        title = convert_markdown_to_telegram_html(it.get("title") or "无标题")
         # 新格式用 page_link；旧日志/缓存可能仍用 link，向后兼容
         page = it.get("page_link") or it.get("link") or ""
-        snippet = escape_html(it.get("snippet") or "")
-        source = escape_html(it.get("source") or "")
-        channel = escape_html(it.get("channel") or "")
-        duration = escape_html(it.get("duration") or "")
-        date = escape_html(it.get("date") or "")
+        snippet = convert_markdown_to_telegram_html(it.get("snippet") or "")
+        source = convert_markdown_to_telegram_html(it.get("source") or "")
+        channel = convert_markdown_to_telegram_html(it.get("channel") or "")
+        duration = convert_markdown_to_telegram_html(it.get("duration") or "")
+        date = convert_markdown_to_telegram_html(it.get("date") or "")
         cover = it.get("cover") or it.get("image_url") or ""
         video_url = it.get("video_url") or ""
         domain = _domain_of(page)
@@ -306,7 +316,7 @@ def _render_videos_items(items: list[dict]) -> str:
         if date:
             meta_bits.append(date)
         if domain:
-            meta_bits.append(escape_html(domain))
+            meta_bits.append(convert_markdown_to_telegram_html(domain))
         if meta_bits:
             card += f" <code>{' · '.join(meta_bits)}</code>"
         card += "<br/>"
@@ -331,9 +341,9 @@ def _render_videos_items(items: list[dict]) -> str:
 def _render_lens_items(items: list[dict]) -> str:
     parts: list[str] = ["<ol>"]
     for it in items:
-        title = escape_html(it.get("title") or "无标题")
+        title = convert_markdown_to_telegram_html(it.get("title") or "无标题")
         page = it.get("page_link") or it.get("link") or ""
-        source = escape_html(it.get("source") or "")
+        source = convert_markdown_to_telegram_html(it.get("source") or "")
         img = it.get("image_url") or ""
         domain = _domain_of(page)
         card = "<li>"
@@ -343,7 +353,7 @@ def _render_lens_items(items: list[dict]) -> str:
             card += f"<b>{title}</b>"
         meta_bits = [x for x in (source, domain) if x]
         if meta_bits:
-            card += f" <code>{escape_html(' · '.join(meta_bits))}</code>"
+            card += f" <code>{convert_markdown_to_telegram_html(' · '.join(meta_bits))}</code>"
         card += "<br/>"
         if img:
             card += f'<a href="{_href(img)}">🖼️ 查看图片</a>'
@@ -367,11 +377,11 @@ def render_web_search_section(section: dict) -> str:
 
     if mode == "error":
         raw = section.get("raw", "")
-        snippet = escape_html(raw[:1000])
+        snippet = convert_markdown_to_telegram_html(raw[:1000])
         return f"<b>❌ 搜索失败</b><br/><i>{snippet}</i>"
 
     if mode == "text":
-        return escape_html(section.get("raw", "")[:60000])
+        return convert_markdown_to_telegram_html(section.get("raw", "")[:60000])
 
     header = _section_header(section)
     items = section.get("items", [])
@@ -380,7 +390,7 @@ def render_web_search_section(section: dict) -> str:
 
     renderer = _MODE_RENDERERS.get(mode)
     if renderer is None:
-        return header + "<br/>" + escape_html(section.get("raw", "")[:2000])
+        return header + "<br/>" + convert_markdown_to_telegram_html(section.get("raw", "")[:2000])
 
     return header + "<br/>" + renderer(items)
 
@@ -422,7 +432,7 @@ def format_web_search_result(fn_args: dict, result_str: str) -> tuple[str, str]:
     # ---- details_html ----
     sections = parse_web_search_sections(text)
     if not sections:
-        return summary, escape_html(text[:60000])
+        return summary, convert_markdown_to_telegram_html(text[:60000])
 
     if len(sections) == 1:
         return summary, render_web_search_section(sections[0])
@@ -437,7 +447,7 @@ def format_web_search_result(fn_args: dict, result_str: str) -> tuple[str, str]:
     ]
     text_fallback = next((s for s in sections if s.get("mode") == "text"), None)
     if not rendered and text_fallback:
-        return summary, escape_html(text_fallback.get("raw", "")[:60000])
+        return summary, convert_markdown_to_telegram_html(text_fallback.get("raw", "")[:60000])
     return summary, "<br/><br/>".join(rendered)
 
 

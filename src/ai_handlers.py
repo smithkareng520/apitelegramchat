@@ -34,11 +34,11 @@ from utils import (
     get_current_time,
     send_rich_html_message,
     strip_html_tags,
-    escape_html,
     get_logger,
     delete_message,
     mark_draft_dead,
 )
+from markdown_converter import convert_markdown_to_telegram_html
 from skills import skill_catalog_brief
 from context_manager import select_request_context
 from tool_visibility import apply_tool_visibility, strip_tool_traces, SILENT_ONLY_TOOLS
@@ -107,7 +107,7 @@ def _workspace_guide_html(chat_id: int | None, workspace_namespace_value: str | 
         logger.debug("_workspace_guide_html 内部忽略的异常", exc_info=True)
         ws_path = ""
     if ws_path:
-        path_html = f"（绝对路径 <code>{escape_html(ws_path)}</code>，也可 <code>echo $WORKSPACE</code> 查看）"
+        path_html = f"（绝对路径 <code>{convert_markdown_to_telegram_html(ws_path)}</code>，也可 <code>echo $WORKSPACE</code> 查看）"
     else:
         path_html = "（绝对路径用 <code>echo $WORKSPACE</code> 查看）"
     return f"""
@@ -381,8 +381,15 @@ _STATIC_ROLE_PROMPTS: dict[str, str] = {
 
 
 def _build_isla_prompt(username: str) -> str:
-    """Isla 是唯一含用户名变量的角色，单独建函数便于维护。"""
-    safe_username = escape_html(username)
+    """Isla 是唯一含用户名变量的角色，单独建函数便于维护。
+
+    已知风险：username 来自 Telegram 用户名，可能包含下划线等 markdown
+    特殊字符（如 ``_admin_``）。convert_markdown_to_telegram_html 会把
+    这类下划线包裹的用户名误转成 ``<i>`` 斜体标签，而不是像
+    escape_html 那样原样转义显示。如果用户名渲染异常，这里是首先要
+    排查的地方。
+    """
+    safe_username = convert_markdown_to_telegram_html(username)
     return f"""
 
 <h2>人设设定：艾拉 (Isla)</h2>

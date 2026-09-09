@@ -12,7 +12,7 @@ import aiohttp
 
 from markdown_converter import convert_markdown_to_telegram_html
 
-from core.text_utils import _SMART_AMP_PATTERN, escape_html
+from core.text_utils import _SMART_AMP_PATTERN
 
 import logging
 
@@ -286,7 +286,7 @@ def _demote_watch_page_videos(html_content: str) -> str:
 
         # href 走属性转义：观看页 URL 一般干净，但上游可能已做过一次转义，
         # escape_media_url_attr 会归一化后统一转义，避免双重转义/裸 &
-        anchor = f'<a href="{escape_media_url_attr(src)}"><b>{escape_html(figcaption_text)}</b></a>'
+        anchor = f'<a href="{escape_media_url_attr(src)}"><b>{convert_markdown_to_telegram_html(figcaption_text)}</b></a>'
         if not rest:
             return anchor
         return f"{anchor} {rest}"
@@ -334,7 +334,7 @@ def _demote_watch_page_videos(html_content: str) -> str:
         if not caption:
             domain = _media_url_domain(src)
             caption = "🎬 观看视频" + (f" · {domain}" if domain else "")
-        return f'<a href="{escape_media_url_attr(src)}"><b>{escape_html(caption)}</b></a>'
+        return f'<a href="{escape_media_url_attr(src)}"><b>{convert_markdown_to_telegram_html(caption)}</b></a>'
 
     result = bare_video_re.sub(_replace_bare_video, result)
     return result

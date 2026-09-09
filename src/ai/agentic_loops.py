@@ -27,7 +27,8 @@ from config import (
     ModelConfig,
 )
 from state import get_llm_session_key
-from utils import get_logger, escape_html, send_rich_html_message, escape_media_url_attr
+from utils import get_logger, send_rich_html_message, escape_media_url_attr
+from markdown_converter import convert_markdown_to_telegram_html
 from chat_actions import (
     chat_action_scope,
     start_chat_action,
@@ -1043,7 +1044,7 @@ async def _agentic_loop_native_image(
                     refusal_text=result.refusal,
                     finish_reason=result.finish_reason,
                 )
-                safe_notice_html = escape_html(final_notice).replace("\n", "<br/>")
+                safe_notice_html = convert_markdown_to_telegram_html(final_notice).replace("\n", "<br/>")
                 await send_rich_html_message(chat_id, safe_notice_html)
                 final_content = "IMAGE_SENT"
                 new_entries = [Message.assistant_text(final_notice or "（已生成图片）")]
@@ -1069,9 +1070,9 @@ async def _agentic_loop_native_image(
                                                           current_model) if image_bytes_list else "Generated image"
             # 单图用 <figure>，多图用 <tg-slideshow> 轮播
             if len(uploaded_urls) == 1:
-                rich_html = f'<figure>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></figure>'
+                rich_html = f'<figure>{img_tags}<figcaption>{convert_markdown_to_telegram_html(caption_text)}</figcaption></figure>'
             else:
-                rich_html = f'<tg-slideshow>{img_tags}<figcaption>{escape_html(caption_text)}</figcaption></tg-slideshow>'
+                rich_html = f'<tg-slideshow>{img_tags}<figcaption>{convert_markdown_to_telegram_html(caption_text)}</figcaption></tg-slideshow>'
             await send_rich_html_message(chat_id, rich_html)
             final_notice = caption_text or (result.text[:200] if result.text else "")
         else:
@@ -1287,7 +1288,7 @@ async def _agentic_loop_native_video(
     )
     video_html = (
         f'<figure><video src="{escape_media_url_attr(final_video_url)}"></video>'
-        f'<figcaption>{escape_html(caption_text)}</figcaption></figure>'
+        f'<figcaption>{convert_markdown_to_telegram_html(caption_text)}</figcaption></figure>'
     )
     send_ok = await send_rich_html_message(chat_id, video_html)
     if not send_ok:

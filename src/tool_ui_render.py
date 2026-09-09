@@ -13,7 +13,7 @@ from typing import Callable
 from urllib.parse import urlparse
 
 from token_budget import truncate_to_token_budget
-from utils import escape_html
+from markdown_converter import convert_markdown_to_telegram_html
 
 import logging
 
@@ -86,7 +86,7 @@ def _render_code_panel(
     # 等宽与空白保留由 <pre> 标签本身保证。转义用严格策略（& 无条件转义），
     # 因为这里承载的是程序原始输出而非 HTML 片段。
     return (
-        f"<details open><summary>{escape_html(title)}</summary>"
+        f"<details open><summary>{convert_markdown_to_telegram_html(title)}</summary>"
         f"<pre><code>{_escape_code_text(display)}</code></pre></details>"
     )
 
@@ -130,14 +130,14 @@ def _render_structured_value(value: object, *, depth: int = 0) -> str:
     if isinstance(value, bool):
         return "是" if value else "否"
     if isinstance(value, (int, float)):
-        return escape_html(str(value))
+        return convert_markdown_to_telegram_html(str(value))
     if isinstance(value, str):
         clean = _trim_ui_value(value)
         if _looks_like_http_url(value):
             return f'<a href="{value.strip()}">打开链接</a>'
-        return escape_html(clean)
+        return convert_markdown_to_telegram_html(clean)
     if depth >= 2:
-        return f"<code>{escape_html(_compact_json(value))}</code>"
+        return f"<code>{convert_markdown_to_telegram_html(_compact_json(value))}</code>"
     if isinstance(value, list):
         if not value:
             return "<i>无</i>"
@@ -153,7 +153,7 @@ def _render_structured_value(value: object, *, depth: int = 0) -> str:
                     f"项目 {index}",
                 )
                 cards.append(
-                    f"<details><summary>{escape_html(_trim_ui_value(title, 80))}</summary>"
+                    f"<details><summary>{convert_markdown_to_telegram_html(_trim_ui_value(title, 80))}</summary>"
                     f"{_render_structured_value(item, depth=depth + 1)}</details>"
                 )
             else:
@@ -169,13 +169,13 @@ def _render_structured_value(value: object, *, depth: int = 0) -> str:
         ]
         for key, item in visible_items[:_UI_MAX_FIELDS]:
             rows.append(
-                f"<tr><td><b>{escape_html(_display_key(key))}</b></td>"
+                f"<tr><td><b>{convert_markdown_to_telegram_html(_display_key(key))}</b></td>"
                 f"<td>{_render_structured_value(item, depth=depth + 1)}</td></tr>"
             )
         if len(visible_items) > _UI_MAX_FIELDS:
             rows.append(f"<tr><td colspan=\"2\"><i>其余 {len(visible_items) - _UI_MAX_FIELDS} 个字段已折叠</i></td></tr>")
         return "<table bordered striped>" + "".join(rows) + "</table>"
-    return escape_html(_trim_ui_value(value))
+    return convert_markdown_to_telegram_html(_trim_ui_value(value))
 
 
 def _parse_structured_payload(result_str: str) -> object | None:
@@ -304,30 +304,30 @@ def _render_poi_cards(payload: object) -> str | None:
                 f'<figcaption><a href="{photo_url}">查看地点图片</a></figcaption></figure>'
             )
         if address:
-            body.append(f"<p><b>地址</b><br/>{escape_html(address)}</p>")
+            body.append(f"<p><b>地址</b><br/>{convert_markdown_to_telegram_html(address)}</p>")
         if distance:
-            body.append(f"<p><b>距离</b> {escape_html(distance)}</p>")
+            body.append(f"<p><b>距离</b> {convert_markdown_to_telegram_html(distance)}</p>")
         if alias:
-            body.append(f"<p><b>别名</b> {escape_html(alias)}</p>")
+            body.append(f"<p><b>别名</b> {convert_markdown_to_telegram_html(alias)}</p>")
         if rating or level:
             quality = "　".join(part for part in (f"评分 {rating}" if rating else "", f"等级 {level}" if level else "") if part)
-            body.append(f"<p><b>评价</b> {escape_html(quality)}</p>")
+            body.append(f"<p><b>评价</b> {convert_markdown_to_telegram_html(quality)}</p>")
         if opening_hours:
-            body.append(f"<details><summary>开放时间</summary><p>{escape_html(opening_hours)}</p></details>")
+            body.append(f"<details><summary>开放时间</summary><p>{convert_markdown_to_telegram_html(opening_hours)}</p></details>")
         if location:
-            body.append(f"<p><b>坐标</b> <code>{escape_html(location)}</code></p>")
+            body.append(f"<p><b>坐标</b> <code>{convert_markdown_to_telegram_html(location)}</code></p>")
         metadata: list[str] = []
         if poi_type:
-            metadata.append(f"分类：{escape_html(poi_type)}")
+            metadata.append(f"分类：{convert_markdown_to_telegram_html(poi_type)}")
         if typecode:
-            metadata.append(f"分类编码：<code>{escape_html(typecode)}</code>")
+            metadata.append(f"分类编码：<code>{convert_markdown_to_telegram_html(typecode)}</code>")
         if poi_id:
-            metadata.append(f"POI ID：<code>{escape_html(poi_id)}</code>")
+            metadata.append(f"POI ID：<code>{convert_markdown_to_telegram_html(poi_id)}</code>")
         if photo_url and index > 3:
             metadata.append(f'<a href="{photo_url}">查看地点图片</a>')
         if metadata:
             body.append("<details><summary>更多信息</summary><p>" + "<br/>".join(metadata) + "</p></details>")
-        cards.append(f"<details{details_open}><summary>{escape_html(summary)}</summary>{''.join(body)}</details>")
+        cards.append(f"<details{details_open}><summary>{convert_markdown_to_telegram_html(summary)}</summary>{''.join(body)}</details>")
 
     if total > len(visible):
         cards.append(f"<p><i>其余 {total - len(visible)} 个地点已省略，模型仍可读取完整结果并按你的需求继续筛选。</i></p>")
@@ -381,12 +381,12 @@ def _render_map_location_card(payload: object, tool_name: str) -> str | None:
             level = _poi_value(record, "level")
             body = []
             if area:
-                body.append(f"<p><b>区域</b><br/>{escape_html(area)}</p>")
+                body.append(f"<p><b>区域</b><br/>{convert_markdown_to_telegram_html(area)}</p>")
             if location:
-                body.append(f"<p><b>坐标</b><br/><code>{escape_html(location)}</code></p>")
+                body.append(f"<p><b>坐标</b><br/><code>{convert_markdown_to_telegram_html(location)}</code></p>")
             if level:
-                body.append(f"<p><b>匹配级别</b> {escape_html(level)}</p>")
-            cards.append(f"<details{' open' if index == 1 else ''}><summary>位置 {index}{' · ' + escape_html(location) if location else ''}</summary>{''.join(body) or '<p><i>上游未返回可展示字段。</i></p>'}</details>")
+                body.append(f"<p><b>匹配级别</b> {convert_markdown_to_telegram_html(level)}</p>")
+            cards.append(f"<details{' open' if index == 1 else ''}><summary>位置 {index}{' · ' + convert_markdown_to_telegram_html(location) if location else ''}</summary>{''.join(body) or '<p><i>上游未返回可展示字段。</i></p>'}</details>")
         return "".join(cards)
 
     return None
@@ -406,13 +406,13 @@ def _render_route_path(path: dict, index: int, *, open_first: bool = False) -> s
     distance = _format_distance(path.get("distance"))
     duration = _format_duration(path.get("duration"))
     steps = _collect_route_steps(path)
-    body = f"<p><b>路程</b> {escape_html(distance)}　<b>预计</b> {escape_html(duration)}</p>"
+    body = f"<p><b>路程</b> {convert_markdown_to_telegram_html(distance)}　<b>预计</b> {convert_markdown_to_telegram_html(duration)}</p>"
     if steps:
-        items = "".join(f"<li>{escape_html(step)}</li>" for step in steps)
+        items = "".join(f"<li>{convert_markdown_to_telegram_html(step)}</li>" for step in steps)
         total = len(_list_of_dicts(path.get("steps")))
         suffix = f"<p><i>其余 {total - len(steps)} 步已折叠</i></p>" if total > len(steps) else ""
         body += f"<details><summary>导航步骤（{total}）</summary><ol>{items}</ol>{suffix}</details>"
-    return f"<details{' open' if open_first else ''}><summary>方案 {index} · {escape_html(distance)} · {escape_html(duration)}</summary>{body}</details>"
+    return f"<details{' open' if open_first else ''}><summary>方案 {index} · {convert_markdown_to_telegram_html(distance)} · {convert_markdown_to_telegram_html(duration)}</summary>{body}</details>"
 
 
 def _render_transit_plan(transit: dict, index: int) -> str:
@@ -428,14 +428,14 @@ def _render_transit_plan(transit: dict, index: int) -> str:
             if line_name:
                 route = " → ".join(part for part in (departure, arrival) if part)
                 bus_segments.append(f"{line_name}{'（' + route + '）' if route else ''}")
-    body = f"<p><b>预计</b> {escape_html(duration)}　<b>步行</b> {escape_html(walking)}</p>"
+    body = f"<p><b>预计</b> {convert_markdown_to_telegram_html(duration)}　<b>步行</b> {convert_markdown_to_telegram_html(walking)}</p>"
     if bus_segments:
-        body += "<p><b>乘车</b></p><ol>" + "".join(f"<li>{escape_html(item)}</li>" for item in bus_segments[:5]) + "</ol>"
+        body += "<p><b>乘车</b></p><ol>" + "".join(f"<li>{convert_markdown_to_telegram_html(item)}</li>" for item in bus_segments[:5]) + "</ol>"
         if len(bus_segments) > 5:
             body += f"<p><i>其余 {len(bus_segments) - 5} 段已折叠</i></p>"
     else:
         body += "<p><i>该方案以步行为主。</i></p>"
-    return f"<details{' open' if index == 1 else ''}><summary>方案 {index} · {escape_html(duration)} · 步行 {escape_html(walking)}</summary>{body}</details>"
+    return f"<details{' open' if index == 1 else ''}><summary>方案 {index} · {convert_markdown_to_telegram_html(duration)} · 步行 {convert_markdown_to_telegram_html(walking)}</summary>{body}</details>"
 
 
 def _render_map_route_card(payload: object) -> str | None:
@@ -449,7 +449,7 @@ def _render_map_route_card(payload: object) -> str | None:
     destination = _poi_value(route, "destination")
     title = "<p><b>🧭 路线规划</b>"
     if origin and destination:
-        title += f"<br/><code>{escape_html(origin)}</code> → <code>{escape_html(destination)}</code>"
+        title += f"<br/><code>{convert_markdown_to_telegram_html(origin)}</code> → <code>{convert_markdown_to_telegram_html(destination)}</code>"
     title += "</p>"
     transits = _list_of_dicts(route.get("transits"))
     if transits:
@@ -475,9 +475,9 @@ def _render_distance_card(payload: object) -> str | None:
         origin_id = _poi_value(record, "origin_id") or "—"
         dest_id = _poi_value(record, "dest_id") or "—"
         rows.append(
-            f"<tr><td>起点 {escape_html(origin_id)} → 终点 {escape_html(dest_id)}</td>"
-            f"<td>{escape_html(_format_distance(record.get('distance')))}</td>"
-            f"<td>{escape_html(_format_duration(record.get('duration')))}</td></tr>"
+            f"<tr><td>起点 {convert_markdown_to_telegram_html(origin_id)} → 终点 {convert_markdown_to_telegram_html(dest_id)}</td>"
+            f"<td>{convert_markdown_to_telegram_html(_format_distance(record.get('distance')))}</td>"
+            f"<td>{convert_markdown_to_telegram_html(_format_duration(record.get('duration')))}</td></tr>"
         )
     suffix = f"<p><i>其余 {len(records) - 12} 条结果已折叠</i></p>" if len(records) > 12 else ""
     return (
@@ -599,12 +599,12 @@ def _truncate_ui_lines_head_tail(text: str, max_lines: int = _TOOL_UI_MAX_LINES)
 def _escape_code_text(text: str) -> str:
     """严格转义代码/终端文本中的 HTML 特殊字符（``&``、``<``、``>`` 一律转义）。
 
-    与 ``utils.escape_html`` 的「智能 ampersand」策略不同：那里为了不破坏
-    调用方自己拼的 ``&amp;``/``&#39;`` 实体，会跳过看起来像实体的 ``&``。
-    但工具结果是**程序的原始输出**，不是 HTML 片段——命令若打印了字面量
-    ``&amp;lt;`` 或 ``&amp;amp;``，智能策略会放行、Telegram 再解析回 ``<``/``&``，
-    用户看到的就不是命令真实的输出。因此这里对 ``&`` 无条件转义，保证
-    终端输出逐字节可见。
+    与 ``markdown_converter.convert_markdown_to_telegram_html`` 不同：那是
+    markdown → HTML 转换器，会把 ``*``、``_``、``` ` ```、``[]()`` 等语法
+    转成真实标签，且对完全不含 markdown 语法的文本直接短路、不转义任何
+    字符。但工具结果是**程序的原始输出**，不是 markdown/HTML 片段——命令
+    输出里字面量的 ``*`` ``_`` ``&amp;`` 等都不该被解析或放行。因此这里
+    保留一份独立、无条件的逐字符转义，保证终端输出逐字节原样可见。
     """
     if not text:
         return ""
@@ -656,7 +656,7 @@ def _render_editor_quote(label: str, value: str, truncator: Callable[[str], str]
         text = "(empty)"
     else:
         text = truncator(text)
-    return f"<p><b>{escape_html(label)}</b></p>{_render_code_text(text)}"
+    return f"<p><b>{convert_markdown_to_telegram_html(label)}</b></p>{_render_code_text(text)}"
 
 
 def _render_media_failure_result(result_str: str, fallback: str) -> str:

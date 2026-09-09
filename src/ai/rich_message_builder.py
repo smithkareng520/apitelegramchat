@@ -20,8 +20,8 @@ from utils import (
     mark_draft_dead,
     is_draft_dead,
     RateLimitError,
-    escape_html,
 )
+from markdown_converter import convert_markdown_to_telegram_html
 from ai.error_formatting import extract_domain
 from ai.attachment_content import _track_task
 from token_budget import count_tokens, truncate_to_token_budget
@@ -122,11 +122,13 @@ def _ensure_rich_block_content(fragment: str) -> str:
 def _escape_reasoning_text(text: str) -> str:
     """严格转义思考原文中的 HTML 特殊字符（&、<、> 一律转义）。
 
-    与 utils.escape_html 的“智能 amp”策略不同：reasoning 字段是模型的原始
-    独白，模型没有意识（也不被要求）自行转义。若沿用智能策略保留
-    ``&amp;``/``&lt;`` 等既有实体不转义，模型在思考中提及这些字面量时会被
-    Telegram 解析回字符，用户看到的就不是模型真实写下的内容；因此这里对
-    ``&`` 无条件转义，保证思考内容逐字可见。
+    与 markdown_converter.convert_markdown_to_telegram_html 不同：reasoning
+    字段是模型的原始独白，不应被当作 markdown 解析（模型没有意识、也不
+    被要求在思考中输出合法 markdown），也不应识别/保留其中形似 HTML 标签
+    的片段。若改用转换器，一来不含 markdown 语法的思考文本会被短路直接
+    透传、裸露的 ``<``、``>``、``&`` 得不到转义，二来形似标签的片段会被
+    当作"已有 HTML 标签"保留而非转义。因此这里保留一次无条件的逐字符
+    转义，保证思考内容原样、安全地逐字可见。
     """
     if not text:
         return ""
@@ -314,7 +316,7 @@ class RichMessageBuilder:
             return ""
         if len(plain) > 30:
             plain = plain[:30].rstrip() + "…"
-        return escape_html(plain)
+        return convert_markdown_to_telegram_html(plain)
 
     def request_flush(self, force: bool = False) -> None:
         """异步触发刷新，确保在途发送期间的新内容一定会补发。"""
@@ -867,7 +869,7 @@ class RichMessageBuilder:
 
     def add_initial_thinking(self, text: str = "Thinking...") -> int:
         self._commit_stream_buffer()
-        block = f"<tg-thinking>{escape_html(text)}</tg-thinking>"
+        block = f"<tg-thinking>{convert_markdown_to_telegram_html(text)}</tg-thinking>"
         self.blocks.append(block)
         self.block_types.append("html")
         # 不在此处调用 request_flush，由 get_ai_response 中显式 await flush() 统一触发，
@@ -876,7 +878,7 @@ class RichMessageBuilder:
 
     def set_thinking_status(self, text: str, *, force: bool = True) -> bool:
         """更新首个仍存在的思考占位，使准备阶段也有可见进度。"""
-        safe_text = escape_html((text or "Thinking...").strip() or "Thinking...")
+        safe_text = convert_markdown_to_telegram_html((text or "Thinking...").strip() or "Thinking...")
         for index, (block, block_type) in enumerate(zip(self.blocks, self.block_types)):
             if block_type == "html" and block.startswith("<tg-thinking>"):
                 updated = f"<tg-thinking>{safe_text}</tg-thinking>"
@@ -1275,8 +1277,8 @@ class RichMessageBuilder:
                 # 纯文本分段。不能等待下一轮或 hard guard，否则新草稿会被拖延。
                 plain = _rich_visible_text(current_html)
                 text_cut = self._plain_text_cut(plain, RICH_DRAFT_ROLLOVER_TOKEN_BUDGET)
-                completed_html = f"<p>{escape_html(plain[:text_cut].rstrip())}</p>"
-                remainder = f"<p>{escape_html(plain[text_cut:].lstrip())}</p>"
+                completed_html = f"<p>{convert_markdown_to_telegram_html(plain[:text_cut].rstrip())}</p>"
+                remainder = f"<p>{convert_markdown_to_telegram_html(plain[text_cut:].lstrip())}</p>"
                 used_fallback = True
 
             if not completed_html or not _rich_visible_text(completed_html).strip():
