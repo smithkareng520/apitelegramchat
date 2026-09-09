@@ -60,10 +60,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && fc-match "Noto Color Emoji" >/dev/null \
     && test -f /usr/share/fonts/truetype/arphic-gbsn00lp/gbsn00lp.ttf \
     && test -f /usr/share/fonts/truetype/arphic/ukai.ttc \
-    && test -f "$APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT" \
     && tesseract --list-langs 2>/dev/null | grep -qx "chi_sim" \
     && tesseract --list-langs 2>/dev/null | grep -qx "chi_tra" \
     && rm -rf /var/lib/apt/lists/*
+# 注意：ReportLab 用的单色 emoji 字体随 .claude/ 在下方 COPY 才进镜像，
+# 因此它的存在性校验不能放在上面的 apt 层（那时文件还不存在，test -f
+# 会直接 exit 1 炸掉构建），必须放在 COPY 之后。
 
 # 沙盒身份固定为 claude（uid/gid 仍为 2000）：
 #   - whoami / id / ls -l 属主列全部真实解析为 "claude"（passwd 级一致，
@@ -80,6 +82,11 @@ COPY requirements.txt pyproject.toml package.json ./
 COPY src ./src
 COPY .claude ./.claude
 COPY README.md ./
+
+# 校验技能内置的单色 emoji 字体已进镜像，且 emoji_font helper 能解析到它
+#（不依赖 reportlab，只查路径与 TrueType magic）。
+RUN test -f "$APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT" \
+    && python3 -c "import sys; sys.path.insert(0, '/app/.claude/skills/pdf/scripts'); from emoji_font import resolve_emoji_font_path; p = resolve_emoji_font_path(); assert open(p, 'rb').read(4) == b'\\x00\\x01\\x00\\x00', 'not a TrueType font'; print('EmojiMono OK:', p)"
 
 RUN python3 -m pip install --break-system-packages --no-cache-dir --upgrade pip && \
     python3 -m pip install --break-system-packages --no-cache-dir -r requirements.txt && \
