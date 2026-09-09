@@ -254,6 +254,10 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 namespace=resolved_namespace,
                 command=arguments.get("command", ""),
                 restart=arguments.get("restart", False),
+                # v2.4：模型可为已知长静默命令显式声明总超时（5-600s），
+                # 传入时同时禁用无输出空闲保护；非法值由 execute_bash 内
+                # _normalize_requested_timeout 静默回退到默认双层配置。
+                timeout=arguments.get("timeout"),
             )
         # ========== Todo 工具分支 ==========
         # 任务 / 待办清单。返回 JSON 字符串给 AI 上下文；UI 渲染由 format_tool_result 处理。

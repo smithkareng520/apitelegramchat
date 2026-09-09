@@ -226,9 +226,21 @@ async def _execute_tool_for_subagent(
         # 各自发起的工具调用（web_search / bash 等）仍受总并发上限约束，
         # 避免 N 个子 agent 同时爆发出 N×M 个不受控的外部请求。
         async with tool_semaphore:
+            # v2.4：bash 的 per-call timeout 参数（5-600s）显式指定时，
+            # 子 agent 外层上限随之放大（+10s 清理缓冲），与主循环
+            # tool_call_loop 的联动逻辑保持一致，避免外层先杀正常长命令。
+            exec_timeout = SUBAGENT_TOOL_TIMEOUT
+            if name == "bash":
+                requested = (arguments or {}).get("timeout")
+                if (
+                    isinstance(requested, (int, float))
+                    and not isinstance(requested, bool)
+                    and requested > 0
+                ):
+                    exec_timeout = max(SUBAGENT_TOOL_TIMEOUT, int(requested) + 10)
             result = await asyncio.wait_for(
                 dispatch_tool_call(name, arguments or {}, chat_id=chat_id),
-                timeout=SUBAGENT_TOOL_TIMEOUT,
+                timeout=exec_timeout,
             )
         # 与主 agent 相同的模型视图精简：子 agent 的单次工具结果预算
         # （默认 20k token）比主循环更紧张，weather / 地图类结果的

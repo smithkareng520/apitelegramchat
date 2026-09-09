@@ -33,6 +33,22 @@ SANDBOX_MAX_FILE_SIZE = int(os.getenv("SANDBOX_MAX_FILE_SIZE", str(100 * 1024 * 
 SANDBOX_MAX_OPEN_FILES = int(os.getenv("SANDBOX_MAX_OPEN_FILES", "256"))
 SANDBOX_TIMEOUT_SEC = int(os.getenv("SANDBOX_TIMEOUT_SEC", "300"))
 
+# ---------- 无输出空闲超时（v2.4 bash 防卡死） ----------
+# 命令持续无输出超过该秒数即判定为卡死（典型：网络不可达时 connect 静默
+# 挂起、交互提示等待、无输出死循环），提前 kill 并向模型返回可操作的
+# 错误消息，而不是等满 SANDBOX_TIMEOUT_SEC（默认 300s）才超时。模型可
+# 通过 bash 工具的 timeout 参数为已知的长静默命令禁用本保护。0 = 禁用。
+SANDBOX_IDLE_TIMEOUT_SEC = int(os.getenv("SANDBOX_IDLE_TIMEOUT_SEC", "60"))
+# bash 工具 timeout 参数允许的硬上限（秒）；外层工具超时（BASH_TOOL_CALL_TIMEOUT）
+# 据此联动放大。
+SANDBOX_TIMEOUT_HARD_MAX = int(os.getenv("SANDBOX_TIMEOUT_HARD_MAX", "600"))
+# 沙箱内 Python 进程的默认 socket 超时（秒）。通过 sitecustomize.py 注入
+# socket.setdefaulttimeout()，让忘记设超时的脚本（smtplib / urllib /
+# requests / socket.create_connection）在网络不可达时快速失败，而不是按
+# 内核默认 TCP 重试挂起约 2 分钟/次。0 = 不注入。该值会写入子进程环境
+# （SANDBOX_SOCKET_TIMEOUT_SEC），由沙箱内 sitecustomize.py 读取。
+SANDBOX_SOCKET_TIMEOUT_SEC = int(os.getenv("SANDBOX_SOCKET_TIMEOUT_SEC", "15"))
+
 # 沙盒内固定身份（whoami / $USER / $LOGNAME / ls 属主列全部一致）。
 # 必须与镜像内 passwd 用户名同步（见 Dockerfile 的 useradd claude 行），
 # 否则 $USER 会与真实 uid 解析结果不一致。历史版本的 chat{chat_id} 已移除：
@@ -348,6 +364,59 @@ def _preexec_sandbox(workspace_path: str) -> None:
 
 
 # =====================================================================
+# sitecustomize 注入（沙箱内 Python 默认 socket 超时）
+# =====================================================================
+# 模型生成的 Python 脚本几乎从不主动设网络超时；一旦网络不可达（防火墙
+# 静默丢包、SMTP 端口被墙），smtplib/urllib/requests 会按内核默认 TCP
+# 重试挂起约 2 分钟/次，bash 层的空闲/总超时只能事后杀。sitecustomize.py
+# 在每个 Python 进程启动时自动执行 socket.setdefaulttimeout()，从源头
+# 把静默挂起变成 15s 快速失败 + 清晰报错。
+# 注意：setdefaulttimeout 是「单次 socket 操作」的不活跃超时而非总时长
+# ——正常的大文件下载（持续有数据流入）不受影响。
+_SITECUSTOMIZE_MARKER = "sandbox-sc-v1"
+_SITECUSTOMIZE_SOURCE = f'''# apitelegramchat sandbox sitecustomize (marker: {_SITECUSTOMIZE_MARKER})
+# Auto-injected by sandbox.build_sandbox_env; do not edit (rewritten on
+# every bash session start). Gives every Python process inside the
+# sandbox a sane default socket timeout so scripts that forget to set
+# one (smtplib, urllib, requests, socket.create_connection) fail fast
+# on unreachable networks instead of hanging on kernel-level TCP
+# retries (~2 minutes per connect attempt).
+import os as _os
+import socket as _socket
+
+_t = _os.getenv("SANDBOX_SOCKET_TIMEOUT_SEC", "")
+if _t:
+    try:
+        _v = float(_t)
+        if _v > 0:
+            _socket.setdefaulttimeout(_v)
+    except Exception:
+        pass
+'''
+
+
+def _ensure_sitecustomize(runtime_bin: Path) -> None:
+    """把 sitecustomize.py 原子写入 runtime bin（经 PYTHONPATH 生效）。
+
+    幂等：内容一致时跳过写入。失败只记 debug——这是尽力而为的增强，
+    绝不能阻断 bash 会话启动。与 net_shims 的 shim 安装同一套模式。
+    """
+    try:
+        target = runtime_bin / "sitecustomize.py"
+        try:
+            if target.read_text(encoding="utf-8") == _SITECUSTOMIZE_SOURCE:
+                return
+        except OSError:
+            pass
+        tmp = runtime_bin / f".sitecustomize.{os.getpid()}.tmp"
+        tmp.write_text(_SITECUSTOMIZE_SOURCE, encoding="utf-8")
+        os.replace(tmp, target)
+        logger.debug("sitecustomize injected at %s (socket default timeout)", target)
+    except OSError as exc:
+        logger.debug("sitecustomize injection skipped: %s", exc)
+
+
+# =====================================================================
 # 构造 bash argv / env
 # =====================================================================
 def build_sandbox_argv() -> list:
@@ -411,6 +480,10 @@ def build_sandbox_env(
     # 兜底 shim 到 runtime bin（PATH 首位）。镜像里出现真二进制后自动让位。
     # 这避免了模型执行 `curl ...` 得到 command not found、浪费一次工具调用。
     ensure_network_shims(runtime_bin)
+    # 沙箱内 Python 默认 socket 超时（sitecustomize 经 PYTHONPATH 注入，
+    # 见上方模块级注释）。让 smtplib/urllib/requests 等忘记设超时的脚本
+    # 在网络不可达时 15s 快速失败，而不是挂起拖到 bash 层超时。
+    _ensure_sitecustomize(runtime_bin)
 
     # Keep runtime_bin first only for local wrappers. The actual compiler remains the
     # system toolchain baked into the image; no apt/pip install happens per Bash run.
@@ -433,6 +506,23 @@ def build_sandbox_env(
         "LOGNAME": SANDBOX_USER,
         "WORKSPACE": workdir_abs,
         "WORKDIR": workdir_abs,
+        # ★ PYTHONPATH 指向 runtime bin：其中的 sitecustomize.py 在沙箱内
+        #   每个 Python 进程启动时自动执行（注入默认 socket 超时）。该目录
+        #   只含 shim 可执行脚本与 sitecustomize.py，无可导入模块名冲突，
+        #   不会遮蔽标准库或 site-packages。
+        "PYTHONPATH": str(runtime_bin),
+        # sitecustomize.py 读取该值设置 socket.setdefaulttimeout。
+        "SANDBOX_SOCKET_TIMEOUT_SEC": str(SANDBOX_SOCKET_TIMEOUT_SEC),
+        # ---------- 常见 CLI 工具的网络超时 ----------
+        # 网络不可达时让命令快速失败，而不是按各自默认值挂起数分钟：
+        #   - pip：连接超时 15s（官方环境变量，等价 --timeout）；
+        #   - git：传输速率低于 1KB/s 持续 30s 即中止（覆盖 clone/fetch 静默卡死）；
+        #   - npm：fetch 阶段 60s 超时 + 最多重试 2 次（npm 默认 300s）。
+        "PIP_DEFAULT_TIMEOUT": "15",
+        "GIT_HTTP_LOW_SPEED_LIMIT": "1000",
+        "GIT_HTTP_LOW_SPEED_TIME": "30",
+        "npm_config_fetch_timeout": "60000",
+        "npm_config_fetch_retries": "2",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "TERM": "xterm-256color",

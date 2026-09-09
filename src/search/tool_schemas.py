@@ -561,6 +561,15 @@ SEARCH_TOOLS = [
                 "ENVIRONMENT & NETWORK (important — read once, saves you wasted calls):\n"
                 "- Outbound network IS allowed. curl and wget are available (if the image lacks the "
                 "real binary, an equivalent Python stdlib shim is installed automatically).\n"
+                "- Network calls carry sandbox-wide default limits (Python sockets 15s via "
+                "socket.setdefaulttimeout, pip 15s, git aborts transfers below 1KB/s for 30s). "
+                "STILL set explicit limits in scripts you write (curl --connect-timeout 10 "
+                "--max-time 60; smtplib.SMTP(..., timeout=15)): unreachable hosts then fail "
+                "fast with a clear error instead of hanging.\n"
+                "- A command that produces NO output for 60s is killed as 'likely stuck' "
+                "(dead network call or interactive prompt). Keep long jobs chatty "
+                "(`pip install -v`, periodic echo) or pass the timeout parameter (5-600s) "
+                "to allow long silent runs.\n"
                 "- Toolchain already in the image: python3 (+pip), node/npm, gcc/g++, make, cmake, "
                 "ccache, git, jq, zip/unzip, LibreOffice, pandoc, ImageMagick, poppler, tesseract.\n"
                 "- Install extra Python packages with `pip install --user <pkg>` (cache persists). "
@@ -623,6 +632,17 @@ SEARCH_TOOLS = [
                     "restart": {
                         "type": "boolean",
                         "description": "true 则重启 bash 会话（清空状态）。"
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "minimum": 5,
+                        "maximum": 600,
+                        "description": (
+                            "本次命令允许的总秒数（5-600，缺省 300）。仅用于已知会长时间静默"
+                            "运行的命令（大型构建、数据集下载等）：显式指定会同时禁用本次调用的"
+                            "「60s 无输出空闲保护」。不要用它重试挂起的网络请求——应给网络调用"
+                            "自身加超时（curl --max-time、smtplib timeout=…）。"
+                        )
                     }
                 },
                 # command 是功能上的必填字段（没有命令的 bash 调用无意义）：
@@ -642,6 +662,7 @@ SEARCH_TOOLS = [
                 {"description": "安装依赖并运行测试", "command": "pip install --user pytest && python3 -m pytest -q"},
                 {"description": "读取用户上传的文档", "command": "head -c 2000 download/brief.pdf | strings | head -40"},
                 {"description": "把报告放入发送暂存区", "command": "cp report.pdf upload/report.pdf"},
+                {"description": "大型构建（长时间静默运行）", "command": "make -j4 && ctest --output-on-failure", "timeout": 600},
                 {"description": "重启卡死的会话", "restart": True}
             ]
         }

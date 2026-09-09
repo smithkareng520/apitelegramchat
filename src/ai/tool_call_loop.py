@@ -361,7 +361,21 @@ async def _run_tool_calls_and_append(
             elif fn_name in SUBAGENT_TOOLS:
                 timeout = SUBAGENT_OUTER_TIMEOUT
             elif fn_name in BASH_TOOLS:
-                timeout = BASH_TOOL_CALL_TIMEOUT
+                # v2.4：bash 支持 per-call timeout 参数（5-600s，用于已知长
+                # 静默命令）。显式指定时外层上限随之放大（+10s 清理缓冲），
+                # 保证不会出现外层先杀仍在正常运行的沙箱命令。
+                requested = (
+                    fn_args.get("timeout")
+                    if isinstance(fn_args, dict) else None
+                )
+                if (
+                    isinstance(requested, (int, float))
+                    and not isinstance(requested, bool)
+                    and requested > 0
+                ):
+                    timeout = max(BASH_TOOL_CALL_TIMEOUT, int(requested) + 10)
+                else:
+                    timeout = BASH_TOOL_CALL_TIMEOUT
             elif fn_name in LONG_RUNNING_TOOLS:
                 timeout = LONG_TOOL_CALL_TIMEOUT
             else:

@@ -13,7 +13,8 @@ from typing import Optional
 from sandbox import (
     build_sandbox_argv, build_sandbox_env,
     watchdog, _preexec_sandbox,
-    SANDBOX_TIMEOUT_SEC,
+    SANDBOX_TIMEOUT_SEC, SANDBOX_IDLE_TIMEOUT_SEC, SANDBOX_TIMEOUT_HARD_MAX,
+    SANDBOX_SOCKET_TIMEOUT_SEC,
 )
 from workspace_paths import (
     workspace_root, workspace_workdir, runtime_cache_root, workspace_namespace,
@@ -60,6 +61,74 @@ def _format_bash_envelope(prompt_cwd: str, command: str, exit_code: int | str, o
 # 头部截断会把最有价值的部分默默丢掉。设为 0 表示不限制（不建议：狂刷
 # 输出的命令会撑爆内存与模型上下文）。
 SANDBOX_OUTPUT_MAX_CHARS = int(os.getenv("SANDBOX_OUTPUT_MAX_CHARS", "80000"))
+# =====================================================================
+# Bash 超时双层模型（v2.4 防卡死）
+# =====================================================================
+# 旧实现只有一层总超时（SANDBOX_TIMEOUT_SEC，默认 300s）：网络不可达时
+# connect() 按内核默认 TCP 重试静默挂起（单次约 2 分钟），命令全程无输出，
+# 模型必须等满 300s 才拿到超时错误，期间整个 agent 回合被卡住（日志实例：
+# SMTP 发信技能在沙箱里挂满整个工具超时窗口）。
+#
+# 现在的读循环对每次 stdout.read() 施加 min(空闲阈值, 剩余总预算) 的独立
+# 超时：
+#   - 空闲超时（idle）：持续无输出超过 SANDBOX_IDLE_TIMEOUT_SEC（默认 60s）
+#     → 立即 kill，返回可操作错误（提示给网络调用加显式超时 / 用 bash 的
+#     timeout 参数声明长静默命令）；
+#   - 总超时（total）：无论是否有输出，超过总预算 → kill（原行为）。
+# 模型显式传 timeout 参数时禁用 idle 保护（已知的长静默构建/下载场景），
+# 两者由 _normalize_requested_timeout 统一解析。
+class _BashIdleTimeout(Exception):
+    """命令持续无输出超过空闲阈值（疑似网络挂起 / 交互卡死）。"""
+
+    def __init__(self, idle_sec: float) -> None:
+        super().__init__(f"no output for {idle_sec:.0f}s")
+        self.idle_sec = idle_sec
+
+
+class _BashTotalTimeout(Exception):
+    """命令运行超过总超时预算（无论是否有输出）。"""
+
+    def __init__(self, total_sec: float) -> None:
+        super().__init__(f"exceeded total {total_sec:.0f}s")
+        self.total_sec = total_sec
+
+
+def _format_idle_timeout_message(idle_sec: float) -> str:
+    """空闲超时的模型可读错误：说清原因 + 给出可操作的自纠路径。"""
+    return (
+        f"Error: killed after no output for {idle_sec:.0f}s (idle limit). "
+        "The command most likely hangs on an unreachable network call or "
+        "waits on an interactive prompt. Give network operations explicit "
+        "limits (e.g. `curl --connect-timeout 10 --max-time 60`, "
+        "`smtplib.SMTP(..., timeout=15)`; sandbox defaults already cap "
+        f"Python sockets at {SANDBOX_SOCKET_TIMEOUT_SEC}s and pip at 15s), "
+        "or keep long jobs chatty (`pip install -v`, periodic echo). If the "
+        "command is legitimately long-running and silent, re-run it with the "
+        "bash `timeout` parameter set (e.g. timeout=300) to disable this "
+        "idle guard for that call."
+    )
+
+
+def _normalize_requested_timeout(timeout: int | None) -> tuple[int, int | None]:
+    """把模型请求的 bash timeout 参数规范化为 (total_timeout, idle_timeout)。
+
+    - None / 非法值 → 默认 (SANDBOX_TIMEOUT_SEC, SANDBOX_IDLE_TIMEOUT_SEC)：
+      总超时兜底 + 无输出空闲保护同时生效；
+    - 合法 int（clamp 到 [5, SANDBOX_TIMEOUT_HARD_MAX]）→ (clamped, None)：
+      模型显式声明这是已知的长静默命令（大构建 / 数据集下载），本次调用
+      禁用 idle 保护，仅保留总超时。
+    """
+    default: tuple[int, int | None] = (SANDBOX_TIMEOUT_SEC, SANDBOX_IDLE_TIMEOUT_SEC)
+    if timeout is None or isinstance(timeout, bool):
+        return default
+    try:
+        value = int(timeout)
+    except (TypeError, ValueError):
+        return default
+    value = max(5, min(value, SANDBOX_TIMEOUT_HARD_MAX))
+    return value, None
+
+
 class _BashOutputBuffer:
     """Bounded accumulator for subprocess output: keeps head + rolling tail.
 
@@ -432,7 +501,12 @@ class BashSession:
             logger.debug("_is_unterminated 内部忽略的异常", exc_info=True)
             return False
 
-    async def _execute_heredoc_isolated(self, command: str, timeout: int) -> str:
+    async def _execute_heredoc_isolated(
+        self,
+        command: str,
+        timeout: int,
+        idle_timeout: int | None = SANDBOX_IDLE_TIMEOUT_SEC,
+    ) -> str:
         """Execute heredoc-heavy (or otherwise syntactically risky) commands
         in a one-shot bash process.
 
@@ -469,38 +543,38 @@ class BashSession:
         )
 
         output_buffer = _BashOutputBuffer()
+        loop = asyncio.get_running_loop()
+        total_deadline = loop.time() + float(timeout)
+        # 超时类型记录：("idle"|"total", 秒数)；None = 正常结束。
+        timed_out: tuple[str, float] | None = None
 
         try:
             # stdout=PIPE 由上方 create_subprocess_exec 调用保证；仅作类型收窄。
             assert proc.stdout is not None
             while True:
-                chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=timeout)
+                # 双层读超时：每次 read 预算 = min(空闲阈值, 剩余总预算)。
+                # 旧实现每次 read 都用完整总超时且无总上限——静默挂起等满
+                # 300s、持续输出则永不超时；现在两种情况都有界。
+                remaining = total_deadline - loop.time()
+                if remaining <= 0:
+                    timed_out = ("total", float(timeout))
+                    break
+                read_budget = remaining
+                if idle_timeout is not None and idle_timeout > 0:
+                    read_budget = min(float(idle_timeout), remaining)
+                try:
+                    chunk = await asyncio.wait_for(
+                        proc.stdout.read(4096), timeout=read_budget
+                    )
+                except asyncio.TimeoutError:
+                    if read_budget < remaining:
+                        timed_out = ("idle", float(idle_timeout or 0))
+                    else:
+                        timed_out = ("total", float(timeout))
+                    break
                 if not chunk:
                     break
                 output_buffer.add(chunk.decode("utf-8", errors="replace"))
-                # Once the first byte arrived, reset the idle read timer to keep
-                # long-running commands alive while still detecting a total hang.
-                timeout = max(timeout, 1)
-        except asyncio.TimeoutError:
-            logger.warning("Bash isolated timeout chat_id=%s cmd=%s", self.chat_id, command[:120])
-            partial_output = ""
-            try:
-                partial_output = _strip_ansi(output_buffer.finalize()).strip()
-            except Exception:
-                pass
-            try:
-                os.killpg(os.getpgid(proc.pid), 9)
-            except (ProcessLookupError, PermissionError):
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except Exception:
-                logger.debug("_execute_heredoc_isolated 内部忽略的异常", exc_info=True)
-                pass
-            msg = f"Error: Command timed out after {timeout} seconds (isolated bash killed)"
-            if partial_output:
-                return f"{msg}\n\nCaptured partial output before timeout:\n{partial_output}"
-            return msg
         except asyncio.CancelledError:
             try:
                 os.killpg(os.getpgid(proc.pid), 9)
@@ -512,6 +586,37 @@ class BashSession:
                 logger.debug("_execute_heredoc_isolated 内部忽略的异常", exc_info=True)
                 pass
             raise
+
+        partial_output = ""
+        try:
+            partial_output = _strip_ansi(output_buffer.finalize()).strip()
+        except Exception:
+            pass
+
+        if timed_out is not None:
+            kind, sec = timed_out
+            logger.warning(
+                "Bash isolated %s timeout chat_id=%s cmd=%s",
+                kind,
+                self.chat_id,
+                command[:120],
+            )
+            try:
+                os.killpg(os.getpgid(proc.pid), 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                logger.debug("_execute_heredoc_isolated 内部忽略的异常", exc_info=True)
+                pass
+            if kind == "idle":
+                msg = _format_idle_timeout_message(sec)
+            else:
+                msg = f"Error: Command timed out after {sec:.0f} seconds (isolated bash killed)"
+            if partial_output:
+                return f"{msg}\n\nCaptured partial output before timeout:\n{partial_output}"
+            return msg
 
         await proc.wait()
         output = output_buffer.finalize()
@@ -532,8 +637,22 @@ class BashSession:
         return _format_bash_envelope(cwd, command, exit_code, output)
 
     # ===================== 执行命令 =====================
-    async def execute(self, command: str, timeout: int = SANDBOX_TIMEOUT_SEC) -> str:
+    async def execute(
+        self,
+        command: str,
+        total_timeout: int = SANDBOX_TIMEOUT_SEC,
+        idle_timeout: int | None = SANDBOX_IDLE_TIMEOUT_SEC,
+    ) -> str:
         """在沙箱中执行 bash 命令，超时自动终止
+
+        超时双层模型（v2.4）：
+        - total_timeout：总超时（默认 SANDBOX_TIMEOUT_SEC）；无论命令是否
+          还有输出，超时即 kill 会话并重启；
+        - idle_timeout：无输出空闲超时（默认 SANDBOX_IDLE_TIMEOUT_SEC；
+          None / 0 = 禁用）。命令持续无输出超过该阈值立即 kill——网络
+          不可达的静默挂起（SMTP connect、死 TCP 重试、交互提示等待）
+          不再等满总超时。execute_bash 在模型显式传 timeout 参数时禁用
+          本保护（已知长静默命令）。
 
         v2.3：不再接受 ``progress_callback``——bash 工具执行期间不推送
         任何进度预览。原始 stdout 对用户价值有限（多为命令日志），
@@ -578,7 +697,7 @@ class BashSession:
             has_heredoc = bool(re.search(r"<<-?\s*(?:[\"']?[A-Za-z_][A-Za-z0-9_]*[\"']?)", command))
             if has_heredoc or await self._is_unterminated(command):
                 return await self._execute_heredoc_isolated(
-                    command, timeout=timeout
+                    command, timeout=total_timeout, idle_timeout=idle_timeout
                 )
 
             tag = uuid.uuid4().hex[:8]
@@ -626,13 +745,15 @@ class BashSession:
             # start() 已保证 proc 非空且 stdin=PIPE（见 _start_locked）；
             # 以下断言仅用于类型收窄，不改变运行时行为。
             assert self.proc is not None and self.proc.stdin is not None
-            pending = ""  # 仅供超时兑底里的防御性 locals() 检查（历史行为保持：恒为空，不追加尾部输出）
             try:
                 self.proc.stdin.write(full_cmd.encode('utf-8'))
                 await self.proc.stdin.drain()
 
                 output_buffer = _BashOutputBuffer()
                 exit_code = "unknown"
+
+                loop = asyncio.get_running_loop()
+                total_deadline = loop.time() + float(total_timeout)
 
                 async def read_until_marker() -> None:
                     nonlocal exit_code
@@ -643,7 +764,36 @@ class BashSession:
                     pending = ""
                     keep_tail = len(marker) + 64
                     while True:
-                        chunk = await self.proc.stdout.read(4096)
+                        # 双层读超时（v2.4 防卡死核心）：每次 read 的预算 =
+                        # min(空闲阈值, 剩余总预算)。命令静默（如网络不可达的
+                        # connect 挂起）→ idle 先触发；持续输出但超总预算 →
+                        # total 触发。旧实现只有外层一层总超时，静默命令必然
+                        # 等满 300s。
+                        remaining = total_deadline - loop.time()
+                        if remaining <= 0:
+                            # 超时抛出前冲刷 pending：跨 chunk 的尾部输出
+                            # （长度 <= keep_tail 时尚未写入缓冲）不能丢。
+                            if pending:
+                                output_buffer.add(pending)
+                                pending = ""
+                            raise _BashTotalTimeout(total_timeout)
+                        read_budget = remaining
+                        if idle_timeout is not None and idle_timeout > 0:
+                            read_budget = min(float(idle_timeout), remaining)
+                        try:
+                            chunk = await asyncio.wait_for(
+                                self.proc.stdout.read(4096), timeout=read_budget
+                            )
+                        except asyncio.TimeoutError as exc:
+                            # 同上：先冲刷 pending 再抛超时。旧实现这里会
+                            # 丢掉最后不足 keep_tail 的输出（历史上 total
+                            # 超时的 partial output 也存在同样的缺口）。
+                            if pending:
+                                output_buffer.add(pending)
+                                pending = ""
+                            if read_budget < remaining:
+                                raise _BashIdleTimeout(idle_timeout or 0) from exc
+                            raise _BashTotalTimeout(total_timeout) from exc
                         if not chunk:
                             if pending:
                                 output_buffer.add(pending)
@@ -667,7 +817,12 @@ class BashSession:
                             output_buffer.add(pending[:-keep_tail])
                             pending = pending[-keep_tail:]
 
-                await asyncio.wait_for(read_until_marker(), timeout=timeout)
+                # 内层 read_until_marker 已按 deadline/idle 精确控时并抛出
+                # _BashIdleTimeout / _BashTotalTimeout；外层 wait_for 仅作
+                # 调度抖动兜底（+15s 缓冲，保证内层先触发）。
+                await asyncio.wait_for(
+                    read_until_marker(), timeout=total_timeout + 15.0
+                )
 
                 # 有界缓冲：预算内完整保留；超预算保留头+尾并省略中间，
                 # 上限由 SANDBOX_OUTPUT_MAX_CHARS 控制（默认 80000）。
@@ -706,24 +861,48 @@ class BashSession:
                     logger.exception("Failed to clean up cancelled bash session chat_id=%s", self.chat_id)
                 raise
 
-            except asyncio.TimeoutError:
-                logger.warning(f"Bash timeout chat_id={self.chat_id} cmd={command[:100]}")
+            except _BashIdleTimeout as exc:
+                logger.warning(
+                    "Bash idle timeout chat_id=%s idle=%.0fs cmd=%s",
+                    self.chat_id,
+                    exc.idle_sec,
+                    command[:100],
+                )
                 partial_output = ""
                 try:
-                    if 'pending' in locals() and pending:
-                        output_buffer.add(pending)
                     partial_output = _strip_ansi(output_buffer.finalize()).strip()
                 except Exception:
                     pass
+                await self._kill_and_close_session()
+                msg = _format_idle_timeout_message(exc.idle_sec)
+                if partial_output:
+                    return f"{msg}\n\nCaptured partial output before timeout:\n{partial_output}"
+                return msg
+
+            except _BashTotalTimeout:
+                logger.warning(f"Bash timeout chat_id={self.chat_id} cmd={command[:100]}")
+                partial_output = ""
                 try:
-                    # 同上：start() 保证会话进程存在，仅作类型收窄。
-                    assert self.proc is not None
-                    os.killpg(os.getpgid(self.proc.pid), 9)
-                except ProcessLookupError:
+                    partial_output = _strip_ansi(output_buffer.finalize()).strip()
+                except Exception:
                     pass
-                # 重启会话
-                await self.close()
-                msg = f"Error: Command timed out after {timeout} seconds (sandbox killed & session will restart)"
+                await self._kill_and_close_session()
+                msg = f"Error: Command timed out after {total_timeout} seconds (sandbox killed & session will restart)"
+                if partial_output:
+                    return f"{msg}\n\nCaptured partial output before timeout:\n{partial_output}"
+                return msg
+
+            except asyncio.TimeoutError:
+                # 兜底路径：正常情况下内层 _BashIdleTimeout / _BashTotalTimeout
+                # 先触发；仅当调度极端抖动越过 +15s 缓冲时才会走到这里。
+                logger.warning(f"Bash outer timeout chat_id={self.chat_id} cmd={command[:100]}")
+                partial_output = ""
+                try:
+                    partial_output = _strip_ansi(output_buffer.finalize()).strip()
+                except Exception:
+                    pass
+                await self._kill_and_close_session()
+                msg = f"Error: Command timed out after {total_timeout} seconds (sandbox killed & session will restart)"
                 if partial_output:
                     return f"{msg}\n\nCaptured partial output before timeout:\n{partial_output}"
                 return msg
@@ -731,6 +910,23 @@ class BashSession:
             except Exception as e:
                 logger.exception(f"Bash execute error chat_id={self.chat_id}")
                 return f"Error: {str(e)}"
+
+    # ===================== 超时公共清理 =====================
+    async def _kill_and_close_session(self) -> None:
+        """超时后的公共清理：SIGKILL 整个进程组并关闭/重启会话。
+
+        调用前 self.proc 必然存在（execute / _execute_heredoc_isolated 的
+        既有约束，assert 仅作类型收窄）；killpg 只捕 ProcessLookupError
+        （进程已死则跳过），随后的 close() 幂等且会取消看门狗。
+        """
+        # start() 保证会话进程存在；仅作类型收窄。
+        assert self.proc is not None
+        try:
+            os.killpg(os.getpgid(self.proc.pid), 9)
+        except ProcessLookupError:
+            pass
+        # 重启会话
+        await self.close()
 
     # ===================== 关闭会话 =====================
     async def close(self) -> None:
@@ -830,16 +1026,28 @@ async def execute_bash(
     command: str = "",
     restart: bool = False,
     namespace: str | None = None,
+    timeout: int | None = None,
 ) -> str:
+    """bash 工具入口。
+
+    timeout（v2.4，可选，5-600 秒）：模型为已知长静默命令显式声明的总
+    超时；传入时禁用本次调用的无输出空闲保护（见
+    _normalize_requested_timeout）。非法值静默回退到默认双层配置。
+    """
     resolved_namespace = workspace_namespace(chat_id, namespace)
     if restart:
         result = await _bash_manager.restart_session(chat_id, resolved_namespace)
         return result
     if not command:
         return "Error: command is required (or set restart=true)"
+    total_timeout, idle_timeout = _normalize_requested_timeout(timeout)
     try:
         session = await _bash_manager.get_session(chat_id, resolved_namespace)
     except RuntimeError as e:
         return f"Error: {e}"
     # 执行命令；workspace 本地文件不会自动同步到 R2。
-    return await session.execute(command)
+    return await session.execute(
+        command,
+        total_timeout=total_timeout,
+        idle_timeout=idle_timeout,
+    )
