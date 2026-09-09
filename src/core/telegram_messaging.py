@@ -727,6 +727,11 @@ async def send_rich_html_message(
                         media_kinds.add("video")
                     if "rich_message_audio_" in body_lower or "rich_message_audio_url_invalid" in body_lower:
                         media_kinds.add("audio")
+                    # <tg-button> 相关 400（BUTTON_URL_INVALID / BUTTON_TEXT_INVALID
+                    # 等）：正常情况下转换层已把非法按钮转义为字面量，这里只作
+                    # 最后防线——命中后走纯文本段落降级，不再“未命中可恢复错误
+                    # 类型”直接放弃。
+                    button_error = "button_" in body_lower
 
                     # ---------- 第 2 次尝试：逐个排查有问题的媒体 ----------
                     # 不再一次性降级所有同类型媒体，而是逐个尝试找出有问题的那个。
@@ -770,10 +775,14 @@ async def send_rich_html_message(
                                 )
                                 return False
 
-                    # ---------- 结构/内容错误：保留可见文字，去掉全部富文本标记 ----------
-                    # CONTENT_REQUIRED 或未知 Rich Message 400 不是媒体问题，不应把
-                    # 无辜的媒体改成链接；纯文本段落是最后一道、语义不丢失的兜底。
-                    if "rich_message_content_required" in body_lower or "rich_message_" in body_lower:
+                    # ---------- 结构/内容/按钮错误：保留可见文字，去掉全部富文本标记 ----------
+                    # CONTENT_REQUIRED / BUTTON_* / 未知 Rich Message 400 不是媒体问题，
+                    # 不应把无辜的媒体改成链接；纯文本段落是最后一道、语义不丢失的兜底。
+                    if (
+                        button_error
+                        or "rich_message_content_required" in body_lower
+                        or "rich_message_" in body_lower
+                    ):
                         plain_html = _rich_message_plain_text_fallback(html_content)
                         if plain_html and plain_html != html_content:
                             plain_payload = {

@@ -10,7 +10,7 @@ from typing import Optional
 
 import aiohttp
 
-from markdown_converter import convert_markdown_to_telegram_html
+from markdown_converter import convert_markdown_to_telegram_html, sanitize_tg_buttons
 
 from core.text_utils import _SMART_AMP_PATTERN
 
@@ -52,6 +52,19 @@ def _rich_message_html_payload(html_content: str) -> dict:
             len(html_content),
             len(normalized),
         )
+
+    # 0.5 <tg-button> 强模式校验（幂等防御）：转换器第 0 步已处理，
+    #     这里显式再跑一遍，确保任何到达发送层的按钮都合法；非法按钮
+    #     已转义为字面量，不会触发 BUTTON_URL_INVALID 类 400。
+    button_sanitized = sanitize_tg_buttons(normalized)
+    if button_sanitized != normalized:
+        logger.warning(
+            "sendRichMessage 兜底清理：检测到非法 <tg-button>，已转义为字面量文本。"
+            "原始长度=%s，清理后长度=%s",
+            len(normalized),
+            len(button_sanitized),
+        )
+        normalized = button_sanitized
 
     cleaned = _strip_invalid_media_urls(normalized)
     demoted = _demote_watch_page_videos(cleaned)

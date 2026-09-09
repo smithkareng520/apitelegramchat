@@ -5,7 +5,10 @@
 """
 import re
 import html as html_lib
+import logging
 from typing import List, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 # 只匹配「不是合法 HTML 实体开头」的裸 & ——即后面没有紧跟
@@ -43,6 +46,133 @@ def _escape_prose(text: str) -> str:
     return text.replace('<', '&lt;').replace('>', '&gt;')
 
 
+# ---- <tg-button> 强模式校验与降级 ----
+# Telegram RichMessage 的 <tg-button> 是强模式标签：type 必填；
+# type="url" 时 url 必填，type="copy_text" 时 text 必填；标签内必须有
+# 可见文字；不允许嵌套。模型输出不保证模式正确——典型场景：用户要求
+# “直接回复 <tg-button>”，模型就原样输出一个裸标签。残缺/非法按钮
+# 一旦原样透传，Telegram 会以 BUTTON_URL_INVALID 等 400 拒绝整条消息，
+# 且该错误不在发送层媒体/结构降级分支内，最终表现为“富文本发送失败、
+# 不再降级”。因此这里在转换边界做代码级校验：非法按钮整体转义为
+# 字面量文本（用户看到标签原文而不是整条消息发送失败），合法按钮
+# 原样保留。这是结构兜底，不依赖提示词堆砌。
+_TG_BUTTON_PRESENT_RE = re.compile(r"tg-button", re.IGNORECASE)
+_TG_BUTTON_TAG_RE = re.compile(r"</?tg-button\b[^>]*>", re.IGNORECASE)
+_TG_BUTTON_ATTR_RE = re.compile(
+    r"""([A-Za-z_][\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')""",
+    re.IGNORECASE,
+)
+_TG_BUTTON_VALID_URL_RE = re.compile(r"^(?:https?|tg)://", re.IGNORECASE)
+_TG_BUTTON_VALID_TYPES = ("url", "copy_text")
+
+
+def _parse_tg_button_attrs(attrs_str: str) -> dict:
+    """把 <tg-button ...> 的属性串解析为 dict（双引号/单引号均可）。"""
+    attrs: dict = {}
+    for key, dq, sq in _TG_BUTTON_ATTR_RE.findall(attrs_str):
+        attrs[key.lower()] = dq if dq else sq
+    return attrs
+
+
+def _tg_button_invalid_reason(attrs: dict, inner: str) -> str | None:
+    """返回 None 表示按钮合法，否则返回不合法原因（用于日志与测试）。"""
+    btype = (attrs.get("type") or "").strip().lower()
+    if btype not in _TG_BUTTON_VALID_TYPES:
+        return f"type 必填且只能为 url/copy_text（实际：{btype!r}）"
+    if btype == "url":
+        url = (attrs.get("url") or "").strip()
+        if not url:
+            return "type=url 时 url 属性必填"
+        if not _TG_BUTTON_VALID_URL_RE.match(url):
+            return f"url 需以 http(s):// 或 tg:// 开头（实际：{url[:80]!r}）"
+    else:
+        text = (attrs.get("text") or "").strip()
+        if not text:
+            return "type=copy_text 时 text 属性必填"
+    if not inner.strip():
+        return "按钮显示文本为空"
+    if "<" in inner:
+        return "按钮显示文本不允许包含 HTML 标签（含嵌套 tg-button）"
+    return None
+
+
+def sanitize_tg_buttons(html: str) -> str:
+    """校验并修复 Telegram <tg-button> 标签，非法按钮降级为字面量文本。
+
+    - 合法按钮（type 必填、url/text 按类型必填、有可见文本、不嵌套）
+      原样保留；
+    - 非法/残缺按钮（裸标签、缺属性、非法 URL、空文本、嵌套）整体
+      转义为字面量（&lt;tg-button ...&gt;），避免 BUTTON_URL_INVALID
+      类 400 让整条消息发送失败；
+    - 对已转义的 &lt;tg-button&gt; 幂等，不会二次转义。
+    """
+    if not html or not _TG_BUTTON_PRESENT_RE.search(html):
+        return html
+    tokens = [(m.start(), m.end(), m.group(0)) for m in _TG_BUTTON_TAG_RE.finditer(html)]
+    if not tokens:
+        return html
+
+    # 用栈配对 <tg-button> 与 </tg-button>
+    stack: List[int] = []
+    pairs: dict = {}
+    for i, (_, _, tag) in enumerate(tokens):
+        if tag.startswith("</"):
+            if stack:
+                pairs[stack.pop()] = i
+        else:
+            stack.append(i)
+    unclosed = set(stack)
+    closed_opens = set(pairs)
+    stray_close = {
+        i for i, (_, _, tag) in enumerate(tokens)
+        if tag.startswith("</") and i not in pairs.values()
+    }
+
+    # 非法配对整体跨度（用于吸收其内部被误判为独立按钮的嵌套配对）
+    invalid_pair_spans: List[Tuple[int, int]] = []
+    escape_tokens: set = set()
+
+    for open_i in closed_opens:
+        close_i = pairs[open_i]
+        open_tag = tokens[open_i][2]
+        attrs_str = re.sub(r"^<tg-button\b", "", open_tag, flags=re.IGNORECASE).rstrip(">").strip()
+        inner = html[tokens[open_i][1]:tokens[close_i][0]]
+        reason = _tg_button_invalid_reason(_parse_tg_button_attrs(attrs_str), inner)
+        if reason is not None:
+            escape_tokens.add(open_i)
+            escape_tokens.add(close_i)
+            invalid_pair_spans.append((tokens[open_i][0], tokens[close_i][1]))
+            logger.warning(
+                "tg-button 非法，已转义为字面量文本：%s（原文：%s…）",
+                reason, open_tag[:120],
+            )
+    for i in unclosed:
+        escape_tokens.add(i)
+        logger.warning("tg-button 未闭合，已转义为字面量文本：%s…", tokens[i][2][:120])
+    for i in stray_close:
+        escape_tokens.add(i)
+        logger.warning("tg-button 出现多余的闭合标签，已转义为字面量文本：%s…", tokens[i][2][:120])
+    # 嵌套在非法按钮内部的“合法”配对并不是独立按钮，同样转义
+    for open_i in closed_opens:
+        s, e = tokens[open_i][0], tokens[pairs[open_i]][1]
+        if any(ps <= s and e <= pe for ps, pe in invalid_pair_spans):
+            escape_tokens.add(open_i)
+            escape_tokens.add(pairs[open_i])
+
+    if not escape_tokens:
+        return html
+
+    out: List[str] = []
+    prev = 0
+    for i, (s, e, tag) in enumerate(tokens):
+        if i in escape_tokens:
+            out.append(html[prev:s])
+            out.append(_escape_prose(tag))
+            prev = e
+    out.append(html[prev:])
+    return "".join(out)
+
+
 def convert_markdown_to_telegram_html(text: str) -> str:
     """将 Markdown 语法转换为 Telegram Rich Message HTML。
     
@@ -59,7 +189,12 @@ def convert_markdown_to_telegram_html(text: str) -> str:
     """
     if not text or not text.strip():
         return text
-    
+
+    # 0. <tg-button> 强模式校验：必须先于「是否含 Markdown」的短路判断
+    #    执行——纯 HTML 消息同样可能携带非法按钮，若在短路透传之后才
+    #    处理，原始 <tg-button> 会直达发送层触发 BUTTON_URL_INVALID。
+    text = sanitize_tg_buttons(text)
+
     # 如果完全不包含 Markdown 语法，直接返回
     if not _contains_markdown(text):
         return text
