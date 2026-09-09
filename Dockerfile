@@ -12,7 +12,8 @@ ENV TZ=Asia/Shanghai
 ENV APITELEGRAMCHAT_CJK_FONT=NotoSansCJKsc
 ENV APITELEGRAMCHAT_CJK_FONT_FILE=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
 # ReportLab needs a TrueType outline for embedding; Noto CJK uses CFF outlines.
-ENV APITELEGRAMCHAT_REPORTLAB_CJK_FONT=/usr/share/fonts/truetype/arphic-gbsn00lp/gbsn00lp.ttf
+ENV APITELEGRAMCHAT_REPORTLAB_CJK_FONT=/usr/share/fonts/truetype/arphic/ukai.ttc
+ENV APITELEGRAMCHAT_REPORTLAB_CJK_SUBFONT_INDEX=0
 
 # 配置系统时区为上海（CST/UTC+8）
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
@@ -49,9 +50,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         fontconfig \
         fonts-noto-cjk \
         fonts-arphic-gbsn00lp \
+        fonts-arphic-ukai \
     && fc-cache -f -v >/dev/null \
     && fc-match "Noto Sans CJK SC" >/dev/null \
     && test -f /usr/share/fonts/truetype/arphic-gbsn00lp/gbsn00lp.ttf \
+    && test -f /usr/share/fonts/truetype/arphic/ukai.ttc \
     && tesseract --list-langs 2>/dev/null | grep -qx "chi_sim" \
     && tesseract --list-langs 2>/dev/null | grep -qx "chi_tra" \
     && rm -rf /var/lib/apt/lists/*

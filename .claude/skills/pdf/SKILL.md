@@ -191,27 +191,26 @@ For canvas-drawn text (not Paragraph objects), manually adjust font the size and
 
 The production Docker image installs **two different CJK font resources for two different renderers**. Treat both as image/runtime dependencies; do not install or download fonts during a normal user request.
 
-### ReportLab: embedded TrueType font
+### ReportLab: embedded Kaiti-style CJK font
 
-ReportLab `TTFont` needs a TrueType-outline font for reliable embedding. The Debian Noto CJK files installed for Office rendering use CFF/PostScript outlines and must **not** be passed to ReportLab `TTFont`.
+ReportLab `TTFont` can embed TrueType fonts and TrueType collections (TTC). The production PDF path uses the first face of Debian's **AR PL UKai** collection, which is a Kaiti-style Unicode font. The CN face covers Hiragana and Katakana and has broad Han coverage, making it a better fit for mixed Chinese/Japanese text than the old Arphic Song fallback.
 
-Use the bundled Arphic Song TrueType font for Chinese PDF generation:
+- Font file: `/usr/share/fonts/truetype/arphic/ukai.ttc`
+- TTC subfont: `0` (AR PL UKai CN)
+- Recommended registered name: `CJKKai`
+- Package: `fonts-arphic-ukai`
 
-- Font file: `/usr/share/fonts/truetype/arphic-gbsn00lp/gbsn00lp.ttf`
-- Recommended registered name: `CJKSong`
-- The font is provided by the Debian `fonts-arphic-gbsn00lp` package.
-
-Register it before drawing or laying out Chinese text:
+Register it before drawing or laying out CJK text:
 
 ```python
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-font_path = "/usr/share/fonts/truetype/arphic-gbsn00lp/gbsn00lp.ttf"
-pdfmetrics.registerFont(TTFont("CJKSong", font_path))
+font_path = "/usr/share/fonts/truetype/arphic/ukai.ttc"
+pdfmetrics.registerFont(TTFont("CJKKai", font_path, subfontIndex=0))
 ```
 
-Then use `fontName="CJKSong"` in Platypus styles/tables or `canvas.setFont("CJKSong", size)` for canvas text. This embeds the glyphs into the generated PDF and keeps the PDF portable across viewers.
+Then use `fontName="CJKKai"` in Platypus styles/tables or `canvas.setFont("CJKKai", size)` for canvas text. This embeds the selected Kaiti face into the generated PDF. The bundled `scripts/cjk_font.py` helper already applies the configured TTC subfont index.
 
 ### LibreOffice / DOCX: Noto Sans CJK SC
 
@@ -226,7 +225,7 @@ Do not try to feed this TTC file to ReportLab `TTFont`; it uses CFF outlines.
 
 - Chinese/CJK text must never use ReportLab's built-in `Helvetica`, `Times-Roman`, or `Courier`.
 - Do not use `Arial` as a server-side assumption; it is not guaranteed to exist in the Linux image.
-- When a PDF contains Chinese, choose an actual CJK font and verify the output by rendering pages to images.
+- When a PDF contains Chinese/Japanese text, choose an actual CJK font and verify the output by rendering pages to images.
 - If the required CJK font is missing, fail clearly instead of silently falling back to a non-CJK font.
 - OCR of simplified/traditional Chinese is supported by the preinstalled `chi_sim` and `chi_tra` Tesseract language data.
 
