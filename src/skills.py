@@ -13,7 +13,7 @@ from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
-# Skill 资源层位于 workspace/skills。workspace 本身不做 R2 全量同步。
+# Skill 资源层位于 workspace/skills，由 workspace_utils 按用户 namespace 持久化。
 SKILL_ASSETS_DIRNAME = "skills"
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)

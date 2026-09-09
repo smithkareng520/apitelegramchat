@@ -339,3 +339,53 @@ async def delete_r2_object(key: str) -> bool:
     except Exception as e:
         logger.warning("R2 delete failed: %s", e)
         return False
+
+
+async def list_r2_keys(prefix: str) -> list[str]:
+    """Return object keys below ``prefix``.
+
+    The local fallback mirrors the same contract so callers can exercise the
+    restart/recovery path without a configured R2 bucket.
+    """
+    prefix = str(prefix).replace("\\", "/").strip("/")
+    if not prefix:
+        return []
+    if not is_r2_configured():
+        root = _safe_local_key_path(prefix)
+        if not root.exists() or not root.is_dir():
+            return []
+        return [
+            path.relative_to(_LOCAL_R2_ROOT).as_posix()
+            for path in root.rglob("*")
+            if path.is_file()
+        ]
+
+    assert session is not None
+    keys: list[str] = []
+    try:
+        async with session.client(
+            "s3",
+            endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=R2_ACCESS_KEY,
+            aws_secret_access_key=R2_SECRET_KEY,
+            region_name=R2_REGION,
+            config=_R2_CONFIG,
+        ) as s3:
+            continuation_token: str | None = None
+            while True:
+                params = {"Bucket": R2_BUCKET_NAME, "Prefix": f"{prefix}/"}
+                if continuation_token:
+                    params["ContinuationToken"] = continuation_token
+                response = await s3.list_objects_v2(**params)
+                keys.extend(
+                    item["Key"] for item in response.get("Contents", [])
+                    if item.get("Key")
+                )
+                if not response.get("IsTruncated"):
+                    break
+                continuation_token = response.get("NextContinuationToken")
+                if not continuation_token:
+                    break
+    except Exception as e:
+        logger.warning("R2 list failed for prefix %s: %s", prefix, e)
+    return keys

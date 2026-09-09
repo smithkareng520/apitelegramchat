@@ -12,11 +12,13 @@ from s3_utils import (
     upload_bytes_to_r2,
     download_from_r2,
     delete_r2_object,
+    list_r2_keys,
 )
 
 logger = logging.getLogger(__name__)
 
-# R2 持久化只发生在明确选择的用户文件上；运行时树永不进行全量同步。
+# R2 持久化只发生在明确选择的用户文件上；运行时缓存树永不进行全量同步。
+# skills/ 是例外：它是用户可编辑的资源层，按用户 namespace 独立保存。
 
 
 class _LockRegistry:
@@ -71,8 +73,8 @@ async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) 
     """Ensure the runtime workspace tree (agent home + upload/ + download/) exists.
 
     This function is intentionally safe to call before every tool invocation.
-    It MUST NOT synchronize packaged skills: ``workspace/skills`` is runtime
-    state and may contain files created or edited by the agent/user.
+    The ``workspace/skills`` resource layer is initialized separately and is
+    persisted per user namespace; other runtime files are not mirrored.
 
     upload/ and download/ are pre-created here (rather than lazily on first
     use) because bash starts with cwd=agent home and the model almost
@@ -97,10 +99,11 @@ async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) 
 
 
 async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = None) -> None:
-    """Run one-time workspace skill initialization.
+    """Restore, bootstrap and persist the per-user skill resource layer.
 
-    Initialization is protected by a per-workspace lock and a persistent marker
-    so repeated calls never re-run the packaged-skill sync.
+    The marker is deliberately checked only after the first startup recovery.
+    This matters on ephemeral deployments: the local workspace and marker can
+    disappear together while the user's skills remain in R2.
     """
     resolved_namespace = workspace_namespace(chat_id, namespace)
     key = resolved_namespace
@@ -112,13 +115,14 @@ async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = No
         home = agent_home(chat_id, resolved_namespace)
         marker = home / ".skills_initialized"
 
-        if key in _workspace_initialized or marker.is_file():
+        if key in _workspace_initialized:
             _workspace_initialized.add(key)
             return
 
         try:
             from skills import sync_all_skill_assets_to_workspace
 
+            restore = await _restore_user_skills_from_r2(home, resolved_namespace)
             summary = await asyncio.to_thread(
                 sync_all_skill_assets_to_workspace,
                 home,
@@ -131,14 +135,87 @@ async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = No
                 )
                 return
 
+            persist = await _persist_user_skills_to_r2(home, resolved_namespace)
+            if persist.get("errors"):
+                logger.warning(
+                    "部分用户 skills 持久化失败 namespace=%s: %s",
+                    resolved_namespace,
+                    "; ".join(persist["errors"]),
+                )
+                return
+
             marker.write_text("initialized\n", encoding="utf-8")
             _workspace_initialized.add(key)
+            logger.info(
+                "用户 skills 已恢复/持久化 namespace=%s restored=%s copied=%s uploaded=%s",
+                resolved_namespace,
+                restore.get("restored", 0),
+                summary.get("copied", 0),
+                persist.get("uploaded", 0),
+            )
         except Exception as exc:
             logger.warning(
                 "初始化 skill 包到 workspace 失败 namespace=%s: %s",
                 resolved_namespace,
                 exc,
             )
+
+
+def _skill_r2_prefix(namespace: str) -> str:
+    return f"skills/{workspace_namespace(0, namespace)}"
+
+
+async def _restore_user_skills_from_r2(home: Path, namespace: str) -> dict[str, object]:
+    """Restore missing files from the namespace's R2 skill prefix."""
+    result: dict[str, object] = {"restored": 0, "errors": []}
+    prefix = _skill_r2_prefix(namespace)
+    try:
+        keys = await list_r2_keys(prefix)
+        skills_root = home / "skills"
+        for key in keys:
+            rel = key[len(prefix):].lstrip("/")
+            if not rel:
+                continue
+            target = (skills_root / rel).resolve()
+            if skills_root.resolve() not in target.parents:
+                result["errors"].append(f"unsafe skill key: {key}")
+                continue
+            if target.exists():
+                continue
+            data = await download_from_r2(key)
+            if data is None:
+                result["errors"].append(f"download failed: {key}")
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            result["restored"] += 1
+    except Exception as exc:
+        result["errors"].append(str(exc))
+    return result
+
+
+async def _persist_user_skills_to_r2(home: Path, namespace: str) -> dict[str, object]:
+    """Upload the complete local skill tree under the user's namespace."""
+    result: dict[str, object] = {"uploaded": 0, "errors": []}
+    skills_root = home / "skills"
+    if not skills_root.is_dir():
+        return result
+    prefix = _skill_r2_prefix(namespace)
+    try:
+        for path in skills_root.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(skills_root).as_posix()
+            remote_key = f"{prefix}/{rel}"
+            content_type = "text/plain" if path.suffix.lower() in {".md", ".txt"} else "application/octet-stream"
+            uploaded = await upload_bytes_to_r2(path.read_bytes(), remote_key, content_type)
+            if uploaded is None:
+                result["errors"].append(f"upload failed: {remote_key}")
+            else:
+                result["uploaded"] += 1
+    except Exception as exc:
+        result["errors"].append(str(exc))
+    return result
 
 
 
