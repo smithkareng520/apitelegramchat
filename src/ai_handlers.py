@@ -227,6 +227,7 @@ _BASE_PROMPT = """
   <tr><th>属性</th><th>必填 / 选填</th><th>取值与含义</th></tr>
   <tr><td><code>type</code></td><td><b>必填</b></td><td><code>url</code>：点击跳转链接；<code>copy_text</code>：点击复制按钮文本</td></tr>
   <tr><td><code>url</code></td><td><b>type="url" 时必填</b></td><td>跳转目标，必须是完整的 <code>https://</code> 链接</td></tr>
+  <tr><td><code>text</code></td><td><b>type="copy_text" 时必填</b></td><td><code>text="文本"</code></td></tr>
   <tr><td><code>style</code></td><td>选填</td><td><code>default</code> 默认蓝色 / <code>primary</code> 主色 / <code>success</code> 绿色 / <code>danger</code> 红色 / <code>link</code> 链接样式；省略即 <code>default</code></td></tr>
 </table>
 
