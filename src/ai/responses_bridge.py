@@ -795,6 +795,10 @@ async def _agentic_loop_openai_responses(
         elif not await builder.finalize_turn():
             builder.request_flush()
 
+        logger.info(
+            "[AI RAW RESPONSE] provider=%s chat_id=%s length=%s\n%s",
+            api_label, builder.chat_id, len(content_acc or ""), content_acc,
+        )
         append_assistant_message(loop_messages, new_history_entries, content_acc,
                                  tool_calls_list, reasoning_acc)
 

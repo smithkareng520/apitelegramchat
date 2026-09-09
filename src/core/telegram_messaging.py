@@ -664,10 +664,10 @@ async def send_rich_html_message(
     # 记录实际 HTTP payload 中的完整 HTML；该内容与上方原始 HTML 一致（仅去首尾空白）。
     payload_html_content = payload["rich_message"]["html"]
     logger.info(
-        "[%s] Telegram sendRichMessage payload HTML（长度=%s）：%s",
+        "[%s] Telegram sendRichMessage payload HTML（完整，未截断，长度=%s）：\n%s",
         chat_id,
         len(payload_html_content),
-        payload_html_content[:200],
+        payload_html_content,
     )
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(

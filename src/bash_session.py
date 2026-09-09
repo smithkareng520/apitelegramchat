@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import asyncio
 import uuid
+from html import escape as html_escape
 from pathlib import Path
 from typing import Optional
 
@@ -54,6 +55,11 @@ def _format_bash_envelope(prompt_cwd: str, command: str, exit_code: int | str, o
     body = str(output or "").rstrip("\n")
     if not body:
         return header
+    # Bash stdout is untrusted text. It may contain Telegram rich-message
+    # markers (for example <details>, <pre>, <a>) which must never leak into
+    # the downstream HTML renderer. Keep the terminal semantics while making
+    # the payload safe for rich transports.
+    body = html_escape(body, quote=False)
     return f"{header}\n{body}"
 # ---------- Bash 输出上限（环境变量可调） ----------
 # 单条 Bash 命令返回给模型的内容上限（字符数）。超限时「保留开头 + 结尾、
