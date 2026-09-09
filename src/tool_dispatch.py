@@ -17,7 +17,6 @@ from search_engine import (
     execute_exchange_rate,
     execute_weather,
     execute_geocode,
-    execute_qr_code,
     execute_generate_image,
     execute_generate_video,
     execute_keyword_search,
@@ -168,8 +167,6 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
         elif name == "weather":
             return await execute_weather(arguments.get("city", ""), arguments.get("unit", "c"),
                                          arguments.get("hours", 6))
-        elif name == "qr_code":
-            return await execute_qr_code(arguments.get("text", ""))
         elif name == "generate_image" or name in _IMAGE_TOOL_LEGACY_ALIASES:
             # 统一图像工具（原 generate_image_from_text / edit_image_with_reference
             # 合并）：image_url 缺省 -> 文生图；提供 -> 编辑/图生图。

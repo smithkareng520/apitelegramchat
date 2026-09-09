@@ -788,7 +788,6 @@ async def get_ai_response(
             _PROACTIVE_ALLOWED_TOOLS = {
                 "web_search", "fetch_url", "wikipedia",
                 "exchange_rate", "weather",
-                "qr_code",
                 "geocode", "route", "distance",
                 "poi_keyword_search", "poi_nearby_search", "poi_details",
                 "todo", "memory", "message_user",

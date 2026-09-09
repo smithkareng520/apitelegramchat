@@ -24,7 +24,6 @@
 | wikipedia | Looking up on Wikipedia | 同左 | Looked up on Wikipedia（单复同形） | Looked up: {词条标题} |
 | weather | Fetching weather | 同左 | Fetched weather / Fetched weather for {n} cities | Fetched weather |
 | exchange_rate | Checking exchange rates | 同左 | Checked exchange rates（单复同形） | Checked exchange rates |
-| qr_code | Generating QR code | 同左 | Generated a QR code / Generated {n} QR codes | Generated a QR code |
 | geocode | Geocoding address | 同左 | Geocoded an address / Geocoded {n} addresses | Geocoded an address |
 | route | Planning route | 同左 | Planned a route / Planned {n} routes | Planned a route |
 | distance | Measuring distance | 同左 | Measured a distance（单复同形） | Measured a distance |
@@ -95,4 +94,4 @@
 | `description` 优先 | 参数带 `description/_summary` 时，组标题与工具标题（运行时+完成后）优先显示它；现仅 bash 声明；web_search / text_editor / todo / memory / subagent / deliver_reply 始终按规范文案生成 |
 | 单复数 | 组内同类工具 ≥2 时切复数模板；不可数对象的动作（Listed todos / Searched memories 等）单复同形 |
 | "Ran an action" 兜底 | 仅当未知工具名漏过所有分支时出现；当前全部已声明工具均有专属文案 |
-| 展开正文形态 | bash / text_editor / web_search / message_user / exchange_rate / deliver_reply 等为 `pre/code` 等宽面板；todo / memory / subagent / weather 为富文本卡片；qr_code / 图片 / 视频为媒体卡片 |
+| 展开正文形态 | bash / text_editor / web_search / message_user / exchange_rate / deliver_reply 等为 `pre/code` 等宽面板；todo / memory / subagent / weather 为富文本卡片；图片 / 视频为媒体卡片 |

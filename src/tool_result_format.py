@@ -44,7 +44,6 @@ _TOOL_TIMEOUT_LABELS = {
     "wikipedia": "Wikipedia lookup",
     "exchange_rate": "Exchange rate lookup",
     "weather": "Weather fetch",
-    "qr_code": "QR code generation",
     "generate_video": "Video generation",
     "geocode": "Geocoding",
     "route": "Route planning",
@@ -319,25 +318,6 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         if input_lines:
             details_html += _render_editor_quote("Input", "\n".join(input_lines))
         details_html += _render_editor_quote("Output", result_str)
-        return summary, details_html
-
-    elif fn_name == "qr_code":
-        if "✅ 二维码生成成功" in result_str:
-            img_match = re.search(r'图片链接：([^\s]+)', result_str)
-            content_match = re.search(r'内容：([^\n]+)', result_str)
-            if img_match:
-                img_url = img_match.group(1)
-                content_text = content_match.group(1) if content_match else "已编码内容"
-                summary = "📱 二维码已生成"
-                details_html = (
-                    f'<img src="{img_url}"/><br/>'
-                    f'<b>✅ 二维码生成成功</b><br/>'
-                    f'<b>内容：</b>{convert_markdown_to_telegram_html(content_text)}<br/>'
-                    f'<b>链接：</b><a href="{img_url}">📷 点击查看 / 下载二维码</a>'
-                )
-                return summary, details_html
-        summary = "📱 二维码"
-        details_html = _render_editor_quote("Output", result_str)
         return summary, details_html
 
     elif fn_name in ("generate_image", "generate_image_from_text", "edit_image_with_reference"):

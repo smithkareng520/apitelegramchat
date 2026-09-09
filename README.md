@@ -90,7 +90,7 @@ Telegram Runtime 共用业务能力，但**不把 Runtime 能力原样暴露**�
 | 多模型 | OpenRouter、ModelScope、Gemini、Grok、DeepSeek、GLM、Agnes |
 | Tool Calling | 并行工具调用、工具状态、结果压缩、错误恢复 |
 | Web | 搜索（search/images/videos/lens 四合一）+ 深度抓取 + Wikipedia |
-| 信息工具 | 天气、汇率、二维码 |
+| 信息工具 | 天气、汇率 |
 | 地图 | 地理编码、POI、路线、距离（经 amap-maps MCP） |
 | 文件 | Telegram 上传、workspace 编辑、文件发送 |
 | Bash | 持久 Shell + Landlock + rlimit + fork bomb watchdog |
@@ -387,7 +387,7 @@ Anthropic（Claude）模型经 OpenRouter 接入即可使用；Anthropic 原生 
 ```text
 web_search    # 4-in-1: search / images / videos / lens（mode 参数选择）
 fetch_url     # 深度抓取：编码检测 / SSRF 防护 / JS·meta 重定向追踪 / 根路径回退
-wikipedia / exchange_rate / weather / qr_code
+wikipedia / exchange_rate / weather
 ```
 
 ### 地图

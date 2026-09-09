@@ -375,20 +375,6 @@ SEARCH_TOOLS = [
             ]
         }
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "qr_code",
-            "description": "Generate a QR code image from text or URL and return its public URL.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "要编码的文本或 URL"}
-                },
-                "required": ["text"]
-            }
-        }
-    },
     # ===================== 地图工具（全部由 amap-maps MCP 提供） =====================
     {
         "type": "function",

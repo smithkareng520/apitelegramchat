@@ -443,7 +443,6 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
         "poi_details": "Fetching POI details",
         "exchange_rate": "Checking exchange rates",
         "weather": "Fetching weather",
-        "qr_code": "Generating QR code",
     }
     return mapping.get(fn_name, "Running...")
 
@@ -530,7 +529,6 @@ def _generate_action_description(fn_name: str, fn_args: Optional[dict] = None) -
         "wikipedia": "looked up Wikipedia",
         "exchange_rate": "checked exchange rates",
         "weather": "fetched weather",
-        "qr_code": "generated a QR code",
         "generate_video": "generated a video",
         "geocode": "geocoded an address",
         "poi_keyword_search": "searched for points of interest by keyword",
@@ -951,8 +949,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         return "Generated an image" if n == 1 else f"Generated {n} images"
     if fn_name == "generate_video":
         return "Generated a video"
-    if fn_name == "qr_code":
-        return "Generated a QR code"
 
     mapping = {
         "wikipedia": "Looked up on Wikipedia",

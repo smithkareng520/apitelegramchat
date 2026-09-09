@@ -648,8 +648,6 @@ class RichMessageBuilder:
             group["outer_summary"] = "Checking exchange rates"
         elif t == "weather":
             group["outer_summary"] = "Fetching weather"
-        elif t == "qr_code":
-            group["outer_summary"] = "Generating QR code"
         elif t == "generate_image_from_text":
             num_images = _coerce_positive_int(fn_args.get("num_images"), 1)
             if num_images == 1:
@@ -700,7 +698,6 @@ class RichMessageBuilder:
         "public_holidays": ("Looked up holidays", "Looked up holidays for {n} countries"),
         "weather": ("Fetched weather", "Fetched weather for {n} cities"),
         "convert": ("Calculated a result", "Ran {n} calculations"),
-        "qr_code": ("Generated a QR code", "Generated {n} QR codes"),
         "generate_image_from_text": ("Generated an image", "Generated {n} images"),
         "edit_image_with_reference": ("Edited an image", "Edited {n} images"),
         # 统一图像工具 generate_image：组类型按 image_url 是否携带派生为

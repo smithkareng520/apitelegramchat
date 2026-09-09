@@ -1,10 +1,8 @@
-"""生活查询工具：wikipedia / exchange_rate / weather / qr_code（自 search_engine.py 拆出）。"""
+"""生活查询工具：wikipedia / exchange_rate / weather（自 search_engine.py 拆出）。"""
 
 import asyncio
-import hashlib
 import json
 import re
-from io import BytesIO
 from urllib.parse import quote
 from typing import Any
 
@@ -13,12 +11,7 @@ try:
     from curl_cffi.requests import AsyncSession
 except Exception:  # pragma: no cover - optional dependency fallback
     AsyncSession = None  # type: ignore
-try:
-    import qrcode
-except Exception:  # pragma: no cover - optional dependency fallback
-    qrcode = None
 
-from s3_utils import upload_bytes_to_r2
 from search.fetch_url import CURL_TIMEOUT, HTTP_TIMEOUT_SHORT, _truncate
 
 import logging
@@ -276,26 +269,3 @@ async def execute_weather(city: str, unit: str = "c", hours: int = 6) -> str:
         logger.debug("execute_weather 内部忽略的异常", exc_info=True)
         return json.dumps({"error": f"天气查询异常：{str(e)[:100]}"}, ensure_ascii=False)
 
-
-# --------------------- qr_code ---------------------
-async def execute_qr_code(text: str) -> str:
-    if not text:
-        return "失败：请提供要编码的文本或 URL。"
-    if qrcode is None:
-        # qrcode 为可选依赖（见文件头部 try/except 导入），缺失时给出
-        # 明确失败原因而不是 AttributeError。
-        return "失败：二维码组件未安装，请联系管理员安装 qrcode 依赖。"
-    qr = qrcode.QRCode(box_size=10, border=2)
-    qr.add_data(text)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    img_bytes = buf.getvalue()
-
-    key = f"qr/{hashlib.md5(text.encode()).hexdigest()}.png"
-    url = await upload_bytes_to_r2(img_bytes, key, "image/png")
-    if url:
-        return f"✅ 二维码生成成功\n内容：{text[:200]}\n图片链接：{url}"
-    else:
-        return "失败：R2 上传失败，请检查配置。"
