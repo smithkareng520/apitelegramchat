@@ -68,6 +68,13 @@ except OSError:
 PR_SET_NO_NEW_PRIVS = 38
 PR_SET_DUMPABLE = 11
 
+# PR_SET_DUMPABLE is a kernel-level hardening primitive. Some managed/container
+# runtimes install a seccomp policy that rejects this prctl with EINVAL even
+# though Landlock and PR_SET_NO_NEW_PRIVS are available. Cache the result so a
+# restricted host is diagnosed once rather than producing one ERROR per bash
+# child. This is deliberately a security-status signal, not log suppression.
+_dumpable_state: Optional[bool] = None
+
 
 def _set_no_new_privs() -> bool:
     """阻止 setuid 提权；失败时返回 False。"""
@@ -82,29 +89,51 @@ def _set_no_new_privs() -> bool:
 
 
 def _set_undumpable() -> bool:
-    """PR_SET_DUMPABLE=0：断开同 uid 进程对本进程 /proc/<pid> 的交叉读取。
+    """Try to disable dumpability and report the host capability accurately.
 
-    效果（对 uid 相同的其它进程生效，含其它 chat 的沙盒子进程）：
-      - /proc/<pid>/environ 属主变为 root:root（mode 0400）→ 同 uid 沙箱
-        无法再偷读本进程完整环境（历史版本里这是最大的残留风险：
-        bot 主进程的 TELEGRAM_BOT_TOKEN / R2 密钥就在 os.environ 里）；
-      - /proc/<pid>/maps、mem 等需要 PTRACE_MODE_READ 的文件同样被封死；
-      - ptrace 本进程被拒绝；core dump 关闭。
-
-    注意：watchdog 依赖的 /proc/<pid>/stat 是世界可读（0444），不受影响；
-    killpg 的信号权限取决于进程真实凭据而非 proc 文件属主，同样不受影响。
-    本层是纵深防御而非主边界（主边界是 Landlock + 环境变量白名单），
-    因此 prctl 失败时选择 fail-open（记 ERROR 后继续），避免个别内核
-    异常导致全部 bash 拒绝服务。
+    ``PR_SET_DUMPABLE`` is defense-in-depth: Landlock remains the filesystem
+    boundary and the child environment is independently allow-listed. A
+    container/host seccomp policy may reject this prctl with ``EINVAL``.
+    In that case there is no userspace workaround: retrying the same prctl
+    cannot make a denied kernel operation succeed. We therefore keep the
+    sandbox usable, but emit one explicit WARNING describing the missing
+    protection and cache the result so every child does not repeat it.
     """
+    global _dumpable_state
+
+    if _dumpable_state is not None:
+        return _dumpable_state
     if _libc is None:
+        _dumpable_state = False
+        logger.warning(
+            "PR_SET_DUMPABLE=0 unavailable: libc is not loadable; "
+            "cross-process /proc protection is inactive"
+        )
         return False
+
+    ctypes.set_errno(0)
     rc = _libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)
-    if rc != 0:
-        err = ctypes.get_errno()
-        logger.error("prctl(PR_SET_DUMPABLE, 0) failed: %s", os.strerror(err))
-        return False
-    return True
+    if rc == 0:
+        _dumpable_state = True
+        return True
+
+    err = ctypes.get_errno()
+    _dumpable_state = False
+    if err == 22:  # EINVAL: commonly returned by container seccomp filters.
+        logger.warning(
+            "PR_SET_DUMPABLE=0 is rejected by the host/container security "
+            "policy (EINVAL); this runtime cannot enable cross-process "
+            "/proc protection. Landlock + child environment isolation remain active. "
+            "Use a runtime policy that permits PR_SET_DUMPABLE if this protection "
+            "is required."
+        )
+    else:
+        logger.warning(
+            "PR_SET_DUMPABLE=0 unavailable (%s); cross-process /proc protection "
+            "is inactive",
+            os.strerror(err),
+        )
+    return False
 
 
 def harden_parent_process() -> None:

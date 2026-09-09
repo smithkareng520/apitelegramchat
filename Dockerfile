@@ -25,9 +25,11 @@ ENV APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT=/app/.claude/skills/pdf/fonts/NotoEmoji
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # 沙箱用 Landlock（Linux 5.13+ 内核特性，非特权进程可用）。
-# node:22-bookworm-slim 基于 Debian 12 (bookworm)，内核 5.15+，Render 上 Landlock 可用。
-# 不需要 bubblewrap —— bwrap 在 Render 的非 privileged 容器里永远起不来
-# （内核禁了 unprivileged userns），留着只会造成误导。
+# 注意：Docker 基础镜像不决定实际内核版本/安全策略；容器共享宿主内核。
+# 因此部署时必须实际探测 Landlock / prctl 能力，不能假定 Render 或任何
+# 托管平台一定允许某个内核接口。
+# 不需要 bubblewrap —— bwrap 依赖的 unprivileged userns 在部分托管容器中
+# 被宿主策略禁用；Landlock 更适合本项目的非特权文件系统边界。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \

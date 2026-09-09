@@ -149,6 +149,36 @@ def test_sitecustomize_sets_real_socket_default(sandbox_env: dict) -> None:
 # ---------------------------------------------------------------------------
 # 集成：真实 bash 会话的双层超时行为（Landlock 直通，见文件头说明）
 # ---------------------------------------------------------------------------
+
+def test_dumpable_prctl_einval_is_reported_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restricted container kernels may reject PR_SET_DUMPABLE with EINVAL.
+
+    The failure is a host capability/security-policy issue, not a reason to
+    spam one ERROR for every bash child. The result is cached and the warning
+    remains explicit so operators can fix the host policy.
+    """
+    class FakeLibc:
+        def prctl(self, option: int, value: int, *args: int) -> int:
+            assert option == sandbox.PR_SET_DUMPABLE
+            assert value == 0
+            return -1
+
+    monkeypatch.setattr(sandbox, "_libc", FakeLibc())
+    monkeypatch.setattr(sandbox.ctypes, "get_errno", lambda: 22)
+    sandbox._dumpable_state = None
+
+    warnings: list[str] = []
+    monkeypatch.setattr(sandbox.logger, "warning", lambda message, *args: warnings.append(str(message)))
+
+    first = sandbox._set_undumpable()
+    second = sandbox._set_undumpable()
+
+    assert first is False
+    assert second is False
+    assert sandbox._dumpable_state is False
+    assert len(warnings) == 1
+    assert "EINVAL" in warnings[0]
+
 def _run(coro: Any) -> Any:
     return asyncio.run(coro)
 

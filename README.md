@@ -712,6 +712,33 @@ python tests/test_whitelist_r2.py          # 白名单 R2 同步回归（可独�
 
 ## 常见问题
 
+### `prctl(PR_SET_DUMPABLE, 0) failed: Invalid argument`
+
+这不是 Bash、HTML 或 heredoc 命令本身的问题。`PR_SET_DUMPABLE=0` 是 Linux
+内核提供的进程级加固，用来阻止同 UID 进程通过 `/proc/<pid>/environ`、
+`/proc/<pid>/maps` 等接口窥探 bot 进程。它属于纵深防御，不是 Landlock
+文件系统边界。
+
+在某些托管容器/沙箱环境里，seccomp 等宿主安全策略会直接拒绝这个
+`prctl`，常见表现就是 `EINVAL (22)`。这种拒绝发生在应用进程到达内核时，
+应用本身无法通过换一种 Python/ctypes 写法“修好”。尤其不要反复重试同一
+系统调用；那只会制造噪声。
+
+本项目现在会：
+
+1. 将 `PR_SET_DUMPABLE` 能力检测结果缓存，避免每个 Bash 子进程重复报错；
+2. 把该情况明确记录为 `WARNING`，说明是 host/container policy 问题，而
+   不是假装调用成功；
+3. 继续使用 Landlock、`PR_SET_NO_NEW_PRIVS`、rlimit、fork-bomb watchdog
+   以及子进程环境白名单；
+4. 只有在宿主/容器允许 `PR_SET_DUMPABLE` 时，才启用额外的同 UID `/proc`
+   交叉读取防护。
+
+如果你的部署环境要求这层保护必须存在，应修改宿主的 seccomp/container
+策略，让 `prctl(PR_SET_DUMPABLE, 0)` 被允许；否则应把它视为明确的部署能力
+缺失，而不是通过关闭日志来掩盖。
+
+
 ### 1. Bot 能启动，但用户收到"未授权访问"
 
 检查白名单文件（`APITELEGRAMCHAT_WHITELIST_FILE`，相对路径挂在
