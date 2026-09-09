@@ -92,9 +92,9 @@ def _workspace_guide_html(chat_id: int | None, workspace_namespace_value: str | 
     这里把三件事显式写进提示词：① 绝对路径；② 只有家目录可读写（含
     典型报错特征）；③ TMPDIR 已重定向，临时文件开箱即用。
 
-    v2.3 布局：bash 起始目录 = $HOME = agent 家目录（容器根下的 claude/），
-    Landlock 放行边界与之重合——父目录（容器根，含 runtime.json 等内部
-    状态）与其余一切路径对沙箱完全不可见。缓存层收敛到家目录内隐藏的
+    v2.3.1 布局：bash 起始目录 = $HOME = agent 家目录（即 workspace 根
+    本身），Landlock 放行边界与之重合——父目录（data_root/workspaces）
+    与其余一切路径对沙箱完全不可见。缓存层收敛到家目录内隐藏的
     .runtime/，普通 ls 只见 download/ upload/ skills/ 与用户文件。
     路径对同一 chat 稳定不变，不影响 prompt cache 的前缀复用。
     """

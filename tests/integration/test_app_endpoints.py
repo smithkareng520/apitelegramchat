@@ -47,7 +47,7 @@ def test_flattened_module_graph_imports():
     import context_window             # noqa: F401
     from mcpserver.server import main  # noqa: F401
     from version import __version__
-    assert __version__ == "2.3.0"
+    assert __version__ == "2.3.1"
 
 
 # ---------------------------------------------------------------------

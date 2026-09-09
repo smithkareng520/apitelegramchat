@@ -10,32 +10,37 @@ logger = logging.getLogger(__name__)
 
 _NAMESPACE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _STATE_DIR_NAME = os.getenv("APITELEGRAMCHAT_STATE_DIR_NAME", "state").strip() or "state"
-# agent 家目录名：workspace 容器根下唯一对模型可见的一层，$HOME、bash
-# 起始 cwd 与 Landlock 放行边界都指向它。默认 claude（与镜像内沙箱
-# 用户名一致），可用 APITELEGRAMCHAT_HOME_DIR_NAME 覆盖。
-_HOME_DIR_NAME = os.getenv("APITELEGRAMCHAT_HOME_DIR_NAME", "claude").strip() or "claude"
 # 运行时缓存层（pip/ccache/HF/tmp/bin/...）是家目录内的隐藏目录：
 #   - 点前缀让普通 `ls` 看不见，模型视角的家目录只剩用户文件；
-#   - 必须位于家目录内部（而非容器根下的兄弟目录），否则 Landlock
-#     为了放行缓存就得放行容器根，"沙箱边界 = 家目录"的收紧就落空。
+#   - 位于家目录内部（家目录即 Landlock 放行边界），缓存天然可写，
+#     无需为放行缓存而扩大边界。
 _RUNTIME_DIR_NAME = os.getenv("APITELEGRAMCHAT_RUNTIME_DIR_NAME", ".runtime").strip() or ".runtime"
 _SKILLS_DIR_NAME = os.getenv("APITELEGRAMCHAT_SKILLS_DIR_NAME", "skills").strip() or "skills"
 _UPLOAD_DIR_NAME = os.getenv("APITELEGRAMCHAT_UPLOAD_DIR_NAME", "upload").strip() or "upload"
 _DOWNLOAD_DIR_NAME = os.getenv("APITELEGRAMCHAT_DOWNLOAD_DIR_NAME", "download").strip() or "download"
 
-# 旧布局（v2.2 及之前）留在容器根下的条目名 → 新布局中家目录下的目标名。
-# runtime.json 是 bash 会话的工具链清单缓存，随缓存层一起进 .runtime/。
+# v2.2（及更早）遗留布局留在 workspace 根下的缓存目录名 → 新布局目标名。
+# download/upload/skills/.skills_initialized 在新布局里本来就归属根，无需动；
+# 只有 runtime/ 更名为隐藏层 .runtime/，runtime.json 随迁进 .runtime/。
 # 迁移用原子 rename（同一文件系统），只移动不合并，幂等可重入。
-_LEGACY_HOME_ENTRIES: tuple[tuple[str, str], ...] = (
+_LEGACY_RUNTIME_DIR = "runtime"
+_LEGACY_RUNTIME_STATE = "runtime.json"
+
+# 过渡布局（v2.3.0 草案，未曾正式发布）：家目录位于根下 claude/ 子目录。
+# 防御性兼容：若某环境短暂部署过该草案，首次访问时把 claude/ 下的条目
+# 逐个折叠回根，再删除空的 claude/ 目录。目标名相对 workspace 根。
+_INTERIM_HOME_DIR_NAME = "claude"
+_INTERIM_HOME_ENTRIES: tuple[tuple[str, str], ...] = (
     ("download", _DOWNLOAD_DIR_NAME),
     ("upload", _UPLOAD_DIR_NAME),
     ("skills", _SKILLS_DIR_NAME),
-    ("runtime", _RUNTIME_DIR_NAME),
+    (".runtime", _RUNTIME_DIR_NAME),
     (".skills_initialized", ".skills_initialized"),
+    ("runtime", _LEGACY_RUNTIME_DIR),
+    ("runtime.json", _LEGACY_RUNTIME_STATE),
 )
-_LEGACY_RUNTIME_STATE = "runtime.json"
 
-# 已完成过迁移检查的 (容器根, namespace)（进程内缓存；重启后靠 exists()
+# 已完成过迁移检查的 (workspace 根, namespace)（进程内缓存；重启后靠 exists()
 # 快路径兜底——旧布局条目在新代码下不再产生，首次迁移后即恒为空操作）。
 _home_migrated: set[tuple[str, str]] = set()
 
@@ -85,47 +90,70 @@ def sanitize_namespace(value: object) -> str:
 
 
 def workspace_root(chat_id: object, namespace: object | None = None) -> Path:
-    """Return the private container root for this chat/scope.
+    """Return the workspace root for this chat/scope — the agent home itself.
 
-    自 v2.3 起该目录只是 bot 自有的存储容器，不再对沙箱放行：模型可见的
-    世界收敛到 :func:`agent_home`（容器根下的 ``claude/`` 家目录）。
-    容器根本身对 bash 沙箱不可读不可写（Landlock 只放行家目录子树）。
+    v2.3.1 布局：workspace 根即 agent 家目录（$HOME、bash 起始 cwd 与
+    Landlock 唯一放行边界三者重合）。根下只存放模型可见的用户文件层
+    （download/ upload/ skills/）与隐藏缓存层 ``.runtime/``；其父目录
+    （data_root/workspaces）与 data_root 下其余内容对沙箱完全不可见。
     """
     ns = _resolved_namespace(chat_id, namespace)
     parent = _secure_directory(data_root() / "workspaces")
     return _secure_directory(parent / ns)
 
 
-def _migrate_legacy_layout(root: Path, home: Path, ns: str) -> None:
-    """One-time move of v2.2 (and earlier) workspace entries into the agent home.
+def _move_if_absent(src: Path, dst: Path) -> None:
+    """仅当源存在且目标不存在时原子改名；否则无操作（只移动不合并）。"""
+    if not src.exists() or dst.exists():
+        return
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(src, dst)
+        logger.info("Workspace migration: moved %s -> %s", src, dst)
+    except OSError as exc:
+        logger.warning("Workspace migration skipped for %s: %s", src, exc)
 
-    旧布局把 download/ upload/ skills/ runtime/ 和 runtime.json 直接放在
-    容器根下；新布局里它们归属家目录（缓存层更名为 ``.runtime``）。迁移
-    规则：
+
+def _migrate_legacy_layout(root: Path, ns: str) -> None:
+    """One-time migration of legacy workspace layouts to the v2.3.1 layout.
+
+    新布局：workspace 根即家目录，根下平铺 download/ upload/ skills/ 与
+    隐藏缓存层 ``.runtime/``（runtime.json 归入其中）。两种遗留布局：
+
+    - v2.3.0 过渡草案（根下 ``claude/`` 家目录，未正式发布）：把 claude/
+      下的条目逐个折叠回根，成功后删除空的 claude/ 目录；
+    - v2.2 及更早（runtime/ 与 runtime.json 平铺在根下）：仅把 runtime/
+      更名为 ``.runtime/``，runtime.json 随迁进 .runtime/；
+      download/upload/skills 本就归属根，原地不动。
+
+    迁移规则：
 
     - 仅当目标不存在且源存在时用 ``os.replace`` 原子改名（同一文件系统），
       不做合并、不覆盖任何已存在的文件 —— 中断后重跑安全，幂等可重入；
-    - 目标已存在时保留双方不动：残留的旧条目位于容器根下，对沙箱完全
-      不可见（Landlock 只放行家目录），不会造成泄漏或混淆；
+    - 目标已存在时保留双方不动（绝不覆盖新数据）；runtime.json 是可再生
+      缓存，目标已存在时旧文件直接丢弃；
     - 全部失败仅记日志，绝不阻断路径解析（迁移失败只影响旧数据可见性，
       不影响新工作区可用性）。
     """
     try:
-        home.mkdir(parents=True, exist_ok=True)
-        for legacy_name, new_name in _LEGACY_HOME_ENTRIES:
-            src = root / legacy_name
-            dst = home / new_name
-            if not src.exists() or dst.exists():
-                continue
+        # 1) 过渡草案折叠：claude/ 下的条目回到根。
+        interim = root / _INTERIM_HOME_DIR_NAME
+        if interim.is_dir() and not interim.is_symlink():
+            for src_name, dst_name in _INTERIM_HOME_ENTRIES:
+                _move_if_absent(interim / src_name, root / dst_name)
             try:
-                os.replace(src, dst)
-                logger.info("Workspace migration: moved %s -> %s", src, dst)
-            except OSError as exc:
-                logger.warning("Workspace migration skipped for %s: %s", src, exc)
+                # 仅当目录已空时成功；仍有残留（未知文件）则原地保留。
+                interim.rmdir()
+                logger.info("Workspace migration: removed empty %s", interim)
+            except OSError:
+                pass
 
-        # runtime.json（bash 工具链清单缓存）→ <home>/.runtime/runtime.json。
+        # 2) v2.2 遗留：runtime/ → .runtime/（隐藏缓存层）。
+        _move_if_absent(root / _LEGACY_RUNTIME_DIR, root / _RUNTIME_DIR_NAME)
+
+        # 3) runtime.json（bash 工具链清单缓存）→ .runtime/runtime.json。
         legacy_state = root / _LEGACY_RUNTIME_STATE
-        new_state = home / _RUNTIME_DIR_NAME / _LEGACY_RUNTIME_STATE
+        new_state = root / _RUNTIME_DIR_NAME / _LEGACY_RUNTIME_STATE
         if legacy_state.is_file():
             try:
                 if new_state.exists():
@@ -144,37 +172,36 @@ def _migrate_legacy_layout(root: Path, home: Path, ns: str) -> None:
 def agent_home(chat_id: object, namespace: object | None = None) -> Path:
     """Return the agent home directory: $HOME, bash cwd and Landlock scope.
 
-    v2.3 布局::
+    v2.3.1 布局（家目录即 workspace 根）::
 
-        <data_root>/workspaces/<ns>/     ← 容器根（bot 自有，对沙箱不可见）
-        └── claude/                      ← 家目录：模型唯一可见可写的世界
-            ├── download/  upload/  skills/
-            └── .runtime/                ← 隐藏缓存层（bin/pip/ccache/HF/...）
+        <data_root>/workspaces/<ns>/   ← 家目录：$HOME = 起始 cwd = Landlock 边界
+        ├── download/  upload/  skills/
+        └── .runtime/                  ← 隐藏缓存层（bin/pip/ccache/HF/... + runtime.json）
 
-    首次访问时把旧布局的容器根条目一次性迁移进家目录（见
+    父目录（data_root/workspaces）与其余一切路径仍被 Landlock 拒绝，
+    沙箱世界收敛到家目录子树。首次访问时一次性迁移两种遗留布局（见
     :func:`_migrate_legacy_layout`），之后每次调用只剩几个 ``exists()``
     快路径检查，开销可忽略。
     """
     ns = _resolved_namespace(chat_id, namespace)
     root = workspace_root(chat_id, ns)
-    home = _secure_directory(root / _HOME_DIR_NAME)
     migrate_key = (str(root), ns)
     if migrate_key not in _home_migrated:
-        _migrate_legacy_layout(root, home, ns)
+        _migrate_legacy_layout(root, ns)
         _home_migrated.add(migrate_key)
-    return home
+    return root
 
 
 def workspace_workdir(chat_id: object, namespace: object | None = None) -> Path:
-    """Return the agent home directory used as the bash cwd.
+    """Return the agent home directory used as the bash cwd (= workspace root).
 
     Every relative path in Bash, text_editor, staging, and file presentation is
-    resolved against this directory (the agent home, e.g. ``.../claude``),
-    which is also ``$HOME`` and the only Landlock-permitted subtree. It sits
-    one level below :func:`workspace_root` (the private container root, never
-    exposed to the sandbox). The workspace is local-only and is never mirrored
-    wholesale to R2. Packaged skills live under ``skills/``; runtime caches
-    live under the hidden ``.runtime/`` inside the home.
+    resolved against this directory (the agent home), which is also ``$HOME``
+    and the only Landlock-permitted subtree — exactly :func:`workspace_root`.
+    Its parent (data_root/workspaces) is never exposed to the sandbox. The
+    workspace is local-only and is never mirrored wholesale to R2. Packaged
+    skills live under ``skills/``; runtime caches live under the hidden
+    ``.runtime/`` inside the home.
     """
     home = agent_home(chat_id, namespace)
     workspace_skills_root(chat_id, namespace)
@@ -215,8 +242,8 @@ def workspace_namespace(chat_id: object, namespace: object | None = None) -> str
 def runtime_cache_root(chat_id: object, namespace: object | None = None) -> Path:
     """隐藏缓存层（家目录内 ``.runtime/``），完全独立于用户文件同步层。
 
-    必须位于家目录内部：Landlock 只放行家目录子树，沙箱内的 pip/TMPDIR/
-    ccache/HF 等全部写这里；放在容器根下会迫使 Landlock 放行容器根。
+    家目录即 Landlock 放行边界，沙箱内的 pip/TMPDIR/ccache/HF 等全部写
+    这里；点前缀让普通 ``ls`` 不显示，不与用户文件混在一起。
     """
     return _secure_directory(agent_home(chat_id, namespace) / _RUNTIME_DIR_NAME)
 

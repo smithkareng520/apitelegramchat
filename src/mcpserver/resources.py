@@ -38,8 +38,8 @@ class ResourceService:
         return self._context.scope
 
     def _workspace(self) -> Path:
-        # 对外暴露模型可见的文件树 = agent 家目录（容器根下的内部状态
-        # 不在 MCP 视野内，与沙箱边界保持一致）。
+        # 对外暴露模型可见的文件树 = agent 家目录（workspace 根本身，
+        # 与沙箱 Landlock 边界保持一致；state/ 等内部状态不在 MCP 视野内）。
         return workspace_workdir(self._chat_id, self._namespace)
 
     @staticmethod

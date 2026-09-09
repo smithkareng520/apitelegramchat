@@ -82,8 +82,8 @@ async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) 
     `mkdir -p upload/` round before doing the real work. This is the
     initialization boundary, not a per-tool concern.
 
-    v2.3：upload/ 与 download/ 挂在 agent 家目录（容器根下的 claude/）下；
-    首次访问家目录时会自动把旧布局的容器根条目迁移进来（见
+    v2.3.1：upload/ 与 download/ 挂在 agent 家目录（即 workspace 根本身）
+    下；首次访问家目录时会自动把遗留布局条目迁移到位（见
     workspace_paths.agent_home）。
     """
     workspace = workspace_root(chat_id, namespace)
@@ -106,8 +106,9 @@ async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = No
     key = resolved_namespace
     lock = await _get_workspace_init_lock(key)
     async with lock:
-        # 家目录（容器根下的 claude/）才是 skills/ 与初始化标记的归属；
-        # agent_home() 首次访问时会自动迁移旧布局条目。
+        # workspace 根（agent 家目录本身）才是 skills/ 与初始化标记的归属；
+        # agent_home() 首次访问时会自动迁移遗留布局条目（含 v2.3.0 过渡
+        # 草案的 claude/ 折叠回根）。
         home = agent_home(chat_id, resolved_namespace)
         marker = home / ".skills_initialized"
 

@@ -232,9 +232,8 @@ _RUNTIME_STATE_FILENAME = "runtime.json"
 def _runtime_state_path(chat_id: int, namespace: str | None = None) -> Path:
     """工具链清单缓存路径：家目录内的隐藏缓存层 ``.runtime/`` 下。
 
-    v2.3 起不再放在容器根（旧位置对模型可见、且与用户文件混在一起），
-    而是归入 ``<home>/.runtime/``：对模型隐藏，且仍在 Landlock 放行边界
-    内（写入方虽是 bot 进程，但路径层保持一致的内外划分）。
+    不直接放在家目录根（与用户文件混在一起、普通 ls 里碍眼），而是归入
+    ``.runtime/``：对模型隐藏，且仍在 Landlock 放行边界（家目录子树）内。
     """
     return runtime_cache_root(chat_id, namespace) / _RUNTIME_STATE_FILENAME
 
@@ -315,8 +314,8 @@ class BashSession:
         # manager 的全局锁内），两把锁互不互斥；每实例锁串行化 spawn，
         # 防止并发双开 bash 导致先 spawn 的进程泄漏、新进程无看门狗。
         self._start_lock = asyncio.Lock()
-        # v2.3 布局：workspace = 容器根（bot 自有，含家目录与残留缓存），
-        # home = 家目录（$HOME / 起始 cwd / Landlock 唯一放行边界）。
+        # v2.3.1 布局：workspace = workdir = agent 家目录，即 workspace 根
+        # 本身（$HOME / 起始 cwd / Landlock 唯一放行边界三者重合）。
         self.workspace = workspace_root(chat_id, self.namespace)
         self.workdir = workspace_workdir(chat_id, self.namespace)
         self._watchdog_task: Optional[asyncio.Task] = None
@@ -342,7 +341,8 @@ class BashSession:
         if self.proc is not None and self.proc.returncode is None:
             return
 
-        # workspace 目录权限 700，防跨 chat 读取
+        # workspace 目录权限 700，防跨 chat 读取（workspace 与 workdir 现为
+        # 同一目录，双写 chmod 只是幂等保险）。
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.workdir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.workspace, 0o700)
@@ -379,11 +379,10 @@ class BashSession:
                     _prepare_runtime_once, self.chat_id, cache_root, self.namespace
                 )
 
-        # ★ Landlock：把文件系统访问限制在 agent 家目录（workdir）内，
-        #   upload/、download/、skills/ 与隐藏缓存层 .runtime/ 都在
-        #   这里；容器根（家目录的父目录，含 runtime.json 等内部状态）
-        #   与其他一切路径默认拒绝。通过 functools.partial 把家目录
-        #   路径传给 preexec。
+        # ★ Landlock：把文件系统访问限制在 agent 家目录（workdir =
+        #   workspace 根）内，upload/、download/、skills/ 与隐藏缓存层
+        #   .runtime/ 都在这里；父目录（data_root/workspaces）与其他一切
+        #   路径默认拒绝。通过 functools.partial 把家目录路径传给 preexec。
         import functools
         preexec = functools.partial(
             _preexec_sandbox,
@@ -531,7 +530,8 @@ class BashSession:
         cwd = self._last_cwd or str(self.workdir.absolute())
         env = build_sandbox_env(workspace, self.chat_id, self.namespace)
         import functools
-        # 隔离执行与持久会话同界：Landlock 只放行 agent 家目录。
+        # 隔离执行与持久会话同界：Landlock 只放行 agent 家目录
+        # （workdir = workspace 根）。
         preexec = functools.partial(_preexec_sandbox, str(workspace.absolute()))
 
         marker = f"__ONE_SHOT_END_{uuid.uuid4().hex[:8]}__"

@@ -257,8 +257,7 @@ curl http://127.0.0.1:5000/health   # → {"status":"ok"}
 | `SERPER_API_KEY` / `SERPER_API_TIMEOUT` | 可选 | Serper 搜索（默认 12s 超时） |
 | `R2_ENDPOINT` / `R2_ACCESS_KEY` / `R2_SECRET_KEY` / `R2_BUCKET_NAME` / `R2_PUBLIC_URL` / `R2_REGION` | 可选 | S3/R2 对象存储 |
 | `APITELEGRAMCHAT_DATA_DIR` | 可选 | 数据根目录 |
-| `APITELEGRAMCHAT_HOME_DIR_NAME` | 可选 | agent 家目录名（默认 `claude`，位于容器根下） |
-| `APITELEGRAMCHAT_RUNTIME_DIR_NAME` | 可选 | 隐藏缓存层目录名（默认 `.runtime`，位于家目录内） |
+| `APITELEGRAMCHAT_RUNTIME_DIR_NAME` | 可选 | 隐藏缓存层目录名（默认 `.runtime`，位于 agent 家目录内） |
 | `APITELEGRAMCHAT_WHITELIST_FILE` | 可选 | 白名单文件 |
 | `APITELEGRAMCHAT_REQUIRE_STRICT_CONFIG=true` | 可选 | 启动时强校验 Telegram 四项核心配置 |
 | `LOG_LEVEL` / `LOG_FILE` | 可选 | 日志级别（默认 INFO）与日志文件路径 |
@@ -431,25 +430,27 @@ LLM 上下文（只要高价值字段）。`tool_result_condense.py` 统一承�
 
 ## Workspace 与文件
 
-每个聊天会话拥有独立 workspace。自 v2.3 起采用「容器根 + agent 家目录」
-双层布局：模型的世界收敛到家目录内，运行时缓存全部隐藏：
+每个聊天会话拥有独立 workspace。自 v2.3.1 起 workspace 根即 agent 家目录：
+`$HOME`、bash 起始 cwd 与 Landlock 唯一放行边界三者重合，模型的世界就是
+这个目录本身；运行时缓存全部收进隐藏层：
 
 ```text
 <data-root>/
 ├── workspaces/
-│   └── <chat-or-scope>/     # 容器根：bot 自有，对沙箱不可见
-│       └── claude/          # agent 家目录：$HOME = bash 起始 cwd = Landlock 唯一放行边界
-│           ├── download/    # Telegram 上传文件的落地目录
-│           ├── upload/      # 准备发送给用户的文件
-│           ├── skills/      # 技能包目录
-│           └── .runtime/    # 隐藏缓存层（bin/pip/ccache/HF/tmp/... + runtime.json）
+│   └── <chat-or-scope>/     # agent 家目录：$HOME = bash 起始 cwd = Landlock 唯一放行边界
+│       ├── download/        # Telegram 上传文件的落地目录
+│       ├── upload/          # 准备发送给用户的文件
+│       ├── skills/          # 技能包目录
+│       └── .runtime/        # 隐藏缓存层（bin/pip/ccache/HF/tmp/... + runtime.json）
 └── state/
 ```
 
-路径边界由 `workspace_paths.py` 统一管理；agent 家目录是 bash 的固定起始
-目录，也是所有相对路径的唯一解析根。旧版（v2.2 及之前）平铺在容器根下的
-`download/ upload/ skills/ runtime/ runtime.json` 会在首次访问时自动原子
-迁移进家目录（只移动不覆盖，幂等可重入）。典型流程：
+路径边界由 `workspace_paths.py` 统一管理；agent 家目录（即 workspace 根）
+是 bash 的固定起始目录，也是所有相对路径的唯一解析根。旧版的杂项会在
+首次访问时自动原子迁移（只移动不覆盖，幂等可重入）：v2.2 及之前平铺在
+根下的 `runtime/` 更名为 `.runtime/`、`runtime.json` 归入其中；若短暂
+部署过 v2.3.0 草案（家目录位于根下 `claude/`），其条目会自动折叠回根并
+删除空的 `claude/` 目录。典型流程：
 
 ```text
 Telegram 上传 → download/ → Agent/Bash 编辑 → upload/ → present_files → Telegram
@@ -468,10 +469,10 @@ Session（`src/bash_session.py` + `src/sandbox.py`）。子进程启动前会：
 4. 使用独立 process group，启动 fork bomb watchdog；
 5. 不继承应用层 secret 环境变量。
 
-Landlock 原则：`agent 家目录（容器根下的 claude/）→ 可读写`；
-`/usr /bin ... → 只读 + 执行`；其他一切路径（含容器根本身、其他用户
+Landlock 原则：`agent 家目录（即 workspace 根）→ 可读写`；
+`/usr /bin ... → 只读 + 执行`；其他一切路径（含家目录的父目录、其他用户
 workspace、state/、/app 源码）→ 默认拒绝。模型在家目录内执行 `cd ..`
-也会被拒绝——容器根只属于 bot 进程。Bash 可以使用镜像内的
+也会被拒绝——父目录只属于 bot 进程。Bash 可以使用镜像内的
 Python/gcc/cmake 等工具，但不能读取 Bot Token、API Key、其他用户
 workspace。
 
@@ -541,8 +542,7 @@ export APITELEGRAMCHAT_DATA_DIR=/var/lib/apitelegramchat
 
 目录权限按 `0700` 方向创建。不要把 `/app`、`/home/claude` 直接作为
 数据根目录，也不要把 Bot Token、API Keys、Docker secret、MCP token
-放进 workspace。需要调整 agent 家目录名（默认 `claude`）时，设置
-`APITELEGRAMCHAT_HOME_DIR_NAME`；缓存层目录名默认 `.runtime`，可用
+放进 workspace。缓存层目录名默认 `.runtime`（agent 家目录内），可用
 `APITELEGRAMCHAT_RUNTIME_DIR_NAME` 覆盖（改回非点前缀会重新暴露给
 模型的 `ls`，不建议）。
 
