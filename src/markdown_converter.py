@@ -190,6 +190,13 @@ def convert_markdown_to_telegram_html(text: str) -> str:
     if not text or not text.strip():
         return text
 
+    # 0.5 已经是 Telegram HTML 的工具输出不要再次经过 Markdown 转换。
+    # tool/bash 结果会包含 <pre><code> 中的原始文本，二次转换会把
+    # 第一次生成的 &lt; / &gt; 当作普通字符继续处理，导致用户看到实体。
+    # 保留代码块隔离，避免 bash 内容污染后续富文本。
+    if "<pre><code" in text and "</code></pre>" in text:
+        return text
+
     # 0. <tg-button> 强模式校验：必须先于「是否含 Markdown」的短路判断
     #    执行——纯 HTML 消息同样可能携带非法按钮，若在短路透传之后才
     #    处理，原始 <tg-button> 会直达发送层触发 BUTTON_URL_INVALID。
