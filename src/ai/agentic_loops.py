@@ -1223,7 +1223,7 @@ async def _agentic_loop_native_video(
                     # 修复 OOM 风险：限制为 200MB（足够任何合理的 720p 视频片段），
                     # 超限则拒绝并回退到原始 URL。
                     _MAX_VIDEO_BYTES = 200 * 1024 * 1024
-                    video_bytes = await dl_resp.content.read(_MAX_VIDEO_BYTES + 1)
+                    video_bytes = await dl_resp.read()
                     if len(video_bytes) > _MAX_VIDEO_BYTES:
                         logger.warning(
                             "[NativeVideo] 视频体积超限 (>%s)，跳过 R2 上传，回退原始 URL: %s",
