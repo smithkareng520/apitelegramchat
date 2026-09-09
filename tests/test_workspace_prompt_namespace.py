@@ -8,15 +8,18 @@ if str(SRC) not in sys.path:
 
 
 def _fresh_workspace_paths(monkeypatch, tmp_path):
-    """Import workspace_paths with a private data root and cleared caches.
+    """Import workspace_paths with private data/workspaces roots and cleared caches.
 
-    data_root() 带 lru_cache，且迁移检查带进程内缓存；每个测试都清空
-    两者，保证用例之间互不污染（与执行顺序无关）。
+    data_root()/workspaces_root() 带 lru_cache，且迁移检查带进程内缓存；
+    每个测试都清空三者，保证用例之间互不污染（与执行顺序无关）。
     """
     monkeypatch.setenv("APITELEGRAMCHAT_DATA_DIR", str(tmp_path / "data"))
+    # 工作空间根同样指到 tmp（生产默认 /home，不属于测试可写假设）。
+    monkeypatch.setenv("APITELEGRAMCHAT_WORKSPACES_DIR", str(tmp_path / "home"))
     import workspace_paths
 
     workspace_paths.data_root.cache_clear()
+    workspace_paths.workspaces_root.cache_clear()
     workspace_paths._home_migrated.clear()
     return workspace_paths
 
@@ -28,9 +31,32 @@ def test_workspace_paths_are_isolated_by_user_namespace(monkeypatch, tmp_path):
     user_b = wp.workspace_workdir(12345, "20002")
 
     assert user_a != user_b
-    # 家目录 = workspace 根本身：data/workspaces/<ns>/，无任何中间层。
-    assert user_a == tmp_path / "data" / "workspaces" / "10001"
-    assert user_b == tmp_path / "data" / "workspaces" / "20002"
+    # 家目录 = workspace 根本身：home/<ns>/（生产默认 /home/<ns>），无中间层。
+    assert user_a == tmp_path / "home" / "10001"
+    assert user_b == tmp_path / "home" / "20002"
+
+
+def test_workspaces_root_defaults_to_home(monkeypatch, tmp_path):
+    """默认工作空间根是 /home：家目录即 /home/<ns>，pwd 不带 data_root 前缀。"""
+    monkeypatch.delenv("APITELEGRAMCHAT_WORKSPACES_DIR", raising=False)
+    monkeypatch.setenv("APITELEGRAMCHAT_DATA_DIR", str(tmp_path / "data"))
+    import workspace_paths
+
+    workspace_paths.data_root.cache_clear()
+    workspace_paths.workspaces_root.cache_clear()
+    workspace_paths._home_migrated.clear()
+    try:
+        assert workspace_paths.workspaces_root() == Path("/home")
+        # 覆盖 env 生效：家目录跟随工作空间根。
+        monkeypatch.setenv("APITELEGRAMCHAT_WORKSPACES_DIR", str(tmp_path / "custom"))
+        workspace_paths.workspaces_root.cache_clear()
+        assert workspace_paths.workspaces_root() == tmp_path / "custom"
+        assert workspace_paths.workspace_root(12345, "10001") == tmp_path / "custom" / "10001"
+    finally:
+        # 清缓存避免污染后续用例（env 由 monkeypatch 自动还原）。
+        workspace_paths.workspaces_root.cache_clear()
+        workspace_paths.data_root.cache_clear()
+        workspace_paths._home_migrated.clear()
 
 
 def test_agent_home_layout(monkeypatch, tmp_path):
@@ -48,7 +74,7 @@ def test_agent_home_layout(monkeypatch, tmp_path):
     # 家目录就是 workspace 根本身（$HOME = cwd = Landlock 边界）。
     assert home == root
     assert wp.agent_home(12345, "10001") == root
-    assert home == tmp_path / "data" / "workspaces" / "10001"
+    assert home == tmp_path / "home" / "10001"
     # 用户可见子目录都在家目录根下（bash 相对路径体验不变）。
     assert upload == home / "upload"
     assert download == home / "download"
@@ -59,6 +85,60 @@ def test_agent_home_layout(monkeypatch, tmp_path):
     assert cache.parent == home
     # 状态域仍在 data_root 下、与 workspace 隔离。
     assert wp.state_root() == tmp_path / "data" / "state"
+
+
+def test_legacy_data_root_workspaces_are_folded_into_home(monkeypatch, tmp_path):
+    """升级迁移：旧位置 data/workspaces/<ns> 首次访问时整目录并入新家。
+
+    工作空间根从 data_root/workspaces 挪到 /home 后，旧位置的用户文件
+    （skills/download/上传等）必须在首次访问时自动跟过来，不能孤儿化。
+    """
+    wp = _fresh_workspace_paths(monkeypatch, tmp_path)
+
+    legacy = tmp_path / "data" / "workspaces" / "10001"
+    (legacy / "skills" / "old-skill").mkdir(parents=True)
+    (legacy / "skills" / "old-skill" / "SKILL.md").write_text("old", encoding="utf-8")
+    (legacy / "download").mkdir()
+    (legacy / "download" / "brief.pdf").write_text("pdf-bytes", encoding="utf-8")
+    (legacy / ".skills_initialized").write_text("initialized\n", encoding="utf-8")
+
+    home = wp.workspace_workdir(12345, "10001")
+
+    # 旧位置内容整体进入新家（home/<ns>），旧目录已删除。
+    assert home == tmp_path / "home" / "10001"
+    assert (home / "skills" / "old-skill" / "SKILL.md").read_text(encoding="utf-8") == "old"
+    assert (home / "download" / "brief.pdf").read_text(encoding="utf-8") == "pdf-bytes"
+    assert (home / ".skills_initialized").is_file()
+    assert not legacy.exists()
+
+    # 幂等可重入：重复触发迁移路径无副作用。
+    wp._home_migrated.clear()
+    wp.agent_home(12345, "10001")
+    assert (home / "skills" / "old-skill" / "SKILL.md").read_text(encoding="utf-8") == "old"
+
+
+def test_legacy_location_migration_never_overwrites_new_home(monkeypatch, tmp_path):
+    """绝不覆盖：新家已存在同名条目时保留双方，旧目录残留原地保留。"""
+    wp = _fresh_workspace_paths(monkeypatch, tmp_path)
+
+    home = wp.workspace_workdir(12345, "10001")
+    (home / "download").mkdir(exist_ok=True)
+    (home / "download" / "new.txt").write_text("new", encoding="utf-8")
+
+    legacy = tmp_path / "data" / "workspaces" / "10001"
+    (legacy / "download").mkdir(parents=True)
+    (legacy / "download" / "new.txt").write_text("stale", encoding="utf-8")
+    (legacy / "upload").mkdir()
+    (legacy / "upload" / "out.txt").write_text("old", encoding="utf-8")
+
+    wp._home_migrated.clear()
+    wp.agent_home(12345, "10001")
+
+    # 新家内容原样保留；旧 upload/（新家没有的条目）照常并入。
+    assert (home / "download" / "new.txt").read_text(encoding="utf-8") == "new"
+    assert (home / "upload" / "out.txt").read_text(encoding="utf-8") == "old"
+    # 同名条目未覆盖 → 旧 download/ 残留原地。
+    assert (legacy / "download" / "new.txt").read_text(encoding="utf-8") == "stale"
 
 
 def test_legacy_workspace_layout_is_migrated(monkeypatch, tmp_path):
@@ -194,7 +274,7 @@ def test_bash_session_landlock_scope_is_agent_home(monkeypatch, tmp_path):
     assert session.workspace == root
     # 家目录即 workspace 根：两者重合，不存在 claude/ 之类的中间层。
     assert session.workdir == session.workspace
-    assert session.workdir == tmp_path / "data" / "workspaces" / "10001"
+    assert session.workdir == tmp_path / "home" / "10001"
 
     # 源码级锁定：preexec 参数来自 workdir（家目录 = workspace 根）。
     source = (SRC / "bash_session.py").read_text(encoding="utf-8")

@@ -96,13 +96,16 @@ def sandbox_env(
 ) -> Iterator[dict]:
     """隔离 data_root 后构建一次沙箱环境变量。"""
     monkeypatch.setenv("APITELEGRAMCHAT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("APITELEGRAMCHAT_WORKSPACES_DIR", str(tmp_path / "home"))
     monkeypatch.setattr(sandbox, "_apply_landlock", lambda path: True)
     workspace_paths.data_root.cache_clear()
+    workspace_paths.workspaces_root.cache_clear()
     try:
         env = sandbox.build_sandbox_env(tmp_path / "ws", 42, "ns42")
         yield env
     finally:
         workspace_paths.data_root.cache_clear()
+        workspace_paths.workspaces_root.cache_clear()
 
 
 def test_build_env_injects_sitecustomize_and_cli_timeouts(
@@ -152,8 +155,10 @@ def _run(coro: Any) -> Any:
 
 def _new_session(tmp_path: Any, monkeypatch: Any) -> BashSession:
     monkeypatch.setenv("APITELEGRAMCHAT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("APITELEGRAMCHAT_WORKSPACES_DIR", str(tmp_path / "home"))
     monkeypatch.setattr(sandbox, "_apply_landlock", lambda path: True)
     workspace_paths.data_root.cache_clear()
+    workspace_paths.workspaces_root.cache_clear()
     return BashSession(424242)
 
 

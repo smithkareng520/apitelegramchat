@@ -7,6 +7,9 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONPATH=/app/src
 ENV APITELEGRAMCHAT_DATA_DIR=/tmp/apitelegramchat_data
+# 工作空间根：agent 家目录即 /home/<userid>，bash 里 pwd 不再携带
+# data_root 前缀。/home 必须对运行用户可写（见下方 chown）。
+ENV APITELEGRAMCHAT_WORKSPACES_DIR=/home
 ENV TZ=Asia/Shanghai
 # Stable CJK font used by PDF generation and server-side Office rendering.
 ENV APITELEGRAMCHAT_CJK_FONT=NotoSansCJKsc
@@ -92,6 +95,12 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir --upgrade pip 
     python3 -m pip install --break-system-packages --no-cache-dir -r requirements.txt && \
     python3 -m pip install --break-system-packages --no-cache-dir . && \
     npm install --omit=dev --no-audit --no-fund
+
+# 工作空间根 /home 交给运行用户（uid 2000）：非 root 进程要能在 /home
+# 下创建每户家目录 /home/<chat-ns>。只 chown /home 本身（不 -R，
+# /home/claude 已属 claude）；0700 收紧家目录隐私边界，其他系统用户
+# （容器内无）无法枚举用户目录。
+RUN mkdir -p /home && chown claude:claude /home && chmod 700 /home
 
 RUN mkdir -p /app/workspace && chown -R claude:claude /app/workspace /app/src /home/claude
 

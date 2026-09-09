@@ -284,6 +284,69 @@ async def file_exists_in_r2(key: str) -> bool:
         return False
 
 
+async def list_r2_objects(prefix: str) -> list[str]:
+    """List object keys under ``prefix`` (or the local cache when R2 is unavailable).
+
+    用于目录级持久化（如用户 skills/ 备份）的枚举入口：与既有函数一样，
+    R2 未配置时回退本地 r2_cache 目录；远端失败返回空列表（调用方按
+    "无备份"处理，绝不抛出阻断主流程）。分页循环覆盖超过单页 1000 条
+    的前缀（skills 目录远小于此，仅为完备性保留）。
+    """
+    clean_prefix = str(prefix or "").strip().strip("/")
+    if not clean_prefix:
+        return []
+
+    if not is_r2_configured():
+        root = _safe_local_key_path(clean_prefix)
+        if not root.is_dir():
+            return []
+        try:
+            return sorted(
+                p.relative_to(_LOCAL_R2_ROOT).as_posix()
+                for p in root.rglob("*")
+                if p.is_file()
+            )
+        except Exception as e:
+            logger.warning("Local R2 cache list failed: %s", e)
+            return []
+
+    # is_r2_configured() 为真 ⇒ session 必非 None（同 upload_bytes_to_r2 的不变量）
+    assert session is not None
+    keys: list[str] = []
+    try:
+        async with session.client(
+            "s3",
+            endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=R2_ACCESS_KEY,
+            aws_secret_access_key=R2_SECRET_KEY,
+            region_name=R2_REGION,
+            config=_R2_CONFIG,
+        ) as s3:
+            token: str | None = None
+            while True:
+                kwargs: dict = {
+                    "Bucket": R2_BUCKET_NAME,
+                    "Prefix": f"{clean_prefix}/",
+                    "MaxKeys": 1000,
+                }
+                if token:
+                    kwargs["ContinuationToken"] = token
+                resp = await s3.list_objects_v2(**kwargs)
+                for obj in resp.get("Contents", []) or []:
+                    key = obj.get("Key")
+                    if key:
+                        keys.append(str(key))
+                if not resp.get("IsTruncated"):
+                    break
+                token = resp.get("NextContinuationToken")
+                if not token:
+                    break
+        return keys
+    except Exception as e:
+        logger.warning("R2 list failed: %s", e)
+        return []
+
+
 async def download_from_r2(key: str) -> bytes | None:
     if not is_r2_configured():
         path = _safe_local_key_path(key)
@@ -339,53 +402,3 @@ async def delete_r2_object(key: str) -> bool:
     except Exception as e:
         logger.warning("R2 delete failed: %s", e)
         return False
-
-
-async def list_r2_keys(prefix: str) -> list[str]:
-    """Return object keys below ``prefix``.
-
-    The local fallback mirrors the same contract so callers can exercise the
-    restart/recovery path without a configured R2 bucket.
-    """
-    prefix = str(prefix).replace("\\", "/").strip("/")
-    if not prefix:
-        return []
-    if not is_r2_configured():
-        root = _safe_local_key_path(prefix)
-        if not root.exists() or not root.is_dir():
-            return []
-        return [
-            path.relative_to(_LOCAL_R2_ROOT).as_posix()
-            for path in root.rglob("*")
-            if path.is_file()
-        ]
-
-    assert session is not None
-    keys: list[str] = []
-    try:
-        async with session.client(
-            "s3",
-            endpoint_url=R2_ENDPOINT,
-            aws_access_key_id=R2_ACCESS_KEY,
-            aws_secret_access_key=R2_SECRET_KEY,
-            region_name=R2_REGION,
-            config=_R2_CONFIG,
-        ) as s3:
-            continuation_token: str | None = None
-            while True:
-                params = {"Bucket": R2_BUCKET_NAME, "Prefix": f"{prefix}/"}
-                if continuation_token:
-                    params["ContinuationToken"] = continuation_token
-                response = await s3.list_objects_v2(**params)
-                keys.extend(
-                    item["Key"] for item in response.get("Contents", [])
-                    if item.get("Key")
-                )
-                if not response.get("IsTruncated"):
-                    break
-                continuation_token = response.get("NextContinuationToken")
-                if not continuation_token:
-                    break
-    except Exception as e:
-        logger.warning("R2 list failed for prefix %s: %s", prefix, e)
-    return keys

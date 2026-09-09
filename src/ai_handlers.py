@@ -93,8 +93,8 @@ def _workspace_guide_html(chat_id: int | None, workspace_namespace_value: str | 
     典型报错特征）；③ TMPDIR 已重定向，临时文件开箱即用。
 
     v2.3.1 布局：bash 起始目录 = $HOME = agent 家目录（即 workspace 根
-    本身），Landlock 放行边界与之重合——父目录（data_root/workspaces）
-    与其余一切路径对沙箱完全不可见。缓存层收敛到家目录内隐藏的
+    本身），Landlock 放行边界与之重合——家目录（默认 /home/<ns>）之外的
+    一切路径对沙箱完全不可见。缓存层收敛到家目录内隐藏的
     .runtime/，普通 ls 只见 download/ upload/ skills/ 与用户文件。
     路径对同一 chat 稳定不变，不影响 prompt cache 的前缀复用。
     """
@@ -437,9 +437,7 @@ async def build_system_prompt(
     """
     base_prompt = _BASE_PROMPT
     if supports_tools:
-        catalog_text = skill_catalog_text or skill_catalog_brief(
-            chat_id, workspace_namespace_value
-        )
+        catalog_text = skill_catalog_text or skill_catalog_brief()
         base_prompt += _TOOLS_SECTION.format(
             workspace_guide=_workspace_guide_html(chat_id, workspace_namespace_value),
             catalog_text=catalog_text,
@@ -536,14 +534,6 @@ async def get_ai_response(
             workspace_namespace_value = state.get_current_user_namespace()
         except Exception:
             workspace_namespace_value = None
-    # 技能目录可能需要从 R2 恢复；不能只依赖 app 层的后台预初始化，
-    # 否则首个回合构建 system prompt 时会漏掉用户技能。
-    try:
-        from workspace_utils import init_workspace
-
-        await init_workspace(chat_id, workspace_namespace_value)
-    except Exception:
-        logger.warning("回合内技能 workspace 初始化失败，继续使用可见本地技能", exc_info=True)
     # usage 形状动态（SDK pydantic 对象 / JSON dict / None），按 Any 标注。
     usage: Any = None
     is_timer = (event_source == "TIMER")
@@ -704,9 +694,7 @@ async def get_ai_response(
             chat_id,
             username,
             supports_tools=supports_tools,
-            skill_catalog_text=skill_catalog_brief(
-                chat_id, workspace_namespace_value
-            ),
+            skill_catalog_text=skill_catalog_brief(),
             workspace_namespace_value=workspace_namespace_value,
         )
         messages = _build_initial_messages(system_prompt)

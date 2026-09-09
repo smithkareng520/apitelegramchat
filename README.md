@@ -256,7 +256,8 @@ curl http://127.0.0.1:5000/health   # → {"status":"ok"}
 | `GROQ_API_KEY` | 可选 | 音频转写 |
 | `SERPER_API_KEY` / `SERPER_API_TIMEOUT` | 可选 | Serper 搜索（默认 12s 超时） |
 | `R2_ENDPOINT` / `R2_ACCESS_KEY` / `R2_SECRET_KEY` / `R2_BUCKET_NAME` / `R2_PUBLIC_URL` / `R2_REGION` | 可选 | S3/R2 对象存储 |
-| `APITELEGRAMCHAT_DATA_DIR` | 可选 | 数据根目录 |
+| `APITELEGRAMCHAT_DATA_DIR` | 可选 | 内部状态根目录（state/、白名单与 R2 本地缓存；工作空间不在这里） |
+| `APITELEGRAMCHAT_WORKSPACES_DIR` | 可选 | 工作空间根目录（默认 `/home`，agent 家目录即 `/home/<userid>`） |
 | `APITELEGRAMCHAT_RUNTIME_DIR_NAME` | 可选 | 隐藏缓存层目录名（默认 `.runtime`，位于 agent 家目录内） |
 | `APITELEGRAMCHAT_WHITELIST_FILE` | 可选 | 白名单文件 |
 | `APITELEGRAMCHAT_REQUIRE_STRICT_CONFIG=true` | 可选 | 启动时强校验 Telegram 四项核心配置 |
@@ -432,25 +433,30 @@ LLM 上下文（只要高价值字段）。`tool_result_condense.py` 统一承�
 
 每个聊天会话拥有独立 workspace。自 v2.3.1 起 workspace 根即 agent 家目录：
 `$HOME`、bash 起始 cwd 与 Landlock 唯一放行边界三者重合，模型的世界就是
-这个目录本身；运行时缓存全部收进隐藏层：
+这个目录本身；工作空间根默认 `/home`（`APITELEGRAMCHAT_WORKSPACES_DIR`），
+家目录即 `/home/<userid>`，bash 里 `pwd` 不再携带数据目录前缀，符合 Linux
+习惯；运行时缓存全部收进隐藏层：
 
 ```text
-<data-root>/
-├── workspaces/
-│   └── <chat-or-scope>/     # agent 家目录：$HOME = bash 起始 cwd = Landlock 唯一放行边界
-│       ├── download/        # Telegram 上传文件的落地目录
-│       ├── upload/          # 准备发送给用户的文件
-│       ├── skills/          # 技能包目录
-│       └── .runtime/        # 隐藏缓存层（bin/pip/ccache/HF/tmp/... + runtime.json）
-└── state/
+/home/                        # 工作空间根（APITELEGRAMCHAT_WORKSPACES_DIR，默认 /home）
+└── <chat-or-scope>/        # agent 家目录：$HOME = bash 起始 cwd = Landlock 唯一放行边界
+    ├── download/            # Telegram 上传文件的落地目录
+    ├── upload/              # 准备发送给用户的文件
+    ├── skills/              # 技能包目录（R2 定向同步：重启后自动找回）
+    └── .runtime/            # 隐藏缓存层（bin/pip/ccache/HF/tmp/... + runtime.json）
+
+<data-root>/                 # 内部状态（APITELEGRAMCHAT_DATA_DIR，对沙箱不可见）
+└── state/                   # todos/memories 等会话状态（R2 同步）
 ```
 
 路径边界由 `workspace_paths.py` 统一管理；agent 家目录（即 workspace 根）
 是 bash 的固定起始目录，也是所有相对路径的唯一解析根。旧版的杂项会在
-首次访问时自动原子迁移（只移动不覆盖，幂等可重入）：v2.2 及之前平铺在
-根下的 `runtime/` 更名为 `.runtime/`、`runtime.json` 归入其中；若短暂
-部署过 v2.3.0 草案（家目录位于根下 `claude/`），其条目会自动折叠回根并
-删除空的 `claude/` 目录。典型流程：
+首次访问时自动原子迁移（只移动不覆盖，幂等可重入）：v2.3.1 及之前位于
+`<data-root>/workspaces/<ns>` 的旧工作空间会整目录并入新家目录（兼容
+跨文件系统，如 Render 挂载盘 → 容器层）；v2.2 及之前平铺在根下的
+`runtime/` 更名为 `.runtime/`、`runtime.json` 归入其中；若短暂部署过
+v2.3.0 草案（家目录位于根下 `claude/`），其条目会自动折叠回根并删除空的
+`claude/` 目录。典型流程：
 
 ```text
 Telegram 上传 → download/ → Agent/Bash 编辑 → upload/ → present_files → Telegram
@@ -503,11 +509,8 @@ fail-closed 拒绝启动受保护 Bash 子进程（见 FAQ）。
 
 **Skills**：从 `.claude/skills` 等位置发现并加载（`src/skills.py`）。
 Skill 包含 `SKILL.md` / `scripts/` / `assets/` / `references/`，runtime
-负责扫描、解析 frontmatter、建立 catalog、按需读取与资产同步；用户
-workspace 中的 skills 按用户 namespace 持久化，服务重启后自动恢复。
-当前用户 workspace 中的同名 Skill 优先于项目内置 Skill，其他用户的
-workspace 不会被扫描。Skill 不是普通 Python import，更接近 Agent 按需
-加载的"操作手册 + 工具资源"。
+负责扫描、解析 frontmatter、建立 catalog、按需读取与资产同步。Skill
+不是普通 Python import，更接近 Agent 按需加载的"操作手册 + 工具资源"。
 
 **外部 MCP**：使用 Streamable HTTP MCP Client 调用外部服务（当前仅保留
 高德地图 `amap-maps`，见 `src/mcp_client.py`）。
@@ -613,7 +616,9 @@ docker run --rm --env-file .env -p 5000:5000 apitelegramchat
 镜像包含 Python 3 / Node.js 22 / gcc / cmake / LibreOffice / Pandoc /
 ImageMagick / Tesseract / Poppler / qpdf 等 Skill 依赖，以非 root 用户
 （UID/GID 2000）运行，默认 `PORT=5000`、
-`APITELEGRAMCHAT_DATA_DIR=/tmp/apitelegramchat_data`。
+`APITELEGRAMCHAT_DATA_DIR=/tmp/apitelegramchat_data`（内部状态）与
+`APITELEGRAMCHAT_WORKSPACES_DIR=/home`（工作空间根，`/home` 已在镜像内
+交给运行用户，agent 家目录即 `/home/<userid>`）。
 
 ### Render
 

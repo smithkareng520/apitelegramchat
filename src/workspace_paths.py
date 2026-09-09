@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 from functools import lru_cache
 from pathlib import Path
 
@@ -77,9 +78,41 @@ def _secure_directory(path: Path) -> Path:
 
 @lru_cache(maxsize=1)
 def data_root() -> Path:
-    """Return the private root for runtime state and workspaces."""
+    """Return the private root for internal runtime state.
+
+    承担 state/（todos/memories 等会话状态）、白名单缓存、R2 本地缓存等
+    内部状态；agent 家目录/工作空间不在这里（见 :func:`workspaces_root`），
+    对沙箱完全不可见。
+    """
     base = os.getenv("APITELEGRAMCHAT_DATA_DIR", "/tmp/apitelegramchat_data")
     return _secure_directory(Path(base))
+
+
+@lru_cache(maxsize=1)
+def workspaces_root() -> Path:
+    """Return the parent directory that holds every per-chat agent home.
+
+    默认 ``/home``：家目录即 ``/home/<ns>``，bash 里 ``pwd`` 直接是
+    ``/home/<ns>``，符合 Linux 习惯，不再携带 data_root 前缀。data_root
+    仍承担内部状态（state/ 等），两者彻底分离。可用
+    ``APITELEGRAMCHAT_WORKSPACES_DIR`` 覆盖（例如受限环境写不了 /home）。
+
+    父目录只创建、不改权限、不做 0700 收紧（/home 是标准系统目录，本
+    函数不应改变系统目录的语义）；隐私边界在每户家目录的 0700 +
+    Landlock（家目录才是放行边界）。若部署镜像里运行用户写不了该目录，
+    这里报出带修复提示的错误，而不是在更深路径上莫名失败。
+    """
+    base = os.getenv("APITELEGRAMCHAT_WORKSPACES_DIR", "/home").strip() or "/home"
+    path = Path(base)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot create workspaces root {path}: {exc} — "
+            "the runtime user must be able to write it; set "
+            "APITELEGRAMCHAT_WORKSPACES_DIR to a writable directory to override"
+        ) from exc
+    return path
 
 
 def sanitize_namespace(value: object) -> str:
@@ -94,11 +127,12 @@ def workspace_root(chat_id: object, namespace: object | None = None) -> Path:
 
     v2.3.1 布局：workspace 根即 agent 家目录（$HOME、bash 起始 cwd 与
     Landlock 唯一放行边界三者重合）。根下只存放模型可见的用户文件层
-    （download/ upload/ skills/）与隐藏缓存层 ``.runtime/``；其父目录
-    （data_root/workspaces）与 data_root 下其余内容对沙箱完全不可见。
+    （download/ upload/ skills/）与隐藏缓存层 ``.runtime/``；家目录之外
+    的一切路径（/home 下其他家目录、data_root、系统目录）对沙箱完全
+    不可见。
     """
     ns = _resolved_namespace(chat_id, namespace)
-    parent = _secure_directory(data_root() / "workspaces")
+    parent = workspaces_root()
     return _secure_directory(parent / ns)
 
 
@@ -112,6 +146,47 @@ def _move_if_absent(src: Path, dst: Path) -> None:
         logger.info("Workspace migration: moved %s -> %s", src, dst)
     except OSError as exc:
         logger.warning("Workspace migration skipped for %s: %s", src, exc)
+
+
+def _fold_legacy_workspaces_location(root: Path, ns: str) -> None:
+    """一次性把旧位置 ``<data_root>/workspaces/<ns>`` 折叠进新家目录。
+
+    v2.3.1 及之前家目录位于 ``<data_root>/workspaces/<ns>``；工作空间根
+    改为 ``APITELEGRAMCHAT_WORKSPACES_DIR``（默认 /home）后，旧目录常与
+    新家目录不在同一文件系统（如 Render 挂载盘 vs 容器层），无法整体
+    rename。规则与既有布局迁移完全一致：只移动不合并、绝不覆盖 ——
+    仅当新家目录内不存在同名条目时逐条 ``shutil.move``（自动兼容跨
+    文件系统），随后尝试删除已空的旧目录（仍有残留则原地保留）；
+    任何失败只记日志，绝不阻断路径解析（迁移失败只影响旧数据可见性，
+    不影响新工作区可用性）。
+    """
+    legacy = data_root() / "workspaces" / ns
+    try:
+        if not legacy.is_dir() or legacy.is_symlink():
+            return
+        try:
+            if legacy.resolve() == root.resolve():
+                return  # env 指回旧位置的部署：新旧同径，无需迁移
+        except OSError:
+            return
+        moved = 0
+        for child in sorted(legacy.iterdir()):
+            dst = root / child.name
+            if dst.exists() or dst.is_symlink():
+                continue  # 绝不覆盖新家已有内容
+            shutil.move(str(child), str(dst))
+            moved += 1
+        if moved:
+            logger.info(
+                "Workspace location migration: %s -> %s (%d items)",
+                legacy, root, moved,
+            )
+        try:
+            legacy.rmdir()  # 仅当已空时成功；有残留则原地保留
+        except OSError:
+            pass
+    except Exception as exc:  # noqa: BLE001 — 迁移绝不阻断路径解析
+        logger.warning("Workspace location migration skipped namespace=%s: %s", ns, exc)
 
 
 def _migrate_legacy_layout(root: Path, ns: str) -> None:
@@ -128,14 +203,19 @@ def _migrate_legacy_layout(root: Path, ns: str) -> None:
 
     迁移规则：
 
-    - 仅当目标不存在且源存在时用 ``os.replace`` 原子改名（同一文件系统），
-      不做合并、不覆盖任何已存在的文件 —— 中断后重跑安全，幂等可重入；
+    - 仅当目标不存在且源存在时原子移动（同一文件系统用 ``os.replace``
+      改名，跨文件系统逐条 ``shutil.move``），不做合并、不覆盖任何已
+      存在的文件 —— 中断后重跑安全，幂等可重入；
     - 目标已存在时保留双方不动（绝不覆盖新数据）；runtime.json 是可再生
       缓存，目标已存在时旧文件直接丢弃；
     - 全部失败仅记日志，绝不阻断路径解析（迁移失败只影响旧数据可见性，
       不影响新工作区可用性）。
     """
     try:
+        # 0) 旧位置折叠：家目录原本在 data_root/workspaces/<ns>，整目录
+        #    并入新家（升级首次访问时把用户旧文件带过来）。
+        _fold_legacy_workspaces_location(root, ns)
+
         # 1) 过渡草案折叠：claude/ 下的条目回到根。
         interim = root / _INTERIM_HOME_DIR_NAME
         if interim.is_dir() and not interim.is_symlink():
@@ -172,16 +252,18 @@ def _migrate_legacy_layout(root: Path, ns: str) -> None:
 def agent_home(chat_id: object, namespace: object | None = None) -> Path:
     """Return the agent home directory: $HOME, bash cwd and Landlock scope.
 
-    v2.3.1 布局（家目录即 workspace 根）::
+    v2.3.1 布局（家目录即 workspace 根，默认位于 /home 下）::
 
-        <data_root>/workspaces/<ns>/   ← 家目录：$HOME = 起始 cwd = Landlock 边界
+        <workspaces_root>/<ns>/   ← 家目录：$HOME = 起始 cwd = Landlock 边界
         ├── download/  upload/  skills/
         └── .runtime/                  ← 隐藏缓存层（bin/pip/ccache/HF/... + runtime.json）
 
-    父目录（data_root/workspaces）与其余一切路径仍被 Landlock 拒绝，
-    沙箱世界收敛到家目录子树。首次访问时一次性迁移两种遗留布局（见
-    :func:`_migrate_legacy_layout`），之后每次调用只剩几个 ``exists()``
-    快路径检查，开销可忽略。
+    workspaces_root 默认 /home（可用 APITELEGRAMCHAT_WORKSPACES_DIR 覆盖），
+    家目录之外的一切路径（其他家目录、data_root、系统目录）仍被
+    Landlock 拒绝，沙箱世界收敛到家目录子树。首次访问时一次性迁移旧
+    位置（data_root/workspaces/<ns>，见 :func:`_fold_legacy_workspaces_location`）
+    与两种遗留布局（见 :func:`_migrate_legacy_layout`），之后每次调用
+    只剩几个 ``exists()`` 快路径检查，开销可忽略。
     """
     ns = _resolved_namespace(chat_id, namespace)
     root = workspace_root(chat_id, ns)
@@ -198,10 +280,11 @@ def workspace_workdir(chat_id: object, namespace: object | None = None) -> Path:
     Every relative path in Bash, text_editor, staging, and file presentation is
     resolved against this directory (the agent home), which is also ``$HOME``
     and the only Landlock-permitted subtree — exactly :func:`workspace_root`.
-    Its parent (data_root/workspaces) is never exposed to the sandbox. The
-    workspace is local-only and is never mirrored wholesale to R2. Packaged
-    skills live under ``skills/``; runtime caches live under the hidden
-    ``.runtime/`` inside the home.
+    Everything outside the home (other homes under the workspaces root,
+    data_root, the rest of the filesystem) is never exposed to the sandbox.
+    The workspace is local-only and is never mirrored wholesale to R2.
+    Packaged skills live under ``skills/``; runtime caches live under the
+    hidden ``.runtime/`` inside the home.
     """
     home = agent_home(chat_id, namespace)
     workspace_skills_root(chat_id, namespace)
@@ -248,7 +331,13 @@ def runtime_cache_root(chat_id: object, namespace: object | None = None) -> Path
     return _secure_directory(agent_home(chat_id, namespace) / _RUNTIME_DIR_NAME)
 
 def workspace_skills_root(chat_id: object, namespace: object | None = None) -> Path:
-    """本地 skill 资源层（家目录下 ``skills/``），不参与用户文件同步。"""
+    """本地 skill 资源层（家目录下 ``skills/``）。
+
+    打包技能由一次性 bootstrap 拷入；运行期用户自建/修改的技能由
+    workspace_utils 按 ``skills/{ns}/`` 前缀定向同步到 R2（首次初始化
+    恢复 + 每次消息 intake 增量备份），服务重启后自动找回。workspace
+    其余部分仍不做全量同步。
+    """
     return _secure_directory(agent_home(chat_id, namespace) / _SKILLS_DIR_NAME)
 
 

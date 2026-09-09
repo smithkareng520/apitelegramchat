@@ -1,10 +1,13 @@
 # workspace_utils.py
 import asyncio
+import hashlib
+import json
 import os
 import logging
 from pathlib import Path
 from workspace_paths import (
     agent_home, workspace_root, workspace_namespace,
+    workspace_skills_root,
     workspace_upload_root, workspace_download_root,
 )
 
@@ -12,13 +15,13 @@ from s3_utils import (
     upload_bytes_to_r2,
     download_from_r2,
     delete_r2_object,
-    list_r2_keys,
+    list_r2_objects,
+    is_r2_configured,
 )
 
 logger = logging.getLogger(__name__)
 
-# R2 持久化只发生在明确选择的用户文件上；运行时缓存树永不进行全量同步。
-# skills/ 是例外：它是用户可编辑的资源层，按用户 namespace 独立保存。
+# R2 持久化只发生在明确选择的用户文件上；运行时树永不进行全量同步。
 
 
 class _LockRegistry:
@@ -73,8 +76,8 @@ async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) 
     """Ensure the runtime workspace tree (agent home + upload/ + download/) exists.
 
     This function is intentionally safe to call before every tool invocation.
-    The ``workspace/skills`` resource layer is initialized separately and is
-    persisted per user namespace; other runtime files are not mirrored.
+    It MUST NOT synchronize packaged skills: ``workspace/skills`` is runtime
+    state and may contain files created or edited by the agent/user.
 
     upload/ and download/ are pre-created here (rather than lazily on first
     use) because bash starts with cwd=agent home and the model almost
@@ -98,12 +101,157 @@ async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) 
     workspace_download_root(chat_id, namespace)
 
 
-async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = None) -> None:
-    """Restore, bootstrap and persist the per-user skill resource layer.
+# ========== 用户 skills/ 目录的 R2 持久化（恢复 + 备份） ==========
+# workspace/skills 里的运行时技能（用户让 agent 创建/修改的技能）此前是
+# 纯本地状态：数据目录易失的部署（未挂持久盘的容器、本机 /tmp）在服务
+# 重启后整个 workspace 被清空，自建技能永久丢失，只有打包技能会被重新
+# 拷回。这里仿照 todo/memory 的定向同步模式，把该目录按 `skills/{ns}/`
+# 前缀接入 R2：
+#   - 恢复（workspace 首次初始化时）：R2 备份里存在而本地缺失的文件拉
+#     回来，绝不覆盖本地已有文件（workspace 运行时内容始终以本地为准，
+#     与打包技能 bootstrap 的"永不覆盖"原则一致）；
+#   - 备份（每次 workspace 初始化时，即每条用户消息 intake 的后台任务）：
+#     与 R2 侧清单按 sha256 比对，只上传新增/变更文件，并把本地已删除
+#     的文件从 R2 同步删除。
+# 清单存放在 `skills/{ns}/.manifest.json`（relpath -> sha256），删除语义
+# 靠它跨重启传播；该文件名在本前缀下为保留名。R2 未配置时整段同步直接
+# 跳过，行为与旧版纯本地完全一致。
+_SKILLS_R2_PREFIX = "skills"
+_SKILLS_MANIFEST_NAME = ".manifest.json"
 
-    The marker is deliberately checked only after the first startup recovery.
-    This matters on ephemeral deployments: the local workspace and marker can
-    disappear together while the user's skills remain in R2.
+
+def _skills_r2_prefix(namespace: str) -> str:
+    return f"{_SKILLS_R2_PREFIX}/{namespace}"
+
+
+def _is_safe_skill_relpath(rel: str) -> bool:
+    """远端清单/备份里的相对路径必须落在 skills/ 内部（防御性校验）。"""
+    if not rel or rel == _SKILLS_MANIFEST_NAME or rel.startswith("/"):
+        return False
+    return all(part not in ("", ".", "..") for part in Path(rel).parts)
+
+
+def _scan_skills_dir(skills_dir: Path) -> dict[str, str]:
+    """本地 skills/ 目录快照：relpath -> sha256。
+
+    用内容哈希而非 mtime 做比对：恢复写盘后 mtime 必然变化，mtime 方案
+    会把整棵树重复上传一遍；哈希方案在无变化时零上传。跳过符号链接，
+    避免把链接目标内容误当技能文件备份。
+    """
+    snapshot: dict[str, str] = {}
+    if not skills_dir.is_dir():
+        return snapshot
+    for path in sorted(skills_dir.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        rel = path.relative_to(skills_dir).as_posix()
+        if not _is_safe_skill_relpath(rel):
+            continue
+        try:
+            snapshot[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            logger.warning("skills 文件读取失败，跳过备份 %s: %s", rel, exc)
+    return snapshot
+
+
+async def _load_skills_manifest(namespace: str) -> dict[str, str]:
+    """读取 R2 侧清单；缺失/损坏一律按空清单处理（自愈式重建）。"""
+    key = f"{_skills_r2_prefix(namespace)}/{_SKILLS_MANIFEST_NAME}"
+    data = await download_from_r2(key)
+    if data is None:
+        return {}
+    try:
+        files = json.loads(data.decode("utf-8")).get("files")
+        if not isinstance(files, dict):
+            return {}
+        return {
+            str(rel): str(digest)
+            for rel, digest in files.items()
+            if _is_safe_skill_relpath(str(rel))
+        }
+    except Exception as exc:
+        logger.warning("skills 清单解析失败 namespace=%s: %s", namespace, exc)
+        return {}
+
+
+async def _restore_user_skills_from_r2(chat_id: int, home: Path, namespace: str) -> int:
+    """从 R2 备份补齐本地缺失的技能文件；返回恢复的文件数。
+
+    只填充缺失文件，绝不覆盖本地已有内容。放在打包技能 bootstrap 之前
+    执行：两步都是"只填缺失"，先恢复 R2（用户实际状态）再补打包副本，
+    用户改过的包内技能文件不会被 pristine 打包版抢先占位。
+    """
+    if not is_r2_configured():
+        return 0
+    prefix = _skills_r2_prefix(namespace)
+    keys = await list_r2_objects(prefix)
+    if not keys:
+        return 0
+    skills_dir = workspace_skills_root(chat_id, namespace)
+    restored = 0
+    for key in keys:
+        rel = key[len(prefix) + 1:]
+        if not _is_safe_skill_relpath(rel):
+            continue
+        dst = skills_dir / rel
+        if dst.exists():
+            continue
+        data = await download_from_r2(key)
+        if data is None:
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(data)
+        restored += 1
+    if restored:
+        logger.info(
+            "从 R2 恢复用户 skills namespace=%s: %d 个文件", namespace, restored,
+        )
+    return restored
+
+
+async def _backup_user_skills_to_r2(chat_id: int, home: Path, namespace: str) -> None:
+    """把本地 skills/ 与 R2 清单比对后做增量备份（上传变更、同步删除）。
+
+    无变化时只有一次清单 GET，零写入；首次备份才整树上传。调用方保证
+    同一 namespace 串行（workspace init 锁内），无需额外并发控制。
+    """
+    if not is_r2_configured():
+        return
+    prefix = _skills_r2_prefix(namespace)
+    manifest = await _load_skills_manifest(namespace)
+    local = await asyncio.to_thread(_scan_skills_dir, home / "skills")
+    changed = {rel: digest for rel, digest in local.items() if manifest.get(rel) != digest}
+    removed = [rel for rel in manifest if rel not in local]
+    if not changed and not removed:
+        return
+
+    skills_dir = home / "skills"
+    for rel in sorted(changed):
+        data = await asyncio.to_thread((skills_dir / rel).read_bytes)
+        await upload_bytes_to_r2(data, f"{prefix}/{rel}", "application/octet-stream")
+    for rel in sorted(removed):
+        await delete_r2_object(f"{prefix}/{rel}")
+
+    payload = json.dumps({"files": local}, ensure_ascii=False).encode("utf-8")
+    await upload_bytes_to_r2(
+        payload, f"{prefix}/{_SKILLS_MANIFEST_NAME}", "application/json",
+    )
+    logger.info(
+        "用户 skills 备份到 R2 namespace=%s: 上传 %d、删除 %d",
+        namespace, len(changed), len(removed),
+    )
+
+
+async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = None) -> None:
+    """Run one-time workspace skill initialization.
+
+    Initialization is protected by a per-workspace lock and a persistent marker
+    so repeated calls never re-run the packaged-skill sync.
+
+    v2.3.1 之后：打包 bootstrap 之外新增用户 skills/ 的 R2 持久化通道——
+    首次初始化先从 R2 恢复自建技能再补打包副本；每次调用（即每条用户
+    消息 intake 的后台任务）都做一次增量备份，把上一回合经 bash/
+    text_editor 落盘的技能变更同步到 R2，服务重启/磁盘清空后自动找回。
     """
     resolved_namespace = workspace_namespace(chat_id, namespace)
     key = resolved_namespace
@@ -115,107 +263,50 @@ async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = No
         home = agent_home(chat_id, resolved_namespace)
         marker = home / ".skills_initialized"
 
-        if key in _workspace_initialized:
+        if key in _workspace_initialized or marker.is_file():
             _workspace_initialized.add(key)
-            return
+        else:
+            try:
+                # 先恢复 R2 备份（用户实际状态），再补打包技能（只填缺失）。
+                await _restore_user_skills_from_r2(
+                    chat_id, home, resolved_namespace,
+                )
 
+                from skills import sync_all_skill_assets_to_workspace
+
+                summary = await asyncio.to_thread(
+                    sync_all_skill_assets_to_workspace,
+                    home,
+                )
+                if summary.get("errors"):
+                    logger.warning(
+                        "部分 skill 包初始化失败 namespace=%s: %s",
+                        resolved_namespace,
+                        "; ".join(summary["errors"]),
+                    )
+                    return
+
+                marker.write_text("initialized\n", encoding="utf-8")
+                _workspace_initialized.add(key)
+            except Exception as exc:
+                logger.warning(
+                    "初始化 skill 包到 workspace 失败 namespace=%s: %s",
+                    resolved_namespace,
+                    exc,
+                )
+                return
+
+        # 备份通道：与 todo/memory 的定向 R2 同步同型，失败只降级（下次
+        # 初始化重试），绝不阻断消息处理。仍在 init 锁内，与首次初始化
+        # 串行，避免恢复/备份互相踩踏。
         try:
-            from skills import sync_all_skill_assets_to_workspace
-
-            restore = await _restore_user_skills_from_r2(home, resolved_namespace)
-            summary = await asyncio.to_thread(
-                sync_all_skill_assets_to_workspace,
-                home,
-            )
-            if summary.get("errors"):
-                logger.warning(
-                    "部分 skill 包初始化失败 namespace=%s: %s",
-                    resolved_namespace,
-                    "; ".join(summary["errors"]),
-                )
-                return
-
-            persist = await _persist_user_skills_to_r2(home, resolved_namespace)
-            if persist.get("errors"):
-                logger.warning(
-                    "部分用户 skills 持久化失败 namespace=%s: %s",
-                    resolved_namespace,
-                    "; ".join(persist["errors"]),
-                )
-                return
-
-            marker.write_text("initialized\n", encoding="utf-8")
-            _workspace_initialized.add(key)
-            logger.info(
-                "用户 skills 已恢复/持久化 namespace=%s restored=%s copied=%s uploaded=%s",
-                resolved_namespace,
-                restore.get("restored", 0),
-                summary.get("copied", 0),
-                persist.get("uploaded", 0),
-            )
+            await _backup_user_skills_to_r2(chat_id, home, resolved_namespace)
         except Exception as exc:
             logger.warning(
-                "初始化 skill 包到 workspace 失败 namespace=%s: %s",
+                "备份用户 skills 到 R2 失败 namespace=%s: %s",
                 resolved_namespace,
                 exc,
             )
-
-
-def _skill_r2_prefix(namespace: str) -> str:
-    return f"skills/{workspace_namespace(0, namespace)}"
-
-
-async def _restore_user_skills_from_r2(home: Path, namespace: str) -> dict[str, object]:
-    """Restore missing files from the namespace's R2 skill prefix."""
-    result: dict[str, object] = {"restored": 0, "errors": []}
-    prefix = _skill_r2_prefix(namespace)
-    try:
-        keys = await list_r2_keys(prefix)
-        skills_root = home / "skills"
-        for key in keys:
-            rel = key[len(prefix):].lstrip("/")
-            if not rel:
-                continue
-            target = (skills_root / rel).resolve()
-            if skills_root.resolve() not in target.parents:
-                result["errors"].append(f"unsafe skill key: {key}")
-                continue
-            if target.exists():
-                continue
-            data = await download_from_r2(key)
-            if data is None:
-                result["errors"].append(f"download failed: {key}")
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
-            result["restored"] += 1
-    except Exception as exc:
-        result["errors"].append(str(exc))
-    return result
-
-
-async def _persist_user_skills_to_r2(home: Path, namespace: str) -> dict[str, object]:
-    """Upload the complete local skill tree under the user's namespace."""
-    result: dict[str, object] = {"uploaded": 0, "errors": []}
-    skills_root = home / "skills"
-    if not skills_root.is_dir():
-        return result
-    prefix = _skill_r2_prefix(namespace)
-    try:
-        for path in skills_root.rglob("*"):
-            if not path.is_file():
-                continue
-            rel = path.relative_to(skills_root).as_posix()
-            remote_key = f"{prefix}/{rel}"
-            content_type = "text/plain" if path.suffix.lower() in {".md", ".txt"} else "application/octet-stream"
-            uploaded = await upload_bytes_to_r2(path.read_bytes(), remote_key, content_type)
-            if uploaded is None:
-                result["errors"].append(f"upload failed: {remote_key}")
-            else:
-                result["uploaded"] += 1
-    except Exception as exc:
-        result["errors"].append(str(exc))
-    return result
 
 
 

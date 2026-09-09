@@ -381,8 +381,9 @@ class BashSession:
 
         # ★ Landlock：把文件系统访问限制在 agent 家目录（workdir =
         #   workspace 根）内，upload/、download/、skills/ 与隐藏缓存层
-        #   .runtime/ 都在这里；父目录（data_root/workspaces）与其他一切
-        #   路径默认拒绝。通过 functools.partial 把家目录路径传给 preexec。
+        #   .runtime/ 都在这里；家目录之外的一切路径（/home 下其他家
+        #   目录、data_root、系统目录）默认拒绝。通过 functools.partial
+        #   把家目录路径传给 preexec。
         import functools
         preexec = functools.partial(
             _preexec_sandbox,

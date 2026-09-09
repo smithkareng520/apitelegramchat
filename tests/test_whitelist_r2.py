@@ -25,6 +25,7 @@ from pathlib import Path
 # ---- 在导入任何项目模块之前，把数据目录指到独立临时目录 ----
 _TEST_ROOT = Path(tempfile.mkdtemp(prefix="wl_r2_test_"))
 os.environ["APITELEGRAMCHAT_DATA_DIR"] = str(_TEST_ROOT / "data")
+os.environ["APITELEGRAMCHAT_WORKSPACES_DIR"] = str(_TEST_ROOT / "home")
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))

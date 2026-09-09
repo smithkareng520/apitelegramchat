@@ -10,7 +10,6 @@ from mcp.server.lowlevel.helper_types import ReadResourceContents
 
 from mcpserver.context import MCPRequestContext
 from skills import get_skill_catalog, load_skill_records, read_skill_text
-from workspace_utils import init_workspace
 from workspace_paths import (
     memory_state_file,
     todo_state_file,
@@ -58,7 +57,6 @@ class ResourceService:
         return items
 
     async def list_resources(self) -> list[types.Resource]:
-        await init_workspace(self._chat_id, self._namespace)
         resources = [
             types.Resource(uri=cast(types.AnyUrl, "workspace://current/todos"), name="todos.json", mimeType="application/json"),
             types.Resource(uri=cast(types.AnyUrl, "workspace://current/memories"), name="memories.json", mimeType="application/json"),
@@ -68,7 +66,7 @@ class ResourceService:
             types.Resource(uri=cast(types.AnyUrl, "workspace://current/download"), name="download.json", mimeType="application/json"),
             types.Resource(uri=cast(types.AnyUrl, "workspace://current/manifest"), name="manifest.json", mimeType="application/json"),
         ]
-        for record in load_skill_records(self._chat_id, self._namespace):
+        for record in load_skill_records():
             resources.append(
                 types.Resource(
                     uri=cast(types.AnyUrl, f"workspace://current/skills/{record.skill_id}"),
@@ -79,7 +77,6 @@ class ResourceService:
         return resources
 
     async def read_resource(self, uri: str) -> Iterable[ReadResourceContents]:
-        await init_workspace(self._chat_id, self._namespace)
         with self._context.activate():
             text = self._read_text(uri)
         return [ReadResourceContents(content=text, mime_type="application/json")]
@@ -93,20 +90,13 @@ class ResourceService:
             path = memory_state_file(self._chat_id, self._namespace)
             return path.read_text(encoding="utf-8") if path.exists() else "{}"
         if uri == "workspace://current/skills":
-            return json.dumps(
-                get_skill_catalog(self._chat_id, self._namespace),
-                ensure_ascii=False,
-                indent=2,
-            )
+            return json.dumps(get_skill_catalog(), ensure_ascii=False, indent=2)
         if uri.startswith("workspace://current/skills/"):
             skill_id = uri.rsplit("/", 1)[-1]
-            advertised = {
-                record.skill_id
-                for record in load_skill_records(self._chat_id, self._namespace)
-            }
+            advertised = {record.skill_id for record in load_skill_records()}
             if skill_id not in advertised:
                 raise ResourceNotFoundError(f"Unknown skill resource: {skill_id}")
-            return read_skill_text(skill_id, self._chat_id, self._namespace)
+            return read_skill_text(skill_id)
         if uri == "workspace://current/files":
             return json.dumps(self._tree(workspace), ensure_ascii=False)
         if uri == "workspace://current/upload":

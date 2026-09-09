@@ -14,6 +14,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 _TEST_ROOT = Path(tempfile.mkdtemp(prefix="apitelegramchat_it_"))
 os.environ.setdefault("APITELEGRAMCHAT_DATA_DIR", str(_TEST_ROOT / "data"))
+# 工作空间根同样隔离（默认 /home，不能让测试摸真实目录）。
+os.environ.setdefault("APITELEGRAMCHAT_WORKSPACES_DIR", str(_TEST_ROOT / "home"))
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456789:TEST_TOKEN_FOR_INTEGRATION_TESTS")
 os.environ.setdefault("WEBHOOK_TOKEN", "it-webhook-secret-token")
 os.environ.setdefault("INGEST_MODE", "polling")
