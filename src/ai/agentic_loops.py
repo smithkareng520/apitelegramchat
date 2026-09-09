@@ -1203,11 +1203,22 @@ async def _agentic_loop_native_video(
     # 不会触发 400 RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND。
     final_video_url = video_url
     video_bytes_len = 0
+    r2_url = None
     await start_chat_action(chat_id, "upload_video")
     try:
         timeout = aiohttp.ClientTimeout(total=180)
+        # Agnes 返回的视频 URL 可能经过 CDN redirect，必须跟随跳转；
+        # 否则可能把 redirect/error 页面当成 mp4 上传到 R2。
         async with aiohttp.ClientSession(timeout=timeout) as dl_session:
-            async with dl_session.get(video_url) as dl_resp:
+            async with dl_session.get(video_url, allow_redirects=True) as dl_resp:
+                content_type = (dl_resp.headers.get("Content-Type") or "").lower()
+                logger.info(
+                    "[NativeVideo] download response: status=%s type=%s length=%s final_url=%s",
+                    dl_resp.status,
+                    content_type,
+                    dl_resp.headers.get("Content-Length"),
+                    str(dl_resp.url)[:200],
+                )
                 if dl_resp.status == 200:
                     # 修复 OOM 风险：限制为 200MB（足够任何合理的 720p 视频片段），
                     # 超限则拒绝并回退到原始 URL。
@@ -1222,12 +1233,28 @@ async def _agentic_loop_native_video(
                         video_bytes_len = 0
                     else:
                         video_bytes_len = len(video_bytes)
-                        logger.debug(
-                            "[NativeVideo] video downloaded: %d bytes from %s",
-                            video_bytes_len, str(video_url)[:200],
-                        )
-                        r2_key = f"generated/{uuid.uuid4().hex}.mp4"
-                        r2_url = await upload_bytes_to_r2(video_bytes, r2_key, "video/mp4")
+
+                        # 防止将 HTML/错误页/redirect body 伪装成 mp4 上传。
+                        # 正常 720p 视频不应只有几 KB，且 MP4 必须包含 ftyp box。
+                        is_mp4 = b"ftyp" in video_bytes[:256]
+                        if video_bytes_len < 100_000 or not is_mp4:
+                            logger.error(
+                                "[NativeVideo] invalid video payload, skip R2 upload: bytes=%s content_type=%s has_ftyp=%s url=%s",
+                                video_bytes_len,
+                                content_type,
+                                is_mp4,
+                                str(video_url)[:200],
+                            )
+                            video_bytes = b""
+                            video_bytes_len = 0
+                        else:
+                            logger.info(
+                                "[NativeVideo] video validated: bytes=%d content_type=%s",
+                                video_bytes_len,
+                                content_type,
+                            )
+                            r2_key = f"generated/{uuid.uuid4().hex}.mp4"
+                            r2_url = await upload_bytes_to_r2(video_bytes, r2_key, "video/mp4")
                         if r2_url:
                             final_video_url = r2_url
                         else:
