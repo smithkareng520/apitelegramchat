@@ -227,11 +227,73 @@ Do not try to feed this TTC file to ReportLab `TTFont`; it uses CFF outlines.
 - Do not use `Arial` as a server-side assumption; it is not guaranteed to exist in the Linux image.
 - When a PDF contains Chinese/Japanese text, choose an actual CJK font and verify the output by rendering pages to images.
 - If the required CJK font is missing, fail clearly instead of silently falling back to a non-CJK font.
+- Emoji require the dedicated `EmojiMono` fallback font and the `emoji_font.py` helpers (see the "Emoji handling" section above). Never feed emoji to ReportLab with only the CJK font registered.
 - OCR of simplified/traditional Chinese is supported by the preinstalled `chi_sim` and `chi_tra` Tesseract language data.
 
 ### Recommended helper
 
 For scripts, prefer the bundled `scripts/cjk_font.py` helper so font paths and ReportLab registration stay consistent with the image.
+
+## Emoji handling (MANDATORY for any content that may contain emoji)
+
+ReportLab has **no automatic font fallback**: every character is drawn with the one font selected for the text object, and any glyph missing from that font renders as an empty box / black square. The production Kaiti CJK font (`AR PL UKai`) contains **zero emoji glyphs**, so emoji characters (✅ ❌ ✨ 🎯 📊 🚀 👍 …) that reach ReportLab directly become garbage in the PDF.
+
+The image ships the **monochrome Noto Emoji** font (real TrueType glyf outlines, embeddable) and the skill bundles it at `.claude/skills/pdf/fonts/NotoEmoji-Regular.ttf`. System **color** emoji fonts (e.g. `NotoColorEmoji.ttf`, CBDT/CBLC bitmaps) can **never** be embedded by ReportLab — do not use them.
+
+### Rules
+
+1. Register both fonts before building any PDF: `cjk_font.register_fonts()` registers `CJKKai` + `EmojiMono` in one call.
+2. Any string that may contain emoji must go through the fallback helpers in `scripts/emoji_font.py` — never pass raw emoji text to `Paragraph(...)` or `canvas.drawString(...)`.
+3. Characters covered by neither font are dropped (with an optional report) instead of garbling the layout. Keep the report and log it if content fidelity matters.
+4. Emoji render in monochrome (black outline, inherits the paragraph's text color). Color emoji in ReportLab PDFs is not possible; if the user explicitly needs color emoji, render that paragraph as an image or strip the emoji instead.
+5. For canvas text (tables drawn manually, headers, watermarks), use `draw_mixed_string` / `string_width_mixed`, not `drawString`.
+
+### Paragraph example
+
+```python
+import sys
+sys.path.insert(0, "/app/.claude/skills/pdf/scripts")
+
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from cjk_font import register_fonts
+from emoji_font import to_fallback_markup
+
+register_fonts()  # registers CJKKai + EmojiMono
+styles = getSampleStyleSheet()
+styles["Normal"].fontName = "CJKKai"
+
+missing = []  # collects characters no font can render
+text = "项目进度：✅ 已完成 80% 🚀 预计下周交付"
+story = [Paragraph(to_fallback_markup(text, missing_report=missing), styles["Normal"])]
+
+SimpleDocTemplate("report.pdf").build(story)
+```
+
+### Canvas example
+
+```python
+from cjk_font import register_fonts
+from emoji_font import draw_mixed_string, string_width_mixed
+
+register_fonts()
+
+c = canvas.Canvas("out.pdf", pagesize=letter)
+text = "验收结果：✔ 通过 3 项 ❌ 未通过 1 项"
+width = string_width_mixed(text, 12)
+draw_mixed_string(c, (letter[0] - width) / 2, 700, text, 12)
+c.save()
+```
+
+### Emoji font facts
+
+- Registered name: `EmojiMono`
+- File: `.claude/skills/pdf/fonts/NotoEmoji-Regular.ttf` (vendored, Apache-2.0)
+- Override path: `APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT`
+- Covers all standard emoji codepoints including ZWJ sequences and skin-tone modifiers; variation selector U+FE0F is zero-width
+- Does **not** cover CJK, kana, arrows (→), math symbols (± × ÷ ≠ ≈), circled numbers (①) — those come from the CJK font, which is exactly what the fallback logic arranges
+
+The runtime check `scripts/check_cjk_runtime.py` verifies the emoji font presence, embeddability, and sample glyph coverage alongside the CJK checks.
 
 ## Command-Line Tools
 

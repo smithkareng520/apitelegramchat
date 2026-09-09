@@ -76,3 +76,24 @@ def assert_cjk_runtime() -> None:
     if missing:
         paths = ", ".join(str(p) for p in missing)
         raise FileNotFoundError(f"Missing production CJK font resources: {paths}")
+
+
+def register_fonts(
+    cjk_name: str = "CJKKai",
+    emoji_name: str = "EmojiMono",
+) -> tuple[str, str]:
+    """Register the CJK font and the monochrome emoji font in one call.
+
+    ReportLab has no automatic font fallback, so PDFs that may contain
+    emoji need both fonts registered. Emoji-bearing text must then go
+    through ``emoji_font.to_fallback_markup()`` (Paragraphs) or
+    ``emoji_font.draw_mixed_string()`` (canvas) — see the skill SKILL.md
+    "Emoji handling" section.
+
+    Returns ``(cjk_name, emoji_name)``.
+    """
+    from emoji_font import register_emoji_font
+
+    register_reportlab_cjk_font(cjk_name)
+    register_emoji_font(emoji_name)
+    return cjk_name, emoji_name

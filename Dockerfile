@@ -14,6 +14,9 @@ ENV APITELEGRAMCHAT_CJK_FONT_FILE=/usr/share/fonts/opentype/noto/NotoSansCJK-Reg
 # ReportLab needs a TrueType outline for embedding; Noto CJK uses CFF outlines.
 ENV APITELEGRAMCHAT_REPORTLAB_CJK_FONT=/usr/share/fonts/truetype/arphic/ukai.ttc
 ENV APITELEGRAMCHAT_REPORTLAB_CJK_SUBFONT_INDEX=0
+# ReportLab 也无法自动 fallback：emoji 走技能内置的单色 Noto Emoji（glyf 轮廓，
+# 可嵌入；系统里的 NotoColorEmoji.ttf 是 CBDT 位图，ReportLab 不能嵌入）。
+ENV APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT=/app/.claude/skills/pdf/fonts/NotoEmoji-Regular.ttf
 
 # 配置系统时区为上海（CST/UTC+8）
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
@@ -49,12 +52,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tesseract-ocr-chi-tra \
         fontconfig \
         fonts-noto-cjk \
+        fonts-noto-color-emoji \
         fonts-arphic-gbsn00lp \
         fonts-arphic-ukai \
     && fc-cache -f -v >/dev/null \
     && fc-match "Noto Sans CJK SC" >/dev/null \
+    && fc-match "Noto Color Emoji" >/dev/null \
     && test -f /usr/share/fonts/truetype/arphic-gbsn00lp/gbsn00lp.ttf \
     && test -f /usr/share/fonts/truetype/arphic/ukai.ttc \
+    && test -f "$APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT" \
     && tesseract --list-langs 2>/dev/null | grep -qx "chi_sim" \
     && tesseract --list-langs 2>/dev/null | grep -qx "chi_tra" \
     && rm -rf /var/lib/apt/lists/*

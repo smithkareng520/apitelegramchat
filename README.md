@@ -744,6 +744,26 @@ serper.dev 控制台（免费版 2,500 次/月）。
 MCP 默认只暴露 `READ_ONLY_SPECS`；mutation 工具需要显式 opt-in，且
 scope 未设置时 Server 直接拒绝启动。
 
+### 8. 生成的 PDF 里 emoji 变成方块/乱码
+
+ReportLab **没有自动字体 fallback**：每个字符只用当前选中的那一个字体
+绘制，缺字形就直接画 notdef 空框；而生产楷体 `AR PL UKai` 不含任何
+emoji 字形，系统里的 `NotoColorEmoji.ttf` 又是 CBDT 位图，ReportLab
+根本无法嵌入。修复方案（已内置）：
+
+- 技能内置**单色** `NotoEmoji-Regular.ttf`（glyf 轮廓，可嵌入），
+  路径可用 `APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT` 覆盖；
+- `.claude/skills/pdf/scripts/emoji_font.py` 提供按实际字体覆盖情况
+  拆分混排文本的 helper：Paragraph 用 `to_fallback_markup()`，canvas
+  用 `draw_mixed_string()` / `string_width_mixed()`；两个字体重叠
+  都没有的字符默认丢弃（可配 `on_missing`），不会再画出乱码框；
+- LibreOffice/DOCX 渲染路径由镜像新装的 `fonts-noto-color-emoji`
+  兜底，DOCX 转 PDF 同样能显示 emoji。
+
+详见 `.claude/skills/pdf/SKILL.md` 的 "Emoji handling" 一节；运行
+`python3 .claude/skills/pdf/scripts/check_cjk_runtime.py` 可一键自检
+CJK + emoji 字体运行时。
+
 ---
 
 ## 开发说明
