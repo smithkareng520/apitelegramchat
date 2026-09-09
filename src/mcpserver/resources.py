@@ -14,7 +14,7 @@ from workspace_paths import (
     memory_state_file,
     todo_state_file,
     workspace_download_root,
-    workspace_root,
+    workspace_workdir,
     workspace_upload_root,
 )
 
@@ -38,7 +38,9 @@ class ResourceService:
         return self._context.scope
 
     def _workspace(self) -> Path:
-        return workspace_root(self._chat_id, self._namespace)
+        # 对外暴露模型可见的文件树 = agent 家目录（容器根下的内部状态
+        # 不在 MCP 视野内，与沙箱边界保持一致）。
+        return workspace_workdir(self._chat_id, self._namespace)
 
     @staticmethod
     def _tree(root: Path) -> list[dict[str, int | str]]:

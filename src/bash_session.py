@@ -230,7 +230,13 @@ _RUNTIME_STATE_FILENAME = "runtime.json"
 
 
 def _runtime_state_path(chat_id: int, namespace: str | None = None) -> Path:
-    return workspace_root(chat_id, namespace) / _RUNTIME_STATE_FILENAME
+    """工具链清单缓存路径：家目录内的隐藏缓存层 ``.runtime/`` 下。
+
+    v2.3 起不再放在容器根（旧位置对模型可见、且与用户文件混在一起），
+    而是归入 ``<home>/.runtime/``：对模型隐藏，且仍在 Landlock 放行边界
+    内（写入方虽是 bot 进程，但路径层保持一致的内外划分）。
+    """
+    return runtime_cache_root(chat_id, namespace) / _RUNTIME_STATE_FILENAME
 
 
 def _tool_version(exe: str) -> str | None:
@@ -309,6 +315,8 @@ class BashSession:
         # manager 的全局锁内），两把锁互不互斥；每实例锁串行化 spawn，
         # 防止并发双开 bash 导致先 spawn 的进程泄漏、新进程无看门狗。
         self._start_lock = asyncio.Lock()
+        # v2.3 布局：workspace = 容器根（bot 自有，含家目录与残留缓存），
+        # home = 家目录（$HOME / 起始 cwd / Landlock 唯一放行边界）。
         self.workspace = workspace_root(chat_id, self.namespace)
         self.workdir = workspace_workdir(chat_id, self.namespace)
         self._watchdog_task: Optional[asyncio.Task] = None
@@ -340,7 +348,7 @@ class BashSession:
         os.chmod(self.workspace, 0o700)
         os.chmod(self.workdir, 0o700)
         # ★ 显式预创建 upload/ 和 download/：bash 进程一启动，cwd 就是
-        # workspace root，模型几乎立刻会跑 `cp out.txt upload/out.txt`
+        # 家目录（workdir），模型几乎立刻会跑 `cp out.txt upload/out.txt`
         # 或 `cat download/x.pdf`。如果不在这里预创建，bash 进程已经
         # 在跑、第一次 execute() 时才补创建，会出两个问题：
         #   1) 如果 execute() 里 _ensure_runtime_workspace 抛异常被
@@ -371,13 +379,15 @@ class BashSession:
                     _prepare_runtime_once, self.chat_id, cache_root, self.namespace
                 )
 
-        # ★ Landlock：把文件系统访问限制在该 chat 的 workspace 层，
-        #   runtime/、skills/ 都在这里；R2 不再对工作区做全量同步。
-        #   通过 functools.partial 把 workspace 路径传给 preexec。
+        # ★ Landlock：把文件系统访问限制在 agent 家目录（workdir）内，
+        #   upload/、download/、skills/ 与隐藏缓存层 .runtime/ 都在
+        #   这里；容器根（家目录的父目录，含 runtime.json 等内部状态）
+        #   与其他一切路径默认拒绝。通过 functools.partial 把家目录
+        #   路径传给 preexec。
         import functools
         preexec = functools.partial(
             _preexec_sandbox,
-            str(self.workspace.absolute()),
+            str(self.workdir.absolute()),
         )
 
         logger.info(
@@ -395,7 +405,7 @@ class BashSession:
             text=False,
             bufsize=0,
             env=env,  # ★ 关键: 不传任何敏感变量
-            cwd=str(self.workdir.absolute()),  # ★ 关键: 沙箱进程启动即位于 workspace root
+            cwd=str(self.workdir.absolute()),  # ★ 关键: 沙箱进程启动即位于 agent 家目录
             start_new_session=True,  # ★ 关键: 创建新会话，便于 killpg
             preexec_fn=preexec,  # Landlock + no-new-privs + rlimit
         )
@@ -517,10 +527,11 @@ class BashSession:
         actual EOF at the end of `command`, so malformed input terminates
         with a shell error instead of hanging the session.
         """
-        workspace = self.workspace
+        workspace = self.workdir
         cwd = self._last_cwd or str(self.workdir.absolute())
-        env = build_sandbox_env(self.workspace, self.chat_id, self.namespace)
+        env = build_sandbox_env(workspace, self.chat_id, self.namespace)
         import functools
+        # 隔离执行与持久会话同界：Landlock 只放行 agent 家目录。
         preexec = functools.partial(_preexec_sandbox, str(workspace.absolute()))
 
         marker = f"__ONE_SHOT_END_{uuid.uuid4().hex[:8]}__"

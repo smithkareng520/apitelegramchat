@@ -83,14 +83,19 @@ logger = get_logger(__name__)
 # 的级别（由 utils.setup_logging 应用 LOG_LEVEL）。
 
 def _workspace_guide_html(chat_id: int | None, workspace_namespace_value: str | None = None) -> str:
-    """系统提示词的「工作区与文件目录」章节（含该 chat 的工作区绝对路径）。
+    """系统提示词的「工作区与文件目录」章节（含该 chat 的家目录绝对路径）。
 
     背景：模型此前只知道"工作区根目录是 bash 起始目录"，但既不知道绝对
     路径，也不知道 Landlock 只放行工作区子树。生产日志里模型习惯性
     `cd /tmp` 下载文件 → curl exit 23（写失败）→ 反复试错 /tmp、/workspace、
     根目录探测，平均浪费 5-7 轮才通过 text_editor 回显"撞"到正确路径。
-    这里把三件事显式写进提示词：① 绝对路径；② 只有工作区可写（含
+    这里把三件事显式写进提示词：① 绝对路径；② 只有家目录可读写（含
     典型报错特征）；③ TMPDIR 已重定向，临时文件开箱即用。
+
+    v2.3 布局：bash 起始目录 = $HOME = agent 家目录（容器根下的 claude/），
+    Landlock 放行边界与之重合——父目录（容器根，含 runtime.json 等内部
+    状态）与其余一切路径对沙箱完全不可见。缓存层收敛到家目录内隐藏的
+    .runtime/，普通 ls 只见 download/ upload/ skills/ 与用户文件。
     路径对同一 chat 稳定不变，不影响 prompt cache 的前缀复用。
     """
     ws_path = ""
@@ -107,13 +112,15 @@ def _workspace_guide_html(chat_id: int | None, workspace_namespace_value: str | 
         path_html = "（绝对路径用 <code>echo $WORKSPACE</code> 查看）"
     return f"""
 <h2>工作区与文件目录</h2>
-<p>bash 与 text_editor 运行在你专属的工作区中，工作区根目录{path_html}就是 bash 会话的起始目录，也是<b>整个环境里唯一可写的位置</b>：Landlock 沙箱只放行这一棵目录树，<code>/tmp</code>、<code>/home</code>、<code>/</code> 等其他路径一律不可写（多数连读都被拒绝）——在那里写文件会得到 <code>curl</code> exit code 23、Python <code>PermissionError</code>。根目录下有两个特殊子目录，直接用相对路径读写：</p>
+<p>bash 与 text_editor 运行在你专属的<b>家目录</b>中：家目录{path_html}就是 bash 会话的起始目录，同时也是 <code>$HOME</code>（<code>~</code> 会展开到这里），更是<b>整个环境里唯一可读可写的位置</b>。Landlock 沙箱只放行这一棵目录树——<code>/tmp</code>、<code>/home</code>、<code>/</code> 以及家目录之外的任何路径（包括家目录的父目录）一律拒绝访问：在那里写文件会得到 <code>curl</code> exit code 23、Python <code>PermissionError</code>。家目录根下有以下特殊子目录，直接用相对路径读写：</p>
 <ul>
   <li><code>download/</code>：用户上传文件（文档等）的落地目录。直接读取即可，如 <code>bash</code> 执行 <code>cat download/报告.pdf</code>，或 <code>text_editor</code> 的 path 填 <code>download/报告.pdf</code>。</li>
   <li><code>upload/</code>：发送文件给用户的暂存区。要把文件发给用户，先用 bash 把文件复制进去（如 <code>cp 结果.docx upload/结果.docx</code>），再调用 <code>present_files</code>，参数只接受 <code>upload/</code> 下的路径（如 <code>upload/结果.docx</code>）。</li>
+  <li><code>skills/</code>：可用技能包目录，每个技能一个同名子目录（详见下方技能目录章节）。</li>
+  <li><code>.runtime/</code>：隐藏的系统缓存目录（pip、编译缓存等）。它以点开头、普通 <code>ls</code> 不显示；不要把产出文件放进去，也不要修改其中内容。</li>
 </ul>
 <ul>
-  <li>临时文件：<code>TMPDIR</code> 已指向沙箱内可写缓存，mktemp / Python tempfile 开箱即用。</li>
+  <li>临时文件：<code>TMPDIR</code> 已指向家目录内可写缓存，mktemp / Python tempfile 开箱即用。</li>
 </ul>
 """
 

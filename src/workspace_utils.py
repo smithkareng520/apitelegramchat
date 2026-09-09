@@ -4,7 +4,7 @@ import os
 import logging
 from pathlib import Path
 from workspace_paths import (
-    workspace_root, workspace_namespace,
+    agent_home, workspace_root, workspace_namespace,
     workspace_upload_root, workspace_download_root,
 )
 
@@ -68,25 +68,30 @@ async def _get_workspace_init_lock(key: str) -> asyncio.Lock:
 
 
 async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) -> None:
-    """Ensure the runtime workspace tree (root + upload/ + download/) exists.
+    """Ensure the runtime workspace tree (agent home + upload/ + download/) exists.
 
     This function is intentionally safe to call before every tool invocation.
     It MUST NOT synchronize packaged skills: ``workspace/skills`` is runtime
     state and may contain files created or edited by the agent/user.
 
     upload/ and download/ are pre-created here (rather than lazily on first
-    use) because bash starts with cwd=workspace root and the model almost
+    use) because bash starts with cwd=agent home and the model almost
     immediately tries `cp out.txt upload/out.txt` or `cat download/x.pdf`.
     Without pre-creating these subtrees, the very first such command fails
     with "No such file or directory" — forcing the model to spend an extra
     `mkdir -p upload/` round before doing the real work. This is the
     initialization boundary, not a per-tool concern.
+
+    v2.3：upload/ 与 download/ 挂在 agent 家目录（容器根下的 claude/）下；
+    首次访问家目录时会自动把旧布局的容器根条目迁移进来（见
+    workspace_paths.agent_home）。
     """
     workspace = workspace_root(chat_id, namespace)
     workspace.mkdir(parents=True, exist_ok=True)
-    # 显式预创建 upload/ 与 download/：workspace_upload_root /
-    # workspace_download_root 是幂等的（mkdir exist_ok + chmod 0o700），
-    # 重复调用不会出错；首次调用就把这两棵子树准备好。
+    # 显式预创建 upload/ 与 download/：两者都位于 agent 家目录下，
+    # workspace_upload_root / workspace_download_root 是幂等的（mkdir
+    # exist_ok + chmod 0o700），重复调用不会出错；首次调用就把这两棵
+    # 子树准备好（并顺带触发家目录的一次性迁移）。
     workspace_upload_root(chat_id, namespace)
     workspace_download_root(chat_id, namespace)
 
@@ -101,9 +106,10 @@ async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = No
     key = resolved_namespace
     lock = await _get_workspace_init_lock(key)
     async with lock:
-        workspace = workspace_root(chat_id, resolved_namespace)
-        workspace.mkdir(parents=True, exist_ok=True)
-        marker = workspace / ".skills_initialized"
+        # 家目录（容器根下的 claude/）才是 skills/ 与初始化标记的归属；
+        # agent_home() 首次访问时会自动迁移旧布局条目。
+        home = agent_home(chat_id, resolved_namespace)
+        marker = home / ".skills_initialized"
 
         if key in _workspace_initialized or marker.is_file():
             _workspace_initialized.add(key)
@@ -114,7 +120,7 @@ async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = No
 
             summary = await asyncio.to_thread(
                 sync_all_skill_assets_to_workspace,
-                workspace,
+                home,
             )
             if summary.get("errors"):
                 logger.warning(

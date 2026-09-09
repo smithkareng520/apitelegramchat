@@ -130,10 +130,11 @@ def harden_parent_process() -> None:
 #
 # 原理：fork 后 exec 前，在子进程里调 landlock_create_ruleset +
 # landlock_add_rule + landlock_restrict_self，给自己加规则：
-#   - workspace 目录：可读写
+#   - agent 家目录（容器根下的 claude/，含 upload/download/skills 与
+#     隐藏缓存层 .runtime/）：可读写
 #   - /usr /bin /lib /etc：只读 + 可执行（bash/python 能跑）
 #   - /dev /proc /sys：只读（/dev/null /dev/urandom 等可读）
-#   - 其他（state/、r2_cache/、/home、/app 源码）：全部拒绝
+#   - 其他（容器根本身、state/、/home、/app 源码）：全部拒绝
 # 限制不可逆，子进程继承。
 
 # Landlock 常量（<linux/landlock.h>）
@@ -252,9 +253,10 @@ def _handled_access_mask(abi: int) -> int:
 def _apply_landlock(workspace_path: str) -> bool:
     """Install a deny-by-default Landlock filesystem policy for the child.
 
-    The workspace tree is the writable application sandbox. R2 persistence is
-    deliberately handled outside the workspace tree; the workspace is never mirrored wholesale to R2.
-    System trees needed to execute
+    The agent home directory (``claude/`` inside the private container root)
+    is the writable application sandbox. R2 persistence is deliberately
+    handled outside the workspace tree; the workspace is never mirrored
+    wholesale to R2. System trees needed to execute
     bash are explicitly read/execute-only. Every syscall and every rule-add
     operation is checked; a partial policy is never accepted.
     """
@@ -302,8 +304,9 @@ def _apply_landlock(workspace_path: str) -> bool:
                 finally:
                     os.close(fd)
 
-            # The only writable/readable user tree. Since Landlock is scoped to
-            # this directory fd, ../ resolves outside the rule and is denied.
+            # The only writable/readable user tree: the agent home. Since
+            # Landlock is scoped to this directory fd, ../ resolves outside
+            # the rule and is denied (container root included).
             add_path_rule(workspace, handled)
 
             # Read/execute-only runtime dependencies. No WRITE/MAKE/REMOVE bits
@@ -429,11 +432,13 @@ def build_sandbox_env(
     chat_id: int,
     namespace: str | None = None,
 ) -> dict:
-    """Build the shell environment from persistent, workspace-local runtime paths.
+    """Build the shell environment rooted at the agent home directory.
 
-    Runtime caches live under the same workspace tree that Landlock already permits.
-    Nothing is installed on every command: the host toolchain (/usr/bin/python3, gcc,
-    etc.) is reused and package/build caches survive Bash session restarts.
+    v2.3 起 ``$HOME`` = agent 家目录（workspace 容器根下的 ``claude/``，
+    也是 bash 起始 cwd 与 Landlock 唯一放行边界），隐藏缓存层
+    ``.runtime/`` 提供全部工具链缓存。Nothing is installed on every
+    command: the host toolchain (/usr/bin/python3, gcc, etc.) is reused
+    and package/build caches survive Bash session restarts.
     """
     workdir = workspace_workdir(chat_id, namespace)
     workdir_abs = str(workdir.absolute())
@@ -444,8 +449,9 @@ def build_sandbox_env(
     tmp_dir = cache_root / "tmp"
     runtime_bin = cache_root / "bin"
 
-    # All common ML/model-download caches are explicitly rooted in runtime.
-    # Do not rely only on HOME: some libraries use their own environment variables.
+    # All common ML/model-download caches are explicitly rooted in the hidden
+    # .runtime layer. Do not rely only on HOME: some libraries use their own
+    # environment variables.
     xdg_cache = cache_root / "xdg_cache"
     hf_home = cache_root / "huggingface"
     hf_hub_cache = hf_home / "hub"
@@ -488,7 +494,7 @@ def build_sandbox_env(
     # Keep runtime_bin first only for local wrappers. The actual compiler remains the
     # system toolchain baked into the image; no apt/pip install happens per Bash run.
     # ★ 工作区自我描述：让模型不用"猜"自己在哪、哪里可写。生产日志显示
-    #   模型习惯性 `cd /tmp` 下载文件，而 Landlock 只放行 workspace 子树，
+    #   模型习惯性 `cd /tmp` 下载文件，而 Landlock 只放行家目录子树，
     #   curl -o 直接 exit 23，平均浪费 5-7 轮试错才撞到正确路径。现在
     #   `echo $WORKSPACE` 一次即可拿到绝对路径；系统提示词与 bash 工具
     #   description 同步引用该变量。
@@ -498,10 +504,15 @@ def build_sandbox_env(
     #     id 泄露进模型可读的 shell 环境；
     #   - $USER 与真实 uid 解析（whoami/id/ls 属主列）不一致还会误导模型
     #     以为自己"是"某个 chat；实际身份统一为镜像内的 claude 用户，
-    #     per-chat 的隔离由 Landlock 按 workspace 路径强制，不靠身份标签。
+    #     per-chat 的隔离由 Landlock 按家目录路径强制，不靠身份标签。
     return {
         "PATH": f"{runtime_bin}:{cache_root / 'python_user' / 'bin'}:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
-        "HOME": str(cache_root),
+        # ★ HOME = agent 家目录（workdir）：`~` 就是模型可见的工作区根，
+        #   `ls` 默认只见 download/ upload/ skills/ 与用户自己的文件；
+        #   缓存层在隐藏的 .runtime/ 下（点前缀不进普通 ls），且个别仍按
+        #   POSIX 惯例写 $HOME 点文件的工具（git config --global 等）也
+        #   只是往模型自己的家目录写隐藏文件，无碍观瞻亦无越界。
+        "HOME": workdir_abs,
         "USER": SANDBOX_USER,
         "LOGNAME": SANDBOX_USER,
         "WORKSPACE": workdir_abs,
