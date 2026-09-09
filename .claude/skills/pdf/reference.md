@@ -425,6 +425,18 @@ doc.build(elements)
 
 ## Complex Workflows
 
+
+## Chinese / CJK fonts
+
+Use the renderer-specific font documented below:
+
+| Renderer | Font | Path | Notes |
+|---|---|---|---|
+| ReportLab | Arphic Song (`gbsn00lp.ttf`) | `/usr/share/fonts/truetype/arphic-gbsn00lp/gbsn00lp.ttf` | TrueType; safe to embed with `TTFont` |
+| LibreOffice / DOCX | Noto Sans CJK SC | `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` | CFF collection; use as a system font, not with ReportLab `TTFont` |
+
+For ReportLab, use `scripts/cjk_font.py` or register the TrueType font explicitly. Do not pass the Noto CJK TTC to `TTFont`: ReportLab will reject CFF/PostScript outlines.
+
 ### Extract Figures/Images from PDF
 
 #### Method 1: Using pdfimages (fastest)

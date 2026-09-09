@@ -113,21 +113,27 @@ size: {
 // Content width = 15840 - left margin - right margin (uses the long edge)
 ```
 
+### Fonts (Chinese / CJK)
+
+The production image includes Noto Sans CJK SC for server-side DOCX generation and LibreOffice → PDF conversion. Use `Noto Sans CJK SC` for Normal and heading styles when the document contains Chinese. Do not claim Arial is universally installed on Linux.
+
+When a document mixes Chinese and Latin text, Noto Sans CJK SC can be used for the whole document unless a specific corporate font is required. Keep the font name exactly as `Noto Sans CJK SC`; LibreOffice/Office will resolve the installed font in the runtime or the user's Office environment.
+
 ### Styles (Override Built-in Headings)
 
-Use Arial as the default font (universally supported). Keep titles black for readability.
+Use **Noto Sans CJK SC** as the default font in the Linux production runtime so Chinese text renders consistently. Keep titles black for readability. For documents intended primarily for Microsoft Office users, `Arial` may be used only when there is a deliberate compatibility reason; do not assume Arial is installed in the server container.
 
 ```javascript
 const doc = new Document({
   styles: {
-    default: { document: { run: { font: "Arial", size: 24 } } }, // 12pt default
+    default: { document: { run: { font: "Noto Sans CJK SC", size: 24 } } }, // 12pt default
     paragraphStyles: [
       // IMPORTANT: Use exact IDs to override built-in styles
       { id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal", quickFormat: true,
-        run: { size: 32, bold: true, font: "Arial" },
+        run: { size: 32, bold: true, font: "Noto Sans CJK SC" },
         paragraph: { spacing: { before: 240, after: 240 }, outlineLevel: 0 } }, // outlineLevel required for TOC
       { id: "Heading2", name: "Heading 2", basedOn: "Normal", next: "Normal", quickFormat: true,
-        run: { size: 28, bold: true, font: "Arial" },
+        run: { size: 28, bold: true, font: "Noto Sans CJK SC" },
         paragraph: { spacing: { before: 180, after: 180 }, outlineLevel: 1 } },
     ]
   },

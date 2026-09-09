@@ -186,6 +186,54 @@ squared = Paragraph("x<super>2</super> + y<super>2</super>", styles['Normal'])
 
 For canvas-drawn text (not Paragraph objects), manually adjust font the size and position rather than using Unicode subscripts/superscripts.
 
+
+## Chinese / CJK font requirements (production)
+
+The production Docker image installs **two different CJK font resources for two different renderers**. Treat both as image/runtime dependencies; do not install or download fonts during a normal user request.
+
+### ReportLab: embedded TrueType font
+
+ReportLab `TTFont` needs a TrueType-outline font for reliable embedding. The Debian Noto CJK files installed for Office rendering use CFF/PostScript outlines and must **not** be passed to ReportLab `TTFont`.
+
+Use the bundled Arphic Song TrueType font for Chinese PDF generation:
+
+- Font file: `/usr/share/fonts/truetype/arphic-gbsn00lp/gbsn00lp.ttf`
+- Recommended registered name: `CJKSong`
+- The font is provided by the Debian `fonts-arphic-gbsn00lp` package.
+
+Register it before drawing or laying out Chinese text:
+
+```python
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+font_path = "/usr/share/fonts/truetype/arphic-gbsn00lp/gbsn00lp.ttf"
+pdfmetrics.registerFont(TTFont("CJKSong", font_path))
+```
+
+Then use `fontName="CJKSong"` in Platypus styles/tables or `canvas.setFont("CJKSong", size)` for canvas text. This embeds the glyphs into the generated PDF and keeps the PDF portable across viewers.
+
+### LibreOffice / DOCX: Noto Sans CJK SC
+
+For DOCX generation and server-side LibreOffice rendering, use **Noto Sans CJK SC**. The production image provides it through `fonts-noto-cjk`:
+
+- Fontconfig family: `Noto Sans CJK SC`
+- Font collection: `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc`
+
+Do not try to feed this TTC file to ReportLab `TTFont`; it uses CFF outlines.
+
+### General rules
+
+- Chinese/CJK text must never use ReportLab's built-in `Helvetica`, `Times-Roman`, or `Courier`.
+- Do not use `Arial` as a server-side assumption; it is not guaranteed to exist in the Linux image.
+- When a PDF contains Chinese, choose an actual CJK font and verify the output by rendering pages to images.
+- If the required CJK font is missing, fail clearly instead of silently falling back to a non-CJK font.
+- OCR of simplified/traditional Chinese is supported by the preinstalled `chi_sim` and `chi_tra` Tesseract language data.
+
+### Recommended helper
+
+For scripts, prefer the bundled `scripts/cjk_font.py` helper so font paths and ReportLab registration stay consistent with the image.
+
 ## Command-Line Tools
 
 ### pdftotext (poppler-utils)

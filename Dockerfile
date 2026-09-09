@@ -8,6 +8,11 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONPATH=/app/src
 ENV APITELEGRAMCHAT_DATA_DIR=/tmp/apitelegramchat_data
 ENV TZ=Asia/Shanghai
+# Stable CJK font used by PDF generation and server-side Office rendering.
+ENV APITELEGRAMCHAT_CJK_FONT=NotoSansCJKsc
+ENV APITELEGRAMCHAT_CJK_FONT_FILE=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+# ReportLab needs a TrueType outline for embedding; Noto CJK uses CFF outlines.
+ENV APITELEGRAMCHAT_REPORTLAB_CJK_FONT=/usr/share/fonts/truetype/arphic-gbsn00lp/gbsn00lp.ttf
 
 # 配置系统时区为上海（CST/UTC+8）
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
@@ -39,6 +44,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pandoc \
         imagemagick \
         tesseract-ocr \
+        tesseract-ocr-chi-sim \
+        tesseract-ocr-chi-tra \
+        fontconfig \
+        fonts-noto-cjk \
+        fonts-arphic-gbsn00lp \
+    && fc-cache -f -v >/dev/null \
+    && fc-match "Noto Sans CJK SC" >/dev/null \
+    && test -f /usr/share/fonts/truetype/arphic-gbsn00lp/gbsn00lp.ttf \
+    && tesseract --list-langs 2>/dev/null | grep -qx "chi_sim" \
+    && tesseract --list-langs 2>/dev/null | grep -qx "chi_tra" \
     && rm -rf /var/lib/apt/lists/*
 
 # 沙盒身份固定为 claude（uid/gid 仍为 2000）：
