@@ -530,7 +530,7 @@ mutation 能力必须显式 opt-in（`MUTATION_SPECS`）。不要因为 Runtime 
 export APITELEGRAMCHAT_DATA_DIR=/var/lib/apitelegramchat
 ```
 
-目录权限按 `0700` 方向创建。不要把 `/app`、`/home/app` 直接作为
+目录权限按 `0700` 方向创建。不要把 `/app`、`/home/claude` 直接作为
 workspace，也不要把 Bot Token、API Keys、Docker secret、MCP token
 放进 workspace。
 

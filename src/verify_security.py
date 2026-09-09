@@ -57,6 +57,18 @@ def info(name: str, detail: str) -> None:
 def check_user() -> bool:
     uid = os.getuid()
     report("1.1 非 root 运行", uid != 0, f"uid={uid}")
+    # dumpable 自检：harden_parent_process 生效后 /proc/self/environ 属主
+    # 变为 root（0400），同 uid 进程（含其它沙箱）无法偷读本进程环境。
+    # root 进程本就 root 属主，无需检查。
+    if uid != 0:
+        try:
+            environ_uid = os.stat("/proc/self/environ").st_uid
+            report("1.3 dumpable=0 已生效（/proc/self/environ root 属主）",
+                   environ_uid == 0,
+                   f"environ owner uid={environ_uid}"
+                   if environ_uid != 0 else "已保护")
+        except OSError as e:
+            warn("1.3 dumpable 自检", str(e))
     return uid != 0
 
 
@@ -195,14 +207,32 @@ async def check_sandbox_isolation(landlock_ok: bool) -> None:
         rc, out = await run("cat /etc/shadow 2>&1\n")
         report("4.8 /etc/shadow 不可读", "Permission denied" in out or "No such file" in out, out[:200])
 
-        rc, out = await run("cat /proc/1/cmdline 2>&1\n")
-        report("4.9 /proc 不可访问", "Permission denied" in out or "No such file" in out, out[:200])
+        rc, out = await run("cat /proc/1/environ 2>&1\n")
+        # /proc/1 是 bot 主进程（CMD exec 形式）；dumpable=0 加固后 environ
+        # 变为 root 属主，同 uid 沙箱读取被拒。若加固失效且同 uid，则会
+        # 直接打印出主进程全部环境变量（含密钥）→ 必须判 FAIL。
+        # 注：cmdline 仍为世界可读（内核固定 0444，见 4.9 的 INFO 说明）。
+        report("4.9 /proc/1/environ 不可读（密钥防偷读）",
+               "Permission denied" in out or "No such file" in out, out[:200])
+        info("4.9-note 残余风险说明",
+             "/proc/<pid>/cmdline 由内核固定为世界可读（与 dumpable 无关），"
+             "同 uid 沙箱可互相看到对方正在运行的命令行；彻底消除需 hidepid=2 "
+             "或按 chat 分 uid（均需 root，Render 非特权容器不可用）")
+
+        rc, out = await run("whoami; id -un; printf '%s\\n' \"$USER\"\n")
+        from sandbox import SANDBOX_USER
+        got = [line.strip() for line in out.strip().splitlines() if line.strip()]
+        # 三路输出全部等于沙盒身份：whoami（passwd 解析）、id -un、$USER。
+        # 若镜像未重建（passwd 里仍是旧用户名），whoami 会返回旧名 → FAIL 提示重建。
+        report("4.10 沙盒身份一致（whoami/id/USER = %s）" % SANDBOX_USER,
+               got == [SANDBOX_USER, SANDBOX_USER, SANDBOX_USER],
+               f"got={got}" + ("" if got == [SANDBOX_USER] * 3 else "（提示：需要重建镜像使 passwd 生效）"))
 
         rc, out = await run("env\n")
         # 用 word boundary 避免误匹配 MONKEY= / PYTHONKEY= / TURKEY= 等无关变量。
         # 仅匹配以 SENSITIVE 字段结尾的环境变量名。
         bad = bool(re.search(r'(^|\n)\S*(?:KEY|TOKEN|SECRET|PASSWORD)=', out))
-        report("4.9 子进程环境无密钥", not bad, out[:300])
+        report("4.11 子进程环境无密钥", not bad, out[:300])
     finally:
         parent_probe.unlink(missing_ok=True)
         outside_target.unlink(missing_ok=True)
@@ -287,6 +317,14 @@ async def main() -> None:
     print(" Bash 沙箱安全自检")
     print("=" * 70)
     print()
+
+    # 若本脚本作为独立容器入口运行（此时自身就是 PID 1），先套用与 bot
+    # 主进程相同的 dumpable=0 加固，保证 4.9 检查在两种运行方式下语义一致。
+    try:
+        from sandbox import harden_parent_process
+        harden_parent_process()
+    except Exception:
+        logger.debug("harden_parent_process 内部忽略的异常", exc_info=True)
 
     info("环境", f"Python {sys.version.split()[0]}, uid={os.getuid()}, pid={os.getpid()}")
     print()

@@ -45,6 +45,7 @@ from message_user_tool import (
 from file_handlers import download_file
 from workspace_paths import workspace_download_root
 from workspace_utils import _get_workspace_lock
+from sandbox import harden_parent_process
 import proactive
 from webhook_sync import run_sync_with_deadline
 import telegram_polling
@@ -53,6 +54,17 @@ import app_state
 # 兼容 re-export：tests 与 telegram_polling 经 `app.update_queue` 引用（同一对象，不重赋值）
 from app_state import update_queue as update_queue  # noqa: F401
 from app_state import WEBHOOK_QUEUE_MAXSIZE as WEBHOOK_QUEUE_MAXSIZE  # noqa: F401
+
+# 进程级加固（幂等，fail-open）：关闭 bot 主进程的 dumpable，
+# 使同 uid 的沙箱子进程无法读 /proc/<bot>/environ（内含全部平台密钥）。
+# 必须在模块导入期尽早执行，此时任何请求处理尚未开始。
+try:
+    harden_parent_process()
+except Exception:  # pragma: no cover - 加固失败不阻断服务启动
+    logging.getLogger(__name__).warning(
+        "harden_parent_process failed; /proc environ cross-read protection inactive",
+        exc_info=True,
+    )
 from app_turns import (
     active_tasks,
     _interrupt_active_generation,

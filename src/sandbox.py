@@ -33,6 +33,13 @@ SANDBOX_MAX_FILE_SIZE = int(os.getenv("SANDBOX_MAX_FILE_SIZE", str(100 * 1024 * 
 SANDBOX_MAX_OPEN_FILES = int(os.getenv("SANDBOX_MAX_OPEN_FILES", "256"))
 SANDBOX_TIMEOUT_SEC = int(os.getenv("SANDBOX_TIMEOUT_SEC", "300"))
 
+# 沙盒内固定身份（whoami / $USER / $LOGNAME / ls 属主列全部一致）。
+# 必须与镜像内 passwd 用户名同步（见 Dockerfile 的 useradd claude 行），
+# 否则 $USER 会与真实 uid 解析结果不一致。历史版本的 chat{chat_id} 已移除：
+# chat id 属于路由/计费元数据，不应以环境变量形式暴露给模型可读的 shell ——
+# 模型需要知道自己在哪个工作区时，读 $WORKSPACE 路径即可，且那是必要信息。
+SANDBOX_USER = os.getenv("APITELEGRAMCHAT_SANDBOX_USER", "claude").strip() or "claude"
+
 # ---------- libc ----------
 # Any：_libc 加载失败时为 None，各调用点各自判空；若声明为 ctypes.CDLL | None，
 # _apply_landlock 内未判空直接 syscall 的既有调用点会级联报错，Any 最小且不失真。
@@ -43,6 +50,7 @@ except OSError:
     _libc = None
 
 PR_SET_NO_NEW_PRIVS = 38
+PR_SET_DUMPABLE = 11
 
 
 def _set_no_new_privs() -> bool:
@@ -55,6 +63,47 @@ def _set_no_new_privs() -> bool:
         logger.error("prctl(NO_NEW_PRIVS) failed: %s", os.strerror(err))
         return False
     return True
+
+
+def _set_undumpable() -> bool:
+    """PR_SET_DUMPABLE=0：断开同 uid 进程对本进程 /proc/<pid> 的交叉读取。
+
+    效果（对 uid 相同的其它进程生效，含其它 chat 的沙盒子进程）：
+      - /proc/<pid>/environ 属主变为 root:root（mode 0400）→ 同 uid 沙箱
+        无法再偷读本进程完整环境（历史版本里这是最大的残留风险：
+        bot 主进程的 TELEGRAM_BOT_TOKEN / R2 密钥就在 os.environ 里）；
+      - /proc/<pid>/maps、mem 等需要 PTRACE_MODE_READ 的文件同样被封死；
+      - ptrace 本进程被拒绝；core dump 关闭。
+
+    注意：watchdog 依赖的 /proc/<pid>/stat 是世界可读（0444），不受影响；
+    killpg 的信号权限取决于进程真实凭据而非 proc 文件属主，同样不受影响。
+    本层是纵深防御而非主边界（主边界是 Landlock + 环境变量白名单），
+    因此 prctl 失败时选择 fail-open（记 ERROR 后继续），避免个别内核
+    异常导致全部 bash 拒绝服务。
+    """
+    if _libc is None:
+        return False
+    rc = _libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)
+    if rc != 0:
+        err = ctypes.get_errno()
+        logger.error("prctl(PR_SET_DUMPABLE, 0) failed: %s", os.strerror(err))
+        return False
+    return True
+
+
+def harden_parent_process() -> None:
+    """对 bot 主进程本身套用 dumpable=0（启动时调用一次）。
+
+    沙箱子进程与 bot 主进程同 uid（镜像内单用户），若不关闭主进程的
+    dumpable，沙箱可以 `cat /proc/1/environ` 直接拿到主进程的完整环境
+    （包含所有平台密钥）。对子进程的同样保护在 _preexec_sandbox 内做，
+    用于隔离子进程互相之间的窥探。
+    """
+    if os.getuid() == 0:
+        # root 进程的 /proc 文件本就 root 属主，无需处理。
+        return
+    if _set_undumpable():
+        logger.info("Parent process hardened: PR_SET_DUMPABLE=0")
 
 
 # =====================================================================
@@ -286,6 +335,10 @@ def _preexec_sandbox(workspace_path: str) -> None:
     if _set_no_new_privs() is False:
         raise SandboxSetupError("PR_SET_NO_NEW_PRIVS failed")
 
+    # dumpable=0 是纵深防御（fail-open）：阻断同 uid 沙箱互相读 environ/maps。
+    # 失败只记日志不阻断 —— 主隔离边界是下面的 Landlock。
+    _set_undumpable()
+
     if not _apply_landlock(workspace_path):
         raise SandboxSetupError("Landlock filesystem sandbox could not be installed")
 
@@ -366,10 +419,18 @@ def build_sandbox_env(
     #   curl -o 直接 exit 23，平均浪费 5-7 轮试错才撞到正确路径。现在
     #   `echo $WORKSPACE` 一次即可拿到绝对路径；系统提示词与 bash 工具
     #   description 同步引用该变量。
+    #
+    # 身份说明（历史遗留问题的修复）：这里不再设置 USER=chat{chat_id}。
+    #   - 旧的 chat{id} 值从未被任何代码读取，只是展示标签，却把会话路由
+    #     id 泄露进模型可读的 shell 环境；
+    #   - $USER 与真实 uid 解析（whoami/id/ls 属主列）不一致还会误导模型
+    #     以为自己"是"某个 chat；实际身份统一为镜像内的 claude 用户，
+    #     per-chat 的隔离由 Landlock 按 workspace 路径强制，不靠身份标签。
     return {
         "PATH": f"{runtime_bin}:{cache_root / 'python_user' / 'bin'}:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
         "HOME": str(cache_root),
-        "USER": f"chat{chat_id}",
+        "USER": SANDBOX_USER,
+        "LOGNAME": SANDBOX_USER,
         "WORKSPACE": workdir_abs,
         "WORKDIR": workdir_abs,
         "LANG": "C.UTF-8",

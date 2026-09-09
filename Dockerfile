@@ -41,7 +41,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
-RUN groupadd -g 2000 app && useradd -u 2000 -g 2000 -m -d /home/app -s /usr/sbin/nologin app
+# 沙盒身份固定为 claude（uid/gid 仍为 2000）：
+#   - whoami / id / ls -l 属主列全部真实解析为 "claude"（passwd 级一致，
+#     不再出现 whoami=app 与 $USER=chat{id} 的精神分裂）；
+#   - uid 保持 2000 不变：老部署在 Render disk 上已有的
+#     /tmp/apitelegramchat_data 文件属主无需迁移，升级零成本；
+#   - 名字可用 APITELEGRAMCHAT_SANDBOX_USER 覆盖（见 src/sandbox.py），
+#     但必须与镜像内 passwd 同步修改，否则 whoami 会退回数字 uid。
+RUN groupadd -g 2000 claude && useradd -u 2000 -g 2000 -m -d /home/claude -s /usr/sbin/nologin claude
 
 WORKDIR /app
 
@@ -55,9 +62,9 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir --upgrade pip 
     python3 -m pip install --break-system-packages --no-cache-dir . && \
     npm install --omit=dev --no-audit --no-fund
 
-RUN mkdir -p /app/workspace && chown -R app:app /app/workspace /app/src /home/app
+RUN mkdir -p /app/workspace && chown -R claude:claude /app/workspace /app/src /home/claude
 
-USER app
+USER claude
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD python3 -c "import os, urllib.request; port=os.getenv('PORT', '5000'); urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=3)" || exit 1
 
