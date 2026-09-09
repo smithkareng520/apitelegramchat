@@ -396,3 +396,21 @@ def test_finish_group_five_tools_two_failed():
     b.update_tool_item("t5", "bad", "<p>x</p>", status="error")
     b.finish_group(idx)
     assert b._tool_groups[idx]["outer_summary"] == "Ran 2 commands, fetched a page, (failed 2)"
+
+
+def test_tool_group_followed_by_content_is_a_sibling_block():
+    """工具调用后的最终正文必须脱离 <details>，成为独立正文块。"""
+    b = _builder()
+    b.add_tool_item("tool-1", "web_search", "Searching", fn_args={})
+    b.finish_group(0)
+    b.begin_stream_text()
+    b.append_stream_delta("现在我清楚了，让我给用户一个清晰的总结。")
+    b.end_stream()
+
+    html = b._build_html()
+    details_end = html.index("</details>")
+    content_pos = html.index("现在我清楚了")
+    assert details_end < content_pos
+    assert html.count("<details>") == 1
+    assert html.count("</details>") == 1
+

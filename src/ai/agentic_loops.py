@@ -483,47 +483,50 @@ async def _agentic_loop_openai_compat(
                                     builder.request_flush(force=True)
                             if round_leading_kind == "tool" and builder._tool_groups and not builder._tool_groups[-1].get(
                                     "finished", False):
-                                # 本轮先出现了工具调用，这段文字是同一轮里紧跟在工具调用之后的说明文字，
-                                # 归入当前（同一轮新开或合并的）工具块内部。
-                                builder.append_to_current_tool_group_text(c_delta)
-                            else:
-                                if "<think>" in c_delta:
-                                    in_reasoning = True
-                                    before, _, rest = c_delta.partition("<think>")
-                                    if before:
-                                        await switch_stream("content")
-                                        builder.append_stream_delta(before)
-                                    await switch_stream("reasoning")
-                                    if "</think>" in rest:
-                                        think_part, _, after = rest.partition("</think>")
-                                        reasoning_acc += think_part
-                                        builder.append_stream_delta(think_part)
-                                        in_reasoning = False
-                                        if after:
-                                            await switch_stream("content")
-                                            builder.append_stream_delta(after)
-                                        else:
-                                            current_stream = None
-                                    else:
-                                        reasoning_acc += rest
-                                        builder.append_stream_delta(rest)
-                                elif in_reasoning:
-                                    if "</think>" in c_delta:
-                                        think_part, _, after = c_delta.partition("</think>")
-                                        reasoning_acc += think_part
-                                        builder.append_stream_delta(think_part)
-                                        in_reasoning = False
-                                        if after:
-                                            await switch_stream("content")
-                                            builder.append_stream_delta(after)
-                                        else:
-                                            current_stream = None
-                                    else:
-                                        reasoning_acc += c_delta
-                                        builder.append_stream_delta(c_delta)
-                                else:
+                                # 工具调用之后再次到达模型正文时，工具组在这里结束；
+                                # 正文必须作为独立的 text block 输出，而不能继续写进
+                                # 当前 <details> 工具折叠块。
+                                builder.finish_group(len(builder._tool_groups) - 1)
+                                # ★ 强制刷新，确保工具组先于最终正文结束并可独立显示 ★
+                                builder.request_flush(force=True)
+
+                        if "<think>" in c_delta:
+                            in_reasoning = True
+                            before, _, rest = c_delta.partition("<think>")
+                            if before:
+                                await switch_stream("content")
+                                builder.append_stream_delta(before)
+                            await switch_stream("reasoning")
+                            if "</think>" in rest:
+                                think_part, _, after = rest.partition("</think>")
+                                reasoning_acc += think_part
+                                builder.append_stream_delta(think_part)
+                                in_reasoning = False
+                                if after:
                                     await switch_stream("content")
-                                    builder.append_stream_delta(c_delta)
+                                    builder.append_stream_delta(after)
+                                else:
+                                    current_stream = None
+                            else:
+                                reasoning_acc += rest
+                                builder.append_stream_delta(rest)
+                        elif in_reasoning:
+                            if "</think>" in c_delta:
+                                think_part, _, after = c_delta.partition("</think>")
+                                reasoning_acc += think_part
+                                builder.append_stream_delta(think_part)
+                                in_reasoning = False
+                                if after:
+                                    await switch_stream("content")
+                                    builder.append_stream_delta(after)
+                                else:
+                                    current_stream = None
+                            else:
+                                reasoning_acc += c_delta
+                                builder.append_stream_delta(c_delta)
+                        else:
+                            await switch_stream("content")
+                            builder.append_stream_delta(c_delta)
 
                         for tc_delta in (getattr(delta, "tool_calls", None) or []):
                             idx = getattr(tc_delta, "index", 0)
