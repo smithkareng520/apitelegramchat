@@ -1003,18 +1003,6 @@ SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
 # -----------------------------------------------------------------------------
 # GLM 系列
 # -----------------------------------------------------------------------------
-SUPPORTED_MODELS["GLM-4.6V-Flash"] = make_model_config(
-    model_id="GLM-4.6V-Flash",
-    provider="glm",
-    name="GLM 4.6V Flash",
-    vision=True,
-    max_context=32768,
-    # 智谱官方 v4 接口：thinking.type=enabled。视觉 Flash 免费档，
-    # 思考默认开启可提升图表/文档理解准确率。
-    # 智谱建议思考模式 temperature 0.5-0.7，取 0.6；top_p 不发送走默认。
-    reasoning_enabled=True,
-    temperature=0.6,
-)
 SUPPORTED_MODELS["GLM-4.7-Flash"] = make_model_config(
     model_id="GLM-4.7-Flash",
     provider="glm",
