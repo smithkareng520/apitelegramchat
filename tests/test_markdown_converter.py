@@ -53,9 +53,14 @@ def test_heading_with_inline_bold():
     assert convert("# Title **bold**") == "<h1>Title <b>bold</b></h1>"
 
 
-def test_horizontal_rule():
+def test_horizontal_rule_and_literal_triple_star():
+    # `---` is treated as the explicit divider syntax supported by the rich-text layer.
     assert convert("---") == "<hr/>"
-    assert convert("***") == "<hr/>"
+    # A standalone `***` is intentionally preserved as visible text.  Treating it as
+    # `<hr/>` produces a message with no visible content in clients that render only
+    # textual blocks, which looks like the message disappeared.
+    assert convert("***") == "***"
+    assert convert("前缀 *** 后缀") == "前缀 *** 后缀"
 
 
 def test_unordered_list_various_markers():
@@ -116,6 +121,17 @@ def test_table_with_inline_markdown_in_cells():
 def test_bold_variants():
     assert convert("**加粗**") == "<b>加粗</b>"
     assert convert("__加粗__") == "<b>加粗</b>"
+
+def test_multiple_bold_tokens_in_one_message():
+    assert convert("**第一处** 和 **第二处**") == "<b>第一处</b> 和 <b>第二处</b>"
+
+
+def test_bare_double_and_triple_stars_are_visible_text():
+    assert convert("**") == "**"
+    assert convert("***") == "***"
+    assert convert("****") == "****"
+
+
 
 
 def test_italic_variants():

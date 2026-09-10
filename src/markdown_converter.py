@@ -391,7 +391,12 @@ def _convert(text: str) -> str:
             continue
         
         # 水平线
-        if re.match(r'^\s*[-*_]{3,}\s*$', line):
+        # Telegram/本项目的 Markdown 兼容层不把单独的 `***` 当水平线：
+        # 这类输出很常见于模型测试星号数量（例如用户要求原样输出 `***`）。
+        # 若把它转换成 `<hr/>`，消息虽然可能通过 API，但正文没有可见文本，
+        # 用户会感觉“整条消息消失”。只有明确使用减号形式的 `---` 才转换为
+        # Rich HTML 分隔线；`___` 也保持为普通文本，避免与 `__粗体__` 冲突。
+        if re.match(r'^\s*-{3,}\s*$', line):
             result.append('<hr/>')
             i += 1
             continue
