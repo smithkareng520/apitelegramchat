@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import asyncio
 import uuid
-from html import escape as html_escape
 from pathlib import Path
 from typing import Optional
 
@@ -55,11 +54,15 @@ def _format_bash_envelope(prompt_cwd: str, command: str, exit_code: int | str, o
     body = str(output or "").rstrip("\n")
     if not body:
         return header
-    # Bash stdout is untrusted text. It may contain Telegram rich-message
-    # markers (for example <details>, <pre>, <a>) which must never leak into
-    # the downstream HTML renderer. Keep the terminal semantics while making
-    # the payload safe for rich transports.
-    body = html_escape(body, quote=False)
+    # 注意：这里刻意不对 body 做 HTML 转义。此信封既是模型看到的工具结果
+    # （模型必须看到未经转义的原始 stdout，否则判断文件内容/做字符串
+    # 匹配会被污染），也是 tool_ui_render.py 渲染 UI 卡片的输入源——后者
+    # 的 _render_code_text/_escape_code_text 才是转义的唯一职责方，会在
+    # 渲染进 <pre><code> 时统一转义一次。若这里提前转义，会与下游转义
+    # 叠加成二次转义（&lt; 变成 &amp;lt;），用户在 Telegram 卡片里看到的
+    # 就是错误的双重实体（历史故障：2026-09 SKILL.md 里的 </example>
+    # 在草稿里显示成 &amp;lt;/example&amp;gt;）。stdout 里形似
+    # <details>/<pre> 的字样交给下游统一转义即可，不需要在这里提前处理。
     return f"{header}\n{body}"
 # ---------- Bash 输出上限（环境变量可调） ----------
 # 单条 Bash 命令返回给模型的内容上限（字符数）。超限时「保留开头 + 结尾、
