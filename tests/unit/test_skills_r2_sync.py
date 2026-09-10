@@ -208,3 +208,35 @@ def test_r2_unconfigured_keeps_pure_local_behavior(monkeypatch, tmp_path):
 
     # 打包技能照常落地；无任何 R2 交互（桩里没有对象被写入）。
     assert (_skills_dir() / "demo" / "SKILL.md").is_file()
+
+
+def test_packaged_skill_upgrade_does_not_clobber_user_edit(monkeypatch, tmp_path):
+    from skills import sync_all_skill_assets_to_workspace
+
+    packaged = tmp_path / "packaged"
+    (packaged / "demo").mkdir(parents=True)
+    source = packaged / "demo" / "SKILL.md"
+    source.write_text("v1", encoding="utf-8")
+    monkeypatch.setenv("APITELEGRAMCHAT_SKILLS_DIR", str(packaged))
+
+    home = tmp_path / "home"
+    first = sync_all_skill_assets_to_workspace(home)
+    assert first["copied"] == 1
+    assert (home / "skills/demo/SKILL.md").read_text() == "v1"
+
+    source.write_text("v2", encoding="utf-8")
+    second = sync_all_skill_assets_to_workspace(home)
+    assert second["updated"] == 1
+    assert (home / "skills/demo/SKILL.md").read_text() == "v2"
+
+    source.write_text("v3", encoding="utf-8")
+    (home / "skills/demo/SKILL.md").write_text("user edit", encoding="utf-8")
+    third = sync_all_skill_assets_to_workspace(home)
+    assert third["preserved_user_edits"] == 1
+    assert (home / "skills/demo/SKILL.md").read_text() == "user edit"
+
+
+def test_packaged_manifest_not_backed_up_to_r2(monkeypatch, tmp_path):
+    fake = _fresh_env(monkeypatch, tmp_path)
+    asyncio.run(wu.init_workspace(CHAT_ID, NS))
+    assert f"skills/{NS}/.packaged-manifest.json" not in fake.objects

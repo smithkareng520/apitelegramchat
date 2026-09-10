@@ -781,24 +781,22 @@ scope 未设置时 Server 直接拒绝启动。
 
 ### 8. 生成的 PDF 里 emoji 变成方块/乱码
 
-ReportLab **没有自动字体 fallback**：每个字符只用当前选中的那一个字体
-绘制，缺字形就直接画 notdef 空框；而生产楷体 `AR PL UKai` 不含任何
-emoji 字形，系统里的 `NotoColorEmoji.ttf` 又是 CBDT 位图，ReportLab
-根本无法嵌入。修复方案（已内置）：
+ReportLab 不会自动做字体 fallback。现在项目把这件事集中在
+`.claude/skills/pdf/scripts/emoji_font.py`：先用 `register_fonts()` 做一次
+初始化，正文优先使用 `safe_paragraph(text, style)`；底层 canvas 代码使用
+`draw_mixed_string()` / `string_width_mixed()`。`to_fallback_markup()` 仍然保留
+用于兼容旧代码，并且现在可以直接接收 `ParagraphStyle`，不再需要先手工
+取 `style.fontName`。
 
-- 镜像构建时下载安装**单色** `NotoEmoji-Regular.ttf`（glyf 轮廓，可嵌入，
-  Dockerfile 里固定版本号 + 校验 sha256，不随项目文件提交），路径可用
-  `APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT` 覆盖；
-- `.claude/skills/pdf/scripts/emoji_font.py` 提供按实际字体覆盖情况
-  拆分混排文本的 helper：Paragraph 用 `to_fallback_markup()`，canvas
-  用 `draw_mixed_string()` / `string_width_mixed()`；两个字体重叠
-  都没有的字符默认丢弃（可配 `on_missing`），不会再画出乱码框；
-- LibreOffice/DOCX 渲染路径由镜像新装的 `fonts-noto-color-emoji`
-  兜底，DOCX 转 PDF 同样能显示 emoji。
+fallback 层按实际注册字体的 glyph coverage 判断，并尽量按 Unicode grapheme
+cluster 保持完整，因此 ZWJ emoji、变体选择符、肤色修饰和旗帜序列不再
+轻易被拆成多个不完整字符。双字体都不支持的字符默认删除，传
+`missing_report=[]` 可以记录被省略的字符，避免悄悄丢内容。
 
-详见 `.claude/skills/pdf/SKILL.md` 的 "Emoji handling" 一节；运行
-`python3 .claude/skills/pdf/scripts/check_cjk_runtime.py` 可一键自检
-CJK + emoji 字体运行时。
+生产镜像仍然在构建时下载并校验单色 `NotoEmoji-Regular.ttf`；系统里的
+`NotoColorEmoji` 继续给 LibreOffice/DOCX 路径使用，而不会直接喂给 ReportLab。
+运行 `python3 .claude/skills/pdf/scripts/check_cjk_runtime.py` 可检查 CJK +
+emoji 运行时依赖。
 
 ---
 

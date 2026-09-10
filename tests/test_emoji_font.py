@@ -82,6 +82,19 @@ BASE = _widths("中文完成失败abc123 →①★±×÷≠≈°□")
 EMOJI = _widths("✅❌✨🎯📊🚀\u200d\ufe0f")
 
 
+def test_base_font_can_be_resolved_from_style_like_object(emoji_font_module):
+    class Style:
+        fontName = "CJKKai"
+
+    assert emoji_font_module._resolve_base_font(Style()) == "CJKKai"
+    assert emoji_font_module._resolve_base_font("BodyFont") == "BodyFont"
+
+
+def test_invalid_base_font_style_is_rejected(emoji_font_module):
+    with pytest.raises(TypeError):
+        emoji_font_module._resolve_base_font(object())
+
+
 def test_split_font_runs_routes_emoji_to_emoji_font(emoji_font_module):
     runs = emoji_font_module.split_font_runs("完成✅失败❌", BASE, EMOJI)
     assert runs == [("完成", "base"), ("✅", "emoji"), ("失败", "base"), ("❌", "emoji")]
@@ -92,6 +105,15 @@ def test_split_font_runs_keeps_cjk_and_math_in_base_font(emoji_font_module):
     assert all(which == "base" for _, which in runs)
     assert "".join(chunk for chunk, _ in runs) == "中文abc→①±×÷"
 
+
+
+
+def test_split_font_runs_keeps_emoji_grapheme_clusters_together(emoji_font_module):
+    base = _widths("ab□")
+    emoji = _widths("👨👩👧👦\u200d")
+    text = "a👨\u200d👩\u200d👧\u200d👦b"
+    runs = emoji_font_module.split_font_runs(text, base, emoji)
+    assert runs == [("a", "base"), ("👨\u200d👩\u200d👧\u200d👦", "emoji"), ("b", "base")]
 
 def test_split_font_runs_merges_adjacent_same_font_runs(emoji_font_module):
     runs = emoji_font_module.split_font_runs("✅✅❌", BASE, EMOJI)
@@ -160,11 +182,15 @@ def test_register_and_markup_end_to_end(emoji_font_module):
         else:
             pytest.skip("no CJK font available for the base font in this env")
 
-    markup = emoji_font_module.to_fallback_markup("进度✅ 100% <目标> & 🚀")
+    styles = getSampleStyleSheet()
+    styles["Normal"].fontName = "CJKKai"
+    markup = emoji_font_module.to_fallback_markup("进度✅ 100% <目标> & 🚀", styles["Normal"])
     assert '<font name="EmojiMono">✅</font>' in markup
     assert "&lt;目标&gt; &amp;" in markup  # XML escaping still applied
     # Paragraph must accept the markup without raising.
-    Paragraph(markup, getSampleStyleSheet()["Normal"])
+    Paragraph(markup, styles["Normal"])
+    para = emoji_font_module.safe_paragraph("完成 ✅", styles["Normal"])
+    assert para is not None
 
     # stringWidth on the emoji font is real (glyphs present, not notdef).
     assert pdfmetrics.stringWidth("✅", "EmojiMono", 12) > 0

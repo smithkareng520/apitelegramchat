@@ -23,7 +23,12 @@ Fix provided by this module:
   Paragraph markup, wrapping emoji runs in ``<font name="EmojiMono">``
   tags. Coverage is decided from the *actual registered fonts*, so
   characters that no font can render are dropped (configurable) instead
-  of garbling the output.
+  of garbling the output. It accepts either a font name or a ReportLab
+  ``ParagraphStyle`` for the base font.
+* ``safe_paragraph()`` is the preferred high-level API: pass plain text and
+  a normal ``ParagraphStyle`` and it handles the fallback markup for you.
+* Font-run splitting is grapheme-cluster aware, so ZWJ emoji, variation
+  selectors, skin-tone modifiers, and flags are kept together where possible.
 * ``draw_mixed_string()`` / ``string_width_mixed()`` provide the same
   fallback for low-level ``canvas.drawString`` code, where markup tags
   are not available.
@@ -141,6 +146,19 @@ def _in_emoji_preferred_blocks(codepoint: int) -> bool:
 # Pure run-splitting logic (unit-testable without ReportLab)
 # --------------------------------------------------------------------------
 
+def _iter_graphemes(text: str) -> list[str]:
+    """Split text into Unicode grapheme clusters.
+
+    ``regex`` is a small, dependency-light Unicode helper and gives us ``\\X``
+    support. Keep a conservative codepoint fallback for isolated utility use.
+    """
+    try:
+        import regex
+    except ImportError:
+        return list(text)
+    return regex.findall(r"\X", text)
+
+
 def split_font_runs(
     text: str,
     base_widths: dict,
@@ -176,23 +194,41 @@ def split_font_runs(
         else:
             runs.append((chunk, which))
 
-    for ch in text:
-        cp = ord(ch)
-        base_ok = cp in base_widths
-        emoji_ok = cp in emoji_widths
-        if emoji_ok and (not base_ok or _in_emoji_preferred_blocks(cp)):
-            append(ch, "emoji")
-        elif base_ok:
-            append(ch, "base")
-        else:
-            if on_missing == "keep":
+    for cluster in _iter_graphemes(text):
+        codepoints = tuple(ord(ch) for ch in cluster)
+        base_ok = all(cp in base_widths for cp in codepoints)
+        emoji_ok = all(cp in emoji_widths for cp in codepoints)
+        has_emoji_preferred = any(_in_emoji_preferred_blocks(cp) for cp in codepoints)
+
+        if emoji_ok and (not base_ok or has_emoji_preferred):
+            append(cluster, "emoji")
+            continue
+        if base_ok:
+            append(cluster, "base")
+            continue
+        if emoji_ok:
+            append(cluster, "emoji")
+            continue
+
+        # Mixed-support clusters (rare, but possible for custom fonts): fall
+        # back to codepoint-level routing rather than dropping the whole cluster.
+        for ch in cluster:
+            cp = ord(ch)
+            ch_base_ok = cp in base_widths
+            ch_emoji_ok = cp in emoji_widths
+            if ch_emoji_ok and (not ch_base_ok or _in_emoji_preferred_blocks(cp)):
+                append(ch, "emoji")
+            elif ch_base_ok:
                 append(ch, "base")
-            elif on_missing == "placeholder" and ord("□") in base_widths:
-                append("□", "base")
             else:
-                append("", "base")  # keep run merging consistent
-            if missing_report is not None:
-                missing_report.append(ch)
+                if on_missing == "keep":
+                    append(ch, "base")
+                elif on_missing == "placeholder" and ord("□") in base_widths:
+                    append("□", "base")
+                else:
+                    append("", "base")
+                if missing_report is not None:
+                    missing_report.append(ch)
     return runs
 
 
@@ -215,16 +251,34 @@ def strip_unrenderable_chars(
 _XML_ESCAPES = str.maketrans({"&": "&amp;", "<": "&lt;", ">": "&gt;"})
 
 
+def _resolve_base_font(base_font_or_style: object | str | None) -> str:
+    """Resolve a ReportLab font name from a font name or ParagraphStyle-like object."""
+    if base_font_or_style is None:
+        return DEFAULT_CJK_FONT_NAME
+    if isinstance(base_font_or_style, str):
+        return base_font_or_style
+    font_name = getattr(base_font_or_style, "fontName", None)
+    if isinstance(font_name, str) and font_name:
+        return font_name
+    raise TypeError(
+        "base_font must be a font name string or a ReportLab ParagraphStyle "
+        "with a fontName attribute"
+    )
+
+
 def to_fallback_markup(
     text: str,
-    base_font: str = DEFAULT_CJK_FONT_NAME,
+    base_font: str | object = DEFAULT_CJK_FONT_NAME,
     emoji_font: str = DEFAULT_EMOJI_FONT_NAME,
     on_missing: str = "drop",
     missing_report: list | None = None,
 ) -> str:
     """Convert mixed CJK/Latin/emoji text into safe Paragraph markup.
 
-    The result is XML-escaped and emoji runs are wrapped in
+    ``base_font`` may be either a registered font name or a ReportLab
+    ``ParagraphStyle``. Passing a style is recommended because it keeps the
+    font configuration in one place. The result is XML-escaped and emoji runs
+    are wrapped in
     ``<font name="EmojiMono">`` tags so ReportLab's Paragraph engine swaps
     fonts mid-string. Use it for every Paragraph that may contain emoji::
 
@@ -234,6 +288,7 @@ def to_fallback_markup(
     Requires both fonts to be registered first (see ``register_fonts`` in
     ``cjk_font.py`` / :func:`register_emoji_font`).
     """
+    base_font = _resolve_base_font(base_font)
     base_widths = _font_char_widths(base_font)
     emoji_widths = _font_char_widths(emoji_font)
     runs = split_font_runs(
@@ -250,16 +305,44 @@ def to_fallback_markup(
     return "".join(parts)
 
 
+def safe_paragraph(
+    text: str,
+    style: object,
+    *,
+    emoji_font: str = DEFAULT_EMOJI_FONT_NAME,
+    on_missing: str = "drop",
+    missing_report: list[str] | None = None,
+) -> object:
+    """Create a ReportLab Paragraph with automatic CJK/emoji font fallback.
+
+    This is the preferred high-level API for new PDF code. Pass a normal
+    ``ParagraphStyle`` after calling ``cjk_font.register_fonts()``; callers no
+    longer need to manually build fallback markup or remember the base font
+    name separately.
+    """
+    from reportlab.platypus import Paragraph
+
+    markup = to_fallback_markup(
+        text,
+        style,
+        emoji_font=emoji_font,
+        on_missing=on_missing,
+        missing_report=missing_report,
+    )
+    return Paragraph(markup, style)
+
+
 def string_width_mixed(
     text: str,
     size: float,
-    base_font: str = DEFAULT_CJK_FONT_NAME,
+    base_font: str | object = DEFAULT_CJK_FONT_NAME,
     emoji_font: str = DEFAULT_EMOJI_FONT_NAME,
     on_missing: str = "drop",
 ) -> float:
     """Width of mixed text when drawn with per-run font fallback."""
     from reportlab.pdfbase import pdfmetrics
 
+    base_font = _resolve_base_font(base_font)
     base_widths = _font_char_widths(base_font)
     emoji_widths = _font_char_widths(emoji_font)
     total = 0.0
@@ -276,7 +359,7 @@ def draw_mixed_string(
     y: float,
     text: str,
     size: float,
-    base_font: str = DEFAULT_CJK_FONT_NAME,
+    base_font: str | object = DEFAULT_CJK_FONT_NAME,
     emoji_font: str = DEFAULT_EMOJI_FONT_NAME,
     on_missing: str = "drop",
 ) -> float:
@@ -288,6 +371,7 @@ def draw_mixed_string(
     """
     from reportlab.pdfbase import pdfmetrics
 
+    base_font = _resolve_base_font(base_font)
     base_widths = _font_char_widths(base_font)
     emoji_widths = _font_char_widths(emoji_font)
     for chunk, which in split_font_runs(text, base_widths, emoji_widths,

@@ -147,6 +147,8 @@ def _scan_skills_dir(skills_dir: Path) -> dict[str, str]:
         rel = path.relative_to(skills_dir).as_posix()
         if not _is_safe_skill_relpath(rel):
             continue
+        if rel == ".packaged-manifest.json":
+            continue
         try:
             snapshot[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
         except OSError as exc:

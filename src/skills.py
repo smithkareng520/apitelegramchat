@@ -7,6 +7,9 @@ import re
 import shutil
 from functools import lru_cache
 from dataclasses import dataclass
+import asyncio
+import hashlib
+import json
 from pathlib import Path
 
 from typing import Any, Iterable
@@ -289,20 +292,64 @@ def _iter_files(root: Path) -> Iterable[Path]:
             yield path
 
 
-def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
-    """Copy missing packaged skill assets into ``workspace/skills``.
+_PACKAGED_MANIFEST_NAME = ".packaged-manifest.json"
+_SYNC_INTERVAL_SECONDS = max(2, float(os.getenv("SKILLS_AUTO_SYNC_INTERVAL_SECONDS", "5")))
+_sync_watcher_task: asyncio.Task[None] | None = None
+_sync_watcher_stop: asyncio.Event | None = None
 
-    This is a one-time bootstrap operation, not a destructive mirror. Existing
-    workspace files are treated as runtime state and are never overwritten or
-    deleted, even when they differ from the packaged source.
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _load_packaged_manifest(dest_root: Path) -> dict[str, str]:
+    path = dest_root / _PACKAGED_MANIFEST_NAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        files = payload.get("files")
+        if isinstance(files, dict):
+            return {str(k): str(v) for k, v in files.items() if _is_safe_relpath(str(k))}
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        pass
+    return {}
+
+
+def _is_safe_relpath(rel: str) -> bool:
+    if not rel or rel.startswith("/"):
+        return False
+    return all(part not in {"", ".", ".."} for part in Path(rel).parts)
+
+
+def _atomic_copy(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}-{id(src)}")
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
+    """Synchronize packaged skills into a runtime workspace safely.
+
+    Packaged files are managed, but user edits are protected: a destination file
+    is overwritten only when its current bytes still match the previously
+    installed packaged version. This gives us automatic upgrades without
+    clobbering runtime-created/customized skills.
+
+    Deletions from the packaged bundle are intentionally non-destructive. The
+    old file remains in the workspace because removing user data is too risky;
+    a cleanup can be performed explicitly in a future migration.
     """
     source_root = _project_skill_source_root()
     dest_root = Path(workspace_root) / SKILL_ASSETS_DIRNAME
     summary: dict[str, Any] = {
-        "synced": 0,
-        "files": 0,
-        "copied": 0,
-        "errors": [],
+        "synced": 0, "files": 0, "copied": 0, "updated": 0,
+        "preserved_user_edits": 0, "errors": [],
         "source": str(source_root) if source_root else None,
         "path": str(dest_root),
     }
@@ -312,34 +359,162 @@ def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
 
     try:
         dest_root.mkdir(parents=True, exist_ok=True)
-        source_files: set[str] = set()
-        copied = 0
-        for src_path in _iter_files(source_root):
+        previous = _load_packaged_manifest(dest_root)
+        current: dict[str, str] = {}
+        source_files = list(_iter_files(source_root))
+
+        for src_path in source_files:
             rel = src_path.relative_to(source_root)
             rel_key = rel.as_posix()
-            source_files.add(rel_key)
-            dst_path = dest_root / rel
+            if not _is_safe_relpath(rel_key):
+                continue
+            src_hash = _file_sha256(src_path)
+            current[rel_key] = src_hash
+            dst = dest_root / rel
 
-            if dst_path.exists():
-                # Runtime workspace owns existing content. Never overwrite a
-                # file or delete a directory that may contain user-created data.
+            if not dst.exists():
+                _atomic_copy(src_path, dst)
+                summary["copied"] += 1
                 continue
 
-            dst_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_path, dst_path)
-            copied += 1
+            previous_hash = previous.get(rel_key)
+            try:
+                dst_hash = _file_sha256(dst)
+            except OSError as exc:
+                summary["errors"].append(f"{rel_key}: {exc}")
+                continue
 
-        skill_ids = {p.name for p in source_root.iterdir() if p.is_dir()}
+            if dst_hash == src_hash:
+                # Already current.
+                continue
+            if previous_hash and dst_hash == previous_hash:
+                _atomic_copy(src_path, dst)
+                summary["updated"] += 1
+            else:
+                # The destination was changed after the previous packaged
+                # install (or predates the manifest): treat it as runtime-owned.
+                summary["preserved_user_edits"] += 1
+
+        manifest_payload = json.dumps({"version": 1, "files": current}, ensure_ascii=False, indent=2) + "\n"
+        manifest_path = dest_root / _PACKAGED_MANIFEST_NAME
+        tmp = manifest_path.with_name(f".{manifest_path.name}.tmp-{os.getpid()}")
+        tmp.write_text(manifest_payload, encoding="utf-8")
+        os.replace(tmp, manifest_path)
+
         summary.update({
-            "synced": len(skill_ids),
-            "files": len(source_files),
-            "copied": copied,
+            "synced": len({p.name for p in source_root.iterdir() if p.is_dir()}),
+            "files": len(current),
         })
     except Exception as exc:
         logger.error("同步项目 skills 到 workspace 失败: %s", exc)
         summary["errors"].append(str(exc))
-
     return summary
+
+
+def _workspace_namespace_dirs() -> list[Path]:
+    try:
+        from workspace_paths import workspaces_root
+        root = workspaces_root()
+    except Exception:
+        return []
+    if not root.is_dir():
+        return []
+    return [p for p in sorted(root.iterdir()) if p.is_dir() and not p.is_symlink()]
+
+
+def sync_packaged_skills_for_existing_workspaces() -> dict[str, Any]:
+    """Refresh packaged skills for every workspace that already exists on disk."""
+    results: dict[str, Any] = {"workspaces": 0, "copied": 0, "updated": 0, "preserved": 0, "errors": []}
+    for home in _workspace_namespace_dirs():
+        try:
+            result = sync_all_skill_assets_to_workspace(home)
+            results["workspaces"] += 1
+            results["copied"] += int(result.get("copied", 0))
+            results["updated"] += int(result.get("updated", 0))
+            results["preserved"] += int(result.get("preserved_user_edits", 0))
+            results["errors"].extend(result.get("errors", []))
+        except Exception as exc:
+            results["errors"].append(f"{home}: {exc}")
+    return results
+
+
+def _packaged_source_fingerprint() -> str:
+    root = _project_skill_source_root()
+    if root is None:
+        return ""
+    items: list[str] = []
+    for path in _iter_files(root):
+        try:
+            stat = path.stat()
+            rel = path.relative_to(root).as_posix()
+            items.append(f"{rel}\0{stat.st_size}\0{stat.st_mtime_ns}")
+        except OSError:
+            continue
+    return hashlib.sha256("\n".join(sorted(items)).encode()).hexdigest()
+
+
+async def start_packaged_skill_auto_sync() -> None:
+    """Synchronize existing workspaces immediately, then watch for source changes."""
+    global _sync_watcher_task, _sync_watcher_stop
+    if _sync_watcher_task and not _sync_watcher_task.done():
+        return
+
+    # Critical path: do one complete refresh before the service begins consuming
+    # user messages, so a deployment never needs a "first message" to hydrate
+    # the skills directory. Keep the file walk off the event loop.
+    initial = await asyncio.to_thread(sync_packaged_skills_for_existing_workspaces)
+    logger.info(
+        "startup packaged skills refresh: workspaces=%s copied=%s updated=%s preserved=%s errors=%s",
+        initial["workspaces"], initial["copied"], initial["updated"],
+        initial["preserved"], len(initial["errors"]),
+    )
+
+    _sync_watcher_stop = asyncio.Event()
+    source_fingerprint = _packaged_source_fingerprint()
+
+    async def _watch() -> None:
+        last = source_fingerprint
+        try:
+            while not _sync_watcher_stop.is_set():
+                try:
+                    await asyncio.wait_for(_sync_watcher_stop.wait(), timeout=_SYNC_INTERVAL_SECONDS)
+                except asyncio.TimeoutError:
+                    pass
+                if _sync_watcher_stop.is_set():
+                    break
+
+                fingerprint = _packaged_source_fingerprint()
+                if fingerprint == last:
+                    continue
+
+                result = await asyncio.to_thread(sync_packaged_skills_for_existing_workspaces)
+                logger.info(
+                    "packaged skills auto-refresh: workspaces=%s copied=%s updated=%s preserved=%s errors=%s",
+                    result["workspaces"], result["copied"], result["updated"],
+                    result["preserved"], len(result["errors"]),
+                )
+                last = fingerprint
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("packaged skill auto-sync stopped unexpectedly", exc_info=True)
+
+    _sync_watcher_task = asyncio.create_task(_watch(), name="packaged-skill-auto-sync")
+
+
+async def stop_packaged_skill_auto_sync() -> None:
+    global _sync_watcher_task, _sync_watcher_stop
+    if _sync_watcher_stop:
+        _sync_watcher_stop.set()
+    task = _sync_watcher_task
+    _sync_watcher_task = None
+    _sync_watcher_stop = None
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def catalog_text() -> str:

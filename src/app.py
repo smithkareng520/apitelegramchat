@@ -106,6 +106,22 @@ app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
 logger = get_logger(__name__)
 
 @app.before_serving
+async def _startup_sync_packaged_skills() -> None:
+    """Start packaged-skill refresh before any user message arrives.
+
+    Existing workspaces are refreshed immediately in a background task; new
+    workspaces still use the synchronous-safe bootstrap path in init_workspace.
+    A lightweight fingerprint watcher also picks up live skill edits during a
+    long-running process without requiring a user message.
+    """
+    try:
+        from skills import start_packaged_skill_auto_sync
+        await start_packaged_skill_auto_sync()
+    except Exception:
+        logger.warning("startup packaged skill auto-sync failed", exc_info=True)
+
+
+@app.before_serving
 async def _startup_load_whitelist() -> None:
     """启动/部署时加载白名单。
 
@@ -164,6 +180,16 @@ async def _startup_sync_webhook() -> None:
     # fire-and-forget：不阻塞 /health 就绪；内部自带单请求超时与总死线，
     # 任何失败都只降级为"沿用上一次注册"。
     asyncio.create_task(run_sync_with_deadline())
+
+
+@app.after_serving
+async def _shutdown_packaged_skill_sync() -> None:
+    """Stop the packaged-skill refresh watcher cleanly."""
+    try:
+        from skills import stop_packaged_skill_auto_sync
+        await stop_packaged_skill_auto_sync()
+    except Exception:
+        logger.warning("shutdown packaged skill auto-sync failed", exc_info=True)
 
 
 @app.after_serving

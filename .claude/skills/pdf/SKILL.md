@@ -234,87 +234,110 @@ Do not try to feed this TTC file to ReportLab `TTFont`; it uses CFF outlines.
 
 For scripts, prefer the bundled `scripts/cjk_font.py` helper so font paths and ReportLab registration stay consistent with the image.
 
-## Emoji handling (MANDATORY for any content that may contain emoji)
+## Emoji handling (built-in, low-friction)
 
-ReportLab has **no automatic font fallback**: every character is drawn with the one font selected for the text object, and any glyph missing from that font renders as an empty box / black square. The production Kaiti CJK font (`AR PL UKai`) contains **zero emoji glyphs**, so emoji characters (✅ ❌ ✨ 🎯 📊 🚀 👍 …) that reach ReportLab directly become garbage in the PDF.
+ReportLab does not perform font fallback. The PDF skill therefore registers a
+TrueType CJK font plus a monochrome Noto Emoji font and provides a small fallback
+layer. The important design goal is that normal PDF code should not have to
+manually build `<font>` markup.
 
-The production image installs the **monochrome Noto Emoji** font (real TrueType glyf outlines, embeddable) at build time — the `Dockerfile` downloads a pinned version, verifies its sha256, and installs it to `/usr/share/fonts/truetype/noto-emoji-mono/NotoEmoji-Regular.ttf`. The font file itself is **not** committed to this repo; do not re-add it under the skill directory. System **color** emoji fonts (e.g. `NotoColorEmoji.ttf`, CBDT/CBLC bitmaps) can **never** be embedded by ReportLab — do not use them.
+### Preferred setup
 
-### Rules
+Call the shared registration helper once during PDF setup:
 
-1. Register both fonts before building any PDF: `cjk_font.register_fonts()` registers `CJKKai` + `EmojiMono` in one call.
-2. Any string that may contain emoji must go through the fallback helpers in `scripts/emoji_font.py` — never pass raw emoji text to `Paragraph(...)` or `canvas.drawString(...)`.
-3. Characters covered by neither font are dropped (with an optional report) instead of garbling the layout. Keep the report and log it if content fidelity matters.
-4. Emoji render in monochrome (black outline, inherits the paragraph's text color). Color emoji in ReportLab PDFs is not possible; if the user explicitly needs color emoji, render that paragraph as an image or strip the emoji instead.
-5. For canvas text (tables drawn manually, headers, watermarks), use `draw_mixed_string` / `string_width_mixed`, not `drawString`.
-
-### IMPORTANT: Common Mistake to Avoid
-
-<b>❌ WRONG</b> — Do NOT pass a ParagraphStyle object to `to_fallback_markup()`:
 ```python
-# 错误：传入 styles['BodyTextCJK'] 对象会导致 KeyError
-text = to_fallback_markup("你好 🎯", styles['BodyTextCJK'])  
+from cjk_font import register_fonts
+
+register_fonts()  # idempotent: safe to call from shared setup code
 ```
 
-<b>✅ CORRECT</b> — Pass the font name string as the second argument:
-```python
-# 正确：字体名称字符串 "CJKKai"
-markup = to_fallback_markup("你好 🎯", "CJKKai")
-story.append(Paragraph(markup, styles['BodyTextCJK']))
-```
-
-<b>关键规则</b>：
-<ul><li><code>to_fallback_markup(text, base_font)</code> 的第二个参数是 <b>字体名称字符串</b>（如 `"CJKKai"`），不是 ParagraphStyle 对象</li><li><code>Paragraph(markup, style)</code> 的第二个参数才是 ParagraphStyle 对象</li></ul>
-
-### Paragraph example
+For Platypus paragraphs, use `safe_paragraph()` and pass the same
+`ParagraphStyle` you would normally pass to `Paragraph`. The helper resolves the
+style's `fontName`, XML-escapes the text, and inserts emoji fallback markup when
+needed:
 
 ```python
-import sys
-sys.path.insert(0, "/app/.claude/skills/pdf/scripts")
-
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
-from cjk_font import register_fonts
-from emoji_font import to_fallback_markup
+from emoji_font import safe_paragraph
 
-register_fonts()  # registers CJKKai + EmojiMono
 styles = getSampleStyleSheet()
-styles["Normal"].fontName = "CJKKai"
-
-missing = []  # collects characters no font can render
-text = "项目进度：✅ 已完成 80% 🚀 预计下周交付"
-story = [Paragraph(to_fallback_markup(text, missing_report=missing), styles["Normal"])]
-
-SimpleDocTemplate("report.pdf").build(story)
+styles["BodyText"].fontName = "CJKKai"
+story.append(safe_paragraph("项目进度：✅ 已完成 80% 🚀", styles["BodyText"]))
 ```
 
-### Canvas example
+Call `register_fonts()` during PDF setup before creating paragraphs. This is the recommended API for new code. Existing code can keep using
+`to_fallback_markup()`, but it now accepts either a font name string or a
+`ParagraphStyle`, so this common pattern is valid:
 
 ```python
-from cjk_font import register_fonts
+markup = to_fallback_markup("你好 🎯", styles["BodyText"])
+story.append(Paragraph(markup, styles["BodyText"]))
+```
+
+### Canvas text
+
+For low-level canvas drawing, continue to use `draw_mixed_string()` and
+`string_width_mixed()` instead of `canvas.drawString()` for mixed CJK/emoji text:
+
+```python
 from emoji_font import draw_mixed_string, string_width_mixed
 
-register_fonts()
-
-c = canvas.Canvas("out.pdf", pagesize=letter)
-text = "验收结果：✔ 通过 3 项 ❌ 未通过 1 项"
-width = string_width_mixed(text, 12)
-draw_mixed_string(c, (letter[0] - width) / 2, 700, text, 12)
-c.save()
+text = "验收结果：✅ 通过 3 项 ❌ 未通过 1 项"
+width = string_width_mixed(text, 12, "CJKKai")
+draw_mixed_string(c, (letter[0] - width) / 2, 700, text, 12, "CJKKai")
 ```
 
-### Emoji font facts
+Both helpers also accept a ReportLab `ParagraphStyle` in place of the base
+font name.
 
-- Registered name: `EmojiMono`
-- Production file: `/usr/share/fonts/truetype/noto-emoji-mono/NotoEmoji-Regular.ttf` — installed by the `Dockerfile` at build time (downloaded from the pinned `googlefonts/noto-emoji` tag and checksum-verified), **not** committed to this repo
-- Override path: `APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT` (also useful for pointing at a local copy during dev/testing outside Docker)
-- License: SIL Open Font License 1.1 (upstream `googlefonts/noto-emoji`)
-- Covers all standard emoji codepoints including ZWJ sequences and skin-tone modifiers; variation selector U+FE0F is zero-width
-- Does **not** cover CJK, kana, arrows (→), math symbols (± × ÷ ≠ ≈), circled numbers (①) — those come from the CJK font, which is exactly what the fallback logic arranges
+### What the fallback layer does
 
-To bump the font version, update `NOTO_EMOJI_VERSION` and `NOTO_EMOJI_SHA256` in the `Dockerfile` together — never one without the other, or the checksum check will fail the build (by design; that's the supply-chain guard).
+- It examines the actual glyph coverage of the registered fonts rather than
+  assuming that a Unicode block is fully supported.
+- It keeps Unicode grapheme clusters together where possible. This avoids
+  splitting common ZWJ emoji, variation selectors, skin-tone sequences, and
+  flag sequences into visually broken pieces.
+- Emoji-preferred characters use the monochrome Noto Emoji font when available;
+  normal CJK, Latin, arrows, and math symbols stay in the base font.
+- Characters unsupported by both fonts are dropped by default instead of
+  emitting a PDF notdef box. Pass `missing_report=[]` when content fidelity is
+  important so the caller can log exactly what was omitted.
+- Color emoji are intentionally not embedded through ReportLab. The ReportLab
+  path uses monochrome TrueType outlines; the LibreOffice/DOCX path can use the
+  system color emoji font separately.
 
-The runtime check `scripts/check_cjk_runtime.py` verifies the emoji font presence, embeddability, and sample glyph coverage alongside the CJK checks.
+### Migration from older code
+
+Old, verbose pattern:
+
+```python
+markup = to_fallback_markup(text, "CJKKai")
+story.append(Paragraph(markup, styles["BodyText"]))
+```
+
+Preferred pattern:
+
+```python
+story.append(safe_paragraph(text, styles["BodyText"]))
+```
+
+Canvas code can stay on `draw_mixed_string()` / `string_width_mixed()`. There is
+no longer a need to manually inspect each string for emoji or manually wrap
+emoji runs.
+
+### Font/runtime requirements
+
+The production image installs:
+
+- ReportLab CJK: `/usr/share/fonts/truetype/arphic/ukai.ttc`, subfont `0`
+- LibreOffice/DOCX CJK: `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc`
+- ReportLab emoji: `/usr/share/fonts/truetype/noto-emoji-mono/NotoEmoji-Regular.ttf`
+
+The emoji TTF is downloaded and checksum-verified during Docker image build and
+is not committed to the repository. Override it for development with
+`APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT`. The runtime checker
+`python3 .claude/skills/pdf/scripts/check_cjk_runtime.py` validates both CJK and
+emoji resources.
 
 ## Command-Line Tools
 
