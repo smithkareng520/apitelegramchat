@@ -17,9 +17,10 @@ ENV APITELEGRAMCHAT_CJK_FONT_FILE=/usr/share/fonts/opentype/noto/NotoSansCJK-Reg
 # ReportLab needs a TrueType outline for embedding; Noto CJK uses CFF outlines.
 ENV APITELEGRAMCHAT_REPORTLAB_CJK_FONT=/usr/share/fonts/truetype/arphic/ukai.ttc
 ENV APITELEGRAMCHAT_REPORTLAB_CJK_SUBFONT_INDEX=0
-# ReportLab 也无法自动 fallback：emoji 走技能内置的单色 Noto Emoji（glyf 轮廓，
-# 可嵌入；系统里的 NotoColorEmoji.ttf 是 CBDT 位图，ReportLab 不能嵌入）。
-ENV APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT=/app/.claude/skills/pdf/fonts/NotoEmoji-Regular.ttf
+# ReportLab 也无法自动 fallback：emoji 走单色 Noto Emoji（glyf 轮廓，可嵌入；
+# 系统里的 NotoColorEmoji.ttf 是 CBDT 位图，ReportLab 不能嵌入）。
+# 该字体不随项目文件提交，构建时从上游下载并校验 checksum，见下方下载层。
+ENV APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT=/usr/share/fonts/truetype/noto-emoji-mono/NotoEmoji-Regular.ttf
 
 # 配置系统时区为上海（CST/UTC+8）
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
@@ -68,9 +69,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && tesseract --list-langs 2>/dev/null | grep -qx "chi_sim" \
     && tesseract --list-langs 2>/dev/null | grep -qx "chi_tra" \
     && rm -rf /var/lib/apt/lists/*
-# 注意：ReportLab 用的单色 emoji 字体随 .claude/ 在下方 COPY 才进镜像，
-# 因此它的存在性校验不能放在上面的 apt 层（那时文件还不存在，test -f
-# 会直接 exit 1 炸掉构建），必须放在 COPY 之后。
+
+# 单色 Noto Emoji 字体（ReportLab emoji fallback 用）：不随项目文件提交，
+# 构建时从上游固定 tag 下载，并校验 sha256，避免供应链投毒或静默替换。
+# 固定 tag（而非 main 分支）是为了可复现构建：上游文件内容不会因为分支
+# 更新而变化，checksum 长期有效，下次升级字体版本时一并更新下面两行。
+ENV NOTO_EMOJI_VERSION=v2.034
+ENV NOTO_EMOJI_SHA256=415dc6290378574135b64c808dc640c1df7531973290c4970c51fdeb849cb0c5
+RUN mkdir -p /usr/share/fonts/truetype/noto-emoji-mono \
+    && curl -fsSL -o /usr/share/fonts/truetype/noto-emoji-mono/NotoEmoji-Regular.ttf \
+        "https://raw.githubusercontent.com/googlefonts/noto-emoji/${NOTO_EMOJI_VERSION}/fonts/NotoEmoji-Regular.ttf" \
+    && echo "${NOTO_EMOJI_SHA256}  /usr/share/fonts/truetype/noto-emoji-mono/NotoEmoji-Regular.ttf" | sha256sum -c - \
+    && fc-cache -f -v >/dev/null
 
 # 沙盒身份固定为 claude（uid/gid 仍为 2000）：
 #   - whoami / id / ls -l 属主列全部真实解析为 "claude"（passwd 级一致，
@@ -88,8 +98,9 @@ COPY src ./src
 COPY .claude ./.claude
 COPY README.md ./
 
-# 校验技能内置的单色 emoji 字体已进镜像，且 emoji_font helper 能解析到它
-#（不依赖 reportlab，只查路径与 TrueType magic）。
+# 校验下载的单色 emoji 字体已就位，且 emoji_font.py 的 resolve_emoji_font_path()
+# 真的能解析到它（不依赖 reportlab，只查路径与 TrueType magic）。此时 .claude
+# 已 COPY 进镜像，才能 import 到技能脚本目录下的 emoji_font 模块。
 RUN test -f "$APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT" \
     && python3 -c "import sys; sys.path.insert(0, '/app/.claude/skills/pdf/scripts'); from emoji_font import resolve_emoji_font_path; p = resolve_emoji_font_path(); assert open(p, 'rb').read(4) == b'\\x00\\x01\\x00\\x00', 'not a TrueType font'; print('EmojiMono OK:', p)"
 

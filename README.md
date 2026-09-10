@@ -786,8 +786,9 @@ ReportLab **没有自动字体 fallback**：每个字符只用当前选中的那
 emoji 字形，系统里的 `NotoColorEmoji.ttf` 又是 CBDT 位图，ReportLab
 根本无法嵌入。修复方案（已内置）：
 
-- 技能内置**单色** `NotoEmoji-Regular.ttf`（glyf 轮廓，可嵌入），
-  路径可用 `APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT` 覆盖；
+- 镜像构建时下载安装**单色** `NotoEmoji-Regular.ttf`（glyf 轮廓，可嵌入，
+  Dockerfile 里固定版本号 + 校验 sha256，不随项目文件提交），路径可用
+  `APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT` 覆盖；
 - `.claude/skills/pdf/scripts/emoji_font.py` 提供按实际字体覆盖情况
   拆分混排文本的 helper：Paragraph 用 `to_fallback_markup()`，canvas
   用 `draw_mixed_string()` / `string_width_mixed()`；两个字体重叠

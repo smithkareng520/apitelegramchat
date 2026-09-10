@@ -14,9 +14,10 @@ Root cause of emoji "乱码" (black boxes / notdef glyphs) in generated PDFs:
 
 Fix provided by this module:
 
-* A **monochrome** Noto Emoji TTF is vendored with the skill
-  (``fonts/NotoEmoji-Regular.ttf``). It has real TrueType ``glyf``
-  outlines, so ReportLab can embed it like any other font.
+* A **monochrome** Noto Emoji TTF is installed into the production image by
+  the ``Dockerfile`` (downloaded at build time, not committed to this
+  repo — see the "Emoji handling" section of ``SKILL.md``). It has real
+  TrueType ``glyf`` outlines, so ReportLab can embed it like any other font.
 * ``register_emoji_font()`` registers it alongside the CJK font.
 * ``to_fallback_markup()`` converts plain mixed text into ReportLab
   Paragraph markup, wrapping emoji runs in ``<font name="EmojiMono">``
@@ -42,22 +43,30 @@ from pathlib import Path
 # Font discovery
 # --------------------------------------------------------------------------
 
-# Monochrome Noto Emoji, vendored with this skill. A *monochrome* TTF is
-# required because ReportLab can only embed TrueType glyf outlines; the
-# color CBDT font shipped for LibreOffice must never be fed to ReportLab.
+# Monochrome Noto Emoji. A *monochrome* TTF is required because ReportLab
+# can only embed TrueType glyf outlines; the color CBDT font shipped for
+# LibreOffice must never be fed to ReportLab.
+#
+# This font is NOT committed to the repo. The Dockerfile downloads it at
+# build time (pinned version, verified checksum) into a system font
+# directory — see the "Emoji handling" section of SKILL.md.
 EMOJI_FONT_FILENAME = "NotoEmoji-Regular.ttf"
 
 _EMOJI_FONT_CANDIDATES = (
     # 1. Explicit runtime override (set in the Docker image).
     os.environ.get("APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT", ""),
-    # 2. Vendored copy in the skill's fonts/ directory (works from any CWD;
-    #    this module lives in <skill>/scripts/, so the font is one level up).
-    str(Path(__file__).resolve().parent.parent / "fonts" / EMOJI_FONT_FILENAME),
-    # 3. Same vendored file, Docker image absolute path.
-    "/app/.claude/skills/pdf/fonts/" + EMOJI_FONT_FILENAME,
-    # 4. Distros that package the monochrome emoji font.
+    # 2. Production image path: installed by the Dockerfile into its own
+    #    directory (kept separate from distro-managed font dirs so it is
+    #    never shadowed or purged by an unrelated fontconfig package).
+    "/usr/share/fonts/truetype/noto-emoji-mono/" + EMOJI_FONT_FILENAME,
+    # 3. Distros that happen to package the monochrome emoji font under a
+    #    standard path.
     "/usr/share/fonts/truetype/noto/" + EMOJI_FONT_FILENAME,
     "/usr/share/fonts/truetype/emoji/" + EMOJI_FONT_FILENAME,
+    # 4. Local dev fallback: a copy placed next to this script's skill dir
+    #    (e.g. manually downloaded for local testing outside Docker). Not
+    #    part of the repo and not required for production.
+    str(Path(__file__).resolve().parent.parent / "fonts" / EMOJI_FONT_FILENAME),
 )
 
 # Unicode blocks where the emoji font wins even when the CJK font also has
@@ -89,13 +98,15 @@ def resolve_emoji_font_path() -> Path:
     raise FileNotFoundError(
         "Missing monochrome emoji font for ReportLab. Checked: "
         + ", ".join(c for c in _EMOJI_FONT_CANDIDATES if c)
-        + ". The skill vendors fonts/NotoEmoji-Regular.ttf; keep it in the "
-        "image or set APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT."
+        + ". The Dockerfile downloads NotoEmoji-Regular.ttf into the image "
+        "at build time (it is not committed to this repo); rebuild the "
+        "image, or set APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT to a local "
+        "copy for dev/testing."
     )
 
 
 def register_emoji_font(name: str = DEFAULT_EMOJI_FONT_NAME) -> str:
-    """Register the vendored monochrome emoji font with ReportLab."""
+    """Register the monochrome emoji font (installed by the Dockerfile) with ReportLab."""
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
 

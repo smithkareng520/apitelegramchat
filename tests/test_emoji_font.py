@@ -2,8 +2,14 @@
 
 ReportLab has no automatic font fallback and the production Kaiti CJK font
 contains zero emoji glyphs, so generated PDFs garble emoji into boxes.
-The skill now vendors a monochrome Noto Emoji TTF and ships coverage-driven
-helpers; these tests pin that behavior.
+
+The monochrome Noto Emoji TTF is NOT committed to this repo: the Dockerfile
+downloads a pinned, checksum-verified copy into the image at build time (see
+the "Emoji handling" section of SKILL.md). So the font is only guaranteed to
+be present when running inside the built image (or APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT
+points at a local copy for dev/testing) — tests that need the actual font
+bytes are skipped when neither is available, rather than asserting a vendored
+file that no longer exists by design.
 """
 
 import sys
@@ -12,7 +18,6 @@ from pathlib import Path
 import pytest
 
 PDF_SKILL_DIR = Path(".claude/skills/pdf")
-EMOJI_FONT_FILE = PDF_SKILL_DIR / "fonts" / "NotoEmoji-Regular.ttf"
 
 
 @pytest.fixture()
@@ -23,22 +28,41 @@ def emoji_font_module():
     return emoji_font
 
 
+def _available_emoji_font_path(emoji_font_module):
+    """Return the resolved font path, or None if not present in this env."""
+    try:
+        return emoji_font_module.resolve_emoji_font_path()
+    except FileNotFoundError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Static / packaging checks
 # ---------------------------------------------------------------------------
 
-def test_vendored_emoji_font_exists_and_is_truetype():
-    assert EMOJI_FONT_FILE.is_file(), "skill must vendor NotoEmoji-Regular.ttf"
-    with EMOJI_FONT_FILE.open("rb") as fh:
+def test_repo_does_not_vendor_the_emoji_font():
+    """The font is installed by the Dockerfile, not committed to the repo."""
+    assert not (PDF_SKILL_DIR / "fonts" / "NotoEmoji-Regular.ttf").exists(), (
+        "NotoEmoji-Regular.ttf must not be committed under the skill directory; "
+        "it is downloaded by the Dockerfile at build time instead"
+    )
+
+
+def test_emoji_font_is_truetype_when_available(emoji_font_module):
+    path = _available_emoji_font_path(emoji_font_module)
+    if path is None:
+        pytest.skip("emoji font not installed in this environment (expected outside Docker)")
+    with path.open("rb") as fh:
         head = fh.read(4)
     assert head == b"\x00\x01\x00\x00", "must be a TrueType (glyf) font, not CFF/CBDT"
 
 
-def test_emoji_font_module_prefers_env_then_vendored_copy(emoji_font_module):
-    vendored = emoji_font_module.resolve_emoji_font_path()
-    assert vendored.name == emoji_font_module.EMOJI_FONT_FILENAME
-    # The vendored copy next to the script must be one of the candidates.
-    assert vendored.is_file()
+def test_missing_font_raises_actionable_error(emoji_font_module, monkeypatch):
+    # Force every candidate to miss so the error path itself is exercised
+    # regardless of whether this environment happens to have the font.
+    monkeypatch.setattr(emoji_font_module, "_EMOJI_FONT_CANDIDATES", ("",))
+    with pytest.raises(FileNotFoundError, match="Dockerfile downloads"):
+        emoji_font_module.resolve_emoji_font_path()
 
 
 def test_emoji_preferred_blocks_cover_common_dingbats(emoji_font_module):
@@ -110,6 +134,9 @@ def test_register_and_markup_end_to_end(emoji_font_module):
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.platypus import Paragraph
     from reportlab.lib.styles import getSampleStyleSheet
+
+    if _available_emoji_font_path(emoji_font_module) is None:
+        pytest.skip("emoji font not installed in this environment (expected outside Docker)")
 
     emoji_font_module.register_emoji_font()
     assert emoji_font_module.font_missing_chars("✅🎯📊", "EmojiMono") == ()

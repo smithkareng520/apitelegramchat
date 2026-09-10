@@ -238,7 +238,7 @@ For scripts, prefer the bundled `scripts/cjk_font.py` helper so font paths and R
 
 ReportLab has **no automatic font fallback**: every character is drawn with the one font selected for the text object, and any glyph missing from that font renders as an empty box / black square. The production Kaiti CJK font (`AR PL UKai`) contains **zero emoji glyphs**, so emoji characters (✅ ❌ ✨ 🎯 📊 🚀 👍 …) that reach ReportLab directly become garbage in the PDF.
 
-The image ships the **monochrome Noto Emoji** font (real TrueType glyf outlines, embeddable) and the skill bundles it at `.claude/skills/pdf/fonts/NotoEmoji-Regular.ttf`. System **color** emoji fonts (e.g. `NotoColorEmoji.ttf`, CBDT/CBLC bitmaps) can **never** be embedded by ReportLab — do not use them.
+The production image installs the **monochrome Noto Emoji** font (real TrueType glyf outlines, embeddable) at build time — the `Dockerfile` downloads a pinned version, verifies its sha256, and installs it to `/usr/share/fonts/truetype/noto-emoji-mono/NotoEmoji-Regular.ttf`. The font file itself is **not** committed to this repo; do not re-add it under the skill directory. System **color** emoji fonts (e.g. `NotoColorEmoji.ttf`, CBDT/CBLC bitmaps) can **never** be embedded by ReportLab — do not use them.
 
 ### Rules
 
@@ -306,10 +306,13 @@ c.save()
 ### Emoji font facts
 
 - Registered name: `EmojiMono`
-- File: `.claude/skills/pdf/fonts/NotoEmoji-Regular.ttf` (vendored, Apache-2.0)
-- Override path: `APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT`
+- Production file: `/usr/share/fonts/truetype/noto-emoji-mono/NotoEmoji-Regular.ttf` — installed by the `Dockerfile` at build time (downloaded from the pinned `googlefonts/noto-emoji` tag and checksum-verified), **not** committed to this repo
+- Override path: `APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT` (also useful for pointing at a local copy during dev/testing outside Docker)
+- License: SIL Open Font License 1.1 (upstream `googlefonts/noto-emoji`)
 - Covers all standard emoji codepoints including ZWJ sequences and skin-tone modifiers; variation selector U+FE0F is zero-width
 - Does **not** cover CJK, kana, arrows (→), math symbols (± × ÷ ≠ ≈), circled numbers (①) — those come from the CJK font, which is exactly what the fallback logic arranges
+
+To bump the font version, update `NOTO_EMOJI_VERSION` and `NOTO_EMOJI_SHA256` in the `Dockerfile` together — never one without the other, or the checksum check will fail the build (by design; that's the supply-chain guard).
 
 The runtime check `scripts/check_cjk_runtime.py` verifies the emoji font presence, embeddability, and sample glyph coverage alongside the CJK checks.
 
