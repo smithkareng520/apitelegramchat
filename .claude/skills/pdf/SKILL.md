@@ -248,6 +248,24 @@ The image ships the **monochrome Noto Emoji** font (real TrueType glyf outlines,
 4. Emoji render in monochrome (black outline, inherits the paragraph's text color). Color emoji in ReportLab PDFs is not possible; if the user explicitly needs color emoji, render that paragraph as an image or strip the emoji instead.
 5. For canvas text (tables drawn manually, headers, watermarks), use `draw_mixed_string` / `string_width_mixed`, not `drawString`.
 
+### IMPORTANT: Common Mistake to Avoid
+
+<b>❌ WRONG</b> — Do NOT pass a ParagraphStyle object to `to_fallback_markup()`:
+```python
+# 错误：传入 styles['BodyTextCJK'] 对象会导致 KeyError
+text = to_fallback_markup("你好 🎯", styles['BodyTextCJK'])  
+```
+
+<b>✅ CORRECT</b> — Pass the font name string as the second argument:
+```python
+# 正确：字体名称字符串 "CJKKai"
+markup = to_fallback_markup("你好 🎯", "CJKKai")
+story.append(Paragraph(markup, styles['BodyTextCJK']))
+```
+
+<b>关键规则</b>：
+<ul><li><code>to_fallback_markup(text, base_font)</code> 的第二个参数是 <b>字体名称字符串</b>（如 `"CJKKai"`），不是 ParagraphStyle 对象</li><li><code>Paragraph(markup, style)</code> 的第二个参数才是 ParagraphStyle 对象</li></ul>
+
 ### Paragraph example
 
 ```python
