@@ -276,8 +276,8 @@ _BASE_PROMPT = """
 <hr/>
 
 <h3>三、来源标注</h3>
-<p>新闻、科学事实、统计数据、技术文档、学术论文、法律条文、历史事件、研究报告等各类信息，必须应标注来源</p>
-<p>当标注来源时，使用 <tg-button type="url" url="链接">显示文本</tg-button> 格式紧贴到需要标注的文本后。显示文本的语言应与来源语言一致：英文网站用英文名称（如 <code>The Wall Street Journal</code>、<code>VOA Chinese</code>），中文网站用中文名称（如 <code>财新网</code>、<code>澎湃新闻</code>）。</p>
+<p>当标注来源时，使用 <tg-button type="url" url="链接">显示文本</tg-button> 按钮链接格式紧贴到需要标注的文本后。显示文本的语言应与来源语言一致：英文网站用英文名称（如 <code>The Wall Street Journal</code>、<code>VOA Chinese</code>），中文网站用中文名称（如 <code>财新网</code>、<code>澎湃新闻</code>）。</p>
+<p>新闻、科学事实、统计数据、技术文档、学术论文、法律条文、历史事件、研究报告等各类信息，必须标注来源</p>
 
 """
 
@@ -687,39 +687,14 @@ async def get_ai_response(
             if is_timer:
                 messages.append(Message.system(
                         "当前会话已关闭草稿预览（静默模式，/show off），且本轮是 TIMER 后台"
-                        "主动巡检回合：你的流式输出与本轮最终回复不会自动送达用户，系统也不会"
-                        "兜底发送。若需要用户看到本轮内容，必须先把完整、自包含的最终回复直接"
-                        "写成消息正文，并在同一条消息中调用 deliver_reply 且显式填写 send=true"
-                        "（系统会把该正文的 content 本身用 sendRichMessage 永久发送给用户，"
-                        "不经过草稿，也不附带其他内容）；send=false 或不填均表示不发送"
-                        "（TIMER 回合默认 false，与不调用语义等价）。特别强调：deliver_reply "
-                        "是本次请求工具列表中真实存在的函数，在正文里用文字\"声称已通过 "
-                        "deliver_reply 发送\"不会有任何效果——必须通过 tool_calls API 真正"
-                        "发起调用，否则用户什么都收不到。交付成功后不要再调用 deliver_reply，"
-                        "也不要输出\"已发送/已确认\"之类的确认正文——用户已经收到，重复确认"
-                        "只会造成冗余消息。需要提问或留言可用 message_user（其超时表示用户"
-                        "不在，不是错误）。若整轮无需用户知晓，可以不调用任何交付工具，保持"
-                        "静默。注意：用户主动发消息的静默回合里 send 缺省值是 true，与本回合"
-                        "不同。"))
+                        "当前用户默认看不到Agent轮次信息"
+                        "你可以调用 deliver_reply 且 send=true来发送Agent轮次中最后一条的文本信息"
+                        "可以调用 message_user 工具与用户交流，但是用户可能不在"))
             else:
                 messages.append(Message.system(
-                        "当前会话已关闭草稿预览（静默模式，/show off），本轮是用户主动发来的"
-                        "消息：默认交付——你的流式输出不会实时展示，你在工具调用之间输出的"
-                        "中间正文用户也看不到；回合结束时，系统会把本轮**最后一条非空助手"
-                        "消息的正文本身**（content 字段，经 sendRichMessage 永久发送，不经过"
-                        "草稿、不附带中间过程）自动交付给用户，无需为此做额外操作。因此请"
-                        "务必把完整、自包含的最终回复写成最后一条消息的正文——中间轮次的"
-                        "过程性文字用户不会收到。也可以在同一条消息中调用 deliver_reply 主动"
-                        "交付（send=true 或不填，本回合默认 true；系统同样发送该正文的 content "
-                        "本身，与收尾自动交付完全同源）。只有当你明确判断本轮内容不该发给"
-                        "用户时，才调用 deliver_reply "
-                        "并显式填写 send=false——此后本轮完全静默，系统不再兜底发送，用户"
-                        "不会收到任何内容。特别强调：deliver_reply 是本次请求工具列表中真实"
-                        "存在的函数，在正文里用文字\"声称已通过 deliver_reply 发送\"不会有任何"
-                        "效果——必须通过 tool_calls API 真正发起调用。交付成功后不要再调用 "
-                        "deliver_reply，也不要输出\"已发送/已确认\"之类的确认正文——用户已经"
-                        "收到，重复确认只会造成冗余消息。需要提问或留言可用 message_user"
-                        "（其超时表示用户不在，不是错误）。"))
+                        "当前用户默认能看到Agent轮次中最后一条的文本信息"
+                        "你可以调用 deliver_reply 且 send=false来取消发送Agent轮次中最后一条的文本信息"
+                        "可以调用 message_user 工具与用户交流，但是用户可能不在"))
 
         # 缓存断点改由协议循环在每轮"渲染后的 wire dict"上统一打
         # （openai_chat: agentic_loops 每轮重打；anthropic_messages:
@@ -773,12 +748,9 @@ async def get_ai_response(
             # TIMER 回合说明：统一草稿流后，/show on 时过程与最终回复对用户
             # 可见；/show off 时静默，交付渠道是 deliver_reply / message_user。
             messages.append(Message.system(
-                    "TIMER 是主动巡检回合，不是普通问答。先检查 Todo，再结合最近上下文判断："
+                    "这是被动触发的Agent过程，不是用户发来的。先检查 Todo，再结合最近上下文判断："
                     "有具体价值就自然地告知或推进；没有合理行动就保持简短，不要为了完成回合"
-                    "而寒暄，也不要输出“我会等待”等等待式文本。需要用户回应时用 message_user；"
-                    "静默模式下需要用户看到结论时，把结论写成消息正文并调用 deliver_reply"
-                    "（显式 send=true，系统会把该正文直接发送给用户；TIMER 回合不填 send 默认"
-                    "false 即不发送，交付后不要再重复确认）。"))
+                    "而寒暄，也不要输出“我会等待”等等待式文本。可以调用 message_user 工具与用户交流，但是用户可能不在；"))
             raw_content, usage, new_msgs = await _call_api(
                 current_model, model_info, messages, chat_id, builder,
                 tools=timer_tools, journal=journal,
