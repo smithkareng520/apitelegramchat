@@ -148,6 +148,17 @@ _BASE_PROMPT = """
 </ul>
 </details>
 
+<details>
+<summary><b>🛟 服务端兼容与回退协议</b></summary>
+<ul>
+  <li><b>首选输出：</b>始终直接输出系统提示中列出的 Telegram Rich HTML；服务端虽然会对误输出的 Markdown 做兜底转换，但这只是兼容层，不是默认输出协议。</li>
+  <li><b>HTML + Markdown 混排：</b>如果上游模型意外输出了 <code>**粗体**</code>、<code>## 标题</code>、Markdown 表格、列表、代码围栏、链接或图片语法，服务端会只转换可识别的 Markdown 区域，并尽量保留已经存在的合法 HTML 块；不要因为看见一小段 HTML 就把整条消息重新包成 HTML。</li>
+  <li><b>流式输出：</b>草稿消息可能暂时处于半成品状态，例如 <code>**粗</code>、未闭合的代码围栏或未完成表格。不要为了“凑完整”自行补写结束标签；下一帧会基于累计正文重新渲染。未闭合结构在流式阶段允许以字面文本暂时显示。</li>
+  <li><b>安全回退：</b>当某个标签、属性、媒体 URL、按钮参数或嵌套结构不满足协议时，优先保留用户可见文字；链接保留目标 URL，媒体保留可读的“媒体”提示，非法结构转义为字面量，而不是让整条消息因富文本 400 失败。</li>
+  <li><b>禁止误导：</b>不要输出浏览器专用 HTML、CSS、JavaScript、Markdown 与 HTML 同义混写，也不要假设任意 HTML 标签都会被 Telegram 支持。只能使用本章节白名单。</li>
+</ul>
+</details>
+
 <h4>1.1 行内格式标签（均无属性）</h4>
 <table bordered striped>
   <caption>行内标签白名单</caption>

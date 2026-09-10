@@ -109,6 +109,73 @@ def test_table_with_inline_markdown_in_cells():
     assert "<td><code>code</code></td>" in out
 
 
+def test_mixed_existing_code_block_and_markdown_afterwards():
+    text = (
+        "<pre><code>print(1)</code></pre>\n\n"
+        "**基本信息**\n\n"
+        "| 模块 | 内容 |\n|------|------|\n| **姓名** | 张三 |"
+    )
+    out = convert(text)
+    assert '<pre><code>print(1)</code></pre>' in out
+    assert '<b>基本信息</b>' in out
+    assert '<table bordered striped>' in out
+    assert '<td><b>姓名</b></td>' in out
+
+
+def test_mixed_existing_details_and_markdown_afterwards():
+    text = '<details open><summary>工具</summary><p>内容</p></details>\n\n**结果**'
+    out = convert(text)
+    assert '<details open><summary>工具</summary><p>内容</p></details>' in out
+    assert '<b>结果</b>' in out
+
+
+def test_mixed_existing_paragraph_and_markdown():
+    text = '<p>已有 HTML</p>\n\n- item'
+    out = convert(text)
+    assert out == '<p>已有 HTML</p>\n\n<ul><li>item</li></ul>'
+
+
+def test_unterminated_code_fence_does_not_parse_inner_markdown():
+    text = '```python\n**not bold**'
+    out = convert(text)
+    assert '<b>not bold</b>' not in out
+    assert '**not bold**' in out
+
+
+def test_conversion_exception_has_readable_plaintext_fallback(monkeypatch):
+    import markdown_converter as module
+
+    def boom(_text):
+        raise RuntimeError('simulated parser failure')
+
+    monkeypatch.setattr(module, '_convert_mixed_document', boom)
+    out = module.convert_markdown_to_telegram_html(
+        '<p>说明</p> 链接 [文档](https://example.com) 与 **重点**'
+    )
+    assert '说明' in out
+    assert 'https://example.com' in out
+    assert '&lt;p&gt;' not in out
+    assert '<b>' not in out
+
+
+def test_nested_pre_inside_existing_details_keeps_structure():
+    text = (
+        '<details><summary>命令</summary>\n'
+        '<pre><code>echo **not markdown**</code></pre>\n'
+        '**结果**</details>'
+    )
+    out = convert(text)
+    assert '<details><summary>命令</summary>' in out
+    assert '<pre><code>echo **not markdown**</code></pre>' in out
+    assert '<b>结果</b></details>' in out
+
+
+def test_spoiler_and_autolink_markdown():
+    out = convert('||秘密|| 与 <https://example.com>')
+    assert '<tg-spoiler>秘密</tg-spoiler>' in out
+    assert '<a href="https://example.com">https://example.com</a>' in out
+
+
 # ---------------------------------------------------------------------
 # 行内元素
 # ---------------------------------------------------------------------

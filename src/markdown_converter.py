@@ -17,18 +17,61 @@ logger = logging.getLogger(__name__)
 # &amp;amp;（用户侧会看到字面量 "&amp;" 而不是 "&"）。
 _BARE_AMP_RE = re.compile(r'&(?![A-Za-z][A-Za-z0-9]*;|#[0-9]+;|#[xX][0-9A-Fa-f]+;)')
 
-# 块级标签切分：把「文字 + 块级标签混排」的转换产物按块切开。
-# 非贪婪匹配 + DOTALL（<pre> 的代码内容可跨多行）。
-# <hr/> 为自闭合标签，单独列出（<p> 内出现 <hr/> 同样属于非法嵌套）。
+# Telegram Rich HTML 的块级容器。
+# 这些块一旦已经是 HTML，就应当作为“原子块”保留；只转换块与块之间的
+# 自由文本/Markdown，而不能因为其中出现一个 <pre> 或 <details> 就把整条消息
+# 短路。
+# _RICH_BLOCK_SPLIT_RE 用于最终块级包装；_OPAQUE_HTML_SPLIT_RE 只用于
+# Markdown 转换阶段。列表、段落、details、表格等“容器”并不需要整块冻结，
+# 这样其中意外出现的 Markdown 仍能被修复；pre/media/button/math 等则视为
+# 不可安全猜测其内部语义的 opaque block。
 _RICH_BLOCK_SPLIT_RE = re.compile(
-    r'(<details>.*?</details>|<ul>.*?</ul>|<ol>.*?</ol>|<pre>.*?</pre>'
-    r'|<blockquote>.*?</blockquote>|<table>.*?</table>'
-    r'|<h[1-6]>.*?</h[1-6]>|<hr\s*/?>)',
+    r'('
+    r'<p\b[^>]*>.*?</p\s*>'
+    r'|<details\b[^>]*>.*?</details\s*>'
+    r'|<ul\b[^>]*>.*?</ul\s*>'
+    r'|<ol\b[^>]*>.*?</ol\s*>'
+    r'|<pre\b[^>]*>.*?</pre\s*>'
+    r'|<blockquote\b[^>]*>.*?</blockquote\s*>'
+    r'|<table\b[^>]*>.*?</table\s*>'
+    r'|<h[1-6]\b[^>]*>.*?</h[1-6]\s*>'
+    r'|<aside\b[^>]*>.*?</aside\s*>'
+    r'|<footer\b[^>]*>.*?</footer\s*>'
+    r'|<figure\b[^>]*>.*?</figure\s*>'
+    r'|<tg-slideshow\b[^>]*>.*?</tg-slideshow\s*>'
+    r'|<video\b[^>]*>.*?</video\s*>'
+    r'|<audio\b[^>]*>.*?</audio\s*>'
+    r'|<tg-button\b[^>]*>.*?</tg-button\s*>'
+    r'|<tg-math-block\b[^>]*>.*?</tg-math-block\s*>'
+    r'|<hr\b[^>]*/?>'
+    r'|<img\b[^>]*/?>'
+    r'|<tg-map\b[^>]*/?>'
+    r')',
     re.DOTALL | re.IGNORECASE,
 )
 
-# 视为「已是块级/段落结构」的前缀。'<h' 同时覆盖 <h1>..<h6> 与 <hr/>。
-_BLOCK_START_PREFIXES = ('<p>', '<details', '<h', '<ul>', '<ol>', '<pre>', '<blockquote>', '<table>')
+_OPAQUE_HTML_SPLIT_RE = re.compile(
+    r'('
+    r'<pre\b[^>]*>.*?</pre\s*>'
+    r'|<figure\b[^>]*>.*?</figure\s*>'
+    r'|<tg-slideshow\b[^>]*>.*?</tg-slideshow\s*>'
+    r'|<video\b[^>]*>.*?</video\s*>'
+    r'|<audio\b[^>]*>.*?</audio\s*>'
+    r'|<tg-button\b[^>]*>.*?</tg-button\s*>'
+    r'|<tg-math-block\b[^>]*>.*?</tg-math-block\s*>'
+    r'|<hr\b[^>]*/?>'
+    r'|<img\b[^>]*/?>'
+    r'|<tg-map\b[^>]*/?>'
+    r')',
+    re.DOTALL | re.IGNORECASE,
+)
+
+_BLOCK_START_PREFIXES = (
+    '<p>', '<p ', '<details', '<h', '<ul>', '<ul ', '<ol>', '<ol ',
+    '<pre>', '<pre ', '<blockquote', '<table>', '<table ', '<aside', '<footer',
+    '<figure', '<tg-slideshow', '<video', '<audio', '<tg-button', '<tg-math-block',
+    '<hr', '<img', '<tg-map',
+)
 
 
 def _escape_prose(text: str) -> str:
@@ -173,41 +216,81 @@ def sanitize_tg_buttons(html: str) -> str:
     return "".join(out)
 
 
+def _convert_mixed_document(text: str) -> str:
+    """转换 HTML/Markdown 混合文档，同时保持 HTML 容器嵌套结构。
+
+    不能简单 split 掉 ``<pre>`` / ``<img>``：例如 ``<details>`` 内部有
+    ``<pre>`` 时，split 会把内部块“抬到” details 外面，造成新的非法嵌套。
+    这里采用占位符保护：只保护 opaque block，本身不拆容器，转换完成后再回填。
+    """
+    shelf: List[str] = []
+
+    def _park_opaque(match: re.Match) -> str:
+        shelf.append(match.group(1))
+        return f'\x00RICH{len(shelf) - 1}\x00'
+
+    protected = _OPAQUE_HTML_SPLIT_RE.sub(_park_opaque, text)
+    converted = _convert(protected)
+    for index, fragment in enumerate(shelf):
+        converted = converted.replace(f'\x00RICH{index}\x00', fragment)
+    return converted
+
+
+def _looks_like_rich_block(text: str) -> bool:
+    stripped = text.lstrip()
+    lower = stripped.lower()
+    return lower.startswith(_BLOCK_START_PREFIXES)
+
+
+def _readable_plaintext_fallback(text: str) -> str:
+    """Markdown/HTML 转换异常时生成可发送的、可读的纯文本 HTML。
+
+    发送层最不应该做的事情是为了格式化失败而让整条消息 400。这个回退保留
+    链接 URL、媒体提示和换行，并把其它 HTML 标记安全转义，让用户至少拿到
+    完整内容。
+    """
+    value = text or ''
+    value = re.sub(
+        r'<a\b[^>]*?href=["\']([^"\']+)["\'][^>]*>(.*?)</a\s*>',
+        lambda m: f'{m.group(2)} ({m.group(1)})',
+        value, flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(
+        r'<(?:img|video|audio)\b[^>]*?src=["\']([^"\']+)["\'][^>]*/?>',
+        lambda m: f'[媒体: {m.group(1)}]',
+        value, flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(r'<br\s*/?>', '\n', value, flags=re.IGNORECASE)
+    value = re.sub(r'</(?:p|div|h[1-6]|li|blockquote|tr|details|figure|footer|aside)\s*>', '\n', value, flags=re.IGNORECASE)
+    value = re.sub(r'<[^>]+>', '', value)
+    value = html_lib.unescape(value)
+    return html_lib.escape(value, quote=False).replace('\n', '<br/>')
+
+
 def convert_markdown_to_telegram_html(text: str) -> str:
-    """将 Markdown 语法转换为 Telegram Rich Message HTML。
-    
-    采用智能逐块转换策略：
-    - 已经是完整 HTML 块的部分保持原样
-    - 检测到 Markdown 语法的部分进行转换
-    - 支持 HTML 和 Markdown 混合的内容
-    
-    Args:
-        text: 可能包含 Markdown、HTML 或两者混合的文本
-        
-    Returns:
-        转换后的 Telegram HTML
+    """将 Markdown / 混合 HTML 转为 Telegram Rich Message HTML。
+
+    处理策略：
+    - 已有合法 Rich HTML 块按块保护，不再因为出现一个 ``<pre>`` 就短路整条消息；
+    - HTML 块外的 Markdown 独立转换，因此 ``<pre>...</pre>`` 后面的 ``**粗体**``
+      / 表格 / 列表仍会被处理；
+    - 流式场景允许“未闭合 Markdown”暂时原样显示，下一帧累计完整后自动恢复格式；
+    - 转换器自身发生异常时回退为可读纯文本 HTML，优先保证送达。
     """
     if not text or not text.strip():
         return text
 
-    # 0.5 已经是 Telegram HTML 的工具输出不要再次经过 Markdown 转换。
-    # tool/bash 结果会包含 <pre><code> 中的原始文本，二次转换会把
-    # 第一次生成的 &lt; / &gt; 当作普通字符继续处理，导致用户看到实体。
-    # 保留代码块隔离，避免 bash 内容污染后续富文本。
-    if "<pre><code" in text and "</code></pre>" in text:
-        return text
-
-    # 0. <tg-button> 强模式校验：必须先于「是否含 Markdown」的短路判断
-    #    执行——纯 HTML 消息同样可能携带非法按钮，若在短路透传之后才
-    #    处理，原始 <tg-button> 会直达发送层触发 BUTTON_URL_INVALID。
+    # 先做按钮结构兜底；即使整条消息已经是 HTML，也必须检查。
     text = sanitize_tg_buttons(text)
 
-    # 如果完全不包含 Markdown 语法，直接返回
-    if not _contains_markdown(text):
-        return text
-    
-    # 执行智能转换
-    return _convert(text)
+    try:
+        if not _contains_markdown(text):
+            # 没有 Markdown 时，仍然返回现有 HTML/纯文本原貌。
+            return text
+        return _convert_mixed_document(text)
+    except Exception:
+        logger.exception('Markdown → Telegram HTML 转换异常，已回退为可读纯文本')
+        return _readable_plaintext_fallback(text)
 
 
 def _is_already_html(text: str) -> bool:
@@ -240,14 +323,18 @@ def _contains_markdown(text: str) -> bool:
         r'\*\*[^*]+\*\*',  # 粗体
         r'__[^_]+__',  # 粗体
         r'\*[^*]+\*',  # 斜体
-        r'_[^_]+_',  # 斜体
+        r'(?<!\w)_[^_\n]+_(?!\w)',  # 斜体
         r'~~[^~]+~~',  # 删除线
+        r'\|\|[^|]+\|\|',  # 常见 spoiler Markdown 方言
         r'`[^`]+`',  # 行内代码
         r'```[\s\S]*?```',  # 代码块
+        r'~~~[\s\S]*?~~~',  # alternative code fence
         r'!\[.*?\]\(.*?\)',  # 图片
         r'\[.*?\]\(.*?\)',  # 链接
+        r'<https?://[^>]+>',  # Markdown 自动链接
         r'^\s*[-*+]\s+',  # 无序列表
-        r'^\s*\d+\.\s+',  # 有序列表
+        r'^\s*[-*+]\s+\[[ xX]\]\s+',  # task list
+        r'^\s*\d+[.)]\s+',  # 有序列表
         r'^>\s+',  # 引用
         r'^[-*_]{3,}\s*$',  # 水平线
         r'^\|.+\|',  # 表格
@@ -269,15 +356,29 @@ def _convert(text: str) -> str:
     while i < len(lines):
         line = lines[i]
         
-        # 代码块（需要先处理，避免内部被转义）
+        # 代码块（需要先处理，避免内部被转义）。流式阶段可能只有开始围栏
+        # 没有结束围栏；此时不要擅自把半成品闭合成 <pre>，否则代码里的
+        # **bold** / [link](...) 会被错误解析。保留围栏本身，等待下一帧补齐。
         if line.strip().startswith('```'):
+            closing_index = None
+            for j in range(i + 1, len(lines)):
+                if lines[j].strip() == '```':
+                    closing_index = j
+                    break
+            if closing_index is None:
+                # 未闭合围栏意味着余下内容仍属于“可能是代码”的流式半成品。
+                # 整段原样作为安全文本显示，绝不在其中执行 Markdown 替换；
+                # 下一帧补齐 ``` 后，整个累计 buffer 会重新转换。
+                result.append(_escape_prose('\n'.join(lines[i:])))
+                break
             code_block, lines_consumed = _extract_code_block(lines[i:])
             result.append(code_block)
             i += lines_consumed
             continue
         
-        # 表格（需要整体处理多行）
-        if _is_table_row(line):
+        # 表格（需要整体处理多行）。仅有一行 ``||文本||`` 不能算表格，
+        # 否则会把 Markdown spoiler 误判为表格并导致 ``||`` 原样漏出。
+        if _is_table_row(line) and i + 1 < len(lines) and _is_table_delimiter(lines[i + 1]):
             table_html, lines_consumed = _extract_table(lines[i:])
             result.append(table_html)
             i += lines_consumed
@@ -310,7 +411,7 @@ def _convert(text: str) -> str:
             continue
         
         # 有序列表
-        if re.match(r'^\s*\d+\.\s+', line):
+        if re.match(r'^\s*\d+[.)]\s+', line):
             list_html, lines_consumed = _extract_ordered_list(lines[i:])
             result.append(list_html)
             i += lines_consumed
@@ -342,7 +443,7 @@ def _convert_heading(line: str) -> str:
 def _extract_code_block(lines: List[str]) -> Tuple[str, int]:
     """提取代码块。返回 (HTML, 消耗的行数)。"""
     first_line = lines[0].strip()
-    lang_match = re.match(r'^```(\w+)?', first_line)
+    lang_match = re.match(r'^```([\w+.-]+)?', first_line)
     lang = lang_match.group(1) if lang_match and lang_match.group(1) else ''
     
     code_lines = []
@@ -372,6 +473,16 @@ def _is_table_row(line: str) -> bool:
     """检测是否为表格行。"""
     stripped = line.strip()
     return stripped.startswith('|') and stripped.endswith('|') and stripped.count('|') >= 2
+
+
+def _is_table_delimiter(line: str) -> bool:
+    """判断一行是否确实是 Markdown 表格分隔线。"""
+    if not _is_table_row(line):
+        return False
+    cells = _parse_table_row(line)
+    if not cells:
+        return False
+    return all(bool(re.fullmatch(r':?-{1,}:?', cell.strip())) for cell in cells)
 
 
 def _extract_table(lines: List[str]) -> Tuple[str, int]:
@@ -467,7 +578,12 @@ def _extract_unordered_list(lines: List[str]) -> Tuple[str, int]:
         line = lines[i]
         match = re.match(r'^\s*([-*+])\s+(.+)$', line)
         if match:
-            content = _convert_inline(match.group(2))
+            content = match.group(2)
+            task = re.match(r'^\[[ xX]\]\s+(.+)$', content)
+            if task:
+                checked = content[1].lower() == 'x'
+                content = ('☑ ' if checked else '☐ ') + task.group(1)
+            content = _convert_inline(content)
             list_items.append(f'<li>{content}</li>')
             i += 1
         else:
@@ -484,7 +600,7 @@ def _extract_ordered_list(lines: List[str]) -> Tuple[str, int]:
     
     while i < len(lines):
         line = lines[i]
-        match = re.match(r'^\s*\d+\.\s+(.+)$', line)
+        match = re.match(r'^\s*\d+[.)]\s+(.+)$', line)
         if match:
             content = _convert_inline(match.group(1))
             list_items.append(f'<li>{content}</li>')
@@ -527,21 +643,34 @@ def _convert_inline(text: str) -> str:
         text,
     )
 
-    # 2) 既有 HTML 标签原样保留（支持 HTML/Markdown 混排）。
+    # 2) Markdown 自动链接与 spoiler：先于 HTML 标签保护。
+    text = re.sub(
+        r'<(https?://[^>]+)>',
+        lambda m: _park(f'<a href="{_escape_attr(m.group(1))}">{html_lib.escape(m.group(1))}</a>'),
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r'\|\|([^|\n]+)\|\|',
+        lambda m: _park(f'<tg-spoiler>{html_lib.escape(m.group(1))}</tg-spoiler>'),
+        text,
+    )
+
+    # 3) 既有 HTML 标签原样保留（支持 HTML/Markdown 混排）。
     #    要求真实标签形状（<字母/!/开头），避免把比较表达式
     #    （如 `a < b && c > d`）误认成标签。
     #    注意：此时行内代码已被保护，代码中的 `<b>` 已转义为 &lt;b&gt; 并存入保护区，
     #    不会被此规则再次匹配。
     text = re.sub(r'<[a-zA-Z!/][^>]*>', lambda m: _park(m.group(0)), text)
 
-    # 3) 图片（须先于链接，否则 ![]() 的 [] 会被链接规则吃掉）
+    # 4) 图片（须先于链接，否则 ![]() 的 [] 会被链接规则吃掉）
     text = re.sub(
         r'!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)',
         lambda m: _park(f'<img src="{_escape_attr(m.group(2))}"/>'),
         text,
     )
 
-    # 4) 链接：href 与文本分别转义后整体保护，URL 中的 _ 不会变斜体
+    # 5) 链接：href 与文本分别转义后整体保护，URL 中的 _ 不会变斜体
     text = re.sub(
         r'\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)',
         lambda m: _park(
@@ -550,12 +679,12 @@ def _convert_inline(text: str) -> str:
         text,
     )
 
-    # 5) 剩下的是纯文本：转义裸露的 < > &，避免 "a < b" 被当成标签。
+    # 6) 剩下的是纯文本：转义裸露的 < > &，避免 "a < b" 被当成标签。
     #    用 _escape_prose 而非 html.escape：模型按提示词输出的正文里
     #    已包含合法实体（&amp;、&lt;、&#39;），二次转义会让用户看到字面量。
     text = _escape_prose(text)
 
-    # 6) 强调符号（此时已无代码/URL 干扰）
+    # 7) 强调符号（此时已无代码/URL 干扰）
     text = re.sub(r'\*\*\*([^*]+)\*\*\*', r'<b><i>\1</i></b>', text)
     text = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'(?<![\w\\])__([^_]+)__(?!\w)', r'<b>\1</b>', text)
@@ -564,7 +693,7 @@ def _convert_inline(text: str) -> str:
     # 下划线斜体只在词边界生效，snake_case 标识符不受影响
     text = re.sub(r'(?<![\w\\])_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)', r'<i>\1</i>', text)
 
-    # 7) 回填保护片段。嵌套场景（如行内代码内部又包含已保护的标签）
+    # 8) 回填保护片段。嵌套场景（如行内代码内部又包含已保护的标签）
     #    需要迭代回填，否则内层占位符会以原始 \x00 字节残留。上限防呆：
     #    正常输入嵌套不超过 2-3 层；循环次数耗尽仍有残留时保持现状返回。
     def _unpark(m: re.Match) -> str:

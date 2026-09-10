@@ -10,7 +10,11 @@ from typing import Optional
 
 import aiohttp
 
-from markdown_converter import convert_markdown_to_telegram_html, sanitize_tg_buttons
+from markdown_converter import (
+    convert_markdown_to_telegram_html,
+    sanitize_tg_buttons,
+    _readable_plaintext_fallback,
+)
 
 from core.text_utils import _SMART_AMP_PATTERN
 
@@ -867,21 +871,14 @@ def strip_html_tags(text: str) -> str:
 
 
 def _rich_message_plain_text_fallback(html_content: str) -> str:
-    """将被 Rich Message 服务端拒绝的 HTML 降级为一个安全的段落。
+    """将被 Rich Message 服务端拒绝的内容降级为可读的安全 HTML。
 
-    模型或工具输出有时仅包含内联标签，或在 ``details`` 中缺少块级内容。此类
-    HTML 视觉上并非空白，但 Telegram 会返回 ``RICH_MESSAGE_CONTENT_REQUIRED``。
-    这里保留其可见文本并转义为单个 ``<p>``，以保证用户不会因格式问题丢失回复。
-
-    顺序很重要：先 strip 标签，再 unescape 实体，最后**重新转义**输出，避免
-    上游 HTML 中的 ``&lt;script&gt;`` 被 unescape 后再次注入回最终 HTML。
+    与简单 ``strip_html_tags`` 不同，这里尽量保留用户真正需要的信息：
+    超链接会留下“文字 (URL)”，图片/视频/音频会留下媒体 URL 提示，换行
+    会保留为 ``<br/>``；未知标签则只剥离标签本身，不让结构错误继续触发 400。
     """
-    visible_text = strip_html_tags(html_content or "")
-    visible_text = html.unescape(visible_text)
-    visible_text = re.sub(r"\s+", " ", visible_text).strip()
-    if not visible_text:
+    readable = _readable_plaintext_fallback(html_content or "")
+    if not readable:
         return ""
-    # 重新转义，确保 unescape 出来的 <、>、& 不会被当作 HTML。
-    visible_text = _SMART_AMP_PATTERN.sub('&amp;', visible_text)
-    visible_text = visible_text.replace('<', '&lt;').replace('>', '&gt;')
-    return f"<p>{visible_text}</p>"
+    # 转换器已完成实体安全处理；单段 <p> 是 Telegram 最保守的块结构。
+    return f"<p>{readable}</p>" if not readable.lstrip().startswith('<p>') else readable
