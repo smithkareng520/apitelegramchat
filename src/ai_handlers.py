@@ -433,6 +433,21 @@ def _build_initial_messages(system_prompt: str) -> list:
     return [Message.system(system_prompt)]
 
 
+async def _maybe_start_media_wizard(chat_id: int, model_id: str, user_message: Optional[dict]) -> bool:
+    """USER 回合命中图像/视频生成分支时改为发"交互参数卡片"。
+
+    卡片会话接管本回合（用户在卡片上配置参数/补传素材后点提交，生成以
+    turn 任务驱动媒体循环）。任何异常都回退 False → 走直接生成的旧流程，
+    卡片故障绝不阻断生成可用性。
+    """
+    try:
+        from media_wizard import start_media_wizard_turn
+        return await start_media_wizard_turn(chat_id, model_id, user_message)
+    except Exception:
+        logger.warning("媒体参数卡片启动失败，回退直接生成", exc_info=True)
+        return False
+
+
 async def get_ai_response(
         chat_id: int,
         user_models: dict,
@@ -720,14 +735,21 @@ async def get_ai_response(
             _sig = "VIDEO_ERROR" if _model_route == "video" else "IMAGE_ERROR"
             raw_content, usage, new_msgs = f"{_sig}:{_preflight.verdict.block_reason}", None, []
         elif _model_route == "video":
-            raw_content, usage, new_msgs = await _agentic_loop_native_video(
-                current_model, messages, builder, chat_id, journal=journal
-            )
+            if not is_timer and await _maybe_start_media_wizard(chat_id, current_model, user_message):
+                # 交互参数卡片已发出：本回合到此为止（用户在卡片上配置后提交）
+                raw_content, usage, new_msgs = "MEDIA_WIZARD", None, []
+            else:
+                raw_content, usage, new_msgs = await _agentic_loop_native_video(
+                    current_model, messages, builder, chat_id, journal=journal
+                )
         elif _model_route == "image":
-            client = api_client.get_client_for_model(model_info)
-            raw_content, usage, new_msgs = await _agentic_loop_native_image(
-                cast("AsyncOpenAI", client), current_model, messages, builder, chat_id, journal=journal
-            )
+            if not is_timer and await _maybe_start_media_wizard(chat_id, current_model, user_message):
+                raw_content, usage, new_msgs = "MEDIA_WIZARD", None, []
+            else:
+                client = api_client.get_client_for_model(model_info)
+                raw_content, usage, new_msgs = await _agentic_loop_native_image(
+                    cast("AsyncOpenAI", client), current_model, messages, builder, chat_id, journal=journal
+                )
         elif is_timer:
             # TIMER 使用"安全主动工具面"，而不是完整 USER 工具面。
             # 后台巡检允许读取/搜索信息、检查 Todo/Memory，并通过
@@ -794,6 +816,18 @@ async def get_ai_response(
             except Exception:
                 logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
                 pass
+
+        if raw_content == "MEDIA_WIZARD":
+            # 媒体参数卡片已作为永久消息送达：清理"Thinking..."草稿气泡，
+            # 回合即止（用户在卡片上配置后提交，提交路径自行沉淀历史）。
+            if builder.draft_message_id:
+                try:
+                    from state import is_preserved_draft
+                    if not await is_preserved_draft(builder.draft_id):
+                        await delete_message(chat_id, builder.draft_message_id)
+                except Exception as e:
+                    logger.debug(f"MEDIA_WIZARD 路径删除草稿失败: {e}")
+            return "MEDIA_WIZARD", "", [], usage
 
         if raw_content and isinstance(raw_content, str) and raw_content.startswith("IMAGE_ERROR:"):
             error_notice = raw_content.split(":", 1)[1].strip()

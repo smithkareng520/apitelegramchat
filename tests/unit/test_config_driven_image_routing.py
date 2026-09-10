@@ -407,8 +407,164 @@ def test_request_agnes_video_posts_to_declared_endpoint(monkeypatch):
     # 500 是预期打断点：提交 URL 已捕获即达成断言目的
     assert video_url is None and error is not None
     assert captured["url"] == "https://apihub.agnes-ai.com/v1/videos"
+    # Agnes Video 2.5 文档 schema：mode 必填；时长字段是字符串 seconds
+    # （发 duration 会被网关 400 "duration is not an allowed request field"）
     assert captured["json"]["model"] == "agnes-video-2.5"
-    assert captured["json"]["duration"] == 5
+    assert captured["json"]["mode"] == "text"
+    assert captured["json"]["seconds"] == "5"
+    assert "duration" not in captured["json"]
+
+
+def test_request_agnes_video_reference_mode_payload(monkeypatch):
+    # 带参考图/参考视频 -> reference 模式 + 占位符注入（文生视频不携带媒体字段）
+    captured = {}
+
+    class _FailResponse:
+        status = 500
+        headers = {}
+
+        async def text(self):
+            return "forced-stop"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    class _CaptureSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post(self, url, headers=None, json=None, **kwargs):
+            captured["url"] = url
+            captured["json"] = json
+            return _FailResponse()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr("ai.media_generation.aiohttp.ClientSession", _CaptureSession)
+    monkeypatch.setattr(app_config, "AGNES_API_KEY", "test-key")
+
+    video_url, error, meta = asyncio.run(_request_agnes_video(
+        "让角色跑起来", 5, "agnes-video-2.5",
+        reference_images=("https://r2.example/a.png", "https://r2.example/b.png"),
+        reference_videos=("https://r2.example/motion.mp4",),
+    ))
+    assert video_url is None and error is not None  # 500 打断点
+    body = captured["json"]
+    assert body["mode"] == "reference"
+    assert body["images"] == ["https://r2.example/a.png", "https://r2.example/b.png"]
+    assert body["videos"] == [{"url": "https://r2.example/motion.mp4"}]
+    assert "<Picture 1>" in body["prompt"] and "<Video 1>" in body["prompt"]
+
+
+def test_request_agnes_video_full_cycle_polls_with_model_name_and_metadata_url(monkeypatch):
+    # 闭环：提交 200（video_id）-> 轮询带 model_name -> completed 后从
+    # metadata.url 取视频地址（文档推荐查询方式 + 响应字段）
+    captured = {"posts": [], "gets": []}
+
+    class _Resp:
+        def __init__(self, body):
+            self.status = 200
+            self._body = body
+            self.headers = {"Content-Type": "application/json"}
+
+        async def text(self):
+            return self._body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    class _Session:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post(self, url, headers=None, json=None, **kwargs):
+            captured["posts"].append({"url": url, "json": json})
+            return _Resp('{"video_id": "video_abc", "status": "queued"}')
+
+        def get(self, url, headers=None, params=None, **kwargs):
+            captured["gets"].append({"url": url, "params": params})
+            return _Resp('{"status": "completed", "progress": 100, "seconds": "7", "size": "720P", "metadata": {"url": "https://cdn.example/out.mp4"}}')
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr("ai.media_generation.aiohttp.ClientSession", _Session)
+    monkeypatch.setattr(app_config, "AGNES_API_KEY", "test-key")
+
+    video_url, error, meta = asyncio.run(_request_agnes_video(
+        "雨后夜景", 7, "agnes-video-2.5",
+    ))
+    assert error is None
+    assert video_url == "https://cdn.example/out.mp4"
+    # 轮询 URL 从声明提交端点的 host 推导；查询参数必须带 model_name
+    assert captured["gets"][0]["url"] == "https://apihub.agnes-ai.com/agnesapi"
+    assert captured["gets"][0]["params"] == {
+        "video_id": "video_abc",
+        "model_name": "agnes-video-2.5",
+    }
+    # meta 携带 seconds/size（供 caption 展示）
+    assert meta["seconds"] == "7" and meta["size"] == "720P"
+    # 提交体：seconds 为字符串，无 duration 字段
+    assert captured["posts"][0]["json"]["seconds"] == "7"
+    assert "duration" not in captured["posts"][0]["json"]
+
+
+def test_request_agnes_video_failed_task_extracts_error_message(monkeypatch):
+    # 失败任务：error 为对象 {message: ...}，需提取 message 而非嵌入 dict
+    class _Resp:
+        def __init__(self, body, status=200):
+            self.status = status
+            self._body = body
+            self.headers = {"Content-Type": "application/json"}
+
+        async def text(self):
+            return self._body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    class _Session:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post(self, url, headers=None, json=None, **kwargs):
+            return _Resp('{"video_id": "video_fail", "status": "queued"}')
+
+        def get(self, url, headers=None, params=None, **kwargs):
+            return _Resp('{"status": "failed", "error": {"message": "Invalid reference media"}}')
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr("ai.media_generation.aiohttp.ClientSession", _Session)
+    monkeypatch.setattr(app_config, "AGNES_API_KEY", "test-key")
+
+    video_url, error, meta = asyncio.run(_request_agnes_video(
+        "以参考图风格生成", 5, "agnes-video-2.5",
+        reference_images=("https://r2.example/a.png",),
+    ))
+    assert video_url is None and error is not None
+    assert "Invalid reference media" in error
+    assert "message" not in error  # 不是 dict 的 json 残片
 
 
 # ---------------------------------------------------------------------------

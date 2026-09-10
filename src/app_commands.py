@@ -475,6 +475,11 @@ async def _handle_callback_query(cb: dict) -> None:
             )
             await _answer_callback_query(cb["id"], notice[:200], show_alert=not ok)
             return
+        elif isinstance(sel, str) and sel.startswith("mw:"):
+            # 媒体参数卡片（media_wizard）：翻页/选参/收集素材/提交/取消
+            from media_wizard import handle_wizard_callback
+            await handle_wizard_callback(chat_id, uid, mid, cb["id"], sel)
+            return
         else:
             await _answer_callback_query(cb["id"], "未知操作")
             return

@@ -29,6 +29,8 @@ from config import (
 from protocols import (
     authorize_request,
     build_media_request_body,
+    build_video_request_body,
+    normalize_video_seconds,
     resolve_input_combination,
     resolve_request_plan,
     run_preflight,
@@ -304,11 +306,10 @@ def test_build_body_inline_img2img_constraints():
 
 
 def test_build_body_non_json_shapes_return_none():
-    # multipart 编辑形状 / chat / video 分支：JSON 构建不适用
+    # multipart 编辑形状 / chat 分支：build_media_request_body 不适用
+    # （video 分支另有 build_video_request_body 出口）
     plan = resolve_request_plan(SUPPORTED_MODELS["agnes-3.0-flash"])
     assert build_media_request_body(plan, model="x", prompt="y") is None
-    vplan = resolve_request_plan(SUPPORTED_MODELS["agnes-video-2.5"])
-    assert build_media_request_body(vplan, model="x", prompt="y") is None
     # multipart 形状：构造一个 inline=False 的图像模型
     cfg = make_model_config(
         model_id="official-style-image", provider="agnes", name="Official",
@@ -318,6 +319,89 @@ def test_build_body_non_json_shapes_return_none():
     mplan = resolve_request_plan(cfg)
     assert mplan.image_style == "multipart_edits"
     assert build_media_request_body(mplan, model="x", prompt="y") is None
+
+
+# ---------------------------------------------------------------------------
+# 7. 视频请求体构建（Agnes Video 2.5 文档 schema）
+# ---------------------------------------------------------------------------
+
+def test_normalize_video_seconds_clamps_to_doc_range():
+    # 文档：seconds 为字符串 "4"–"12"，默认 "5"
+    assert normalize_video_seconds(5) == "5"
+    assert normalize_video_seconds("7") == "7"
+    assert normalize_video_seconds(3) == "4"       # 下界钳制
+    assert normalize_video_seconds(15) == "12"     # 上界钳制
+    assert normalize_video_seconds(None) == "5"    # 默认值
+    assert normalize_video_seconds("abc") == "5"   # 非数字回退
+
+
+def test_build_video_body_text_mode_schema():
+    # 纯文本 -> mode=text；时长字段是字符串 seconds（发 duration 会被
+    # 网关 400 "duration is not an allowed request field"，2026-09-11 生产事故）
+    plan = resolve_request_plan(SUPPORTED_MODELS["agnes-video-2.5"])
+    body = build_video_request_body(
+        plan, model="agnes-video-2.5", prompt="日落延时", seconds="5",
+    )
+    assert body == {
+        "model": "agnes-video-2.5",
+        "prompt": "日落延时",
+        "seconds": "5",
+        "mode": "text",
+    }
+    assert "duration" not in body
+    assert "images" not in body and "videos" not in body  # text 模式禁止媒体字段
+    assert "n" not in body  # 仅支持 1，不发送
+
+
+def test_build_video_body_size_ratio_whitelist():
+    plan = resolve_request_plan(SUPPORTED_MODELS["agnes-video-2.5"])
+    body = build_video_request_body(
+        plan, model="agnes-video-2.5", prompt="x",
+        size="1080p", aspect_ratio="9:16",
+    )
+    assert body["size"] == "1080P"      # 大小写归一
+    assert body["aspect_ratio"] == "9:16"
+    # 白名单外（像素尺寸 / 非法画幅 / auto）一律不发送，走网关默认
+    body2 = build_video_request_body(
+        plan, model="agnes-video-2.5", prompt="x",
+        size="1280x720", aspect_ratio="2:3",
+    )
+    assert "size" not in body2 and "aspect_ratio" not in body2
+
+
+def test_build_video_body_reference_mode_with_placeholders():
+    # 带参考媒体 -> mode=reference；图片进 images 数组、视频进 videos
+    # 对象数组；prompt 追加 <Picture N>/<Video N> 占位符说明（文档建议）
+    plan = resolve_request_plan(SUPPORTED_MODELS["agnes-video-2.5"])
+    body = build_video_request_body(
+        plan, model="agnes-video-2.5", prompt="让角色跑起来",
+        reference_images=("https://r2.example/a.png", "https://r2.example/b.png"),
+        reference_videos=("https://r2.example/motion.mp4",),
+    )
+    assert body["mode"] == "reference"
+    assert body["images"] == ["https://r2.example/a.png", "https://r2.example/b.png"]
+    assert body["videos"] == [{"url": "https://r2.example/motion.mp4"}]
+    assert "<Picture 1>" in body["prompt"]
+    assert "<Picture 2>" in body["prompt"]
+    assert "<Video 1>" in body["prompt"]
+
+
+def test_build_video_body_reference_media_caps():
+    # 文档限制：图片最多 8 张、参考视频最多 1 个（超出截断而非让网关 400）
+    plan = resolve_request_plan(SUPPORTED_MODELS["agnes-video-2.5"])
+    urls = tuple(f"https://r2.example/{i}.png" for i in range(10))
+    body = build_video_request_body(
+        plan, model="agnes-video-2.5", prompt="x",
+        reference_images=urls,
+        reference_videos=("https://r2.example/1.mp4", "https://r2.example/2.mp4"),
+    )
+    assert len(body["images"]) == 8
+    assert len(body["videos"]) == 1
+
+
+def test_build_video_body_non_video_plan_returns_none():
+    plan = resolve_request_plan(SUPPORTED_MODELS["agnes-3.0-flash"])
+    assert build_video_request_body(plan, model="x", prompt="y") is None
 
 
 # ---------------------------------------------------------------------------

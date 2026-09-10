@@ -578,6 +578,14 @@ async def _cleanup_task(chat_id: int, task: asyncio.Task) -> None:
 # 上传照片/语音/…”，语义完全相反；typing 也只在模型流式输出期间才有
 # 意义（见 chat_actions.py 与 ai/agentic_loops.py 的实现）。
 async def _handle_text_message(chat_id: int, user_input: str, username: str, user_message: dict) -> None:
+    # 媒体参数卡片会话优先接管：seed/起始秒数输入，或更新待生成提示词
+    # （卡片就地重绘，本消息不再进入正常回合）
+    try:
+        from media_wizard import try_consume_text_message
+        if await try_consume_text_message(chat_id, user_input):
+            return
+    except Exception:
+        logger.debug("media_wizard 文本消费检查失败（可忽略）", exc_info=True)
     # 后台预初始化 workspace：与模型生成响应并行，避免第一个工具调用
     # 是 no-op。
     asyncio.create_task(init_workspace(chat_id))
@@ -599,6 +607,13 @@ async def _handle_text_message(chat_id: int, user_input: str, username: str, use
         await send_rich_html_message(chat_id, f"❌ <b>处理消息时出错</b>\n<code>{str(e)[:100]}</code>")
 
 async def _handle_photo_message(chat_id: int, user_message: dict, username: str) -> None:
+    # 媒体参数卡片收集素材（首尾帧/参考图）时优先接管本图片消息
+    try:
+        from media_wizard import try_consume_media_message
+        if await try_consume_media_message(chat_id, user_message):
+            return
+    except Exception:
+        logger.debug("media_wizard 图片消费检查失败（可忽略）", exc_info=True)
     asyncio.create_task(init_workspace(chat_id))
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
@@ -637,6 +652,13 @@ async def _handle_document_message(chat_id: int, user_message: dict, username: s
         await send_rich_html_message(chat_id, f"❌ <b>处理文档时出错</b>\n<code>{str(e)[:100]}</code>")
 
 async def _handle_audio_message(chat_id: int, user_message: dict, username: str) -> None:
+    # 媒体参数卡片收集参考音频时优先接管本音频/语音消息
+    try:
+        from media_wizard import try_consume_media_message
+        if await try_consume_media_message(chat_id, user_message):
+            return
+    except Exception:
+        logger.debug("media_wizard 音频消费检查失败（可忽略）", exc_info=True)
     # 用户上传语音时回发 upload_voice 是错误语义（那是“bot 正在上传语音”
     # 的指示）——用户上传的内容与 chat action 无关，这里不发送任何动作。
     asyncio.create_task(init_workspace(chat_id))
@@ -665,6 +687,13 @@ async def _handle_video_message(chat_id: int, user_message: dict, username: str)
     ——支持视频输入的模型（stealth/ox-alpha、Gemini 系列等）收到
     video_url content part，不支持的模型收到文本占位；切换模型不丢信息。
     """
+    # 媒体参数卡片收集参考视频时优先接管本视频消息
+    try:
+        from media_wizard import try_consume_media_message
+        if await try_consume_media_message(chat_id, user_message):
+            return
+    except Exception:
+        logger.debug("media_wizard 视频消费检查失败（可忽略）", exc_info=True)
     asyncio.create_task(init_workspace(chat_id))
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)

@@ -84,7 +84,7 @@ from ai.strict_tools import (
     strict_tools_for_request,
 )
 from core.images import ImageTask
-from core.messages import Message, TextBlock, ImageBlock, render_openai_messages
+from core.messages import Message, TextBlock, ImageBlock, VideoBlock, render_openai_messages
 from protocols.images import dispatch_image_task
 
 # Anthropic 原生 Messages API 专用循环：独立实现，位于 anthropic_bridge.py
@@ -936,6 +936,20 @@ def _extract_native_image_urls_from_user_message(msg: Message) -> list[str]:
     return urls
 
 
+def _extract_native_video_urls_from_user_message(msg: Message) -> list[str]:
+    """从单条 user 消息（内部 Message）中提取全部参考视频 URL。
+
+    视频输入模态（VideoBlock.url）在视频生成模型上对应 Agnes Video 2.5
+    的 videos[].url 参考语义（动作/节奏参考）；URL 均为 R2 公开地址，
+    满足文档"参考媒体必须公开可访问"的要求。
+    """
+    urls: list[str] = []
+    for block in msg.blocks:
+        if isinstance(block, VideoBlock) and block.url:
+            urls.append(block.url)
+    return urls
+
+
 def _extract_image_prompt_and_reference_urls(msgs: list) -> tuple[str, list[str]]:
     """从（内部 Message 列表）请求消息中提取图像模型的 prompt 与参考图 URL 列表。
 
@@ -998,6 +1012,7 @@ async def _agentic_loop_native_image(
         builder: "DraftManager",
         chat_id: int,
         journal: Optional[list[dict[str, Any]]] = None,
+        media_overrides: Optional[dict[str, Any]] = None,
 ) -> tuple[str | None, object | None, list]:
     """原生图像模型回合：prompt/参考图提取 -> ImageTask -> 协议分发 ->
     R2 上传 -> 富媒体消息。
@@ -1007,21 +1022,43 @@ async def _agentic_loop_native_image(
     经 protocols.images.dispatch_image_task 按**模型协议**分发——
     openai_images（ModelScope/XXTF）与 openai_chat modalities
     （OpenRouter 图像模型）两条链路共用同一任务模型与后处理。
+
+    media_overrides（可选，交互参数卡片的提交产物），键（全部可省略）：
+      image_size（"1K"–"4K" 档位）/ aspect_ratio（官方比例集合）/
+      num_images（1-4，仅请求层实际消费时生效）/ reference_images(list[str])
     """
+    overrides = media_overrides if isinstance(media_overrides, dict) else {}
     model_info = SUPPORTED_MODELS.get(current_model)
 
     # 采样参数由图像协议适配器按 model_info 自取（get_sampling_params）；
     # 推理控制不适用于图像生成端点，不发送。
     prompt_text, image_urls = _extract_image_prompt_and_reference_urls(messages)
 
+    # 卡片显式给出参考图时优先于消息内提取（卡片收集的 URL 均已通过
+    # 公开可访问解析）。
+    if "reference_images" in overrides:
+        image_urls = [str(u) for u in (overrides.get("reference_images") or []) if str(u or "").strip()]
+
     clean_prompt = _clean_prompt_for_image_model(prompt_text)
 
     # ---- 显式构造图像任务：带参考图 = edit，否则 generate（任务构造层
     # 的唯一推断点；进入适配器后不再有任何"看图猜端点"逻辑）。----
+    # 卡片参数（尺寸档位/宽高比/张数）作为 ImageTask 一等字段透传，由
+    # 请求层按端点形状消费（inline 形状进 size/ratio，multipart 进 size）。
+    task_kwargs: dict[str, Any] = {}
+    if overrides.get("image_size"):
+        task_kwargs["image_size"] = str(overrides["image_size"])
+    if overrides.get("aspect_ratio"):
+        task_kwargs["aspect_ratio"] = str(overrides["aspect_ratio"])
+    if overrides.get("num_images"):
+        try:
+            task_kwargs["num_images"] = max(1, min(int(overrides["num_images"]), 4))
+        except (TypeError, ValueError):
+            pass
     if image_urls:
-        task = ImageTask.edit(clean_prompt or prompt_text, image_urls, model=current_model)
+        task = ImageTask.edit(clean_prompt or prompt_text, image_urls, model=current_model, **task_kwargs)
     else:
-        task = ImageTask.generate(clean_prompt or prompt_text, model=current_model)
+        task = ImageTask.generate(clean_prompt or prompt_text, model=current_model, **task_kwargs)
 
     try:
         # ---- 协议分发：openai_images -> /images/{generations,edits}；
@@ -1139,11 +1176,20 @@ async def _agentic_loop_native_video(
         builder: "DraftManager",
         chat_id: int,
         journal: Optional[list[dict[str, Any]]] = None,
+        media_overrides: Optional[dict[str, Any]] = None,
 ) -> tuple[str | None, object | None, list]:
     """
     处理视频生成模型。
     目前支持 Agnes 和 OpenRouter。
+
+    media_overrides（可选，交互参数卡片的提交产物）：显式携带卡片上选择
+    的参数与收集的参考媒体，优先级高于消息内提取。键（全部可省略）：
+      seconds / size / aspect_ratio / mode / seed / first_frame / last_frame /
+      reference_images(list[str]) / reference_audios(list[str]) /
+      video_specs(list[dict]{url,start_seconds?,require_audio?})
     """
+    overrides = media_overrides if isinstance(media_overrides, dict) else {}
+
     # 提取 prompt（最后一条 user 消息的文本块）
     prompt = ""
     for item in reversed(messages):
@@ -1154,18 +1200,28 @@ async def _agentic_loop_native_video(
     if not prompt:
         return "VIDEO_ERROR:未提供提示词", None, []
 
-    # 可选：解析时长
+    # 可选：解析时长（文档硬约束：seconds 字符串 "4"–"12"，默认 "5"；
+    # 超出范围一律钳到边界，否则网关 400）。卡片显式选择的 seconds 优先
+    # 于 prompt 文本里的"N 秒"解析。
     duration = 5
-    # 时长解析：兼容中英文（"5秒" 与 "5 seconds" / "5s"）
-    # 中文"秒"与后续汉字都是 \w，末尾的 \b 对中文分支永不成立（导致
-    # "生成5秒的视频" 匹配失败、时长恒为默认值）——中文分支不加边界。
-    match = re.search(r'(\d+)\s*(?:秒|seconds?\b|secs?\b|s\b)', prompt, re.IGNORECASE)
-    if match:
+    override_seconds = overrides.get("seconds")
+    if override_seconds is not None:
         try:
-            duration = int(match.group(1))
-            duration = max(3, min(duration, 30))
-        except ValueError:
+            duration = int(str(override_seconds).strip())
+        except (TypeError, ValueError):
             duration = 5
+        duration = max(4, min(duration, 12))
+    else:
+        # 时长解析：兼容中英文（"5秒" 与 "5 seconds" / "5s"）
+        # 中文"秒"与后续汉字都是 \w，末尾的 \b 对中文分支永不成立（导致
+        # "生成5秒的视频" 匹配失败、时长恒为默认值）——中文分支不加边界。
+        match = re.search(r'(\d+)\s*(?:秒|seconds?\b|secs?\b|s\b)', prompt, re.IGNORECASE)
+        if match:
+            try:
+                duration = int(match.group(1))
+                duration = max(4, min(duration, 12))
+            except ValueError:
+                duration = 5
 
     # 获取模型信息，确定 provider
     model_info = SUPPORTED_MODELS.get(current_model)
@@ -1177,6 +1233,27 @@ async def _agentic_loop_native_video(
     error = None
     video_meta: Optional[dict] = None
 
+    # 参考媒体提取（与图像循环同语义：最后一条 user 消息优先，缺失时
+    # 回溯最近一条带媒体的消息）：图片 -> images[]，视频 -> videos[]。
+    # Agnes 侧由请求体构建器自动判为 reference/keyframe 模式并追加
+    # <Picture N>/<Video N> 占位符；纯文本则为 text 模式（请求层唯一推断点）。
+    # 卡片 media_overrides 显式给出参考媒体时优先于消息内提取（卡片收集
+    # 的 URL 已经过公开可访问解析，且视频可携带 start_seconds/require_audio）。
+    _, image_ref_urls = _extract_image_prompt_and_reference_urls(messages)
+    video_ref_urls: list[str] = []
+    for item in reversed(messages):
+        m = item if isinstance(item, Message) else Message.from_openai_dict(item)
+        if m.role != "user":
+            continue
+        video_ref_urls = _extract_native_video_urls_from_user_message(m)
+        if video_ref_urls:
+            break
+
+    if "reference_images" in overrides:
+        image_ref_urls = [str(u) for u in (overrides.get("reference_images") or []) if str(u or "").strip()]
+    if "reference_videos" in overrides:
+        video_ref_urls = [str(u) for u in (overrides.get("reference_videos") or []) if str(u or "").strip()]
+
     # chat action 语义（与 chat_actions.py 的白名单约定一致）：
     # - 生成阶段（调用生视频模型的轮询/生成）-> record_video（bot 正在
     #   "录制"视频），每 4 秒循环重发，覆盖动辄数十秒到数分钟的生成过程；
@@ -1184,7 +1261,19 @@ async def _agentic_loop_native_video(
     #   -> upload_video（bot 正在发送视频）。
     if provider == "agnes":
         async with chat_action_scope(chat_id, "record_video"):
-            video_url, error, video_meta = await _request_agnes_video(prompt, duration, current_model)
+            video_url, error, video_meta = await _request_agnes_video(
+                prompt, duration, current_model,
+                reference_images=tuple(image_ref_urls),
+                reference_videos=tuple(video_ref_urls),
+                size=overrides.get("size"),
+                aspect_ratio=overrides.get("aspect_ratio"),
+                mode=overrides.get("mode"),
+                first_frame=overrides.get("first_frame"),
+                last_frame=overrides.get("last_frame"),
+                seed=overrides.get("seed"),
+                reference_audios=tuple(overrides.get("reference_audios") or ()),
+                video_specs=tuple(overrides.get("video_specs") or ()),
+            )
     elif provider == "openrouter":
         async with chat_action_scope(chat_id, "record_video"):
             video_url, error, video_meta = await _request_openrouter_video(prompt, duration, current_model)

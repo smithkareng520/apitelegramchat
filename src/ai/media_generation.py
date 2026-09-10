@@ -16,6 +16,7 @@ import io
 import aiohttp
 import base64
 import hashlib
+from urllib.parse import urlsplit
 from openai import AsyncOpenAI
 import re
 import mimetypes
@@ -1555,47 +1556,101 @@ async def _request_agnes_video(
         prompt: str,
         duration: int,
         model: str,
+        reference_images: tuple = (),
+        reference_videos: tuple = (),
+        *,
+        size: Optional[str] = None,
+        aspect_ratio: Optional[str] = None,
+        mode: Optional[str] = None,
+        first_frame: Optional[str] = None,
+        last_frame: Optional[str] = None,
+        seed: Optional[int] = None,
+        reference_audios: tuple = (),
+        video_specs: tuple = (),
 ) -> tuple[str | None, str | None, Optional[dict]]:
-    """
-    提交视频任务到 Agnes 并轮询结果。
-    返回 (video_url, error_message, meta)；成功时 error=None，meta 含 width/height/frame_rate/num_frames 等元数据。
+    """提交视频任务到 Agnes（OpenAI Videos 兼容）并轮询结果。
+
+    返回 (video_url, error_message, meta)；成功时 error=None，meta 含
+    seconds/size 等任务元数据（供 caption 使用）。
+
+    请求体由统一管道构建器装配（protocols.pipeline.build_video_request_body，
+    Agnes Video 2.5 文档 schema）：seconds 为字符串 "4"–"12"（发 duration
+    字段会被网关 400 "duration is not an allowed request field"）、mode
+    必填（text/keyframe/reference——keyframe 带首尾帧、reference 带参考
+    媒体，构建器按媒体自动推断/校验）、size/画幅白名单校验。参考媒体
+    URL 必须公开可访问（vision_prefer_url 路径产出的 R2 公开 URL 恰好
+    满足）。
 
     提交端点由模型配置驱动（endpoint 字段，如
     "https://apihub.agnes-ai.com/v1/videos"），未声明时回退内置默认；
-    轮询端点是协议实现细节（与 ModelScope 的 /tasks/{id} 同理），保持内置。
+    轮询端点从声明提交端点的 scheme://host 推导（{host}/agnesapi），
+    未声明时回退内置默认——与文档推荐的
+    GET /agnesapi?video_id=<VIDEO_ID>&model_name=<MODEL> 查询方式一致
+    （keyframe/reference 模式必须带 model_name，text 模式亦推荐）。
     """
-    base_url = "https://apihub.agnes-ai.com/v1"
     headers = {
         "Authorization": f"Bearer {AGNES_API_KEY}",
         "Content-Type": "application/json",
     }
 
     # 提交端点：模型声明了 endpoint 就用声明值（配置驱动，无需按厂商分支）。
-    submit_url = f"{base_url}/videos"
+    submit_url = "https://apihub.agnes-ai.com/v1/videos"
+    declared_endpoint = ""
     try:
         model_info = SUPPORTED_MODELS.get(model)
         if model_info is not None:
             declared = str(get_effective_endpoint(model_info).endpoint or "").strip()
             if declared:
                 submit_url = declared
+                declared_endpoint = declared
     except Exception:
         logger.debug("[NativeVideo/Agnes] 解析模型 endpoint 失败，回退默认提交端点", exc_info=True)
 
-    clean_prompt = (prompt or "").strip()
+    # 请求体：统一管道构建器（文档 schema 硬约束集中在一处，可单测）。
+    from protocols.pipeline import build_video_request_body
+    plan = None
+    try:
+        from protocols.pipeline import resolve_request_plan
+        plan = resolve_request_plan(SUPPORTED_MODELS.get(model))
+    except Exception:
+        plan = None
+    if plan is None or plan.api_type != "video":
+        # 未注册/非视频模型的安全兜底：按 video 分支最小形状构造。
+        from protocols.pipeline import RequestPlan
+        plan = RequestPlan(route="video", api_type="video", protocol="", base_url="")
+    payload = build_video_request_body(
+        plan,
+        model=model,
+        prompt=prompt,
+        seconds=duration,
+        reference_images=tuple(reference_images),
+        reference_videos=tuple(reference_videos),
+        size=size,
+        aspect_ratio=aspect_ratio,
+        mode=mode,
+        first_frame=first_frame,
+        last_frame=last_frame,
+        seed=seed,
+        reference_audios=tuple(reference_audios),
+        video_specs=tuple(video_specs),
+    )
+    if payload is None:  # 理论不可达（上方已强制 video 分支）；保守兜底
+        payload = {"model": model, "prompt": (prompt or "").strip(),
+                   "seconds": str(max(4, min(int(duration or 5), 12))), "mode": "text"}
+
+    clean_prompt = str(payload.get("prompt") or "")
     logger.debug(
-        "[NativeVideo/Agnes] request prepared: model=%s duration=%ss submit_url=%s prompt_len=%s prompt_preview=%r",
+        "[NativeVideo/Agnes] request prepared: model=%s seconds=%s mode=%s submit_url=%s "
+        "ref_images=%s ref_videos=%s prompt_len=%s prompt_preview=%r",
         model,
-        duration,
+        payload.get("seconds"),
+        payload.get("mode"),
         submit_url,
+        len(payload.get("images") or ()),
+        len(payload.get("videos") or ()),
         len(clean_prompt),
         clean_prompt[:240],
     )
-
-    payload = {
-        "model": model,
-        "prompt": clean_prompt,
-        "duration": duration,
-    }
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -1632,19 +1687,26 @@ async def _request_agnes_video(
         logger.exception("[NativeVideo/Agnes] submit exception")
         return None, f"Agnes 提交异常: {str(e)[:100]}", None
 
-    # 轮询结果
-    poll_url = "https://apihub.agnes-ai.com/agnesapi"
+    # 轮询结果：端点从声明提交端点的 host 推导（/agnesapi 在站点根路径，
+    # 不在 /v1 下）；查询参数必须带 model_name（keyframe/reference 模式
+    # 硬要求，text 模式亦为文档推荐写法）。
+    if declared_endpoint:
+        parts = urlsplit(declared_endpoint)
+        poll_url = f"{parts.scheme}://{parts.netloc}/agnesapi"
+    else:
+        poll_url = "https://apihub.agnes-ai.com/agnesapi"
     max_wait = 300  # 5分钟
     interval = 3
     start_time = time.monotonic()
     poll_iter = 0
 
     logger.debug(
-        "[NativeVideo/Agnes] start polling: poll_url=%s max_wait=%ss interval=%ss video_id=%s",
+        "[NativeVideo/Agnes] start polling: poll_url=%s max_wait=%ss interval=%ss video_id=%s model_name=%s",
         poll_url,
         max_wait,
         interval,
         video_id,
+        model,
     )
 
     async with aiohttp.ClientSession() as session:
@@ -1653,7 +1715,7 @@ async def _request_agnes_video(
             elapsed = time.monotonic() - start_time
 
             try:
-                params = {"video_id": video_id}
+                params = {"video_id": video_id, "model_name": model}
                 async with session.get(poll_url, headers=headers, params=params, timeout=15) as resp:
                     body_text = await resp.text()
                     logger.debug(
@@ -1695,14 +1757,26 @@ async def _request_agnes_video(
                     )
 
                     if status == "completed":
+                        # 文档：结果地址在 metadata.url；保留旧字段回退
+                        # （video_url / url / output.url）兼容历史网关响应。
+                        metadata = data.get("metadata") or {}
+                        if not isinstance(metadata, dict):
+                            metadata = {}
                         video_url = (
-                                data.get("video_url")
+                                metadata.get("url")
+                                or data.get("video_url")
                                 or data.get("url")
                                 or (data.get("output") or {}).get("url")
                         )
                         if video_url:
-                            # 同时上报 perf_params 作为视频元数据（用于 caption）
+                            # 元数据（用于 caption）：优先 perf_params，
+                            # 补充文档响应中的 seconds / size 档位。
                             meta = data.get("perf_params") or {}
+                            if not isinstance(meta, dict):
+                                meta = {}
+                            for _k in ("seconds", "size"):
+                                if data.get(_k) and _k not in meta:
+                                    meta[_k] = data.get(_k)
                             logger.info(
                                 "[NativeVideo/Agnes] polling succeeded: iter=%s elapsed=%.1fs video_url=%r",
                                 poll_iter,
@@ -1720,7 +1794,15 @@ async def _request_agnes_video(
                         return None, "Agnes 任务完成但未返回视频 URL", None
 
                     if status in ("failed", "error"):
-                        error_msg = data.get("error") or data.get("message") or "未知错误"
+                        # 文档：失败响应 error 为对象 {message: ...}；兼容
+                        # 字符串形态与旧字段 message。
+                        raw_error = data.get("error")
+                        if isinstance(raw_error, dict):
+                            error_msg = raw_error.get("message") or json.dumps(raw_error, ensure_ascii=False)
+                        elif raw_error:
+                            error_msg = str(raw_error)
+                        else:
+                            error_msg = data.get("message") or "未知错误"
                         logger.error(
                             "[NativeVideo/Agnes] polling failed: iter=%s elapsed=%.1fs error=%r",
                             poll_iter,
