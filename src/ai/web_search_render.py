@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 
-from markdown_converter import convert_markdown_to_telegram_html
+from markdown_converter import render_telegram_fragment as convert_markdown_to_telegram_html
 
 
 # ---------- 正则与常量 ----------

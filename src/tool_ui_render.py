@@ -13,7 +13,7 @@ from typing import Callable
 from urllib.parse import urlparse
 
 from token_budget import truncate_to_token_budget
-from markdown_converter import convert_markdown_to_telegram_html
+from markdown_converter import render_telegram_fragment as convert_markdown_to_telegram_html
 
 import logging
 

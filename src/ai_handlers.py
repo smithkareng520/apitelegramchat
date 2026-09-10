@@ -38,7 +38,7 @@ from utils import (
     delete_message,
     mark_draft_dead,
 )
-from markdown_converter import convert_markdown_to_telegram_html
+from markdown_converter import render_telegram_fragment as convert_markdown_to_telegram_html
 from skills import skill_catalog_brief
 from context_manager import select_request_context
 from tool_visibility import apply_tool_visibility, strip_tool_traces, SILENT_ONLY_TOOLS

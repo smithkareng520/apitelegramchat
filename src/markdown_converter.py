@@ -582,6 +582,42 @@ def _escape_attr(url: str) -> str:
     return html_lib.escape(url, quote=True)
 
 
+def render_telegram_fragment(text: str) -> str:
+    """统一入口（片段级）：Markdown 转换 + HTML 转义 + tg-button 校验。
+
+    用于「转义结果会被嵌入调用方手写好的 <p>/<b>/<td>/<code> 骨架」的
+    场景——例如 ``f"<b>轮次</b>：{render_telegram_fragment(x)}"``。
+    不做块级包裹（不调用 ``wrap_mixed_content_as_blocks``），因为给
+    短字段外面多包一层 ``<p>`` 会破坏调用方已有的标签结构。
+
+    等价于目前散落在各模块的 ``convert_markdown_to_telegram_html`` 直接
+    调用；新代码请统一使用本函数，不要再直接 import
+    ``convert_markdown_to_telegram_html``。
+
+    处理顺序（内部已保证，调用方无需关心）：
+    1. Markdown → Telegram HTML 转换
+    2. <tg-button> 强模式校验（非法按钮降级为字面量文本）
+    """
+    return convert_markdown_to_telegram_html(text)
+
+
+def render_telegram_block(text: str) -> str:
+    """统一入口（块级）：Markdown 转换 + tg-button 校验 + 块级结构修复。
+
+    用于「整段自由文本要独立渲染成一块 Telegram Rich Message HTML」的
+    场景——例如思考内容、用户可读的独立说明段落。在
+    ``render_telegram_fragment`` 的基础上再做块级包裹修复，避免
+    「文字 + Markdown 列表」混排被整体塞进单个 ``<p>`` 产出非法嵌套
+    （``<p>…<ul>…</ul>…</p>``），从而被 Telegram 以结构类 400 拒收。
+
+    处理顺序：
+    1. Markdown → Telegram HTML 转换
+    2. <tg-button> 强模式校验
+    3. 按块级标签切段，纯文本段落分别包 <p>
+    """
+    return wrap_mixed_content_as_blocks(convert_markdown_to_telegram_html(text))
+
+
 def wrap_mixed_content_as_blocks(converted: str) -> str:
     """把 Markdown 转换产物整理为 Telegram Rich Message 合法的块级序列。
 

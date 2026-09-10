@@ -7,7 +7,7 @@ from typing import List
 
 from tool_dispatch import _TOOL_TIMEOUT_MARKER
 
-from markdown_converter import convert_markdown_to_telegram_html, _escape_prose
+from markdown_converter import render_telegram_fragment as convert_markdown_to_telegram_html, _escape_prose
 from todo_tool import render_todo_card
 from memory_tool import render_memory_card
 from subagent_tool import render_subagent_card

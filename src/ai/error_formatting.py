@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 from PIL import Image
 
 from utils import strip_html_tags, get_logger
-from markdown_converter import convert_markdown_to_telegram_html
+from markdown_converter import render_telegram_fragment as convert_markdown_to_telegram_html
 
 logger = get_logger(__name__)
 

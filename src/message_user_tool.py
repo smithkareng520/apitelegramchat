@@ -36,7 +36,10 @@ import aiohttp
 
 from config import BASE_URL
 from utils import send_rich_html_message
-from markdown_converter import convert_markdown_to_telegram_html, wrap_mixed_content_as_blocks
+from markdown_converter import (
+    render_telegram_fragment as convert_markdown_to_telegram_html,
+    render_telegram_block,
+)
 from core.rich_media import _rich_message_html_payload
 from token_budget import truncate_to_token_budget
 
@@ -190,7 +193,7 @@ def _question_rich_text(question: str) -> str:
     text = str(question or "")
     if not text:
         return ""
-    return wrap_mixed_content_as_blocks(convert_markdown_to_telegram_html(text))
+    return render_telegram_block(text)
 
 
 def _question_html(interaction: AskUserInteraction) -> str:

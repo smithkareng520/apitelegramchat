@@ -14,7 +14,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
 from utils import get_logger
-from markdown_converter import convert_markdown_to_telegram_html
+from markdown_converter import render_telegram_fragment as convert_markdown_to_telegram_html
 from core.messages import Message
 from token_budget import truncate_to_token_budget
 from tool_result_condense import condense_for_model
