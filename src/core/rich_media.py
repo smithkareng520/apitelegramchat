@@ -23,78 +23,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-# Telegram Bot API Rich Messages currently allow at most 16 nested formatting/block levels.
-# This transport guard is intentionally kept at the final boundary so every upstream
-# renderer is protected, including future/new tool UI paths.
-_RICH_MESSAGE_MAX_DEPTH = 16
-_RICH_DEPTH_TAG_RE = re.compile(r"<(/?)\s*([A-Za-z][\w:-]*)\b[^>]*?>", re.IGNORECASE)
-_RICH_VOID_TAGS = frozenset({"br", "hr", "img", "video", "audio", "source", "meta", "link", "input"})
-
-
-def _enforce_rich_message_max_depth(html_content: str, max_depth: int = _RICH_MESSAGE_MAX_DEPTH) -> str:
-    """Flatten tags that would exceed Telegram's Rich Message nesting limit.
-
-    This is a last-resort transport guard, not a normal formatter. The visible
-    content is preserved while excessive nested markup is removed so a malformed
-    subtree cannot make the entire message fail with RICH_MESSAGE_DEPTH_INVALID.
-    """
-    if not html_content:
-        return html_content
-
-    stack: list[str | None] = []
-    parts: list[str] = []
-    pos = 0
-    changed = False
-
-    for match in _RICH_DEPTH_TAG_RE.finditer(html_content):
-        tag = match.group(2).lower()
-        closing = bool(match.group(1))
-        raw = match.group(0)
-        is_void = tag in _RICH_VOID_TAGS or raw.rstrip().endswith("/>")
-
-        if match.start() > pos:
-            parts.append(html_content[pos:match.start()])
-
-        if is_void:
-            parts.append(raw)
-        elif closing:
-            # Only the current top opener may consume this close. A None entry means
-            # that opener was intentionally flattened because it would exceed max_depth.
-            if not stack:
-                changed = True
-            else:
-                opener = stack.pop()
-                if opener is None:
-                    changed = True
-                elif opener == tag:
-                    parts.append(raw)
-                else:
-                    # Malformed/mismatched closing tag: do not pass it downstream.
-                    changed = True
-        else:
-            if len(stack) >= max_depth:
-                stack.append(None)
-                changed = True
-            else:
-                stack.append(tag)
-                parts.append(raw)
-
-        pos = match.end()
-
-    parts.append(html_content[pos:])
-
-    # Any still-open tags belong to an incomplete streaming frame. Preserve only
-    # their already-emitted bytes; unmatched opens are not themselves a depth error
-    # here, because sendRichMessageDraft can receive transient partial content.
-    result = "".join(parts)
-    if changed:
-        logger.warning(
-            "sendRichMessage 结构保护：检测到超过最大嵌套深度 %s 或非法闭合标签，已展平超深结构。",
-            max_depth,
-        )
-    return result
-
-
 def _rich_message_html_payload(html_content: str) -> dict:
     """构造符合 InputRichMessage 规范的 HTML 富消息。
 
@@ -144,8 +72,6 @@ def _rich_message_html_payload(html_content: str) -> dict:
 
     cleaned = _strip_invalid_media_urls(normalized)
     demoted = _demote_watch_page_videos(cleaned)
-    # 最终发送前再过一次深度闸门，覆盖所有上游 HTML 生产路径。
-    demoted = _enforce_rich_message_max_depth(demoted)
     if demoted != normalized:
         logger.warning(
             "sendRichMessage 兜底清理：检测到伪 URL 或观看页 URL 媒体块，"
