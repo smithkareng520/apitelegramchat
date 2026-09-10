@@ -910,38 +910,31 @@ SUPPORTED_MODELS: Dict[str, ModelConfig] = {}
 # -----------------------------------------------------------------------------
 # OpenRouter 模型
 # -----------------------------------------------------------------------------
-SUPPORTED_MODELS["nex-agi/nex-n2.5-pro:free"] = make_model_config(
-    model_id="nex-agi/nex-n2.5-pro:free",
+SUPPORTED_MODELS["openrouter/free"] = make_model_config(
+    model_id="openrouter/free",
     provider="openrouter",
-    name="Nex N2.5 Pro Free",
+    name="Free",
     vision=True,
     reasoning_enabled=True,
     reasoning_effort="high",
-    max_context=262000,
+    supports_tools=False,
+    max_context=200000,
 )
-SUPPORTED_MODELS["poolside/laguna-s-2.1:free"] = make_model_config(
-    model_id="poolside/laguna-s-2.1:free",
-    provider="openrouter",
-    name="Laguna S 2.1 Free",
-    reasoning_enabled=True,
-    reasoning_effort="high",
-    max_context=262000,
-)
-SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
-    model_id="anthropic/claude-sonnet-5",
-    provider="openrouter",
-    name="Claude Sonnet 5",
-    vision=True,
-    native_document=True,
-    supports_prompt_cache=True,
-    max_context=1000000,
-    # 扩展思考：高努力档位，经 OpenRouter 统一 reasoning 接口下发。
-    reasoning_enabled=True,
-    reasoning_effort="high",
-    # Anthropic 思考模式官方要求 temperature=1.0，且不建议调整 top_p；
-    # top_p 不配置即不发送，走供应商默认。
-    temperature=1.0,
-)
+# SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
+#     model_id="anthropic/claude-sonnet-5",
+#     provider="openrouter",
+#     name="Claude Sonnet 5",
+#     vision=True,
+#     native_document=True,
+#     supports_prompt_cache=True,
+#     max_context=1000000,
+#     # 扩展思考：高努力档位，经 OpenRouter 统一 reasoning 接口下发。
+#     reasoning_enabled=True,
+#     reasoning_effort="high",
+#     # Anthropic 思考模式官方要求 temperature=1.0，且不建议调整 top_p；
+#     # top_p 不配置即不发送，走供应商默认。
+#     temperature=1.0,
+# )
 
 # -----------------------------------------------------------------------------
 # Agnes 免费模型
@@ -969,18 +962,6 @@ SUPPORTED_MODELS["deepseek-ai/DeepSeek-V4-Flash-0731"] = make_model_config(
     max_context=1000000,
     reasoning_enabled=True,
     reasoning_effort="high",
-    temperature=0.6,
-)
-
-SUPPORTED_MODELS["ZhipuAI/GLM-5.2"] = make_model_config(
-    model_id="ZhipuAI/GLM-5.2",
-    provider="modelscope",
-    name="GLM 5.2",
-    max_context=1000000,
-    reasoning_effort="high",
-    # GLM 混合思考：ModelScope 通道开启思考，智谱官方建议思考模式
-    # temperature=0.6；如需关闭改 reasoning_enabled=False。
-    reasoning_enabled=True,
     temperature=0.6,
 )
 
