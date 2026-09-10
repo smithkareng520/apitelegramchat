@@ -188,6 +188,11 @@ class APIClient:
                 supports_prompt_cache=base.supports_prompt_cache,
                 vision_prefer_url=base.vision_prefer_url,
                 session_affinity=base.session_affinity,
+                # 配置驱动的完整请求端点与图像 API 形状（与
+                # get_effective_endpoint 的合并语义保持一致：厂商级默认直传）。
+                endpoint=base.endpoint,
+                edits_endpoint=base.edits_endpoint,
+                image_edit_inline=base.image_edit_inline,
             )
             self._clients[api_type] = self._build_client(endpoint)
         return self._clients[api_type]

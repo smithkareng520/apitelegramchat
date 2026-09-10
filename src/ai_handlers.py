@@ -64,6 +64,12 @@ from ai.agentic_loops import (
 )
 # 协议路由（Model -> Protocol -> Adapter）：聊天协议的唯一分发出口。
 from protocols import resolve_chat_adapter
+# 模型级公共路由：按模型配置字段匹配 文本/视频/生图 链路（新增模型
+# 无需在调度处新建分支）。
+from protocols import resolve_model_route
+# 统一请求管道：参数分层（厂商默认->模型覆盖）-> 输入组合鉴权 -> API
+# 分支（chat/images/video：协议+端点+形状），回合入口一次性预检。
+from protocols import run_preflight
 from core.messages import Message
 # chat action 状态指示：回合开始时清场（防止上一回合被取消时残留的
 # 后台重发任务跨回合存活）、收尾时兑底熄灭（正常/异常/取消路径均生效）。
@@ -697,11 +703,27 @@ async def get_ai_response(
                      json.dumps([m.to_openai_dict() for m in messages],
                                 ensure_ascii=False, default=str)[:1000])
 
-        if model_info.native_video:
+        # 统一请求管道预检：一次解析全回合共用，取代散落的能力/路由读取：
+        #   ① 参数分层：厂商默认参数 -> 模型覆盖参数（resolve_effective_params）
+        #   ② 输入组合鉴权：本轮用户发了什么（文本/图/音/视/文档） vs 模型能力
+        #      （不支持的模态 -> 降级文本占位；媒体分支缺 prompt -> 短路）
+        #   ③ API 分支：chat/images/video + 协议 + 端点 + 图像形状
+        # 鉴权与分支完全配置驱动，不按厂商/模型写分支。
+        _preflight = run_preflight(model_info, user_message)
+        _log_stage("统一管道预检完成")
+        logger.info("统一管道预检: chat=%s %s", chat_id, _preflight.describe())
+        _model_route = _preflight.plan.route
+        if _preflight.verdict.blocked and not is_timer:
+            # 媒体分支硬性前置不满足（生图/生视频缺文本 prompt）：空 prompt
+            # 打到生成端点必败（上游 400），提前短路并复用 IMAGE/VIDEO_ERROR
+            # 的失败渲染与失败轮标记，给用户可操作的提示。
+            _sig = "VIDEO_ERROR" if _model_route == "video" else "IMAGE_ERROR"
+            raw_content, usage, new_msgs = f"{_sig}:{_preflight.verdict.block_reason}", None, []
+        elif _model_route == "video":
             raw_content, usage, new_msgs = await _agentic_loop_native_video(
                 current_model, messages, builder, chat_id, journal=journal
             )
-        elif model_info.native_image:
+        elif _model_route == "image":
             client = api_client.get_client_for_model(model_info)
             raw_content, usage, new_msgs = await _agentic_loop_native_image(
                 cast("AsyncOpenAI", client), current_model, messages, builder, chat_id, journal=journal

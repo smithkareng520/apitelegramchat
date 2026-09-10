@@ -66,6 +66,139 @@ logger = get_logger(__name__)
 IMAGES_API_PROVIDERS = frozenset({"modelscope", "xxtf"})
 
 
+# =============================================================================
+# 配置驱动的图像端点解析（公共出口）
+# -----------------------------------------------------------------------------
+# "这个图像模型到底 POST 到哪个 URL、参考图怎么传"由模型/厂商配置决定，
+# 不再按提供商写 if-else 分支：
+#   - 模型配置声明 endpoint="https://apihub.agnes-ai.com/v1/images/generations"
+#     -> 生成（及内联编辑）原样 POST 到该 URL；
+#   - 厂商/模型声明 image_edit_inline=True（如 Agnes：参考图内联进生成
+#     端点的 extra_body.image）-> 生成与编辑共用同一端点，无独立 edits；
+#   - 未声明任何端点覆盖 -> 维持官方形状推导 {base_url}/images/{generations,edits}
+#     （XXTF 等标准 OpenAI Images 中转行为完全不变）。
+# =============================================================================
+_INLINE_IMAGE_SIZE_TIERS = frozenset({"1K", "2K", "3K", "4K"})
+# Agnes 官方支持的宽高比集合（size 档位 + ratio 配合使用；不在集合内的
+# aspect_ratio 不发送，走网关默认 1:1）。
+_INLINE_IMAGE_RATIOS = frozenset({"1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9"})
+_EXACT_SIZE_PATTERN = re.compile(r"^\d{3,4}[xX]\d{3,4}$")
+
+
+class ImagesEndpointShape:
+    """图像请求的端点与参考图形状（配置驱动解析结果，见
+    :func:`resolve_images_endpoint_shape`）。"""
+
+    __slots__ = ("generate_url", "edits_url", "edit_inline", "style")
+
+    def __init__(self, *, generate_url: str, edits_url: str, edit_inline: bool, style: str) -> None:
+        self.generate_url = generate_url
+        self.edits_url = edits_url
+        self.edit_inline = edit_inline
+        self.style = style
+
+    def __repr__(self) -> str:  # 调试便利
+        return (
+            f"ImagesEndpointShape(generate_url={self.generate_url!r}, "
+            f"edits_url={self.edits_url!r}, edit_inline={self.edit_inline!r}, "
+            f"style={self.style!r})"
+        )
+
+
+def resolve_images_endpoint_shape(model_info: Optional[ModelConfig]):
+    """按模型/厂商配置解析图像请求的端点与参考图形状（公共出口）。
+
+    返回 :class:`ImagesEndpointShape`：
+      - generate_url: 文生图（及内联编辑）应 POST 的完整 URL；
+      - edits_url:    multipart 编辑应 POST 的完整 URL（inline 风格下不用）；
+      - edit_inline:  True = 参考图内联进 generate_url 的 JSON 请求体
+        （Agnes extra_body.image / ModelScope image_url 风格）；
+      - style:        展示用风格标签（"inline_images" / "multipart_edits"）。
+    model_info 为 None 时按未声明处理（官方形状 + 无端点覆盖）。
+    """
+    ep = None
+    if model_info is not None:
+        try:
+            ep = get_effective_endpoint(model_info)
+        except Exception:
+            ep = None
+    base_url = ((getattr(ep, "base_url", "") or "").rstrip("/") if ep else "")
+    declared_endpoint = str(getattr(ep, "endpoint", None) or "").strip() if ep else ""
+    declared_edits = str(getattr(ep, "edits_endpoint", None) or "").strip() if ep else ""
+    edit_inline = bool(getattr(ep, "image_edit_inline", False)) if ep else False
+
+    generate_url = declared_endpoint or (f"{base_url}/images/generations" if base_url else "")
+    edits_url = declared_edits or (f"{base_url}/images/edits" if base_url else "")
+    return ImagesEndpointShape(
+        generate_url=generate_url,
+        edits_url=edits_url,
+        edit_inline=edit_inline,
+        style=("inline_images" if edit_inline else "multipart_edits"),
+    )
+
+
+def _normalize_inline_size(image_size: str | None) -> str | None:
+    """归一化 inline 风格的 size 参数（Agnes 档位 / 历史精确尺寸）。
+
+    - 档位（1K/2K/3K/4K，大小写不敏感）-> 原样大写发送；
+    - 历史精确尺寸（如 1024x768）-> 原样发送（网关自动标准化到最近档位）；
+    - 其他/缺省 -> None（不发送 size，走网关默认）。
+    """
+    value = str(image_size or "").strip().upper()
+    if value in _INLINE_IMAGE_SIZE_TIERS:
+        return value
+    if _EXACT_SIZE_PATTERN.match(value):
+        # 历史精确尺寸按文档示例小写 x 归一（1024X768 -> 1024x768）
+        return value.replace("X", "x")
+    return None
+
+
+def _normalize_inline_ratio(aspect_ratio: str | None) -> str | None:
+    """归一化 inline 风格的 ratio 参数（仅在官方支持集合内才发送）。"""
+    value = str(aspect_ratio or "").strip()
+    return value if value in _INLINE_IMAGE_RATIOS else None
+
+
+def build_inline_images_payload(
+        *,
+        model: str,
+        prompt: str,
+        size: str | None,
+        ratio: str | None,
+        image_data_urls: list[str] | tuple[str, ...] = (),
+) -> dict:
+    """构造 Agnes 式 inline 图像请求 payload（文生图 / 图生图 / 多图合成共用）。
+
+    严格对齐 Agnes Images API 文档：
+      - 顶层只放 model / prompt / size / ratio（+ return_base64）；
+      - response_format 绝不放顶层：文生图要 Base64 用 return_base64=true，
+        图生图/多图合成的参考图与输出格式统一进 extra_body；
+      - 参考图（公共 URL 或 Data URI）放 extra_body.image 数组，多图合成
+        传多张即得；
+      - 不传 tags（图生图无需 tags: ["img2img"]）。
+
+    image_data_urls 为空 = 文生图（return_base64=true 直取 b64_json，
+    免一次签名 URL 下载往返）；非空 = 图生图/多图合成
+    （extra_body.response_format="b64_json" 同理）。
+    """
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+    }
+    if size:
+        payload["size"] = size
+    if ratio:
+        payload["ratio"] = ratio
+    if image_data_urls:
+        payload["extra_body"] = {
+            "image": list(image_data_urls),
+            "response_format": "b64_json",
+        }
+    else:
+        payload["return_base64"] = True
+    return payload
+
+
 def _get_images_api_display_name(model_info: Optional[ModelConfig]) -> str:
     """返回提供商展示名（如 "ModelScope" / "XXTF"），用于错误提示文案。"""
     provider_key = getattr(model_info, "provider", "") or ""
@@ -793,43 +926,55 @@ async def _request_openai_compat_image(
         num_images: int = 1,
         model: str = "",
         aspect_ratio: str | None = None,
+        image_size: str | None = None,
 ) -> tuple[dict | None, str, str, int, str]:
-    """通用 OpenAI Images 兼容实现（XXTF 等中转站走这里）。
+    """通用 OpenAI Images 兼容实现（端点与形状配置驱动，公共出口）。
 
-    端点选择严格对齐 OpenAI 官方 Images API 语义（developers.openai.com
-    api/reference/resources/images/methods/{generate,edit}）：
+    端点与参考图形状经 :func:`resolve_images_endpoint_shape` 从模型/厂商
+    配置解析，支持两种 API 形状。新增一个走不同子端点/形状的模型只需在
+    config 里声明 endpoint / image_edit_inline，无需在本函数新建分支：
 
+    形状 A —— inline_images（Agnes 式：生成/编辑/多图合成共用同一端点）：
+      - 全部请求 POST JSON 到配置声明的 generate_url（如
+        ``https://apihub.agnes-ai.com/v1/images/generations``）；
+      - payload 由 :func:`build_inline_images_payload` 构造：顶层
+        model/prompt/size(档位 1K-4K 或历史精确尺寸)/ratio(官方 8 种)，
+        参考图内联 ``extra_body.image``（多图合成传多张即得），输出格式
+        ``extra_body.response_format`` / ``return_base64``——绝不在顶层放
+        response_format、绝不传 tags（严格对齐 Agnes 文档要求）；
+      - 文生图 return_base64=true 直取 b64_json；图生图/多图合成
+        extra_body.response_format="b64_json"，省一次签名 URL 下载往返。
+
+    形状 B —— multipart_edits（OpenAI 官方语义，XXTF 等标准中转，行为不变）：
     - 无参考图（文生图）: POST JSON ``{base_url}/images/generations``
       （官方 "Create image"，仅接受文本 prompt，无 image 参数）。
-    - 有参考图（图生图/编辑）: 官方是独立端点 "Create image edit"
+    - 有参考图（图生图/编辑）: 官方独立端点 "Create image edit"
       ``{base_url}/images/edits``，且必须是 multipart/form-data——参考图以
       重复的 ``image[]`` 文件字段逐张上传（gpt-image 系列支持多张），
       文本字段为 model / prompt / n [/ size]：
 
-          curl https://api.openai.com/v1/images/edits \\
-            -F "model=gpt-image-1.5" -F "image[]=@a.png" -F "image[]=@b.png" \\
+          curl https://api.openai.com/v1/images/edits \
+            -F "model=gpt-image-1.5" -F "image[]=@a.png" -F "image[]=@b.png" \
             -F 'prompt=...'
 
       ⚠️ 编辑请求绝不回退 ``/images/generations``：官方 generations 端点
       并不接受 image 参数，把参考图塞进 JSON 发给 generations 只会被部分
       中转站静默忽略——上游返回 200，实际执行的是纯文生图，用户看到的
       "编辑结果"与原图毫无关系（2026-09-08 生产事故：要求"移除行人"，
-      结果场景/风格整体重绘）。因此按以下顺序：
+      结果场景/风格整体重绘）。因此：
         1. 参考图先经真实图片校验（Pillow magic bytes），不合法直接 400；
         2. 严格 POST multipart /images/edits；
         3. edits 失败（含 404/405 路由未实现）→ 明确报错，绝不降级。
-      鲁棒性保留："请求体未完整/请重试"类瞬态 400 同形状自动重试一次；
-      超大参考图（>3MB）先降采样再上传，避免中转站读不满请求体。
 
-    - base_url 沿用 provider/模型端点覆盖的合并结果（XXTF 默认
-      ``https://xxtf.baby/v1``，即最终请求 ``https://xxtf.baby/v1/images/edits``
-      等真实路径）。
-    - 鉴权：``Bearer {api_key_env 解析出的 key}``；provider 级
-      default_headers（如 XXTF 的浏览器 UA）一并下发。multipart 请求
-      不手动设置 Content-Type（aiohttp 自动生成带 boundary 的头）。
-    - 响应：两个端点同为 OpenAI 标准 ``{data: [{url} | {b64_json}]}``，
-      图片提取复用 :func:`_extract_image_items`（gpt-image 系列固定回
-      b64_json，同样覆盖）。
+    共同鲁棒性："请求体未完整/请重试"类瞬态 400 同形状自动重试一次；
+    超大参考图（>3MB）先降采样再上传，避免中转站读不满请求体。
+    URL 优先级：模型/厂商声明的完整端点（endpoint / edits_endpoint）>
+    {base_url}/images/{generations,edits} 官方推导。
+    鉴权：``Bearer {api_key_env 解析出的 key}``；provider 级
+    default_headers（如 XXTF 的浏览器 UA）一并下发。multipart 请求
+    不手动设置 Content-Type（aiohttp 自动生成带 boundary 的头）。
+    响应：两类形状同为 ``{data: [{url} | {b64_json}]}``，图片提取复用
+    :func:`_extract_image_items`（gpt-image 系列固定回 b64_json，同样覆盖）。
 
     返回: (response_json, endpoint, error_detail, status_code, request_id)
     endpoint 为实际使用的相对路径（"/images/edits" 或 "/images/generations"），
@@ -839,11 +984,11 @@ async def _request_openai_compat_image(
     edits_endpoint = "/images/edits"
     log_prefix = "[NativeImage/OpenAICompat]"
     ep = get_effective_endpoint(model_info)
-    base_url = (getattr(ep, "base_url", "") or "").rstrip("/")
+    shape = resolve_images_endpoint_shape(model_info)
     api_key_env = getattr(ep, "api_key_env", "") or ""
     api_key = _resolve_provider_api_key(api_key_env)
-    if not base_url:
-        return None, gen_endpoint, f"提供商 {ep.name!r} 未配置 base_url", 400, ""
+    if not shape.generate_url:
+        return None, gen_endpoint, f"提供商 {ep.name!r} 未配置 base_url / endpoint", 400, ""
     if not api_key:
         return None, gen_endpoint, f"缺少 API Key: {api_key_env}，请设置环境变量", 401, ""
 
@@ -855,25 +1000,77 @@ async def _request_openai_compat_image(
     timeout = aiohttp.ClientTimeout(total=300, connect=10, sock_read=180)
 
     clean_prompt = _clean_prompt_for_image_model(prompt)
-    size = _aspect_ratio_to_openai_size(aspect_ratio)
     n = max(1, min(num_images, 4))
-
-    def _payload_base(prompt_text: str) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "model": model,
-            "prompt": prompt_text,
-            "n": n,
-        }
-        if size:
-            payload["size"] = size
-        return payload
+    # endpoint 变量贯穿 except 分支用于错误展示，先按即将使用的路径初始化。
+    endpoint = gen_endpoint
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
+            # ============ 形状 A：inline_images（Agnes 式，同一端点）============
+            if shape.edit_inline:
+                inline_size = _normalize_inline_size(image_size)
+                inline_ratio = _normalize_inline_ratio(aspect_ratio)
+                if not image_urls:
+                    # 文生图：JSON，return_base64=true 直取 b64_json
+                    payload = build_inline_images_payload(
+                        model=model,
+                        prompt=clean_prompt or "请生成一张图片。",
+                        size=inline_size,
+                        ratio=inline_ratio,
+                    )
+                    logger.debug(
+                        "%s [inline] request prepared: provider=%s url=%s model=%s "
+                        "size=%s ratio=%s prompt_len=%s(cleaned, raw=%s) prompt_preview=%r",
+                        log_prefix, ep.name, shape.generate_url, model,
+                        inline_size, inline_ratio,
+                        len(clean_prompt or ""), len(prompt or ""),
+                        (clean_prompt or "")[:240],
+                    )
+                    return await _post_images_with_retry(
+                        session, shape.generate_url,
+                        endpoint=gen_endpoint, log_prefix=log_prefix,
+                        headers=json_headers, json_payload=payload,
+                    )
+
+                # 图生图 / 多图合成：参考图下载校验后内联进 extra_body.image
+                image_data_urls = await _image_urls_to_data_urls(session, image_urls)
+                if not image_data_urls:
+                    return None, gen_endpoint, "未能读取参考图片", 400, ""
+                # 超大参考图先降采样（与 multipart 形状同一套压缩鲁棒性）
+                image_data_urls = [_shrink_data_url(u) for u in image_data_urls]
+                payload = build_inline_images_payload(
+                    model=model,
+                    prompt=clean_prompt or "请根据参考图进行编辑。",
+                    size=inline_size,
+                    ratio=inline_ratio,
+                    image_data_urls=image_data_urls,
+                )
+                logger.debug(
+                    "%s [inline] edit prepared: provider=%s url=%s model=%s size=%s ratio=%s "
+                    "prompt_len=%s(cleaned, raw=%s) image_count=%s prompt_preview=%r",
+                    log_prefix, ep.name, shape.generate_url, model,
+                    inline_size, inline_ratio,
+                    len(clean_prompt or ""), len(prompt or ""),
+                    len(image_data_urls), (clean_prompt or "")[:240],
+                )
+                return await _post_images_with_retry(
+                    session, shape.generate_url,
+                    endpoint=gen_endpoint, log_prefix=log_prefix,
+                    headers=json_headers, json_payload=payload,
+                )
+
+            # ========= 形状 B：multipart_edits（OpenAI 官方语义，不变）=========
             # ---------------- 文生图：JSON /images/generations ----------------
             if not image_urls:
                 endpoint = gen_endpoint
-                payload = _payload_base(clean_prompt or "请生成一张图片。")
+                size = _aspect_ratio_to_openai_size(aspect_ratio)
+                payload: dict[str, Any] = {
+                    "model": model,
+                    "prompt": clean_prompt or "请生成一张图片。",
+                    "n": n,
+                }
+                if size:
+                    payload["size"] = size
                 logger.debug(
                     "%s request prepared: provider=%s endpoint=%s model=%s prompt_len=%s(cleaned, raw=%s) prompt_preview=%r",
                     log_prefix, ep.name, endpoint, model,
@@ -881,7 +1078,7 @@ async def _request_openai_compat_image(
                     (clean_prompt or "")[:240],
                 )
                 return await _post_images_with_retry(
-                    session, f"{base_url}{endpoint}",
+                    session, shape.generate_url,
                     endpoint=endpoint, log_prefix=log_prefix,
                     headers=json_headers, json_payload=payload,
                 )
@@ -937,6 +1134,7 @@ async def _request_openai_compat_image(
                 form.add_field("model", str(model))
                 form.add_field("prompt", clean_prompt or "请根据参考图进行编辑。")
                 form.add_field("n", str(n))
+                size = _aspect_ratio_to_openai_size(aspect_ratio)
                 if size:
                     form.add_field("size", str(size))
                 for idx, img_bytes, mime, ext in decoded_refs:
@@ -966,7 +1164,7 @@ async def _request_openai_compat_image(
 
             parsed, used_endpoint, detail, status_code, req_id = (
                 await _post_images_with_retry(
-                    session, f"{base_url}{endpoint}",
+                    session, shape.edits_url,
                     endpoint=endpoint, log_prefix=log_prefix,
                     headers=auth_headers, form_factory=_build_edits_form,
                 )
@@ -989,7 +1187,7 @@ async def _request_openai_compat_image(
                 None,
                 used_endpoint,
                 (
-                    f"图像编辑端点 {base_url}{edits_endpoint} 不可用或拒绝请求；"
+                    f"图像编辑端点 {shape.edits_url} 不可用或拒绝请求；"
                     "为避免把编辑误降级成全新图片生成，程序不会回退到 "
                     f"/images/generations。上游状态={status_code}，"
                     f"详情={(detail or '无').strip()[:240]}"
@@ -1013,16 +1211,19 @@ async def _request_images_generations(
         num_images: int = 1,
         model: str = "",
         aspect_ratio: str | None = None,
+        image_size: str | None = None,
 ) -> tuple[dict | None, str, str, int, str]:
     """统一图像请求出口：所有 OpenAI Images 协议提供商共用这一个函数。
 
     调用方（_agentic_loop_native_image / execute_generate_image）不再按
     提供商各写一套请求逻辑，只拿到统一形状的返回值后做各自的呈现：
 
-    - modelscope -> _request_modelscope_native_image（异步任务轮询特化）
-    - 其它（xxtf 等中转站）-> _request_openai_compat_image（标准同步 REST；
-      文生图走 JSON /images/generations，带参考图的编辑只走官方
-      multipart /images/edits，失败即报错，绝不回退 generations 形状）
+    - modelscope -> _request_modelscope_native_image（异步任务轮询特化，
+      其协议差异是厂商级而非模型级，保留内部分支）
+    - 其它 -> _request_openai_compat_image（端点与参考图形状完全由模型/
+      厂商配置驱动：inline_images 如 Agnes 生成/编辑/多图合成共用同一
+      声明端点；multipart_edits 如 XXTF 走官方
+      /images/{generations,edits}，失败即报错，绝不回退 generations 形状）
 
     返回: (response_json, endpoint, error_detail, status_code, request_id)
     endpoint 为实际使用的相对路径（"/images/generations" 或
@@ -1043,6 +1244,7 @@ async def _request_images_generations(
         num_images=num_images,
         model=model,
         aspect_ratio=aspect_ratio,
+        image_size=image_size,
     )
 
 
@@ -1357,6 +1559,10 @@ async def _request_agnes_video(
     """
     提交视频任务到 Agnes 并轮询结果。
     返回 (video_url, error_message, meta)；成功时 error=None，meta 含 width/height/frame_rate/num_frames 等元数据。
+
+    提交端点由模型配置驱动（endpoint 字段，如
+    "https://apihub.agnes-ai.com/v1/videos"），未声明时回退内置默认；
+    轮询端点是协议实现细节（与 ModelScope 的 /tasks/{id} 同理），保持内置。
     """
     base_url = "https://apihub.agnes-ai.com/v1"
     headers = {
@@ -1364,17 +1570,27 @@ async def _request_agnes_video(
         "Content-Type": "application/json",
     }
 
+    # 提交端点：模型声明了 endpoint 就用声明值（配置驱动，无需按厂商分支）。
+    submit_url = f"{base_url}/videos"
+    try:
+        model_info = SUPPORTED_MODELS.get(model)
+        if model_info is not None:
+            declared = str(get_effective_endpoint(model_info).endpoint or "").strip()
+            if declared:
+                submit_url = declared
+    except Exception:
+        logger.debug("[NativeVideo/Agnes] 解析模型 endpoint 失败，回退默认提交端点", exc_info=True)
+
     clean_prompt = (prompt or "").strip()
     logger.debug(
-        "[NativeVideo/Agnes] request prepared: model=%s duration=%ss prompt_len=%s prompt_preview=%r",
+        "[NativeVideo/Agnes] request prepared: model=%s duration=%ss submit_url=%s prompt_len=%s prompt_preview=%r",
         model,
         duration,
+        submit_url,
         len(clean_prompt),
         clean_prompt[:240],
     )
 
-    # 提交任务
-    submit_url = f"{base_url}/videos"
     payload = {
         "model": model,
         "prompt": clean_prompt,
@@ -1793,6 +2009,7 @@ async def _request_openai_images_task(task: "ImageTask") -> "ImageTaskResult":
         num_images=max(1, min(int(task.num_images or 1), 4)),
         model=task.model,
         aspect_ratio=task.aspect_ratio,
+        image_size=task.image_size,
     )
     if response_json is None:
         raise ImageRequestError(

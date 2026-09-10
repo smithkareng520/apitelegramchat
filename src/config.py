@@ -195,6 +195,29 @@ class ProviderConfig:
     # 内联 base64 会被静默忽略甚至报 4xx。开启后，会在 _resolve_multimodal_content
     # 里优先用 R2 公开 URL（不泄露 Telegram bot token），R2 不可用时回退 base64。
     vision_prefer_url: bool = False
+    # ===================== 请求端点与图像 API 形状（厂商级默认）=====================
+    # 配置驱动端点路由：这三个字段让"同一个网关下不同模型走不同子端点 /
+    # 不同图像 API 形状"只需要在配置里写清楚，不需要为每个模型/厂商在
+    # 请求层新建 if-else 分支。模型侧（ModelConfig）同名字段可逐模型覆盖。
+    # endpoint:
+    #   完整请求 URL（含路径）。图像模型填图像生成端点，如
+    #   "https://apihub.agnes-ai.com/v1/images/generations"；视频模型可填
+    #   视频任务提交端点。None = 由协议按 base_url 推导标准路径
+    #   （openai_images -> {base_url}/images/generations，chat -> SDK 自拼）。
+    # edits_endpoint:
+    #   编辑端点完整 URL（OpenAI 官方形状的 /images/edits 覆盖）。仅
+    #   openai_images 协议且未启用 image_edit_inline 时使用；None =
+    #   {base_url}/images/edits。
+    # image_edit_inline:
+    #   参考图传递形状（仅 openai_images 协议的图像请求读取）：
+    #   True  = 参考图内联进生成端点的 JSON 请求体（Agnes 的
+    #           extra_body.image、ModelScope 的 image_url 风格），生成与
+    #           编辑共用同一 endpoint，无独立 edits 端点；
+    #   False = OpenAI 官方形状：编辑走独立 multipart /images/edits；
+    #   None  = 视为 False（官方形状，向后兼容）。
+    endpoint: Optional[str] = None
+    edits_endpoint: Optional[str] = None
+    image_edit_inline: Optional[bool] = None
     # 是否向该网关下发"会话亲和键"（session_id / X-Session-Id，同一对话
     # 窗口/同一任务共用，清空对话时轮换，见 state.get_llm_session_key）。
     # 背景：OpenRouter 官方支持 body.session_id 粘性路由（见
@@ -276,10 +299,19 @@ class ModelConfig:
     #     显式填 protocol="openai_chat" 覆盖。
     #   - 图像模型：填 protocol="openai_images"（OpenAI Images 协议）或
     #     保持 "openai_chat"（经 chat.completions + modalities 出图）。
+    #   - 图像/视频模型还可以直接声明完整请求端点（endpoint=完整 URL，
+    #     如 "https://apihub.agnes-ai.com/v1/images/generations"），统一
+    #     请求出口会原样 POST 到该 URL——端点路由完全由配置驱动，新增
+    #     一个走不同子端点的模型不需要在请求层新建任何分支。
     # 见 get_effective_endpoint() 获取合并后的有效端点配置。
     base_url: Optional[str] = None
     api_key_env: Optional[str] = None
     default_headers: Optional[Dict[str, str]] = None
+    # 完整请求端点与图像 API 形状（语义见 ProviderConfig 同名字段注释；
+    # None = 继承厂商默认）。
+    endpoint: Optional[str] = None
+    edits_endpoint: Optional[str] = None
+    image_edit_inline: Optional[bool] = None
     # 协议选择器（单字段，取值域同 ProviderConfig.protocol）：
     # None = 继承厂商默认；显式声明即覆盖，无独立开关字段。
     protocol: Optional[str] = None
@@ -350,6 +382,13 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         # Agnes 官方文档明确只接受 image_url 中的公开 URL（不接受 data: base64），
         # 因此 _resolve_multimodal_content 会优先用 R2 公开 URL，R2 不可用时回退 base64。
         vision_prefer_url=True,
+        # 图像 API 形状（厂商级声明一次，全厂商图像模型共用，无需逐模型分支）：
+        # Agnes 的图像生成/编辑/多图合成共用同一端点（/v1/images/generations），
+        # 参考图以 JSON 内联字段（extra_body.image）传递，无独立 /images/edits。
+        # 具体端点 URL 由各图像模型用 endpoint 字段声明（如
+        # "https://apihub.agnes-ai.com/v1/images/generations"），见
+        # media_generation.resolve_images_endpoint_shape。
+        image_edit_inline=True,
         # 聚合网关多副本缓存隔离：不下发会话亲和键时，同一前缀的命中率随
         # 路由到的副本随机波动（生产日志中 run 边界 40%、run 内 90%+ 的
         # 交替即此原因）。开启后每个请求携带 session_id + X-Session-Id，
@@ -566,6 +605,11 @@ class EffectiveEndpoint:
     supports_prompt_cache: bool
     vision_prefer_url: bool
     session_affinity: bool
+    # 配置驱动的完整请求端点与图像 API 形状（None = 未声明，按协议从
+    # base_url 推导标准路径；语义见 ProviderConfig 同名字段注释）。
+    endpoint: Optional[str] = None
+    edits_endpoint: Optional[str] = None
+    image_edit_inline: Optional[bool] = None
     # 是否存在模型级端点覆盖（仅用于日志/调试，不参与业务判断）。
     is_override: bool = False
 
@@ -575,7 +619,8 @@ def get_effective_endpoint(model_info: Optional[ModelConfig]) -> EffectiveEndpoi
     返回某个 ModelConfig 实际应使用的端点配置：
     以 PROVIDERS[model_info.provider] 为默认值，逐字段用模型上非 None 的
     覆盖字段（base_url / api_key_env / default_headers / protocol /
-    session_affinity / vision_prefer_url）替换。
+    session_affinity / vision_prefer_url / endpoint / edits_endpoint /
+    image_edit_inline）替换。
 
     这是"每模型独立配置中转端点/协议"的唯一合并出口：api_client.py /
     agentic_loops.py / attachment_content.py 等一切需要知道"这个模型到底
@@ -598,13 +643,17 @@ def get_effective_endpoint(model_info: Optional[ModelConfig]) -> EffectiveEndpoi
     override_protocol = getattr(model_info, "protocol", None)
     override_session_aff = getattr(model_info, "session_affinity", None)
     override_vision_url = getattr(model_info, "vision_prefer_url", None)
+    override_endpoint = getattr(model_info, "endpoint", None)
+    override_edits_endpoint = getattr(model_info, "edits_endpoint", None)
+    override_image_edit_inline = getattr(model_info, "image_edit_inline", None)
 
     is_override = any(
         v is not None
         for v in (
             override_base_url, override_api_key_env, override_headers,
             override_protocol, override_session_aff,
-            override_vision_url,
+            override_vision_url, override_endpoint, override_edits_endpoint,
+            override_image_edit_inline,
         )
     )
 
@@ -618,6 +667,12 @@ def get_effective_endpoint(model_info: Optional[ModelConfig]) -> EffectiveEndpoi
         supports_prompt_cache=bool(getattr(model_info, "supports_prompt_cache", base.supports_prompt_cache)),
         vision_prefer_url=bool(_pick("vision_prefer_url")),
         session_affinity=bool(_pick("session_affinity")),
+        endpoint=override_endpoint if override_endpoint is not None else base.endpoint,
+        edits_endpoint=(override_edits_endpoint if override_edits_endpoint is not None else base.edits_endpoint),
+        image_edit_inline=(
+            override_image_edit_inline if override_image_edit_inline is not None
+            else base.image_edit_inline
+        ),
         is_override=is_override,
     )
 
@@ -655,6 +710,9 @@ _ENDPOINT_OVERRIDE_FIELDS = (
     "protocol",
     "session_affinity",
     "vision_prefer_url",
+    "endpoint",
+    "edits_endpoint",
+    "image_edit_inline",
 )
 
 
@@ -774,6 +832,9 @@ def make_model_config(
         protocol=endpoint_overrides.get("protocol"),
         session_affinity=endpoint_overrides.get("session_affinity"),
         vision_prefer_url=endpoint_overrides.get("vision_prefer_url"),
+        endpoint=endpoint_overrides.get("endpoint"),
+        edits_endpoint=endpoint_overrides.get("edits_endpoint"),
+        image_edit_inline=endpoint_overrides.get("image_edit_inline"),
     )
 
 
@@ -903,6 +964,120 @@ def get_reasoning_request_fields(
 
 
 # =============================================================================
+# 统一参数出口：厂商默认参数 -> 模型覆盖参数（唯一合并视图）
+# -----------------------------------------------------------------------------
+# 回答"当前选定的模型到底用什么参数/能力/端点"这一个问题。分层规则：
+#   厂商默认（ProviderConfig + _PROVIDER_DEFAULTS）
+#     -> 模型覆盖（make_model_config 时已把非 None 的模型字段合并进
+#        ModelConfig；端点字段在使用时经 get_effective_endpoint 合并）
+# 能力查询（鉴权）、参数查询（请求体构建）、端点查询（路由）都应经过
+# resolve_effective_params / get_effective_endpoint，而不是各自散落读取
+# 原始配置——这是"统一模块按模型参数与输入组合鉴权、构建请求"的数据底座。
+# =============================================================================
+@dataclass
+class EffectiveParams:
+    """某模型合并后的有效参数总览（厂商默认 -> 模型覆盖）。"""
+    # ---- 身份 ----
+    provider: str
+    model_id: str
+    name: str
+    # ---- 输入模态能力（鉴权用：用户输入了什么 vs 模型能收什么）----
+    vision: bool                  # 图片输入
+    audio: bool                   # 音频输入
+    video_input: bool             # 视频输入（ModelConfig.video，与生成输出区分）
+    native_document: bool         # 原生文档输入
+    # ---- 输出模态能力（分支判断用）----
+    native_image: bool            # 图像生成输出
+    native_video: bool            # 视频生成输出
+    # ---- 工具面 / 采样 ----
+    supports_tools: bool
+    supports_sampling: bool
+    supports_prompt_cache: bool
+    # ---- 采样与推理参数（None = 不发送，走供应商默认）----
+    temperature: Optional[float]
+    top_p: Optional[float]
+    reasoning_enabled: Optional[bool]
+    reasoning_effort: Optional[str]
+    reasoning_max_tokens: Optional[int]
+    # ---- 上下文预算 ----
+    max_context: int
+    max_output_tokens: int
+    # ---- 端点（厂商默认 -> 模型覆盖 的合并结果，含协议）----
+    endpoint: EffectiveEndpoint
+
+    def capability_for_modality(self, modality: str) -> bool:
+        """输入模态标签 -> 该模型是否支持（鉴权判定的唯一映射出口）。
+
+        modality 取值与 Telegram 附件 kind 对齐：
+        photo/image -> vision；audio/voice -> audio；video -> video_input；
+        document -> native_document；未知模态保守返回 False（鉴权方会降级
+        为文本占位，与 _resolve_multimodal_content 的行为一致）。
+        """
+        key = str(modality or "").strip().lower()
+        mapping = {
+            "photo": self.vision,
+            "image": self.vision,
+            "audio": self.audio,
+            "voice": self.audio,
+            "video": self.video_input,
+            "document": self.native_document,
+        }
+        return bool(mapping.get(key, False))
+
+
+def resolve_effective_params(model_info: Optional[ModelConfig]) -> EffectiveParams:
+    """把厂商默认参数与模型覆盖参数合并为一份平坦的有效参数视图。
+
+    这是"厂商默认参数，模型覆盖参数"的统一读取出口：
+      - 能力字段：make_model_config 阶段已按 _PROVIDER_DEFAULTS 合并进
+        ModelConfig（模型显式声明 > 厂商默认），这里原样呈现；
+      - 采样/推理：与 get_sampling_params / get_reasoning_request_fields
+        同源（None = 不发送该字段）；
+      - 端点/协议：经 get_effective_endpoint 合并（模型覆盖 > 厂商默认）。
+    model_info 为 None（未注册模型）时返回全 False 能力 + 空 endpoint
+    视图（provider/model_id 为空串），调用方按未注册模型降级处理。
+    """
+    if model_info is None:
+        return EffectiveParams(
+            provider="", model_id="", name="",
+            vision=False, audio=False, video_input=False, native_document=False,
+            native_image=False, native_video=False,
+            supports_tools=False, supports_sampling=False, supports_prompt_cache=False,
+            temperature=None, top_p=None,
+            reasoning_enabled=None, reasoning_effort=None, reasoning_max_tokens=None,
+            max_context=0, max_output_tokens=0,
+            endpoint=None,  # type: ignore[arg-type]
+        )
+    try:
+        endpoint = get_effective_endpoint(model_info)
+    except ValueError:
+        # 未知厂商：保留能力视图但端点置空（鉴权照常，路由层会显式报错）。
+        endpoint = None  # type: ignore[assignment]
+    return EffectiveParams(
+        provider=str(getattr(model_info, "provider", "") or ""),
+        model_id=str(getattr(model_info, "model_id", "") or ""),
+        name=str(getattr(model_info, "name", "") or ""),
+        vision=bool(getattr(model_info, "vision", False)),
+        audio=bool(getattr(model_info, "audio", False)),
+        video_input=bool(getattr(model_info, "video", False)),
+        native_document=bool(getattr(model_info, "native_document", False)),
+        native_image=bool(getattr(model_info, "native_image", False)),
+        native_video=bool(getattr(model_info, "native_video", False)),
+        supports_tools=bool(getattr(model_info, "supports_tools", False)),
+        supports_sampling=bool(getattr(model_info, "supports_sampling", True)),
+        supports_prompt_cache=bool(getattr(model_info, "supports_prompt_cache", False)),
+        temperature=getattr(model_info, "temperature", None),
+        top_p=getattr(model_info, "top_p", None),
+        reasoning_enabled=getattr(model_info, "reasoning_enabled", None),
+        reasoning_effort=getattr(model_info, "reasoning_effort", None),
+        reasoning_max_tokens=getattr(model_info, "reasoning_max_tokens", None),
+        max_context=int(getattr(model_info, "max_context", 0) or 0),
+        max_output_tokens=int(getattr(model_info, "max_output_tokens", 0) or 0),
+        endpoint=endpoint,
+    )
+
+
+# =============================================================================
 # 模型列表（所有支持的模型）
 # =============================================================================
 SUPPORTED_MODELS: Dict[str, ModelConfig] = {}
@@ -1013,8 +1188,19 @@ SUPPORTED_MODELS["agnes-image-2.1-flash"] = make_model_config(
     model_id="agnes-image-2.1-flash",
     provider="agnes",
     name="Agnes Image 2.1 Flash",
+    # 与 2.5 能力一致（官方文档：请求/响应参数、尺寸、计费保持一致）：
+    # native_image 进入图像模型目录与图像循环，vision 使其支持参考图编辑。
+    native_image=True,
+    vision=True,
+    supports_tools=False,
     max_context=32768,
     max_output_tokens=4000,
+    # 图像模型：显式声明 OpenAI Images 协议 + 完整请求端点（配置驱动，
+    # 请求层按此 URL 直接 POST，不再按厂商/模型写分支）。Agnes 图像网关的
+    # 生成/编辑/多图合成均走该端点（参考图内联 extra_body.image，由厂商级
+    # image_edit_inline=True 声明）。
+    protocol="openai_images",
+    endpoint="https://apihub.agnes-ai.com/v1/images/generations",
 )
 SUPPORTED_MODELS["Tongyi-MAI/Z-Image-Turbo"] = make_model_config(
     model_id="Tongyi-MAI/Z-Image-Turbo",
@@ -1057,7 +1243,6 @@ SUPPORTED_MODELS["bytedance-seed/seedream-4.5"] = make_model_config(
 
 SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
     model_id="agnes-image-2.5-flash",
-    base_url="https://apihub.agnes-ai.com/v1",
     provider="agnes",
     name="Agnes Image 2.5 Flash",
     native_image=True,
@@ -1065,6 +1250,13 @@ SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
     supports_tools=False,
     max_context=4000,
     max_output_tokens=1024,
+    # 图像模型：显式声明 OpenAI Images 协议 + 完整请求端点（与 2.1 同形状，
+    # 官方文档：请求/响应参数、尺寸、计费与 2.1 保持一致）。此前未声明
+    # protocol，继承厂商默认 openai_chat 后把图像请求发到
+    # /v1/chat/completions，被网关 400（"is an image model. Use
+    # /v1/images/generations"）。现在端点路由完全由配置驱动。
+    protocol="openai_images",
+    endpoint="https://apihub.agnes-ai.com/v1/images/generations",
 )
 
 # -----------------------------------------------------------------------------
@@ -1079,6 +1271,9 @@ SUPPORTED_MODELS["agnes-video-2.5"] = make_model_config(
     native_video=True,
     max_context=32768,
     max_output_tokens=4000,
+    # 视频任务提交端点（配置驱动）：_request_agnes_video 优先 POST 到该
+    # URL，未声明时回退内置默认，行为不变。
+    endpoint="https://apihub.agnes-ai.com/v1/videos",
 )
 
 

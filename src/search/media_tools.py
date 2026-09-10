@@ -144,10 +144,22 @@ async def execute_generate_image(
         )
 
     _protocol = _effective_image_protocol(model_info)
-    used_endpoint = (
-        ("/v1/images/edits" if image_url else "/v1/images/generations")
-        if _protocol == "openai_images" else "/v1/chat/completions"
-    )
+    # 展示用相对端点：inline_images 形状（Agnes 式）编辑同样走生成端点；
+    # multipart_edits 形状才区分 /images/edits。
+    if _protocol == "openai_images":
+        _inline = False
+        try:
+            from ai.media_generation import resolve_images_endpoint_shape
+            _inline = resolve_images_endpoint_shape(model_info).edit_inline
+        except Exception:
+            _inline = False
+        used_endpoint = (
+            "/v1/images/generations"
+            if (not image_url or _inline)
+            else "/v1/images/edits"
+        )
+    else:
+        used_endpoint = "/v1/chat/completions"
 
     def _format_success_links(uploaded_urls: list[str], total_count: int) -> str:
         """生成图上传 R2 后的统一成功文案（部分上传失败时如实说明）。"""
