@@ -234,110 +234,136 @@ Do not try to feed this TTC file to ReportLab `TTFont`; it uses CFF outlines.
 
 For scripts, prefer the bundled `scripts/cjk_font.py` helper so font paths and ReportLab registration stay consistent with the image.
 
-## Emoji handling (built-in, low-friction)
+## Emoji handling (MANDATORY for any content that may contain emoji)
 
-ReportLab does not perform font fallback. The PDF skill therefore registers a
-TrueType CJK font plus a monochrome Noto Emoji font and provides a small fallback
-layer. The important design goal is that normal PDF code should not have to
-manually build `<font>` markup.
+ReportLab has **no automatic font fallback**: every character is drawn with the one font selected for the text object, and any glyph missing from that font renders as an empty box / black square. The production Kaiti CJK font (`AR PL UKai`) contains **zero emoji glyphs**, so emoji characters (✅ ❌ ✨ 🎯 📊 🚀 👍 …) that reach ReportLab directly become garbage in the PDF.
 
-### Preferred setup
+The image ships the **monochrome Noto Emoji** font (real TrueType glyf outlines, embeddable) and the skill bundles it at `.claude/skills/pdf/fonts/NotoEmoji-Regular.ttf`. System **color** emoji fonts (e.g. `NotoColorEmoji.ttf`, CBDT/CBLC bitmaps) can **never** be embedded by ReportLab — do not use them.
 
-Call the shared registration helper once during PDF setup:
+### Rules
+
+1. Register both fonts before building any PDF: `cjk_font.register_fonts()` registers `CJKKai` + `EmojiMono` in one call.
+2. Any string that may contain emoji must go through the fallback helpers in `scripts/emoji_font.py` — never pass raw emoji text to `Paragraph(...)` or `canvas.drawString(...)`.
+3. Characters covered by neither font are dropped (with an optional report) instead of garbling the layout. Keep the report and log it if content fidelity matters.
+4. Emoji render in monochrome (black outline, inherits the paragraph's text color). Color emoji in ReportLab PDFs is not possible; if the user explicitly needs color emoji, render that paragraph as an image or strip the emoji instead.
+5. For canvas text (tables drawn manually, headers, watermarks), use `draw_mixed_string` / `string_width_mixed`, not `drawString`.
+
+### IMPORTANT: Common Mistake to Avoid
+
+<b>❌ WRONG</b> — Do NOT pass a ParagraphStyle object to `to_fallback_markup()`:
+```python
+# 错误：传入 styles['BodyTextCJK'] 对象会导致 KeyError
+text = to_fallback_markup("你好 🎯", styles['BodyTextCJK'])  
+```
+
+<b>✅ CORRECT</b> — Pass the font name string as the second argument:
+```python
+# 正确：字体名称字符串 "CJKKai"
+markup = to_fallback_markup("你好 🎯", "CJKKai")
+story.append(Paragraph(markup, styles['BodyTextCJK']))
+```
+
+<b>关键规则</b>：
+<ul><li><code>to_fallback_markup(text, base_font)</code> 的第二个参数是 <b>字体名称字符串</b>（如 `"CJKKai"`），不是 ParagraphStyle 对象</li><li><code>Paragraph(markup, style)</code> 的第二个参数才是 ParagraphStyle 对象</li></ul>
+
+### Paragraph example
+
+```python
+import sys
+sys.path.insert(0, "/app/.claude/skills/pdf/scripts")
+
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from cjk_font import register_fonts
+from emoji_font import to_fallback_markup
+
+register_fonts()  # registers CJKKai + EmojiMono
+
+# ⚠️ 关键：永远不要直接用 styles["Normal"] 等默认样式写中文，它们的 fontName
+#     是 Helvetica/Times-Roman，会显示黑框。必须显式指定 fontName="CJKKai"
+normal = ParagraphStyle('NormalCN', parent=getSampleStyleSheet()['Normal'],
+                        fontName='CJKKai', fontSize=11, leading=18)
+
+missing = []  # 收集两个字体都无法渲染的字符（正常情况下只收集到换行符）
+text = "项目进度：✅ 已完成 80% 🚀 预计下周交付"
+# to_fallback_markup 返回值是 XML-escaped 字符串，第二个参数是字体名称
+markup = to_fallback_markup(text, missing_report=missing)
+story = [Paragraph(markup, normal)]
+
+SimpleDocTemplate("report.pdf").build(story)
+```
+
+### Canvas example
 
 ```python
 from cjk_font import register_fonts
-
-register_fonts()  # idempotent: safe to call from shared setup code
-```
-
-For Platypus paragraphs, use `safe_paragraph()` and pass the same
-`ParagraphStyle` you would normally pass to `Paragraph`. The helper resolves the
-style's `fontName`, XML-escapes the text, and inserts emoji fallback markup when
-needed:
-
-```python
-from reportlab.lib.styles import getSampleStyleSheet
-from emoji_font import safe_paragraph
-
-styles = getSampleStyleSheet()
-styles["BodyText"].fontName = "CJKKai"
-story.append(safe_paragraph("项目进度：✅ 已完成 80% 🚀", styles["BodyText"]))
-```
-
-Call `register_fonts()` during PDF setup before creating paragraphs. This is the recommended API for new code. Existing code can keep using
-`to_fallback_markup()`, but it now accepts either a font name string or a
-`ParagraphStyle`, so this common pattern is valid:
-
-```python
-markup = to_fallback_markup("你好 🎯", styles["BodyText"])
-story.append(Paragraph(markup, styles["BodyText"]))
-```
-
-### Canvas text
-
-For low-level canvas drawing, continue to use `draw_mixed_string()` and
-`string_width_mixed()` instead of `canvas.drawString()` for mixed CJK/emoji text:
-
-```python
 from emoji_font import draw_mixed_string, string_width_mixed
 
-text = "验收结果：✅ 通过 3 项 ❌ 未通过 1 项"
-width = string_width_mixed(text, 12, "CJKKai")
-draw_mixed_string(c, (letter[0] - width) / 2, 700, text, 12, "CJKKai")
+register_fonts()
+
+c = canvas.Canvas("out.pdf", pagesize=letter)
+text = "验收结果：✔ 通过 3 项 ❌ 未通过 1 项"
+width = string_width_mixed(text, 12)
+draw_mixed_string(c, (letter[0] - width) / 2, 700, text, 12)
+c.save()
 ```
 
-Both helpers also accept a ReportLab `ParagraphStyle` in place of the base
-font name.
+### Emoji font facts
 
-### What the fallback layer does
+- Registered name: `EmojiMono`
+- File: `.claude/skills/pdf/fonts/NotoEmoji-Regular.ttf` (vendored, Apache-2.0)
+- Override path: `APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT`
+- Covers all standard emoji codepoints including ZWJ sequences and skin-tone modifiers; variation selector U+FE0F is zero-width
+- Does **not** cover CJK, kana, arrows (→), math symbols (± × ÷ ≠ ≈), circled numbers (①) — those come from the CJK font, which is exactly what the fallback logic arranges
 
-- It examines the actual glyph coverage of the registered fonts rather than
-  assuming that a Unicode block is fully supported.
-- It keeps Unicode grapheme clusters together where possible. This avoids
-  splitting common ZWJ emoji, variation selectors, skin-tone sequences, and
-  flag sequences into visually broken pieces.
-- Emoji-preferred characters use the monochrome Noto Emoji font when available;
-  normal CJK, Latin, arrows, and math symbols stay in the base font.
-- Characters unsupported by both fonts are dropped by default instead of
-  emitting a PDF notdef box. Pass `missing_report=[]` when content fidelity is
-  important so the caller can log exactly what was omitted.
-- Color emoji are intentionally not embedded through ReportLab. The ReportLab
-  path uses monochrome TrueType outlines; the LibreOffice/DOCX path can use the
-  system color emoji font separately.
+The runtime check `scripts/check_cjk_runtime.py` verifies the emoji font presence, embeddability, and sample glyph coverage alongside the CJK checks.
 
-### Migration from older code
+<h3>⚠️ 重要：中文PDF生成的常见陷阱</h3>
 
-Old, verbose pattern:
+<b>问题描述：</b>ReportLab 的默认样式（如 <code>styles['Normal']</code>、<code>styles['Title']</code>、<code>styles['Heading1']</code> 等）的 <code>fontName</code> 默认是 <code>Helvetica</code>、<code>Helvetica-Bold</code>、<code>Courier</code> 等西文字体，<b>不支持任何中文字符</b>。如果直接使用这些样式而不修改字体，中文会显示为黑框（复制出来是"n"）。
 
-```python
-markup = to_fallback_markup(text, "CJKKai")
-story.append(Paragraph(markup, styles["BodyText"]))
-```
+<b>系统可用中文字体：</b>
+<ul><li><code>AR PL UKai CN</code>（楷体风格）- 路径：<code>/usr/share/fonts/truetype/arphic/ukai.ttc</code></li><li><code>Noto Sans CJK SC</code>（黑体风格）- 路径：<code>/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc</code></li><li><code>Noto Serif CJK SC</code>（宋体风格）- 路径：<code>/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc</code></li><li><code>AR PL SungtiL GB</code>（宋体风格）- 路径：<code>/usr/share/fonts/truetype/arphic-gbsn00lp/gbsn00lp.ttf</code></li></ul>
 
-Preferred pattern:
+<b>正确做法：</b>
 
-```python
-story.append(safe_paragraph(text, styles["BodyText"]))
-```
+<pre><code class="language-python">from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
-Canvas code can stay on `draw_mixed_string()` / `string_width_mixed()`. There is
-no longer a need to manually inspect each string for emoji or manually wrap
-emoji runs.
+styles = getSampleStyleSheet()
 
-### Font/runtime requirements
+# ❌ 错误：直接使用默认样式（fontName='Helvetica'，不支持中文）
+story.append(Paragraph("这是一段中文", styles['Normal']))
 
-The production image installs:
+# ✅ 正确方法1：定义自定义样式并指定中文字体
+cn_style = ParagraphStyle(
+    'ChineseStyle',
+    parent=styles['Normal'],
+    fontName='CJKKai',  # 必须指定中文字体！
+    fontSize=11,
+    leading=18
+)
+story.append(Paragraph("这是一段中文", cn_style))
 
-- ReportLab CJK: `/usr/share/fonts/truetype/arphic/ukai.ttc`, subfont `0`
-- LibreOffice/DOCX CJK: `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc`
-- ReportLab emoji: `/usr/share/fonts/truetype/noto-emoji-mono/NotoEmoji-Regular.ttf`
+# ✅ 正确方法2：修改默认样式的字体（影响所有使用该样式的文本）
+styles['Normal'].fontName = 'CJKKai'
+story.append(Paragraph("这是一段中文", styles['Normal']))
 
-The emoji TTF is downloaded and checksum-verified during Docker image build and
-is not committed to the repository. Override it for development with
-`APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT`. The runtime checker
-`python3 .claude/skills/pdf/scripts/check_cjk_runtime.py` validates both CJK and
-emoji resources.
+# ✅ 正确方法3：在表格样式中明确指定字体
+from reportlab.platypus import Table, TableStyle
+data = [['姓名', '张山'], ['年龄', '25']]
+table = Table(data)
+table.setStyle(TableStyle([
+    ('FONTNAME', (0, 0), (-1, -1), 'CJKKai'),  # 表格单元格也需指定字体
+    ...
+]))
+
+# ✅ 正确方法4：使用 cjk_font.py 的 helper（推荐）
+from cjk_font import register_fonts
+register_fonts()  # 注册 CJKKai 和 EmojiMono 字体
+# 然后所有样式都使用 fontName='CJKKai'</code></pre>
+
+<b>检查清单：</b>
+<ul><li>所有使用 <code>Paragraph()</code> 的样式都必须包含 <code>fontName='CJKKai'</code></li><li>表格中的 <code>TableStyle</code> 必须设置 <code>('FONTNAME', ..., 'CJKKai')</code></li><li>不要依赖默认样式的字体设置，它们都是西文字体</li><li>生成PDF后务必检查输出，确认中文正常显示</li></ul>
 
 ## Command-Line Tools
 

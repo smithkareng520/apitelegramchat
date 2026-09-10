@@ -461,7 +461,23 @@ class RichMessageBuilder:
         }
         group["items"].append(item)
         self._refresh_outer_summary(group)
-        self.request_flush(force=False)
+        # 工具卡片首次出现必须强制独立成帧立即上屏。
+        #
+        # 此前这里走 request_flush(force=False)，存在一个与在途 flush 的
+        # 合并竞态：content_block_start 触发本方法时，前一段正文/思考的
+        # flush 往往仍在途（正卡在 send_rich_message_draft 的 250ms 最小
+        # 间隔等待里，持有 _flush_lock 与草稿发送锁），本次请求只置脏标
+        # 记即返回；而 flush() 是在拿到 _flush_lock 之后才构建 HTML，等
+        # 轮到构建时 input_json_delta 往往已把（通常很短的）bash command
+        # 等参数流完——空壳占位帧与"参数已完整"帧被合并成一帧，用户看到
+        # 的第一帧就是完整命令，折叠块"参数打完/开始执行后才出现"。
+        # force=True 保证：无在途 flush 时立即建帧发送；有在途 flush 时
+        # 下一轮循环以 force 发送（绕过 250ms 限流与"内容相同"短路边，
+        # send_rich_message_draft 的 force 语义），卡片骨架抢先独立上屏，
+        # 之后的参数增量再按非强制节奏自然填充。批量同步建卡（如
+        # tool_call_loop）时多个 force 会被在途 runner 合并为一帧，不会
+        # 放大请求量；服务端 429 冷却（_rate_limited_until）不受影响。
+        self.request_flush(force=True)
 
     def attach_stream_tool_identity(self, item_id: str, new_id: str | None = None,
                                     tool_type: str | None = None) -> bool:

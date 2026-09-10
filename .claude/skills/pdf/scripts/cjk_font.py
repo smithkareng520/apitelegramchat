@@ -82,19 +82,21 @@ def register_fonts(
     cjk_name: str = "CJKKai",
     emoji_name: str = "EmojiMono",
 ) -> tuple[str, str]:
-    """Idempotently register the ReportLab CJK + emoji font pair.
+    """Register the CJK font and the monochrome emoji font in one call.
 
-    Call this once near PDF creation setup. The higher-level PDF helpers can
-    then accept plain text plus a normal ``ParagraphStyle`` without manual
-    font switching.
+    ReportLab has no automatic font fallback, so PDFs that may contain
+    emoji need both fonts registered. Emoji-bearing text must then go
+    through ``emoji_font.to_fallback_markup()`` (Paragraphs) or
+    ``emoji_font.draw_mixed_string()`` (canvas) — see the skill SKILL.md
+    "Emoji handling" section.
 
     Returns ``(cjk_name, emoji_name)``.
+
+    After calling this, always use custom ParagraphStyles with ``fontName='CJKKai'``
+    instead of default styles (which use Helvetica and don't support Chinese).
     """
-    from reportlab.pdfbase import pdfmetrics
     from emoji_font import register_emoji_font
 
-    if cjk_name not in pdfmetrics.getRegisteredFontNames():
-        register_reportlab_cjk_font(cjk_name)
-    if emoji_name not in pdfmetrics.getRegisteredFontNames():
-        register_emoji_font(emoji_name)
+    register_reportlab_cjk_font(cjk_name)
+    register_emoji_font(emoji_name)
     return cjk_name, emoji_name
