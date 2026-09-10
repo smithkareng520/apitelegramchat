@@ -94,4 +94,4 @@
 | `description` 优先 | 参数带 `description/_summary` 时，组标题与工具标题（运行时+完成后）优先显示它；现仅 bash 声明；web_search / text_editor / todo / memory / subagent / deliver_reply 始终按规范文案生成 |
 | 单复数 | 组内同类工具 ≥2 时切复数模板；不可数对象的动作（Listed todos / Searched memories 等）单复同形 |
 | "Ran an action" 兜底 | 仅当未知工具名漏过所有分支时出现；当前全部已声明工具均有专属文案 |
-| 展开正文形态 | bash / text_editor / web_search / message_user / exchange_rate / deliver_reply 等为 `pre/code` 等宽面板；todo / memory / subagent / weather 为富文本卡片；图片 / 视频为媒体卡片 |
+| 展开正文形态 | bash / text_editor / message_user / exchange_rate / deliver_reply 等为 `pre/code` 等宽面板；web_search 为富文本紧凑列表（标题链接 + 域名/时间/评分徽标，**不渲染** `🔍 「query」 引擎 · N/M 条` section 头与摘要 snippet——摘要只进模型上下文，前端多结果累计太长）；images / videos / lens 各 section 仍带头行；todo / memory / subagent / weather 为富文本卡片；图片 / 视频为媒体卡片 |

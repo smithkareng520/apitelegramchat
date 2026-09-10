@@ -6,8 +6,10 @@
 - 解析 ``execute_web_search`` 返回的多 section envelope（search / images
   / videos / lens）为结构化字典；
 - 用与 fetch_url / wikipedia 一致的视觉语言（``<b>`` 标题、
-  ``<code>`` 来源徽标、``<i>`` 摘要、``<a>`` 带 emoji 前缀的链接）渲染
-  每个 section；
+  ``<code>`` 来源徽标、``<a>`` 链接）渲染每个 section；search 模式为
+  紧凑列表：不渲染 section 头（引擎/条数已由折叠块摘要展示）与摘要
+  snippet，只保留标题链接 + 域名/时间/评分徽标；images / videos /
+  lens 仍带各自头行；
 - 失败 / 旧格式 / 空 envelope 各自兜底，保证总能拿到合法 HTML。
 
 刻意避免引入 project 内部的重型模块（``api_client`` / ``subagent_tool``
@@ -219,12 +221,16 @@ def _section_header(section: dict) -> str:
 
 # ---------- 各 mode 渲染 ----------
 def _render_search_items(items: list[dict]) -> str:
-    """search 模式：ol 卡片，标题链接 + 域名徽标 + 时间/评分徽标 + 斜体摘要。"""
+    """search 模式：紧凑 ol 列表，仅保留标题链接 + 域名/时间/评分徽标。
+
+    刻意不渲染 snippet（摘要）：十条结果的摘要累计起来会把整张工具卡片
+    撑得过长，且模型上下文里已保留完整摘要供回答使用，前端只需给出
+    可点击的标题与来源即可。
+    """
     parts: list[str] = ["<ol>"]
     for it in items:
         title = convert_markdown_to_telegram_html(it.get("title") or "无标题")
         link = it.get("link") or ""
-        snippet = convert_markdown_to_telegram_html(it.get("snippet") or "")
         domain = _domain_of(link)
         date = it.get("date") or ""
         rating = it.get("rating") or ""
@@ -244,8 +250,6 @@ def _render_search_items(items: list[dict]) -> str:
             meta_bits.append(rating_disp)
         if meta_bits:
             card += f" <code>{' · '.join(meta_bits)}</code>"
-        card += "<br/>"
-        card += f"<i>{snippet}</i>" if snippet else "<i>(无摘要)</i>"
         card += "</li>"
         parts.append(card)
     parts.append("</ol>")
@@ -372,7 +376,12 @@ _MODE_RENDERERS = {
 
 
 def render_web_search_section(section: dict) -> str:
-    """Render one parsed section into Telegram Rich HTML."""
+    """Render one parsed section into Telegram Rich HTML.
+
+    search 模式刻意不渲染 section 头（🔍 「query」 引擎 · N/M 条）：
+    折叠块摘要行已展示「搜索词 N results」，再渲染一遍只会把结果列表
+    越撑越长；images / videos / lens 仍保留各自头行以区分列表来源。
+    """
     mode = section.get("mode", "text")
 
     if mode == "error":
@@ -383,11 +392,17 @@ def render_web_search_section(section: dict) -> str:
     if mode == "text":
         return convert_markdown_to_telegram_html(section.get("raw", "")[:60000])
 
-    header = _section_header(section)
     items = section.get("items", [])
     if not items:
-        return f"{header}<br/><i>无结果</i>"
+        # search 模式无头行可省，「无结果」占位保留；其余模式带头行。
+        if mode == "search":
+            return "<i>无结果</i>"
+        return f"{_section_header(section)}<br/><i>无结果</i>"
 
+    if mode == "search":
+        return _render_search_items(items)
+
+    header = _section_header(section)
     renderer = _MODE_RENDERERS.get(mode)
     if renderer is None:
         return header + "<br/>" + convert_markdown_to_telegram_html(section.get("raw", "")[:2000])

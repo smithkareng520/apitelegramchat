@@ -2,7 +2,8 @@
 
 覆盖：
 1. web_search 与信息类工具（exchange_rate）结果用富文本卡片展示
-   （标题链接 + 来源徽标 + 斜体摘要，自旧版恢复）；message_user 及其他
+   （web_search 为紧凑列表：标题链接 + 来源徽标，不含 section 头与
+   斜体摘要）；message_user 及其他
    纯文本返回的工具，统一用 ``<pre><code>`` 等宽代码面板展示（与 bash /
    text_editor 同规范）；
 2. ``description`` 不再被 normalize_tool_schema 强制注入 required，
@@ -38,13 +39,18 @@ def test_web_search_result_rich_cards():
     )
     summary, details = format_web_search_result({"query": "np"}, envelope)
     assert summary == "np 1 result"
-    # 富文本卡片：section 头 + <ol> 列表 + 标题链接 + 来源徽标 + 斜体摘要
-    assert "<b>🔍 「np」</b>" in details
-    assert "Serper / Google" in details and "1/1 条" in details
+    # 紧凑卡片：<ol> 列表 + 标题链接 + 来源徽标；
+    # 前端不再显示 section 头与摘要（多结果累计太长），模型上下文仍保留完整摘要
     assert "<ol>" in details and "</ol>" in details
     assert '<b><a href="https://example.com/a">某标题</a></b>' in details
     assert "<code>example.com</code>" in details
-    assert "<i>某摘要</i>" in details
+    # section 头（🔍 「query」 引擎 · N/M 条）不再渲染
+    assert "<b>🔍 「np」</b>" not in details
+    assert "Serper / Google" not in details
+    assert "1/1 条" not in details
+    # 摘要 snippet 不再渲染
+    assert "某摘要" not in details
+    assert "<i>" not in details
     # 不再使用等宽代码面板
     assert "<pre><code>" not in details
 
