@@ -7,7 +7,7 @@ from typing import List
 
 from tool_dispatch import _TOOL_TIMEOUT_MARKER
 
-from markdown_converter import convert_markdown_to_telegram_html
+from markdown_converter import convert_markdown_to_telegram_html, _escape_prose
 from todo_tool import render_todo_card
 from memory_tool import render_memory_card
 from subagent_tool import render_subagent_card
@@ -290,7 +290,10 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
     elif fn_name == "exchange_rate":
         base = fn_args.get('base', 'USD')
         summary = f"💱 {convert_markdown_to_telegram_html(base)} 汇率"
-        details_html = result_str if not result_str.startswith("失败：") else convert_markdown_to_telegram_html(result_str)
+        # 失败分支必须用 _escape_prose 无条件转义：错误文本通常不含
+        # Markdown 语法，convert_markdown_to_telegram_html 会短路透传，
+        # 上游错误消息里的 < > & 会原样打坏 Rich Message 结构。
+        details_html = result_str if not result_str.startswith("失败：") else _escape_prose(result_str)
         return summary, details_html
 
     elif fn_name == "message_user" or fn_name == "ask_user":

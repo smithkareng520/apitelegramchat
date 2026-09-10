@@ -32,7 +32,11 @@ from ai.tool_summary import (
     _generate_pending_tool_summary,
     _get_tool_description_from_args,
 )
-from markdown_converter import convert_markdown_to_telegram_html, wrap_mixed_content_as_blocks
+from markdown_converter import (
+    convert_markdown_to_telegram_html,
+    wrap_mixed_content_as_blocks,
+    _escape_prose,
+)
 
 logger = get_logger(__name__)
 
@@ -119,45 +123,47 @@ def _ensure_rich_block_content(fragment: str) -> str:
     return f"<p>{content}</p>"
 
 
-def _escape_reasoning_text(text: str) -> str:
-    """严格转义思考原文中的 HTML 特殊字符（&、<、> 一律转义）。
-
-    与 markdown_converter.convert_markdown_to_telegram_html 不同：reasoning
-    字段是模型的原始独白，不应被当作 markdown 解析（模型没有意识、也不
-    被要求在思考中输出合法 markdown），也不应识别/保留其中形似 HTML 标签
-    的片段。若改用转换器，一来不含 markdown 语法的思考文本会被短路直接
-    透传、裸露的 ``<``、``>``、``&`` 得不到转义，二来形似标签的片段会被
-    当作"已有 HTML 标签"保留而非转义。因此这里保留一次无条件的逐字符
-    转义，保证思考内容原样、安全地逐字可见。
-    """
-    if not text:
-        return ""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
 def _render_reasoning_html(content: str) -> str:
     """把思考原文渲染为可安全嵌入 ``<details>`` 的块级 HTML 片段。
 
-    思考内容通过 Markdown 转换器处理，将 Markdown 语法（**粗体**、`代码`等）
-    转换为 Telegram HTML 标签。转换器内部会正确转义 HTML 代码示例，不会破坏
-    外层折叠块的结构。空内容返回空串：调用方（``_build_html*``）对空思考块
-    整块跳过，等首个字符到达后再渲染折叠块，不再输出"思考中…"占位。
+    思考（reasoning）是模型的原始独白，其中形似 HTML 标签的片段极其常见：
+    模型会复述系统提示词的标签白名单（"Allowed tags: <b>, <strong>, <p>…"）、
+    提到 ``<tg-button>``、写 "a < b" 等。这些片段必须按字面量展示，绝不能
+    被当成真实标签。因此渲染分两步：
 
-    结构安全：转换产物经 ``wrap_mixed_content_as_blocks`` 整理。此前这里
-    对「不以块级标签开头」的产物一律整体包单个 ``<p>``，当思考内容是
-    「文字 + Markdown 列表」混排时（模型思考中极其常见），列表转换出的
-    ``<ul>`` 会被吞进段落里，产出 ``<p>…<ul>…</ul>…</p>`` 非法嵌套，
-    Telegram 以 400 rich_message 结构类错误拒绝整条消息，触发
-    plain-text fallback——用户看到整条回复退化为无格式纯文本。
+    1. 先用 ``markdown_converter._escape_prose`` 对原文做幂等转义（只转义
+       裸 ``&``，``<``/``>`` 一律转义）。之所以不用无条件逐字符转义：模型
+       有时会按提示词输出已转义实体（如 ``&lt;tg-button&gt;``），只转义
+       裸 ``&`` 才能保证幂等，不会把已有实体二次转义成 ``&amp;lt;``。
+    2. 再交给 Markdown 转换器，让思考中的 ``**粗体**``、`` `代码` ``、列表、
+       代码围栏等语法正常渲染。转义后原文里已无裸 ``<``，形似标签的片段
+       不会再被转换器当作"已有 HTML"保留，也不会触发 ``sanitize_tg_buttons``
+       对思考中按钮字样的逐帧 WARNING。
+
+    历史教训（2026-09 线上故障）：此前直接把思考原文交给 Markdown 转换器，
+    「无 Markdown 语法」的思考被短路透传、标签片段被当作已有 HTML 保留，
+    嵌入 ``<details>`` 后产生几十层非法嵌套，Telegram 以 400
+    RICH_MESSAGE_DEPTH_INVALID 拒收，草稿判死、整条消息退化为纯文本。
+
+    空内容返回空串：调用方（``_build_html*``）对空思考块整块跳过，等首个
+    字符到达后再渲染折叠块，不再输出"思考中…"占位。
+
+    结构安全：转换产物经 ``wrap_mixed_content_as_blocks`` 整理，避免
+    「文字 + Markdown 列表」混排被整体包进单个 ``<p>`` 产出
+    ``<p>…<ul>…</ul>…</p>`` 非法嵌套。
     """
     text = (content or "").strip()
     if not text:
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    
-    # 使用 Markdown 转换器处理思考内容
+
+    # 第一步：幂等转义思考原文（详见 docstring——先转义后转换是本函数的
+    # 安全不变量，顺序不能颠倒）。
+    text = _escape_prose(text)
+
+    # 第二步：Markdown 转换器处理（**粗体**、`代码`、列表、代码围栏等）。
     converted = convert_markdown_to_telegram_html(text)
-    
+
     # 按块级标签切段后包 <p>：混排内容不再整体塞进单个 <p>。
     return wrap_mixed_content_as_blocks(converted)
 
@@ -305,9 +311,11 @@ class RichMessageBuilder:
         摘要与折叠块正文一样按纯文本对待：正文已整体转义、标签只会按字面
         展示，因此这里不再剥除标签（也避免了旧正则会把 “x < 5, y > 3” 中
         的 ``< 5, y >`` 误当成标签剥掉的问题），只折叠空白、截断长度，最后
-        严格转义，确保 ``<summary>`` 不会被思考中出现的 ``<``、``>``、``&``
-        破坏。空内容返回空串；空思考块由调用方整块跳过，不会出现空
-        ``<summary>``。
+        用 ``_escape_prose`` 幂等转义，确保 ``<summary>`` 不会被思考中出现
+        的 ``<``、``>``、``&`` 破坏。这里绝不能走 Markdown 转换器：摘要里
+        通常没有 Markdown 语法，转换器会短路透传，裸 ``<`` 会直达
+        ``<summary>``（历史版本正是因此被 Telegram 拒收）。空内容返回空串；
+        空思考块由调用方整块跳过，不会出现空 ``<summary>``。
         """
         if not content:
             return ""
@@ -316,7 +324,7 @@ class RichMessageBuilder:
             return ""
         if len(plain) > 30:
             plain = plain[:30].rstrip() + "…"
-        return convert_markdown_to_telegram_html(plain)
+        return _escape_prose(plain)
 
     def request_flush(self, force: bool = False) -> None:
         """异步触发刷新，确保在途发送期间的新内容一定会补发。"""
