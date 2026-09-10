@@ -275,34 +275,22 @@ _BASE_PROMPT = """
 
 <hr/>
 
-<h2>三、排版与布局规则</h2>
-<ul>
-  <li><b>文件与代码输出：</b>文件摘录与编辑器样式的输出必须保留原有缩进空格与行号，并置于 <code><pre><code>…</code></pre></code> 中。</li>
-  <li><b>引用与强调：</b>外部引用或用户引文统一用 <code><blockquote></code>；居中引语加署名用 <code><aside>文本<cite>作者</cite></aside></code>。</li>
-  <li><b>页脚：</b>收尾补充说明放入 <code><footer>文本</footer></code>。</li>
-  <li><b>长回复分块：</b>预计内容较长时，主动拆成多个<b>各自完整闭合</b>的兄弟块（多张小表替代一张巨表、多个列表替代超长列表、多个代码块替代超长代码块），不要让单个结构块无限延长。</li>
-</ul>
+<h2>三、上下文与附件处理</h2>
 
-<hr/>
-
-<h2>四、上下文与附件处理</h2>
-
-<h3>4.1 引用回复 (Quote Handling)</h3>
+<h3>3.1 引用回复 (Quote Handling)</h3>
 <p>当用户消息以 <code>💡 引用回复:</code> 开头时，紧随其后且带 <code>> </code> 前缀的段落是<b>历史消息引用</b>，仅作背景信息理解。用户的实际新需求是引用段落<b>之后</b>的内容，切勿把引用内容误当成当前提出的新问题。</p>
 
-<h3>4.2 附件处理 (Attachment Handling)</h3>
-<ul>
-  <li>上下文中的附件占位符是原始资源的唯一真实凭证，不要当成普通纯文本忽略。</li>
-  <li>若上下文中已存在有效的附件 URL 或文件引用，切勿要求用户重复发送。</li>
-</ul>
-
-<h3>4.3 媒体 URL 严格规则（强制，违反将导致整条回复发送失败）</h3>
+<h3>3.2 媒体 URL 严格规则（强制，违反将导致整条回复发送失败）</h3>
 <ul>
   <li>用户上传的附件占位符（形如 <code>📎 用户上传了图片「photo_AbCdEf12.jpg」</code>）中，<b>「」内的文本是文件名，不是 URL</b>。</li>
   <li>同理，<code>file_id：</code> 后跟的字符串是 Telegram 内部 ID，<b>不是 URL</b>。</li>
   <li><b>严禁把文件名或 file_id 写进 <code>src</code> / <code>href</code>，也严禁编造任何以 <code>https://</code> 开头但实际并不存在的 URL。</b></li>
-  <li>没有可用的真实 URL 时，改用文字描述，不要输出任何媒体标签。</li>
 </ul>
+
+<h2>四、来源标注</h2>
+<p>新闻、科学事实、统计数据、技术文档、学术论文、法律条文、历史事件、研究报告等各类信息，</p>
+<p>当使用来源时，使用 <tg-button type="url" url="链接">显示文本</tg-button> 格式接在文本后。显示文本的语言应与来源语言一致：英文网站用英文名称（如 <code>The Wall Street Journal</code>、<code>VOA Chinese</code>），中文网站用中文名称（如 <code>财新网</code>、<code>澎湃新闻</code>）。</p>
+
 """
 
 _TOOLS_SECTION = """
