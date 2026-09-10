@@ -265,6 +265,8 @@ def test_tool_batch_end_consumes_newly_armed_rollover_without_waiting_for_next_r
 
 # ---------------------------------------------------------------------
 # Test 3（场景三）：tool call + result + 下一轮回答
+# ---------------------------------------------------------------------
+def test_3_tool_result_and_next_round_answer_same_draft(env):
     async def scenario():
         builder, manager, sends = env["builder"], env["manager"], env["sends"]
         old_draft_id = builder.draft_id
@@ -334,10 +336,11 @@ def test_buffer_replay_order_during_slow_swap(env, monkeypatch):
             return 80001
 
         monkeypatch.setattr(rmb, "send_rich_html_message", slow_permanent)
-        builder._rollover_pending = True  # 直接置位，聚焦缓冲语义
-
         manager.emit(EventTypes.REASONING_START)
         manager.emit(EventTypes.REASONING_DELTA, "<p>思考中</p>")
+        # 预警在思考增量之后置位：聚焦缓冲语义（若在增量前置位，预警后的
+        # 首个思考增量会触发"思考折叠提前收束"路径，见下方专门用例）。
+        builder._rollover_pending = True
         manager.emit(EventTypes.REASONING_END)   # 调度后台滚动，卡在 gate
         assert manager._swap_scheduled is True
         for _ in range(5):
@@ -471,6 +474,108 @@ def test_pending_tool_group_defers_rollover(env):
         assert sends.permanent_count == 1
         # 工具卡片（call）完整留在永久化草稿中，绝不被拆散
         assert "Running..." in sends.permanent[0] or "bash" in sends.permanent[0]
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------
+# 草稿预警后的超长思考：提前收束思考折叠 → 滚动 → 新草稿折叠块续写
+# ---------------------------------------------------------------------
+def test_long_reasoning_splits_fold_at_capacity_warning(env):
+    """预警后思考流仍在输出：无需等 reasoning.end，首个增量即提前收束。
+
+    原行为下思考必须整段输出完毕才在 reasoning.end 安全点滚动；预警后
+    思考继续写入同一折叠块，草稿一路膨胀。现行为在预警后的首个思考增量
+    处提前收束折叠块并调度滚动，续写增量落入新草稿的新折叠块。
+    """
+    async def scenario():
+        builder, manager, sends = env["builder"], env["manager"], env["sends"]
+        old_draft_id = builder.draft_id
+        head_marker = "预警前思考段_头部"
+        trigger_marker = "触发提前收束的思考增量"
+        continuation_marker = "预警后思考续写段_尾部"
+
+        manager.emit(EventTypes.REASONING_START)
+        manager.emit(EventTypes.REASONING_DELTA, head_marker)
+        # 直接置位预警（真实容量 arm 路径已由 Test 1 覆盖）：聚焦收束行为。
+        builder._rollover_pending = True
+
+        # 预警后的首个思考增量：触发提前收束 + 调度后台滚动（无需等显式
+        # reasoning.end；Agent 不等待，网络发送在后台）。该增量本身仍写入
+        # 旧折叠块（先应用增量、再收束定桥）。
+        manager.emit(EventTypes.REASONING_DELTA, trigger_marker)
+        assert manager._swap_scheduled is True
+        assert manager._reasoning_split_pending is True
+        assert sends.permanent_count == 0
+        # Agent 侧思考流未受影响：流类别保持 reasoning、相位保持 THINKING
+        assert manager._open_stream_kind == "reasoning"
+        assert manager.agent_phase == AgentPhase.THINKING
+        assert manager.draft_phase == DraftPhase.WAIT_SAFE_POINT
+
+        # 滚动已调度：后续思考增量进入缓冲（§9），滚动完成后回放进新草稿。
+        manager.emit(EventTypes.REASONING_DELTA, continuation_marker)
+
+        await _await_swap(manager)
+
+        # 旧草稿：思考折叠块以完整结构定格并永久化（含触发增量，
+        # 绝不包含滚动之后才到达的续写内容）。
+        assert sends.permanent_count == 1
+        permanent_html = sends.permanent[0]
+        assert head_marker in permanent_html
+        assert trigger_marker in permanent_html
+        assert permanent_html.rstrip().endswith("</details>")
+        assert continuation_marker not in permanent_html
+        assert old_draft_id in sends.dead
+
+        # 新草稿：续写增量落入新的思考折叠块（滚动后重开的 reasoning 块；
+        # 增量先入流式缓冲，提交后按折叠块渲染——生产中刷新循环每帧提交）。
+        assert builder.draft_id != old_draft_id
+        assert manager.draft_phase == DraftPhase.ACTIVE
+        assert builder.block_types[-1] == "reasoning"
+
+        # 思考流真实结束：语义不变——提交续写折叠块；新草稿容量未满，
+        # 不再触发第二次滚动。
+        manager.emit(EventTypes.REASONING_DELTA, continuation_marker)
+        manager.emit(EventTypes.REASONING_END)
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert manager._swap_scheduled is False
+        assert sends.permanent_count == 1
+        draft_html = builder._build_html_no_thinking()
+        assert "<details>" in draft_html and "</details>" in draft_html
+        assert continuation_marker in draft_html
+        assert manager.pending_ui_events == 0
+
+    asyncio.run(scenario())
+
+
+def test_reasoning_fold_split_defers_to_pending_tool_group(env):
+    """预警 + 思考流 + 未收束工具组：不提前收束，等 tool.end 安全点。"""
+    async def scenario():
+        builder, manager, sends = env["builder"], env["manager"], env["sends"]
+        builder._rollover_pending = True
+        manager.add_tool_item("call_1", "bash", "Running...", fn_args={})
+        manager.emit(EventTypes.REASONING_START)
+        manager.emit(EventTypes.REASONING_DELTA, "工具组未收束时的思考增量")
+        for _ in range(10):
+            await asyncio.sleep(0)
+        # 工具组未收束：不提前收束、不调度滚动
+        assert manager._swap_scheduled is False
+        assert manager._reasoning_split_pending is False
+        assert sends.permanent_count == 0
+        # 思考未被拆成两个折叠块，增量仍写入原折叠块（提交流式缓冲后断言）
+        manager._commit_stream_buffer()
+        reasoning_blocks = [
+            b for b, t in zip(builder.blocks, builder.block_types)
+            if t == "reasoning"
+        ]
+        assert len(reasoning_blocks) == 1
+        assert "工具组未收束时的思考增量" in reasoning_blocks[0]
+        # tool.end 后预警仍在：安全点照常调度滚动（原有行为不变）
+        manager.finish_group(None)
+        assert manager._swap_scheduled is True
+        await _await_swap(manager)
+        assert sends.permanent_count == 1
 
     asyncio.run(scenario())
 

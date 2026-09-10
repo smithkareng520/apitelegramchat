@@ -228,6 +228,12 @@ class DraftManager:
         # 同步置位：调度瞬间即生效，杜绝"调度后、任务首帧前"的直写窗口。
         self._swap_scheduled = False
         self._rollover_task: Optional[asyncio.Task] = None
+        # ---- 思考折叠提前收束续写标记 ----
+        # 草稿预警后思考流仍在输出时，提前收束当前思考折叠块并调度滚动；
+        # 本标记表示"滚动换血后首个思考增量需先在新草稿重开折叠块"，
+        # 由 _apply 的 reasoning.delta 分支消费（见
+        # _split_reasoning_fold_for_rollover）。
+        self._reasoning_split_pending = False
 
     # ------------------------------------------------------------------
     # duck-typing 兼容层：未拦截的属性一律透传内部 builder
@@ -301,11 +307,27 @@ class DraftManager:
         """把单个事件应用到 builder（同步渲染；永不阻塞）。"""
         etype, data = event.type, event.data
         builder = self._builder
+        if etype != EventTypes.REASONING_DELTA:
+            # 任何非思考增量事件都终结"思考折叠续写"窗口（见
+            # _split_reasoning_fold_for_rollover）：滚动后真正继续思考时，
+            # 首个 reasoning.delta 会先重开折叠块；思考流正常结束或 Agent
+            # 转入其他事件（content/tool/turn…）时窗口作废，避免之后误开
+            # 空的续写折叠块。滚动换血期间事件只入缓冲、不经本方法，
+            # 窗口在换血期间自然保持。
+            self._reasoning_split_pending = False
         if etype == EventTypes.REASONING_START:
             self._open_stream_kind = "reasoning"
             builder.begin_stream_reasoning()
         elif etype == EventTypes.REASONING_DELTA:
+            if self._reasoning_split_pending:
+                # 思考折叠已在前一草稿提前收束且滚动换血完成：在新草稿
+                # 重开思考折叠块，后续思考增量继续写入（用户看到的是
+                # 新草稿中接续的折叠块，而不是散落的正文文本）。
+                self._reasoning_split_pending = False
+                self._open_stream_kind = "reasoning"
+                builder.begin_stream_reasoning()
             builder.append_stream_delta(data)
+            self._maybe_split_reasoning_fold_for_rollover()
         elif etype == EventTypes.REASONING_END:
             self._open_stream_kind = None
             builder.finalize_reasoning_block()
@@ -563,6 +585,65 @@ class DraftManager:
         self.draft_phase = DraftPhase.CLOSED
         self.agent_phase = AgentPhase.DONE
         return ok
+
+    # ------------------------------------------------------------------
+    # 思考折叠提前收束（草稿预警后的超长思考续写）
+    # ------------------------------------------------------------------
+    def _maybe_split_reasoning_fold_for_rollover(self) -> None:
+        """草稿预警后思考流仍在输出：提前收束思考折叠并调度滚动。
+
+        原行为：滚动只在安全边界（reasoning.end / content.end / tool.end）
+        调度——超长思考必须整段输出完毕才有机会换草稿，预警后思考继续
+        原地写入同一折叠块，草稿一路膨胀，极端时超出草稿上限、整帧被拒。
+
+        现行为：思考流期间一旦容量预警置位（``_rollover_pending``），在
+        最近的思考增量处提前收束当前折叠块（等价于一个合成 reasoning.end
+        安全点），由既有安全点路径调度后台滚动；滚动换血后首个思考增量
+        在新草稿重开折叠块继续写入。Agent 侧思考流本身不受影响——后续
+        增量仍按 reasoning.delta 记账，真实 reasoning.end 的语义与时序
+        保持不变。
+
+        守卫与 ``_handle_safe_boundary`` 的调度条件保持一致：静默构建器、
+        已有在途滚动、容量未预警、存在未收束工具组时都不触发——这些情形
+        下提前收束不会带来滚动，只会把思考拆成同草稿内的两个折叠块。
+        "滚动绝不发生在 reasoning block 中间"的不变量依旧成立：先提交并
+        复位流指针使折叠块定格，再经合成 reasoning.end 走安全点。
+        """
+        if self._open_stream_kind != "reasoning":
+            return
+        builder = self._builder
+        if getattr(builder, "silent", False):
+            # 静默构建器无可见草稿、永不滚动（与 _handle_safe_boundary 一致）。
+            return
+        if self._swap_scheduled or (
+            self._rollover_task is not None and not self._rollover_task.done()
+        ):
+            return  # 幂等：已有滚动在排队/执行
+        if not getattr(builder, "_rollover_pending", False) or builder._stop_flush:
+            return  # 未预警或草稿已停止刷新：保持原行为，等真实安全边界
+        if builder._has_pending_tool_group():
+            return  # 工具组未收束：滚动被推迟到 tool.end，提前收束无收益
+        self._split_reasoning_fold_for_rollover()
+
+    def _split_reasoning_fold_for_rollover(self) -> None:
+        """提前收束思考折叠并经安全点调度滚动（合成 reasoning.end）。"""
+        builder = self._builder
+        logger.info(
+            "草稿预警后提前收束思考折叠，调度滚动续写: chat=%s draft=%s",
+            builder.chat_id, builder.draft_id,
+        )
+        # ① 提前结束思考折叠：提交未落块的思考增量并复位流指针——当前
+        #    草稿中的思考折叠块至此定格，后续思考增量不再写入。
+        builder.end_stream()
+        # ② 事件流完整性：补发 reasoning.end 安全点事件。折叠块在旧草稿
+        #    以完整结构定格；安全点检查随即调度后台滚动，此后到达的事件
+        #    进入缓冲（§9）。
+        self.emit(EventTypes.REASONING_END, fold_split=True)
+        # ③ Agent 侧思考流并未结束：恢复流类别标注（reasoning.end 的应用
+        #    路径会把它置空），后续增量仍按 reasoning.delta 记账；并标记
+        #    滚动换血后首个思考增量在新草稿重开折叠块续写思考内容。
+        self._open_stream_kind = "reasoning"
+        self._reasoning_split_pending = True
 
     # ------------------------------------------------------------------
     # 安全点判定与后台滚动调度
