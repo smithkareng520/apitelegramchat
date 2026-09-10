@@ -1057,7 +1057,7 @@ SUPPORTED_MODELS["bytedance-seed/seedream-4.5"] = make_model_config(
 
 SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
     model_id="agnes-image-2.5-flash",
-    base_url="https://apihub.agnes-ai.com/v1"
+    base_url="https://apihub.agnes-ai.com/v1",
     provider="agnes",
     name="Agnes Image 2.5 Flash",
     native_image=True,
