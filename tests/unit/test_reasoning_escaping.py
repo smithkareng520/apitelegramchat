@@ -144,3 +144,34 @@ def test_reasoning_summary_truncates_and_escapes():
 @pytest.mark.parametrize("empty", ["", "   ", None])
 def test_reasoning_empty_returns_empty(empty):
     assert _render_reasoning_html(empty) == ""
+
+
+def test_tool_summaries_escape_html_injection():
+    """工具 description/summary 是纯文本，不能注入 details 树结构。"""
+    builder = RichMessageBuilder(123)
+    idx = builder.start_new_tool_group()
+    builder._tool_groups[idx]["outer_summary"] = '<details><summary>evil</summary></details>'
+    builder._tool_groups[idx]["items"] = [{
+        "id": "x",
+        "summary": '</details><details><summary>evil',
+        "details_html": "<p>ok</p>",
+        "status": "done",
+    }]
+    out = builder._build_tool_group_html(builder._tool_groups[idx])
+    assert "&lt;details&gt;" in out
+    assert "</details><details><summary>evil" not in out
+    assert out.count("<details>") == 2
+
+
+def test_model_text_html_examples_are_literals():
+    """最终回复里的 HTML 示例不能成为真正的嵌套 Rich Message 结构。"""
+    from ai.rich_message_builder import _render_model_text_html
+    out = _render_model_text_html(
+        "示例：<details><summary>标题</summary><p><b>内容</b></p></details>\n\n"
+        "同时保留 **Markdown 粗体**。"
+    )
+    assert "&lt;details&gt;" in out
+    assert "&lt;summary&gt;" in out
+    assert "&lt;b&gt;" in out
+    assert "<b>Markdown 粗体</b>" in out
+    assert out.count("<details>") == 0

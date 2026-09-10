@@ -168,6 +168,22 @@ def _render_reasoning_html(content: str) -> str:
     return wrap_mixed_content_as_blocks(converted)
 
 
+def _render_model_text_html(content: str) -> str:
+    """将模型普通文本按 Markdown 渲染，但把原始 HTML 标签视为字面量。
+
+    模型最终回答属于不可信输入：当用户询问 HTML/富文本语法时，模型很容易
+    原样输出 ``<details>``, ``<table>`` 等标签示例。若直接交给支持 HTML 混排
+    的转换器，这些示例会变成真实结构并叠加到内部折叠块上，可能超过 Telegram
+    Rich Message 的 16 层深度上限。与 reasoning 一样，先幂等转义，再解析 Markdown。
+    """
+    text = (content or "").strip()
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    converted = convert_markdown_to_telegram_html(_escape_prose(text))
+    return wrap_mixed_content_as_blocks(converted)
+
+
 def _scan_rich_html_boundaries(
     html_content: str,
 ) -> tuple[list[tuple[int, int, int, int]], int, int, int]:
@@ -1009,7 +1025,7 @@ class RichMessageBuilder:
         if not items:
             return ""
 
-        outer_summary = (group.get("outer_summary", "") or "").strip()
+        outer_summary = _escape_prose((group.get("outer_summary", "") or "").strip())
         if not outer_summary:
             # 防御性兜底：正常情况下 _refresh_outer_summary / finish_group 总会
             # 写入一个非空摘要。如果由于某个未预见的路径（例如未来新增的状态值）
@@ -1038,7 +1054,7 @@ class RichMessageBuilder:
         return f"<details><summary>{outer_summary}</summary>\n{inner_html}\n</details>"
 
     def _get_inner_content(self, item: dict) -> str:
-        inner_summary = item["summary"]
+        inner_summary = _escape_prose(str(item.get("summary") or "").strip())
         details_html = (item.get("details_html") or "").strip()
         if details_html:
             inner_body = _ensure_rich_block_content(details_html)
@@ -1095,10 +1111,13 @@ class RichMessageBuilder:
                 continue
 
             else:
-                # text/html 及其他类型的块都按原样拼接。
                 content = block
                 if i == self._stream_text_index:
                     content += self._stream_buffer
+                # 普通模型文本不是可信 HTML：只允许 Markdown 生效，
+                # 原始 <tag> 示例必须按字面量展示，避免注入 Rich Message 结构。
+                if b_type == "text":
+                    content = _render_model_text_html(content)
                 html_parts.append(content)
                 i += 1
 
@@ -1140,10 +1159,13 @@ class RichMessageBuilder:
                 continue
 
             else:
-                # text/html 及其他类型的块都按原样拼接。
                 content = block
                 if i == self._stream_text_index:
                     content += self._stream_buffer
+                # 普通模型文本不是可信 HTML：只允许 Markdown 生效，
+                # 原始 <tag> 示例必须按字面量展示，避免注入 Rich Message 结构。
+                if b_type == "text":
+                    content = _render_model_text_html(content)
                 html_parts.append(content)
                 i += 1
 
