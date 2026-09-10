@@ -761,7 +761,7 @@ def make_model_config(
         native_video=merged.get("native_video"),
         supports_sampling=merged.get("supports_sampling"),
         supports_prompt_cache=merged.get("supports_prompt_cache"),
-        max_output_tokens=merged.get("max_output_tokens", 8192),
+        max_output_tokens=merged.get("max_output_tokens", 65535),
         max_context=merged.get("max_context", 128000),
         reasoning_enabled=merged.get("reasoning_enabled"),
         reasoning_effort=merged.get("reasoning_effort"),
@@ -940,10 +940,10 @@ SUPPORTED_MODELS["openrouter/free"] = make_model_config(
 # Agnes 免费模型
 # -----------------------------------------------------------------------------
 # (duplicate gemma entry removed)
-SUPPORTED_MODELS["agnes-2.5-flash"] = make_model_config(
-    model_id="agnes-2.5-flash",
+SUPPORTED_MODELS["agnes-3.0-flash"] = make_model_config(
+    model_id="agnes-3.0-flash",
     provider="agnes",
-    name="Agnes 2.5 Flash",
+    name="Agnes 3.0 Flash",
     reasoning_enabled=True,
     reasoning_effort="high",
     max_context=512000,
@@ -1054,117 +1054,36 @@ SUPPORTED_MODELS["bytedance-seed/seedream-4.5"] = make_model_config(
     max_context=4000,
     max_output_tokens=1024,
 )
-# XXTF 中转的图像模型：走 OpenAI Images 标准端点（https://xxtf.baby/v1/...），
-# 按 OpenAI 官方语义分端点（见 developers.openai.com "Create image"/"Create image edit"）：
-#   - 文生图 -> JSON /v1/images/generations
-#   - 带参考图编辑 -> 官方规范 /v1/images/edits（multipart/form-data，
-#     image[] 字段逐张上传）；中转站未实现该路由时编辑请求明确报错，
-#     绝不降级 JSON /v1/images/generations + image 字段（降级会被中转站
-#     当纯文生图执行，产生"参考图未生效"的假成功，见 HOTFIX_2026-09-08_EDIT_FALLBACK.md）
-# 请求由 media_generation 的统一图像请求出口（_request_images_generations ->
-# _request_openai_compat_image）发送：鉴权沿用 XXTF_API_KEY，请求头沿用
-# PROVIDERS["xxtf"] 的浏览器 UA。
-SUPPORTED_MODELS["gpt-image-2"] = make_model_config(
-    model_id="gpt-image-2",
-    provider="xxtf",
-    name="GPT Image 2 (XXTF)",
+
+SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
+    model_id="agnes-image-2.5-flash",
+    base_url="https://apihub.agnes-ai.com/v1"
+    provider="agnes",
+    name="Agnes Image 2.5 Flash",
     native_image=True,
-    # XXTF 的图像端点同样按 OpenAI Images 协议接入（文生图 ->
-    # /v1/images/generations，编辑 -> /v1/images/edits multipart，见
-    # protocols/images.py 与 media_generation 的端点语义说明）。
-    protocol="openai_images",
-    # 支持参考图编辑（图生图）：vision=True 使其进入统一图像工具
-    # generate_image 的可编辑模型列表 EDIT_MODELS（vision 在图像模型上
-    # 表示"可接受图像输入"，即具备图生图/编辑能力，与聊天模型的"看图"
-    # 能力共用同一能力位）；实际编辑请求走 /v1/images/edits（见
-    # _request_openai_compat_image）。文生图（generate_image 不带
-    # image_url）同样可用。
     vision=True,
     supports_tools=False,
-    max_context=32768,
-    max_output_tokens=4000,
+    max_context=4000,
+    max_output_tokens=1024,
 )
 
 # -----------------------------------------------------------------------------
 # 视频生成模型
 # -----------------------------------------------------------------------------
-SUPPORTED_MODELS["agnes-video-v2.0"] = make_model_config(
-    model_id="agnes-video-v2.0",
+SUPPORTED_MODELS["agnes-video-2.5"] = make_model_config(
+    model_id="agnes-video-2.5",
     provider="agnes",
-    name="Agnes Video V2.0",
+    name="Agnes video 2.5",
+    vision=True,
+    video=True,
     native_video=True,
     max_context=32768,
     max_output_tokens=4000,
 )
 
-# -----------------------------------------------------------------------------
-# Anthropic 官方模型（原生 Messages API，专用循环）
-# -----------------------------------------------------------------------------
-# =============================================================================
-# XXTF 中转（https://xxtf.baby）：同一模型名在该平台上有多种协议挂载方式，
-# 这里按"平台标注的协议"接入，而不是按模型名猜协议——
-#   claude-opus-5   平台标 anthropic -> 走 Anthropic 原生 Messages 协议
-#   gpt-5.6-sol     平台标 openai    -> 走 OpenAI 原生 Responses API
-#                                       （入口 /v1/responses，专用循环见
-#                                       ai/responses_bridge.py）
-#
-# 两个模型共用同一个 provider="xxtf" 壳、同一份 XXTF_API_KEY，但各自按
-# 端点覆盖字段（base_url / protocol）
-# 分别连到 Anthropic 原生入口和 OpenAI Responses 入口，互不干扰
-# （api_client.py 按 model_id 分别缓存客户端，见 APIClient.get_client_for_model；
-# Responses API 复用同一个 AsyncOpenAI SDK 客户端，无需新增原生 SDK 依赖，
-# 走 client.responses.create 而不是 client.chat.completions.create）。
-# =============================================================================
-SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
-    supports_tools=True,
-    model_id="claude-opus-5",
-    provider="xxtf",
-    name="Claude Opus 5 (XXTF)",
-    vision=True,
-    native_document=True,
-    supports_prompt_cache=True,
-    # 平台标注协议为 anthropic：走 Anthropic 原生 Messages 协议适配器。
-    # 注意 base_url 不带 /v1——AsyncAnthropic SDK 会自动拼接
-    # {base_url}/v1/messages -> https://xxtf.baby/v1/messages，
-    # 与项目截图中 claude-opus-5 / anthropic 协议那一行的入口一致。
-    protocol="anthropic_messages",
-    base_url="https://xxtf.baby",
-    reasoning_enabled=True,
-    max_context=1000000,
-    reasoning_effort="Max",
-    temperature=1.0,
-)
-
-SUPPORTED_MODELS["gpt-5.6-sol"] = make_model_config(
-    model_id="gpt-5.6-sol",
-    provider="xxtf",
-    name="GPT 5.6 Sol (XXTF)",
-    vision=True,
-    max_context=1000000,
-    reasoning_enabled=True,
-    reasoning_effort="max",
-    supports_tools=True,
-    # 默认走自动缓存；显式断点由 RESPONSES_EXPLICIT_CACHE_ENABLED 控制。
-    supports_prompt_cache=True,
-    # 平台协议入口标注为 /v1/responses（OpenAI 原生 Responses API），
-    # 与本项目 openai_chat 循环使用的 Chat Completions 协议
-    # （/v1/chat/completions）不是同一套协议——字段形状、流式事件、
-    # 工具调用格式均不同。现走专用的 openai_responses 协议适配器
-    # （protocols/openai_responses.py -> ai/responses_bridge.py，原生
-    # Responses SSE 流式事件 + function_call item 累积，边界转换模式
-    # 与 anthropic_messages / gemini_native 同构）。
-    # 不覆盖 base_url：沿用 PROVIDERS["xxtf"] 默认的
-    # https://xxtf.baby/v1（AsyncOpenAI SDK 不会自动拼接 /v1，必须显式
-    # 带上——与 claude-opus-5 用的 AsyncAnthropic SDK 行为不同，那个 SDK
-    # 才会自动拼接 /v1/messages）。协议适配器调用 client.responses.create(...)，
-    # SDK 内部据此请求 {base_url}/responses -> https://xxtf.baby/v1/responses。
-    protocol="openai_responses",
-)
-# =============================================================================
-
 
 # ========== 默认模型 ==========
-DEFAULT_MODEL = "agnes-2.5-flash"
+DEFAULT_MODEL = "agnes-3.0-flash"
 assert DEFAULT_MODEL in SUPPORTED_MODELS, f"默认模型 {DEFAULT_MODEL} 未定义"
 
 
