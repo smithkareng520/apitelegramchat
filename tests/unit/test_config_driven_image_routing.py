@@ -1,13 +1,13 @@
 """配置驱动端点路由回归测试（Agnes Image 2.5 Flash 接入重构）。
 
 验证目标：新增/接入一个走不同子端点、不同图像 API 形状的模型，只需要
-在 config.py 的模型/厂商配置里声明字段（protocol / endpoint /
-edits_endpoint / image_edit_inline），请求层自动按配置路由——不需要为
-任何模型或厂商新建请求分支。
+在 config.py 的模型/厂商配置里声明字段（protocol / endpoint），请求层
+自动按配置路由——不需要为任何模型或厂商新建请求分支。
 
 覆盖五个层面：
-1. 配置合并：模型声明的完整端点/协议/inline 形状正确落到有效端点；
-   模型级覆盖厂商级（inline=True 厂商下声明 False 可回到官方形状）。
+1. 配置合并：模型声明的完整端点/协议正确落到有效端点；endpoint 指向
+   /images/generations|edits 时按完整图像端点处理（内联形状），指向
+   API 根时按官方形状推导（multipart 编辑）。
 2. 公共路由：resolve_model_route 按能力字段匹配 文本/视频/生图。
 3. 图像适配器解析：协议正确时直接路由；协议缺失但声明了 images 端点
    时配置驱动回退；两者皆无时明确报错。
@@ -59,27 +59,32 @@ def test_agnes_image_25_declares_images_protocol_and_endpoint():
     assert ep.protocol == "openai_images"
     # 模型配置一侧声明的完整端点原样生效
     assert ep.endpoint == AGNES_IMAGES_URL
-    # Agnes 厂商级声明 inline 形状（生成/编辑/多图合成共用同一端点）
-    assert ep.image_edit_inline is True
-    assert cfg.native_image is True
+    # 完整图像端点（指向 /images/generations）-> 内联形状（生成/编辑/多图
+    # 合成共用同一端点，Agnes 形状）
+    shape = resolve_images_endpoint_shape(cfg)
+    assert shape.edit_inline is True
+    assert shape.style == "inline_images"
+    assert cfg.image_output is True
 
 
 def test_agnes_image_21_shares_same_shape():
-    ep = get_effective_endpoint(SUPPORTED_MODELS["agnes-image-2.1-flash"])
+    cfg = SUPPORTED_MODELS["agnes-image-2.1-flash"]
+    ep = get_effective_endpoint(cfg)
     assert ep.protocol == "openai_images"
     assert ep.endpoint == AGNES_IMAGES_URL
-    assert ep.image_edit_inline is True
+    shape = resolve_images_endpoint_shape(cfg)
+    assert shape.edit_inline is True
 
 
-def test_model_level_inline_override_beats_provider_default():
-    # agnes 厂商默认 inline=True；模型级显式声明 False 应回到官方形状
+def test_no_declared_endpoint_derives_official_shape():
+    # endpoint 沿用厂商 API 根（未声明完整图像端点）-> OpenAI 官方形状推导：
+    # {endpoint}/images/{generations,edits}，编辑走独立 multipart /images/edits。
     cfg = make_model_config(
         model_id="test-official-style",
         provider="agnes",
         name="Official Style Test",
-        native_image=True,
+        image_output=True,
         protocol="openai_images",
-        image_edit_inline=False,
     )
     shape = resolve_images_endpoint_shape(cfg)
     assert shape.edit_inline is False
@@ -88,28 +93,28 @@ def test_model_level_inline_override_beats_provider_default():
     assert shape.edits_url == "https://apihub.agnes-ai.com/v1/images/edits"
 
 
-def test_declared_endpoint_takes_priority_over_base_url_derivation():
+def test_declared_endpoint_wins_over_root_derivation():
     cfg = make_model_config(
         model_id="test-relay-images",
         provider="openrouter",
         name="Relay Images Test",
-        native_image=True,
+        image_output=True,
         protocol="openai_images",
-        base_url="https://relay.example.com/v1",
         endpoint="https://relay.example.com/v1/images/generations",
     )
     shape = resolve_images_endpoint_shape(cfg)
     assert shape.generate_url == "https://relay.example.com/v1/images/generations"
+    assert shape.edit_inline is True
 
 
 def test_no_override_falls_back_to_official_derivation():
-    # XXTF 式：未声明 endpoint -> 官方推导 {base_url}/images/{generations,edits}
+    # XXTF 式：未声明完整图像端点 -> 官方推导 {endpoint}/images/{generations,edits}
     cfg = make_model_config(
         model_id="test-std-images",
         provider="xxtf",
         name="Std Images Test",
-        native_image=True,
-        vision=True,
+        image_output=True,
+        image_input=True,
         protocol="openai_images",
     )
     shape = resolve_images_endpoint_shape(cfg)
@@ -142,7 +147,7 @@ def test_resolve_image_adapter_endpoint_fallback_for_misconfigured_protocol():
         model_id="test-endpoint-only",
         provider="agnes",
         name="Endpoint Only Test",
-        native_image=True,
+        image_output=True,
         endpoint=AGNES_IMAGES_URL,
     )
     assert get_effective_endpoint(cfg).protocol == "openai_chat"
@@ -166,7 +171,7 @@ def test_resolve_image_adapter_rejects_non_image_protocol_without_endpoint():
         model_id="test-anthropic-with-images-ep",
         provider="anthropic",
         name="Anthropic With Images Endpoint",
-        native_image=True,
+        image_output=True,
         endpoint=AGNES_IMAGES_URL,
     )
     assert resolve_image_adapter(cfg_with_ep) is IMAGE_PROTOCOLS["openai_images"]
@@ -335,15 +340,15 @@ def test_openai_compat_inline_edit_posts_same_endpoint_with_extra_body_image(fak
 
 
 def test_openai_compat_multipart_style_still_posts_to_edits_endpoint(fake_http):
-    # 模型级覆盖 inline=False（官方形状）：编辑必须走独立 /images/edits
+    # 未声明完整图像端点（endpoint 为厂商 API 根，官方形状推导）：
+    # 编辑必须走独立 multipart /images/edits
     cfg = make_model_config(
         model_id="test-official-edit",
         provider="agnes",
         name="Official Edit Test",
-        native_image=True,
-        vision=True,
+        image_output=True,
+        image_input=True,
         protocol="openai_images",
-        image_edit_inline=False,
     )
     parsed, endpoint, detail, status, _req = asyncio.run(_request_openai_compat_image(
         cfg,

@@ -15,8 +15,8 @@ if TYPE_CHECKING:
     from config import ModelConfig
 
 # 模型路由标签：
-#   video: 原生视频生成模型（native_video=True）-> 视频任务循环
-#   image: 原生图像生成模型（native_image=True）-> 图像任务循环
+#   video: 原生视频生成模型（video_output=True）-> 视频任务循环
+#   image: 原生图像生成模型（image_output=True）-> 图像任务循环
 #   chat:  其余模型 -> 常规 agentic chat 循环（工具调用/纯文本）
 ModelRoute = Literal["video", "image", "chat"]
 
@@ -24,7 +24,7 @@ ModelRoute = Literal["video", "image", "chat"]
 def resolve_model_route(model_info: "ModelConfig | None") -> ModelRoute:
     """按模型配置字段返回应进入的执行链路（公共路由唯一出口）。
 
-    判定完全基于模型自身的能力声明字段（native_video / native_image），
+    判定完全基于模型自身的能力声明字段（video_output / image_output），
     与厂商无关——同一厂商下混布文本/图像/视频模型时无需任何特判：
         agnes-3.0-flash      -> "chat"
         agnes-image-2.5-flash -> "image"
@@ -34,9 +34,9 @@ def resolve_model_route(model_info: "ModelConfig | None") -> ModelRoute:
     """
     if model_info is None:
         return "chat"
-    if bool(getattr(model_info, "native_video", False)):
+    if bool(getattr(model_info, "video_output", False)):
         return "video"
-    if bool(getattr(model_info, "native_image", False)):
+    if bool(getattr(model_info, "image_output", False)):
         return "image"
     return "chat"
 

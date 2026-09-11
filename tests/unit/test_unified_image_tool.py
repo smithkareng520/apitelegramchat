@@ -143,7 +143,7 @@ def _run_execute_generate_image(monkeypatch, *, model_info, image_url):
 def test_generate_only_model_rejects_image_url(monkeypatch):
     from types import SimpleNamespace
 
-    model_info = SimpleNamespace(vision=False, provider="openrouter")
+    model_info = SimpleNamespace(image_input=False, provider="openrouter")
     result = _run_execute_generate_image(monkeypatch, model_info=model_info, image_url="https://x/y.png")
     assert "仅支持文生图" in result
     # 可操作：告知应改用哪个模型
@@ -157,7 +157,7 @@ def test_generate_only_model_without_image_url_still_works(monkeypatch):
 
     import search.media_tools as mt
 
-    model_info = SimpleNamespace(vision=False, provider="openrouter")
+    model_info = SimpleNamespace(image_input=False, provider="openrouter")
 
     captured = {}
 

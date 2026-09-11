@@ -286,9 +286,9 @@ async def _process_document_group_inner(chat_id: int, media_group_id: str) -> No
     async with lock:
         current_model = get_user_model(chat_id)
         model_info = SUPPORTED_MODELS.get(current_model)
-        supports_native_document = bool(model_info.native_document) if model_info else False
+        supports_document_input = bool(model_info.document_input) if model_info else False
 
-    if supports_native_document:
+    if supports_document_input:
         content_text = f"📎 用户上传了文档组（共 {len(file_ids)} 个文件）：{', '.join(file_names)}"
         if combined_caption:
             content_text += f"\n\n{combined_caption}"

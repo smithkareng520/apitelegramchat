@@ -28,17 +28,17 @@ logger = logging.getLogger(__name__)
 def _get_image_models_by_capability() -> tuple[list[str], list[str]]:
     """
     返回两个列表：
-    - text_models: 支持文生图的全部模型（native_image=True；vision=True 的
+    - text_models: 支持文生图的全部模型（image_output=True；image_input=True 的
       模型同样能纯文生图，一并列入，如 gpt-image-2 / gemini 图像模型）
-    - edit_models: 支持图生图/编辑（native_image=True, vision=True）
+    - edit_models: 支持图生图/编辑（image_output=True, image_input=True）
     """
     text_models = []
     edit_models = []
     for model_id, cfg in SUPPORTED_MODELS.items():
-        if not cfg.native_image:
+        if not cfg.image_output:
             continue
         text_models.append(model_id)
-        if cfg.vision:
+        if cfg.image_input:
             edit_models.append(model_id)
     return text_models, edit_models
 
@@ -47,8 +47,8 @@ TEXT_ONLY_MODELS, EDIT_MODELS = _get_image_models_by_capability()
 
 
 def _get_video_models() -> list[str]:
-    """返回所有支持原生视频生成的模型 ID（native_video=True）。"""
-    return [model_id for model_id, cfg in SUPPORTED_MODELS.items() if cfg.native_video]
+    """返回所有支持原生视频生成的模型 ID（video_output=True）。"""
+    return [model_id for model_id, cfg in SUPPORTED_MODELS.items() if cfg.video_output]
 
 
 # ----- 视频生成模型目录 -----

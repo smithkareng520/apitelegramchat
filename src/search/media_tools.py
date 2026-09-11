@@ -115,7 +115,7 @@ async def execute_generate_image(
       openai_images -> /images/{generations,edits}（ModelScope/XXTF 等）
       openai_chat   -> chat.completions + modalities（OpenRouter 图像模型；
                        未注册的 flux 等别名按 OpenRouter 兼容直连）
-    能力硬校验：带参考图时若模型仅支持文生图（vision=False），直接返回
+    能力硬校验：带参考图时若模型仅支持文生图（image_input=False），直接返回
     可操作错误并列出支持编辑的模型，而不是让请求在上游莫名失败。
     """
     MODEL_ALIAS_MAP = {
@@ -134,7 +134,7 @@ async def execute_generate_image(
     # 统一工具后 image_url 由模型自行决定是否携带；选错模型（只支持
     # 文生图却带了 image_url）时给出可操作错误，引导其改选编辑模型，
     # 而不是把注定失败的请求发往上游。
-    if image_url and model_info is not None and not getattr(model_info, "vision", False):
+    if image_url and model_info is not None and not getattr(model_info, "image_input", False):
         from search.tool_schemas import EDIT_MODELS  # 局部导入避免循环依赖
         edit_list = ", ".join(EDIT_MODELS) if EDIT_MODELS else "(未配置)"
         return (
@@ -278,7 +278,7 @@ async def execute_generate_video(
     model_info = SUPPORTED_MODELS.get(model)
     if not model_info:
         return f"❌ 未知视频模型：{model}"
-    if not model_info.native_video:
+    if not model_info.video_output:
         return f"❌ 模型 {model} 不支持视频生成。"
 
     provider = model_info.provider

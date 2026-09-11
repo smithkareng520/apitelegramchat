@@ -174,7 +174,22 @@ SUPPORTED_ROLES = ["china", "think", "neko_catgirl", "succubus", "isla"]
 class ProviderConfig:
     """厂商级默认配置，包括端点、鉴权变量和协议能力。"""
     name: str
-    base_url: str
+    # 该厂商的 API 端点 URL（唯一端点字段，端点路由完全由 endpoint 支持；
+    # 个别模型可经 ModelConfig.endpoint 覆盖为完整请求 URL）。语义按协议
+    # 自然分流：
+    #   - SDK 兼容协议（openai_chat / openai_responses 等）：填 SDK base，
+    #     AsyncOpenAI 会自动拼接 /chat/completions 等标准路径；
+    #   - anthropic_messages：填 Anthropic 根端点（等于官方默认时由 SDK
+    #     自带默认值生效，见 api_client._build_native_client）；
+    #   - 图像模型：模型侧把 endpoint 覆盖为完整图像端点（如
+    #     "https://apihub.agnes-ai.com/v1/images/generations"）——URL 指向
+    #     /images/generations|edits 时按"完整图像端点"处理（参考图内联
+    #     JSON，生成/编辑共用同一端点，见
+    #     media_generation.resolve_images_endpoint_shape）；URL 不指向图像
+    #     路径时视为 API 根，按 OpenAI 官方形状推导
+    #     {endpoint}/images/{generations,edits}（编辑走 multipart /images/edits）；
+    #   - 视频模型：模型侧把 endpoint 覆盖为视频任务提交端点（如 .../v1/videos）。
+    endpoint: str
     api_key_env: str
     default_headers: Optional[Dict[str, str]] = None
     # 协议选择器（单字段）：该厂商默认走哪种 API 协议。填该厂商
@@ -190,34 +205,6 @@ class ProviderConfig:
     protocol: str = DEFAULT_PROTOCOL
     # 是否支持 Prompt Caching（仅部分厂商需要显式标记）
     supports_prompt_cache: bool = False
-    # 视觉输入是否需要"公开可访问 HTTP URL"而非 data:image/...;base64,... 内联格式。
-    # 部分 OpenAI 兼容网关（如 Agnes）官方文档明确只接受 image_url 中的公开 URL，
-    # 内联 base64 会被静默忽略甚至报 4xx。开启后，会在 _resolve_multimodal_content
-    # 里优先用 R2 公开 URL（不泄露 Telegram bot token），R2 不可用时回退 base64。
-    vision_prefer_url: bool = False
-    # ===================== 请求端点与图像 API 形状（厂商级默认）=====================
-    # 配置驱动端点路由：这三个字段让"同一个网关下不同模型走不同子端点 /
-    # 不同图像 API 形状"只需要在配置里写清楚，不需要为每个模型/厂商在
-    # 请求层新建 if-else 分支。模型侧（ModelConfig）同名字段可逐模型覆盖。
-    # endpoint:
-    #   完整请求 URL（含路径）。图像模型填图像生成端点，如
-    #   "https://apihub.agnes-ai.com/v1/images/generations"；视频模型可填
-    #   视频任务提交端点。None = 由协议按 base_url 推导标准路径
-    #   （openai_images -> {base_url}/images/generations，chat -> SDK 自拼）。
-    # edits_endpoint:
-    #   编辑端点完整 URL（OpenAI 官方形状的 /images/edits 覆盖）。仅
-    #   openai_images 协议且未启用 image_edit_inline 时使用；None =
-    #   {base_url}/images/edits。
-    # image_edit_inline:
-    #   参考图传递形状（仅 openai_images 协议的图像请求读取）：
-    #   True  = 参考图内联进生成端点的 JSON 请求体（Agnes 的
-    #           extra_body.image、ModelScope 的 image_url 风格），生成与
-    #           编辑共用同一 endpoint，无独立 edits 端点；
-    #   False = OpenAI 官方形状：编辑走独立 multipart /images/edits；
-    #   None  = 视为 False（官方形状，向后兼容）。
-    endpoint: Optional[str] = None
-    edits_endpoint: Optional[str] = None
-    image_edit_inline: Optional[bool] = None
     # 是否向该网关下发"会话亲和键"（session_id / X-Session-Id，同一对话
     # 窗口/同一任务共用，清空对话时轮换，见 state.get_llm_session_key）。
     # 背景：OpenRouter 官方支持 body.session_id 粘性路由（见
@@ -241,19 +228,19 @@ class ModelConfig:
     model_id: str               # 完整的模型 ID，如 "google/gemini-2.5-flash"
     provider: str               # 对应 PROVIDERS 的 key
     name: str                   # 显示名称
-    vision: Optional[bool] = None
-    audio: Optional[bool] = None
+    image_input: Optional[bool] = None   # 图片输入（视觉理解）能力
+    audio_input: Optional[bool] = None   # 音频输入能力
     # 视频输入（video understanding）能力：模型能否直接“看”视频内容。
-    # 注意与 native_video（视频生成输出）区分：前者是输入模态，后者是
+    # 注意与 video_output（视频生成输出）区分：前者是输入模态，后者是
     # 生成模态。视频输入通过 OpenAI 兼容协议的 video_url content part
     # 传递（OpenRouter / vLLM / LiteLLM 等均为该事实标准），且由于视频
     # 体积远大于图片，base64 内联容易触发网关请求体上限，因此统一优先
     # 走 R2 公开 URL（见 attachment_content._resolve_r2_public_url_for_video）。
     video: Optional[bool] = None
     supports_tools: Optional[bool] = None
-    native_image: Optional[bool] = None
-    native_document: Optional[bool] = None
-    native_video: Optional[bool] = None
+    image_output: Optional[bool] = None      # 原生图像生成（输出）能力
+    document_input: Optional[bool] = None    # 原生文档输入能力
+    video_output: Optional[bool] = None      # 原生视频生成（输出）能力
     supports_sampling: Optional[bool] = None
     supports_prompt_cache: Optional[bool] = None
     max_output_tokens: Optional[int] = None
@@ -279,11 +266,11 @@ class ModelConfig:
     top_p: Optional[float] = None
 
     # ===================== 端点覆盖（每模型独立中转/协议）=====================
-    # 背景：中转/聚合端点常见"同一 base_url 下不同模型协议不同"（如某端点
+    # 背景：中转/聚合端点常见"同一端点下不同模型协议不同"（如某端点
     # 的 OpenAI 兼容模型走 /v1/chat/completions，Anthropic 系模型走原生
     # Messages API，二者 502/404 互不兼容），或者"想用的模型分散在多个
     # 中转站"。原先端点信息完全挂在 provider 级（PROVIDERS[provider]），
-    # 同一 provider 下所有模型被迫共用同一 base_url/key/协议，选完供应商
+    # 同一 provider 下所有模型被迫共用同一端点/key/协议，选完供应商
     # 还要再确认这台端点这个模型走不走得通，配置心智负担很重。
     #
     # 以下字段全部可选，None = 沿用 provider（PROVIDERS[provider]）的默认值；
@@ -291,7 +278,7 @@ class ModelConfig:
     # 端点覆盖改三件事："连到哪、用哪个 key、带什么请求头"，以及协议
     # 本身（protocol，单字段选择器，None=继承厂商默认）。换句话说：
     #   - 想换端点但协议不变（同样是 OpenAI 兼容 / 同样是 Anthropic 原生）：
-    #     只填 base_url / api_key_env（可选 default_headers）。
+    #     只填 endpoint / api_key_env（可选 default_headers）。
     #   - 想强制该模型走某种协议（如某中转的这个模型只认 Anthropic
     #     原生 Messages 协议，即使 provider 挂在 openrouter 之类壳下）：
     #     填 protocol="anthropic_messages"。
@@ -301,22 +288,18 @@ class ModelConfig:
     #     保持 "openai_chat"（经 chat.completions + modalities 出图）。
     #   - 图像/视频模型还可以直接声明完整请求端点（endpoint=完整 URL，
     #     如 "https://apihub.agnes-ai.com/v1/images/generations"），统一
-    #     请求出口会原样 POST 到该 URL——端点路由完全由配置驱动，新增
-    #     一个走不同子端点的模型不需要在请求层新建任何分支。
+    #     请求出口会原样 POST 到该 URL——端点路由完全由 endpoint 驱动，
+    #     新增一个走不同子端点的模型不需要在请求层新建任何分支。
     # 见 get_effective_endpoint() 获取合并后的有效端点配置。
-    base_url: Optional[str] = None
     api_key_env: Optional[str] = None
     default_headers: Optional[Dict[str, str]] = None
-    # 完整请求端点与图像 API 形状（语义见 ProviderConfig 同名字段注释；
+    # 完整请求端点覆盖（语义见 ProviderConfig.endpoint 注释；
     # None = 继承厂商默认）。
     endpoint: Optional[str] = None
-    edits_endpoint: Optional[str] = None
-    image_edit_inline: Optional[bool] = None
     # 协议选择器（单字段，取值域同 ProviderConfig.protocol）：
     # None = 继承厂商默认；显式声明即覆盖，无独立开关字段。
     protocol: Optional[str] = None
     session_affinity: Optional[bool] = None
-    vision_prefer_url: Optional[bool] = None
 
     @property
     def api_type(self) -> str:
@@ -332,24 +315,24 @@ class ModelConfig:
 PROVIDERS: Dict[str, ProviderConfig] = {
     "openrouter": ProviderConfig(
         name="OpenRouter",
-        base_url="https://openrouter.ai/api/v1",
+        endpoint="https://openrouter.ai/api/v1",
         api_key_env="OPENROUTER_API_KEY",
         supports_prompt_cache=False,  # OpenAI 等自动缓存
     ),
     "modelscope": ProviderConfig(
         name="ModelScope",
-        base_url="https://api-inference.modelscope.cn/v1",
+        endpoint="https://api-inference.modelscope.cn/v1",
         api_key_env="MODELSCOPE_API_KEY",
         supports_prompt_cache=False,  # OpenAI 等自动缓存
     ),
     "gemini": ProviderConfig(
         name="Gemini",
-        # base_url 仅供 subagent 的一次性非流式补全调用继续使用
+        # endpoint 仅供 subagent 的一次性非流式补全调用继续使用
         # （subagent_tool 的 OpenAI 兼容客户端）；主 Agent Loop 走
         # gemini_native 协议适配器（protocols/gemini_native.py ->
         # ai/gemini_bridge.py，streamGenerateContent?alt=sse + 原生
         # function calling），不经过该兼容端点。
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        endpoint="https://generativelanguage.googleapis.com/v1beta/openai/",
         api_key_env="GEMINI_API_KEY",
         # Gemini 官方 API 广泛支持的是原生协议：厂商默认 gemini_native；
         # 个别兼容层模型可在模型侧覆盖 protocol="openai_chat"。
@@ -358,37 +341,33 @@ PROVIDERS: Dict[str, ProviderConfig] = {
     ),
     "grok": ProviderConfig(
         name="Grok",
-        base_url="https://api.x.ai/v1",
+        endpoint="https://api.x.ai/v1",
         api_key_env="XAI_API_KEY",
         supports_prompt_cache=False,
     ),
     "deepseek": ProviderConfig(
         name="DeepSeek",
-        base_url="https://api.deepseek.com/v1",
+        endpoint="https://api.deepseek.com/v1",
         api_key_env="DEEPSEEK_API_KEY",
         supports_prompt_cache=False,
     ),
     "glm": ProviderConfig(
         name="glm",
-        base_url="https://open.bigmodel.cn/api/paas/v4",
+        endpoint="https://open.bigmodel.cn/api/paas/v4",
         api_key_env="GLM_API_KEY",
         supports_prompt_cache=False,
     ),
     "agnes": ProviderConfig(
         name="agnes",
-        base_url="https://apihub.agnes-ai.com/v1",
+        endpoint="https://apihub.agnes-ai.com/v1",
         api_key_env="AGNES_API_KEY",
         supports_prompt_cache=False,
-        # Agnes 官方文档明确只接受 image_url 中的公开 URL（不接受 data: base64），
-        # 因此 _resolve_multimodal_content 会优先用 R2 公开 URL，R2 不可用时回退 base64。
-        vision_prefer_url=True,
-        # 图像 API 形状（厂商级声明一次，全厂商图像模型共用，无需逐模型分支）：
+        # 图像 API 形状由各图像模型的 endpoint 声明推导（无需独立形状字段）：
         # Agnes 的图像生成/编辑/多图合成共用同一端点（/v1/images/generations），
         # 参考图以 JSON 内联字段（extra_body.image）传递，无独立 /images/edits。
-        # 具体端点 URL 由各图像模型用 endpoint 字段声明（如
+        # 各图像模型用 endpoint 字段声明该完整 URL（如
         # "https://apihub.agnes-ai.com/v1/images/generations"），见
         # media_generation.resolve_images_endpoint_shape。
-        image_edit_inline=True,
         # 聚合网关多副本缓存隔离：不下发会话亲和键时，同一前缀的命中率随
         # 路由到的副本随机波动（生产日志中 run 边界 40%、run 内 90%+ 的
         # 交替即此原因）。开启后每个请求携带 session_id + X-Session-Id，
@@ -397,10 +376,10 @@ PROVIDERS: Dict[str, ProviderConfig] = {
     ),
     "anthropic": ProviderConfig(
         name="Anthropic",
-        # base_url 仅为占位（保持 ProviderConfig 结构一致），api_client 对
+        # endpoint 仅为占位（保持 ProviderConfig 结构一致），api_client 对
         # anthropic_messages 协议不会用它构造 AsyncOpenAI 客户端，而是
         # 构造原生 AsyncAnthropic 客户端（见 api_client.py）。
-        base_url="https://api.anthropic.com",
+        endpoint="https://api.anthropic.com",
         api_key_env="ANTHROPIC_API_KEY",
         # Anthropic 官方 API 广泛支持的是原生 Messages 协议：厂商默认
         # anthropic_messages（协议适配器见 protocols/anthropic_messages.py）。
@@ -419,9 +398,9 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         },
         name="XXTF",
         # 壳的默认端点按 OpenAI 协议填（gpt-5.6-sol 沿用这个默认值）；
-        # AsyncOpenAI 会自动拼接为 {base_url}/chat/completions
+        # AsyncOpenAI 会自动拼接为 {endpoint}/chat/completions
         # -> https://xxtf.baby/v1/chat/completions。
-        base_url="https://xxtf.baby/v1",
+        endpoint="https://xxtf.baby/v1",
         api_key_env="XXTF_API_KEY",
     ),
 }
@@ -432,13 +411,13 @@ PROVIDERS: Dict[str, ProviderConfig] = {
 # =============================================================================
 _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "openrouter": {
-        "vision": False,
-        "audio": False,
+        "image_input": False,
+        "audio_input": False,
         "video": False,
         "supports_tools": True,
-        "native_image": False,
-        "native_document": False,
-        "native_video": False,
+        "image_output": False,
+        "document_input": False,
+        "video_output": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -450,12 +429,12 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "max_context": 128000,
     },
     "modelscope": {
-        "vision": False,
-        "audio": False,
+        "image_input": False,
+        "audio_input": False,
         "video": False,
         "supports_tools": True,
-        "native_image": False,
-        "native_document": False,
+        "image_output": False,
+        "document_input": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -467,12 +446,12 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "max_context": 128000,
     },
     "gemini": {
-        "vision": True,
-        "audio": False,
+        "image_input": True,
+        "audio_input": False,
         "video": False,
         "supports_tools": True,
-        "native_image": False,
-        "native_document": False,
+        "image_output": False,
+        "document_input": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -484,12 +463,12 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "max_context": 1000000,
     },
     "grok": {
-        "vision": False,
-        "audio": False,
+        "image_input": False,
+        "audio_input": False,
         "video": False,
         "supports_tools": True,
-        "native_image": False,
-        "native_document": False,
+        "image_output": False,
+        "document_input": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -501,12 +480,12 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "max_context": 128000,
     },
     "deepseek": {
-        "vision": False,
-        "audio": False,
+        "image_input": False,
+        "audio_input": False,
         "video": False,
         "supports_tools": True,
-        "native_image": False,
-        "native_document": False,
+        "image_output": False,
+        "document_input": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -518,12 +497,12 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "max_context": 128000,
     },
     "glm": {
-        "vision": False,
-        "audio": False,
+        "image_input": False,
+        "audio_input": False,
         "video": False,
         "supports_tools": True,
-        "native_image": False,
-        "native_document": False,
+        "image_output": False,
+        "document_input": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -535,13 +514,13 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "max_context": 128000,
     },
     "agnes": {
-        "vision": False,
-        "audio": False,
+        "image_input": False,
+        "audio_input": False,
         "video": False,
         "supports_tools": True,
-        "native_image": False,
-        "native_document": False,
-        "native_video": False,
+        "image_output": False,
+        "document_input": False,
+        "video_output": False,
         "supports_sampling": True,
         "supports_prompt_cache": False,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -553,13 +532,13 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "max_context": 128000,
     },
     "anthropic": {
-        "vision": True,
-        "audio": False,
+        "image_input": True,
+        "audio_input": False,
         "video": False,
         "supports_tools": True,
-        "native_image": False,
-        "native_document": True,
-        "native_video": False,
+        "image_output": False,
+        "document_input": True,
+        "video_output": False,
         "supports_sampling": True,
         "supports_prompt_cache": True,
         "temperature": None,          # None -> 不发送，走供应商默认
@@ -571,13 +550,13 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "max_context": 200000,
     },
     "xxtf": {
-        "vision": True,
-        "audio": False,
+        "image_input": True,
+        "audio_input": False,
         "video": False,
         "supports_tools": True,
-        "native_image": False,
-        "native_document": True,
-        "native_video": False,
+        "image_output": False,
+        "document_input": True,
+        "video_output": False,
         "supports_sampling": True,
         # GPT-5.6 Sol 的 Responses API 支持原生 Prompt Caching；由
         # ai.responses_bridge 为每个会话稳定注入 prompt_cache_key。
@@ -598,18 +577,17 @@ class EffectiveEndpoint:
     """某个模型合并后的最终端点配置。"""
     provider: str                 # 厂商标签（鉴权/日志/展示用途）
     name: str                     # 展示名（沿用 provider 名，端点覆盖不改展示名）
-    base_url: str
+    # 合并后的端点 URL（模型级 endpoint 覆盖 > 厂商级 endpoint）：
+    #   - chat 等协议：API 根（SDK 客户端据此构造，自动拼标准路径）；
+    #   - 图像模型声明了完整图像端点（指向 /images/generations|edits）：
+    #     即完整请求 URL；未声明时为厂商 API 根，请求层按官方形状推导
+    #     {endpoint}/images/{generations,edits}（语义见 ProviderConfig.endpoint）。
+    endpoint: str
     api_key_env: str
     default_headers: Dict[str, str]
     protocol: str                 # 协议标签（决定走哪个协议适配器 / 请求体形状）
     supports_prompt_cache: bool
-    vision_prefer_url: bool
     session_affinity: bool
-    # 配置驱动的完整请求端点与图像 API 形状（None = 未声明，按协议从
-    # base_url 推导标准路径；语义见 ProviderConfig 同名字段注释）。
-    endpoint: Optional[str] = None
-    edits_endpoint: Optional[str] = None
-    image_edit_inline: Optional[bool] = None
     # 是否存在模型级端点覆盖（仅用于日志/调试，不参与业务判断）。
     is_override: bool = False
 
@@ -618,9 +596,8 @@ def get_effective_endpoint(model_info: Optional[ModelConfig]) -> EffectiveEndpoi
     """
     返回某个 ModelConfig 实际应使用的端点配置：
     以 PROVIDERS[model_info.provider] 为默认值，逐字段用模型上非 None 的
-    覆盖字段（base_url / api_key_env / default_headers / protocol /
-    session_affinity / vision_prefer_url / endpoint / edits_endpoint /
-    image_edit_inline）替换。
+    覆盖字段（endpoint / api_key_env / default_headers / protocol /
+    session_affinity）替换。
 
     这是"每模型独立配置中转端点/协议"的唯一合并出口：api_client.py /
     agentic_loops.py / attachment_content.py 等一切需要知道"这个模型到底
@@ -637,42 +614,29 @@ def get_effective_endpoint(model_info: Optional[ModelConfig]) -> EffectiveEndpoi
         override = getattr(model_info, attr_name, None)
         return override if override is not None else getattr(base, attr_name)
 
-    override_base_url = getattr(model_info, "base_url", None)
     override_api_key_env = getattr(model_info, "api_key_env", None)
     override_headers = getattr(model_info, "default_headers", None)
     override_protocol = getattr(model_info, "protocol", None)
     override_session_aff = getattr(model_info, "session_affinity", None)
-    override_vision_url = getattr(model_info, "vision_prefer_url", None)
     override_endpoint = getattr(model_info, "endpoint", None)
-    override_edits_endpoint = getattr(model_info, "edits_endpoint", None)
-    override_image_edit_inline = getattr(model_info, "image_edit_inline", None)
 
     is_override = any(
         v is not None
         for v in (
-            override_base_url, override_api_key_env, override_headers,
-            override_protocol, override_session_aff,
-            override_vision_url, override_endpoint, override_edits_endpoint,
-            override_image_edit_inline,
+            override_api_key_env, override_headers,
+            override_protocol, override_session_aff, override_endpoint,
         )
     )
 
     return EffectiveEndpoint(
         provider=provider_key,
         name=base.name,
-        base_url=_pick("base_url"),
+        endpoint=str(_pick("endpoint") or ""),
         api_key_env=_pick("api_key_env"),
         default_headers=(override_headers if override_headers is not None else (base.default_headers or {})),
         protocol=_pick("protocol"),
         supports_prompt_cache=bool(getattr(model_info, "supports_prompt_cache", base.supports_prompt_cache)),
-        vision_prefer_url=bool(_pick("vision_prefer_url")),
         session_affinity=bool(_pick("session_affinity")),
-        endpoint=override_endpoint if override_endpoint is not None else base.endpoint,
-        edits_endpoint=(override_edits_endpoint if override_edits_endpoint is not None else base.edits_endpoint),
-        image_edit_inline=(
-            override_image_edit_inline if override_image_edit_inline is not None
-            else base.image_edit_inline
-        ),
         is_override=is_override,
     )
 
@@ -698,21 +662,30 @@ def get_openrouter_provider_preferences() -> dict:
     return prefs
 
 
-# 端点覆盖字段：这些字段不参与 _PROVIDER_DEFAULTS 的能力合并（vision/
+# 端点覆盖字段：这些字段不参与 _PROVIDER_DEFAULTS 的能力合并（image_input/
 # supports_tools 等走厂商默认继承的逻辑），而是"模型有填就用模型的，
 # 模型没填就是 None（=沿用 provider）"，直接原样落到 ModelConfig 上，
 # 由 get_effective_endpoint() 在使用时合并，因此这里先从 kwargs 中摘出、
 # 不参与 _merge_with_defaults。
 _ENDPOINT_OVERRIDE_FIELDS = (
-    "base_url",
     "api_key_env",
     "default_headers",
     "protocol",
     "session_affinity",
-    "vision_prefer_url",
     "endpoint",
+)
+
+# 已移除的端点字段迁移守卫：base_url 已并入 endpoint（唯一端点字段，
+# 完全靠 endpoint 支持端点路由）；edits_endpoint / image_edit_inline /
+# vision_prefer_url 属补丁式参数已精简——图像编辑形状由 endpoint 指向的
+# URL 路径推导（见 media_generation.resolve_images_endpoint_shape），图片
+# 输入统一优先 R2 公开 URL（见 ai/attachment_content.py）。旧字段写法
+# 直接报错暴露，避免旧配置被静默吞掉后行为与预期不符。
+_REMOVED_ENDPOINT_FIELDS = (
+    "base_url",
     "edits_endpoint",
     "image_edit_inline",
+    "vision_prefer_url",
 )
 
 
@@ -725,18 +698,18 @@ def make_model_config(
     """
     工厂函数：根据 provider 和覆盖项创建 ModelConfig。
 
-    除了原有的能力字段（vision/supports_tools/reasoning_* 等，走厂商
+    除了原有的能力字段（image_input/supports_tools/reasoning_* 等，走厂商
     默认继承），还接受端点覆盖字段（见 _ENDPOINT_OVERRIDE_FIELDS）：
     当某个中转端点对不同模型使用不同协议或不同子端点时，可以在具体
     模型这里单独指定（protocol=...），无需为此新建一个 provider。
 
     示例：假设 provider="my_relay" 的中转站里，
     gpt-5.6-sol 走 OpenAI 兼容协议、claude-opus-5 走 Anthropic 原生协议，
-    但用的是同一个 base_url 与同一个 key：
+    但用的是同一个 endpoint 与同一个 key：
 
         PROVIDERS["my_relay"] = ProviderConfig(
             name="MyRelay",
-            base_url="https://xxtf.baby/query/v1",   # OpenAI 兼容子路径
+            endpoint="https://xxtf.baby/query/v1",   # OpenAI 兼容子路径
             api_key_env="MY_RELAY_API_KEY",
         )
 
@@ -748,9 +721,9 @@ def make_model_config(
         SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
             provider="my_relay",
             name="Claude Opus 5 (中转)",
-            # 仅此模型覆盖：换协议 + 换子路径，key 仍沿用 my_relay 默认。
+            # 仅此模型覆盖：换协议 + 换完整端点，key 仍沿用 my_relay 默认。
             protocol="anthropic_messages",
-            base_url="https://xxtf.baby",
+            endpoint="https://xxtf.baby",
         )
     """
     endpoint_overrides = {
@@ -765,6 +738,17 @@ def make_model_config(
                 f"模型 {model_id} 传入了已移除的字段 {_legacy_field}："
                 "协议字段已硬切为 protocol，请改用 protocol"
                 f"（合法值: {sorted(_VALID_PROTOCOLS)}，不填=继承厂商默认）。"
+            )
+    # 迁移守卫（端点字段精简）：base_url 并入 endpoint；edits_endpoint /
+    # image_edit_inline / vision_prefer_url 已移除（见 _REMOVED_ENDPOINT_FIELDS）。
+    for _removed_field in _REMOVED_ENDPOINT_FIELDS:
+        if _removed_field in kwargs:
+            raise ValueError(
+                f"模型 {model_id} 传入了已移除的字段 {_removed_field}："
+                "端点配置已精简为唯一 endpoint 字段（完整 URL）——base_url 并入"
+                " endpoint；edits_endpoint / image_edit_inline 已删除（编辑形状"
+                "由 endpoint 指向的图像端点路径推导）；vision_prefer_url 已删除"
+                "（图片输入统一优先 R2 公开 URL）。"
             )
 
     override_protocol = endpoint_overrides.get("protocol")
@@ -810,13 +794,13 @@ def make_model_config(
         model_id=normalized_model_id,
         provider=provider,
         name=name,
-        vision=merged.get("vision"),
-        audio=merged.get("audio"),
+        image_input=merged.get("image_input"),
+        audio_input=merged.get("audio_input"),
         video=merged.get("video"),
         supports_tools=merged.get("supports_tools"),
-        native_image=merged.get("native_image"),
-        native_document=merged.get("native_document"),
-        native_video=merged.get("native_video"),
+        image_output=merged.get("image_output"),
+        document_input=merged.get("document_input"),
+        video_output=merged.get("video_output"),
         supports_sampling=merged.get("supports_sampling"),
         supports_prompt_cache=merged.get("supports_prompt_cache"),
         max_output_tokens=merged.get("max_output_tokens", 65535),
@@ -826,15 +810,11 @@ def make_model_config(
         reasoning_max_tokens=(int(budget) if budget is not None else None),
         temperature=merged.get("temperature"),
         top_p=merged.get("top_p"),
-        base_url=endpoint_overrides.get("base_url"),
         api_key_env=endpoint_overrides.get("api_key_env"),
         default_headers=endpoint_overrides.get("default_headers"),
         protocol=endpoint_overrides.get("protocol"),
         session_affinity=endpoint_overrides.get("session_affinity"),
-        vision_prefer_url=endpoint_overrides.get("vision_prefer_url"),
         endpoint=endpoint_overrides.get("endpoint"),
-        edits_endpoint=endpoint_overrides.get("edits_endpoint"),
-        image_edit_inline=endpoint_overrides.get("image_edit_inline"),
     )
 
 
@@ -982,13 +962,13 @@ class EffectiveParams:
     model_id: str
     name: str
     # ---- 输入模态能力（鉴权用：用户输入了什么 vs 模型能收什么）----
-    vision: bool                  # 图片输入
-    audio: bool                   # 音频输入
+    image_input: bool             # 图片输入
+    audio_input: bool             # 音频输入
     video_input: bool             # 视频输入（ModelConfig.video，与生成输出区分）
-    native_document: bool         # 原生文档输入
+    document_input: bool          # 原生文档输入
     # ---- 输出模态能力（分支判断用）----
-    native_image: bool            # 图像生成输出
-    native_video: bool            # 视频生成输出
+    image_output: bool            # 图像生成输出
+    video_output: bool            # 视频生成输出
     # ---- 工具面 / 采样 ----
     supports_tools: bool
     supports_sampling: bool
@@ -1009,18 +989,19 @@ class EffectiveParams:
         """输入模态标签 -> 该模型是否支持（鉴权判定的唯一映射出口）。
 
         modality 取值与 Telegram 附件 kind 对齐：
-        photo/image -> vision；audio/voice -> audio；video -> video_input；
-        document -> native_document；未知模态保守返回 False（鉴权方会降级
-        为文本占位，与 _resolve_multimodal_content 的行为一致）。
+        photo/image -> image_input；audio/voice -> audio_input；
+        video -> video_input；document -> document_input；未知模态保守返回
+        False（鉴权方会降级为文本占位，与 _resolve_multimodal_content 的
+        行为一致）。
         """
         key = str(modality or "").strip().lower()
         mapping = {
-            "photo": self.vision,
-            "image": self.vision,
-            "audio": self.audio,
-            "voice": self.audio,
+            "photo": self.image_input,
+            "image": self.image_input,
+            "audio": self.audio_input,
+            "voice": self.audio_input,
             "video": self.video_input,
-            "document": self.native_document,
+            "document": self.document_input,
         }
         return bool(mapping.get(key, False))
 
@@ -1040,8 +1021,8 @@ def resolve_effective_params(model_info: Optional[ModelConfig]) -> EffectivePara
     if model_info is None:
         return EffectiveParams(
             provider="", model_id="", name="",
-            vision=False, audio=False, video_input=False, native_document=False,
-            native_image=False, native_video=False,
+            image_input=False, audio_input=False, video_input=False, document_input=False,
+            image_output=False, video_output=False,
             supports_tools=False, supports_sampling=False, supports_prompt_cache=False,
             temperature=None, top_p=None,
             reasoning_enabled=None, reasoning_effort=None, reasoning_max_tokens=None,
@@ -1057,12 +1038,12 @@ def resolve_effective_params(model_info: Optional[ModelConfig]) -> EffectivePara
         provider=str(getattr(model_info, "provider", "") or ""),
         model_id=str(getattr(model_info, "model_id", "") or ""),
         name=str(getattr(model_info, "name", "") or ""),
-        vision=bool(getattr(model_info, "vision", False)),
-        audio=bool(getattr(model_info, "audio", False)),
+        image_input=bool(getattr(model_info, "image_input", False)),
+        audio_input=bool(getattr(model_info, "audio_input", False)),
         video_input=bool(getattr(model_info, "video", False)),
-        native_document=bool(getattr(model_info, "native_document", False)),
-        native_image=bool(getattr(model_info, "native_image", False)),
-        native_video=bool(getattr(model_info, "native_video", False)),
+        document_input=bool(getattr(model_info, "document_input", False)),
+        image_output=bool(getattr(model_info, "image_output", False)),
+        video_output=bool(getattr(model_info, "video_output", False)),
         supports_tools=bool(getattr(model_info, "supports_tools", False)),
         supports_sampling=bool(getattr(model_info, "supports_sampling", True)),
         supports_prompt_cache=bool(getattr(model_info, "supports_prompt_cache", False)),
@@ -1089,7 +1070,7 @@ SUPPORTED_MODELS["openrouter/free"] = make_model_config(
     model_id="openrouter/free",
     provider="openrouter",
     name="Free",
-    vision=True,
+    image_input=True,
     reasoning_enabled=True,
     reasoning_effort="high",
     supports_tools=False,
@@ -1099,8 +1080,8 @@ SUPPORTED_MODELS["openrouter/free"] = make_model_config(
 #     model_id="anthropic/claude-sonnet-5",
 #     provider="openrouter",
 #     name="Claude Sonnet 5",
-#     vision=True,
-#     native_document=True,
+#     image_input=True,
+#     document_input=True,
 #     supports_prompt_cache=True,
 #     max_context=1000000,
 #     # 扩展思考：高努力档位，经 OpenRouter 统一 reasoning 接口下发。
@@ -1122,7 +1103,7 @@ SUPPORTED_MODELS["agnes-3.0-flash"] = make_model_config(
     reasoning_enabled=True,
     reasoning_effort="high",
     max_context=512000,
-    vision=True,
+    image_input=True,
     # 默认主力模型：网关对推理/采样参数的支持未公开，保守起见两者都不发送，
     # 完全走供应商默认。确认网关支持后可在此显式开启。
 )
@@ -1147,7 +1128,7 @@ SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
     model_id="gemini-3.5-flash-lite",
     provider="gemini",
     name="Gemini 3.5 Flash-Lite",
-    vision=True,
+    image_input=True,
     max_context=1000000,
     # Flash-Lite 定位轻快：思考限制在低档，避免响应变慢。
     # Google 建议不调整 temperature（默认 1.0）；top_p 不配置即不发送。
@@ -1177,8 +1158,8 @@ SUPPORTED_MODELS["Qwen/Qwen-Image-Edit"] = make_model_config(
     model_id="Qwen/Qwen-Image-Edit",
     provider="modelscope",
     name="Qwen Image Edit",
-    vision=True,
-    native_image=True,
+    image_input=True,
+    image_output=True,
     # 图像模型显式声明 OpenAI Images 协议（ModelScope 图像端点）。
     protocol="openai_images",
     max_context=32768,
@@ -1188,7 +1169,7 @@ SUPPORTED_MODELS["Tongyi-MAI/Z-Image-Turbo"] = make_model_config(
     model_id="Tongyi-MAI/Z-Image-Turbo",
     provider="modelscope",
     name="Z Image Turbo",
-    native_image=True,
+    image_output=True,
     # 同上：ModelScope 图像端点走 OpenAI Images 协议。
     protocol="openai_images",
     max_context=32768,
@@ -1198,8 +1179,8 @@ SUPPORTED_MODELS["Tongyi-MAI/Z-Image-Turbo"] = make_model_config(
 #     model_id="google/gemini-3.1-flash-lite-image",
 #     provider="openrouter",
 #     name="Gemini 3.1 Flash Lite Image",
-#     native_image=True,
-#     vision=True,
+#     image_output=True,
+#     image_input=True,
 #     supports_tools=False,
 #     max_context=131000,
 # )
@@ -1207,8 +1188,8 @@ SUPPORTED_MODELS["Tongyi-MAI/Z-Image-Turbo"] = make_model_config(
 #     model_id="google/gemini-3-pro-image-preview",
 #     provider="openrouter",
 #     name="Gemini 3 Pro Image Preview",
-#     native_image=True,
-#     vision=True,
+#     image_output=True,
+#     image_input=True,
 #     supports_tools=False,
 #     max_context=66000,
 # )
@@ -1216,8 +1197,8 @@ SUPPORTED_MODELS["Tongyi-MAI/Z-Image-Turbo"] = make_model_config(
 #     model_id="bytedance-seed/seedream-4.5",
 #     provider="openrouter",
 #     name="Seedream 4.5",
-#     native_image=True,
-#     vision=True,
+#     image_output=True,
+#     image_input=True,
 #     supports_tools=False,
 #     max_context=4000,
 #     max_output_tokens=1024,
@@ -1227,19 +1208,19 @@ SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
     model_id="agnes-image-2.5-flash",
     provider="agnes",
     name="Agnes Image 2.5 Flash",
-    native_image=True,
-    # 注意（2026-09 排查"支持 vision 但看不到历史图片"实锤）：这里的
-    # vision=True 仅表示"可以把图片当输入模态接收"——即图片能被当作
+    image_output=True,
+    # 注意（2026-09 排查"支持看图但看不到历史图片"实锤）：这里的
+    # image_input=True 仅表示"可以把图片当输入模态接收"——即图片能被当作
     # 图生图/编辑的参考图使用（ai.agentic_loops._agentic_loop_native_image
     # 会从历史 user 消息里提取 ImageBlock 传给 ImageTask.edit）。它**不**
     # 表示该模型具备视觉问答（能对图片内容做文字理解/回答）能力：
-    # native_image=True 决定了该模型恒定走 openai_images 协议，请求发到
+    # image_output=True 决定了该模型恒定走 openai_images 协议，请求发到
     # /v1/images/generations、/images/edits，响应体系（ImageTaskResult）
     # 里从没有"针对输入图片内容的文字理解"这一产物。如果用户诉求是
     # "让模型看着历史图片聊天/回答图片里是什么"，这个模型架构上做不到，
-    # 应引导切到走 chat 协议、vision=True 的对话模型，而不是在这里
+    # 应引导切到走 chat 协议、image_input=True 的对话模型，而不是在这里
     # 试图"修出"一个它本来就不具备的能力。
-    vision=True,
+    image_input=True,
     supports_tools=False,
     max_context=4000,
     max_output_tokens=1024,
@@ -1259,9 +1240,9 @@ SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
 #     model_id="agnes-video-2.5",
 #     provider="agnes",
 #     name="Agnes video 2.5",
-#     vision=True,
+#     image_input=True,
 #     video=True,
-#     native_video=True,
+#     video_output=True,
 #     max_context=32768,
 #     max_output_tokens=4000,
 #     # 视频任务提交端点（配置驱动）：_request_agnes_video 优先 POST 到该

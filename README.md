@@ -353,8 +353,8 @@ export OPENROUTER_REQUIRE_PARAMETERS=false   # 是否要求 provider 满足请�
 | GLM | `GLM_API_KEY` | 智谱 |
 | Agnes | `AGNES_API_KEY` | Agnes（默认模型 `agnes-2.5-flash`） |
 
-模型可声明能力位：`vision` / `audio` / `video` / `supports_tools` /
-`native_image` / `native_document` / `native_video` / `search` /
+模型可声明能力位：`image_input` / `audio_input` / `video` / `supports_tools` /
+`image_output` / `document_input` / `video_output` / `search` /
 `sampling` / `prompt cache` / `max_output_tokens` / `max_context`。
 支持按 `provider/model-id` 自动发现部分未预先登记的模型。
 
@@ -807,8 +807,8 @@ emoji 运行时依赖。
 
 ### 修改模型
 
-编辑 `src/config.py`，为模型声明完整能力位（provider / vision / audio /
-video / supports_tools / native_image / native_document / native_video /
+编辑 `src/config.py`，为模型声明完整能力位（provider / image_input / audio_input /
+video / supports_tools / image_output / document_input / video_output /
 max_context / max_output_tokens）。不要只改显示名称而忽略实际能力，
 否则多模态输入或 tool calling 会在运行时失败。
 

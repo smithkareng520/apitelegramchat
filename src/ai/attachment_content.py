@@ -205,7 +205,7 @@ async def _upload_and_mark(file_id: str, data: bytes, r2_key: str) -> None:
 #      "先发给不支持视频的模型，再切换到支持视频的模型"这条路径不丢
 #      信息，视频在首次进入 fallback（模型不支持视频）路径时也会
 #      fire-and-forget 地后台上传 R2（图片的 fallback 路径不做上传，
-#      因为图片场景下 supports_vision 的模型占比高，且图片字节便宜）。
+#      因为图片场景下 supports_image_input 的模型占比高，且图片字节便宜）。
 # =====================================================================
 
 
@@ -470,7 +470,7 @@ def _guess_document_mime_type(file_name: str = "", explicit_mime: str = "") -> s
 def _is_anthropic_native_model(model_info: Optional[ModelConfig]) -> bool:
     """判断模型是否走 Anthropic 原生 Messages 协议（anthropic_messages）。
 
-    与 _resolve_multimodal_content 里 vision_prefer_url 的取法同口径：
+    与 _resolve_multimodal_content 里端点字段的取法同口径：
     走"有效端点"合并（模型级 protocol 覆盖优先），未知厂商返回 False。
     """
     if model_info is None:
@@ -802,24 +802,20 @@ async def _build_audio_fallback_text(
 
 
 async def _build_image_block(
-    chat_id: int | None, file_id: str, vision_prefer_url: bool
+    chat_id: int | None, file_id: str
 ) -> Optional[ImageBlock]:
     """把单个图片 file_id 解析为 ImageBlock（失败返回 None）。
 
-    从 photo_group 分支抽出的公共逻辑，混合附件分支复用：
-    vision_prefer_url 网关（Agnes）优先 R2 公开 URL，失败回退 base64；
-    其余网关直接 base64 内联，并顺带做 R2 预上传与 TTL 缓存。
+    从 photo_group 分支抽出的公共逻辑，混合附件分支复用。
+    统一解析顺序：优先 R2 公开 URL（公开可访问的 image_url 是各网关的
+    公共分母，Agnes 等只接受公开 URL 的网关同样兼容；R2 未配置时该
+    解析零成本返回空串），失败回退 base64 内联，并顺带做 R2 预上传与
+    TTL 缓存。
     """
-    # Agnes 等 vision_prefer_url 网关：走公开 URL 路径。
-    # 失败回退到 base64（OpenAI 等多数网关都支持）。
-    if vision_prefer_url:
-        public_url = await _resolve_r2_public_url_for_vision(file_id)
-        if public_url:
-            return ImageBlock(url=public_url, detail="high")
-        # R2 不可用，回退到 base64（仍然好过完全没图）。
-        logger.debug(
-            f"vision_prefer_url=True 但 R2 URL 不可用，回退 base64: {file_id[:12]}"
-        )
+    public_url = await _resolve_r2_public_url_for_vision(file_id)
+    if public_url:
+        return ImageBlock(url=public_url, detail="high")
+    logger.debug(f"R2 公开 URL 不可用，回退 base64 内联: {file_id[:12]}")
 
     img_bytes = await get_cached_image_data(chat_id, file_id) if chat_id else None
     if not img_bytes:
@@ -829,9 +825,9 @@ async def _build_image_block(
     # 目的：
     #   1. 让内存 TTLCache (~5min) 过期后能从 R2 拉取，避免再调
     #      Telegram getFile API（Telegram bot getFile 有 rate limit）。
-    #   2. 让未来切换到 Agnes (vision_prefer_url=True) 的轮次能
-    #      零延迟拿 R2 公开 URL，不必再走同步上传路径。
-    # Agnes 路径不经过这里（vision_prefer_url=True 时早已 return），
+    #   2. 让后续轮次能零延迟拿 R2 公开 URL（上面的优先路径），
+    #      不必再走同步上传路径。
+    # R2 命中路径不经过这里（拿到 URL 时早已 return），
     # 所以同一张图不会被 put_object 两次。
     r2_key = _get_r2_key(file_id)
     _track_task(_upload_and_mark(file_id, img_bytes, r2_key))
@@ -864,7 +860,6 @@ async def _resolve_mixed_attachments(
     model_info: ModelConfig,
     chat_id: int | None,
     user_text: str,
-    vision_prefer_url: bool,
 ) -> list[Block]:
     """逐条解析混合 kind / 多音频附件（打断合并产物，无单一 type 可路由）。
 
@@ -873,10 +868,10 @@ async def _resolve_mixed_attachments(
     失败的降级为文本占位（音频走转录降级，视频顺带后台持久化，保证切换
     模型后可恢复）。返回 Block 列表；全部失败时返回占位文本块。
     """
-    supports_vision = model_info.vision
-    supports_audio = model_info.audio
+    supports_image_input = model_info.image_input
+    supports_audio_input = model_info.audio_input
     supports_video = bool(getattr(model_info, "video", False))
-    supports_native_documents = bool(getattr(model_info, "native_document", False))
+    supports_document_input = bool(getattr(model_info, "document_input", False))
 
     blocks: list[Block] = []
     fallback_texts: list[str] = []
@@ -890,8 +885,8 @@ async def _resolve_mixed_attachments(
         mime = str(entry.get("mime_type") or "").strip()
 
         resolved_block: Optional[Block] = None
-        if kind == "photo" and supports_vision:
-            resolved_block = await _build_image_block(chat_id, fid, vision_prefer_url)
+        if kind == "photo" and supports_image_input:
+            resolved_block = await _build_image_block(chat_id, fid)
         elif kind == "video" and supports_video:
             public_url = await _resolve_r2_public_url_for_video(fid, mime or "video/mp4")
             if public_url:
@@ -901,7 +896,7 @@ async def _resolve_mixed_attachments(
                 # 万一 R2 稍后恢复，下一轮可重新解析为原生视频。
                 _track_task(_ensure_video_persisted(fid, mime or "video/mp4"))
         elif kind in ("audio", "voice"):
-            if supports_audio:
+            if supports_audio_input:
                 audio_bytes = await _get_cached_audio_data(chat_id, fid)
                 if audio_bytes:
                     b64_data = base64.b64encode(audio_bytes).decode()
@@ -918,7 +913,7 @@ async def _resolve_mixed_attachments(
                     user_text="",
                 ))
                 continue
-        elif kind == "document" and supports_native_documents:
+        elif kind == "document" and supports_document_input:
             resolved_block = await _build_native_document_block(
                 chat_id,
                 fid,
@@ -970,24 +965,15 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
     对应块（ImageBlock / AudioBlock / VideoBlock / DocumentBlock），不支持
     或解析失败时降级为文本占位块——调用方拿到的永远是合法的块列表。
     """
-    supports_vision = model_info.vision
-    supports_audio = model_info.audio
+    supports_image_input = model_info.image_input
+    supports_audio_input = model_info.audio_input
     # 视频输入模态：默认由 provider 能力决定，模型必须显式设置 video=True 才开启。
-    # 与 vision/audio 等参数保持一致：provider 只提供默认能力，模型配置负责覆盖。
+    # 与 image_input/audio_input 等参数保持一致：provider 只提供默认能力，模型配置负责覆盖。
     # 例如 OpenRouter 默认 video=False，但某个模型经过验证支持后可以手动 video=True。
     # 这样不会因为免费模型 metadata 声明支持视频而误发送 video_url。
     supports_video = bool(getattr(model_info, "video", False))
 
-    supports_native_documents = bool(getattr(model_info, "native_document", False))
-    # 部分网关（Agnes）只接受 image_url 里的公开 HTTP URL，不接受 data: base64。
-    # 命中时优先用 R2 公开 URL；R2 不可用时回退 base64。
-    # 走"有效端点"合并（provider 默认值 + 模型级覆盖），而非直接查
-    # PROVIDERS[model_info.provider]：否则某个模型若单独覆盖了
-    # vision_prefer_url，这里会读到厂商默认值而非模型自己的设置。
-    try:
-        vision_prefer_url = get_effective_endpoint(model_info).vision_prefer_url
-    except ValueError:
-        vision_prefer_url = False
+    supports_document_input = bool(getattr(model_info, "document_input", False))
     user_text = msg.get("content", "")
     if isinstance(user_text, str):
         user_text = _strip_reply_prefix(user_text)
@@ -1006,15 +992,15 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
         att_kinds = {str(a.get("kind") or "").strip().lower() for a in entries}
         if entries and (len(att_kinds) > 1 or att_kinds <= {"audio", "voice"}):
             return await _resolve_mixed_attachments(
-                entries, model_info, chat_id, user_text, vision_prefer_url
+                entries, model_info, chat_id, user_text
             )
 
     # ---------- 图片 / 图片组 ----------
     if "file_ids" in msg and msg.get("type") in ("photo", "photo_group"):
         file_ids = list(msg.get("file_ids") or [])
-        if supports_vision:
+        if supports_image_input:
             results = await asyncio.gather(
-                *[_build_image_block(chat_id, fid, vision_prefer_url) for fid in file_ids]
+                *[_build_image_block(chat_id, fid) for fid in file_ids]
             )
             content_blocks: list[Block] = [r for r in results if r is not None]
             if content_blocks:
@@ -1104,7 +1090,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
             doc_file_names = list(msg.get("file_names") or [])
             doc_mime_types = list(msg.get("mime_types") or [])
 
-        if supports_native_documents:
+        if supports_document_input:
             if doc_file_ids:
                 content_blocks = []
                 fallback_texts = []
@@ -1188,7 +1174,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
             file_name = msg.get("file_name", f"{file_type}_{fid[:8]}")
             mime_type = msg.get("mime_type", "")
 
-            # ---------- 视频输入模态（与图片 supports_vision 路径对称） ----------
+            # ---------- 视频输入模态（与图片 supports_image_input 路径对称） ----------
             # OpenRouter / vLLM / LiteLLM 等的事实标准：
             #   {"type": "video_url", "video_url": {"url": "<公开 URL>"}}
             # 视频统一走 URL（R2 公开域名 / 预签名），不走 base64 内联。
@@ -1235,7 +1221,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
             return [TextBlock("\n".join(lines))]
 
         # 说明：document / document_group 在上方"原生文档"分支已全路径
-        # 处理（supports_native_documents 与降级文本均返回），此处不可能
+        # 处理（supports_document_input 与降级文本均返回），此处不可能
         # 再收到该类型，无需再降级。
 
     return [TextBlock(user_text)] if user_text else []

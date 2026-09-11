@@ -426,7 +426,7 @@ def _blocks_to_gemini_parts(blocks: list) -> list:
                     "data": data,
                 }})
         elif isinstance(block, DocumentBlock):
-            # 原生文档块仅 Anthropic（native_document=True）启用；
+            # 原生文档块仅 Anthropic（document_input=True）启用；
             # Gemini 当前模型未开启该能力，防御性降级为文本占位。
             parts.append({"text": "[收到一个文档附件，当前模型不支持原生文档输入]"})
         else:

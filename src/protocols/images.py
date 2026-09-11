@@ -85,11 +85,8 @@ IMAGE_PROTOCOLS: dict[str, ImageProtocolAdapter] = {
 
 def _endpoint_shape_is_images(ep) -> bool:
     """合并后的有效端点是否声明了 OpenAI Images 形状的完整 URL。"""
-    for attr in ("endpoint", "edits_endpoint"):
-        url = str(getattr(ep, attr, None) or "").strip()
-        if url and _IMAGES_ENDPOINT_PATH_PATTERN.search(url):
-            return True
-    return False
+    url = str(getattr(ep, "endpoint", None) or "").strip()
+    return bool(url and _IMAGES_ENDPOINT_PATH_PATTERN.search(url))
 
 
 def resolve_image_adapter(model_info: "ModelConfig") -> ImageProtocolAdapter:

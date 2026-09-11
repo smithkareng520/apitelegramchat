@@ -206,7 +206,7 @@ _unreachable_chats: set[int] = set()
 _turn_runner_callback: Optional[Callable[[int], Awaitable[None]]] = None
 _busy_check_callback: Optional[Callable[[int], bool]] = None
 # 由 app.py 注册的回调：判断该 chat 当前是否为原生图片/视频生成模型
-#   （native_image 或 native_video）。返回 True 时 _fire_turn 不会创建
+#   （image_output 或 video_output）。返回 True 时 _fire_turn 不会创建
 #   runner 任务、不会布置下一次 timer（详见模块 docstring）。
 _media_model_check_callback: Optional[Callable[[int], bool]] = None
 # 由 app.py 注册的回调：判断该 chat_id 是否在白名单内。返回 False 时

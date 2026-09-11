@@ -70,20 +70,24 @@ IMAGES_API_PROVIDERS = frozenset({"modelscope", "xxtf"})
 # =============================================================================
 # 配置驱动的图像端点解析（公共出口）
 # -----------------------------------------------------------------------------
-# "这个图像模型到底 POST 到哪个 URL、参考图怎么传"由模型/厂商配置决定，
-# 不再按提供商写 if-else 分支：
+# "这个图像模型到底 POST 到哪个 URL、参考图怎么传"由模型配置的 endpoint
+# 字段决定，不再按提供商写 if-else 分支：
 #   - 模型配置声明 endpoint="https://apihub.agnes-ai.com/v1/images/generations"
-#     -> 生成（及内联编辑）原样 POST 到该 URL；
-#   - 厂商/模型声明 image_edit_inline=True（如 Agnes：参考图内联进生成
-#     端点的 extra_body.image）-> 生成与编辑共用同一端点，无独立 edits；
-#   - 未声明任何端点覆盖 -> 维持官方形状推导 {base_url}/images/{generations,edits}
-#     （XXTF 等标准 OpenAI Images 中转行为完全不变）。
+#     （URL 指向 /images/generations|edits）-> 视为完整图像端点：生成与
+#     编辑（参考图内联 extra_body.image）共用该 URL（Agnes 形状）；
+#   - endpoint 指向 API 根（未声明图像子路径）-> 按 OpenAI 官方形状推导
+#     {endpoint}/images/{generations,edits}，编辑走独立 multipart
+#     /images/edits（XXTF 等标准 OpenAI Images 中转行为完全不变）。
 # =============================================================================
 _INLINE_IMAGE_SIZE_TIERS = frozenset({"1K", "2K", "3K", "4K"})
 # Agnes 官方支持的宽高比集合（size 档位 + ratio 配合使用；不在集合内的
 # aspect_ratio 不发送，走网关默认 1:1）。
 _INLINE_IMAGE_RATIOS = frozenset({"1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9"})
 _EXACT_SIZE_PATTERN = re.compile(r"^\d{3,4}[xX]\d{3,4}$")
+# 视频任务提交端点判定：URL 路径指向 /videos（子路径可带 query/尾斜）。
+# endpoint 现为唯一端点字段（API 根也经由它表达），只有指向视频子路径的
+# 声明才会被 _request_agnes_video 用作提交 URL，否则回退内置默认。
+_VIDEO_SUBMIT_PATH_PATTERN = re.compile(r"/videos(?:[/?#]|$)")
 
 
 class ImagesEndpointShape:
@@ -107,13 +111,21 @@ class ImagesEndpointShape:
 
 
 def resolve_images_endpoint_shape(model_info: Optional[ModelConfig]):
-    """按模型/厂商配置解析图像请求的端点与参考图形状（公共出口）。
+    """按模型配置的 endpoint 解析图像请求的端点与参考图形状（公共出口）。
+
+    端点路由完全由唯一的 endpoint 字段支撑（URL 自身即形状声明）：
+      - endpoint 指向 /images/generations|edits -> 视为完整图像端点：
+        generate_url = edits_url = 该 URL，参考图内联 JSON（Agnes 形状，
+        extra_body.image），生成/编辑/多图合成共用同一端点；
+      - endpoint 为 API 根（不指向图像子路径）-> 按 OpenAI 官方形状推导：
+        generate_url = {endpoint}/images/generations（JSON），
+        edits_url    = {endpoint}/images/edits（multipart）。
 
     返回 :class:`ImagesEndpointShape`：
       - generate_url: 文生图（及内联编辑）应 POST 的完整 URL；
-      - edits_url:    multipart 编辑应 POST 的完整 URL（inline 风格下不用）；
+      - edits_url:    multipart 编辑应 POST 的完整 URL（inline 形状下不用）；
       - edit_inline:  True = 参考图内联进 generate_url 的 JSON 请求体
-        （Agnes extra_body.image / ModelScope image_url 风格）；
+        （Agnes extra_body.image 风格）；
       - style:        展示用风格标签（"inline_images" / "multipart_edits"）。
     model_info 为 None 时按未声明处理（官方形状 + 无端点覆盖）。
     """
@@ -123,13 +135,33 @@ def resolve_images_endpoint_shape(model_info: Optional[ModelConfig]):
             ep = get_effective_endpoint(model_info)
         except Exception:
             ep = None
-    base_url = ((getattr(ep, "base_url", "") or "").rstrip("/") if ep else "")
-    declared_endpoint = str(getattr(ep, "endpoint", None) or "").strip() if ep else ""
-    declared_edits = str(getattr(ep, "edits_endpoint", None) or "").strip() if ep else ""
-    edit_inline = bool(getattr(ep, "image_edit_inline", False)) if ep else False
+    ep_url = ((getattr(ep, "endpoint", "") or "").rstrip("/") if ep else "")
 
-    generate_url = declared_endpoint or (f"{base_url}/images/generations" if base_url else "")
-    edits_url = declared_edits or (f"{base_url}/images/edits" if base_url else "")
+    # 完整图像端点判定：URL 路径指向 /images/generations|edits（与
+    # protocols.images._IMAGES_ENDPOINT_PATH_PATTERN 同义；惰性导入
+    # 避免模块级循环依赖）。
+    is_full_images_endpoint = False
+    if ep_url:
+        try:
+            from protocols.images import _IMAGES_ENDPOINT_PATH_PATTERN
+            is_full_images_endpoint = bool(_IMAGES_ENDPOINT_PATH_PATTERN.search(ep_url))
+        except Exception:
+            is_full_images_endpoint = False
+
+    if is_full_images_endpoint:
+        # 形状 A：完整图像端点 -> 参考图内联 JSON，生成/编辑共用同一 URL。
+        generate_url = ep_url
+        edits_url = ""
+        edit_inline = True
+    elif ep_url:
+        # 形状 B：API 根 -> OpenAI 官方形状推导，编辑走 multipart /images/edits。
+        generate_url = f"{ep_url}/images/generations"
+        edits_url = f"{ep_url}/images/edits"
+        edit_inline = False
+    else:
+        generate_url = ""
+        edits_url = ""
+        edit_inline = False
     return ImagesEndpointShape(
         generate_url=generate_url,
         edits_url=edits_url,
@@ -416,13 +448,13 @@ async def _request_modelscope_native_image(
     - 若服务直接返回图片结果，则 response_json 为最终结果。
     - 若先返回 task_id，则会自动轮询任务结果后再返回最终 JSON。
     """
-    base_url = "https://api-inference.modelscope.cn/v1"
+    api_root = "https://api-inference.modelscope.cn/v1"
     # 注意：ModelScope 的图生图（image-to-image）同样走 /images/generations 端点，
     # /images/edits 在 ModelScope API-Inference 上不存在（返回 404 page not found）。
     # 区分文生图与图生图的是 X-ModelScope-Task-Type 头部，而非 URL 路径。
     # 参考实现: https://github.com/hujuying/ComfyUI-ModelScope-API/blob/main/modelscope_image_node.py
     endpoint = "/images/generations"
-    request_url = f"{base_url}{endpoint}"
+    request_url = f"{api_root}{endpoint}"
 
     # 注意：ModelScope 异步图像接口要求在 POST 与轮询 GET 上分别附带
     # X-ModelScope-Async-Mode / X-ModelScope-Task-Type 头部，否则任务虽然
@@ -489,7 +521,7 @@ async def _request_modelscope_native_image(
             logger.debug(
                 "[NativeImage/ModelScope] %s %s response: status=%s content_type=%s body_preview=%r",
                 method,
-                url.replace(base_url, ''),
+                url.replace(api_root, ''),
                 resp.status,
                 resp.headers.get("Content-Type", ""),
                 _body_preview(body_text),
@@ -603,7 +635,7 @@ async def _request_modelscope_native_image(
                     task_id[:32],
                 )
                 return None, endpoint, "上游返回了非法的 task_id", 200, request_id
-            poll_url = f"{base_url}/tasks/{task_id}"
+            poll_url = f"{api_root}/tasks/{task_id}"
             poll_deadline = time.monotonic() + 240
             poll_interval = 3.0
             poll_max_interval = 5.0
@@ -929,11 +961,12 @@ async def _request_openai_compat_image(
         aspect_ratio: str | None = None,
         image_size: str | None = None,
 ) -> tuple[dict | None, str, str, int, str]:
-    """通用 OpenAI Images 兼容实现（端点与形状配置驱动，公共出口）。
+    """通用 OpenAI Images 兼容实现（端点与形状由 endpoint 驱动，公共出口）。
 
-    端点与参考图形状经 :func:`resolve_images_endpoint_shape` 从模型/厂商
-    配置解析，支持两种 API 形状。新增一个走不同子端点/形状的模型只需在
-    config 里声明 endpoint / image_edit_inline，无需在本函数新建分支：
+    端点与参考图形状经 :func:`resolve_images_endpoint_shape` 从模型配置
+    的 endpoint 解析，支持两种 API 形状。新增一个走不同子端点/形状的模型
+    只需在 config 里声明 endpoint（完整图像端点或 API 根），无需在本函数
+    新建分支：
 
     形状 A —— inline_images（Agnes 式：生成/编辑/多图合成共用同一端点）：
       - 全部请求 POST JSON 到配置声明的 generate_url（如
@@ -946,11 +979,12 @@ async def _request_openai_compat_image(
       - 文生图 return_base64=true 直取 b64_json；图生图/多图合成
         extra_body.response_format="b64_json"，省一次签名 URL 下载往返。
 
-    形状 B —— multipart_edits（OpenAI 官方语义，XXTF 等标准中转，行为不变）：
-    - 无参考图（文生图）: POST JSON ``{base_url}/images/generations``
+    形状 B —— multipart_edits（OpenAI 官方语义，endpoint 为 API 根时推导，
+    XXTF 等标准中转，行为不变）：
+    - 无参考图（文生图）: POST JSON ``{endpoint}/images/generations``
       （官方 "Create image"，仅接受文本 prompt，无 image 参数）。
     - 有参考图（图生图/编辑）: 官方独立端点 "Create image edit"
-      ``{base_url}/images/edits``，且必须是 multipart/form-data——参考图以
+      ``{endpoint}/images/edits``，且必须是 multipart/form-data——参考图以
       重复的 ``image[]`` 文件字段逐张上传（gpt-image 系列支持多张），
       文本字段为 model / prompt / n [/ size]：
 
@@ -969,8 +1003,9 @@ async def _request_openai_compat_image(
 
     共同鲁棒性："请求体未完整/请重试"类瞬态 400 同形状自动重试一次；
     超大参考图（>3MB）先降采样再上传，避免中转站读不满请求体。
-    URL 优先级：模型/厂商声明的完整端点（endpoint / edits_endpoint）>
-    {base_url}/images/{generations,edits} 官方推导。
+    URL 解析：模型声明的完整图像端点（endpoint 指向
+    /images/generations|edits）原样使用（参考图内联，生成/编辑共用）；
+    否则按 API 根推导 {endpoint}/images/{generations,edits} 官方形状。
     鉴权：``Bearer {api_key_env 解析出的 key}``；provider 级
     default_headers（如 XXTF 的浏览器 UA）一并下发。multipart 请求
     不手动设置 Content-Type（aiohttp 自动生成带 boundary 的头）。
@@ -982,14 +1017,14 @@ async def _request_openai_compat_image(
     调用方拼 /v1 前缀用于展示。
     """
     gen_endpoint = "/images/generations"
-    edits_endpoint = "/images/edits"
+    edits_path = "/images/edits"
     log_prefix = "[NativeImage/OpenAICompat]"
     ep = get_effective_endpoint(model_info)
     shape = resolve_images_endpoint_shape(model_info)
     api_key_env = getattr(ep, "api_key_env", "") or ""
     api_key = _resolve_provider_api_key(api_key_env)
     if not shape.generate_url:
-        return None, gen_endpoint, f"提供商 {ep.name!r} 未配置 base_url / endpoint", 400, ""
+        return None, gen_endpoint, f"提供商 {ep.name!r} 未配置 endpoint", 400, ""
     if not api_key:
         return None, gen_endpoint, f"缺少 API Key: {api_key_env}，请设置环境变量", 401, ""
 
@@ -1094,7 +1129,7 @@ async def _request_openai_compat_image(
             #   有参考图 -> 只能 POST /images/edits multipart；
             #   edits 失败 -> 明确报错；
             #   绝不 fallback 到 /images/generations（宁可失败，不假成功）。
-            endpoint = edits_endpoint
+            endpoint = edits_path
             image_data_urls = await _image_urls_to_data_urls(session, image_urls)
             if not image_data_urls:
                 return None, endpoint, "未能读取参考图片", 400, ""
@@ -1148,7 +1183,7 @@ async def _request_openai_compat_image(
                 logger.debug(
                     "%s multipart prepared: endpoint=%s model=%s prompt_len=%s "
                     "reference_count=%s refs=%s",
-                    log_prefix, edits_endpoint, model,
+                    log_prefix, edits_path, model,
                     len(clean_prompt or ""),
                     len(decoded_refs),
                     [
@@ -1695,13 +1730,13 @@ async def _request_agnes_video(
     字段会被网关 400 "duration is not an allowed request field"）、mode
     必填（text/keyframe/reference——keyframe 带首尾帧、reference 带参考
     媒体，构建器按媒体自动推断/校验）、size/画幅白名单校验。参考媒体
-    URL 必须公开可访问（vision_prefer_url 路径产出的 R2 公开 URL 恰好
-    满足）。
+    URL 必须公开可访问（R2 公开 URL 解析路径产出的地址恰好满足）。
 
     提交端点由模型配置驱动（endpoint 字段，如
-    "https://apihub.agnes-ai.com/v1/videos"），未声明时回退内置默认；
-    轮询端点从声明提交端点的 scheme://host 推导（{host}/agnesapi），
-    未声明时回退内置默认——与文档推荐的
+    "https://apihub.agnes-ai.com/v1/videos"）：endpoint 指向视频子路径
+    （/videos）时作为提交 URL，否则（endpoint 为 API 根/其它协议端点）
+    回退内置默认；轮询端点从声明提交端点的 scheme://host 推导
+    （{host}/agnesapi），未声明时回退内置默认——与文档推荐的
     GET /agnesapi?video_id=<VIDEO_ID>&model_name=<MODEL> 查询方式一致
     （keyframe/reference 模式必须带 model_name，text 模式亦推荐）。
     """
@@ -1710,14 +1745,16 @@ async def _request_agnes_video(
         "Content-Type": "application/json",
     }
 
-    # 提交端点：模型声明了 endpoint 就用声明值（配置驱动，无需按厂商分支）。
+    # 提交端点：模型声明了指向视频子路径（/videos）的 endpoint 就用声明值
+    # （端点路由完全由 endpoint 支撑，无需按厂商分支）；endpoint 为 API 根
+    # 或其它形状时回退内置默认。
     submit_url = "https://apihub.agnes-ai.com/v1/videos"
     declared_endpoint = ""
     try:
         model_info = SUPPORTED_MODELS.get(model)
         if model_info is not None:
             declared = str(get_effective_endpoint(model_info).endpoint or "").strip()
-            if declared:
+            if declared and _VIDEO_SUBMIT_PATH_PATTERN.search(declared):
                 submit_url = declared
                 declared_endpoint = declared
     except Exception:
@@ -1734,7 +1771,7 @@ async def _request_agnes_video(
     if plan is None or plan.api_type != "video":
         # 未注册/非视频模型的安全兜底：按 video 分支最小形状构造。
         from protocols.pipeline import RequestPlan
-        plan = RequestPlan(route="video", api_type="video", protocol="", base_url="")
+        plan = RequestPlan(route="video", api_type="video", protocol="", endpoint="")
     payload = build_video_request_body(
         plan,
         model=model,
@@ -1960,7 +1997,7 @@ async def _request_openrouter_video(
     提交视频任务到 OpenRouter 并轮询结果。
     返回 (video_url, error_message, meta)；成功时 error=None，meta 通常为 None（OpenRouter 不暴露同量级的元数据）。
     """
-    base_url = "https://openrouter.ai/api/v1"
+    api_root = "https://openrouter.ai/api/v1"
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -1976,7 +2013,7 @@ async def _request_openrouter_video(
     )
 
     # 提交任务
-    submit_url = f"{base_url}/videos"
+    submit_url = f"{api_root}/videos"
     payload = {
         "model": model,
         "prompt": clean_prompt,

@@ -799,8 +799,8 @@ def _is_media_model_active(chat_id: int) -> bool:
     if model_info is None:
         return False
     return bool(
-        getattr(model_info, "native_image", False)
-        or getattr(model_info, "native_video", False)
+        getattr(model_info, "image_output", False)
+        or getattr(model_info, "video_output", False)
     )
 
 
@@ -845,7 +845,7 @@ async def _handle_timer_wakeup(chat_id: int) -> None:
             username = ctx.get("username") or f"User_{chat_id}"
         model_info = SUPPORTED_MODELS.get(cm)
         if model_info is not None and (
-            getattr(model_info, "native_image", False) or getattr(model_info, "native_video", False)
+            getattr(model_info, "image_output", False) or getattr(model_info, "video_output", False)
         ):
             logger.info(
                 f"[proactive] chat={chat_id} 当前模型 {cm} 为原生媒体模型"

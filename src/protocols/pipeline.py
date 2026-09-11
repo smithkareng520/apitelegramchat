@@ -229,15 +229,15 @@ class RequestPlan:
     route: ModelRoute
     api_type: ApiBranch
     protocol: str                  # 协议标签（openai_chat / openai_images / ...）
-    endpoint: Optional[str]        # 声明的完整端点 URL；None = 按协议从 base_url 推导
-    base_url: str
+    # 合并后的端点 URL（get_effective_endpoint().endpoint）：chat 等协议为
+    # API 根（SDK 自拼标准路径）；图像模型声明了完整图像端点时即为请求 URL。
+    endpoint: str = ""
     image_style: Optional[str] = None   # 仅 images 分支：inline_images / multipart_edits
     session_affinity: bool = False
-    vision_prefer_url: bool = False
 
     def describe(self) -> str:
         bits = [f"route={self.route}", f"api={self.api_type}", f"protocol={self.protocol}"]
-        bits.append(f"endpoint={self.endpoint or '(协议推导)'}")
+        bits.append(f"endpoint={self.endpoint or '(未配置)'}")
         if self.image_style:
             bits.append(f"shape={self.image_style}")
         return " ".join(bits)
@@ -247,8 +247,9 @@ def resolve_request_plan(model_info: Optional["ModelConfig"]) -> RequestPlan:
     """解析模型应进入的 API 分支（chat / images / video）+ 端点 + 形状。
 
     分支判断完全来自配置：能力字段决定链路（resolve_model_route），端点
-    字段决定连到哪（get_effective_endpoint），图像形状由端点/inline 声明
-    决定（media_generation.resolve_images_endpoint_shape）。新增一个模型
+    字段决定连到哪（get_effective_endpoint 的唯一 endpoint），图像形状由
+    endpoint 指向的 URL 路径推导
+    （media_generation.resolve_images_endpoint_shape）。新增一个模型
     不需要改这里任何代码。
     """
     from config import get_effective_endpoint
@@ -260,7 +261,7 @@ def resolve_request_plan(model_info: Optional["ModelConfig"]) -> RequestPlan:
     except ValueError:
         ep = None
     protocol = str(getattr(ep, "protocol", "") or "") if ep else ""
-    base_url = str(getattr(ep, "base_url", "") or "") if ep else ""
+    endpoint_url = str(getattr(ep, "endpoint", "") or "") if ep else ""
 
     image_style: Optional[str] = None
     if api_type == "images":
@@ -277,11 +278,9 @@ def resolve_request_plan(model_info: Optional["ModelConfig"]) -> RequestPlan:
         route=route,
         api_type=api_type,
         protocol=protocol,
-        endpoint=(getattr(ep, "endpoint", None) if ep else None),
-        base_url=base_url,
+        endpoint=endpoint_url,
         image_style=image_style,
         session_affinity=bool(getattr(ep, "session_affinity", False)) if ep else False,
-        vision_prefer_url=bool(getattr(ep, "vision_prefer_url", False)) if ep else False,
     )
 
 

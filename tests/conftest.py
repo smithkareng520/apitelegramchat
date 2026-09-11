@@ -49,9 +49,9 @@ def _register_test_media_models() -> None:
             model_id="agnes-video-2.5",
             provider="agnes",
             name="Agnes video 2.5",
-            vision=True,
+            image_input=True,
             video=True,
-            native_video=True,
+            video_output=True,
             max_context=32768,
             max_output_tokens=4000,
             # 视频任务提交端点（配置驱动）：_request_agnes_video 优先 POST
@@ -63,21 +63,21 @@ def _register_test_media_models() -> None:
             model_id="google/gemini-3-pro-image-preview",
             provider="openrouter",
             name="Gemini 3 Pro Image Preview",
-            native_image=True,
-            vision=True,
+            image_output=True,
+            image_input=True,
             supports_tools=False,
             max_context=66000,
         )
     # agnes-image-2.1-flash：生产注册已下线，但 config.py 中 2.5 的注册注释
     # 明确说"与 2.1 同形状"，test_agnes_image_21_shares_same_shape 以它为
-    # 路由回归夹具。形状与 2.5 完全一致（images 协议 + 官方生成端点）。
+    # 路由回归夹具。形状与 2.5 完全一致（images 协议 + 完整图像端点）。
     if "agnes-image-2.1-flash" not in config.SUPPORTED_MODELS:
         config.SUPPORTED_MODELS["agnes-image-2.1-flash"] = make(
             model_id="agnes-image-2.1-flash",
             provider="agnes",
             name="Agnes Image 2.1 Flash",
-            native_image=True,
-            vision=True,
+            image_output=True,
+            image_input=True,
             supports_tools=False,
             max_context=4000,
             max_output_tokens=1024,

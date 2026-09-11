@@ -2,12 +2,12 @@
 """
 统一 API 客户端工厂（协议驱动）
 支持通过 config.py 中的 PROVIDERS 字典动态添加新厂商，也支持每个模型
-单独覆盖端点（base_url / api_key_env / 协议），详见
+单独覆盖端点（endpoint / api_key_env / 协议），详见
 config.get_effective_endpoint()。
 
 客户端构造按"协议"分流（protocol -> SDK client）：
   - anthropic_messages -> AsyncAnthropic
-  - 其它协议（openai_chat 及一切带 base_url 的兼容端点）-> AsyncOpenAI
+  - 其它协议（openai_chat 及一切带 endpoint 的兼容端点）-> AsyncOpenAI
   - gemini_native / openai_images 的主链路不经过 SDK 客户端
     （协议适配器内直连 aiohttp），但 subagent 等兼容层调用方仍可拿到
     AsyncOpenAI 客户端访问同一厂商的 OpenAI 兼容端点。
@@ -54,11 +54,11 @@ class APIClient:
       - protocol="anthropic_messages" 的端点：AsyncAnthropic
 
     客户端按"模型 ID"缓存（而非按 provider 缓存）：因为现在允许同一个
-    provider 下的不同模型分别覆盖 base_url/api_key_env/协议，若仍按
+    provider 下的不同模型分别覆盖 endpoint/api_key_env/协议，若仍按
     provider 缓存，第二个模型会错误复用第一个模型建好的客户端（连去
     第一个模型的端点）。model_id 在 SUPPORTED_MODELS 中天然唯一，用它
     做缓存 key 不会引入额外开销——未做任何端点覆盖的模型，合并结果与
-    厂商默认完全一致，多个模型各自持有一个指向同一 base_url 的独立
+    厂商默认完全一致，多个模型各自持有一个指向同一 endpoint 的独立
     client 实例，除了多几个 httpx 连接池外无实质差别。
 
     添加新的 OpenAI 兼容厂商只需在 config.py 的 PROVIDERS 中配置；
@@ -95,12 +95,12 @@ class APIClient:
             api_key = self._get_api_key(endpoint.api_key_env)
             if not api_key:
                 raise ValueError(f"缺少 API Key: {endpoint.api_key_env}，请设置环境变量")
-            logger.debug(f"创建 {endpoint.name} 原生客户端 base_url={endpoint.base_url}")
+            logger.debug(f"创建 {endpoint.name} 原生客户端 endpoint={endpoint.endpoint}")
             kwargs: dict[str, Any] = {}
-            # 仅当端点覆盖了 base_url 且不同于 Anthropic 官方默认时才显式传入，
+            # 仅当端点覆盖为非 Anthropic 官方默认时才显式传入，
             # 否则沿用 AsyncAnthropic SDK 自带的官方默认值，行为与此前完全一致。
-            if endpoint.base_url and endpoint.base_url != "https://api.anthropic.com":
-                kwargs["base_url"] = endpoint.base_url
+            if endpoint.endpoint and endpoint.endpoint != "https://api.anthropic.com":
+                kwargs["base_url"] = endpoint.endpoint
             if endpoint.default_headers:
                 kwargs["default_headers"] = endpoint.default_headers
             return AsyncAnthropic(
@@ -129,7 +129,7 @@ class APIClient:
 
         headers = endpoint.default_headers or {}
 
-        logger.debug(f"创建 {endpoint.name} 客户端，base_url={endpoint.base_url}")
+        logger.debug(f"创建 {endpoint.name} 客户端，endpoint={endpoint.endpoint}")
 
         # 禁用 OpenAI SDK 的隐式自动重试。SDK 默认会依据服务端 Retry-After
         # 睡眠，可能出现“Retrying request ... in 60.000000 seconds”，并且会与
@@ -141,7 +141,7 @@ class APIClient:
             sdk_max_retries = 0
 
         return AsyncOpenAI(
-            base_url=endpoint.base_url,
+            base_url=endpoint.endpoint,
             api_key=api_key,
             max_retries=sdk_max_retries,
             # Agent 在多轮工具调用后，下一轮 SSE 的首个事件可能显著晚于普通聊天。
@@ -154,7 +154,7 @@ class APIClient:
     def get_client_for_model(self, model_info: ModelConfig) -> Union[AsyncOpenAI, "AsyncAnthropic"]:
         """
         【推荐入口】根据具体的 ModelConfig 返回对应客户端实例（按 model_id 缓存）。
-        自动合并该模型的端点覆盖（base_url/api_key_env/协议等，见
+        自动合并该模型的端点覆盖（endpoint/api_key_env/协议等，见
         config.get_effective_endpoint），因此同一 provider 下配置了不同
         中转端点的模型会拿到各自独立、指向各自端点的客户端。
         """
@@ -181,18 +181,12 @@ class APIClient:
             endpoint = EffectiveEndpoint(
                 provider=api_type,
                 name=base.name,
-                base_url=base.base_url,
+                endpoint=base.endpoint,
                 api_key_env=base.api_key_env,
                 default_headers=base.default_headers or {},
                 protocol=base.protocol,
                 supports_prompt_cache=base.supports_prompt_cache,
-                vision_prefer_url=base.vision_prefer_url,
                 session_affinity=base.session_affinity,
-                # 配置驱动的完整请求端点与图像 API 形状（与
-                # get_effective_endpoint 的合并语义保持一致：厂商级默认直传）。
-                endpoint=base.endpoint,
-                edits_endpoint=base.edits_endpoint,
-                image_edit_inline=base.image_edit_inline,
             )
             self._clients[api_type] = self._build_client(endpoint)
         return self._clients[api_type]

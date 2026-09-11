@@ -7,7 +7,7 @@
 （build_media_request_body）。
 
 覆盖五个层面：
-1. 参数分层：模型覆盖 > 厂商默认（openrouter/free 示例：vision=True
+1. 参数分层：模型覆盖 > 厂商默认（openrouter/free 示例：image_input=True
    覆盖厂商默认 False；未覆盖字段继承厂商默认）；端点合并同规则。
 2. 输入组合解析：单一类型信封 / 混合 attachments 信封 / 空信封。
 3. 鉴权：支持模态 ok；不支持模态降级（degrade 记录原因，不阻断）；
@@ -45,19 +45,19 @@ AGNES_VIDEOS_URL = "https://apihub.agnes-ai.com/v1/videos"
 # ---------------------------------------------------------------------------
 
 def test_model_override_beats_provider_default():
-    # 用户示例模型：openrouter/free 显式声明 vision=True / supports_tools=False
+    # 用户示例模型：openrouter/free 显式声明 image_input=True / supports_tools=False
     # / reasoning_effort="high" / max_context=200000，全部应覆盖厂商默认
-    # （openrouter 默认 vision=False / supports_tools=True / max_context=128000）。
+    # （openrouter 默认 image_input=False / supports_tools=True / max_context=128000）。
     params = resolve_effective_params(SUPPORTED_MODELS["openrouter/free"])
     assert params.provider == "openrouter"
     assert params.model_id == "openrouter/free"
-    assert params.vision is True          # 模型覆盖（厂商默认 False）
+    assert params.image_input is True   # 模型覆盖（厂商默认 False）
     assert params.supports_tools is False  # 模型覆盖（厂商默认 True）
     assert params.reasoning_effort == "high"
     assert params.max_context == 200000
     # 未覆盖字段继承厂商默认
-    assert params.audio is False
-    assert params.native_image is False
+    assert params.audio_input is False
+    assert params.image_output is False
 
 
 def test_unspecified_fields_inherit_provider_defaults():
@@ -66,27 +66,24 @@ def test_unspecified_fields_inherit_provider_defaults():
         model_id="plain-model", provider="openrouter", name="Plain",
     )
     params = resolve_effective_params(cfg)
-    assert params.vision is False
+    assert params.image_input is False
     assert params.supports_tools is True
     assert params.max_context == 128000
     assert params.max_output_tokens == 65536
 
 
 def test_endpoint_layering_provider_default_then_model_override():
-    # 端点分层：模型未声明 -> 厂商默认（openrouter 无端点声明，按协议推导）；
-    # 模型声明完整端点 -> 模型覆盖生效。
+    # 端点分层：模型未声明 -> 厂商默认 endpoint（openrouter 为 API 根，
+    # SDK 客户端自拼标准路径）；模型声明完整端点 -> 模型覆盖生效。
     plain = make_model_config(
         model_id="plain-model", provider="openrouter", name="Plain",
     )
     p = resolve_effective_params(plain)
-    assert p.endpoint.endpoint is None
-    assert p.endpoint.base_url == PROVIDERS["openrouter"].base_url
+    assert p.endpoint.endpoint == PROVIDERS["openrouter"].endpoint
 
     agnes_img = resolve_effective_params(SUPPORTED_MODELS["agnes-image-2.5-flash"])
     assert agnes_img.endpoint.endpoint == AGNES_IMAGES_URL
     assert agnes_img.endpoint.protocol == "openai_images"
-    # inline 形状来自厂商级声明（agnes: image_edit_inline=True）
-    assert agnes_img.endpoint.image_edit_inline is True
 
 
 def test_capability_for_modality_mapping():
@@ -103,7 +100,7 @@ def test_capability_for_modality_mapping():
 def test_none_model_returns_safe_empty_params():
     params = resolve_effective_params(None)
     assert params.model_id == ""
-    assert params.vision is False
+    assert params.image_input is False
     assert params.supports_tools is False
 
 
@@ -162,7 +159,7 @@ def test_combination_none_and_non_string_content():
 # ---------------------------------------------------------------------------
 
 def test_auth_text_and_photo_to_vision_model_ok():
-    # 用户示例场景：openrouter/free vision=True，用户输入文本+图片 -> 鉴权通过
+    # 用户示例场景：openrouter/free image_input=True，用户输入文本+图片 -> 鉴权通过
     combo = resolve_input_combination({
         "type": "photo_group", "file_ids": ["a", "b"], "content": "这是什么",
     })
@@ -174,7 +171,7 @@ def test_auth_text_and_photo_to_vision_model_ok():
 
 
 def test_auth_photo_to_non_vision_model_degrades():
-    # GLM-4.7-Flash 继承厂商默认 vision=False：图片降级文本占位，回合继续
+    # GLM-4.7-Flash 继承厂商默认 image_input=False：图片降级文本占位，回合继续
     combo = resolve_input_combination({"type": "photo", "file_id": "x", "content": "看图"})
     verdict = authorize_request(SUPPORTED_MODELS["GLM-4.7-Flash"], combo)
     assert verdict.ok is True           # 降级不阻断
@@ -183,7 +180,7 @@ def test_auth_photo_to_non_vision_model_degrades():
 
 
 def test_auth_mixed_modalities_partial_degrade():
-    # 图片可收（vision=True）、音频不支持（audio=False）：部分降级
+    # 图片可收（image_input=True）、音频不支持（audio_input=False）：部分降级
     combo = resolve_input_combination({
         "content": "处理一下",
         "attachments": [
@@ -235,8 +232,8 @@ def test_plan_chat_model():
     assert plan.route == "chat"
     assert plan.api_type == "chat"
     assert plan.protocol == "openai_chat"
-    assert plan.endpoint is None  # 无端点声明 -> 协议按 base_url 推导
-    assert plan.base_url == PROVIDERS["agnes"].base_url
+    # 无模型级覆盖 -> 端点为厂商 API 根（协议按它自拼标准路径）
+    assert plan.endpoint == PROVIDERS["agnes"].endpoint
 
 
 def test_plan_image_model_uses_declared_endpoint_and_inline_shape():
@@ -261,7 +258,8 @@ def test_plan_openrouter_chat_modalities_image_model():
     assert plan.route == "image"
     assert plan.api_type == "images"
     assert plan.protocol == "openai_chat"
-    assert plan.endpoint is None
+    # 端点为厂商 API 根（请求走 chat modalities，不经图像端点）
+    assert plan.endpoint == PROVIDERS["openrouter"].endpoint
 
 
 def test_plan_none_model_falls_back_to_chat():
@@ -310,11 +308,12 @@ def test_build_body_non_json_shapes_return_none():
     # （video 分支另有 build_video_request_body 出口）
     plan = resolve_request_plan(SUPPORTED_MODELS["agnes-3.0-flash"])
     assert build_media_request_body(plan, model="x", prompt="y") is None
-    # multipart 形状：构造一个 inline=False 的图像模型
+    # multipart 形状：不声明完整图像端点（endpoint 沿用厂商 API 根）->
+    # 官方形状推导，编辑走独立 multipart /images/edits
     cfg = make_model_config(
         model_id="official-style-image", provider="agnes", name="Official",
-        native_image=True, vision=True, supports_tools=False,
-        protocol="openai_images", image_edit_inline=False,
+        image_output=True, image_input=True, supports_tools=False,
+        protocol="openai_images",
     )
     mplan = resolve_request_plan(cfg)
     assert mplan.image_style == "multipart_edits"
@@ -412,7 +411,7 @@ def test_run_preflight_end_to_end_vision_turn():
     pf = run_preflight(SUPPORTED_MODELS["openrouter/free"], {
         "type": "photo_group", "file_ids": ["a"], "content": "这是什么",
     })
-    assert pf.params.vision is True
+    assert pf.params.image_input is True
     assert pf.combination.photo_count == 1
     assert pf.verdict.ok is True and pf.verdict.blocked is False
     assert pf.plan.api_type == "chat"

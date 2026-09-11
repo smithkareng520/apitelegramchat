@@ -25,7 +25,7 @@ Agnes 官方文档参数表）：请求层不消费 / API 不接受的参数绝�
 默认与参考媒体
 --------
 未选择的参数不进请求体（跟随 API 网关默认，与官方文档一致）；参考媒体统一
-经 R2 转为公开可访问 URL（与 vision_prefer_url 同源）；上传失败 / 未取得
+经 R2 转为公开可访问 URL（与图片输入的 R2 公开 URL 优先路径同源）；上传失败 / 未取得
 URL 时卡片提示"重新发送"，绝不静默丢弃；用户发送参考视频后可就绪设置
 start_seconds（起始时间）与 require_audio（是否必须包含音轨）。
 """
@@ -259,7 +259,7 @@ def extract_media_attachments(user_message: Optional[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 媒体公开 URL 解析（R2；与 vision_prefer_url 同源）
+# 媒体公开 URL 解析（R2；与图片输入的 R2 公开 URL 优先路径同源）
 # ---------------------------------------------------------------------------
 async def resolve_media_public_url(kind: str, file_id: str, mime_type: str = "") -> str:
     """把 Telegram file_id 解析为公开可访问 URL（Agnes 参考媒体硬要求）。

@@ -676,9 +676,9 @@ async def process_update(data: dict) -> None:
                 async with lock:
                     cm = get_user_model(chat_id)
                     model_info = SUPPORTED_MODELS.get(cm)
-                    supports_native_document = bool(model_info.native_document) if model_info else False
+                    supports_document_input = bool(model_info.document_input) if model_info else False
 
-                if supports_native_document:
+                if supports_document_input:
                     content_text = f"📎 用户上传了文档「{fname}」"
                     if cap:
                         content_text += f"\n\n{cap}"
@@ -743,9 +743,9 @@ async def process_update(data: dict) -> None:
                 async with lock:
                     current_model = get_user_model(chat_id)
                     model_info = SUPPORTED_MODELS.get(current_model)
-                    supports_audio = model_info.audio if model_info else False
+                    supports_audio_input = model_info.audio_input if model_info else False
 
-                if supports_audio:
+                if supports_audio_input:
                     content_text = f"📎 用户上传了音频「{fname}」"
                     if cap:
                         content_text += f"\n\n{cap}"
@@ -910,8 +910,8 @@ async def process_update(data: dict) -> None:
                 async with lock:
                     cm = get_user_model(chat_id)
                     model_info = SUPPORTED_MODELS.get(cm)
-                    supports_audio = model_info.audio if model_info else False
-                    supports_native_document = bool(model_info.native_document) if model_info else False
+                    supports_audio_input = model_info.audio_input if model_info else False
+                    supports_document_input = bool(model_info.document_input) if model_info else False
 
                 if reply_media:
                     media_type = reply_media.get("type")
@@ -943,7 +943,7 @@ async def process_update(data: dict) -> None:
                         safe_fname = os.path.basename(file_name)
                         mime_type = reply_media.get("mime_type") or mimetypes.guess_type(safe_fname)[0] or "application/pdf"
 
-                        if supports_native_document:
+                        if supports_document_input:
                             content_text = f"📎 用户引用了文档「{safe_fname}」"
                             if user_input:
                                 content_text += f"\n\n{user_input}"
@@ -980,7 +980,7 @@ async def process_update(data: dict) -> None:
                             user_message = {"role": "user", "content": content_text}
 
                     elif media_type in ("audio", "voice"):
-                        if supports_audio:
+                        if supports_audio_input:
                             content_text = f"📎 用户引用了音频「{file_name}」"
                             if user_input:
                                 content_text += f"\n\n{user_input}"

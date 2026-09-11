@@ -1115,15 +1115,15 @@ async def get_ai_response(
             model_cfg = SUPPORTED_MODELS.get(current_model)
             if model_cfg is None:
                 api_name = current_model
-                is_native_image = False
+                is_image_output = False
             else:
                 api_name = getattr(model_cfg, "name", current_model)
-                is_native_image = bool(getattr(model_cfg, "native_image", False))
+                is_image_output = bool(getattr(model_cfg, "image_output", False))
         except Exception:
             logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
             current_model = DEFAULT_MODEL
             api_name = "模型"
-            is_native_image = False
+            is_image_output = False
 
         code = getattr(e, "status_code", getattr(e, "status", 500))
         # 给用户/LLM 的错误消息必须避免泄漏上游 SDK 的内部信息
@@ -1167,7 +1167,7 @@ async def get_ai_response(
             error_message=error_msg_for_user,
             api_name=api_name,
             exception=e,
-            endpoint="/v1/images/generations" if is_native_image else "/v1/chat/completions",
+            endpoint="/v1/images/generations" if is_image_output else "/v1/chat/completions",
             model=current_model,
         )
         # 异常路径保全（额度不足/网关错误/网络中断等）：已完成的
