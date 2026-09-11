@@ -1604,8 +1604,33 @@ async def _response_items_to_bytes(
                             # 同样限制远端下载体积，避免恶意 upstream 用
                             # 一个 100 MB 的"图片"把进程拖垮。
                             max_remote = 25 * 1024 * 1024
-                            image_bytes = await resp.content.read(max_remote + 1)
-                            if len(image_bytes) > max_remote:
+                            # 修复（2026-09 生产事故）：resp.content.read(n)
+                            # 语义是"最多读 n 字节"——响应分块传输时立即返回
+                            # buffer 中已到达的部分数据，85KB 的 PNG 被读成
+                            # 半张（缺 IEND 尾部）→ PIL verify 判"损坏或截断"
+                            # 误拒（浏览器直接打开同一 URL 完全正常）。
+                            # 必须循环 readany() 读到 EOF，边读边限体积。
+                            content_length = resp.headers.get("Content-Length") or ""
+                            if content_length.isdigit() and int(content_length) > max_remote:
+                                logger.warning(
+                                    "[NativeImage] 远端图片体积超限 (Content-Length=%s)，跳过: %s",
+                                    content_length, img_url[:120],
+                                )
+                                diagnostics.append(
+                                    f"图片 #{idx + 1}（{host}）：体积约 "
+                                    f"{int(content_length) / 1024 / 1024:.1f}MB 超过 25MB 上限，已跳过")
+                                continue
+                            chunks: list[bytes] = []
+                            total = 0
+                            while True:
+                                block = await resp.content.readany()
+                                if not block:
+                                    break
+                                chunks.append(block)
+                                total += len(block)
+                                if total > max_remote:
+                                    break
+                            if total > max_remote:
                                 logger.warning(
                                     "[NativeImage] 远端图片体积超限 (>%s)，跳过: %s",
                                     max_remote, img_url[:120],
@@ -1613,6 +1638,7 @@ async def _response_items_to_bytes(
                                 diagnostics.append(
                                     f"图片 #{idx + 1}（{host}）：下载体积超过 25MB 上限，已跳过")
                                 continue
+                            image_bytes = b"".join(chunks)
                             content_type = str(resp.headers.get('Content-Type') or '').split(';', 1)[0].strip().lower()
                             if content_type and not content_type.startswith('image/'):
                                 logger.warning('[NativeImage] 远端响应不是图片，跳过: content_type=%s url=%s', content_type or '-', img_url[:120])

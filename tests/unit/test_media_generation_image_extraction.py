@@ -100,8 +100,14 @@ class _FakeDownloadResponse:
         class _Content:
             def __init__(self, body):
                 self._body = body
+                self._consumed = False
 
-            async def read(self, n=-1):
+            async def readany(self):
+                # 模拟 aiohttp StreamReader.readany：数据一次性返回，
+                # 之后返回空字节表示 EOF
+                if self._consumed:
+                    return b""
+                self._consumed = True
                 return self._body
 
         self.content = _Content(body)
@@ -165,6 +171,66 @@ def test_response_items_to_bytes_accepts_real_image_url(monkeypatch):
     images, diagnostics = asyncio.run(_response_items_to_bytes(payload, max_images=1))
     assert images == [PNG_1X1]
     assert diagnostics == []
+
+
+def test_response_items_to_bytes_reads_chunked_image_fully(monkeypatch):
+    """回归（2026-09 生产事故，85451 字节 PNG 被误拒）：
+
+    resp.content.read(n) 语义是"最多读 n 字节"——分块传输时立即返回
+    buffer 中已到达的部分数据，大图被读成半张（缺 IEND 尾部）→ PIL
+    verify 判"损坏或截断"误拒（浏览器打开同一 URL 完全正常）。
+    修复后必须循环 readany() 读到 EOF，分块到达也要拼出完整字节。
+    """
+    import io
+
+    from PIL import Image
+
+    import ai.media_generation as mg
+
+    buf = io.BytesIO()
+    Image.new("RGB", (400, 400), (120, 30, 200)).save(buf, "PNG")
+    body = buf.getvalue()
+    assert len(body) > 256      # 确保会被切成多块
+
+    class _ChunkedContent:
+        def __init__(self, data, size=64):
+            self._chunks = [data[i:i + size] for i in range(0, len(data), size)]
+            self._i = 0
+
+        async def readany(self):
+            if self._i >= len(self._chunks):
+                return b""      # EOF
+            chunk = self._chunks[self._i]
+            self._i += 1
+            return chunk
+
+    class _Resp:
+        status = 200
+        headers = {"Content-Type": "image/png"}
+        content = _ChunkedContent(body)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def get(self, url, **kwargs):
+            return _Resp()
+
+    monkeypatch.setattr(mg.aiohttp, "ClientSession", lambda **k: _Session())
+
+    payload = {"data": [{"url": "https://cdn.example.com/chunked.png"}]}
+    images, diagnostics = asyncio.run(_response_items_to_bytes(payload, max_images=1))
+    assert diagnostics == []
+    assert images == [body]     # 完整字节，一字不少
 
 
 def test_sniff_payload_kind_reports_content_shape():
