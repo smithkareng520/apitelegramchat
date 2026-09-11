@@ -1163,13 +1163,22 @@ SUPPORTED_MODELS["GLM-4.7-Flash"] = make_model_config(
 # -----------------------------------------------------------------------------
 # 图像生成模型
 # -----------------------------------------------------------------------------
+SUPPORTED_MODELS["Qwen/Qwen-Image"] = make_model_config(
+    model_id="Qwen/Qwen-Image",
+    provider="modelscope",
+    name="Qwen Image Edit",
+    image_output=True,
+    # 图像模型显式声明 OpenAI Images 协议（ModelScope 图像端点）。
+    protocol="openai_images",
+    max_context=32768,
+    max_output_tokens=4000,
+)
 SUPPORTED_MODELS["Qwen/Qwen-Image-Edit"] = make_model_config(
     model_id="Qwen/Qwen-Image-Edit",
     provider="modelscope",
     name="Qwen Image Edit",
     image_input=True,
     image_output=True,
-    # 图像模型显式声明 OpenAI Images 协议（ModelScope 图像端点）。
     protocol="openai_images",
     max_context=32768,
     max_output_tokens=4000,
@@ -1179,7 +1188,6 @@ SUPPORTED_MODELS["Tongyi-MAI/Z-Image-Turbo"] = make_model_config(
     provider="modelscope",
     name="Z Image Turbo",
     image_output=True,
-    # 同上：ModelScope 图像端点走 OpenAI Images 协议。
     protocol="openai_images",
     max_context=32768,
     max_output_tokens=4000,
@@ -1217,19 +1225,19 @@ SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
 # -----------------------------------------------------------------------------
 # 视频生成模型
 # -----------------------------------------------------------------------------
-# SUPPORTED_MODELS["agnes-video-2.5"] = make_model_config(
-#     model_id="agnes-video-2.5",
-#     provider="agnes",
-#     name="Agnes video 2.5",
-#     image_input=True,
-#     video_input=True,
-#     video_output=True,
-#     max_context=32768,
-#     max_output_tokens=4000,
-#     # 视频任务提交端点（配置驱动）：_request_agnes_video 优先 POST 到该
-#     # URL，未声明时回退内置默认，行为不变。
-#     endpoint="https://apihub.agnes-ai.com/v1/videos",
-# )
+SUPPORTED_MODELS["agnes-video-2.5-flash"] = make_model_config(
+    model_id="agnes-video-2.5-flash",
+    provider="agnes",
+    name="Agnes video 2.5 Flash",
+    image_input=True,
+    video_input=True,
+    video_output=True,
+    max_context=32768,
+    max_output_tokens=4000,
+    # 视频任务提交端点（配置驱动）：_request_agnes_video 优先 POST 到该
+    # URL，未声明时回退内置默认，行为不变。
+    endpoint="https://apihub.agnes-ai.com/v1/videos",
+)
 
 
 # ========== 默认模型 ==========
