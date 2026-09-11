@@ -715,7 +715,10 @@ SEARCH_TOOLS = [
                     "Models differ only in whether image_url is ALLOWED (dual-mode models run both operations on the same endpoint): "
                     f"Dual-mode models (image_url OPTIONAL — omit it to create, provide it to edit): {', '.join(DUAL_MODE_MODELS) if DUAL_MODE_MODELS else '(none)'}. "
                     f"Generate-only models (text-to-image; image_url NOT accepted): {', '.join(GENERATE_ONLY_MODELS) if GENERATE_ONLY_MODELS else '(none)'}. "
-                    "Any model can CREATE (omit image_url); EDIT requires a dual-mode model."
+                    "Any model can CREATE (omit image_url); EDIT requires a dual-mode model. "
+                    "Most calls only need prompt/model(/image_url); `extra_params` is an escape "
+                    "hatch for provider-specific options this schema doesn't expose as a dedicated "
+                    "field — see its own description before using it."
                 ),
                 "parameters": {
                     "type": "object",
@@ -749,6 +752,37 @@ SEARCH_TOOLS = [
                             "minimum": 1,
                             "maximum": 4,
                             "description": "一次生成的图片数量（仅文生图模式；编辑模式固定为 1 张，忽略本参数）。"
+                        },
+                        "extra_params": {
+                            "type": "object",
+                            "description": (
+                                "OPTIONAL escape hatch: raw provider-specific parameters merged "
+                                "into the request body, for options this schema doesn't expose as "
+                                "a dedicated field. Leave this out for ordinary calls — prompt / "
+                                "model / aspect_ratio / image_size / num_images / image_url already "
+                                "cover normal usage. "
+                                "Currently effective for Agnes dual-mode models "
+                                f"({', '.join(DUAL_MODE_MODELS) if DUAL_MODE_MODELS else '(none)'}), "
+                                "merged into the JSON body (known useful key: "
+                                "`extra_body.response_format`, \"url\" or \"b64_json\", to force a "
+                                "specific output encoding instead of this tool's default choice — "
+                                "e.g. {\"extra_body\": {\"response_format\": \"url\"}}). "
+                                "Also merged (same reserved-key protection) for any future model "
+                                "routed through the chat-completions image path (OpenRouter-style); "
+                                "no such model is registered right now, so this branch has no known "
+                                "useful key yet. Models using the standard OpenAI multipart "
+                                "/images/edits endpoint ignore this parameter entirely — it does not "
+                                "reach the request. "
+                                "Do NOT put model/prompt/size/ratio here (use the dedicated top-level "
+                                "params instead) and do NOT put image/extra_body.image here (use "
+                                "`image_url`) — those keys are reserved and will be silently dropped "
+                                "if included, precisely because they're already owned by other "
+                                "fields on this tool and letting extra_params override them could "
+                                "silently corrupt the request (e.g. losing the reference image). "
+                                "Only pass parameters that the target model's official API "
+                                "documentation confirms exist; unknown keys may be rejected by the "
+                                "upstream API with a 400 error."
+                            )
                         }
                     },
                     "required": ["prompt", "model"]
@@ -762,6 +796,12 @@ SEARCH_TOOLS = [
                         "prompt": "移除场景中所有行人，保持其他内容完全不变",
                         "model": DUAL_MODE_MODELS[0] if DUAL_MODE_MODELS else "",
                         "image_url": "https://example.com/previous-image.png"
+                    },
+                    # extra_params 透传示例：显式要求 URL 输出而非工具默认选择
+                    {
+                        "prompt": "一座漂浮在云雾峡谷上空的发光城市，电影感写实风格",
+                        "model": DUAL_MODE_MODELS[0] if DUAL_MODE_MODELS else "",
+                        "extra_params": {"extra_body": {"response_format": "url"}}
                     }
                 ]
             }

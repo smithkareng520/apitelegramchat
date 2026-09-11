@@ -53,6 +53,15 @@ class ImageTask:
         aspect_ratio: 宽高比（"1:1" / "16:9" ...；由适配器映射为厂商参数）。
         image_size:   图像尺寸档位（"1K" 等；仅 chat modalities 路径的
                       image_config 使用）。
+        extra_params: 调用方（通常是模型通过 generate_image 工具）显式
+                      传入的厂商专属附加参数，原样透传进请求体（inline_images
+                      形状下经 build_inline_images_payload 合并）。用于
+                      覆盖官方已发布但本工具未单列专属字段的可选参数
+                      （如 extra_body.response_format），不进请求体的
+                      保留键（model/prompt/image/size/ratio/return_base64/
+                      extra_body.image）会被适配器丢弃并记录 warning，
+                      防止意外覆盖任务已有的结构化字段。空字典/None 语义
+                      等价，均不改变现有请求形状。
         meta:         调用方附加工元数据（日志/UI 用，不进请求体）。
     """
 
@@ -63,6 +72,7 @@ class ImageTask:
     num_images: int = 1
     aspect_ratio: str = "1:1"
     image_size: str = "1K"
+    extra_params: dict[str, Any] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

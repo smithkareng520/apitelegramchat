@@ -184,7 +184,11 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
                 aspect_ratio=arguments.get("aspect_ratio", "1:1"),
                 image_size=arguments.get("image_size", "1K"),
                 num_images=arguments.get("num_images", 1),
-                image_url=image_url
+                image_url=image_url,
+                # 厂商专属附加参数透传（如 Agnes extra_body.response_format
+                # 覆盖）；未传时为 None，execute_generate_image 内部按空
+                # dict 处理，完全不影响现有行为。
+                extra_params=arguments.get("extra_params"),
             )
         elif name == "generate_video":
             return await execute_generate_video(

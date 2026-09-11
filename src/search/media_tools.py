@@ -104,6 +104,7 @@ async def execute_generate_image(
     image_size: str = "1K",
     num_images: int = 1,
     image_url: Optional[str] = None,
+    extra_params: Optional[dict] = None,
 ) -> str:
     """统一图像工具入口（原 generate_image_from_text / edit_image_with_reference 合并）。
 
@@ -117,6 +118,19 @@ async def execute_generate_image(
                        未注册的 flux 等别名按 OpenRouter 兼容直连）
     能力硬校验：带参考图时若模型仅支持文生图（image_input=False），直接返回
     可操作错误并列出双能力模型（生成+编辑二合一），而不是让请求在上游莫名失败。
+
+    extra_params（可选）：模型按需透传的厂商专属附加参数（详见
+    search.tool_schemas 里 generate_image 工具的同名参数说明与
+    core.images.ImageTask.extra_params）。生效范围随任务分发到的协议
+    /形状而定，均带保留键防护（结构化字段禁止被覆盖）：
+      - openai_images 协议、inline_images 形状（Agnes 式）
+        -> 安全合并进请求体（见 media_generation._merge_extra_params_into_inline_payload）
+      - openai_images 协议、multipart_edits 形状（XXTF 等标准中转）
+        -> 严格对齐官方 multipart 字段集，不接受任意透传字段，忽略该参数
+      - openai_chat 协议（OpenRouter 图像模型）
+        -> 安全合并进 extra_body（见 media_generation._merge_extra_params，
+           modalities/provider/image_config/n 等结构化字段同样受保护）
+    未传时行为完全不变。
     """
     MODEL_ALIAS_MAP = {
         "flux-schnell": "black-forest-labs/flux-schnell",
@@ -169,14 +183,21 @@ async def execute_generate_image(
             return f"✅ 已生成 {total_count} 张图片。\n图片链接：\n{links}"
         return f"✅ 已生成 {total_count} 张图片（部分图片上传失败）。\n图片链接：\n{links}"
 
+    # extra_params 容错：模型偶发传入非 dict（如字符串化 JSON、null）时
+    # 静默忽略而非报错中断整次生图——透传参数本身是"锦上添花"，不应
+    # 成为生图失败的新故障点。
+    clean_extra_params = extra_params if isinstance(extra_params, dict) else {}
+
     # ---- 显式构造 ImageTask：操作类型由调用入参决定，不再隐式推断 ----
     if image_url:
         task = ImageTask.edit(prompt, [image_url], model=model,
                               num_images=1, aspect_ratio=aspect_ratio, image_size=image_size,
+                              extra_params=clean_extra_params,
                               meta={"image_config": {"aspect_ratio": aspect_ratio, "image_size": image_size}})
     else:
         task = ImageTask.generate(prompt, model=model,
                                   num_images=num_images, aspect_ratio=aspect_ratio, image_size=image_size,
+                                  extra_params=clean_extra_params,
                                   meta={"image_config": {"aspect_ratio": aspect_ratio, "image_size": image_size}})
 
     _api_name = f"{_get_images_api_display_name(model_info)} 图像接口" if model_info else "图像接口"

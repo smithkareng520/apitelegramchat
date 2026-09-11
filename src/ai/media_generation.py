@@ -192,6 +192,83 @@ def _normalize_inline_ratio(aspect_ratio: str | None) -> str | None:
     return value if value in _INLINE_IMAGE_RATIOS else None
 
 
+
+# ---- extra_params 安全合并（通用工具，两条图像链路共用）----
+# 这些键由任务的结构化字段（model/prompt/参考图/尺寸/输出格式/modalities
+# 等）派生，一旦被 extra_params 覆盖会破坏已有的正确性保证（如
+# extra_body.image 被覆盖 = 参考图丢失、modalities 被覆盖 = 图片输出
+# 请求变成纯文本输出）。调用方按各自请求形状传入相应的保留键集合，
+# 命中的键丢弃并记录 warning，其余键原样透传——覆盖不了的官方参数一律
+# 不拦，未来新增的可选参数（无需等代码发版）可以直接通过这个口子递进去。
+def _merge_extra_params(
+        target: dict[str, Any],
+        extra_params: dict[str, Any] | None,
+        *,
+        reserved_top_keys: frozenset[str],
+        nested_key: str = "",
+        reserved_nested_keys: frozenset[str] = frozenset(),
+        log_prefix: str = "[NativeImage]",
+) -> dict[str, Any]:
+    """把 extra_params 安全合并进 target（就地修改并返回）。
+
+    - extra_params 顶层命中 reserved_top_keys 的键丢弃；
+    - 若声明了 nested_key（如 "extra_body"），extra_params 顶层同名键
+      （必须是 dict）与 target 已有的同名字典做浅合并（extra_params 一侧
+      优先），其中命中 reserved_nested_keys 的子键同样丢弃；
+    - 其余顶层键直接并入 target 顶层；
+    - 非 dict / 空值原样跳过，不抛错——工具层传参异常不应打断整次生图。
+    """
+    if not extra_params or not isinstance(extra_params, dict):
+        return target
+    dropped: list[str] = []
+    for key, value in extra_params.items():
+        if nested_key and key == nested_key:
+            if not isinstance(value, dict):
+                continue
+            merged_nested = dict(target.get(nested_key) or {})
+            for nk, nv in value.items():
+                if nk in reserved_nested_keys:
+                    dropped.append(f"{nested_key}.{nk}")
+                    continue
+                merged_nested[nk] = nv
+            if merged_nested:
+                target[nested_key] = merged_nested
+            continue
+        if key in reserved_top_keys:
+            dropped.append(key)
+            continue
+        target[key] = value
+    if dropped:
+        logger.warning(
+            "%s extra_params 中的保留键已被忽略（会破坏任务已有的结构化字段，"
+            "禁止覆盖）：%s",
+            log_prefix, ", ".join(dropped),
+        )
+    return target
+
+
+# inline_images（Agnes 式）形状的保留键：见 build_inline_images_payload。
+_INLINE_PAYLOAD_RESERVED_TOP_KEYS = frozenset({"model", "prompt", "extra_body"})
+_INLINE_PAYLOAD_RESERVED_EXTRA_BODY_KEYS = frozenset({"image"})
+
+
+def _merge_extra_params_into_inline_payload(
+        payload: dict[str, Any], extra_params: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """把 extra_params 安全合并进 inline 形状 payload（_merge_extra_params 的薄封装）。
+
+    保留键黑名单：顶层 model/prompt/extra_body（extra_body 走嵌套合并，
+    不会被整体丢弃）；extra_body 内的 image（参考图，必须来自 image_url
+    工具参数，不接受由 extra_params 篡改）。
+    """
+    return _merge_extra_params(
+        payload, extra_params,
+        reserved_top_keys=_INLINE_PAYLOAD_RESERVED_TOP_KEYS,
+        nested_key="extra_body",
+        reserved_nested_keys=_INLINE_PAYLOAD_RESERVED_EXTRA_BODY_KEYS,
+    )
+
+
 def build_inline_images_payload(
         *,
         model: str,
@@ -199,6 +276,7 @@ def build_inline_images_payload(
         size: str | None,
         ratio: str | None,
         image_data_urls: list[str] | tuple[str, ...] = (),
+        extra_params: dict[str, Any] | None = None,
 ) -> dict:
     """构造 Agnes 式 inline 图像请求 payload（文生图 / 图生图 / 多图合成共用）。
 
@@ -213,6 +291,12 @@ def build_inline_images_payload(
     image_data_urls 为空 = 文生图（return_base64=true 直取 b64_json，
     免一次签名 URL 下载往返）；非空 = 图生图/多图合成
     （extra_body.response_format="b64_json" 同理）。
+
+    extra_params（可选）：模型通过 generate_image 工具显式传入的厂商专属
+    附加参数，构造完标准字段后安全合并（见
+    _merge_extra_params_into_inline_payload）——用于覆盖/补充官方文档中
+    本函数未单列专属字段的可选参数（如显式要求 extra_body.response_format
+    = "url"），不会影响未传该参数时的既有行为。
     """
     payload: dict[str, Any] = {
         "model": model,
@@ -229,7 +313,7 @@ def build_inline_images_payload(
         }
     else:
         payload["return_base64"] = True
-    return payload
+    return _merge_extra_params_into_inline_payload(payload, extra_params)
 
 
 def _get_images_api_display_name(model_info: Optional[ModelConfig]) -> str:
@@ -960,6 +1044,7 @@ async def _request_openai_compat_image(
         model: str = "",
         aspect_ratio: str | None = None,
         image_size: str | None = None,
+        extra_params: dict[str, Any] | None = None,
 ) -> tuple[dict | None, str, str, int, str]:
     """通用 OpenAI Images 兼容实现（端点与形状由 endpoint 驱动，公共出口）。
 
@@ -1000,6 +1085,14 @@ async def _request_openai_compat_image(
         1. 参考图先经真实图片校验（Pillow magic bytes），不合法直接 400；
         2. 严格 POST multipart /images/edits；
         3. edits 失败（含 404/405 路由未实现）→ 明确报错，绝不降级。
+
+    extra_params：模型通过 generate_image 工具显式传入的厂商专属附加参数
+    （详见 core.images.ImageTask.extra_params）。仅 inline_images 形状
+    （Agnes 式）会安全合并进请求体（见 build_inline_images_payload /
+    _merge_extra_params_into_inline_payload）；multipart_edits 形状
+    （XXTF 等标准 OpenAI Images 中转）严格对齐官方 multipart 字段集
+    （model/prompt/n/size/image[]），不接受任意透传字段，该参数在此形状
+    下被忽略。
 
     共同鲁棒性："请求体未完整/请重试"类瞬态 400 同形状自动重试一次；
     超大参考图（>3MB）先降采样再上传，避免中转站读不满请求体。
@@ -1053,6 +1146,7 @@ async def _request_openai_compat_image(
                         prompt=clean_prompt or "请生成一张图片。",
                         size=inline_size,
                         ratio=inline_ratio,
+                        extra_params=extra_params,
                     )
                     logger.debug(
                         "%s [inline] request prepared: provider=%s url=%s model=%s "
@@ -1080,6 +1174,7 @@ async def _request_openai_compat_image(
                     size=inline_size,
                     ratio=inline_ratio,
                     image_data_urls=image_data_urls,
+                    extra_params=extra_params,
                 )
                 logger.debug(
                     "%s [inline] edit prepared: provider=%s url=%s model=%s size=%s ratio=%s "
@@ -1248,6 +1343,7 @@ async def _request_images_generations(
         model: str = "",
         aspect_ratio: str | None = None,
         image_size: str | None = None,
+        extra_params: dict[str, Any] | None = None,
 ) -> tuple[dict | None, str, str, int, str]:
     """统一图像请求出口：所有 OpenAI Images 协议提供商共用这一个函数。
 
@@ -1255,11 +1351,13 @@ async def _request_images_generations(
     提供商各写一套请求逻辑，只拿到统一形状的返回值后做各自的呈现：
 
     - modelscope -> _request_modelscope_native_image（异步任务轮询特化，
-      其协议差异是厂商级而非模型级，保留内部分支）
+      其协议差异是厂商级而非模型级，保留内部分支；该厂商官方接口未公开
+      额外可选参数，extra_params 在此分支被忽略）
     - 其它 -> _request_openai_compat_image（端点与参考图形状完全由模型/
       厂商配置驱动：inline_images 如 Agnes 生成/编辑/多图合成共用同一
-      声明端点；multipart_edits 如 XXTF 走官方
-      /images/{generations,edits}，失败即报错，绝不回退 generations 形状）
+      声明端点，extra_params 在此形状下安全合并进请求体；multipart_edits
+      如 XXTF 走官方 /images/{generations,edits}，失败即报错，绝不回退
+      generations 形状，该形状同样不接受任意透传字段）
 
     返回: (response_json, endpoint, error_detail, status_code, request_id)
     endpoint 为实际使用的相对路径（"/images/generations" 或
@@ -1281,6 +1379,7 @@ async def _request_images_generations(
         model=model,
         aspect_ratio=aspect_ratio,
         image_size=image_size,
+        extra_params=extra_params,
     )
 
 
@@ -2246,6 +2345,7 @@ async def _request_openai_images_task(task: "ImageTask") -> "ImageTaskResult":
         model=task.model,
         aspect_ratio=task.aspect_ratio,
         image_size=task.image_size,
+        extra_params=task.extra_params,
     )
     if response_json is None:
         raise ImageRequestError(
@@ -2269,6 +2369,13 @@ async def _request_openai_images_task(task: "ImageTask") -> "ImageTaskResult":
     )
 
 
+# chat modalities（OpenRouter 式）形状的保留键：modalities/provider 由
+# 本函数固定管理（决定输出模态与路由偏好，覆盖会导致图片输出请求变成
+# 纯文本或路由行为失控）；image_config/n 同样由 task 的结构化字段
+# （meta.image_config / num_images）派生，覆盖会与工具其他参数的预期不符。
+_CHAT_MODALITIES_RESERVED_TOP_KEYS = frozenset({"modalities", "provider", "image_config", "n"})
+
+
 async def _request_chat_modalities_image_task(task: "ImageTask") -> "ImageTaskResult":
     """Chat Completions + modalities 图像出口（OpenRouter 图像模型等）。
 
@@ -2279,6 +2386,13 @@ async def _request_chat_modalities_image_task(task: "ImageTask") -> "ImageTaskRe
     网关不支持 image+text 输出时按既有行为自动降级重试 image-only。
     未注册到 SUPPORTED_MODELS 的模型按 OpenRouter 兼容直连（保持旧
     execute_generate_image 对 flux 等别名的可达性）。
+
+    task.extra_params 同样在此路径生效（与 inline_images/Agnes 形状一致的
+    "escape hatch"语义）：安全合并进 extra_body（首次请求与 image-only
+    降级重试都会带上），modalities/provider 等本函数管理的字段禁止被
+    覆盖（见 _CHAT_MODALITIES_RESERVED_TOP_KEYS）。上游网关（OpenRouter）
+    转发的具体模型若支持额外采样参数（如某些图像模型的 seed），可通过
+    这个口子传入而无需等代码发版。
     """
     model_info = SUPPORTED_MODELS.get(task.model)
 
@@ -2317,6 +2431,13 @@ async def _request_chat_modalities_image_task(task: "ImageTask") -> "ImageTaskRe
         extra_body["image_config"] = task.meta["image_config"]
     if int(task.num_images or 1) > 1:
         extra_body["n"] = max(1, min(int(task.num_images), 4))
+    # extra_params 透传（如上游网关文档化的采样/风格类可选字段）：
+    # modalities/provider 属于本函数管理的结构化字段，禁止被覆盖，见
+    # _CHAT_MODALITIES_RESERVED_TOP_KEYS。
+    _merge_extra_params(
+        extra_body, task.extra_params,
+        reserved_top_keys=_CHAT_MODALITIES_RESERVED_TOP_KEYS,
+    )
 
     max_tokens = (model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192)
 
@@ -2345,6 +2466,10 @@ async def _request_chat_modalities_image_task(task: "ImageTask") -> "ImageTaskRe
                                        "provider": OPENROUTER_PROVIDER_PREFERENCES}
         if int(task.num_images or 1) > 1:
             retry_extra["n"] = max(1, min(int(task.num_images), 4))
+        _merge_extra_params(
+            retry_extra, task.extra_params,
+            reserved_top_keys=_CHAT_MODALITIES_RESERVED_TOP_KEYS,
+        )
         try:
             response = await client.chat.completions.create(
                 model=task.model,
