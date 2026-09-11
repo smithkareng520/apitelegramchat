@@ -934,7 +934,17 @@ async def _agentic_loop_openai_compat(
 # 原生图像循环的 prompt / 参考图提取（Internal Message 原生）
 # =====================================================================
 def _extract_native_image_urls_from_user_message(msg: Message) -> list[str]:
-    """从单条 user 消息（内部 Message）中提取全部参考图 URL。"""
+    """从单条 user 消息（内部 Message）中提取全部参考图 URL。
+
+    重要边界（2026-09 排查 agnes-image-2.5-flash "看不到历史图片"实锤）：
+    这里读的是 msg.blocks 里已经解析好的 ImageBlock——它是否存在，完全
+    取决于上游 _append_history_async -> _resolve_multimodal_content 有没有
+    按当前模型的 model_info.vision 重新解析出图片块（见 attachment_content.py）。
+    若历史消息携带的 meta 信封形状异常（如 R2 下载失败、file_id 已过期、
+    信封字段缺失等），_resolve_multimodal_content 会静默降级为纯文本占位，
+    此处自然读不到任何 ImageBlock——这不是本函数的 bug，但排查时必须
+    先确认"图片有没有进 messages"，而不是想当然地怀疑这里的提取逻辑。
+    """
     urls: list[str] = []
     for block in msg.blocks:
         if isinstance(block, ImageBlock) and block.url:
@@ -972,6 +982,20 @@ def _extract_image_prompt_and_reference_urls(msgs: list) -> tuple[str, list[str]
     条 user 消息——旧实现此时提取不到任何参考图，请求退化为不带参考
     图的文生图（"失败后只发了文本，没把图片发给 AI"）。回溯最近一条
     带图 user 消息即可让重试继续拿到参考图（图生图/编辑语义保持）。
+
+    重要边界（务必与"vision 理解历史图片"区分开，这是本函数唯一职责）：
+    这里只解决"编辑/变体任务该用哪张参考图"，不解决、也不可能解决
+    "模型能不能针对历史图片内容做文本问答"——native_image=True 的模型
+    （如 agnes-image-2.5-flash）走的是 openai_images 协议（/images/
+    generations、/images/edits），响应体系里没有"针对输入图片的文字
+    理解"这一产物（ImageTaskResult 只有 images/text(拒绝说明)/refusal），
+    所以即使这里成功拿到了历史图片 URL，模型也不会、也不能用文字回答
+    "这张图里画的是什么"之类的问题。该模型配置里的 vision=True 仅表示
+    "支持把图片当输入模态接收"（即：可以被当参考图使用），并不等价于
+    "支持视觉问答"——两者是完全不同的能力，排查"看不到历史图片"类问题
+    时先确认用户诉求是"想用旧图继续编辑"（本函数负责）还是"想问模型
+    图片里有什么"（该模型架构上不支持，应引导用户切换到真正的多模态
+    对话模型，如任意 vision=True 且走 chat 协议的模型）。
     """
     last_user_msg: Optional[Message] = None
     for item in reversed(msgs):
@@ -991,6 +1015,7 @@ def _extract_image_prompt_and_reference_urls(msgs: list) -> tuple[str, list[str]
     image_urls = _extract_native_image_urls_from_user_message(last_user_msg)
 
     if not image_urls:
+        skipped_user_turns = 0
         for item in reversed(msgs):
             m = item if isinstance(item, Message) else Message.from_openai_dict(item)
             if m is last_user_msg or m.role != "user":
@@ -999,11 +1024,22 @@ def _extract_image_prompt_and_reference_urls(msgs: list) -> tuple[str, list[str]
             if carried:
                 image_urls = carried
                 logger.info(
-                    "[NativeImage] 本轮 user 消息未带参考图，回溯沿用最近一条带图"
-                    " user 消息的 %s 张参考图（重试/追问场景保持图生图输入）",
-                    len(carried),
+                    "[NativeImage] 本轮 user 消息未带参考图，向前跳过 %s 条无图"
+                    " user 消息后，沿用最近一条带图 user 消息的 %s 张参考图"
+                    "（重试/追问场景保持图生图输入）",
+                    skipped_user_turns, len(carried),
                 )
                 break
+            skipped_user_turns += 1
+        else:
+            if skipped_user_turns:
+                logger.info(
+                    "[NativeImage] 本轮及此前 %s 条 user 消息均未解析出参考图"
+                    "（可能原因：历史图片的 R2 链接已过期/下载失败，或该模型的"
+                    " model_info.vision 在解析历史时被判定为不支持——见"
+                    " attachment_content._resolve_multimodal_content），"
+                    "本次按纯文生图处理", skipped_user_turns,
+                )
 
     return prompt, image_urls
 

@@ -1228,6 +1228,17 @@ SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
     provider="agnes",
     name="Agnes Image 2.5 Flash",
     native_image=True,
+    # 注意（2026-09 排查"支持 vision 但看不到历史图片"实锤）：这里的
+    # vision=True 仅表示"可以把图片当输入模态接收"——即图片能被当作
+    # 图生图/编辑的参考图使用（ai.agentic_loops._agentic_loop_native_image
+    # 会从历史 user 消息里提取 ImageBlock 传给 ImageTask.edit）。它**不**
+    # 表示该模型具备视觉问答（能对图片内容做文字理解/回答）能力：
+    # native_image=True 决定了该模型恒定走 openai_images 协议，请求发到
+    # /v1/images/generations、/images/edits，响应体系（ImageTaskResult）
+    # 里从没有"针对输入图片内容的文字理解"这一产物。如果用户诉求是
+    # "让模型看着历史图片聊天/回答图片里是什么"，这个模型架构上做不到，
+    # 应引导切到走 chat 协议、vision=True 的对话模型，而不是在这里
+    # 试图"修出"一个它本来就不具备的能力。
     vision=True,
     supports_tools=False,
     max_context=4000,
