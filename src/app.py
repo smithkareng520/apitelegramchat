@@ -380,7 +380,9 @@ async def webhook() -> tuple:
         # 判读：本行有、下方 "telegram webhook arrived" 无 → logging 管线问题；
         #       两行都无 → 请求根本没进 Quart（Telegram 未投递，或 event loop
         #       被同步/CPU 任务冻结——配合 loop watchdog 心跳 gap 即可区分）。
-        print(f">>> WEBHOOK TCP ARRIVED id={request_id}", flush=True)
+        # 默认关闭（每请求直写 stdout 噪音大），设 WEBHOOK_TCP_HEARTBEAT=1 开启排障。
+        if os.getenv("WEBHOOK_TCP_HEARTBEAT", "").strip().lower() in ("1", "true", "yes"):
+            print(f">>> WEBHOOK TCP ARRIVED id={request_id}", flush=True)
         set_request_id(request_id)
         logger.info(f"telegram webhook arrived {request_id}")
 

@@ -178,11 +178,6 @@ true、收尾有兜底）。注意：deliver_reply 必须通过 tool_calls API �
 _active_flows: dict[int, asyncio.Task] = {}
 
 
-def is_proactive_flow_active(chat_id: int) -> bool:
-    """该 chat 是否有进行中的 TIMER 回合。"""
-    return chat_id in _active_flows
-
-
 # =====================================================================
 # 调度器：事件驱动单 timer 模型
 # =====================================================================

@@ -37,10 +37,7 @@ class RateLimitError(Exception):
 
 @retry_async(max_retries=5, delay=0.5, backoff=3.0, exceptions=(aiohttp.ClientError, asyncio.TimeoutError, RateLimitError))
 async def delete_message(chat_id: int, message_id: int) -> None:
-    from state import deleted_message_ids, deleted_messages_lock, is_protected_message
-    if await is_protected_message(message_id):
-        logger.info(f"deleteMessage 跳过受保护消息: chat={chat_id} msg={message_id}")
-        return
+    from state import deleted_message_ids, deleted_messages_lock
     async with deleted_messages_lock:
         if message_id in deleted_message_ids:
             return
@@ -152,7 +149,10 @@ class _DraftSendState:
 
 _draft_states: Dict[Tuple[int, int], _DraftSendState] = {}
 _draft_states_lock = asyncio.Lock()
-_dead_draft_ids: set[int] = set()
+# 有界集合（BoundedIDSet）：死亡草稿标记只需覆盖最近窗口，无界增长无意义。
+from state import BoundedIDSet as _BoundedIDSet  # noqa: E402  局部导入避免顶部循环依赖
+
+_dead_draft_ids: "_BoundedIDSet" = _BoundedIDSet()
 _dead_draft_ids_lock = asyncio.Lock()
 _DRAFT_MIN_INTERVAL = 0.25
 # 草稿是可被后续完整状态替代的瞬态 UI；不能像永久消息一样在发送锁中
@@ -709,6 +709,17 @@ async def send_rich_html_message(
                     body_lower = body.lower()
                     # 只有明确的内容错误才进入针对性兜底。网络错误由装饰器重试，
                     # 认证、权限、限流和参数错误不能靠改 HTML 修复，必须原样失败。
+                    if resp.status >= 500:
+                        # 5xx 是 Telegram 侧瞬时故障（网关抖动/临时不可用），
+                        # 不是异常就不会进装饰器的重试元组——一次 5xx 即最终
+                        # 失败，最终回复可能就此静默丢失。这里转成 ClientError
+                        # 抛出，交给 @retry_async 的既有退避重试。
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info,
+                            resp.history,
+                            status=resp.status,
+                            message=f"sendRichMessage transient {resp.status}",
+                        )
                     if resp.status != 400:
                         # 403 类永久性失败（用户屏蔽 bot / 账号注销 / chat 不
                         # 存在）：重试与降级都救不回来。熔断该 chat 的主动唤

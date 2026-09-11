@@ -11,6 +11,7 @@ dependencies = [
   "aiohttp==3.11.15",
   "mcp>=1.28,<2",
   "openai==3.8.0",
+  "httpx>=0.27,<1",
   "httpx2==2.12.0",
   "anthropic==0.69.0",
   "Pillow==11.1.0",
@@ -18,23 +19,21 @@ dependencies = [
   "trafilatura==1.12.2",
   "lxml==5.3.0",
   "curl_cffi==0.7.1",
-  "qrcode==7.4.2",
   "cachetools==5.5.0",
   "aioboto3==12.4.0",
-  "numpy<2.0.0",
   "defusedxml==0.7.1",
   "pypdf==5.9.0",
   "pdfplumber==0.11.6",
   "reportlab==4.3.1",
-  "pypdfium2==4.30.1",
   "pdf2image==1.17.0",
-  "pytesseract==0.3.13",
-  "pandas==2.2.3",
   "tiktoken==0.11.0",
-  "regex>=2024.11,<2027",
+  "PyYAML>=6,<7",
   "json-repair>=0.30,<1",
   "jsonschema>=4.23,<5",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "mypy"]
 
 [project.scripts]
 apitelegramchat-mcp = "entrypoints.mcp_server:main"
@@ -45,15 +44,23 @@ py-modules = [
   "ai_handlers",
   "api_client",
   "app",
+  "app_commands",
+  "app_lists",
+  "app_media_groups",
+  "app_state",
+  "app_turns",
+  "bash_session",
   "chat_actions",
   "config",
   "context_manager",
   "context_window",
   "fetch_rich_content",
   "fetch_url_fallback",
+  "file_delivery",
   "file_handlers",
   "markdown_converter",
   "mcp_client",
+  "media_wizard",
   "memory_tool",
   "message_user_tool",
   "net_shims",
@@ -70,8 +77,11 @@ py-modules = [
   "token_budget",
   "tool_assembly",
   "tool_context_compaction",
+  "tool_dispatch",
   "tool_executors",
   "tool_result_condense",
+  "tool_result_format",
+  "tool_ui_render",
   "tool_visibility",
   "turn_recovery",
   "utils",
@@ -86,7 +96,7 @@ py-modules = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["ai*", "core*", "entrypoints*", "mcpserver*", "search*"]
+include = ["ai*", "core*", "entrypoints*", "mcpserver*", "protocols*", "search*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -236,12 +236,6 @@ def _convert_mixed_document(text: str) -> str:
     return converted
 
 
-def _looks_like_rich_block(text: str) -> bool:
-    stripped = text.lstrip()
-    lower = stripped.lower()
-    return lower.startswith(_BLOCK_START_PREFIXES)
-
-
 def _readable_plaintext_fallback(text: str) -> str:
     """Markdown/HTML 转换异常时生成可发送的、可读的纯文本 HTML。
 
@@ -291,29 +285,6 @@ def convert_markdown_to_telegram_html(text: str) -> str:
     except Exception:
         logger.exception('Markdown → Telegram HTML 转换异常，已回退为可读纯文本')
         return _readable_plaintext_fallback(text)
-
-
-def _is_already_html(text: str) -> bool:
-    """检测文本是否已经包含 HTML 标签。"""
-    # Telegram 特有标签
-    telegram_tags = [
-        r'<tg-spoiler>', r'<tg-math>', r'<tg-math-block>', 
-        r'<tg-slideshow>', r'<tg-map>', r'<tg-reference>',
-    ]
-    for tag in telegram_tags:
-        if tag in text:
-            return True
-    
-    # 常见的 HTML 块级标签（带属性或自闭合）
-    html_patterns = [
-        r'<(h[1-6]|p|div|pre|blockquote|details|ul|ol|table|figure|aside|footer)\b[^>]*>',
-        r'<(img|video|audio|hr)\b[^>]*/?>'
-    ]
-    for pattern in html_patterns:
-        if re.search(pattern, text, re.IGNORECASE):
-            return True
-    
-    return False
 
 
 def _contains_markdown(text: str) -> bool:

@@ -12,6 +12,7 @@ import pytest
 from markdown_converter import (
     _escape_prose,
     convert_markdown_to_telegram_html as convert,
+    sanitize_tg_buttons,
 )
 
 
@@ -314,3 +315,82 @@ def test_idempotency_on_rich_document():
     )
     once = convert(doc)
     assert convert(once) == once
+
+
+def test_bare_unpaired_tg_button_escaped_to_literal():
+    # 本次 bug 的直接场景：模型按用户要求原样输出裸 <tg-button>。
+    # 必须转义为字面量文本，而不是原样透传给发送层。
+    out = convert("<tg-button>\n</tg-button>")
+    assert out == "&lt;tg-button&gt;\n&lt;/tg-button&gt;"
+    assert "<tg-button" not in out
+
+def test_valid_tg_button_url_passthrough():
+    button = '<tg-button type="url" url="https://example.com" style="success">打开官网</tg-button>'
+    assert convert(button) == button
+
+def test_valid_tg_button_copy_text_passthrough():
+    button = '<tg-button type="copy_text" text="复制的文本">复制</tg-button>'
+    assert convert(button) == button
+
+def test_tg_button_missing_url_escaped():
+    out = convert('<tg-button type="url">打开官网</tg-button>')
+    assert "&lt;tg-button" in out and "&lt;/tg-button&gt;" in out
+    assert "<tg-button" not in out
+
+def test_tg_button_missing_type_escaped():
+    out = convert('<tg-button url="https://example.com">打开官网</tg-button>')
+    assert out == '&lt;tg-button url="https://example.com"&gt;打开官网&lt;/tg-button&gt;'
+    # 转义后内部文本保留，用户仍能看到按钮上的文字
+    assert "打开官网" in out
+
+def test_tg_button_empty_label_escaped():
+    out = convert('<tg-button type="url" url="https://example.com"></tg-button>')
+    assert "&lt;tg-button" in out
+    assert "<tg-button" not in out
+
+def test_tg_button_invalid_url_scheme_escaped():
+    out = convert('<tg-button type="url" url="javascript:alert(1)">点我</tg-button>')
+    assert "<tg-button" not in out
+    assert "javascript" in out  # 原文以字面量形式保留
+
+def test_tg_button_stray_close_escaped():
+    assert convert("文字</tg-button>") == "文字&lt;/tg-button&gt;"
+
+def test_tg_button_truly_unclosed_escaped_but_inner_kept():
+    # 只有开标签、没有 </tg-button>：开标签转义为字面量，后面的文字保留
+    out = convert('<tg-button type="url" url="https://example.com">没有闭合')
+    assert out == '&lt;tg-button type="url" url="https://example.com"&gt;没有闭合'
+
+def test_tg_button_nested_escaped_together():
+    out = convert(
+        "<tg-button><tg-button type=\"url\" url=\"https://x.com\">内层</tg-button></tg-button>"
+    )
+    assert "<tg-button" not in out
+    assert "内层" in out
+
+def test_tg_button_inside_details_escaped():
+    # 接近真实失败消息的形态：AI 推理包在 <details> 里，末尾跟着裸按钮
+    html = (
+        "<details><summary>推理</summary><p>正文</p></details>\n"
+        "<tg-button>\n</tg-button>"
+    )
+    out = convert(html)
+    assert "<details><summary>推理</summary><p>正文</p></details>\n" in out
+    assert "&lt;tg-button&gt;" in out
+    assert "<tg-button>" not in out
+
+def test_tg_button_escaped_already_idempotent():
+    once = convert("<tg-button>\n</tg-button>")
+    assert convert(once) == once
+    assert "&amp;lt;" not in once
+
+def test_tg_button_with_markdown_elsewhere_preserved():
+    text = "点击 **这里**\n<tg-button type=\"url\" url=\"https://e.com\">按钮</tg-button>"
+    out = convert(text)
+    assert "<b>这里</b>" in out
+    assert '<tg-button type="url" url="https://e.com">按钮</tg-button>' in out
+
+def test_tg_button_entity_form_untouched():
+    assert sanitize_tg_buttons("&lt;tg-button&gt;") == "&lt;tg-button&gt;"
+    assert sanitize_tg_buttons("普通文本") == "普通文本"
+    assert sanitize_tg_buttons("") == ""

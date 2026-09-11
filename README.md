@@ -253,6 +253,7 @@ curl http://127.0.0.1:5000/health   # → {"status":"ok"}
 | `DROP_PENDING_ON_STARTUP` | 可选 | `true` 时启动丢弃 Telegram 侧积压 update，默认 `false` |
 | `OPENROUTER_API_KEY` | 是（严格模式） | 默认模型厂商/主要模型入口 |
 | `MODELSCOPE_API_KEY` / `GEMINI_API_KEY` / `XAI_API_KEY` / `DEEPSEEK_API_KEY` / `GLM_API_KEY` / `AGNES_API_KEY` | 可选 | 各模型厂商 |
+| `ANTHROPIC_API_KEY` / `XXTF_API_KEY` | 可选 | Anthropic 原生协议桥接 / XXTF 中转（原生 Claude 模型接入必需） |
 | `GROQ_API_KEY` | 可选 | 音频转写 |
 | `SERPER_API_KEY` / `SERPER_API_TIMEOUT` | 可选 | Serper 搜索（默认 12s 超时） |
 | `R2_ENDPOINT` / `R2_ACCESS_KEY` / `R2_SECRET_KEY` / `R2_BUCKET_NAME` / `R2_PUBLIC_URL` / `R2_REGION` | 可选 | S3/R2 对象存储 |
@@ -262,6 +263,8 @@ curl http://127.0.0.1:5000/health   # → {"status":"ok"}
 | `APITELEGRAMCHAT_WHITELIST_FILE` | 可选 | 白名单文件 |
 | `APITELEGRAMCHAT_REQUIRE_STRICT_CONFIG=true` | 可选 | 启动时强校验 Telegram 四项核心配置 |
 | `LOG_LEVEL` / `LOG_FILE` | 可选 | 日志级别（默认 INFO）与日志文件路径 |
+| `WEBHOOK_TCP_HEARTBEAT` | 可选 | `1` 时 webhook 入口逐请求直写 stdout 心跳（排障用，默认关闭） |
+| `MAX_CONCURRENT_TOOLS` | 可选 | 单批工具调用并发上限（Render 部署默认 16） |
 
 #### 主动唤醒（TIMER 事件源）
 

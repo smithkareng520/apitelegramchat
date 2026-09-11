@@ -74,28 +74,33 @@ _dedup_lock = asyncio.Lock()
 role_message_ids: dict = {}
 
 # ---------- 已删除消息ID ----------
-deleted_message_ids: set = set()
+class BoundedIDSet:
+    """有界 ID 集合：超容量时按"最早插入"淘汰（OrderedDict 保持插入序）。
+
+    用于只需覆盖"最近窗口"的持久 ID 集合（已删除消息 / 死亡草稿 /
+    冻结草稿），替代无界 set，避免长期运行进程内存缓慢增长。重复 add
+    会刷新位置（视为最新），与"最新标记最不可能被淘汰"的语义一致。
+    """
+
+    def __init__(self, maxsize: int = 10000) -> None:
+        self._maxsize = maxsize
+        self._items: OrderedDict[int, None] = OrderedDict()
+
+    def add(self, item: int) -> None:
+        self._items.pop(item, None)
+        self._items[item] = None
+        while len(self._items) > self._maxsize:
+            self._items.popitem(last=False)
+
+    def __contains__(self, item: object) -> bool:
+        return item in self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+deleted_message_ids: BoundedIDSet = BoundedIDSet()
 deleted_messages_lock = asyncio.Lock()
-
-# ---------- 受保护消息ID（例如停止消息） ----------
-protected_message_ids: set = set()
-protected_messages_lock = asyncio.Lock()
-
-async def mark_protected_message(message_id: int) -> None:
-    try:
-        message_id_int = int(message_id)
-    except (TypeError, ValueError):
-        return
-    async with protected_messages_lock:
-        protected_message_ids.add(message_id_int)
-
-async def is_protected_message(message_id: int) -> bool:
-    try:
-        message_id_int = int(message_id)
-    except (TypeError, ValueError):
-        return False
-    async with protected_messages_lock:
-        return message_id_int in protected_message_ids
 
 # ---------- 图片缓存状态 ----------
 _image_cache_r2_attempted: set = set()
@@ -249,7 +254,8 @@ _active_drafts: dict = {}
 _active_drafts_lock = asyncio.Lock()
 
 # 被明确"冻结"为停止输出的草稿，会被保留在状态里，避免后续清理误删/误收回。
-_preserved_draft_ids: set[int] = set()
+# 有界集合：死亡/冻结标记只需覆盖"最近活跃窗口"，无界增长无意义。
+_preserved_draft_ids: BoundedIDSet = BoundedIDSet()
 _preserved_draft_ids_lock = asyncio.Lock()
 
 async def set_active_draft(chat_id: int, draft_id: int, message_id: int) -> None:

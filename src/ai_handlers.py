@@ -1252,9 +1252,15 @@ async def _call_api(
     tools_to_pass = tools if supports_tools else None
 
     if api_type not in PROVIDERS:
-        logger.error(f"未知的 api_type: {api_type}，降级到 openrouter")
-        api_type = "openrouter"
+        logger.error(f"未知的 provider: {api_type}，降级到默认模型 {DEFAULT_MODEL}")
+        # 必须同步替换 model_info 与 current_model：适配器按 model_info 的
+        # 协议/端点建请求，请求体里的 model 字段取 current_model。只换
+        # model_info 不换 current_model 会把原模型名发到默认厂商端点，
+        # 必然 400/404。supports_tools 同步按新模型重算。
         model_info = SUPPORTED_MODELS.get(DEFAULT_MODEL, model_info)
+        current_model = DEFAULT_MODEL
+        supports_tools = bool(model_info.supports_tools)
+        tools_to_pass = tools if supports_tools else None
 
     # 协议路由（Model -> Protocol -> Adapter）：按模型的有效协议取
     # 适配器，替代旧版 if anthropic / elif gemini / else openai 的
@@ -1274,24 +1280,15 @@ async def _call_api(
 
 
 # ========== 向后兼容重导出 ==========
-# 以下符号定义在 ai 子包中；保留重导出，使
-# search_engine.py / app.py 等模块的
-# "from ai_handlers import X" 语句无需修改。
+# 以下符号定义在 ai 子包中；仅保留仍有外部调用点的重导出
+# （经 AST 全仓引用分析精简）：
+# - search/media_tools.py:260 局部导入视频请求函数（避免循环依赖）；
+# - app.py:22 导入音频缓存读取。
+# 其余历史重导出（图像请求全家桶）已无消费者：调用方均直连
+# ai.media_generation，测试也直接 monkeypatch "ai.media_generation.X"。
 from ai.media_generation import (  # noqa: F401
-    _request_modelscope_native_image,
     _request_agnes_video,
     _request_openrouter_video,
-    # 统一图像请求出口（OpenAI Images 协议：文生图 /v1/images/generations、
-    # 编辑 /v1/images/edits multipart）及其公共辅助函数：
-    # search_engine.execute_generate_image 等模块通过本模块延迟导入使用。
-    _request_images_generations,
-    _request_openai_compat_image,
-    _response_items_to_bytes,
-    _extract_image_items,
-    _upload_generated_images_to_r2,
-    _get_images_api_display_name,
-    _validate_image_bytes,
-    IMAGES_API_PROVIDERS,
 )
 from ai.attachment_content import (  # noqa: F401
     _get_cached_audio_data,

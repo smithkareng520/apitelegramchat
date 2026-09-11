@@ -146,6 +146,29 @@ INTERRUPTED_TOOL_PLACEHOLDER = "用户打断，未执行"
 # user 消息提前持久化标记：update_conversation_and_ledger 见到此标记跳过 append。
 EARLY_PERSIST_FLAG = "__apitc_early_persisted__"
 
+# 引用回复前缀标记（与 app_turns/media_wizard 同值；此处复制以避免循环导入）。
+# 引用前缀只服务当前请求的上下文提示（拼在 user content 开头），持久化历史
+# 时必须剥离，否则每轮请求都会把引用全文重发给模型，污染上下文并浪费 token。
+REPLY_MARKER = "💡 引用回复:"
+
+
+def _strip_reply_prefix(content: str) -> str:
+    """剥离 user content 开头的引用回复前缀块，返回净文本。
+
+    前缀由 app_turns._get_reply_context 拼接，形态固定为
+    f"{REPLY_MARKER}\n> {quote}\n\n" 且位于 content 开头。这里只把开头
+    的前缀块整体剥掉；不能用 split(REPLY_MARKER)[-1]——快速连发的
+    合并消息里旧文本在标记之前，split[-1] 会把旧文本一并丢弃。
+    """
+    if not isinstance(content, str) or not content.startswith(REPLY_MARKER):
+        return content
+    lines = content[len(REPLY_MARKER):].split("\n")
+    idx = 0
+    # 跳过紧随标记的空行与 "> " 引用行；前缀块以空行与正文分隔。
+    while idx < len(lines) and (lines[idx].strip() == "" or lines[idx].startswith(">")):
+        idx += 1
+    return "\n".join(lines[idx:]).strip()
+
 # 请求失败标记：轮次以异常/媒体错误/空响应告终（无任何 assistant 输出）时，
 # 由 get_ai_response 的失败路径打在历史末尾那条未获回应的 user 消息上。
 # 下一条 user 消息到来时 persist_user_message_entry 看到该标记走
@@ -511,6 +534,10 @@ def _merge_user_message(old: dict, new: dict) -> None:
     """
     old_text = old.get("content")
     new_text = new.get("content")
+    # 新文本先剥掉引用回复前缀再拼接：否则前缀会落在合并文本中部，
+    # 既污染历史，也会让后续基于前缀的剥离逻辑（只认开头）失效。
+    if isinstance(new_text, str):
+        new_text = _strip_reply_prefix(new_text)
     parts = [str(t).strip() for t in (old_text, new_text) if isinstance(t, str) and str(t).strip()]
     if parts:
         old["content"] = "\n\n".join(parts)
@@ -672,9 +699,15 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
         return env
 
     def _wrap_envelope(env: dict) -> Message:
-        """信封 dict -> 存储 Message（文本进 blocks，其余进 meta）。"""
+        """信封 dict -> 存储 Message（文本进 blocks，其余进 meta）。
+
+        统一在此剥离引用回复前缀：追加/合并/替换三条路径进入持久历史
+        的消息都可能带 "💡 引用回复:\n> ...\n\n" 前缀。前缀只对当前请求
+        有意义，进历史后会在后续每轮请求中重复重发给模型，污染上下文。
+        """
         env = dict(env)
         content = env.pop("content", "")
+        content = _strip_reply_prefix(content if isinstance(content, str) else str(content or ""))
         return Message.user_text(str(content or ""), **env)
 
     lock = await get_chat_lock(chat_id)

@@ -152,7 +152,10 @@ async def poll_updates_forever(queue: asyncio.Queue) -> None:
       · 只有 update **成功入队**后才把 offset 推进到 update_id+1；
       · 队列满时原地等待，不推进 offset、不丢弃——Telegram 会在下一轮
         重新返回这批 update，形成天然背压；
-      · 进程崩溃时未确认的 update 会被重新拉取，由 worker 侧去重兜底。
+      · 进程崩溃时未确认的 update 会被 Telegram 重新拉取。worker 侧
+        去重集合是进程内存态，重启后清零——因此崩溃恢复窗口内同一
+        update 可能被完整处理两次（at-least-once 语义，重复回复概率
+        低但存在；跨重启精确一次需要把去重集合持久化）。
     """
     logger.info(
         "telegram polling started (timeout=%ss limit=%s allowed_updates=%s)",

@@ -61,7 +61,7 @@ def test_missing_font_raises_actionable_error(emoji_font_module, monkeypatch):
     # Force every candidate to miss so the error path itself is exercised
     # regardless of whether this environment happens to have the font.
     monkeypatch.setattr(emoji_font_module, "_EMOJI_FONT_CANDIDATES", ("",))
-    with pytest.raises(FileNotFoundError, match="Dockerfile downloads"):
+    with pytest.raises(FileNotFoundError, match="APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT"):
         emoji_font_module.resolve_emoji_font_path()
 
 
@@ -82,18 +82,9 @@ BASE = _widths("中文完成失败abc123 →①★±×÷≠≈°□")
 EMOJI = _widths("✅❌✨🎯📊🚀\u200d\ufe0f")
 
 
-def test_base_font_can_be_resolved_from_style_like_object(emoji_font_module):
-    class Style:
-        fontName = "CJKKai"
-
-    assert emoji_font_module._resolve_base_font(Style()) == "CJKKai"
-    assert emoji_font_module._resolve_base_font("BodyFont") == "BodyFont"
-
-
-def test_invalid_base_font_style_is_rejected(emoji_font_module):
-    with pytest.raises(TypeError):
-        emoji_font_module._resolve_base_font(object())
-
+# 注：脚本已重构为显式 base_font: str 参数（to_fallback_markup /
+# draw_mixed_string 等），旧的 _resolve_base_font（style 对象解析）
+# 已删除，对应的两个单测随之一并移除。
 
 def test_split_font_runs_routes_emoji_to_emoji_font(emoji_font_module):
     runs = emoji_font_module.split_font_runs("完成✅失败❌", BASE, EMOJI)

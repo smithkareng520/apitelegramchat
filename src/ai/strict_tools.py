@@ -66,21 +66,6 @@ def _strict_env_disabled() -> bool:
     return os.getenv("DISABLE_STRICT_TOOL_SCHEMA", "").strip().lower() in _TRUTHY
 
 
-def gemini_strict_env_enabled() -> bool:
-    """Gemini OpenAI-compat 层默认不注入 strict；此环境变量用于实验。"""
-    return os.getenv("ENABLE_STRICT_TOOL_SCHEMA_GEMINI", "").strip().lower() in _TRUTHY
-
-
-def strict_rejected_labels() -> set:
-    """当前进程内已判定『strict 被网关拒绝』的 api_label 集合（测试用）。"""
-    return set(_strict_rejected_labels)
-
-
-def reset_strict_rejection_state() -> None:
-    """清空运行时降级状态（仅供测试）。"""
-    _strict_rejected_labels.clear()
-
-
 def mark_strict_tools_rejected(api_label: str, reason: str = "") -> None:
     """记录该 api_label 的网关拒绝了 strict 工具 schema，此后不再注入。"""
     if api_label in _strict_rejected_labels:

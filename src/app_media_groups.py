@@ -25,7 +25,7 @@ from utils import send_rich_html_message, get_logger
 from ai_handlers import get_ai_response
 from file_handlers import download_file
 from workspace_paths import workspace_download_root
-from workspace_utils import init_workspace
+from workspace_utils import init_workspace, schedule_workspace_init
 from app_turns import (
     pre_flight_context_check,
     update_conversation_and_ledger,
@@ -49,10 +49,14 @@ _document_group_tasks: dict[str, asyncio.Task] = {}
 # 避免混合相册里两类分片互相争抢聚合存储 / 互相取消任务）。
 _video_group_tasks: dict[str, asyncio.Task] = {}
 async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
+    _interrupted = False
     try:
         await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
         messages = await pop_media_group(media_group_id)
-        _media_group_tasks.pop(media_group_id, None)
+        # 注意：不在此处从 _media_group_tasks 摘除本组——整个 AI 回合都在
+        # 本任务内运行，任务表摘除交给 _schedule_group 的 done 回调。
+        # 过早摘除会让迟到分片（Telegram 重投/延迟分片）把本组当作新组，
+        # 触发 _interrupt_active_generation 打断正在生成中的相册回合。
         if not messages:
             return
 
@@ -111,10 +115,19 @@ async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
             await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
 
     except asyncio.CancelledError:
+        # 用户主动打断：迟到分片不补聚合（用户意图是停止，不是重跑）。
+        _interrupted = True
         raise
     except Exception as e:
         logger.exception(f"_process_media_group_once 异常: {e}")
         await send_rich_html_message(chat_id, f"❌ <b>处理图片组时出错</b>\n<code>{str(e)[:100]}</code>")
+    finally:
+        if not _interrupted:
+            try:
+                await _reschedule_if_late_shards(chat_id, media_group_id)
+            except Exception:
+                logger.debug("图片组迟到分片补聚合失败（可忽略）", exc_info=True)
+
 async def _process_video_group_once(chat_id: int, group_key: str) -> None:
     """聚合处理视频相册（对称 _process_media_group_once）。
 
@@ -124,10 +137,11 @@ async def _process_video_group_once(chat_id: int, group_key: str) -> None:
     支持视频的模型收到多个 video_url content part，不支持的模型收到文本
     占位——与单视频、图片组行为完全一致，切换模型不丢信息。
     """
+    _interrupted = False
     try:
         await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
         messages = await pop_media_group(group_key)
-        _video_group_tasks.pop(group_key, None)
+        # 对称 _process_media_group_once：不在处理中摘除任务表键。
         if not messages:
             return
 
@@ -196,17 +210,29 @@ async def _process_video_group_once(chat_id: int, group_key: str) -> None:
             await update_conversation_and_ledger(chat_id, user_message, new_msgs, usage)
 
     except asyncio.CancelledError:
+        # 用户主动打断：迟到分片不补聚合。
+        _interrupted = True
         raise
     except Exception as e:
         logger.exception(f"_process_video_group_once 异常: {e}")
         await send_rich_html_message(chat_id, f"❌ <b>处理视频组时出错</b>\n<code>{str(e)[:100]}</code>")
+    finally:
+        if not _interrupted:
+            try:
+                await _reschedule_if_late_shards(chat_id, group_key)
+            except Exception:
+                logger.debug("视频组迟到分片补聚合失败（可忽略）", exc_info=True)
+
 async def _process_document_group_once(chat_id: int, media_group_id: str) -> None:
     # 与图片/视频组对称的异常保护：下载/建目录等任一环节抛异常时，
     # 用户能收到错误提示，而不是任务静默终止、只留下
     # "Task exception was never retrieved" 日志。
+    _interrupted = False
     try:
         await _process_document_group_inner(chat_id, media_group_id)
     except asyncio.CancelledError:
+        # 用户主动打断：迟到分片不补聚合。
+        _interrupted = True
         raise
     except Exception as e:
         logger.exception(f"处理文档组异常 group={media_group_id}: {e}")
@@ -217,13 +243,19 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
         except Exception:
             logger.debug("_process_document_group_once 内部忽略的异常", exc_info=True)
             pass
+    finally:
+        if not _interrupted:
+            try:
+                await _reschedule_if_late_shards(chat_id, media_group_id)
+            except Exception:
+                logger.debug("文档组迟到分片补聚合失败（可忽略）", exc_info=True)
 
 
 async def _process_document_group_inner(chat_id: int, media_group_id: str) -> None:
-    asyncio.create_task(init_workspace(chat_id))
+    schedule_workspace_init(chat_id)
     await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
     messages = await pop_media_group(media_group_id)
-    _document_group_tasks.pop(media_group_id, None)
+    # 对称 _process_media_group_once：不在处理中摘除任务表键。
     if not messages:
         return
 
@@ -330,13 +362,16 @@ async def _process_document_group_inner(chat_id: int, media_group_id: str) -> No
     # 消除 dict 联合推断带来的宽化，运行时值恒为 str。
     await _handle_text_message(chat_id, cast(str, user_message.get("content", "")), username, user_message)
 
-async def _schedule_group(chat_id: int, group_key: str, tasks: dict, coro_factory) -> None:
+async def _schedule_group(chat_id: int, group_key: str, tasks: dict, coro_factory, force: bool = False) -> None:
     """统一相册聚合调度（合并原图片/视频/文档三份相同样板）。
 
     去重（同组已排队直接返回）→ create_task → 登记为当前 chat 的可取消
     生成任务 → 完成回调清理组表并通知 _cleanup_task。
+
+    force=True：迟到分片补聚合专用——旧任务仍在任务表（自身 done 回调
+    尚未触发）时强制替换条目；旧回调的 is 检查保证它不会误删新任务。
     """
-    if group_key in tasks:
+    if group_key in tasks and not force:
         return
     task = asyncio.create_task(coro_factory(chat_id, group_key))
     tasks[group_key] = task
@@ -349,6 +384,26 @@ async def _schedule_group(chat_id: int, group_key: str, tasks: dict, coro_factor
         asyncio.create_task(_cleanup_task(chat_id, done_task))
 
     task.add_done_callback(_done)
+
+
+async def _reschedule_if_late_shards(chat_id: int, group_key: str) -> None:
+    """处理期间到达的迟到分片补聚合。
+
+    聚合 pop 与 AI 回合结束后，若组存储里还有新分片（Telegram 延迟重投
+    等），重新调度一轮聚合：force 覆盖本组任务条目（旧任务已近尾声），
+    新任务会先 sleep MEDIA_GROUP_TIMEOUT 给后续分片留合并窗口。
+    取消路径不调用本函数（用户主动打断不应重跑）。
+    """
+    late = await pop_media_group(group_key)
+    if not late:
+        return
+    logger.info("[media-group] %s 处理结束后发现 %s 个迟到分片，追加聚合", group_key, len(late))
+    if group_key.endswith(":photo"):
+        await _schedule_group(chat_id, group_key, _media_group_tasks, _process_media_group_once, force=True)
+    elif group_key.endswith(":video"):
+        await _schedule_group(chat_id, group_key, _video_group_tasks, _process_video_group_once, force=True)
+    else:
+        await _schedule_group(chat_id, group_key, _document_group_tasks, _process_document_group_once, force=True)
 
 
 async def _schedule_media_group(chat_id: int, media_group_id: str) -> None:

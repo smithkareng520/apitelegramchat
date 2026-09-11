@@ -687,7 +687,23 @@ async def _run_tool_calls_and_append(
     #   b) 追加一条配对的 role=tool 消息回传给模型。
     for idx, res in enumerate(results):
         if isinstance(res, asyncio.CancelledError):
-            raise res
+            # 单个子任务被单独取消（整批取消走上方 except CancelledError
+            # 分支）：直接 raise 会跳过本批其余全部配对补齐，产生未配对的
+            # assistant.tool_calls（下一轮请求 400 或模型死循环）。这里改为
+            # 补齐占位 tool 消息 + UI 状态后继续处理其余结果。
+            try:
+                fn_name, fn_args, tc_id = tool_tasks[idx]
+            except (IndexError, ValueError):
+                fn_name, fn_args, tc_id = "unknown", {}, f"call_cancelled_{uuid.uuid4().hex[:8]}"
+            logger.warning("[%s] 工具 %s 被单独取消，补齐占位 tool 消息", api_label, tc_id)
+            builder.update_tool_item(
+                tc_id, "⚠️ 工具已取消", "<p>工具执行被取消，未获得结果。</p>",
+                status="error",
+            )
+            tool_msg = Message.tool_result(tc_id, fn_name, INTERRUPTED_TOOL_PLACEHOLDER)
+            loop_messages.append(tool_msg)
+            new_history_entries.append(tool_msg)
+            continue
         if isinstance(res, Exception):
             # 不在 except 块内，使用 exc_info 显式附加 traceback
             logger.error("工具执行异常: %s", res, exc_info=res)

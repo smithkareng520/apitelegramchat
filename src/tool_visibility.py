@@ -64,7 +64,6 @@ anthropic_messages / gemini_native）共用该入口，一处清理全覆盖。
 
 from __future__ import annotations
 
-import copy
 import os
 from dataclasses import dataclass, field
 from core.messages import Message, TextBlock, ToolCallBlock
@@ -155,28 +154,6 @@ SILENT_ONLY_TOOLS: frozenset[str] = frozenset({"deliver_reply"})
 # =====================================================================
 def _rule_mode_for(rule: ToolVisibilityRule, event_source: str) -> str:
     return rule.timer_turn if str(event_source).upper() == "TIMER" else rule.user_turn
-
-
-def _call_tool_name(tool_call: dict) -> Optional[str]:
-    try:
-        name = tool_call["function"]["name"]
-        return name if isinstance(name, str) and name else None
-    except (KeyError, TypeError):
-        return None
-
-
-def _merge_note_into_content(content: str | list | None, note: str) -> str | list:
-    """把 shadow 摘要并入 assistant content（兼容 str / None / 多模态 list）。"""
-    if content is None or content == "":
-        return note
-    if isinstance(content, str):
-        return f"{content}\n{note}"
-    if isinstance(content, list):
-        merged = copy.deepcopy(content)
-        merged.append({"type": "text", "text": note})
-        return merged
-    # 未知形状：退化为拼接字符串，保证信息不丢。
-    return f"{content}\n{note}"
 
 
 def apply_tool_visibility(

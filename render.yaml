@@ -41,6 +41,12 @@ services:
         sync: false
       - key: XXTF_API_KEY
         sync: false
+      - key: GLM_API_KEY
+        sync: false
+      - key: MODELSCOPE_API_KEY
+        sync: false
+      - key: AGNES_API_KEY
+        sync: false
       - key: R2_ENDPOINT
         sync: false
       - key: R2_ACCESS_KEY

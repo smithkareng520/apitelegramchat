@@ -62,14 +62,6 @@ def _msg_text(message: Any) -> str:
     return ""
 
 
-def _msg_has_tool_calls(message: Any) -> bool:
-    if isinstance(message, Message):
-        return bool(message.tool_calls())
-    if isinstance(message, dict):
-        return bool(message.get("tool_calls"))
-    return False
-
-
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, "") or default)

@@ -350,22 +350,6 @@ def _convert_tools_to_gemini(tools: Optional[list]) -> Optional[list]:
 #   - role=tool   -> 攒为下一条 user 消息的 functionResponse part
 #                    （Gemini 要求 function response 以 user 角色出现；
 #                     连续多条 tool 结果必须合并进同一个 user turn）
-def _extract_thought_signature(tc: dict) -> str:
-    """从 OpenAI 形状的 tool_call 条目里取回 thought signature。
-
-    沿用旧 Gemini 循环的双字段存储格式：tc["thought_signature"] 与
-    tc["extra_content"]["google"]["thought_signature"]，任一存在即可。
-    """
-    if not isinstance(tc, dict):
-        return ""
-    sig = tc.get("thought_signature")
-    if sig is None:
-        extra = tc.get("extra_content") or {}
-        if isinstance(extra, dict):
-            sig = (extra.get("google") or {}).get("thought_signature")
-    return str(sig) if sig else ""
-
-
 _EXT_MIME_MAP = {
     "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
     "webp": "image/webp", "gif": "image/gif", "heic": "image/heic",

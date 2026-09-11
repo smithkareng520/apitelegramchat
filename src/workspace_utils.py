@@ -375,3 +375,22 @@ async def init_workspace(chat_id: int, namespace: str | None = None) -> None:
         await _ensure_workspace_initialized(chat_id, namespace)
     except Exception as e:
         logger.error(f"Workspace 初始化失败: {e}")
+
+
+# 后台 init_workspace 任务强引用集：事件循环只持有任务的弱引用，若调用方
+# 不保存返回值，任务可能在执行中途被 GC 回收（CPython asyncio 官方文档
+# 明确警告的坑），表现为 workspace 预初始化静默消失、首个工具调用退化为
+# 同步 no-op 初始化。此集合保证任务存活到自然结束。
+_workspace_init_tasks: set = set()
+
+
+def schedule_workspace_init(chat_id: int, namespace: str | None = None) -> asyncio.Task:
+    """后台调度 init_workspace 并保留强引用（fire-and-forget 的安全封装）。
+
+    所有"预初始化工作区"的调用点都应使用本函数而非裸
+    ``asyncio.create_task(init_workspace(chat_id))``。
+    """
+    task = asyncio.create_task(init_workspace(chat_id, namespace))
+    _workspace_init_tasks.add(task)
+    task.add_done_callback(_workspace_init_tasks.discard)
+    return task

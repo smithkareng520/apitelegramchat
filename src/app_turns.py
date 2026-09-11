@@ -43,7 +43,7 @@ from context_window import (
     resolve_history_budget,
 )
 from tool_context_compaction import compact_older_tool_calls, _eligible_calls
-from workspace_utils import init_workspace
+from workspace_utils import init_workspace, schedule_workspace_init
 
 
 logger = get_logger(__name__)
@@ -484,9 +484,14 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
         if user_message is not None and not user_message.get(turn_recovery.EARLY_PERSIST_FLAG):
+            # 剥离引用回复前缀后再入历史（前缀只服务当前请求上下文）。
+            # USER 回合的正常路径已由 persist_user_message_entry 提前持久化
+            # 并在 _wrap_envelope 里剥离；这里是兜底路径（早持久化未发生的
+            # 场景），必须做同样的剥离，否则引用全文会永久进入历史。
             block_content = user_message.get("content", "")
-            if isinstance(block_content, str) and REPLY_MARKER in block_content:
-                user_message["content"] = block_content.split(REPLY_MARKER)[-1].strip()
+            if isinstance(block_content, str):
+                block_content = turn_recovery._strip_reply_prefix(block_content)
+                user_message["content"] = block_content
             # 历史统一存 Message：信封 dict 的其余键（附件元数据/内部标记）
             # 归入 meta，出站渲染时结构性剔除。
             history.append(Message.user_text(str(block_content or ""), **{
@@ -588,7 +593,7 @@ async def _handle_text_message(chat_id: int, user_input: str, username: str, use
         logger.debug("media_wizard 文本消费检查失败（可忽略）", exc_info=True)
     # 后台预初始化 workspace：与模型生成响应并行，避免第一个工具调用
     # 是 no-op。
-    asyncio.create_task(init_workspace(chat_id))
+    schedule_workspace_init(chat_id)
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
@@ -614,7 +619,7 @@ async def _handle_photo_message(chat_id: int, user_message: dict, username: str)
             return
     except Exception:
         logger.debug("media_wizard 图片消费检查失败（可忽略）", exc_info=True)
-    asyncio.create_task(init_workspace(chat_id))
+    schedule_workspace_init(chat_id)
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
@@ -633,7 +638,7 @@ async def _handle_photo_message(chat_id: int, user_message: dict, username: str)
         await send_rich_html_message(chat_id, f"❌ <b>处理图片时出错</b>\n<code>{str(e)[:100]}</code>")
 
 async def _handle_document_message(chat_id: int, user_message: dict, username: str) -> None:
-    asyncio.create_task(init_workspace(chat_id))
+    schedule_workspace_init(chat_id)
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
@@ -661,7 +666,7 @@ async def _handle_audio_message(chat_id: int, user_message: dict, username: str)
         logger.debug("media_wizard 音频消费检查失败（可忽略）", exc_info=True)
     # 用户上传语音时回发 upload_voice 是错误语义（那是“bot 正在上传语音”
     # 的指示）——用户上传的内容与 chat action 无关，这里不发送任何动作。
-    asyncio.create_task(init_workspace(chat_id))
+    schedule_workspace_init(chat_id)
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
@@ -694,7 +699,7 @@ async def _handle_video_message(chat_id: int, user_message: dict, username: str)
             return
     except Exception:
         logger.debug("media_wizard 视频消费检查失败（可忽略）", exc_info=True)
-    asyncio.create_task(init_workspace(chat_id))
+    schedule_workspace_init(chat_id)
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
@@ -721,7 +726,7 @@ async def _handle_sticker_message(chat_id: int, user_message: dict, username: st
     不携带 file_id 附件，避免 _resolve_multimodal_content 把不可识别的
     媒体推到模型 API 触发 400。
     """
-    asyncio.create_task(init_workspace(chat_id))
+    schedule_workspace_init(chat_id)
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
@@ -868,7 +873,7 @@ async def _handle_timer_wakeup(chat_id: int) -> None:
             return
 
         # 后台预初始化 workspace（与用户回合一致，避免首个工具调用 no-op）
-        asyncio.create_task(init_workspace(chat_id))
+        schedule_workspace_init(chat_id)
 
         full, _, new_msgs, usage = await get_ai_response(
             chat_id, user_models, user_contexts, username,

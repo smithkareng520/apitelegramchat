@@ -716,8 +716,14 @@ async def _agentic_loop_openai_compat(
                 except Exception:
                     logger.exception(f"[{api_label}] 记录回退 tool_calls 日志失败")
             except Exception as e:
+                # 流式与非流式都失败：向上抛给 get_ai_response 顶层异常路径
+                # 统一处理（错误通知 + journal 保全 + mark_failed_unanswered_
+                # user）。绝不能把"请求失败，请稍后重试。"当成功正文返回——
+                # 那会被当成正常模型回复写入历史并持久化，失败轮既没有
+                # ⚠️/❌ 前缀供失败守卫识别，也不会打失败标记，重试语义退化
+                # （历史里模型"自己说过请求失败"，下一条消息与之合并）。
                 logger.exception(f"非流式回退失败: {e}")
-                content_acc = "请求失败，请稍后重试。"
+                raise
 
         tool_calls_list = [tool_calls_acc[i] for i in sorted(tool_calls_acc.keys())] if tool_calls_acc else []
         # v2.5：流被完整消费却从未见到终止事件，且本轮确实产出了工具调用 →
@@ -1330,40 +1336,70 @@ async def _agentic_loop_native_video(
                 )
                 if dl_resp.status == 200:
                     # 修复 OOM 风险：限制为 200MB（足够任何合理的 720p 视频片段），
-                    # 超限则拒绝并回退到原始 URL。
+                    # 超限则拒绝并回退到原始 URL。防护必须在"读取"阶段生效：
+                    # 1) Content-Length 预拒绝（服务器声明超限直接放弃）；
+                    # 2) 分块流式累积，超限即中止（服务器不声明长度/谎报时，
+                    #    旧实现 resp.read() 仍会把整个 body 读进内存才检查，
+                    #    防护形同虚设）。
                     _MAX_VIDEO_BYTES = 200 * 1024 * 1024
-                    video_bytes = await dl_resp.read()
-                    if len(video_bytes) > _MAX_VIDEO_BYTES:
+                    declared_len_raw = dl_resp.headers.get("Content-Length")
+                    declared_len: Optional[int] = None
+                    if declared_len_raw is not None:
+                        try:
+                            declared_len = int(declared_len_raw)
+                        except ValueError:
+                            declared_len = None
+                    if declared_len is not None and declared_len > _MAX_VIDEO_BYTES:
                         logger.warning(
-                            "[NativeVideo] 视频体积超限 (>%s)，跳过 R2 上传，回退原始 URL: %s",
-                            _MAX_VIDEO_BYTES, str(video_url)[:200],
+                            "[NativeVideo] Content-Length 超限 (%s > %s)，跳过下载与 R2 上传，回退原始 URL: %s",
+                            declared_len, _MAX_VIDEO_BYTES, str(video_url)[:200],
                         )
                         video_bytes = b""
                         video_bytes_len = 0
                     else:
-                        video_bytes_len = len(video_bytes)
-
-                        # 防止将 HTML/错误页/redirect body 伪装成 mp4 上传。
-                        # 正常 720p 视频不应只有几 KB，且 MP4 必须包含 ftyp box。
-                        is_mp4 = b"ftyp" in video_bytes[:256]
-                        if video_bytes_len < 100_000 or not is_mp4:
-                            logger.error(
-                                "[NativeVideo] invalid video payload, skip R2 upload: bytes=%s content_type=%s has_ftyp=%s url=%s",
-                                video_bytes_len,
-                                content_type,
-                                is_mp4,
-                                str(video_url)[:200],
+                        chunks: list[bytes] = []
+                        total = 0
+                        overflow = False
+                        async for chunk in dl_resp.content.iter_chunked(1024 * 1024):
+                            total += len(chunk)
+                            if total > _MAX_VIDEO_BYTES:
+                                overflow = True
+                                break
+                            chunks.append(chunk)
+                        if overflow:
+                            logger.warning(
+                                "[NativeVideo] 视频体积超限 (>%s)，跳过 R2 上传，回退原始 URL: %s",
+                                _MAX_VIDEO_BYTES, str(video_url)[:200],
                             )
                             video_bytes = b""
                             video_bytes_len = 0
                         else:
-                            logger.info(
-                                "[NativeVideo] video validated: bytes=%d content_type=%s",
-                                video_bytes_len,
-                                content_type,
-                            )
-                            r2_key = f"generated/{uuid.uuid4().hex}.mp4"
-                            r2_url = await upload_bytes_to_r2(video_bytes, r2_key, "video/mp4")
+                            video_bytes = b"".join(chunks)
+                            video_bytes_len = len(video_bytes)
+
+                        # 防止将 HTML/错误页/redirect body 伪装成 mp4 上传。
+                        # 正常 720p 视频不应只有几 KB，且 MP4 必须包含 ftyp box。
+                        # 仅在真正读到字节时校验（超限拒绝路径 video_bytes 为空）。
+                        if video_bytes_len:
+                            is_mp4 = b"ftyp" in video_bytes[:256]
+                            if video_bytes_len < 100_000 or not is_mp4:
+                                logger.error(
+                                    "[NativeVideo] invalid video payload, skip R2 upload: bytes=%s content_type=%s has_ftyp=%s url=%s",
+                                    video_bytes_len,
+                                    content_type,
+                                    is_mp4,
+                                    str(video_url)[:200],
+                                )
+                                video_bytes = b""
+                                video_bytes_len = 0
+                            else:
+                                logger.info(
+                                    "[NativeVideo] video validated: bytes=%d content_type=%s",
+                                    video_bytes_len,
+                                    content_type,
+                                )
+                                r2_key = f"generated/{uuid.uuid4().hex}.mp4"
+                                r2_url = await upload_bytes_to_r2(video_bytes, r2_key, "video/mp4")
                         if r2_url:
                             final_video_url = r2_url
                         else:

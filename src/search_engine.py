@@ -1,76 +1,18 @@
 # search_engine.py —— 兼容 facade。
 # 原 3997 行单体已按职责拆分至 search/ 包（caches / text_editor /
 # tool_schemas / serper / fetch_url / quick_lookup / media_tools /
-# map_tools）；本文件显式 re-export 全部既有顶层符号，保证所有
-# `from search_engine import X` 调用点零改动。新代码请直接 import search.*。
+# map_tools）。本文件只 re-export 存在外部调用点的符号（经 AST 全仓
+# 引用分析精简）；新代码请直接 import search.*。
 import logging
 
 from search.tool_schemas import (  # noqa: F401
-    ASK_USER_TOOL,
-    DELIVER_REPLY_TOOL,
-    EDIT_MODELS,
-    MESSAGE_USER_TOOL,
     SEARCH_TOOLS,
-    TEXT_ONLY_MODELS,
-    VIDEO_MODELS,
-    _get_image_models_by_capability,
-    _get_video_models,
     build_deliver_reply_tool,
 )
-from search.caches import (  # noqa: F401
-    _fetch_cache,
-    _is_cacheable_search_result,
-    _normalize_fetch_cache_key,
-    _search_cache,
-    _search_cache_key,
-    get_fetch_cache,
-    set_fetch_cache,
-)
 from search.serper import (  # noqa: F401
-    SERPER_PAGE_SIZE,
-    SerperSearchTransientError,
-    _SEARCH_MEDIA_MAX_RESULTS,
-    _execute_web_search_uncached,
-    _format_image_results,
-    _format_lens_results,
-    _format_search_results,
-    _format_video_results,
-    _normalize_modes,
-    _normalize_requested_results,
-    _parse_serper_images_result,
-    _parse_serper_lens_result,
-    _parse_serper_search_result,
-    _parse_serper_videos_result,
-    _serper_api_timeout,
-    _serper_search_one_mode,
     execute_web_search,
 )
 from search.fetch_url import (  # noqa: F401
-    CURL_TIMEOUT,
-    FETCH_CONTENT_TOKEN_BUDGET,
-    FETCH_TITLE_TOKEN_BUDGET,
-    HTTP_TIMEOUT_SHORT,
-    TRAFILATURA_TIMEOUT,
-    _BOM_TABLE,
-    _META_CHARSET_RE,
-    _ALLOWED_FETCH_SCHEMES,
-    _JS_DROP_IDENTIFIERS,
-    _JS_HOST_IDENTIFIERS,
-    _build_rich_fetch_payload,
-    _check_ip_safe,
-    _decode_html_bytes,
-    _detect_html_encoding,
-    _download_html_with_trafilatura,
-    _extract_js_redirect_targets,
-    _extract_meta_refresh_targets,
-    _fetch_html_with_curl,
-    _get_title_from_html,
-    _is_safe_url_to_fetch,
-    _is_safe_url_to_fetch_sync,
-    _normalize_encoding_name,
-    _normalize_url_for_compare,
-    _truncate,
-    _try_root_url_fallback,
     execute_fetch_url,
 )
 from search.quick_lookup import (  # noqa: F401
@@ -79,20 +21,10 @@ from search.quick_lookup import (  # noqa: F401
     execute_wikipedia,
 )
 from search.media_tools import (  # noqa: F401
-    OPENROUTER_PROVIDER_PREFERENCES,
-    _format_image_api_error,
     execute_generate_image,
     execute_generate_video,
 )
 from search.map_tools import (  # noqa: F401
-    _ROUTE_MODE_ALIASES,
-    _ROUTE_TOOL_CANDIDATES,
-    _amap_error,
-    _call_amap_mcp,
-    _call_amap_mcp_candidates,
-    _empty_mcp_error,
-    _is_unknown_mcp_tool_error,
-    _normalize_amap_coordinate,
     execute_distance,
     execute_geocode,
     execute_keyword_search,
@@ -101,31 +33,7 @@ from search.map_tools import (  # noqa: F401
     execute_route,
 )
 from search.text_editor import (  # noqa: F401
-    EDITOR_PREFIX,
-    SNIPPET_LINES,
-    _EDITOR_MAX_EDIT_BYTES,
-    _EDITOR_MAX_LINE_CHARS,
-    _EDITOR_MAX_VIEW_BYTES,
-    _EDITOR_VIEW_TOKEN_BUDGET,
-    _editor_get_r2_key,
-    _editor_safe_path,
-    _file_too_large_error,
-    _format_editor_line,
-    _format_editor_snippet,
-    _latest_editor_snapshot,
-    _list_directory_contents,
-    _normalize_editor_text,
-    _permission_error,
-    _persist_edited_file,
-    _read_editor_content,
-    _render_view_output,
-    _resolve_editor_path,
-    _spawn_persist_task,
-    _with_editor_snippet_or_tail,
-    _with_latest_editor_snapshot,
-    _write_text_editor_file,
     execute_text_editor,
-    persist_workspace_file,
 )
 
 logger = logging.getLogger(__name__)

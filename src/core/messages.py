@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Optional
+from typing import Any, Optional
 
 
 # ===========================================================================
@@ -525,18 +525,8 @@ def as_message(msg: Any) -> Message:
     raise TypeError(f"无法解释的消息类型: {type(msg)!r}")
 
 
-def first_text(messages: list, role: str, *, from_end: bool = False) -> str:
-    """取列表中（默认第一条 / from_end 时最后一条）指定角色的文本。"""
-    seq: Iterator = reversed(messages) if from_end else iter(messages)
-    for m in seq:
-        m = as_message(m)
-        if m.role == role:
-            return m.text()
-    return ""
-
-
 __all__ = [
     "TextBlock", "ReasoningBlock", "ImageBlock", "AudioBlock", "VideoBlock",
     "DocumentBlock", "ToolCallBlock", "ToolResultBlock", "Block",
-    "Message", "render_openai_messages", "as_message", "first_text",
+    "Message", "render_openai_messages", "as_message",
 ]

@@ -267,15 +267,6 @@ def test_openai_images_task_carries_diagnostics(monkeypatch):
     # 无诊断路径默认空列表（向后兼容旧构造）
     assert ImageTaskResult().diagnostics == []
 
-def test_validate_image_bytes_is_legacy_exported_from_ai_handlers():
-    # Avoid importing the whole application in this focused unit test (it pulls
-    # optional runtime dependencies such as tiktoken). Verify the compatibility
-    # re-export directly from the module source.
-    from pathlib import Path
-    source = (Path(__file__).resolve().parents[2] / "src" / "ai_handlers.py").read_text()
-    assert "    _validate_image_bytes," in source
-
-
 def test_openai_images_task_resolves_registered_model_without_name_error(monkeypatch):
     async def fake_request(*args, **kwargs):
         return {"data": []}, "/images/generations", "", 200, "req-test"
