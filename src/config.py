@@ -1120,14 +1120,14 @@ SUPPORTED_MODELS["agnes-3.0-flash"] = make_model_config(
 # -----------------------------------------------------------------------------
 # ModelScope 免费模型
 # -----------------------------------------------------------------------------
-SUPPORTED_MODELS["deepseek-ai/DeepSeek-V4-Flash-0731"] = make_model_config(
-    model_id="deepseek-ai/DeepSeek-V4-Flash-0731",
+SUPPORTED_MODELS["ZhipuAI/GLM-5.3-Flash"] = make_model_config(
+    model_id="ZhipuAI/GLM-5.3-Flash",
     provider="modelscope",
-    name="Deepseek V4 Flash",
+    name="GLM 5.3 Flash",
     max_context=1000000,
     reasoning_enabled=True,
-    reasoning_effort="high",
-    temperature=0.6,
+    reasoning_effort="max",
+    image_input=True,
 )
 
 # -----------------------------------------------------------------------------
@@ -1184,34 +1184,6 @@ SUPPORTED_MODELS["Tongyi-MAI/Z-Image-Turbo"] = make_model_config(
     max_context=32768,
     max_output_tokens=4000,
 )
-# SUPPORTED_MODELS["google/gemini-3.1-flash-lite-image"] = make_model_config(
-#     model_id="google/gemini-3.1-flash-lite-image",
-#     provider="openrouter",
-#     name="Gemini 3.1 Flash Lite Image",
-#     image_output=True,
-#     image_input=True,
-#     supports_tools=False,
-#     max_context=131000,
-# )
-# SUPPORTED_MODELS["google/gemini-3-pro-image-preview"] = make_model_config(
-#     model_id="google/gemini-3-pro-image-preview",
-#     provider="openrouter",
-#     name="Gemini 3 Pro Image Preview",
-#     image_output=True,
-#     image_input=True,
-#     supports_tools=False,
-#     max_context=66000,
-# )
-# SUPPORTED_MODELS["bytedance-seed/seedream-4.5"] = make_model_config(
-#     model_id="bytedance-seed/seedream-4.5",
-#     provider="openrouter",
-#     name="Seedream 4.5",
-#     image_output=True,
-#     image_input=True,
-#     supports_tools=False,
-#     max_context=4000,
-#     max_output_tokens=1024,
-# )
 
 SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
     model_id="agnes-image-2.5-flash",
