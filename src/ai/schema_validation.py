@@ -44,15 +44,38 @@ _ARGUMENTS_EXCERPT_LIMIT = 400
 # 参数预处理：null 剥离 + 常见写法矫正
 # ---------------------------------------------------------------------------
 
+# 模型偶发把"未提供"表达成字符串字面量而非真正的 JSON null——与
+# json_repair._LITERAL_MAP 同一类模型怪癖在语义层的体现（那边修的是
+# "JSON 语法非法"，这里修的是"JSON 合法但字符串值本该是 null"，如
+# agnes-3.0-flash 实测把 image_size 传成字符串 "None" 而非 null，
+# 导致 enum 校验拿字符串 'None' 去匹配 ['1K','2K','4K'] 必然失败，
+# 模型只能靠盲试重试，白白浪费工具轮次）。集合内的拼写严格取自
+# json_repair 已验证的字面量表，不做大小写/模糊匹配，避免误剥某个
+# 字段恰好合法取值就是这几个词的场景（本项目工具 schema 里没有这种
+# 字段，但保持精确匹配是更安全的默认）。
+_STRINGIFIED_NULL_LITERALS = frozenset({"None", "null", "NULL", "undefined"})
+
+
 def strip_null_arguments(fn_args: dict) -> dict:
-    """剥掉值为 None 的键（strict 模式的 null = 未提供）。
+    """剥掉值为 None（或模型误写成的空值字面量字符串）的键。
+
+    strict 模式下 null = 未提供，直接剥；此外容错剥掉值恰好是
+    ``"None"`` / ``"null"`` / ``"NULL"`` / ``"undefined"`` 这几个精确
+    拼写的字符串——模型把 Python/JS 的空值字面量误当字符串写出时的
+    已知怪癖（同类问题在 json_repair 的语法层已有对应处理，这里补
+    上语义层）。
 
     返回新 dict（不修改调用方传入的对象）；非 dict 输入原样返回。
-    False / "" / 0 是有语义的取值，不属于"未提供"，不剥。
+    False / "" / 0 是有语义的取值，不属于"未提供"，不剥；其余任何
+    字符串值（哪怕看起来奇怪）一律保留，交给后续 schema 校验按
+    工具真实 schema 判定。
     """
     if not isinstance(fn_args, dict) or not fn_args:
         return fn_args
-    return {k: v for k, v in fn_args.items() if v is not None}
+    return {
+        k: v for k, v in fn_args.items()
+        if v is not None and not (isinstance(v, str) and v in _STRINGIFIED_NULL_LITERALS)
+    }
 
 
 def find_tool_schema(fn_name: str, tools: Optional[list]) -> Optional[dict]:
