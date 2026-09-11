@@ -1678,7 +1678,6 @@ R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
-R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
 R2_REGION = os.getenv("R2_REGION", "auto")
 
 # -----------------------------------------------------------------------------
@@ -1745,7 +1744,7 @@ _SENSITIVE_EXACT = {
     "XAI_API_KEY", "GROQ_API_KEY", "MODELSCOPE_API_KEY", "AGNES_API_KEY",
     "XXTF_API_KEY",
     "R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY",
-    "R2_BUCKET_NAME", "R2_PUBLIC_URL", "R2_REGION",
+    "R2_BUCKET_NAME", "R2_REGION",
     "SERPER_API_KEY", "GAODE_MCP_TOKEN",
     "WEBHOOK_TOKEN", "WEBHOOK_URL",
 }

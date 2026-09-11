@@ -695,15 +695,14 @@ async def get_ai_response(
         if silent_mode:
             if is_timer:
                 messages.append(Message.system(
-                        "当前会话已关闭草稿预览（静默模式，/show off），且本轮是 TIMER 后台"
                         "当前用户默认看不到Agent轮次信息"
-                        "你可以调用 deliver_reply 且 send=true来发送Agent轮次中最后一条的文本信息"
-                        "可以调用 message_user 工具与用户交流，但是用户可能不在"))
+                        "如果你想让用户看到Agent轮次中最后一条的文本信息，可以调用 deliver_reply 且 send=true来显示"
+                        "你也可以调用 message_user 工具与用户交流，但是用户可能不在"))
             else:
                 messages.append(Message.system(
                         "当前用户默认能看到Agent轮次中最后一条的文本信息"
-                        "你可以调用 deliver_reply 且 send=false来取消发送Agent轮次中最后一条的文本信息"
-                        "可以调用 message_user 工具与用户交流，但是用户可能不在"))
+                        "如果你不想让用户看到Agent轮次中最后一条的文本信息，可以调用 deliver_reply 且 send=false来取消显示"
+                        "你也可以调用 message_user 工具与用户交流，但是用户可能不在"))
 
         # 缓存断点改由协议循环在每轮"渲染后的 wire dict"上统一打
         # （openai_chat: agentic_loops 每轮重打；anthropic_messages:
@@ -780,9 +779,8 @@ async def get_ai_response(
             # TIMER 回合说明：统一草稿流后，/show on 时过程与最终回复对用户
             # 可见；/show off 时静默，交付渠道是 deliver_reply / message_user。
             messages.append(Message.system(
-                    "这是被动触发的Agent过程，不是用户发来的。先检查 Todo，再结合最近上下文判断："
-                    "有具体价值就自然地告知或推进；没有合理行动就保持简短，不要为了完成回合"
-                    "而寒暄，也不要输出“我会等待”等等待式文本。可以调用 message_user 工具与用户交流，但是用户可能不在；"))
+                    "这是后台自动触发的Agent请求，为了模拟人类的主动思考"
+                    "可以调用 message_user 工具与用户交流，但是用户可能不在；"))
             raw_content, usage, new_msgs = await _call_api(
                 current_model, model_info, messages, chat_id, builder,
                 tools=timer_tools, journal=journal,

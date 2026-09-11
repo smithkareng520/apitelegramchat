@@ -256,7 +256,7 @@ curl http://127.0.0.1:5000/health   # → {"status":"ok"}
 | `ANTHROPIC_API_KEY` / `XXTF_API_KEY` | 可选 | Anthropic 原生协议桥接 / XXTF 中转（原生 Claude 模型接入必需） |
 | `GROQ_API_KEY` | 可选 | 音频转写 |
 | `SERPER_API_KEY` / `SERPER_API_TIMEOUT` | 可选 | Serper 搜索（默认 12s 超时） |
-| `R2_ENDPOINT` / `R2_ACCESS_KEY` / `R2_SECRET_KEY` / `R2_BUCKET_NAME` / `R2_PUBLIC_URL` / `R2_REGION` | 可选 | S3/R2 对象存储 |
+| `R2_ENDPOINT` / `R2_ACCESS_KEY` / `R2_SECRET_KEY` / `R2_BUCKET_NAME` / `R2_REGION` | 可选 | S3/R2 对象存储（媒体输入与对外交付全部走预签名 URL，无需公开域名） |
 | `APITELEGRAMCHAT_DATA_DIR` | 可选 | 内部状态根目录（state/、白名单与 R2 本地缓存；工作空间不在这里） |
 | `APITELEGRAMCHAT_WORKSPACES_DIR` | 可选 | 工作空间根目录（默认 `/home`，agent 家目录即 `/home/<userid>`） |
 | `APITELEGRAMCHAT_RUNTIME_DIR_NAME` | 可选 | 隐藏缓存层目录名（默认 `.runtime`，位于 agent 家目录内） |
@@ -555,26 +555,25 @@ export APITELEGRAMCHAT_DATA_DIR=/var/lib/apitelegramchat
 `APITELEGRAMCHAT_RUNTIME_DIR_NAME` 覆盖（改回非点前缀会重新暴露给
 模型的 `ls`，不建议）。
 
-R2 / S3 用于长期保存与公开资源 URL：
+R2 / S3 用于长期保存与预签名媒体 URL：
 
 ```bash
 export R2_ENDPOINT="https://<account>.r2.cloudflarestorage.com"
 export R2_ACCESS_KEY="..."
 export R2_SECRET_KEY="..."
 export R2_BUCKET_NAME="..."
-export R2_PUBLIC_URL="https://cdn.example.com"
 export R2_REGION="auto"
 ```
 
 Bash sandbox 不直接拥有这些 credentials；预签名 URL 在过期前 5 分钟内
 记忆化复用，保护 LLM 前缀缓存。
 
-媒体输入（图片 / 视频 / 原生文档 PDF）统一使用 R2 预签名 URL：
-`image_url` / `video_url` / document url source 一律签发 1h 预签名 URL
-（不依赖 `R2_PUBLIC_URL` 公开域名，自定义域 / r2.dev 配不配都能用），
-过期前自动重签，历史消息字节级稳定；R2 未配置时图片降级 base64 内联，
-视频 / 文档降级文本占位。`R2_PUBLIC_URL` 仅用于对外交付（生成结果、
-文件下载等 Telegram 渲染 URL）。
+媒体输入（图片 / 视频 / 原生文档 PDF）与对外交付（生成结果、文件下载
+等 Telegram 渲染）统一使用 R2 预签名 URL，`image_url` / `video_url` /
+document url source 及上传返回的交付链接一律签发 24h 预签名 URL
+（不依赖任何公开域名配置，无需自定义域 / r2.dev），过期前自动重签，
+历史消息字节级稳定；R2 未配置时图片降级 base64 内联，视频 / 文档降级
+文本占位。
 
 ---
 
@@ -780,9 +779,9 @@ serper.dev 控制台（免费版 2,500 次/月）。
 
 ### 6. R2 不工作
 
-核对 `R2_ENDPOINT`（含 account id）、密钥对、bucket 名与
-`R2_PUBLIC_URL`；R2 未配置时系统回退本地存储，已配置但对象不存在时
-白名单会在启动时把本地数据播种上 R2。
+核对 `R2_ENDPOINT`（含 account id）、密钥对与 bucket 名；R2 未配置时
+系统回退本地存储，已配置但对象不存在时白名单会在启动时把本地数据
+播种上 R2。
 
 ### 7. 为什么某些 MCP 工具看不到？
 

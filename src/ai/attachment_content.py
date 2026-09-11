@@ -309,7 +309,7 @@ async def _resolve_r2_presigned_url_for_video(file_id: str, mime_type: str = "vi
 
       1. R2 未配置 → 空串，调用方降级为文本占位（视频不走 base64，
          避免请求体膨胀触发网关上限）。
-      2. R2 已有对象 → 直接返回预签名 URL（1h 有效，TTLCache 记忆化
+      2. R2 已有对象 → 直接返回预签名 URL（24h 有效，TTLCache 记忆化
          至过期前 5 分钟，窗口内字节级稳定保前缀缓存；每轮重解析时
          若已过期会自动重签，与图片路径一致）。
       3. R2 未有对象 → 同步从 Telegram 拉字节 → 同步上传 R2 → 签发并
@@ -355,7 +355,7 @@ async def _resolve_r2_presigned_url_for_document(file_id: str, mime_type: str = 
     媒体输入统一预签名，解析顺序与视频版完全一致：
 
       1. R2 未配置 → 空串，调用方降级 base64 / 文本占位。
-      2. R2 已有对象 → 直接返回预签名 URL（1h 有效，TTLCache 记忆化
+      2. R2 已有对象 → 直接返回预签名 URL（24h 有效，TTLCache 记忆化
          至过期前 5 分钟——Anthropic 在请求时即时抓取，1h 足够；
          切换模型的热路径不重复上传）。
       3. R2 未有对象 → 同步从 Telegram 拉字节 → 同步上传 R2 → 签发并

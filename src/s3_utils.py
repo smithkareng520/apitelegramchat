@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from urllib.parse import urlparse
 
 try:
     import aioboto3
@@ -19,7 +18,6 @@ from config import (
     R2_ACCESS_KEY,
     R2_SECRET_KEY,
     R2_BUCKET_NAME,
-    R2_PUBLIC_URL,
     R2_REGION,
 )
 from workspace_paths import data_root
@@ -41,7 +39,11 @@ except Exception:  # pragma: no cover - cachetools 是硬依赖，仅为防御�
 # 这里把同一 key 的预签名 URL 缓存到过期前 5 分钟，窗口内字节级稳定，
 # 同时也避免了每轮重复签名的开销。
 # =====================================================================
-_PRESIGN_DEFAULT_EXPIRES = 3600
+# 预签名有效期：24 小时。媒体输入 URL 与对外交付 URL（生成结果、文件
+# 下载等 Telegram 渲染）全部由预签名承担，长有效期同时拉长历史消息
+# content 块的字节稳定窗口（LLM 前缀缓存友好）与交付链接的可抓取窗口。
+# R2 SigV4 预签名的硬上限是 7 天，如需更长可调到 604800。
+_PRESIGN_DEFAULT_EXPIRES = 86400
 _PRESIGN_SAFETY_MARGIN = 300  # 提前 5 分钟失效，避免返回临期/过期 URL
 _presigned_url_cache = TTLCache(maxsize=512, ttl=_PRESIGN_DEFAULT_EXPIRES - _PRESIGN_SAFETY_MARGIN) if TTLCache is not None else None
 _presign_lock = asyncio.Lock()
@@ -74,45 +76,21 @@ def _safe_local_key_path(key: str) -> Path:
     return _LOCAL_R2_ROOT.joinpath(*parts)
 
 
-def _public_delivery_base_url() -> str | None:
-    """返回可由 Telegram 等外部抓取器访问的公开媒体基地址。
+def _local_file_url(key: str) -> str:
+    """本地缓存模式的对象地址（file://）。
 
-    ``<account>.r2.cloudflarestorage.com`` 是 R2 的 S3 API 端点，不是公开
-    下载域名；不带签名直接拼接对象 key 会得到 AccessDenied，继而导致 Telegram
-    返回 RICH_MESSAGE_VIDEO_INVALID 或 RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND。
-    遇到该端点（或无效 URL）时应使用预签名 URL。真正可公开访问的 r2.dev
-    域名和自定义域名则保留为无查询参数的稳定媒体 URL。
+    仅作日志/调试用途：``file://`` 地址既不能交给模型（媒体输入），
+    也不能被 Telegram 抓取（对外交付）。调用方按各自协议降级
+    （base64 内联 / 文本占位 / 本地文件直读）。
     """
-    base = (R2_PUBLIC_URL or "").strip().rstrip("/")
-    if not base:
-        return None
-
-    parsed = urlparse(base)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme not in {"http", "https"} or not host or parsed.query or parsed.fragment:
-        logger.warning("忽略无效 R2_PUBLIC_URL，改用预签名 URL: %r", base[:160])
-        return None
-    if host.endswith(".r2.cloudflarestorage.com"):
-        logger.warning(
-            "R2_PUBLIC_URL 指向私有 S3 API 端点（%s），改用预签名 URL 供 Telegram 抓取",
-            host,
-        )
-        return None
-    return base
-
-
-def _local_public_url(key: str) -> str:
-    base = _public_delivery_base_url()
-    if base:
-        return f"{base}/{key}"
     return f"file://{_safe_local_key_path(key).resolve()}"
 
 
 def is_r2_configured() -> bool:
     """是否配置了远程 R2（含 endpoint / access key / secret / bucket）。
 
-    公开化：附件层需要据此决定走 R2 公开 URL 路径还是降级 base64，
-    并据此早退避免"拉字节→写本地 file://→发现不可公开访问→降级"的
+    公开化：附件层需要据此决定走 R2 预签名 URL 路径还是降级 base64，
+    并据此早退避免"拉字节→写本地 file://→发现不可交付→降级"的
     无谓链路。
     """
     return bool(aioboto3 and R2_ENDPOINT and R2_ACCESS_KEY and R2_SECRET_KEY and R2_BUCKET_NAME)
@@ -130,7 +108,7 @@ async def upload_bytes_to_r2(
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
             logger.info("Local R2 cache saved: %s", key)
-            return _local_public_url(key)
+            return _local_file_url(key)
         except Exception:
             # logger.exception 自带 traceback，不必再传 e。
             logger.exception("Local R2 cache write failed")
@@ -161,12 +139,11 @@ async def upload_bytes_to_r2(
                     ContentType=content_type,
                 )
             logger.info("R2 上传成功：%s", key)
-            public_base = _public_delivery_base_url()
-            if public_base:
-                return f"{public_base}/{key}"
-            # R2 S3 API endpoint 并非公开 URL。使用预签名 URL，使 Telegram 的
-            # 媒体抓取器无需 R2 凭据也能读取刚上传的视频；调用方会在 HTML 属性
-            # 中将查询参数的 & 幂等转义为 &amp;。
+            # R2 S3 API endpoint 并非公开 URL，带签名才能匿名读取。对外交付
+            #（生成结果、文件下载等 Telegram 渲染）与媒体输入一样统一返回
+            # 预签名 URL，使 Telegram 的媒体抓取器无需 R2 凭据也能读取刚
+            # 上传的对象；调用方会在 HTML 属性中将查询参数的 & 幂等转义为
+            # &amp;。不依赖任何公开域名配置。
             return await generate_presigned_url(key)
         except Exception:
             logger.exception("R2 上传失败（第 %d/%d 次）：%s", attempt + 1, max_attempts, key)
@@ -179,14 +156,14 @@ async def upload_bytes_to_r2(
 
 async def generate_presigned_url(
     key: str,
-    expires_in: int = 3600,
+    expires_in: int = _PRESIGN_DEFAULT_EXPIRES,
 ) -> str:
     if not is_r2_configured():
-        return _local_public_url(key)
+        return _local_file_url(key)
 
     # is_r2_configured() 为真 ⇒ session 必非 None（同 upload_bytes_to_r2 的不变量）
     assert session is not None
-    # 仅对默认 1h 有效期做记忆化：TTLCache 的 ttl 是 cache 级参数，
+    # 仅对默认 24h 有效期做记忆化：TTLCache 的 ttl 是 cache 级参数，
     # 自定义 expires_in 走原路径直接签名。TTLCache 不可用时禁用记忆化，
     # 避免无过期时间的普通 dict 越积越多。
     memoizable = expires_in == _PRESIGN_DEFAULT_EXPIRES and TTLCache is not None
@@ -232,11 +209,11 @@ async def presigned_url_for_existing_key(key: str) -> str | None:
       * 预签名 URL 由 TTLCache 记忆化至过期前 5 分钟（见
         ``generate_presigned_url``），窗口内字节级稳定——历史消息里的
         多模态 content 块不会因重签而变字节，前缀缓存得以保全；
-      * 签名访问不依赖 ``R2_PUBLIC_URL`` 公开域名配置（自定义域 /
-        r2.dev 配不配都能用），也不把对象内容暴露给无凭证的匿名抓取。
+      * 签名访问不依赖任何公开域名配置（无需自定义域 / r2.dev），
+        也不把对象内容暴露给无凭证的匿名抓取。
 
     返回值约定：
-      1. R2 已配置：返回预签名 URL（默认 1h 有效，过期前 5 分钟内
+      1. R2 已配置：返回预签名 URL（默认 24h 有效，过期前 5 分钟内
          的缓存条目已提前失效，长会话下一轮会自动签发新 URL）。
       2. R2 未配置（本地缓存模式）：返回 None——``file://`` 地址不可
          作为模型输入，调用方按各自协议降级（base64 内联 / 文本占位）。

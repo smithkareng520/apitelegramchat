@@ -55,8 +55,6 @@ services:
         sync: false
       - key: R2_BUCKET_NAME
         sync: false
-      - key: R2_PUBLIC_URL
-        sync: false
       - key: R2_REGION
         value: auto
       - key: WEBHOOK_URL
