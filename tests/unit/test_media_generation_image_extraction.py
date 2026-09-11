@@ -5,10 +5,11 @@ from ai.media_generation import (
     _extract_image_items,
     _response_items_to_bytes,
     _detect_valid_image,
+    _sniff_payload_kind,
     _request_openai_images_task,
     _request_chat_modalities_image_task,
 )
-from core.images import ImageTask
+from core.images import ImageTask, ImageTaskResult
 
 
 # 1x1 transparent PNG.
@@ -50,15 +51,155 @@ def test_detect_valid_image_rejects_html():
 def test_response_items_to_bytes_rejects_non_image_base64():
     html_b64 = base64.b64encode(b"<html>fallback</html>").decode("ascii")
     payload = {"data": [{"b64_json": html_b64}]}
-    assert asyncio.run(_response_items_to_bytes(payload, max_images=1)) == []
+    images, diagnostics = asyncio.run(_response_items_to_bytes(payload, max_images=1))
+    assert images == []
+    # 拒绝必须留下诊断：base64 内容非图片（HTML 错误页）
+    assert len(diagnostics) == 1
+    assert "base64" in diagnostics[0]
+    assert "HTML" in diagnostics[0]
 
 
 def test_response_items_to_bytes_accepts_one_real_image_and_respects_limit():
     image_b64 = base64.b64encode(PNG_1X1).decode("ascii")
     payload = {"data": [{"b64_json": image_b64}, {"b64_json": image_b64}]}
-    result = asyncio.run(_response_items_to_bytes(payload, max_images=1))
-    assert len(result) == 1
-    assert result[0] == PNG_1X1
+    images, diagnostics = asyncio.run(_response_items_to_bytes(payload, max_images=1))
+    assert len(images) == 1
+    assert images[0] == PNG_1X1
+    assert diagnostics == []      # 全部成功时无诊断
+
+
+# ---------------------------------------------------------------------------
+# 回归测试（2026-09 ModelScope 生产事故）：中转商返回 HTTP 200 + 图片 URL，
+# 但 URL 下载下来是防盗链错误页（7627 字节 HTML）。旧代码静默拒绝后上层
+# 只会报“接口返回成功，但未找到可用图片数据”——语义完全失真。
+# 诊断必须逐项记录真实原因并透传给用户报错。
+# ---------------------------------------------------------------------------
+
+class _FakeDownloadSession:
+    """按 {status, headers, body} 脚本返回响应的最小 aiohttp 会话替身。"""
+
+    def __init__(self, script):
+        self._script = script
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def get(self, url, **kwargs):
+        status, headers, body = self._script(url)
+        return _FakeDownloadResponse(status, headers, body)
+
+
+class _FakeDownloadResponse:
+    def __init__(self, status, headers, body):
+        self.status = status
+        self.headers = headers
+
+        class _Content:
+            def __init__(self, body):
+                self._body = body
+
+            async def read(self, n=-1):
+                return self._body
+
+        self.content = _Content(body)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def test_response_items_to_bytes_diagnoses_non_image_url(monkeypatch):
+    """声称 image/png 的 URL 下载到 HTML 错误页：拒绝 + 诊断带 host 与内容形态。"""
+    import ai.media_generation as mg
+
+    anti_leech = b"<!DOCTYPE html><html><body>Request rejected (anti-leech)</body></html>" * 40
+
+    def script(url):
+        return 200, {"Content-Type": "image/png"}, anti_leech
+
+    monkeypatch.setattr(mg.aiohttp, "ClientSession", lambda **k: _FakeDownloadSession(script))
+
+    payload = {"data": [{"url":
+        "https://modelscope-studios.oss-cn-zhangjiakou.aliyuncs.com/aigc/text-to-image/abc.png"}]}
+    images, diagnostics = asyncio.run(_response_items_to_bytes(payload, max_images=1))
+    assert images == []
+    assert len(diagnostics) == 1
+    # host 定位 + 字节数 + 内容形态（不带带签名参数的完整 URL）
+    assert "modelscope-studios.oss-cn-zhangjiakou.aliyuncs.com" in diagnostics[0]
+    assert "字节" in diagnostics[0]
+    assert "HTML" in diagnostics[0]
+
+
+def test_response_items_to_bytes_diagnoses_download_failure(monkeypatch):
+    """图片 URL 下载 HTTP 403：诊断说明下载失败与状态码。"""
+    import ai.media_generation as mg
+
+    def script(url):
+        return 403, {"Content-Type": "text/plain"}, b"forbidden"
+
+    monkeypatch.setattr(mg.aiohttp, "ClientSession", lambda **k: _FakeDownloadSession(script))
+
+    payload = {"data": [{"url": "https://cdn.example.com/expired.png"}]}
+    images, diagnostics = asyncio.run(_response_items_to_bytes(payload, max_images=1))
+    assert images == []
+    assert len(diagnostics) == 1
+    assert "cdn.example.com" in diagnostics[0]
+    assert "403" in diagnostics[0]
+
+
+def test_response_items_to_bytes_accepts_real_image_url(monkeypatch):
+    """URL 下载到真实 PNG：正常入库且无诊断。"""
+    import ai.media_generation as mg
+
+    def script(url):
+        return 200, {"Content-Type": "image/png"}, PNG_1X1
+
+    monkeypatch.setattr(mg.aiohttp, "ClientSession", lambda **k: _FakeDownloadSession(script))
+
+    payload = {"data": [{"url": "https://cdn.example.com/ok.png"}]}
+    images, diagnostics = asyncio.run(_response_items_to_bytes(payload, max_images=1))
+    assert images == [PNG_1X1]
+    assert diagnostics == []
+
+
+def test_sniff_payload_kind_reports_content_shape():
+    """非图片字节流的内容嗅探：能一眼看出错误页/XML/JSON/截断等形态。"""
+    f = _sniff_payload_kind
+    assert "HTML" in f(b"<!DOCTYPE html><html><body>x</body></html>")
+    assert "XML" in f(b'<?xml version="1.0"?><Error><Code>AccessDenied</Code></Error>')
+    assert "JSON" in f(b'{"error": {"message": "quota exceeded"}}')
+    assert "PDF" in f(b"%PDF-1.7 rest")
+    assert "GZIP" in f(b"\x1f\x8b\x08\x00payload")
+    assert "损坏" in f(b"\x89PNG\r\n\x1a\n" + b"truncated-garbage")
+    assert "纯文本" in f(b"hello world, this is plain text response")
+    assert "未知二进制" in f(b"\x00\x01\x02\xfe\xff\x07")
+    assert "空内容" in f(b"")
+
+
+def test_openai_images_task_carries_diagnostics(monkeypatch):
+    """响应解析层的拒绝诊断必须透传到 ImageTaskResult（供上层报错）。"""
+
+    async def fake_request(*args, **kwargs):
+        return {"data": [{"url": "https://host.example/x.png"}]}, "/images/generations", "", 200, "req"
+
+    async def fake_to_bytes(response_json, max_images=1):
+        return [], ["图片 #1（host.example）：链接下载了 7627 字节，但内容不是有效图片（HTML 页面）"]
+
+    monkeypatch.setattr("ai.media_generation._request_images_generations", fake_request)
+    monkeypatch.setattr("ai.media_generation._response_items_to_bytes", fake_to_bytes)
+
+    task = ImageTask.generate("test", model="google/gemini-3-pro-image-preview")
+    result = asyncio.run(_request_openai_images_task(task))
+    assert result.images == []
+    assert len(result.diagnostics) == 1
+    assert "host.example" in result.diagnostics[0]
+    # 无诊断路径默认空列表（向后兼容旧构造）
+    assert ImageTaskResult().diagnostics == []
 
 def test_validate_image_bytes_is_legacy_exported_from_ai_handlers():
     # Avoid importing the whole application in this focused unit test (it pulls
@@ -77,6 +218,7 @@ def test_openai_images_task_resolves_registered_model_without_name_error(monkeyp
     task = ImageTask.generate("test", model="google/gemini-3-pro-image-preview")
     result = asyncio.run(_request_openai_images_task(task))
     assert result.images == []
+    assert result.diagnostics == []   # 空响应是“无图片数据”，不是下载校验失败
     assert result.endpoint == "/v1/images/generations"
 
 

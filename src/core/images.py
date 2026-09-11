@@ -138,6 +138,9 @@ class ImageTaskResult:
     endpoint:  实际使用的相对端点（"/images/generations" / "/images/edits"
                / "/chat/completions"），供日志与错误提示。
     usage:     上游 usage（如有）。
+    diagnostics: 逐项拒绝诊断（如"图片 URL 下载下来是 HTML 错误页"）。
+               images 为空时调用方应把诊断并入错误提示，替代笼统的
+               "未找到可用图片数据"。
     """
     images: list[bytes] = field(default_factory=list)
     text: str = ""
@@ -145,6 +148,7 @@ class ImageTaskResult:
     finish_reason: str = ""
     endpoint: str = ""
     usage: Any = None
+    diagnostics: list[str] = field(default_factory=list)
 
 
 __all__ = [

@@ -608,3 +608,110 @@ def test_image_loop_overrides_reach_task(monkeypatch):
     # 卡片参考图 -> edit 语义（图生图/多图合成）
     assert task.operation == "edit"
     assert len(task.input_images) == 2
+
+
+# ---------------------------------------------------------------------------
+# 7. 失败通知渲染与报错语义（2026-09 ModelScope 事故回归）
+# ---------------------------------------------------------------------------
+def test_notify_generation_failure_no_double_escape(monkeypatch):
+    """修复回归：HTML notice 不得被二次转义（用户曾看到 &lt;b&gt; 字面量）。
+
+    notice 来自 IMAGE_ERROR/VIDEO_ERROR 信号，本身是 Telegram HTML；
+    _notify_generation_failure 现在复用 _render_media_failure_quote
+    （与 ai_handlers 的 IMAGE_ERROR/VIDEO_ERROR 渲染完全同款 <pre> 结果块）。
+    """
+    import media_wizard as mw
+    import turn_recovery
+    import utils
+
+    sent: dict = {}
+
+    async def fake_send(chat_id, html_text, **kwargs):
+        sent["html"] = html_text
+
+    async def fake_mark(chat_id):
+        pass
+
+    monkeypatch.setattr(utils, "send_rich_html_message", fake_send)
+    monkeypatch.setattr(turn_recovery, "mark_failed_unanswered_user", fake_mark)
+
+    notice = "⚠️ <b>ModelScope 图像接口 请求失败</b><br/>HTTP 状态：200<br/>模型：Qwen/Qwen-Image-Edit"
+    run = asyncio.new_event_loop()
+    run.run_until_complete(mw._notify_generation_failure(1, notice))
+    run.close()
+
+    out = sent["html"]
+    # 核心断言：不再出现转义后的标签字面量
+    assert "&lt;b&gt;" not in out
+    assert "&lt;br/&gt;" not in out
+    # 标题文本保留（标签被剥掉，内容可见）
+    assert "ModelScope 图像接口 请求失败" in out
+    assert "HTTP 状态：200" in out
+    # 与 IMAGE_ERROR 非卡片路径同款 <pre> 结果块渲染
+    assert out.startswith("<p><b>Result</b></p><pre><code>")
+    assert out.endswith("</code></pre>")
+
+
+def test_notify_generation_failure_escapes_pure_text(monkeypatch):
+    """纯文本 notice（含 <、& 特殊字符）也必须安全转义，不破坏 HTML 结构。"""
+    import media_wizard as mw
+    import turn_recovery
+    import utils
+
+    sent: dict = {}
+
+    async def fake_send(chat_id, html_text, **kwargs):
+        sent["html"] = html_text
+
+    async def fake_mark(chat_id):
+        pass
+
+    monkeypatch.setattr(utils, "send_rich_html_message", fake_send)
+    monkeypatch.setattr(turn_recovery, "mark_failed_unanswered_user", fake_mark)
+
+    run = asyncio.new_event_loop()
+    run.run_until_complete(mw._notify_generation_failure(1, "生成任务异常: <ModelScope> & quota"))
+    run.close()
+
+    out = sent["html"]
+    # 既有契约：notice 走"可能含 HTML 的混合文本"净化通道——标签被剥除、
+    # & 被转义，输出始终是结构安全的 <pre> 结果块（绝不输出原始尖括号）。
+    assert "<ModelScope>" not in out
+    assert "&amp;" in out
+    assert "quota" in out
+    assert out.startswith("<p><b>Result</b></p><pre><code>")
+    assert out.endswith("</code></pre>")
+
+
+def test_image_loop_error_reports_download_diagnostics(monkeypatch):
+    """图片链接下载校验失败：报错必须说明真实原因，而非"未找到可用图片数据"。"""
+    import ai.agentic_loops as loops
+
+    async def fake_dispatch(task):
+        return ImageTaskResult(
+            images=[],
+            endpoint="/images/generations",
+            diagnostics=[
+                "图片 #1（modelscope-studios.oss-cn-zhangjiakou.aliyuncs.com）："
+                "链接下载了 7627 字节，但内容不是有效图片（HTML 页面（疑似防盗链/错误页））",
+            ],
+        )
+
+    monkeypatch.setattr(loops, "dispatch_image_task", fake_dispatch)
+
+    from core.messages import Message, TextBlock
+    messages = [Message.user([TextBlock("一只猫")])]
+    run = asyncio.new_event_loop()
+    raw, _, _ = run.run_until_complete(
+        loops._agentic_loop_native_image(None, "agnes-image-2.5-flash", messages, None, 1))
+    run.close()
+
+    assert raw.startswith("IMAGE_ERROR")
+    notice = raw.split(":", 1)[1]
+    # 语义准确：说明"下载/校验失败" + 诊断行 + 建议，不再误报"没有数据"
+    assert "下载/校验失败" in notice
+    assert "7627" in notice
+    assert "防盗链" in notice
+    assert "未找到可用图片数据" not in notice
+    # HTML notice 无转义残留
+    assert "&lt;" not in notice and "&gt;" not in notice

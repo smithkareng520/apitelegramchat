@@ -1181,13 +1181,20 @@ async def _cb_submit(sess: WizardSession, callback_id: str) -> None:
 
 
 async def _notify_generation_failure(chat_id: int, notice: str) -> None:
-    """生成失败通知（与 IMAGE/VIDEO_ERROR 的渲染语义一致）。"""
+    """生成失败通知（与 IMAGE/VIDEO_ERROR 的渲染语义一致）。
+
+    渲染复用 ``_render_media_failure_quote``（ai.error_formatting）——
+    修复（2026-09 生产事故）：notice 来自 ``IMAGE_ERROR:``/``VIDEO_ERROR:``
+    信号，本身已是 Telegram HTML（如 ``⚠️ <b>… 请求失败</b>…``），此前
+    ``html.escape(notice)`` 把标签再次转义，用户看到的是 ``&lt;b&gt;``
+    字面量而非加粗标题。改走与 ai_handlers IMAGE_ERROR/VIDEO_ERROR 完全
+    相同的渲染出口：unescape → 剥标签 → 严格转义后放入 <pre> 结果块，
+    纯文本 notice 同样安全。
+    """
     try:
         from utils import send_rich_html_message
-        await send_rich_html_message(
-            chat_id,
-            f"❌ <b>生成失败</b><br/><blockquote>{html.escape(notice[:600])}</blockquote>",
-        )
+        from ai.error_formatting import _render_media_failure_quote
+        await send_rich_html_message(chat_id, _render_media_failure_quote(notice))
     except Exception:
         logger.warning("生成失败通知发送失败: chat=%s", chat_id, exc_info=True)
     try:

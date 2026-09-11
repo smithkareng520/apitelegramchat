@@ -1088,12 +1088,31 @@ async def _agentic_loop_native_image(
                 if journal is not None:
                     journal.extend(new_entries)
                 return final_content, result.usage, new_entries
+            # 语义准确化（2026-09 ModelScope 生产事故）：HTTP 200 + 空 images
+            # 有两种截然不同的情形——
+            #   a) 响应里真的没有图片数据；
+            #   b) 响应里有图片链接，但下载校验失败（防盗链/链接过期/错误页）。
+            # 情形 b 会带逐项诊断，报错必须反映真实原因，否则用户会误以为
+            # 接口什么都没返回（旧文案"未找到可用图片数据"就是栽在这里）。
+            # detail 传纯文本多行（\n 分行）：_format_api_error_notice 内部
+            # 会剥 HTML 并按行重排。
+            if result.diagnostics:
+                diag_body = "\n".join(f"· {line}" for line in result.diagnostics[:4])
+                if len(result.diagnostics) > 4:
+                    diag_body += f"\n· …等共 {len(result.diagnostics)} 项"
+                detail = (
+                    f"接口返回了 {len(result.diagnostics)} 个图片数据项，但全部下载/校验失败：\n"
+                    f"{diag_body}\n"
+                    "常见原因：中转商返回的图片链接有防盗链或已过期（下载到的是错误页而非图片），请直接重试一次。"
+                )
+            else:
+                detail = "接口返回成功，但未找到可用图片数据。"
             error_notice = _format_api_error_notice(
                 api_name=f"{_get_images_api_display_name(model_info)} 图像接口",
                 error_code=200,
                 endpoint=used_endpoint,
                 model=current_model,
-                detail="接口返回成功，但未找到可用图片数据。",
+                detail=detail,
             )
             return f"IMAGE_ERROR:{error_notice}", None, []
 
@@ -1125,7 +1144,7 @@ async def _agentic_loop_native_image(
                     error_code=200,
                     endpoint=used_endpoint,
                     model=current_model,
-                    detail="接口返回成功，但图片上传失败。",
+                    detail="接口返回成功，图片已生成，但转存图片存储失败（多为对象存储临时故障），请直接重试。",
                 )
                 return f"IMAGE_ERROR:{error_notice}", None, []
 

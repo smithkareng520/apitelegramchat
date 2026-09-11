@@ -1383,11 +1383,51 @@ def _detect_valid_image(bytes_data: bytes) -> tuple[str, str] | None:
     return format_map.get(fmt)
 
 
+def _sniff_payload_kind(bytes_data: bytes) -> str:
+    """对被判为"非图片"的字节流做轻量嗅探，返回人类可读的内容形态描述。
+
+    用途：中转商返回的"图片 URL"下载下来经常是防盗链错误页 / OSS XML
+    错误 / JSON 报错体而非图片本体。只看 size 无法定位原因，把实际内容
+    形态带进日志与用户报错，能一眼看出"链接给的是 HTML 错误页"。
+    只读前 512 字节，绝不解析整个 payload。
+    """
+    if not isinstance(bytes_data, (bytes, bytearray)) or not bytes_data:
+        return "空内容"
+    head = bytes(bytes_data[:512])
+    stripped = head.lstrip()
+    if stripped.startswith(b"%PDF"):
+        return "PDF 文档"
+    if stripped.startswith((b"<!DOCTYPE html", b"<!doctype html", b"<html", b"<HTML")):
+        return "HTML 页面（疑似防盗链/错误页）"
+    if stripped.startswith((b"<?xml", b"<Error", b"<error")):
+        return "XML 错误响应（疑似 OSS/CDN 拒绝）"
+    if stripped.startswith((b"{", b"[")):
+        return "JSON（疑似 API 错误响应）"
+    if stripped.startswith(b"\x1f\x8b"):
+        return "GZIP 压缩数据"
+    if stripped.startswith((b"GIF8", b"\x89PNG", b"\xff\xd8\xff")):
+        # 头部像图片但 PIL verify 失败 → 文件截断/损坏
+        return "图片头部但数据损坏或截断"
+    sample = head[:256]
+    if sample and all(32 <= b < 127 or b in (9, 10, 13) for b in sample):
+        try:
+            text = sample.decode("ascii", "ignore").strip()
+            snippet = re.sub(r"\s+", " ", text)[:60]
+            return f"纯文本（开头: {snippet!r}）"
+        except Exception:
+            pass
+    return f"未知二进制（magic: {bytes(bytes_data[:8]).hex(' ')}）"
+
+
 def _validate_image_bytes(bytes_data: bytes, source: str = '') -> bytes | None:
     """只允许真正可解析的图片字节进入 R2。"""
     detected = _detect_valid_image(bytes_data)
     if detected is None:
-        logger.warning('[NativeImage] rejected non-image payload: source=%s size=%s', source[:160], len(bytes_data or b''))
+        payload = bytes(bytes_data or b'')
+        logger.warning(
+            '[NativeImage] rejected non-image payload: source=%s size=%s kind=%s',
+            source[:160], len(payload), _sniff_payload_kind(payload),
+        )
         return None
     return bytes(bytes_data)
 
@@ -1467,16 +1507,38 @@ def _format_native_image_notice(
     return "⚠️ 图片生成失败，请稍后重试。"
 
 
-async def _response_items_to_bytes(response_json: dict, max_images: int = 4) -> list[bytes]:
+async def _response_items_to_bytes(
+        response_json: dict, max_images: int = 4,
+) -> tuple[list[bytes], list[str]]:
+    """解析响应中的图片数据为字节列表，并收集"逐项拒绝"诊断。
+
+    返回 (image_bytes_list, diagnostics)。diagnostics 记录每个被跳过的
+    图片项的真实原因（下载失败 / 内容非图片 / 体积超限…）——上游返回
+    HTTP 200 但图片 URL 下载下来是防盗链错误页时（2026-09 ModelScope
+    生产事故），调用方不能再笼统报"未找到可用图片数据"，而要把真实
+    原因带给用户。
+
+    诊断行面向用户展示，刻意不带完整 URL（中转 URL 常含签名参数，又长
+    又敏感），只保留 host 供定位是哪个域的链接出了问题。
+    """
     image_bytes_list: list[bytes] = []
+    diagnostics: list[str] = []
     limit = max(1, min(int(max_images or 1), 4))
     items = _extract_image_items(response_json, max_items=limit)
     logger.debug("[NativeImage/ModelScope] extracted image item count=%s", len(items))
     # 防止恶意/失控的上游用超大 base64 串触发 OOM：
     # 单张图片的 base64 串超过 25 MB 时直接拒绝解码。
     MAX_BASE64_ENCODED_BYTES = 25 * 1024 * 1024
+
+    def _host_of(url: str) -> str:
+        try:
+            from urllib.parse import urlparse
+            return urlparse(url).netloc or url[:60]
+        except Exception:
+            return url[:60]
+
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
-        for img_data in items:
+        for idx, img_data in enumerate(items):
             img_url = ''
             if isinstance(img_data.get('image_url'), dict):
                 img_url = str(img_data['image_url'].get('url') or '').strip()
@@ -1491,17 +1553,23 @@ async def _response_items_to_bytes(response_json: dict, max_images: int = 4) -> 
                         "[NativeImage] 跳过超大 base64 图片 (len=%s, 上限=%s)",
                         len(b64_json), MAX_BASE64_ENCODED_BYTES,
                     )
+                    diagnostics.append(
+                        f"图片 #{idx + 1}：base64 体积超限（{len(b64_json) // 1024 // 1024}MB），已跳过")
                     continue
                 try:
                     decoded = base64.b64decode(b64_json, validate=True)
                     validated = _validate_image_bytes(decoded, source='b64_json')
                     if validated is not None:
                         image_bytes_list.append(validated)
+                    else:
+                        diagnostics.append(
+                            f"图片 #{idx + 1}：base64 内容不是有效图片（{_sniff_payload_kind(decoded)}）")
                     if len(image_bytes_list) >= limit:
                         break
                     continue
                 except Exception as e:
                     logger.warning(f"[NativeImage] Base64 图片解码失败: {e}")
+                    diagnostics.append(f"图片 #{idx + 1}：base64 解码失败（{str(e)[:60]}）")
 
             if img_url.startswith('data:image'):
                 try:
@@ -1511,18 +1579,25 @@ async def _response_items_to_bytes(response_json: dict, max_images: int = 4) -> 
                             "[NativeImage] 跳过超大 data URL 图片 (len=%s, 上限=%s)",
                             len(base64_data), MAX_BASE64_ENCODED_BYTES,
                         )
+                        diagnostics.append(
+                            f"图片 #{idx + 1}：data URL 体积超限（{len(base64_data) // 1024 // 1024}MB），已跳过")
                         continue
                     decoded = base64.b64decode(base64_data, validate=True)
                     validated = _validate_image_bytes(decoded, source='data_url')
                     if validated is not None:
                         image_bytes_list.append(validated)
+                    else:
+                        diagnostics.append(
+                            f"图片 #{idx + 1}：data URL 内容不是有效图片（{_sniff_payload_kind(decoded)}）")
                     if len(image_bytes_list) >= limit:
                         break
                     continue
                 except Exception as e:
                     logger.warning(f"[NativeImage] data URL 解码失败: {e}")
+                    diagnostics.append(f"图片 #{idx + 1}：data URL 解码失败（{str(e)[:60]}）")
 
             if img_url.startswith('http'):
+                host = _host_of(img_url)
                 try:
                     async with session.get(img_url, timeout=30) as resp:
                         if resp.status == 200:
@@ -1535,21 +1610,37 @@ async def _response_items_to_bytes(response_json: dict, max_images: int = 4) -> 
                                     "[NativeImage] 远端图片体积超限 (>%s)，跳过: %s",
                                     max_remote, img_url[:120],
                                 )
+                                diagnostics.append(
+                                    f"图片 #{idx + 1}（{host}）：下载体积超过 25MB 上限，已跳过")
                                 continue
                             content_type = str(resp.headers.get('Content-Type') or '').split(';', 1)[0].strip().lower()
                             if content_type and not content_type.startswith('image/'):
                                 logger.warning('[NativeImage] 远端响应不是图片，跳过: content_type=%s url=%s', content_type or '-', img_url[:120])
+                                diagnostics.append(
+                                    f"图片 #{idx + 1}（{host}）：响应类型是 {content_type or '未知'}，不是图片")
                                 continue
                             validated = _validate_image_bytes(image_bytes, source=img_url)
                             if validated is not None:
                                 image_bytes_list.append(validated)
+                            else:
+                                diagnostics.append(
+                                    f"图片 #{idx + 1}（{host}）：链接下载了 {len(image_bytes)} 字节，"
+                                    f"但内容不是有效图片（{_sniff_payload_kind(image_bytes)}）")
                             if len(image_bytes_list) >= limit:
                                 break
                         else:
                             logger.warning(f"[NativeImage] 下载生成图片失败 {resp.status}: {img_url[:120]}")
+                            diagnostics.append(
+                                f"图片 #{idx + 1}（{host}）：下载失败，HTTP {resp.status}")
                 except Exception as e:
                     logger.warning(f"[NativeImage] 下载生成图片异常: {e}")
-    return image_bytes_list
+                    diagnostics.append(
+                        f"图片 #{idx + 1}（{host}）：下载异常（{str(e)[:60]}）")
+            elif not b64_json:
+                # 既不是 base64 / data URL，也不是 http(s) 链接：识别不出
+                # 任何图片数据形态。
+                diagnostics.append(f"图片 #{idx + 1}：响应项里没有可识别的图片数据")
+    return image_bytes_list, diagnostics
 
 
 async def _request_agnes_video(
@@ -2100,9 +2191,19 @@ async def _request_openai_images_task(task: "ImageTask") -> "ImageTaskResult":
             endpoint=f"/v1{endpoint}",
             request_id=request_id,
         )
-    image_bytes_list = await _response_items_to_bytes(response_json, max_images=task.num_images or 1)
+    image_bytes_list, diagnostics = await _response_items_to_bytes(
+        response_json, max_images=task.num_images or 1)
     usage = response_json.get("usage") if isinstance(response_json, dict) else None
-    return ImageTaskResult(images=image_bytes_list, endpoint=f"/v1{endpoint}", usage=usage)
+    if diagnostics:
+        logger.warning(
+            "[NativeImage] %s 响应解析出 %s 张图片，另有 %s 条拒绝诊断: %s",
+            task.model, len(image_bytes_list), len(diagnostics),
+            " | ".join(diagnostics)[:500],
+        )
+    return ImageTaskResult(
+        images=image_bytes_list, endpoint=f"/v1{endpoint}", usage=usage,
+        diagnostics=diagnostics,
+    )
 
 
 async def _request_chat_modalities_image_task(task: "ImageTask") -> "ImageTaskResult":
