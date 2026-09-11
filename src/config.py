@@ -1184,24 +1184,6 @@ SUPPORTED_MODELS["Qwen/Qwen-Image-Edit"] = make_model_config(
     max_context=32768,
     max_output_tokens=4000,
 )
-SUPPORTED_MODELS["agnes-image-2.1-flash"] = make_model_config(
-    model_id="agnes-image-2.1-flash",
-    provider="agnes",
-    name="Agnes Image 2.1 Flash",
-    # 与 2.5 能力一致（官方文档：请求/响应参数、尺寸、计费保持一致）：
-    # native_image 进入图像模型目录与图像循环，vision 使其支持参考图编辑。
-    native_image=True,
-    vision=True,
-    supports_tools=False,
-    max_context=32768,
-    max_output_tokens=4000,
-    # 图像模型：显式声明 OpenAI Images 协议 + 完整请求端点（配置驱动，
-    # 请求层按此 URL 直接 POST，不再按厂商/模型写分支）。Agnes 图像网关的
-    # 生成/编辑/多图合成均走该端点（参考图内联 extra_body.image，由厂商级
-    # image_edit_inline=True 声明）。
-    protocol="openai_images",
-    endpoint="https://apihub.agnes-ai.com/v1/images/generations",
-)
 SUPPORTED_MODELS["Tongyi-MAI/Z-Image-Turbo"] = make_model_config(
     model_id="Tongyi-MAI/Z-Image-Turbo",
     provider="modelscope",
@@ -1212,34 +1194,34 @@ SUPPORTED_MODELS["Tongyi-MAI/Z-Image-Turbo"] = make_model_config(
     max_context=32768,
     max_output_tokens=4000,
 )
-SUPPORTED_MODELS["google/gemini-3.1-flash-lite-image"] = make_model_config(
-    model_id="google/gemini-3.1-flash-lite-image",
-    provider="openrouter",
-    name="Gemini 3.1 Flash Lite Image",
-    native_image=True,
-    vision=True,
-    supports_tools=False,
-    max_context=131000,
-)
-SUPPORTED_MODELS["google/gemini-3-pro-image-preview"] = make_model_config(
-    model_id="google/gemini-3-pro-image-preview",
-    provider="openrouter",
-    name="Gemini 3 Pro Image Preview",
-    native_image=True,
-    vision=True,
-    supports_tools=False,
-    max_context=66000,
-)
-SUPPORTED_MODELS["bytedance-seed/seedream-4.5"] = make_model_config(
-    model_id="bytedance-seed/seedream-4.5",
-    provider="openrouter",
-    name="Seedream 4.5",
-    native_image=True,
-    vision=True,
-    supports_tools=False,
-    max_context=4000,
-    max_output_tokens=1024,
-)
+# SUPPORTED_MODELS["google/gemini-3.1-flash-lite-image"] = make_model_config(
+#     model_id="google/gemini-3.1-flash-lite-image",
+#     provider="openrouter",
+#     name="Gemini 3.1 Flash Lite Image",
+#     native_image=True,
+#     vision=True,
+#     supports_tools=False,
+#     max_context=131000,
+# )
+# SUPPORTED_MODELS["google/gemini-3-pro-image-preview"] = make_model_config(
+#     model_id="google/gemini-3-pro-image-preview",
+#     provider="openrouter",
+#     name="Gemini 3 Pro Image Preview",
+#     native_image=True,
+#     vision=True,
+#     supports_tools=False,
+#     max_context=66000,
+# )
+# SUPPORTED_MODELS["bytedance-seed/seedream-4.5"] = make_model_config(
+#     model_id="bytedance-seed/seedream-4.5",
+#     provider="openrouter",
+#     name="Seedream 4.5",
+#     native_image=True,
+#     vision=True,
+#     supports_tools=False,
+#     max_context=4000,
+#     max_output_tokens=1024,
+# )
 
 SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
     model_id="agnes-image-2.5-flash",
@@ -1262,19 +1244,19 @@ SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
 # -----------------------------------------------------------------------------
 # 视频生成模型
 # -----------------------------------------------------------------------------
-SUPPORTED_MODELS["agnes-video-2.5"] = make_model_config(
-    model_id="agnes-video-2.5",
-    provider="agnes",
-    name="Agnes video 2.5",
-    vision=True,
-    video=True,
-    native_video=True,
-    max_context=32768,
-    max_output_tokens=4000,
-    # 视频任务提交端点（配置驱动）：_request_agnes_video 优先 POST 到该
-    # URL，未声明时回退内置默认，行为不变。
-    endpoint="https://apihub.agnes-ai.com/v1/videos",
-)
+# SUPPORTED_MODELS["agnes-video-2.5"] = make_model_config(
+#     model_id="agnes-video-2.5",
+#     provider="agnes",
+#     name="Agnes video 2.5",
+#     vision=True,
+#     video=True,
+#     native_video=True,
+#     max_context=32768,
+#     max_output_tokens=4000,
+#     # 视频任务提交端点（配置驱动）：_request_agnes_video 优先 POST 到该
+#     # URL，未声明时回退内置默认，行为不变。
+#     endpoint="https://apihub.agnes-ai.com/v1/videos",
+# )
 
 
 # ========== 默认模型 ==========
