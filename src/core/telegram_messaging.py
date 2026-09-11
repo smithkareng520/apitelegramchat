@@ -618,6 +618,7 @@ async def send_rich_html_message(
     reply_markup: Optional[Dict] = None,
     message_thread_id: Optional[int] = None,
     reassert_draft: bool = False,
+    pre_rendered: bool = False,
 ) -> int | bool:
     """
     发送永久富文本消息。
@@ -632,6 +633,16 @@ async def send_rich_html_message(
               例如停止提示、清空确认、错误提示、最终回复等。
       True  — 若该 chat 仍有活跃草稿，则在发送后立刻 reassert 草稿，
               仅在你确实想让草稿继续贴在新消息下方时使用。
+
+    pre_rendered:
+      False — 内容可能仍含 Markdown，发送层第 0 步会先做一遍
+              Markdown→HTML 兑底转换（模型内容路径的默认行为）。
+      True  — 调用方已构建好最终 HTML（构建层已完成唯一一次 Markdown
+              转换，如错误卡片 / 媒体失败引用块 / <figure> 媒体卡），
+              发送层跳过整篇再转换，只保留 tg-button 校验与媒体 URL
+              清理两道结构性安全网。机器错误文本二次过转换器会把
+              ``***`` 脱敏掩码等形状误判为 Markdown 标记（2026-09
+              [5332ea8f] 错误卡片乱码事故根源），系统构建内容一律传 True。
     """
     if not html_content or not html_content.strip():
         return False
@@ -657,7 +668,7 @@ async def send_rich_html_message(
 
     payload: dict[str, Any] = {
         "chat_id": chat_id,
-        "rich_message": _rich_message_html_payload(html_content),
+        "rich_message": _rich_message_html_payload(html_content, pre_rendered=pre_rendered),
         "disable_notification": False,
         "protect_content": False,
     }
@@ -762,7 +773,9 @@ async def send_rich_html_message(
                         if media_demoted and media_demoted != html_content:
                             media_payload = {
                                 **payload,
-                                "rich_message": _rich_message_html_payload(media_demoted),
+                                "rich_message": _rich_message_html_payload(
+                                    media_demoted, pre_rendered=pre_rendered
+                                ),
                             }
                             logger.warning(
                                 "sendRichHtmlMessage retrying with ALL affected media demoted (last resort) "
@@ -798,7 +811,9 @@ async def send_rich_html_message(
                         if plain_html and plain_html != html_content:
                             plain_payload = {
                                 **payload,
-                                "rich_message": _rich_message_html_payload(plain_html),
+                                "rich_message": _rich_message_html_payload(
+                                    plain_html, pre_rendered=pre_rendered
+                                ),
                             }
                             logger.warning(
                                 "sendRichHtmlMessage retrying with plain-text paragraph fallback "

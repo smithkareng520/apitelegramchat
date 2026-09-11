@@ -830,7 +830,9 @@ async def get_ai_response(
         if raw_content and isinstance(raw_content, str) and raw_content.startswith("IMAGE_ERROR:"):
             error_notice = raw_content.split(":", 1)[1].strip()
             error_html = _render_media_failure_quote(error_notice)
-            await send_rich_html_message(chat_id, error_html, reassert_draft=False)
+            # pre_rendered=True：_render_media_failure_quote 产出的是已转义的
+            # 最终 HTML，发送层不再整篇重过 Markdown 转换器。
+            await send_rich_html_message(chat_id, error_html, reassert_draft=False, pre_rendered=True)
             if builder.draft_message_id:
                 try:
                     from state import is_preserved_draft
@@ -880,8 +882,9 @@ async def get_ai_response(
         if raw_content and isinstance(raw_content, str) and raw_content.startswith("VIDEO_ERROR:"):
             error_notice = raw_content.split(":", 1)[1].strip()
             error_html = _render_media_failure_quote(error_notice)
-            # 失败提示单独发一条永久消息（与 IMAGE_ERROR 一致）
-            await send_rich_html_message(chat_id, error_html, reassert_draft=False)
+            # 失败提示单独发一条永久消息（与 IMAGE_ERROR 一致；同援
+            # pre_rendered=True：引用块已是最终 HTML，不重过转换器）
+            await send_rich_html_message(chat_id, error_html, reassert_draft=False, pre_rendered=True)
             if builder.draft_message_id:
                 try:
                     from state import is_preserved_draft
@@ -1194,7 +1197,12 @@ async def get_ai_response(
             return error_msg, "", [], None
         # 静默模式下的错误提示是系统级通知（非模型内容），仍然送达，
         # 避免用户提问后彻底石沉大海。
-        await send_rich_html_message(chat_id, error_msg)
+        # pre_rendered=True：error_msg 由 get_error_notification_message
+        # 构建层逐字段/逐行完成唯一一次 Markdown→HTML 转换（含机器文本
+        # 星号惰性化），发送层不再整篇重过转换器——两遍转换会把网关
+        # 脱敏掩码 *** 误判为粗斜体定界符，正是 [5332ea8f] 错误卡片
+        # 乱码事故的根源（用户要求：只转一次）。
+        await send_rich_html_message(chat_id, error_msg, pre_rendered=True)
         return error_msg, "", [], None
 
     finally:

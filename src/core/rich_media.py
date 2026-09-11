@@ -23,7 +23,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _rich_message_html_payload(html_content: str) -> dict:
+def _rich_message_html_payload(html_content: str, *, pre_rendered: bool = False) -> dict:
     """构造符合 InputRichMessage 规范的 HTML 富消息。
 
     在交付给 Telegram 前，依次跑两道兜底清理：
@@ -39,23 +39,40 @@ def _rich_message_html_payload(html_content: str) -> dict:
        看着合法（``http(s)://`` 开头），但 Telegram 去抓会拿到 HTML
        页面，以 ``RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND`` 拒绝整条消息。
        降级后保留模型生成的 figcaption 文本，让用户仍可点击跳转观看页。
+
+    Args:
+        pre_rendered: 调用方声明 ``html_content`` 已是最终 HTML（构建层
+            已完成唯一一次 Markdown→HTML 转换，例如错误卡片、媒体失败
+            引用块、图片/视频 <figure> 等系统构建内容）。此时跳过第 0 步
+            整篇 Markdown 再转换——机器生成的错误文本里 ``***``、
+            ``__x__``、URL 参数等形状会被转换器误判为 Markdown 标记，
+            第二遍转换是纯风险没有收益（2026-09-11 [5332ea8f] 错误卡片
+            乱码事故正是构建+发送两遍转换叠加造成的）。调用方仍需对
+            自行拼接的动态片段（来自模型/用户的自由文本）在构建层先做
+            ``convert_markdown_to_telegram_html``。tg-button 校验与媒体
+            URL 清理是结构性安全网，两遍皆幂等，pre_rendered 下照常执行。
     """
     # 0. Markdown → Telegram HTML 兜底转换。必须排在媒体清理之前：
     #    Markdown 图片 ![alt](url) 此时才会变成 <img src>，从而同样接受
     #    下面两道 URL 合法性检查；若放在之后，伪 URL 图片会绕过校验并
     #    导致整条消息被 Telegram 拒绝。
     #    模型已按提示词输出纯 HTML 时，转换是幂等 no-op。
-    normalized = convert_markdown_to_telegram_html(html_content)
-    if normalized != html_content:
-        # 该转换在流式草稿路径上每帧都会命中（同一条草稿每 0.65s 刷一次），
-        # 用 INFO 记录会产生日志刷屏——真实日志里同一行重复了数十次，既淹没
-        # 了有效信息，也让 logging 本身成为热路径开销。降级为 DEBUG。
-        logger.debug(
-            "sendRichMessage 兜底转换：检测到 Markdown 语法，已转为 Telegram HTML。"
-            "原始长度=%s，转换后长度=%s",
-            len(html_content),
-            len(normalized),
-        )
+    #    pre_rendered=True 时整步跳过：内容已是最终 HTML，唯一一次转换
+    #    由构建层完成（见 docstring——两遍转换正是错误卡片乱码的根源）。
+    if pre_rendered:
+        normalized = html_content
+    else:
+        normalized = convert_markdown_to_telegram_html(html_content)
+        if normalized != html_content:
+            # 该转换在流式草稿路径上每帧都会命中（同一条草稿每 0.65s 刷一次），
+            # 用 INFO 记录会产生日志刷屏——真实日志里同一行重复了数十次，既淹没
+            # 了有效信息，也让 logging 本身成为热路径开销。降级为 DEBUG。
+            logger.debug(
+                "sendRichMessage 兜底转换：检测到 Markdown 语法，已转为 Telegram HTML。"
+                "原始长度=%s，转换后长度=%s",
+                len(html_content),
+                len(normalized),
+            )
 
     # 0.5 <tg-button> 强模式校验（幂等防御）：转换器第 0 步已处理，
     #     这里显式再跑一遍，确保任何到达发送层的按钮都合法；非法按钮

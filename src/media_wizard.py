@@ -1245,7 +1245,9 @@ async def _notify_generation_failure(
     try:
         from utils import send_rich_html_message
         from ai.error_formatting import _render_media_failure_quote
-        await send_rich_html_message(chat_id, _render_media_failure_quote(notice))
+        # pre_rendered=True：引用块是严格转义的最终 HTML，发送层不重过
+        # Markdown 转换器（与 ai_handlers IMAGE/VIDEO_ERROR 出口同援）。
+        await send_rich_html_message(chat_id, _render_media_failure_quote(notice), pre_rendered=True)
     except Exception:
         logger.warning("生成失败通知发送失败: chat=%s", chat_id, exc_info=True)
     try:

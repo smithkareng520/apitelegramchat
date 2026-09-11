@@ -39,6 +39,42 @@ _CONTENT_SAFETY_KEYWORDS = frozenset(
     for kw in _CONTENT_SAFETY_KEYWORDS_RAW
 )
 
+# =====================================================================
+# 机器错误文本的 Markdown 触发符惰性化
+# ---------------------------------------------------------------------
+# 错误详情是机器文本（上游网关/SDK 的原始报错），不是用户或模型写的
+# Markdown。但错误卡片会经过两遍 Markdown→HTML 转换：① 本模块构建卡片时
+# （_format_error_detail_for_display 逐行调用转换器）；② 发送层兜底
+# （core/rich_media.py _rich_message_html_payload 第 0 步对整条消息再跑
+# 一遍）。转换器会把 `*` 序列配对成强调标签：`***x***`→`<b><i>x</i></b>`、
+# `**x**`→`<b>`、`*x*`→`<i>`。
+#
+# 生产事故实锤（2026-09-11 [5332ea8f]）：Agnes 网关在 400 报错文本里对
+# R2 域名/路径/预签名参数做了 `***` 脱敏掩码——`***.BadRequestError: ...`
+# `https://***.com/***/***?X-Amz-Credential=***&...` 共 11 个掩码，两两
+# 配对后被转换器吃成 <b><i> 粗斜体对：掩码本身消失、报错被随机粗斜体
+# 切碎（用户看到 `https://.com///`、`.BadRequestError` 等乱码），奇数
+# 残留的最后一个掩码以字面 `***` 幸存，整体观感即“乱码”。
+#
+# 修复：机器错误文本中的 `*` 统一替换为全角 `＊`（U+FF0A）——视觉等价
+# （脱敏掩码本意就是“此处有内容被隐藏”），且不匹配转换器的任何 `\*`
+# 强调规则，两遍转换均惰性、幂等。中文界面下全角星号也是最自然的掩码
+# 写法。注意：必须同时覆盖①②两遍——只修①的话，发送层第二遍仍会把
+# 残留的 `*` 配对吃掉。
+# =====================================================================
+
+
+def _neutralize_markdown_triggers(text: str) -> str:
+    """把机器错误文本里的 `*` 替换为全角 `＊`，使其对 Markdown 转换惰性。
+
+    专用于“注定要被嵌入 HTML 卡片、且发送层还会再过一遍 Markdown 转换器”
+    的机器文本（上游报错、诊断行）。幂等：已替换的文本再替换一次不变。
+    """
+    if not text or "*" not in text:
+        return text
+    return text.replace("*", "＊")
+
+
 def _strip_prefix_error_message(text: str) -> str:
     if not text:
         return ""
@@ -306,14 +342,23 @@ def _format_error_detail_for_display(detail: str) -> str:
     if payload is not None:
         lines = _extract_detail_lines_from_payload(payload)
         if lines:
-            return "<br/>".join(convert_markdown_to_telegram_html(line) for line in lines)
+            # 机器文本先惰性化 `*` 再转换：上游报错里的 `***` 脱敏掩码
+            # 若直接进转换器会被配对成 <b><i> 粗斜体，掩码消失、文本切碎
+            # （2026-09-11 生产事故，见 _neutralize_markdown_triggers 注释块）。
+            return "<br/>".join(
+                convert_markdown_to_telegram_html(_neutralize_markdown_triggers(line))
+                for line in lines
+            )
 
     # fallback：按行输出，先把转义序列恢复成可读文本
     clean = clean.replace("\\r\\n", "\\n").replace("\\r", "\\n").replace("\\n", "\n")
     lines = [line.strip() for line in clean.splitlines() if line.strip()]
     if not lines:
         return ""
-    return "<br/>".join(convert_markdown_to_telegram_html(line) for line in lines)
+    return "<br/>".join(
+        convert_markdown_to_telegram_html(_neutralize_markdown_triggers(line))
+        for line in lines
+    )
 
 
 def _format_api_error_notice(
@@ -370,7 +415,10 @@ def _format_image_safety_notice(detail: str = "", model: str = "") -> str:
     if detail:
         clean_detail = strip_html_tags(detail).strip()
         if clean_detail and len(clean_detail) < 500:
-            parts.append(f"<i>详情：{convert_markdown_to_telegram_html(clean_detail)}</i>")
+            # 同 _format_error_detail_for_display：上游报错是机器文本，
+            # `*` 先惰性化再转换，避免脱敏掩码被吃成粗斜体。
+            safe_detail = _neutralize_markdown_triggers(clean_detail)
+            parts.append(f"<i>详情：{convert_markdown_to_telegram_html(safe_detail)}</i>")
     return "<br/>".join(parts)
 
 

@@ -290,9 +290,22 @@ def _merged_extra_body(
 #        index 0: ... Timed out while downloading media URL: https://...
 #        ?X-Amz-Expires=...", "type": "upstream_error"}
 # 这类错误表明"网关拉取我们引用的媒体失败"，请求体本身没有问题——在
-# 首个增量前重放同一请求是幂等的（与下方 httpx.ReadTimeout 重试同语义）。
+# 首个增量前重放是安全的（与下方 httpx.ReadTimeout 重试同语义）。
 # 必须与请求形状类 400（参数错误 / schema 拒绝，需要模型自纠）严格区分，
 # 后者绝不能吞掉重试。
+#
+# 重放梯子（2026-09-11 [5332ea8f] 之后的升级，用户指示"用 base64 通用兑底"）：
+#   尝试 0（URL）→ 失败 → 1.5s 后原样重放（尝试 1，URL，抖动自愈）
+#     → 再失败 → 把消息里的 http(s) 图片全部内联为 base64 data URI 后重放
+#       （尝试 2，_inline_wire_images_as_data_urls，通用兑底）。
+# 依据：Agnes 图像文档明确输入图像支持 Data URI Base64（chat 的
+# image_url 同样接受 data:image/...;base64,...，内部 ImageBlock 早已
+# 在 R2 不可用时走同形状）；图像端点链路（media_generation）更是本来就
+# 自行下载参考图后以 data URI 内联。内联后网关无需再访问 R2，彻底绕开
+# 其下载链路——不再受 R2 慢窗口连续覆盖的影响（[5332ea8f] 实证同一
+# 慢窗口会连续击落 URL 重放）。视频/音频/文档不内联：体积可达数十 MB，
+# 内联会让请求体爆炸，仍走 URL（若命中这三类媒体拉取失败，内联数为 0
+# 时按无兑底可用快速抛出，见重放分支）。
 # =============================================================================
 _GATEWAY_MEDIA_FETCH_ERROR_MARKERS = (
     "timed out while downloading media url",
@@ -301,6 +314,165 @@ _GATEWAY_MEDIA_FETCH_ERROR_MARKERS = (
     "an exception occurred while loading audio data",
     "an exception occurred while loading file data",
 )
+
+# 媒体拉取失败的首增量前重放次数上限（总请求数 = 1 + _MEDIA_FETCH_MAX_REPLAYS）。
+# 生产实证（2026-09-11 [5332ea8f]）：R2 慢窗口往往不止覆盖一次重试——首
+# 次请求与 1.5s 后的 URL 重放都撞在同一个窗口里双双 400。第二次重放
+# 不再原样重试 URL，而是改用 base64 内联通用兑底（见上方梯子说明），
+# 上限仍然是硬闸门，绝不无限重试。
+_MEDIA_FETCH_MAX_REPLAYS = 2
+
+# base64 内联兑底的单图字节上限（Telegram 照片通常 ≤ 数 MB；超过上限
+# 的图片保持 URL 不动，避免单个请求体失控）。
+_MEDIA_INLINE_MAX_BYTES = 15 * 1024 * 1024
+# 内联兑底下载阶段的总超时：兑底本身已是第三次尝试，不能在下载上久等。
+_MEDIA_INLINE_FETCH_TIMEOUT = aiohttp.ClientTimeout(total=20, connect=5)
+
+# URL 扩展名 → image MIME 的兑底映射（magic sniff 与 Content-Type 都拿
+# 不到时用；大小写不敏感）。
+_MEDIA_INLINE_EXT_MIME = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+}
+
+
+def _sniff_image_mime(data: bytes) -> str:
+    """按 magic bytes 嗅探常见图片 MIME；认不出返回空串。"""
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    return ""
+
+
+def _media_fetch_replay_mode(failed_stream_attempt: int) -> str:
+    """第 failed_stream_attempt 次尝试刚失败后，本次重放应采用的形态。
+
+    - "url"：原样重放同一请求（首次抖动自愈；请求体逐字节不变，
+      幂等性最强，对 prompt cache 最友好）。
+    - "inline"：base64 内联兑底重放（把 http(s) 图片替换为 data URI，
+      网关不再需要下载）。
+
+    纯判定便于单测；调用方先用 _should_retry_media_fetch_400 过闸门，
+    本函数只在闸门放行后被调用（即 failed_stream_attempt ∈ {0, 1}）。
+    """
+    return "url" if failed_stream_attempt <= 0 else "inline"
+
+
+async def _inline_wire_images_as_data_urls(
+    wire_messages: list,
+    *,
+    _fetch=None,
+) -> tuple[int, int]:
+    """把 wire 消息里所有 http(s) 图片内联为 base64 data URI（原地替换）。
+
+    base64 通用兑底的核心步骤：Agnes 等网关对输入图像同时接受公共 URL
+    与 Data URI Base64（图像端点文档明示；chat image_url 同形状）。当
+    网关侧下载 URL 连续失败时，由我方自行下载图片字节（我方到 R2 的
+    链路正常，超时只发生在网关出口），替换 ``image_url.url`` 后重放，
+    网关彻底不再需要访问 R2。
+
+    处理范围与边界：
+      - 只处理 ``{"type": "image_url", "image_url": {"url": ...}}`` part；
+        ``video_url`` / ``file`` / ``input_audio`` 明确不内联（视频可达
+        数十 MB，内联会让请求体爆炸），保持 URL 原样；
+      - 已经是 ``data:`` 的 part 天然跳过；
+      - 下载失败 / 非 200 / 超过 _MEDIA_INLINE_MAX_BYTES 的图片保持 URL
+        原样（部分兑底：能内联几张是几张）；
+      - MIME 判定顺序：magic bytes 嗅探 → 响应 Content-Type（仅接受
+        image/*）→ URL 扩展名 → image/jpeg 兑底；
+      - ``image_url.detail`` 等其它字段原样保留；
+      - 原地替换传入的 wire dicts，无返回值副作用面（wire 消息是本轮
+        临时渲染产物，下一轮 _round 会从内部消息重新渲染，不污染历史）。
+
+    Args:
+        wire_messages: render_openai_messages 产出的 OpenAI wire dict 列表。
+        _fetch: 测试注入点——``async def(url) -> tuple[bytes, str]``
+            （返回响应字节与 Content-Type）；默认 None 时用 aiohttp 真实下载。
+
+    Returns:
+        (成功内联数, 失败保持 URL 数)。没有 http 图片时返回 (0, 0)。
+    """
+    targets: list[tuple[dict, str]] = []
+    for msg in wire_messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            inner = part.get("image_url")
+            url = inner.get("url") if isinstance(inner, dict) else None
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                targets.append((part, url))
+    if not targets:
+        return 0, 0
+
+    async def _default_fetch(url: str) -> tuple[bytes, str]:
+        async with aiohttp.ClientSession(timeout=_MEDIA_INLINE_FETCH_TIMEOUT) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history,
+                        status=resp.status, message=f"status {resp.status}",
+                    )
+                # OOM 防护：Content-Length 预拒绝 + 分块累积超限即中止
+                # （服务器不声明长度/谎报时，逐块检查仍然生效）。
+                declared = resp.headers.get("Content-Length")
+                if declared and declared.isdigit() and int(declared) > _MEDIA_INLINE_MAX_BYTES:
+                    raise ValueError(f"image exceeds inline cap: {declared} bytes")
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.content.iter_chunked(256 * 1024):
+                    total += len(chunk)
+                    if total > _MEDIA_INLINE_MAX_BYTES:
+                        raise ValueError(f"image exceeds inline cap: >{_MEDIA_INLINE_MAX_BYTES} bytes")
+                    chunks.append(chunk)
+                return b"".join(chunks), (resp.headers.get("Content-Type") or "").strip()
+
+    fetch = _fetch or _default_fetch
+
+    async def _inline_one(part: dict, url: str) -> bool:
+        try:
+            data, content_type = await fetch(url)
+        except Exception as e:
+            logger.warning(
+                "base64 内联兑底：图片下载失败，保持 URL 原样：%s… (%s: %s)",
+                url[:120], type(e).__name__, str(e)[:120],
+            )
+            return False
+        if not data:
+            return False
+        mime = _sniff_image_mime(data)
+        if not mime and content_type.lower().startswith("image/"):
+            mime = content_type.split(";", 1)[0].strip().lower()
+        if not mime:
+            ext = url.split("?", 1)[0].rsplit(".", 1)
+            if len(ext) == 2:
+                mime = _MEDIA_INLINE_EXT_MIME.get(f".{ext[1].lower()}", "")
+        if not mime:
+            mime = "image/jpeg"
+        inner = part.get("image_url")
+        if not isinstance(inner, dict):
+            return False
+        inner["url"] = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+        return True
+
+    results = await asyncio.gather(*(_inline_one(part, url) for part, url in targets))
+    inlined = sum(1 for ok in results if ok)
+    return inlined, len(results) - inlined
 
 
 def _looks_like_transient_media_fetch_error(exc: BaseException) -> bool:
@@ -319,19 +491,20 @@ def _looks_like_transient_media_fetch_error(exc: BaseException) -> bool:
 def _should_retry_media_fetch_400(
     exc: BaseException, *, received_any: bool, stream_attempt: int
 ) -> bool:
-    """400 媒体拉取失败是否应重放同一请求（纯判定，便于单测）。
+    """400 媒体拉取失败是否应重放（纯判定，便于单测）。
 
     条件三者缺一不可：
       - 尚未收到任何流式增量（重放幂等；已向用户/工具状态写入增量
         则重放会产生半个模型回合，必须直接抛出）；
-      - 尚未用过重试机会（stream_attempt < 1，与 ReadTimeout 重试
-        一样只补试一次）；
+      - 尚未用完重试机会（stream_attempt < _MEDIA_FETCH_MAX_REPLAYS，
+        至多补试两次；重放形态见 :func:`_media_fetch_replay_mode`——
+        第一次原样 URL 重放，第二次 base64 内联兑底重放）；
       - 错误形状确属网关媒体拉取失败（见
         :func:`_looks_like_transient_media_fetch_error`）。
     """
     return (
         not received_any
-        and stream_attempt < 1
+        and stream_attempt < _MEDIA_FETCH_MAX_REPLAYS
         and _looks_like_transient_media_fetch_error(exc)
     )
 
@@ -486,7 +659,10 @@ async def _agentic_loop_openai_compat(
             # 某些聚合网关会在长工具链后的首个 SSE 事件前沉默较久。
             # 只有尚未收到任何增量时，重试相同请求才是幂等且安全的；一旦已经向
             # 用户或工具状态写入增量，必须直接抛出，避免重放半个模型回合。
-            for stream_attempt in range(2):
+            # attempt 上限取 1 + _MEDIA_FETCH_MAX_REPLAYS 与 ReadTimeout 旧上限
+            # 的较大者：ReadTimeout 仍由自身闸门（stream_attempt >= 1 即抛）
+            # 保持"只补试一次"的旧语义，不因 attempt 空间变大而多试。
+            for stream_attempt in range(1 + _MEDIA_FETCH_MAX_REPLAYS):
                 try:
                     comp_stream = await client.chat.completions.create(**create_params)
                     # typing 状态：仅在本轮真实消费流式增量（思考/文本字段）
@@ -679,15 +855,40 @@ async def _agentic_loop_openai_compat(
                         continue
                     # 网关侧媒体拉取瞬态失败（如 Agnes 下载消息历史里的
                     # R2 预签名 URL 超时，400 + upstream_error）：请求体
-                    # 本身没有问题，首个增量前重放同一请求是幂等的——与
-                    # 下方 ReadTimeout 重试同语义，只补试一次。R2 跨区域
-                    # 下载抖动常见（同一张图上一轮能下、下一轮超时），
-                    # 一次重试即可挽救大多数原本整轮报废的回合。
+                    # 本身没有问题，首个增量前重放是安全的——与下方
+                    # ReadTimeout 重试同语义。重放梯子（见模块常量区说明）：
+                    #   第 1 次重放（stream_attempt=0 失败后）：1.5s 后原样
+                    #     URL 重放，抖动自愈；
+                    #   第 2 次重放（stream_attempt=1 失败后）：base64 内联
+                    #     通用兜底——把消息里的 http(s) 图片替换为 data URI
+                    #     后重放，网关不再需要访问 R2（[5332ea8f] 实证同一
+                    #     R2 慢窗口会连续击落 URL 重放，原样重试无效）。
+                    # 内联数为 0（无 http 图片/全部下载失败）时兜底不可用，
+                    # 快速抛出，避免注定失败的第三次 400 再等一轮。
                     if _should_retry_media_fetch_400(
                         exc, received_any=received_any, stream_attempt=stream_attempt
                     ):
+                        if _media_fetch_replay_mode(stream_attempt) == "inline":
+                            inlined, failed = await _inline_wire_images_as_data_urls(
+                                create_params["messages"]
+                            )
+                            if inlined == 0:
+                                logger.warning(
+                                    "[%s] 第 %s 轮网关媒体拉取失败（400 upstream_error），"
+                                    "base64 兜底无可内联图片（失败 %s 个或无 http 图片），放弃重放",
+                                    api_label, _round + 1, failed,
+                                )
+                                raise
+                            logger.warning(
+                                "[%s] 第 %s 轮网关媒体拉取失败（400 upstream_error），"
+                                "连续两次 URL 下载均超时——改用 base64 内联通用兜底重放"
+                                "（已内联 %s 张图片，网关无需再下载；%s 张未能内联保持 URL）",
+                                api_label, _round + 1, inlined, failed,
+                            )
+                            continue
                         logger.warning(
-                            "[%s] 第 %s 轮网关媒体拉取失败（400 upstream_error），等待后重放同一请求",
+                            "[%s] 第 %s 轮网关媒体拉取失败（400 upstream_error），"
+                            "1.5s 后第 1 次重放同一请求",
                             api_label, _round + 1,
                         )
                         await asyncio.sleep(1.5)
@@ -1195,7 +1396,8 @@ async def _agentic_loop_native_image(
                     finish_reason=result.finish_reason,
                 )
                 safe_notice_html = convert_markdown_to_telegram_html(final_notice).replace("\n", "<br/>")
-                await send_rich_html_message(chat_id, safe_notice_html)
+                # pre_rendered=True：上一行已完成唯一一次转换，发送层不再重过
+                await send_rich_html_message(chat_id, safe_notice_html, pre_rendered=True)
                 final_content = "IMAGE_SENT"
                 new_entries = [Message.assistant_text(final_notice or "（已生成图片）")]
                 if journal is not None:
@@ -1242,7 +1444,8 @@ async def _agentic_loop_native_image(
                 rich_html = f'<figure>{img_tags}<figcaption>{convert_markdown_to_telegram_html(caption_text)}</figcaption></figure>'
             else:
                 rich_html = f'<tg-slideshow>{img_tags}<figcaption>{convert_markdown_to_telegram_html(caption_text)}</figcaption></tg-slideshow>'
-            await send_rich_html_message(chat_id, rich_html)
+            # pre_rendered=True：figcaption 已在上方转换，发送层不重过转换器
+            await send_rich_html_message(chat_id, rich_html, pre_rendered=True)
             final_notice = caption_text or (result.text[:200] if result.text else "")
         else:
             if result.text or result.refusal:
@@ -1541,7 +1744,8 @@ async def _agentic_loop_native_video(
         f'<figure><video src="{escape_media_url_attr(final_video_url)}"></video>'
         f'<figcaption>{convert_markdown_to_telegram_html(caption_text)}</figcaption></figure>'
     )
-    send_ok = await send_rich_html_message(chat_id, video_html)
+    # pre_rendered=True：figcaption 已在上方转换，发送层不重过转换器
+    send_ok = await send_rich_html_message(chat_id, video_html, pre_rendered=True)
     if not send_ok:
         logger.error(
             "视频已生成，但 sendRichMessage 发送失败 final_video_url=%s",
