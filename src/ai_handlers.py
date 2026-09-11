@@ -270,8 +270,9 @@ _BASE_PROMPT = """
 <hr/>
 
 <h3>三、来源标注</h3>
-<p>新闻、科学事实、统计数据、技术文档、学术论文、法律条文、历史事件、研究报告等各类信息，必须在内容后标注来源</p>
-<p>使用 <tg-button type="url" url="链接">显示文本</tg-button> 按钮链接格式在需要标注的内容后（紧挨着），显示文本的语言应与来源语言一致：英文网站用英文名称（如 <code>The Wall Street Journal</code>、<code>VOA Chinese</code>），中文网站用中文名称（如 <code>财新网</code>、<code>澎湃新闻</code>）。</p>
+<p>当标注来源时，使用 <tg-button type="url" url="链接">显示文本</tg-button> 按钮链接格式紧贴到需要标注的文本后。显示文本的语言应与来源语言一致：英文网站用英文名称（如 <code>The Wall Street Journal</code>、<code>VOA Chinese</code>），中文网站用中文名称（如 <code>财新网</code>、<code>澎湃新闻</code>）。</p>
+<p>新闻、科学事实、统计数据、技术文档、学术论文、法律条文、历史事件、研究报告等各类信息，必须标注来源</p>
+
 """
 
 _TOOLS_SECTION = """
@@ -630,14 +631,13 @@ async def get_ai_response(
             supports_tools = bool(model_info.supports_tools)  # Optional[bool] 归一：None 与 False 同为真值假，仅用于真值判断
         _log_stage("获取chat_lock+上下文快照完成")
 
-        # 按事件源改写历史中"回合专属工具"的调用痕迹，并对静默专属工具做
-        # 历史上下文插拔（均可拔插，见 tool_visibility.py）：deliver_reply 只在
-        # 静默回合暴露——非静默回合不仅工具面不提供它（见下方 _call_api 分支），
-        # 历史里已有的调用痕迹也从出站副本中拔除，避免模型模仿调用一个当前
-        # 不可用的工具；静默回合原样保留（插回原位置）。持久历史本身从不被
-        # 改动，开关切换后痕迹仍在原处。注册表当前为空，本调用仅处理插拔。
+        # 静默专属工具的历史上下文插拔（见 tool_visibility.py）：
+        # deliver_reply 只在静默回合暴露——非静默回合不仅工具面不提供它
+        # （见下方 _call_api 分支），历史里已有的调用痕迹也从出站副本中
+        # 拔除，避免模型模仿调用一个当前不可用的工具；静默回合原样保留
+        # （插回原位置）。持久历史本身从不被改动，开关切换后痕迹仍在原处。
         history = apply_tool_visibility(
-            history, event_source,
+            history,
             hidden_tools=None if silent_mode else SILENT_ONLY_TOOLS,
         )
 

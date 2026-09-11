@@ -8,8 +8,8 @@
   - 未被打断的"无结果 tool_call"同样清除（drop 不需要配对回溯）；
   - user / system 消息原样引用（零拷贝）；
   - 持久历史对象绝不被原地修改（只改出站副本）；
-  - 旧 dict 形状兼容（assistant dict 剔除 tool_calls 键、tool dict 移除、
-    空壳 dict 丢弃、非 assistant/tool dict 直通）；
+  - 旧 dict 形状直通不改写（双形状兼容层已移除，归一化由
+    _append_history_async 统一负责）；
   - 无工具痕迹时零开销直通（返回原列表对象）；
   - 确定性：同一输入两次调用结果一致；
   - wire 级验证：清理后的 Message 渲染出的 OpenAI JSON 不含 tool_calls
@@ -137,9 +137,17 @@ def test_parallel_calls_and_results_all_gone():
 
 
 # ---------------------------------------------------------------------------
-# 旧 dict 形状（双形状过渡期兼容）
+# 旧 dict 形状（直通契约）
 # ---------------------------------------------------------------------------
-def test_legacy_dict_shapes():
+def test_legacy_dict_shapes_passthrough():
+    """旧 dict 形状：直通不改写（双形状兼容层已移除）。
+
+    历史存储统一为内部 Message（见 attachment_content._append_history_async
+    的模块注释），strip_tool_traces 的改写逻辑只针对 Message。任何残留的
+    旧 dict 形状条目一律原样透传，由请求装配前游的统一归一化点
+    （_append_history_async 的 from_openai_dict 兜底）负责转成 Message——
+    本函数不再维护第二套 dict 改写逻辑。
+    """
     history = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "u"},
@@ -150,22 +158,15 @@ def test_legacy_dict_shapes():
                             "function": {"name": "t1", "arguments": "{}"}}],
         },
         {"role": "tool", "tool_call_id": "c1", "name": "t1", "content": "r1"},
-        {
-            "role": "assistant",
-            "content": None,  # 只有调用没有正文
-            "tool_calls": [{"id": "c2", "type": "function",
-                            "function": {"name": "t2", "arguments": "{}"}}],
-        },
         {"role": "user", "content": "下一问"},
     ]
     out = strip_tool_traces(history)
 
-    assert [m.get("role") for m in out] == ["system", "user", "assistant", "user"]
-    assert "tool_calls" not in out[2]
-    assert out[2]["content"] == "有正文的调用"
-    # 入参 dict 不被原地修改
+    # Message 存在时 dict 条目也不改写；纯 dict 列表则原样直通。
+    assert all(m in history for m in out)
     assert history[2]["tool_calls"][0]["id"] == "c1"
-    assert history[4]["tool_calls"][0]["id"] == "c2"
+    # 入参列表对象不被替换
+    assert out == history
 
 
 # ---------------------------------------------------------------------------

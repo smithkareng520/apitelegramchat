@@ -9,12 +9,11 @@
        authorize_request(params, combination)   鉴权：输入组合 vs 模型能力
     ③ resolve_request_plan(model_info)          分支：chat / images / video
                                                 （api 类型 + 协议 + 端点 + 形状）
-    ④ build_media_request_body(plan, ...)       请求体：按内容/api类型/端点装配
 
 回合入口（ai_handlers.get_ai_response）只需要调一次 :func:`run_preflight`
-就能拿到 ①②③ 的全部结论与日志摘要；④ 供媒体链路与工具层按计划装配
-请求体。聊天（chat）分支的流式请求体由各协议循环装配（openai_chat /
-anthropic_messages / gemini_native），采样与推理参数同样来自 ① 的
+就能拿到 ①②③ 的全部结论与日志摘要。聊天（chat）分支的流式请求体由
+各协议循环装配（openai_chat / anthropic_messages / gemini_native），
+采样与推理参数同样来自 ① 的
 统一出口（get_sampling_params / get_reasoning_request_fields）——
 本模块不重复实现协议循环，只负责"鉴权 + 分支 + 媒体请求体"。
 
@@ -287,40 +286,6 @@ def resolve_request_plan(model_info: Optional["ModelConfig"]) -> RequestPlan:
 # ---------------------------------------------------------------------------
 # ④ 请求体构建：按（请求内容，api 类型，端点）装配
 # ---------------------------------------------------------------------------
-def build_media_request_body(
-    plan: RequestPlan,
-    *,
-    model: str,
-    prompt: str,
-    reference_images: tuple = (),
-    size: Optional[str] = None,
-    ratio: Optional[str] = None,
-    return_base64: bool = True,
-) -> Optional[dict]:
-    """按分支计划装配媒体请求体（当前覆盖 images 分支的 inline 形状）。
-
-    - plan.api_type == "images" 且形状为 inline_images（Agnes 式）：
-      返回完整 JSON 请求体（文生图 / 图生图 / 多图合成共用，硬约束见
-      media_generation.build_inline_images_payload：response_format 只进
-      extra_body、参考图数组 extra_body.image、不传 tags）；
-    - multipart_edits 形状：编辑体是 multipart/form-data（文件字段），
-      不适用 JSON 构建，返回 None（由 media_generation 按任务装配）；
-    - chat 分支：请求体由协议循环装配，返回 None；
-    - video 分支：使用 :func:`build_video_request_body`（本文件下方）。
-    """
-    if plan.api_type != "images" or plan.image_style != "inline_images":
-        return None
-    from ai.media_generation import build_inline_images_payload
-
-    return build_inline_images_payload(
-        model=model,
-        prompt=prompt,
-        size=size,
-        ratio=ratio,
-        image_data_urls=tuple(reference_images),
-    )
-
-
 # Agnes Video 2.5 文档硬约束（https://wiki.agnes-ai.com）：
 #   - 时长字段叫 seconds（字符串 "4"–"12"，默认 "5"）——发 duration 会被
 #     网关 400 "duration is not an allowed request field"（2026-09-11 生产事故）；
@@ -573,7 +538,6 @@ __all__ = [
     "resolve_input_combination",
     "authorize_request",
     "resolve_request_plan",
-    "build_media_request_body",
     "build_video_request_body",
     "normalize_video_seconds",
     "run_preflight",

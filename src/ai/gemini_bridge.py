@@ -969,11 +969,18 @@ async def _agentic_loop_gemini_native(
         if not tool_calls_list and not content_acc.strip():
             content_acc = "（模型未返回任何内容）"
 
-        # 个别情况下 Gemini 会把函数调用 XML 错当普通正文输出；已在
-        # 流式阶段写入草稿，从最终内容里剥离（与旧兼容循环同语义）。
+        # 个别情况下 Gemini 会把函数调用 XML 错当普通正文输出；该内容
+        # 已在流式阶段写入草稿，必须先从构建器撤回，再从最终内容里剥离
+        # （与 _agentic_loop_openai_compat 同语义）。
         textual_tool_call = not tool_calls_list and _contains_textual_tool_call(content_acc)
         if textual_tool_call:
+            raw_textual_content = content_acc
             content_acc = _strip_textual_tool_calls(content_acc)
+            if not builder.replace_trailing_text(raw_textual_content, content_acc):
+                logger.warning(
+                    "[%s] 未能在草稿中定位伪工具调用文本，已阻止其进入最终内容",
+                    api_label,
+                )
 
         if reasoning_acc:
             builder.finalize_reasoning_block()

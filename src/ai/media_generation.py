@@ -64,7 +64,6 @@ logger = get_logger(__name__)
 # 其它提供商（如 openrouter 的 gemini 图像模型）继续走
 # chat/completions + modalities 路径，行为不变。
 # =============================================================================
-IMAGES_API_PROVIDERS = frozenset({"modelscope", "xxtf"})
 
 
 # =============================================================================

@@ -1,80 +1,51 @@
 # tool_visibility.py
-"""按事件源（USER / TIMER）与模型能力控制历史中工具调用的可见性——可拔插的出站消息过滤器。
+"""出站历史中工具调用痕迹的插拔过滤器（纯函数，只改出站副本）。
 
-现状（本轮重构）
-================
+本模块只做两件事，两者都围绕同一核心动作——把出站历史副本中的
+assistant tool_calls 与配对 role=tool 消息成对拔除：
 
-``send_message_to_user`` 工具已随 TIMER 静默机制整体移除；替代它的
-``message_user`` 在 USER 与 TIMER 两类回合的工具面里都存在，历史中的
-调用痕迹无需再按事件源折叠——因此事件源注册表为空。
+1. 开关维度插拔（apply_tool_visibility）
+   静默专属工具 ``deliver_reply`` 只在 /show off（静默）回合的工具面
+   里暴露（模型通过 send 布尔参数决定是否发送；send 缺省值按事件源
+   区分——静默 USER 回合默认 true，静默 TIMER 回合默认 false，因此
+   /show on 下模型看不到该工具也就不会产生除草稿外的单独发送）。
+   非静默回合除了不提供工具定义（见 ai_handlers._call_api），出站
+   历史副本中已有的调用痕迹也一并拔除，避免模型看到并模仿调用一个
+   当前不可用的工具；回到静默回合时痕迹在原位置原样插回。
 
-但静默专属工具 ``deliver_reply`` 需要按 ``/show`` 开关做**历史上下文
-插拔**（见 ``SILENT_ONLY_TOOLS``）：它只在静默回合（/show off）的工具面
-里暴露（模型通过 send 布尔参数决定是否发送；send 缺省值按事件源区分
-——静默 USER 回合默认 true（不填即发送，收尾有兜底），静默 TIMER
-回合默认 false，因此 /show on 下模型看不到该工具也就不会产生除草稿
-外的单独发送）；非静默回合除了不提供工具定义，出站历史副本中已有的
-调用痕迹（assistant 的 tool_calls 与配对的 tool 消息）也一并拔除，
-避免模型看到并模仿调用一个当前不可用的工具；回到静默回合时痕迹在
-原位置原样插回（持久历史从不被改动，插拔只作用于出站副本）。
+2. 能力维度全清（strip_tool_traces）
+   ``supports_tools=False`` 的模型（图像模型等）切进一个充满工具痕迹
+   的对话时，出站历史里的痕迹原样透传会出问题：严格网关（Anthropic
+   原生等，要求消息含 tool_use/tool_result 块时请求必须声明 tools）
+   直接 400；宽松网关虽然接受，但痕迹照常占上下文并诱导模型模仿输出
+   文本形态的工具调用（且与 _NO_TOOLS_SECTION 的系统提示自相矛盾）。
+   全量 DROP：assistant 消息剔除全部 ToolCallBlock（文本保留）、
+   role=tool 消息整条移除、剔除后既无文本也无剩余调用的 assistant
+   空壳整条丢弃。
 
-事件源维度的可拔插机制保留，供未来需要按事件源隐藏某个工具时使用：
-在 ``TOOL_VISIBILITY_RULES`` 加一行规则即可。
+三条硬性保证
+============
 
-能力维度（strip_tool_traces）
-=============================
-
-``supports_tools=False`` 的模型（图像模型等）切进一个充满工具痕迹的
-对话时，出站历史里的 assistant tool_calls 与 role=tool 消息原样透传
-会出问题：严格网关（Anthropic 原生等，要求消息含 tool_use/tool_result
-块时请求必须声明 tools）直接 400；宽松网关（OpenAI 官方等）虽然接受
-（校验的是配对结构而非是否声明 tools），但痕迹照常占上下文并诱导
-模型模仿输出文本形态的工具调用（且与 _NO_TOOLS_SECTION 的系统提示
-自相矛盾）。``strip_tool_traces`` 在请求出口把这些痕迹整体 DROP：
-
-  - assistant 消息剔除全部 ToolCallBlock（文本保留）；
-  - role=tool 消息整条移除；
-  - 剔除后既无文本也无剩余调用的 assistant 空壳整条丢弃。
-
-持久历史从不被改动——切回支持工具的模型时完整痕迹自动恢复。
-注入点：ai_handlers.get_ai_response（apply_tool_visibility 之后、
-_append_history_async 之前），三条协议路径（openai_chat /
-anthropic_messages / gemini_native）共用该入口，一处清理全覆盖。
-
-三条硬性保证（机制不变）
-========================
-
-1. **只改出站副本，绝不改持久历史**：需要改写的消息一律深拷贝。
-2. **结构合法性**：被移除/折叠的 tool_call 与其配对 tool 消息总是成对处理，
+1. **只改出站副本，绝不改持久历史**：需要改写的消息一律重建新 Message。
+2. **结构合法性**：被移除的 tool_call 与其配对 tool 消息总是成对处理，
    出站消息里不存在悬空 ``tool_call_id``（否则多数供应商直接 400）。
-3. **确定性**：同一份历史在同一事件源下的改写结果逐字节一致，隐式前缀
-   缓存不会因本模块而额外退化。
+3. **确定性**：同一份历史在同一开关组合下的改写结果逐字节一致，
+   隐式前缀缓存不会因本模块而额外退化。
 
-可拔插设计
-==========
-
-- 注册表 ``TOOL_VISIBILITY_RULES`` 是事件源维度的唯一扩展点：要隐藏
-  某个工具，加一行规则即可；删掉对应条目即恢复直通。
-- 每条规则分别指定 ``user_turn`` / ``timer_turn`` 两个方向的模式，互不影响。
-- ``hidden_tools`` 参数是开关维度的扩展点：与事件源无关、两个方向都
-  DROP 的工具集合（``SILENT_ONLY_TOOLS`` 即由此驱动）。
-- 环境变量 ``TOOL_VISIBILITY_FILTER=false`` 可整体关闭（等价于拔掉本模块）。
-- shadow 摘要文案通过规则的 ``shadow_note_builder`` 注入。
+注入点：ai_handlers.get_ai_response（apply_tool_visibility 之后、
+strip_tool_traces 之后、_append_history_async 之前），三条协议路径
+（openai_chat / anthropic_messages / gemini_native）共用该入口，
+一处清理全覆盖。环境变量 ``TOOL_VISIBILITY_FILTER=false`` 可整体
+关闭（等价于拔掉本模块）。
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
 from core.messages import Message, TextBlock, ToolCallBlock
-from typing import Callable, Iterable, Optional
+from typing import Iterable, Optional
 
 __all__ = [
-    "VISIBILITY_KEEP",
-    "VISIBILITY_DROP",
-    "VISIBILITY_SHADOW",
-    "ToolVisibilityRule",
-    "TOOL_VISIBILITY_RULES",
     "SILENT_ONLY_TOOLS",
     "apply_tool_visibility",
     "strip_tool_traces",
@@ -82,7 +53,7 @@ __all__ = [
 
 
 # =====================================================================
-# 开关与模式
+# 开关
 # =====================================================================
 def _env_flag(name: str, default: bool = True) -> bool:
     """与 proactive._env_flag 同语义的本地实现（避免跨模块私有导入）。"""
@@ -95,122 +66,39 @@ def _env_flag(name: str, default: bool = True) -> bool:
 # 总开关：false = 整个过滤器直通（等价于拔掉本模块）。
 TOOL_VISIBILITY_FILTER = _env_flag("TOOL_VISIBILITY_FILTER", True)
 
-VISIBILITY_KEEP = "keep"
-VISIBILITY_DROP = "drop"
-VISIBILITY_SHADOW = "shadow"
-
-_VALID_MODES = (VISIBILITY_KEEP, VISIBILITY_DROP, VISIBILITY_SHADOW)
-
-
-# =====================================================================
-# 规则注册表（可拔插扩展点）
-# =====================================================================
-def _default_shadow_note(tool_call: dict, tool_result: Optional[dict]) -> str:
-    """通用 shadow 摘要：不解析工具语义，只说明"这里发生过一次已隐藏的调用"。"""
-    return f"（历史记录：此处曾有一次 {tool_call.get('function', {}).get('name', 'unknown')} 调用，已按可见性规则隐藏）"
-
-
-@dataclass(frozen=True)
-class ToolVisibilityRule:
-    """单个工具在两类事件源下的可见性规则。
-
-    - ``user_turn`` / ``timer_turn``：各自方向的处理模式
-      （keep / drop / shadow），TIMER 方向建议保持 keep——后台回合本来
-      就需要看到完整调用史（edit/delete 依赖历史 message_id）。
-    - ``shadow_note_builder``：shadow 模式的摘要生成器，入参为原始
-      tool_call 与配对的 tool 结果消息（可能为 None）。
-    """
-
-    tool_name: str
-    user_turn: str = VISIBILITY_KEEP
-    timer_turn: str = VISIBILITY_KEEP
-    shadow_note_builder: Callable[[dict, Optional[dict]], str] = field(
-        default=_default_shadow_note
-    )
-
-    def __post_init__(self) -> None:
-        for label, mode in (("user_turn", self.user_turn), ("timer_turn", self.timer_turn)):
-            if mode not in _VALID_MODES:
-                raise ValueError(
-                    f"ToolVisibilityRule[{self.tool_name}].{label} 非法模式: {mode!r}，"
-                    f"可选 {_VALID_MODES}"
-                )
-
-
-# 扩展点：新增需要按事件源隐藏的工具，在这里加一行规则即可。
-# 当前为空：message_user 在 USER / TIMER 两类回合都合法存在，无需折叠。
-TOOL_VISIBILITY_RULES: dict[str, ToolVisibilityRule] = {}
-
-# 静默专属工具（开关维度插拔，与事件源无关）：仅在 /show off（静默）
-# 回合的工具面里暴露。非静默回合由 get_ai_response 通过
+# 静默专属工具（开关维度插拔）：仅在 /show off（静默）回合的工具面里
+# 暴露。非静默回合由 get_ai_response 通过
 # ``apply_tool_visibility(..., hidden_tools=SILENT_ONLY_TOOLS)`` 把这些
-# 工具在出站历史副本中的调用痕迹（assistant 的 tool_calls 与配对的
-# tool 消息成对）整体拔除；静默回合不传 hidden_tools，痕迹在原位置
-# 原样保留（插回原位置）。持久历史从不被改动。
+# 工具在出站历史副本中的调用痕迹整体拔除；静默回合不传 hidden_tools，
+# 痕迹在原位置原样保留（插回原位置）。持久历史从不被改动。
 SILENT_ONLY_TOOLS: frozenset[str] = frozenset({"deliver_reply"})
+
 
 # =====================================================================
 # 核心：出站消息改写（纯函数，绝不原地修改入参）
 # =====================================================================
-def _rule_mode_for(rule: ToolVisibilityRule, event_source: str) -> str:
-    return rule.timer_turn if str(event_source).upper() == "TIMER" else rule.user_turn
-
-
 def apply_tool_visibility(
     messages: list,
-    event_source: str = "USER",
     hidden_tools: Optional[Iterable[str]] = None,
 ) -> list:
-    """按事件源 + 开关改写出站消息列表（内部 Message 原生）。
+    """把 ``hidden_tools`` 中工具的调用痕迹从出站消息列表中拔除。
 
     纯函数：返回新列表；未被改写的消息原样引用（零拷贝），被改写的
-    一律重建新 Message——绝不污染调用方持有的持久历史。无活跃规则且
-    无 hidden_tools 时直接返回原列表（零开销直通路径）。
+    一律重建新 Message——绝不污染调用方持有的持久历史。无 hidden_tools
+    时直接返回原列表（零开销直通路径）。
 
-    ``hidden_tools``：与事件源无关、一律 DROP 的工具名集合（如非静默
-    回合的 ``SILENT_ONLY_TOOLS``）。被拔除的 tool_call 与其配对的 tool
-    结果消息总是成对处理，出站消息里不存在悬空 ``tool_call_id``；
-    同名的事件源注册表规则优先于 hidden_tools。
+    被拔除的 tool_call 与其配对的 tool 结果消息总是成对处理，出站
+    消息里不存在悬空 ``tool_call_id``。
     """
     if not TOOL_VISIBILITY_FILTER or not messages:
         return messages
 
-    # 解析本事件源下实际生效的规则（mode != keep 才需要动手）
-    active_rules: dict[str, tuple[ToolVisibilityRule, str]] = {}
-    for rule in TOOL_VISIBILITY_RULES.values():
-        mode = _rule_mode_for(rule, event_source)
-        if mode != VISIBILITY_KEEP:
-            active_rules[rule.tool_name] = (rule, mode)
-    # 开关维度插拔：hidden_tools 一律按 DROP 处理，两个事件源方向相同。
-    for name in (hidden_tools or ()):
-        if isinstance(name, str) and name and name not in active_rules:
-            active_rules[name] = (
-                ToolVisibilityRule(
-                    tool_name=name,
-                    user_turn=VISIBILITY_DROP,
-                    timer_turn=VISIBILITY_DROP,
-                ),
-                VISIBILITY_DROP,
-            )
-    if not active_rules:
+    targets = {
+        name for name in (hidden_tools or ())
+        if isinstance(name, str) and name
+    }
+    if not targets:
         return messages
-
-    # 预索引：tool_call_id -> 配对 tool 结果消息（shadow 摘要用）。
-    tool_results_by_id: dict[str, Message] = {}
-    for msg in messages:
-        if isinstance(msg, Message) and msg.role == "tool":
-            tr = msg.tool_result_block()
-            if tr is not None and tr.tool_call_id:
-                tool_results_by_id[tr.tool_call_id] = msg
-
-    def _shadow_note(rule: ToolVisibilityRule, tc: ToolCallBlock) -> str:
-        paired = tool_results_by_id.get(tc.id)
-        paired_dict = None
-        if paired is not None:
-            tr = paired.tool_result_block()
-            paired_dict = {"tool_call_id": tr.tool_call_id, "content": tr.content} if tr else None
-        tc_dict = {"function": {"name": tc.name}}
-        return rule.shadow_note_builder(tc_dict, paired_dict)
 
     # Pass 1：改写含目标工具调用的 assistant 消息，登记被隐藏的 tool_call_id。
     rewritten: list = []
@@ -225,20 +113,14 @@ def apply_tool_visibility(
             continue
 
         kept_calls: list[ToolCallBlock] = []
-        shadow_specs: list[tuple[ToolVisibilityRule, ToolCallBlock]] = []
         touched = False
         for tc in calls:
-            entry = active_rules.get(tc.name) if tc.name else None
-            if entry is None:
-                kept_calls.append(tc)
+            if tc.name in targets:
+                if tc.id:
+                    hidden_call_ids.add(tc.id)
+                touched = True
                 continue
-            rule, mode = entry
-            if tc.id:
-                hidden_call_ids.add(tc.id)
-            touched = True
-            if mode == VISIBILITY_DROP:
-                continue
-            shadow_specs.append((rule, tc))
+            kept_calls.append(tc)
 
         if not touched:
             rewritten.append(msg)
@@ -248,10 +130,6 @@ def apply_tool_visibility(
         new_msg = Message(role=msg.role, blocks=list(kept_calls) + [
             b for b in msg.blocks if not isinstance(b, ToolCallBlock)
         ], name=msg.name, meta=dict(msg.meta))
-        if shadow_specs:
-            notes = [_shadow_note(rule, tc) for rule, tc in shadow_specs]
-            note = "\n".join(notes)
-            new_msg.blocks.append(TextBlock(note))
 
         # 整条消息折叠后既无文本也无剩余调用：丢弃空壳，避免产生
         # content=None 且无 tool_calls 的非法 assistant 消息。
@@ -276,108 +154,60 @@ def apply_tool_visibility(
     return out
 
 
-# =====================================================================
-# 能力维度：supports_tools=False 时拔除全部工具痕迹（纯 DROP 模式）
-# =====================================================================
-def _assistant_dict_without_tool_calls(msg: dict) -> Optional[dict]:
-    """旧 dict 形状的 assistant 消息：剔除 tool_calls 键后的出站副本。
-
-    content 为空（None / ""）且原本只有 tool_calls 时返回 None（空壳
-    丢弃，避免产生 content=None 且无 tool_calls 的非法 assistant 消息）。
-    浅拷贝重建，绝不改写入参 dict。
-    """
-    clean = {k: v for k, v in msg.items() if k != "tool_calls"}
-    content = clean.get("content")
-    has_text = isinstance(content, str) and content.strip()
-    if not has_text:
-        # content 为 None/""/其他空值：剔除 tool_calls 后无任何正文，
-        # 整条丢弃（与 Message 路径的空壳保护同语义）。
-        return None
-    return clean
-
-
 def strip_tool_traces(messages: list) -> list:
     """把出站消息列表中的全部工具调用痕迹 DROP（能力维度过滤）。
 
-    适用场景：本轮模型 ``supports_tools=False``（图像模型等）。历史里
-    的 assistant tool_calls 与配对 role=tool 消息若原样出站，严格网关
-    （Anthropic 原生：tool_use/tool_result 块要求请求声明 tools）直接
-    400，宽松网关也会诱导模型模仿调用并占上下文。本函数在请求出口把
-    痕迹整体拔除：
-
-      - assistant 消息剔除全部 ToolCallBlock，正文（含思考块外的文本）
-        保留；
-      - role=tool 消息整条移除（无论是否与某条 tool_call 配对——本轮
-        不提供工具，一切结果消息都失去依附对象）；
-      - 剔除后既无文本也无剩余调用的 assistant 空壳整条丢弃，杜绝
-        content=None 且无 tool_calls 的非法 assistant 消息。
-
     纯函数：返回新列表；未被改写的消息原样引用（零拷贝），被改写的
-    一律重建新 Message / 新 dict——绝不污染调用方持有的持久历史。无
-    工具痕迹时直接返回原列表（零开销直通路径）。改写是确定性的（同一
-    输入逐字节同输出），隐式前缀缓存不因本函数额外退化。
+    一律重建新 Message——绝不污染调用方持有的持久历史。无工具痕迹时
+    直接返回原列表（零开销直通路径）。改写是确定性的（同一输入逐字节
+    同输出），隐式前缀缓存不因本函数额外退化。
 
-    与 ``apply_tool_visibility`` 的分工：后者按"工具名"做事件源/开关
-    维度的选择性插拔；本函数按"模型能力"做全量清除。调用顺序：先
-    apply_tool_visibility（选择性），后 strip_tool_traces（全量，直接
-    覆盖前者的结果，语义上后者包含前者）。
+    与 ``apply_tool_visibility`` 的分工：后者按"工具名"做开关维度的
+    选择性插拔；本函数按"模型能力"做全量清除。调用顺序：先
+    apply_tool_visibility（选择性），后 strip_tool_traces（全量，语义
+    上后者包含前者）。
     """
-    if not messages:
+    if not TOOL_VISIBILITY_FILTER or not messages:
         return messages
 
     # 预扫描：是否存在工具痕迹（零开销直通路径）。
     has_traces = False
     for m in messages:
-        if isinstance(m, Message):
-            if m.role == "tool" or (m.role == "assistant" and m.tool_calls()):
-                has_traces = True
-                break
-        elif isinstance(m, dict):
-            if m.get("role") == "tool" or (m.get("role") == "assistant" and m.get("tool_calls")):
-                has_traces = True
-                break
+        if isinstance(m, Message) and (
+            m.role == "tool" or (m.role == "assistant" and m.tool_calls())
+        ):
+            has_traces = True
+            break
     if not has_traces:
         return messages
 
     out: list = []
     for m in messages:
-        if isinstance(m, Message):
-            if m.role == "tool":
-                # role=tool 整条移除（结果随依附的 tool_call 一起消失）。
-                continue
-            if m.role == "assistant" and m.tool_calls():
-                # 重建不含 ToolCallBlock 的 assistant（保留文本/多模态/
-                # 思考块）；meta 原样保留（内部标记永不进出站，由渲染
-                # 层结构性保证）。
-                kept_blocks = [
-                    b for b in m.blocks if not isinstance(b, ToolCallBlock)
-                ]
-                has_text = any(
-                    isinstance(b, TextBlock) and b.text for b in kept_blocks
-                )
-                if not has_text:
-                    # 只有工具调用没有正文：剔除后是空壳，整条丢弃。
-                    continue
-                out.append(Message(
-                    role="assistant",
-                    blocks=kept_blocks,
-                    name=m.name,
-                    meta=dict(m.meta),
-                ))
-                continue
+        if not isinstance(m, Message):
             out.append(m)
-        elif isinstance(m, dict):
-            # 旧 dict 形状（双形状过渡期兼容），与 Message 路径同语义。
-            role = m.get("role")
-            if role == "tool":
+            continue
+        if m.role == "tool":
+            # role=tool 整条移除（结果随依附的 tool_call 一起消失）。
+            continue
+        if m.role == "assistant" and m.tool_calls():
+            # 重建不含 ToolCallBlock 的 assistant（保留文本/多模态/
+            # 思考块）；meta 原样保留（内部标记永不进出站，由渲染
+            # 层结构性保证）。
+            kept_blocks = [
+                b for b in m.blocks if not isinstance(b, ToolCallBlock)
+            ]
+            has_text = any(
+                isinstance(b, TextBlock) and b.text for b in kept_blocks
+            )
+            if not has_text:
+                # 只有工具调用没有正文：剔除后是空壳，整条丢弃。
                 continue
-            if role == "assistant" and m.get("tool_calls"):
-                clean = _assistant_dict_without_tool_calls(m)
-                if clean is not None:
-                    out.append(clean)
-                continue
-            out.append(m)
-        else:
-            # 未知形状：原样透传（与 apply_tool_visibility 同策略）。
-            out.append(m)
+            out.append(Message(
+                role="assistant",
+                blocks=kept_blocks,
+                name=m.name,
+                meta=dict(m.meta),
+            ))
+            continue
+        out.append(m)
     return out

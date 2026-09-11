@@ -775,12 +775,15 @@ async def _agentic_loop_anthropic(
                             f"[{api_label}] stream 可重试错误（零输出，{wait_s:.1f}s 后第 "
                             f"{stream_attempts}/{_ANTHROPIC_STREAM_MAX_RETRIES} 次重试）: {e}"
                         )
-                        # 重置本轮累积状态（零输出前提下本应全空，双保险）
+                        # 重置本轮累积状态（零输出前提下本应全空，双保险）。
+                        # 流状态存于 current_stream_cell[0]（make_switch_stream
+                        # 状态机），重试前一并复位；若重试前确有残留流，
+                        # 下一次 switch_stream 会先 end_stream 再开新流。
                         content_acc = ""
                         reasoning_acc = ""
                         tool_use_blocks = {}
                         stop_reason = ""
-                        current_stream = None
+                        current_stream_cell[0] = None
                         await asyncio.sleep(wait_s)
                         continue
                     logger.exception(f"[{api_label}] stream error: {e}")

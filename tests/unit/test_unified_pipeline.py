@@ -28,7 +28,6 @@ from config import (
 )
 from protocols import (
     authorize_request,
-    build_media_request_body,
     build_video_request_body,
     normalize_video_seconds,
     resolve_input_combination,
@@ -266,58 +265,6 @@ def test_plan_none_model_falls_back_to_chat():
     plan = resolve_request_plan(None)
     assert plan.route == "chat"
     assert plan.api_type == "chat"
-
-
-# ---------------------------------------------------------------------------
-# 5. 请求体构建：按（内容，api 类型，端点/形状）装配
-# ---------------------------------------------------------------------------
-
-def test_build_body_inline_txt2img_uses_return_base64():
-    plan = resolve_request_plan(SUPPORTED_MODELS["agnes-image-2.5-flash"])
-    body = build_media_request_body(
-        plan, model="agnes-image-2.5-flash", prompt="一只猫",
-        size="2K", ratio="16:9",
-    )
-    assert body == {
-        "model": "agnes-image-2.5-flash",
-        "prompt": "一只猫",
-        "size": "2K",
-        "ratio": "16:9",
-        "return_base64": True,
-    }
-
-
-def test_build_body_inline_img2img_constraints():
-    # Agnes 文档硬约束：参考图进 extra_body.image；response_format 只进
-    # extra_body；不传 tags。
-    plan = resolve_request_plan(SUPPORTED_MODELS["agnes-image-2.5-flash"])
-    body = build_media_request_body(
-        plan, model="agnes-image-2.5-flash", prompt="把物体变成橙色",
-        size="1024x768", ratio="1:1",
-        reference_images=("https://example.com/in.png", "data:image/png;base64,AAAA"),
-    )
-    assert body["extra_body"]["image"] == ["https://example.com/in.png", "data:image/png;base64,AAAA"]
-    assert body["extra_body"]["response_format"] == "b64_json"
-    assert "tags" not in body
-    assert "response_format" not in body  # 绝不在顶层
-    assert "return_base64" not in body    # 图生图路径不需要
-
-
-def test_build_body_non_json_shapes_return_none():
-    # multipart 编辑形状 / chat 分支：build_media_request_body 不适用
-    # （video 分支另有 build_video_request_body 出口）
-    plan = resolve_request_plan(SUPPORTED_MODELS["agnes-3.0-flash"])
-    assert build_media_request_body(plan, model="x", prompt="y") is None
-    # multipart 形状：不声明完整图像端点（endpoint 沿用厂商 API 根）->
-    # 官方形状推导，编辑走独立 multipart /images/edits
-    cfg = make_model_config(
-        model_id="official-style-image", provider="agnes", name="Official",
-        image_output=True, image_input=True, supports_tools=False,
-        protocol="openai_images",
-    )
-    mplan = resolve_request_plan(cfg)
-    assert mplan.image_style == "multipart_edits"
-    assert build_media_request_body(mplan, model="x", prompt="y") is None
 
 
 # ---------------------------------------------------------------------------

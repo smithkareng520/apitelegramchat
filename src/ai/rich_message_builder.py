@@ -288,7 +288,6 @@ class RichMessageBuilder:
         # “已有 pending task”被吞掉；该标记保证当前帧结束后必补发最新状态。
         self._flush_dirty: bool = False
         self._stop_flush = False
-        self._pending_reasoning_html: str = ""
         self._flush_lock = asyncio.Lock()
         self._rollover_lock = asyncio.Lock()
         self._rate_limited_until: float = 0.0
@@ -387,10 +386,8 @@ class RichMessageBuilder:
             "placeholder_idx": idx,
             "outer_summary": "",
             "finished": False,
-            "reasoning_html": self._pending_reasoning_html,
             "text_content": "",
         }
-        self._pending_reasoning_html = ""
         self._tool_groups.append(group)
         self._current_group_idx = len(self._tool_groups) - 1
         self.request_flush(force=False)
@@ -1018,14 +1015,9 @@ class RichMessageBuilder:
             # 进行中的组用通用占位符，已结束的组按状态兜底展示。
             outer_summary = "Working..." if not group.get("finished", False) else "Tool activity"
 
-        reasoning_html = group.get("reasoning_html", "")
         text_content = group.get("text_content", "")
 
         inner_parts = []
-        if reasoning_html:
-            # 工具组内的思考片段同样按纯文本严格转义后渲染，防止其中的标签
-            # 破坏外层 <details> 结构（与独立思考块的转义策略保持一致）。
-            inner_parts.append(_render_reasoning_html(reasoning_html))
         if text_content:
             inner_parts.append(_ensure_rich_block_content(text_content))
 
@@ -1063,14 +1055,25 @@ class RichMessageBuilder:
             placeholder = "Running..."
         return f"<details><summary>{inner_summary}</summary>\n<p>{placeholder}</p>\n</details>"
 
-    # ========== 关键修改：_build_html 不再将 tool_group 合并到 reasoning 中 ==========
-    def _build_html(self) -> str:
+    # ========== 关键修改：不再将 tool_group 合并到 reasoning 中 ==========
+    def _build_html(self, *, hide_thinking: bool = False) -> str:
+        """把块列表拼装为草稿 HTML。
+
+        ``hide_thinking=True``（原 _build_html_no_thinking）额外跳过
+        ``<tg-thinking>`` 占位块：草稿流式期显示“Thinking...”占位，
+        但终稿/滚动不应再出现它——两个版本除了这一处外完全一致，
+        合并为单实现避免双份逻辑漂移。
+        """
         html_parts = []
         i = 0
         group_idx = 0
         while i < len(self.blocks):
             b_type = self.block_types[i]
             block = self.blocks[i]
+
+            if hide_thinking and b_type == "html" and block.startswith("<tg-thinking>"):
+                i += 1
+                continue
 
             if b_type == "reasoning":
                 reasoning_content = block
@@ -1105,50 +1108,9 @@ class RichMessageBuilder:
         result = "".join(html_parts)
         return result if result.strip() else " "
 
-    # ========== 关键修改：_build_html_no_thinking 同样修改 ==========
     def _build_html_no_thinking(self) -> str:
-        html_parts = []
-        i = 0
-        group_idx = 0
-        while i < len(self.blocks):
-            b_type = self.block_types[i]
-            block = self.blocks[i]
-
-            if b_type == "html" and block.startswith("<tg-thinking>"):
-                i += 1
-                continue
-
-            if b_type == "reasoning":
-                reasoning_content = block
-                i += 1
-                # 与 _build_html 一致：空思考块不渲染占位，内容到达后再出现。
-                if not reasoning_content.strip():
-                    continue
-                # 不再收集后续 tool_group，只渲染 reasoning 自身
-                summary = self._get_reasoning_summary(reasoning_content)
-                # 与 _build_html 保持一致：思考原文先严格转义再嵌入，
-                # 防止标签被解析或破坏折叠结构。
-                reasoning_body = _render_reasoning_html(reasoning_content)
-                html_parts.append(f"<details><summary>{summary}</summary>\n{reasoning_body}\n</details>")
-                continue
-
-            elif b_type == "tool_group":
-                if group_idx < len(self._tool_groups):
-                    html_parts.append(self._build_tool_group_html(self._tool_groups[group_idx]))
-                    group_idx += 1
-                i += 1
-                continue
-
-            else:
-                # text/html 及其他类型的块都按原样拼接。
-                content = block
-                if i == self._stream_text_index:
-                    content += self._stream_buffer
-                html_parts.append(content)
-                i += 1
-
-        result = "".join(html_parts)
-        return result if result.strip() else " "
+        """终稿/滚动视图：隐藏 <tg-thinking> 占位（单实现委托）。"""
+        return self._build_html(hide_thinking=True)
 
     # ---------- 容量预警与回合边界滚动 ----------
     @staticmethod

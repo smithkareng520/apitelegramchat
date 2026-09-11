@@ -64,7 +64,6 @@ from ai.media_generation import (
     _response_items_to_bytes,
     _upload_generated_images_to_r2,
     _validate_image_bytes,
-    IMAGES_API_PROVIDERS,
 )
 from ai.tool_summary import (
     _contains_textual_tool_call,
@@ -76,8 +75,18 @@ from ai.tool_summary import (
     _strip_textual_tool_calls,
     _tool_limit_summary,
 )
-from ai.tool_call_loop import _run_tool_calls_and_append
 from ai.attachment_content import _apply_cache_control
+# bridge_common 骨架：switch_stream 状态机 / 工具批次 / over-limit 合成 /
+# 终局兜底 / assistant 组装 —— 与两条原生 bridge 循环共用同一份实现，
+# 消除本循环内逐字重复的内联版本。
+from ai.bridge_common import (
+    append_assistant_message,
+    ensure_final_content,
+    finish_open_tool_group,
+    make_switch_stream,
+    over_limit_final_summary,
+    run_tool_batch,
+)
 from ai.strict_tools import (
     looks_like_strict_tool_rejection,
     mark_strict_tools_rejected,
@@ -594,7 +603,6 @@ async def _agentic_loop_openai_compat(
         # 跨轮复用会把上一轮的命中量安到本轮头上。
         usage_with_cache = None
         in_reasoning = False
-        current_stream = None
         received_any = False
         # v2.5：本轮流结束原因（length / stop / tool_calls / content_filter…）。
         # 初始 None = 尚未见到任何终止事件；流被完整消费却仍为 None 时，
@@ -605,28 +613,13 @@ async def _agentic_loop_openai_compat(
         # 只有第一次出现时才据此决定是否要关闭上一个未闭合的工具块，之后不再重复判断。
         round_leading_kind = None
 
-        async def switch_stream(target: str) -> None:
-            nonlocal current_stream
-            if current_stream == target:
-                return
-            ended = current_stream
-            builder.end_stream()
-            # 块边界换草稿检查点①②（解耦改造后为非阻塞事件）：一个思考块
-            # 或文本块刚刚闭合、下一个块尚未开启，此刻 HTML 正好停在完整
-            # 外层块边界上，是回合中途最安全的切换时机（不必再等整批工具
-            # 结果回来）。是否切换仍由 DraftManager 内的容量阈值决定；
-            # 未达阈值时无任何开销；满容量时由后台任务执行滚动，Agent
-            # 不等待 UI（§8）。滚动换血期间到达的事件由 DraftEventBuffer
-            # 缓冲、滚动完成后回放进新草稿（§9）。
-            # 若本轮已有未收束的工具组，安全点守卫会推迟滚动到 tool.end，
-            # 从而不会把工具卡片拆散（历史问题1）。
-            if ended is not None:
-                builder.on_stream_block_closed(ended)
-            if target == "reasoning":
-                builder.begin_stream_reasoning()
-            elif target == "content":
-                builder.begin_stream_text()
-            current_stream = target
+        # 草稿流切换状态机（与两条原生 bridge 循环共用 make_switch_stream）：
+        # 同一流类型幂等返回；切换前结束当前流，并在"此前确有流"时触发
+        # 块边界换草稿检查点（非阻塞事件，由 DraftManager 容量阈值决定
+        # 是否真实滚动，§8/§9）。状态存于 cell，代替本循环原先逐字相同
+        # 的 nonlocal current_stream 闭包。
+        current_stream_cell = [None]
+        switch_stream = make_switch_stream(builder, current_stream_cell)
 
         try:
             # SDK create() 重载不接受 dict[str, object] 的 ** 解包；
@@ -736,7 +729,7 @@ async def _agentic_loop_openai_compat(
                                             await switch_stream("content")
                                             builder.append_stream_delta(after)
                                         else:
-                                            current_stream = None
+                                            current_stream_cell[0] = None
                                     else:
                                         reasoning_acc += rest
                                         builder.append_stream_delta(rest)
@@ -750,7 +743,7 @@ async def _agentic_loop_openai_compat(
                                             await switch_stream("content")
                                             builder.append_stream_delta(after)
                                         else:
-                                            current_stream = None
+                                            current_stream_cell[0] = None
                                     else:
                                         reasoning_acc += c_delta
                                         builder.append_stream_delta(c_delta)
@@ -1078,11 +1071,9 @@ async def _agentic_loop_openai_compat(
             # 终局：等待旧段永久化（不开新草稿）；未滚动时保底刷一帧。
             builder.request_flush()
 
-        assistant_msg = Message.assistant_with_tool_calls(
-            content_acc or "", tool_calls_list, reasoning_acc,
-        )
-        loop_messages.append(assistant_msg)
-        new_history_entries.append(assistant_msg)
+        # assistant 消息组装 + 双列表追加（与两条原生 bridge 循环共用骨架）。
+        append_assistant_message(loop_messages, new_history_entries,
+                                 content_acc, tool_calls_list, reasoning_acc)
 
         # 文本伪工具调用最多纠正三次；达到次数后直接给出安全状态说明，而不是
         # 把 XML 原文返回给用户，也避免模型在不可恢复状态下无限循环。
@@ -1109,96 +1100,71 @@ async def _agentic_loop_openai_compat(
                     builder.add_text(final_content)
             else:
                 final_content = content_acc
-            if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-                builder.finish_group(len(builder._tool_groups) - 1)
+            finish_open_tool_group(builder)
             # 终局：同步收束旧段（只永久化、不创建新草稿）。
             await builder.finalize_turn()
             break
-        status = await _run_tool_calls_and_append(
-            tool_calls_list, loop_messages, new_history_entries,
-            tool_call_count_ref, api_label, builder, chat_id=builder.chat_id,
-            tools=tools,
+        status = await run_tool_batch(
+            builder, tool_calls_list, loop_messages, new_history_entries,
+            tool_call_count_ref, api_label, tools,
         )
         # ★ 解耦关键点（§8）：工具结果已全部进入 conversation context，
         # 下一轮 LLM 请求立即发出；满容量时草稿滚动由 DraftManager 在
-        # tool.end 安全点后台执行，Agent 不再等待草稿切换。
-        builder.on_tool_batch_end()
+        # tool.end 安全点后台执行，Agent 不再等待草稿切换。（run_tool_batch
+        # 已在内部触发 tool.end 安全点。）
 
         # ===== FIX: 只对 over_limit 做强制总结并退出 =====
         if status == "over_limit":
-            # 与上方 create_params 同理：** 解包需 Any 值类型。
-            synth_params: dict[str, Any] = {
-                "model": current_model,
-                "messages": render_openai_messages(loop_messages) + [{"role": "user",
-                                              "content": f"System: Maximum tool calls ({MAX_TOOL_CALLS}) reached for this turn. Tool usage is now DISABLED. Please immediately summarize what you have successfully done so far, explicitly state what failed or what is left to do, and ask the user if they want to continue the operation in the next turn."}],
-                "stream": True,
-                "max_tokens": max_tokens,
-            }
-            synth_params.update(sampling_params)
-            synth_params.update(reasoning_top)
-            synth_extra_body = _merged_extra_body(
-                api_label, reasoning_extra,
-                chat_id=builder.chat_id,
-                supports_prompt_cache=prompt_cache_enabled,
-                session_key=loop_session_key,
-                model_info=model_info,
-            )
-            if synth_extra_body is not None:
-                synth_params["extra_body"] = synth_extra_body
-            if affinity_headers:
-                synth_params["extra_headers"] = affinity_headers
-            try:
-                synth_stream = await client.chat.completions.create(**synth_params)
-                # 合成总结同样走流式输出：消费增量期间显示 typing（同主流语义）。
-                await start_chat_action(builder.chat_id, "typing")
-                builder.begin_stream_text()
+
+            def _build_synth_request(extra_msg: Message) -> dict[str, Any]:
+                # 与上方 create_params 同理：** 解包需 Any 值类型。
+                synth_params: dict[str, Any] = {
+                    "model": current_model,
+                    "messages": render_openai_messages(loop_messages + [extra_msg]),
+                    "stream": True,
+                    "max_tokens": max_tokens,
+                }
+                synth_params.update(sampling_params)
+                synth_params.update(reasoning_top)
+                synth_extra_body = _merged_extra_body(
+                    api_label, reasoning_extra,
+                    chat_id=builder.chat_id,
+                    supports_prompt_cache=prompt_cache_enabled,
+                    session_key=loop_session_key,
+                    model_info=model_info,
+                )
+                if synth_extra_body is not None:
+                    synth_params["extra_body"] = synth_extra_body
+                if affinity_headers:
+                    synth_params["extra_headers"] = affinity_headers
+                return synth_params
+
+            async def _stream_synth(desc: dict[str, Any]) -> str:
+                # 合成总结同样走流式输出；typing 状态与文本块开闭由骨架统一管理。
                 synth_text = ""
+                synth_stream = await client.chat.completions.create(**desc)
                 async for chunk in synth_stream:
                     if chunk.choices:
                         c_delta = getattr(chunk.choices[0].delta, "content", None) or ""
                         if c_delta:
                             synth_text += c_delta
                             builder.append_stream_delta(c_delta)
-                raw_synth_content = builder.end_stream_text() or synth_text
-                # 文本块结束时检查是否需要切换草稿（终局：同步收束旧段）
-                if raw_synth_content:
-                    await builder.finalize_turn()
-                final_content = _strip_textual_tool_calls(raw_synth_content)
-                if final_content != raw_synth_content:
-                    builder.replace_trailing_text(raw_synth_content, final_content)
-                if not final_content:
-                    final_content = _tool_limit_summary()
-                    builder.add_text(final_content)
-            except Exception as synth_err:
-                # 合成流失败时使用兜底文本，避免丢失整个工具调用历史或泄漏工具 XML。
-                logger.warning(f"OpenAI 合成流失败: {synth_err}")
-                try:
-                    builder.end_stream_text()
-                except Exception:
-                    logger.debug("_agentic_loop_openai_compat 内部忽略的异常", exc_info=True)
-                    pass
-                final_content = _tool_limit_summary()
-                builder.add_text(final_content)
-            finally:
-                await stop_chat_action(builder.chat_id, "typing")
-            new_history_entries.append(Message.assistant_text(final_content))
-            if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-                builder.finish_group(len(builder._tool_groups) - 1)
-            # 工具上限总结是终局回复；同步结束旧草稿，不创建新草稿。
-            await builder.finalize_turn()
+                return synth_text
+
+            # over-limit 强制总结骨架（与两条原生 bridge 循环共用）：
+            # 合成指令注入 -> 流式总结 -> 空内容兜底 -> 写历史 -> 收束。
+            final_content = await over_limit_final_summary(
+                builder, new_history_entries,
+                api_label=api_label, loop_name="_agentic_loop_openai_compat",
+                build_synth_request=_build_synth_request,
+                stream_synth=_stream_synth,
+                postprocess=_strip_textual_tool_calls,
+            )
             break
         # 如果 status == "continue"（包括之前熔断返回的），循环自然继续
 
-    # 理论上真实工具调用会先触发 over_limit；此处仍为轮次数耗尽或异常模型行为提供
-    # 可见的、无工具调用标记的最终状态，避免 final_content 为 None。
-    if final_content is None:
-        final_content = _tool_limit_summary()
-        builder.add_text(final_content)
-        new_history_entries.append(Message.assistant_text(final_content))
-        if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
-            builder.finish_group(len(builder._tool_groups) - 1)
-        # 轮次数耗尽后的兜底文本同样是终局内容：同步结束旧草稿，不创建下一段。
-        await builder.finalize_turn()
+    # 轮次数耗尽 / 空终局兜底（与两条原生 bridge 循环共用 bridge_common 骨架）。
+    final_content = await ensure_final_content(builder, new_history_entries, final_content)
     return final_content, final_usage, new_history_entries
 
 

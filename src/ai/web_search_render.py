@@ -355,9 +355,15 @@ def _render_lens_items(items: list[dict]) -> str:
             card += f'<b><a href="{_href(page)}">{title}</a></b>'
         else:
             card += f"<b>{title}</b>"
-        meta_bits = [x for x in (source, domain) if x]
+        # 与 search/videos 渲染器一致：逐项转义后直接拼接，
+        # 不再对 join 结果整体二次转义（source 已在上方转义过）。
+        meta_bits: list[str] = []
+        if source:
+            meta_bits.append(source)
+        if domain:
+            meta_bits.append(convert_markdown_to_telegram_html(domain))
         if meta_bits:
-            card += f" <code>{convert_markdown_to_telegram_html(' · '.join(meta_bits))}</code>"
+            card += f" <code>{' · '.join(meta_bits)}</code>"
         card += "<br/>"
         if img:
             card += f'<a href="{_href(img)}">🖼️ 查看图片</a>'

@@ -1162,7 +1162,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
 
         if file_type in ("audio", "voice"):
             file_name = msg.get("file_name", f"{file_type}_{fid[:8]}.ogg")
-            if supports_audio:
+            if supports_audio_input:
                 audio_bytes = await _get_cached_audio_data(chat_id, fid)
                 if audio_bytes:
                     b64_data = base64.b64encode(audio_bytes).decode()
