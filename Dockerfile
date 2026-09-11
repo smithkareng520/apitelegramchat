@@ -82,6 +82,18 @@ RUN mkdir -p /usr/share/fonts/truetype/noto-emoji-mono \
     && echo "${NOTO_EMOJI_SHA256}  /usr/share/fonts/truetype/noto-emoji-mono/NotoEmoji-Regular.ttf" | sha256sum -c - \
     && fc-cache -f -v >/dev/null
 
+# 基础镜像 node:22-bookworm-slim 自带系统用户 node（/home/node，uid/gid
+# 通常为 1000），未被后续任何步骤 chown。而 workspaces_root() 默认把
+# /home 当作"每个聊天 namespace 一个子目录"的父目录——namespace 只要
+# sanitize 后等于字符串 "node"（例如某个 chat 的 username 恰为 node），
+# workspace_root() 就会解析到这个预置的 /home/node，claude 用户对它既
+# 无写权限也无所有权，导致 skills 同步等所有写操作 PermissionError(13)。
+# 下方 chown /home（非递归）只处理 /home 本身，不会修复已存在的
+# /home/node，必须显式删除这个预置账号与家目录，让 /home 在 chown 前
+# 是真正空目录，chown 之后其下任何子目录都由 claude 按需创建、天然
+# 属于 claude。
+RUN deluser --remove-home node 2>/dev/null || true
+
 # 沙盒身份固定为 claude（uid/gid 仍为 2000）：
 #   - whoami / id / ls -l 属主列全部真实解析为 "claude"（passwd 级一致，
 #     不再出现 whoami=app 与 $USER=chat{id} 的精神分裂）；
@@ -110,10 +122,12 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir --upgrade pip 
     npm install --omit=dev --no-audit --no-fund
 
 # 工作空间根 /home 交给运行用户（uid 2000）：非 root 进程要能在 /home
-# 下创建每户家目录 /home/<chat-ns>。只 chown /home 本身（不 -R，
-# /home/claude 已属 claude）；0700 收紧家目录隐私边界，其他系统用户
-# （容器内无）无法枚举用户目录。
-RUN mkdir -p /home && chown claude:claude /home && chmod 700 /home
+# 下创建每户家目录 /home/<chat-ns>。这里改为 -R：上面已删除基础镜像
+# 预置的 node 账号家目录，但仍用递归 chown 兜底任何遗留/未来新增的
+# 基础镜像用户目录，避免同类 PermissionError 以其他 namespace 名字
+# 复发；/home/claude 已属 claude，递归 chown 对它是无操作。0700 收紧
+# 家目录隐私边界，其他系统用户（容器内无）无法枚举用户目录。
+RUN mkdir -p /home && chown -R claude:claude /home && chmod 700 /home
 
 RUN mkdir -p /app/workspace && chown -R claude:claude /app/workspace /app/src /home/claude
 
