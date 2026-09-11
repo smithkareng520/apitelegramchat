@@ -37,6 +37,7 @@ from media_wizard import (
     handle_wizard_callback,
     render_page,
     resolve_media_param_spec,
+    run_media_generation,
     try_consume_media_message,
     try_consume_text_message,
 )
@@ -715,3 +716,96 @@ def test_image_loop_error_reports_download_diagnostics(monkeypatch):
     assert "未找到可用图片数据" not in notice
     # HTML notice 无转义残留
     assert "&lt;" not in notice and "&gt;" not in notice
+
+
+# ---------------------------------------------------------------------------
+# 8. 提交卡片终态就地更新（修复：卡片提交后停在"进行中"不再变化）
+# ---------------------------------------------------------------------------
+def test_submit_card_shows_in_progress_not_done(monkeypatch):
+    """提交瞬间卡片文案必须是"进行中"语义，不能读起来像已经生成完成。"""
+    io = _IO().install(monkeypatch)
+    sess = _register(_video_session(message_id=55), monkeypatch)
+
+    import media_wizard as mw
+
+    class _FakeTurnModule:
+        @staticmethod
+        async def spawn_turn_task(chat_id, coro):
+            coro.close()   # 本测试只关心提交瞬间的卡片文案，不跑生成
+            return None
+
+    monkeypatch.setitem(__import__("sys").modules, "app_turns", _FakeTurnModule)
+
+    run = asyncio.new_event_loop()
+    run.run_until_complete(_tap(io, sess, "mw:submit"))
+    run.close()
+
+    assert "生成完成" not in io.last_text
+    assert "已提交" not in io.last_text or "进行中" in io.last_text or "正在生成" in io.last_text
+    assert "正在生成" in io.last_text
+
+
+def test_run_media_generation_finalizes_card_on_success(monkeypatch):
+    """生成成功后必须就地把提交卡片编辑为终态，而不是留在"进行中"。"""
+    io = _IO().install(monkeypatch)
+    sess = _video_session(message_id=55)
+    request, _, _ = build_submission(sess)
+    request["message_id"] = sess.message_id
+
+    import ai.agentic_loops as loops
+    import app_turns
+
+    async def fake_video(*a, **k):
+        return "VIDEO_SENT", None, []
+
+    async def fake_ledger(*a, **k):
+        return None
+
+    monkeypatch.setattr(loops, "_agentic_loop_native_video", fake_video)
+    monkeypatch.setattr(app_turns, "update_conversation_and_ledger", fake_ledger)
+
+    run = asyncio.new_event_loop()
+    run.run_until_complete(run_media_generation(sess.chat_id, request))
+    run.close()
+
+    assert io.edits, "生成成功后应至少编辑一次卡片"
+    final_message_ids = [mid for mid, _, _ in io.edits]
+    assert sess.message_id in final_message_ids
+    finalized_text = next(text for mid, text, _ in io.edits if mid == sess.message_id)
+    assert "生成完成" in finalized_text
+    assert "进行中" not in finalized_text
+
+
+def test_run_media_generation_finalizes_card_on_failure(monkeypatch):
+    """生成失败也必须把提交卡片编辑为失败终态（而不是只发一条不相关的新消息）。"""
+    io = _IO().install(monkeypatch)
+    sess = _video_session(message_id=55)
+    request, _, _ = build_submission(sess)
+    request["message_id"] = sess.message_id
+
+    import ai.agentic_loops as loops
+    import turn_recovery
+    import utils
+
+    async def fake_video(*a, **k):
+        return "VIDEO_ERROR:配额不足", None, []
+
+    async def fake_send(chat_id, html_text, **kwargs):
+        pass
+
+    async def fake_mark(chat_id):
+        pass
+
+    monkeypatch.setattr(loops, "_agentic_loop_native_video", fake_video)
+    monkeypatch.setattr(utils, "send_rich_html_message", fake_send)
+    monkeypatch.setattr(turn_recovery, "mark_failed_unanswered_user", fake_mark)
+
+    run = asyncio.new_event_loop()
+    run.run_until_complete(run_media_generation(sess.chat_id, request))
+    run.close()
+
+    assert io.edits, "生成失败后应至少编辑一次卡片"
+    finalized_text = next(text for mid, text, _ in io.edits if mid == sess.message_id)
+    assert "生成失败" in finalized_text
+    assert "配额不足" in finalized_text
+    assert "进行中" not in finalized_text

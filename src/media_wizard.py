@@ -1142,11 +1142,12 @@ def build_submission(sess: WizardSession) -> tuple[Optional[dict], str, str]:
         if sess.ref_images:
             overrides["reference_images"] = list(sess.ref_images)
 
+    param_line = ' · '.join(html.escape(b) for b in summary_bits) or '模型默认参数'
     summary = (
-        "🚀 <b>已提交，开始生成…</b>\n\n"
+        "⏳ <b>正在生成…</b>\n\n"
         f"📝 {_quote(sess.prompt, 160)}\n\n"
-        f"⚙️ {' · '.join(html.escape(b) for b in summary_bits) or '模型默认参数'}\n"
-        "（生成完成后自动发送结果，可随时发新消息打断）"
+        f"⚙️ {param_line}\n"
+        "（完成后本卡片会自动更新为结果，可随时发新消息打断）"
     )
     request = {
         "chat_id": sess.chat_id,
@@ -1158,6 +1159,8 @@ def build_submission(sess: WizardSession) -> tuple[Optional[dict], str, str]:
         "pending_audios": [dict(a) for a in sess.pending_audios],
         "pending_videos": [dict(a) for a in sess.pending_videos],
         "summary": summary,
+        "prompt_preview": _quote(sess.prompt, 160),
+        "param_line": param_line,
     }
     return request, "", ""
 
@@ -1170,6 +1173,10 @@ async def _cb_submit(sess: WizardSession, callback_id: str) -> None:
         await answer_callback(callback_id, err_msg or "无法提交", alert=True)
         return
     _sessions.pop(sess.chat_id, None)
+    # 卡片提交后不再是终态文案——真正的完成/失败由 run_media_generation
+    # 在生成结束时就地编辑同一条卡片消息（见 _finalize_card），避免卡片
+    # 停留在"进行中"状态、观感像是卡住。
+    request["message_id"] = sess.message_id
     await edit_card_message(sess.chat_id, sess.message_id, request["summary"], None)
     await answer_callback(callback_id, "已提交，开始生成…")
     try:
@@ -1177,10 +1184,47 @@ async def _cb_submit(sess: WizardSession, callback_id: str) -> None:
         await spawn_turn_task(sess.chat_id, run_media_generation(sess.chat_id, request))
     except Exception:
         logger.exception("生成任务派发失败: chat=%s", sess.chat_id)
-        await send_card_message(sess.chat_id, "❌ <b>生成任务派发失败</b>，请重试。", None)
+        await edit_card_message(
+            sess.chat_id, sess.message_id,
+            "❌ <b>生成任务派发失败</b>，请重试。", None)
 
 
-async def _notify_generation_failure(chat_id: int, notice: str) -> None:
+async def _finalize_card(
+    chat_id: int, message_id: int, request: dict, *, ok: bool, note: str = "",
+) -> None:
+    """把提交卡片就地编辑为终态（成功/失败），不再让它停在"进行中"。
+
+    结果媒体（图片/视频）本身仍由生成循环作为独立消息直发——Telegram
+    无法把媒体塞进一条已存在的纯文本消息——但卡片自身必须显示与之对应
+    的终态，否则用户看到的是"卡片卡住 + 平白多出一条消息"的割裂体验。
+    """
+    if not message_id:
+        return
+    prompt_preview = request.get("prompt_preview") or ""
+    param_line = request.get("param_line") or "模型默认参数"
+    if ok:
+        text = (
+            "✅ <b>生成完成</b>\n\n"
+            f"📝 {prompt_preview}\n\n"
+            f"⚙️ {param_line}\n"
+            "结果已在上方/下方消息中发送。"
+        )
+    else:
+        text = (
+            "❌ <b>生成失败</b>\n\n"
+            f"📝 {prompt_preview}\n\n"
+            f"⚙️ {param_line}\n"
+            f"原因：{html.escape(note)[:300] or '未知错误'}"
+        )
+    try:
+        await edit_card_message(chat_id, message_id, text, None)
+    except Exception:
+        logger.debug("卡片终态编辑失败（可忽略）: chat=%s", chat_id, exc_info=True)
+
+
+async def _notify_generation_failure(
+    chat_id: int, notice: str, *, message_id: int = 0, request: Optional[dict] = None,
+) -> None:
     """生成失败通知（与 IMAGE/VIDEO_ERROR 的渲染语义一致）。
 
     渲染复用 ``_render_media_failure_quote``（ai.error_formatting）——
@@ -1190,7 +1234,12 @@ async def _notify_generation_failure(chat_id: int, notice: str) -> None:
     字面量而非加粗标题。改走与 ai_handlers IMAGE_ERROR/VIDEO_ERROR 完全
     相同的渲染出口：unescape → 剥标签 → 严格转义后放入 <pre> 结果块，
     纯文本 notice 同样安全。
+
+    同时把提交卡片（若提供 message_id）编辑为"❌ 生成失败"终态，避免卡片
+    停在"进行中"而失败提示只出现在另一条不相关的新消息里。
     """
+    if message_id and request is not None:
+        await _finalize_card(chat_id, message_id, request, ok=False, note=notice)
     try:
         from utils import send_rich_html_message
         from ai.error_formatting import _render_media_failure_quote
@@ -1216,6 +1265,7 @@ async def run_media_generation(chat_id: int, request: dict) -> None:
     api_type = request["api_type"]
     prompt = request["prompt"]
     overrides = dict(request.get("overrides") or {})
+    card_message_id = int(request.get("message_id") or 0)
 
     dropped = 0
     resolved_images: list[str] = []
@@ -1270,15 +1320,21 @@ async def run_media_generation(chat_id: int, request: dict) -> None:
         raise
     except Exception as e:
         logger.exception("卡片提交生成异常: chat=%s model=%s", chat_id, model_id)
-        await _notify_generation_failure(chat_id, f"生成任务异常: {str(e)[:200]}")
+        await _notify_generation_failure(
+            chat_id, f"生成任务异常: {str(e)[:200]}",
+            message_id=card_message_id, request=request)
         return
 
     if isinstance(raw, str) and raw.startswith(("VIDEO_ERROR:", "IMAGE_ERROR:")):
-        await _notify_generation_failure(chat_id, raw.split(":", 1)[1].strip())
+        await _notify_generation_failure(
+            chat_id, raw.split(":", 1)[1].strip(),
+            message_id=card_message_id, request=request)
         return
 
-    # 成功：媒体已由循环直发；assistant 结果沉淀历史（user prompt 已在
-    # 卡片拦截轮写入历史，这里传 None 不重复写）。
+    # 成功：媒体已由循环直发；卡片就地编辑为"生成完成"终态，不再停在
+    # "进行中"；assistant 结果沉淀历史（user prompt 已在卡片拦截轮写入
+    # 历史，这里传 None 不重复写）。
+    await _finalize_card(chat_id, card_message_id, request, ok=True)
     try:
         from app_turns import update_conversation_and_ledger
         await update_conversation_and_ledger(chat_id, None, new_msgs, usage)
