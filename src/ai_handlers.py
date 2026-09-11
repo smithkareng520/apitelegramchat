@@ -270,9 +270,8 @@ _BASE_PROMPT = """
 <hr/>
 
 <h3>三、来源标注</h3>
-<p>当标注来源时，使用 <tg-button type="url" url="链接">显示文本</tg-button> 按钮链接格式紧贴到需要标注的文本后。显示文本的语言应与来源语言一致：英文网站用英文名称（如 <code>The Wall Street Journal</code>、<code>VOA Chinese</code>），中文网站用中文名称（如 <code>财新网</code>、<code>澎湃新闻</code>）。</p>
-<p>新闻、科学事实、统计数据、技术文档、学术论文、法律条文、历史事件、研究报告等各类信息，必须标注来源</p>
-
+<p>新闻、科学事实、统计数据、技术文档、学术论文、法律条文、历史事件、研究报告等各类信息，必须在内容后标注来源</p>
+<p>使用 <tg-button type="url" url="链接">显示文本</tg-button> 按钮链接格式在需要标注的内容后（紧挨着），显示文本的语言应与来源语言一致：英文网站用英文名称（如 <code>The Wall Street Journal</code>、<code>VOA Chinese</code>），中文网站用中文名称（如 <code>财新网</code>、<code>澎湃新闻</code>）。</p>
 """
 
 _TOOLS_SECTION = """
