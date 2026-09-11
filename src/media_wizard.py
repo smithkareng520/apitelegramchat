@@ -259,10 +259,10 @@ def extract_media_attachments(user_message: Optional[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 媒体公开 URL 解析（R2；与图片输入的 R2 公开 URL 优先路径同源）
+# 媒体预签名 URL 解析（R2；与图片输入的统一预签名路径同源）
 # ---------------------------------------------------------------------------
-async def resolve_media_public_url(kind: str, file_id: str, mime_type: str = "") -> str:
-    """把 Telegram file_id 解析为公开可访问 URL（Agnes 参考媒体硬要求）。
+async def resolve_media_presigned_url(kind: str, file_id: str, mime_type: str = "") -> str:
+    """把 Telegram file_id 解析为 R2 预签名 URL（媒体输入统一预签名）。
 
     失败 / R2 未配置返回空串——调用方据此提示用户重新上传，绝不把
     Telegram 直链（泄露 bot token）或 file:// 地址交给第三方 API。
@@ -272,27 +272,29 @@ async def resolve_media_public_url(kind: str, file_id: str, mime_type: str = "")
         return ""
     try:
         if kind == "photo":
-            from ai.attachment_content import _resolve_r2_public_url_for_vision
-            return await _resolve_r2_public_url_for_vision(fid)
+            from ai.attachment_content import _resolve_r2_presigned_url_for_vision
+            return await _resolve_r2_presigned_url_for_vision(fid)
         if kind == "video":
-            from ai.attachment_content import _resolve_r2_public_url_for_video
-            return await _resolve_r2_public_url_for_video(fid, mime_type or "video/mp4")
+            from ai.attachment_content import _resolve_r2_presigned_url_for_video
+            return await _resolve_r2_presigned_url_for_video(fid, mime_type or "video/mp4")
         if kind in ("audio", "voice"):
-            # 音频没有现成的公开 URL 出口：取字节后按真实 MIME 上传 R2。
+            # 音频没有现成的预签名 URL 出口：取字节后按真实 MIME 上传 R2，
+            # 再统一签发预签名 URL（与图片/视频路径同口径）。
             from ai.attachment_content import _get_cached_audio_data, _get_r2_key
-            from s3_utils import is_r2_configured, upload_bytes_to_r2
+            from s3_utils import generate_presigned_url, is_r2_configured, upload_bytes_to_r2
             if not is_r2_configured():
                 return ""
             data = await _get_cached_audio_data(None, fid)
             if not data:
                 return ""
             mime = "audio/ogg" if kind == "voice" else (mime_type or "audio/mpeg")
-            url = await upload_bytes_to_r2(data, _get_r2_key(fid), mime)
-            if url and not url.startswith("file://"):
-                return url
-            return ""
+            r2_key = _get_r2_key(fid)
+            result = await upload_bytes_to_r2(data, r2_key, mime)
+            if result is None:
+                return ""
+            return await generate_presigned_url(r2_key)
     except Exception:
-        logger.warning("媒体公开 URL 解析失败 kind=%s fid=%s", kind, fid[:12], exc_info=True)
+        logger.warning("媒体预签名 URL 解析失败 kind=%s fid=%s", kind, fid[:12], exc_info=True)
     return ""
 
 
@@ -1005,7 +1007,7 @@ async def try_consume_media_message(chat_id: int, user_message: Optional[dict]) 
     sess.collect_error = None
     added, failed = 0, 0
     for att in matched:
-        url = await resolve_media_public_url(
+        url = await resolve_media_presigned_url(
             att["kind"], att.get("file_id", ""), att.get("mime") or "")
         if url and _store_into_slot(sess, slot, url):
             added += 1
@@ -1015,7 +1017,7 @@ async def try_consume_media_message(chat_id: int, user_message: Optional[dict]) 
         # 全部失败：保持收集态，要求再次上传（绝不静默丢弃）
         sess.collect_slot = slot
         sess.collect_error = (
-            "上传失败：未能取得可公开访问的素材 URL（预签名 URL）。"
+            "上传失败：未能取得素材的 R2 预签名 URL。"
             "请重新发送该素材再试一次。"
         )
     elif failed:
@@ -1256,7 +1258,7 @@ async def _notify_generation_failure(
 async def run_media_generation(chat_id: int, request: dict) -> None:
     """执行卡片提交的生成（turn 任务；结果媒体由媒体循环直接发送）。
 
-    触发消息自带的附件在这里才解析为 R2 公开 URL（卡片发送零等待）；
+    触发消息自带的附件在这里才解析为 R2 预签名 URL（卡片发送零等待）；
     解析失败的附件计数并提示，绝不静默丢弃。
     """
     from core.messages import Message, TextBlock
@@ -1270,7 +1272,7 @@ async def run_media_generation(chat_id: int, request: dict) -> None:
     dropped = 0
     resolved_images: list[str] = []
     for att in request.get("pending_photos") or []:
-        url = await resolve_media_public_url(
+        url = await resolve_media_presigned_url(
             "photo", str(att.get("file_id") or ""), str(att.get("mime") or ""))
         if url:
             resolved_images.append(url)
@@ -1278,7 +1280,7 @@ async def run_media_generation(chat_id: int, request: dict) -> None:
             dropped += 1
     resolved_audios: list[str] = []
     for att in request.get("pending_audios") or []:
-        url = await resolve_media_public_url(
+        url = await resolve_media_presigned_url(
             str(att.get("kind") or "audio"), str(att.get("file_id") or ""),
             str(att.get("mime") or ""))
         if url:
@@ -1287,7 +1289,7 @@ async def run_media_generation(chat_id: int, request: dict) -> None:
             dropped += 1
     resolved_specs: list[dict] = []
     for att in request.get("pending_videos") or []:
-        url = await resolve_media_public_url(
+        url = await resolve_media_presigned_url(
             "video", str(att.get("file_id") or ""), str(att.get("mime") or ""))
         if url:
             resolved_specs.append({"url": url})
@@ -1302,7 +1304,7 @@ async def run_media_generation(chat_id: int, request: dict) -> None:
     if dropped:
         await send_card_message(
             chat_id,
-            f"⚠️ 有 {dropped} 个随消息附带的素材上传失败（未取得公开 URL），已跳过。",
+            f"⚠️ 有 {dropped} 个随消息附带的素材上传失败（未取得预签名 URL），已跳过。",
             None,
         )
 
@@ -1347,7 +1349,7 @@ __all__ = [
     "WizardSession",
     "WIZARD_CALLBACK_PREFIX",
     "resolve_media_param_spec",
-    "resolve_media_public_url",
+    "resolve_media_presigned_url",
     "clean_prompt_text",
     "extract_media_attachments",
     "get_session",

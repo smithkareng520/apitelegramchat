@@ -353,7 +353,7 @@ export OPENROUTER_REQUIRE_PARAMETERS=false   # 是否要求 provider 满足请�
 | GLM | `GLM_API_KEY` | 智谱 |
 | Agnes | `AGNES_API_KEY` | Agnes（默认模型 `agnes-2.5-flash`） |
 
-模型可声明能力位：`image_input` / `audio_input` / `video` / `supports_tools` /
+模型可声明能力位：`image_input` / `audio_input` / `video_input` / `supports_tools` /
 `image_output` / `document_input` / `video_output` / `search` /
 `sampling` / `prompt cache` / `max_output_tokens` / `max_context`。
 支持按 `provider/model-id` 自动发现部分未预先登记的模型。
@@ -568,6 +568,13 @@ export R2_REGION="auto"
 
 Bash sandbox 不直接拥有这些 credentials；预签名 URL 在过期前 5 分钟内
 记忆化复用，保护 LLM 前缀缓存。
+
+媒体输入（图片 / 视频 / 原生文档 PDF）统一使用 R2 预签名 URL：
+`image_url` / `video_url` / document url source 一律签发 1h 预签名 URL
+（不依赖 `R2_PUBLIC_URL` 公开域名，自定义域 / r2.dev 配不配都能用），
+过期前自动重签，历史消息字节级稳定；R2 未配置时图片降级 base64 内联，
+视频 / 文档降级文本占位。`R2_PUBLIC_URL` 仅用于对外交付（生成结果、
+文件下载等 Telegram 渲染 URL）。
 
 ---
 
@@ -808,7 +815,7 @@ emoji 运行时依赖。
 ### 修改模型
 
 编辑 `src/config.py`，为模型声明完整能力位（provider / image_input / audio_input /
-video / supports_tools / image_output / document_input / video_output /
+video_input / supports_tools / image_output / document_input / video_output /
 max_context / max_output_tokens）。不要只改显示名称而忽略实际能力，
 否则多模态输入或 tool calling 会在运行时失败。
 

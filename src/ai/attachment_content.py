@@ -28,8 +28,7 @@ from s3_utils import (
     upload_bytes_to_r2,
     file_exists_in_r2,
     download_from_r2,
-    public_url_for_existing_key,
-    generate_presigned_url,
+    presigned_url_for_existing_key,
     is_r2_configured,
 )
 import state as state
@@ -75,7 +74,7 @@ async def get_cached_image_data(chat_id: int | None, file_id: str) -> Optional[b
          这是 TTLCache 过期后的恢复路径，让历史图片不依赖 Telegram API。
       4. Telegram getFile —— 首次拉取；拉到后只填内存缓存，**不**触发
          R2 上传。上传由调用方按需显式触发（见 ``_upload_and_mark`` 与
-         ``_resolve_r2_public_url_for_vision``）。
+         ``_resolve_r2_presigned_url_for_vision``）。
 
     IMPORTANT: ``state.mark_r2_attempted`` 是**永久失败标记**，必须在
     ``get_cached_image_data`` 看到 hard failure（404/403/410 from Telegram，
@@ -86,7 +85,7 @@ async def get_cached_image_data(chat_id: int | None, file_id: str) -> Optional[b
 
     设计取舍：旧版本在此函数末尾调用 ``_track_task(_upload_and_mark(...))``
     做后台上传。这把"取字节"和"预防性 R2 上传"两个职责耦合在一起，导致
-    Agnes 路径（``_resolve_r2_public_url_for_vision``）首次访问时
+    Agnes 路径（``_resolve_r2_presigned_url_for_vision``）首次访问时
     同一张图被 ``put_object`` 两次（一次后台 + 一次同步）。重构后此函数
     职责单一，Agnes 路径自己负责唯一的同步上传，Gemini 路径在
     ``process_one`` 内显式触发后台上传。
@@ -117,7 +116,7 @@ async def _fetch_from_telegram_and_cache(file_id: str) -> Optional[bytes]:
 
     供两条路径共用：
       * ``get_cached_image_data`` —— 内存缓存 + R2 download miss 后的兜底
-      * ``_resolve_r2_public_url_for_vision`` —— R2 已知 miss 时直接调本
+      * ``_resolve_r2_presigned_url_for_vision`` —— R2 已知 miss 时直接调本
         函数拉字节，避免重复 HEAD 检查
 
     临时失败（429/5xx/网络抖动）只 WARNING 日志，**不**永久标记，
@@ -191,9 +190,9 @@ async def _upload_and_mark(file_id: str, data: bytes, r2_key: str) -> None:
 
 
 # =====================================================================
-# 视频输入模态：缓存获取 / R2 持久化 / 公开 URL 解析
+# 视频输入模态：缓存获取 / R2 持久化 / 预签名 URL 解析
 # 与图片路径（get_cached_image_data / _upload_and_mark /
-# _resolve_r2_public_url_for_vision）完全对称，但有两个关键差异：
+# _resolve_r2_presigned_url_for_vision）完全对称，但有两个关键差异：
 #
 #   1. **只走 URL，不走 base64**。视频体积远大于图片（Telegram bot
 #      下载上限 20MB），base64 后请求体会膨胀 ~33%，极易触发网关的
@@ -229,7 +228,7 @@ async def get_cached_video_data(chat_id: int | None, file_id: str) -> Optional[b
     """取视频字节，不触发任何 R2 上传（与 get_cached_image_data 对称）。
 
     解析顺序：内存 TTLCache → 永久失败标记 → R2 下载 → Telegram getFile。
-    上传由调用方按需触发（``_resolve_r2_public_url_for_video`` 同步上传，
+    上传由调用方按需触发（``_resolve_r2_presigned_url_for_video`` 同步上传，
     ``_ensure_video_persisted`` 后台上传）。
     """
     cache_key = file_id
@@ -302,17 +301,19 @@ async def _upload_video_and_mark(file_id: str, data: bytes, r2_key: str, mime_ty
         await state.mark_r2_attempted(file_id)
 
 
-async def _resolve_r2_public_url_for_video(file_id: str, mime_type: str = "video/mp4") -> str:
-    """为视频输入模态解析公开可访问的 HTTP URL（对称图片版 _resolve_r2_public_url_for_vision）。
+async def _resolve_r2_presigned_url_for_video(file_id: str, mime_type: str = "video/mp4") -> str:
+    """为视频输入模态解析 R2 预签名 URL（对称图片版 _resolve_r2_presigned_url_for_vision）。
 
     video_url content part（OpenRouter / vLLM / LiteLLM 等的事实标准）只
-    接受可公开抓取的 URL 或 data: URL；这里统一走 URL：
+    接受可公开抓取的 URL 或 data: URL；媒体输入统一走 R2 预签名 URL：
 
       1. R2 未配置 → 空串，调用方降级为文本占位（视频不走 base64，
          避免请求体膨胀触发网关上限）。
-      2. R2 已有对象 → 直接返回公开 URL（自定义域 / r2.dev）或预签名
-         URL（1h 有效，每轮重解析时重新签发，与图片 Agnes 路径一致）。
-      3. R2 未有对象 → 同步从 Telegram 拉字节 → 同步上传 R2 → 返回 URL。
+      2. R2 已有对象 → 直接返回预签名 URL（1h 有效，TTLCache 记忆化
+         至过期前 5 分钟，窗口内字节级稳定保前缀缓存；每轮重解析时
+         若已过期会自动重签，与图片路径一致）。
+      3. R2 未有对象 → 同步从 Telegram 拉字节 → 同步上传 R2 → 签发并
+         返回预签名 URL。
 
     返回值绝不包含 bot token：Telegram 直链会泄露 token 给第三方 API。
     """
@@ -326,41 +327,43 @@ async def _resolve_r2_public_url_for_video(file_id: str, mime_type: str = "video
     r2_key = _get_r2_key(fid)
 
     if await file_exists_in_r2(r2_key):
-        url = await public_url_for_existing_key(r2_key)
+        url = await presigned_url_for_existing_key(r2_key)
         if url:
             return url
         return ""
 
     # 冷路径：同步拉取 + 同步上传（首次访问支持视频的模型时触发一次，
-    # 之后切换模型直接命中路径 2）。
+    # 之后切换模型直接命中路径 2）。上传返回值（公开 URL / file://）
+    # 不作数：媒体输入统一重新签发预签名 URL。
     video_bytes = await _fetch_video_from_telegram_and_cache(fid)
     if not video_bytes:
         return ""
 
     result = await upload_bytes_to_r2(video_bytes, r2_key, _normalize_video_mime_type(mime_type))
-    if result is None or result.startswith("file://"):
+    if result is None:
         return ""
-    return result
+    return await presigned_url_for_existing_key(r2_key) or ""
 
 
-async def _resolve_r2_public_url_for_document(file_id: str, mime_type: str = "application/pdf") -> str:
-    """为文档原生输入解析公开可访问的 HTTP URL（对称视频版
-    _resolve_r2_public_url_for_video）。
+async def _resolve_r2_presigned_url_for_document(file_id: str, mime_type: str = "application/pdf") -> str:
+    """为文档原生输入解析 R2 预签名 URL（对称视频版
+    _resolve_r2_presigned_url_for_video）。
 
     Anthropic 原生 document 块的 URL source
     （{"type": "document", "source": {"type": "url", "url": ...}}）要求
-    该 URL 可被 Anthropic 服务端公开抓取（与图片 Agnes 路径同一要求）。
-    解析顺序与视频版完全一致：
+    该 URL 可被 Anthropic 服务端抓取（与图片 Agnes 路径同一要求）。
+    媒体输入统一预签名，解析顺序与视频版完全一致：
 
       1. R2 未配置 → 空串，调用方降级 base64 / 文本占位。
-      2. R2 已有对象 → 直接返回公开 URL（自定义域 / r2.dev）或预签名
-         URL（1h 有效，每轮重解析时重新签发——Anthropic 在请求时即时
-         抓取，1h 足够；切换模型的热路径不重复上传）。
-      3. R2 未有对象 → 同步从 Telegram 拉字节 → 同步上传 R2 → 返回 URL。
+      2. R2 已有对象 → 直接返回预签名 URL（1h 有效，TTLCache 记忆化
+         至过期前 5 分钟——Anthropic 在请求时即时抓取，1h 足够；
+         切换模型的热路径不重复上传）。
+      3. R2 未有对象 → 同步从 Telegram 拉字节 → 同步上传 R2 → 签发并
+         返回预签名 URL。
 
     冷路径复用 _get_cached_document_data：它只做 Telegram 下载 + 内存
     TTLCache，不触发 R2 上传，与本函数"唯一上传出口"的约定一致
-    （同 _resolve_r2_public_url_for_vision 的设计注释）。
+    （同 _resolve_r2_presigned_url_for_vision 的设计注释）。
     返回值绝不包含 bot token：Telegram 直链会泄露 token 给第三方 API。
     """
     fid = str(file_id or "").strip()
@@ -373,21 +376,22 @@ async def _resolve_r2_public_url_for_document(file_id: str, mime_type: str = "ap
     r2_key = _get_r2_key(fid)
 
     if await file_exists_in_r2(r2_key):
-        url = await public_url_for_existing_key(r2_key)
+        url = await presigned_url_for_existing_key(r2_key)
         if url:
             return url
         return ""
 
     # 冷路径：同步拉取 + 同步上传（首次访问 anthropic 原生文档路径时
-    # 触发一次，之后切换模型直接命中路径 2）。
+    # 触发一次，之后切换模型直接命中路径 2）。上传返回值不作数：
+    # 媒体输入统一重新签发预签名 URL。
     doc_bytes = await _get_cached_document_data(None, fid)
     if not doc_bytes:
         return ""
 
     result = await upload_bytes_to_r2(doc_bytes, r2_key, mime_type or "application/pdf")
-    if result is None or result.startswith("file://"):
+    if result is None:
         return ""
-    return result
+    return await presigned_url_for_existing_key(r2_key) or ""
 
 
 async def _ensure_video_persisted(file_id: str, mime_type: str = "video/mp4") -> None:
@@ -573,7 +577,8 @@ async def _build_native_document_block(
       官方限制：URL / base64 source 的 document 块**仅接受 PDF**
       （docx/xlsx 等二进制格式不被 document 块支持，官方要求先转成
       文本或 PDF）。因此：
-        * PDF      → 优先 R2 公开 URL（与图片 Agnes 路径同一套解析），
+        * PDF      → 优先 R2 预签名 URL（与图片 Agnes 路径同一套解析，
+                      媒体输入统一预签名），
                       URL 不可用时退回 base64 内联；
         * 非 PDF   → 返回 None，调用方走文本占位（链接 + file_id，
                       模型可用工具读取），绝不静默内联一个错误形状。
@@ -597,7 +602,7 @@ async def _build_native_document_block(
             )
             return None
 
-        url = await _resolve_r2_public_url_for_document(file_id, safe_mime)
+        url = await _resolve_r2_presigned_url_for_document(file_id, safe_mime)
         if url:
             return DocumentBlock(url=url, filename=safe_name, mime=safe_mime)
 
@@ -617,45 +622,49 @@ def _attachment_label(kind: str) -> str:
     return _ATTACHMENT_KIND_LABELS.get(str(kind or "").lower(), str(kind or "附件"))
 
 
-async def _resolve_public_attachment_url(file_id: str) -> str:
-    """把 Telegram file_id 解析成一个可供模型/工具继续引用的公开 URL。
+async def _resolve_presigned_attachment_url(file_id: str) -> str:
+    """把 Telegram file_id 解析成一个可供模型/工具继续引用的 R2 预签名 URL。
 
     安全约束：此函数的返回值会被嵌入到发送给 LLM 的 fallback 文本里
     （见 ``_build_attachment_fallback_text``），因此**绝对不能**返回
     Telegram 直链 —— 那会暴露 ``bot{TELEGRAM_BOT_TOKEN}/`` 给第三方模型
-    API。优先返回 R2 公开 URL；若 R2 未配置则返回空串，由调用方降级为
-    file_id 文本。
+    API。与多模态注入一致，统一返回 R2 预签名 URL（不依赖公开域名
+    配置，切换模型时地址始终可重新签发）；R2 未配置则返回空串，由
+    调用方降级为 file_id 文本。
     """
     fid = str(file_id or "").strip()
     if not fid:
         return ""
 
     # 不再返回 Telegram 直链（避免把 bot token 暴露给第三方模型 API）。
-    # 仅 R2 公开 URL 是安全的：它要么是自定义域，要么是 r2.dev。
+    # 仅 R2 预签名 URL 是安全的媒体引用：R2 未配置时返回 None（本地
+    # file:// 地址对模型不可达），由调用方降级。
     try:
         r2_key = _get_r2_key(fid)
         if await file_exists_in_r2(r2_key):
             # fallback 与多模态注入统一使用上传后的临时访问 URL。
             # 不依赖永久公开域名，避免切换模型时丢失可访问地址。
-            return await generate_presigned_url(r2_key)
+            return await presigned_url_for_existing_key(r2_key) or ""
     except Exception as e:
         logger.debug(f"解析 R2 文件 URL 失败 {fid[:12]}: {e}")
 
     return ""
 
 
-async def _resolve_r2_public_url_for_vision(file_id: str) -> str:
-    """为 vision API 解析公开可访问的 HTTP URL（Agnes 等只接受公开 URL 的网关）。
+async def _resolve_r2_presigned_url_for_vision(file_id: str) -> str:
+    """为 vision 输入解析 R2 预签名 URL（Agnes 等只接受 URL 输入的网关）。
 
-    三条路径，按开销从低到高：
+    媒体输入统一预签名后，三条路径按开销从低到高：
 
       1. **R2 未配置 → 立即返回空串**。让调用方降级 base64，避免"拉字节
-         → 上传本地 file:// → 检测不可公开访问 → 降级 base64"的无谓链路
+         → 上传本地 file:// → 检测不可达 → 降级 base64"的无谓链路
          （浪费一次本地磁盘 IO 和一次 download_from_r2 调用）。
-      2. **R2 已有该对象 → 直接拿公开 URL**。无上传开销，无 Telegram API
-         调用。这是切换模型场景下的热路径（Gemini 那轮已上传过）。
+      2. **R2 已有该对象 → 直接签发预签名 URL**。无上传开销，无 Telegram
+         API 调用。这是切换模型场景下的热路径（Gemini 那轮已上传过）。
+         URL 由 TTLCache 记忆化至过期前 5 分钟，窗口内字节级稳定，
+         历史消息里的 image_url 不会因重签而变字节，前缀缓存得以保全。
       3. **R2 有配置但对象不存在 → 同步从 Telegram 拉字节 → 同步上传到
-         R2 → 返回 URL**。这是首次访问 Agnes 的冷路径。
+         R2 → 签发并返回预签名 URL**。这是首次访问 Agnes 的冷路径。
 
     关键设计：本函数负责**唯一的** R2 上传调用，不通过
     ``get_cached_image_data`` 触发后台上传。旧版本调 ``get_cached_image_data``
@@ -674,28 +683,28 @@ async def _resolve_r2_public_url_for_vision(file_id: str) -> str:
 
     r2_key = _get_r2_key(fid)
 
-    # 路径 2：R2 已有 → 直接拿公开 URL（custom domain / r2.dev / presigned）
+    # 路径 2：R2 已有 → 直接签发预签名 URL
     if await file_exists_in_r2(r2_key):
-        url = await public_url_for_existing_key(r2_key)
+        url = await presigned_url_for_existing_key(r2_key)
         if url:
             return url
-        # R2 已有对象但拿不到公开 URL（罕见：custom domain 未配 + presign 失败）
+        # R2 已有对象但签发失败（罕见：R2 API 瞬时异常）
         # → 让调用方降级 base64
         return ""
 
     # 路径 3：R2 未有 → 同步从 Telegram 拉字节 + 同步上传
     # 不调 get_cached_image_data：它会再做一次 file_exists_in_r2（外层刚做过）
-    # 是纯浪费 HEAD 请求。
+    # 是纯浪费 HEAD 请求。上传返回值（公开 URL）不作数：媒体输入统一
+    # 重新签发预签名 URL。
     img_bytes = await _fetch_from_telegram_and_cache(fid)
     if not img_bytes:
         return ""
 
     result = await upload_bytes_to_r2(img_bytes, r2_key, "image/jpeg")
-    if result is None or result.startswith("file://"):
-        # upload_bytes_to_r2 返回 file:// 说明 is_r2_configured() 其实是 False，
-        # 但路径 1 已早退，这里理论上不该走到；保险起见仍降级。
+    if result is None:
+        # upload_bytes_to_r2 返回 None 说明上传最终失败（已记日志），降级。
         return ""
-    return result
+    return await presigned_url_for_existing_key(r2_key) or ""
 
 
 async def _build_attachment_fallback_text(
@@ -728,7 +737,7 @@ async def _build_attachment_fallback_text(
         mime = ""
         if mime_types and idx - 1 < len(mime_types):
             mime = str(mime_types[idx - 1] or "").strip()
-        url = await _resolve_public_attachment_url(fid) if fid else ""
+        url = await _resolve_presigned_attachment_url(fid) if fid else ""
         any_url = any_url or bool(url)
         parts = [f"{safe_kind}{idx if total > 1 else ''}"]
         if fname:
@@ -807,15 +816,16 @@ async def _build_image_block(
     """把单个图片 file_id 解析为 ImageBlock（失败返回 None）。
 
     从 photo_group 分支抽出的公共逻辑，混合附件分支复用。
-    统一解析顺序：优先 R2 公开 URL（公开可访问的 image_url 是各网关的
-    公共分母，Agnes 等只接受公开 URL 的网关同样兼容；R2 未配置时该
-    解析零成本返回空串），失败回退 base64 内联，并顺带做 R2 预上传与
-    TTL 缓存。
+    统一解析顺序：优先 R2 预签名 URL（媒体输入统一预签名是本项目的
+    统一约定，Agnes 等只接受 URL 输入的网关同样兼容；预签名 URL 由
+    TTLCache 记忆化至过期前 5 分钟，窗口内字节级稳定保前缀缓存；
+    R2 未配置时该解析零成本返回空串），失败回退 base64 内联，并顺带
+    做 R2 预上传与 TTL 缓存。
     """
-    public_url = await _resolve_r2_public_url_for_vision(file_id)
-    if public_url:
-        return ImageBlock(url=public_url, detail="high")
-    logger.debug(f"R2 公开 URL 不可用，回退 base64 内联: {file_id[:12]}")
+    presigned_url = await _resolve_r2_presigned_url_for_vision(file_id)
+    if presigned_url:
+        return ImageBlock(url=presigned_url, detail="high")
+    logger.debug(f"R2 预签名 URL 不可用，回退 base64 内联: {file_id[:12]}")
 
     img_bytes = await get_cached_image_data(chat_id, file_id) if chat_id else None
     if not img_bytes:
@@ -825,7 +835,7 @@ async def _build_image_block(
     # 目的：
     #   1. 让内存 TTLCache (~5min) 过期后能从 R2 拉取，避免再调
     #      Telegram getFile API（Telegram bot getFile 有 rate limit）。
-    #   2. 让后续轮次能零延迟拿 R2 公开 URL（上面的优先路径），
+    #   2. 让后续轮次能零延迟拿 R2 预签名 URL（上面的优先路径），
     #      不必再走同步上传路径。
     # R2 命中路径不经过这里（拿到 URL 时早已 return），
     # 所以同一张图不会被 put_object 两次。
@@ -870,7 +880,7 @@ async def _resolve_mixed_attachments(
     """
     supports_image_input = model_info.image_input
     supports_audio_input = model_info.audio_input
-    supports_video = bool(getattr(model_info, "video", False))
+    supports_video = bool(getattr(model_info, "video_input", False))
     supports_document_input = bool(getattr(model_info, "document_input", False))
 
     blocks: list[Block] = []
@@ -888,9 +898,9 @@ async def _resolve_mixed_attachments(
         if kind == "photo" and supports_image_input:
             resolved_block = await _build_image_block(chat_id, fid)
         elif kind == "video" and supports_video:
-            public_url = await _resolve_r2_public_url_for_video(fid, mime or "video/mp4")
-            if public_url:
-                resolved_block = VideoBlock(url=public_url)
+            presigned_url = await _resolve_r2_presigned_url_for_video(fid, mime or "video/mp4")
+            if presigned_url:
+                resolved_block = VideoBlock(url=presigned_url)
             else:
                 # URL 不可用（R2 未配置/上传失败）：后台持久化，
                 # 万一 R2 稍后恢复，下一轮可重新解析为原生视频。
@@ -967,11 +977,11 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
     """
     supports_image_input = model_info.image_input
     supports_audio_input = model_info.audio_input
-    # 视频输入模态：默认由 provider 能力决定，模型必须显式设置 video=True 才开启。
+    # 视频输入模态：默认由 provider 能力决定，模型必须显式设置 video_input=True 才开启。
     # 与 image_input/audio_input 等参数保持一致：provider 只提供默认能力，模型配置负责覆盖。
-    # 例如 OpenRouter 默认 video=False，但某个模型经过验证支持后可以手动 video=True。
+    # 例如 OpenRouter 默认 video_input=False，但某个模型经过验证支持后可以手动 video_input=True。
     # 这样不会因为免费模型 metadata 声明支持视频而误发送 video_url。
-    supports_video = bool(getattr(model_info, "video", False))
+    supports_video = bool(getattr(model_info, "video_input", False))
 
     supports_document_input = bool(getattr(model_info, "document_input", False))
     user_text = msg.get("content", "")
@@ -1010,7 +1020,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                 url_lines = []
                 for fid in file_ids:
                     try:
-                        temp_url = await _resolve_public_attachment_url(fid)
+                        temp_url = await _resolve_presigned_attachment_url(fid)
                     except Exception:
                         logger.debug("_resolve_multimodal_content 内部忽略的异常", exc_info=True)
                         temp_url = ""
@@ -1043,9 +1053,9 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                 mime = ""
                 if idx < len(vg_mime_types):
                     mime = str(vg_mime_types[idx] or "").strip()
-                public_url = await _resolve_r2_public_url_for_video(fid, mime or "video/mp4")
-                if public_url:
-                    return VideoBlock(url=public_url)
+                presigned_url = await _resolve_r2_presigned_url_for_video(fid, mime or "video/mp4")
+                if presigned_url:
+                    return VideoBlock(url=presigned_url)
                 return None
 
             results = await asyncio.gather(
@@ -1176,13 +1186,13 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
 
             # ---------- 视频输入模态（与图片 supports_image_input 路径对称） ----------
             # OpenRouter / vLLM / LiteLLM 等的事实标准：
-            #   {"type": "video_url", "video_url": {"url": "<公开 URL>"}}
-            # 视频统一走 URL（R2 公开域名 / 预签名），不走 base64 内联。
+            #   {"type": "video_url", "video_url": {"url": "<R2 预签名 URL>"}}
+            # 视频统一走 R2 预签名 URL，不走 base64 内联。
             if supports_video:
-                public_url = await _resolve_r2_public_url_for_video(fid, mime_type or "video/mp4")
-                if public_url:
+                presigned_url = await _resolve_r2_presigned_url_for_video(fid, mime_type or "video/mp4")
+                if presigned_url:
                     return [
-                        VideoBlock(url=public_url),
+                        VideoBlock(url=presigned_url),
                         TextBlock(user_text or "请分析这段视频。"),
                     ]
                 # URL 不可用（R2 未配置 / 上传失败）：降级为文本占位。
@@ -1190,7 +1200,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                 # 重新解析为原生视频。
                 _track_task(_ensure_video_persisted(fid, mime_type or "video/mp4"))
                 logger.warning(
-                    f"模型 {getattr(model_info, 'model_id', '?')} 支持视频但无法解析公开 URL，"
+                    f"模型 {getattr(model_info, 'model_id', '?')} 支持视频但无法解析预签名 URL，"
                     f"降级为文本占位: {fid[:12]}（检查 R2 配置）"
                 )
             else:
@@ -1198,7 +1208,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                 # 保证后续切换到支持视频的模型时不丢信息。
                 _track_task(_ensure_video_persisted(fid, mime_type or "video/mp4"))
 
-            url = await _resolve_public_attachment_url(fid)
+            url = await _resolve_presigned_attachment_url(fid)
             lines = [f"📎 用户上传了{_attachment_label(file_type)}「{file_name}」"]
             if url:
                 lines.append(f"链接：{url}")

@@ -50,7 +50,7 @@ def _register_test_media_models() -> None:
             provider="agnes",
             name="Agnes video 2.5",
             image_input=True,
-            video=True,
+            video_input=True,
             video_output=True,
             max_context=32768,
             max_output_tokens=4000,

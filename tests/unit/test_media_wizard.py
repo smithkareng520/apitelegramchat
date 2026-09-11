@@ -363,11 +363,11 @@ def test_media_collect_success_and_failure_retry(monkeypatch):
     import media_wizard as mw
     run = asyncio.new_event_loop()
 
-    # 第一次上传失败（未取得公开 URL）-> 提示重新发送（用户要求的重传语义）
+    # 第一次上传失败（未取得预签名 URL）-> 提示重新发送（用户要求的重传语义）
     async def fail_url(kind, file_id, mime=""):
         return ""
 
-    monkeypatch.setattr(mw, "resolve_media_public_url", fail_url)
+    monkeypatch.setattr(mw, "resolve_media_presigned_url", fail_url)
     consumed = run.run_until_complete(
         try_consume_media_message(sess.chat_id, {"type": "photo", "file_id": "f1"}))
     assert consumed and sess.first_frame is None
@@ -377,7 +377,7 @@ def test_media_collect_success_and_failure_retry(monkeypatch):
     async def ok_url(kind, file_id, mime=""):
         return f"https://r2.example/{file_id}"
 
-    monkeypatch.setattr(mw, "resolve_media_public_url", ok_url)
+    monkeypatch.setattr(mw, "resolve_media_presigned_url", ok_url)
     consumed = run.run_until_complete(
         try_consume_media_message(sess.chat_id, {"type": "photo", "file_id": "f2"}))
     assert consumed and sess.first_frame == "https://r2.example/f2"
@@ -408,7 +408,7 @@ def test_media_ref_video_then_start_seconds_and_audio(monkeypatch):
     async def ok_url(kind, file_id, mime=""):
         return f"https://r2.example/{file_id}.mp4"
 
-    monkeypatch.setattr(mw, "resolve_media_public_url", ok_url)
+    monkeypatch.setattr(mw, "resolve_media_presigned_url", ok_url)
     # 用户发的是视频 -> 收集后直接进入其设置页（起始时间/音轨）
     run.run_until_complete(
         try_consume_media_message(sess.chat_id, {"type": "video", "file_id": "vid", "mime_type": "video/mp4"}))

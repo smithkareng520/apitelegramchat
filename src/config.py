@@ -234,9 +234,9 @@ class ModelConfig:
     # 注意与 video_output（视频生成输出）区分：前者是输入模态，后者是
     # 生成模态。视频输入通过 OpenAI 兼容协议的 video_url content part
     # 传递（OpenRouter / vLLM / LiteLLM 等均为该事实标准），且由于视频
-    # 体积远大于图片，base64 内联容易触发网关请求体上限，因此统一优先
-    # 走 R2 公开 URL（见 attachment_content._resolve_r2_public_url_for_video）。
-    video: Optional[bool] = None
+    # 体积远大于图片，base64 内联容易触发网关请求体上限，因此统一走
+    # R2 预签名 URL（见 attachment_content._resolve_r2_presigned_url_for_video）。
+    video_input: Optional[bool] = None
     supports_tools: Optional[bool] = None
     image_output: Optional[bool] = None      # 原生图像生成（输出）能力
     document_input: Optional[bool] = None    # 原生文档输入能力
@@ -413,7 +413,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "openrouter": {
         "image_input": False,
         "audio_input": False,
-        "video": False,
+        "video_input": False,
         "supports_tools": True,
         "image_output": False,
         "document_input": False,
@@ -431,7 +431,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "modelscope": {
         "image_input": False,
         "audio_input": False,
-        "video": False,
+        "video_input": False,
         "supports_tools": True,
         "image_output": False,
         "document_input": False,
@@ -448,7 +448,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "gemini": {
         "image_input": True,
         "audio_input": False,
-        "video": False,
+        "video_input": False,
         "supports_tools": True,
         "image_output": False,
         "document_input": False,
@@ -465,7 +465,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "grok": {
         "image_input": False,
         "audio_input": False,
-        "video": False,
+        "video_input": False,
         "supports_tools": True,
         "image_output": False,
         "document_input": False,
@@ -482,7 +482,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "deepseek": {
         "image_input": False,
         "audio_input": False,
-        "video": False,
+        "video_input": False,
         "supports_tools": True,
         "image_output": False,
         "document_input": False,
@@ -499,7 +499,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "glm": {
         "image_input": False,
         "audio_input": False,
-        "video": False,
+        "video_input": False,
         "supports_tools": True,
         "image_output": False,
         "document_input": False,
@@ -516,7 +516,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "agnes": {
         "image_input": False,
         "audio_input": False,
-        "video": False,
+        "video_input": False,
         "supports_tools": True,
         "image_output": False,
         "document_input": False,
@@ -534,7 +534,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "anthropic": {
         "image_input": True,
         "audio_input": False,
-        "video": False,
+        "video_input": False,
         "supports_tools": True,
         "image_output": False,
         "document_input": True,
@@ -552,7 +552,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "xxtf": {
         "image_input": True,
         "audio_input": False,
-        "video": False,
+        "video_input": False,
         "supports_tools": True,
         "image_output": False,
         "document_input": True,
@@ -679,7 +679,7 @@ _ENDPOINT_OVERRIDE_FIELDS = (
 # 完全靠 endpoint 支持端点路由）；edits_endpoint / image_edit_inline /
 # vision_prefer_url 属补丁式参数已精简——图像编辑形状由 endpoint 指向的
 # URL 路径推导（见 media_generation.resolve_images_endpoint_shape），图片
-# 输入统一优先 R2 公开 URL（见 ai/attachment_content.py）。旧字段写法
+# 输入统一使用 R2 预签名 URL（见 ai/attachment_content.py）。旧字段写法
 # 直接报错暴露，避免旧配置被静默吞掉后行为与预期不符。
 _REMOVED_ENDPOINT_FIELDS = (
     "base_url",
@@ -748,7 +748,16 @@ def make_model_config(
                 "端点配置已精简为唯一 endpoint 字段（完整 URL）——base_url 并入"
                 " endpoint；edits_endpoint / image_edit_inline 已删除（编辑形状"
                 "由 endpoint 指向的图像端点路径推导）；vision_prefer_url 已删除"
-                "（图片输入统一优先 R2 公开 URL）。"
+                "（媒体输入统一使用 R2 预签名 URL）。"
+            )
+    # 迁移守卫（能力字段改名）：旧字段名若被静默忽略，模型会无声丢失
+    # 对应输入能力（如 video=True 被丢弃后视频输入关闭），直接报错暴露。
+    for _old_name, _new_name in (("video", "video_input"),):
+        if _old_name in kwargs:
+            raise ValueError(
+                f"模型 {model_id} 传入了已改名的字段 {_old_name}："
+                f"请改用 {_new_name}（能力字段统一以 _input/_output 后缀"
+                "区分输入/输出模态）。"
             )
 
     override_protocol = endpoint_overrides.get("protocol")
@@ -796,7 +805,7 @@ def make_model_config(
         name=name,
         image_input=merged.get("image_input"),
         audio_input=merged.get("audio_input"),
-        video=merged.get("video"),
+        video_input=merged.get("video_input"),
         supports_tools=merged.get("supports_tools"),
         image_output=merged.get("image_output"),
         document_input=merged.get("document_input"),
@@ -964,7 +973,7 @@ class EffectiveParams:
     # ---- 输入模态能力（鉴权用：用户输入了什么 vs 模型能收什么）----
     image_input: bool             # 图片输入
     audio_input: bool             # 音频输入
-    video_input: bool             # 视频输入（ModelConfig.video，与生成输出区分）
+    video_input: bool             # 视频输入（ModelConfig.video_input，与生成输出区分）
     document_input: bool          # 原生文档输入
     # ---- 输出模态能力（分支判断用）----
     image_output: bool            # 图像生成输出
@@ -1040,7 +1049,7 @@ def resolve_effective_params(model_info: Optional[ModelConfig]) -> EffectivePara
         name=str(getattr(model_info, "name", "") or ""),
         image_input=bool(getattr(model_info, "image_input", False)),
         audio_input=bool(getattr(model_info, "audio_input", False)),
-        video_input=bool(getattr(model_info, "video", False)),
+        video_input=bool(getattr(model_info, "video_input", False)),
         document_input=bool(getattr(model_info, "document_input", False)),
         image_output=bool(getattr(model_info, "image_output", False)),
         video_output=bool(getattr(model_info, "video_output", False)),
@@ -1241,7 +1250,7 @@ SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
 #     provider="agnes",
 #     name="Agnes video 2.5",
 #     image_input=True,
-#     video=True,
+#     video_input=True,
 #     video_output=True,
 #     max_context=32768,
 #     max_output_tokens=4000,

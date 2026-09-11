@@ -223,36 +223,31 @@ async def generate_presigned_url(
         return url
 
 
-async def public_url_for_existing_key(key: str) -> str | None:
-    """Return a publicly-accessible URL for an object that's already in R2.
+async def presigned_url_for_existing_key(key: str) -> str | None:
+    """媒体输入统一出口：为已存在于 R2 的对象签发预签名 URL。
 
-    Used by vision flows (e.g. Agnes, which rejects base64 image_url) to
-    satisfy the "publicly accessible image_url" requirement without
-    re-uploading the same bytes every turn.
+    媒体输入（image_url / video_url / document url source）统一走 R2
+    预签名 URL，不再区分"公开域名优先 / 预签名兜底"两条路径：
 
-    Resolution order:
-      1. If R2_PUBLIC_URL is configured (custom domain or r2.dev):
-         return ``{R2_PUBLIC_URL}/{key}`` — no signature, no expiry.
-      2. Otherwise, if R2 is configured remotely: return a presigned URL
-         (default 1h expiry). The URL is publicly fetchable but expires;
-         long-running sessions will re-issue a fresh one on the next turn.
-      3. R2 is not configured at all (local-cache fallback): return None.
-         ``file://`` URLs aren't publicly reachable, so the vision caller
-         must fall back to base64 (or skip the image entirely).
+      * 预签名 URL 由 TTLCache 记忆化至过期前 5 分钟（见
+        ``generate_presigned_url``），窗口内字节级稳定——历史消息里的
+        多模态 content 块不会因重签而变字节，前缀缓存得以保全；
+      * 签名访问不依赖 ``R2_PUBLIC_URL`` 公开域名配置（自定义域 /
+        r2.dev 配不配都能用），也不把对象内容暴露给无凭证的匿名抓取。
+
+    返回值约定：
+      1. R2 已配置：返回预签名 URL（默认 1h 有效，过期前 5 分钟内
+         的缓存条目已提前失效，长会话下一轮会自动签发新 URL）。
+      2. R2 未配置（本地缓存模式）：返回 None——``file://`` 地址不可
+         作为模型输入，调用方按各自协议降级（base64 内联 / 文本占位）。
     """
     if not is_r2_configured():
-        # Local cache: file:// URLs aren't publicly accessible, so signal
-        # the caller to fall back to base64.
         return None
 
-    base = _public_delivery_base_url()
-    if base:
-        return f"{base}/{key}"
-    # No public delivery URL — issue a presigned URL instead.
     try:
         return await generate_presigned_url(key)
     except Exception as e:
-        logger.warning("public_url_for_existing_key presign 失败 %s: %s", key, e)
+        logger.warning("presigned_url_for_existing_key presign 失败 %s: %s", key, e)
         return None
 
 
