@@ -27,10 +27,15 @@ logger = logging.getLogger(__name__)
 
 def _get_image_models_by_capability() -> tuple[list[str], list[str]]:
     """
-    返回两个列表：
+    返回两个列表（按模型配置能力推导，不按操作意图归类）：
     - text_models: 支持文生图的全部模型（image_output=True；image_input=True 的
       模型同样能纯文生图，一并列入，如 gpt-image-2 / gemini 图像模型）
-    - edit_models: 支持图生图/编辑（image_output=True, image_input=True）
+    - edit_models: 生成+编辑双能力模型（image_output=True, image_input=True）。
+      ⚠️ 这不是"只能编辑"的模型桶：该类模型在同一端点上，不带参考图即
+      纯文生图、带参考图即编辑（如 agnes-image-2.5-flash 恒定 POST
+      /images/generations，extra_body.image 可选——不传=生成，传=编辑）。
+      生成/编辑是"每次调用"由 image_url 是否携带决定的操作语义，不是
+      模型属性；模型属性只有"允不允许携带 image_url"这一条能力边界。
     """
     text_models = []
     edit_models = []
@@ -45,6 +50,11 @@ def _get_image_models_by_capability() -> tuple[list[str], list[str]]:
 # ----- 图像模型能力目录（统一图像工具 generate_image 用）-----
 TEXT_ONLY_MODELS, EDIT_MODELS = _get_image_models_by_capability()
 
+# 双能力模型显式别名（生成+编辑二合一，image_url 可选）。工具描述以
+# "Dual-mode models"名义列出该类，避免把模型呈现成"非纯生成即纯编辑"
+# 的两个互斥桶——EDIT_MODELS 里的模型同样能省略 image_url 纯文生图。
+DUAL_MODE_MODELS = list(EDIT_MODELS)
+
 
 def _get_video_models() -> list[str]:
     """返回所有支持原生视频生成的模型 ID（video_output=True）。"""
@@ -54,8 +64,9 @@ def _get_video_models() -> list[str]:
 # ----- 视频生成模型目录 -----
 VIDEO_MODELS = _get_video_models()
 
-# 仅支持文生图（不可携带参考图编辑）的图像模型 = 全部图像模型 - 可编辑模型。
-# generate_image 的工具描述据此向模型说明"什么模型可以编辑、什么只能生成"。
+# 仅支持文生图（不可携带参考图编辑）的图像模型 = 全部图像模型 - 双能力模型。
+# generate_image 的工具描述据此向模型说明能力边界：双能力模型 image_url
+# 可选（省略=生成、提供=编辑）；仅生成模型不接受 image_url。
 GENERATE_ONLY_MODELS = [m for m in TEXT_ONLY_MODELS if m not in EDIT_MODELS]
 
 # ---------- 工具定义 ----------
@@ -687,16 +698,24 @@ SEARCH_TOOLS = [
                 # 合并）：操作语义由 image_url 是否提供决定——省略 = 文生图，
                 # 提供 = 以该图为底编辑（图生图）。旧工具名仍可分发（别名
                 # 兼容，见 tool_dispatch），但不再进入工具清单。
+                # 显示口径（2026-09）：生成/编辑是"每次调用"的操作（由
+                # image_url 是否携带决定），不是模型属性；模型只按"允许
+                # 不允许携带 image_url"分两档——双能力模型（image_url 可选，
+                # 同一端点不带 URL 即生成、带 URL 即编辑，如
+                # agnes-image-2.5-flash）与仅生成模型（不接受 image_url）。
+                # 不再把模型呈现成"非纯生成即纯编辑"的两个互斥桶。
                 "name": "generate_image",
                 "description": (
-                    "Unified image tool: generate OR edit, decided by whether `image_url` is provided. "
+                    "Unified image tool: generate OR edit — the operation is decided PER CALL by whether "
+                    "`image_url` is provided, NOT by the model. "
                     "CREATE — omit `image_url`: generates a brand-new image from the text prompt. "
                     "EDIT — provide `image_url` (an image URL from earlier tool results, a user-upload URL, or a base64 data URL): "
                     "modifies that exact image according to the prompt (style change, object add/remove, background, angle...) "
                     "while keeping the rest of the scene unchanged. "
-                    f"Edit-capable models (accept image_url): {', '.join(EDIT_MODELS) if EDIT_MODELS else '(none)'}. "
-                    f"Generate-only models (text-to-image; do NOT pass image_url): {', '.join(GENERATE_ONLY_MODELS) if GENERATE_ONLY_MODELS else '(none)'}. "
-                    "Pick a model that matches the intended operation."
+                    "Models differ only in whether image_url is ALLOWED (dual-mode models run both operations on the same endpoint): "
+                    f"Dual-mode models (image_url OPTIONAL — omit it to create, provide it to edit): {', '.join(DUAL_MODE_MODELS) if DUAL_MODE_MODELS else '(none)'}. "
+                    f"Generate-only models (text-to-image; image_url NOT accepted): {', '.join(GENERATE_ONLY_MODELS) if GENERATE_ONLY_MODELS else '(none)'}. "
+                    "Any model can CREATE (omit image_url); EDIT requires a dual-mode model."
                 ),
                 "parameters": {
                     "type": "object",
@@ -708,7 +727,7 @@ SEARCH_TOOLS = [
                         "model": {
                             "type": "string",
                             "enum": TEXT_ONLY_MODELS,
-                            "description": "图像模型。带 image_url 编辑时必须从支持编辑的模型中选择（见工具描述中的 Edit-capable models）；纯文生图可选任意模型。"
+                            "description": "图像模型。所有模型均可纯文生图（省略 image_url）；带 image_url 编辑时必须从 Dual-mode models 中选择（这些模型同样支持纯文生图，同一模型省略/携带 image_url 即切换生成/编辑）。"
                         },
                         "image_url": {
                             "type": "string",
@@ -735,10 +754,13 @@ SEARCH_TOOLS = [
                     "required": ["prompt", "model"]
                 },
                 "input_examples": [
+                    # 纯文生图：任意模型（此处刻意用双能力模型演示——同一
+                    # 模型省略 image_url 即生成，与下一例同模型不同操作）
                     {"prompt": "一只在月球上骑自行车的橘猫，赛博朋克风格", "model": TEXT_ONLY_MODELS[0] if TEXT_ONLY_MODELS else ""},
+                    # 编辑：同一模型携带 image_url 即切换为编辑
                     {
                         "prompt": "移除场景中所有行人，保持其他内容完全不变",
-                        "model": EDIT_MODELS[0] if EDIT_MODELS else "",
+                        "model": DUAL_MODE_MODELS[0] if DUAL_MODE_MODELS else "",
                         "image_url": "https://example.com/previous-image.png"
                     }
                 ]

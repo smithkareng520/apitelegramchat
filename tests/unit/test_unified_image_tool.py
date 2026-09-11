@@ -14,6 +14,7 @@ import asyncio
 import pytest
 
 from search.tool_schemas import (
+    DUAL_MODE_MODELS,
     EDIT_MODELS,
     GENERATE_ONLY_MODELS,
     SEARCH_TOOLS,
@@ -56,11 +57,52 @@ def test_unified_image_tool_description_lists_capabilities():
     desc = _tool_defs()["generate_image"]["function"]["description"]
     # 双模式语义
     assert "EDIT" in desc and "CREATE" in desc
-    # 什么模型可以编辑 / 什么只能生成，随配置自动列全
+    # 什么模型可编辑 / 什么只能生成，随配置自动列全
     for model in EDIT_MODELS:
         assert model in desc
     for model in GENERATE_ONLY_MODELS:
         assert model in desc
+
+
+def test_unified_image_tool_description_states_dual_mode_semantics():
+    """双能力模型（如 agnes-image-2.5-flash）同一端点 image_url 可选：
+
+    描述必须把「操作由每次调用是否携带 image_url 决定（不是模型属性）」
+    与「模型只约束 image_url 允不允许携带」讲清楚，而不是把模型呈现成
+    非纯生成即纯编辑的两个互斥桶。
+    """
+    desc = _tool_defs()["generate_image"]["function"]["description"]
+    # 操作按次调用决定，不由模型决定
+    assert "PER CALL" in desc and "NOT by the model" in desc
+    # 双能力桶语义：image_url 可选——省略即生成、提供即编辑
+    assert "Dual-mode models" in desc and "OPTIONAL" in desc
+    # 仅生成桶语义：不接受 image_url
+    assert "NOT accepted" in desc
+    # 结论句：任意模型都能生成，编辑需双能力模型
+    assert "Any model can CREATE" in desc
+    assert "EDIT requires a dual-mode model" in desc
+    # 每个双能力模型都必须列在 Dual-mode 段内（而非仅出现在描述任意位置）
+    dual_section = desc.split("Dual-mode models")[1].split("Generate-only models")[0]
+    for model in DUAL_MODE_MODELS:
+        assert model in dual_section
+
+
+def test_dual_mode_models_is_edit_models_alias():
+    # DUAL_MODE_MODELS 是 EDIT_MODELS 的显式别名（同一能力集合，
+    # 仅显示口径不同：这些模型并非"只能编辑"，省略 image_url 同样能生成）
+    assert DUAL_MODE_MODELS == EDIT_MODELS
+
+
+def test_dual_mode_example_shows_same_model_both_operations():
+    # 示例对必须演示"同一模型省略/携带 image_url 切换生成/编辑"：
+    # 两例使用同一个双能力模型，第一例无 image_url，第二例有
+    tool = _tool_defs()["generate_image"]["function"]
+    examples = tool["input_examples"]
+    assert len(examples) >= 2
+    if DUAL_MODE_MODELS:
+        assert examples[0]["model"] == examples[1]["model"]
+        assert "image_url" not in examples[0]
+        assert examples[1].get("image_url")
 
 
 # ---------------------------------------------------------------------------

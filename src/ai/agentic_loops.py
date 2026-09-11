@@ -280,6 +280,62 @@ def _merged_extra_body(
     return body
 
 
+# =============================================================================
+# 网关侧媒体拉取瞬态失败判定（400 upstream_error 家族）
+# -----------------------------------------------------------------------------
+# 特征场景（2026-09-11 生产 [3a64f5cd]）：agnes-3.0-flash 等只接受 URL 输入
+# 的网关，每次请求都要自行下载消息历史里的媒体 URL（R2 预签名地址）。
+# R2 跨区域下载存在抖动——同一张图上一轮下载成功（3s），下一轮即超时：
+#   400 {"message": "... An exception occurred while loading IMAGE data at
+#        index 0: ... Timed out while downloading media URL: https://...
+#        ?X-Amz-Expires=...", "type": "upstream_error"}
+# 这类错误表明"网关拉取我们引用的媒体失败"，请求体本身没有问题——在
+# 首个增量前重放同一请求是幂等的（与下方 httpx.ReadTimeout 重试同语义）。
+# 必须与请求形状类 400（参数错误 / schema 拒绝，需要模型自纠）严格区分，
+# 后者绝不能吞掉重试。
+# =============================================================================
+_GATEWAY_MEDIA_FETCH_ERROR_MARKERS = (
+    "timed out while downloading media url",
+    "an exception occurred while loading image data",
+    "an exception occurred while loading video data",
+    "an exception occurred while loading audio data",
+    "an exception occurred while loading file data",
+)
+
+
+def _looks_like_transient_media_fetch_error(exc: BaseException) -> bool:
+    """判断是否为网关拉取媒体 URL 的瞬态失败（可重试）。
+
+    按错误文本的大小写不敏感子串匹配媒体拉取层标记，覆盖
+    LiteLLM/OpenAIException 等网关的层层包装变体。只匹配显式的
+    "加载 image/video/audio/file 数据失败" 与 "下载媒体 URL 超时"，
+    不匹配宽泛的 upstream_error（避免把非媒体类的上游错误误判为
+    可重试，吞掉真正需要暴露的请求问题）。
+    """
+    text = str(exc or "").lower()
+    return any(marker in text for marker in _GATEWAY_MEDIA_FETCH_ERROR_MARKERS)
+
+
+def _should_retry_media_fetch_400(
+    exc: BaseException, *, received_any: bool, stream_attempt: int
+) -> bool:
+    """400 媒体拉取失败是否应重放同一请求（纯判定，便于单测）。
+
+    条件三者缺一不可：
+      - 尚未收到任何流式增量（重放幂等；已向用户/工具状态写入增量
+        则重放会产生半个模型回合，必须直接抛出）；
+      - 尚未用过重试机会（stream_attempt < 1，与 ReadTimeout 重试
+        一样只补试一次）；
+      - 错误形状确属网关媒体拉取失败（见
+        :func:`_looks_like_transient_media_fetch_error`）。
+    """
+    return (
+        not received_any
+        and stream_attempt < 1
+        and _looks_like_transient_media_fetch_error(exc)
+    )
+
+
 async def _agentic_loop_openai_compat(
         client: AsyncOpenAI, current_model: str, messages: list, api_label: str,
         builder: "DraftManager", tools: Optional[list[dict[str, Any]]] = None, supports_tools: bool = True,
@@ -620,6 +676,21 @@ async def _agentic_loop_openai_compat(
                         mark_strict_tools_rejected(api_label, str(exc))
                         request_tools = tools
                         create_params["tools"] = tools
+                        continue
+                    # 网关侧媒体拉取瞬态失败（如 Agnes 下载消息历史里的
+                    # R2 预签名 URL 超时，400 + upstream_error）：请求体
+                    # 本身没有问题，首个增量前重放同一请求是幂等的——与
+                    # 下方 ReadTimeout 重试同语义，只补试一次。R2 跨区域
+                    # 下载抖动常见（同一张图上一轮能下、下一轮超时），
+                    # 一次重试即可挽救大多数原本整轮报废的回合。
+                    if _should_retry_media_fetch_400(
+                        exc, received_any=received_any, stream_attempt=stream_attempt
+                    ):
+                        logger.warning(
+                            "[%s] 第 %s 轮网关媒体拉取失败（400 upstream_error），等待后重放同一请求",
+                            api_label, _round + 1,
+                        )
+                        await asyncio.sleep(1.5)
                         continue
                     raise
                 except httpx.ReadTimeout:
