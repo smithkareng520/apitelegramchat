@@ -95,17 +95,24 @@ class InputCombination:
 
 
 def _count_kind(modality: Modality, count: dict, file_id: Any, seen: set) -> None:
-    """按 file_id 去重计数。
+    """按 (模态, file_id) 去重计数。
 
-    photo_group 等组信封同时携带 file_ids 数组与 attachments 列表（同一
-    批文件的两份视图），不去重会把单图数成 2、双图相册数成 4——预检
-    日志的 photo×N 因此失真，误导多图链路排查（2026-09-12 生产案例：
-    单图被日志显示为 photo×2，被误读为"两张图都进了管道"）。
+    去重背景（2026-09-12 生产事故）：所有消息生产者写入的信封同时携带
+    ``file_ids`` 数组与 ``attachments`` 列表（同一附件的两种表示）。旧版
+    对两种表示各数一遍，1 张照片被计成 photo×2——预检日志失真，直接
+    把"第二张照片在管道上游丢失"的事故误判为"两张图都到了、模型只
+    描述一张"，排查方向被带偏数轮补丁。改为 (模态, file_id) 联合去重
+    后，无论信封带哪种表示（或两者都带），每个物理附件恒计 1 次。
+    （Telegram 对同一文件的每次发送分配唯一 file_id，file_id 去重不会
+    误合并用户真正重复发送的两张图。）
     """
-    key = str(file_id) if file_id else ""
-    if key and key not in seen:
-        seen.add(key)
-        count[modality] = count.get(modality, 0) + 1
+    if not file_id:
+        return
+    key = (modality, str(file_id))
+    if key in seen:
+        return
+    seen.add(key)
+    count[modality] = count.get(modality, 0) + 1
 
 
 def resolve_input_combination(user_message: Optional[dict]) -> InputCombination:
@@ -124,7 +131,9 @@ def resolve_input_combination(user_message: Optional[dict]) -> InputCombination:
     if not isinstance(text, str):
         text = ""
     counts: dict = {}
-    seen_file_ids: set = set()
+    # (模态, file_id) 去重集合：信封可能同时携带 file_ids/file_id 与
+    # attachments 两种表示（同一物理附件），联合去重保证恰好计 1 次。
+    seen: set = set()
 
     msg_type = str(user_message.get("type") or "").strip().lower()
     kind_map = {
@@ -138,9 +147,9 @@ def resolve_input_combination(user_message: Optional[dict]) -> InputCombination:
         file_ids = user_message.get("file_ids")
         if isinstance(file_ids, list) and file_ids:
             for fid in file_ids:
-                _count_kind(modality, counts, fid, seen_file_ids)
+                _count_kind(modality, counts, fid, seen)
         else:
-            _count_kind(modality, counts, user_message.get("file_id"), seen_file_ids)
+            _count_kind(modality, counts, user_message.get("file_id"), seen)
 
     atts = user_message.get("attachments")
     if isinstance(atts, list):
@@ -151,7 +160,7 @@ def resolve_input_combination(user_message: Optional[dict]) -> InputCombination:
                 continue
             kind = att_kind_map.get(str(att.get("kind") or "").strip().lower())
             if kind:
-                _count_kind(kind, counts, att.get("file_id"), seen_file_ids)
+                _count_kind(kind, counts, att.get("file_id"), seen)
 
     return InputCombination(
         text=text,

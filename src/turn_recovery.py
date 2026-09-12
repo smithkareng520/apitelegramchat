@@ -108,6 +108,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -123,6 +124,8 @@ logger = get_logger(__name__)
 __all__ = [
     "INTERRUPTED_TOOL_PLACEHOLDER",
     "EARLY_PERSIST_FLAG",
+    "EARLY_PERSIST_MODE",
+    "EARLY_PERSIST_TS",
     "TURN_FAILED_FLAG",
     "register_inflight_turn",
     "note_turn_persisted",
@@ -131,6 +134,7 @@ __all__ = [
     "drain_completed_turns",
     "persist_salvaged_journal",
     "persist_user_message_entry",
+    "undo_early_persist",
     "mark_failed_unanswered_user",
     "reset_turn_delivery_state",
     "default_send_value",
@@ -145,6 +149,14 @@ INTERRUPTED_TOOL_PLACEHOLDER = "用户打断，未执行"
 
 # user 消息提前持久化标记：update_conversation_and_ledger 见到此标记跳过 append。
 EARLY_PERSIST_FLAG = "__apitc_early_persisted__"
+
+# 提前持久化的落库方式（appended=独立追加 / merged=合并进上一条未回应 user）：
+# 消费型接管（media_wizard 收素材）与 pre_flight 拒绝分支据此决定是否回滚。
+EARLY_PERSIST_MODE = "__apitc_early_persist_mode__"
+# 提前持久化的身份标记：与消息一起写入历史 Message.meta，undo 时校验
+# 历史末尾那条 user 消息确实是本次写入的那一条（防误删并发写入的消息）。
+# meta 永不出站（见 core/messages.py），不会进入请求体。
+EARLY_PERSIST_TS = "__apitc_early_persist_ts__"
 
 # 引用回复前缀标记（与 app_turns/media_wizard 同值；此处复制以避免循环导入）。
 # 引用前缀只服务当前请求的上下文提示（拼在 user content 开头），持久化历史
@@ -710,6 +722,9 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
         content = _strip_reply_prefix(content if isinstance(content, str) else str(content or ""))
         return Message.user_text(str(content or ""), **env)
 
+    # 身份标记必须 BEFORE 落库写入：它会随 _wrap_envelope 进入存储消息的
+    # meta，undo_early_persist 据此校验"历史末尾那条就是我写的这条"。
+    user_message[EARLY_PERSIST_TS] = uuid.uuid4().hex
     lock = await get_chat_lock(chat_id)
     async with lock:
         ctx = get_or_init_context(chat_id)
@@ -722,6 +737,7 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
                 # 上一轮请求失败：替换而非合并（重试语义，见函数 docstring）。
                 _replace_failed_user_message(last_env, user_message)
                 history[-1] = _wrap_envelope(last_env)
+                user_message[EARLY_PERSIST_MODE] = "replaced"
                 logger.info(
                     "[turn-recovery] chat=%s 上一轮请求失败：新 user 消息替换失败轮消息"
                     "（不合并旧文本/图片，媒体仅在新消息为空时搬移一份）",
@@ -731,14 +747,74 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
                 # 打断发生在任何 assistant 输出之前：合并，避免连续两条 user。
                 _merge_user_message(last_env, user_message)
                 history[-1] = _wrap_envelope(last_env)
+                user_message[EARLY_PERSIST_MODE] = "merged"
                 logger.info(
                     "[turn-recovery] chat=%s 新 user 消息合并进上一条未回应的 user 消息",
                     chat_id,
                 )
         else:
             history.append(_wrap_envelope(user_message))
+            user_message[EARLY_PERSIST_MODE] = "appended"
     user_message[EARLY_PERSIST_FLAG] = True
     return True
+
+
+async def undo_early_persist(chat_id: int, user_message: dict) -> None:
+    """回滚一次提前持久化（消费型接管 / pre_flight 拒绝时恢复原状）。
+
+    背景（2026-09-12 生产事故修复）：spawn_turn_task 在派发回合任务前
+    先把 user 消息持久化，消除"回合在 persist 前被下一条消息打断、
+    消息静默丢失"的窗口。代价是：消息入库后，媒体参数卡片接管
+    （try_consume_media_message / try_consume_text_message）或
+    pre_flight_context_check 拒绝时需要撤回这条入库——本函数就是那个
+    撤回入口。
+
+    语义：
+      - mode=appended：历史末尾就是本次 append 的那条 → 校验 TS 一致后
+        pop，恢复到未入库状态；
+      - mode=merged / replaced：旧消息已被改写（合并/替换），无法也不应
+        机械回滚——保持现状（消息确实是用户发的，留在历史不产生错误
+        信息；被卡片消费的素材下次回合作为上下文出现属可接受的边界）。
+      - 未持久化（无标记）：无操作。幂等，可安全重复调用。
+    """
+    if chat_id is None or not isinstance(user_message, dict):
+        return
+    if not user_message.get(EARLY_PERSIST_FLAG):
+        return
+    mode = user_message.get(EARLY_PERSIST_MODE)
+    if mode != "appended":
+        logger.debug(
+            "[turn-recovery] chat=%s undo_early_persist 跳过（mode=%s，不回滚）",
+            chat_id, mode,
+        )
+        return
+    ts = user_message.get(EARLY_PERSIST_TS)
+    lock = await get_chat_lock(chat_id)
+    async with lock:
+        ctx = get_or_init_context(chat_id)
+        history = ctx.get("conversation_history") or []
+        last = history[-1] if history else None
+        if (
+            isinstance(last, Message)
+            and last.role == "user"
+            and ts
+            and last.meta.get(EARLY_PERSIST_TS) == ts
+        ):
+            history.pop()
+            logger.info(
+                "[turn-recovery] chat=%s 已回滚提前持久化的 user 消息（消费/拒绝路径）",
+                chat_id,
+            )
+        else:
+            # 历史末尾不是本次写入的那条（并发写入/已被改写）：保守不删。
+            logger.debug(
+                "[turn-recovery] chat=%s undo_early_persist 未命中末尾消息，保持不动",
+                chat_id,
+            )
+    # 清理标记，避免同一次派发内重复回滚。
+    user_message.pop(EARLY_PERSIST_FLAG, None)
+    user_message.pop(EARLY_PERSIST_MODE, None)
+    user_message.pop(EARLY_PERSIST_TS, None)
 
 
 async def mark_failed_unanswered_user(chat_id: int) -> None:

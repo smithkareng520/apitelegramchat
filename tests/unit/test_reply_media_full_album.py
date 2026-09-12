@@ -141,94 +141,15 @@ def test_reply_to_album_returns_all_photos():
 
 def test_reply_to_album_registry_miss_falls_back_to_single_shard():
     state.album_media_registry.clear()
-    state.user_contexts.pop(777, None)  # 隔离：确保历史回退也查不到
     items = _get_reply_media(_reply_msg({
         "message_id": 102,
         "media_group_id": "MG-gone",
         "photo": [{"file_id": "small2"}, {"file_id": "big2"}],
     }))
-    # bot 重启 / 登记淘汰且历史信封也没有 media_group_id（修复前的旧相册）：
-    # 退化为单分片（旧行为），不报错
+    # bot 重启 / 登记淘汰：退化为单分片（旧行为），不报错
     assert len(items) == 1
     assert items[0]["file_id"] == "big2"
     assert items[0]["kind"] == "photo"
-
-
-def test_reply_to_album_history_fallback_after_restart():
-    # 2026-09-12 [6c15a092] 生产案例的修复路径：bot 重启后内存登记表
-    # （album_media_registry 不持久化）为空，但相册聚合时的组信封携带
-    # media_group_id 存进了对话历史（Message.meta）——回复该相册时应从
-    # 历史反查回整组图片，而不是退化单分片（"只看到一张图"）。
-    from core.messages import Message
-
-    state.album_media_registry.clear()
-    envelope = Message.user_text(
-        "📎 用户上传了图片组（共 3 张）",
-        type="photo_group",
-        file_ids=["big1", "big2", "big3"],
-        media_group_id="MG-hist",
-        message_ids=[101, 102, 103],
-        attachments=[
-            {"kind": "photo", "file_id": "big1"},
-            {"kind": "photo", "file_id": "big2"},
-            {"kind": "photo", "file_id": "big3"},
-        ],
-    )
-    state.user_contexts.setdefault(777, {})["conversation_history"] = [envelope]
-    try:
-        items = _get_reply_media(_reply_msg({
-            "message_id": 102,
-            "media_group_id": "MG-hist",
-            "photo": [{"file_id": "small2"}, {"file_id": "big2"}],
-        }))
-        assert [it["file_id"] for it in items] == ["big1", "big2", "big3"]
-        assert all(it["kind"] == "photo" for it in items)
-    finally:
-        state.user_contexts.pop(777, None)
-
-
-def test_reply_to_album_history_fallback_without_attachments_rebuilds_from_file_ids():
-    # 极旧信封（组类型 + file_ids 数组、无 attachments）：按组类型重建条目
-    from core.messages import Message
-
-    state.album_media_registry.clear()
-    envelope = Message.user_text(
-        "x", type="photo_group", file_ids=["p1", "p2"], media_group_id="MG-old",
-    )
-    state.user_contexts.setdefault(777, {})["conversation_history"] = [envelope]
-    try:
-        items = _get_reply_media(_reply_msg({
-            "message_id": 2,
-            "media_group_id": "MG-old",
-            "photo": [{"file_id": "p1"}],
-        }))
-        assert [it["file_id"] for it in items] == ["p1", "p2"]
-        assert all(it["kind"] == "photo" for it in items)
-    finally:
-        state.user_contexts.pop(777, None)
-
-
-def test_reply_to_album_history_fallback_respects_chat_isolation():
-    # 历史回退同样按 chat 归属隔离：别的 chat 的同名组不串
-    from core.messages import Message
-
-    state.album_media_registry.clear()
-    envelope = Message.user_text(
-        "x", type="photo_group", file_ids=["o1", "o2"],
-        media_group_id="MG-cross", attachments=[{"kind": "photo", "file_id": "o1"},
-                                                {"kind": "photo", "file_id": "o2"}],
-    )
-    state.user_contexts.setdefault(888, {})["conversation_history"] = [envelope]
-    try:
-        items = _get_reply_media(_reply_msg({
-            "message_id": 9,
-            "media_group_id": "MG-cross",
-            "photo": [{"file_id": "px"}],
-        }, chat_id=777))
-        # chat 777 历史里没有该组 → 退化单分片
-        assert len(items) == 1 and items[0]["file_id"] == "px"
-    finally:
-        state.user_contexts.pop(888, None)
 
 
 def test_reply_media_single_media_messages():

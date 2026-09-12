@@ -974,6 +974,11 @@ async def try_consume_media_message(chat_id: int, user_message: Optional[dict]) 
 
     上传失败（未取得公开访问 URL）时卡片给出错误提示并保持可重传——
     用户明确要求"没有获取预签名 URL 可以要求再次上传"，绝不静默丢弃。
+
+    可观测性（2026-09-12）：消费分支一律 INFO 留痕。此前被卡片消费的
+    消息无任何日志，一旦用户反馈"发两张图只处理了一张"，无法从日志
+    区分"被卡片消费"还是"回合被打断丢失"（后者是当时真实存在的
+    缺陷），排查成本极高。
     """
     sess = get_session(chat_id)
     if sess is None:
@@ -991,6 +996,10 @@ async def try_consume_media_message(chat_id: int, user_message: Optional[dict]) 
         # 一次莫名其妙"缺 prompt"的生成回合）
         sess.collect_error = "请先点击对应的『上传/添加』按钮，再发送素材。"
         await _render_card(sess)
+        logger.info(
+            "[media-wizard] chat=%s 已消费媒体消息（未进入收集态）：kind=%s",
+            chat_id, atts[0].get("kind"),
+        )
         return True
 
     expect = _SLOT_EXPECT[slot]
@@ -1001,6 +1010,10 @@ async def try_consume_media_message(chat_id: int, user_message: Optional[dict]) 
             f"本次发送的{_KIND_LABEL.get(atts[0]['kind'], atts[0]['kind'])}已忽略。"
         )
         await _render_card(sess)
+        logger.info(
+            "[media-wizard] chat=%s 已消费媒体消息（类型不匹配 slot=%s）：kind=%s",
+            chat_id, slot, atts[0].get("kind"),
+        )
         return True
 
     sess.collect_slot = None
@@ -1028,6 +1041,10 @@ async def try_consume_media_message(chat_id: int, user_message: Optional[dict]) 
         # 用户要求的流程：发完参考视频立即进入其设置页（起始时间/音轨）
         sess.page = f"videoref:{len(sess.ref_videos)}"
     await _render_card(sess)
+    logger.info(
+        "[media-wizard] chat=%s 已消费媒体消息并入槽 slot=%s：added=%d failed=%d kind=%s",
+        chat_id, slot, added, failed, matched[0].get("kind") if matched else "?",
+    )
     return True
 
 
@@ -1035,6 +1052,7 @@ async def try_consume_text_message(chat_id: int, raw_text: str) -> bool:
     """卡片会话接管文本消息：seed/起始秒数输入，或更新提示词。
 
     返回 True = 消息已消费（不进入正常回合）。无活跃卡片时恒为 False。
+    消费分支 INFO 留痕（同 try_consume_media_message 的可观测性说明）。
     """
     sess = get_session(chat_id)
     if sess is None:
@@ -1051,6 +1069,7 @@ async def try_consume_text_message(chat_id: int, raw_text: str) -> bool:
             sess.collect_error = None
         sess.page = "seed"
         await _render_card(sess)
+        logger.info("[media-wizard] chat=%s 已消费文本消息（seed 输入）", chat_id)
         return True
 
     if sess.awaiting_input and sess.awaiting_input.startswith("start_seconds:"):
@@ -1072,6 +1091,7 @@ async def try_consume_text_message(chat_id: int, raw_text: str) -> bool:
             sess.collect_error = None
         sess.page = f"videoref:{idx}" if idx else "refs"
         await _render_card(sess)
+        logger.info("[media-wizard] chat=%s 已消费文本消息（起始秒数输入）", chat_id)
         return True
 
     if not text:

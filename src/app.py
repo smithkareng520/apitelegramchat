@@ -812,7 +812,11 @@ async def process_update(data: dict) -> None:
                 # 首次绑定即标注 dict[str, Any]：后续媒体分支会写入 list/dict
                 # 值（file_ids/attachments/sticker_meta 等 Telegram 载荷）。
                 user_message: dict[str, Any] = {"role": "user", "content": content_text}
-                await spawn_turn_task(chat_id, _handle_text_message(chat_id, content_text, username, user_message))
+                await spawn_turn_task(
+                    chat_id,
+                    _handle_text_message(chat_id, content_text, username, user_message),
+                    user_message=user_message,
+                )
                 return
 
             # ── 媒体组（图片） ─────────────────────────────────
@@ -908,7 +912,11 @@ async def process_update(data: dict) -> None:
                     ],
                 }
 
-                await spawn_turn_task(chat_id, _handle_photo_message(chat_id, user_message, username))
+                await spawn_turn_task(
+                    chat_id,
+                    _handle_photo_message(chat_id, user_message, username),
+                    user_message=user_message,
+                )
                 return
 
             # ── 单个文档 ──────────────────────────────────────────────────
@@ -982,7 +990,11 @@ async def process_update(data: dict) -> None:
 
                     user_message = {"role": "user", "content": content_text, "file_id": fid, "file_name": safe_fname, "mime_type": mime_type, "type": "document", "attachments": [{"kind": "document", "file_id": fid, "file_name": safe_fname, "mime_type": mime_type}]}
 
-                await spawn_turn_task(chat_id, _handle_document_message(chat_id, user_message, username))
+                await spawn_turn_task(
+                    chat_id,
+                    _handle_document_message(chat_id, user_message, username),
+                    user_message=user_message,
+                )
                 return
 
             # ── 语音 / 音频 ───────────────────────────────────────────────
@@ -1045,7 +1057,11 @@ async def process_update(data: dict) -> None:
                             }
                         ] + extra_audio_attachments,
                     }
-                    await spawn_turn_task(chat_id, _handle_audio_message(chat_id, user_message, username))
+                    await spawn_turn_task(
+                        chat_id,
+                        _handle_audio_message(chat_id, user_message, username),
+                        user_message=user_message,
+                    )
                     return
                 else:
                     content_text_parts = []
@@ -1078,7 +1094,11 @@ async def process_update(data: dict) -> None:
                             }
                         ],
                     }
-                    await spawn_turn_task(chat_id, _handle_audio_message(chat_id, user_message, username))
+                    await spawn_turn_task(
+                        chat_id,
+                        _handle_audio_message(chat_id, user_message, username),
+                        user_message=user_message,
+                    )
                     return
             # ── 视频 / 圆形视频（单发，无 media_group_id） ─────
             # 相册里的视频分片已在上方"视频相册"分支聚合处理；到达这里的
@@ -1129,7 +1149,11 @@ async def process_update(data: dict) -> None:
                         ],
                     }
 
-                    await spawn_turn_task(chat_id, _handle_video_message(chat_id, user_message, username))
+                    await spawn_turn_task(
+                        chat_id,
+                        _handle_video_message(chat_id, user_message, username),
+                        user_message=user_message,
+                    )
                     return
 
             # ── 贴纸（sticker）─────────────────────────────────────────────
@@ -1167,7 +1191,11 @@ async def process_update(data: dict) -> None:
                     "sticker_meta": sticker_meta,
                 }
 
-                await spawn_turn_task(chat_id, _handle_sticker_message(chat_id, user_message, username))
+                await spawn_turn_task(
+                    chat_id,
+                    _handle_sticker_message(chat_id, user_message, username),
+                    user_message=user_message,
+                )
                 return
 
             # ── 文本消息 ──────────────────────────────────────────────────
@@ -1335,7 +1363,11 @@ async def process_update(data: dict) -> None:
 
                 logger.debug(f"最终 user_message 内容: {user_message.get('content', '')[:500]}")
 
-                await spawn_turn_task(chat_id, _handle_text_message(chat_id, user_input, username, user_message))
+                await spawn_turn_task(
+                    chat_id,
+                    _handle_text_message(chat_id, user_input, username, user_message),
+                    user_message=user_message,
+                )
                 return
         if "callback_query" in data:
             await _handle_callback_query(data["callback_query"])

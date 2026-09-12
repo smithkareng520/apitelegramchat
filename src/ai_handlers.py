@@ -567,12 +567,19 @@ async def get_ai_response(
         # ── 新 user 消息提前持久化（USER 回合）────────────────────────
         # 历史末尾是上一条未获回应的 user 消息时合并（避免连续 user），
         # 否则直接追加。提前持久化让快速连发消息的合并链天然成立。
+        # 2026-09-12 修复：spawn_turn_task 已在派发前持久化（消除"回合
+        # 在落库前被打断、消息静默丢失"的窗口），带 EARLY_PERSIST_FLAG
+        # 的信封在此跳过——本入口的落库只兜底"未走 spawn_turn_task 的
+        # 路径"（媒体组聚合、TIMER 注入等）。
         if user_message is not None and not is_timer:
-            try:
-                user_msg_in_history = await turn_recovery.persist_user_message_entry(chat_id, user_message)
-            except Exception:
-                logger.debug("persist_user_message_entry 失败", exc_info=True)
-                user_msg_in_history = False
+            if user_message.get(turn_recovery.EARLY_PERSIST_FLAG):
+                user_msg_in_history = True
+            else:
+                try:
+                    user_msg_in_history = await turn_recovery.persist_user_message_entry(chat_id, user_message)
+                except Exception:
+                    logger.debug("persist_user_message_entry 失败", exc_info=True)
+                    user_msg_in_history = False
 
         if silent_mode:
             # /show off（静默模式）：不创建可见草稿、不注册活跃草稿、不发

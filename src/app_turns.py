@@ -7,7 +7,7 @@ pre_flight 自动压缩、历史/台账写入、6 类消息 handler、proactive
 import asyncio
 import json
 import time
-from typing import Any, cast
+from typing import Any, Optional, cast
 
 from token_budget import count_tokens
 
@@ -258,10 +258,8 @@ def _get_reply_media(msg: dict) -> list[dict]:
     先查 state.album_media_registry（相册聚合时登记的整组媒体），命中
     则返回相册的全部图片/音频/视频/文档。
 
-    登记表未命中（bot 重启 / 相册早于进程生命周期 / 登记被 LRU 淘汰）
-    时按 media_group_id 反查对话历史（组信封的 Message.meta 持久化有
-    整组附件，见 1.5 分支）；历史也查不到（修复前的旧相册）才退化为
-    单分片引用，即旧有的单媒体行为。
+    未命中（bot 重启 / 相册早于进程生命周期 / 登记被 LRU 淘汰）时退化
+    为单分片引用，即旧有的单媒体行为。
     """
     reply = msg.get("reply_to_message")
     if not reply:
@@ -291,52 +289,6 @@ def _get_reply_media(msg: dict) -> list[dict]:
             for d in entry.get("documents", []):
                 if isinstance(d, dict) and d.get("file_id"):
                     items.append({"kind": "document", **d})
-            if items:
-                return items
-
-    # 1.5) 历史回退：登记表未命中（bot 重启 / LRU 淘汰）时，按
-    #      media_group_id 反查对话历史——photo_group / video_group /
-    #      document_group 信封自身携带 media_group_id（随 Message.meta
-    #      持久化，见 app_media_groups 的组信封构造），历史里存有当年
-    #      整组附件。找不到再退化单分片引用（旧行为）。修复"重启后回复
-    #      相册只带被回复的那一张"的生产案例（2026-09-12 [6c15a092]）。
-    #      仅对修复之后聚合的相册生效；更早的历史信封没有该字段，无法反查。
-    if mgid:
-        items: list[dict] = []
-        chat = msg.get("chat") or {}
-        try:
-            fallback_chat_id = int(chat.get("id"))
-        except (TypeError, ValueError):
-            fallback_chat_id = None
-        if fallback_chat_id is not None:
-            history = (user_contexts.get(fallback_chat_id) or {}).get(
-                "conversation_history"
-            ) or []
-            for m in reversed(history):
-                meta = getattr(m, "meta", None)
-                if not isinstance(meta, dict):
-                    continue
-                if str(meta.get("media_group_id") or "") != str(mgid):
-                    continue
-                entries = [
-                    dict(a) for a in (meta.get("attachments") or [])
-                    if isinstance(a, dict) and a.get("file_id")
-                ]
-                if not entries:
-                    # 极旧信封可能只有数组字段没有 attachments：按组类型重建。
-                    group_type = str(meta.get("type") or "")
-                    fids = meta.get("file_ids")
-                    if isinstance(fids, list) and fids:
-                        kind = group_type.removesuffix("_group") or "photo"
-                        entries = [{"kind": kind, "file_id": f} for f in fids]
-                if entries:
-                    items = entries
-                    logger.info(
-                        "[reply-media] 登记表未命中，历史回退补齐相册整组: "
-                        "chat=%s media_group_id=%s items=%d",
-                        fallback_chat_id, mgid, len(items),
-                    )
-                    break
             if items:
                 return items
 
@@ -721,13 +673,31 @@ async def _cleanup_task(chat_id: int, task: asyncio.Task) -> None:
 # 正在做的动作，用户上传媒体时回发这些动作会被客户端渲染成“bot 正在
 # 上传照片/语音/…”，语义完全相反；typing 也只在模型流式输出期间才有
 # 意义（见 chat_actions.py 与 ai/agentic_loops.py 的实现）。
+
+async def undo_early_persist_safe(chat_id: int, user_message: dict) -> None:
+    """回滚 spawn_turn_task 的提前持久化（消息被卡片消费 / pre_flight 拒绝时）。
+
+    只在 mode=appended（本次派发独立追加的那条）时真正回滚，详见
+    turn_recovery.undo_early_persist。任何异常只降级为 debug 日志：
+    回滚失败的最坏后果是多一条用户消息留在历史，不应炸掉当前分支。
+    """
+    try:
+        await turn_recovery.undo_early_persist(chat_id, user_message)
+    except Exception:
+        logger.debug("undo_early_persist 失败（可忽略）", exc_info=True)
+
 async def _handle_text_message(chat_id: int, user_input: str, username: str, user_message: dict) -> None:
     # 媒体参数卡片会话优先接管：seed/起始秒数输入，或更新待生成提示词
     # （卡片就地重绘，本消息不再进入正常回合）
     try:
         from media_wizard import try_consume_text_message
         if await try_consume_text_message(chat_id, user_input):
+            # 消息被卡片消费：回滚 spawn_turn_task 的提前持久化（appended 时），
+            # 避免卡片内部输入（seed/提示词）泄漏进对话历史。
+            await undo_early_persist_safe(chat_id, user_message)
             return
+    except asyncio.CancelledError:
+        raise
     except Exception:
         logger.debug("media_wizard 文本消费检查失败（可忽略）", exc_info=True)
     # 后台预初始化 workspace：与模型生成响应并行，避免第一个工具调用
@@ -736,6 +706,7 @@ async def _handle_text_message(chat_id: int, user_input: str, username: str, use
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
+            await undo_early_persist_safe(chat_id, user_message)
             await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的内容过长，已超过模型单次处理极限，请分批或精简发送。")
             return
         full, _, new_msgs, usage = await get_ai_response(
@@ -755,13 +726,18 @@ async def _handle_photo_message(chat_id: int, user_message: dict, username: str)
     try:
         from media_wizard import try_consume_media_message
         if await try_consume_media_message(chat_id, user_message):
+            # 消息被卡片消费：回滚提前持久化，素材不入对话历史。
+            await undo_early_persist_safe(chat_id, user_message)
             return
+    except asyncio.CancelledError:
+        raise
     except Exception:
         logger.debug("media_wizard 图片消费检查失败（可忽略）", exc_info=True)
     schedule_workspace_init(chat_id)
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
+            await undo_early_persist_safe(chat_id, user_message)
             await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的图片附加内容过长，已超过模型单次处理极限，请精简发送。")
             return
         full, _, new_msgs, usage = await get_ai_response(
@@ -781,6 +757,7 @@ async def _handle_document_message(chat_id: int, user_message: dict, username: s
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
+            await undo_early_persist_safe(chat_id, user_message)
             await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的文档内容过长，已超过模型单次处理极限，请精简发送。")
             return
         full, _, new_msgs, usage = await get_ai_response(
@@ -800,7 +777,11 @@ async def _handle_audio_message(chat_id: int, user_message: dict, username: str)
     try:
         from media_wizard import try_consume_media_message
         if await try_consume_media_message(chat_id, user_message):
+            # 消息被卡片消费：回滚提前持久化，素材不入对话历史。
+            await undo_early_persist_safe(chat_id, user_message)
             return
+    except asyncio.CancelledError:
+        raise
     except Exception:
         logger.debug("media_wizard 音频消费检查失败（可忽略）", exc_info=True)
     # 用户上传语音时回发 upload_voice 是错误语义（那是“bot 正在上传语音”
@@ -809,6 +790,7 @@ async def _handle_audio_message(chat_id: int, user_message: dict, username: str)
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
+            await undo_early_persist_safe(chat_id, user_message)
             await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的音频转录文本过长，已超过模型单次处理极限，请精简发送。")
             return
         full, _, new_msgs, usage = await get_ai_response(
@@ -835,13 +817,18 @@ async def _handle_video_message(chat_id: int, user_message: dict, username: str)
     try:
         from media_wizard import try_consume_media_message
         if await try_consume_media_message(chat_id, user_message):
+            # 消息被卡片消费：回滚提前持久化，素材不入对话历史。
+            await undo_early_persist_safe(chat_id, user_message)
             return
+    except asyncio.CancelledError:
+        raise
     except Exception:
         logger.debug("media_wizard 视频消费检查失败（可忽略）", exc_info=True)
     schedule_workspace_init(chat_id)
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
+            await undo_early_persist_safe(chat_id, user_message)
             await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的视频附加内容过长，已超过模型单次处理极限，请精简发送。")
             return
         full, _, new_msgs, usage = await get_ai_response(
@@ -869,6 +856,7 @@ async def _handle_sticker_message(chat_id: int, user_message: dict, username: st
     try:
         is_safe = await pre_flight_context_check(chat_id, user_message)
         if not is_safe:
+            await undo_early_persist_safe(chat_id, user_message)
             await send_rich_html_message(chat_id, "⚠️ <b>发送失败</b><br/>您当前发送的贴纸附加内容过长，已超过模型单次处理极限，请精简发送。")
             return
         full, _, new_msgs, usage = await get_ai_response(
@@ -1035,13 +1023,49 @@ async def _handle_timer_wakeup(chat_id: int) -> None:
     except Exception as e:
         logger.exception(f"_handle_timer_wakeup 异常: {e}")
 
-async def spawn_turn_task(chat_id: int, coro: Any) -> asyncio.Task:
+async def spawn_turn_task(
+    chat_id: int,
+    coro: Any,
+    *,
+    user_message: Optional[dict] = None,
+) -> asyncio.Task:
     """派发新回合任务并登记为可打断任务（process_update 各分支共用样板）。
 
     合并原先在 process_update 各消息分支重复 8 处的派发样板：
     打断旧回合 → create_task → 写入 active_tasks → 挂自动清理回调。
+
+    提前持久化（user_message 非空时，2026-09-12 生产事故修复）：
+    ------------------------------------------------------------------
+    user 消息原先在回合任务内部的 get_ai_response 才落库——从 create_task
+    到落库之间有 1~2 秒以上的窗口（wizard 消费检查、pre_flight 上下文
+    检查、草稿首帧等都在落库之前）。用户快速连发两条消息时，第二条的
+    spawn_turn_task 会打断并取消第一条的回合任务；若第一条尚未落库，
+    它就**静默消失**：历史里没有、无任何日志、模型只看到第二条
+    （生产表现："发两张图模型只收到一张"、"两条消息只回了最后一条"）。
+
+    修复：在打断旧回合**之后**、创建新任务**之前**，由本函数直接调用
+    turn_recovery.persist_user_message_entry 落库。次序要点：
+      1. 必须在 _interrupt_active_generation 之后——旧回合的 journal
+         保全（finalize_pending_turns）会先把已完成的 assistant/tool
+         消息写入历史，新的 user 消息才能落在它们之后，保持
+         user→assistant 的时序正确；
+      2. 落库带 EARLY_PERSIST_FLAG：回合任务内的 get_ai_response 看到
+         标记会跳过重复落库（见 ai_handlers.get_ai_response）；
+      3. 消费型接管（媒体参数卡片收素材）与 pre_flight 拒绝的分支，
+         由各 handler 调 turn_recovery.undo_early_persist 回滚。
+    落库失败不阻断派发：get_ai_response 内的既有落库路径（标记缺失时
+    仍会执行）自动兜底。
     """
     await _interrupt_active_generation(chat_id)
+    if user_message is not None and isinstance(user_message, dict):
+        if not user_message.get(turn_recovery.EARLY_PERSIST_FLAG):
+            try:
+                await turn_recovery.persist_user_message_entry(chat_id, user_message)
+            except Exception:
+                logger.debug(
+                    "spawn_turn_task 提前持久化失败（get_ai_response 内将重试）",
+                    exc_info=True,
+                )
     task = asyncio.create_task(coro)
     async with active_tasks_lock:
         active_tasks[chat_id] = task
