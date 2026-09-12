@@ -1302,8 +1302,6 @@ SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
     name="Claude Opus 5 (LFree)",
     image_input=True,
     max_context=1000000,
-    reasoning_enabled=True,
-    reasoning_effort="high",
 )
 SUPPORTED_MODELS["mimo-v2.5"] = make_model_config(
     model_id="mimo-v2.5",
@@ -1311,8 +1309,6 @@ SUPPORTED_MODELS["mimo-v2.5"] = make_model_config(
     name="MiMo v2.5 (LFree)",
     image_input=True,
     max_context=1000000,
-    reasoning_enabled=True,
-    reasoning_effort="high",
 )
 SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
     model_id="muse-spark-1.3-contributor",
@@ -1320,8 +1316,6 @@ SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
     name="Muse Spark 1.3 (LFree)",
     image_input=True,
     max_context=1000000,
-    reasoning_enabled=True,
-    reasoning_effort="high",
 )
 
 
