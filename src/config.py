@@ -594,7 +594,7 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "image_input": False,
         "audio_input": False,
         "video_input": False,
-        "supports_tools": False,
+        "supports_tools": True,
         "image_output": False,
         "document_input": False,
         "video_output": False,
@@ -1286,10 +1286,6 @@ SUPPORTED_MODELS["agnes-video-2.5-flash"] = make_model_config(
 #     （base64 数据 URI 最稳，直接传 URL 时中转下游拉取可能 400）；
 #     原生 function calling ❌（接受 tools 参数但不返回 tool_calls），
 #     按纯对话模型配置（supports_tools 沿用厂商默认 False）；
-#   - nv/kimi-k3：原生 tool_calls ✅（finish_reason=tool_calls）；图片
-#     输入 ❌（中转未把图片传给后端）；且其定价 输入 $3 / 补全 $15
-#     （每 1M tokens）是本中转其余 3 个模型（$0.012 / $0.021）的 250 倍，
-#     日常任务慎用；
 #   - 推理开销：muse-spark 系 reasoning 很吃 completion token，该中转未
 #     公开 reasoning_* 控制参数，故一律不发送（走 _PROVIDER_DEFAULTS 的
 #     全 None 默认），调用侧需要充足 max_tokens 预算。
@@ -1298,27 +1294,29 @@ SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
     provider="lfree",
     name="Claude Opus 5 (LFree)",
     image_input=True,
+    max_context=1000000,
+    reasoning_enabled=True,
+    reasoning_effort="high",
 )
 SUPPORTED_MODELS["mimo-v2.5"] = make_model_config(
     model_id="mimo-v2.5",
     provider="lfree",
     name="MiMo v2.5 (LFree)",
     image_input=True,
+    max_context=1000000,
+    reasoning_enabled=True,
+    reasoning_effort="high",
 )
 SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
     model_id="muse-spark-1.3-contributor",
     provider="lfree",
     name="Muse Spark 1.3 (LFree)",
     image_input=True,
+    max_context=1000000,
+    reasoning_enabled=True,
+    reasoning_effort="high",
 )
-SUPPORTED_MODELS["nv/kimi-k3"] = make_model_config(
-    model_id="nv/kimi-k3",
-    provider="lfree",
-    name="Kimi K3 (LFree)",
-    # 本中转唯一支持原生 function calling 的模型。
-    supports_tools=True,
-    # 图片输入 ❌（沿用厂商默认 image_input=False，无需显式覆盖）。
-)
+
 
 # ========== 默认模型 ==========
 DEFAULT_MODEL = "agnes-3.0-flash"
