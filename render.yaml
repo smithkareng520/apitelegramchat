@@ -41,6 +41,8 @@ services:
         sync: false
       - key: XXTF_API_KEY
         sync: false
+      - key: LFREE_API_KEY
+        sync: false
       - key: GLM_API_KEY
         sync: false
       - key: MODELSCOPE_API_KEY
