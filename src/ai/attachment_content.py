@@ -829,6 +829,14 @@ async def _build_image_block(
 
     img_bytes = await get_cached_image_data(chat_id, file_id) if chat_id else None
     if not img_bytes:
+        # 双重失败：R2 预签名不可用 + base64 兜底也拿不到字节（Telegram
+        # getFile 失败/限流、内存 TTL 缓存已过期等）。之前这里完全静默，
+        # 上层 gather 直接把 None 过滤掉，问题排查只能靠猜。
+        logger.warning(
+            "[_build_image_block] chat=%s file_id=%s 图片彻底解析失败："
+            "R2 预签名不可用且 base64 兜底拿不到字节，该图片将从本轮丢失",
+            chat_id, file_id[:12] if file_id else "",
+        )
         return None
 
     # 预防性后台上传到 R2：fire-and-forget，不阻塞 base64 编码。
@@ -1012,6 +1020,21 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
             results = await asyncio.gather(
                 *[_build_image_block(chat_id, fid) for fid in file_ids]
             )
+            # 关键修复：_build_image_block 对单张图片的失败（R2 预签名/上传
+            # 失败、Telegram getFile 失败、图片解码异常等）一律返回 None，
+            # 之前这里直接过滤掉 None 且没有任何日志或提示——用户发 N 张图，
+            # 只要有 1 张解析失败，模型就会静默收到 N-1 张，还以为用户只
+            # 发了这么多（典型症状："我看到 1 张图片"，用户却发了 2 张）。
+            # 现在：失败的 file_id 记 warning 日志（附 chat_id 便于排查），
+            # 并在部分失败时额外注入一条文本提示，让模型如实告知用户，而
+            # 不是把缺失的图片当作用户没发。
+            failed_ids = [fid for fid, r in zip(file_ids, results) if r is None]
+            if failed_ids:
+                logger.warning(
+                    "[_resolve_multimodal_content] chat=%s 图片解析失败 %d/%d 张，file_ids=%s",
+                    chat_id, len(failed_ids), len(file_ids),
+                    [f[:12] for f in failed_ids],
+                )
             content_blocks: list[Block] = [r for r in results if r is not None]
             if content_blocks:
                 # 即使当前模型支持视觉输入，也额外注入附件临时 URL。
@@ -1028,6 +1051,14 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                         url_lines.append(f"原始图片 URL: {temp_url}")
                 if url_lines:
                     content_blocks.append(TextBlock("\n".join(url_lines)))
+                if failed_ids:
+                    content_blocks.append(TextBlock(
+                        f"⚠️ 系统提示：用户本轮共上传了 {len(file_ids)} 张图片，"
+                        f"但其中 {len(failed_ids)} 张因网络/存储问题加载失败，"
+                        f"你目前只能看到 {len(content_blocks) - (1 if url_lines else 0)} 张。"
+                        f"请明确告知用户部分图片未能成功接收，请其重新发送，"
+                        f"不要误以为用户只发送了这些图片。"
+                    ))
                 content_blocks.append(TextBlock(user_text))
                 return content_blocks
             return [TextBlock(user_text)] if user_text else []
