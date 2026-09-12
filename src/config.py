@@ -414,7 +414,13 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         # -> https://ai.lfree.org/bot/XpBv3okYsbAV/v1/chat/completions。
         # 该中转的 bot token 在 URL 路径里，鉴权仍走
         # Authorization: Bearer LFREE_API_KEY（已实测 4 个模型全部可用）。
-        endpoint="https://ai.lfree.org/bot/XpBv3okYsbAV/v1",
+        default_headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        endpoint="https://ai.lfree.org/bot/XpBv3okYsbAV",
         api_key_env="LFREE_API_KEY",
     ),
 }
