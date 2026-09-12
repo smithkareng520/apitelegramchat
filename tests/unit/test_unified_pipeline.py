@@ -153,6 +153,40 @@ def test_combination_none_and_non_string_content():
     assert resolve_input_combination({"content": None}).text == ""
 
 
+def test_combination_group_envelope_file_ids_and_attachments_dedup():
+    # 组信封同时携带 file_ids 数组与 attachments 列表（同一批文件的两份
+    # 视图）：按 file_id 去重后计数，单图 = ×1、双图相册 = ×2。
+    # 2026-09-12 生产案例：单图被数成 photo×2，误导"两张图都进了管道"
+    # 的排查方向（真实丢图点在信封构造之前的回复引用降级）。
+    single = resolve_input_combination({
+        "type": "photo_group", "file_ids": ["a"],
+        "attachments": [{"kind": "photo", "file_id": "a"}],
+        "content": "x",
+    })
+    assert single.photo_count == 1
+
+    album = resolve_input_combination({
+        "type": "photo_group", "file_ids": ["a", "b"],
+        "attachments": [{"kind": "photo", "file_id": "a"},
+                        {"kind": "photo", "file_id": "b"}],
+        "content": "x",
+    })
+    assert album.photo_count == 2
+    assert "photo×2" in album.summary()
+
+
+def test_combination_preflight_describe_matches_real_turn():
+    # 复现 2026-09-12 [6c15a092] 的真实信封（单图 + 引用回复文本 35 字符）：
+    # 预检摘要应显示 photo×1（修复前误报 photo×2）。
+    env = {
+        "type": "photo_group", "file_ids": ["f1"],
+        "attachments": [{"kind": "photo", "file_id": "f1"}],
+        "content": "📎 用户引用了图片\n\n💡 引用回复:\n> [图片，无文字说明]\n\n回答",
+    }
+    pf = run_preflight(SUPPORTED_MODELS["agnes-3.0-flash"], env)
+    assert pf.combination.summary() == "text=35字符+photo×1"
+
+
 # ---------------------------------------------------------------------------
 # 3. 鉴权：输入组合 vs 模型能力
 # ---------------------------------------------------------------------------

@@ -78,9 +78,12 @@ async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
 
         file_ids = []
         captions = []
+        message_ids = []
         for msg in messages:
             if "photo" in msg:
                 file_ids.append(msg["photo"][-1]["file_id"])
+            if msg.get("message_id"):
+                message_ids.append(msg["message_id"])
             if msg.get("caption"):
                 captions.append(msg["caption"].strip())
         if not file_ids:
@@ -102,6 +105,11 @@ async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
             "content": content_text,
             "file_ids": file_ids,
             "type": "photo_group",
+            # 供重启后引用回复反查整组相册（内存登记表 album_media_registry
+            # 不持久化，见 _get_reply_media 的历史回退）。这两项随信封进入
+            # Message.meta，永不进出站请求体。
+            "media_group_id": media_group_id.removesuffix(":photo"),
+            "message_ids": message_ids,
             "attachments": [
                 {
                     "kind": "photo",
@@ -169,6 +177,7 @@ async def _process_video_group_once(chat_id: int, group_key: str) -> None:
 
         video_items = []
         captions = []
+        message_ids = []
         for gmsg in messages:
             media = gmsg.get("video") or gmsg.get("video_note")
             if media and media.get("file_id"):
@@ -178,6 +187,8 @@ async def _process_video_group_once(chat_id: int, group_key: str) -> None:
                     "file_name": media.get("file_name") or f"video_{fid[:8]}.mp4",
                     "mime_type": media.get("mime_type") or "video/mp4",
                 })
+            if gmsg.get("message_id"):
+                message_ids.append(gmsg["message_id"])
             if gmsg.get("caption"):
                 captions.append(gmsg["caption"].strip())
         if not video_items:
@@ -201,6 +212,10 @@ async def _process_video_group_once(chat_id: int, group_key: str) -> None:
             "file_names": [v["file_name"] for v in video_items],
             "mime_types": [v["mime_type"] for v in video_items],
             "type": "video_group",
+            # 与 photo_group 同理：供重启后引用回复按组反查（Message.meta，
+            # 不进出站请求体）。
+            "media_group_id": group_key.removesuffix(":video"),
+            "message_ids": message_ids,
             "attachments": [
                 {
                     "kind": "video",
@@ -289,6 +304,7 @@ async def _process_document_group_inner(chat_id: int, media_group_id: str) -> No
     file_names = []
     mime_types = []
     captions = []
+    message_ids = []
     for msg in messages:
         if "document" in msg:
             doc = msg["document"]
@@ -296,8 +312,10 @@ async def _process_document_group_inner(chat_id: int, media_group_id: str) -> No
             fname = doc.get("file_name") or f"document_{doc['file_id'][:8]}.bin"
             file_names.append(fname)
             mime_types.append(doc.get("mime_type", mimetypes.guess_type(fname)[0] or "application/pdf"))
-            if msg.get("caption"):
-                captions.append(msg["caption"].strip())
+        if msg.get("message_id"):
+            message_ids.append(msg["message_id"])
+        if msg.get("caption"):
+            captions.append(msg["caption"].strip())
 
     combined_caption = " ".join(c for c in captions if c) if captions else ""
 
@@ -321,6 +339,10 @@ async def _process_document_group_inner(chat_id: int, media_group_id: str) -> No
             "file_names": file_names,
             "mime_types": mime_types,
             "type": "document_group",
+            # 与 photo_group 同理：供重启后引用回复按组反查（Message.meta，
+            # 不进出站请求体）。
+            "media_group_id": media_group_id,
+            "message_ids": message_ids,
             "attachments": [
                 {
                     "kind": "document",
@@ -370,7 +392,7 @@ async def _process_document_group_inner(chat_id: int, media_group_id: str) -> No
                     "再直接读取（如 `cat download/<文件名>`），或用 text_editor（path 填 download/<文件名>）查看。"
                 )
 
-        user_message = {"role": "user", "content": content_text, "file_ids": file_ids, "file_names": file_names, "mime_types": mime_types, "type": "document_group", "attachments": [{"kind": "document", "file_id": fid, "file_name": fname, "mime_type": mime} for fid, fname, mime in zip(file_ids, file_names, mime_types)]}
+        user_message = {"role": "user", "content": content_text, "file_ids": file_ids, "file_names": file_names, "mime_types": mime_types, "type": "document_group", "media_group_id": media_group_id, "message_ids": message_ids, "attachments": [{"kind": "document", "file_id": fid, "file_name": fname, "mime_type": mime} for fid, fname, mime in zip(file_ids, file_names, mime_types)]}
 
     lock = await get_chat_lock(chat_id)
     async with lock:

@@ -94,8 +94,17 @@ class InputCombination:
         return "+".join(parts)
 
 
-def _count_kind(modality: Modality, count: dict, file_id: Any) -> None:
-    if file_id:
+def _count_kind(modality: Modality, count: dict, file_id: Any, seen: set) -> None:
+    """按 file_id 去重计数。
+
+    photo_group 等组信封同时携带 file_ids 数组与 attachments 列表（同一
+    批文件的两份视图），不去重会把单图数成 2、双图相册数成 4——预检
+    日志的 photo×N 因此失真，误导多图链路排查（2026-09-12 生产案例：
+    单图被日志显示为 photo×2，被误读为"两张图都进了管道"）。
+    """
+    key = str(file_id) if file_id else ""
+    if key and key not in seen:
+        seen.add(key)
         count[modality] = count.get(modality, 0) + 1
 
 
@@ -115,6 +124,7 @@ def resolve_input_combination(user_message: Optional[dict]) -> InputCombination:
     if not isinstance(text, str):
         text = ""
     counts: dict = {}
+    seen_file_ids: set = set()
 
     msg_type = str(user_message.get("type") or "").strip().lower()
     kind_map = {
@@ -128,9 +138,9 @@ def resolve_input_combination(user_message: Optional[dict]) -> InputCombination:
         file_ids = user_message.get("file_ids")
         if isinstance(file_ids, list) and file_ids:
             for fid in file_ids:
-                _count_kind(modality, counts, fid)
+                _count_kind(modality, counts, fid, seen_file_ids)
         else:
-            _count_kind(modality, counts, user_message.get("file_id"))
+            _count_kind(modality, counts, user_message.get("file_id"), seen_file_ids)
 
     atts = user_message.get("attachments")
     if isinstance(atts, list):
@@ -141,7 +151,7 @@ def resolve_input_combination(user_message: Optional[dict]) -> InputCombination:
                 continue
             kind = att_kind_map.get(str(att.get("kind") or "").strip().lower())
             if kind:
-                _count_kind(kind, counts, att.get("file_id"))
+                _count_kind(kind, counts, att.get("file_id"), seen_file_ids)
 
     return InputCombination(
         text=text,

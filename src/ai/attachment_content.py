@@ -1055,6 +1055,16 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                 )
             content_blocks: list[Block] = [r for r in results if r is not None]
             if content_blocks:
+                # 多图回合显式声明张数（放在首位）：组信封经过打断合并/
+                # 失败轮替换后，文本里的"共 N 张"可能缺失或与实际块数
+                # 不一致，模型会默认只有一张（2026-09-12 生产案例）。让
+                # 模型先看到事实框架，再逐张读图。
+                if len(file_ids) >= 2:
+                    content_blocks.insert(0, TextBlock(
+                        f"📎 系统核对：本条消息共携带 {len(file_ids)} 张图片"
+                        f"（以下 image 内容全部属于本条消息），"
+                        f"请逐张确认后再回应，不要默认只有一张。"
+                    ))
                 # 即使当前模型支持视觉输入，也额外注入附件临时 URL。
                 # 该 URL 与非多模态 fallback 使用同一套解析逻辑，
                 # 便于图片编辑工具调用，以及后续模型切换后继续复用。
