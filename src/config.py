@@ -35,10 +35,6 @@ AGNES_API_KEY = os.getenv("AGNES_API_KEY", "")
 # 互不影响；本 key 仅供 anthropic 厂商专用循环
 # （ai/agentic_loops._agentic_loop_anthropic）使用。
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-# XXTF 中转（https://xxtf.baby）：claude-opus-5（Anthropic 原生协议）与
-# gpt-5.6-sol（OpenAI 协议）共用同一个 key，见下方 PROVIDERS["xxtf"] 与
-# SUPPORTED_MODELS 中的模型定义（"XXTF 中转"注释块）。
-XXTF_API_KEY = os.getenv("XXTF_API_KEY", "")
 # LFREE 中转（https://ai.lfree.org，bot token 在 URL 路径里）：OpenAI 兼容
 # /v1/chat/completions，一个 key 覆盖全部 4 个模型（claude-opus-5 /
 # mimo-v2.5 / muse-spark-1.3-contributor / nv/kimi-k3），见下方
@@ -393,21 +389,6 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         # anthropic 协议适配器按 supports_prompt_cache 开启。
         supports_prompt_cache=True,
     ),
-    "xxtf": ProviderConfig(
-        default_headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-        },
-        name="XXTF",
-        # 壳的默认端点按 OpenAI 协议填（gpt-5.6-sol 沿用这个默认值）；
-        # AsyncOpenAI 会自动拼接为 {endpoint}/chat/completions
-        # -> https://xxtf.baby/v1/chat/completions。
-        endpoint="https://xxtf.baby/v1",
-        api_key_env="XXTF_API_KEY",
-    ),
     "lfree": ProviderConfig(
         name="LFree",
         # OpenAI 兼容 base：AsyncOpenAI 自动拼接 /chat/completions
@@ -561,26 +542,6 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "document_input": True,
         "video_output": False,
         "supports_sampling": True,
-        "supports_prompt_cache": True,
-        "temperature": None,          # None -> 不发送，走供应商默认
-        "top_p": None,                # None -> 不发送，走供应商默认
-        "reasoning_enabled": None,    # None -> 不发送推理控制参数
-        "reasoning_effort": None,
-        "reasoning_max_tokens": None,
-        "max_output_tokens": 65536,
-        "max_context": 200000,
-    },
-    "xxtf": {
-        "image_input": True,
-        "audio_input": False,
-        "video_input": False,
-        "supports_tools": True,
-        "image_output": False,
-        "document_input": True,
-        "video_output": False,
-        "supports_sampling": True,
-        # GPT-5.6 Sol 的 Responses API 支持原生 Prompt Caching；由
-        # ai.responses_bridge 为每个会话稳定注入 prompt_cache_key。
         "supports_prompt_cache": True,
         "temperature": None,          # None -> 不发送，走供应商默认
         "top_p": None,                # None -> 不发送，走供应商默认
@@ -1807,7 +1768,7 @@ _SENSITIVE_EXACT = {
     "TELEGRAM_BOT_TOKEN", "GLM_API_KEY",
     "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY",
     "XAI_API_KEY", "GROQ_API_KEY", "MODELSCOPE_API_KEY", "AGNES_API_KEY",
-    "XXTF_API_KEY", "LFREE_API_KEY",
+    "LFREE_API_KEY",
     "R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY",
     "R2_BUCKET_NAME", "R2_REGION",
     "SERPER_API_KEY", "GAODE_MCP_TOKEN",
