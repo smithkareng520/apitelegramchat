@@ -28,6 +28,7 @@ from state import (
     get_active_draft_info,
     clear_active_draft,
     mark_preserved_draft,
+    get_album_media,
 )
 from core.messages import Message
 import turn_recovery
@@ -193,6 +194,32 @@ async def reply_unauthorized(chat_id: int, reply_message_id: int | None = None) 
     )
 
 # ---------- 工具函数 ----------
+def _describe_reply_media_kinds(reply: dict) -> str:
+    """被引用消息的媒体类型概览（方括号描述，无媒体时返回空串）。
+
+    仅基于 reply_to_message 单个分片可见信息；相册整组情况由
+    _get_reply_media 查登记表补齐，这里不做相册反查。
+    """
+    if not isinstance(reply, dict):
+        return ""
+    kinds = []
+    if "photo" in reply:
+        kinds.append("图片")
+    if "video" in reply or "video_note" in reply:
+        kinds.append("视频")
+    if "audio" in reply:
+        kinds.append("音频")
+    if "voice" in reply:
+        kinds.append("语音")
+    if "document" in reply:
+        kinds.append("文档")
+    if "sticker" in reply:
+        kinds.append("贴纸")
+    if not kinds:
+        return ""
+    return "[" + "＋".join(kinds) + "，无文字说明]"
+
+
 def _get_reply_context(msg: dict) -> str:
     if "reply_to_message" not in msg:
         return ""
@@ -201,50 +228,114 @@ def _get_reply_context(msg: dict) -> str:
     quote = quote_obj.get("text", "") if quote_obj else ""
     if not quote:
         quote = extract_message_text(reply)
+        # 媒体消息无 caption 时 extract_message_text 返回 "[媒体内容]" /
+        # "[语音消息]" 这类通用占位——替换为具体的类型描述，模型能直接
+        # 看懂被引用的是什么（有 caption 时直接用原文，媒体随附件路径
+        # 单独附带，见 _get_reply_media）。
+        if quote in ("[媒体内容]", "[语音消息]"):
+            quote = _describe_reply_media_kinds(reply) or quote
     if not quote:
-        if any(key in reply for key in ("photo", "video", "audio", "document", "sticker", "voice")):
-            quote = "[该消息为媒体内容，无文字引用]"
-        else:
-            quote = "[该消息无文字内容]"
+        quote = "[该消息无文字内容]"
     if REPLY_MARKER in quote:
         quote = quote.split(REPLY_MARKER)[-1].strip()
     if len(quote) > 800:
         quote = quote[:800] + "...(truncated)"
     return f"{REPLY_MARKER}\n> {quote}\n\n"
 
-def _get_reply_media(msg: dict) -> dict:
+def _get_reply_media(msg: dict) -> list[dict]:
+    """提取被引用消息的媒体列表（回复/引用场景，供各 handler 挂附件）。
+
+    返回 item 形状（kind 与 attachments 的 kind 字段一致）：
+      {"kind": "photo",    "file_id": ...}
+      {"kind": "audio",    "file_id": ..., "file_name": ...}
+      {"kind": "voice",    "file_id": ..., "file_name": ...}
+      {"kind": "video",    "file_id": ..., "file_name": ..., "mime_type": ...}
+      {"kind": "document", "file_id": ..., "file_name": ..., "mime_type": ...}
+
+    相册整组补齐：被引用消息属于相册（带 media_group_id）时，Telegram
+    的 reply_to_message 只携带被长按回复的那**一个**分片——只看它，
+    模型只能看到一张图（旧版表现即“回复相册只带上单张图片”）。这里
+    先查 state.album_media_registry（相册聚合时登记的整组媒体），命中
+    则返回相册的全部图片/音频/视频/文档。
+
+    未命中（bot 重启 / 相册早于进程生命周期 / 登记被 LRU 淘汰）时退化
+    为单分片引用，即旧有的单媒体行为。
+    """
     reply = msg.get("reply_to_message")
     if not reply:
-        return {}
+        return []
+
+    # 1) 相册整组补齐：reply_to_message 携带的 media_group_id 就是
+    #    Telegram 原始 ID（聚合存储的 ":photo"/":video" 后缀只存在于
+    #    state.media_groups 的 key，登记表按原始 ID 记录）。
+    mgid = reply.get("media_group_id")
+    if mgid:
+        chat = msg.get("chat") or {}
+        try:
+            chat_id = int(chat.get("id"))
+        except (TypeError, ValueError):
+            chat_id = None
+        entry = get_album_media(chat_id, str(mgid))
+        if entry:
+            items: list[dict] = []
+            for fid in entry.get("photos", []):
+                items.append({"kind": "photo", "file_id": fid})
+            for a in entry.get("audios", []):
+                if isinstance(a, dict) and a.get("file_id"):
+                    items.append({"kind": "audio", **a})
+            for v in entry.get("videos", []):
+                if isinstance(v, dict) and v.get("file_id"):
+                    items.append({"kind": "video", **v})
+            for d in entry.get("documents", []):
+                if isinstance(d, dict) and d.get("file_id"):
+                    items.append({"kind": "document", **d})
+            if items:
+                return items
+
+    # 2) 单媒体消息（或登记表未命中的相册分片）：沿用单分片行为
     if "photo" in reply:
-        photos = reply["photo"]
+        photos = reply["photo"] or []
         if photos:
-            return {"type": "photo", "file_ids": [photos[-1]["file_id"]], "file_name": "photo.jpg"}
+            return [{"kind": "photo", "file_id": photos[-1]["file_id"]}]
     if "document" in reply:
         doc = reply["document"]
-        return {"type": "document", "file_id": doc["file_id"], "file_name": doc.get("file_name", "document"), "mime_type": doc.get("mime_type", "")}
+        return [{
+            "kind": "document",
+            "file_id": doc["file_id"],
+            "file_name": doc.get("file_name", "document"),
+            "mime_type": doc.get("mime_type", ""),
+        }]
     if "audio" in reply:
         audio = reply["audio"]
-        return {"type": "audio", "file_id": audio["file_id"], "file_name": audio.get("file_name", "audio")}
+        return [{
+            "kind": "audio",
+            "file_id": audio["file_id"],
+            "file_name": audio.get("file_name", "audio"),
+        }]
     if "voice" in reply:
         voice = reply["voice"]
-        return {"type": "voice", "file_id": voice["file_id"], "file_name": voice.get("file_name", "voice.ogg")}
+        return [{
+            "kind": "voice",
+            "file_id": voice["file_id"],
+            "file_name": voice.get("file_name", "voice.ogg"),
+        }]
     if "video" in reply:
         video = reply["video"]
-        return {
-            "type": "video",
+        return [{
+            "kind": "video",
             "file_id": video["file_id"],
             "file_name": video.get("file_name", "video.mp4"),
             "mime_type": video.get("mime_type", "video/mp4"),
-        }
+        }]
     if "video_note" in reply:
         vn = reply["video_note"]
-        return {
-            "type": "video",
+        return [{
+            "kind": "video",
             "file_id": vn["file_id"],
             "file_name": "video_note.mp4",
             "mime_type": "video/mp4",
-        }
+        }]
+    return []
 # ---------- Token 估算及上下文修剪 ----------
 _MEDIA_TOKEN_OVERHEAD = 64
 _MESSAGE_WRAPPER_TOKENS = 4

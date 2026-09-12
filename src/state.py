@@ -63,6 +63,107 @@ async def pop_media_group(media_group_id: str) -> list:
     async with media_groups_lock:
         return media_groups.pop(media_group_id, [])
 
+# ---------- 相册媒体登记表（回复引用补齐整组媒体） ----------
+# 背景：用户回复相册（media group）中的任意分片时，Telegram 的
+# reply_to_message 只携带被长按回复的那一个分片消息——如果只看
+# reply_to_message，模型只能看到一张图（表现即"回复相册只带上最后/
+# 单张图片"）。聚合分片存储 media_groups 在聚合处理时会被 pop 清空，
+# 无法在回复时反查，因此聚合完成后在这里另登记一份"整组媒体摘要"。
+#
+# key 为 Telegram 原始 media_group_id（不带聚合存储的 ":photo"/":video"
+# 后缀），value 为 record_album_media() 写入的摘要 dict。查询入口
+# get_album_media() 校验 chat_id 归属，避免跨 chat 串组。
+#
+# 有界（LRU，最多 _ALBUM_REGISTRY_MAX 条）+ 进程内存级，不持久化：
+# 重启或登记被淘汰后，回复相册退化为单分片引用（旧行为），不影响
+# 正确性，只是少带几张图。
+_ALBUM_REGISTRY_MAX = 200
+album_media_registry: OrderedDict = OrderedDict()
+
+
+def record_album_media(media_group_id: str, chat_id: int, messages: list) -> None:
+    """相册聚合处理时登记整组媒体摘要，供回复引用时补齐全部图片等。
+
+    messages 为该相册的全部分片（Telegram update 的 message dict）。
+    重复登记同一组时以最后一次为准（并把该组移到 LRU 最新端）。
+    """
+    if not media_group_id or not messages:
+        return
+    photos: list[str] = []
+    audios: list[dict] = []
+    videos: list[dict] = []
+    documents: list[dict] = []
+    captions: list[str] = []
+    message_ids: list[int] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        mid = msg.get("message_id")
+        if mid:
+            message_ids.append(mid)
+        photo = msg.get("photo")
+        if isinstance(photo, list) and photo:
+            fid = (photo[-1] or {}).get("file_id")
+            if fid and fid not in photos:
+                photos.append(fid)
+        audio = msg.get("audio")
+        if isinstance(audio, dict) and audio.get("file_id"):
+            audios.append({
+                "file_id": audio["file_id"],
+                "file_name": audio.get("file_name") or f"audio_{audio['file_id'][:8]}",
+                "mime_type": audio.get("mime_type") or "",
+            })
+        video = msg.get("video") or msg.get("video_note")
+        if isinstance(video, dict) and video.get("file_id"):
+            videos.append({
+                "file_id": video["file_id"],
+                "file_name": video.get("file_name") or f"video_{video['file_id'][:8]}.mp4",
+                "mime_type": video.get("mime_type") or "video/mp4",
+            })
+        doc = msg.get("document")
+        if isinstance(doc, dict) and doc.get("file_id"):
+            documents.append({
+                "file_id": doc["file_id"],
+                "file_name": doc.get("file_name") or f"document_{doc['file_id'][:8]}.bin",
+                "mime_type": doc.get("mime_type") or "",
+            })
+        if msg.get("caption"):
+            captions.append(str(msg["caption"]).strip())
+    entry = {
+        "chat_id": chat_id,
+        "photos": photos,
+        "audios": audios,
+        "videos": videos,
+        "documents": documents,
+        "captions": captions,
+        "message_ids": message_ids,
+        "ts": time.time(),
+    }
+    # 纯内存 dict 读写，无 await 点，asyncio 单线程语义下无需加锁。
+    album_media_registry.pop(media_group_id, None)
+    album_media_registry[media_group_id] = entry
+    while len(album_media_registry) > _ALBUM_REGISTRY_MAX:
+        album_media_registry.popitem(last=False)
+
+
+def get_album_media(chat_id: int | None, media_group_id: str) -> dict | None:
+    """按原始 media_group_id 查询登记的整组媒体摘要。
+
+    校验 chat_id 归属（不同 chat 出现相同 media_group_id 时隔离）；
+    命中时把该组移到 LRU 最新端。
+    """
+    if not media_group_id:
+        return None
+    entry = album_media_registry.get(media_group_id)
+    if not isinstance(entry, dict):
+        return None
+    if chat_id is not None and entry.get("chat_id") is not None \
+            and entry.get("chat_id") != chat_id:
+        return None
+    album_media_registry.move_to_end(media_group_id)
+    return entry
+
+
 # ---------- 消息去重 ----------
 # 用 OrderedDict 保留插入顺序，淘汰时按"最早插入"的 5000 条淘汰，避免
 # 之前 set 无序时把刚加入的 update_id 随机淘汰导致重复处理。

@@ -445,7 +445,8 @@ async def execute_todo(
     if filter_ not in VALID_FILTERS:
         filter_ = "all"
 
-    # TIMER 主动巡检依赖 Todo 作为第一检查项；这里记录操作元数据，
+    # TIMER 主动巡检可能会查看 Todo（提示词以"查看任务清单"能力描述，
+    # 工具存在时模型自然调用）；这里记录操作元数据，
     # 不记录任务标题/备注，避免后台日志泄露不必要的用户内容。
     logger.info(
         "[TIMER-TODO] chat=%s action=%s filter=%s todo_id=%s",

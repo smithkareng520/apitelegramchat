@@ -19,6 +19,7 @@ from state import (
     get_user_model,
     get_chat_lock,
     pop_media_group,
+    record_album_media,
     set_current_user_namespace,
 )
 from utils import send_rich_html_message, get_logger
@@ -59,6 +60,14 @@ async def _process_media_group_once(chat_id: int, media_group_id: str) -> None:
         # 触发 _interrupt_active_generation 打断正在生成中的相册回合。
         if not messages:
             return
+
+        # 聚合存储已 pop 清空，另登记一份整组媒体摘要（按原始
+        # media_group_id，去掉聚合 key 的 ":photo" 后缀）：用户之后回复
+        # 本相册时，reply_to_message 只带被回复的那一个分片，靠登记表
+        # 把相册的全部图片补齐给模型（state.record_album_media）。
+        record_album_media(
+            media_group_id.removesuffix(":photo"), chat_id, messages
+        )
 
         first_msg = messages[0]
         username, user_id = get_user_info(first_msg)
@@ -144,6 +153,12 @@ async def _process_video_group_once(chat_id: int, group_key: str) -> None:
         # 对称 _process_media_group_once：不在处理中摘除任务表键。
         if not messages:
             return
+
+        # 对称图片组：登记整组媒体摘要（原始 media_group_id，去 ":video"
+        # 后缀），供之后回复本视频相册时补齐全部视频。
+        record_album_media(
+            group_key.removesuffix(":video"), chat_id, messages
+        )
 
         first_msg = messages[0]
         username, user_id = get_user_info(first_msg)
@@ -258,6 +273,10 @@ async def _process_document_group_inner(chat_id: int, media_group_id: str) -> No
     # 对称 _process_media_group_once：不在处理中摘除任务表键。
     if not messages:
         return
+
+    # 对称图片/视频组：登记整组媒体摘要（文档组的 key 就是原始
+    # media_group_id，无后缀），供之后回复本文档相册时补齐全部文件。
+    record_album_media(media_group_id, chat_id, messages)
 
     first_msg = messages[0]
     username, user_id = get_user_info(first_msg)

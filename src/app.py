@@ -105,6 +105,232 @@ app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
 
 logger = get_logger(__name__)
 
+
+# ---------- 回复引用媒体辅助（"回复消息带上全部图片/音频等"） ----------
+async def _transcribe_quoted_audios(chat_id: int, audios: list[dict]) -> list[str]:
+    """把被引用的音频/语音逐条 Groq 转录为文本（未配置 Groq 或失败时跳过）。
+
+    用于模型不支持音频输入、或当前消息信封挂不下音频附件的场景：
+    转录是让被引用语音内容到达模型的唯一通道。
+    """
+    texts: list[str] = []
+    if not GROQ_API_KEY:
+        return texts
+    for item in audios:
+        qfid = item.get("file_id")
+        if not qfid:
+            continue
+        audio_bytes = await _get_cached_audio_data(chat_id, qfid)
+        if not audio_bytes:
+            continue
+        ext = os.path.splitext(item.get("file_name") or "")[1] or ".ogg"
+        try:
+            transcribed = await transcribe_audio_with_groq(audio_bytes, ext)
+            if transcribed:
+                texts.append(transcribed)
+        except Exception as e:
+            logger.error(f"Groq 转录失败: {e}")
+    return texts
+
+
+async def _quoted_media_note_lines(chat_id: int, items: list[dict], *, transcribe_audio: bool = True) -> list[str]:
+    """把被引用媒体转成给模型看的说明文本行（可能为空）。
+
+    - 引用的音频/语音：transcribe_audio=True 时 Groq 转录进文本
+      （模型不支持音频输入时，这是语音内容不丢失的关键）；
+    - 引用的图片/视频/文档：计数说明——这些模态挂不进当前消息信封时，
+      至少让模型知道用户引用了什么。
+    """
+    lines: list[str] = []
+    if not items:
+        return lines
+    if transcribe_audio:
+        q_audios = [it for it in items if it.get("kind") in ("audio", "voice")]
+        for t in await _transcribe_quoted_audios(chat_id, q_audios):
+            lines.append(f"[被引用音频的转录] {t}")
+    counts = []
+    n_photos = sum(1 for it in items if it.get("kind") == "photo")
+    n_videos = sum(1 for it in items if it.get("kind") == "video")
+    n_docs = sum(1 for it in items if it.get("kind") == "document")
+    if n_photos:
+        counts.append(f"图片x{n_photos}")
+    if n_videos:
+        counts.append(f"视频x{n_videos}")
+    if n_docs:
+        counts.append(f"文档x{n_docs}")
+    if counts:
+        lines.append(f"[被引用消息还包含未随本条附带的：{'、'.join(counts)}]")
+    return lines
+
+
+async def _build_quoted_audio_message(
+    chat_id: int,
+    audios: list[dict],
+    user_input: str,
+    *,
+    supports_audio_input: bool,
+) -> dict:
+    """构造"引用音频/语音"的 user 消息信封（文本回复分支专用）。
+
+    - 模型支持音频输入：挂全部音频附件（多个音频时下游走
+      _resolve_mixed_attachments 的多音频分支，逐条出 AudioBlock）；
+    - 不支持：逐条 Groq 转录进正文——模型读不到音频字节，但读得到内容。
+    """
+    names = [
+        a.get("file_name") or f"{a.get('kind', 'audio')}_{a['file_id'][:8]}.ogg"
+        for a in audios
+    ]
+    attachments = [
+        {"kind": a.get("kind", "audio"), "file_id": a["file_id"], "file_name": name}
+        for a, name in zip(audios, names)
+    ]
+    if supports_audio_input:
+        content_text = (
+            f"📎 用户引用了音频（共 {len(audios)} 条）"
+            if len(audios) > 1
+            else f"📎 用户引用了音频「{names[0]}」"
+        )
+        if user_input:
+            content_text += f"\n\n{user_input}"
+        else:
+            content_text += "\n\n请分析这段音频" if len(audios) == 1 else "\n\n请分析这些音频"
+    else:
+        content_text_parts = []
+        if user_input:
+            content_text_parts.append(user_input)
+        content_text_parts.extend(await _transcribe_quoted_audios(chat_id, audios))
+        if not content_text_parts:
+            content_text_parts.append("请分析这段音频" if len(audios) == 1 else "请分析这些音频")
+        content_text = "\n\n".join(content_text_parts)
+    return {
+        "role": "user",
+        "content": content_text,
+        "file_id": audios[0]["file_id"],
+        "file_name": names[0],
+        "type": audios[0].get("kind", "audio"),
+        "attachments": attachments,
+    }
+
+
+async def _build_quoted_document_message(
+    chat_id: int,
+    docs: list[dict],
+    user_input: str,
+    *,
+    supports_document_input: bool,
+) -> dict:
+    """构造"引用文档"的 user 消息信封（文本回复分支专用）。
+
+    - 模型支持文档输入：单个走旧单文档信封，多个走 document_group 数组；
+    - 不支持：下载到工作区 download/ 目录并把路径写进正文（单个保持旧
+      纯文本信封；多个带 document_group 信封，与文档组聚合行为一致）。
+    """
+    safe_names = [
+        os.path.basename(d.get("file_name") or f"document_{d['file_id'][:8]}.bin")
+        for d in docs
+    ]
+    mime_types = [
+        d.get("mime_type") or mimetypes.guess_type(n)[0] or "application/pdf"
+        for d, n in zip(docs, safe_names)
+    ]
+    if supports_document_input:
+        if len(docs) == 1:
+            content_text = f"📎 用户引用了文档「{safe_names[0]}」"
+            if user_input:
+                content_text += f"\n\n{user_input}"
+            else:
+                content_text += "\n\n请直接阅读并分析这个文档。"
+            return {
+                "role": "user",
+                "content": content_text,
+                "file_id": docs[0]["file_id"],
+                "file_name": safe_names[0],
+                "mime_type": mime_types[0],
+                "type": "document",
+            }
+        content_text = f"📎 用户引用了文档组（共 {len(docs)} 个文件）：{', '.join(safe_names)}"
+        if user_input:
+            content_text += f"\n\n{user_input}"
+        else:
+            content_text += "\n\n请直接阅读并分析这些文档。"
+        return {
+            "role": "user",
+            "content": content_text,
+            "file_ids": [d["file_id"] for d in docs],
+            "file_names": safe_names,
+            "mime_types": mime_types,
+            "type": "document_group",
+            "attachments": [
+                {"kind": "document", "file_id": d["file_id"], "file_name": n, "mime_type": m}
+                for d, n, m in zip(docs, safe_names, mime_types)
+            ],
+        }
+
+    # 模型不支持文档输入：下载到工作区 download/ 目录，正文给出可访问路径
+    workspace = workspace_download_root(chat_id)
+    workspace.mkdir(parents=True, exist_ok=True)
+    downloaded: list[str] = []
+    failed: list[str] = []
+    stored_names: list[str] = []
+    workspace_lock = await _get_workspace_lock(chat_id)
+    async with workspace_lock:
+        for d, safe_fname in zip(docs, safe_names):
+            target_path = workspace / safe_fname
+            counter = 1
+            while target_path.exists():
+                stem, ext = os.path.splitext(safe_fname)
+                target_path = workspace / f"{stem}_{counter}{ext}"
+                counter += 1
+            # download_file 内部已经把字节缓存到 R2 的 telegram/{file_id} 前缀，
+            # download/ 只是本地落地缓冲，不需要再往 R2 镜像一份。
+            success = await download_file(d["file_id"], str(target_path))
+            if success:
+                downloaded.append(target_path.name)
+                stored_names.append(target_path.name)
+            else:
+                failed.append(safe_fname)
+    if len(docs) == 1:
+        if downloaded:
+            content_text = (
+                f"📎 用户引用了文档「{downloaded[0]}」，已保存在工作区根目录的 "
+                f"download/ 子目录，可直接访问（如 `cat download/{downloaded[0]}`）。"
+            )
+        else:
+            content_text = f"📎 用户引用了文档「{safe_names[0]}」，但下载失败。"
+        if user_input:
+            content_text += f"\n\n用户指令：{user_input}"
+        elif downloaded:
+            content_text += "\n\n请根据用户指令处理该文档。"
+        # 与旧行为一致：单文档降级路径为纯文本信封，不再挂附件。
+        return {"role": "user", "content": content_text}
+
+    if downloaded:
+        content_text = (
+            f"📎 用户引用了文档组（共 {len(downloaded)} 个文件）：{', '.join(downloaded)}，"
+            f"已保存在工作区根目录的 download/ 子目录，可直接访问。"
+        )
+    else:
+        content_text = "📎 用户引用了文档组，但所有文件下载失败。"
+    if failed:
+        content_text += f"\n⚠️ 以下文件下载失败：{', '.join(failed)}，请重新发送。"
+    if user_input:
+        content_text += f"\n\n用户指令：{user_input}"
+    elif downloaded:
+        content_text += "\n\n请根据用户指令处理这些文档。"
+    return {
+        "role": "user",
+        "content": content_text,
+        "file_ids": [d["file_id"] for d in docs],
+        "file_names": stored_names or safe_names,
+        "mime_types": mime_types,
+        "type": "document_group",
+        "attachments": [
+            {"kind": "document", "file_id": d["file_id"], "file_name": n, "mime_type": m}
+            for d, n, m in zip(docs, stored_names or safe_names, mime_types)
+        ],
+    }
+
+
 @app.before_serving
 async def _startup_sync_packaged_skills() -> None:
     """Start packaged-skill refresh before any user message arrives.
@@ -637,25 +863,48 @@ async def process_update(data: dict) -> None:
                 if context_prefix:
                     cap = context_prefix + cap
 
+                # 回复引用补齐：用户发新图的同时引用了旧消息（典型：回复
+                # 相册）——相册登记表命中时全部图片一并附带，不再只带被
+                # 回复的那一个分片；引用的音频转录进文本，其余类型给说明。
+                quoted_items = _get_reply_media(msg)
+                extra_photo_ids = [
+                    it["file_id"] for it in quoted_items
+                    if it.get("kind") == "photo" and it.get("file_id") != fid
+                ]
+                quoted_others = [it for it in quoted_items if it.get("kind") != "photo"]
+                if quoted_others:
+                    note_lines = await _quoted_media_note_lines(chat_id, quoted_others)
+                    if note_lines:
+                        cap = (cap + "\n\n" if cap else "") + "\n".join(note_lines)
+
+                file_ids = [fid] + extra_photo_ids
                 file_name = f"photo_{fid[:8]}.jpg"
-                content_text = f"📎 用户上传了图片「{file_name}」"
+                if extra_photo_ids:
+                    content_text = (
+                        f"📎 用户上传了图片「{file_name}」，并同时引用了 {len(extra_photo_ids)} 张图片"
+                    )
+                else:
+                    content_text = f"📎 用户上传了图片「{file_name}」"
                 if cap:
                     content_text += f"\n\n{cap}"
+                elif extra_photo_ids:
+                    content_text += "\n\n请描述这张图片的内容，并一并分析引用的图片"
                 else:
                     content_text += "\n\n请描述这张图片的内容"
 
                 user_message = {
                     "role": "user",
                     "content": content_text,
-                    "file_ids": [fid],
-                    "file_names": [file_name],
+                    "file_ids": file_ids,
+                    "file_names": [f"photo_{f[:8]}.jpg" for f in file_ids],
                     "type": "photo_group",
                     "attachments": [
                         {
                             "kind": "photo",
-                            "file_id": fid,
-                            "file_name": file_name,
+                            "file_id": f,
+                            "file_name": f"photo_{f[:8]}.jpg",
                         }
+                        for f in file_ids
                     ],
                 }
 
@@ -672,6 +921,13 @@ async def process_update(data: dict) -> None:
                 context_prefix = _get_reply_context(msg)
                 if context_prefix:
                     cap = context_prefix + cap
+                # 回复引用补齐：引用的音频转录进文本，图片/视频给说明
+                # （这些模态挂不进单文档信封，至少让模型知道引用了什么）。
+                quoted_items = _get_reply_media(msg)
+                if quoted_items:
+                    note_lines = await _quoted_media_note_lines(chat_id, quoted_items)
+                    if note_lines:
+                        cap = (cap + "\n\n" if cap else "") + "\n".join(note_lines)
 
                 async with lock:
                     cm = get_user_model(chat_id)
@@ -745,6 +1001,31 @@ async def process_update(data: dict) -> None:
                     model_info = SUPPORTED_MODELS.get(current_model)
                     supports_audio_input = model_info.audio_input if model_info else False
 
+                # 回复引用补齐（兼顾音频）：被引用的音频在模型支持音频输入时
+                # 直接挂附件（多音频走下游 _resolve_mixed_attachments 逐条
+                # 解析），不支持时转录进文本；引用的图片/视频/文档给说明。
+                quoted_items = _get_reply_media(msg)
+                q_audios = [it for it in quoted_items if it.get("kind") in ("audio", "voice")]
+                q_others = [it for it in quoted_items if it.get("kind") not in ("audio", "voice")]
+                extra_audio_attachments = []
+                if q_audios and supports_audio_input:
+                    extra_audio_attachments = [
+                        {
+                            "kind": it.get("kind", "audio"),
+                            "file_id": it["file_id"],
+                            "file_name": it.get("file_name") or f"audio_{it['file_id'][:8]}.ogg",
+                        }
+                        for it in q_audios
+                    ]
+                note_lines = []
+                if q_others or (q_audios and not supports_audio_input):
+                    note_lines = await _quoted_media_note_lines(
+                        chat_id,
+                        q_others + (q_audios if not supports_audio_input else []),
+                    )
+                if note_lines:
+                    cap = (cap + "\n\n" if cap else "") + "\n".join(note_lines)
+
                 if supports_audio_input:
                     content_text = f"📎 用户上传了音频「{fname}」"
                     if cap:
@@ -762,7 +1043,7 @@ async def process_update(data: dict) -> None:
                                 "file_id": fid,
                                 "file_name": fname,
                             }
-                        ],
+                        ] + extra_audio_attachments,
                     }
                     await spawn_turn_task(chat_id, _handle_audio_message(chat_id, user_message, username))
                     return
@@ -817,6 +1098,13 @@ async def process_update(data: dict) -> None:
                     context_prefix = _get_reply_context(msg)
                     if context_prefix:
                         cap = context_prefix + cap
+                    # 回复引用补齐：引用的音频转录进文本，图片/文档给说明
+                    # （这些模态挂不进单视频信封，至少让模型知道引用了什么）。
+                    quoted_items = _get_reply_media(msg)
+                    if quoted_items:
+                        note_lines = await _quoted_media_note_lines(chat_id, quoted_items)
+                        if note_lines:
+                            cap = (cap + "\n\n" if cap else "") + "\n".join(note_lines)
 
                     content_text = f"📎 用户上传了视频「{fname}」"
                     if cap:
@@ -905,7 +1193,9 @@ async def process_update(data: dict) -> None:
                 if context_prefix:
                     user_input = context_prefix + user_input
 
-                reply_media = _get_reply_media(msg)
+                # 被引用消息的媒体列表：相册引用时为整组媒体（登记表补齐），
+                # 单媒体消息时为单元素列表，无媒体时为空列表。
+                reply_media_items = _get_reply_media(msg)
 
                 async with lock:
                     cm = get_user_model(chat_id)
@@ -913,149 +1203,133 @@ async def process_update(data: dict) -> None:
                     supports_audio_input = model_info.audio_input if model_info else False
                     supports_document_input = bool(model_info.document_input) if model_info else False
 
-                if reply_media:
-                    media_type = reply_media.get("type")
-                    file_name = reply_media.get("file_name", f"{media_type}_{reply_media.get('file_id', '')[:8]}")
+                if reply_media_items:
+                    photos = [it for it in reply_media_items if it.get("kind") == "photo"]
+                    audios = [it for it in reply_media_items if it.get("kind") in ("audio", "voice")]
+                    videos = [it for it in reply_media_items if it.get("kind") == "video"]
+                    docs = [it for it in reply_media_items if it.get("kind") == "document"]
+                    kind_count = sum(1 for part in (photos, audios, videos, docs) if part)
 
-                    if media_type == "photo":
-                        file_ids = reply_media.get("file_ids", [])
-                        content_text = f"📎 用户引用了图片「{file_name}」"
+                    if kind_count > 1:
+                        # 混合类型（如混合相册 photo+video 的整组引用）：交给
+                        # 下游 _resolve_mixed_attachments 按 attachments 逐条
+                        # 解析——支持的模态出对应内容块，不支持的降级文本占位
+                        # （音频自动转录、视频顺带后台持久化）。
+                        kind_names = []
+                        if photos:
+                            kind_names.append(f"图片x{len(photos)}")
+                        if audios:
+                            kind_names.append(f"音频x{len(audios)}")
+                        if videos:
+                            kind_names.append(f"视频x{len(videos)}")
+                        if docs:
+                            kind_names.append(f"文档x{len(docs)}")
+                        content_text = f"📎 用户引用了媒体（{'、'.join(kind_names)}）"
+                        if user_input:
+                            content_text += f"\n\n{user_input}"
+                        user_message = {
+                            "role": "user",
+                            "content": content_text,
+                            "attachments": reply_media_items,
+                        }
+
+                    elif photos:
+                        # 回复图片 / 图片相册：登记表命中时 photos 即相册
+                        # 全部图片（"回复相册带上全部图片，而不是只带被回复
+                        # 的那一张"），未命中退化为单张（旧行为）。
+                        file_ids = [it["file_id"] for it in photos]
+                        content_text = (
+                            f"📎 用户引用了图片（共 {len(file_ids)} 张）"
+                            if len(file_ids) > 1
+                            else "📎 用户引用了图片"
+                        )
                         if user_input:
                             content_text += f"\n\n{user_input}"
                         else:
-                            content_text += "\n\n请分析这张图片"
+                            content_text += (
+                                "\n\n请分析这张图片"
+                                if len(file_ids) == 1
+                                else "\n\n请分析这些图片"
+                            )
                         user_message = {
                             "role": "user",
                             "content": content_text,
                             "file_ids": file_ids,
                             "type": "photo_group",
                             "attachments": [
-                                {
-                                    "kind": "photo",
-                                    "file_id": fid,
-                                    "file_name": file_name,
-                                }
+                                {"kind": "photo", "file_id": fid}
                                 for fid in file_ids
                             ],
                         }
 
-                    elif media_type == "document":
-                        safe_fname = os.path.basename(file_name)
-                        mime_type = reply_media.get("mime_type") or mimetypes.guess_type(safe_fname)[0] or "application/pdf"
+                    elif audios:
+                        user_message = await _build_quoted_audio_message(
+                            chat_id, audios, user_input,
+                            supports_audio_input=supports_audio_input,
+                        )
 
-                        if supports_document_input:
-                            content_text = f"📎 用户引用了文档「{safe_fname}」"
+                    elif videos:
+                        if len(videos) == 1:
+                            video = videos[0]
+                            file_name = video.get("file_name") or f"video_{video['file_id'][:8]}.mp4"
+                            mime_type = video.get("mime_type") or "video/mp4"
+                            content_text = f"📎 用户引用了视频「{file_name}」"
                             if user_input:
                                 content_text += f"\n\n{user_input}"
                             else:
-                                content_text += "\n\n请直接阅读并分析这个文档。"
+                                content_text += "\n\n请分析这个视频"
                             user_message = {
                                 "role": "user",
                                 "content": content_text,
-                                "file_id": reply_media["file_id"],
-                                "file_name": safe_fname,
+                                "file_id": video["file_id"],
+                                "file_name": file_name,
                                 "mime_type": mime_type,
-                                "type": "document",
+                                "type": "video",
+                                "attachments": [
+                                    {
+                                        "kind": "video",
+                                        "file_id": video["file_id"],
+                                        "file_name": file_name,
+                                        "mime_type": mime_type,
+                                    }
+                                ],
                             }
                         else:
-                            workspace = workspace_download_root(chat_id)
-                            workspace.mkdir(parents=True, exist_ok=True)
-                            target_path = workspace / safe_fname
-                            workspace_lock = await _get_workspace_lock(chat_id)
-                            async with workspace_lock:
-                                # download_file 内部已经把字节缓存到 R2 的 telegram/{file_id} 前缀，
-                                # download/ 只是本地落地缓冲，不需要再往 R2 镜像一份。
-                                success = await download_file(reply_media["file_id"], str(target_path))
-                                if success:
-                                    content_text = (
-                                        f"📎 用户引用了文档「{safe_fname}」，已保存在工作区根目录的 "
-                                        f"download/ 子目录，可直接访问（如 `cat download/{safe_fname}`）。"
-                                    )
-                                else:
-                                    content_text = f"📎 用户引用了文档「{safe_fname}」，但下载失败。"
-                                if user_input:
-                                    content_text += f"\n\n用户指令：{user_input}"
-                                else:
-                                    content_text += "\n\n请根据用户指令处理该文档。"
-                            user_message = {"role": "user", "content": content_text}
-
-                    elif media_type in ("audio", "voice"):
-                        if supports_audio_input:
-                            content_text = f"📎 用户引用了音频「{file_name}」"
+                            # 视频相册整组引用：video_group 数组形态，下游
+                            # 原生支持多视频（支持视频的模型出多个 video 块，
+                            # 不支持的降级文本占位并后台持久化，切换模型不丢）。
+                            video_names = [
+                                v.get("file_name") or f"video_{v['file_id'][:8]}.mp4"
+                                for v in videos
+                            ]
+                            content_text = f"📎 用户引用了视频（共 {len(videos)} 个）"
                             if user_input:
                                 content_text += f"\n\n{user_input}"
                             else:
-                                content_text += "\n\n请分析这段音频"
+                                content_text += "\n\n请分析这些视频"
                             user_message = {
                                 "role": "user",
                                 "content": content_text,
-                                "file_id": reply_media["file_id"],
-                                "file_name": file_name,
-                                "type": media_type,
+                                "file_ids": [v["file_id"] for v in videos],
+                                "file_names": video_names,
+                                "mime_types": [v.get("mime_type") or "video/mp4" for v in videos],
+                                "type": "video_group",
                                 "attachments": [
                                     {
-                                        "kind": media_type,
-                                        "file_id": reply_media["file_id"],
-                                        "file_name": file_name,
+                                        "kind": "video",
+                                        "file_id": v["file_id"],
+                                        "file_name": name,
+                                        "mime_type": v.get("mime_type") or "video/mp4",
                                     }
+                                    for v, name in zip(videos, video_names)
                                 ],
                             }
-                        else:
-                            content_text_parts = []
-                            if user_input:
-                                content_text_parts.append(user_input)
-                            if GROQ_API_KEY:
-                                audio_bytes = await _get_cached_audio_data(chat_id, reply_media["file_id"])
-                                if audio_bytes:
-                                    ext = os.path.splitext(file_name)[1] or ".ogg"
-                                    try:
-                                        transcribed_text = await transcribe_audio_with_groq(audio_bytes, ext)
-                                        if transcribed_text:
-                                            content_text_parts.append(transcribed_text)
-                                    except Exception as e:
-                                        logger.error(f"Groq 转录失败: {e}")
-                            if not content_text_parts:
-                                content_text_parts.append("请分析这段音频")
-                            content_text = "\n\n".join(content_text_parts)
-                            user_message = {
-                                "role": "user",
-                                "content": content_text,
-                                "file_id": reply_media["file_id"],
-                                "file_name": file_name,
-                                "type": media_type,
-                                "attachments": [
-                                    {
-                                        "kind": media_type,
-                                        "file_id": reply_media["file_id"],
-                                        "file_name": file_name,
-                                    }
-                                ],
-                            }
-                    elif media_type == "video":
-                        content_text = f"📎 用户引用了视频「{file_name}」"
-                        if user_input:
-                            content_text += f"\n\n{user_input}"
-                        else:
-                            content_text += "\n\n请分析这个视频"
-                        user_message = {
-                            "role": "user",
-                            "content": content_text,
-                            "file_id": reply_media["file_id"],
-                            "file_name": file_name,
-                            "mime_type": reply_media.get("mime_type", "video/mp4"),
-                            "type": "video",
-                            "attachments": [
-                                {
-                                    "kind": "video",
-                                    "file_id": reply_media["file_id"],
-                                    "file_name": file_name,
-                                    "mime_type": reply_media.get("mime_type", "video/mp4"),
-                                }
-                            ],
-                        }
-                    else:
-                        content_text = f"📎 用户引用了媒体「{file_name}」\n\n{user_input}" if user_input else f"📎 用户引用了媒体「{file_name}」"
-                        user_message = {"role": "user", "content": content_text}
+
+                    else:  # 仅文档（单个或文档相册整组）
+                        user_message = await _build_quoted_document_message(
+                            chat_id, docs, user_input,
+                            supports_document_input=supports_document_input,
+                        )
                 else:
                     user_message = {"role": "user", "content": user_input}
 
