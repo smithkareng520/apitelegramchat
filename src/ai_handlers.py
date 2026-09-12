@@ -118,22 +118,23 @@ def _workspace_guide_html(chat_id: int | None, workspace_namespace_value: str | 
         path_html = "（绝对路径用 <code>echo $WORKSPACE</code> 查看）"
     return f"""
 <h2>工作区与文件目录</h2>
-<p>bash 与 text_editor 运行在你专属的<b>家目录</b>中：家目录{path_html}就是 bash 会话的起始目录，同时也是 <code>$HOME</code>（<code>~</code> 会展开到这里），更是<b>整个环境里唯一可读可写的位置</b>。Landlock 沙箱只放行这一棵目录树——<code>/tmp</code>、<code>/home</code>、<code>/</code> 以及家目录之外的任何路径（包括家目录的父目录）一律拒绝访问：在那里写文件会得到 <code>curl</code> exit code 23、Python <code>PermissionError</code>。家目录根下有以下特殊子目录，直接用相对路径读写：</p>
-<ul>
-  <li><code>download/</code>：用户上传文件（文档等）的落地目录。直接读取即可，如 <code>bash</code> 执行 <code>cat download/报告.pdf</code>，或 <code>text_editor</code> 的 path 填 <code>download/报告.pdf</code>。</li>
-  <li><code>upload/</code>：发送文件给用户的暂存区。要把文件发给用户，先用 bash 把文件复制进去（如 <code>cp 结果.docx upload/结果.docx</code>），再调用 <code>present_files</code>，参数只接受 <code>upload/</code> 下的路径（如 <code>upload/结果.docx</code>）。</li>
-  <li><code>skills/</code>：可用技能包目录，每个技能一个同名子目录（详见下方技能目录章节）。</li>
-  <li><code>.runtime/</code>：隐藏的系统缓存目录（pip、编译缓存等）。它以点开头、普通 <code>ls</code> 不显示；不要把产出文件放进去，也不要修改其中内容。</li>
-</ul>
+<p>bash 与 text_editor 运行在<b>沙盒</b>中：这是你的工作空间：{path_html}，你无法访问沙盒以外的任何路径或文件。</p>
 <ul>
   <li>临时文件：<code>TMPDIR</code> 已指向家目录内可写缓存，mktemp / Python tempfile 开箱即用。</li>
 </ul>
+<ul>
+  <li><code>download/</code>：用户发送的文件在个目录下</li>
+  <li><code>upload/</code>：发送文件给用户的暂存区。要把文件发给用户，先用把文件放到个目录中，再调用 <code>present_files</code>来发送</li>
+  <li><code>.runtime/</code>：隐藏的系统缓存目录（pip、编译缓存等）。它以点开头、普通 <code>ls</code> 不显示；不要把产出文件放进去，也不要修改其中内容。</li>
+  <li><code>skills/</code>：可用技能包目录，每个技能一个同名子目录（详见下方技能目录章节）。</li>    
+</ul>
+
 """
 
 
 # ── 系统提示词各片段（模块级常量）────────────────────────────────
 # 把 base / tools / no-tools / 角色 prompt 全部抽到模块层，build_system_prompt
-# 本体只剩装配逻辑。每段都以 <h2> 标题开头、结构上互相独立。
+# 本体只剩装配逻辑。每段结构上互相独立。
 # 缓存相关：除末尾追加的"当前时间"在 build_system_prompt 里拼上之外，
 # 其他片段逐字节稳定，能被 Anthropic/OpenRouter 稳定复用前缀缓存。
 
@@ -245,7 +246,7 @@ _BASE_PROMPT = """
 
 <h4>2.2 媒体标签与属性</h4>
 <table bordered striped>
-  <caption>媒体标签白名单</caption>
+  <caption>媒体标签写法</caption>
   <tr><th>用途</th><th>写法</th><th>属性（必填 / 选填）</th></tr>
   <tr><td>图片</td><td><code><img src="URL"/></code></td><td><b>必填</b> <code>src</code>：图片直链</td></tr>
   <tr><td>视频</td><td><code><video src="URL"></video></code></td><td><b>必填</b> <code>src</code>：视频直链</td></tr>
@@ -255,23 +256,11 @@ _BASE_PROMPT = """
   <tr><td>地图</td><td><code><tg-map lat="41.9" long="12.5" zoom="14"/></code></td><td><b>必填</b> <code>lat</code> 纬度、<code>long</code> 经度；<b>选填</b> <code>zoom</code>：13–20</td></tr>
 </table>
 
-<h4>2.3 GIF 规则</h4>
-<p>GIF 属于<b>图片</b>资源。URL 路径以 <code>.gif</code> 结尾时必须使用 <code><img src="URL"/></code>；需要图注时用 <code><figure><img src="URL"/><figcaption>…</figcaption></figure></code>。<b>严禁用 <code><video></code> 包裹 GIF。</b></p>
-
-<h4>2.4 图片生成工具的结果处理</h4>
-<p>当 <code>generate_image</code>（统一图像工具；旧名 <code>generate_image_from_text</code> / <code>edit_image_with_reference</code> 同样有效）成功返回 <code>图片链接：URL</code>（可能多行，每行一个 URL）时：</p>
-<ul>
-  <li><b>单张：</b>用 <code><img src="URL"/></code> 输出。</li>
-  <li><b>多张（≥2）：</b>用 <code><tg-slideshow><img src="URL1"/><img src="URL2"/></tg-slideshow></code> 输出。</li>
-  <li><b>绝对禁止</b>使用 Markdown 图片/链接语法（<code>![...](URL)</code>、<code>[...](URL)</code>），也不得只输出裸 URL 或仅用文字描述。</li>
-  <li>只能使用工具返回的<b>原始</b> HTTP/HTTPS URL，原样写入 <code>src</code>（以及需要时的下载 <code>href</code>）；<b>不得</b>转义、解码、重写、拼接或截断。</li>
-</ul>
-
 <hr/>
 
 <h3>三、来源标注</h3>
-<p>当标注来源时，使用 <tg-button type="url" url="链接">显示文本</tg-button> 按钮链接格式紧贴到需要标注的文本后。显示文本的语言应与来源语言一致：英文网站用英文名称（如 <code>The Wall Street Journal</code>、<code>VOA Chinese</code>），中文网站用中文名称（如 <code>财新网</code>、<code>澎湃新闻</code>）。</p>
-<p>新闻、科学事实、统计数据、技术文档、学术论文、法律条文、历史事件、研究报告等各类信息，必须标注来源</p>
+<p>当你发送包括但不限于新闻、科学事实、统计数据、技术文档、学术论文、法律条文、历史事件、研究报告等各类信息时，必须在该条消息后标注来源链接</p>
+<p>当标注来源时，使用 <tg-button type="url" url="链接">显示文本</tg-button> 按钮链接格式，显示文本的语言应与来源语言一致：英文网站用英文名称（如 <code>The Wall Street Journal</code>、<code>VOA Chinese</code>），中文网站用中文名称（如 <code>财新网</code>、<code>澎湃新闻</code>）。</p>
 
 """
 
