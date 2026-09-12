@@ -420,6 +420,7 @@ PROVIDERS: Dict[str, ProviderConfig] = {
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
+        },
         endpoint="https://ai.lfree.org/bot/XpBv3okYsbAV",
         api_key_env="LFREE_API_KEY",
     ),
