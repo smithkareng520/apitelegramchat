@@ -381,7 +381,9 @@ def _media_fetch_replay_mode(failed_stream_attempt: int) -> str:
 async def _inline_wire_images_as_data_urls(
     wire_messages: list,
     *,
+    chat_id: int | None = None,
     _fetch=None,
+    _resolve_file_id=None,
 ) -> tuple[int, int]:
     """把 wire 消息里所有 http(s) 图片内联为 base64 data URI（原地替换）。
 
@@ -411,6 +413,10 @@ async def _inline_wire_images_as_data_urls(
 
     Returns:
         (成功内联数, 失败保持 URL 数)。没有 http 图片时返回 (0, 0)。
+
+    ``chat_id`` / ``_resolve_file_id``：优先从本轮 attachment layer 建立的
+    URL->file_id 映射恢复原始附件字节，再退回直接下载 URL。这样网关
+    首轮拉取失败时，不会因为“二次下载同一个预签名 URL”再丢掉其中一张图。
     """
     targets: list[tuple[dict, str]] = []
     for msg in wire_messages:
@@ -454,6 +460,30 @@ async def _inline_wire_images_as_data_urls(
     fetch = _fetch or _default_fetch
 
     async def _inline_one(part: dict, url: str) -> bool:
+        # 最优先：通过本轮附件解析阶段建立的 URL -> file_id 映射，直接
+        # 复用 get_cached_image_data。这里拿到的字节与首轮 ImageBlock
+        # 使用的是同一附件，避免再次依赖 R2 预签名 URL 的匿名 HTTP GET。
+        if _resolve_file_id is not None and chat_id is not None:
+            try:
+                file_id = str(_resolve_file_id(url) or "")
+            except Exception:
+                file_id = ""
+            if file_id:
+                try:
+                    from ai.attachment_content import get_cached_image_data
+                    data = await get_cached_image_data(chat_id, file_id)
+                    if data:
+                        mime = _sniff_image_mime(data) or "image/jpeg"
+                        inner = part.get("image_url")
+                        if isinstance(inner, dict):
+                            inner["url"] = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+                            return True
+                except Exception as e:
+                    logger.warning(
+                        "base64 内联兑底：按 file_id 复用图片字节失败，回退 URL 下载：%s… (%s: %s)",
+                        url[:120], type(e).__name__, str(e)[:120],
+                    )
+
         try:
             data, content_type = await fetch(url)
         except Exception as e:
@@ -866,8 +896,24 @@ async def _agentic_loop_openai_compat(
                         exc, received_any=received_any, stream_attempt=stream_attempt
                     ):
                         if _media_fetch_replay_mode(stream_attempt) == "inline":
+                            from ai.attachment_content import _file_id_for_image_url
+                            image_part_count = sum(
+                                1
+                                for _m in create_params["messages"]
+                                if isinstance(_m, dict) and isinstance(_m.get("content"), list)
+                                for _p in _m["content"]
+                                if isinstance(_p, dict) and _p.get("type") == "image_url"
+                                and isinstance(_p.get("image_url"), dict)
+                                and str(_p["image_url"].get("url") or "").startswith(("http://", "https://"))
+                            )
                             inlined, failed = await _inline_wire_images_as_data_urls(
-                                create_params["messages"]
+                                create_params["messages"],
+                                chat_id=builder.chat_id,
+                                _resolve_file_id=lambda url: _file_id_for_image_url(url),
+                            )
+                            logger.info(
+                                "[%s] base64 兜底媒体统计: http_image_parts=%s inlined=%s failed=%s",
+                                api_label, image_part_count, inlined, failed,
                             )
                             if inlined == 0:
                                 logger.warning(

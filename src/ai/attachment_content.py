@@ -45,6 +45,10 @@ _document_cache = TTLCache(maxsize=300, ttl=CACHE_TTL)
 # 视频体积大（Telegram bot 下载上限 20MB），缓存条数比图片少，
 # 避免内存被少数大文件占满。
 _video_cache = TTLCache(maxsize=50, ttl=CACHE_TTL)
+# 当前请求内：R2 预签名 URL -> Telegram file_id。
+# Agnes 媒体拉取失败做 base64 兜底时，优先通过 file_id 回到本地/内存/R2
+# 的原始字节，避免对刚生成的签名 URL 再做一次可能失败的 HTTP GET。
+_image_url_file_id_cache = TTLCache(maxsize=2000, ttl=CACHE_TTL)
 
 # ---------- 后台任务引用集合（防止 asyncio.create_task 创建的任务被 GC 提前回收）----------
 _background_tasks: set = set()
@@ -622,6 +626,15 @@ def _attachment_label(kind: str) -> str:
     return _ATTACHMENT_KIND_LABELS.get(str(kind or "").lower(), str(kind or "附件"))
 
 
+def _remember_image_url_file_id(url: str, file_id: str) -> None:
+    if url and file_id:
+        _image_url_file_id_cache[url] = file_id
+
+
+def _file_id_for_image_url(url: str) -> str:
+    return str(_image_url_file_id_cache.get(url) or "")
+
+
 async def _resolve_presigned_attachment_url(file_id: str) -> str:
     """把 Telegram file_id 解析成一个可供模型/工具继续引用的 R2 预签名 URL。
 
@@ -644,7 +657,9 @@ async def _resolve_presigned_attachment_url(file_id: str) -> str:
         if await file_exists_in_r2(r2_key):
             # fallback 与多模态注入统一使用上传后的临时访问 URL。
             # 不依赖永久公开域名，避免切换模型时丢失可访问地址。
-            return await presigned_url_for_existing_key(r2_key) or ""
+            url = await presigned_url_for_existing_key(r2_key) or ""
+            _remember_image_url_file_id(url, fid)
+            return url
     except Exception as e:
         logger.debug(f"解析 R2 文件 URL 失败 {fid[:12]}: {e}")
 
@@ -687,6 +702,7 @@ async def _resolve_r2_presigned_url_for_vision(file_id: str) -> str:
     if await file_exists_in_r2(r2_key):
         url = await presigned_url_for_existing_key(r2_key)
         if url:
+            _remember_image_url_file_id(url, fid)
             return url
         # R2 已有对象但签发失败（罕见：R2 API 瞬时异常）
         # → 让调用方降级 base64
@@ -704,7 +720,9 @@ async def _resolve_r2_presigned_url_for_vision(file_id: str) -> str:
     if result is None:
         # upload_bytes_to_r2 返回 None 说明上传最终失败（已记日志），降级。
         return ""
-    return await presigned_url_for_existing_key(r2_key) or ""
+    url = await presigned_url_for_existing_key(r2_key) or ""
+    _remember_image_url_file_id(url, fid)
+    return url
 
 
 async def _build_attachment_fallback_text(

@@ -218,6 +218,41 @@ class TestInlineWireImages:
         assert asyncio.run(_inline_wire_images_as_data_urls(
             wire, _fetch=_fetch_ok(PNG_MAGIC))) == (0, 0)
 
+
+    def test_file_id_cache_reuse_does_not_require_second_url_download(self):
+        # 当网关连续两次无法拉取 R2 URL 时，兜底应优先复用附件层已经拿到
+        # 的原始字节；否则两张图很容易出现“2 张 -> 只内联 1 张”的假丢图。
+        parts = [_image_part("https://r2.example/p1.jpg"), _image_part("https://r2.example/p2.jpg")]
+        wire = [_wire_user(parts)]
+        fetched_urls = []
+
+        async def _fetch(_url: str):
+            fetched_urls.append(_url)
+            raise AssertionError("file_id cache should avoid URL re-download")
+
+        from ai import attachment_content
+        attachment_content._image_url_file_id_cache.clear()
+        attachment_content._image_url_file_id_cache[parts[0]["image_url"]["url"]] = "fid1"
+        attachment_content._image_url_file_id_cache[parts[1]["image_url"]["url"]] = "fid2"
+
+        async def _get_cached(chat_id, file_id):
+            return {"fid1": PNG_MAGIC, "fid2": PNG_MAGIC}
+
+        original = attachment_content.get_cached_image_data
+        attachment_content.get_cached_image_data = _get_cached
+        try:
+            inlined, failed = asyncio.run(_inline_wire_images_as_data_urls(
+                wire, chat_id=123,
+                _resolve_file_id=lambda url: attachment_content._file_id_for_image_url(url),
+                _fetch=_fetch,
+            ))
+        finally:
+            attachment_content.get_cached_image_data = original
+
+        assert (inlined, failed) == (2, 0)
+        assert not fetched_urls
+        assert all(part["image_url"]["url"].startswith("data:image/png;base64,") for part in parts)
+
     def test_inline_replay_bypasses_gateway_download_shape(self):
         # 端到端形状验证：内联后的 user 消息里不再有任何 http(s) 图片引用，
         # 网关侧无需再访问 R2（这正是"通用兜底"的意义）
