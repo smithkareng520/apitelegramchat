@@ -87,6 +87,41 @@ def test_registry_lru_bounded():
     assert get_album_media(777, "MG-fill-249") is not None
 
 
+
+def test_record_album_media_merges_late_shards():
+    state.album_media_registry.clear()
+    record_album_media("MG-late", 777, PHOTO_SHARDS[:2])
+    record_album_media("MG-late", 777, PHOTO_SHARDS[2:])
+    entry = get_album_media(777, "MG-late")
+    assert entry is not None
+    assert entry["photos"] == ["big1", "big2", "big3"]
+
+
+def test_reply_to_album_can_resolve_incremental_registration():
+    state.album_media_registry.clear()
+
+    # 模拟 Telegram 分片到达：第二张图到达后，用户立刻回复；
+    # add_media_group_message 应已把“当前已知整组”登记到 registry。
+    asyncio.run(state.add_media_group_message(
+        "MG-incremental:photo",
+        {"chat": {"id": 777}, "message_id": 101,
+         "media_group_id": "MG-incremental",
+         "photo": [{"file_id": "small1"}, {"file_id": "big1"}]},
+    ))
+    asyncio.run(state.add_media_group_message(
+        "MG-incremental:photo",
+        {"chat": {"id": 777}, "message_id": 102,
+         "media_group_id": "MG-incremental",
+         "photo": [{"file_id": "small2"}, {"file_id": "big2"}]},
+    ))
+
+    items = _get_reply_media(_reply_msg({
+        "message_id": 102,
+        "media_group_id": "MG-incremental",
+        "photo": [{"file_id": "small2"}, {"file_id": "big2"}],
+    }))
+    assert [it["file_id"] for it in items] == ["big1", "big2"]
+
 # ----------------------------------------------------------------------
 # _get_reply_media：相册整组补齐 + 单媒体列表化
 # ----------------------------------------------------------------------

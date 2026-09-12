@@ -59,6 +59,26 @@ async def add_media_group_message(media_group_id: str, msg: dict) -> None:
             media_groups[media_group_id] = []
         media_groups[media_group_id].append(msg)
 
+        # Telegram 的 album 每张图片都是一个独立 message update。
+        # reply_to_message 只会带被回复的那一个分片；如果只在聚合任务
+        # 等待 5 秒后才登记 album，用户在这之前回复时必然查不到整组。
+        # 因此在每个分片到达时同步维护一份“当前已知整组”登记表。
+        # 这里仅对 :photo 这类媒体组做原始 ID 归一，文档/单组不受影响。
+        raw_group_id = str(media_group_id or "")
+        for suffix in (":photo", ":video"):
+            if raw_group_id.endswith(suffix):
+                raw_group_id = raw_group_id[:-len(suffix)]
+                break
+        if raw_group_id:
+            chat = msg.get("chat") or {}
+            chat_id = chat.get("id")
+            try:
+                chat_id = int(chat_id)
+            except (TypeError, ValueError):
+                chat_id = None
+            if chat_id is not None:
+                record_album_media(raw_group_id, chat_id, media_groups[media_group_id])
+
 async def pop_media_group(media_group_id: str) -> list:
     async with media_groups_lock:
         return media_groups.pop(media_group_id, [])
@@ -85,7 +105,7 @@ def record_album_media(media_group_id: str, chat_id: int, messages: list) -> Non
     """相册聚合处理时登记整组媒体摘要，供回复引用时补齐全部图片等。
 
     messages 为该相册的全部分片（Telegram update 的 message dict）。
-    重复登记同一组时以最后一次为准（并把该组移到 LRU 最新端）。
+    重复登记同一组时做增量合并（并把该组移到 LRU 最新端）。
     """
     if not media_group_id or not messages:
         return
@@ -139,6 +159,33 @@ def record_album_media(media_group_id: str, chat_id: int, messages: list) -> Non
         "message_ids": message_ids,
         "ts": time.time(),
     }
+
+    # 相册分片可能迟到：_reschedule_if_late_shards() 会再次调用
+    # record_album_media()，这一次拿到的 messages 只有“迟到分片”。
+    # 如果简单覆盖旧 entry，就会把之前已登记的图片丢掉，回复相册时
+    # 最终只会找到最后一张。因此同 chat / 同 group 必须做增量合并。
+    existing = album_media_registry.get(media_group_id)
+    if isinstance(existing, dict) and existing.get("chat_id") == chat_id:
+        def _merge_values(old_values: list, new_values: list, key=None) -> list:
+            out = list(old_values or [])
+            seen = {
+                (item if key is None else item.get(key))
+                for item in out
+                if key is None or isinstance(item, dict)
+            }
+            for item in (new_values or []):
+                marker = item if key is None else (item.get(key) if isinstance(item, dict) else None)
+                if marker not in seen:
+                    out.append(item)
+                    seen.add(marker)
+            return out
+
+        entry["photos"] = _merge_values(existing.get("photos"), photos)
+        entry["audios"] = _merge_values(existing.get("audios"), audios, "file_id")
+        entry["videos"] = _merge_values(existing.get("videos"), videos, "file_id")
+        entry["documents"] = _merge_values(existing.get("documents"), documents, "file_id")
+        entry["captions"] = _merge_values(existing.get("captions"), captions)
+        entry["message_ids"] = _merge_values(existing.get("message_ids"), message_ids)
     # 纯内存 dict 读写，无 await 点，asyncio 单线程语义下无需加锁。
     album_media_registry.pop(media_group_id, None)
     album_media_registry[media_group_id] = entry
