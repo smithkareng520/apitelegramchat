@@ -55,6 +55,13 @@ class BridgeLoopState:
     final_content: Optional[str] = None
     final_usage: Any = None
     tool_call_count_ref: list = field(default_factory=lambda: [0])
+    # 连续相同工具错误的熔断计数：key 是错误签名（首行，截 100 字符），
+    # value 是连续命中次数。本轮 turn 内跨多次 _run_tool_calls_and_append
+    # 调用共享同一份状态（每个 turn 由 init_bridge_loop_state 重新创建，
+    # 不跨 turn 存活）。显式字段替代旧版借用 builder 对象做
+    # setattr/getattr/vars() 反射存储的写法——熔断计数是"本轮工具循环"的
+    # 状态，不属于 DraftManager（UI 渲染）的职责范围。
+    error_streak: dict = field(default_factory=dict)
 
 
 def init_bridge_loop_state(messages: list, journal: list | None, current_model: str) -> BridgeLoopState:
@@ -146,17 +153,24 @@ async def run_tool_batch(
     tool_call_count_ref: list,
     api_label: str,
     tools: list,
+    error_streak: Optional[dict] = None,
 ) -> str:
     """执行工具批次，随后触发 tool.end 安全点（非阻塞）。
 
     解耦改造（§8）：工具结果已全部写入 loop_messages / 历史（即已进入
     conversation context），调用方立即发起下一轮 LLM 请求；满容量时
     草稿滚动由 DraftManager 在 tool.end 安全点后台执行，不再阻塞 Agent。
+
+    ``error_streak``：连续相同工具错误的熔断计数状态，由调用方传入的
+    ``BridgeLoopState.error_streak``（或等价的本轮字典）在多轮之间共享；
+    省略时 ``_run_tool_calls_and_append`` 内部临时创建一个一次性字典，
+    熔断退化为\"仅本批次内生效\"（不建议——调用方应始终传入跨轮共享的
+    字典）。
     """
     status = await _run_tool_calls_and_append(
         tool_calls_list, loop_messages, new_history_entries,
         tool_call_count_ref, api_label, builder, chat_id=builder.chat_id,
-        tools=tools,
+        tools=tools, error_streak=error_streak,
     )
     builder.on_tool_batch_end()
     return status

@@ -541,6 +541,10 @@ async def _agentic_loop_openai_compat(
     # prompt_tokens_details，见 _extract_cache_usage 上方说明）。
     usage_with_cache = None
     tool_call_count_ref = [0]
+    # 连续相同工具错误的熔断计数：跨本轮全部工具批次共享，见
+    # bridge_common.run_tool_batch 与 tool_call_loop._run_tool_calls_and_append
+    # 的 error_streak 参数说明。
+    error_streak: dict = {}
     # journal：由 get_ai_response 注入的轮次日志（打断保全用，见 turn_recovery.py）。
     # 注入时循环直接往里追加，轮次被打断时已完成的消息不至于丢失。
     new_history_entries = journal if journal is not None else []
@@ -1106,7 +1110,7 @@ async def _agentic_loop_openai_compat(
             break
         status = await run_tool_batch(
             builder, tool_calls_list, loop_messages, new_history_entries,
-            tool_call_count_ref, api_label, tools,
+            tool_call_count_ref, api_label, tools, error_streak=error_streak,
         )
         # ★ 解耦关键点（§8）：工具结果已全部进入 conversation context，
         # 下一轮 LLM 请求立即发出；满容量时草稿滚动由 DraftManager 在

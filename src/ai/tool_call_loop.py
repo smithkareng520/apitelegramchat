@@ -72,128 +72,12 @@ logger = get_logger(__name__)
 
 
 # ---------- 子 agent 进度预览渲染 ----------
-# 子 agent 在 _subagent_agentic_loop 里通过 _report 推送的 status_text 是
-# 一组带固定模式的中文短句（"第 X/Y 轮：LLM 思考中…（已耗时 Xs）"、
-# "完成：X 轮，N 次工具调用，Xs" 等）。这里把它们解析成结构化字段，
-# 渲染成 Telegram Rich Message 块级 HTML，让用户能直接读到当前阶段、
-# 当前轮数、已耗时、正在执行的工具名 —— 而不是一行被 italic 化、被
-# 截断到 300 token 的灰色状态句。
-
-# 顺序敏感：先匹配「完成 / 结束 / 超时 / 失败」再匹配「执行工具」、
-# 最后兜底「启动」。
-_SUBAGENT_PROGRESS_PHASE_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
-    ("done",     re.compile(r"^完成[:：]")),
-    ("terminal", re.compile(r"^结束[:：]")),
-    ("timeout",  re.compile(r"整体超时|LLM 调用超时|轮.*超时")),
-    ("error",    re.compile(r"失败|解析失败")),
-    ("tools",    re.compile(r"执行工具")),
-    ("thinking", re.compile(r"LLM 思考中")),
-    ("start",    re.compile(r"^启动子")),
-]
-
-_SUBAGENT_ROUND_RE = re.compile(r"第\s*(\d+)\s*[/／]\s*(\d+)\s*轮")
-_SUBAGENT_PLAIN_ROUND_RE = re.compile(r"第\s*(\d+)\s*轮")
-_SUBAGENT_ELAPSED_RE = re.compile(r"已耗时\s*([0-9.]+)\s*[s秒]")
-# 「完成：X 轮，N 次工具调用，Xs」与「结束：…（X 轮，N 次工具调用）」
-# 共享同一个轮次+工具调用次数模式；秒数仅在完成行出现，故设为可选。
-_SUBAGENT_TOTAL_TIME_RE = re.compile(
-    r"(\d+)\s*轮[，,]\s*(\d+)\s*次工具调用"
-    r"(?:[，,]\s*([0-9.]+)\s*[s秒])?"
+# 已拆分至 ai/subagent_progress.py（正则解析 + HTML 渲染是独立于工具调用
+# 编排的表现层关切）。此处保留旧名重导出，避免本文件内其余代码改动。
+from ai.subagent_progress import (
+    subagent_progress_phase as _subagent_progress_phase,
+    format_subagent_progress_html as _format_subagent_progress_html,
 )
-_SUBAGENT_TOOL_NAMES_RE = re.compile(r"执行工具\s*(.+?)\s*[（(]?\s*已耗时")
-_SUBAGENT_MODEL_RE = re.compile(r"模型\s*([^，,（(]+?)\s*[，,]")
-
-
-def _subagent_progress_phase(status_text: str) -> str:
-    """从 status_text 里抽出当前阶段，用于节流决策（同一阶段内合并刷新）。"""
-    if not status_text:
-        return "unknown"
-    for phase, pattern in _SUBAGENT_PROGRESS_PHASE_PATTERNS:
-        if pattern.search(status_text):
-            return phase
-    return "unknown"
-
-
-def _format_subagent_progress_html(status_text: str) -> str:
-    """把子 agent 的中文状态短句渲染成结构化富文本卡片。
-
-    返回的 HTML 片段由若干 ``<p>`` 块级元素组成，可直接嵌入工具卡片的
-    ``<details>``。所有外露文本均经 ``convert_markdown_to_telegram_html``
-    处理，避免模型或子 agent 控制的字符串破坏 Rich Message 结构。
-    """
-    text = status_text or "正在执行…"
-    phase = _subagent_progress_phase(text)
-    phase_meta = {
-        "start":    ("🤖", "启动子 agent"),
-        "thinking": ("🧠", "LLM 思考中"),
-        "tools":    ("🔧", "正在调用工具"),
-        "done":     ("✅", "子 agent 已完成"),
-        "terminal": ("⚠️", "已结束"),
-        "timeout":  ("⏱️", "超时"),
-        "error":    ("❌", "出错"),
-        "unknown":  ("…",  "进行中"),
-    }.get(phase, ("…", "进行中"))
-    icon, phase_label = phase_meta
-
-    round_match = _SUBAGENT_ROUND_RE.search(text)
-    plain_round_match = _SUBAGENT_PLAIN_ROUND_RE.search(text)
-    elapsed_match = _SUBAGENT_ELAPSED_RE.search(text)
-    total_match = _SUBAGENT_TOTAL_TIME_RE.search(text)
-    tool_names_match = _SUBAGENT_TOOL_NAMES_RE.search(text)
-    model_match = _SUBAGENT_MODEL_RE.search(text)
-
-    rows = []
-    if model_match:
-        rows.append(f"<b>模型</b>：{convert_markdown_to_telegram_html(model_match.group(1).strip())}")
-    if round_match:
-        rows.append(
-            f"<b>轮次</b>：{convert_markdown_to_telegram_html(round_match.group(1))} / "
-            f"{convert_markdown_to_telegram_html(round_match.group(2))}"
-        )
-    elif plain_round_match and phase not in ("done", "terminal"):
-        rows.append(f"<b>轮次</b>：{convert_markdown_to_telegram_html(plain_round_match.group(1))}")
-    if tool_names_match:
-        # 子 agent 推送的 status_text 在工具名后追加了「…」，原样展示会
-        # 把省略号当成工具名一部分。统一去除尾部省略号 / 点号。
-        raw_names = tool_names_match.group(1).strip().rstrip("….").strip()
-        tool_list = [t.strip() for t in raw_names.split("+") if t.strip()]
-        if len(tool_list) > 6:
-            tool_display = " + ".join(tool_list[:6]) + f" 等 {len(tool_list)} 个"
-        else:
-            tool_display = " + ".join(tool_list)
-        rows.append(f"<b>调用工具</b>：{convert_markdown_to_telegram_html(tool_display)}")
-    if total_match:
-        rounds_s = convert_markdown_to_telegram_html(total_match.group(1))
-        tool_calls_s = convert_markdown_to_telegram_html(total_match.group(2))
-        seconds_s = convert_markdown_to_telegram_html(total_match.group(3)) if total_match.group(3) else None
-        if phase == "done":
-            label = "完成"
-        elif phase == "terminal":
-            label = "结束"
-        else:
-            label = "进度"
-        if seconds_s:
-            rows.append(
-                f"<b>{label}</b>：{rounds_s} 轮 · "
-                f"{tool_calls_s} 次工具调用 · "
-                f"{seconds_s}s"
-            )
-        else:
-            rows.append(
-                f"<b>{label}</b>：{rounds_s} 轮 · "
-                f"{tool_calls_s} 次工具调用"
-            )
-    elif elapsed_match:
-        rows.append(f"<b>已耗时</b>：{convert_markdown_to_telegram_html(elapsed_match.group(1))}s")
-
-    header = f"<p>{icon} <b>{convert_markdown_to_telegram_html(phase_label)}</b></p>"
-    if rows:
-        body = "<p>" + " · ".join(rows) + "</p>"
-    else:
-        # 兜底：状态文本本身已结构化失败，原样展示但截断到合理长度。
-        safe = convert_markdown_to_telegram_html(text[:160])
-        body = f"<p><i>{safe}</i></p>"
-    return header + body
 
 
 def _last_assistant_text(journal: list) -> str:
@@ -238,7 +122,14 @@ async def _run_tool_calls_and_append(
         builder: "DraftManager",
         chat_id: Optional[int] = None,
         tools: Optional[list] = None,
+        error_streak: Optional[dict] = None,
 ) -> str:
+    # 连续相同工具错误的熔断计数状态：调用方（bridge_common.run_tool_batch）
+    # 应传入跨本轮全部工具批次共享的字典（如 BridgeLoopState.error_streak）。
+    # 省略时退化为函数内局部字典——熔断只在本次调用内有意义（不跨批次
+    # 累积），不作为异常用法禁止，但正常路径应始终显式传入。
+    if error_streak is None:
+        error_streak = {}
     valid_tool_calls: list[Any] = []
     skipped_tool_calls = []
     remaining_budget = max(0, MAX_TOOL_CALLS - tool_call_count_ref[0])
@@ -803,26 +694,25 @@ async def _run_tool_calls_and_append(
                 # 反复发生时熔断计数准确命中，不会因细节差异而漏判。
                 error_msgs.append(llm_content.split("\n", 1)[0][:100])
     if error_msgs and len(set(error_msgs)) == 1 and len(error_msgs) == len(results):
-        key = f"_streak:{error_msgs[0]}"
-        prev = getattr(builder, key, 0)
-        curr = prev + 1
-        setattr(builder, key, curr)
+        signature = error_msgs[0]
+        curr = error_streak.get(signature, 0) + 1
+        error_streak[signature] = curr
         if curr >= TOOL_ERROR_STREAK_LIMIT:
             logger.warning(
-                f"[{api_label}] 检测到工具连续相同错误熔断: {error_msgs[0]!r} x{curr}"
+                f"[{api_label}] 检测到工具连续相同错误熔断: {signature!r} x{curr}"
             )
             loop_messages.append(Message.user_text(
-                f"System: tool '{error_msgs[0]}' has failed {curr} times in a row with the same error. "
+                f"System: tool '{signature}' has failed {curr} times in a row with the same error. "
                 "STOP retrying the same operation. Switch strategy (use str_replace to edit, "
                 "or view first, or give up and explain to the user). Do NOT call the same "
                 "tool with the same arguments again."
             ))
-            setattr(builder, key, 0)
+            error_streak[signature] = 0
             return "continue"
     else:
-        for attr in list(vars(builder).keys()):
-            if attr.startswith("_streak:"):
-                delattr(builder, attr)
+        # 本批次结果不是"清一色同一错误"（有成功、或错误签名不一致）：
+        # 熔断计数清零，不让不连续的偶发错误累积触发熔断。
+        error_streak.clear()
 
     return "continue"
 

@@ -1021,7 +1021,7 @@ async def _agentic_loop_gemini_native(
 
         status = await run_tool_batch(builder, tool_calls_list, loop_messages,
                                       new_history_entries, tool_call_count_ref,
-                                      api_label, tools)
+                                      api_label, tools, error_streak=state.error_streak)
 
         if status == "over_limit":
 
