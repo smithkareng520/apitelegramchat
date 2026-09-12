@@ -402,7 +402,7 @@ PROVIDERS: Dict[str, ProviderConfig] = {
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
         },
-        endpoint="https://ai.lfree.org/bot/XpBv3okYsbAV",
+        endpoint="https://ai.lfree.org/bot/XpBv3okYsbAV/v1",
         api_key_env="LFREE_API_KEY",
     ),
 }
