@@ -376,11 +376,14 @@ def test_finalize_turn_permanentizes_without_new_draft(env):
     async def scenario():
         builder, manager, sends = env["builder"], env["manager"], env["sends"]
         old_draft_id = builder.draft_id
-        builder._rollover_pending = True
         manager.emit(EventTypes.CONTENT_START)
         manager.emit(EventTypes.CONTENT_DELTA, "<p>终局回复正文</p>")
+        # 预警置位于最后一条正文增量写完之后（模拟真实时序：异步 flush
+        # 才 arm _rollover_pending），因此不会被 content.delta 提前收束
+        # 触发——finalize_turn 是第一次、也是唯一一次消费预警的地方。
         # 终局轮不再发中途边界事件：直接走 finalize_turn（对应生产中
         # will_request_again=False 的终局分支——只永久化旧段、不创建新草稿）
+        builder._rollover_pending = True
         result = await manager.finalize_turn()
         assert result is True
         assert sends.permanent_count == 1

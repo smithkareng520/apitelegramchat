@@ -234,6 +234,12 @@ class DraftManager:
         # 由 _apply 的 reasoning.delta 分支消费（见
         # _split_reasoning_fold_for_rollover）。
         self._reasoning_split_pending = False
+        # ---- 正文流提前收束续写标记（与思考折叠对称）----
+        # 草稿预警后正文流仍在输出时，提前收束当前正文流式块并调度滚动；
+        # 本标记表示"滚动换血后首个正文增量需先在新草稿重开流式块"，
+        # 由 _apply 的 content.delta 分支消费（见
+        # _split_content_stream_for_rollover）。
+        self._content_split_pending = False
 
     # ------------------------------------------------------------------
     # duck-typing 兼容层：未拦截的属性一律透传内部 builder
@@ -315,6 +321,11 @@ class DraftManager:
             # 空的续写折叠块。滚动换血期间事件只入缓冲、不经本方法，
             # 窗口在换血期间自然保持。
             self._reasoning_split_pending = False
+        if etype != EventTypes.CONTENT_DELTA:
+            # 对称地终结"正文续写"窗口（见 _split_content_stream_for_rollover）：
+            # 正文流正常结束或 Agent 转入其他事件时窗口作废，避免误在新草稿
+            # 开出一个空的续写文本块。
+            self._content_split_pending = False
         if etype == EventTypes.REASONING_START:
             self._open_stream_kind = "reasoning"
             builder.begin_stream_reasoning()
@@ -336,7 +347,15 @@ class DraftManager:
             self._open_stream_kind = "content"
             builder.begin_stream_text()
         elif etype == EventTypes.CONTENT_DELTA:
+            if self._content_split_pending:
+                # 正文流已在前一草稿提前收束且滚动换血完成：在新草稿
+                # 重开正文流式块，后续正文增量继续写入（用户看到的是
+                # 新草稿中接续的正文，而不是丢失续写窗口）。
+                self._content_split_pending = False
+                self._open_stream_kind = "content"
+                builder.begin_stream_text()
             builder.append_stream_delta(data)
+            self._maybe_split_content_stream_for_rollover()
         elif etype == EventTypes.CONTENT_END:
             self._open_stream_kind = None
             self._handle_safe_boundary()
@@ -644,6 +663,68 @@ class DraftManager:
         #    滚动换血后首个思考增量在新草稿重开折叠块续写思考内容。
         self._open_stream_kind = "reasoning"
         self._reasoning_split_pending = True
+
+    # ------------------------------------------------------------------
+    # 正文流提前收束（草稿预警后的超长正文续写，与思考折叠对称）
+    # ------------------------------------------------------------------
+    def _maybe_split_content_stream_for_rollover(self) -> None:
+        """草稿预警后正文流仍在输出：提前收束当前正文块并调度滚动。
+
+        原行为：滚动只在安全边界（reasoning.end / content.end / tool.end）
+        调度——超长正文必须整段输出完毕才有机会换草稿，预警后正文继续
+        原地写入同一草稿，草稿一路膨胀，极端时超出草稿上限、整帧被拒。
+
+        现行为：正文流期间一旦容量预警置位（``_rollover_pending``），在
+        最近的正文增量处提前收束当前流式文本块（等价于一个合成
+        content.end 安全点），由既有安全点路径调度后台滚动；滚动换血后
+        首个正文增量在新草稿重开流式块继续写入。Agent 侧正文流本身不受
+        影响——后续增量仍按 content.delta 记账，真实 content.end 的语义
+        与时序保持不变。
+
+        提前收束天然落在完整外层块边界：``builder.end_stream()`` 会先
+        提交流式缓冲、把当前未闭合的正文块在其自然结尾处定格，
+        ``_pick_rollover_boundary`` 扫描到的正是这个刚刚闭合的块——不会
+        在 markdown 结构（如未闭合的 ``<p>``/列表/代码块）中间腰斩。
+
+        守卫与 ``_handle_safe_boundary`` 的调度条件保持一致：静默构建器、
+        已有在途滚动、容量未预警、存在未收束工具组时都不触发——这些情形
+        下提前收束不会带来滚动，只会把正文拆成同草稿内的两个文本块。
+        """
+        if self._open_stream_kind != "content":
+            return
+        builder = self._builder
+        if getattr(builder, "silent", False):
+            # 静默构建器无可见草稿、永不滚动（与 _handle_safe_boundary 一致）。
+            return
+        if self._swap_scheduled or (
+            self._rollover_task is not None and not self._rollover_task.done()
+        ):
+            return  # 幂等：已有滚动在排队/执行
+        if not getattr(builder, "_rollover_pending", False) or builder._stop_flush:
+            return  # 未预警或草稿已停止刷新：保持原行为，等真实安全边界
+        if builder._has_pending_tool_group():
+            return  # 工具组未收束：滚动被推迟到 tool.end，提前收束无收益
+        self._split_content_stream_for_rollover()
+
+    def _split_content_stream_for_rollover(self) -> None:
+        """提前收束正文流式块并经安全点调度滚动（合成 content.end）。"""
+        builder = self._builder
+        logger.info(
+            "草稿预警后提前收束正文流式块，调度滚动续写: chat=%s draft=%s",
+            builder.chat_id, builder.draft_id,
+        )
+        # ① 提前结束正文流：提交未落块的正文增量并复位流指针——当前
+        #    草稿中的正文块至此定格，后续正文增量不再写入。
+        builder.end_stream()
+        # ② 事件流完整性：补发 content.end 安全点事件。文本块在旧草稿
+        #    以完整边界定格；安全点检查随即调度后台滚动，此后到达的事件
+        #    进入缓冲（§9）。
+        self.emit(EventTypes.CONTENT_END, fold_split=True)
+        # ③ Agent 侧正文流并未结束：恢复流类别标注（content.end 的应用
+        #    路径会把它置空），后续增量仍按 content.delta 记账；并标记
+        #    滚动换血后首个正文增量在新草稿重开流式块续写正文内容。
+        self._open_stream_kind = "content"
+        self._content_split_pending = True
 
     # ------------------------------------------------------------------
     # 安全点判定与后台滚动调度
