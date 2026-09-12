@@ -39,6 +39,11 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # gpt-5.6-sol（OpenAI 协议）共用同一个 key，见下方 PROVIDERS["xxtf"] 与
 # SUPPORTED_MODELS 中的模型定义（"XXTF 中转"注释块）。
 XXTF_API_KEY = os.getenv("XXTF_API_KEY", "")
+# LFREE 中转（https://ai.lfree.org，bot token 在 URL 路径里）：OpenAI 兼容
+# /v1/chat/completions，一个 key 覆盖全部 4 个模型（claude-opus-5 /
+# mimo-v2.5 / muse-spark-1.3-contributor / nv/kimi-k3），见下方
+# PROVIDERS["lfree"] 与模型定义（"LFREE 中转"注释块）。
+LFREE_API_KEY = os.getenv("LFREE_API_KEY", "")
 # Responses API 缓存策略：默认只使用供应商自动缓存（implicit）。
 # 只有明确设置为 true 时，才在内容块上添加显式 breakpoint。
 RESPONSES_EXPLICIT_CACHE_ENABLED = os.getenv(
@@ -403,6 +408,15 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         endpoint="https://xxtf.baby/v1",
         api_key_env="XXTF_API_KEY",
     ),
+    "lfree": ProviderConfig(
+        name="LFree",
+        # OpenAI 兼容 base：AsyncOpenAI 自动拼接 /chat/completions
+        # -> https://ai.lfree.org/bot/XpBv3okYsbAV/v1/chat/completions。
+        # 该中转的 bot token 在 URL 路径里，鉴权仍走
+        # Authorization: Bearer LFREE_API_KEY（已实测 4 个模型全部可用）。
+        endpoint="https://ai.lfree.org/bot/XpBv3okYsbAV/v1",
+        api_key_env="LFREE_API_KEY",
+    ),
 }
 
 
@@ -568,6 +582,31 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "reasoning_max_tokens": None,
         "max_output_tokens": 65536,
         "max_context": 200000,
+    },
+    "lfree": {
+        # 保守默认：中转能力以 2026-09-12 实测为准——
+        #   图片输入：claude-opus-5 / mimo-v2.5 / muse-spark-1.3-contributor
+        #     支持（base64 数据 URI 最稳），nv/kimi-k3 不支持（中转未把图片
+        #     传给后端，模型会声称"没收到图片"）；
+        #   工具调用：仅 nv/kimi-k3 支持原生 tool_calls，其余 3 个模型接受
+        #     tools 参数但从不返回 tool_calls（推理后拒答或在正文里模拟
+        #     工具文本），故厂商级默认 supports_tools=False。
+        "image_input": False,
+        "audio_input": False,
+        "video_input": False,
+        "supports_tools": False,
+        "image_output": False,
+        "document_input": False,
+        "video_output": False,
+        "supports_sampling": True,
+        "supports_prompt_cache": False,
+        "temperature": None,          # None -> 不发送，走供应商默认
+        "top_p": None,                # None -> 不发送，走供应商默认
+        "reasoning_enabled": None,    # 中转未公开推理控制参数，一律不发送
+        "reasoning_effort": None,
+        "reasoning_max_tokens": None,
+        "max_output_tokens": 65536,
+        "max_context": 128000,
     },
 }
 
@@ -1239,6 +1278,47 @@ SUPPORTED_MODELS["agnes-video-2.5-flash"] = make_model_config(
     endpoint="https://apihub.agnes-ai.com/v1/videos",
 )
 
+# -----------------------------------------------------------------------------
+# LFREE 中转模型（https://ai.lfree.org，OpenAI 兼容，一个 key 覆盖全部模型）
+# -----------------------------------------------------------------------------
+# 2026-09-12 实测结论（均走 OpenAI 兼容 /v1/chat/completions）：
+#   - claude-opus-5 / mimo-v2.5 / muse-spark-1.3-contributor：图片输入 ✅
+#     （base64 数据 URI 最稳，直接传 URL 时中转下游拉取可能 400）；
+#     原生 function calling ❌（接受 tools 参数但不返回 tool_calls），
+#     按纯对话模型配置（supports_tools 沿用厂商默认 False）；
+#   - nv/kimi-k3：原生 tool_calls ✅（finish_reason=tool_calls）；图片
+#     输入 ❌（中转未把图片传给后端）；且其定价 输入 $3 / 补全 $15
+#     （每 1M tokens）是本中转其余 3 个模型（$0.012 / $0.021）的 250 倍，
+#     日常任务慎用；
+#   - 推理开销：muse-spark 系 reasoning 很吃 completion token，该中转未
+#     公开 reasoning_* 控制参数，故一律不发送（走 _PROVIDER_DEFAULTS 的
+#     全 None 默认），调用侧需要充足 max_tokens 预算。
+SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
+    model_id="claude-opus-5",
+    provider="lfree",
+    name="Claude Opus 5 (LFree)",
+    image_input=True,
+)
+SUPPORTED_MODELS["mimo-v2.5"] = make_model_config(
+    model_id="mimo-v2.5",
+    provider="lfree",
+    name="MiMo v2.5 (LFree)",
+    image_input=True,
+)
+SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
+    model_id="muse-spark-1.3-contributor",
+    provider="lfree",
+    name="Muse Spark 1.3 (LFree)",
+    image_input=True,
+)
+SUPPORTED_MODELS["nv/kimi-k3"] = make_model_config(
+    model_id="nv/kimi-k3",
+    provider="lfree",
+    name="Kimi K3 (LFree)",
+    # 本中转唯一支持原生 function calling 的模型。
+    supports_tools=True,
+    # 图片输入 ❌（沿用厂商默认 image_input=False，无需显式覆盖）。
+)
 
 # ========== 默认模型 ==========
 DEFAULT_MODEL = "agnes-3.0-flash"
@@ -1722,7 +1802,7 @@ _SENSITIVE_EXACT = {
     "TELEGRAM_BOT_TOKEN", "GLM_API_KEY",
     "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY",
     "XAI_API_KEY", "GROQ_API_KEY", "MODELSCOPE_API_KEY", "AGNES_API_KEY",
-    "XXTF_API_KEY",
+    "XXTF_API_KEY", "LFREE_API_KEY",
     "R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY",
     "R2_BUCKET_NAME", "R2_REGION",
     "SERPER_API_KEY", "GAODE_MCP_TOKEN",
