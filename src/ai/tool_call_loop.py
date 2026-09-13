@@ -32,7 +32,7 @@ from message_user_tool import (
     answer_to_tool_result,
 )
 import turn_recovery
-from turn_recovery import INTERRUPTED_TOOL_PLACEHOLDER
+from turn_recovery import INTERRUPTED_TOOL_PLACEHOLDER, DETACHED_TOOL_PLACEHOLDER
 from ai._constants import (
     MAX_TOOL_CALLS,
     TOOL_CALL_TIMEOUT,
@@ -45,6 +45,8 @@ from ai._constants import (
     MEDIA_GEN_TOOLS,
     TOOL_ERROR_STREAK_LIMIT,
     CONSUMER_TOOLS,
+    DETACHED_ON_INTERRUPT_TOOLS,
+    DETACHED_TOOL_FINAL_WAIT,
 )
 from ai.error_formatting import extract_domain
 from ai.json_repair import (
@@ -69,6 +71,86 @@ if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
 
 logger = get_logger(__name__)
+
+
+# ---------- 写操作工具的脱离（五阶段打断规范·阶段4b） ----------
+# 后台死等任务防 GC 引用集：detach 的任务在旧轮次取消后继续存活，
+# 没有强引用会被事件循环 GC 掉（结果静默丢失）。
+_DETACHED_TASKS: set = set()
+
+
+def _detach_tool_for_final_state(
+    chat_id: int, tc_id: str, fn_name: str, fn_args: dict,
+    inner_task: "asyncio.Task",
+) -> None:
+    """写操作工具脱离主进程：注册后台任务死等确切终态并回写历史。
+
+    调用语境（取消路径，无 await）：run_one 捕获 CancelledError /
+    TimeoutError 后同步注册。``inner_task`` 已被 asyncio.shield 保护——
+    外层的取消/超时只作用于"等待"，不作用于"执行"；执行在后台继续，
+    终态（成功/失败/回滚）拿到后经 writeback_detached_tool_result 原地
+    替换历史中的占位 tool 消息（调用声明与回执的配对结构不变）。
+    """
+    task = asyncio.create_task(
+        _wait_detached_tool_final_state(chat_id, tc_id, fn_name, fn_args, inner_task)
+    )
+    _DETACHED_TASKS.add(task)
+    task.add_done_callback(_DETACHED_TASKS.discard)
+    logger.info(
+        "[tool] 写操作 %s(%s) 已脱离主进程后台执行（等待确切终态后回写历史）",
+        fn_name, tc_id,
+    )
+
+
+async def _wait_detached_tool_final_state(
+    chat_id: int, tc_id: str, fn_name: str, fn_args: dict,
+    inner_task: "asyncio.Task",
+) -> None:
+    """后台死等脱离工具的确切终态，格式化后回写历史（阶段4b）。"""
+    try:
+        result = await asyncio.wait_for(
+            asyncio.shield(inner_task), timeout=DETACHED_TOOL_FINAL_WAIT)
+    except asyncio.TimeoutError:
+        # 死等到顶（挂死的沙箱命令等）：结果未知——不再等，也不再杀
+        # （杀一个写库命令半途同样危险），按"终态未知"如实记录。
+        content = (
+            f"Error: tool {fn_name} 后台等待终态超时（{DETACHED_TOOL_FINAL_WAIT}s），"
+            "执行结果未知：可能已成功、也可能失败/回滚，请勿盲目重试写操作，"
+            "先用只读手段核实实际状态。"
+        )
+        logger.error("[tool] 脱离工具 %s(%s) 后台死等超时，终态未知", fn_name, tc_id)
+    except asyncio.CancelledError:
+        # 后台等待任务自身被取消（进程关闭）：吞掉，不上炸日志。
+        return
+    except Exception as e:
+        logger.exception(f"[tool] 脱离工具 {fn_name}({tc_id}) 执行异常")
+        content = f"Exception: tool {fn_name} failed - {truncate_to_token_budget(str(e), 64, suffix='…')}"
+    else:
+        content = str(result or "")
+
+    # 模型视图与主路径同口径：先按工具剔除无价值字段，再套 token 预算。
+    try:
+        model_view = condense_for_model(fn_name, fn_args, content)
+    except Exception:
+        logger.debug("脱离工具终态精简失败（可忽略，退回原文）", exc_info=True)
+        model_view = content
+    if model_view != content:
+        try:
+            content = _truncate_tool_result(model_view, fn_name=fn_name)
+        except Exception:
+            logger.debug("脱离工具终态截断失败（可忽略）", exc_info=True)
+    else:
+        try:
+            content = _truncate_tool_result(content, fn_name=fn_name)
+        except Exception:
+            logger.debug("脱离工具终态截断失败（可忽略）", exc_info=True)
+
+    try:
+        await turn_recovery.writeback_detached_tool_result(chat_id, tc_id, fn_name, content)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.exception(f"[tool] 脱离工具 {fn_name}({tc_id}) 终态回写历史失败")
 
 
 # ---------- 子 agent 进度预览渲染 ----------
@@ -424,13 +506,58 @@ async def _run_tool_calls_and_append(
                                 timeout=timeout,
                             )
                 else:
-                    result_str = await asyncio.wait_for(
-                        dispatch_tool_call(
+                    # 五阶段打断规范·阶段4：按工具的副作用性质分两处理。
+                    #
+                    # 只读工具（web_search / fetch_url 等）：直接 await——
+                    # 取消传播到 dispatch_tool_call 协程内部，底层网络请求
+                    # 被 aiohttp/httpx 同步中止（沉没成本只有流量），打断方
+                    # 为其注入 aborted 占位回执。
+                    #
+                    # 写操作（bash / text_editor / memory / todo，见
+                    # DETACHED_ON_INTERRUPT_TOOLS）：ensure_future + shield
+                    # ——打断 / 超时只取消"等待"，不取消"执行"。执行脱离
+                    # 主进程继续，后台任务死等确切终态（成功/失败/回滚）
+                    # 后回写历史；本轮先拿到"仍在后台执行"的占位结果。
+                    if fn_name in DETACHED_ON_INTERRUPT_TOOLS:
+                        inner_task = asyncio.ensure_future(dispatch_tool_call(
                             fn_name, fn_args, chat_id=builder.chat_id,
                             progress_callback=tool_progress_callback,
-                        ),
-                        timeout=timeout
-                    )
+                        ))
+                        try:
+                            result_str = await asyncio.wait_for(
+                                asyncio.shield(inner_task), timeout=timeout)
+                        except asyncio.TimeoutError:
+                            # 写操作超时 ≠ 失败（写库慢 ≠ 回滚）：不能像只读
+                            # 工具那样回传超时标记让模型误判——脱离后台死等
+                            # 终态，本轮先告知"仍在执行"。
+                            logger.warning(
+                                f"[tool] 写操作 {fn_name} 等待超 {timeout}s，"
+                                "已脱离后台继续执行等待终态"
+                            )
+                            _detach_tool_for_final_state(
+                                builder.chat_id, tc_id, fn_name, fn_args, inner_task)
+                            result_str = (
+                                f"写操作 {fn_name} 执行超过 {timeout}s，已转入后台"
+                                "继续等待完成（写操作不可安全中止）：真实终态"
+                                "稍后自动回填本条结果，在回填前请勿假定其成败，"
+                                "也不要盲目重试同一写操作。"
+                            )
+                            # 后台终态会经 writeback 原地替换本条 tool 消息。
+                            completed_results[tc_id] = result_str
+                        except asyncio.CancelledError:
+                            # 用户新消息 / TIMER 唤醒打断了本轮：脱离继续执行
+                            # （取消照常向上传播，取消路径回填 DETACHED 占位）。
+                            _detach_tool_for_final_state(
+                                builder.chat_id, tc_id, fn_name, fn_args, inner_task)
+                            raise
+                    else:
+                        result_str = await asyncio.wait_for(
+                            dispatch_tool_call(
+                                fn_name, fn_args, chat_id=builder.chat_id,
+                                progress_callback=tool_progress_callback,
+                            ),
+                            timeout=timeout
+                        )
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
@@ -548,17 +675,30 @@ async def _run_tool_calls_and_append(
     except asyncio.CancelledError:
         # 用户新消息 / TIMER 唤醒打断了本批次：同步补齐 tool 消息后向上传播。
         # 只做纯同步列表操作，不做任何 await（取消路径必须最小化）。
+        # 五阶段规范·阶段4：占位回执按工具性质区分——只读工具带 aborted
+        # 状态（已中止、无结果）；写操作带"已脱离后台执行"状态（终态稍后
+        # 回填，回填前不得假定成败）。已执行完的真实结果一律优先回填
+        # （阶段5 / 数据看后台：外部事实不因打断而消失）。
         for fn_name, fn_args, tc_id in tool_tasks:
             real_content = _batch_completed_results.get(tc_id)
-            content = real_content if isinstance(real_content, str) and real_content else INTERRUPTED_TOOL_PLACEHOLDER
+            if isinstance(real_content, str) and real_content:
+                content = real_content
+            elif fn_name in DETACHED_ON_INTERRUPT_TOOLS:
+                content = DETACHED_TOOL_PLACEHOLDER
+            else:
+                content = INTERRUPTED_TOOL_PLACEHOLDER
             tool_msg = Message.tool_result(tc_id, fn_name, content)
             loop_messages.append(tool_msg)
             new_history_entries.append(tool_msg)
         logger.info(
-            "[%s] 工具批次被取消：已回填 %s 条 tool 消息（真实结果 %s 条，占位 %s 条）",
+            "[%s] 工具批次被取消：已回填 %s 条 tool 消息（真实结果 %s 条，"
+            "脱离占位 %s 条，中止占位 %s 条）",
             api_label, len(tool_tasks),
             sum(1 for _, _, t in tool_tasks if t in _batch_completed_results),
-            sum(1 for _, _, t in tool_tasks if t not in _batch_completed_results),
+            sum(1 for fn, _, t in tool_tasks
+                if t not in _batch_completed_results and fn in DETACHED_ON_INTERRUPT_TOOLS),
+            sum(1 for fn, _, t in tool_tasks
+                if t not in _batch_completed_results and fn not in DETACHED_ON_INTERRUPT_TOOLS),
         )
         raise
 

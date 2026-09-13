@@ -7,6 +7,14 @@ agentic 循环在「回合骨架」上完全同构——循环初始化、assist
 沉淀为公共实现；厂商差异只保留在各自桥接内的请求构造 / 流消费钩子里，
 骨架级 bug（如草稿切换时序、超限总结语义）修复一处即两桥同时生效。
 
+打断保全（2026-09 新增，见问题排查文档）：:class:`LiveAssistantSlot`
+把"本轮 assistant 消息"从「流式循环跑完才一次性写入 journal」改为
+「流式期间实时占位、随增量原地同步」——打断发生在任何时间点，journal
+里都有一条与当前进度同步的 assistant 消息，打断方
+（turn_recovery.finalize_interrupted_turn）即可连同既有占位补齐逻辑一起
+正确保全。四条 agentic 循环（openai_compat / anthropic / gemini /
+responses）统一接入。
+
 对外契约不变：
 - ai.anthropic_bridge._agentic_loop_anthropic(client, model, messages, builder, ...)
 - ai.gemini_bridge._agentic_loop_gemini_native(model, messages, builder, ...)
@@ -20,7 +28,8 @@ from typing import Any, Awaitable, Callable, Optional
 from config import SUPPORTED_MODELS, get_sampling_params
 from utils import get_logger
 from chat_actions import start_chat_action, stop_chat_action
-from core.messages import Message
+from core.messages import Message, ReasoningBlock, TextBlock
+from turn_recovery import LIVE_STREAM_FLAG, SYNTHETIC_ASSISTANT_FLAG
 
 from ai._constants import MAX_TOOL_CALLS
 from ai.tool_summary import _tool_limit_summary
@@ -136,6 +145,11 @@ def append_assistant_message(
     ToolCallBlock），协议形状由各适配器在出站时渲染。tool_calls_list 仍是
     流式累积产出的 OpenAI wire 形状（由 Message.assistant_with_tool_calls
     解析为结构化 ToolCallBlock）。
+
+    .. note::
+        四条 agentic 循环已切换到 :class:`LiveAssistantSlot`（流式期间实时
+        占位进 journal，打断保全，见该类 docstring）。本函数保留为等价
+        语义参考与兼容出口（循环外的一次性追加场景），行为与旧版逐字一致。
     """
     assistant_msg = Message.assistant_with_tool_calls(
         content_acc or "", tool_calls_list, reasoning_acc,
@@ -143,6 +157,180 @@ def append_assistant_message(
     loop_messages.append(assistant_msg)
     new_history_entries.append(assistant_msg)
     return assistant_msg
+
+
+class LiveAssistantSlot:
+    """本轮 assistant 消息的实时占位（打断保全，问题修复改动点 1）。
+
+    问题背景（打断信息丢失，见问题排查文档）：
+    ``content_acc`` / ``reasoning_acc`` 是流式循环里的**局部变量**，只有
+    ``async for chunk in comp_stream`` 循环正常跑完、走到循环末尾的
+    ``append_assistant_message`` 时才被写进 journal（new_history_entries）。
+    而 ``except asyncio.CancelledError: raise`` 在这之前——打断一旦发生，
+    函数直接退出，已产出的文本从未落地：
+
+    - 草稿层（用户界面）走 ``RichMessageBuilder._stream_buffer`` 同步即时
+      写入，``finalize_interrupted_draft`` 能拿到全部内容（"数到 123"）；
+    - 历史层（模型记忆）走"函数跑完才写入"，完全是空的——模型下一轮
+      不知道自己说过什么。
+
+    本类让 journal 在流式期间始终持有一条**与当前进度同步**的 assistant
+    占位消息，对齐业界三条硬性原则（Claude Code / Codex / Anthropic 官方
+    API 的一致做法）：
+
+    1. 中断前已产出的内容必须原样保留在历史里（不能连 prompt 一起丢）；
+    2. 绝不能把半成品当完整消息存进历史——空占位（无文本且无
+       tool_calls）由 ``turn_recovery._normalize_journal`` 过滤，未完成的
+       工具调用参数 JSON **不写入**（见下）；
+    3. 已产出的文本可作为续写起点，而不是丢弃重来。
+
+    用法（四条循环同构，见 _agentic_loop_openai_compat 等接入点）::
+
+        live = LiveAssistantSlot(new_history_entries)   # 轮次开始：空占位入 journal
+        async for chunk in comp_stream:
+            content_acc += c_delta
+            live.sync(content_acc, reasoning_acc)       # 每片增量后原地同步
+            ...
+        # 流正常结束（原 append_assistant_message 调用点）：
+        live.finalize(loop_messages, content_acc, tool_calls_list, reasoning_acc)
+
+    取消安全性：``sync`` / ``finalize`` 全部为同步方法（无 await 窗口），
+    与注册表的同步原子操作同一取消安全模式——取消只能落在 await 点上，
+    而 journal 在每个 await 点之前都已持有最近一次 sync 的内容快照。
+
+    五阶段规范（2026-09 二期）：占位在流式期间携带 ``LIVE_STREAM_FLAG``
+    （直播中），finalize（流正常结束）时摘除。打断保全的字段级裁剪
+    （``turn_recovery.trim_interrupted_stream``）只作用于仍带标记的占位：
+    剥残缺思考 + 按前端渲染游标截断文本；已定稿消息的思考/文本完整，
+    绝不误伤——纯文本轮的定稿消息无 tool_calls，形状上与直播占位无法
+    区分，标记是唯一可靠的判据。
+
+    工具调用（改动点 2）：占位消息在流式期间**只**携带文本与思考，
+    绝不携带 tool_calls——流式中途的参数 JSON 无法可靠判断"完整可解析"
+    （``{"a":1}`` 可能是 ``{"a":1,"b":2}`` 的截断前缀），按官方原则
+    "Tool use ... cannot be partially recovered"整体丢弃，只有 finalize
+    （流已正常结束、参数已定型并经归一化）才写入。打断发生在参数流中
+    时，journal 只保留已同步的文本部分，不会出现"有 tool_use 却永远没有
+    配对 tool_result"的悬空状态。
+    """
+
+    __slots__ = ("_journal", "_msg")
+
+    def __init__(self, journal: list) -> None:
+        self._journal = journal
+        # 空 assistant 占位（blocks=[]）；文本/思考块由 sync 原地维护。
+        # 注意：绝不写入 loop_messages——请求侧消息只在轮次正常完成后
+        # 由 finalize 追加，打断时绝不把半成品发进下一次请求。
+        # LIVE_STREAM_FLAG：直播中标记（打断裁剪的判据，见类 docstring）。
+        self._msg = Message(role="assistant", blocks=[], meta={LIVE_STREAM_FLAG: True})
+        journal.append(self._msg)
+
+    @property
+    def message(self) -> Message:
+        """占位消息本体（journal 持有同一对象，原地更新即时可见）。"""
+        return self._msg
+
+    def sync(self, content_acc: str, reasoning_acc: str) -> None:
+        """把当前累积的文本/思考快照原地写入占位消息（幂等）。
+
+        调用时机与 ``RichMessageBuilder._stream_buffer`` 的更新对齐——
+        同一份 delta，草稿/历史两条消费管线同步更新。每次重建至多两个
+        内容块（ReasoningBlock / TextBlock），成本 O(1)，远低于增量字符串
+        累积本身；块序与 ``Message.assistant_with_tool_calls`` 一致
+        （思考在前、文本在后），保证打断路径与正常路径写出的消息形状
+        逐字段相同。
+        """
+        blocks: list = []
+        if reasoning_acc:
+            blocks.append(ReasoningBlock(reasoning_acc))
+        if content_acc:
+            blocks.append(TextBlock(content_acc))
+        self._msg.blocks = blocks
+
+    def finalize(
+        self,
+        loop_messages: list,
+        content_acc: str,
+        tool_calls_list: list,
+        reasoning_acc: str,
+    ) -> Message:
+        """流正常结束：原地补全占位消息（tool_calls 等），并追加进请求消息列表。
+
+        与旧 ``append_assistant_message`` 的双列表语义完全等价——journal 里
+        的占位消息被原地升级为完整消息（而不是新增一条，正常路径不会出现
+        重复的两条 assistant），同一对象追加进 loop_messages 供下一轮请求
+        渲染出站。
+        """
+        final = Message.assistant_with_tool_calls(
+            content_acc or "", tool_calls_list, reasoning_acc,
+        )
+        # 原地替换 blocks：journal 持有的是同一 Message 引用，占位即时
+        # 升级为终态（tool_calls / reasoning / 最终文本一次到位）。
+        self._msg.blocks = final.blocks
+        # 直播标记摘除：流已正常结束，思考/文本/参数均已定型——打断
+        # 保全的字段级裁剪从此不再触碰本条消息（阶段4/5 语义）。
+        self._msg.meta.pop(LIVE_STREAM_FLAG, None)
+        loop_messages.append(self._msg)
+        return self._msg
+
+
+class MediaProgressSlot:
+    """媒体生成任务的 journal 进度占位（打断保全，问题修复改动点 4）。
+
+    背景：原生图像/视频循环只在**生成完成后**才把 assistant 消息写入
+    journal；生成是原子性第三方调用（没有"半张图"中间态），但等待返回
+    的几十秒里被打断时，"这次尝试"完全不被记住——模型下一轮不知道自己
+    刚才在生成图片。
+
+    本类在**发起生成请求之前**往 journal 放一条进度占位（如
+    "[图片生成中] 指令: …"），随后按结果三分支：
+
+    - 成功：``complete(final_text)`` 原地更新为最终历史内容，返回
+      ``[该消息]`` 作为 new_entries（调用方 journal.extend 语义不变，
+      历史里恰一条消息，不与占位叠加）；
+    - 失败（IMAGE_ERROR / VIDEO_ERROR 返回路径）：``drop()`` 整体移除，
+      保持"失败轮历史末尾仍是 user 消息"的既有替换语义（重试不叠加）；
+    - 取消（CancelledError，不走 except Exception）：占位留在 journal，
+      由打断方保全——"模型上一轮确实在生成图片"这条上下文得以保留，
+      比完全没有记录好。
+
+    与 :class:`LiveAssistantSlot` 的分工：后者服务流式文本（增量同步），
+    本类服务一次性媒体调用（请求前占位、请求后定稿），journal 语义一致。
+    """
+
+    __slots__ = ("_journal", "_msg")
+
+    def __init__(self, journal: Optional[list], progress_text: str) -> None:
+        self._journal = journal
+        # 合成占位标记：文本不是流式渲染产物、从未进入渲染游标计数——
+        # trim_interrupted_stream 计算前文合计时排除本条，避免挤压
+        # 后续直播占位的截断预算（媒体轮之后通常还有文本总结轮）。
+        self._msg = Message(
+            role="assistant",
+            blocks=[TextBlock(progress_text)] if progress_text else [],
+            meta={SYNTHETIC_ASSISTANT_FLAG: True},
+        )
+        if journal is not None:
+            journal.append(self._msg)
+
+    @property
+    def message(self) -> Message:
+        """占位消息本体（journal 持有同一对象，原地更新即时可见）。"""
+        return self._msg
+
+    def complete(self, final_text: str) -> list:
+        """生成成功：占位原地更新为最终历史内容，返回 new_entries 列表。"""
+        self._msg.set_text(final_text)
+        return [self._msg]
+
+    def drop(self) -> None:
+        """生成失败：整体移除占位（幂等；保持失败轮替换语义不变）。"""
+        if self._journal is None:
+            return
+        try:
+            self._journal.remove(self._msg)
+        except ValueError:
+            pass  # 已被移除（重复 drop / 并发保全快照后原列表被清理）
 
 
 async def run_tool_batch(

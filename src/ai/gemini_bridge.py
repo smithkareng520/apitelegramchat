@@ -71,7 +71,7 @@ from ai.tool_summary import (
     _strip_textual_tool_calls,
 )
 from ai.bridge_common import (
-    append_assistant_message,
+    LiveAssistantSlot,
     ensure_final_content,
     finish_open_tool_group,
     init_bridge_loop_state,
@@ -789,6 +789,12 @@ async def _agentic_loop_gemini_native(
         content_acc = ""
         reasoning_acc = ""
         tool_calls_list: list = []
+        # 打断保全（改动点1，与 openai_compat / anthropic / responses 循环同构）：
+        # 流式期间 journal 始终持有一条与 content_acc / reasoning_acc 同步的
+        # assistant 占位消息。Gemini 的 functionCall 事件虽携带完整参数（无
+        # 半截 JSON 问题），但按四循环统一约束，tool_calls 仍只在流正常结束
+        # 后由 finalize 写入（改动点2），流式期间占位只同步文本与思考。
+        live_slot = LiveAssistantSlot(new_history_entries)
         # v2.5 语义与 OpenAI 循环对齐：None=尚未见到终止事件；流被完整
         # 消费却仍为 None 且本轮有工具调用时，记 ""（断流证据）。
         finish_reason: Optional[str] = None
@@ -918,12 +924,14 @@ async def _agentic_loop_gemini_native(
                             reasoning_acc += text
                             await switch_stream("reasoning")
                             builder.append_stream_delta(text)
+                            live_slot.sync(content_acc, reasoning_acc)
                             continue
                         # kind == "text"
                         text = event["text"]
                         content_acc += text
                         await switch_stream("content")
                         builder.append_stream_delta(text)
+                        live_slot.sync(content_acc, reasoning_acc)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1009,8 +1017,9 @@ async def _agentic_loop_gemini_native(
             # 终局：等待旧段永久化（不开新草稿）；未滚动时保底刷一帧。
             builder.request_flush()
 
-        append_assistant_message(loop_messages, new_history_entries, content_acc,
-                                 tool_calls_list, reasoning_acc)
+        # 打断保全（改动点1）：升级 journal 里的实时占位为完整消息
+        # （tool_calls / reasoning / 最终文本原地补全，同一对象进 loop_messages）。
+        live_slot.finalize(loop_messages, content_acc, tool_calls_list, reasoning_acc)
 
         if not tool_calls_list:
             final_content = content_acc

@@ -37,6 +37,49 @@ OpenAI 兼容协议要求 assistant 消息里的每个 ``tool_calls[i].id`` 都�
 （``ai/tool_call_loop.py`` 在取消路径上会先把**已经执行完**的工具结果回填
 真实 tool 消息，只剩真正未完成的才落到占位——最大化保留进度。）
 
+流式文本的实时保全（2026-09 新增）
+==================================
+
+旧问题：纯文本流式输出中途被打断时，``content_acc`` 是循环局部变量、
+从未写入 journal——草稿层（用户可见）保全了内容，历史层（模型记忆）
+完全为空。修复后（见 ``ai/bridge_common.py`` 的 ``LiveAssistantSlot``）：
+四条 agentic 循环在流式期间把文本/思考增量**实时同步**进 journal 里的
+占位 assistant 消息，打断发生在任何时间点都能被本模块保全。配套防御：
+
+- ``_normalize_journal`` 剔除"无正文且无 tool_calls"的空 assistant 占位
+  （模型一字未吐即被打断；Codex #22602——空 assistant 消息会让严格网关
+  拒绝下一轮请求）。"只吐了思考、没吐正文"的占位同样剔除：思考块按
+  官方原则不可部分保全，且 content=null 的出站形状与上述雷同。
+- 流式中途未完成的 tool_call 参数 JSON 由循环侧**整体不写入**
+  （LiveAssistantSlot 只在 finalize 写 tool_calls），journal 不会出现
+  "有 tool_use 却永远没有配对 tool_result"的悬空状态。
+
+五阶段打断规范（2026-09 二期，本次重构）
+========================================
+
+按打断发生时的物理阶段执行确定性动作，数据保留基准"文本看前端、
+数据看后台"：
+
+- **阶段 1（思考推演中）**：残缺思考**全量丢弃**（
+  ``trim_interrupted_stream`` 剥离 ReasoningBlock）——未完成的逻辑推导
+  前提已失效，残缺思考会污染模型下一轮隐空间；
+- **阶段 2（文本输出中）**：文本按**前端渲染确认游标**物理截断——后端
+  超前生成、用户尚未在草稿上看到的文本一律裁掉（"用户没看到的等于
+  模型没说过的"，对齐认知现场，防"我明明解释过"幻觉）。游标由
+  RichMessageBuilder 维护（最后一帧成功送达时刻的回合累计可见文本
+  字符数），经 ``render_cursor_box`` 引用注册进 ``_InFlightEntry``；
+  静默回合（/show off）不渲染草稿 → 无游标 → 不裁剪（保全后端全量以
+  衔接进度）；
+- **阶段 3（工具参数生成中）**：半截 JSON 整体剥离（循环侧已不写入）；
+- **阶段 4（工具执行中）**：只读工具——取消传播直接拒断底层网络请求，
+  占位回执带 ``aborted`` 状态语义；写操作（bash / text_editor / memory /
+  todo，见 ``ai._constants.DETACHED_ON_INTERRUPT_TOOLS``）——
+  ``asyncio.shield`` 让执行脱离主进程后台死等确切终态（成功/失败/回滚），
+  终态由 ``writeback_detached_tool_result`` 轮询回写进历史（原地替换占位
+  tool 消息的 content）；
+- **阶段 5（工具结果刚返回）**：调用声明与真实数据结果全量保留（既有
+  ``_batch_completed_results`` 回填机制）。
+
 user 消息落位（OpenAI 格式）
 ============================
 
@@ -110,24 +153,30 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from state import (
     get_chat_lock,
     get_or_init_context,
 )
 from utils import get_logger
-from core.messages import Message
+from core.messages import Message, ReasoningBlock
 
 logger = get_logger(__name__)
 
 __all__ = [
     "INTERRUPTED_TOOL_PLACEHOLDER",
+    "DETACHED_TOOL_PLACEHOLDER",
+    "LIVE_STREAM_FLAG",
+    "SYNTHETIC_ASSISTANT_FLAG",
     "EARLY_PERSIST_FLAG",
     "EARLY_PERSIST_MODE",
     "EARLY_PERSIST_TS",
     "TURN_FAILED_FLAG",
     "register_inflight_turn",
+    "attach_render_cursor",
+    "trim_interrupted_stream",
+    "writeback_detached_tool_result",
     "note_turn_persisted",
     "finalize_interrupted_turn",
     "finalize_pending_turns",
@@ -144,8 +193,33 @@ __all__ = [
     "pop_reply_suppressed",
 ]
 
-# 打断时未执行/被取消的工具调用的占位结果（OpenAI 格式 tool 消息 content）。
-INTERRUPTED_TOOL_PLACEHOLDER = "用户打断，未执行"
+# 打断时未执行/被取消的【只读】工具调用的占位回执（tool 消息 content）。
+# 五阶段规范·阶段4a：必须带 aborted（已中止）状态语义，保证调用声明与
+# 回执绝对成对闭合——网关不会因悬空 tool_use 报 400，模型也不会把
+# "没有结果"误读成"执行成功"。
+INTERRUPTED_TOOL_PLACEHOLDER = (
+    "用户打断，工具调用已中止（aborted）：执行未完成、没有结果返回；"
+    "请根据新指令决定是否需要重新发起。"
+)
+
+# 打断时仍在执行的【写操作】工具的占位回执（阶段4b）：写操作不可安全
+# 中止（中止≠回滚），已脱离主进程后台死等确切终态；终态到达后由
+# writeback_detached_tool_result 原地替换本占位——回填前模型不得假定成败。
+DETACHED_TOOL_PLACEHOLDER = (
+    "用户打断，但该工具是不可中止的写操作：已脱离本轮在后台继续执行，"
+    "确切终态（成功/失败/回滚）稍后自动回填本条目；在回填前请勿假定其成败。"
+)
+
+# 流式直播中标记：LiveAssistantSlot 占位在流式期间携带，finalize（流
+# 正常结束、参数定型）时摘除。打断保全的字段级裁剪（剥残缺思考 + 按
+# 渲染游标截断文本）**只作用于仍带此标记的占位**——已定稿消息的思考与
+# 文本都已完整，绝不误伤。meta 永不出站（见 core/messages.py）。
+LIVE_STREAM_FLAG = "__apitc_live_stream__"
+
+# 合成 assistant 消息标记（媒体生成进度占位等）：文本不是流式渲染产物、
+# 从未进入渲染游标计数——trim 计算"前文合计"时排除，避免挤压当前
+# 直播占位的截断预算。
+SYNTHETIC_ASSISTANT_FLAG = "__apitc_synthetic__"
 
 # user 消息提前持久化标记：update_conversation_and_ledger 见到此标记跳过 append。
 EARLY_PERSIST_FLAG = "__apitc_early_persisted__"
@@ -201,6 +275,12 @@ class _InFlightEntry:
     task: Optional[asyncio.Task]
     event_source: str
     registered_at: float = field(default_factory=time.monotonic)
+    # 渲染确认游标引用（builder 的 render_cursor_box，单元素列表）。
+    # register 时 builder 尚未创建，由 get_ai_response 在 builder 就绪后
+    # 经 attach_render_cursor 回填；打断保全时零拷贝读取最新值（builder
+    # 每帧送达后原地更新 box[0]）。None / 缺失 = 无渲染基准（静默回合），
+    # trim 不裁剪文本。
+    render_cursor_ref: Optional[list] = None
 
 
 # chat_id -> 该 chat 进行中（或尚未注销）的轮次登记，按注册顺序排列。
@@ -231,6 +311,108 @@ def _current_task() -> Optional[asyncio.Task]:
         return asyncio.current_task()
     except RuntimeError:
         return None
+
+
+def _read_render_cursor(ref: Optional[list]) -> Optional[int]:
+    """读取渲染确认游标的当前值（异常客错 → None = 不裁剪）。"""
+    if not ref:
+        return None
+    try:
+        value = ref[0]
+    except Exception:
+        return None
+    return value if isinstance(value, int) and value >= 0 else None
+
+
+def attach_render_cursor(chat_id: int, journal: list, cursor_ref: Optional[list]) -> None:
+    """把 builder 的渲染确认游标绑定到该轮次的登记条目（同步原子）。
+
+    register_inflight_turn 时 builder 尚未创建（登记在最前、builder 在
+    预处理后）；get_ai_response 在 builder 就绪后调用本函数按 journal
+    对象身份回填。静默回合传 None（无渲染基准，保全时不裁剪文本）。
+    """
+    if chat_id is None or journal is None:
+        return
+    entries = _inflight.get(chat_id)
+    if not entries:
+        return
+    for entry in entries:
+        if entry.journal is journal:
+            entry.render_cursor_ref = cursor_ref
+
+
+def trim_interrupted_stream(journal: list, render_cursor: Optional[int]) -> bool:
+    """打断保全的字段级裁剪（五阶段规范：阶段1/2/3 的落地）。
+
+    只处理 journal 末尾**仍带 LIVE_STREAM_FLAG** 的直播占位（正在流式的
+    assistant 消息）；已定稿消息（流正常结束、含 tool_calls）的思考与
+    文本都是完整的，绝不触碰。判断依据是标记而非形状——纯文本轮的
+    定稿消息同样无 tool_calls，形状上与直播占位无法区分。
+
+    - 阶段 1（思考推演中打断）：ReasoningBlock 全量丢弃——未完成的
+      逻辑推导前提已失效，残缺思考会污染模型下一轮的隐空间；
+    - 阶段 2（文本输出中打断）：TextBlock 按前端渲染确认游标物理截断
+      ——后端超前生成、用户尚未在草稿上看到的文本一律裁掉（"用户没
+      看到的等于模型没说过的"，对齐认知现场，防"我明明解释过"幻觉）。
+      render_cursor 为 None（静默回合，无渲染基准）时不裁剪，保全后端
+      全量以衔接进度；
+    - 阶段 3（工具参数生成中打断）：半截 JSON 本就未写入占位（循环侧
+      整体丢弃），此处只剩文本与思考的处置。
+
+    游标是**回合累计口径**（含此前各轮已渲染文本与非流式 add_text），
+    当前占位的保留预算 = render_cursor - 之前所有流式 assistant 消息
+    文本之和；SYNTHETIC_ASSISTANT_FLAG 标记的合成占位（媒体生成进度等
+    非流式渲染文本）从未进入游标计数，不计入合计——否则会挤压当前
+    占位的预算、把用户已看到的流式文本多裁掉。
+
+    原地修改（打断时刻的固化语义）；裁剪/剥离后消息变空由
+    ``_normalize_journal`` 的 _is_persistable_assistant 过滤兑底。
+    返回是否实际触到了直播占位。
+    """
+    target_idx: Optional[int] = None
+    for i in range(len(journal) - 1, -1, -1):
+        msg = journal[i]
+        if isinstance(msg, Message) and msg.role == "assistant":
+            if bool(msg.meta.get(LIVE_STREAM_FLAG)):
+                target_idx = i
+            break  # 只看最后一条 assistant：非直播占位（已定稿）不动
+    if target_idx is None:
+        return False
+
+    msg = journal[target_idx]
+
+    # 阶段 2：文本按渲染游标物理截断（无基准 → 不裁）。
+    if render_cursor is not None:
+        prior_chars = 0
+        for j in range(target_idx):
+            prev = journal[j]
+            if (
+                isinstance(prev, Message)
+                and prev.role == "assistant"
+                and not prev.meta.get(SYNTHETIC_ASSISTANT_FLAG)
+            ):
+                prior_chars += len(prev.text())
+        budget = render_cursor - prior_chars
+        text = msg.text()
+        if len(text) > budget:
+            msg.set_text(text[:max(0, budget)])
+            logger.info(
+                "[turn-recovery] 打断裁剪：直播文本 %s 字符 → 保留 %s 字符"
+                "（渲染游标=%s，前文合计=%s）——用户未看到的文本不进历史",
+                len(text), max(0, budget), render_cursor, prior_chars,
+            )
+
+    # 阶段 1：残缺思考全量丢弃（放在截断之后：set_text 保留非文本块）。
+    reasoning = msg.reasoning()
+    if reasoning:
+        msg.blocks = [b for b in msg.blocks if not isinstance(b, ReasoningBlock)]
+        logger.info(
+            "[turn-recovery] 打断裁剪：丢弃残缺思考 %s 字符（推演前提已失效）",
+            len(reasoning),
+        )
+    # 直播标记随之摘除：裁剪已落地，防后续重复处理。
+    msg.meta.pop(LIVE_STREAM_FLAG, None)
+    return True
 
 
 def _pop_registry_entries(chat_id: int, *, expect_task: Optional[asyncio.Task] = None, only_done: bool = False) -> list[_InFlightEntry]:
@@ -387,9 +569,59 @@ def _unpaired_tool_calls(journal: list) -> list[tuple[str, str]]:
     return unpaired
 
 
+def _is_persistable_assistant(msg: Any) -> bool:
+    """判断 assistant 消息是否携带可出站的实质内容（打断保全过滤）。
+
+    Codex #22602 教训（问题排查文档引用）：把 "content=null 且
+    tool_calls=null" 的半成品 assistant 消息存进历史，下一轮请求会被
+    严格网关直接拒绝（Invalid assistant message: content or tool_calls
+    must be set），整个对话线程报废。
+
+    本过滤器在保全阶段（_normalize_journal）把这类消息剔除，覆盖两类
+    来源：
+
+    - LiveAssistantSlot 的空占位：打断发生在模型输出任何内容之前
+      （含"只吐了思考、没吐正文"的半成品——思考块按官方原则不可部分
+      保全，无续写价值，剔除后 content 仍为 null 的形状一并消失）；
+    - 其它路径意外产生的空 assistant 消息（防御性兜底）。
+
+    正常路径不受影响：四条循环的终局兜底（"（模型未返回任何内容）" /
+    _tool_limit_summary）保证正常写入的 assistant 消息必有正文。
+    """
+    if isinstance(msg, Message):
+        if msg.role != "assistant":
+            return True
+        return bool(msg.text().strip() or msg.tool_calls())
+    if isinstance(msg, dict):
+        if msg.get("role") != "assistant":
+            return True
+        content = msg.get("content")
+        has_text = (
+            (isinstance(content, str) and bool(content.strip()))
+            or (isinstance(content, list) and bool(content))
+        )
+        return has_text or bool(msg.get("tool_calls"))
+    return True
+
+
 def _normalize_journal(journal: list) -> list:
-    """返回补齐占位 tool 消息后的 journal 副本（原列表不被修改）。"""
-    normalized = list(journal)
+    """返回补齐占位 tool 消息后的 journal 副本（原列表不被修改）。
+
+    打断保全过滤（改动点1第4项）：先剔除"无正文且无 tool_calls"的空
+    assistant 占位——模型一字未吐就被打断时，journal 里的实时占位不落
+    历史（Codex #22602 防御，见 _is_persistable_assistant）。剔除只发生在
+    保全副本上，内存中的 journal 原列表不动（LiveAssistantSlot 仍持有
+    同一对象，轮次若继续正常推进不受影响）。
+    """
+    normalized = [
+        m for m in journal
+        if _is_persistable_assistant(m)
+    ]
+    if len(normalized) != len(journal):
+        logger.debug(
+            "[turn-recovery] 打断保全剔除空 assistant 占位 %s 条（模型无任何输出）",
+            len(journal) - len(normalized),
+        )
     placeholders = [
         Message.tool_result(tc_id, name, INTERRUPTED_TOOL_PLACEHOLDER)
         for tc_id, name in _unpaired_tool_calls(normalized)
@@ -429,6 +661,10 @@ async def _persist_one_entry(entry: _InFlightEntry, *, reason: str) -> list:
             raise
         except Exception:
             logger.debug("[turn-recovery] 等待旧轮次收尾失败（按当前快照保全）", exc_info=True)
+    # 五阶段规范·阶段1/2：等待旧任务收尾后（builder 渲染游标已定格）
+    # 先做字段级裁剪（剥残缺思考 + 按前端渲染游标截断直播文本），
+    # 再补齐结构与落库。无渲染基准（静默回合 / 未 attach）时只剥思考。
+    trim_interrupted_stream(entry.journal, _read_render_cursor(entry.render_cursor_ref))
     journal = _normalize_journal(entry.journal)
     if not journal:
         return []
@@ -472,6 +708,10 @@ async def persist_salvaged_journal(chat_id: int, journal: list, *, reason: str) 
     """异常路径（额度不足/网关错误等）保全进度：补齐结构并写历史。"""
     if chat_id is None:
         return []
+    # 异常路径同样做字段级裁剪：流断了 → 末尾直播占位的思考是残缺的、
+    # 文本只该保留到用户已渲染的部分（与打断同语义）。渲染游标按
+    # journal 身份从注册表回查（builder 侧 attach 过）。
+    trim_interrupted_stream(journal, _render_cursor_of_journal(journal))
     deregister_turn(chat_id, journal)
     normalized = _normalize_journal(journal)
     if not normalized:
@@ -482,6 +722,76 @@ async def persist_salvaged_journal(chat_id: int, journal: list, *, reason: str) 
         chat_id, reason, len(normalized),
     )
     return normalized
+
+
+def _render_cursor_of_journal(journal: list) -> Optional[int]:
+    """按 journal 对象身份回查渲染游标（异常路径用，找不到返回 None）。"""
+    for entries in _inflight.values():
+        for entry in entries:
+            if entry.journal is journal:
+                return _read_render_cursor(entry.render_cursor_ref)
+    return None
+
+
+# =====================================================================
+# 脱离工具（写操作）终态回写
+# =====================================================================
+# 回写轮询间隔：历史中该 tool_call_id 的 tool 消息可能尚未写入（打断方
+# 保全 / 正常收尾都在异步进行），等待其出现后原地替换。
+_DETACHED_WRITEBACK_POLL = 2.0
+# 回写等待上限：超过则放弃（该轮次历史本身未能落库，无处可写）。
+_DETACHED_WRITEBACK_WAIT = 600.0
+
+
+async def writeback_detached_tool_result(
+    chat_id: int, tool_call_id: str, tool_name: str, content: str,
+) -> bool:
+    """把脱离工具（写操作）的最终结果回写进持久历史（阶段4b）。
+
+    写操作（转账/写库等）不可安全中止：主进程取消后由后台任务死等
+    确切终态（成功/失败/回滚），拿到后经本函数写入上下文——历史中
+    该 tool_call_id 的 tool 消息（打断时的 DETACHED 占位 / 超时的
+    "仍在执行"标记）被**原地替换**为真实终态，调用声明与回执的配对
+    结构不变，只有 content 换血。
+
+    时序：该 tool 消息此刻可能尚未写入历史（打断方还在等旧任务收尾 /
+    正常轮次还在跑）——轮询等待其出现后替换，最多等
+    ``_DETACHED_WRITEBACK_WAIT`` 秒（超时放弃并告警；那种场景下
+    历史本身就没落库，回写无处可去）。
+
+    替换的是历史 Message 的 ToolResultBlock.content（对象原地改写，
+    journal/loop_messages 与持久历史持有的都是同一对象引用）。chat 锁
+    内完成查找+替换，与任何写入方互斥。
+    """
+    if chat_id is None or not tool_call_id:
+        return False
+    deadline = time.monotonic() + _DETACHED_WRITEBACK_WAIT
+    while True:
+        lock = await get_chat_lock(chat_id)
+        async with lock:
+            history = get_or_init_context(chat_id).get("conversation_history") or []
+            for msg in reversed(history):
+                if isinstance(msg, Message) and msg.role == "tool":
+                    tr = msg.tool_result_block()
+                    if tr is not None and tr.tool_call_id == tool_call_id:
+                        if tr.content != content:
+                            tr.content = str(content or "")
+                            logger.info(
+                                "[turn-recovery] chat=%s 脱离工具 %s(%s) 终态已回写历史（%s 字符）",
+                                chat_id, tool_name, tool_call_id, len(tr.content),
+                            )
+                        return True
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "[turn-recovery] chat=%s 脱离工具终态回写等待超时：历史始终未出现 tool_call_id=%s",
+                chat_id, tool_call_id,
+            )
+            return False
+        try:
+            await asyncio.sleep(_DETACHED_WRITEBACK_POLL)
+        except asyncio.CancelledError:
+            # 进程关闭等场景：回写中止（下次启动后无从追补，但绝不向上炸日志）
+            return False
 
 
 # =====================================================================
@@ -745,6 +1055,23 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
                 )
             else:
                 # 打断发生在任何 assistant 输出之前：合并，避免连续两条 user。
+                # 防御性断言（改动点5）：合并的前提是"旧轮次无任何 assistant
+                # 输出"——此刻注册表里不应再有带未保全 journal 的旧登记
+                # （顺序上 _interrupt_active_generation → finalize_pending_
+                # turns 已跑完；本轮自己的登记 journal 为空，不会误报）。
+                # 若仍有，说明前提被打破（旧轮实际有输出却走了合并），
+                # ERROR 落日志即可从日志直接定位，不必再靠用户截图反推。
+                residual = [
+                    e for e in _inflight.get(chat_id, [])
+                    if e.journal  # 非空 journal = 旧轮有进度未被保全
+                ]
+                if residual:
+                    logger.error(
+                        "[turn-recovery] chat=%s 合并分支触发，但仍有 %s 条旧轮次登记"
+                        "带未保全的 journal（合并前提『无 assistant 输出』被破坏——"
+                        "检查打断/保全时序，本轮进度可能被错误合并）",
+                        chat_id, len(residual),
+                    )
                 _merge_user_message(last_env, user_message)
                 history[-1] = _wrap_envelope(last_env)
                 user_message[EARLY_PERSIST_MODE] = "merged"

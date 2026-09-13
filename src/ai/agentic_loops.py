@@ -80,7 +80,8 @@ from ai.attachment_content import _apply_cache_control
 # 终局兜底 / assistant 组装 —— 与两条原生 bridge 循环共用同一份实现，
 # 消除本循环内逐字重复的内联版本。
 from ai.bridge_common import (
-    append_assistant_message,
+    LiveAssistantSlot,
+    MediaProgressSlot,
     ensure_final_content,
     finish_open_tool_group,
     make_switch_stream,
@@ -633,6 +634,12 @@ async def _agentic_loop_openai_compat(
         content_acc = ""
         reasoning_acc = ""
         tool_calls_acc: dict = {}
+        # 打断保全（改动点1）：本轮 assistant 消息的实时占位——流式期间
+        # journal 始终持有一条与 content_acc / reasoning_acc 同步的消息，
+        # 取消发生在任何 await 点上都能被 finalize_interrupted_turn 保全。
+        # tool_calls 只在 finalize（流正常结束）写入（改动点2：流式中途
+        # 的半截参数 JSON 整体丢弃，绝不进历史）。四条循环同构接入。
+        live_slot = LiveAssistantSlot(new_history_entries)
         # 每轮重置缓存字段快照：hint 必须与本轮 token 数同源，
         # 跨轮复用会把上一轮的命中量安到本轮头上。
         usage_with_cache = None
@@ -731,9 +738,14 @@ async def _agentic_loop_openai_compat(
                             await switch_stream("reasoning")
                             reasoning_acc += r_delta
                             builder.append_stream_delta(r_delta)
+                            live_slot.sync(content_acc, reasoning_acc)
 
                         if c_delta:
                             content_acc += c_delta
+                            # 打断保全：增量落地后立即同步 journal 占位（
+                            # 与 builder._stream_buffer 同一制律）；下方
+                            # 思考标记分区后还会精化一次 reasoning 部分。
+                            live_slot.sync(content_acc, reasoning_acc)
                             if round_leading_kind is None:
                                 round_leading_kind = "content"
                                 if builder._tool_groups and not builder._tool_groups[-1].get("finished", False):
@@ -784,6 +796,10 @@ async def _agentic_loop_openai_compat(
                                 else:
                                     await switch_stream("content")
                                     builder.append_stream_delta(c_delta)
+                            # 思考标记分区已把 reasoning_acc 补齐：再同步一次
+                            # 占位，保证 journal 与两个累积器的最终状态一致
+                            # （该语句无 await，与下一轮 chunk 之间不存在取消窗口）。
+                            live_slot.sync(content_acc, reasoning_acc)
 
                         for tc_delta in (getattr(delta, "tool_calls", None) or []):
                             idx = getattr(tc_delta, "index", 0)
@@ -1122,8 +1138,10 @@ async def _agentic_loop_openai_compat(
             builder.request_flush()
 
         # assistant 消息组装 + 双列表追加（与两条原生 bridge 循环共用骨架）。
-        append_assistant_message(loop_messages, new_history_entries,
-                                 content_acc, tool_calls_list, reasoning_acc)
+        # 打断保全（改动点1）：改为"升级已存在的占位消息"而不是新增一条——
+        # journal 里的实时占位原地补全 tool_calls / reasoning / 最终文本，
+        # 同一对象追加进 loop_messages（正常路径不出现重复 assistant 消息）。
+        live_slot.finalize(loop_messages, content_acc, tool_calls_list, reasoning_acc)
 
         # 文本伪工具调用最多纠正三次；达到次数后直接给出安全状态说明，而不是
         # 把 XML 原文返回给用户，也避免模型在不可恢复状态下无限循环。
@@ -1397,6 +1415,15 @@ async def _agentic_loop_native_image(
         if model_info is None:
             return f"IMAGE_ERROR:未知图像模型 {current_model}", None, []
 
+        # 打断保全（改动点4）：发起生成请求前先往 journal 放进度占位——
+        # 生成是原子性调用（无“半张图”中间态），等待返回的几十秒里被打断
+        # 时，占位提供“模型上一轮确实在生成图片”的上下文；请求成功后原地
+        # 更新为最终结果，失败路径整体移除（保持失败轮替换语义不变）。
+        media_slot = MediaProgressSlot(
+            journal,
+            f"[图片生成中] 指令: {clean_prompt or prompt_text or '(无)'}"[:300],
+        )
+
         result = await dispatch_image_task(task)
         used_endpoint = result.endpoint or "/images/generations"
 
@@ -1415,9 +1442,7 @@ async def _agentic_loop_native_image(
                 # pre_rendered=True：上一行已完成唯一一次转换，发送层不再重过
                 await send_rich_html_message(chat_id, safe_notice_html, pre_rendered=True)
                 final_content = "IMAGE_SENT"
-                new_entries = [Message.assistant_text(final_notice or "（已生成图片）")]
-                if journal is not None:
-                    journal.extend(new_entries)
+                new_entries = media_slot.complete(final_notice or "（已生成图片）")
                 return final_content, result.usage, new_entries
             # 语义准确化（2026-09 ModelScope 生产事故）：HTTP 200 + 空 images
             # 有两种截然不同的情形——
@@ -1445,6 +1470,7 @@ async def _agentic_loop_native_image(
                 model=current_model,
                 detail=detail,
             )
+            media_slot.drop()
             return f"IMAGE_ERROR:{error_notice}", None, []
 
         uploaded_urls = await _upload_generated_images_to_r2(image_bytes_list)
@@ -1478,6 +1504,7 @@ async def _agentic_loop_native_image(
                     model=current_model,
                     detail="接口返回成功，图片已生成，但转存图片存储失败（多为对象存储临时故障），请直接重试。",
                 )
+                media_slot.drop()
                 return f"IMAGE_ERROR:{error_notice}", None, []
 
         final_content = f"IMAGE_SENT:{final_notice}" if final_notice else "IMAGE_SENT"
@@ -1485,13 +1512,18 @@ async def _agentic_loop_native_image(
             history_content = f"[图片已生成] 指令: {clean_prompt or '(无)'} | {final_notice}".strip(" |")
         else:
             history_content = final_notice or "（已生成图片）"
-        new_entries = [Message.assistant_text(history_content)]
-        if journal is not None:
-            journal.extend(new_entries)
+        # 打断保全（改动点4）：占位原地定稿为最终历史内容（journal 中恰一条，
+        # 不与占位叠加；journal=None 时 complete 仍返回有效 new_entries）。
+        new_entries = media_slot.complete(history_content)
         return final_content, result.usage, new_entries
 
     except Exception as e:
         logger.exception(f"Native image model request failed: {e}")
+        # 打断保全（改动点4）：异常路径移除进度占位——失败轮保持“历史末尾
+        # 仍是 user 消息”，mark_failed_unanswered_user / 下一条消息的替换
+        # 语义不变。（CancelledError 不是 Exception，不走本分支：占位留在
+        # journal 由打断方保全。）
+        media_slot.drop()
         # 修复：旧写法 hasattr(e, "response") and hasattr(e.response, "text")
         # 在流式响应未读取时会抛 httpx.ResponseNotRead（hasattr 只吞
         # AttributeError），且旧代码 `await e.response.text()` 对同步
@@ -1610,6 +1642,16 @@ async def _agentic_loop_native_video(
     #   "录制"视频），每 4 秒循环重发，覆盖动辄数十秒到数分钟的生成过程；
     # - 发送阶段（视频下载 / R2 上传 / sendRichMessage 携带 <video>）
     #   -> upload_video（bot 正在发送视频）。
+    # 打断保全（改动点4）：发起生成请求前先往 journal 放进度占位——
+    # 视频生成动辄数十秒到数分钟，等待期间被打断时，占位提供“模型上一轮
+    # 确实在生成视频”的上下文；成功后原地定稿为最终历史内容，失败路径
+    # 整体移除（保持失败轮替换语义不变），取消路径留在 journal 由打断方
+    # 保全（CancelledError 不走 except Exception）。
+    media_slot = MediaProgressSlot(
+        journal,
+        f"[视频生成中] 提示词: {prompt[:200]}" if prompt else "[视频生成中]",
+    )
+
     if provider == "agnes":
         async with chat_action_scope(chat_id, "record_video"):
             video_url, error, video_meta = await _request_agnes_video(
@@ -1629,12 +1671,15 @@ async def _agentic_loop_native_video(
         async with chat_action_scope(chat_id, "record_video"):
             video_url, error, video_meta = await _request_openrouter_video(prompt, duration, current_model)
     else:
+        media_slot.drop()
         return f"VIDEO_ERROR:不支持的视频提供商 {provider}", None, []
 
     if error:
+        media_slot.drop()
         return f"VIDEO_ERROR:{error}", None, []
 
     if not video_url:
+        media_slot.drop()
         return "VIDEO_ERROR:未获取到视频链接", None, []
 
     # ---------- 发送视频富文本消息（与图片生成路径保持一致） ----------
@@ -1767,13 +1812,12 @@ async def _agentic_loop_native_video(
             "视频已生成，但 sendRichMessage 发送失败 final_video_url=%s",
             str(final_video_url)[:200],
         )
+        media_slot.drop()
         return "VIDEO_ERROR:视频发送失败", None, []
 
-    # 生成历史记录
+    # 生成历史记录（打断保全改动点4：占位原地定稿，journal 中恰一条）
     history_content = f"[视频已生成] 提示词: {prompt[:200]}" if prompt else "[视频已生成]"
-    new_entries = [Message.assistant_text(history_content)]
-    if journal is not None:
-        journal.extend(new_entries)
+    new_entries = media_slot.complete(history_content)
 
     final_content = f"VIDEO_SENT:{prompt[:100]}"  # 用于上游判断
     return final_content, None, new_entries

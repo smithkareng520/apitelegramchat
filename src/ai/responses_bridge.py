@@ -62,7 +62,7 @@ from ai.tool_summary import (
     _safe_parse_args,
 )
 from ai.bridge_common import (
-    append_assistant_message,
+    LiveAssistantSlot,
     ensure_final_content,
     finish_open_tool_group,
     init_bridge_loop_state,
@@ -596,6 +596,11 @@ async def _agentic_loop_openai_responses(
 
         content_acc = ""
         reasoning_acc = ""
+        # 打断保全（改动点1，与 openai_compat / anthropic / gemini 循环同构）：
+        # 流式期间 journal 始终持有一条与 content_acc / reasoning_acc 同步的
+        # assistant 占位消息；function_call 累积只在流正常结束后由 finalize
+        # 写入（改动点2：未完成的调用不入历史）。
+        live_slot = LiveAssistantSlot(new_history_entries)
         # output_index -> {"call_id","name","args_json"}（function_call
         # 累积；键用 output_index 而非 item_id，因为 arguments.delta 事件
         # 用 item_id 关联，两者在同一 item 生命周期内一一对应，用哪个做
@@ -620,6 +625,7 @@ async def _agentic_loop_openai_responses(
                         content_acc += text
                         await switch_stream("content")
                         builder.append_stream_delta(text)
+                        live_slot.sync(content_acc, reasoning_acc)
 
                 elif etype == "response.output_item.added":
                     item = getattr(event, "item", None)
@@ -671,6 +677,7 @@ async def _agentic_loop_openai_responses(
                             reasoning_acc += summary_text
                             await switch_stream("reasoning")
                             builder.append_stream_delta(summary_text)
+                            live_slot.sync(content_acc, reasoning_acc)
                     elif itype == "function_call":
                         # 兜底：若前面 .added / .delta 事件因网关差异未触发
                         # （个别兼容层只在 .done 里一次性给出完整 item），
@@ -799,8 +806,9 @@ async def _agentic_loop_openai_responses(
             "[AI RAW RESPONSE] provider=%s chat_id=%s length=%s\n%s",
             api_label, builder.chat_id, len(content_acc or ""), content_acc,
         )
-        append_assistant_message(loop_messages, new_history_entries, content_acc,
-                                 tool_calls_list, reasoning_acc)
+        # 打断保全（改动点1）：升级 journal 里的实时占位为完整消息
+        # （tool_calls / reasoning / 最终文本原地补全，同一对象进 loop_messages）。
+        live_slot.finalize(loop_messages, content_acc, tool_calls_list, reasoning_acc)
 
         if not tool_calls_list:
             final_content = content_acc

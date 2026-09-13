@@ -67,4 +67,23 @@ IMAGE_GEN_TOOLS = {
 VIDEO_GEN_TOOLS = {"generate_video"}
 # 所有需要跳过外层超时的"长耗时生成类"工具集合
 MEDIA_GEN_TOOLS = IMAGE_GEN_TOOLS | VIDEO_GEN_TOOLS
+
+# ---------- 写操作工具（五阶段打断规范·阶段4b） ----------
+# 一旦开始执行就不能安全中止的工具：中止 ≠ 回滚（写库 / 转账 / 文件
+# 落盘 / 记忆与待办写入半途掐断，留下的不是"未执行"而是"结果未知"）。
+# 打断/超时发生时 asyncio.shield 让执行脱离主进程在后台继续，确切终态
+# （成功/失败/回滚）由后台任务死等并回写历史（见 tool_call_loop 的
+# detach 机制与 turn_recovery.writeback_detached_tool_result）：
+#   - bash          ：可执行任意写操作（写库 / 转账 curl / 文件修改），
+#                     从命令文本无法可靠判断读写，统一按写操作处理；
+#   - text_editor   ：文件创建 / 编辑 / 删除，落盘不可逆；
+#   - memory        ：长期记忆写入；
+#   - todo          ：待办事项写入。
+# 只读工具（web_search / fetch_url 等）不在此列：取消传播直接掐断底层
+# 网络请求（沉没成本只有一点流量），占位回执带 aborted 状态即可。
+DETACHED_ON_INTERRUPT_TOOLS = frozenset({"bash", "text_editor", "memory", "todo"})
+# 脱离工具的后台死等上限：转账 / 写库等操作必须拿到确切终态，但挂死
+# 的执行（如卡死的沙箱命令）不能无限占用后台任务——到顶后按"结果未知"
+# 记录并放弃等待（与子 agent 用户可配上限同量级）。
+DETACHED_TOOL_FINAL_WAIT = _positive_env_int("DETACHED_TOOL_FINAL_WAIT", 1800, minimum=1)
 TIMEOUT = aiohttp.ClientTimeout(total=300, connect=10, sock_read=180)

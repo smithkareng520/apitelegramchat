@@ -24,6 +24,7 @@ from utils import (
 from markdown_converter import convert_markdown_to_telegram_html
 from ai.error_formatting import extract_domain
 from ai.attachment_content import _track_task
+from core.messages import Message
 from token_budget import count_tokens, truncate_to_token_budget
 from ai.tool_summary import (
     _coerce_positive_int,
@@ -99,6 +100,45 @@ _RICH_BLOCK_OPEN_TAG_RE = re.compile(
     r"figure|figcaption|tg-slideshow|tg-map|img|video|audio|tg-math-block|aside|footer)\b",
     re.IGNORECASE,
 )
+
+def _log_draft_journal_consistency(
+    chat_id: int, draft_id: int, draft_plain: str, journal: Optional[list],
+) -> None:
+    """草稿层 ↔ 历史层一致性观测（改动点3，诊断用、不改变行为）。
+
+    打断固化草稿后校验"本轮 journal 是否留有 assistant 进度"：草稿有
+    可观可见文本而 journal 无任何 assistant 文本/工具调用，即两层数据
+    结构再次失同步——正是历史上"草稿显示数到 123、模型记忆全空"回归的
+    直接特征。第一时间落 WARNING（而非再靠用户截图反馈）；一致时落
+    INFO 供事后观测。
+
+    刻意只做"journal 完全无 assistant 进度"的空值判定，不做长度比例
+    判定：草稿可见文本天然包含工具卡片摘要等内容，与 journal 的
+    assistant 正文不可同比，宽松比例只会制造噪音告警。
+    """
+    if journal is None:
+        return
+    journal_text_len = 0
+    journal_has_assistant_content = False
+    for m in journal:
+        if isinstance(m, Message) and m.role == "assistant":
+            journal_text_len += len(m.text())
+            if m.text().strip() or m.tool_calls():
+                journal_has_assistant_content = True
+    if len(draft_plain) >= 100 and not journal_has_assistant_content:
+        logger.warning(
+            "[打断保全] 草稿固化了 %s 字符可见内容，但轮次 journal 中"
+            "无任何 assistant 文本/工具调用——草稿层与历史层失同步"
+            "（LiveAssistantSlot 同步链路可能损坏，请排查）: chat=%s draft=%s",
+            len(draft_plain), chat_id, draft_id,
+        )
+    else:
+        logger.info(
+            "[打断保全] 草稿固化 %s 字符；journal assistant 进度 %s 字符"
+            "（两层一致）: chat=%s draft=%s",
+            len(draft_plain), journal_text_len, chat_id, draft_id,
+        )
+
 
 def _rich_visible_text(text: str) -> str:
     """按 Rich Message 的近似语义计算解析后的可见字符，不计 HTML 标签和属性。"""
@@ -303,6 +343,21 @@ class RichMessageBuilder:
         # 收尾只处理当前草稿而不会重复发送已完成的段落。
         self._rollover_history: list[dict[str, int | str | None]] = []
         self._rollover_count: int = 0
+        # ---- 打断裁剪基准（五阶段规范：文本看前端）----
+        # 本回合用户可见文本的累计字符数：流式文本 delta（思考流不计——
+        # 思考不进入裁剪后的历史）+ 非流式 add_text（超限总结等，同样
+        # 会发给用户）。渲染确认游标（_render_confirmed_chars）是最后一帧
+        # 成功送达 / 永久化时刻的快照——用户实际看到的边界。后端超前生成、
+        # 尚未送达的文本不计入：打断保全时历史据此物理截断（"用户没看到的
+        # 等于模型没说过"）。box 单元素列表供 turn_recovery 注册表持有同一
+        # 引用，打断时零拷贝读取最新值。类型为 Optional：静默回合
+        # （SilentMessageBuilder）覆盖为 None（无渲染基准）。
+        self._visible_text_chars_total: int = 0
+        self._render_confirmed_chars: int = 0
+        self._render_cursor_box: Optional[list] = [0]
+        # 当前开启的流式块类别（"text" / "reasoning"）：append_stream_delta
+        # 按它判定是否计入可见文本计数——思考流不计入游标。
+        self._current_stream_kind: Optional[str] = None
 
     def _get_reasoning_summary(self, content: str) -> str:
         """从思考原文中提取单行纯文本摘要（长度不超过 30 字符）并严格转义。
@@ -909,6 +964,10 @@ class RichMessageBuilder:
     def add_text(self, text: str) -> None:
         if not text or not text.strip():
             return
+        # 可见文本计数：非流式块（超限总结 / 兜底文案）同样会发给用户，
+        # 计入回合累计口径——与 journal 里对应的 assistant 消息文本平衡，
+        # 避免挤压后续直播占位的截断预算。
+        self._visible_text_chars_total += len(text)
         if self._handoff_text is not None:
             self._handoff_text.append(text)
             return
@@ -957,6 +1016,9 @@ class RichMessageBuilder:
         self.block_types.append(stream_type)
         self._stream_text_index = len(self.blocks) - 1
         self._stream_buffer = ""
+        # 打断裁剪基准：记录当前流类别（text 计入可见文本计数，reasoning
+        # 不计——思考不进入裁剪后的历史）。
+        self._current_stream_kind = stream_type
         self.request_flush(force=False)
 
     def begin_stream_text(self) -> None:
@@ -968,6 +1030,10 @@ class RichMessageBuilder:
     def append_stream_delta(self, delta: str) -> None:
         if not delta:
             return
+        # 可见文本计数：只计文本流（思考不计入游标——思考在打断保全时
+        # 整体丢弃，不计入"用户看到的正文"边界）。
+        if self._current_stream_kind == "text":
+            self._visible_text_chars_total += len(delta)
         if self._handoff_text is not None:
             self._handoff_text.append(delta)
             return
@@ -986,6 +1052,31 @@ class RichMessageBuilder:
             self.block_types.append("text")
             self._stream_buffer = ""
 
+    def _advance_render_cursor(self, chars: int) -> None:
+        """推进渲染确认游标（帧送达 / 永久化成功后调用，单调不减）。
+
+        五阶段规范"文本看前端"：chars 是"用户此刻已实际看到的回合累计
+        文本字符数"——草稿帧成功送达（send_rich_message_draft 返回）取
+        帧构建时刻的快照；滚动永久化（sendRichMessage 成功）取永久化
+        时刻的全量。box 同步更新，打断方（turn_recovery 注册表持有同一
+        引用）零拷贝读取。静默回合 box 为 None（无渲染基准，防御性短路）。
+        """
+        if self._render_cursor_box is None:
+            return
+        if chars > self._render_confirmed_chars:
+            self._render_confirmed_chars = chars
+            self._render_cursor_box[0] = chars
+
+    @property
+    def render_cursor_box(self) -> Optional[list]:
+        """渲染确认游标引用（单元素列表；打断保全裁剪的基准）。
+
+        get_ai_response 在 builder 就绪后把本引用 attach 进
+        turn_recovery 注册表；静默回合（SilentMessageBuilder）为 None——
+        不渲染草稿就没有"用户所见"基准，保全时不裁剪文本。
+        """
+        return self._render_cursor_box
+
     def end_stream(self) -> str:
         self._commit_stream_buffer()
         if self._stream_text_index >= 0 and self._stream_text_index < len(self.blocks):
@@ -993,6 +1084,7 @@ class RichMessageBuilder:
         else:
             text = ""
         self._stream_text_index = -1
+        self._current_stream_kind = None
         return text
 
     def end_stream_text(self) -> str:
@@ -1356,6 +1448,11 @@ class RichMessageBuilder:
                     rollover_mode,
                 )
 
+            # 打断裁剪基准：旧段已永久化送达（用户已见），滚动边界上的全部
+            # 可见文本计入渲染确认游标——防滚动后新帧送达前被打断时，游标
+            # 停在旧值把用户已看到的已永久化段落裁掉。
+            self._advance_render_cursor(self._visible_text_chars_total)
+
             if old_draft_message_id:
                 async def _cleanup_old_preview() -> None:
                     deleted = await delete_message_fast(self.chat_id, old_draft_message_id)
@@ -1391,7 +1488,7 @@ class RichMessageBuilder:
             self._rollover_in_progress = False
             raise
 
-    async def finalize_interrupted_draft(self) -> bool:
+    async def finalize_interrupted_draft(self, journal: Optional[list] = None) -> bool:
         """打断收尾：把草稿已累积的内容经 sendRichMessage 固定为永久消息。
 
         与正常收尾的最终交付、回合边界滚动永久化**同源同法**：
@@ -1403,6 +1500,13 @@ class RichMessageBuilder:
         - 清理语义：送达成功才删除瞬态草稿气泡；失败则保留冻结草稿，
           由打断方（app._interrupt_active_generation 的 mark_dead +
           mark_preserved_draft）兜底为可见进度现场。
+
+        草稿层 ↔ 历史层反向校验（改动点3，诊断用、不改变行为）：
+        ``journal``（轮次日志，打断保全的真值来源）传入时，固化草稿后
+        校验"本轮 journal 是否留有 assistant 进度"。草稿有可观可见文本
+        而 journal 无任何 assistant 文本/工具调用，即两层数据结构再次
+        失同步（历史上"草稿显示数到 123、模型记忆全空"回归的直接特征），
+        第一时间落 WARNING，而不是再靠用户截图反馈。
 
         守卫：
         - 草稿已死亡时跳过——打断若恰好落在正常收尾阶段（stop_flush 后
@@ -1424,6 +1528,11 @@ class RichMessageBuilder:
         if not final_html.strip() or not _rich_visible_text(final_html).strip():
             # 打断发生在任何可见内容产出之前：无可固定内容。
             return False
+        # 草稿层 ↔ 历史层反向校验（改动点3）：见 _log_draft_journal_consistency。
+        _log_draft_journal_consistency(
+            self.chat_id, self.draft_id,
+            _rich_visible_text(final_html).strip(), journal,
+        )
         chat_id = self.chat_id
         draft_id = self.draft_id
         draft_message_id = self.draft_message_id
@@ -1490,6 +1599,11 @@ class RichMessageBuilder:
                 html_content = "<p>Working...</p>"
             self._arm_rollover_if_needed(html_content)
 
+            # 打断裁剪基准：帧构建时刻的可见文本快照——发送成功后用户
+            # 看到的正是这一帧（blocks + stream_buffer），此后新到的 delta
+            # 属于"后端超前生成"，不计入游标（打断保全时会裁掉）。
+            frame_visible_chars = self._visible_text_chars_total
+
             # 边界扫描会对全部块做逐块 token 编码（O(块数×全文)），其结果
             # 只用于 DEBUG 日志；生产（INFO 级别）跳过，流式热路径不再
             # 每帧做全量编码。
@@ -1511,6 +1625,8 @@ class RichMessageBuilder:
                     self.chat_id, self.draft_id, self._flush_sequence, force, msg_id,
                     frame_tokens, frame_blocks, int((time.monotonic() - frame_started) * 1000),
                 )
+                # 帧送达成功：渲染确认游标推进到帧构建时刻的快照。
+                self._advance_render_cursor(frame_visible_chars)
                 if msg_id:
                     self.draft_message_id = msg_id
                     await self._register_active_draft(msg_id)
@@ -1631,6 +1747,12 @@ class SilentMessageBuilder(RichMessageBuilder):
     def __init__(self, chat_id: int) -> None:
         super().__init__(chat_id)
         self.silent = True
+        # 打断裁剪基准：静默回合从不渲染草稿帧——用户认知现场为空，没有
+        # "视觉所见"基准。置 None 后 get_ai_response 不 attach 游标，
+        # turn_recovery 打断保全时只剥残缺思考、不裁剪文本（保全后端
+        # 全量，让下一轮能衔接进度——静默模式交付走 deliver_reply 终稿，
+        # 中间过程文本本就不对用户可见，不存在认知偏差问题）。
+        self._render_cursor_box: Optional[list] = None
 
     # ---------- 覆盖所有会产生 Telegram 副作用的路径 ----------
 
@@ -1660,11 +1782,13 @@ class SilentMessageBuilder(RichMessageBuilder):
         # 这会把 agent 过程泄漏给用户。静默回合永不滚动。
         return False
 
-    async def finalize_interrupted_draft(self) -> bool:
+    async def finalize_interrupted_draft(self, journal: Optional[list] = None) -> bool:
         # 关键覆盖：父类实现会把打断时已累积的草稿内容经 sendRichMessage
         # 固定为永久消息——静默回合没有可见草稿，整轮倾倒过程正文会违反
         # /show off 语义（交付只经 deliver_reply / 收尾兜底，且只发最后
         # 一条 assistant 正文）。静默回合的打断只走 turn_recovery 保全。
+        # journal 参数仅为签名对齐（父类的草稿层↔历史层反向校验对静默
+        # 回合无草稿可比，直接忽略）。
         return False
 
     async def _register_active_draft(self, message_id: int = 0) -> None:

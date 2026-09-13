@@ -603,6 +603,18 @@ async def get_ai_response(
             builder.start_flush_loop()
             _log_stage("首帧草稿已发送+刷新循环启动")
 
+        # ── 渲染确认游标 attach（五阶段打断规范：文本看前端）─────────
+        # builder 就绪后把 render_cursor_box 引用绑定到本轮次登记条目：
+        # 打断保全（turn_recovery.trim_interrupted_stream）据此把 journal
+        # 里的直播文本物理截断到用户实际看到的边界——后端超前生成、尚未
+        # 送达草稿的文本不进历史（对齐认知现场，防"我明明解释过"幻觉）。
+        # 静默回合 box 为 None（无渲染基准，保全时不裁剪文本）。
+        try:
+            turn_recovery.attach_render_cursor(
+                chat_id, journal, getattr(builder, "render_cursor_box", None))
+        except Exception:
+            logger.debug("attach_render_cursor 失败（打断裁剪降级为不裁剪文本）", exc_info=True)
+
         lock = await state.get_chat_lock(chat_id)
         async with lock:
             current_model = user_models.get(chat_id, DEFAULT_MODEL)
@@ -1089,8 +1101,9 @@ async def get_ai_response(
             # 把过程倾倒给用户）。无可见内容或发送失败时保留冻结草稿，
             # 由打断方 mark_preserved_draft 兜底——见
             # RichMessageBuilder.finalize_interrupted_draft。
+            # journal 传入做草稿层↔历史层反向校验（改动点3，诊断用）。
             try:
-                await builder.finalize_interrupted_draft()
+                await builder.finalize_interrupted_draft(journal=journal)
             except asyncio.CancelledError:
                 # 二次取消（打断方对旧任务的等待超时）：后台固定化继续，
                 # 取消本身照常向上传播。
