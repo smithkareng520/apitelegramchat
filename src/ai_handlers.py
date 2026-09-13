@@ -377,24 +377,44 @@ async def build_system_prompt(
     supports_tools: bool = True,
     skill_catalog_text: str | None = None,
     workspace_namespace_value: str | None = None,
-) -> str:
-    """组装完整 system prompt。
+) -> tuple[str, str]:
+    """组装 system prompt，拆成两段返回，对应两个手动缓存断点。
 
-    结构 = _BASE_PROMPT + [_TOOLS_SECTION 或 _NO_TOOLS_SECTION] + [角色 prompt] + 时间戳
+    返回 (base_segment, extra_segment)：
+      - base_segment：仅 _BASE_PROMPT。整个项目里字节最稳定的部分——
+        不随模型能力、角色选择、技能目录变化。断点 1 打在这段末尾，
+        长 TTL，几乎每一轮、每个模型都能命中。
+      - extra_segment：[_TOOLS_SECTION 或 _NO_TOOLS_SECTION]（是否含
+        技能目录取决于 supports_tools）+ [角色 prompt] + 时间戳。这段
+        会随模型是否支持工具、用户选择的角色而变化，比 base_segment
+        易失效，所以单独成段、单独打断点 2，不拖累断点 1 的命中率——
+        两段各自失效，互不连累。
 
-    prompt cache 备注：除末尾追加的"当前时间"在 build_system_prompt 里
-    拼上之外，其他片段（_BASE_PROMPT / _TOOLS_SECTION / _NO_TOOLS_SECTION /
-    角色 prompt）逐字节稳定，能被 Anthropic/OpenRouter 稳定复用前缀缓存。
+    调用方（ai_handlers.get_ai_response）应把两段作为两条独立的
+    role=system 消息依次传入历史（而不是拼成一个字符串），下游协议
+    适配器才能在两条消息的末尾分别打断点 1 / 断点 2。
+
+    prompt cache 备注：base_segment 逐字节稳定；extra_segment 内部
+    除末尾追加的"当前时间"外，其余片段（_TOOLS_SECTION /
+    _NO_TOOLS_SECTION / 角色 prompt）在 supports_tools 与角色选择不变
+    时也逐字节稳定。
     """
-    base_prompt = _BASE_PROMPT
+    base_segment = _BASE_PROMPT
+
+    extra_parts: list[str] = []
     if supports_tools:
         catalog_text = skill_catalog_text or skill_catalog_brief()
-        base_prompt += _TOOLS_SECTION.format(
+        extra_parts.append(_TOOLS_SECTION.format(
             workspace_guide=_workspace_guide_html(chat_id, workspace_namespace_value),
             catalog_text=catalog_text,
-        )
+        ))
     else:
-        base_prompt += _NO_TOOLS_SECTION
+        # 模型不支持工具调用：绝不能把技能目录（_TOOLS_SECTION）发给它——
+        # 技能只能通过 bash 读取 SKILL.md 再运行脚本来使用，没有工具面的
+        # 模型看到"技能目录 + 调用规则"这类文字只会产生幻觉（声称自己
+        # 读取/执行了实际未发生的操作），且与下面这段"未启用外部工具"
+        # 的说明自相矛盾。只发不依赖工具的运行模式说明。
+        extra_parts.append(_NO_TOOLS_SECTION)
 
     selected_role = await state.get_user_role(chat_id) if chat_id else None
     if selected_role == "isla":
@@ -404,24 +424,41 @@ async def build_system_prompt(
         # selected_role 为 None（chat_id 为空）时 dict.get 本就返回默认值 ""；
         # or "" 仅把键归一为 str，查询结果不变（无空字符串键）。
         extra = _STATIC_ROLE_PROMPTS.get(selected_role or "", "")
+    if extra:
+        extra_parts.append(extra)
 
-    # 时间戳放在整个 system prompt 的最末尾追加：它是唯一"每天必变"的
-    # 内容，放在末尾可以让前面所有稳定内容作为一个完整、逐字节一致的
-    # 缓存前缀被复用；只有这最后一小段之外的部分才需要重新计算/计费。
+    # 时间戳放在 extra_segment 的最末尾追加：它是唯一"每天必变"的内容，
+    # 放在末尾可以让 base_segment 与 extra_segment 里时间戳之外的部分
+    # 仍作为逐字节一致的缓存前缀被复用；只有这最后一小段之外的部分才
+    # 需要重新计算/计费。CURRENT_TIME 按天变化，粒度足够粗，继续放在
+    # extra_segment（断点 2 覆盖范围内）就行，没必要为它单独再切一层
+    # 断点——多切一层只会占用 Anthropic 最多 4 个断点里宝贵的一个名额，
+    # 换不来实际收益（断点 2 本来就会因 supports_tools/角色变化而失效，
+    # 时间戳只是让它"多一个"失效原因，不影响断点 1 的稳定命中）。
     current_time = get_current_time()
-    return (
-        base_prompt
-        + ("\n" + extra if extra else "")
-        + f"\n<footer>当前时间：{current_time}。</footer>"
-    )
+    extra_segment = "\n".join(extra_parts) + f"\n<footer>当前时间：{current_time}。</footer>"
+
+    return base_segment, extra_segment
 
 
 def clean_ai_content(content: str) -> str:
     return content.strip() if content else ""
 
 
-def _build_initial_messages(system_prompt: str) -> list:
-    return [Message.system(system_prompt)]
+def _build_initial_messages(base_segment: str, extra_segment: str) -> list:
+    """两段分别构造成两条 role=system 消息。
+
+    保持两条独立消息（而不是拼成一条）是为了让下游协议适配器能在
+    base_segment 消息末尾打断点 1、extra_segment 消息末尾打断点 2——
+    _convert_messages_to_anthropic 等转换函数会把多条 role=system
+    消息用 "\n\n" 拼接进请求的顶层 system 字段（Anthropic 无 system
+    角色消息），拼接顺序与本函数 append 顺序一致，字节上等价于旧版
+    单字符串，只是缓存断点的挂载粒度从"字符串"变成了"消息"。
+    """
+    messages = [Message.system(base_segment)]
+    if extra_segment:
+        messages.append(Message.system(extra_segment))
+    return messages
 
 
 async def _maybe_start_media_wizard(chat_id: int, model_id: str, user_message: Optional[dict]) -> bool:
@@ -674,14 +711,14 @@ async def get_ai_response(
 
         builder.set_thinking_status("Thinking...")
         await builder.flush(force=False)
-        system_prompt = await build_system_prompt(
+        base_segment, extra_segment = await build_system_prompt(
             chat_id,
             username,
             supports_tools=supports_tools,
             skill_catalog_text=skill_catalog_brief(),
             workspace_namespace_value=workspace_namespace_value,
         )
-        messages = _build_initial_messages(system_prompt)
+        messages = _build_initial_messages(base_segment, extra_segment)
         _log_stage("system_prompt构建完成")
         await _append_history_async(messages, history, model_info, chat_id=chat_id)
         _log_stage("历史消息追加完成")
@@ -701,17 +738,33 @@ async def get_ai_response(
         # 事件源分叉——USER 回合默认交付（收尾有兜底，显式 send=false 才
         # 静默），TIMER 回合默认静默（必须显式 send=true）。缺失这层告知，
         # 模型会误以为自己的正文用户能看到，或把两类回合的默认值弄混。
+        #
+        # 这里必须按 supports_tools 分叉措辞：deliver_reply / message_user
+        # 都是工具，模型不支持工具调用时它们根本不在发给模型的 tools
+        # 列表里（tools_to_pass = tools if supports_tools else None，见
+        # _call_api）。之前的版本无条件提及这两个工具名，等于告诉一个
+        # 拿不到工具面的模型"你可以调用 XX 工具"——纯粹的错误组装，
+        # 只会诱导模型在正文里幻觉出工具调用文本。不支持工具的模型
+        # 没有除"直接回复"之外的交付方式，只需要告知可见性状态即可。
         if silent_mode:
-            if is_timer:
-                messages.append(Message.system(
-                        "当前用户默认看不到Agent轮次信息"
-                        "如果你想让用户看到Agent轮次中最后一条的文本信息，可以调用 deliver_reply 且 send=true来显示"
-                        "你也可以调用 message_user 工具与用户交流，但是用户可能不在"))
+            if supports_tools:
+                if is_timer:
+                    messages.append(Message.system(
+                            "当前用户默认看不到Agent轮次信息"
+                            "如果你想让用户看到Agent轮次中最后一条的文本信息，可以调用 deliver_reply 且 send=true来显示"
+                            "你也可以调用 message_user 工具与用户交流，但是用户可能不在"))
+                else:
+                    messages.append(Message.system(
+                            "当前用户默认能看到Agent轮次中最后一条的文本信息"
+                            "如果你不想让用户看到Agent轮次中最后一条的文本信息，可以调用 deliver_reply 且 send=false来取消显示"
+                            "你也可以调用 message_user 工具与用户交流，但是用户可能不在"))
             else:
-                messages.append(Message.system(
-                        "当前用户默认能看到Agent轮次中最后一条的文本信息"
-                        "如果你不想让用户看到Agent轮次中最后一条的文本信息，可以调用 deliver_reply 且 send=false来取消显示"
-                        "你也可以调用 message_user 工具与用户交流，但是用户可能不在"))
+                if is_timer:
+                    messages.append(Message.system(
+                            "当前用户默认看不到Agent轮次信息，你的正文不会被展示给用户。"))
+                else:
+                    messages.append(Message.system(
+                            "当前用户默认能看到Agent轮次中最后一条的文本信息。"))
 
         # 缓存断点改由协议循环在每轮"渲染后的 wire dict"上统一打
         # （openai_chat: agentic_loops 每轮重打；anthropic_messages:
@@ -809,12 +862,21 @@ async def get_ai_response(
                 timer_tools = timer_tools + [build_deliver_reply_tool(default_send=False)]
             # TIMER 回合说明：统一草稿流后，/show on 时过程与最终回复对用户
             # 可见；/show off 时静默，交付渠道是 deliver_reply / message_user。
-            messages.append(Message.system(
-                    "这是后台自动触发的Agent请求，为了模拟人类的主动思考"
-                    "可以调用 message_user 工具与用户交流，但是用户可能不在；"))
+            #
+            # message_user 是工具，不支持工具调用的模型永远拿不到它
+            # （_call_api 里 tools_to_pass = tools if supports_tools else
+            # None，timer_tools 会被整体丢弃），说明文字必须跟着分叉，
+            # 否则又是"模型没有的能力被写进提示词"的错误组装。
+            if supports_tools:
+                messages.append(Message.system(
+                        "这是后台自动触发的Agent请求，为了模拟人类的主动思考"
+                        "可以调用 message_user 工具与用户交流，但是用户可能不在；"))
+            else:
+                messages.append(Message.system(
+                        "这是后台自动触发的Agent请求，为了模拟人类的主动思考。"))
             raw_content, usage, new_msgs = await _call_api(
                 current_model, model_info, messages, chat_id, builder,
-                tools=timer_tools, journal=journal,
+                tools=timer_tools if supports_tools else None, journal=journal,
                 workspace_namespace=workspace_namespace_value,
             )
         else:
@@ -1305,6 +1367,19 @@ async def _call_api(
         # 协议/端点建请求，请求体里的 model 字段取 current_model。只换
         # model_info 不换 current_model 会把原模型名发到默认厂商端点，
         # 必然 400/404。supports_tools 同步按新模型重算。
+        #
+        # 已知局限（未在此处修复，避免引入新的不一致）：messages 里的
+        # system 段（含技能目录/deliver_reply·message_user 说明文字）
+        # 已经在 get_ai_response 里按"降级前"的 model_info.supports_tools
+        # 组装好了。这里只重算了 tools_to_pass（决定实际发不发工具面），
+        # 没有重新调用 build_system_prompt 重建 messages——因为重建需要
+        # chat_id/username/workspace_namespace_value 等一整套上下文，
+        # 这些参数本函数并不具备，强行在这里重建容易和上游的组装顺序
+        # （base_segment/extra_segment 两段 + TIMER/静默模式追加段）
+        # 产生新的不一致。降级到未知 provider 属于配置错误触发的极端
+        # 分支，不是常规路径；常规路径（未知 provider 不出现）里
+        # supports_tools 在组装 messages 时和这里读到的完全一致，
+        # 不受此限制影响。
         model_info = SUPPORTED_MODELS.get(DEFAULT_MODEL, model_info)
         current_model = DEFAULT_MODEL
         supports_tools = bool(model_info.supports_tools)

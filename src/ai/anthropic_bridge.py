@@ -223,19 +223,29 @@ def _blocks_to_anthropic_content(blocks: list) -> list:
     return out_blocks
 
 
-def _convert_messages_to_anthropic(messages: list) -> tuple[str, list]:
-    """把内部消息（Message）列表转换成 Anthropic 的 (system_prompt, messages)。
+def _convert_messages_to_anthropic(messages: list) -> tuple[list[dict], list]:
+    """把内部消息（Message）列表转换成 Anthropic 的 (system_blocks, messages)。
 
     规则：
-      - role=system -> 拼接进顶层 system 字符串（Anthropic 无 system 角色消息）
+      - role=system -> 转成顶层 system 的一个独立 text block（Anthropic
+        无 system 角色消息，但顶层 system 字段本身接受块列表）。不再
+        拼成一个字符串：内部产生 system 消息的调用方（build_system_prompt
+        的 base/extra 两段、TIMER/静默模式追加的说明等）分段边界各不
+        相同、失效频率也不同，保留成独立 block 才能让下游按块打不同
+        的手动缓存断点（断点 1 打在最稳定的 block 末尾、断点 2 打在
+        次稳定的 block 末尾），拼成一个字符串会让整段被迫共用同一个
+        断点、同一个失效频率。
       - role=user   -> Anthropic user 消息（blocks 转换为块列表）
       - role=assistant -> Anthropic assistant 消息；ToolCallBlock 渲染为
         tool_use 块（input 为结构化 dict）
       - role=tool   -> ToolResultBlock 追加/合并进下一个 Anthropic user
         消息的 tool_result 块（Anthropic 要求 tool_result 必须放在 user
         消息里，且通常紧跟在触发它的 assistant tool_use 消息之后）
+
+    返回的 system_blocks 是"裸" text block 列表（不含 cache_control），
+    调用方按需在其中某几个 block 上追加 cache_control。
     """
-    system_parts: list[str] = []
+    system_blocks: list[dict] = []
     anthropic_messages: list[dict] = []
     pending_tool_results: list[dict] = []
 
@@ -253,7 +263,7 @@ def _convert_messages_to_anthropic(messages: list) -> tuple[str, list]:
         if role == "system":
             text = msg.text()
             if text:
-                system_parts.append(text)
+                system_blocks.append({"type": "text", "text": text})
             continue
 
         if role == "tool":
@@ -297,8 +307,7 @@ def _convert_messages_to_anthropic(messages: list) -> tuple[str, list]:
 
     _flush_pending_tool_results()
 
-    system_prompt = "\n\n".join(p for p in system_parts if p)
-    return system_prompt, anthropic_messages
+    return system_blocks, anthropic_messages
 
 
 # =============================================================================
@@ -361,7 +370,7 @@ async def anthropic_chat_completions_create(
     完成到 Anthropic {system, messages} 形状的转换；返回值同样转换回
     OpenAI SDK 形状，调用方感知不到协议差异。
     """
-    system_prompt, anthropic_messages = _convert_messages_to_anthropic(messages)
+    system_blocks, anthropic_messages = _convert_messages_to_anthropic(messages)
     if supports_prompt_cache and anthropic_messages:
         last_msg = anthropic_messages[-1]
         content = last_msg.get("content")
@@ -382,6 +391,10 @@ async def anthropic_chat_completions_create(
                 }
             ]
     anthropic_tools = _convert_tools_to_anthropic(tools) if tools else None
+
+    # 子 agent 是一次性任务，system 段没有跨轮复用价值，不需要拆断点；
+    # 仍按 build_system_prompt 段落顺序拼回一个字符串即可。
+    system_prompt = "\n\n".join(b["text"] for b in system_blocks if b.get("text"))
 
     request_kwargs: dict = {
         "model": model,
@@ -611,69 +624,69 @@ async def _agentic_loop_anthropic(
     prompt_cache_enabled = bool(model_info and model_info.supports_prompt_cache)
 
     for _round in range(MAX_TOOL_CALLS):
-        system_prompt, anthropic_messages = _convert_messages_to_anthropic(loop_messages)
+        system_blocks, anthropic_messages = _convert_messages_to_anthropic(loop_messages)
         # 顶层 system 请求参数：默认 None（非缓存路径用纯字符串）。
         request_system = None
 
         if prompt_cache_enabled and anthropic_messages:
-            # Anthropic 多断点缓存策略（官方上限：单请求最多 4 个显式断点）
-            # 断点应打在希望下一轮请求能复用的前缀末尾，按重要性排序：
-            # 0. 顶层 system 段末尾（最稳定，几乎每轮都命中；打 1h TTL——
-            #    系统提示会话内不变，Telegram 对话间隔经常超过默认 5 分钟，
-            #    短 TTL 会反复过期重写；1h 写入溢价 2x 只付一次，读取仍 0.1x）
-            # 1. 第一条 user 消息末尾（覆盖开场上下文注入）
-            # 2. 倒数第二条 user/assistant 消息末尾（覆盖上一轮完整内容）
-            # 3. 最后一条消息末尾（覆盖本轮新输入，loop 内多轮复用）
-            # 合计恰好 4 个，不超上限（本循环没有其他动态打标出口）。
-            cache_points_applied = 0
-            MAX_CACHE_POINTS = 3  # 断点 1..3（不含顶层 system 段）
+            # Anthropic 缓存策略：手动断点只打 2 个（system 段的 base/
+            # extra 两段），尾部（对应"断点 4"）交给 Anthropic 的自动
+            # 前缀缓存机制（读取时按最长匹配前缀命中，不需要显式
+            # cache_control），不在这里遍历消息手动找位置打标记：
+            #   - 自动机制本来就会覆盖请求末尾，手动再打一次是重复劳动，
+            #     且如果手动选的位置和自动机制选的位置不一致，两套断点
+            #     反而会让缓存更碎、命中率更低；
+            #   - 4 个断点名额里，手动只用 2 个（断点 1 + 断点 2），
+            #     省下的名额不需要找别的地方用掉——不打比多打更安全。
+            #
+            #   断点 1（手动）：system 第 1 块末尾，即 build_system_prompt
+            #     的 base_segment——整个项目里字节最稳定的段，不随模型
+            #     能力/角色/技能目录变化，几乎每轮每个模型都能命中；
+            #     打 1h TTL（会话间隔常超默认 5 分钟，短 TTL 反复过期
+            #     重写；1h 写入溢价 2x 只付一次，读取仍 0.1x）。
+            #   断点 2（手动）：system 最后一块末尾，即 base_segment 之后
+            #     的 extra_segment（技能目录/工具说明/角色 prompt/时间戳，
+            #     以及 TIMER、静默模式追加的说明性 system 消息全部并入
+            #     这一块——它们本就随模型能力/回合类型变化，跟着断点 2
+            #     一起失效，不连累断点 1）；同样 1h TTL——尽管这段比
+            #     断点 1 更易失效（换模型/切角色都会变），但只要没变就
+            #     和断点 1 一样是"会话内不变"的内容，短 TTL 一样会在
+            #     慢节奏对话里反复过期重写，付 1h 的 2x 写入溢价换更高
+            #     命中率仍然划算。
+            #   断点 3：不打。
+            #   断点 4：不手动打，留给 Anthropic 自动前缀缓存处理尾部。
 
-            # 断点 0: 顶层 system 段（1h TTL）。Anthropic 的 system 参数
-            # 接受字符串或块列表；转成块列表才能挂 cache_control。
-            if system_prompt:
-                request_system = [{
-                    "type": "text",
-                    "text": system_prompt,
+            # 断点 1 + 断点 2：system 块列表的第一块与最后一块分别打标。
+            # system_blocks 对应 _build_initial_messages 产出的两条
+            # role=system 消息（base_segment、extra_segment）——只有一条
+            # 时（例如 extra_segment 为空，或历史被截断只剩一段）两个
+            # 断点会落在同一块上，Anthropic 允许同一 block 只保留最后
+            # 一次 cache_control 赋值，不会报错，只是退化为一个断点。
+            if system_blocks:
+                marked_blocks = list(system_blocks)
+                first_block = {
+                    **marked_blocks[0],
                     "cache_control": {"type": "ephemeral", "ttl": "1h"},
-                }]
+                }
+                marked_blocks[0] = first_block
+                last_block = {
+                    **marked_blocks[-1],
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+                marked_blocks[-1] = last_block
+                request_system = marked_blocks
             else:
                 request_system = None
 
-            # 断点 1: 第一条 user 消息
-            if system_prompt and anthropic_messages:
-                first_msg = anthropic_messages[0]
-                if first_msg.get("role") == "user" and first_msg.get("content"):
-                    content = first_msg["content"]
-                    if isinstance(content, list) and content:
-                        content[-1] = {
-                            **content[-1],
-                            "cache_control": {"type": "ephemeral"},
-                        }
-                        cache_points_applied += 1
-            
-            # 断点 2 & 3: 从后往前找两条 user/assistant 消息
-            remaining = MAX_CACHE_POINTS - cache_points_applied
-            for i in range(len(anthropic_messages) - 1, 0, -1):
-                if remaining <= 0:
-                    break
-                msg = anthropic_messages[i]
-                if msg.get("role") in ("user", "assistant") and msg.get("content"):
-                    content = msg["content"]
-                    if isinstance(content, list) and content:
-                        already_marked = "cache_control" in content[-1]
-                        if not already_marked:
-                            content[-1] = {
-                                **content[-1],
-                                "cache_control": {"type": "ephemeral"},
-                            }
-                            remaining -= 1
-                            cache_points_applied += 1
-
+        # 非缓存路径（prompt_cache_enabled=False 或无消息）：system_blocks
+        # 退回裸块列表（无 cache_control），保持"多条 role=system 消息
+        # 各自独立"的结构不变，只是不挂缓存标记。
+        request_system_fallback = system_blocks if system_blocks else None
         request_kwargs: dict = {
             "model": current_model,
             # 缓存开启时 system 为带断点的块列表（1h TTL）；否则退回
-            # 纯字符串形态，与旧行为一致。
-            "system": request_system or (system_prompt or "You are a helpful assistant."),
+            # 不带 cache_control 的裸块列表。
+            "system": request_system or request_system_fallback or "You are a helpful assistant.",
             "messages": anthropic_messages,
             "max_tokens": max_tokens,
         }

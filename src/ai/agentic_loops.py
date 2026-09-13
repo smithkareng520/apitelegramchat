@@ -224,9 +224,11 @@ def _openrouter_extra_body(
     # Anthropic 系模型的"自动缓存"：顶层 cache_control 由网关翻译成打在
     # 最后一个可缓存块上的断点，并随对话增长自动前移。这让 agentic loop
     # 的每一轮（含 tool 结果之后的内容）都能作为缓存前缀被下一轮命中，
-    # 下一轮用户请求也能直接命中上一轮的完整前缀（含工具调用中段）。
-    # 与 _apply_cache_control 的显式断点叠加后总数不超过 Anthropic 的
-    # 4 断点上限（3 显式 + 1 自动）。
+    # 下一轮用户请求也能直接命中上一轮的完整前缀（含工具调用中段）——
+    # 这就是"断点 4"，交给自动机制处理，_apply_cache_control 不再手动
+    # 遍历消息找尾部位置打标记。与 _apply_cache_control 的 2 个显式
+    # 断点（system 段首尾，断点 1 + 断点 2）叠加后总数为 3，不超过
+    # Anthropic 的 4 断点上限（2 显式 + 1 自动，还留 1 个余量）。
     if supports_prompt_cache:
         body["cache_control"] = {"type": "ephemeral"}
     return body

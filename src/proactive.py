@@ -12,17 +12,17 @@
 
 核心规则（简单、无需复杂计算）：
 
-- 一开始就随机 5~20min 布置第一次唤醒（没有"空闲启动阈值"）；
-- timer 到点触发一次 TIMER 回合；**回合结束后**再随机 5~20min 布置下一次；
+- 一开始就随机 30~60min 布置第一次唤醒（没有"空闲启动阈值"）；
+- timer 到点触发一次 TIMER 回合；**回合结束后**再随机 30~60min 布置下一次；
 - 用户发送任何消息：先取消挂起的 timer（不提前触发），等当前 agent 回合
-  （含被打断后续上的 USER 回合）完整结束后，再随机 5~20min 布置下一次；
+  （含被打断后续上的 USER 回合）完整结束后，再随机 30~60min 布置下一次；
 - 若 2 小时内用户都没有主动发过消息：暂停 1 小时再触发，之后继续保持
-  "每 1h 看一眼"的慢节奏（用户一回来就恢复正常 5~20min）；
-- ``/clear`` 后：timer 重置为随机 5~20min 下一次。
+  "每 1h 看一眼"的慢节奏（用户一回来就恢复正常 30~60min）；
+- ``/clear`` 后：timer 重置为随机 30~60min 下一次。
 
 打断链路：用户消息打断进行中的 TIMER 回合时，先取消后台任务并经
 turn_recovery 保全已完成的进度，随后 USER 回合正常续上；该回合结束时
-再随机 5~20min 布置下一次——即"打断不影响节奏，只重算下一次"。
+再随机 30~60min 布置下一次——即"打断不影响节奏，只重算下一次"。
 
 白名单与媒体模型隔离
 ====================
@@ -38,7 +38,7 @@ turn_recovery 保全已完成的进度，随后 USER 回合正常续上；该回
 - 用户屏蔽/封禁 bot（Telegram 对该 chat 返回 403 Forbidden 类永久错误）
   时的熔断：发送层（utils 的各发送函数）识别到 403/"chat not found"
   等永久性错误后调用 ``notify_chat_unreachable``——停用该 chat 的调度
-  （取消挂起 timer/watch、移除 schedule），避免 TIMER 继续每 5~20min
+  （取消挂起 timer/watch、移除 schedule），避免 TIMER 继续每 30~60min
   空转一轮完整 LLM 回合却永远送达不了。用户解除屏蔽并再次发消息/
   点按钮时，``note_user_activity`` 会清除不可达标记并自动恢复调度
   （一次活动即视为"用户回来了"；若实际上仍被屏蔽，下一轮 403 会再次
@@ -103,9 +103,14 @@ def _env_seconds(name: str, default: int, *, minimum: int = 1) -> int:
 
 
 PROACTIVE_ENABLED = _env_flag("PROACTIVE_ENABLED", True)
-# 两次唤醒之间的随机间隔（默认 5~20min；像人一样不定期）
-PROACTIVE_INTERVAL_MIN_SECONDS = _env_seconds("PROACTIVE_INTERVAL_MIN_SECONDS", 5 * 60)
-PROACTIVE_INTERVAL_MAX_SECONDS = _env_seconds("PROACTIVE_INTERVAL_MAX_SECONDS", 20 * 60)
+# 两次唤醒之间的随机间隔（默认 30~60min；像人一样不定期）。之前是
+# 5~20min，太短——TIMER 回合会追加与 USER 回合不同的 system 说明文字
+# （见 ai_handlers.get_ai_response 的 is_timer 分支），过于频繁的唤醒
+# 等于频繁在"稳定的 system 前缀"后面插入一段易变内容，加剧断点 2
+# 的失效频率，也让 Anthropic 1h TTL 缓存条目更难撑满有效期；调大间隔
+# 后两次 TIMER 之间的时间跨度更可能覆盖 1h TTL 窗口，缓存收益更高。
+PROACTIVE_INTERVAL_MIN_SECONDS = _env_seconds("PROACTIVE_INTERVAL_MIN_SECONDS", 30 * 60)
+PROACTIVE_INTERVAL_MAX_SECONDS = _env_seconds("PROACTIVE_INTERVAL_MAX_SECONDS", 60 * 60)
 # 主动消息保护（【已废弃】：不再限制每日主动消息数，默认值改为大数=不生效；
 # 保留变量名仅为兼容旧配置/旧导入，如需限流可显式设置较小值）
 PROACTIVE_DAILY_MESSAGE_LIMIT = _env_seconds("PROACTIVE_DAILY_MESSAGE_LIMIT", 10 ** 9)
@@ -309,7 +314,7 @@ def _cancel_watcher_locked(sched: _ChatSchedule) -> None:
 
 
 def _next_delay(sched: _ChatSchedule) -> tuple[float, str]:
-    """计算下一次唤醒延迟：2h 无用户消息 → 暂停 1h；否则随机 5~20min。"""
+    """计算下一次唤醒延迟：2h 无用户消息 → 暂停 1h；否则随机 30~60min。"""
     idle = time.monotonic() - sched.last_user_message
     if idle >= PROACTIVE_MAX_IDLE_SECONDS:
         return float(PROACTIVE_REST_SECONDS), "rest"
@@ -377,7 +382,7 @@ async def _user_event_watcher(chat_id: int) -> None:
     - 会启动 agent 回合的用户消息：回合结束时由 note_turn_finished 布置，
       watcher 检测到回合在运行就直接退出（不重复布置）；
     - 纯命令 / 按钮输入（不产生回合）：观望窗口过后直接布置下一次
-      随机 5~20min——用户刚刚活动过（在线），正常节奏继续。
+      随机 30~60min——用户刚刚活动过（在线），正常节奏继续。
     """
     try:
         if await _sleep_or_stop(_PROACTIVE_WATCH_DELAY):
@@ -406,10 +411,10 @@ async def note_user_activity(chat_id: int, *, private: bool = True) -> None:
 
     - 更新"最近用户消息"时间戳（慢节奏判断依据：2h 无消息 → 暂停 1h）；
     - 取消挂起的 timer（用户发消息后不提前触发，等当前 agent 回合结束后
-      再随机 5~20min 下一次）；
+      再随机 30~60min 下一次）；
     - 启动/重启观望协程：若短暂延迟后没有 agent 回合接管（纯命令/按钮
       输入），直接布置下一次；
-    - 首次见到私聊 chat：一开始就随机 5~20min 布置第一次唤醒。
+    - 首次见到私聊 chat：一开始就随机 30~60min 布置第一次唤醒。
 
     任何授权用户消息（含命令、按钮点击）都算活动。群聊不参与主动唤醒。
     非白名单 chat 直接返回：不为它创建任何 timer，保证非授权用户永远
@@ -441,7 +446,7 @@ async def note_user_activity(chat_id: int, *, private: bool = True) -> None:
             sched = _ChatSchedule(chat_id)
             sched.last_user_message = now
             _schedules[chat_id] = sched
-            _arm_next_locked(sched)  # 一开始就随机 5~20min
+            _arm_next_locked(sched)  # 一开始就随机 30~60min
             logger.info("[proactive] chat=%s 开始跟踪用户活动（已布置第一次主动唤醒）", chat_id)
             return
         sched.last_user_message = now
@@ -468,7 +473,7 @@ async def note_turn_finished(chat_id: int) -> None:
 
 
 async def reset_proactive_timer(chat_id: int) -> None:
-    """重置该 chat 的唤醒节奏：立即布置随机 5~20min 的下一次。
+    """重置该 chat 的唤醒节奏：立即布置随机 30~60min 的下一次。
 
     供 /clear 等语义边界使用：历史清空意味着重新开始，timer 也从头计。
     """
@@ -510,7 +515,7 @@ async def notify_chat_unreachable(chat_id: int, reason: str = "") -> None:
     的熔断入口：停用该 chat 的主动唤醒调度。
 
     背景：白名单无法覆盖这一场景——用户仍在白名单里，但已把 bot 屏蔽，
-    Telegram 对该 chat 的所有发送永久 403。若不熔断，TIMER 会每 5~20min
+    Telegram 对该 chat 的所有发送永久 403。若不熔断，TIMER 会每 30~60min
     照常触发一轮完整 LLM 回合（白白消耗 token），且所有送达永远失败，
     形成无限空转循环。此处 pop 掉 schedule 后：进行中的回合照常结束，
     但 ``note_turn_finished`` 找不到 schedule，不再重排下一次；用户解除
@@ -605,7 +610,7 @@ async def _fire_turn(chat_id: int) -> None:
             if _active_flows.get(chat_id) is task:
                 _active_flows.pop(chat_id, None)
             if not interrupted and not _stop_event.is_set():
-                # 回合完整结束（含异常收尾）：随机 5~20min（或慢节奏 1h）下一次
+                # 回合完整结束（含异常收尾）：随机 30~60min（或慢节奏 1h）下一次
                 try:
                     await note_turn_finished(chat_id)
                 except Exception:

@@ -1374,24 +1374,23 @@ def _mark_last_content_block_cacheable(msg: dict, ttl: Optional[str] = None) -> 
     return False
 
 
-# 显式 cache_control 断点预算：system 消息 1 个固定 + 尾部最多 2 个动态。
-# Anthropic 单请求上限 4 个断点，剩余 1 个额度留给顶层自动缓存
-# （agentic_loops._openrouter_extra_body 的 extra_body.cache_control）。
-_CACHE_MAX_EXPLICIT_MARKS = 3
-_CACHE_TAIL_MARKS = _CACHE_MAX_EXPLICIT_MARKS - 1
+# 显式 cache_control 断点预算：只手动打 2 个，system 段的 base/extra
+# 首尾各一个（断点 1 + 断点 2，见 ai_handlers.build_system_prompt 的
+# 两段拆分）。尾部（对应"断点 4"）交给 Anthropic 的自动前缀缓存
+# （读取时按最长匹配前缀命中，不需要显式 cache_control）——不在这里
+# 遍历消息找位置手动打标记：自动机制本来就会覆盖请求末尾，手动再打
+# 一次是重复劳动，且如果手动选的位置和自动机制选的位置不一致，两套
+# 断点反而会让缓存更碎、命中率更低。4 个断点名额只用 2 个，省下的
+# 2 个不需要找别的地方用掉。
+_CACHE_MAX_EXPLICIT_MARKS = 2
 # system 断点用 1 小时 TTL：系统提示在会话内不变，是最值得长期持有的
 # 缓存资产。Telegram 对话间隔经常超过默认 5 分钟，短 TTL 会让 system
 # 段反复过期、每轮按 1.25x 重写；1h TTL 写入溢价 2x 只付一次（读取仍
-# 0.1x，且每次命中会刷新 1h 时钟），低频长会话净省。尾部断点保持默认
-# 5 分钟：尾部内容每轮都在前进，条目本来就是每轮新写入，长 TTL 无意义。
+# 0.1x，且每次命中会刷新 1h 时钟），低频长会话净省。
 # （OpenRouter：ttl 显式断点在全部 Claude 供应商（Anthropic/Bedrock/
 # Vertex）均支持；本模块只在 supports_prompt_cache=True 的 Claude 系
 # 模型上被调用，字段不会发给其他厂商。）
 _CACHE_SYSTEM_TTL = "1h"
-# 可打断点的角色：user / assistant / tool。tool（工具结果）消息的负载
-# 往往是 agentic loop 中 token 的大头，把断点打在最新的 tool 结果上，
-# loop 内 2..N 轮可以直接命中到最新工具输出为止的完整前缀。
-_CACHE_MARKABLE_ROLES = ("user", "assistant", "tool")
 
 
 def _remove_message_cache_marks(msg: dict) -> None:
@@ -1411,62 +1410,70 @@ def _remove_message_cache_marks(msg: dict) -> None:
 
 def _apply_cache_control(messages: list) -> None:
     """
-    为系统消息与尾部消息添加 cache_control 显式断点（OpenRouter 上
-    Anthropic 系模型的手动缓存标记）。显式断点总量恒定 ≤3
-    （system 1 个 + 尾部最多 2 个），与顶层自动缓存叠加后不超过
-    Anthropic 4 断点上限。
+    为 system 段的 base/extra 两段添加 cache_control 显式断点
+    （OpenRouter 上 Anthropic 系模型的手动缓存标记）。显式断点总量
+    恒定 ≤2，与 Anthropic 自动前缀缓存叠加后不超过 4 断点上限。
 
     注意：cache_control 必须打在 content block 上（见
     _mark_last_content_block_cacheable），打在消息顶层对 OpenRouter/
     OpenAI 兼容网关无效，会被静默忽略。
 
     断点策略（Anthropic 前缀缓存最佳实践）：
-      1. system 消息末尾 —— 稳定不变的巨型系统提示（含技能目录）在每一轮
-         都能命中，这是收益最大、最稳定的缓存段；打 1h TTL
-         （_CACHE_SYSTEM_TTL），避免低频对话下 5 分钟即过期重写；
-      2. 尾部倒数第二条可标记消息 —— 把上一轮的完整内容（含工具调用
-         中段与最终 assistant 回复）纳入缓存前缀。没有这个断点时，
-         下一轮请求最多命中到更早的位置，上一轮的工具链负载（往往占
-         一轮 token 的大头）全部按原价重算；
-      3. 最后一条可标记消息（本轮新 user 消息，或 loop 内最新的 tool
-         结果）—— 断点越靠后，缓存覆盖的前缀越长；agentic loop 的
-         第 2..N 轮请求（追加了 tool 结果）可以直接命中到这里。
+      1. 开头连续 system 消息中的第一条 —— 对应
+         ai_handlers.build_system_prompt 拆出的 base_segment，整个项目
+         里字节最稳定的段，不随模型能力/角色/技能目录变化，几乎每轮
+         每个模型都能命中；打 1h TTL（_CACHE_SYSTEM_TTL），避免低频
+         对话下 5 分钟即过期重写；
+      2. 开头连续 system 消息中的最后一条 —— 对应 build_system_prompt
+         的 extra_segment（技能目录/工具说明/角色 prompt/时间戳），以及
+         TIMER、静默模式在其后追加的说明性 system 消息。这段会随模型
+         是否支持工具、回合类型（USER/TIMER）、/show 开关而变化，比
+         base_segment 更易失效；单独成一个断点后，它的失效不会连累
+         断点 1——只有它自己需要重新计算，base_segment 前缀依旧命中。
+         若开头只有一条 system 消息（extra_segment 为空，或历史被截断
+         只剩一段），断点 1 与断点 2 会落在同一条消息上，是安全的
+         "退化"，不会重复计费或报错。
+         若开头连续 system 消息超过两条，中间的消息不打断点——它们仍
+         处于断点 1 与断点 2 之间，只要前后两个断点命中，中间内容
+         本就在被缓存的前缀范围内，不需要额外断点。
+
+    尾部（本轮新 user 消息、loop 内最新 tool 结果等）不在这里手动
+    打断点：这部分交给 Anthropic 的自动前缀缓存机制处理，不需要显式
+    cache_control，也不需要本函数遍历消息去找"最靠尾部的可标记消息"。
 
     幂等性与断点回收（再平衡）：本函数会被 agentic loop 的每一轮重复
-    调用（以及跨回合在共享历史副本上再次调用）。每次调用先摘除 system
-    之外的全部旧标记，再从尾部重新分配 2 个断点——与 anthropic_bridge
-    "每轮重建消息后重打断点"的语义对齐，保证：
-      - 标记总数恒定 ≤3，绝不随轮次/回合累积（否则超过 Anthropic
+    调用（以及跨回合在共享历史副本上再次调用）。每次调用先摘除开头
+    system 段之外的全部旧标记（清理历史遗留或旧版本代码打过的尾部
+    标记），保证：
+      - 标记总数恒定 ≤2，绝不随轮次/回合累积（否则超过 Anthropic
         4 断点上限会被 400 拒绝）；
-      - 断点始终打在最有利于命中的位置（尾部最新内容）；
+      - 断点始终打在最有利于命中的位置（system 首尾）；
       - 已有缓存前缀不受影响（摘除标记不改写字节，见上方说明）。
     本函数必须在"全部消息（含本轮新 user 消息）就位之后"调用，
-    供 agentic loop 的每一轮请求复用：loop 内追加的 tool 消息位于
-    断点之后，不影响断点之前的前缀命中。
+    供 agentic loop 的每一轮请求复用。
     """
     if not messages:
         return
-    # 断点 1：system 消息（幂等：每轮重打同一标记，ttl 值恒定）。
-    # 长 TTL 只给 system：尾部断点的内容每轮前进，条目每轮都是新写入，
-    # 用默认 5 分钟即可（长 TTL 的 2x 写入溢价对它们是纯浪费）。
-    if messages[0].get("role") == "system":
+    # 开头连续的 system 消息段：build_system_prompt 产出的
+    # base_segment/extra_segment，以及 TIMER/静默模式追加的说明性
+    # system 消息都紧跟在它们后面（见 ai_handlers.get_ai_response 的
+    # 组装顺序），因此"开头连续 system"这个边界就是整个 system 段的
+    # 范围，不会误吃到后面的 user/assistant 消息。
+    system_run_end = 0
+    while system_run_end < len(messages) and messages[system_run_end].get("role") == "system":
+        system_run_end += 1
+
+    # 断点 1 + 断点 2：system 段的第一条与最后一条（幂等：每轮重打同一
+    # 标记，ttl 值恒定）。两者重合时退化为一个断点，安全。
+    if system_run_end > 0:
         _mark_last_content_block_cacheable(messages[0], ttl=_CACHE_SYSTEM_TTL)
-    # 回收旧标记：system 以外的消息全部摘除后从尾部重新分配。这一步让
-    # 函数变成"每轮重打"语义——跨回合/跨轮次的旧断点不会累积超限，
-    # 也避免历史深处的陈旧断点占用尾部断点额度。
-    for msg in messages[1:]:
+        _mark_last_content_block_cacheable(messages[system_run_end - 1], ttl=_CACHE_SYSTEM_TTL)
+
+    # 回收旧标记：system 段以外的消息全部摘除，不再重新分配尾部断点。
+    # 这一步仍然需要保留——历史消息里可能残留旧版本代码打过的尾部
+    # 标记（或上一次调用本函数时打的），必须清掉，否则会跨轮次累积，
+    # 超过 Anthropic 4 断点上限会被 400 拒绝。
+    for msg in messages[system_run_end:]:
         _remove_message_cache_marks(msg)
-    # 断点 2 + 3：从最后一条消息往前找两条可标记（user/assistant/tool）
-    # 消息。最末一条覆盖"本轮新输入 / 最新 tool 结果"（loop 内多轮复用）；
-    # 再往前一条覆盖"上一轮对话末尾"（跨轮命中）。
-    remaining_markers = _CACHE_TAIL_MARKS
-    for i in range(len(messages) - 1, 0, -1):
-        if remaining_markers <= 0:
-            break
-        msg = messages[i]
-        if msg.get("role") not in _CACHE_MARKABLE_ROLES:
-            continue
-        if _mark_last_content_block_cacheable(msg):
-            remaining_markers -= 1
 
 

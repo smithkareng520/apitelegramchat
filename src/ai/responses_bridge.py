@@ -276,7 +276,7 @@ def _responses_prompt_cache_key(api_label: str, model: str, chat_id: Any) -> str
     return "tg-global"
 
 
-_RESPONSES_EXPLICIT_CACHE_MARKS = 3
+_RESPONSES_EXPLICIT_CACHE_MARKS = 2
 _RESPONSES_TTL = "30m"
 
 
@@ -286,43 +286,72 @@ def _is_responses_text_content(part: Any) -> bool:
 
 
 def _apply_responses_cache_breakpoints(input_items: list[dict]) -> int:
-    """硬编码 3 个显式断点，并保留 Responses 的第 4 个 implicit 断点。
+    """只手动打 2 个显式断点（system 段首尾），尾部交给 Responses 的
+    implicit 自动缓存（_add_responses_cache_options 里设置的
+    prompt_cache_options.mode="implicit"），不在这里遍历消息找尾部
+    位置手动打 prompt_cache_breakpoint。
 
-    复刻项目原 Anthropic 显式缓存策略的结构：
-      1) 前部 1 个固定断点：稳定锚点，优先覆盖 system/instructions 之后的
-         第一段长期不变内容；
-      2) 尾部 2 个滚动断点：贴近最近的会话内容/工具回填，支持 agentic loop
-         中连续轮次缓存最近前缀。
+    复刻项目 Anthropic 显式缓存策略的结构（与 anthropic_bridge /
+    attachment_content._apply_cache_control 三处保持同一套编号）：
+      1) 断点 1：开头连续 system/developer 消息段的第一个可用文本
+         block——对应 ai_handlers.build_system_prompt 的 base_segment，
+         字节最稳定，不随模型能力/角色/技能目录变化；
+      2) 断点 2：开头连续 system/developer 消息段的最后一个可用文本
+         block——对应 extra_segment（技能目录/工具说明/角色 prompt/
+         时间戳，以及 TIMER、静默模式追加的说明性消息）。这段更易
+         失效，单独打点后失效不连累断点 1；段内只有一条消息时与
+         断点 1 落在同一 block，安全退化。
+      3) 断点 3：不打。
+      4) 断点 4：不手动打。Responses 的 implicit 缓存模式本来就是
+         "没有显式断点时按最长匹配前缀自动命中"的默认行为，不是在
+         显式断点之外额外覆盖尾部的机制——手动去找一个尾部 block 打
+         explicit 标记既不必要，也可能和 implicit 模式的命中逻辑
+         产生冲突（同一份请求里 explicit 标记越多，implicit 能自由
+         匹配的空间越受限）。
 
-    注意：Responses API 当前的 prompt_cache_options.ttl 对整次请求统一为
-    30m，不能逐断点设置不同 TTL。因此“前长后短”只能通过断点位置复刻
-    原策略的缓存层次，不能在同一 request 内真正设置 1h + 5m + 5m。
+    注意：Responses API 当前的 prompt_cache_options.ttl 对整次请求统一
+    为 30m，不能逐断点设置不同 TTL，因此这里的"断点 1/2"只是位置上
+    复刻原策略的缓存层次，不能像 Anthropic 原生请求那样对断点 1/2
+    单独设置 1h。
     返回实际添加的显式断点数。
     """
-    candidates: list[tuple[int, int]] = []
-    for item_index, item in enumerate(input_items):
-        if not isinstance(item, dict):
-            continue
-        content = item.get("content")
-        if not isinstance(content, list):
-            continue
-        for part_index, part in enumerate(content):
-            if _is_responses_text_content(part):
-                candidates.append((item_index, part_index))
-
-    if not candidates:
-        return 0
-
-    # 第一处：固定在最前面的可用文本 block。
-    selected: list[tuple[int, int]] = [candidates[0]]
-
-    # 最后两处：从尾部向前取，避免与第一处重复。
-    for candidate in reversed(candidates):
-        if candidate in selected:
-            continue
-        selected.append(candidate)
-        if len(selected) >= _RESPONSES_EXPLICIT_CACHE_MARKS:
+    # 开头连续的 system/developer 消息段：Responses 用 role in
+    # ("system", "developer") 表达系统级指令，build_system_prompt 的
+    # 两段以及 TIMER/静默模式追加的说明性消息都在这个开头连续段内。
+    system_run_end = 0
+    while system_run_end < len(input_items):
+        item = input_items[system_run_end]
+        if not isinstance(item, dict) or item.get("role") not in ("system", "developer"):
             break
+        system_run_end += 1
+
+    def _first_text_candidate(start: int, stop: int, *, reverse: bool) -> tuple[int, int] | None:
+        rng = range(stop - 1, start - 1, -1) if reverse else range(start, stop)
+        for item_index in rng:
+            item = input_items[item_index]
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            part_rng = range(len(content) - 1, -1, -1) if reverse else range(len(content))
+            for part_index in part_rng:
+                if _is_responses_text_content(content[part_index]):
+                    return (item_index, part_index)
+        return None
+
+    selected: list[tuple[int, int]] = []
+
+    # 断点 1：system 段第一个可用文本 block。
+    first_system = _first_text_candidate(0, system_run_end, reverse=False)
+    if first_system:
+        selected.append(first_system)
+
+    # 断点 2：system 段最后一个可用文本 block（与断点 1 相同时去重，
+    # 退化为一个断点）。
+    last_system = _first_text_candidate(0, system_run_end, reverse=True)
+    if last_system and last_system not in selected:
+        selected.append(last_system)
 
     for item_index, part_index in selected:
         input_items[item_index]["content"][part_index]["prompt_cache_breakpoint"] = {"mode": "explicit"}
@@ -338,18 +367,23 @@ def _add_responses_cache_options(
     chat_id: Any,
     enabled: bool = True,
 ) -> None:
-    """注入稳定 key 和自动缓存；按开关可附加最多 3 个显式断点。
+    """注入稳定 key 和自动缓存；按开关可附加最多 2 个显式断点（system
+    段首尾，见 _apply_responses_cache_breakpoints）。
 
-    默认模式只发送 ``mode=implicit``，兼容只支持自动缓存的中转。
-    显式模式仍保持 ``implicit + 3 explicit`` 的原策略。
+    默认模式只发送 ``mode=implicit``，兼容只支持自动缓存的中转；
+    implicit 模式本身也是尾部内容的缓存机制，不需要额外的显式尾部
+    断点。显式模式在此基础上叠加最多 2 个 explicit breakpoint（只打在
+    system 段），implicit 继续覆盖尾部——不是"implicit + explicit
+    分别覆盖不同范围"，而是 explicit 断点精确锁定 system 段的两个
+    稳定/半稳定边界，implicit 兜底其余部分的最长前缀匹配。
     """
     if not enabled:
         return
     request_kwargs["prompt_cache_key"] = _responses_prompt_cache_key(
         api_label, model, chat_id
     )
-    # 默认保留 1 个 implicit 自动断点；若开关打开，调用方会另外写入最多 3 个
-    # explicit breakpoint，使总缓存层级为：自动 1 + 手动最多 3。
+    # 默认保留 implicit 自动断点；若开关打开，调用方会另外写入最多 2 个
+    # explicit breakpoint（system 段首尾）。
     # ttl 当前只有 30m 这一档，不能逐 breakpoint 区分长短。
     request_kwargs["prompt_cache_options"] = {
         "mode": "implicit",
