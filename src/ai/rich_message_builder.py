@@ -1840,36 +1840,71 @@ class RichMessageBuilder:
             self._flush_task = asyncio.create_task(self._stream_flush_loop())
 
     async def stop_flush_loop(self) -> None:
-        """停止并限时等待草稿刷新子任务；回合边界滚动不再存在后台任务。
+        """停止并排空草稿刷新子任务；回合边界滚动不再存在后台任务。
 
         本方法是该 builder 推流生命周期的终点（正常收尾与打断取消均经
         此处）：顺手清掉打断冻结登记，避免集合无限增长。固化路径
         （finalize_interrupted_draft → send_rich_html_message）不是草稿
         帧、不受冻结门约束，清理时机不影响固化送达。
         """
+        # 不能直接 cancel 正在 ``sendRichMessageDraft`` 的 task。
+        #
+        # 请求一旦已经写入 socket，取消本地 coroutine 并不能撤回 Telegram
+        # 服务端可能已经接收的草稿帧；若在 ``await send_rich_message_draft``
+        # 返回前取消，_advance_render_cursor() 没有机会记账。随后打断固化
+        # 会把客户端已经看到的尾巴误判为“未送达”而裁掉。先停止生产新的
+        # flush，再让已起飞的单帧自然完成，才能让游标、历史和永久消息以
+        # 同一个 Telegram 确认边界收束。
         self._stop_flush = True
         self._rollover_pending = False
         self._restore_handoff_text()
-        _FROZEN_DRAFTS.discard(self.draft_id)
 
         pending: list[tuple[str, asyncio.Task]] = []
+        handed_off: list[asyncio.Task] = []
         for attr in ("_flush_task", "_pending_flush_task"):
             task = getattr(self, attr, None)
             if task is not None and not task.done():
-                task.cancel()
                 pending.append((attr, task))
-            setattr(self, attr, None)
 
         for attr, task in pending:
             try:
-                await asyncio.wait_for(task, timeout=0.5)
+                # shield 防止本轮被取消时把已发出的 HTTP 请求也取消。超时
+                # 后 task 继续在后台完成；它不会再发新帧（_stop_flush 已置
+                # 位），只会完成当前帧并推进已确认的渲染游标。
+                await asyncio.wait_for(asyncio.shield(task), timeout=5.5)
             except asyncio.CancelledError:
-                pass
+                # 外层在等待旧轮次时再次取消也不得波及在途发送；保留 task
+                # 让其自行收束，随后把取消继续向上传播。
+                raise
             except asyncio.TimeoutError:
-                logger.debug("%s 未在 0.5s 内停止，转入后台清理: draft_id=%s", attr, self.draft_id)
+                logger.debug("%s 未在 5.5s 内停止，转入后台清理: draft_id=%s", attr, self.draft_id)
                 asyncio.create_task(_swallow_flush_task(task, attr, self.draft_id))
+                handed_off.append(task)
             except Exception as exc:
                 logger.debug("%s 停止时出现异常（可忽略）: %s", attr, exc)
+            finally:
+                if task.done():
+                    setattr(self, attr, None)
+
+        if not handed_off:
+            # 所有已起飞的刷新均已确认结束，安全解除本轮的冻结登记。
+            _FROZEN_DRAFTS.discard(self.draft_id)
+            return
+
+        # 超时转交后台的 task 可能已通过 flush 的外层冻结检查、正等待
+        # _flush_lock。此刻若解除冻结，它会在旧轮已交给新轮之后补发一帧。
+        # 因而冻结必须持有到这些任务真正结束；_stop_flush 阻止其循环产生
+        # 新任务，冻结门则阻止已排队 flush 在拿到锁后落地。
+        draft_id = self.draft_id
+
+        async def _release_freeze_when_drained() -> None:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in handed_off),
+                return_exceptions=True,
+            )
+            _FROZEN_DRAFTS.discard(draft_id)
+
+        asyncio.create_task(_release_freeze_when_drained())
 
 
 class SilentMessageBuilder(RichMessageBuilder):
@@ -1942,5 +1977,3 @@ class SilentMessageBuilder(RichMessageBuilder):
         # 不注册活跃草稿：打断逻辑（mark_draft_dead / clear_active_draft）
         # 与新用户回合的草稿占位都与之无关。
         return
-
-

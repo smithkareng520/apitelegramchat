@@ -644,15 +644,15 @@ async def _cancel_old_task(chat_id: int) -> None:
         task = active_tasks.pop(chat_id, None)
     if task is not None and not task.done():
         task.cancel()
-        # 给旧任务足够的退出窗口：它的 finally 里会 await 草稿刷新循环
-        # （含所有在途的刷新请求）真正停止后才返回。这里的超时必须
-        # 大于 RichMessageBuilder.stop_flush_loop() 内部的等待时间，
-        # 否则我们会在旧的刷新请求还没落地前就抢先发送新消息，导致
-        # 旧草稿的刷新“迟到”出现在新消息之后（显示错乱）。
+        # 给旧任务足够的退出窗口：它的 finally 会排空已起飞的草稿请求，
+        # 让 Telegram 成功确认的最后一帧先推进渲染游标，再固化与写历史。
+        # 此值必须略大于 RichMessageBuilder.stop_flush_loop() 的 5.5s
+        # 排空窗口；否则外层二次取消会重新制造“客户端已见、游标未记账”
+        # 的竞态。
         try:
-            await asyncio.wait_for(task, timeout=3.0)
+            await asyncio.wait_for(task, timeout=6.0)
         except asyncio.TimeoutError:
-            logger.warning(f"旧任务取消超时（>3s）: chat_id={chat_id}，转入后台等待其结束")
+            logger.warning(f"旧任务取消超时（>6s）: chat_id={chat_id}，转入后台等待其结束")
             asyncio.create_task(_log_task_cancel(task, chat_id))
         except asyncio.CancelledError:
             pass
@@ -1083,4 +1083,3 @@ async def spawn_turn_task(
         active_tasks[chat_id] = task
     task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
     return task
-

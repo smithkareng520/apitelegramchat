@@ -1216,6 +1216,46 @@ async def test_freeze_draft_streaming_gates_flush_and_clears_on_stop(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_stop_flush_drains_inflight_delivery_before_interrupt_finalize(monkeypatch):
+    """已发往 Telegram、但尚未返回的帧不能因打断被漏记到渲染游标。
+
+    这是线上“草稿已见 400 字、固定消息少几十字”的回归：取消发生在
+    HTTP 请求飞行中时，stop_flush_loop 必须排空该请求，而非取消它。
+    """
+    b = RichMessageBuilder(1)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_draft_send(chat_id, draft_id, html, force=False):
+        started.set()
+        await release.wait()
+        return 123
+
+    monkeypatch.setattr(
+        "ai.rich_message_builder.send_rich_message_draft", delayed_draft_send)
+
+    b.begin_stream_text()
+    b.append_stream_delta("Telegram 已接收的尾段")
+    b.end_stream()
+    inflight = asyncio.create_task(b.flush(force=True))
+    await started.wait()
+
+    freeze_draft_streaming(b.draft_id)
+    stopping = asyncio.create_task(b.stop_flush_loop())
+    await asyncio.sleep(0)
+    assert not inflight.done()  # 修复前：stop_flush_loop 会取消这条请求。
+
+    release.set()
+    await stopping
+    await inflight
+    assert b._render_confirmed_chars == len("Telegram 已接收的尾段")
+
+    # 固化不再把客户端已经看到的尾段裁掉。
+    assert b._truncate_unrendered_backlog() == 0
+    assert b.blocks == ["Telegram 已接收的尾段"]
+
+
+@pytest.mark.asyncio
 async def test_freeze_draft_streaming_ignores_none():
     """freeze(None)（无活跃草稿）为安全 no-op。"""
     freeze_draft_streaming(None)
