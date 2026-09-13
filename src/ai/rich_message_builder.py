@@ -41,6 +41,25 @@ from markdown_converter import (
 
 logger = get_logger(__name__)
 
+# ---------- 打断即时冻结（"实际发送到草稿的那里截断"） ----------
+# 打断入口（app_turns._interrupt_active_generation）在取消旧任务**之前**
+# 把当前活跃草稿加进本集合：从这一刻起，该草稿禁止再推送任何新帧。
+# 旧任务的取消信号传播到 stop_flush_loop 存在事件循环窗口，期间后台
+# 刷新循环的 0.1s tick 仍可能把"后端超前生成、尚未送达"的积压文本整帧
+# 倒给用户（用户体感：按了停止，草稿却又刷出一段）。冻结门在 flush 的
+# 入口与锁内各设一道同步检查点，杜绝这一窗口期的任何新帧；已在途的
+# 发送不中断（送达即用户所见，交由游标口径吸收）。条目在
+# stop_flush_loop（该 builder 的推流生命周期终点）统一清理。
+_FROZEN_DRAFTS: set = set()
+
+
+def freeze_draft_streaming(draft_id: object) -> None:
+    """打断入口先行冻结：该草稿自此不再推送任何新帧（在途请求除外）。"""
+    if draft_id is None:
+        return
+    _FROZEN_DRAFTS.add(draft_id)
+    logger.info("[打断冻结] 草稿推送已冻结（以实际送达为截断基准）: draft=%s", draft_id)
+
 # ---------- Telegram Rich Message 草稿滚动 ----------
 # 内部内容预算一律按 tiktoken 计算。Telegram 仍有 32,768 个解析后 Unicode
 # 字符的协议上限；该值仅作为最终的传输安全边界，并非内容预算。
@@ -423,9 +442,13 @@ class RichMessageBuilder:
                 ):
                     self.request_flush(force=self._force_flush_requested)
 
+        runner = _runner()
         try:
-            self._pending_flush_task = asyncio.create_task(_runner())
+            self._pending_flush_task = asyncio.create_task(runner)
         except RuntimeError:
+            # 无运行中的事件循环（同步上下文/测试直调）：显式关闭协程，
+            # 避免 "coroutine was never awaited" 资源告警。
+            runner.close()
             self._pending_flush_task = None
 
     # ---------- 工具组管理 ----------
@@ -628,6 +651,11 @@ class RichMessageBuilder:
                 return
 
     def append_to_current_tool_group_text(self, text: str) -> None:
+        # 可见文本计数：工具组旁白同样会发给用户（折叠块内的说明文字），
+        # 与 journal 里 content_acc 的口径一致——不计数会挤压后续直播占位
+        # 的截断预算，把用户已看到的流式文本多裁掉（历史层过度裁剪）。
+        if text:
+            self._visible_text_chars_total += len(text)
         if self._handoff_text is not None:
             self._handoff_text.append(text)
             return
@@ -1077,6 +1105,101 @@ class RichMessageBuilder:
         """
         return self._render_cursor_box
 
+    def _truncate_unrendered_backlog(self) -> int:
+        """打断收尾：把"后端超前生成、尚未送达草稿"的文本积压物理裁掉。
+
+        数据保留基准（修订版）：文本以**实际送达草稿的帧**为准。渲染确认
+        游标（_render_confirmed_chars，最后一次成功送达 / 永久化时刻的回合
+        累计可见字符数）就是用户所见边界；积压 =
+        _visible_text_chars_total - _render_confirmed_chars。打断后的固化
+        消息**不得多于用户已见**：积压从显示序列尾部裁掉（送达是前缀单调
+        的，未送达内容必然集中在末端），固化消息、冻结草稿、历史记录三
+        者对齐同一游标。返回实际裁掉的字符数。
+
+        覆盖面：文本块（流式 text / add_text）与工具组旁白
+        （text_content，同样计入游标）按显示顺序从尾回裁；在途
+        _stream_buffer 先行裁掉。思考流不计入游标、不裁（固化视图保留
+        已送达的思考折叠块，历史层由 trim_interrupted_stream 另行全量
+        丢弃）。静默回合（box=None，无渲染基准）不裁剪。
+
+        过度裁剪防御：游标口径漂移（如 replace_trailing_text 撤回已计数
+        文本）会使积压大于当前草稿可裁文本。此时**整体不裁**并落
+        WARNING——无法计算正确边界时，多保留一点未送达尾巴的危害远
+        小于裁掉已送达内容（后者正是本机制要根治的 bug 类）：宁可多
+        保留，绝不多裁。
+        """
+        if self._render_cursor_box is None:
+            return 0
+        backlog = self._visible_text_chars_total - self._render_confirmed_chars
+        if backlog <= 0:
+            return 0
+        # 预扫描：当前草稿内游标口径的可裁文本总量（文本块 + 工具组旁白
+        # + 在途文本缓冲）。积压 ≤ 可裁量为正常关系（送达前缀单调）；
+        # 超限即口径漂移 → 整体不裁，绝不裁掉已送达内容。
+        available = 0
+        if self._stream_buffer and self._current_stream_kind == "text":
+            available += len(self._stream_buffer)
+        for i, b_type in enumerate(self.block_types):
+            if b_type == "text":
+                available += len(self.blocks[i])
+        for group in self._tool_groups:
+            available += len(group.get("text_content", ""))
+        if backlog > available:
+            logger.warning(
+                "[打断收尾] 未送达积压 %s 字符大于当前草稿可裁文本 %s 字符"
+                "（游标口径漂移，整体不裁，绝不多裁已送达内容）: chat=%s draft=%s",
+                backlog, available, self.chat_id, self.draft_id,
+            )
+            return 0
+        remaining = backlog
+        # 1) 在途流式缓冲（仅文本流计入游标；思考缓冲不裁）。
+        if self._stream_buffer and self._current_stream_kind == "text":
+            cut = min(remaining, len(self._stream_buffer))
+            self._stream_buffer = self._stream_buffer[: len(self._stream_buffer) - cut]
+            remaining -= cut
+        # 2) 文本块与工具组旁白按显示顺序从尾部回裁：_build_html 顺序消费
+        #    blocks，tool_group 占位与 _tool_groups 按序一一对应，逆序配对。
+        group_idx = len(self._tool_groups)
+        for i in range(len(self.blocks) - 1, -1, -1):
+            if remaining <= 0:
+                break
+            b_type = self.block_types[i]
+            if b_type == "tool_group":
+                group_idx -= 1
+                if 0 <= group_idx < len(self._tool_groups):
+                    narration = self._tool_groups[group_idx].get("text_content", "")
+                    cut = min(remaining, len(narration))
+                    if cut > 0:
+                        self._tool_groups[group_idx]["text_content"] = narration[: len(narration) - cut]
+                        remaining -= cut
+                continue
+            if b_type != "text":
+                continue
+            block = self.blocks[i]
+            cut = min(remaining, len(block))
+            new_block = block[: len(block) - cut]
+            if new_block:
+                self.blocks[i] = new_block
+            else:
+                del self.blocks[i]
+                del self.block_types[i]
+                if self._stream_text_index == i:
+                    self._stream_text_index = -1
+                elif self._stream_text_index > i:
+                    self._stream_text_index -= 1
+            remaining -= cut
+        trimmed = backlog - remaining
+        # 计数对齐：裁剪后累计可见文本 == 渲染确认游标（固化消息、冻结
+        # 草稿、历史裁剪三者共用同一基准）。预扫描度已保证 remaining == 0。
+        self._visible_text_chars_total = self._render_confirmed_chars
+        if trimmed > 0:
+            logger.info(
+                "[打断收尾] 固化消息按送达游标裁掉未渲染积压 %s 字符"
+                "（用户未看到的不出现在固化消息里）: chat=%s draft=%s",
+                trimmed, self.chat_id, self.draft_id,
+            )
+        return trimmed
+
     def end_stream(self) -> str:
         self._commit_stream_buffer()
         if self._stream_text_index >= 0 and self._stream_text_index < len(self.blocks):
@@ -1493,8 +1616,10 @@ class RichMessageBuilder:
 
         与正常收尾的最终交付、回合边界滚动永久化**同源同法**：
         - 内容构建：``_commit_stream_buffer`` + ``remove_thinking`` +
-          ``_build_html_no_thinking``（与 get_ai_response 正常路径同一套，
-          打断时的部分流式文本也随之固定，不因截断而丢弃可见进度）；
+          ``_truncate_unrendered_backlog`` + ``_build_html_no_thinking``
+          （与 get_ai_response 正常路径同一套，但额外按渲染确认游标把
+          未送达草稿的积压文本裁掉——固化内容严格等于用户实际所见，
+          不是后端已生成的全量）；
         - 交付通道：``send_rich_html_message``（``reassert_draft=False``，
           本轮流式已结束，不再把旧草稿回挂到新消息下方）；
         - 清理语义：送达成功才删除瞬态草稿气泡；失败则保留冻结草稿，
@@ -1524,6 +1649,13 @@ class RichMessageBuilder:
         self._restore_handoff_text()
         self._commit_stream_buffer()
         self.remove_thinking()
+        # "实际发送到草稿的那里截断"（数据保留基准修订版）：固化消息
+        # 不得多于用户已见——后端超前生成、尚未送达草稿的积压文本在
+        # 固化前物理裁掉（修复：打断后固化路径把整段积压“倒”给用户，
+        # 草稿仿佛又刷新了一段才停）。固化消息、冻结草稿、历史记录
+        # （turn_recovery.trim_interrupted_stream 同游标裁剪）三者对齐
+        # 同一送达边界。
+        self._truncate_unrendered_backlog()
         final_html = self._build_html_no_thinking()
         if not final_html.strip() or not _rich_visible_text(final_html).strip():
             # 打断发生在任何可见内容产出之前：无可固定内容。
@@ -1578,6 +1710,11 @@ class RichMessageBuilder:
 
     # ---------- 刷新与清理 ----------
     async def flush(self, force: bool = False) -> None:
+        # 冻结门（入口检查点）：打断入口已冻结本草稿 → 不再推送任何新帧。
+        # 同步检查、零 await，与打断方 freeze_draft_streaming 之间不存在
+        # 取消窗口。已在途的发送不在此处中断（送达即用户所见）。
+        if self.draft_id in _FROZEN_DRAFTS:
+            return
         now = time.monotonic()
         if now < self._rate_limited_until:
             logger.debug(
@@ -1590,6 +1727,9 @@ class RichMessageBuilder:
         # 内容会重新构建、下面还要再扫一次。热路径上每帧多一次 O(全文)
         # 的同步 CPU 工作，直接叠加到事件循环 lag 上。改为只在锁内做一次。
         async with self._flush_lock:
+            # 冻结门（锁内第二道检查点）：等锁期间可能恰逢打断冻结。
+            if self.draft_id in _FROZEN_DRAFTS:
+                return
             now = time.monotonic()
             if now < self._rate_limited_until:
                 return
@@ -1700,10 +1840,17 @@ class RichMessageBuilder:
             self._flush_task = asyncio.create_task(self._stream_flush_loop())
 
     async def stop_flush_loop(self) -> None:
-        """停止并限时等待草稿刷新子任务；回合边界滚动不再存在后台任务。"""
+        """停止并限时等待草稿刷新子任务；回合边界滚动不再存在后台任务。
+
+        本方法是该 builder 推流生命周期的终点（正常收尾与打断取消均经
+        此处）：顺手清掉打断冻结登记，避免集合无限增长。固化路径
+        （finalize_interrupted_draft → send_rich_html_message）不是草稿
+        帧、不受冻结门约束，清理时机不影响固化送达。
+        """
         self._stop_flush = True
         self._rollover_pending = False
         self._restore_handoff_text()
+        _FROZEN_DRAFTS.discard(self.draft_id)
 
         pending: list[tuple[str, asyncio.Task]] = []
         for attr in ("_flush_task", "_pending_flush_task"):

@@ -1062,3 +1062,273 @@ async def test_interrupt_read_tool_stays_aborted_no_writeback(_isolate, monkeypa
     # 只读工具无脱离任务注册（沉没成本只有流量，掐断即结束）。
     from ai.tool_call_loop import _DETACHED_TASKS
     assert not _DETACHED_TASKS
+
+
+# ===========================================================================
+# v3 修订（2026-09-13 实测反馈）：以"实际发送到草稿"为截断基准
+#
+# 实测 bug：打断信号发出后，草稿有时还会再刷新一段文本才停。根因：
+#   1. finalize_interrupted_draft 固化时发送的是全量后端缓冲——未送达
+#      草稿的积压文本被一次性"倒"给用户（固化消息 > 用户已见）；
+#   2. 打断信号传播到 stop_flush_loop 之间存在事件循环窗口，刷新 tick
+#      仍可能推出积压帧。
+# 修复语义：
+#   - 固化消息 == 冻结草稿最后一帧 == 历史记录（三层同一条送达边界）；
+#   - 打断入口先行冻结草稿推送（freeze_draft_streaming）；
+#   - 游标入账完整（工具组旁白同样计入可见文本）。
+# ===========================================================================
+from ai.rich_message_builder import (  # noqa: E402
+    RichMessageBuilder,
+    _FROZEN_DRAFTS,
+    _rich_visible_text,
+    freeze_draft_streaming,
+)
+from ai.draft_manager import DraftManager  # noqa: E402
+
+
+def test_tool_group_narration_counts_into_visible_total():
+    """游标入账完整性：工具组旁白（折叠块内可见文字）计入累计可见文本。
+
+    不计数会挤压后续直播占位的截断预算（历史层 budget = 游标 - 前文
+    合计，而前文 assistant 文本含旁白）→ 把用户已看到的流式文本多裁掉。
+    """
+    b = RichMessageBuilder(1)
+    assert b._visible_text_chars_total == 0
+    b.start_new_tool_group()
+    b.append_to_current_tool_group_text("先搜索再总结")
+    assert b._visible_text_chars_total == len("先搜索再总结")
+    b.append_to_current_tool_group_text("。")
+    assert b._visible_text_chars_total == len("先搜索再总结。")
+
+
+def test_truncate_backlog_text_tail():
+    """裁剪主路径：文本积压从尾部精确裁到送达游标。"""
+    b = RichMessageBuilder(1)
+    b.begin_stream_text()
+    b.append_stream_delta("A" * 100)
+    b.end_stream()
+    b._advance_render_cursor(60)  # 用户只看到前 60 字符（最后一帧送达边界）
+    trimmed = b._truncate_unrendered_backlog()
+    assert trimmed == 40
+    assert b.blocks == ["A" * 60]
+    assert b._visible_text_chars_total == 60 == b._render_confirmed_chars
+
+
+def test_truncate_backlog_spans_tool_group_narration():
+    """裁剪跨层：积压横跨"末段文本 + 工具组旁白尾部"时按显示顺序回裁。"""
+    b = RichMessageBuilder(1)
+    b.begin_stream_text()
+    b.append_stream_delta("正文一")
+    b.end_stream()
+    b.start_new_tool_group()
+    b.append_to_current_tool_group_text("工具旁白")
+    b.finish_group(0)
+    b.begin_stream_text()
+    b.append_stream_delta("正文二")
+    b.end_stream()
+    # total = 3 + 4 + 3 = 10；送达游标 6（正文一 + 旁白前 3 字）
+    b._advance_render_cursor(6)
+    trimmed = b._truncate_unrendered_backlog()
+    assert trimmed == 4  # 尾部：正文二(3) + 旁白尾(1)
+    assert b.blocks[0] == "正文一"
+    assert b._tool_groups[0]["text_content"] == "工具旁"
+    text_all = "".join(
+        blk for t, blk in zip(b.block_types, b.blocks) if t == "text"
+    )
+    assert text_all == "正文一"
+    assert b._visible_text_chars_total == 6
+
+
+def test_truncate_backlog_inflight_stream_buffer():
+    """裁剪覆盖在途流式缓冲（打断落在流式中、缓冲未提交时）。"""
+    b = RichMessageBuilder(1)
+    b.begin_stream_text()
+    b.append_stream_delta("已送达前段")
+    b._advance_render_cursor(len("已送达前段"))
+    b.append_stream_delta("积压尾巴")
+    trimmed = b._truncate_unrendered_backlog()
+    assert trimmed == len("积压尾巴")
+    assert b._stream_buffer == "已送达前段"
+
+
+def test_truncate_backlog_silent_builder_noop():
+    """静默回合无渲染基准（box=None）→ 不裁剪，保全后端全量。"""
+    b = RichMessageBuilder(1)
+    b.begin_stream_text()
+    b.append_stream_delta("静默回合不应被裁")
+    b.end_stream()
+    b._render_cursor_box = None
+    assert b._truncate_unrendered_backlog() == 0
+    assert b.blocks == ["静默回合不应被裁"]
+
+
+def test_truncate_backlog_over_trim_guard(caplog):
+    """过度裁剪防御：积压大于可裁文本（口径漂移）→ 整体不裁 + WARNING。"""
+    b = RichMessageBuilder(1)
+    b.begin_stream_text()
+    b.append_stream_delta("A" * 30)
+    b.end_stream()
+    b._advance_render_cursor(10)
+    b._visible_text_chars_total = 100  # 模拟口径漂移（积压 90 > 可裁 30）
+    with caplog.at_level("WARNING", logger="ai.rich_message_builder"):
+        trimmed = b._truncate_unrendered_backlog()
+    assert trimmed == 0
+    assert b.blocks == ["A" * 30]  # 绝不裁掉已送达内容
+    assert "整体不裁" in caplog.text
+
+
+def test_truncate_backlog_no_backlog_noop():
+    """无积压（全部送达）→ 裁剪为 no-op（正常结束语义不受影响）。"""
+    b = RichMessageBuilder(1)
+    b.begin_stream_text()
+    b.append_stream_delta("全部送达")
+    b.end_stream()
+    b._advance_render_cursor(len("全部送达"))
+    assert b._truncate_unrendered_backlog() == 0
+    assert b.blocks == ["全部送达"]
+
+
+@pytest.mark.asyncio
+async def test_freeze_draft_streaming_gates_flush_and_clears_on_stop(monkeypatch):
+    """冻结门：打断入口冻结后 flush 不再推送任何新帧；stop 时清理登记。"""
+    b = RichMessageBuilder(1)
+    sent: list[str] = []
+
+    async def fake_draft_send(chat_id, draft_id, html, force=False):
+        sent.append(html)
+        return 0
+
+    monkeypatch.setattr(
+        "ai.rich_message_builder.send_rich_message_draft", fake_draft_send)
+
+    b.begin_stream_text()
+    b.append_stream_delta("hello")
+
+    freeze_draft_streaming(b.draft_id)
+    assert b.draft_id in _FROZEN_DRAFTS
+    await b.flush(force=True)
+    assert sent == []  # 冻结门：不推送任何新帧
+
+    await b.stop_flush_loop()  # 推流生命周期终点 → 清理冻结登记
+    assert b.draft_id not in _FROZEN_DRAFTS
+    await b.flush(force=True)
+    assert sent and "hello" in sent[0]  # 解冻后恢复推送
+
+
+@pytest.mark.asyncio
+async def test_freeze_draft_streaming_ignores_none():
+    """freeze(None)（无活跃草稿）为安全 no-op。"""
+    freeze_draft_streaming(None)
+    assert all(v is not None for v in _FROZEN_DRAFTS)
+
+
+@pytest.mark.asyncio
+async def test_finalize_interrupted_draft_clamps_to_delivered_cursor(monkeypatch):
+    """打断固化 = 用户实际所见：固化消息不含未送达草稿的积压文本。"""
+    b = RichMessageBuilder(1)
+    sent: list[str] = []
+
+    async def fake_send(chat_id, html, reassert_draft=True):
+        sent.append(html)
+        return True
+
+    async def fake_dead(draft_id):
+        return False
+
+    async def fake_delete(chat_id, msg_id):
+        return True
+
+    monkeypatch.setattr("ai.rich_message_builder.send_rich_html_message", fake_send)
+    monkeypatch.setattr("ai.rich_message_builder.is_draft_dead", fake_dead)
+    monkeypatch.setattr("ai.rich_message_builder.delete_message_fast", fake_delete)
+
+    b.begin_stream_text()
+    b.append_stream_delta("用户看到的部分" + "用户没看到的积压")
+    b.end_stream()
+    b._advance_render_cursor(len("用户看到的部分"))
+
+    ok = await b.finalize_interrupted_draft(journal=None)
+    assert ok
+    assert len(sent) == 1
+    visible = _rich_visible_text(sent[0])
+    assert "用户看到的部分" in visible
+    assert "积压" not in visible  # 修复前：全量缓冲被"倒"给用户
+
+
+@pytest.mark.asyncio
+async def test_interrupt_three_layers_align_on_delivered_cursor(
+        _isolate, monkeypatch):
+    """三层同基准集成：固化消息 == 冻结草稿边界 == 历史记录（同一游标）。
+
+    真实 DraftManager + RichMessageBuilder 走 openai_compat 流式循环，
+    打断于流式中途（用户只见 "1, "）：固化消息与历史记录都必须是
+    "1, "，且打断后不再有任何草稿帧推送（冻结门）。
+    """
+    chat_id = _isolate(_next_chat_id())
+    history = get_or_init_context(chat_id).setdefault("conversation_history", [])
+    await persist_user_message_entry(chat_id, {"role": "user", "content": "数到100"})
+
+    frames: list[str] = []
+
+    async def fake_draft_send(chat_id_, draft_id_, html, force=False):
+        raise RuntimeError("offline: draft channel disabled")  # 不推进游标
+
+    async def fake_send(chat_id_, html, reassert_draft=True):
+        frames.append(html)
+        return True
+
+    async def fake_dead(draft_id_):
+        return False
+
+    async def fake_delete(chat_id_, msg_id_):
+        return True
+
+    monkeypatch.setattr(
+        "ai.rich_message_builder.send_rich_message_draft", fake_draft_send)
+    monkeypatch.setattr("ai.rich_message_builder.send_rich_html_message", fake_send)
+    monkeypatch.setattr("ai.rich_message_builder.is_draft_dead", fake_dead)
+    monkeypatch.setattr("ai.rich_message_builder.delete_message_fast", fake_delete)
+
+    builder = DraftManager(RichMessageBuilder(chat_id))
+    stream = FakeStream(
+        [_text_chunk("1, "), _text_chunk("2, "), _text_chunk("3, ")],
+        hang=True,
+    )
+    client = FakeClient(lambda i: stream)
+    journal: list = []
+
+    async def turn():
+        await register_inflight_turn(chat_id, journal, event_source="USER")
+        attach_render_cursor(chat_id, journal, builder.render_cursor_box)
+        return await _agentic_loop_openai_compat(
+            client, TEST_MODEL, [Message.user_text("请从 1 数到 100")],
+            "test", builder, tools=[], journal=journal,
+        )
+
+    task = asyncio.create_task(turn())
+    await stream.hanging.wait()
+    # 打断时刻：用户只看到 "1, "（3 字符）——最后一帧成功送达的边界。
+    builder._advance_render_cursor(3)
+    # 打断入口先行冻结（真实顺序：冻结 → 取消 → 收尾固化 → 历史保全）。
+    freeze_draft_streaming(builder.draft_id)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await builder.stop_flush_loop()
+
+    # 可见层：固化消息 = 用户实际所见，绝不含积压（"2, 3" 不得出现）。
+    ok = await builder.finalize_interrupted_draft(journal=journal)
+    assert ok
+    assert len(frames) == 1
+    assert "2, 3" not in frames[0]
+    visible = _rich_visible_text(frames[0]).strip()
+
+    # 历史层：同一游标裁剪（trim 预算 = 游标 3 - 前文 0）。
+    await finalize_interrupted_turn(chat_id, reason="user-interrupt")
+    preserved = history[-1]
+    assert preserved.role == "assistant"
+
+    # 三层同基准：固化消息 == 历史记录 == "1, "。
+    assert visible == "1,"
+    assert preserved.text() == "1, "
+    assert visible.rstrip(", ") == preserved.text().rstrip(", ")

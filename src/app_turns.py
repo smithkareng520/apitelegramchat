@@ -18,6 +18,7 @@ from utils import (
     extract_message_text,
 )
 from ai_handlers import get_ai_response
+from ai.rich_message_builder import freeze_draft_streaming
 from config import SUPPORTED_MODELS, is_admin_identity, is_whitelisted_identity
 from state import (
     user_contexts,
@@ -121,6 +122,17 @@ async def _interrupt_active_generation(chat_id: int) -> None:
     except Exception:
         logger.debug("_interrupt_active_generation 内部忽略的异常", exc_info=True)
         draft_info = None
+
+    # 0.2) 【即时冻结】在取消旧任务**之前**把草稿推送冻结（
+    #    "实际发送到草稿的那里截断"）：打断信号从 task.cancel() 传播到
+    #    旧任务内部的 stop_flush_loop 存在事件循环窗口，期间后台刷新循环
+    #    的 0.1s tick 仍可能把未送达的积压文本整帧倒给用户（体感：按了
+    #    停止，草稿却又刷出一段）。冻结门在 flush 入口/锁内同步短路，
+    #    自此不再推送任何新帧；已在途的请求送达即用户所见，交由渲染
+    #    确认游标口径吸收。冻结登记在旧任务自身的 stop_flush_loop
+    #    （推流生命周期终点）统一清理，不影响后续固化送达。
+    if draft_info:
+        freeze_draft_streaming(draft_info[0])
 
     # 1) 先彻底停掉旧任务（包括其草稿刷新循环），确保没有任何后台刷新
     #    还在飞行中，再继续后面的步骤。
