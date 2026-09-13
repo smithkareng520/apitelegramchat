@@ -843,7 +843,7 @@ async def get_ai_response(
             from tool_assembly import prioritize_tool_defs, restrict_tool_defs
             _PROACTIVE_ALLOWED_TOOLS = {
                 "web_search", "fetch_url", "wikipedia",
-                "exchange_rate", "weather",
+                "present_files", "weather", "bash",
                 "geocode", "route", "distance",
                 "poi_keyword_search", "poi_nearby_search", "poi_details",
                 "todo", "memory", "message_user",
