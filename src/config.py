@@ -1261,12 +1261,12 @@ SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
     max_context=1000000,
     protocol="openai_responses",
 )
-SUPPORTED_MODELS["mimo-v2.5"] = make_model_config(
-    model_id="mimo-v2.5",
+SUPPORTED_MODELS["nv/kimi-k3"] = make_model_config(
+    model_id="nv/kimi-k3",
     provider="lfree",
     image_input=True,
     reasoning_enabled=True,
-    reasoning_effort="high",
+    reasoning_effort="max",
     max_context=1000000,
     protocol="openai_responses",
 )
