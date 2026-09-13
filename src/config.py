@@ -1261,13 +1261,12 @@ SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
     max_context=1000000,
     protocol="openai_responses",
 )
-SUPPORTED_MODELS["nv/kimi-k3"] = make_model_config(
-    model_id="nv/kimi-k3",
+SUPPORTED_MODELS["big-pickle"] = make_model_config(
+    model_id="big-pickle",
     provider="lfree",
-    image_input=True,
     reasoning_enabled=True,
-    reasoning_effort="max",
-    max_context=1000000,
+    reasoning_effort="high",
+    max_context=200000,
     protocol="openai_responses",
 )
 SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
