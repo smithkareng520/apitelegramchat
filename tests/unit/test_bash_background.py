@@ -178,6 +178,102 @@ def test_notice_queue_drain_and_cap(tmp_path: Any, monkeypatch: Any) -> None:
         _reset_registries()
 
 
+def test_prune_finished_tasks_keeps_retention_and_running(tmp_path: Any, monkeypatch: Any) -> None:
+    """已终结任务超过 BASH_TASK_FINISHED_RETENTION 时按 finished_at 回收：
+    内存条目 + .json/.log/.exit 三件磁盘文件一并删除；运行中任务永不回收；
+    保留的是最近的 N 个（而非任意 N 个）。"""
+    _isolate(tmp_path, monkeypatch)
+    _reset_registries()
+    monkeypatch.setattr(bash_background, "BASH_TASK_FINISHED_RETENTION", 3)
+    try:
+        chat = 990201
+        ns = str(chat)
+        tdir = bash_background._tasks_dir(chat, ns)
+        tdir.mkdir(parents=True, exist_ok=True)
+        tasks = bash_background._TASKS.setdefault((chat, ns), {})
+
+        def make_task(idx: int, status: str, finished_at: float | None) -> "bash_background.BackgroundTask":
+            task_id = f"bg-{idx:08d}"
+            log_path = tdir / f"{task_id}.log"
+            state_path = tdir / f"{task_id}.json"
+            log_path.write_text(f"output-{idx}", encoding="utf-8")
+            task = bash_background.BackgroundTask(
+                task_id=task_id, chat_id=chat, namespace=ns,
+                command=f"echo {idx}", description="", cwd=str(tdir),
+                pid=0, log_path=str(log_path), state_path=str(state_path),
+                started_at=float(idx), lifetime=3600.0,
+                status=status, finished_at=finished_at,
+            )
+            tasks[task_id] = task
+            bash_background._dump_state(task)
+            return task
+
+        # 5 个已终结任务（finished_at 递增：0 最旧，4 最新）+ 1 个运行中。
+        finished_tasks = [make_task(i, "done", float(i)) for i in range(5)]
+        running_task = make_task(99, "running", None)
+
+        bash_background._prune_finished_tasks(chat, ns)
+
+        # 只保留最近 3 个已终结任务（idx 2/3/4），最旧的 idx 0/1 被回收。
+        for old_task in finished_tasks[:2]:
+            assert old_task.task_id not in tasks
+            assert not Path(old_task.log_path).exists()
+            assert not Path(old_task.state_path).exists()
+            assert not Path(old_task.state_path).with_suffix(".exit").exists()
+        for kept_task in finished_tasks[2:]:
+            assert kept_task.task_id in tasks
+            assert Path(kept_task.log_path).exists()
+        # 运行中任务永不回收，即便它在数量之外。
+        assert running_task.task_id in tasks
+        assert Path(running_task.log_path).exists()
+    finally:
+        _reset_registries()
+
+
+def test_finish_task_triggers_prune(tmp_path: Any, monkeypatch: Any) -> None:
+    """_finish_task 记录终态后自动触发回收（无需调用方手动裁剪）。"""
+    _isolate(tmp_path, monkeypatch)
+    _reset_registries()
+    monkeypatch.setattr(bash_background, "BASH_TASK_FINISHED_RETENTION", 1)
+    try:
+        chat = 990202
+        ns = str(chat)
+        tdir = bash_background._tasks_dir(chat, ns)
+        tdir.mkdir(parents=True, exist_ok=True)
+        tasks = bash_background._TASKS.setdefault((chat, ns), {})
+
+        old_task = bash_background.BackgroundTask(
+            task_id="bg-old00001", chat_id=chat, namespace=ns,
+            command="echo old", description="", cwd=str(tdir),
+            pid=0, log_path=str(tdir / "bg-old00001.log"),
+            state_path=str(tdir / "bg-old00001.json"),
+            started_at=0.0, lifetime=3600.0, status="done", finished_at=0.0,
+        )
+        Path(old_task.log_path).write_text("old", encoding="utf-8")
+        tasks[old_task.task_id] = old_task
+        bash_background._dump_state(old_task)
+
+        new_task = bash_background.BackgroundTask(
+            task_id="bg-new00001", chat_id=chat, namespace=ns,
+            command="echo new", description="", cwd=str(tdir),
+            pid=0, log_path=str(tdir / "bg-new00001.log"),
+            state_path=str(tdir / "bg-new00001.json"),
+            started_at=1.0, lifetime=3600.0, status="running",
+        )
+        Path(new_task.log_path).write_text("", encoding="utf-8")
+        tasks[new_task.task_id] = new_task
+        bash_background._dump_state(new_task)
+
+        bash_background._finish_task(new_task, status="done", exit_code=0, notify=False)
+
+        # 回收时机：new_task 终态落盘之后，保留数为 1 → 旧的 old_task 被回收。
+        assert old_task.task_id not in tasks
+        assert not Path(old_task.log_path).exists()
+        assert new_task.task_id in tasks
+    finally:
+        _reset_registries()
+
+
 # ---------------------------------------------------------------------------
 # 进程集成（POSIX）
 # ---------------------------------------------------------------------------

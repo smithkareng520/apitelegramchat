@@ -596,6 +596,12 @@ async def _agentic_loop_openai_responses(
 
         content_acc = ""
         reasoning_acc = ""
+        # 与下方 response.output_item.done / reasoning 分支配合：标记本轮
+        # 是否已经通过 response.reasoning_summary_text.delta 逐块推送过。
+        # 每个 reasoning item 开始（output_item.added, type=reasoning）时
+        # 重置，item 结束（output_item.done）时读取——同一 item 生命周期
+        # 内一一对应，不会跨 item 误判。
+        reasoning_seen_via_delta = False
         # 打断保全（改动点1，与 openai_compat / anthropic / gemini 循环同构）：
         # 流式期间 journal 始终持有一条与 content_acc / reasoning_acc 同步的
         # assistant 占位消息；function_call 累积只在流正常结束后由 finalize
@@ -627,10 +633,29 @@ async def _agentic_loop_openai_responses(
                         builder.append_stream_delta(text)
                         live_slot.sync(content_acc, reasoning_acc)
 
+                elif etype == "response.reasoning_summary_text.delta":
+                    # 与 anthropic_bridge 的 thinking_delta 对称：逐块推草稿，
+                    # 不等这段 reasoning item 的 .done 事件再整段推送——否则
+                    # 思考阶段（往往比正文更耗时）会表现为"卡住不动直到
+                    # 整段思考结束才刷新"的明显延迟。reasoning_seen 标记
+                    # 该 item 已走过 delta 路径，供 .done 分支避免重复累加。
+                    text = getattr(event, "delta", "") or ""
+                    if text:
+                        reasoning_acc += text
+                        reasoning_seen_via_delta = True
+                        await switch_stream("reasoning")
+                        builder.append_stream_delta(text)
+                        live_slot.sync(content_acc, reasoning_acc)
+
                 elif etype == "response.output_item.added":
                     item = getattr(event, "item", None)
                     itype = getattr(item, "type", None) if item is not None else None
-                    if itype == "function_call":
+                    if itype == "reasoning":
+                        # 新的 reasoning item 开始：重置本 item 的 delta 标记
+                        # （一轮响应内可能有多个 reasoning item，例如工具调用
+                        # 前后各思考一次），避免上一个 item 的标记误判本次。
+                        reasoning_seen_via_delta = False
+                    elif itype == "function_call":
                         item_id = getattr(item, "id", "") or f"fc_{uuid.uuid4().hex[:24]}"
                         call_id = getattr(item, "call_id", "") or item_id
                         name = getattr(item, "name", "") or ""
@@ -669,15 +694,25 @@ async def _agentic_loop_openai_responses(
                     item = getattr(event, "item", None)
                     itype = getattr(item, "type", None) if item is not None else None
                     if itype == "reasoning":
-                        summary_list = getattr(item, "summary", None) or []
-                        summary_text = "\n".join(
-                            getattr(s, "text", "") or "" for s in summary_list if getattr(s, "text", "")
-                        )
-                        if summary_text:
-                            reasoning_acc += summary_text
-                            await switch_stream("reasoning")
-                            builder.append_stream_delta(summary_text)
-                            live_slot.sync(content_acc, reasoning_acc)
+                        if reasoning_seen_via_delta:
+                            # 已经通过 response.reasoning_summary_text.delta
+                            # 逐块推送过本段思考内容，这里不再重复累加/推送
+                            # ——否则会把同一段文字在 reasoning_acc 里加两遍。
+                            pass
+                        else:
+                            # 兜底：网关不发 delta、只在 .done 里给出完整
+                            # summary 的情况（例如某些非官方中转），退回
+                            # 整段推送，保证内容不丢，即便体验上仍是一次性
+                            # 到达（无法比网关实际发送的粒度更细）。
+                            summary_list = getattr(item, "summary", None) or []
+                            summary_text = "\n".join(
+                                getattr(s, "text", "") or "" for s in summary_list if getattr(s, "text", "")
+                            )
+                            if summary_text:
+                                reasoning_acc += summary_text
+                                await switch_stream("reasoning")
+                                builder.append_stream_delta(summary_text)
+                                live_slot.sync(content_acc, reasoning_acc)
                     elif itype == "function_call":
                         # 兜底：若前面 .added / .delta 事件因网关差异未触发
                         # （个别兼容层只在 .done 里一次性给出完整 item），

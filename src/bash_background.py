@@ -20,6 +20,12 @@
 system 消息搭车发出（见 ai_handlers.get_ai_response）。历史只增不改：
 启动调用的句柄结果写一次永不改写，通知不持久化——稳定前缀逐字节一致，
 前缀缓存全额命中，分叉点恰在通知本身。
+
+历史回收（BASH_TASK_FINISHED_RETENTION，默认 20）：每 (chat_id,
+namespace) 只保留最近 N 个已终结任务，超出部分在下一次 _finish_task
+或注册表恢复时连同 .json/.log/.exit 一起删除。只回收终态任务，运行中
+任务不受影响——防止长期运行的 chat 反复起后台任务后，内存注册表与
+磁盘 tasks 目录无限增长（task_action=list 也随之越列越长）。
 """
 
 import asyncio
@@ -59,6 +65,11 @@ QUERY_OUTPUT_TAIL_LINES = 50
 QUERY_OUTPUT_TAIL_CHARS = 4000
 # 孤儿进程探活轮询间隔。
 _ORPHAN_POLL_INTERVAL_SEC = 5.0
+# 每个 (chat_id, namespace) 保留的已终结任务上限：超出部分（按
+# finished_at 从旧到新）连同磁盘文件一起清理。只回收终态任务，运行中
+# 任务永不在此清理范围内。防止长期运行的 chat 反复起后台任务后，
+# 内存注册表与磁盘 tasks 目录无限增长。
+BASH_TASK_FINISHED_RETENTION = int(os.getenv("BASH_TASK_FINISHED_RETENTION", "20"))
 
 _TERMINAL_STATUSES = frozenset({"done", "failed", "stopped", "expired", "lost"})
 _TASK_ID_RE = re.compile(r"bg-[0-9a-f]{8}")
@@ -426,6 +437,10 @@ def _ensure_registry_loaded(chat_id: int, namespace: str) -> None:
         else:
             # was-running 且进程已死：补推「因重启被中止」，不再无声消失。
             _finish_task(task, status="lost", exit_code=None, notify=True)
+    # completed 分支（磁盘上早已终态、本次直接 continue 恢复）不经过
+    # _finish_task，不会触发其内部的裁剪；这里统一补一次，防止「旧安装
+    # 多年积累的历史任务文件」在重启后被整批读入内存又从不清理。
+    _prune_finished_tasks(chat_id, namespace)
 
 
 # ===================== 终态与通知 =====================
@@ -455,6 +470,42 @@ def _finish_task(
     _mark_terminal_on_disk(task)
     if notify:
         push_completion_notice(task.chat_id, task.namespace, _format_notice(task))
+    _prune_finished_tasks(task.chat_id, task.namespace)
+
+
+def _prune_finished_tasks(chat_id: int, namespace: str) -> None:
+    """回收超出 BASH_TASK_FINISHED_RETENTION 的已终结任务（内存 + 磁盘）。
+
+    只清理终态任务（status in _TERMINAL_STATUSES），运行中任务不受影响。
+    按 finished_at 排序，保留最近的 N 个，其余的内存条目与
+    .json/.log/.exit 三件磁盘文件一并删除——避免长期运行的 chat 反复
+    起后台任务后，注册表和 tasks 目录无限增长（list/status 也随之越
+    列越长）。删除是尽力而为：单个文件删除失败不影响其余清理，也不
+    影响调用方（_finish_task）的主流程。
+    """
+    tasks = _TASKS.get((chat_id, namespace))
+    if not tasks:
+        return
+    finished = [t for t in tasks.values() if t.status in _TERMINAL_STATUSES]
+    if len(finished) <= BASH_TASK_FINISHED_RETENTION:
+        return
+    finished.sort(key=lambda t: t.finished_at or 0.0)
+    overflow = finished[: len(finished) - BASH_TASK_FINISHED_RETENTION]
+    for old_task in overflow:
+        tasks.pop(old_task.task_id, None)
+        for path_str in (old_task.log_path, old_task.state_path):
+            try:
+                Path(path_str).unlink(missing_ok=True)
+            except OSError:
+                logger.debug("后台任务旧文件清理失败: %s", path_str, exc_info=True)
+        try:
+            Path(old_task.state_path).with_suffix(".exit").unlink(missing_ok=True)
+        except OSError:
+            logger.debug("后台任务旧 .exit 清理失败: %s", old_task.state_path, exc_info=True)
+    logger.debug(
+        "后台任务注册表回收 chat_id=%s namespace=%s 清理=%d 保留=%d",
+        chat_id, namespace, len(overflow), BASH_TASK_FINISHED_RETENTION,
+    )
 
 
 def _cancel_aux_tasks(task: BackgroundTask) -> None:
