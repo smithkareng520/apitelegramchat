@@ -56,6 +56,29 @@ _TOOL_TIMEOUT_LABELS = {
     "present_files": "File presentation",
 }
 
+# ---------- bash 后台任务结果识别与渲染（v2.5） ----------
+def _is_background_bash_call(fn_args: dict) -> bool:
+    """按调用参数识别后台任务模式的 bash 调用：启动（run_in_background）
+    或 task_action 查询/停止。task_id 单独出现不构成后台调用（防御形状）。"""
+    if not isinstance(fn_args, dict):
+        return False
+    return bool(fn_args.get("run_in_background")) or bool(fn_args.get("task_action"))
+
+
+def _format_background_bash_result(fn_args: dict, result_str: str) -> tuple[str, str] | None:
+    """后台任务结果的卡片渲染：summary = 结果首行（自带状态徽标），
+    details = 全文的等宽引用块。非后台调用返回 None 交回通用分支。"""
+    if not _is_background_bash_call(fn_args):
+        return None
+    text = str(result_str or "").strip()
+    if not text:
+        return "后台任务（空结果）", _render_editor_quote("Output", "(empty)")
+    first_line = text.splitlines()[0].strip()
+    summary = first_line if len(first_line) <= 60 else first_line[:57] + "…"
+    details_html = _render_editor_quote("Output", text)
+    return summary, details_html
+
+
 # ---------- web_search 结果解析与渲染 ----------
 # 实现拆到 ai.web_search_render，避免在 tool_executors
 # 里维护大段正则与渲染函数；这里只暴露 _format_web_search_result 给
@@ -565,6 +588,13 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
     # ===================== Bash 工具格式化 =====================
     elif fn_name == "bash":
+        # 后台任务模式（v2.5）：启动句柄 / task_action 查询与停止的结果
+        # 不走终端信封，直接以结果首行做 summary——bash_background 生成
+        # 文本时首行已自带 emoji 徽标 + 任务标识，天然可作卡片摘要；
+        # 全文放 Output 引用块。非后台调用返回 None，落回通用信封渲染。
+        bg_rendered = _format_background_bash_result(fn_args, result_str)
+        if bg_rendered is not None:
+            return bg_rendered
         # 优先展示模型提供的意图描述（description/_summary），让用户一眼
         # 看到命令目的；未提供时退化为命令首行摘要。意图文本直接原样展示、
         # 不加符号，与进行时摘要（tool_summary._generate_initial_tool_summary、

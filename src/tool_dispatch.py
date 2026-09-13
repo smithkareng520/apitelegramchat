@@ -253,12 +253,18 @@ async def dispatch_tool_call(name: str, arguments: dict, chat_id: int, progress_
             return await execute_bash(
                 chat_id=chat_id,
                 namespace=resolved_namespace,
-                command=arguments.get("command", ""),
+                command=arguments.get("command") or "",
                 restart=arguments.get("restart", False),
                 # v2.4：模型可为已知长静默命令显式声明总超时（5-600s），
                 # 传入时同时禁用无输出空闲保护；非法值由 execute_bash 内
                 # _normalize_requested_timeout 静默回退到默认双层配置。
                 timeout=arguments.get("timeout"),
+                # v2.5：后台任务模式——启动（run_in_background）与查询/
+                # 停止（task_action+task_id）。后台模式忽略 timeout。
+                run_in_background=bool(arguments.get("run_in_background", False)),
+                task_action=arguments.get("task_action"),
+                task_id=arguments.get("task_id"),
+                description=str(arguments.get("description") or ""),
             )
         # ========== Todo 工具分支 ==========
         # 任务 / 待办清单。返回 JSON 字符串给 AI 上下文；UI 渲染由 format_tool_result 处理。

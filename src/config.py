@@ -226,9 +226,8 @@ class ModelConfig:
     能力字段未显式指定时继承厂商默认值；端点字段未显式指定时继承
     ``PROVIDERS[provider]``。
     """
-    model_id: str               # 完整的模型 ID，如 "google/gemini-2.5-flash"
+    model_id: str               # 完整的模型 ID，如 "google/gemini-2.5-flash"（唯一标识兼展示名）
     provider: str               # 对应 PROVIDERS 的 key
-    name: str                   # 显示名称
     image_input: Optional[bool] = None   # 图片输入（视觉理解）能力
     audio_input: Optional[bool] = None   # 音频输入能力
     # 视频输入（video understanding）能力：模型能否直接“看”视频内容。
@@ -699,11 +698,14 @@ _REMOVED_ENDPOINT_FIELDS = (
 def make_model_config(
     model_id: str,
     provider: str,
-    name: str,
     **kwargs: Any
 ) -> ModelConfig:
     """
     工厂函数：根据 provider 和覆盖项创建 ModelConfig。
+
+    模型的唯一标识与展示名统一为 model_id（每模型不再另设命名字段
+    name——两个名字意味着两处要同步的真相，列表 UI / 切换回执 / 日志
+    各取其一必然分叉）。
 
     除了原有的能力字段（image_input/supports_tools/reasoning_* 等，走厂商
     默认继承），还接受端点覆盖字段（见 _ENDPOINT_OVERRIDE_FIELDS）：
@@ -723,11 +725,9 @@ def make_model_config(
         SUPPORTED_MODELS["gpt-5.6-sol"] = make_model_config(
             model_id="gpt-5.6-sol",
             provider="my_relay",
-            name="GPT 5.6 Sol",
         )
         SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
             provider="my_relay",
-            name="Claude Opus 5 (中转)",
             # 仅此模型覆盖：换协议 + 换完整端点，key 仍沿用 my_relay 默认。
             protocol="anthropic_messages",
             endpoint="https://xxtf.baby",
@@ -736,6 +736,15 @@ def make_model_config(
     endpoint_overrides = {
         field: kwargs.pop(field) for field in _ENDPOINT_OVERRIDE_FIELDS if field in kwargs
     }
+
+    # 迁移守卫（模型 name 字段已删除）：展示统一用 model_id。旧字段若被
+    # 静默忽略，配置里精心起的名字会无声失效，直接报错暴露。
+    if "name" in kwargs:
+        raise ValueError(
+            f"模型 {model_id} 传入了已移除的字段 name："
+            "每模型不再另设展示名，统一用 model_id（列表/切换回执/日志"
+            "同源）。请删除 name=... 行。"
+        )
 
     # 迁移守卫：协议字段已硬切为 protocol（新命名），旧字段写法直接报错
     # 暴露，避免旧配置被静默吞掉后行为与预期不符。
@@ -809,7 +818,6 @@ def make_model_config(
     return ModelConfig(
         model_id=normalized_model_id,
         provider=provider,
-        name=name,
         image_input=merged.get("image_input"),
         audio_input=merged.get("audio_input"),
         video_input=merged.get("video_input"),
@@ -976,7 +984,6 @@ class EffectiveParams:
     # ---- 身份 ----
     provider: str
     model_id: str
-    name: str
     # ---- 输入模态能力（鉴权用：用户输入了什么 vs 模型能收什么）----
     image_input: bool             # 图片输入
     audio_input: bool             # 音频输入
@@ -1036,7 +1043,7 @@ def resolve_effective_params(model_info: Optional[ModelConfig]) -> EffectivePara
     """
     if model_info is None:
         return EffectiveParams(
-            provider="", model_id="", name="",
+            provider="", model_id="",
             image_input=False, audio_input=False, video_input=False, document_input=False,
             image_output=False, video_output=False,
             supports_tools=False, supports_sampling=False, supports_prompt_cache=False,
@@ -1053,7 +1060,6 @@ def resolve_effective_params(model_info: Optional[ModelConfig]) -> EffectivePara
     return EffectiveParams(
         provider=str(getattr(model_info, "provider", "") or ""),
         model_id=str(getattr(model_info, "model_id", "") or ""),
-        name=str(getattr(model_info, "name", "") or ""),
         image_input=bool(getattr(model_info, "image_input", False)),
         audio_input=bool(getattr(model_info, "audio_input", False)),
         video_input=bool(getattr(model_info, "video_input", False)),
@@ -1085,7 +1091,6 @@ SUPPORTED_MODELS: Dict[str, ModelConfig] = {}
 SUPPORTED_MODELS["openrouter/free"] = make_model_config(
     model_id="openrouter/free",
     provider="openrouter",
-    name="Free",
     image_input=True,
     reasoning_enabled=True,
     reasoning_effort="high",
@@ -1095,7 +1100,6 @@ SUPPORTED_MODELS["openrouter/free"] = make_model_config(
 # SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
 #     model_id="anthropic/claude-sonnet-5",
 #     provider="openrouter",
-#     name="Claude Sonnet 5",
 #     image_input=True,
 #     document_input=True,
 #     supports_prompt_cache=True,
@@ -1115,7 +1119,6 @@ SUPPORTED_MODELS["openrouter/free"] = make_model_config(
 SUPPORTED_MODELS["agnes-3.0-flash"] = make_model_config(
     model_id="agnes-3.0-flash",
     provider="agnes",
-    name="Agnes 3.0 Flash",
     reasoning_enabled=True,
     reasoning_effort="high",
     max_context=512000,
@@ -1130,7 +1133,6 @@ SUPPORTED_MODELS["agnes-3.0-flash"] = make_model_config(
 SUPPORTED_MODELS["ZhipuAI/GLM-5.3-Flash"] = make_model_config(
     model_id="ZhipuAI/GLM-5.3-Flash",
     provider="modelscope",
-    name="GLM 5.3 Flash",
     max_context=1000000,
     reasoning_enabled=True,
     reasoning_effort="max",
@@ -1143,7 +1145,6 @@ SUPPORTED_MODELS["ZhipuAI/GLM-5.3-Flash"] = make_model_config(
 SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
     model_id="gemini-3.5-flash-lite",
     provider="gemini",
-    name="Gemini 3.5 Flash-Lite",
     image_input=True,
     max_context=1000000,
     # Flash-Lite 定位轻快：思考限制在低档，避免响应变慢。
@@ -1159,7 +1160,6 @@ SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
 SUPPORTED_MODELS["GLM-4.7-Flash"] = make_model_config(
     model_id="GLM-4.7-Flash",
     provider="glm",
-    name="GLM 4.7 Flash",
     max_context=200000,
     # 同上：思考开启，智谱思考模式建议 temperature=0.6。
     # 需要更快响应时改 reasoning_enabled=False。
@@ -1173,7 +1173,6 @@ SUPPORTED_MODELS["GLM-4.7-Flash"] = make_model_config(
 SUPPORTED_MODELS["Qwen/Qwen-Image"] = make_model_config(
     model_id="Qwen/Qwen-Image",
     provider="modelscope",
-    name="Qwen Image Edit",
     image_output=True,
     # 图像模型显式声明 OpenAI Images 协议（ModelScope 图像端点）。
     protocol="openai_images",
@@ -1183,7 +1182,6 @@ SUPPORTED_MODELS["Qwen/Qwen-Image"] = make_model_config(
 SUPPORTED_MODELS["Qwen/Qwen-Image-Edit"] = make_model_config(
     model_id="Qwen/Qwen-Image-Edit",
     provider="modelscope",
-    name="Qwen Image Edit",
     image_input=True,
     image_output=True,
     protocol="openai_images",
@@ -1193,7 +1191,6 @@ SUPPORTED_MODELS["Qwen/Qwen-Image-Edit"] = make_model_config(
 SUPPORTED_MODELS["Tongyi-MAI/Z-Image-Turbo"] = make_model_config(
     model_id="Tongyi-MAI/Z-Image-Turbo",
     provider="modelscope",
-    name="Z Image Turbo",
     image_output=True,
     protocol="openai_images",
     max_context=32768,
@@ -1203,7 +1200,6 @@ SUPPORTED_MODELS["Tongyi-MAI/Z-Image-Turbo"] = make_model_config(
 SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
     model_id="agnes-image-2.5-flash",
     provider="agnes",
-    name="Agnes Image 2.5 Flash",
     image_output=True,
     # 注意（2026-09 排查"支持看图但看不到历史图片"实锤）：这里的
     # image_input=True 仅表示"可以把图片当输入模态接收"——即图片能被当作
@@ -1235,7 +1231,6 @@ SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
 SUPPORTED_MODELS["agnes-video-2.5-flash"] = make_model_config(
     model_id="agnes-video-2.5-flash",
     provider="agnes",
-    name="Agnes video 2.5 Flash",
     image_input=True,
     video_input=True,
     video_output=True,
@@ -1260,7 +1255,6 @@ SUPPORTED_MODELS["agnes-video-2.5-flash"] = make_model_config(
 SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
     model_id="claude-opus-5",
     provider="lfree",
-    name="Claude Opus 5 (LFree)",
     image_input=True,
     reasoning_enabled=True,
     reasoning_effort="high",
@@ -1270,7 +1264,6 @@ SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
 SUPPORTED_MODELS["mimo-v2.5"] = make_model_config(
     model_id="mimo-v2.5",
     provider="lfree",
-    name="MiMo v2.5 (LFree)",
     image_input=True,
     reasoning_enabled=True,
     reasoning_effort="high",
@@ -1280,7 +1273,6 @@ SUPPORTED_MODELS["mimo-v2.5"] = make_model_config(
 SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
     model_id="muse-spark-1.3-contributor",
     provider="lfree",
-    name="Muse Spark 1.3 (LFree)",
     image_input=True,
     reasoning_enabled=True,
     reasoning_effort="high",

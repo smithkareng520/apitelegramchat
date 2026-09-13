@@ -567,6 +567,24 @@ SEARCH_TOOLS = [
                 "(dead network call or interactive prompt). Keep long jobs chatty "
                 "(`pip install -v`, periodic echo) or pass the timeout parameter (5-600s) "
                 "to allow long silent runs.\n"
+                "\n"
+                "BACKGROUND TASKS (for installs/builds you don't want to wait on):\n"
+                "- run_in_background=true starts the command detached and returns a task "
+                "handle immediately; you can keep doing other work in the SAME turn or "
+                "later turns. Use it for jobs expected to run longer than ~2 minutes "
+                "(large installs, builds, dataset downloads).\n"
+                "- The task is fully independent of the interactive session: foreground "
+                "command timeouts, restart=true, and user interruptions never affect it. "
+                "Output goes to a log file (path is in the handle). There is NO idle "
+                "timeout for background tasks; a lifetime cap (default 3600s) force-kills "
+                "them eventually.\n"
+                "- When the task finishes (done/failed/stopped/expired), the system "
+                "automatically attaches a result summary to your NEXT AI request — you "
+                "don't need to poll, just relay it to the user when it arrives.\n"
+                "- Manage tasks with task_action: `status`/`output` (tail of log)/`stop` "
+                "(graceful SIGTERM then SIGKILL) each take task_id; `list` needs none. "
+                "Max 3 running tasks per chat. Note: `restart=true` does NOT kill "
+                "background tasks.\n"
                 "- Toolchain already in the image: python3 (+pip), node/npm, gcc/g++, make, cmake, "
                 "ccache, git, jq, zip/unzip, LibreOffice, pandoc, ImageMagick, poppler, tesseract.\n"
                 "- Install extra Python packages with `pip install --user <pkg>` (cache persists). "
@@ -641,6 +659,34 @@ SEARCH_TOOLS = [
                             "运行的命令（大型构建、数据集下载等）：显式指定会同时禁用本次调用的"
                             "「60s 无输出空闲保护」。不要用它重试挂起的网络请求——应给网络调用"
                             "自身加超时（curl --max-time、smtplib timeout=…）。"
+                            "仅前台命令有效；run_in_background=true 时忽略（后台任务用统一的"
+                            "寿命上限兜底）。"
+                        )
+                    },
+                    "run_in_background": {
+                        "type": "boolean",
+                        "description": (
+                            "true 则把命令作为独立后台任务启动，立即返回任务句柄（task_id、"
+                            "日志路径），不阻塞当前回合。适用于预计超过 2 分钟的安装/构建/下载。"
+                            "后台任务不受前台超时、restart=true、用户插话影响；完成时系统会"
+                            "自动把结果摘要附加到下一次 AI 请求。"
+                        )
+                    },
+                    "task_action": {
+                        "type": "string",
+                        "enum": ["status", "output", "stop", "list"],
+                        "description": (
+                            "后台任务操作：status=查状态（需 task_id）；output=看日志尾部"
+                            "（需 task_id）；stop=停止任务（需 task_id，SIGTERM 优雅终止，"
+                            "超时后 SIGKILL）；list=列出本 chat 全部任务（无需 task_id）。"
+                            "与 command/run_in_background 互斥。"
+                        )
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": (
+                            "后台任务 ID（形如 bg-1a2b3c，来自启动句柄）。task_action 为 "
+                            "status/output/stop 时必填。"
                         )
                     }
                 },
@@ -654,7 +700,10 @@ SEARCH_TOOLS = [
                 # 轮自纠即可；strict 模式下保持非可空 string，不会被模型
                 # 用 null 糊弄过去（null 会在 strip_null_arguments 后变成
                 # 缺键，同样被 L2 拦截）。
-                "required": ["description", "command"]
+                # 注意：command 不再列入 required（v2.5）——task_action 调用
+                # （list/status 等）没有 command；两者互斥由执行器给可操作
+                # 错误兜底。
+                "required": ["description"]
             },
             "input_examples": [
                 {"description": "查看项目文件列表", "command": "ls -la"},

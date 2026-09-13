@@ -371,10 +371,10 @@ def _quote(text: str, limit: int = 220) -> str:
 
 
 def _model_title(sess: WizardSession) -> str:
-    model = SUPPORTED_MODELS.get(sess.model_id)
-    name = model.name if model else sess.model_id
+    # 模型标识统一用 model_id（每模型命名字段 name 已删除）：卡片标题
+    # 直接展示用户所选的模型 ID，与模型列表按钮同源。
     icon = "🎬" if sess.api_type == "video" else "🖼"
-    return f"{icon} <b>参数配置</b> · {html.escape(name)}"
+    return f"{icon} <b>参数配置</b> · {html.escape(sess.model_id)}"
 
 
 def _pending_line(sess: WizardSession) -> str:
@@ -1333,13 +1333,19 @@ async def run_media_generation(chat_id: int, request: dict) -> None:
     messages = [Message.user([TextBlock(prompt)])]
     try:
         if api_type == "video":
-            from ai.agentic_loops import _agentic_loop_native_video
-            raw, usage, new_msgs = await _agentic_loop_native_video(
-                model_id, messages, None, chat_id, media_overrides=overrides)
+            # 经由 _media_loop_with_notices（drain 注入点②）进入生成循环：
+            # 卡片提交也是一次真正的模型调用，按不变式必须 drain 待送通知。
+            from ai.agentic_loops import _agentic_loop_native_video, _media_loop_with_notices
+            raw, usage, new_msgs = await _media_loop_with_notices(
+                _agentic_loop_native_video,
+                current_model=model_id, messages=messages, builder=None,
+                chat_id=chat_id, media_overrides=overrides)
         else:
-            from ai.agentic_loops import _agentic_loop_native_image
-            raw, usage, new_msgs = await _agentic_loop_native_image(
-                None, model_id, messages, None, chat_id, media_overrides=overrides)
+            from ai.agentic_loops import _agentic_loop_native_image, _media_loop_with_notices
+            raw, usage, new_msgs = await _media_loop_with_notices(
+                _agentic_loop_native_image,
+                client=None, current_model=model_id, messages=messages, builder=None,
+                chat_id=chat_id, media_overrides=overrides)
     except asyncio.CancelledError:
         raise
     except Exception as e:

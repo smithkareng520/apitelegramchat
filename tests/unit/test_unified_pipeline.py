@@ -62,7 +62,7 @@ def test_model_override_beats_provider_default():
 def test_unspecified_fields_inherit_provider_defaults():
     # 不做任何覆盖的模型：全部继承厂商默认
     cfg = make_model_config(
-        model_id="plain-model", provider="openrouter", name="Plain",
+        model_id="plain-model", provider="openrouter",
     )
     params = resolve_effective_params(cfg)
     assert params.image_input is False
@@ -75,7 +75,7 @@ def test_endpoint_layering_provider_default_then_model_override():
     # 端点分层：模型未声明 -> 厂商默认 endpoint（openrouter 为 API 根，
     # SDK 客户端自拼标准路径）；模型声明完整端点 -> 模型覆盖生效。
     plain = make_model_config(
-        model_id="plain-model", provider="openrouter", name="Plain",
+        model_id="plain-model", provider="openrouter",
     )
     p = resolve_effective_params(plain)
     assert p.endpoint.endpoint == PROVIDERS["openrouter"].endpoint

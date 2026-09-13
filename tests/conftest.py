@@ -48,7 +48,6 @@ def _register_test_media_models() -> None:
         config.SUPPORTED_MODELS["agnes-video-2.5"] = make(
             model_id="agnes-video-2.5",
             provider="agnes",
-            name="Agnes video 2.5",
             image_input=True,
             video_input=True,
             video_output=True,
@@ -62,7 +61,6 @@ def _register_test_media_models() -> None:
         config.SUPPORTED_MODELS["google/gemini-3-pro-image-preview"] = make(
             model_id="google/gemini-3-pro-image-preview",
             provider="openrouter",
-            name="Gemini 3 Pro Image Preview",
             image_output=True,
             image_input=True,
             supports_tools=False,
@@ -75,7 +73,6 @@ def _register_test_media_models() -> None:
         config.SUPPORTED_MODELS["agnes-image-2.1-flash"] = make(
             model_id="agnes-image-2.1-flash",
             provider="agnes",
-            name="Agnes Image 2.1 Flash",
             image_output=True,
             image_input=True,
             supports_tools=False,

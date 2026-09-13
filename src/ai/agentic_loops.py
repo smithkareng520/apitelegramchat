@@ -123,6 +123,58 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+
+# ===================== 后台任务通知 drain 注入点（收敛） =====================
+# 后台 bash 任务（bash_background）终态时把摘要推入每 chat 待送队列；
+# 下一次真正调用模型的请求构建消息时 drain，合并为一条尾部 system 消息
+# 搭车发出——不新建回合、不挑回合类型，什么请求来了就搭什么车。缓存
+# 语义：稳定前缀 [system, …history…, user_msg] 与上一轮逐字节一致，通知
+# 只出现在尾部（分叉点=通知本身，不重排任何既有消息）；通知不持久化、
+# 历史 append-only。
+#
+# 注入点曾散落在 get_ai_response 里 4 处手工调用——新增模型调用路径
+# 忘了接线就会静默丢通知且最难测。现已收敛为两个最低公共入口，即
+# 结构性不变式「凡到达模型调用的路径，队列必被 drain」的落点（由
+# tests/unit/test_bg_notice_drain_invariant.py 守护）：
+#   ① ai_handlers._call_api —— 全部 chat 协议模型调用的唯一入口（函数
+#      入口自守卫 drain）；
+#   ② _media_loop_with_notices —— image/video 生成（agentic 循环内的
+#      POST）两条循环的唯一入口，get_ai_response 与媒体向导提交路径
+#      共用。
+# 不调用模型的路径（媒体参数卡片、preflight 短路等）不消费，通知留给
+# 下一次请求。
+
+
+def _append_bg_task_notices(messages: list, chat_id: int, namespace: str | None = None) -> None:
+    """唯一 drain+append 实现：取走全部待送通知并合并为一条尾部 system 消息。
+
+    两个注入点（_call_api 入口 / _media_loop_with_notices）共用本函数；
+    drain 自身持 per-chat 锁做原子「整段换空」，见 bash_background。
+    """
+    try:
+        from bash_background import drain_completion_notices
+        notices = drain_completion_notices(chat_id, namespace)
+    except Exception:
+        logger.debug("后台任务通知 drain 失败（可忽略）", exc_info=True)
+        return
+    if notices:
+        messages.append(Message.system("\n\n".join(notices)))
+
+
+async def _media_loop_with_notices(loop_fn, **kwargs):
+    """媒体生成循环统一入口（drain 注入点②）。
+
+    image/video 原生生成循环（agentic 循环内的 POST）只能经由本 wrapper
+    调用：loop_fn 为 _agentic_loop_native_image / _agentic_loop_native_video
+    之一；messages / chat_id 按关键字传入（本 wrapper 据此定位 drain 的
+    队列键），可选 namespace 透传给 drain 做键解析后被摘除。新增调用方
+    （如未来的媒体提交路径）经由本入口即自动 drain，不可能忘接线。
+    """
+    _append_bg_task_notices(
+        kwargs["messages"], kwargs["chat_id"], kwargs.pop("namespace", None))
+    return await loop_fn(**kwargs)
+
+
 def _merge_tool_call_delta(accumulator: dict, index: int, delta_tc: dict) -> None:
     if index not in accumulator:
         accumulator[index] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}

@@ -25,7 +25,6 @@ def _model_info(**overrides) -> ModelConfig:
     base = dict(
         model_id="test-model",
         provider="test",
-        name="Test Model",
         image_input=True,
     )
     base.update(overrides)

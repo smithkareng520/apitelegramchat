@@ -82,7 +82,6 @@ def test_no_declared_endpoint_derives_official_shape():
     cfg = make_model_config(
         model_id="test-official-style",
         provider="agnes",
-        name="Official Style Test",
         image_output=True,
         protocol="openai_images",
     )
@@ -97,7 +96,6 @@ def test_declared_endpoint_wins_over_root_derivation():
     cfg = make_model_config(
         model_id="test-relay-images",
         provider="openrouter",
-        name="Relay Images Test",
         image_output=True,
         protocol="openai_images",
         endpoint="https://relay.example.com/v1/images/generations",
@@ -112,7 +110,6 @@ def test_no_override_falls_back_to_official_derivation():
     cfg = make_model_config(
         model_id="test-std-images",
         provider="xxtf",
-        name="Std Images Test",
         image_output=True,
         image_input=True,
         protocol="openai_images",
@@ -146,7 +143,6 @@ def test_resolve_image_adapter_endpoint_fallback_for_misconfigured_protocol():
     cfg = make_model_config(
         model_id="test-endpoint-only",
         provider="agnes",
-        name="Endpoint Only Test",
         image_output=True,
         endpoint=AGNES_IMAGES_URL,
     )
@@ -161,7 +157,6 @@ def test_resolve_image_adapter_rejects_non_image_protocol_without_endpoint():
     cfg = make_model_config(
         model_id="test-no-image-route",
         provider="anthropic",
-        name="No Image Route Test",
     )
     with pytest.raises(ValueError):
         resolve_image_adapter(cfg)
@@ -170,7 +165,6 @@ def test_resolve_image_adapter_rejects_non_image_protocol_without_endpoint():
     cfg_with_ep = make_model_config(
         model_id="test-anthropic-with-images-ep",
         provider="anthropic",
-        name="Anthropic With Images Endpoint",
         image_output=True,
         endpoint=AGNES_IMAGES_URL,
     )
@@ -345,7 +339,6 @@ def test_openai_compat_multipart_style_still_posts_to_edits_endpoint(fake_http):
     cfg = make_model_config(
         model_id="test-official-edit",
         provider="agnes",
-        name="Official Edit Test",
         image_output=True,
         image_input=True,
         protocol="openai_images",

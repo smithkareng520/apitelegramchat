@@ -429,12 +429,14 @@ async def _handle_callback_query(cb: dict) -> None:
             # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置
             await _send_via_send_message(chat_id, f"✅ <b>{notice}</b>", reply_message_id=mid)
         elif sel in SUPPORTED_MODELS:
-            await _answer_callback_query(cb["id"], f"切换到 {SUPPORTED_MODELS[sel].name}...")
+            # 模型标识统一用 model_id（每模型命名字段 name 已删除）：
+            # 列表按钮、切换回执、日志三处同源，不再有"列表显示 A、回执
+            # 显示 B"的分叉。
+            await _answer_callback_query(cb["id"], f"切换到 {sel}...")
+            prev_model = get_user_model(chat_id)
             await safe_set_user_model(chat_id, sel)
-            model_name = SUPPORTED_MODELS[sel].name
-            confirmation = (
-                f"✅ <b>模型切换成功</b>\n已切换到模型：<b>{model_name}</b>\n<i>（对话历史已保留）</i>"
-            )
+            # 回执只保留一行：旧 → 新（对话历史本就保留，无需赘述）。
+            confirmation = f"模型已切换 {prev_model} → {sel}"
             # 使用 sendMessage 避免在 AI 生成中挤占活跃草稿的位置。
             # 快速连点时，本次点击的列表消息可能已被 delete_after
             # 定时清理删除；reply 到已不存在的消息会被 Telegram 以 400

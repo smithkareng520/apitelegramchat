@@ -59,8 +59,10 @@ from ai.attachment_content import (
 from ai.rich_message_builder import RichMessageBuilder
 from ai.draft_manager import DraftManager
 from ai.agentic_loops import (
+    _append_bg_task_notices,
     _agentic_loop_native_image,
     _agentic_loop_native_video,
+    _media_loop_with_notices,
 )
 # 协议路由（Model -> Protocol -> Adapter）：聊天协议的唯一分发出口。
 from protocols import resolve_chat_adapter
@@ -716,6 +718,15 @@ async def get_ai_response(
         # anthropic_bridge 4 断点策略）——内部 Message 不携带任何
         # 出站缓存装饰，本入口不再预处理。
 
+        # ---------- 后台 bash 任务完成通知「就近搭车」 ----------
+        # 注入点已收敛（不再在此手工调用）：所有模型调用路径的 drain 在
+        # 两个最低公共入口自守卫——① _call_api 函数入口（chat 协议全部
+        # 路由）；② ai.agentic_loops._media_loop_with_notices（image/video
+        # 生成 POST 循环，含媒体向导提交路径）。不变式「凡到达模型调用
+        # 的路径，队列必被 drain」由 tests/unit/test_bg_notice_drain_invariant.py
+        # 守护；不调模型的路径（媒体向导卡片 / preflight 短路）不消费，
+        # 通知留给下一次请求。
+
         builder.set_thinking_status("Thinking...")
         await builder.flush(force=False)
         _log_stage("预处理全部完成，开始模型请求")
@@ -745,16 +756,29 @@ async def get_ai_response(
                 # 交互参数卡片已发出：本回合到此为止（用户在卡片上配置后提交）
                 raw_content, usage, new_msgs = "MEDIA_WIZARD", None, []
             else:
-                raw_content, usage, new_msgs = await _agentic_loop_native_video(
-                    current_model, messages, builder, chat_id, journal=journal
+                raw_content, usage, new_msgs = await _media_loop_with_notices(
+                    _agentic_loop_native_video,
+                    current_model=current_model,
+                    messages=messages,
+                    builder=builder,
+                    chat_id=chat_id,
+                    journal=journal,
+                    namespace=workspace_namespace_value,
                 )
         elif _model_route == "image":
             if not is_timer and await _maybe_start_media_wizard(chat_id, current_model, user_message):
                 raw_content, usage, new_msgs = "MEDIA_WIZARD", None, []
             else:
                 client = api_client.get_client_for_model(model_info)
-                raw_content, usage, new_msgs = await _agentic_loop_native_image(
-                    cast("AsyncOpenAI", client), current_model, messages, builder, chat_id, journal=journal
+                raw_content, usage, new_msgs = await _media_loop_with_notices(
+                    _agentic_loop_native_image,
+                    client=cast("AsyncOpenAI", client),
+                    current_model=current_model,
+                    messages=messages,
+                    builder=builder,
+                    chat_id=chat_id,
+                    journal=journal,
+                    namespace=workspace_namespace_value,
                 )
         elif is_timer:
             # TIMER 使用"安全主动工具面"，而不是完整 USER 工具面。
@@ -791,6 +815,7 @@ async def get_ai_response(
             raw_content, usage, new_msgs = await _call_api(
                 current_model, model_info, messages, chat_id, builder,
                 tools=timer_tools, journal=journal,
+                workspace_namespace=workspace_namespace_value,
             )
         else:
             # USER 回合：静默模式（/show off）追加 deliver_reply，send 缺省
@@ -804,10 +829,12 @@ async def get_ai_response(
                     current_model, model_info, messages, chat_id, builder,
                     tools=None, journal=journal,
                     extra_tools=[build_deliver_reply_tool(default_send=True)],
+                    workspace_namespace=workspace_namespace_value,
                 )
             else:
                 raw_content, usage, new_msgs = await _call_api(
-                    current_model, model_info, messages, chat_id, builder, journal=journal
+                    current_model, model_info, messages, chat_id, builder, journal=journal,
+                    workspace_namespace=workspace_namespace_value,
                 )
 
         await builder.stop_flush_loop()
@@ -1250,7 +1277,14 @@ async def _call_api(
         tools: Optional[list[Any]] = None,
         journal: Optional[list[Any]] = None,
         extra_tools: Optional[list[Any]] = None,
+        workspace_namespace: Optional[str] = None,
 ) -> tuple[str | None, object | None, list]:
+    # 后台任务通知 drain 注入点①（函数入口自守卫）：本函数是全部 chat
+    # 协议模型调用的最低公共入口——USER / TIMER / 静默以及任何未来新增
+    # 路由经由它到达模型即自动 drain，不可能再出现「新增路径忘接线就
+    # 静默丢通知」（结构性不变式，见
+    # tests/unit/test_bg_notice_drain_invariant.py）。
+    _append_bg_task_notices(messages, chat_id, workspace_namespace)
     if tools is None:
         from search_engine import SEARCH_TOOLS
         tools = SEARCH_TOOLS

@@ -468,6 +468,13 @@ async def _shutdown_close_http_session() -> None:
     except Exception:
         logger.warning("shutdown _bash_manager.cleanup_all failed", exc_info=True)
     try:
+        # 后台 bash 任务：先取消 monitor 再杀进程（.exit 不写，下次启动
+        # 按「应用重启期间结束」恢复，不会误报为 failed）。见 bash_background。
+        import bash_background
+        await bash_background.shutdown_all()
+    except Exception:
+        logger.warning("shutdown bash_background.shutdown_all failed", exc_info=True)
+    try:
         from utils import close_http_session
         await close_http_session()
     except Exception:

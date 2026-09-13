@@ -16,6 +16,10 @@ from sandbox import (
     SANDBOX_TIMEOUT_SEC, SANDBOX_IDLE_TIMEOUT_SEC, SANDBOX_TIMEOUT_HARD_MAX,
     SANDBOX_SOCKET_TIMEOUT_SEC,
 )
+# 后台任务模块是本模块的下游叶子（它对 bash_session 只有函数内延迟导入），
+# 顶层导入安全：_command_is_safe 供 _is_safe 委托，start/query 供 execute_bash 路由。
+import bash_background
+from bash_background import _command_is_safe
 from workspace_paths import (
     workspace_root, workspace_workdir, runtime_cache_root, workspace_namespace,
     workspace_upload_root, workspace_download_root,
@@ -432,35 +436,12 @@ class BashSession:
     # ===================== 命令安全检查（最小黑名单） =====================
     # 设计原则: 不限制语法（heredoc/管道/重定向/&&/|| 全部允许），
     #          只拦截极端灾难模式，剩余靠沙箱兜底
-    _DANGEROUS_PATTERNS = [
-        # rm -rf / 或 rm -rf /*
-        (re.compile(r'\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*)\s+/(?:\s|$|\*)'),
-         "rm -rf /"),
-        # fork bomb
-        (re.compile(r':\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:'),
-         "fork bomb"),
-        # 写裸设备
-        (re.compile(r'\bdd\s+if=\S+\s+of=/dev/(?!null|zero|random|urandom)'),
-         "dd to raw device"),
-        # mkfs 任意设备
-        (re.compile(r'\bmkfs\.\w+\s+/dev/'),
-         "mkfs on device"),
-        # 写 /dev/mem /dev/kmem
-        (re.compile(r'\bof=/dev/(mem|kmem|port)'),
-         "write to kernel memory"),
-        # :(){...} 的变体
-        (re.compile(r'\.\s*\(\s*\)\s*\{'),
-         "anonymous fork function"),
-    ]
-
+    # 模式表已抽到 bash_background._DANGEROUS_PATTERNS（后台任务启动与
+    # 前台会话共用同一份）；本方法只保留 chat 维度的日志语境。
     def _is_safe(self, command: str) -> bool:
-        """最小黑名单，仅拦极端操作；其余靠沙箱"""
-        if not command or not command.strip():
+        if not _command_is_safe(command):
+            logger.warning(f"🚫 Bash rejected chat_id={self.chat_id}: {command[:200]}")
             return False
-        for pattern, name in self._DANGEROUS_PATTERNS:
-            if pattern.search(command):
-                logger.warning(f"🚫 Bash rejected ({name}) chat_id={self.chat_id}: {command[:200]}")
-                return False
         return True
 
     @staticmethod
@@ -1048,17 +1029,37 @@ async def execute_bash(
     restart: bool = False,
     namespace: str | None = None,
     timeout: int | None = None,
+    run_in_background: bool = False,
+    task_action: str | None = None,
+    task_id: str | None = None,
+    description: str = "",
 ) -> str:
     """bash 工具入口。
 
     timeout（v2.4，可选，5-600 秒）：模型为已知长静默命令显式声明的总
     超时；传入时禁用本次调用的无输出空闲保护（见
     _normalize_requested_timeout）。非法值静默回退到默认双层配置。
+
+    后台任务模式（v2.5）：run_in_background=True 启动独立后台任务并立即
+    返回句柄；task_action（status/output/stop/list）查询/停止既有任务。
+    两者都忽略 timeout——后台任务没有 idle 超时，寿命由
+    BASH_TASK_MAX_LIFETIME_SEC 统一兜底。路由优先级：restart →
+    task_action → run_in_background → 前台执行。
     """
     resolved_namespace = workspace_namespace(chat_id, namespace)
     if restart:
         result = await _bash_manager.restart_session(chat_id, resolved_namespace)
         return result
+    if task_action:
+        return await bash_background.query_task(
+            chat_id, resolved_namespace, action=task_action, task_id=task_id,
+        )
+    if run_in_background:
+        if not command:
+            return "Error: command is required (or set restart=true)"
+        return await bash_background.start_background_task(
+            chat_id, resolved_namespace, command, description=description,
+        )
     if not command:
         return "Error: command is required (or set restart=true)"
     total_timeout, idle_timeout = _normalize_requested_timeout(timeout)
