@@ -1260,6 +1260,7 @@ SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
     reasoning_effort="high",
     max_context=1000000,
     protocol="openai_responses",
+    supports_prompt_cache=True,
 )
 SUPPORTED_MODELS["big-pickle"] = make_model_config(
     model_id="big-pickle",
@@ -1268,6 +1269,7 @@ SUPPORTED_MODELS["big-pickle"] = make_model_config(
     reasoning_effort="high",
     max_context=200000,
     protocol="openai_responses",
+    supports_prompt_cache=True,
 )
 SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
     model_id="muse-spark-1.3-contributor",
@@ -1277,6 +1279,7 @@ SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
     reasoning_effort="high",
     max_context=1000000,
     protocol="openai_responses",
+    supports_prompt_cache=True,
 )
 
 
