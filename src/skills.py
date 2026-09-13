@@ -469,18 +469,23 @@ async def start_packaged_skill_auto_sync() -> None:
         initial["preserved"], len(initial["errors"]),
     )
 
-    _sync_watcher_stop = asyncio.Event()
+    stop_event = asyncio.Event()
+    _sync_watcher_stop = stop_event
     source_fingerprint = _packaged_source_fingerprint()
 
     async def _watch() -> None:
+        # Keep a stable local reference to the stop event.  Shutdown clears the
+        # module-level handle after signalling the watcher; reading the global
+        # from here creates a race where the task can resume between awaits and
+        # hit ``None.is_set()``.
         last = source_fingerprint
         try:
-            while not _sync_watcher_stop.is_set():
+            while not stop_event.is_set():
                 try:
-                    await asyncio.wait_for(_sync_watcher_stop.wait(), timeout=_SYNC_INTERVAL_SECONDS)
+                    await asyncio.wait_for(stop_event.wait(), timeout=_SYNC_INTERVAL_SECONDS)
                 except asyncio.TimeoutError:
                     pass
-                if _sync_watcher_stop.is_set():
+                if stop_event.is_set():
                     break
 
                 fingerprint = _packaged_source_fingerprint()
@@ -504,17 +509,28 @@ async def start_packaged_skill_auto_sync() -> None:
 
 async def stop_packaged_skill_auto_sync() -> None:
     global _sync_watcher_task, _sync_watcher_stop
-    if _sync_watcher_stop:
-        _sync_watcher_stop.set()
+
+    # Snapshot the handles before changing module-level state.  The watcher
+    # itself owns a stable local Event reference, so clearing this global is
+    # now safe even if the task is resumed during shutdown.
+    stop_event = _sync_watcher_stop
     task = _sync_watcher_task
-    _sync_watcher_task = None
-    _sync_watcher_stop = None
-    if task:
+
+    if stop_event is not None:
+        stop_event.set()
+
+    if task is not None:
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
+
+    # Only clear the globals after the task has fully stopped.  This makes the
+    # lifecycle easier to reason about and avoids exposing half-torn-down state
+    # to concurrent startup/shutdown calls.
+    _sync_watcher_task = None
+    _sync_watcher_stop = None
 
 
 def catalog_text() -> str:

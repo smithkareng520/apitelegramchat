@@ -1,3 +1,10 @@
+# 2026-09-14 shutdown lifecycle hardening
+
+- Fixed a race in `src/skills.py` where the packaged-skill watcher could read `_sync_watcher_stop` after shutdown had cleared it to `None`, causing `AttributeError: 'NoneType' object has no attribute 'is_set'`. The watcher now captures a stable local `asyncio.Event`, and shutdown clears global handles only after the task has stopped.
+- Added an `APPLICATION SHUTDOWN BEGIN` lifecycle marker to `src/app.py` so runtime logs clearly distinguish platform/server shutdown from component-level failures.
+- Increased Render `maxShutdownDelaySeconds` to 60 seconds to give the existing graceful cleanup enough time before a forced termination.
+- Added a regression test covering the watcher/global-handle race.
+
 # 代码审查报告 & 本轮修改说明
 
 审查范围：AI 请求/响应处理链路（`src/ai_handlers.py`、`src/ai/*.py`、

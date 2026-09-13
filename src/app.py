@@ -409,6 +409,29 @@ async def _startup_sync_webhook() -> None:
 
 
 @app.after_serving
+async def _shutdown_lifecycle_marker() -> None:
+    """Record the exact moment Quart has entered graceful shutdown.
+
+    This is deliberately diagnostic-only: the platform/server remains responsible
+    for initiating shutdown (for example, Render may send SIGTERM during deploys,
+    maintenance, or instance replacement). Keeping this marker separate from the
+    component cleanup logs makes it possible to distinguish "shutdown started"
+    from "a component crashed" in runtime logs.
+    """
+    try:
+        logger.warning(
+            "APPLICATION SHUTDOWN BEGIN pid=%s ppid=%s queue=%s active_tasks=%s tasks=%s",
+            os.getpid(),
+            os.getppid(),
+            app_state.update_queue.qsize(),
+            len(active_tasks),
+            len(asyncio.all_tasks()),
+        )
+    except Exception:
+        logger.warning("APPLICATION SHUTDOWN BEGIN (diagnostic details unavailable)", exc_info=True)
+
+
+@app.after_serving
 async def _shutdown_packaged_skill_sync() -> None:
     """Stop the packaged-skill refresh watcher cleanly."""
     try:

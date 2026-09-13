@@ -17,6 +17,10 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /health
+    # Give the bot enough time to finish its graceful cleanup after SIGTERM.
+    # Render uses SIGTERM for normal instance replacement/deploys and may send
+    # SIGKILL after this window if the process is still alive.
+    maxShutdownDelaySeconds: 60
     autoDeploy: true
     envVars:
       - key: PORT
