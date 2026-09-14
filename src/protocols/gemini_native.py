@@ -40,8 +40,8 @@ class GeminiNativeAdapter(ChatProtocolAdapter):
         chat_id = getattr(builder, "chat_id", None)
         if chat_id is not None:
             try:
-                from conversation_state import invalidate_responses_cursor
-                invalidate_responses_cursor(chat_id)
+                from conversation_state import mark_legacy_divergence
+                mark_legacy_divergence(chat_id)
             except Exception:
                 pass
         return await _agentic_loop_gemini_native(

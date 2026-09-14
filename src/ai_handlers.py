@@ -584,18 +584,16 @@ async def get_ai_response(
                 "AI 响应预处理阶段: chat=%s stage=%s stage_ms=%s total_ms=%s",
                 chat_id, stage_name, elapsed_ms, total_ms,
             )
-    # conversation_state.TurnState：本回合的 generation/revision 快照，
-    # 用于 openai_responses 桥接判断"服务端会话 cursor 是否仍然有效"、
-    # 以及回合结束后 commit 新 cursor 前的乐观并发校验（fencing，防止
-    # 已经被 /clear 的过期回合迟到结果污染当前状态）。创建放在
-    # register_inflight_turn 之后没有强制顺序要求，这里与其相邻只是
-    # 保持"回合级初始化"聚在一起，便于阅读；两者失败都不阻断主流程
-    # （turn=None 时下游按旧行为处理，见 protocols/base.py 的参数说明）。
+    # conversation_state.TurnState：本回合的事务快照（多厂商会话同步
+    # 状态机，见 conversation_state.py 模块头注释）。回合开始时同时在
+    # 状态机上登记"在途回合"——server_compaction 的服务端压缩回拉据此
+    # 让路（不在回合流式中途覆盖镜像工作集），回拉延迟到回合收尾。
     turn = None
     try:
-        from conversation_state import get_conversation_state
+        from conversation_state import get_conversation_state, register_active_turn
         _conv_st = await get_conversation_state(chat_id)
         turn = _conv_st.begin_turn(event_source)
+        register_active_turn(chat_id, turn)
     except Exception:
         logger.debug("conversation_state.begin_turn 失败（服务端会话优化降级）", exc_info=True)
 
@@ -1325,6 +1323,14 @@ async def get_ai_response(
         # 关键：被取消时不在 finally 里删草稿——webhook 入口已经删过了
         # （或者正在删，或者下一个任务已经注册了新草稿）
         # 强行删会跟下一个任务的草稿打架
+        # 多厂商会话状态机：注销在途回合登记（幂等；服务端压缩回拉
+        # 据此判断"是否有回合在途"，回合结束后回拉才允许覆盖镜像）。
+        if turn is not None:
+            try:
+                from conversation_state import unregister_active_turn
+                unregister_active_turn(chat_id, turn)
+            except Exception:
+                logger.debug("unregister_active_turn 失败（可忽略）", exc_info=True)
         if builder:
             try:
                 await builder.stop_flush_loop()
@@ -1409,6 +1415,16 @@ async def _call_api(
     # 硬编码分支。适配器内部负责客户端获取与循环转发；新增协议只需
     # 在 protocols/registry 注册，本函数零改动。
     adapter = resolve_chat_adapter(model_info)
+    if chat_id is not None:
+        # 多厂商会话状态机：登记本回合产出消息的写入者（厂商分区键）。
+        # update_conversation_and_ledger 落库时消费该标签记入写入者台账
+        # ——跨厂商 / 传统模型的写入据此触发分叉（作废重建），这是
+        # "厂商间 ID 强隔离"的判定依据（conversation_state.py 二.3）。
+        try:
+            from conversation_state import derive_vendor_key, note_turn_writer
+            note_turn_writer(chat_id, derive_vendor_key(model_info))
+        except Exception:
+            logger.debug("note_turn_writer 失败（写入者标签降级为 unknown）", exc_info=True)
     return await adapter.run_agent_loop(
         current_model=current_model,
         model_info=model_info,

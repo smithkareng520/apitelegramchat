@@ -73,7 +73,7 @@ def _fit_message_to_token_budget(message: Any, token_budget: int) -> Any:
         return None
 
     original = text_blocks[0].text
-    empty = Message(role=m.role, blocks=[], name=m.name)
+    empty = Message(role=m.role, blocks=[], name=m.name, meta=dict(m.meta))
     available = token_budget - _message_token_count(empty)
     if available <= 0:
         return None
@@ -81,12 +81,14 @@ def _fit_message_to_token_budget(message: Any, token_budget: int) -> Any:
     candidate_text = original
     candidate_text = truncate_to_token_budget(original, available, suffix="…")
     while available > 0 and _message_token_count(
-        Message(role=m.role, blocks=[TextBlock(candidate_text)], name=m.name)
+        Message(role=m.role, blocks=[TextBlock(candidate_text)], name=m.name, meta=dict(m.meta))
     ) > token_budget:
         available -= 1
         candidate_text = truncate_to_token_budget(original, available, suffix="…")
 
-    fitted = Message(role=m.role, blocks=[TextBlock(candidate_text)], name=m.name)
+    # meta 随拷贝保留（镜像序列号是跨回合增量同步的身份依据，见
+    # conversation_state.SEQ_META_KEY；meta 永不进出站请求体）。
+    fitted = Message(role=m.role, blocks=[TextBlock(candidate_text)], name=m.name, meta=dict(m.meta))
     return fitted if _message_token_count(fitted) <= token_budget else None
 
 

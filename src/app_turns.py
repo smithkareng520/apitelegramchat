@@ -541,6 +541,18 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
                     budget_tokens=effective_digest_budget(budget),
                 )
                 apply_eviction_plan(history, plan, digest_text)
+                # 多厂商会话状态机（需求文档 二.2 本地压缩处理）：结构性
+                # 淘汰（滑动窗口/摘要合并）使本地镜像与云端历史产生结构
+                # 分叉 ⇒ 立即作废当前绑定的全部厂商 conversation_id，
+                # 下一轮 Responses 请求以本地压缩后的完整上下文作为新会话
+                # 首轮数据重新自举（服务端前缀匹配自动命中 Prompt Cache）。
+                # 注意：L1 工具负载归档（指针化）不改镜像结构（条数不变），
+                # 不触发分叉。
+                try:
+                    from conversation_state import mark_structural_fork
+                    mark_structural_fork(chat_id, "local_compaction_eviction")
+                except Exception:
+                    logger.warning("mark_structural_fork 失败（忽略）", exc_info=True)
                 history_est = _estimate_history_tokens(history)
                 evicted_blocks = len(plan.evicted_blocks)
                 evicted_messages = plan.evicted_message_count
@@ -587,6 +599,7 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
     async with lock:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
+        from conversation_state import record_mirror_append  # 镜像台账（chat 锁内）
         if user_message is not None and not user_message.get(turn_recovery.EARLY_PERSIST_FLAG):
             # 剥离引用回复前缀后再入历史（前缀只服务当前请求上下文）。
             # USER 回合的正常路径已由 persist_user_message_entry 提前持久化
@@ -598,10 +611,14 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
                 user_message["content"] = block_content
             # 历史统一存 Message：信封 dict 的其余键（附件元数据/内部标记）
             # 归入 meta，出站渲染时结构性剔除。
-            history.append(Message.user_text(str(block_content or ""), **{
+            user_entry = Message.user_text(str(block_content or ""), **{
                 k: v for k, v in user_message.items() if k != "content"
-            }))
+            })
+            history.append(user_entry)
             appended_any = True
+            # 镜像台账：用户输入是厂商无关写入者（增量合法来源，见
+            # conversation_state 写入者台账规则）。
+            record_mirror_append(chat_id, [user_entry], "user")
         # 历史标记清理：早持久化的消息进入历史时去掉内部标记。
         if isinstance(user_message, dict):
             user_message.pop(turn_recovery.EARLY_PERSIST_FLAG, None)
@@ -618,16 +635,32 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
         # 消息已落历史：立即注销该轮的 in-flight 登记（在释放 chat 锁前）。
         if new_msgs:
             turn_recovery.note_turn_persisted(chat_id, new_msgs)
-        # conversation_state.py：canonical history 每次成功追加后递增
-        # revision——与本函数共享同一把 chat 锁，保证"历史写入"与
-        # "版本号推进"同一原子区间内完成。早持久化路径（user 消息已经
-        # 在 get_ai_response 开始时提前写入）本函数看不到那次 append，
-        # 但那次写入已经在 turn_recovery.persist_user_message_entry 里
-        # 单独推进过一次 revision（见该函数改动），这里只对本函数自己
-        # 实际 append 的内容推进，避免重复计数。
-        if appended_any:
-            from conversation_state import bump_canonical_revision
-            await bump_canonical_revision(chat_id)
+        # 多厂商会话状态机：回合产出（assistant/tool 消息）追加入库并
+        # 记入写入者台账——写入者 = 本回合实际服务的厂商分区键
+        # （_call_api 派发前登记；媒体向导等未经 _call_api 的路径取不到
+        # 标签时降级为 unknown，plan 阶段保守触发分叉，安全侧倾斜）。
+        # 与历史写入共享同一把 chat 锁，保证"写入"与"台账"同一原子区间。
+        if new_msgs:
+            writer = "unknown"
+            try:
+                from conversation_state import consume_turn_writer
+                writer = consume_turn_writer(chat_id)
+            except Exception:
+                logger.debug("consume_turn_writer 失败（写入者降级 unknown）", exc_info=True)
+            record_mirror_append(
+                chat_id,
+                [m for m in new_msgs if isinstance(m, Message)],
+                writer,
+            )
+        elif appended_any:
+            # 理论上不可达（user 兜底追加已在上方单独记账）；防御：仅有
+            # dict 形状追加（极端遗留路径）时推进诊断版本号，避免旧
+            # bump_canonical_revision 调用点语义丢失。
+            try:
+                from conversation_state import bump_canonical_revision
+                await bump_canonical_revision(chat_id)
+            except Exception:
+                pass
         if usage:
             if hasattr(usage, "model_dump"):
                 usage_dict = usage.model_dump()

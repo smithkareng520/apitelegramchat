@@ -349,11 +349,19 @@ async def safe_clear_history(chat_id: int) -> None:
         # 清空对话 = 新建会话：同步轮换 LLM 会话亲和键，旧会话的路由
         # 亲和性（OpenRouter 粘性路由 / agnes 副本粘性）不再作用于新对话。
         rotate_llm_session_token(chat_id)
-        # 同步重置对话状态层（conversation_state.py）：generation += 1，
-        # canonical_revision 归零，全部 provider cursor（如 Responses
-        # 服务端会话）失效。与历史清空同在本临界区内完成，保证"新历史"
-        # 与"新状态账本"原子生效，不会出现旧 cursor 残留、下一轮误判
-        # 为可续接的情况。
+        # 多厂商会话状态机（需求文档 二.4 /clear）：在重置前快照当前
+        # 绑定的全部厂商 conversation_id，派发后台尽力删除服务端会话
+        # 对象（不阻塞 /clear，失败静默——遗留会话不影响本地正确性）。
+        try:
+            from server_compaction import collect_and_spawn_conversation_deletions
+            collect_and_spawn_conversation_deletions(chat_id)
+        except Exception:
+            pass
+        # 同步重置对话状态机（conversation_state.py）：generation += 1
+        # （fencing 边界），清空全部厂商的 conversation_id 绑定，镜像
+        # 序列号 / 写入者台账 / 结构纪元全部归零。与历史清空同在本临界区
+        # 内完成，保证"新历史"与"新状态账本"原子生效，不会出现旧会话
+        # 残留、下一轮误判为可续接的情况。
         from conversation_state import reset_conversation_state
         await reset_conversation_state(chat_id)
 

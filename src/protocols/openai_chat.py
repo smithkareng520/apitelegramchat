@@ -41,16 +41,18 @@ class OpenAIChatAdapter(ChatProtocolAdapter):
         from ai.agentic_loops import _agentic_loop_openai_compat
 
         # Chat Completions 没有等价的服务端会话概念，协议路由到这里
-        # 意味着当前回合不使用 Responses 的服务端会话；令 cursor 失效，
-        # 下次切回 openai_responses 协议时重新自举（见
-        # conversation_state.py"模型切换语义"）。canonical history 不受
-        # 影响，Chat Completions 继续按既有行为全量重发（本协议本就是
-        # "无状态 provider"，见任务指南 Task 9）。
+        # 意味着：传统模型的问答尚未在任何厂商的 Responses 服务端会话
+        # 中登记。按多厂商状态机规则（conversation_state.py"分叉态"），
+        # 作废全部厂商会话——下次切回 Responses 协议时以本地全量上下文
+        # 重新自举（服务端前缀匹配命中 Prompt Cache）。canonical history
+        # 不受影响，Chat Completions 继续按既有行为全量重发（本协议本就
+        # 是"无状态 provider"）；厂商隔离的另一道保险是回合产出写入者
+        # 台账（_call_api 登记 + update_conversation_and_ledger 落账）。
         chat_id = getattr(builder, "chat_id", None)
         if chat_id is not None:
             try:
-                from conversation_state import invalidate_responses_cursor
-                invalidate_responses_cursor(chat_id)
+                from conversation_state import mark_legacy_divergence
+                mark_legacy_divergence(chat_id)
             except Exception:
                 pass
         client = api_client.get_client_for_model(model_info)

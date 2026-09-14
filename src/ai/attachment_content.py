@@ -1323,7 +1323,11 @@ async def _append_history_async(messages: list, history: list, model_info: Model
                     out_blocks.append(TextBlock(_strip_reply_prefix(b.text)))
                 else:
                     out_blocks.append(b)
-            messages.append(Message(role=m.role, blocks=out_blocks, name=m.name))
+            # meta 必须随拷贝保留：其中携带多厂商会话状态机的镜像序列号
+            # （conversation_state.SEQ_META_KEY），是跨回合增量同步的身份
+            # 依据；meta 本身永不进出站请求体（Message.to_openai_dict
+            # 结构性保证），拷贝无副作用。
+            messages.append(Message(role=m.role, blocks=out_blocks, name=m.name, meta=dict(m.meta)))
 
 
 def _strip_reply_prefix(content: str) -> str:

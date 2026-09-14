@@ -41,30 +41,34 @@ Responses API 与 Chat Completions 虽同属 OpenAI，但线上协议形状完�
 把这些差异塞进 _agentic_loop_openai_compat 会让该函数的分支判断进一步
 膨胀；按项目既有的原生协议桥接惯例单独实现一份，改动面清晰、互不干扰。
 
-3. 服务端会话状态（真正的 stateful Responses，2026-09 新增）：
+3. 服务端会话状态（多厂商同步状态机，2026-09 按需求文档重写）：
    ==================================================
    上面两条原则描述的是"边界转换"这一层，与是否使用服务端会话无关，
-   继续对全部调用方成立。本次新增的是**请求侧的传输优化**：当调用方
+   继续对全部调用方成立。本节描述的是**请求侧的同步机制**：当调用方
    通过 ``turn``（conversation_state.TurnState）接入了对话状态层时，
-   本文件会优先复用 OpenAI 的 ``conversation`` 服务端会话对象——只把
-   "尚未发给服务端的增量消息"放进 ``input``，不再每轮全量重发
-   canonical history；cursor 失效（跨协议切换回来 / 历史被压缩 /
-   `/clear` 之后）时自动退化为一次性全量"自举"，建立新的会话对象。
+   本文件按 conversation_state 的多厂商状态机运作——日常态（增量优先）
+   复用服务端 ``conversation`` 对象，只把"尚未发给服务端的增量消息"
+   放进 ``input``；分叉态（本地压缩 / 跨厂商写入 / 传统模型登记缺失 /
+   ``/clear`` 之后）作废旧会话 id，以本地全量上下文一次性"自举"建立
+   新会话（服务端前缀匹配自动命中 Prompt Cache）；检测到服务端压缩
+   事件时登记回拉同步（server_compaction 持锁覆盖本地镜像）。
 
-   这一优化完全不影响原则 1/2：
+   这一机制完全不影响原则 1/2：
      - canonical history（loop_messages / new_history_entries）依然是
        全量的内部 Message 列表，只读，从不因为"发没发给服务端"而被
        裁剪或改写；
-     - 只有"即将序列化成 Responses input"这一步会按 sent_count 切片，
-       且切片只影响这一次网络请求的 payload，不影响任何持久化路径。
+     - 只有"即将序列化成 Responses input"这一步会按对象身份切片
+       （sent_ids / local_assistant_ids，见 _TurnSyncContext），切片
+       只影响这一次网络请求的 payload，不影响任何持久化路径。
 
    详细设计与 fencing（TIMER/USER 并发、/clear、模型切换）见
    conversation_state.py 模块头注释；本文件内的接入点集中在
-   "Conversation State：服务端会话（真正的 stateful Responses）"一节。
+   "Conversation State：多厂商会话同步状态机接入"一节。
 """
 import hashlib
 import json
 import uuid
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 from utils import get_logger
@@ -328,40 +332,43 @@ def _add_responses_cache_options(
 
 
 # =============================================================================
-# Conversation State：服务端会话（真正的 stateful Responses）
+# Conversation State：多厂商会话同步状态机接入（需求文档 一/二）
 # =============================================================================
-# 背景（务必先读 conversation_state.py 模块头注释）：本节把
-# _agentic_loop_openai_responses 从"每轮全量重发 canonical history"改造
-# 成"cursor 有效时只发本轮增量"。策略：
+# 本节把 _agentic_loop_openai_responses 接入 conversation_state 的多厂商
+# 状态机（详见该模块 docstring）。回合级语义：
 #
-#   1) 回合开始（第一次进入下面的 for _round 循环）时，查询
-#      conversation_state 里该 chat 的 Responses cursor 是否仍然对当前
-#      canonical_revision 有效（is_valid_for）。
-#        - 有效 -> 增量模式：只转换 loop_messages 里"尚未发送过"的
-#          消息（通常就是本轮新增的 user 消息），请求携带
-#          conversation=cursor.conversation_id，不携带 input 之外的
-#          历史；
-#        - 无效（从未建立过 / 模型此前不是 Responses / 历史被压缩 /
-#          `/clear` 之后第一次）-> 自举模式：全量转换 loop_messages
-#          （与旧行为一致），请求携带 conversation=<新建的 conversation
-#          对象 id>，建立服务端会话起点。
-#   2) 工具调用继续同一轮对话（同一个 for _round 迭代继续）时，
-#      不需要重新判断 cursor 有效性——同一个 turn 内本来就是同一个
-#      conversation，只需要把"本轮循环内新产生的" assistant/tool
-#      消息（上一次请求之后 loop_messages 新增的部分）作为下一次请求
-#      的增量 input 发送。用 _sent_count 追踪"loop_messages 里已经
-#      发给 Responses 服务端的前缀长度"即可，逻辑与 revision 机制正交
-#      （revision 只用于跨轮次/跨协议判断 cursor 是否需要重新自举）。
-#   3) response.completed 时（循环末尾拿到 resp_obj.conversation.id /
-#      resp_obj.id）尝试 commit 新 cursor——只有 TurnState fencing 校验
-#      通过（回合发起后没有发生 /clear）才真正写入，避免过期回合的
-#      迟到响应污染当前状态（见 conversation_state.ConversationState.
-#      is_turn_current）。
+#   1) 回合开始（第一次进入 for _round 循环之前）：
+#      - 由 model_info 推导厂商分区键 vendor_key（provider|endpoint|
+#        protocol，厂商间 ID 强隔离）；
+#      - 为请求视图中未发号的 Message 补 seq（镜像副本经 meta 携带既有
+#        seq；本回合私有新条目——TIMER 合成 user 消息、中段 system 通知
+#        ——发号后按厂商无关写入者记台账）；
+#      - plan_vendor_request 判定增量 vs 自举：
+#          * 日常态（incremental）：ref 有效、结构纪元匹配、水位之后镜像
+#            条目的写入者全部 ∈ {"user", 本厂商} ⇒ 复用 conversation_id，
+#            本轮只发送"seq > 水位 / 本回合新增"的增量 input；
+#          * 分叉态（bootstrap）：本地压缩 / 跨厂商写入 / 传统模型登记
+#            缺失 / 会话不存在 ⇒ 作废旧 id，新建 conversation 对象，以
+#            本地全量上下文做首轮自举（服务端前缀匹配命中 Prompt Cache）。
+#   2) 工具调用续轮（同一个 for _round 迭代继续）：不重新判定有效性——
+#      同一回合共用同一个 conversation_id。增量切片按"对象身份"追踪：
+#      sent_ids 记录已发出的视图条目，local_assistant_ids 记录本回合由
+#      服务端响应产生的 assistant 消息（其 output item 已随响应自动进入
+#      服务端会话，重发会造成重复条目）；每次请求后 loop_messages 新增的
+#      tool 结果自然成为下一轮的增量 input。
+#   3) 服务端压缩监听（需求文档 二.1）：流式事件与 response.completed
+#      元数据中检测到 compaction / 历史截断标识 ⇒ 登记待回拉同步；
+#      回合收尾后由 server_compaction.run_pending_server_sync 持 chat 锁
+#      执行"GET items -> Adapter 清洗 -> 覆盖本地镜像"。
+#   4) 回合结束 commit（fencing）：写入厂商会话的水位（本回合已发号最大
+#      seq）与结构纪元；/clear 后迟到的 commit 被 generation fencing 拒绝。
+#   5) 异常兜底：回合中途异常 / 被打断 ⇒ 作废本回合使用的厂商会话
+#      （分叉态重建，避免服务端残留半轮内容与本地镜像静默错位）；
+#      增量首轮请求失败（4xx 会话类错误）⇒ 当场作废并以全量自举重试一次。
 #
-# 环境开关（默认开启）：出于稳妥考虑保留一个总开关，允许在观察到
-# 网关侧对 `conversation` 参数支持不稳定时整体回退到旧的"每轮全量
-# 自举"行为（等价于把 cursor 永远判定为无效），不影响功能正确性，
-# 只是放弃 token/延迟优化。
+# 环境开关（默认开启）：允许在观察到网关侧对 `conversation` 参数支持
+# 不稳定时整体回退到旧的"每轮全量重发"行为（等价于永远 stateless），
+# 不影响功能正确性，只是放弃 token/延迟优化。
 import os as _os
 
 
@@ -370,27 +377,213 @@ def _responses_stateful_enabled() -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
-async def _resolve_conversation_plan(
+@dataclass
+class _TurnSyncContext:
+    """单个回合内的服务端会话同步上下文（桥接层私有）。
+
+    sent_ids：请求视图中"已经作为 input 发出"的条目对象 id——增量切片
+        按对象身份而非列表下标，天然免疫出站视图裁剪与中段 system 通知
+        带来的下标错位（旧实现 revision≈条数 假设的缺陷根因）。
+    local_assistant_ids：本回合由服务端响应产生的 assistant 消息对象 id
+        ——这些内容的 output item 已随响应自动登记进服务端会话，不能
+        再次作为增量 input 重发。
+    max_seq：本回合已发号的最大镜像 seq（commit 时作为同步水位——覆盖
+        user 提前持久化 + 回合内全部新增单元）。
+    dispatched：是否已有请求真正发往服务端（增量失败兜底与中断作废的
+        判据）。
+    """
+
+    vendor_key: str
+    mode: str  # "incremental" | "bootstrap"
+    conversation_id: str
+    sent_ids: set[int] = field(default_factory=set)
+    local_assistant_ids: set[int] = field(default_factory=set)
+    max_seq: int = 0
+    dispatched: bool = False
+    bootstrap_retried: bool = False
+
+
+async def _begin_turn_sync(
+    client: "AsyncOpenAI",
     chat_id: Any,
     turn: Optional["_conv_state.TurnState"],
-) -> tuple[Optional[str], bool]:
-    """返回 (conversation_id_to_reuse, need_bootstrap)。
+    model_info: Any,
+    current_model: str,
+    loop_messages: list,
+) -> Optional[_TurnSyncContext]:
+    """回合开始时建立（或放弃）服务端会话同步上下文。
 
-    - chat_id 为 None（无法定位会话，如 subagent 一次性调用）或本轮未
-      提供 TurnState（调用方未接入 conversation_state，如旧版直接调用
-      _agentic_loop_openai_responses 的测试/脚本）-> 一律不使用服务端
-      会话，退回旧的"全量自举，不复用"行为，保证向后兼容。
-    - conversation_id_to_reuse 非空 -> 复用该会话，只发增量；
-    - need_bootstrap=True 且 conversation_id_to_reuse 为空 -> 需要新建
-      一个 conversation 对象后再首次全量自举。
+    返回 None 表示本回合走无状态全量路径（未接入 TurnState / 总开关
+    关闭 / 自举建会话失败 / 状态机异常兜底），调用方按旧行为每轮全量
+    转换 loop_messages——任何异常都不阻断回合主流程（需求文档 三.2
+    边界条件异常捕获）。
     """
     if chat_id is None or turn is None or not _responses_stateful_enabled():
-        return None, False
-    st = await _conv_state.get_conversation_state(chat_id)
-    cursor = st.responses
-    if cursor.is_valid_for(st.canonical_revision):
-        return cursor.conversation_id, False
-    return None, True
+        return None
+    try:
+        return await _begin_turn_sync_inner(
+            client, chat_id, turn, model_info, current_model, loop_messages,
+        )
+    except Exception:
+        logger.warning(
+            "[openai_responses] chat=%s 会话同步计划异常，本轮回退无状态全量",
+            chat_id, exc_info=True,
+        )
+        return None
+
+
+async def _begin_turn_sync_inner(
+    client: "AsyncOpenAI",
+    chat_id: Any,
+    turn: Optional["_conv_state.TurnState"],
+    model_info: Any,
+    current_model: str,
+    loop_messages: list,
+) -> Optional[_TurnSyncContext]:
+    if chat_id is None or turn is None or not _responses_stateful_enabled():
+        return None
+    vendor_key = _conv_state.derive_vendor_key(model_info)
+    state = await _conv_state.get_conversation_state(chat_id)
+
+    # 为视图内未发号的 Message 补 seq。镜像副本经 meta 携带既有 seq；
+    # 回合私有新条目（TIMER 合成 user 消息 / 中段 system 通知）发号后
+    # 按厂商无关写入者（user）记台账——它们要么随 append-back 进入镜像，
+    # 要么只存在于本轮请求（不入镜像的合成条目，其 seq 留在台账中无副作用）。
+    for msg in loop_messages:
+        if isinstance(msg, Message) and _conv_state.SEQ_META_KEY not in msg.meta:
+            msg.meta[_conv_state.SEQ_META_KEY] = state.next_seq()
+            if msg.role in ("user", "system"):
+                state.record_append([msg], _conv_state.WRITER_USER)
+
+    # 候选同步单元的序列号（非 system 全量参与写入者检查；system 条目
+    # 走 instructions，且均已有台账或水位覆盖）。非 Message 形状（旧 dict
+    # 兼容路径）以 None 占位 → plan 判定为未发号条目 → 保守分叉。
+    candidate_seqs: list[Optional[int]] = []
+    for msg in loop_messages:
+        if not isinstance(msg, Message):
+            candidate_seqs.append(None)
+            continue
+        if msg.role == "system":
+            continue
+        seq = msg.meta.get(_conv_state.SEQ_META_KEY)
+        candidate_seqs.append(seq if isinstance(seq, int) else None)
+
+    plan = _conv_state.plan_vendor_request(
+        chat_id, vendor_key, current_model, candidate_seqs, _head_instructions_key(loop_messages)
+    )
+    sync_max_seq = state.last_seq
+
+    if plan.mode == "incremental" and plan.conversation_id:
+        # 日常态增量：预置"水位已覆盖"的条目为已发送。
+        sent_ids: set[int] = set()
+        for msg in loop_messages:
+            if not isinstance(msg, Message):
+                continue
+            seq = msg.meta.get(_conv_state.SEQ_META_KEY)
+            if isinstance(seq, int) and seq <= plan.synced_through_seq:
+                sent_ids.add(id(msg))
+        ctx = _TurnSyncContext(
+            vendor_key=vendor_key,
+            mode="incremental",
+            conversation_id=plan.conversation_id,
+            sent_ids=sent_ids,
+            max_seq=sync_max_seq,
+        )
+        logger.info(
+            "[openai_responses] chat=%s 日常态增量复用会话 conversation=%s "
+            "水位=%s 视图单元=%s 增量单元=%s",
+            chat_id, plan.conversation_id, plan.synced_through_seq,
+            len(candidate_seqs), len(loop_messages) - len(sent_ids),
+        )
+    else:
+        # 分叉态自举（或首次建立）：作废已由 plan 完成，新建 conversation。
+        new_conversation_id = await _create_responses_conversation(client)
+        if new_conversation_id is None:
+            # 建会话失败：整轮回退无状态全量；下一轮自然再次尝试自举。
+            return None
+        ctx = _TurnSyncContext(
+            vendor_key=vendor_key,
+            mode="bootstrap",
+            conversation_id=new_conversation_id,
+            max_seq=sync_max_seq,
+        )
+        logger.info(
+            "[openai_responses] chat=%s 自举新 Responses 会话 conversation=%s "
+            "（原因=%s，全量上下文 %s 条）",
+            chat_id, new_conversation_id, plan.reason, len(loop_messages),
+        )
+    turn.sync_ctx = ctx  # 供回合中断/异常路径作废对应厂商会话
+    return ctx
+
+
+def _invalidate_on_interrupt(builder: Any, turn: Optional["_conv_state.TurnState"]) -> None:
+    """回合异常 / 被打断时作废本回合使用的厂商会话（分叉态兜底）。
+
+    仅在"确有请求发往服务端"（dispatched）时作废——请求未出网时服务端
+    会话未被污染，保留 ref 可继续享受增量。本地镜像是单一事实来源，
+    作废后的下一轮请求会以本地全量上下文重建新会话。
+    """
+    ctx = getattr(turn, "sync_ctx", None) if turn is not None else None
+    if ctx is None or not getattr(ctx, "dispatched", False):
+        return
+    chat_id = getattr(builder, "chat_id", None)
+    if chat_id is None:
+        return
+    try:
+        _conv_state.invalidate_vendor_session(
+            chat_id, ctx.vendor_key, "turn_interrupted_midflight"
+        )
+        logger.info(
+            "[openai_responses] chat=%s 回合中断/异常，作废厂商会话进入分叉态 "
+            "vendor=%s",
+            chat_id, ctx.vendor_key,
+        )
+    except Exception:
+        logger.debug("[openai_responses] 中断作废厂商会话失败（忽略）", exc_info=True)
+
+
+def _head_instructions_key(loop_messages: list) -> str:
+    """头部 system 段（服务端会话 instructions 的来源）的稳定指纹。
+
+    增量轮不重发头部 system 段——本地系统提示变化（技能激活 / 能力面
+    变化等）通过指纹比对感知：不匹配 ⇒ 结构分叉，作废重建，保证模型
+    始终拿到当前系统提示。
+    """
+    parts: list[str] = []
+    for msg in loop_messages:
+        if isinstance(msg, Message) and msg.role == "system":
+            parts.append(msg.text())
+            continue
+        break
+    return hashlib.sha256("\n\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _is_conversation_error(exc: BaseException) -> bool:
+    """判定增量首轮请求失败是否属于"会话类 4xx"错误。
+
+    服务端会话过期 / conversation 对象不存在 / 条目校验失败等都会以
+    4xx 状态返回；401/403（鉴权）与 429（限流）不属于会话问题，
+    不做自举重试（避免重复撞限）。非 SDK 状态错误（连接异常等）
+    同样不重试——由上层统一的错误路径处理。
+    """
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        return False
+    return 400 <= status < 500 and status not in (401, 403, 429)
+
+
+def _compaction_detect_signal(event: Any) -> Optional[str]:
+    """转发 server_compaction 的事件检测（惰性导入避免环）。"""
+    from server_compaction import detect_compaction_signal
+
+    return detect_compaction_signal(event)
+
+
+def _compaction_detect_metadata(resp_obj: Any) -> Optional[str]:
+    """转发 server_compaction 的响应元数据检测（惰性导入避免环）。"""
+    from server_compaction import detect_compaction_metadata
+
+    return detect_compaction_metadata(resp_obj)
 
 
 async def _create_responses_conversation(client: "AsyncOpenAI") -> Optional[str]:
@@ -601,7 +794,33 @@ async def _agentic_loop_openai_responses(
     调用方接入了 conversation_state 时才生效（见
     protocols/openai_responses.py 与 ai_handlers.get_ai_response 的
     改动点）。
+
+    异常兜底（需求文档 三.2）：回合中途异常 / 被打断时，作废本回合使用
+    的厂商会话（分叉态）——服务端残留的半轮内容不允许与本地镜像静默
+    错位，下一轮请求以本地全量上下文重建新会话。
     """
+    try:
+        return await _agentic_loop_openai_responses_impl(
+            client, current_model, messages, builder,
+            api_label=api_label, tools=tools, supports_tools=supports_tools,
+            journal=journal, turn=turn,
+        )
+    except BaseException:
+        _invalidate_on_interrupt(builder, turn)
+        raise
+
+
+async def _agentic_loop_openai_responses_impl(
+        client: "AsyncOpenAI",
+        current_model: str,
+        messages: list,
+        builder: "DraftManager",
+        api_label: str = "openai_responses",
+        tools: list | None = None,
+        supports_tools: bool = True,
+        journal: list | None = None,
+        turn: Optional["_conv_state.TurnState"] = None,
+) -> tuple[str | None, object | None, list]:
     if tools is None:
         from search_engine import SEARCH_TOOLS
         tools = SEARCH_TOOLS
@@ -626,71 +845,49 @@ async def _agentic_loop_openai_responses(
         # reasoning_effort 字段语义相同，形状不同。
         reasoning_param = {"effort": str(effort).lower()}
 
-    # ---- Conversation State：本回合是否使用服务端会话 ----------------
+    # ---- Conversation State：建立本回合的服务端会话同步上下文 --------
     # chat_id 取自 builder（DraftManager 透传自 get_ai_response，全部
-    # 调用路径统一可用）；resolve 只在回合的第一轮之前做一次，工具调用
-    # 触发的后续轮次复用同一个 conversation_id，不重新判断。
+    # 调用路径统一可用）。_begin_turn_sync 完成三件事：厂商分区键推导、
+    # 视图发号、plan（增量 vs 自举）。工具调用触发的后续轮次复用同一个
+    # conversation_id，不重新判定。
     chat_id = getattr(builder, "chat_id", None)
-    conversation_id, need_bootstrap = await _resolve_conversation_plan(chat_id, turn)
-    if need_bootstrap:
-        conversation_id = await _create_responses_conversation(client)
-        if conversation_id is None:
-            # 建会话失败：整轮退回旧的"无状态全量"行为（既不复用也不
-            # 新建），下一轮自然会再次尝试自举，不影响正确性。
-            need_bootstrap = False
-    using_stateful_conversation = bool(conversation_id)
-    # sent_count：loop_messages 中已经作为 input 发送过的前缀长度。
-    # 增量模式下，每次请求只转换 loop_messages[sent_count:]；工具调用
-    # 轮次结束后 loop_messages 会追加新的 assistant/tool 消息，下一次
-    # 请求据此自然只发"新增部分"。首轮：
-    #   - 使用服务端会话（无论是复用已存在的还是刚新建的）时，"首轮"
-    #     的语义不同——复用场景只发本轮新消息（sent_count 从"已同步
-    #     revision 对应的消息条数"起算）；自举场景第一次仍需全量发送
-    #     （sent_count=0），之后才转为增量。
-    #   - 不使用服务端会话（cursor 判定/新建失败/未接入 TurnState）时
-    #     sent_count 恒为 0，等价于旧行为（每轮全量转换 loop_messages）。
-    sent_count = 0
-    if using_stateful_conversation and not need_bootstrap and chat_id is not None:
-        # 复用现有 cursor：cursor.synced_revision 对应的是"canonical
-        # history 在建立/续接 cursor 那一刻的条数"，而 loop_messages 的
-        # 前半段就是那份 canonical history（select_request_context 未
-        # 触发兜底裁剪时是全量透传，见 context_manager.py）。因此可以
-        # 直接用 canonical_revision 的语义近似为"loop_messages 里对应
-        # 那部分的长度"——两者在未压缩历史的常态路径下条数一致。
-        # 兜底：任何长度不匹配（历史被压缩导致条数与 revision 不再
-        # 一一对应）一律退化为 sent_count=0（全量发送，安全但少一次
-        # 优化），不会产生错误的截断。
-        st = await _conv_state.get_conversation_state(chat_id)
-        candidate = st.responses.synced_revision
-        if 0 <= candidate <= len(loop_messages):
-            sent_count = candidate
-        logger.debug(
-            "[openai_responses] 复用服务端会话 conversation=%s synced=%s "
-            "loop_len=%s -> sent_count=%s",
-            conversation_id, candidate, len(loop_messages), sent_count,
-        )
-    elif using_stateful_conversation and need_bootstrap:
-        logger.info(
-            "[openai_responses] chat=%s 自举新 Responses 会话 conversation=%s",
-            chat_id, conversation_id,
-        )
+    sync_ctx = await _begin_turn_sync(
+        client, chat_id, turn, model_info, current_model, loop_messages,
+    )
+    using_stateful_conversation = sync_ctx is not None
+    conversation_id = sync_ctx.conversation_id if sync_ctx else None
 
     for _round in range(MAX_TOOL_CALLS):
-        if using_stateful_conversation:
-            # 增量模式：只转换尚未发送过的部分。首轮自举时 sent_count=0，
-            # 等价于全量转换（与旧行为逐字节一致）；工具调用续轮时
-            # sent_count 已推进到上一次请求发出后的 loop_messages 长度，
-            # 这里自然只转换本轮新增的 assistant(tool_calls)/tool 消息。
-            delta_messages = loop_messages[sent_count:]
+        if sync_ctx is not None:
+            # 增量模式：只转换"尚未发出且非本回合服务端产物"的条目。
+            # - sent_ids（对象身份）：水位内条目 + 本回合已发出的条目；
+            #   按对象身份而非列表下标切片，免疫出站视图裁剪与中段
+            #   system 通知造成的下标错位。
+            # - local_assistant_ids：本回合由服务端响应产生的 assistant
+            #   消息——其 output item 已随响应自动进入服务端会话，重发
+            #   会造成重复条目；只有配对的 tool 结果（function_call_output）
+            #   需要作为增量发送。
+            # - 头部 system 段（instructions 来源）：自举轮已随首轮
+            #   instructions 登记进服务端会话；增量轮不重发（变化由
+            #   _head_instructions_key 指纹守卫触发分叉重建）；中段/
+            #   尾部的 system 通知（TIMER / 静默提示）仍随本轮 delta。
+            # 首轮自举时 sent_ids 为空，等价于全量转换（与旧行为一致）。
+            delta_messages: list = []
+            _in_head_system = sync_ctx.mode == "incremental"
+            for _msg in loop_messages:
+                if _in_head_system and isinstance(_msg, Message) and _msg.role == "system":
+                    continue
+                _in_head_system = False
+                if id(_msg) in sync_ctx.sent_ids or id(_msg) in sync_ctx.local_assistant_ids:
+                    continue
+                delta_messages.append(_msg)
             instructions, input_items = _convert_messages_to_responses_input(delta_messages)
-            # instructions（系统提示）只在自举轮携带一次：Responses 的
-            # conversation 是"新建即空白"的容器，系统指令作为 canonical
-            # history 最前面的 system 消息，天然会在 delta_messages 里
-            # 只出现一次（sent_count=0 的那一轮）；后续增量轮
-            # delta_messages 不含 system 消息，instructions 自然为空，
-            # 不会重复携带——这正是我们想要的语义（Responses 的
-            # instructions 参数是"本次请求覆盖"而非"追加"，重复携带
-            # 反而更省事但没有必要，服务端已经记得第一轮的 instructions）。
+            # instructions（系统提示）语义：自举轮携带头部 system 段一次
+            # （服务端会话记住它）；后续增量轮 delta 不含头部 system，
+            # instructions 自然为空，不会重复携带；系统提示变化通过指纹
+            # 比对触发分叉重建（见 _head_instructions_key）。TIMER /
+            # 静默回合的尾部 system 通知属"本轮新增条目"，随本轮 delta
+            # 作为 instructions 携带——与旧版行为一致。
         else:
             instructions, input_items = _convert_messages_to_responses_input(loop_messages)
 
@@ -700,16 +897,14 @@ async def _agentic_loop_openai_responses(
             "stream": True,
             "max_output_tokens": max_tokens,
         }
-        if using_stateful_conversation:
-            request_kwargs["conversation"] = conversation_id
-            # 这次请求即将把 loop_messages[sent_count:len(loop_messages)]
-            # 作为 input 发出去；把 sent_count 推进到当前长度，下一轮
-            # （工具调用续轮）自然只转换从这里往后新增的部分。必须在
-            # 发请求"之前"就推进（而不是等响应回来再推进）——即使这次
-            # 请求最终失败/被打断，循环也不会再次进入下一轮迭代（要么
-            # 抛出异常终止整个回合，要么正常 break），不存在"同一段
-            # 消息被重复计入 sent_count 又被重复发送"的重复计数风险。
-            sent_count = len(loop_messages)
+        if sync_ctx is not None:
+            request_kwargs["conversation"] = sync_ctx.conversation_id
+            # 这次请求即将把 delta_messages 作为 input 发出；先把它们
+            # 登记为已发送（对象身份），下一轮（工具调用续轮）自然只转换
+            # 之后新增的部分。必须在发请求"之前"登记——即使这次请求
+            # 最终失败/被打断，循环也不会再次进入下一轮迭代（要么抛出
+            # 异常终止整个回合（中断兑底作废会话），要么正常 break），
+            # 不存在同一段条目被重复发送的重复计数风险。
         _add_responses_cache_options(
             request_kwargs,
             api_label=api_label,
@@ -754,19 +949,72 @@ async def _agentic_loop_openai_responses(
         response_error_text: str = ""
         # 服务端会话 commit 素材：response.completed 事件里读取，回合
         # 正常结束（无更多工具调用）后用于 conversation_state.
-        # commit_responses_cursor。工具调用续轮也会被覆盖为最新一次，
+        # commit_vendor_sync。工具调用续轮也会被覆盖为最新一次，
         # 只有循环最终退出时的值参与 commit——语义上"这一整个 turn
         # 最终同步到了哪个 response"，而不是中间某一轮。
-        resolved_conversation_id: Optional[str] = conversation_id if using_stateful_conversation else None
+        resolved_conversation_id: Optional[str] = conversation_id if sync_ctx is not None else None
         resolved_response_id: Optional[str] = None
 
         switch_stream = make_switch_stream(builder, current_stream_cell)
 
         try:
             await start_chat_action(builder.chat_id, "typing")
-            stream = await client.responses.create(**request_kwargs)
+            if sync_ctx is not None:
+                # 本轮 delta 即将发出：先按对象身份登记为已发送（见上方
+                # request_kwargs["conversation"] 处的说明）。
+                sync_ctx.sent_ids.update(id(m) for m in delta_messages)
+            try:
+                stream = await client.responses.create(**request_kwargs)
+            except Exception as create_exc:
+                if sync_ctx is not None and sync_ctx.dispatched:
+                    raise
+                if (
+                    sync_ctx is None
+                    or chat_id is None
+                    or sync_ctx.mode != "incremental"
+                    or sync_ctx.bootstrap_retried
+                ):
+                    raise
+                if not _is_conversation_error(create_exc):
+                    raise
+                # 日常态增量首轮请求失败（会话类 4xx，例如服务端会话
+                # 已过期 / 条目校验失败）：作废会话进入分叉态，当场以
+                # "全量自举"重试一次（下一轮迭代 sent_ids 已清空，
+                # delta = 全量视图，携带新 conversation 建立新会话）。
+                sync_ctx.bootstrap_retried = True
+                _conv_state.invalidate_vendor_session(
+                    chat_id, sync_ctx.vendor_key, "incremental_request_failed"
+                )
+                retried_conversation_id = await _create_responses_conversation(client)
+                if retried_conversation_id is None:
+                    raise
+                logger.warning(
+                    "[openai_responses] chat=%s 增量请求失败（%r），作废旧会话并以"
+                    "全量自举重试 conversation=%s",
+                    chat_id, create_exc, retried_conversation_id,
+                )
+                sync_ctx.conversation_id = retried_conversation_id
+                sync_ctx.mode = "bootstrap"
+                sync_ctx.sent_ids.clear()
+                continue
+            if sync_ctx is not None:
+                sync_ctx.dispatched = True
+                conversation_id = sync_ctx.conversation_id
             async for event in stream:
                 etype = getattr(event, "type", None)
+
+                # ---- 服务端压缩事件监听（需求文档 二.1）----------------
+                # 只登记待回拉事项（每厂商去重），绝不在流式中途抢占
+                # 镜像；回合收尾后由 server_compaction 持锁执行回拉覆盖。
+                compaction_reason = _compaction_detect_signal(event)
+                if compaction_reason and sync_ctx is not None and chat_id is not None:
+                    _conv_state.request_server_sync(
+                        chat_id, sync_ctx.vendor_key, f"stream:{compaction_reason}"
+                    )
+                    logger.info(
+                        "[openai_responses] chat=%s 检测到服务端压缩事件 %s（已登记回拉同步）",
+                        chat_id, compaction_reason,
+                    )
 
                 if etype == "response.output_text.delta":
                     text = getattr(event, "delta", "") or ""
@@ -892,6 +1140,16 @@ async def _agentic_loop_openai_responses(
                         resp_conv_id = getattr(resp_conv, "id", None) if resp_conv is not None else None
                         if resp_conv_id:
                             resolved_conversation_id = resp_conv_id
+                        # ---- 服务端压缩标识（响应体元数据，二.1）------
+                        metadata_reason = _compaction_detect_metadata(resp_obj)
+                        if metadata_reason and sync_ctx is not None and chat_id is not None:
+                            _conv_state.request_server_sync(
+                                chat_id, sync_ctx.vendor_key, f"metadata:{metadata_reason}"
+                            )
+                            logger.info(
+                                "[openai_responses] chat=%s 响应元数据检测到压缩标识 %s（已登记回拉同步）",
+                                chat_id, metadata_reason,
+                            )
 
                 elif etype in ("response.failed", "response.incomplete"):
                     resp_obj = getattr(event, "response", None)
@@ -1019,7 +1277,12 @@ async def _agentic_loop_openai_responses(
 
         # 打断保全（改动点1）：升级 journal 里的实时占位为完整消息
         # （tool_calls / reasoning / 最终文本原地补全，同一对象进 loop_messages）。
-        live_slot.finalize(loop_messages, content_acc, tool_calls_list, reasoning_acc)
+        finalized_assistant_msg = live_slot.finalize(loop_messages, content_acc, tool_calls_list, reasoning_acc)
+        if sync_ctx is not None:
+            # 本回合由服务端响应产生的 assistant 消息：其 output item 已
+            # 随响应自动进入服务端会话，后续增量轮不再重发（否则服务端
+            # 会话会出现重复条目）。
+            sync_ctx.local_assistant_ids.add(id(finalized_assistant_msg))
 
         if not tool_calls_list:
             final_content = content_acc
@@ -1030,6 +1293,23 @@ async def _agentic_loop_openai_responses(
         status = await run_tool_batch(builder, tool_calls_list, loop_messages,
                                       new_history_entries, tool_call_count_ref,
                                       api_label, tools)
+
+        if sync_ctx is not None and chat_id is not None:
+            # 为回合内新增条目（run_tool_batch 追加的 tool 结果、错误占位
+            # 等）补发 seq 并推进水位追踪；同时捕获所有尚未发出的
+            # assistant 对象（防御：异常分支可能直接追加 assistant 错误
+            # 消息），避免它们被误当作增量重发。
+            new_last_seq = _conv_state.ensure_mirror_sequenced(chat_id, loop_messages)
+            if new_last_seq > sync_ctx.max_seq:
+                sync_ctx.max_seq = new_last_seq
+            for _m in loop_messages:
+                if (
+                    isinstance(_m, Message)
+                    and _m.role == "assistant"
+                    and id(_m) not in sync_ctx.sent_ids
+                    and id(_m) not in sync_ctx.local_assistant_ids
+                ):
+                    sync_ctx.local_assistant_ids.add(id(_m))
 
         if status == "over_limit":
 
@@ -1072,28 +1352,39 @@ async def _agentic_loop_openai_responses(
 
     final_content = await ensure_final_content(builder, new_history_entries, final_content)
 
-    # ---- Conversation State：回合结束，尝试 commit 服务端会话游标 ----
-    # 只有本回合确实用了服务端会话（resolved_conversation_id 非空）且
-    # 调用方接入了 conversation_state（turn 非 None）才尝试写入；写入
-    # 前的 fencing 校验（turn.generation 是否仍是发起回合时的那个）在
-    # commit_responses_cursor 内部完成，过期回合（回合进行期间发生了
-    # /clear）的迟到结果会被安全丢弃，不会复活一个本该失效的 cursor。
-    if chat_id is not None and turn is not None and resolved_conversation_id:
+    # ---- Conversation State：回合结束，提交厂商会话同步账本（fencing）----
+    # 只有本回合确实使用了服务端会话且调用方接入了 conversation_state
+    # （turn 非 None）才提交；提交前的 generation fencing 校验在
+    # commit_vendor_sync 内部完成——回合进行期间发生了 /clear 的过期
+    # 回合，其迟到结果会被安全丢弃，绝不复活已作废的会话。
+    # 水位 = 本回合已发号最大 seq（覆盖 user 提前持久化 + 回合内全部
+    # 新增单元；append-back 稍后把同一批对象落入镜像，seq 已预发号，
+    # 无需等待追加完成即可对齐）。
+    if sync_ctx is not None and chat_id is not None and turn is not None and resolved_conversation_id:
         try:
-            committed = _conv_state.commit_responses_cursor(
+            committed = _conv_state.commit_vendor_sync(
                 chat_id, turn,
+                vendor_key=sync_ctx.vendor_key,
                 conversation_id=resolved_conversation_id,
-                response_id=resolved_response_id,
                 model=current_model,
+                synced_through_seq=sync_ctx.max_seq,
+                instructions_hash=_head_instructions_key(loop_messages),
             )
-            logger.debug(
-                "[openai_responses] chat=%s conversation cursor commit=%s conversation=%s",
-                chat_id, committed, resolved_conversation_id,
+            logger.info(
+                "[openai_responses] chat=%s 厂商会话同步提交=%s vendor=%s mode=%s "
+                "conversation=%s 水位=%s",
+                chat_id, committed, sync_ctx.vendor_key, sync_ctx.mode,
+                resolved_conversation_id, sync_ctx.max_seq,
             )
+            if committed:
+                # 存在待执行的服务端压缩回拉（本回合或更早回合登记的）：
+                # 派发后台同步（持 chat 锁 + Adapter 覆盖镜像 + 兑底）。
+                from server_compaction import maybe_spawn_server_sync
+                maybe_spawn_server_sync(chat_id)
         except Exception:
             # commit 失败绝不能影响本轮已经产出的正常回复——降级为
             # "下一轮重新自举"，用户侧无感知，只是错失一次增量优化。
-            logger.debug("[openai_responses] commit_responses_cursor 异常（忽略）", exc_info=True)
+            logger.debug("[openai_responses] commit_vendor_sync 异常（忽略）", exc_info=True)
 
     return final_content, final_usage, new_history_entries
 
@@ -1104,7 +1395,7 @@ __all__ = [
     "_convert_messages_to_responses_input",
     "_convert_tools_to_responses",
     "_responses_usage_to_openai",
-    "_resolve_conversation_plan",
+    "_begin_turn_sync",
     "_create_responses_conversation",
     "_responses_stateful_enabled",
 ]

@@ -172,6 +172,19 @@ Telegram Runtime 共用业务能力，但**不把 Runtime 能力原样暴露**�
 全局 HTTP 会话、HTML 转义等文本工具、富消息媒体兜底清理、Telegram
 消息发送/删除与草稿状态机、供应商余额查询、消息文本提取与语音转录。
 
+### 多厂商会话同步状态机（2026-09 重构）
+
+`conversation_state.py` / `server_compaction.py` 与 `ai/responses_bridge.py`
+实现了多厂商 / 多模型下的 Conversation 与上下文同步机制：本地
+`conversation_history` 是单一事实来源，厂商服务端会话（Responses
+`conversation` 对象）只是投影副本。日常态（增量优先）在同厂商体系内复用
+服务端会话、仅发送增量 `input`；分叉态（本地压缩 / 跨厂商或传统模型写入 /
+系统提示变化 / `/clear`）一律作废旧 `conversation_id` 并以本地全量上下文
+重建新会话（服务端前缀匹配自动命中 Prompt Cache）；服务端压缩事件通过
+流式监听 + `GET /v1/conversations/{id}` 回拉 + Adapter 数据清洗覆盖本地
+镜像（持 chat 锁，失败兜底为作废重建）。设计细节见
+`docs/conversation-sync-state-machine.md`。
+
 ### 为什么 Telegram Runtime 与 MCP 要分开？
 
 Telegram Agent 拥有 Bash、文件写入、文件发送、多媒体生成、子 Agent、

@@ -640,14 +640,15 @@ async def _append_journal_to_history(chat_id: int, journal: list) -> None:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
         history.extend(journal)
-        # conversation_state.py：打断保全 / 异常保全都是绕开
-        # update_conversation_and_ledger 的独立 append 路径，必须在这里
-        # 同样推进 canonical_revision——否则通过 TIMER 被打断、又或者
-        # 请求异常但已有部分输出被保全的场景，历史其实变长了，但
-        # Responses provider cursor 会继续认为自己"仍然同步"，下一轮
-        # 增量请求会漏发这部分刚保全的内容。
-        from conversation_state import bump_canonical_revision
-        await bump_canonical_revision(chat_id)
+        # 多厂商会话状态机：打断/异常保全的镜像追加记入写入者台账，
+        # writer = "recovery"（非本厂商写入 → plan 阶段保守触发分叉）。
+        # 保全内容可能是任意厂商在途产出的片段，且对应的请求可能已
+        # 发往服务端（部分内容已在会话中），增量差分不可靠——按需求
+        # 文档"分叉态作废重建"原则处理。与本函数旧版 bump
+        # canonical_revision 的调用点相同（历史变长必须推进账本，否则
+        # Responses 会话会误判"仍然同步"而漏发刚保全的内容）。
+        from conversation_state import record_mirror_append
+        record_mirror_append(chat_id, [m for m in journal if isinstance(m, Message)], "recovery")
     logger.info(
         "[turn-recovery] chat=%s 已保全轮次进度 %s 条消息（历史总长=%s）",
         chat_id, len(journal), len(get_or_init_context(chat_id).get("conversation_history") or []),
@@ -1051,11 +1052,19 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
         last_is_user = isinstance(last, Message) and last.role == "user"
         if last_is_user:
             last_env = _envelope_of(last)
+            # 多厂商会话状态机：改写前先取旧条目的镜像序列号——若该 seq
+            # 已被某个厂商会话同步（水位覆盖），改写会使服务端残留旧文本，
+            # note_mirror_entry_rewritten 会作废这些会话（分叉重建）。
+            _old_entry_seq = (
+                last.meta.get("mirror_seq") if isinstance(last, Message) else None
+            )
             if last_env.pop(TURN_FAILED_FLAG, None):
                 # 上一轮请求失败：替换而非合并（重试语义，见函数 docstring）。
                 _replace_failed_user_message(last_env, user_message)
                 history[-1] = _wrap_envelope(last_env)
                 user_message[EARLY_PERSIST_MODE] = "replaced"
+                from conversation_state import note_mirror_entry_rewritten
+                note_mirror_entry_rewritten(chat_id, _old_entry_seq, history[-1])
                 logger.info(
                     "[turn-recovery] chat=%s 上一轮请求失败：新 user 消息替换失败轮消息"
                     "（不合并旧文本/图片，媒体仅在新消息为空时搬移一份）",
@@ -1083,6 +1092,8 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
                 _merge_user_message(last_env, user_message)
                 history[-1] = _wrap_envelope(last_env)
                 user_message[EARLY_PERSIST_MODE] = "merged"
+                from conversation_state import note_mirror_entry_rewritten
+                note_mirror_entry_rewritten(chat_id, _old_entry_seq, history[-1])
                 logger.info(
                     "[turn-recovery] chat=%s 新 user 消息合并进上一条未回应的 user 消息",
                     chat_id,
@@ -1090,12 +1101,13 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
         else:
             history.append(_wrap_envelope(user_message))
             user_message[EARLY_PERSIST_MODE] = "appended"
-            # conversation_state.py：只有真正新增一条消息（append 分支）
-            # 才推进 canonical_revision——merged/replaced 分支是原地改写
-            # 末尾既有的 user 消息，历史长度不变，不应计数（否则会与
-            # undo_early_persist 的回滚不对称，revision 只增不减）。
-            from conversation_state import bump_canonical_revision
-            await bump_canonical_revision(chat_id)
+            # 多厂商会话状态机：只有真正新增一条消息（append 分支）才
+            # 记入镜像台账——写入者 = "user"（用户输入，厂商无关，增量
+            # 合法来源）。merged/replaced 分支是原地改写末尾既有的 user
+            # 消息，由 note_mirror_entry_rewritten 单独处理（含服务端
+            # 已见旧文本时的作废兑底）。
+            from conversation_state import record_mirror_append
+            record_mirror_append(chat_id, [history[-1]], "user")
     user_message[EARLY_PERSIST_FLAG] = True
     return True
 
@@ -1142,16 +1154,13 @@ async def undo_early_persist(chat_id: int, user_message: dict) -> None:
             and last.meta.get(EARLY_PERSIST_TS) == ts
         ):
             history.pop()
-            # 与 persist_user_message_entry 的 append 分支对称：撤回一条
-            # 真正写入的消息，revision 也回退一格，保持"revision 数值
-            # 等于 canonical history 实际写入次数"的不变式，否则
-            # Responses provider cursor 的 is_valid_for 比较会因为
-            # revision 虚高而误判 cursor 已经过期（安全但会多打一次
-            # 不必要的自举请求，不是正确性问题，仍值得在这里修正）。
-            from conversation_state import get_conversation_state
-            st = await get_conversation_state(chat_id)
-            if st.canonical_revision > 0:
-                st.canonical_revision -= 1
+            # 多厂商会话状态机：镜像条目被撤回。撤回发生在请求派发前
+            # （消费接管 / pre_flight 拒绝，服务端不可能见过该条），
+            # note_mirror_entry_retracted 防御性作废"水位已覆盖该 seq"
+            # 的厂商会话，保证任何时序下都不静默错位（镜像序列号单调
+            # 不回退，旧版 revision -1 的对账语义不再需要）。
+            from conversation_state import note_mirror_entry_retracted
+            note_mirror_entry_retracted(chat_id, last)
             logger.info(
                 "[turn-recovery] chat=%s 已回滚提前持久化的 user 消息（消费/拒绝路径）",
                 chat_id,
