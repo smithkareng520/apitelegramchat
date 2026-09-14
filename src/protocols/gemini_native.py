@@ -32,6 +32,7 @@ class GeminiNativeAdapter(ChatProtocolAdapter):
         tools: Optional[list[Any]] = None,
         supports_tools: bool = True,
         journal: Optional[list[Any]] = None,
+        conversation_state: Any = None,
     ) -> tuple[str | None, Any, list]:
         from ai.gemini_bridge import _agentic_loop_gemini_native
 

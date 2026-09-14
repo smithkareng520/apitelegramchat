@@ -35,6 +35,7 @@ class OpenAIChatAdapter(ChatProtocolAdapter):
         tools: Optional[list[Any]] = None,
         supports_tools: bool = True,
         journal: Optional[list[Any]] = None,
+        conversation_state: Any = None,
     ) -> tuple[str | None, Any, list]:
         from ai.agentic_loops import _agentic_loop_openai_compat
 

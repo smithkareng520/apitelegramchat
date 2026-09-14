@@ -17,8 +17,9 @@
      进 new_history_entries 的内容，全部是内部 Message（core/messages），
      可以直接复用 tool_call_loop._run_tool_calls_and_append 与
      bridge_common 的公共骨架。
-   - 仅在"即将调用 Responses API"之前，把当前累积的内部消息转换成
-     Responses 的 input item 列表（_convert_messages_to_responses_input）；
+   - 仅在"即将调用 Responses API"之前，把内部 Message 转换成 Responses
+     的 input item 列表；使用显式 conversation 时，首个请求 bootstrap 完整
+     canonical history，后续 USER/TIMER 只发送本轮新增 input。
      工具 schema 转换见 _convert_tools_to_responses。
    - Responses API 返回的内容在写回 loop_messages / new_history_entries
      前，统一转换回内部 Message（文本 + tool_calls 列表），与其它两条
@@ -73,6 +74,7 @@ from ai.bridge_common import (
 )
 from ai.cache_usage import _log_cache_usage
 from config import RESPONSES_EXPLICIT_CACHE_ENABLED
+import state
 from state import get_llm_session_key
 
 if TYPE_CHECKING:
@@ -184,9 +186,9 @@ def _convert_messages_to_responses_input(messages: list) -> tuple[str, list]:
             Responses API 接受把助手历史消息作为 input 回传。
           * 每个 ToolCallBlock -> function_call item
             {"type":"function_call","call_id","name","arguments"}。
-        reasoning（ReasoningBlock）不回填：Responses API 的 reasoning
-        item 需要服务端签发的 id 才能被同一 response 链路复用，跨轮次
-        重新构造的 reasoning 文本无法以合法 item 形式回传，静默跳过
+        reasoning（ReasoningBlock）不在 bootstrap input 中重建：Responses
+        conversation 会保存服务端原生 reasoning item；跨 provider bootstrap
+        时没有合法的原生 reasoning item id，故只保留 canonical assistant 结论。
         （与 Anthropic thinking 块在非官方最新模型上的降级策略一致，
         不影响功能，只是模型看不到上一轮的思考过程文本，只看得到结论）。
       - role=tool   -> function_call_output item
@@ -557,6 +559,85 @@ def _responses_usage_to_openai(usage: Any) -> Optional[dict]:
 # =============================================================================
 # 原生 agentic 循环
 # =============================================================================
+def _conversation_history_fingerprint(messages: list) -> str:
+    """Canonical history 的稳定指纹。用于判断 provider conversation 是否仍
+    与项目自己的共享历史同步；模型切换到 Chat/Anthropic 后再切回 Responses
+    时，指纹变化会触发新的 Responses conversation bootstrap。
+    """
+    payload = []
+    for raw in messages or []:
+        if isinstance(raw, Message):
+            try:
+                payload.append(raw.to_openai_dict())
+            except Exception:
+                payload.append(str(raw))
+        elif isinstance(raw, dict):
+            payload.append(raw)
+        else:
+            payload.append(str(raw))
+    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+async def _ensure_responses_conversation(client: "AsyncOpenAI", chat_id: int) -> str | None:
+    """懒创建显式 Responses Conversation。
+
+    OpenAI 官方 Responses API 的 `conversation` 是服务端持久上下文容器。
+    某些 OpenAI-compatible 网关可能只实现 /v1/responses 而没有
+    /v1/conversations；这种情况下返回 None，让调用方安全回退到旧的全量
+    input 模式，而不会把一次兼容性故障升级成整条聊天不可用。
+    """
+    existing = state.get_responses_conversation_id(chat_id)
+    if existing:
+        return existing
+    lock = await state.get_responses_conversation_lock(chat_id)
+    async with lock:
+        existing = state.get_responses_conversation_id(chat_id)
+        if existing:
+            return existing
+        try:
+            conversations_api = getattr(client, "conversations", None)
+            create = getattr(conversations_api, "create", None) if conversations_api is not None else None
+            if create is None:
+                logger.warning("Responses client 不支持 conversations.create，回退全量 input: chat=%s", chat_id)
+                return None
+            conversation = await create()
+            conversation_id = getattr(conversation, "id", None)
+            if not conversation_id and isinstance(conversation, dict):
+                conversation_id = conversation.get("id")
+            if not conversation_id:
+                logger.warning("Responses conversation 创建成功但未返回 id，回退全量 input: chat=%s", chat_id)
+                return None
+            state.set_responses_conversation_id(chat_id, str(conversation_id))
+            return str(conversation_id)
+        except Exception:
+            logger.warning("创建 Responses conversation 失败，回退全量 input: chat=%s", chat_id, exc_info=True)
+            return None
+
+
+def _stateful_turn_input(messages: list) -> list:
+    """从完整内部消息中提取本轮真正需要追加到 provider conversation 的 item。
+
+    USER/TIMER 正常回合：最新 user 是本轮输入；TIMER 若只有临时 system
+    指令则由 instructions 驱动，input 可以为空。
+    Agent tool loop 的后续轮次只发送新产生的 tool result；assistant 的
+    function_call 已由上一轮 Responses response 自动写入 conversation。
+    """
+    non_system = [m for m in messages if isinstance(m, Message) and m.role != "system"]
+    if not non_system:
+        return []
+    if non_system[-1].role == "user":
+        return [non_system[-1]]
+    if non_system[-1].role == "tool":
+        trailing = []
+        for msg in reversed(non_system):
+            if msg.role != "tool":
+                break
+            trailing.append(msg)
+        return list(reversed(trailing))
+    return []
+
+
 async def _agentic_loop_openai_responses(
         client: "AsyncOpenAI",
         current_model: str,
@@ -566,6 +647,7 @@ async def _agentic_loop_openai_responses(
         tools: list | None = None,
         supports_tools: bool = True,
         journal: list | None = None,
+        conversation_state: dict | None = None,
 ) -> tuple[str | None, object | None, list]:
     """OpenAI 原生 Responses API（/v1/responses）专用循环。
 
@@ -598,9 +680,61 @@ async def _agentic_loop_openai_responses(
         # reasoning_effort 字段语义相同，形状不同。
         reasoning_param = {"effort": str(effort).lower()}
 
+    chat_id = builder.chat_id
+    ctx = conversation_state if isinstance(conversation_state, dict) else state.get_or_init_context(chat_id)
+    canonical_history = list(ctx.get("conversation_history") or [])
+    canonical_fingerprint = _conversation_history_fingerprint(canonical_history)
+    stored_fingerprint = ctx.get("openai_responses_canonical_fingerprint")
+    conversation_id = state.get_responses_conversation_id(chat_id)
+
+    # provider conversation 只有在它代表的 canonical history 与本项目共享历史
+    # 完全一致时才可继续使用。切到 Chat/Anthropic/Gemini 后再切回来时，
+    # canonical fingerprint 会变化，于是丢弃旧 provider conversation 并重新
+    # bootstrap；不会把两个分支的历史拼成一条错误链。
+    stateful = bool(conversation_id and stored_fingerprint == canonical_fingerprint)
+    if not stateful:
+        if conversation_id and stored_fingerprint and stored_fingerprint != canonical_fingerprint:
+            logger.info(
+                "Responses conversation 与 canonical history 脱节，重新 bootstrap: chat=%s", chat_id
+            )
+            state.clear_responses_conversation(chat_id)
+            conversation_id = None
+        if conversation_id is None:
+            conversation_id = await _ensure_responses_conversation(client, chat_id)
+        stateful = bool(conversation_id)
+
+    first_request = True
+
     for _round in range(MAX_TOOL_CALLS):
-        instructions, input_items = _convert_messages_to_responses_input(loop_messages)
-        if RESPONSES_EXPLICIT_CACHE_ENABLED:
+        # instructions 不属于 conversation items：即使使用显式 conversation，
+        # 也必须在每个 response request 上重新发送稳定系统规则，以及本轮
+        # TIMER/静默等 ephemeral system 指令。只有 input 历史本身才由
+        # conversation 服务端持久化。
+        system_messages = [
+            m for m in loop_messages
+            if isinstance(m, Message) and m.role == "system"
+        ]
+        instructions, _ = _convert_messages_to_responses_input(system_messages)
+
+        if first_request:
+            # 第一次进入一个新 provider conversation：bootstrap 时发送
+            # canonical history + 本轮输入；已有且仍与 canonical history 同步
+            # 的 conversation 则只发送本轮最新输入。
+            if stateful and stored_fingerprint == canonical_fingerprint and conversation_id:
+                request_messages = _stateful_turn_input(loop_messages)
+            else:
+                request_messages = loop_messages
+            _, input_items = _convert_messages_to_responses_input(request_messages)
+        else:
+            # Responses conversation 已经自动保存上一轮 assistant/function_call。
+            # 下一轮只需补 function_call_output，不重复发送整个历史。
+            request_messages = [
+                m for m in loop_messages
+                if isinstance(m, Message) and m.role == "tool"
+            ]
+            _, input_items = _convert_messages_to_responses_input(request_messages)
+
+        if RESPONSES_EXPLICIT_CACHE_ENABLED and input_items:
             _apply_responses_cache_breakpoints(input_items)
 
         request_kwargs: dict[str, Any] = {
@@ -609,6 +743,8 @@ async def _agentic_loop_openai_responses(
             "stream": True,
             "max_output_tokens": max_tokens,
         }
+        if conversation_id:
+            request_kwargs["conversation"] = conversation_id
         _add_responses_cache_options(
             request_kwargs,
             api_label=api_label,
@@ -889,6 +1025,17 @@ async def _agentic_loop_openai_responses(
             "[AI RAW RESPONSE] provider=%s chat_id=%s length=%s\n%s",
             api_label, builder.chat_id, len(content_acc or ""), content_acc,
         )
+        if conversation_id and response_status == "completed":
+            # 从此刻开始 provider conversation 已包含本轮 response。真正的
+            # canonical history 会在 get_ai_response 收尾时持久化；这里先记录
+            #“当前历史 + 本轮已完成消息”的预期指纹。下一轮若 canonical history
+            # 已落库，指纹即可命中；若本轮被中断/清空/被其他 provider 接管，
+            # 指纹不命中则安全 bootstrap。
+            expected_history = list(canonical_history) + list(new_history_entries)
+            ctx["openai_responses_canonical_fingerprint"] = _conversation_history_fingerprint(expected_history)
+            ctx["openai_responses_conversation_id"] = conversation_id
+
+        first_request = False
         # 纯文本终局截断提示：必须在 live_slot.finalize 之前算出追加后的
         # 文本（与 anthropic_bridge / gemini_bridge 同一修复，理由见
         # bridge_common）。response_status 此前只在事件名为 incomplete/
@@ -918,12 +1065,17 @@ async def _agentic_loop_openai_responses(
             async def _synth_stream(req: tuple) -> str:
                 synth_instructions, synth_input = req
                 synth_text = ""
+                synth_instructions, _ignored_synth_input = req
                 synth_kwargs: dict[str, Any] = {
                     "model": current_model,
-                    "input": synth_input,
+                    # 上游 conversation 已保存全部上下文；强制总结只需要临时
+                    # instructions，不要把完整历史再次复制进 conversation。
+                    "input": [],
                     "stream": True,
                     "max_output_tokens": max_tokens,
                 }
+                if conversation_id:
+                    synth_kwargs["conversation"] = conversation_id
                 _add_responses_cache_options(
                     synth_kwargs,
                     api_label=api_label,

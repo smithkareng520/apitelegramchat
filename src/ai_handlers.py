@@ -1390,6 +1390,9 @@ async def _call_api(
     # 硬编码分支。适配器内部负责客户端获取与循环转发；新增协议只需
     # 在 protocols/registry 注册，本函数零改动。
     adapter = resolve_chat_adapter(model_info)
+    conversation_state = None
+    if getattr(adapter, "name", "") == "openai_responses":
+        conversation_state = state.get_or_init_context(chat_id)
     return await adapter.run_agent_loop(
         current_model=current_model,
         model_info=model_info,

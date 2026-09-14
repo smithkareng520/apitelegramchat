@@ -45,6 +45,7 @@ class ChatProtocolAdapter(ABC):
         tools: Optional[list[Any]] = None,
         supports_tools: bool = True,
         journal: Optional[list[Any]] = None,
+        conversation_state: Any = None,
     ) -> tuple[str | None, Any, list]:
         """执行该协议的 agentic 循环（含工具执行与历史追加）。"""
         raise NotImplementedError

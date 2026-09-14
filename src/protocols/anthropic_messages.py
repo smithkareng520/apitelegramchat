@@ -33,6 +33,7 @@ class AnthropicMessagesAdapter(ChatProtocolAdapter):
         tools: Optional[list[Any]] = None,
         supports_tools: bool = True,
         journal: Optional[list[Any]] = None,
+        conversation_state: Any = None,
     ) -> tuple[str | None, Any, list]:
         from ai.anthropic_bridge import _agentic_loop_anthropic
 
