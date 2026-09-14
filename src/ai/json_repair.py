@@ -561,7 +561,10 @@ def _finish_reason_cut_info(stream_finish_reason: Optional[str]) -> tuple:
     """把流结束原因归类为「是否异常截断 + 面向模型的原因描述」。
 
     返回 ``(is_cut, cause)``。仅基于积极证据判定截断：
-    - ``length`` / ``max_tokens``：输出 token 上限（OpenAI / Anthropic 各自的拼写）；
+    - ``length`` / ``max_tokens`` / ``max_output_tokens``：输出 token 上限
+      （OpenAI Chat Completions / Anthropic / OpenAI Responses API 三种
+      不同拼写口径——Responses API 走 response.incomplete_details.reason，
+      字面量是 max_output_tokens，与前两者不同，此前未被识别）；
     - ``content_filter``：内容过滤器拦停；
     - ``""``：流被完整消费但从未出现终止事件——正常兼容端一定会发
       finish_reason，缺失本身就是断流证据（网关提前关闭 / 连接中断）；
@@ -574,7 +577,7 @@ def _finish_reason_cut_info(stream_finish_reason: Optional[str]) -> tuple:
     fr = str(stream_finish_reason).strip().lower()
     if not fr:
         return True, "the stream ended without a finish_reason termination event (connection or gateway cutoff)"
-    if fr in ("length", "max_tokens"):
+    if fr in ("length", "max_tokens", "max_output_tokens"):
         return True, "the output token limit was reached before the tool call finished"
     if fr == "content_filter":
         return True, "the response was stopped by the content filter"

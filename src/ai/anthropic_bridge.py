@@ -50,6 +50,7 @@ from ai.tool_summary import (
 )
 from ai.bridge_common import (
     LiveAssistantSlot,
+    append_truncation_notice_if_needed,
     ensure_final_content,
     finish_open_tool_group,
     init_bridge_loop_state,
@@ -890,6 +891,13 @@ async def _agentic_loop_anthropic(
         elif not await builder.finalize_turn():
             # 终局：等待旧段永久化（不开新草稿）；未滚动时保底刷一帧。
             builder.request_flush()
+
+        # 纯文本终局截断提示：必须在 live_slot.finalize 之前算出追加后的
+        # 文本，否则 journal/loop_messages 定稿的仍是未追加提示的
+        # content_acc——模型下一轮和历史里的用户都看不到"回答被截断"。
+        if not tool_calls_list:
+            content_acc = append_truncation_notice_if_needed(
+                builder, content_acc, stop_reason)
 
         # 打断保全（改动点1）：升级 journal 里的实时占位为完整消息
         # （tool_calls / reasoning / 最终文本原地补全，同一对象进 loop_messages）。

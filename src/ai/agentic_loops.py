@@ -82,6 +82,7 @@ from ai.attachment_content import _apply_cache_control
 from ai.bridge_common import (
     LiveAssistantSlot,
     MediaProgressSlot,
+    append_truncation_notice_if_needed,
     ensure_final_content,
     finish_open_tool_group,
     make_switch_stream,
@@ -1190,6 +1191,18 @@ async def _agentic_loop_openai_compat(
         elif not await builder.finalize_turn():
             # 终局：等待旧段永久化（不开新草稿）；未滚动时保底刷一帧。
             builder.request_flush()
+
+        # 纯文本终局截断提示：仅对"本轮确实是干净的纯文本终局"追加
+        # （不含 textual_tool_call 分支——那是模型把工具调用写成了 XML
+        # 文本的另一类问题，final_content 由下方分支自行给出安全说明，
+        # 与"输出长度不够把话说完"无关，两者不应混在一起提示）。必须在
+        # live_slot.finalize 之前算出追加后的文本，否则 journal/
+        # loop_messages 定稿的仍是未追加提示的 content_acc（与
+        # anthropic_bridge / gemini_bridge / responses_bridge 同一修复，
+        # 理由见 bridge_common.append_truncation_notice_if_needed）。
+        if not tool_calls_list and not textual_tool_call:
+            content_acc = append_truncation_notice_if_needed(
+                builder, content_acc, stream_finish_reason)
 
         # assistant 消息组装 + 双列表追加（与两条原生 bridge 循环共用骨架）。
         # 打断保全（改动点1）：改为"升级已存在的占位消息"而不是新增一条——

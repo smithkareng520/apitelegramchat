@@ -63,6 +63,7 @@ from ai.tool_summary import (
 )
 from ai.bridge_common import (
     LiveAssistantSlot,
+    append_truncation_notice_if_needed,
     ensure_final_content,
     finish_open_tool_group,
     init_bridge_loop_state,
@@ -776,7 +777,20 @@ async def _agentic_loop_openai_responses(
 
                 elif etype in ("response.failed", "response.incomplete"):
                     resp_obj = getattr(event, "response", None)
-                    response_status = etype.rsplit(".", 1)[-1]
+                    # response.incomplete 本身只说"没说完"，真正的截断原因在
+                    # response.incomplete_details.reason（"max_output_tokens" /
+                    # "content_filter"，见 OpenAI Responses API 文档）。此前
+                    # 这里只记了事件名 "incomplete"，既不等于 _finish_reason_
+                    # cut_info 认识的任何取值，也丢失了"是输出上限还是内容
+                    # 过滤"的区分——下游诊断信封和本轮新增的截断提示都会
+                    # 因此永远判定为"未截断"。改为优先读取 details.reason，
+                    # 取不到时才退回事件名，保持旧行为不回退。
+                    incomplete_details = (
+                        getattr(resp_obj, "incomplete_details", None)
+                        if resp_obj is not None else None
+                    )
+                    reason = getattr(incomplete_details, "reason", None) if incomplete_details else None
+                    response_status = str(reason) if reason else etype.rsplit(".", 1)[-1]
                     err = getattr(resp_obj, "error", None) if resp_obj is not None else None
                     if err is not None:
                         response_error_text = getattr(err, "message", "") or str(err)
@@ -875,6 +889,16 @@ async def _agentic_loop_openai_responses(
             "[AI RAW RESPONSE] provider=%s chat_id=%s length=%s\n%s",
             api_label, builder.chat_id, len(content_acc or ""), content_acc,
         )
+        # 纯文本终局截断提示：必须在 live_slot.finalize 之前算出追加后的
+        # 文本（与 anthropic_bridge / gemini_bridge 同一修复，理由见
+        # bridge_common）。response_status 此前只在事件名为 incomplete/
+        # failed 时才有值，现在已改为优先携带 incomplete_details.reason
+        # （见上方事件处理分支），"max_output_tokens" 会被
+        # _finish_reason_cut_info 按 length/max_tokens 同类归一识别。
+        if not tool_calls_list:
+            content_acc = append_truncation_notice_if_needed(
+                builder, content_acc, response_status)
+
         # 打断保全（改动点1）：升级 journal 里的实时占位为完整消息
         # （tool_calls / reasoning / 最终文本原地补全，同一对象进 loop_messages）。
         live_slot.finalize(loop_messages, content_acc, tool_calls_list, reasoning_acc)
