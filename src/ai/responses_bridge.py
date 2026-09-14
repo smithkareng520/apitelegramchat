@@ -40,9 +40,24 @@ Responses API 与 Chat Completions 虽同属 OpenAI，但线上协议形状完�
     不是 Chat Completions 的 choices[0].delta 增量合并模型。
 把这些差异塞进 _agentic_loop_openai_compat 会让该函数的分支判断进一步
 膨胀；按项目既有的原生协议桥接惯例单独实现一份，改动面清晰、互不干扰。
+
+Responses stateful 增量链（Phase 1，2026-09）：
+====================================================
+本循环支持 previous_response_id 增量会话（模型配置
+responses_stateful=True 时启用，见 ai/responses_state.py）：首轮
+bootstrap 全量发送本地历史；后续每轮（同一轮内的工具续链 + 后续
+user 轮次）只发送水位之后的增量 input 并携带 previous_response_id 续链。
+不变式：
+  - 本地 conversation_history 是唯一业务真相，形状与写入节奏完全不变；
+  - server state（response_id 链）只是可丢弃的缓存：指针失效时
+    create 阶段的 4xx/404 被捕获后自动丢弃指针、从本地历史 bootstrap
+    重建重试一次；水位/指纹不对齐时静默回落 bootstrap；
+  - instructions（system）每轮全量重发——它是逐请求参数，不进入
+    server 链；reasoning item 永不重造重发（由 server state 承载）。
 """
-import hashlib
+import asyncio
 import json
+import time
 import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -72,7 +87,15 @@ from ai.bridge_common import (
     run_tool_batch,
 )
 from ai.cache_usage import _log_cache_usage
-from config import RESPONSES_EXPLICIT_CACHE_ENABLED
+from ai.responses_state import (
+    count_input_visible_messages,
+    drop_responses_session,
+    fingerprint_synced_prefix,
+    get_responses_session,
+    resolve_synced_prefix,
+    save_responses_session,
+)
+from config import get_effective_endpoint
 from state import get_llm_session_key
 
 if TYPE_CHECKING:
@@ -277,87 +300,198 @@ def _responses_prompt_cache_key(api_label: str, model: str, chat_id: Any) -> str
     return "tg-global"
 
 
-_RESPONSES_EXPLICIT_CACHE_MARKS = 2
 _RESPONSES_TTL = "30m"
 
+# -----------------------------------------------------------------------------
+# Background Mode（Phase 3 长任务）轮询参数
+# -----------------------------------------------------------------------------
+# background=True 的响应不再有 SSE 连接：create 立即返回（status=queued/
+# in_progress），由本模块轮询 retrieve() 到终态。节奏对齐 OpenAI 官方
+# background 任务指南：起步 2s 轮询足够（服务端还要排队/推理），总超时
+# 15 分钟覆盖最长常规回合；连续轮询失败 5 次视为网关故障（网络抖动在
+# 中间轮次自动重试，不中断长任务）。
+_RESPONSES_BG_POLL_INTERVAL_SECONDS = 2.0
+_RESPONSES_BG_POLL_TIMEOUT_SECONDS = 900.0
+_RESPONSES_BG_POLL_MAX_FAILURES = 5
 
-def _is_responses_text_content(part: Any) -> bool:
-    """显式缓存断点只挂在 Responses 支持 breakpoint 的文本 content block 上。"""
-    return isinstance(part, dict) and part.get("type") == "input_text"
 
+class _SynthEvent:
+    """background 终态 Response 的合成流事件。
 
-def _apply_responses_cache_breakpoints(input_items: list[dict]) -> int:
-    """只手动打 2 个显式断点（system 段首尾），尾部交给 Responses 的
-    implicit 自动缓存（_add_responses_cache_options 里设置的
-    prompt_cache_options.mode="implicit"），不在这里遍历消息找尾部
-    位置手动打 prompt_cache_breakpoint。
-
-    复刻项目 Anthropic 显式缓存策略的结构（与 anthropic_bridge /
-    attachment_content._apply_cache_control 三处保持同一套编号）：
-      1) 断点 1：开头连续 system/developer 消息段的第一个可用文本
-         block——对应 ai_handlers.build_system_prompt 的 base_segment，
-         字节最稳定，不随模型能力/角色/技能目录变化；
-      2) 断点 2：开头连续 system/developer 消息段的最后一个可用文本
-         block——对应 extra_segment（技能目录/工具说明/角色 prompt/
-         时间戳，以及 TIMER、静默模式追加的说明性消息）。这段更易
-         失效，单独打点后失效不连累断点 1；段内只有一条消息时与
-         断点 1 落在同一 block，安全退化。
-      3) 断点 3：不打。
-      4) 断点 4：不手动打。Responses 的 implicit 缓存模式本来就是
-         "没有显式断点时按最长匹配前缀自动命中"的默认行为，不是在
-         显式断点之外额外覆盖尾部的机制——手动去找一个尾部 block 打
-         explicit 标记既不必要，也可能和 implicit 模式的命中逻辑
-         产生冲突（同一份请求里 explicit 标记越多，implicit 能自由
-         匹配的空间越受限）。
-
-    注意：Responses API 当前的 prompt_cache_options.ttl 对整次请求统一
-    为 30m，不能逐断点设置不同 TTL，因此这里的"断点 1/2"只是位置上
-    复刻原策略的缓存层次，不能像 Anthropic 原生请求那样对断点 1/2
-    单独设置 1h。
-    返回实际添加的显式断点数。
+    getattr 形状与真实 SSE 事件对齐（type / delta / item / item_id /
+    arguments / response），让流式路径的事件分发代码原样复用：文本/思考/
+    工具卡片/参数修复/截断提示/水位推进全部零改动。缺失属性统一回
+    默认值（getattr 的 default 由调用方提供）。
     """
-    # 开头连续的 system/developer 消息段：Responses 用 role in
-    # ("system", "developer") 表达系统级指令，build_system_prompt 的
-    # 两段以及 TIMER/静默模式追加的说明性消息都在这个开头连续段内。
-    system_run_end = 0
-    while system_run_end < len(input_items):
-        item = input_items[system_run_end]
-        if not isinstance(item, dict) or item.get("role") not in ("system", "developer"):
-            break
-        system_run_end += 1
 
-    def _first_text_candidate(start: int, stop: int, *, reverse: bool) -> tuple[int, int] | None:
-        rng = range(stop - 1, start - 1, -1) if reverse else range(start, stop)
-        for item_index in rng:
-            item = input_items[item_index]
-            if not isinstance(item, dict):
+    _raw: dict
+
+    def __init__(self, raw: dict) -> None:
+        self._raw = raw
+
+    @property
+    def type(self) -> str:
+        return self._raw.get("type", "")
+
+    @property
+    def delta(self) -> str:
+        return self._raw.get("delta", "")
+
+    @property
+    def item(self) -> Any:
+        return self._raw.get("item")
+
+    @property
+    def item_id(self) -> str:
+        return self._raw.get("item_id", "")
+
+    @property
+    def arguments(self) -> str:
+        return self._raw.get("arguments", "")
+
+    @property
+    def response(self) -> Any:
+        return self._raw.get("response")
+
+
+class _BackgroundResponseStream:
+    """把 background 轮询得到的终态 Response 转成 async 事件流。
+
+    事件形状与真实 SSE 同构（见 _SynthEvent）：message item ->
+    output_text.delta（一次性全量文本，background 无打字机语义）；
+    reasoning item -> output_item.done（走既有 .done 兑底分支提取
+    summary）；function_call -> added + arguments.done + done（与流式
+    累积/卡片渲染路径一致）；终态 -> completed / incomplete / failed。
+    """
+
+    def __init__(self, response: Any) -> None:
+        self._response = response
+
+    def _events(self) -> list[dict[str, Any]]:
+        resp = self._response
+        status = getattr(resp, "status", None) or "completed"
+        events: list = []
+        for item in (getattr(resp, "output", None) or []):
+            itype = getattr(item, "type", None)
+            if itype == "message":
+                text = "".join(
+                    getattr(part, "text", "") or ""
+                    for part in (getattr(item, "content", None) or [])
+                    if getattr(part, "type", None) in ("output_text", "text")
+                )
+                if text:
+                    events.append({"type": "response.output_text.delta", "delta": text})
+            elif itype == "reasoning":
+                events.append({"type": "response.output_item.done", "item": item})
+            elif itype == "function_call":
+                events.append({"type": "response.output_item.added", "item": item})
+                events.append({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": getattr(item, "id", "") or "",
+                    "arguments": getattr(item, "arguments", "") or "",
+                })
+                events.append({"type": "response.output_item.done", "item": item})
+        terminal_type = {
+            "completed": "response.completed",
+            "incomplete": "response.incomplete",
+            "failed": "response.failed",
+            "cancelled": "response.failed",
+        }.get(status, "response.completed")
+        events.append({"type": terminal_type, "response": resp})
+        return events
+
+    def __aiter__(self) -> "_BackgroundResponseStream":
+        self._iter = iter(self._events())
+        return self
+
+    async def __anext__(self) -> _SynthEvent:
+        try:
+            return _SynthEvent(next(self._iter))
+        except StopIteration:
+            raise StopAsyncIteration
+
+
+async def _cancel_response_background(client: "AsyncOpenAI", response_id: Optional[str]) -> None:
+    """尽力取消服务端 background 任务（超时/被打断时调用，失败不影响主流程）。"""
+    if not response_id:
+        return
+    try:
+        await client.responses.cancel(response_id)
+    except Exception:
+        logger.debug("Responses background 取消请求失败（忽略）", exc_info=True)
+
+
+async def _run_response_background_round(
+        client: "AsyncOpenAI",
+        *,
+        request_kwargs: dict[str, Any],
+        builder: "DraftManager",
+        api_label: str,
+) -> Any:
+    """Background Mode（Phase 3）：background=True 提交 + 轮询 retrieve 至终态。
+
+    request_kwargs 应已含 background=True 且不含 stream（见
+    _build_request_kwargs）。返回终态 Response 对象（status ∈
+    completed / incomplete / failed / cancelled），由调用方经
+    _BackgroundResponseStream 转成合成事件后复用流式管线。
+
+    长任务语义：
+      - 轮询间隔/总超时/连续失败上限见模块顶部常量；
+      - 轮询期间经 builder.set_thinking_status 推送心跳（草稿区的
+        thinking 状态文本）；Telegram typing 指示不刷新（后台分钟级
+        任务里持续刷 typing 无意义，草稿状态即用户可见信号）；
+      - 超时：cancel 服务端任务后抛 RuntimeError（走上层统一错误提示）；
+      - 被打断（asyncio.CancelledError）：尽力 cancel 后原样传播，
+        保留打断保全（LiveAssistantSlot 占位过滤）语义。
+    """
+    response = await client.responses.create(**request_kwargs)
+    round_response_id = getattr(response, "id", None)
+    started = time.monotonic()
+    deadline = started + _RESPONSES_BG_POLL_TIMEOUT_SECONDS
+    consecutive_failures = 0
+    status = getattr(response, "status", None) or "queued"
+    if status in ("queued", "in_progress") and not round_response_id:
+        # 网关接了 background 却没回 id：无法轮询，立即失败而非空转超时。
+        raise RuntimeError(
+            f"[{api_label}] Responses background 响应缺少 id（status={status}），无法轮询")
+    # mypy 收窄：进入轮询后 round_response_id 必为 str（终态直达时不用）。
+    poll_response_id: str = round_response_id or ""
+    try:
+        while status in ("queued", "in_progress"):
+            await asyncio.sleep(_RESPONSES_BG_POLL_INTERVAL_SECONDS)
+            if time.monotonic() > deadline:
+                await _cancel_response_background(client, poll_response_id)
+                raise RuntimeError(
+                    f"[{api_label}] Responses background 任务超时"
+                    f"（>{int(_RESPONSES_BG_POLL_TIMEOUT_SECONDS)}s），"
+                    f"response_id={poll_response_id} 已请求取消")
+            try:
+                response = await client.responses.retrieve(poll_response_id)
+                consecutive_failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # 瞬时网络抖动：长任务轮询必须容忍中间失败，连续超限才放弃。
+                consecutive_failures += 1
+                if consecutive_failures >= _RESPONSES_BG_POLL_MAX_FAILURES:
+                    raise
+                logger.debug(
+                    "[%s] background 轮询瞬时失败（%d/%d）",
+                    api_label, consecutive_failures, _RESPONSES_BG_POLL_MAX_FAILURES,
+                    exc_info=True,
+                )
                 continue
-            content = item.get("content")
-            if not isinstance(content, list):
-                continue
-            part_rng = range(len(content) - 1, -1, -1) if reverse else range(len(content))
-            for part_index in part_rng:
-                if _is_responses_text_content(content[part_index]):
-                    return (item_index, part_index)
-        return None
-
-    selected: list[tuple[int, int]] = []
-
-    # 断点 1：system 段第一个可用文本 block。
-    first_system = _first_text_candidate(0, system_run_end, reverse=False)
-    if first_system:
-        selected.append(first_system)
-
-    # 断点 2：system 段最后一个可用文本 block（与断点 1 相同时去重，
-    # 退化为一个断点）。
-    last_system = _first_text_candidate(0, system_run_end, reverse=True)
-    if last_system and last_system not in selected:
-        selected.append(last_system)
-
-    for item_index, part_index in selected:
-        input_items[item_index]["content"][part_index]["prompt_cache_breakpoint"] = {"mode": "explicit"}
-
-    return len(selected)
+            status = getattr(response, "status", None) or status
+            # 心跳：草稿区 thinking 状态文本（不打扰正文流）。
+            try:
+                builder.set_thinking_status(
+                    f"Background task {status} ({int(time.monotonic() - started)}s)")
+            except Exception:
+                logger.debug("background 心跳更新失败（忽略）", exc_info=True)
+        return response
+    except asyncio.CancelledError:
+        await _cancel_response_background(client, poll_response_id)
+        raise
 
 
 def _add_responses_cache_options(
@@ -368,15 +502,14 @@ def _add_responses_cache_options(
     chat_id: Any,
     enabled: bool = True,
 ) -> None:
-    """注入稳定 key 和自动缓存；按开关可附加最多 2 个显式断点（system
-    段首尾，见 _apply_responses_cache_breakpoints）。
+    """注入稳定 key 和自动缓存（implicit 模式）。
 
-    默认模式只发送 ``mode=implicit``，兼容只支持自动缓存的中转；
-    implicit 模式本身也是尾部内容的缓存机制，不需要额外的显式尾部
-    断点。显式模式在此基础上叠加最多 2 个 explicit breakpoint（只打在
-    system 段），implicit 继续覆盖尾部——不是"implicit + explicit
-    分别覆盖不同范围"，而是 explicit 断点精确锁定 system 段的两个
-    稳定/半稳定边界，implicit 兜底其余部分的最长前缀匹配。
+    只发送 ``mode=implicit``： Responses 的 implicit 缓存是"按最长匹配
+    前缀自动命中"的默认行为，兼容只支持自动缓存的中转；不需要额外的
+    显式 breakpoint 标记（历史上的 RESPONSES_EXPLICIT_CACHE_ENABLED 显式
+    断点机制已移除——除本桥接外没有任何模型/环境启用过它，保留一个
+    全局开关只增加分支复杂度；前缀稳定性由 prompt_cache_key +
+    stateful 增量输入共同保证）。
     """
     if not enabled:
         return
@@ -573,6 +706,10 @@ async def _agentic_loop_openai_responses(
     _agentic_loop_gemini_native 完全一致：入参/出参（messages、返回的
     new_history_entries）统一为内部 Message（core/messages），只在请求
     Responses API 前做内部 -> 原生协议的边界转换（见模块头注释）。
+
+    模型配置 responses_stateful=True 时启用增量会话（Phase 1）：首轮
+    bootstrap 全量、后续增量 + 工具续链 + server state 失效自动重建
+    （见模块头注释与 ai/responses_state.py）。
     """
     if tools is None:
         from search_engine import SEARCH_TOOLS
@@ -598,36 +735,138 @@ async def _agentic_loop_openai_responses(
         # reasoning_effort 字段语义相同，形状不同。
         reasoning_param = {"effort": str(effort).lower()}
 
-    for _round in range(MAX_TOOL_CALLS):
-        instructions, input_items = _convert_messages_to_responses_input(loop_messages)
-        if RESPONSES_EXPLICIT_CACHE_ENABLED:
-            _apply_responses_cache_breakpoints(input_items)
+    # =========================================================================
+    # Responses stateful（Phase 1）：previous_response_id 增量链
+    # =========================================================================
+    # 本地历史是唯一业务真相；response_id 只是上游上下文指针（见
+    # ai/responses_state.py 模块头注释）：
+    #   1) 轮次开始：读取 (chat, provider, endpoint, model) 对应的指针，
+    #      并用「水位 + 指纹」校验 server 链是否仍与本地历史前缀对齐；
+    #   2) 对齐 → 本轮只发送水位之后的增量 input（新 user 消息 / 工具
+    #      function_call_output），带 previous_response_id 续链；
+    #   3) 不对齐 / 指针失效 → bootstrap 全量发送（本地历史重立新链）。
+    # 模型切换天然隔离：键含 provider/endpoint/model，切到没有指针的
+    # 模型自动 bootstrap，切回旧模型指纹对齐即可继续增量，无需复制历史。
+    responses_stateful = bool(model_info and getattr(model_info, "responses_stateful", False))
+    responses_store = getattr(model_info, "responses_store", None) if model_info else None
+    # Phase 3 长任务：Background Mode + Prompt Templates（均默认关闭，
+    # 逐模型配置开启，语义见 config.ModelConfig 字段注释）。
+    responses_background = bool(
+        model_info and getattr(model_info, "responses_background", False))
+    responses_prompt = getattr(model_info, "responses_prompt", None) if model_info else None
+    # state 键的 provider/endpoint：provider 沿用 api_label（协议适配器传入
+    # 的 provider key）；endpoint 取合并后的有效端点（同一 provider 下不同
+    # 模型可能有模型级端点覆盖，endpoint 参与键避免跨端点串链）。
+    state_endpoint = ""
+    if model_info is not None:
+        try:
+            state_endpoint = get_effective_endpoint(model_info).endpoint or ""
+        except Exception:
+            state_endpoint = ""
 
-        request_kwargs: dict[str, Any] = {
+    responses_session = None
+    if responses_stateful:
+        try:
+            responses_session = await get_responses_session(
+                builder.chat_id, api_label, state_endpoint, current_model)
+        except Exception:
+            logger.debug("读取 Responses state 失败，按无 state 继续", exc_info=True)
+            responses_session = None
+    synced_count = 0
+    synced_fingerprint = ""
+    if responses_session is not None and responses_session.response_id:
+        delta_start = resolve_synced_prefix(
+            loop_messages,
+            responses_session.synced_message_count,
+            responses_session.synced_fingerprint,
+        )
+        if delta_start is not None:
+            synced_count = responses_session.synced_message_count
+            synced_fingerprint = responses_session.synced_fingerprint
+            logger.debug(
+                "[responses] stateful 续链：previous_response_id=%s synced=%d delta_start=%d",
+                responses_session.response_id, synced_count, delta_start,
+            )
+        else:
+            logger.info(
+                "[responses] server state 与本地历史前缀不对齐（水位=%d），本轮 bootstrap 重建",
+                responses_session.synced_message_count,
+            )
+            responses_session = None
+    current_response_id: Optional[str] = (
+        responses_session.response_id if responses_session is not None else None
+    )
+
+    def _build_request_kwargs(
+            instructions: str,
+            input_items: list,
+            previous_response_id: Optional[str],
+    ) -> dict[str, Any]:
+        """组装单轮请求 kwargs（bootstrap / 增量 / fallback / background 共用）。"""
+        kwargs: dict[str, Any] = {
             "model": current_model,
             "input": input_items,
-            "stream": True,
             "max_output_tokens": max_tokens,
         }
+        if responses_background:
+            # Background Mode（Phase 3 长任务）：非流式提交，由
+            # _run_response_background_round 轮询 retrieve() 到终态。
+            kwargs["background"] = True
+        else:
+            kwargs["stream"] = True
         _add_responses_cache_options(
-            request_kwargs,
+            kwargs,
             api_label=api_label,
             model=current_model,
             chat_id=builder.chat_id,
             enabled=prompt_cache_enabled,
         )
-        if instructions:
-            request_kwargs["instructions"] = instructions
+        if responses_prompt is not None:
+            # Prompt Templates（Phase 3）：模板自带 system 消息，与
+            # instructions 互斥（官方语义），二者只能选其一。
+            kwargs["prompt"] = responses_prompt
+        elif instructions:
+            kwargs["instructions"] = instructions
         if sampling_params.get("temperature") is not None:
-            request_kwargs["temperature"] = sampling_params["temperature"]
+            kwargs["temperature"] = sampling_params["temperature"]
         if sampling_params.get("top_p") is not None:
-            request_kwargs["top_p"] = sampling_params["top_p"]
+            kwargs["top_p"] = sampling_params["top_p"]
         if reasoning_param:
-            request_kwargs["reasoning"] = reasoning_param
+            kwargs["reasoning"] = reasoning_param
         if responses_tools:
-            request_kwargs["tools"] = responses_tools
-            request_kwargs["tool_choice"] = "auto"
-            request_kwargs["parallel_tool_calls"] = True
+            kwargs["tools"] = responses_tools
+            kwargs["tool_choice"] = "auto"
+            kwargs["parallel_tool_calls"] = True
+        if previous_response_id:
+            kwargs["previous_response_id"] = previous_response_id
+        if responses_store is not None:
+            kwargs["store"] = bool(responses_store)
+        return kwargs
+
+    for _round in range(MAX_TOOL_CALLS):
+        # instructions 每轮都从完整本地历史重算：system prompt 会随技能/
+        # 静默模式/TIMER 变化，而 Responses 的 instructions 是逐请求参数，
+        # previous_response_id 链不会继承上一请求的 instructions。
+        instructions, full_input_items = _convert_messages_to_responses_input(loop_messages)
+        # 增量模式：水位之后的非 system 消息转成 delta input；空增量
+        # （尾部只有 system 提示等不可见消息）退回全量 bootstrap——
+        # Responses 不接受空 input，全量重发永远是最安全的一致状态。
+        input_items: list = full_input_items
+        previous_response_id: Optional[str] = None
+        if current_response_id and synced_count > 0:
+            delta_start = resolve_synced_prefix(
+                loop_messages, synced_count, synced_fingerprint)
+            if delta_start is not None and delta_start < len(loop_messages):
+                _, delta_items = _convert_messages_to_responses_input(
+                    loop_messages[delta_start:])
+                if delta_items:
+                    input_items = delta_items
+                    previous_response_id = current_response_id
+            # delta_start 为 None / 空增量：维持全量 bootstrap（指针暂不
+            # 丢，本轮成功后按新水位推进——失败重试天然安全）。
+
+        request_kwargs: dict[str, Any] = _build_request_kwargs(
+            instructions, input_items, previous_response_id)
 
         content_acc = ""
         reasoning_acc = ""
@@ -651,12 +890,51 @@ async def _agentic_loop_openai_responses(
         current_stream_cell = [None]
         response_status: str = ""
         response_error_text: str = ""
+        # 本轮响应的 server 端 id（response.completed / response.incomplete
+        # 事件携带）：stateful 模式下作为下一轮的 previous_response_id。
+        round_response_id: Optional[str] = None
 
         switch_stream = make_switch_stream(builder, current_stream_cell)
 
         try:
             await start_chat_action(builder.chat_id, "typing")
-            stream = await client.responses.create(**request_kwargs)
+            if responses_background:
+                # Background Mode（Phase 3）：轮询到终态后转成与 SSE 同构的
+                # 合成事件流，下游累积/修复/UI/水位推进管线零改动复用。
+                stream = _BackgroundResponseStream(
+                    await _run_response_background_round(
+                        client, request_kwargs=request_kwargs,
+                        builder=builder, api_label=api_label))
+            elif previous_response_id:
+                # server state 失效（previous_response_id 不可达 / 网关不
+                # 支持 / 上游保留期过期）会在 create 阶段直接抛 4xx/404。
+                # 捕获后丢弃指针、从本地历史 bootstrap 重试一次——这是
+                # 「server state 是缓存不是业务数据」的执行点：本地完整
+                # 历史永远足够重建全新链路，不丢任何业务数据。
+                try:
+                    stream = await client.responses.create(**request_kwargs)
+                except Exception as state_exc:
+                    logger.warning(
+                        "[%s] previous_response_id=%s 请求失败（%s: %s），"
+                        "丢弃 server state 并从本地历史 bootstrap 重建",
+                        api_label, previous_response_id,
+                        type(state_exc).__name__, str(state_exc)[:300],
+                    )
+                    try:
+                        await drop_responses_session(
+                            builder.chat_id, api_label, state_endpoint, current_model)
+                    except Exception:
+                        logger.debug("丢弃 Responses state 失败（忽略）", exc_info=True)
+                    responses_session = None
+                    current_response_id = None
+                    synced_count = 0
+                    synced_fingerprint = ""
+                    previous_response_id = None
+                    request_kwargs = _build_request_kwargs(
+                        instructions, full_input_items, None)
+                    stream = await client.responses.create(**request_kwargs)
+            else:
+                stream = await client.responses.create(**request_kwargs)
             async for event in stream:
                 etype = getattr(event, "type", None)
 
@@ -771,12 +1049,21 @@ async def _agentic_loop_openai_responses(
 
                 elif etype == "response.completed":
                     resp_obj = getattr(event, "response", None)
-                    if resp_obj is not None and getattr(resp_obj, "usage", None):
-                        final_usage = resp_obj.usage
+                    if resp_obj is not None:
+                        # stateful 增量链的续链指针：completed 响应一定已
+                        # 在 server 端落库，可安全作为下一轮的 previous_id。
+                        round_response_id = getattr(resp_obj, "id", None) or round_response_id
+                        if getattr(resp_obj, "usage", None):
+                            final_usage = resp_obj.usage
                     response_status = "completed"
 
                 elif etype in ("response.failed", "response.incomplete"):
                     resp_obj = getattr(event, "response", None)
+                    if resp_obj is not None:
+                        # incomplete 响应同样已落库（可被 previous_response_id
+                        # 引用）；failed 响应的落库状态不可靠，下方推进水位
+                        # 时会按 status="failed" 跳过，这里仅作观测记录。
+                        round_response_id = getattr(resp_obj, "id", None) or round_response_id
                     # response.incomplete 本身只说"没说完"，真正的截断原因在
                     # response.incomplete_details.reason（"max_output_tokens" /
                     # "content_filter"，见 OpenAI Responses API 文档）。此前
@@ -903,6 +1190,31 @@ async def _agentic_loop_openai_responses(
         # （tool_calls / reasoning / 最终文本原地补全，同一对象进 loop_messages）。
         live_slot.finalize(loop_messages, content_acc, tool_calls_list, reasoning_acc)
 
+        # stateful（Phase 1）：本条 assistant 消息此刻已同时进入本地
+        # loop_messages；响应若是 completed/incomplete，其全部 item 也已在
+        # server 端落库。把指针与水位推进到当前本地长度——下一轮（工具
+        # 续链或后续 user 轮次）只需发送水位之后的增量。
+        # response.failed 不推进：失败响应的 server 落库状态不可靠，下一轮
+        # 会把本轮局部产物（如有）作为普通 input 随增量重新发送。
+        # 水位含本轮 assistant 消息本身（server 链已包含它，无需重发）。
+        if responses_stateful and round_response_id and response_status != "failed":
+            synced_count = count_input_visible_messages(loop_messages)
+            synced_fingerprint = fingerprint_synced_prefix(loop_messages, synced_count)
+            current_response_id = round_response_id
+            try:
+                responses_session = await save_responses_session(
+                    builder.chat_id, api_label, state_endpoint, current_model,
+                    round_response_id,
+                    synced_message_count=synced_count,
+                    synced_fingerprint=synced_fingerprint,
+                    status=response_status or "completed",
+                )
+            except Exception:
+                # 指针保存失败只影响"跨轮次续链"，本轮内的增量续链
+                # （current_response_id / 水位局部变量）不受影响。
+                logger.debug("保存 Responses state 失败（不影响本轮结果）", exc_info=True)
+                responses_session = None
+
         if not tool_calls_list:
             final_content = content_acc
             finish_open_tool_group(builder)
@@ -916,6 +1228,11 @@ async def _agentic_loop_openai_responses(
         if status == "over_limit":
 
             async def _synth_stream(req: tuple) -> str:
+                # 超限强制总结是本 turn 的终局一次性请求：维持无状态
+                # 全量 bootstrap（不带 previous_response_id，与 build_
+                # synth_request 的全量转换配对）。它不推进水位——总结
+                # 产生的 assistant 消息只进历史不入 server 链，下一轮
+                # 作为普通增量 input 发送，链路仍然自洽。
                 synth_instructions, synth_input = req
                 synth_text = ""
                 synth_kwargs: dict[str, Any] = {

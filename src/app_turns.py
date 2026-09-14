@@ -549,6 +549,19 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
                 ctx["last_prompt_tokens"] = 0
                 ctx["last_completion_tokens"] = 0
 
+        # Phase 3 compaction 联动：本地历史压缩事件 → Responses server
+        # state 同步 reset（"本地历史压缩 + Responses server state reset
+        # 两个系统一起管理"，见 ai/responses_state.py）。水位指纹机制本来
+        # 就能在下轮请求时兜底检测（对不齐 → bootstrap），这里显式提前
+        # 丢弃指针，省掉一次注定失败的增量请求并让协调在日志可见。
+        # 只在压缩确实发生（L1 归档 / L2 淘汰任一杠杆实际生效）时触发。
+        if archived_calls or evicted_blocks:
+            try:
+                from ai.responses_state import reset_responses_session_for_model
+                await reset_responses_session_for_model(chat_id, model_info)
+            except Exception:
+                logger.debug("Responses state reset 失败（指纹机制仍会兜底）", exc_info=True)
+
         logger.info(
             "Context compaction event: chat=%s model=%s budget=%s trigger=%s target=%s "
             "archived_calls=%s evicted_blocks=%s evicted_messages=%s history_tokens=%s "

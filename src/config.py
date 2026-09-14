@@ -40,11 +40,6 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # mimo-v2.5 / muse-spark-1.3-contributor / nv/kimi-k3），见下方
 # PROVIDERS["lfree"] 与模型定义（"LFREE 中转"注释块）。
 LFREE_API_KEY = os.getenv("LFREE_API_KEY", "")
-# Responses API 缓存策略：默认只使用供应商自动缓存（implicit）。
-# 只有明确设置为 true 时，才在内容块上添加显式 breakpoint。
-RESPONSES_EXPLICIT_CACHE_ENABLED = os.getenv(
-    "RESPONSES_EXPLICIT_CACHE_ENABLED", "false"
-).strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ---------- 高德地图 MCP 服务（@amap/amap-maps on ModelScope）----------
@@ -300,6 +295,36 @@ class ModelConfig:
     # None = 继承厂商默认；显式声明即覆盖，无独立开关字段。
     protocol: Optional[str] = None
     session_affinity: Optional[bool] = None
+
+    # ===================== Responses API stateful 增量会话 ============
+    # 仅 protocol="openai_responses" 的模型生效（其它协议忽略这两个字段）。
+    # responses_stateful: 是否启用 previous_response_id 增量链（Phase 1，
+    #   见 ai/responses_state.py）。None/False = 每轮全量发送历史（原行为）；
+    #   True = 首轮 bootstrap 全量、后续只发增量 + 工具续链。开启后本地
+    #   历史仍是唯一业务真相：server state 失效时自动回落 bootstrap
+    #   （responses_bridge 内置 fallback），最坏代价是多一次失败请求。
+    #   建议：官方 OpenAI 端点开启；第三方网关确认支持后开启（若网关
+    #   静默忽略 previous_response_id 导致模型丢上下文，改回 False）。
+    # responses_store: 是否显式下发 store 参数。None = 不发送（跟随
+    #   网关默认，官方 OpenAI 默认 true，保留期约 30 天）；True/False =
+    #   显式下发。第三方兼容网关不完整支持 store 时保持 None 最安全。
+    # responses_background: 是否启用 Background Mode（Phase 3 长任务，
+    #   见 responses_bridge._run_response_background_round）。None/False =
+    #   流式（默认，打字机体验）；True = background=True 非流式提交 +
+    #   轮询 retrieve() 到终态。适合长代码任务 / 长时间 shell / 复杂
+    #   research 等分钟级任务；代价是失去流式草稿体验（文本/工具卡片
+    #   在响应完成后一次性到达，轮询期间只有 thinking 状态心跳）。
+    #   按“不要全局打开”的保守原则，默认关闭，需要长任务的模型单独开启。
+    # responses_prompt: Responses Prompt Templates（Phase 3，官方 Dashboard
+    #   创建的模板对象）。形如 {"id": "pmpt_xxx", "version": "2",
+    #   "variables": {...}}；设置后请求携带 prompt 且不再发送 instructions
+    #   （模板自带 system 消息，二者互斥）。注意：variables 是静态配置，
+    #   动态 system prompt（技能目录/角色/静默模式等每轮变化）的场景
+    #   不应启用——那是 prompt 模板与本项目动态提示的语义冲突。
+    responses_stateful: Optional[bool] = None
+    responses_store: Optional[bool] = None
+    responses_background: Optional[bool] = None
+    responses_prompt: Optional[dict] = None
 
     @property
     def api_type(self) -> str:
@@ -810,6 +835,16 @@ def make_model_config(
     if budget is not None and int(budget) < 1:
         raise ValueError(f"模型 {model_id} 的 reasoning_max_tokens={budget!r} 必须 >= 1")
 
+    # Responses Prompt Templates：必须是带 id 的 dict（官方 prompt 对象形状）。
+    # 拼错会在运行期被网关 400，尽早暴露。
+    prompt_template = merged.get("responses_prompt")
+    if prompt_template is not None:
+        if not isinstance(prompt_template, dict) or not prompt_template.get("id"):
+            raise ValueError(
+                f"模型 {model_id} 的 responses_prompt={prompt_template!r} 无效，"
+                '必须是形如 {"id": "pmpt_xxx", "version": "2", "variables": {...}} 的 dict'
+            )
+
     # OpenRouter 的模型 ID 需要完整的 openrouter/<author>/<slug> 形式。
     normalized_model_id = model_id
     if provider == "openrouter" and not model_id.startswith("openrouter/"):
@@ -834,6 +869,10 @@ def make_model_config(
         reasoning_max_tokens=(int(budget) if budget is not None else None),
         temperature=merged.get("temperature"),
         top_p=merged.get("top_p"),
+        responses_stateful=merged.get("responses_stateful"),
+        responses_store=merged.get("responses_store"),
+        responses_background=merged.get("responses_background"),
+        responses_prompt=merged.get("responses_prompt"),
         api_key_env=endpoint_overrides.get("api_key_env"),
         default_headers=endpoint_overrides.get("default_headers"),
         protocol=endpoint_overrides.get("protocol"),
@@ -1260,6 +1299,12 @@ SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
     reasoning_effort="high",
     max_context=1000000,
     protocol="openai_responses",
+    # Responses stateful 增量链（Phase 1）：三个 openai_responses 协议模型
+    # 全部开启 previous_response_id 增量会话（见 ai/responses_state.py）。
+    # 网关不支持时会报 4xx，bridge 自动回落 bootstrap 重试（每轮多一次
+    # 失败请求，日志可见 warning）；若实测发现网关静默忽略指针导致
+    # 丢上下文，把这三个模型的 responses_stateful 改回 False 即可。
+    responses_stateful=True,
 )
 SUPPORTED_MODELS["big-pickle"] = make_model_config(
     model_id="big-pickle",
@@ -1268,6 +1313,8 @@ SUPPORTED_MODELS["big-pickle"] = make_model_config(
     reasoning_effort="high",
     max_context=200000,
     protocol="openai_responses",
+    # 同上：Responses stateful 增量链（见 claude-opus-5 注释）。
+    responses_stateful=True,
 )
 SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
     model_id="muse-spark-1.3-contributor",
@@ -1277,6 +1324,8 @@ SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
     reasoning_effort="high",
     max_context=1000000,
     protocol="openai_responses",
+    # 同上：Responses stateful 增量链（见 claude-opus-5 注释）。
+    responses_stateful=True,
 )
 
 
