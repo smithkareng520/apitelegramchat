@@ -137,7 +137,6 @@ tool 结果作为增量发送。
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `RESPONSES_STATEFUL_CONVERSATION_ENABLED` | `true` | 总开关：关闭后 Responses 路径回退"每轮全量重发" |
 | `RESPONSES_SYNC_MAX_PAGES` / `RESPONSES_SYNC_PAGE_LIMIT` | 40 / 100 | 回拉分页上限（超限保守作废重建） |
 | `RESPONSES_SYNC_MAX_ITEMS` | 2000 | 回拉清洗后镜像条目上限（保留最近 N 条） |
 | `RESPONSES_SYNC_TIMEOUT` | 15.0 | 单次 items 拉取 / 删除超时（秒） |

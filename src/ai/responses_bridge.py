@@ -366,17 +366,6 @@ def _add_responses_cache_options(
 #      （分叉态重建，避免服务端残留半轮内容与本地镜像静默错位）；
 #      增量首轮请求失败（4xx 会话类错误）⇒ 当场作废并以全量自举重试一次。
 #
-# 环境开关（默认开启）：允许在观察到网关侧对 `conversation` 参数支持
-# 不稳定时整体回退到旧的"每轮全量重发"行为（等价于永远 stateless），
-# 不影响功能正确性，只是放弃 token/延迟优化。
-import os as _os
-
-
-def _responses_stateful_enabled() -> bool:
-    raw = _os.getenv("RESPONSES_STATEFUL_CONVERSATION_ENABLED", "true")
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-
 @dataclass
 class _TurnSyncContext:
     """单个回合内的服务端会话同步上下文（桥接层私有）。
@@ -413,12 +402,10 @@ async def _begin_turn_sync(
 ) -> Optional[_TurnSyncContext]:
     """回合开始时建立（或放弃）服务端会话同步上下文。
 
-    返回 None 表示本回合走无状态全量路径（未接入 TurnState / 总开关
-    关闭 / 自举建会话失败 / 状态机异常兜底），调用方按旧行为每轮全量
-    转换 loop_messages——任何异常都不阻断回合主流程（需求文档 三.2
-    边界条件异常捕获）。
+    自举建会话失败 / 状态机异常时返回 None；任何异常都不阻断回合主流程
+    （需求文档 三.2 边界条件异常捕获）。
     """
-    if chat_id is None or turn is None or not _responses_stateful_enabled():
+    if chat_id is None or turn is None:
         return None
     try:
         return await _begin_turn_sync_inner(
@@ -440,7 +427,7 @@ async def _begin_turn_sync_inner(
     current_model: str,
     loop_messages: list,
 ) -> Optional[_TurnSyncContext]:
-    if chat_id is None or turn is None or not _responses_stateful_enabled():
+    if chat_id is None or turn is None:
         return None
     vendor_key = _conv_state.derive_vendor_key(model_info)
     state = await _conv_state.get_conversation_state(chat_id)
@@ -1397,5 +1384,4 @@ __all__ = [
     "_responses_usage_to_openai",
     "_begin_turn_sync",
     "_create_responses_conversation",
-    "_responses_stateful_enabled",
 ]
