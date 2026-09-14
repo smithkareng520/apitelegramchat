@@ -140,7 +140,10 @@ def test_search_tool_schemas_description_only_on_bash():
 
     bash_params = by_name["bash"]["function"]["parameters"]
     assert "description" in bash_params["properties"]
-    assert bash_params["required"] == ["description", "command"]
+    # v2.5 起 command 不再列入 required：task_action 调用（list/status 等）
+    # 没有 command，与 command 互斥，由执行器给可操作错误兜底。
+    assert bash_params["required"] == ["description"]
+    assert "command" not in bash_params["required"]
 
     for name in ("weather", "exchange_rate",
                  "geocode", "route", "distance", "poi_keyword_search",

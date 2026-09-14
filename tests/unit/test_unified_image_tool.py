@@ -93,16 +93,30 @@ def test_dual_mode_models_is_edit_models_alias():
     assert DUAL_MODE_MODELS == EDIT_MODELS
 
 
-def test_dual_mode_example_shows_same_model_both_operations():
-    # 示例对必须演示"同一模型省略/携带 image_url 切换生成/编辑"：
-    # 两例使用同一个双能力模型，第一例无 image_url，第二例有
+def test_input_examples_cover_generate_and_edit_shapes():
+    # 示例组覆盖三种调用形状（全部配置驱动，不硬编码模型名，避免模型
+    # 目录调整后测试再次过时）：
+    #   例 1：纯文生图——无 image_url，模型取 TEXT_ONLY_MODELS[0]
+    #         （当前配置为仅生成模型 Qwen/Qwen-Image，与编辑示例分别
+    #         示范"仅生成桶"与"双能力桶"两种模型）；
+    #   例 2：编辑——携带 image_url，且模型必须是双能力模型
+    #         （仅生成模型禁止携带 image_url，执行层硬校验兜底）；
+    #   例 3：双能力模型省略 image_url 纯文生图 + extra_params 透传。
     tool = _tool_defs()["generate_image"]["function"]
     examples = tool["input_examples"]
     assert len(examples) >= 2
+    # 例 1：纯文生图形状（无 image_url）
+    assert "image_url" not in examples[0]
+    if TEXT_ONLY_MODELS:
+        assert examples[0]["model"] in TEXT_ONLY_MODELS
+    # 例 2：编辑形状（携带 image_url，双能力模型）
     if DUAL_MODE_MODELS:
-        assert examples[0]["model"] == examples[1]["model"]
-        assert "image_url" not in examples[0]
         assert examples[1].get("image_url")
+        assert examples[1]["model"] in DUAL_MODE_MODELS
+    # 例 3（存在则校验）：双能力模型省略 image_url 同样是生成
+    if len(examples) >= 3 and DUAL_MODE_MODELS:
+        assert "image_url" not in examples[2]
+        assert examples[2]["model"] in DUAL_MODE_MODELS
 
 
 # ---------------------------------------------------------------------------

@@ -320,8 +320,8 @@ def test_openrouter_chat_image_task_resolves_registered_model_without_name_error
 
 def test_openai_compat_edit_never_falls_back_to_generations(monkeypatch):
     """编辑端点失败时绝不能伪装成文生图成功。"""
-    from types import SimpleNamespace
     import ai.media_generation as mg
+    from config import make_model_config
 
     class FakeSession:
         async def __aenter__(self):
@@ -358,7 +358,16 @@ def test_openai_compat_edit_never_falls_back_to_generations(monkeypatch):
     monkeypatch.setattr(mg, "_post_images_with_retry", fake_post)
     monkeypatch.setattr(mg, "_data_url_to_bytes", lambda _: (PNG_1X1, "image/png"))
 
-    model_info = SimpleNamespace(provider="xxtf", name="XXTF")
+    # 注：原夹具 SimpleNamespace(provider="xxtf") 已过时——xxtf 厂商从
+    # PROVIDERS 移除后 get_effective_endpoint 会直接拒绝。改用现存
+    # deepseek 厂商（API 根端点 -> 官方 multipart /images/edits 形状）。
+    model_info = make_model_config(
+        model_id="test-edit-no-fallback",
+        provider="deepseek",
+        image_output=True,
+        image_input=True,
+        protocol="openai_images",
+    )
 
     result = asyncio.run(
         mg._request_openai_compat_image(
@@ -380,7 +389,7 @@ def test_openai_compat_edit_never_falls_back_to_generations(monkeypatch):
     # 明确告诉模型/用户：不会降级成文生图。
     assert "不会回退" in detail
     # 只打过 /images/edits 一趟，绝不出现第二次 generations 请求。
-    assert calls == ["https://xxtf.baby/v1/images/edits"]
+    assert calls == ["https://api.deepseek.com/v1/images/edits"]
 
 
 def test_image_task_edit_requires_reference_image():

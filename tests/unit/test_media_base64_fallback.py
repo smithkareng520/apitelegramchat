@@ -235,8 +235,10 @@ class TestInlineWireImages:
         attachment_content._image_url_file_id_cache[parts[0]["image_url"]["url"]] = "fid1"
         attachment_content._image_url_file_id_cache[parts[1]["image_url"]["url"]] = "fid2"
 
-        async def _get_cached(chat_id, file_id):
-            return {"fid1": PNG_MAGIC, "fid2": PNG_MAGIC}
+        async def _get_cached(_chat_id, file_id):
+            # 新版签名：get_cached_image_data(chat_id, file_id) -> Optional[bytes]
+            # 按 file_id 逐个返回该图的原始字节（旧版返回 dict 映射的形状已废弃）。
+            return PNG_MAGIC if file_id in {"fid1", "fid2"} else None
 
         original = attachment_content.get_cached_image_data
         attachment_content.get_cached_image_data = _get_cached

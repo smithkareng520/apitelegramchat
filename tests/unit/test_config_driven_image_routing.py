@@ -106,18 +106,21 @@ def test_declared_endpoint_wins_over_root_derivation():
 
 
 def test_no_override_falls_back_to_official_derivation():
-    # XXTF 式：未声明完整图像端点 -> 官方推导 {endpoint}/images/{generations,edits}
+    # DeepSeek 式标准 OpenAI 兼容中转：未声明完整图像端点 -> 官方推导
+    # {endpoint}/images/{generations,edits}（与 agnes 不同厂商，验证推导
+    # 不绑定特定 provider）。注：原夹具 xxtf 厂商已从 PROVIDERS 移除，
+    # 改用现存的 deepseek 厂商根端点。
     cfg = make_model_config(
         model_id="test-std-images",
-        provider="xxtf",
+        provider="deepseek",
         image_output=True,
         image_input=True,
         protocol="openai_images",
     )
     shape = resolve_images_endpoint_shape(cfg)
     assert shape.edit_inline is False
-    assert shape.generate_url == "https://xxtf.baby/v1/images/generations"
-    assert shape.edits_url == "https://xxtf.baby/v1/images/edits"
+    assert shape.generate_url == "https://api.deepseek.com/v1/images/generations"
+    assert shape.edits_url == "https://api.deepseek.com/v1/images/edits"
 
 
 # ---------------------------------------------------------------------------
