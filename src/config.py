@@ -40,11 +40,6 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # mimo-v2.5 / muse-spark-1.3-contributor / nv/kimi-k3），见下方
 # PROVIDERS["lfree"] 与模型定义（"LFREE 中转"注释块）。
 LFREE_API_KEY = os.getenv("LFREE_API_KEY", "")
-# Responses API 缓存策略：默认只使用供应商自动缓存（implicit）。
-# 只有明确设置为 true 时，才在内容块上添加显式 breakpoint。
-RESPONSES_EXPLICIT_CACHE_ENABLED = os.getenv(
-    "RESPONSES_EXPLICIT_CACHE_ENABLED", "false"
-).strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ---------- 高德地图 MCP 服务（@amap/amap-maps on ModelScope）----------
