@@ -5,11 +5,6 @@ import time
 import uuid
 from collections import OrderedDict
 from config import DEFAULT_MODEL
-# 注意：不能 import utils（facade 会拉起 core.telegram_messaging -> state
-# 的顶部循环依赖），直接取最底层的 logging_setup。
-from core.logging_setup import get_logger
-
-logger = get_logger(__name__)
 
 # ---------- 用户会话 ----------
 user_contexts: dict = {}
@@ -354,17 +349,6 @@ async def safe_clear_history(chat_id: int) -> None:
         # 清空对话 = 新建会话：同步轮换 LLM 会话亲和键，旧会话的路由
         # 亲和性（OpenRouter 粘性路由 / agnes 副本粘性）不再作用于新对话。
         rotate_llm_session_token(chat_id)
-    # Responses stateful 指针同步失效（见 ai/responses_state.py）：response_id
-    # 只是上游上下文缓存，对话清空后绝不允许增量续上旧 server 链。注册表
-    # 键里的纪元 token 已随 rotate 轮换（旧条目天然不可达），这里按 chat_id
-    # 再做一次显式清扫兜底。延迟导入避免 state -> ai 的模块级循环依赖。
-    try:
-        from ai.responses_state import drop_responses_sessions_for_chat
-        dropped = drop_responses_sessions_for_chat(chat_id)
-        if dropped:
-            logger.info("已清理 chat_id=%s 的 %d 条 Responses state 指针", chat_id, dropped)
-    except Exception:  # pragma: no cover - 防御性：清理失败不影响清空对话
-        pass
 
 
 # ---------- 草稿预览开关（/show on|off，USER 与 TIMER 回合统一生效） ----------
