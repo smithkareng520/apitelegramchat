@@ -20,6 +20,7 @@ from protocols.base import ChatProtocolAdapter
 if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
     from config import ModelConfig
+    from conversation_state import TurnState
 
 
 class OpenAIChatAdapter(ChatProtocolAdapter):
@@ -35,10 +36,23 @@ class OpenAIChatAdapter(ChatProtocolAdapter):
         tools: Optional[list[Any]] = None,
         supports_tools: bool = True,
         journal: Optional[list[Any]] = None,
-        conversation_state: Any = None,
+        turn: Optional["TurnState"] = None,
     ) -> tuple[str | None, Any, list]:
         from ai.agentic_loops import _agentic_loop_openai_compat
 
+        # Chat Completions 没有等价的服务端会话概念，协议路由到这里
+        # 意味着当前回合不使用 Responses 的服务端会话；令 cursor 失效，
+        # 下次切回 openai_responses 协议时重新自举（见
+        # conversation_state.py"模型切换语义"）。canonical history 不受
+        # 影响，Chat Completions 继续按既有行为全量重发（本协议本就是
+        # "无状态 provider"，见任务指南 Task 9）。
+        chat_id = getattr(builder, "chat_id", None)
+        if chat_id is not None:
+            try:
+                from conversation_state import invalidate_responses_cursor
+                invalidate_responses_cursor(chat_id)
+            except Exception:
+                pass
         client = api_client.get_client_for_model(model_info)
         api_label = model_info.provider
         return await _agentic_loop_openai_compat(

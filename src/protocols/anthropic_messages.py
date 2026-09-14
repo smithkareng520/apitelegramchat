@@ -18,6 +18,7 @@ from protocols.base import ChatProtocolAdapter
 if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
     from config import ModelConfig
+    from conversation_state import TurnState
 
 
 class AnthropicMessagesAdapter(ChatProtocolAdapter):
@@ -33,10 +34,21 @@ class AnthropicMessagesAdapter(ChatProtocolAdapter):
         tools: Optional[list[Any]] = None,
         supports_tools: bool = True,
         journal: Optional[list[Any]] = None,
-        conversation_state: Any = None,
+        turn: Optional["TurnState"] = None,
     ) -> tuple[str | None, Any, list]:
         from ai.anthropic_bridge import _agentic_loop_anthropic
 
+        # 协议路由到了 Anthropic：当前 chat 若持有 openai_responses 的
+        # 服务端会话 cursor，令其失效（不影响 canonical history，只是
+        # 下次切回 Responses 协议时需要重新自举）。见
+        # conversation_state.py 模块头注释"模型切换语义"。
+        chat_id = getattr(builder, "chat_id", None)
+        if chat_id is not None:
+            try:
+                from conversation_state import invalidate_responses_cursor
+                invalidate_responses_cursor(chat_id)
+            except Exception:
+                pass
         client = api_client.get_client_for_model(model_info)
         return await _agentic_loop_anthropic(
             client, current_model, messages, builder,

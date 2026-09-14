@@ -17,9 +17,8 @@
      进 new_history_entries 的内容，全部是内部 Message（core/messages），
      可以直接复用 tool_call_loop._run_tool_calls_and_append 与
      bridge_common 的公共骨架。
-   - 仅在"即将调用 Responses API"之前，把内部 Message 转换成 Responses
-     的 input item 列表；使用显式 conversation 时，首个请求 bootstrap 完整
-     canonical history，后续 USER/TIMER 只发送本轮新增 input。
+   - 仅在"即将调用 Responses API"之前，把当前累积的内部消息转换成
+     Responses 的 input item 列表（_convert_messages_to_responses_input）；
      工具 schema 转换见 _convert_tools_to_responses。
    - Responses API 返回的内容在写回 loop_messages / new_history_entries
      前，统一转换回内部 Message（文本 + tool_calls 列表），与其它两条
@@ -41,6 +40,27 @@ Responses API 与 Chat Completions 虽同属 OpenAI，但线上协议形状完�
     不是 Chat Completions 的 choices[0].delta 增量合并模型。
 把这些差异塞进 _agentic_loop_openai_compat 会让该函数的分支判断进一步
 膨胀；按项目既有的原生协议桥接惯例单独实现一份，改动面清晰、互不干扰。
+
+3. 服务端会话状态（真正的 stateful Responses，2026-09 新增）：
+   ==================================================
+   上面两条原则描述的是"边界转换"这一层，与是否使用服务端会话无关，
+   继续对全部调用方成立。本次新增的是**请求侧的传输优化**：当调用方
+   通过 ``turn``（conversation_state.TurnState）接入了对话状态层时，
+   本文件会优先复用 OpenAI 的 ``conversation`` 服务端会话对象——只把
+   "尚未发给服务端的增量消息"放进 ``input``，不再每轮全量重发
+   canonical history；cursor 失效（跨协议切换回来 / 历史被压缩 /
+   `/clear` 之后）时自动退化为一次性全量"自举"，建立新的会话对象。
+
+   这一优化完全不影响原则 1/2：
+     - canonical history（loop_messages / new_history_entries）依然是
+       全量的内部 Message 列表，只读，从不因为"发没发给服务端"而被
+       裁剪或改写；
+     - 只有"即将序列化成 Responses input"这一步会按 sent_count 切片，
+       且切片只影响这一次网络请求的 payload，不影响任何持久化路径。
+
+   详细设计与 fencing（TIMER/USER 并发、/clear、模型切换）见
+   conversation_state.py 模块头注释；本文件内的接入点集中在
+   "Conversation State：服务端会话（真正的 stateful Responses）"一节。
 """
 import hashlib
 import json
@@ -74,8 +94,8 @@ from ai.bridge_common import (
 )
 from ai.cache_usage import _log_cache_usage
 from config import RESPONSES_EXPLICIT_CACHE_ENABLED
-import state
 from state import get_llm_session_key
+import conversation_state as _conv_state
 
 if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
@@ -186,9 +206,9 @@ def _convert_messages_to_responses_input(messages: list) -> tuple[str, list]:
             Responses API 接受把助手历史消息作为 input 回传。
           * 每个 ToolCallBlock -> function_call item
             {"type":"function_call","call_id","name","arguments"}。
-        reasoning（ReasoningBlock）不在 bootstrap input 中重建：Responses
-        conversation 会保存服务端原生 reasoning item；跨 provider bootstrap
-        时没有合法的原生 reasoning item id，故只保留 canonical assistant 结论。
+        reasoning（ReasoningBlock）不回填：Responses API 的 reasoning
+        item 需要服务端签发的 id 才能被同一 response 链路复用，跨轮次
+        重新构造的 reasoning 文本无法以合法 item 形式回传，静默跳过
         （与 Anthropic thinking 块在非官方最新模型上的降级策略一致，
         不影响功能，只是模型看不到上一轮的思考过程文本，只看得到结论）。
       - role=tool   -> function_call_output item
@@ -395,6 +415,90 @@ def _add_responses_cache_options(
 
 
 # =============================================================================
+# Conversation State：服务端会话（真正的 stateful Responses）
+# =============================================================================
+# 背景（务必先读 conversation_state.py 模块头注释）：本节把
+# _agentic_loop_openai_responses 从"每轮全量重发 canonical history"改造
+# 成"cursor 有效时只发本轮增量"。策略：
+#
+#   1) 回合开始（第一次进入下面的 for _round 循环）时，查询
+#      conversation_state 里该 chat 的 Responses cursor 是否仍然对当前
+#      canonical_revision 有效（is_valid_for）。
+#        - 有效 -> 增量模式：只转换 loop_messages 里"尚未发送过"的
+#          消息（通常就是本轮新增的 user 消息），请求携带
+#          conversation=cursor.conversation_id，不携带 input 之外的
+#          历史；
+#        - 无效（从未建立过 / 模型此前不是 Responses / 历史被压缩 /
+#          `/clear` 之后第一次）-> 自举模式：全量转换 loop_messages
+#          （与旧行为一致），请求携带 conversation=<新建的 conversation
+#          对象 id>，建立服务端会话起点。
+#   2) 工具调用继续同一轮对话（同一个 for _round 迭代继续）时，
+#      不需要重新判断 cursor 有效性——同一个 turn 内本来就是同一个
+#      conversation，只需要把"本轮循环内新产生的" assistant/tool
+#      消息（上一次请求之后 loop_messages 新增的部分）作为下一次请求
+#      的增量 input 发送。用 _sent_count 追踪"loop_messages 里已经
+#      发给 Responses 服务端的前缀长度"即可，逻辑与 revision 机制正交
+#      （revision 只用于跨轮次/跨协议判断 cursor 是否需要重新自举）。
+#   3) response.completed 时（循环末尾拿到 resp_obj.conversation.id /
+#      resp_obj.id）尝试 commit 新 cursor——只有 TurnState fencing 校验
+#      通过（回合发起后没有发生 /clear）才真正写入，避免过期回合的
+#      迟到响应污染当前状态（见 conversation_state.ConversationState.
+#      is_turn_current）。
+#
+# 环境开关（默认开启）：出于稳妥考虑保留一个总开关，允许在观察到
+# 网关侧对 `conversation` 参数支持不稳定时整体回退到旧的"每轮全量
+# 自举"行为（等价于把 cursor 永远判定为无效），不影响功能正确性，
+# 只是放弃 token/延迟优化。
+import os as _os
+
+
+def _responses_stateful_enabled() -> bool:
+    raw = _os.getenv("RESPONSES_STATEFUL_CONVERSATION_ENABLED", "true")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def _resolve_conversation_plan(
+    chat_id: Any,
+    turn: Optional["_conv_state.TurnState"],
+) -> tuple[Optional[str], bool]:
+    """返回 (conversation_id_to_reuse, need_bootstrap)。
+
+    - chat_id 为 None（无法定位会话，如 subagent 一次性调用）或本轮未
+      提供 TurnState（调用方未接入 conversation_state，如旧版直接调用
+      _agentic_loop_openai_responses 的测试/脚本）-> 一律不使用服务端
+      会话，退回旧的"全量自举，不复用"行为，保证向后兼容。
+    - conversation_id_to_reuse 非空 -> 复用该会话，只发增量；
+    - need_bootstrap=True 且 conversation_id_to_reuse 为空 -> 需要新建
+      一个 conversation 对象后再首次全量自举。
+    """
+    if chat_id is None or turn is None or not _responses_stateful_enabled():
+        return None, False
+    st = await _conv_state.get_conversation_state(chat_id)
+    cursor = st.responses
+    if cursor.is_valid_for(st.canonical_revision):
+        return cursor.conversation_id, False
+    return None, True
+
+
+async def _create_responses_conversation(client: "AsyncOpenAI") -> Optional[str]:
+    """新建一个空的 Responses conversation 对象，返回其 id。
+
+    失败（网关不支持 conversations 端点 / 网络错误）时返回 None，
+    调用方据此退回"本轮不使用服务端会话，仍走全量 input"的安全路径
+    ——不影响功能正确性，只是这一轮放弃增量优化。
+    """
+    try:
+        conv = await client.conversations.create()
+        return getattr(conv, "id", None)
+    except Exception:
+        logger.info(
+            "[openai_responses] 创建 Responses conversation 失败，本轮回退为无状态全量请求",
+            exc_info=True,
+        )
+        return None
+
+
+# =============================================================================
 # 非流式一次性调用：供 subagent_tool.py 复用（与
 # anthropic_bridge.anthropic_chat_completions_create 同一角色）。
 # =============================================================================
@@ -559,85 +663,6 @@ def _responses_usage_to_openai(usage: Any) -> Optional[dict]:
 # =============================================================================
 # 原生 agentic 循环
 # =============================================================================
-def _conversation_history_fingerprint(messages: list) -> str:
-    """Canonical history 的稳定指纹。用于判断 provider conversation 是否仍
-    与项目自己的共享历史同步；模型切换到 Chat/Anthropic 后再切回 Responses
-    时，指纹变化会触发新的 Responses conversation bootstrap。
-    """
-    payload = []
-    for raw in messages or []:
-        if isinstance(raw, Message):
-            try:
-                payload.append(raw.to_openai_dict())
-            except Exception:
-                payload.append(str(raw))
-        elif isinstance(raw, dict):
-            payload.append(raw)
-        else:
-            payload.append(str(raw))
-    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
-    return hashlib.sha256(data.encode("utf-8")).hexdigest()
-
-
-async def _ensure_responses_conversation(client: "AsyncOpenAI", chat_id: int) -> str | None:
-    """懒创建显式 Responses Conversation。
-
-    OpenAI 官方 Responses API 的 `conversation` 是服务端持久上下文容器。
-    某些 OpenAI-compatible 网关可能只实现 /v1/responses 而没有
-    /v1/conversations；这种情况下返回 None，让调用方安全回退到旧的全量
-    input 模式，而不会把一次兼容性故障升级成整条聊天不可用。
-    """
-    existing = state.get_responses_conversation_id(chat_id)
-    if existing:
-        return existing
-    lock = await state.get_responses_conversation_lock(chat_id)
-    async with lock:
-        existing = state.get_responses_conversation_id(chat_id)
-        if existing:
-            return existing
-        try:
-            conversations_api = getattr(client, "conversations", None)
-            create = getattr(conversations_api, "create", None) if conversations_api is not None else None
-            if create is None:
-                logger.warning("Responses client 不支持 conversations.create，回退全量 input: chat=%s", chat_id)
-                return None
-            conversation = await create()
-            conversation_id = getattr(conversation, "id", None)
-            if not conversation_id and isinstance(conversation, dict):
-                conversation_id = conversation.get("id")
-            if not conversation_id:
-                logger.warning("Responses conversation 创建成功但未返回 id，回退全量 input: chat=%s", chat_id)
-                return None
-            state.set_responses_conversation_id(chat_id, str(conversation_id))
-            return str(conversation_id)
-        except Exception:
-            logger.warning("创建 Responses conversation 失败，回退全量 input: chat=%s", chat_id, exc_info=True)
-            return None
-
-
-def _stateful_turn_input(messages: list) -> list:
-    """从完整内部消息中提取本轮真正需要追加到 provider conversation 的 item。
-
-    USER/TIMER 正常回合：最新 user 是本轮输入；TIMER 若只有临时 system
-    指令则由 instructions 驱动，input 可以为空。
-    Agent tool loop 的后续轮次只发送新产生的 tool result；assistant 的
-    function_call 已由上一轮 Responses response 自动写入 conversation。
-    """
-    non_system = [m for m in messages if isinstance(m, Message) and m.role != "system"]
-    if not non_system:
-        return []
-    if non_system[-1].role == "user":
-        return [non_system[-1]]
-    if non_system[-1].role == "tool":
-        trailing = []
-        for msg in reversed(non_system):
-            if msg.role != "tool":
-                break
-            trailing.append(msg)
-        return list(reversed(trailing))
-    return []
-
-
 async def _agentic_loop_openai_responses(
         client: "AsyncOpenAI",
         current_model: str,
@@ -647,7 +672,7 @@ async def _agentic_loop_openai_responses(
         tools: list | None = None,
         supports_tools: bool = True,
         journal: list | None = None,
-        conversation_state: dict | None = None,
+        turn: Optional["_conv_state.TurnState"] = None,
 ) -> tuple[str | None, object | None, list]:
     """OpenAI 原生 Responses API（/v1/responses）专用循环。
 
@@ -655,6 +680,14 @@ async def _agentic_loop_openai_responses(
     _agentic_loop_gemini_native 完全一致：入参/出参（messages、返回的
     new_history_entries）统一为内部 Message（core/messages），只在请求
     Responses API 前做内部 -> 原生协议的边界转换（见模块头注释）。
+
+    ``turn``：本回合的 conversation_state.TurnState 快照（由
+    get_ai_response 在回合开始时创建、经协议适配器透传到这里）。为
+    None 时（旧调用点 / 独立脚本 / subagent 一次性调用）本函数退回
+    "每轮全量重发"的旧行为，完全向后兼容——真正的服务端会话状态只在
+    调用方接入了 conversation_state 时才生效（见
+    protocols/openai_responses.py 与 ai_handlers.get_ai_response 的
+    改动点）。
     """
     if tools is None:
         from search_engine import SEARCH_TOOLS
@@ -680,61 +713,78 @@ async def _agentic_loop_openai_responses(
         # reasoning_effort 字段语义相同，形状不同。
         reasoning_param = {"effort": str(effort).lower()}
 
-    chat_id = builder.chat_id
-    ctx = conversation_state if isinstance(conversation_state, dict) else state.get_or_init_context(chat_id)
-    canonical_history = list(ctx.get("conversation_history") or [])
-    canonical_fingerprint = _conversation_history_fingerprint(canonical_history)
-    stored_fingerprint = ctx.get("openai_responses_canonical_fingerprint")
-    conversation_id = state.get_responses_conversation_id(chat_id)
-
-    # provider conversation 只有在它代表的 canonical history 与本项目共享历史
-    # 完全一致时才可继续使用。切到 Chat/Anthropic/Gemini 后再切回来时，
-    # canonical fingerprint 会变化，于是丢弃旧 provider conversation 并重新
-    # bootstrap；不会把两个分支的历史拼成一条错误链。
-    stateful = bool(conversation_id and stored_fingerprint == canonical_fingerprint)
-    if not stateful:
-        if conversation_id and stored_fingerprint and stored_fingerprint != canonical_fingerprint:
-            logger.info(
-                "Responses conversation 与 canonical history 脱节，重新 bootstrap: chat=%s", chat_id
-            )
-            state.clear_responses_conversation(chat_id)
-            conversation_id = None
+    # ---- Conversation State：本回合是否使用服务端会话 ----------------
+    # chat_id 取自 builder（DraftManager 透传自 get_ai_response，全部
+    # 调用路径统一可用）；resolve 只在回合的第一轮之前做一次，工具调用
+    # 触发的后续轮次复用同一个 conversation_id，不重新判断。
+    chat_id = getattr(builder, "chat_id", None)
+    conversation_id, need_bootstrap = await _resolve_conversation_plan(chat_id, turn)
+    if need_bootstrap:
+        conversation_id = await _create_responses_conversation(client)
         if conversation_id is None:
-            conversation_id = await _ensure_responses_conversation(client, chat_id)
-        stateful = bool(conversation_id)
-
-    first_request = True
+            # 建会话失败：整轮退回旧的"无状态全量"行为（既不复用也不
+            # 新建），下一轮自然会再次尝试自举，不影响正确性。
+            need_bootstrap = False
+    using_stateful_conversation = bool(conversation_id)
+    # sent_count：loop_messages 中已经作为 input 发送过的前缀长度。
+    # 增量模式下，每次请求只转换 loop_messages[sent_count:]；工具调用
+    # 轮次结束后 loop_messages 会追加新的 assistant/tool 消息，下一次
+    # 请求据此自然只发"新增部分"。首轮：
+    #   - 使用服务端会话（无论是复用已存在的还是刚新建的）时，"首轮"
+    #     的语义不同——复用场景只发本轮新消息（sent_count 从"已同步
+    #     revision 对应的消息条数"起算）；自举场景第一次仍需全量发送
+    #     （sent_count=0），之后才转为增量。
+    #   - 不使用服务端会话（cursor 判定/新建失败/未接入 TurnState）时
+    #     sent_count 恒为 0，等价于旧行为（每轮全量转换 loop_messages）。
+    sent_count = 0
+    if using_stateful_conversation and not need_bootstrap and chat_id is not None:
+        # 复用现有 cursor：cursor.synced_revision 对应的是"canonical
+        # history 在建立/续接 cursor 那一刻的条数"，而 loop_messages 的
+        # 前半段就是那份 canonical history（select_request_context 未
+        # 触发兜底裁剪时是全量透传，见 context_manager.py）。因此可以
+        # 直接用 canonical_revision 的语义近似为"loop_messages 里对应
+        # 那部分的长度"——两者在未压缩历史的常态路径下条数一致。
+        # 兜底：任何长度不匹配（历史被压缩导致条数与 revision 不再
+        # 一一对应）一律退化为 sent_count=0（全量发送，安全但少一次
+        # 优化），不会产生错误的截断。
+        st = await _conv_state.get_conversation_state(chat_id)
+        candidate = st.responses.synced_revision
+        if 0 <= candidate <= len(loop_messages):
+            sent_count = candidate
+        logger.debug(
+            "[openai_responses] 复用服务端会话 conversation=%s synced=%s "
+            "loop_len=%s -> sent_count=%s",
+            conversation_id, candidate, len(loop_messages), sent_count,
+        )
+    elif using_stateful_conversation and need_bootstrap:
+        logger.info(
+            "[openai_responses] chat=%s 自举新 Responses 会话 conversation=%s",
+            chat_id, conversation_id,
+        )
 
     for _round in range(MAX_TOOL_CALLS):
-        # instructions 不属于 conversation items：即使使用显式 conversation，
-        # 也必须在每个 response request 上重新发送稳定系统规则，以及本轮
-        # TIMER/静默等 ephemeral system 指令。只有 input 历史本身才由
-        # conversation 服务端持久化。
-        system_messages = [
-            m for m in loop_messages
-            if isinstance(m, Message) and m.role == "system"
-        ]
-        instructions, _ = _convert_messages_to_responses_input(system_messages)
-
-        if first_request:
-            # 第一次进入一个新 provider conversation：bootstrap 时发送
-            # canonical history + 本轮输入；已有且仍与 canonical history 同步
-            # 的 conversation 则只发送本轮最新输入。
-            if stateful and stored_fingerprint == canonical_fingerprint and conversation_id:
-                request_messages = _stateful_turn_input(loop_messages)
-            else:
-                request_messages = loop_messages
-            _, input_items = _convert_messages_to_responses_input(request_messages)
+        if using_stateful_conversation:
+            # 增量模式：只转换尚未发送过的部分。首轮自举时 sent_count=0，
+            # 等价于全量转换（与旧行为逐字节一致）；工具调用续轮时
+            # sent_count 已推进到上一次请求发出后的 loop_messages 长度，
+            # 这里自然只转换本轮新增的 assistant(tool_calls)/tool 消息。
+            delta_messages = loop_messages[sent_count:]
+            instructions, input_items = _convert_messages_to_responses_input(delta_messages)
+            # instructions（系统提示）只在自举轮携带一次：Responses 的
+            # conversation 是"新建即空白"的容器，系统指令作为 canonical
+            # history 最前面的 system 消息，天然会在 delta_messages 里
+            # 只出现一次（sent_count=0 的那一轮）；后续增量轮
+            # delta_messages 不含 system 消息，instructions 自然为空，
+            # 不会重复携带——这正是我们想要的语义（Responses 的
+            # instructions 参数是"本次请求覆盖"而非"追加"，重复携带
+            # 反而更省事但没有必要，服务端已经记得第一轮的 instructions）。
         else:
-            # Responses conversation 已经自动保存上一轮 assistant/function_call。
-            # 下一轮只需补 function_call_output，不重复发送整个历史。
-            request_messages = [
-                m for m in loop_messages
-                if isinstance(m, Message) and m.role == "tool"
-            ]
-            _, input_items = _convert_messages_to_responses_input(request_messages)
-
-        if RESPONSES_EXPLICIT_CACHE_ENABLED and input_items:
+            instructions, input_items = _convert_messages_to_responses_input(loop_messages)
+        if RESPONSES_EXPLICIT_CACHE_ENABLED and not using_stateful_conversation:
+            # 显式缓存断点只在"仍然全量发送 input"的传统模式下有意义
+            # （断点挂在 system 段首尾）；增量模式下 delta_messages 通常
+            # 根本不含 system 段，打断点没有目标、也没有必要——服务端
+            # 会话本身就是比 prompt cache 更彻底的"不重复计算"机制。
             _apply_responses_cache_breakpoints(input_items)
 
         request_kwargs: dict[str, Any] = {
@@ -743,8 +793,16 @@ async def _agentic_loop_openai_responses(
             "stream": True,
             "max_output_tokens": max_tokens,
         }
-        if conversation_id:
+        if using_stateful_conversation:
             request_kwargs["conversation"] = conversation_id
+            # 这次请求即将把 loop_messages[sent_count:len(loop_messages)]
+            # 作为 input 发出去；把 sent_count 推进到当前长度，下一轮
+            # （工具调用续轮）自然只转换从这里往后新增的部分。必须在
+            # 发请求"之前"就推进（而不是等响应回来再推进）——即使这次
+            # 请求最终失败/被打断，循环也不会再次进入下一轮迭代（要么
+            # 抛出异常终止整个回合，要么正常 break），不存在"同一段
+            # 消息被重复计入 sent_count 又被重复发送"的重复计数风险。
+            sent_count = len(loop_messages)
         _add_responses_cache_options(
             request_kwargs,
             api_label=api_label,
@@ -787,6 +845,13 @@ async def _agentic_loop_openai_responses(
         current_stream_cell = [None]
         response_status: str = ""
         response_error_text: str = ""
+        # 服务端会话 commit 素材：response.completed 事件里读取，回合
+        # 正常结束（无更多工具调用）后用于 conversation_state.
+        # commit_responses_cursor。工具调用续轮也会被覆盖为最新一次，
+        # 只有循环最终退出时的值参与 commit——语义上"这一整个 turn
+        # 最终同步到了哪个 response"，而不是中间某一轮。
+        resolved_conversation_id: Optional[str] = conversation_id if using_stateful_conversation else None
+        resolved_response_id: Optional[str] = None
 
         switch_stream = make_switch_stream(builder, current_stream_cell)
 
@@ -910,6 +975,16 @@ async def _agentic_loop_openai_responses(
                     if resp_obj is not None and getattr(resp_obj, "usage", None):
                         final_usage = resp_obj.usage
                     response_status = "completed"
+                    if resp_obj is not None:
+                        resolved_response_id = getattr(resp_obj, "id", None) or resolved_response_id
+                        # 网关若未回传 conversation 字段（例如不支持该
+                        # 功能的中转直接透传给不认识的字段），保留请求时
+                        # 已知的 conversation_id（本来就是我们自己传入
+                        # 或自建的），不会因为响应缺字段而误判失效。
+                        resp_conv = getattr(resp_obj, "conversation", None)
+                        resp_conv_id = getattr(resp_conv, "id", None) if resp_conv is not None else None
+                        if resp_conv_id:
+                            resolved_conversation_id = resp_conv_id
 
                 elif etype in ("response.failed", "response.incomplete"):
                     resp_obj = getattr(event, "response", None)
@@ -1025,17 +1100,6 @@ async def _agentic_loop_openai_responses(
             "[AI RAW RESPONSE] provider=%s chat_id=%s length=%s\n%s",
             api_label, builder.chat_id, len(content_acc or ""), content_acc,
         )
-        if conversation_id and response_status == "completed":
-            # 从此刻开始 provider conversation 已包含本轮 response。真正的
-            # canonical history 会在 get_ai_response 收尾时持久化；这里先记录
-            #“当前历史 + 本轮已完成消息”的预期指纹。下一轮若 canonical history
-            # 已落库，指纹即可命中；若本轮被中断/清空/被其他 provider 接管，
-            # 指纹不命中则安全 bootstrap。
-            expected_history = list(canonical_history) + list(new_history_entries)
-            ctx["openai_responses_canonical_fingerprint"] = _conversation_history_fingerprint(expected_history)
-            ctx["openai_responses_conversation_id"] = conversation_id
-
-        first_request = False
         # 纯文本终局截断提示：必须在 live_slot.finalize 之前算出追加后的
         # 文本（与 anthropic_bridge / gemini_bridge 同一修复，理由见
         # bridge_common）。response_status 此前只在事件名为 incomplete/
@@ -1065,17 +1129,12 @@ async def _agentic_loop_openai_responses(
             async def _synth_stream(req: tuple) -> str:
                 synth_instructions, synth_input = req
                 synth_text = ""
-                synth_instructions, _ignored_synth_input = req
                 synth_kwargs: dict[str, Any] = {
                     "model": current_model,
-                    # 上游 conversation 已保存全部上下文；强制总结只需要临时
-                    # instructions，不要把完整历史再次复制进 conversation。
-                    "input": [],
+                    "input": synth_input,
                     "stream": True,
                     "max_output_tokens": max_tokens,
                 }
-                if conversation_id:
-                    synth_kwargs["conversation"] = conversation_id
                 _add_responses_cache_options(
                     synth_kwargs,
                     api_label=api_label,
@@ -1106,6 +1165,29 @@ async def _agentic_loop_openai_responses(
 
     final_content = await ensure_final_content(builder, new_history_entries, final_content)
 
+    # ---- Conversation State：回合结束，尝试 commit 服务端会话游标 ----
+    # 只有本回合确实用了服务端会话（resolved_conversation_id 非空）且
+    # 调用方接入了 conversation_state（turn 非 None）才尝试写入；写入
+    # 前的 fencing 校验（turn.generation 是否仍是发起回合时的那个）在
+    # commit_responses_cursor 内部完成，过期回合（回合进行期间发生了
+    # /clear）的迟到结果会被安全丢弃，不会复活一个本该失效的 cursor。
+    if chat_id is not None and turn is not None and resolved_conversation_id:
+        try:
+            committed = _conv_state.commit_responses_cursor(
+                chat_id, turn,
+                conversation_id=resolved_conversation_id,
+                response_id=resolved_response_id,
+                model=current_model,
+            )
+            logger.debug(
+                "[openai_responses] chat=%s conversation cursor commit=%s conversation=%s",
+                chat_id, committed, resolved_conversation_id,
+            )
+        except Exception:
+            # commit 失败绝不能影响本轮已经产出的正常回复——降级为
+            # "下一轮重新自举"，用户侧无感知，只是错失一次增量优化。
+            logger.debug("[openai_responses] commit_responses_cursor 异常（忽略）", exc_info=True)
+
     return final_content, final_usage, new_history_entries
 
 
@@ -1115,4 +1197,7 @@ __all__ = [
     "_convert_messages_to_responses_input",
     "_convert_tools_to_responses",
     "_responses_usage_to_openai",
+    "_resolve_conversation_plan",
+    "_create_responses_conversation",
+    "_responses_stateful_enabled",
 ]

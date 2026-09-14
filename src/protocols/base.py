@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     # 仅供类型注解；运行时由调用方传入，避免循环导入。
     from ai.draft_manager import DraftManager
     from config import ModelConfig
+    from conversation_state import TurnState
 
 
 class ChatProtocolAdapter(ABC):
@@ -29,6 +30,14 @@ class ChatProtocolAdapter(ABC):
 
     统一签名与旧的 ai_handlers._call_api 分发约定一致，返回
     (final_content, final_usage, new_history_entries)。
+
+    ``turn``（conversation_state.TurnState，2026-09 新增，可选）：
+    本回合的对话状态快照，由 get_ai_response 在回合登记时创建、经
+    _call_api 透传到这里。目前只有 openai_responses 适配器会用它来
+    判断是否可以复用服务端会话（见 ai/responses_bridge.py）；其余
+    适配器（openai_chat / anthropic_messages / gemini_native）按基类
+    默认忽略该参数即可——它们的协议本身没有等价的服务端会话概念，
+    继续走"每轮全量重发 canonical history"的既有行为，不受影响。
     """
 
     #: 协议标签（与 config._VALID_PROTOCOLS 的取值一致）
@@ -45,7 +54,7 @@ class ChatProtocolAdapter(ABC):
         tools: Optional[list[Any]] = None,
         supports_tools: bool = True,
         journal: Optional[list[Any]] = None,
-        conversation_state: Any = None,
+        turn: Optional["TurnState"] = None,
     ) -> tuple[str | None, Any, list]:
         """执行该协议的 agentic 循环（含工具执行与历史追加）。"""
         raise NotImplementedError

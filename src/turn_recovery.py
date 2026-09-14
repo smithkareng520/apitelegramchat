@@ -640,6 +640,14 @@ async def _append_journal_to_history(chat_id: int, journal: list) -> None:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
         history.extend(journal)
+        # conversation_state.py：打断保全 / 异常保全都是绕开
+        # update_conversation_and_ledger 的独立 append 路径，必须在这里
+        # 同样推进 canonical_revision——否则通过 TIMER 被打断、又或者
+        # 请求异常但已有部分输出被保全的场景，历史其实变长了，但
+        # Responses provider cursor 会继续认为自己"仍然同步"，下一轮
+        # 增量请求会漏发这部分刚保全的内容。
+        from conversation_state import bump_canonical_revision
+        await bump_canonical_revision(chat_id)
     logger.info(
         "[turn-recovery] chat=%s 已保全轮次进度 %s 条消息（历史总长=%s）",
         chat_id, len(journal), len(get_or_init_context(chat_id).get("conversation_history") or []),
@@ -1082,6 +1090,12 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
         else:
             history.append(_wrap_envelope(user_message))
             user_message[EARLY_PERSIST_MODE] = "appended"
+            # conversation_state.py：只有真正新增一条消息（append 分支）
+            # 才推进 canonical_revision——merged/replaced 分支是原地改写
+            # 末尾既有的 user 消息，历史长度不变，不应计数（否则会与
+            # undo_early_persist 的回滚不对称，revision 只增不减）。
+            from conversation_state import bump_canonical_revision
+            await bump_canonical_revision(chat_id)
     user_message[EARLY_PERSIST_FLAG] = True
     return True
 
@@ -1128,6 +1142,16 @@ async def undo_early_persist(chat_id: int, user_message: dict) -> None:
             and last.meta.get(EARLY_PERSIST_TS) == ts
         ):
             history.pop()
+            # 与 persist_user_message_entry 的 append 分支对称：撤回一条
+            # 真正写入的消息，revision 也回退一格，保持"revision 数值
+            # 等于 canonical history 实际写入次数"的不变式，否则
+            # Responses provider cursor 的 is_valid_for 比较会因为
+            # revision 虚高而误判 cursor 已经过期（安全但会多打一次
+            # 不必要的自举请求，不是正确性问题，仍值得在这里修正）。
+            from conversation_state import get_conversation_state
+            st = await get_conversation_state(chat_id)
+            if st.canonical_revision > 0:
+                st.canonical_revision -= 1
             logger.info(
                 "[turn-recovery] chat=%s 已回滚提前持久化的 user 消息（消费/拒绝路径）",
                 chat_id,

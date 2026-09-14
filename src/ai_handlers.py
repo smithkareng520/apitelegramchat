@@ -584,6 +584,21 @@ async def get_ai_response(
                 "AI 响应预处理阶段: chat=%s stage=%s stage_ms=%s total_ms=%s",
                 chat_id, stage_name, elapsed_ms, total_ms,
             )
+    # conversation_state.TurnState：本回合的 generation/revision 快照，
+    # 用于 openai_responses 桥接判断"服务端会话 cursor 是否仍然有效"、
+    # 以及回合结束后 commit 新 cursor 前的乐观并发校验（fencing，防止
+    # 已经被 /clear 的过期回合迟到结果污染当前状态）。创建放在
+    # register_inflight_turn 之后没有强制顺序要求，这里与其相邻只是
+    # 保持"回合级初始化"聚在一起，便于阅读；两者失败都不阻断主流程
+    # （turn=None 时下游按旧行为处理，见 protocols/base.py 的参数说明）。
+    turn = None
+    try:
+        from conversation_state import get_conversation_state
+        _conv_st = await get_conversation_state(chat_id)
+        turn = _conv_st.begin_turn(event_source)
+    except Exception:
+        logger.debug("conversation_state.begin_turn 失败（服务端会话优化降级）", exc_info=True)
+
     try:
         # ── 轮次登记（打断保全，见 turn_recovery.py）──────────────────
         # 放在最前：此后任何阶段被打断，已完成的消息都在 journal 里。
@@ -878,6 +893,7 @@ async def get_ai_response(
                 current_model, model_info, messages, chat_id, builder,
                 tools=timer_tools if supports_tools else None, journal=journal,
                 workspace_namespace=workspace_namespace_value,
+                turn=turn,
             )
         else:
             # USER 回合：静默模式（/show off）追加 deliver_reply，send 缺省
@@ -892,11 +908,13 @@ async def get_ai_response(
                     tools=None, journal=journal,
                     extra_tools=[build_deliver_reply_tool(default_send=True)],
                     workspace_namespace=workspace_namespace_value,
+                    turn=turn,
                 )
             else:
                 raw_content, usage, new_msgs = await _call_api(
                     current_model, model_info, messages, chat_id, builder, journal=journal,
                     workspace_namespace=workspace_namespace_value,
+                    turn=turn,
                 )
 
         await builder.stop_flush_loop()
@@ -1340,6 +1358,7 @@ async def _call_api(
         journal: Optional[list[Any]] = None,
         extra_tools: Optional[list[Any]] = None,
         workspace_namespace: Optional[str] = None,
+        turn: Optional[Any] = None,
 ) -> tuple[str | None, object | None, list]:
     # 后台任务通知 drain 注入点①（函数入口自守卫）：本函数是全部 chat
     # 协议模型调用的最低公共入口——USER / TIMER / 静默以及任何未来新增
@@ -1390,9 +1409,6 @@ async def _call_api(
     # 硬编码分支。适配器内部负责客户端获取与循环转发；新增协议只需
     # 在 protocols/registry 注册，本函数零改动。
     adapter = resolve_chat_adapter(model_info)
-    conversation_state = None
-    if getattr(adapter, "name", "") == "openai_responses":
-        conversation_state = state.get_or_init_context(chat_id)
     return await adapter.run_agent_loop(
         current_model=current_model,
         model_info=model_info,
@@ -1401,6 +1417,7 @@ async def _call_api(
         tools=tools_to_pass,
         supports_tools=supports_tools,
         journal=journal,
+        turn=turn,
     )
 
 

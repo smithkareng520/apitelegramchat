@@ -17,6 +17,7 @@ from protocols.base import ChatProtocolAdapter
 if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
     from config import ModelConfig
+    from conversation_state import TurnState
 
 
 class GeminiNativeAdapter(ChatProtocolAdapter):
@@ -32,10 +33,17 @@ class GeminiNativeAdapter(ChatProtocolAdapter):
         tools: Optional[list[Any]] = None,
         supports_tools: bool = True,
         journal: Optional[list[Any]] = None,
-        conversation_state: Any = None,
+        turn: Optional["TurnState"] = None,
     ) -> tuple[str | None, Any, list]:
         from ai.gemini_bridge import _agentic_loop_gemini_native
 
+        chat_id = getattr(builder, "chat_id", None)
+        if chat_id is not None:
+            try:
+                from conversation_state import invalidate_responses_cursor
+                invalidate_responses_cursor(chat_id)
+            except Exception:
+                pass
         return await _agentic_loop_gemini_native(
             current_model, messages, builder,
             tools=tools, supports_tools=supports_tools, journal=journal,

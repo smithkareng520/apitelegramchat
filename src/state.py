@@ -10,28 +10,6 @@ from config import DEFAULT_MODEL
 user_contexts: dict = {}
 user_models: dict = {}
 
-# ---------- OpenAI Responses Conversation 状态 ----------
-# 这是 provider-side conversation cursor，不是 canonical history。
-# canonical history 仍保存在 ctx["conversation_history"]，模型切换时可
-# 无损回退/重新 bootstrap；同一 chat 的 USER/TIMER 共用这里的 conversation。
-_responses_conversation_locks: dict = {}
-_responses_conversation_locks_guard = asyncio.Lock()
-
-async def get_responses_conversation_lock(chat_id: int) -> asyncio.Lock:
-    async with _responses_conversation_locks_guard:
-        if chat_id not in _responses_conversation_locks:
-            _responses_conversation_locks[chat_id] = asyncio.Lock()
-        return _responses_conversation_locks[chat_id]
-
-def get_responses_conversation_id(chat_id: int) -> str | None:
-    return get_or_init_context(chat_id).get("openai_responses_conversation_id")
-
-def set_responses_conversation_id(chat_id: int, conversation_id: str | None) -> None:
-    get_or_init_context(chat_id)["openai_responses_conversation_id"] = conversation_id
-
-def clear_responses_conversation(chat_id: int) -> None:
-    get_or_init_context(chat_id)["openai_responses_conversation_id"] = None
-
 # ---------- 当前用户命名空间（用于按 user_id 隔离工作区/状态文件） ----------
 _current_user_namespace: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "apitelegramchat_current_user_namespace", default=None
@@ -294,9 +272,6 @@ def get_or_init_context(chat_id: int) -> dict:
             # "username"（无 username 时回退 first_name/ID）严格分离。
             "tg_username": "",
             "active_skill": None,
-            # OpenAI Responses API 的显式 conversation ID。USER/TIMER/模型切换共用；
-            # /clear 时随会话一起清空。
-            "openai_responses_conversation_id": None,
         }
     return user_contexts[chat_id]
 
@@ -371,11 +346,16 @@ async def safe_clear_history(chat_id: int) -> None:
     async with lock:
         ctx = get_or_init_context(chat_id)
         ctx["conversation_history"] = []
-        clear_responses_conversation(chat_id)
-        ctx.pop("openai_responses_canonical_fingerprint", None)
         # 清空对话 = 新建会话：同步轮换 LLM 会话亲和键，旧会话的路由
         # 亲和性（OpenRouter 粘性路由 / agnes 副本粘性）不再作用于新对话。
         rotate_llm_session_token(chat_id)
+        # 同步重置对话状态层（conversation_state.py）：generation += 1，
+        # canonical_revision 归零，全部 provider cursor（如 Responses
+        # 服务端会话）失效。与历史清空同在本临界区内完成，保证"新历史"
+        # 与"新状态账本"原子生效，不会出现旧 cursor 残留、下一轮误判
+        # 为可续接的情况。
+        from conversation_state import reset_conversation_state
+        await reset_conversation_state(chat_id)
 
 
 # ---------- 草稿预览开关（/show on|off，USER 与 TIMER 回合统一生效） ----------

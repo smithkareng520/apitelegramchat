@@ -25,6 +25,7 @@ from protocols.base import ChatProtocolAdapter
 if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
     from config import ModelConfig
+    from conversation_state import TurnState
 
 
 class OpenAIResponsesAdapter(ChatProtocolAdapter):
@@ -40,7 +41,7 @@ class OpenAIResponsesAdapter(ChatProtocolAdapter):
         tools: Optional[list[Any]] = None,
         supports_tools: bool = True,
         journal: Optional[list[Any]] = None,
-        conversation_state: Any = None,
+        turn: Optional["TurnState"] = None,
     ) -> tuple[str | None, Any, list]:
         from ai.responses_bridge import _agentic_loop_openai_responses
 
@@ -49,7 +50,7 @@ class OpenAIResponsesAdapter(ChatProtocolAdapter):
         return await _agentic_loop_openai_responses(
             client, current_model, messages, builder, api_label=api_label,
             tools=tools, supports_tools=supports_tools, journal=journal,
-            conversation_state=conversation_state,
+            turn=turn,
         )
 
 

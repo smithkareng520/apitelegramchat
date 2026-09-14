@@ -583,6 +583,7 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
     "写入"与"注销"原子成对，取消竞态下既不双写也不漏写。
     """
     lock = await get_chat_lock(chat_id)
+    appended_any = False
     async with lock:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
@@ -600,6 +601,7 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
             history.append(Message.user_text(str(block_content or ""), **{
                 k: v for k, v in user_message.items() if k != "content"
             }))
+            appended_any = True
         # 历史标记清理：早持久化的消息进入历史时去掉内部标记。
         if isinstance(user_message, dict):
             user_message.pop(turn_recovery.EARLY_PERSIST_FLAG, None)
@@ -612,9 +614,20 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
             elif isinstance(msg, dict) and msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
                 msg["content"] = msg["content"].strip()
             history.append(msg)
+            appended_any = True
         # 消息已落历史：立即注销该轮的 in-flight 登记（在释放 chat 锁前）。
         if new_msgs:
             turn_recovery.note_turn_persisted(chat_id, new_msgs)
+        # conversation_state.py：canonical history 每次成功追加后递增
+        # revision——与本函数共享同一把 chat 锁，保证"历史写入"与
+        # "版本号推进"同一原子区间内完成。早持久化路径（user 消息已经
+        # 在 get_ai_response 开始时提前写入）本函数看不到那次 append，
+        # 但那次写入已经在 turn_recovery.persist_user_message_entry 里
+        # 单独推进过一次 revision（见该函数改动），这里只对本函数自己
+        # 实际 append 的内容推进，避免重复计数。
+        if appended_any:
+            from conversation_state import bump_canonical_revision
+            await bump_canonical_revision(chat_id)
         if usage:
             if hasattr(usage, "model_dump"):
                 usage_dict = usage.model_dump()
