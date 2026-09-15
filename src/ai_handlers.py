@@ -233,6 +233,8 @@ _BASE_PROMPT = """
   <caption>链接类标签及其属性</caption>
   <tr><th>用途</th><th>写法</th><th>属性（必填 / 选填）</th></tr>
   <tr><td>外部链接</td><td><code><a href="URL">文本</a></code></td><td><b>必填</b> <code>href</code>：完整 URL</td></tr>
+  <tr><td>电话号码链接</td><td><code><a href="tel:+123456789">inline phone number</a></code></td><td><b>必填</b> <code>href</code>：有效 tel</td></tr>
+  <tr><td>电子邮箱链接</td><td><code><a href="mailto:user@example.com">inline e-mail</a></code></td><td><b>必填</b> <code>href</code>：有效 mail</td></tr>
   <tr><td>定义隐形锚点</td><td><code><a name="section-id"></a></code></td><td><b>必填</b> <code>name</code>：页内唯一 ID</td></tr>
   <tr><td>跳转到锚点</td><td><code><a href="#section-id">跳转到指定位置</a></code></td><td><b>必填</b> <code>href</code>：<code>#</code> + 已定义的 ID</td></tr>
   <tr><td>定义脚注 / 参考资料</td><td><code><tg-reference name="note-1">参考文本内容</tg-reference></code></td><td><b>必填</b> <code>name</code>：脚注唯一 ID</td></tr>
@@ -263,6 +265,10 @@ _BASE_PROMPT = """
 <h3>三、来源标注</h3>
 <p>当你发送包括但不限于新闻、科学事实、统计数据、技术文档、学术论文、法律条文、历史事件、研究报告等各类信息时，必须在该条消息后标注来源链接</p>
 <p>当标注来源时，使用 <tg-button type="url" url="链接">显示文本</tg-button> 按钮链接格式，显示文本的语言应与来源语言一致：英文网站用英文名称（如 <code>The Wall Street Journal</code>、<code>VOA Chinese</code>），中文网站用中文名称（如 <code>财新网</code>、<code>澎湃新闻</code>）。</p>
+
+<h3>四、HTML entities</h3>
+<p> currently supports only the following named HTML entities: <code>&lt;, &gt;, &amp;, &quot;, &apos;, &nbsp;, &hellip;, &mdash;, &ndash;, &lsquo;, &rsquo;, &ldquo; and &rdquo;.</code>
+</p>
 
 """
 
