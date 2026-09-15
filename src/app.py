@@ -418,6 +418,10 @@ async def _shutdown_lifecycle_marker() -> None:
     component cleanup logs makes it possible to distinguish "shutdown started"
     from "a component crashed" in runtime logs.
     """
+    # 第一个 after_serving 钩子：尽早置位，让后台循环把之后收到的
+    # CancelledError 当作关停而不是误取消（详见 app_state._shutting_down）。
+    app_state._shutting_down = True
+    telegram_polling.mark_shutdown()
     try:
         logger.warning(
             "APPLICATION SHUTDOWN BEGIN pid=%s ppid=%s queue=%s active_tasks=%s tasks=%s",
@@ -446,6 +450,12 @@ async def _shutdown_close_http_session() -> None:
     """优雅关闭：先停 update worker 与主动唤醒调度器，再关掉所有持久
     bash 沙箱进程，最后关全局 aiohttp session。
     """
+    # 0) 置关停标志：后台常驻循环（轮询 / worker）据此把随后的
+    #    CancelledError 判定为真正的退出信号。没有这一步，它们会把关停
+    #    取消当成"误取消"吸收掉并继续运行，关停就会挂到 SIGKILL。
+    app_state._shutting_down = True
+    telegram_polling.mark_shutdown()
+
     # 1) 先停摄取源（polling 模式）：轮询器停掉后不再有新 update 进队列。
     #    polling 模式下未确认的 update 因 offset 未推进，会在下次启动时被
     #    Telegram 重新投递，不会丢失（worker 侧去重保证不会重复处理）——
@@ -507,7 +517,23 @@ async def _shutdown_close_http_session() -> None:
 @app.route('/health', methods=['GET'])
 async def health_check() -> tuple[dict[str, str], int]:
     # 健康检查端点对外可访问，不应暴露内部统计信息（白名单数量、活跃任务数）。
-    # 这些信息可能被探测方用于侧信道推断。
+    # 这些信息可能被探测方用于侧信道推断——因此响应体只有一个状态词，
+    # 细节一律只进日志（见 _loop_watchdog 心跳）。
+    #
+    # ⚠️ 为什么不能无条件返回 200（2026-09-15 事故核心）：
+    # 旧版写死 200，于是"进程活着但摄取通道已死"这一最致命的状态对外表现
+    # 为完全健康——Render 健康检查与 Docker HEALTHCHECK 都满意，实例永远
+    # 不会被重建，用户发消息石沉大海，日志里只剩每分钟一条心跳。
+    # 现在摄取通道断了就返回 503：连续失败触发平台自动重启，故障从"要人肉
+    # 发现"降级为"几分钟内自愈"。
+    if telegram_polling.is_ingest_broken():
+        logger.critical(
+            "🚨 健康检查失败：摄取通道不可用 %s —— 返回 503 请求平台重建实例",
+            telegram_polling.ingest_state(),
+        )
+        return {
+            "status": "degraded",
+        }, 503
     return {
         "status": "ok",
     }, 200
@@ -547,21 +573,59 @@ async def telegram_worker() -> None:
       namespace 等）不会泄漏到下一条 update，语义与旧版"每个 webhook
       请求一个全新上下文"一致。
     - 任何业务异常都在这里兜底记录，绝不杀死 worker 循环。
+    - CancelledError 只有在**确实关停**时才退出。旧版把任意取消都当成
+      关停直接 raise：而 `await` 的是 process_update 的子 task，子 task 被
+      打断机制（打断旧回合、媒体组重排、proactive 打断）取消时，
+      CancelledError 会沿 await 链回传到这里，worker 就此静默死亡——队列
+      从此只进不出，直到积压 1000 条把轮询也一起堵死，而 /health 全程 200。
+      现在以 app_state._shutting_down 为唯一判据，误取消一律吸收后继续。
     """
     logger.info("telegram worker started")
     while True:
-        update = await app_state.update_queue.get()
+        try:
+            update = await app_state.update_queue.get()
+        except asyncio.CancelledError:
+            if app_state._shutting_down:
+                logger.warning("telegram worker cancelled (shutdown)")
+                raise
+            _uncancel_current_task()
+            logger.critical("🚨 telegram worker 在取队列时收到非关停取消信号，已吸收并继续")
+            continue
         try:
             uid = (update or {}).get("update_id")
             logger.info(f"telegram worker processing update (update_id={uid})")
             await asyncio.create_task(process_update(update))
         except asyncio.CancelledError:
-            logger.warning("telegram worker cancelled (shutdown)")
-            raise
+            if app_state._shutting_down:
+                logger.warning("telegram worker cancelled (shutdown)")
+                raise
+            # 子 task 被取消（打断旧回合等）→ 与 worker 生死无关，记录后继续。
+            _uncancel_current_task()
+            logger.critical(
+                "🚨 telegram worker 收到非关停取消信号（update_id=%s），已吸收并继续消费队列",
+                (update or {}).get("update_id"),
+            )
         except Exception:
             logger.exception("telegram update failed")
         finally:
+            # 每次 get() 恰好配一次 task_done()：关停 raise 路径也要记账，
+            # 否则 join() 永远等不到队列排空。
             app_state.update_queue.task_done()
+
+
+def _uncancel_current_task() -> None:
+    """清掉当前任务的"正在取消"标记（Python 3.11+）。
+
+    吞掉 CancelledError 却不 uncancel，任务会停留在 cancelling 状态，
+    后续 await 可能被再次打断。旧版本没有该 API，直接跳过。
+    """
+    try:
+        task = asyncio.current_task()
+        uncancel = getattr(task, "uncancel", None)
+        if uncancel is not None:
+            uncancel()
+    except Exception:
+        logger.debug("uncancel 当前任务失败（忽略）", exc_info=True)
 
 @app.before_serving
 async def _startup_start_telegram_worker() -> None:
@@ -606,10 +670,17 @@ async def _loop_watchdog() -> None:
         # 常规水位：每 6 tick（默认 1 分钟）打一条，事故时留时间线证据
         if tick % 6 == 0 or lag >= LOOP_LAG_WARN_S:
             try:
+                # ingest=… 是本次事故最缺的一列：没有它，"没人发消息"和
+                # "摄取通道已死"在日志里长得一模一样（都只有心跳 + /health）。
+                # alive=轮询子任务在跑；age=距上一次成功 getUpdates 的秒数
+                # （正常空闲 ≤ TELEGRAM_POLL_TIMEOUT，长期增长即链路停摆）。
+                ingest = telegram_polling.ingest_state()
                 logger.info(
                     f"heartbeat: loop_lag={lag:.2f}s "
                     f"queue={app_state.update_queue.qsize()}/{WEBHOOK_QUEUE_MAXSIZE} "
-                    f"active_tasks={len(active_tasks)} tasks={len(asyncio.all_tasks())}"
+                    f"active_tasks={len(active_tasks)} tasks={len(asyncio.all_tasks())} "
+                    f"ingest=alive:{ingest['alive']},age:{ingest['last_success_age']}s,"
+                    f"stalled:{ingest['stalled']},restarts:{ingest['restarts']}"
                 )
             except Exception:
                 # watchdog 自身绝不能死：水位统计失败只降级为纯 lag 心跳

@@ -17,3 +17,12 @@ update_queue: "asyncio.Queue[dict[str, Any]]" = asyncio.Queue(maxsize=WEBHOOK_QU
 _telegram_worker_task: asyncio.Task | None = None
 _telegram_polling_task: asyncio.Task | None = None
 _loop_watchdog_task: asyncio.Task | None = None
+
+# 进程是否正在关停（after_serving 第一步置位）。
+#
+# 后台常驻循环（telegram_worker / 轮询循环）据此区分两种 CancelledError：
+#   · 关停信号 → 正常退出；
+#   · 误取消（子任务取消沿 await 链回传、aiohttp 超时取消逸出等）→ 必须
+#     吸收并继续，否则一次偶发取消就让 bot 永久失聪：进程活着、/health
+#     200、心跳照常，但再也收不到任何消息（2026-09-15 事故现场）。
+_shutting_down: bool = False

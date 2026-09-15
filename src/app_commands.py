@@ -168,11 +168,17 @@ async def _handle_admin_commands(chat_id: int, msg: dict, text: str, username: s
             # 轮询模式下 url 应为空；若非空说明 deleteWebhook 没生效，
             # getUpdates 会持续 409，必须立刻暴露出来。
             registered = info.get("url") or ""
+            # 摄取通道内部快照：任务存活 / 距上次成功拉取多久 / 自愈重启次数。
+            import telegram_polling
+            _ingest = telegram_polling.ingest_state()
             lines = [
                 "🩺 <b>投递链路状态（getUpdates 长轮询）</b>",
                 "<blockquote>",
                 "摄取模式：<code>polling</code>（不经过边缘 WAF，含 shell 特征的消息可正常送达）",
-                f"轮询任务：<b>{'运行中 ✅' if (app_state._telegram_polling_task and not app_state._telegram_polling_task.done()) else '未运行 ❌'}</b>",
+                f"轮询任务：<b>{'运行中 ✅' if _ingest.get('alive') else '未运行 ❌'}</b>",
+                f"上次成功拉取：<code>{_ingest.get('last_success_age')}s 前</code>"
+                f"{'（已停摆 ⚠️）' if _ingest.get('stalled') else ''}",
+                f"通道重启次数：<code>{_ingest.get('restarts')}</code>",
                 f"队列水位：<code>{update_queue.qsize()}/{WEBHOOK_QUEUE_MAXSIZE}</code>",
                 f"Telegram 侧积压：<b>{pending}</b>",
                 f"webhook 注册：<code>{mask_webhook_url(registered) if registered else '已注销（正确）'}</code>",

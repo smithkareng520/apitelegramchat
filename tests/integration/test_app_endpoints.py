@@ -145,3 +145,39 @@ def test_webhook_post_ignored_in_polling_mode(client):
 def test_webhook_get_with_token_and_polling_still_alive(client):
     resp = run(client.head(f"/webhook?token={EXPECTED_TOKEN}"))
     assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------
+# /health 反映摄取通道存活（2026-09-15 失聪事故回归护栏）
+# ---------------------------------------------------------------------
+# 旧版 /health 写死 200：进程活着但 getUpdates 轮询任务已死时，Render
+# 健康检查与 Docker HEALTHCHECK 都认为实例健康，永远不重启，用户发消息
+# 石沉大海。现在摄取通道断了必须返回 503，让平台自动重建实例。
+def test_health_degrades_when_ingest_broken(client, monkeypatch):
+    import telegram_polling
+
+    monkeypatch.setattr(telegram_polling, "is_ingest_broken", lambda: True)
+    resp = run(client.get("/health"))
+    assert resp.status_code == 503
+    data = asyncio.run(resp.get_json())
+    assert data == {"status": "degraded"}
+
+
+def test_health_degraded_body_leaks_no_internal_stats(client, monkeypatch):
+    """降级响应同样不得泄露内部统计（与 200 分支同一约束）。"""
+    import telegram_polling
+
+    monkeypatch.setattr(telegram_polling, "is_ingest_broken", lambda: True)
+    resp = run(client.get("/health"))
+    body = asyncio.run(resp.get_data(as_text=True))
+    for forbidden in ("whitelist", "task", "count", "worker", "queue"):
+        assert forbidden not in body.lower()
+
+
+def test_health_ok_when_polling_never_started(client):
+    """webhook 模式 / 单测进程从未启动轮询 → 不得误报不健康。"""
+    import telegram_polling
+
+    assert telegram_polling.is_ingest_broken() is False
+    resp = run(client.get("/health"))
+    assert resp.status_code == 200
