@@ -222,11 +222,19 @@ _BASE_PROMPT = """
 <table bordered striped>
   <caption>tg-button 属性</caption>
   <tr><th>属性</th><th>必填 / 选填</th><th>取值与含义</th></tr>
-  <tr><td><code>type</code></td><td><b>必填</b></td><td><code>url</code>：点击跳转链接；<code>copy_text</code>：点击复制按钮文本</td></tr>
+  <tr><td><code>type</code></td><td><b>必填</b></td><td><code>url</code>：点击跳转链接；<code>copy_text</code>：点击复制按钮文本；<code>callback_data</code>：点击后把 data 内容作为一条新消息发给你自己（见下）</td></tr>
   <tr><td><code>url</code></td><td><b>type="url" 时必填</b></td><td>跳转目标，必须是完整的 <code>https://</code> 链接</td></tr>
   <tr><td><code>text</code></td><td><b>type="copy_text" 时必填</b></td><td><code>text="文本"</code></td></tr>
+  <tr><td><code>data</code></td><td><b>type="callback_data" 时必填</b></td><td>必须以 <code>tgb:</code> 开头，例如 <code>data="tgb:choose_1"</code>；见下方说明</td></tr>
   <tr><td><code>style</code></td><td>选填</td><td><code>default</code> 默认蓝色 / <code>primary</code> 主色 / <code>success</code> 绿色 / <code>danger</code> 红色 / <code>link</code> 链接样式；省略即 <code>default</code></td></tr>
 </table>
+<p><b>type="callback_data" 用法</b>：用户点击按钮后，<code>data</code> 属性的内容（去掉 <code>tgb:</code> 前缀）会被<b>当作用户发来的一条新消息</b>直接交给你，你会看到这条消息并继续对话——不需要用户手动输入任何文字。适合“点击后让我继续执行某个操作”的场景，例如：<code><tg-button type="callback_data" data="tgb:choose_1">如果你愿意，我可以为你生成一张图像</tg-button></code>，点击后你会收到一条内容为 <code>choose_1</code> 的用户消息，请结合上下文理解这个短语/代码的含义并继续对话。</p>
+<p><b>data 的长度限制（Telegram 强制，无法绕过）</b>：整个 <code>data</code> 属性值（含 <code>tgb:</code> 前缀）按 <b>UTF-8 编码后的字节数</b>计算，必须在 <b>1-64 字节</b>之间——<b>不是字符数</b>。英文/数字每字符 1 字节，中文等多字节字符每字符约 3 字节，所以中文内容最多约 <b>17 个汉字</b>（含 4 字节前缀）。超过该限制的按钮会被判定为非法按钮，整体降级为字面量文本发送给用户（不会报错崩溃，但按钮会失效）。因此：</p>
+<ul>
+<li>优先使用<b>短语义代码</b>（如 <code>tgb:choose_1</code>、<code>tgb:yes</code>、<code>tgb:show_more</code>），依靠你自己已有的对话上下文去理解这个代码点击后代表什么，不必把完整语句塞进 data；</li>
+<li>只有确定内容很短时才把完整中文/英文短句直接写进 data（如 <code>tgb:好的，继续</code>），并自行控制在 64 字节以内；</li>
+<li>绝不要把长句、完整问题或多个信息点塞进一个 <code>data</code> 属性。</li>
+</ul>
 
 <h4>1.7 链接、锚点与脚注</h4>
 <table bordered striped>

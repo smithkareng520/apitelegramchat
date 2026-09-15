@@ -91,14 +91,17 @@ def _escape_prose(text: str) -> str:
 
 # ---- <tg-button> 强模式校验与降级 ----
 # Telegram RichMessage 的 <tg-button> 是强模式标签：type 必填；
-# type="url" 时 url 必填，type="copy_text" 时 text 必填；标签内必须有
-# 可见文字；不允许嵌套。模型输出不保证模式正确——典型场景：用户要求
-# “直接回复 <tg-button>”，模型就原样输出一个裸标签。残缺/非法按钮
-# 一旦原样透传，Telegram 会以 BUTTON_URL_INVALID 等 400 拒绝整条消息，
-# 且该错误不在发送层媒体/结构降级分支内，最终表现为“富文本发送失败、
-# 不再降级”。因此这里在转换边界做代码级校验：非法按钮整体转义为
-# 字面量文本（用户看到标签原文而不是整条消息发送失败），合法按钮
-# 原样保留。这是结构兜底，不依赖提示词堆砌。
+# type="url" 时 url 必填，type="copy_text" 时 text 必填，
+# type="callback_data" 时 data 必填且须为 1-64 字节（UTF-8 编码后，
+# 非字符数——中文等多字节字符很容易超限）；标签内必须有可见文字；
+# 不允许嵌套。模型输出不保证模式正确——典型场景：用户要求
+# “直接回复 <tg-button>”，模型就原样输出一个裸标签，或 callback_data
+# 的 data 写了一长串中文超出 64 字节。残缺/非法按钮一旦原样透传，
+# Telegram 会以 BUTTON_URL_INVALID / BUTTON_DATA_INVALID 等 400 拒绝
+# 整条消息，且该错误不在发送层媒体/结构降级分支内，最终表现为
+# “富文本发送失败、不再降级”。因此这里在转换边界做代码级校验：
+# 非法按钮整体转义为字面量文本（用户看到标签原文而不是整条消息发送
+# 失败），合法按钮原样保留。这是结构兜底，不依赖提示词堆砌。
 _TG_BUTTON_PRESENT_RE = re.compile(r"tg-button", re.IGNORECASE)
 _TG_BUTTON_TAG_RE = re.compile(r"</?tg-button\b[^>]*>", re.IGNORECASE)
 _TG_BUTTON_ATTR_RE = re.compile(
@@ -106,7 +109,16 @@ _TG_BUTTON_ATTR_RE = re.compile(
     re.IGNORECASE,
 )
 _TG_BUTTON_VALID_URL_RE = re.compile(r"^(?:https?|tg)://", re.IGNORECASE)
-_TG_BUTTON_VALID_TYPES = ("url", "copy_text")
+_TG_BUTTON_VALID_TYPES = ("url", "copy_text", "callback_data")
+# Telegram Bot API 硬性限制：callback_data 按 UTF-8 编码后的字节数计，
+# 1-64 字节（不是字符数）。超限会被 Telegram 以 400 BUTTON_DATA_INVALID
+# 整条拒绝，因此必须在转换边界做字节级校验，超限按钮降级为字面量文本，
+# 而不是把错误留到发送层才炸。
+_TG_BUTTON_CALLBACK_DATA_MAX_BYTES = 64
+# 应用层（app_commands._handle_callback_query）用这个前缀区分
+# "AI 定义的、点击后要喂回给 AI 的按钮回调" 与角色/模型切换等其他
+# callback_data 消费者，必须与 app_commands.py 中的判断保持一致。
+_TG_BUTTON_CALLBACK_DATA_PREFIX = "tgb:"
 
 
 def _parse_tg_button_attrs(attrs_str: str) -> dict:
@@ -121,17 +133,40 @@ def _tg_button_invalid_reason(attrs: dict, inner: str) -> str | None:
     """返回 None 表示按钮合法，否则返回不合法原因（用于日志与测试）。"""
     btype = (attrs.get("type") or "").strip().lower()
     if btype not in _TG_BUTTON_VALID_TYPES:
-        return f"type 必填且只能为 url/copy_text（实际：{btype!r}）"
+        return f"type 必填且只能为 url/copy_text/callback_data（实际：{btype!r}）"
     if btype == "url":
         url = (attrs.get("url") or "").strip()
         if not url:
             return "type=url 时 url 属性必填"
         if not _TG_BUTTON_VALID_URL_RE.match(url):
             return f"url 需以 http(s):// 或 tg:// 开头（实际：{url[:80]!r}）"
-    else:
+    elif btype == "copy_text":
         text = (attrs.get("text") or "").strip()
         if not text:
             return "type=copy_text 时 text 属性必填"
+    else:  # callback_data
+        data = attrs.get("data")
+        if data is None or not data.strip():
+            return "type=callback_data 时 data 属性必填"
+        # 约定前缀：应用层（app_commands._handle_callback_query）靠
+        # "tgb:" 前缀把这类按钮回调与角色/模型切换、message_user 等其他
+        # callback_data 消费者区分开，缺少前缀的按钮点击后无法被路由到
+        # AI 回合，因此在校验阶段就拒绝，而不是留到运行时静默变成
+        # "未知操作"。
+        if not data.startswith(_TG_BUTTON_CALLBACK_DATA_PREFIX):
+            return (
+                f"type=callback_data 的 data 必须以 "
+                f"{_TG_BUTTON_CALLBACK_DATA_PREFIX!r} 开头，实际：{data[:40]!r}"
+            )
+        # Telegram 硬限制：1-64 字节（UTF-8 编码后），不是字符数，
+        # 且这里的字节数是整个 data（含 "tgb:" 前缀）的字节数。
+        # 中文等多字节字符很容易超限，必须按编码后字节数校验。
+        data_bytes = len(data.encode("utf-8"))
+        if data_bytes < 1 or data_bytes > _TG_BUTTON_CALLBACK_DATA_MAX_BYTES:
+            return (
+                f"data 属性（含前缀）须为 1-{_TG_BUTTON_CALLBACK_DATA_MAX_BYTES} 字节"
+                f"（UTF-8 编码，非字符数），实际 {data_bytes} 字节：{data[:40]!r}"
+            )
     if not inner.strip():
         return "按钮显示文本为空"
     if "<" in inner:

@@ -394,3 +394,51 @@ def test_tg_button_entity_form_untouched():
     assert sanitize_tg_buttons("&lt;tg-button&gt;") == "&lt;tg-button&gt;"
     assert sanitize_tg_buttons("普通文本") == "普通文本"
     assert sanitize_tg_buttons("") == ""
+
+def test_valid_tg_button_callback_data_passthrough():
+    button = '<tg-button type="callback_data" style="link" data="tgb:choose_1">生成图像</tg-button>'
+    assert convert(button) == button
+
+def test_tg_button_callback_data_missing_data_escaped():
+    out = convert('<tg-button type="callback_data">点我</tg-button>')
+    assert "&lt;tg-button" in out
+    assert "<tg-button" not in out
+
+def test_tg_button_callback_data_missing_prefix_escaped():
+    # 缺少 "tgb:" 前缀：应用层无法路由，必须在校验阶段就拒绝
+    out = convert('<tg-button type="callback_data" data="choose_1">按钮</tg-button>')
+    assert "<tg-button" not in out
+    assert "&lt;tg-button" in out
+
+def test_tg_button_callback_data_within_64_bytes_ascii_passthrough():
+    # "tgb:" (4 字节) + 60 个 ASCII 字符 = 64 字节，刚好在边界内
+    data = "tgb:" + "a" * 60
+    button = f'<tg-button type="callback_data" data="{data}">按钮</tg-button>'
+    assert convert(button) == button
+
+def test_tg_button_callback_data_over_64_bytes_ascii_escaped():
+    # "tgb:" (4 字节) + 61 个 ASCII 字符 = 65 字节，超出边界
+    data = "tgb:" + "a" * 61
+    out = convert(f'<tg-button type="callback_data" data="{data}">按钮</tg-button>')
+    assert "<tg-button" not in out
+    assert "&lt;tg-button" in out
+
+def test_tg_button_callback_data_chinese_byte_length_enforced():
+    # 中文在 UTF-8 下每字符 3 字节；"tgb:" (4 字节) + 21 个汉字 (63 字节)
+    # = 67 字节，超过 64 字节上限，即使字符数很少也必须按字节数拒绝。
+    data = "tgb:" + "帮" * 21
+    assert len(data.encode("utf-8")) == 67
+    out = convert(f'<tg-button type="callback_data" data="{data}">按钮</tg-button>')
+    assert "<tg-button" not in out
+    assert "&lt;tg-button" in out
+
+def test_tg_button_callback_data_chinese_within_budget_passthrough():
+    # "tgb:" (4 字节) + 20 个汉字 (60 字节) = 64 字节，刚好在预算内
+    data = "tgb:" + "帮" * 20
+    assert len(data.encode("utf-8")) == 64
+    button = f'<tg-button type="callback_data" data="{data}">继续任务</tg-button>'
+    assert convert(button) == button
+
+def test_tg_button_callback_data_empty_string_escaped():
+    out = convert('<tg-button type="callback_data" data="">按钮</tg-button>')
+    assert "<tg-button" not in out

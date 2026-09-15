@@ -44,7 +44,15 @@ from core.http_session import get_http_session
 import proactive
 import app_state
 from app_state import update_queue, WEBHOOK_QUEUE_MAXSIZE
-from app_turns import _cmd_match, _reply_params, is_admin, is_authorized, _interrupt_active_generation
+from app_turns import (
+    _cmd_match,
+    _reply_params,
+    is_admin,
+    is_authorized,
+    _interrupt_active_generation,
+    spawn_turn_task,
+    _handle_text_message,
+)
 from app_lists import (
     _send_via_send_message,
     update_role_list,
@@ -387,7 +395,8 @@ async def _handle_text_command(chat_id: int, msg: dict, user_input: str) -> bool
 
 
 async def _handle_callback_query(cb: dict) -> None:
-    """inline 按钮回调：角色切换 / 模型切换 / message_user 按钮回调解码。"""
+    """inline 按钮回调：角色切换 / 模型切换 / message_user 按钮回调解码 /
+    <tg-button type="callback_data"> 点击回传给 AI。"""
     chat_id = cb["message"]["chat"]["id"]
     uid = cb["from"]["id"]
     mid = cb["message"]["message_id"]
@@ -487,6 +496,28 @@ async def _handle_callback_query(cb: dict) -> None:
             # 媒体参数卡片（media_wizard）：翻页/选参/收集素材/提交/取消
             from media_wizard import handle_wizard_callback
             await handle_wizard_callback(chat_id, uid, mid, cb["id"], sel)
+            return
+        elif isinstance(sel, str) and sel.startswith("tgb:"):
+            # <tg-button type="callback_data" data="tgb:..."> 的点击回调：
+            # 把 data 原文（去掉 "tgb:" 前缀）当作一条新的用户消息喂回给
+            # AI，走与普通文本消息完全相同的回合流程（spawn_turn_task +
+            # _handle_text_message），而不是只做一句通用提示。这样模型
+            # 自己在按钮上写的短语/短代码（如 "choose_1"）能借助已有
+            # 对话上下文被正确理解，AI 据此继续对话或触发下一步动作。
+            # data 的字节长度已在 markdown_converter.sanitize_tg_buttons
+            # 阶段做过 1-64 字节校验，这里不再重复校验。
+            content_text = sel[len("tgb:"):]
+            if not content_text:
+                await _answer_callback_query(cb["id"], "空回调")
+                return
+            await _answer_callback_query(cb["id"], "已收到")
+            username = (cb.get("from") or {}).get("username") or (cb.get("from") or {}).get("first_name") or ""
+            user_message: dict[str, Any] = {"role": "user", "content": content_text}
+            await spawn_turn_task(
+                chat_id,
+                _handle_text_message(chat_id, content_text, username, user_message),
+                user_message=user_message,
+            )
             return
         else:
             await _answer_callback_query(cb["id"], "未知操作")
