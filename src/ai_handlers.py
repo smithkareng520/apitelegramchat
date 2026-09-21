@@ -188,17 +188,16 @@ _BASE_PROMPT = """
   <tr><td><code><td></code> / <code><th></code></td><td><code>align</code></td><td>选填</td><td><code>left</code> / <code>center</code> / <code>right</code>，水平对齐</td></tr>
   <tr><td><code><td></code> / <code><th></code></td><td><code>valign</code></td><td>选填</td><td><code>top</code> / <code>middle</code> / <code>bottom</code>，垂直对齐</td></tr>
 </table>
-<p><b>内容限制：</b>单元格内<b>仅允许行内格式元素</b>（<code><b></code>、<code><i></code>、<code><code></code>、<code><a></code> 等）；严禁在单元格中嵌套表格、列表、代码块或任何媒体元素。</p>
-
+<p>Table cells can contain only inline formatting.</p>
 <h4>1.4 数学公式</h4>
-<p><b>⚠️ 关键约束：</b>严禁使用 <code>$</code> 或 <code>$$</code> 包裹公式。两个标签均无属性，内容写 LaTeX。</p>
+<p><b>Formula source is treated as raw LaTeX.</p>
 <ul>
   <li><b>行内公式：</b><code><tg-math>x^2 + y^2</tg-math></code></li>
   <li><b>块级公式：</b><code><tg-math-block>E = mc^2</tg-math-block></code></li>
 </ul>
 
 <h4>1.5 时间实体 <code><tg-time></code></h4>
-<p>写法：<code><tg-time unix="1647531900" format="wDT">fallback 文本</tg-time></code>。标签内文本是<b>降级显示内容</b>，在不支持渲染时原样展示，必须填写。</p>
+<p>写法：<code><tg-time unix="1647531900" format="wDT">fallback 文本</tg-time></code></p>
 <table bordered striped>
   <caption>tg-time 属性</caption>
   <tr><th>属性</th><th>必填 / 选填</th><th>含义</th></tr>
@@ -218,7 +217,7 @@ _BASE_PROMPT = """
 <p>除 <code>r</code> 外，其余字符可自由组合，例如 <code>format="wDT"</code> 渲染为“星期二，2022 年 3 月 17 日 22:45:00”。<b>format 值中不得包含空格或其他分隔符</b>（要短时间用 <code>t</code>，直接写 <code>wDTt</code>，不要写 <code>wDT t</code>）。</p>
 
 <h4>1.6 按钮 <code><tg-button></code></h4>
-<p>写法：<code><tg-button type="url" url="https://example.com" style="success">按钮显示文本</tg-button></code>。标签内文本即按钮上的文字；按钮须作为<b>独立块级元素</b>输出，不要塞进段落、列表或表格里。</p>
+<p>写法：<code><tg-button type="url" url="https://example.com" style="success">按钮显示文本</tg-button></code>。</p>
 <table bordered striped>
   <caption>tg-button 属性</caption>
   <tr><th>属性</th><th>必填 / 选填</th><th>取值与含义</th></tr>
@@ -247,7 +246,7 @@ _BASE_PROMPT = """
 <h3>二、媒体与地图资源</h3>
 
 <h4>2.1 通用规则</h4>
-<p>媒体元素必须作为<b>独立块级元素</b>输出，绝对禁止嵌入表格、段落、列表项或任何行内容器中。</p>
+<p>Images, videos, and audio files can be specified only as separate media blocks.</p>
 
 <h4>2.2 媒体标签与属性</h4>
 <table bordered striped>
@@ -260,6 +259,9 @@ _BASE_PROMPT = """
   <tr><td>图片轮播</td><td><code><tg-slideshow><img src="URL1"/><img src="URL2"/></tg-slideshow></code></td><td>无属性；子元素只能是 <code><img></code>，且需 <b>≥2 张</b></td></tr>
   <tr><td>地图</td><td><code><tg-map lat="41.9" long="12.5" zoom="14"/></code></td><td><b>必填</b> <code>lat</code> 纬度、<code>long</code> 经度；<b>选填</b> <code>zoom</code>：13–20</td></tr>
 </table>
+<p>Media blocks support only HTTP and HTTPS URLs.
+Media type is determined by the MIME type and the URL of the media.
+</p>
 
 <hr/>
 
@@ -268,7 +270,8 @@ _BASE_PROMPT = """
 <p>当标注来源时，使用 <tg-button type="url" url="链接">显示文本</tg-button> 按钮链接格式，显示文本的语言应与来源语言一致：英文网站用英文名称（如 <code>The Wall Street Journal</code>、<code>VOA Chinese</code>），中文网站用中文名称（如 <code>财新网</code>、<code>澎湃新闻</code>）。</p>
 
 <h3>四、HTML entities</h3>
-<p> currently supports only the following named HTML entities: <code>&lt;, &gt;, &amp;, &quot;, &apos;, &nbsp;, &hellip;, &mdash;, &ndash;, &lsquo;, &rsquo;, &ldquo; and &rdquo;.</code>
+<p>All numerical HTML entities are supported.
+The API currently supports only the following named HTML entities: &lt;, &gt;, &amp;, &quot;, &apos;, &nbsp;, &hellip;, &mdash;, &ndash;, &lsquo;, &rsquo;, &ldquo; and &rdquo;.
 </p>
 
 """
