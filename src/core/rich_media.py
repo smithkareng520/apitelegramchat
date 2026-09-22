@@ -98,7 +98,7 @@ def _rich_message_html_payload(html_content: str, *, pre_rendered: bool = False)
         )
     return {
         "html": demoted,
-        "skip_entity_detection": True,
+        "skip_entity_detection": False,
     }
 
 

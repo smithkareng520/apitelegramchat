@@ -28,7 +28,13 @@ class TestPreRenderedSkipConversion:
         payload = _rich_message_html_payload(MD_TEXT)
         assert "<b>加粗</b>" in payload["html"]
         assert '<img src="https://x/y.png"/>' in payload["html"]
-        assert payload["skip_entity_detection"] is True
+        assert payload["skip_entity_detection"] is False
+
+    def test_entity_detection_is_enabled_for_rich_messages(self):
+        payload = _rich_message_html_payload(
+            "#hashtag $USD +12345678901 https://t.me t.me a@t.me /command @username"
+        )
+        assert payload["skip_entity_detection"] is False
 
     def test_pre_rendered_keeps_text_byte_identical(self):
         payload = _rich_message_html_payload(MD_TEXT, pre_rendered=True)
