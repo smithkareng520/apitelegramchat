@@ -114,8 +114,8 @@ def reset_all(r2_mode: bool):
     """完全复位：内存 set、本地文件、fake R2、管理员名单。"""
     fake_r2.reset()
     config.WHITELIST_USERS.clear()
-    config.ADMIN_USERS = ["dearella"]
-    config._ADMIN_NAME_SET, config._ADMIN_ID_SET = config._build_admin_sets()
+    config.ADMIN_USER = "@dearella"
+    config._refresh_admin_identity()
     try:
         local_file().unlink(missing_ok=True)
         Path(str(local_file()) + ".tmp").unlink(missing_ok=True)
@@ -126,6 +126,7 @@ def reset_all(r2_mode: bool):
 
 async def t_a_normalization():
     section("A. 归一化与管理员目标判断")
+    reset_all(r2_mode=False)
     n = config._normalize_target
     check("A1 @前缀剥离+小写", n("@Alice") == "alice")
     check("A2 前后空白剥离", n("  BOB ") == "bob")
@@ -141,12 +142,23 @@ async def t_a_normalization():
     check("A12 非管理员身份", config.is_admin_identity("someuser", "42") is False)
 
     # 动态加入数字 ID 管理员
-    config.ADMIN_USERS = ["dearella", "555000111"]
-    config._ADMIN_NAME_SET, config._ADMIN_ID_SET = config._build_admin_sets()
+    config.ADMIN_USER = "555000111"
+    config._refresh_admin_identity()
     check("A13 数字ID管理员", config._is_admin_target("555000111") is True and config.is_admin_identity(user_id="555000111") is True)
     check("A14 数字ID管理员目标互斥", config._is_admin_target("555000112") is False)
-    config.ADMIN_USERS = ["dearella"]
-    config._ADMIN_NAME_SET, config._ADMIN_ID_SET = config._build_admin_sets()
+    config.ADMIN_USER = "@dearella"
+    config._refresh_admin_identity()
+
+    # 管理员用户名配置必须显式带 @；数字 user_id 不受此限制。
+    config.ADMIN_USER = "dearella"
+    try:
+        config._refresh_admin_identity()
+    except ValueError:
+        check("A15 用户名配置缺少@被拒", True)
+    else:
+        check("A15 用户名配置缺少@被拒", False)
+    config.ADMIN_USER = "@dearella"
+    config._refresh_admin_identity()
 
 
 async def t_b_parse():

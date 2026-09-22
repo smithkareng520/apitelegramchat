@@ -1295,17 +1295,22 @@ assert DEFAULT_MODEL in SUPPORTED_MODELS, f"默认模型 {DEFAULT_MODEL} 未定�
 #     回退本地文件；R2 上没有对象但本地有数据时，把本地数据作为种子
 #     推送上 R2（完成本地 → R2 的首次迁移）。
 # 管理员保护：
-#   ADMIN_USERS 是管理员名单，与"用户白名单"完全独立。管理员：
+#   ADMIN_USER 是唯一的管理员配置，与"用户白名单"完全独立。管理员：
 #   - 不能被 /adduser 加进用户白名单（add_whitelist_user 返回 admin）；
 #   - 不能被 /deluser 从用户白名单删除（remove_whitelist_user 返回
 #     admin——管理员根本不属于用户白名单，且显式拒绝而非提示不存在）；
 #   - 加载本地文件 / R2 内容时会过滤掉管理员条目（防止手改数据绕过）。
 #   管理员的授权走 is_admin_identity，不依赖白名单。
+#   来源：环境变量 ADMIN_USER。可以填写 Telegram 数字 user_id，或填写
+#   Telegram 用户名；用户名必须带 @，例如：
+#     ADMIN_USER=@dearella
+#     ADMIN_USER=123456789
+#   未配置时无人拥有管理员权限，而非硬编码回退。
+#   未授权提示中的联系人显示文本由 ADMIN_CONTACT_USER 控制；它只用于
+#   展示，不参与管理员身份校验。
 # 大小写语义：
-#   Telegram 用户名大小写不敏感（@Alice 与 alice 是同一账号），因此
-#   用户名条目统一归一化为小写存储与比较；纯数字 user_id 按精确字符串
-#   比较。这保证 /adduser @Alice 后，实际用户名为 alice 的用户能通过
-#   权限校验，不会出现"加了大写、小写进不来"的隐藏 bug。
+#   Telegram 用户名大小写不敏感，因此用户名统一归一化为小写存储与比较；
+#   纯数字 user_id 按精确字符串比较。
 # =============================================================================
 
 WHITELIST_FILE = os.getenv("APITELEGRAMCHAT_WHITELIST_FILE") or "whitelist.txt"
@@ -1319,7 +1324,30 @@ WHITELIST_R2_KEY = _raw_whitelist_r2_key
 del _raw_whitelist_r2_key
 WHITELIST_CONTENT_TYPE = "text/plain; charset=utf-8"
 
-ADMIN_USERS = ["dearella"]
+ADMIN_USER = (os.getenv("ADMIN_USER") or "").strip()
+ADMIN_CONTACT_USER = (os.getenv("ADMIN_CONTACT_USER") or "").strip()
+
+
+def _build_admin_identity(value: str) -> tuple[str, str]:
+    """把 ADMIN_USER 解析成（类型, 归一化值）。
+
+    类型仅为 ``"username"`` 或 ``"user_id"``。用户名配置必须显式带
+    ``@``；数字 user_id 则直接填写数字。
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return "", ""
+    if raw.isdigit():
+        return "user_id", raw
+    if not raw.startswith("@"):
+        raise ValueError("ADMIN_USER 设置用户名时必须带 @ 前缀；数字 user_id 可直接填写。")
+    normalized = raw.lstrip("@").strip().lower()
+    if not normalized:
+        raise ValueError("ADMIN_USER 的用户名不能为空。")
+    return "username", normalized
+
+
+_ADMIN_USER_KIND, _ADMIN_TARGET = _build_admin_identity(ADMIN_USER)
 
 
 class WhitelistStore:
@@ -1396,47 +1424,43 @@ def _normalize_target(target: str) -> str:
     return t.lower()
 
 
-def _build_admin_sets() -> tuple[set[str], set[str]]:
-    """把 ADMIN_USERS 拆成（用户名小写集合, 数字ID集合），供大小写不敏感匹配。"""
-    names: set[str] = set()
-    ids: set[str] = set()
-    for admin in ADMIN_USERS:
-        a = _normalize_target(admin)
-        if not a:
-            continue
-        if a.isdigit():
-            ids.add(a)
-        else:
-            names.add(a)
-    return names, ids
-
-
-_ADMIN_NAME_SET, _ADMIN_ID_SET = _build_admin_sets()
+def _refresh_admin_identity() -> None:
+    """重新解析 ADMIN_USER；测试和运行时配置刷新可复用。"""
+    global _ADMIN_USER_KIND, _ADMIN_TARGET
+    _ADMIN_USER_KIND, _ADMIN_TARGET = _build_admin_identity(ADMIN_USER)
 
 
 def _is_admin_target(target: str) -> bool:
-    """target（用户名或数字 ID）是否指向管理员。用户名比较大小写不敏感。"""
-    t = _normalize_target(target)
-    if not t:
+    """target（用户名或数字 ID）是否指向唯一管理员。"""
+    if not _ADMIN_TARGET:
         return False
-    if t.isdigit():
-        return t in _ADMIN_ID_SET
-    return t in _ADMIN_NAME_SET
+
+    raw = str(target or "").strip()
+    if not raw:
+        return False
+
+    if _ADMIN_USER_KIND == "user_id":
+        return raw == _ADMIN_TARGET
+    if _ADMIN_USER_KIND == "username":
+        return _normalize_target(raw) == _ADMIN_TARGET
+    return False
 
 
 def is_admin_identity(username: str = "", user_id: str = "") -> bool:
-    """按 Telegram 身份（用户名 / 数字 ID）判断是否管理员。
+    """按 Telegram 身份（用户名 / 数字 ID）判断是否为唯一管理员。
 
     app.is_admin 委托本函数，保证整个代码库的管理员判断语义一致：
     用户名大小写不敏感，数字 ID 精确匹配。
     """
-    uid = str(user_id or "").strip()
-    if uid and uid in _ADMIN_ID_SET:
-        return True
-    if username:
-        u = _normalize_target(username)
-        if u and u in _ADMIN_NAME_SET:
-            return True
+    if not _ADMIN_TARGET:
+        return False
+
+    if _ADMIN_USER_KIND == "user_id":
+        return str(user_id or "").strip() == _ADMIN_TARGET
+
+    if _ADMIN_USER_KIND == "username" and username:
+        return _normalize_target(username) == _ADMIN_TARGET
+
     return False
 
 

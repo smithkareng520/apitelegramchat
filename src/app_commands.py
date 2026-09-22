@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 from config import (
+    ADMIN_CONTACT_USER,
     BASE_URL,
     SUPPORTED_MODELS,
     SUPPORTED_ROLES,
@@ -237,8 +238,10 @@ async def _handle_start_command(chat_id: int, msg: dict, text: str, username: st
         return False
 
     authorized = is_authorized(username, user_id)
+    contact = html.escape(ADMIN_CONTACT_USER, quote=False)
     if authorized:
-        welcome_msg = """
+        contact_hint = f" {contact}" if contact else ""
+        welcome_msg = f"""
 <b>🤖 欢迎使用 AI 助手！</b></br>
 ✅ 您已获得授权，可以直接发送消息与我对话。</br>
 <u>支持的功能：</u></br>
@@ -250,13 +253,18 @@ async def _handle_start_command(chat_id: int, msg: dict, text: str, username: st
     <li><b>🔗 联网搜索</b> - 实时信息查询</li>
 </ul>
 </blockquote>
-</br>💡 <i>提示：如需帮助，请联系管理员 @dearella</i>
+</br>💡 <i>提示：如需帮助，请联系管理员{contact_hint}</i>
 """
     else:
-        welcome_msg = """
+        contact_line = (
+            f"请联系管理员 <b>{contact}</b></br>"
+            if contact
+            else "请联系管理员</br>"
+        )
+        welcome_msg = f"""
 <b>🤖 欢迎使用 AI 助手！</b></br>
 ⚠️ <b>注意</b>：此机器人启用了白名单机制。</br>
-请联系管理员 <b>@dearella</b></br> 申请白名单后，才能使用全部功能。
+{contact_line} 申请白名单后，才能使用全部功能。
 """
     await send_rich_html_message(chat_id, welcome_msg, reply_parameters=_reply_params(msg["message_id"]))
     return True

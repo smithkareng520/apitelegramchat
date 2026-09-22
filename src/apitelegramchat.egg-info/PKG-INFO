@@ -1,0 +1,33 @@
+Metadata-Version: 2.4
+Name: apitelegramchat
+Version: 2.3.1
+Summary: Telegram AI assistant with MCP-native tool exposure
+Requires-Python: >=3.10
+License-File: LICENSE
+Requires-Dist: aiohttp==3.11.15
+Requires-Dist: mcp<2,>=1.28
+Requires-Dist: openai==3.8.0
+Requires-Dist: httpx<1,>=0.27
+Requires-Dist: httpx2==2.12.0
+Requires-Dist: anthropic==0.69.0
+Requires-Dist: Pillow==11.1.0
+Requires-Dist: quart==0.20.0
+Requires-Dist: trafilatura==1.12.2
+Requires-Dist: lxml==5.3.0
+Requires-Dist: curl_cffi==0.7.1
+Requires-Dist: cachetools==5.5.0
+Requires-Dist: aioboto3==12.4.0
+Requires-Dist: defusedxml==0.7.1
+Requires-Dist: pypdf==5.9.0
+Requires-Dist: pdfplumber==0.11.6
+Requires-Dist: reportlab==4.3.1
+Requires-Dist: pdf2image==1.17.0
+Requires-Dist: tiktoken==0.11.0
+Requires-Dist: PyYAML<7,>=6
+Requires-Dist: json-repair<1,>=0.30
+Requires-Dist: jsonschema<5,>=4.23
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: pytest-asyncio; extra == "dev"
+Requires-Dist: mypy; extra == "dev"
+Dynamic: license-file

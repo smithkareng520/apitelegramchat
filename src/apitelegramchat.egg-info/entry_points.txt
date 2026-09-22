@@ -1,0 +1,2 @@
+[console_scripts]
+apitelegramchat-mcp = entrypoints.mcp_server:main

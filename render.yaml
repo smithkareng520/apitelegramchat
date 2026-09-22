@@ -31,6 +31,12 @@ services:
         sync: false
       - key: WEBHOOK_TOKEN
         sync: false
+      # 唯一管理员：Telegram 用户名必须带 @，也可以填写数字 user_id。
+      - key: ADMIN_USER
+        sync: false
+      # 未授权提示中展示的联系对象，仅用于显示，不参与权限判断。
+      - key: ADMIN_CONTACT_USER
+        sync: false
       - key: OPENROUTER_API_KEY
         sync: false
       - key: ANTHROPIC_API_KEY

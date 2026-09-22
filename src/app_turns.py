@@ -8,6 +8,7 @@ import asyncio
 import json
 import time
 from typing import Any, Optional, cast
+from html import escape
 
 from token_budget import count_tokens
 
@@ -19,7 +20,7 @@ from utils import (
 )
 from ai_handlers import get_ai_response
 from ai.rich_message_builder import freeze_draft_streaming
-from config import SUPPORTED_MODELS, is_admin_identity, is_whitelisted_identity
+from config import ADMIN_CONTACT_USER, SUPPORTED_MODELS, is_admin_identity, is_whitelisted_identity
 from state import (
     user_contexts,
     user_models,
@@ -195,12 +196,18 @@ def is_authorized(username: str, user_id: str) -> bool:
     return is_whitelisted_identity(username, user_id)
 
 async def reply_unauthorized(chat_id: int, reply_message_id: int | None = None) -> None:
+    contact = escape(ADMIN_CONTACT_USER, quote=False)
+    contact_line = (
+        f"请联系管理员 <b>{contact}</b> 申请白名单。"
+        if contact
+        else "请联系管理员申请白名单。"
+    )
     await send_rich_html_message(
         chat_id,
-        """
+        f"""
 ❌ <b>未授权访问</b></br>
 您未被授权使用此机器人。</br>
-请联系管理员 <b>@dearella</b> 申请白名单。
+{contact_line}
 """,
         reply_parameters=_reply_params(reply_message_id),
     )
