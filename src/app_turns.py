@@ -20,7 +20,7 @@ from utils import (
 )
 from ai_handlers import get_ai_response
 from ai.rich_message_builder import freeze_draft_streaming
-from config import ADMIN_CONTACT_USER, SUPPORTED_MODELS, is_admin_identity, is_whitelisted_identity
+from config import ADMIN_USER, SUPPORTED_MODELS, is_admin_identity, is_whitelisted_identity
 from state import (
     user_contexts,
     user_models,
@@ -196,7 +196,7 @@ def is_authorized(username: str, user_id: str) -> bool:
     return is_whitelisted_identity(username, user_id)
 
 async def reply_unauthorized(chat_id: int, reply_message_id: int | None = None) -> None:
-    contact = escape(ADMIN_CONTACT_USER, quote=False)
+    contact = escape(ADMIN_USER, quote=False)
     contact_line = (
         f"请联系管理员 <b>{contact}</b> 申请白名单。"
         if contact

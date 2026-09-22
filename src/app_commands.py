@@ -10,7 +10,7 @@ import time
 from typing import Any
 
 from config import (
-    ADMIN_CONTACT_USER,
+    ADMIN_USER,
     BASE_URL,
     SUPPORTED_MODELS,
     SUPPORTED_ROLES,
@@ -238,7 +238,7 @@ async def _handle_start_command(chat_id: int, msg: dict, text: str, username: st
         return False
 
     authorized = is_authorized(username, user_id)
-    contact = html.escape(ADMIN_CONTACT_USER, quote=False)
+    contact = html.escape(ADMIN_USER, quote=False)
     if authorized:
         contact_hint = f" {contact}" if contact else ""
         welcome_msg = f"""

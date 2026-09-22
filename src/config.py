@@ -1306,8 +1306,7 @@ assert DEFAULT_MODEL in SUPPORTED_MODELS, f"默认模型 {DEFAULT_MODEL} 未定�
 #     ADMIN_USER=@dearella
 #     ADMIN_USER=123456789
 #   未配置时无人拥有管理员权限，而非硬编码回退。
-#   未授权提示中的联系人显示文本由 ADMIN_CONTACT_USER 控制；它只用于
-#   展示，不参与管理员身份校验。
+#   未授权提示中显示的联系人直接使用 ADMIN_USER 的配置值，二者始终一致。
 # 大小写语义：
 #   Telegram 用户名大小写不敏感，因此用户名统一归一化为小写存储与比较；
 #   纯数字 user_id 按精确字符串比较。
@@ -1325,7 +1324,6 @@ del _raw_whitelist_r2_key
 WHITELIST_CONTENT_TYPE = "text/plain; charset=utf-8"
 
 ADMIN_USER = (os.getenv("ADMIN_USER") or "").strip()
-ADMIN_CONTACT_USER = (os.getenv("ADMIN_CONTACT_USER") or "").strip()
 
 
 def _build_admin_identity(value: str) -> tuple[str, str]:

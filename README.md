@@ -221,7 +221,6 @@ export WEBHOOK_TOKEN="随机且不可预测的 Webhook Token"
 export WEBHOOK_URL="https://example.com/webhook"
 export OPENROUTER_API_KEY="你的 OpenRouter API Key"
 export ADMIN_USER="@你的 Telegram 用户名"
-export ADMIN_CONTACT_USER="@dearella"
 ```
 
 建议将所有 secret 放入部署平台的 Secret/Environment 管理，不要提交到 Git。
@@ -264,8 +263,7 @@ curl http://127.0.0.1:5000/health   # → {"status":"ok"}
 |---|---:|---|
 | `TELEGRAM_BOT_TOKEN` | 是 | Telegram Bot API |
 | `WEBHOOK_URL` / `WEBHOOK_TOKEN` | 是 | Webhook 注册与鉴权 |
-| `ADMIN_USER` | 是 | 唯一管理员：Telegram 用户名必须带 `@`，也可以填写数字 `user_id`，如 `@dearella` 或 `123456789`。未设置则无人拥有管理员权限 |
-| `ADMIN_CONTACT_USER` | 否 | 未授权用户提示中展示的联系对象，仅用于显示、不参与权限判断；例如 `@dearella` |
+| `ADMIN_USER` | 否 | 唯一管理员，同时作为“联系管理员”提示中显示的联系人。Telegram 用户名必须带 `@`，也可以填写数字 `user_id`，如 `@dearella` 或 `123456789`；未设置则无人拥有管理员权限且不显示联系人 |
 | `INGEST_MODE` | 可选 | `polling`（默认，getUpdates 长轮询）/ `webhook` |
 | `DROP_PENDING_ON_STARTUP` | 可选 | `true` 时启动丢弃 Telegram 侧积压 update，默认 `false` |
 | `OPENROUTER_API_KEY` | 是（严格模式） | 默认模型厂商/主要模型入口 |
@@ -650,7 +648,7 @@ ImageMagick / Tesseract / Poppler / qpdf 等 Skill 依赖，以非 root 用户
 
 仓库提供 `render.yaml` Blueprint：推送到 GitHub/GitLab → 在 Render 创建
 Blueprint → 填写 Secret（`TELEGRAM_BOT_TOKEN`、`WEBHOOK_TOKEN`、
-`ADMIN_USER`、`ADMIN_CONTACT_USER`、各厂商 API Key、R2 密钥、`SERPER_API_KEY`、
+`ADMIN_USER`、各厂商 API Key、R2 密钥、`SERPER_API_KEY`、
 `GAODE_MCP_TOKEN` 等）→ 等待构建 → 检查 `/health` 与 Webhook。不要把
 token 写进 `render.yaml` 明文。
 
