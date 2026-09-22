@@ -16,9 +16,9 @@ from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
-# Skill 资源层位于 workspace/skills。workspace 本身不做 R2 全量同步；
-# 但用户运行期自建/修改的技能由 workspace_utils 按 skills/{ns}/ 前缀
-# 定向持久化到 R2（恢复 + 增量备份），打包技能仍只在首次初始化时拷入。
+# Skill 资源层位于 workspace/skills。项目内 .claude/skills 在部署时生成一个
+# skills bundle ZIP 并写入 R2；workspace/skills 只是该 bundle 的运行时副本。
+# R2 的 skills 域不保存逐文件副本。
 SKILL_ASSETS_DIRNAME = "skills"
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
@@ -270,11 +270,7 @@ def read_skill(skill_id: str) -> dict[str, Any]:
 
 
 def _project_skill_source_root() -> Path | None:
-    """Return the highest-priority packaged skill root used for bootstrap.
-
-    The packaged tree is only the initial source for populating a workspace.
-    ``workspace/skills`` remains runtime-owned after initialization.
-    """
+    """Return the project ``.claude/skills`` source tree used to build a bundle."""
     for root in _candidate_skill_roots():
         try:
             root = root.resolve()
@@ -288,14 +284,18 @@ def _project_skill_source_root() -> Path | None:
 
 def _iter_files(root: Path) -> Iterable[Path]:
     for path in root.rglob("*"):
-        if path.is_file():
+        if path.is_file() and not path.is_symlink():
             yield path
 
 
 _PACKAGED_MANIFEST_NAME = ".packaged-manifest.json"
+_SKILLS_BUNDLE_KEY = os.getenv("APITELEGRAMCHAT_SKILLS_BUNDLE_KEY", "skills/skills.bundle.zip").strip().strip("/") or "skills/skills.bundle.zip"
 _SYNC_INTERVAL_SECONDS = max(2, float(os.getenv("SKILLS_AUTO_SYNC_INTERVAL_SECONDS", "5")))
 _sync_watcher_task: asyncio.Task[None] | None = None
 _sync_watcher_stop: asyncio.Event | None = None
+_bundle_lock = asyncio.Lock()
+_bundle_source_root: Path | None = None
+_bundle_source_hash: str = ""
 
 
 def _file_sha256(path: Path) -> str:
@@ -333,19 +333,154 @@ def _atomic_copy(src: Path, dst: Path) -> None:
             pass
 
 
-def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
-    """Synchronize packaged skills into a runtime workspace safely.
+def _source_snapshot(root: Path) -> tuple[str, dict[str, str]]:
+    """Return a deterministic content hash and per-file hashes for the source tree."""
+    files: dict[str, str] = {}
+    for path in sorted(_iter_files(root), key=lambda p: p.relative_to(root).as_posix()):
+        rel = path.relative_to(root).as_posix()
+        if not _is_safe_relpath(rel):
+            continue
+        files[rel] = _file_sha256(path)
+    digest_input = "\n".join(f"{rel}\0{digest}" for rel, digest in files.items()).encode()
+    return hashlib.sha256(digest_input).hexdigest(), files
 
-    Packaged files are managed, but user edits are protected: a destination file
-    is overwritten only when its current bytes still match the previously
-    installed packaged version. This gives us automatic upgrades without
-    clobbering runtime-created/customized skills.
 
-    Deletions from the packaged bundle are intentionally non-destructive. The
-    old file remains in the workspace because removing user data is too risky;
-    a cleanup can be performed explicitly in a future migration.
+def _bundle_cache_paths() -> tuple[Path, Path]:
+    from workspace_paths import data_root
+    root = data_root() / "skills_bundle"
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "skills.bundle.zip", root / "extracted"
+
+
+def _build_bundle_bytes(source_root: Path, source_hash: str, files: dict[str, str]) -> bytes:
+    import io
+    import zipfile
+
+    manifest = {
+        "format": 1,
+        "source_sha256": source_hash,
+        "files": files,
+    }
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        info = zipfile.ZipInfo(".bundle-manifest.json")
+        info.date_time = (1980, 1, 1, 0, 0, 0)
+        info.compress_type = zipfile.ZIP_DEFLATED
+        zf.writestr(info, json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        for rel in sorted(files):
+            info = zipfile.ZipInfo(rel)
+            info.date_time = (1980, 1, 1, 0, 0, 0)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            zf.writestr(info, (source_root / rel).read_bytes())
+    return out.getvalue()
+
+
+def _extract_bundle(bundle_bytes: bytes, extracted_root: Path, expected_hash: str) -> Path:
+    import io
+    import zipfile
+
+    tmp = extracted_root.with_name(f"{extracted_root.name}.tmp-{os.getpid()}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(io.BytesIO(bundle_bytes)) as zf:
+            raw = zf.read(".bundle-manifest.json")
+            manifest = json.loads(raw.decode("utf-8"))
+            if manifest.get("source_sha256") != expected_hash:
+                raise ValueError("skills bundle source hash mismatch")
+            names = zf.namelist()
+            for name in names:
+                if name == ".bundle-manifest.json":
+                    continue
+                if not _is_safe_relpath(name):
+                    raise ValueError(f"unsafe skills bundle path: {name!r}")
+                target = tmp / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(name) as src, target.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+        shutil.rmtree(extracted_root, ignore_errors=True)
+        os.replace(tmp, extracted_root)
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    return extracted_root
+
+
+async def _ensure_packaged_skill_bundle() -> Path | None:
+    """Build/upload the project skills bundle when needed, then extract it once.
+
+    R2 intentionally stores exactly one skills object: ``skills/skills.bundle.zip``.
+    The ZIP contains its own manifest, including the source content hash. A HEAD
+    metadata check avoids downloading/uploading an unchanged bundle. The extracted
+    directory is process-local cache shared by every workspace.
     """
-    source_root = _project_skill_source_root()
+    global _bundle_source_root, _bundle_source_hash
+    async with _bundle_lock:
+        source_root = _project_skill_source_root()
+        if source_root is None:
+            return None
+        source_hash, files = await asyncio.to_thread(_source_snapshot, source_root)
+        zip_path, extracted_root = _bundle_cache_paths()
+
+        from s3_utils import (
+            get_r2_object_metadata, download_from_r2, is_r2_configured,
+            upload_bytes_to_r2, list_r2_objects, delete_r2_object,
+        )
+
+        remote_meta = await get_r2_object_metadata(_SKILLS_BUNDLE_KEY)
+        remote_hash = (remote_meta or {}).get("skills-sha256", "")
+        bundle_bytes: bytes | None = None
+
+        if remote_hash == source_hash:
+            if zip_path.is_file():
+                try:
+                    bundle_bytes = await asyncio.to_thread(zip_path.read_bytes)
+                except OSError:
+                    bundle_bytes = None
+            if bundle_bytes is None:
+                bundle_bytes = await download_from_r2(_SKILLS_BUNDLE_KEY)
+        else:
+            bundle_bytes = await asyncio.to_thread(_build_bundle_bytes, source_root, source_hash, files)
+            if is_r2_configured() or bundle_bytes is not None:
+                await upload_bytes_to_r2(
+                    bundle_bytes,
+                    _SKILLS_BUNDLE_KEY,
+                    "application/zip",
+                    metadata={"skills-sha256": source_hash, "skills-format": "1"},
+                )
+
+        if bundle_bytes is None:
+            # R2 may be unavailable. A local build is still sufficient for the
+            # current process and preserves the deployment's local behavior.
+            bundle_bytes = await asyncio.to_thread(_build_bundle_bytes, source_root, source_hash, files)
+
+        # One-time compatibility cleanup: older releases stored individual skill
+        # files below skills/<namespace>/. Keep the new R2 namespace strictly to
+        # the single bundle object. This is intentionally best-effort.
+        if is_r2_configured() and not remote_meta:
+            try:
+                old_keys = await list_r2_objects("skills")
+                for key in old_keys:
+                    if key != _SKILLS_BUNDLE_KEY:
+                        await delete_r2_object(key)
+            except Exception:
+                logger.warning("清理旧的逐文件 Skills R2 对象失败", exc_info=True)
+
+        await asyncio.to_thread(zip_path.write_bytes, bundle_bytes)
+        await asyncio.to_thread(_extract_bundle, bundle_bytes, extracted_root, source_hash)
+        _bundle_source_root = extracted_root
+        _bundle_source_hash = source_hash
+        return extracted_root
+
+
+def _bundle_or_project_source_root() -> Path | None:
+    return _bundle_source_root or _project_skill_source_root()
+
+
+def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
+    """Synchronize the unpacked packaged bundle into a runtime workspace safely."""
+    source_root = _bundle_or_project_source_root()
     dest_root = Path(workspace_root) / SKILL_ASSETS_DIRNAME
     summary: dict[str, Any] = {
         "synced": 0, "files": 0, "copied": 0, "updated": 0,
@@ -354,7 +489,7 @@ def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
         "path": str(dest_root),
     }
     if source_root is None:
-        summary["errors"].append("No packaged skill directory found")
+        summary["errors"].append("No packaged skill bundle/source found")
         return summary
 
     try:
@@ -362,7 +497,6 @@ def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
         previous = _load_packaged_manifest(dest_root)
         current: dict[str, str] = {}
         source_files = list(_iter_files(source_root))
-
         for src_path in source_files:
             rel = src_path.relative_to(source_root)
             rel_key = rel.as_posix()
@@ -371,36 +505,29 @@ def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
             src_hash = _file_sha256(src_path)
             current[rel_key] = src_hash
             dst = dest_root / rel
-
             if not dst.exists():
                 _atomic_copy(src_path, dst)
                 summary["copied"] += 1
                 continue
-
             previous_hash = previous.get(rel_key)
             try:
                 dst_hash = _file_sha256(dst)
             except OSError as exc:
                 summary["errors"].append(f"{rel_key}: {exc}")
                 continue
-
             if dst_hash == src_hash:
-                # Already current.
                 continue
             if previous_hash and dst_hash == previous_hash:
                 _atomic_copy(src_path, dst)
                 summary["updated"] += 1
             else:
-                # The destination was changed after the previous packaged
-                # install (or predates the manifest): treat it as runtime-owned.
                 summary["preserved_user_edits"] += 1
 
-        manifest_payload = json.dumps({"version": 1, "files": current}, ensure_ascii=False, indent=2) + "\n"
+        manifest_payload = json.dumps({"version": 1, "bundle_sha256": _bundle_source_hash, "files": current}, ensure_ascii=False, indent=2) + "\n"
         manifest_path = dest_root / _PACKAGED_MANIFEST_NAME
         tmp = manifest_path.with_name(f".{manifest_path.name}.tmp-{os.getpid()}")
         tmp.write_text(manifest_payload, encoding="utf-8")
         os.replace(tmp, manifest_path)
-
         summary.update({
             "synced": len({p.name for p in source_root.iterdir() if p.is_dir()}),
             "files": len(current),
@@ -411,19 +538,8 @@ def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
     return summary
 
 
-def _workspace_namespace_dirs() -> list[Path]:
-    try:
-        from workspace_paths import workspaces_root
-        root = workspaces_root()
-    except Exception:
-        return []
-    if not root.is_dir():
-        return []
-    return [p for p in sorted(root.iterdir()) if p.is_dir() and not p.is_symlink()]
-
-
 def sync_packaged_skills_for_existing_workspaces() -> dict[str, Any]:
-    """Refresh packaged skills for every workspace that already exists on disk."""
+    """Refresh packaged skills for every existing workspace from the unpacked bundle."""
     results: dict[str, Any] = {"workspaces": 0, "copied": 0, "updated": 0, "preserved": 0, "errors": []}
     for home in _workspace_namespace_dirs():
         try:
@@ -438,30 +554,29 @@ def sync_packaged_skills_for_existing_workspaces() -> dict[str, Any]:
     return results
 
 
-def _packaged_source_fingerprint() -> str:
+def _project_source_fingerprint() -> str:
     root = _project_skill_source_root()
     if root is None:
         return ""
+    # Fast watcher path: metadata only. The expensive content hash is computed
+    # only after this fingerprint changes.
     items: list[str] = []
     for path in _iter_files(root):
         try:
             stat = path.stat()
-            rel = path.relative_to(root).as_posix()
-            items.append(f"{rel}\0{stat.st_size}\0{stat.st_mtime_ns}")
+            items.append(f"{path.relative_to(root).as_posix()}\0{stat.st_size}\0{stat.st_mtime_ns}")
         except OSError:
             continue
     return hashlib.sha256("\n".join(sorted(items)).encode()).hexdigest()
 
 
 async def start_packaged_skill_auto_sync() -> None:
-    """Synchronize existing workspaces immediately, then watch for source changes."""
+    """Build/upload the bundle once, then watch the project source for changes."""
     global _sync_watcher_task, _sync_watcher_stop
     if _sync_watcher_task and not _sync_watcher_task.done():
         return
 
-    # Critical path: do one complete refresh before the service begins consuming
-    # user messages, so a deployment never needs a "first message" to hydrate
-    # the skills directory. Keep the file walk off the event loop.
+    await _ensure_packaged_skill_bundle()
     initial = await asyncio.to_thread(sync_packaged_skills_for_existing_workspaces)
     logger.info(
         "startup packaged skills refresh: workspaces=%s copied=%s updated=%s preserved=%s errors=%s",
@@ -471,13 +586,9 @@ async def start_packaged_skill_auto_sync() -> None:
 
     stop_event = asyncio.Event()
     _sync_watcher_stop = stop_event
-    source_fingerprint = _packaged_source_fingerprint()
+    source_fingerprint = _project_source_fingerprint()
 
     async def _watch() -> None:
-        # Keep a stable local reference to the stop event.  Shutdown clears the
-        # module-level handle after signalling the watcher; reading the global
-        # from here creates a race where the task can resume between awaits and
-        # hit ``None.is_set()``.
         last = source_fingerprint
         try:
             while not stop_event.is_set():
@@ -487,11 +598,10 @@ async def start_packaged_skill_auto_sync() -> None:
                     pass
                 if stop_event.is_set():
                     break
-
-                fingerprint = _packaged_source_fingerprint()
+                fingerprint = _project_source_fingerprint()
                 if fingerprint == last:
                     continue
-
+                await _ensure_packaged_skill_bundle()
                 result = await asyncio.to_thread(sync_packaged_skills_for_existing_workspaces)
                 logger.info(
                     "packaged skills auto-refresh: workspaces=%s copied=%s updated=%s preserved=%s errors=%s",
@@ -509,46 +619,18 @@ async def start_packaged_skill_auto_sync() -> None:
 
 async def stop_packaged_skill_auto_sync() -> None:
     global _sync_watcher_task, _sync_watcher_stop
-
-    # Snapshot the handles before changing module-level state.  The watcher
-    # itself owns a stable local Event reference, so clearing this global is
-    # now safe even if the task is resumed during shutdown.
     stop_event = _sync_watcher_stop
     task = _sync_watcher_task
-
     if stop_event is not None:
         stop_event.set()
-
     if task is not None:
-        task.cancel()
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-    # Only clear the globals after the task has fully stopped.  This makes the
-    # lifecycle easier to reason about and avoids exposing half-torn-down state
-    # to concurrent startup/shutdown calls.
+            await asyncio.wait_for(task, timeout=2.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     _sync_watcher_task = None
     _sync_watcher_stop = None
-
-
-def catalog_text() -> str:
-    """生成系统提示词用的 skill 目录，每行格式：name - description。"""
-    records = load_skill_records()
-    lines = []
-    for rec in records:
-        desc = rec.description.strip() if rec.description else "(no description)"
-        lines.append(f"{rec.name} - {desc}")
-    return "\n".join(lines)
-
-
-def read_skill_text(skill_id: str) -> str:
-    data = read_skill(skill_id)
-    if "error" in data:
-        return data["error"]
-    payload = {
-        "skill": data["skill"],
-        "body": data["body"],
-    }
-    return json.dumps(payload, ensure_ascii=False, indent=2)
