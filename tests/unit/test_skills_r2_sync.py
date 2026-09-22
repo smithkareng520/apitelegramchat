@@ -1,12 +1,11 @@
-"""Skills bundle R2 persistence and workspace bootstrap tests."""
+"""skills/ R2 压缩快照同步回归测试。"""
 from __future__ import annotations
 
 import asyncio
 import io
-import json
-import sys
-import zipfile
+import tarfile
 from pathlib import Path
+import sys
 
 SRC = Path(__file__).resolve().parents[2] / "src"
 if str(SRC) not in sys.path:
@@ -14,7 +13,6 @@ if str(SRC) not in sys.path:
 
 import workspace_paths as wp
 import workspace_utils as wu
-import skills
 
 NS = "10001"
 CHAT_ID = 12345
@@ -23,39 +21,31 @@ CHAT_ID = 12345
 class _FakeR2:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
-        self.metadata: dict[str, dict[str, str]] = {}
-        self.uploads = 0
-
-    async def get_r2_object_metadata(self, key: str):
-        if key not in self.objects:
-            return None
-        return self.metadata.get(key, {})
 
     async def download_from_r2(self, key: str):
         data = self.objects.get(key)
         return bytes(data) if data is not None else None
 
-    async def upload_bytes_to_r2(self, data: bytes, key: str, content_type: str = "", metadata=None):
+    async def upload_bytes_to_r2(self, data: bytes, key: str, content_type: str = ""):
         self.objects[key] = bytes(data)
-        self.metadata[key] = {str(k).lower(): str(v) for k, v in (metadata or {}).items()}
-        self.uploads += 1
         return key
 
+    async def list_r2_objects(self, prefix: str):
+        p = prefix.rstrip("/") + "/"
+        return sorted(k for k in self.objects if k.startswith(p))
 
-def _fresh_env(monkeypatch, tmp_path):
+    async def delete_r2_object(self, key: str) -> bool:
+        return self.objects.pop(key, None) is not None
+
+
+def _fresh_env(monkeypatch, tmp_path) -> _FakeR2:
     data_dir = tmp_path / "data"
-    home_dir = tmp_path / "home"
-    packaged = tmp_path / "packaged_skills"
-    (packaged / "demo" / "scripts").mkdir(parents=True, exist_ok=True)
-    (packaged / "demo" / "SKILL.md").write_text(
-        "---\nname: demo\npriority: 1\n---\nbody\n", encoding="utf-8"
-    )
-    (packaged / "demo" / "scripts" / "run.py").write_text("print('ok')\n", encoding="utf-8")
-
     monkeypatch.setenv("APITELEGRAMCHAT_DATA_DIR", str(data_dir))
-    monkeypatch.setenv("APITELEGRAMCHAT_WORKSPACES_DIR", str(home_dir))
+    monkeypatch.setenv("APITELEGRAMCHAT_WORKSPACES_DIR", str(tmp_path / "home"))
+    packaged = tmp_path / "packaged_skills"
+    (packaged / "demo").mkdir(parents=True)
+    (packaged / "demo" / "SKILL.md").write_text("v1", encoding="utf-8")
     monkeypatch.setenv("APITELEGRAMCHAT_SKILLS_DIR", str(packaged))
-    monkeypatch.setenv("APITELEGRAMCHAT_SKILLS_BUNDLE_KEY", "skills/skills.bundle.zip")
 
     wp.data_root.cache_clear()
     wp.workspaces_root.cache_clear()
@@ -63,81 +53,113 @@ def _fresh_env(monkeypatch, tmp_path):
     wu._workspace_initialized.clear()
     wu._workspace_init_lock_registry._locks.clear()
     wu._workspace_file_locks._locks.clear()
-    skills._bundle_source_root = None
-    skills._bundle_source_hash = ""
-    skills._bundle_lock = asyncio.Lock()
 
     fake = _FakeR2()
-    import s3_utils
-    monkeypatch.setattr(s3_utils, "is_r2_configured", lambda: True)
-    monkeypatch.setattr(s3_utils, "get_r2_object_metadata", fake.get_r2_object_metadata)
-    monkeypatch.setattr(s3_utils, "download_from_r2", fake.download_from_r2)
-    monkeypatch.setattr(s3_utils, "upload_bytes_to_r2", fake.upload_bytes_to_r2)
-    return fake, packaged, home_dir
+    monkeypatch.setattr(wu, "is_r2_configured", lambda: True)
+    monkeypatch.setattr(wu, "download_from_r2", fake.download_from_r2)
+    monkeypatch.setattr(wu, "upload_bytes_to_r2", fake.upload_bytes_to_r2)
+    monkeypatch.setattr(wu, "list_r2_objects", fake.list_r2_objects)
+    monkeypatch.setattr(wu, "delete_r2_object", fake.delete_r2_object)
+    return fake
 
 
-def test_deploy_builds_one_zip_in_r2(monkeypatch, tmp_path):
-    fake, _, _ = _fresh_env(monkeypatch, tmp_path)
-
-    asyncio.run(skills._ensure_packaged_skill_bundle())
-
-    assert list(fake.objects) == ["skills/skills.bundle.zip"]
-    bundle = fake.objects["skills/skills.bundle.zip"]
-    assert zipfile.is_zipfile(io.BytesIO(bundle))
-    with zipfile.ZipFile(io.BytesIO(bundle)) as zf:
-        manifest = json.loads(zf.read(".bundle-manifest.json"))
-        assert manifest["format"] == 1
-        assert "demo/SKILL.md" in manifest["files"]
-        assert "demo/scripts/run.py" in manifest["files"]
-    assert fake.metadata["skills/skills.bundle.zip"]["skills-sha256"] == manifest["source_sha256"]
+def _skills_dir() -> Path:
+    return wp.workspace_skills_root(CHAT_ID, NS)
 
 
-def test_unchanged_deploy_does_not_upload_again(monkeypatch, tmp_path):
-    fake, _, _ = _fresh_env(monkeypatch, tmp_path)
-    asyncio.run(skills._ensure_packaged_skill_bundle())
-    assert fake.uploads == 1
-
-    # Simulate a fresh process: remote metadata is enough to avoid a new upload.
-    skills._bundle_source_root = None
-    skills._bundle_source_hash = ""
-    asyncio.run(skills._ensure_packaged_skill_bundle())
-    assert fake.uploads == 1
-
-
-def test_skill_change_rebuilds_and_replaces_same_r2_object(monkeypatch, tmp_path):
-    fake, packaged, _ = _fresh_env(monkeypatch, tmp_path)
-    asyncio.run(skills._ensure_packaged_skill_bundle())
-    old = fake.objects["skills/skills.bundle.zip"]
-
-    (packaged / "demo" / "SKILL.md").write_text(
-        "---\nname: demo\npriority: 1\n---\nchanged\n", encoding="utf-8"
-    )
-    skills._bundle_source_root = None
-    skills._bundle_source_hash = ""
-    asyncio.run(skills._ensure_packaged_skill_bundle())
-
-    assert fake.uploads == 2
-    assert fake.objects["skills/skills.bundle.zip"] != old
-    assert list(fake.objects) == ["skills/skills.bundle.zip"]
+def _wipe_disk(tmp_path) -> None:
+    import shutil
+    shutil.rmtree(tmp_path / "data", ignore_errors=True)
+    shutil.rmtree(tmp_path / "home", ignore_errors=True)
+    wp.data_root.cache_clear()
+    wp.workspaces_root.cache_clear()
+    wp._home_migrated.clear()
+    wu._workspace_initialized.clear()
+    wu._workspace_init_lock_registry._locks.clear()
+    wu._workspace_file_locks._locks.clear()
 
 
-def test_workspace_unpacks_bundle_once_and_preserves_user_edit(monkeypatch, tmp_path):
-    fake, packaged, home_dir = _fresh_env(monkeypatch, tmp_path)
-    asyncio.run(skills._ensure_packaged_skill_bundle())
+def test_first_init_bootstraps_and_uploads_only_archive(monkeypatch, tmp_path):
+    fake = _fresh_env(monkeypatch, tmp_path)
+    asyncio.run(wu.init_workspace(CHAT_ID, NS))
 
-    home = home_dir / NS
-    first = skills.sync_all_skill_assets_to_workspace(home)
-    assert first["copied"] == 2
-    assert (home / "skills/demo/SKILL.md").read_text(encoding="utf-8").endswith("body\n")
+    local = _skills_dir()
+    assert (local / "demo" / "SKILL.md").read_text() == "v1"
+    assert list(fake.objects) == [f"skills/{NS}/skills.tar.gz"]
+    assert fake.objects[f"skills/{NS}/skills.tar.gz"].startswith(b"\x1f\x8b")
 
-    (home / "skills/demo/SKILL.md").write_text("user edit\n", encoding="utf-8")
-    (packaged / "demo" / "SKILL.md").write_text(
-        "---\nname: demo\n---\nserver update\n", encoding="utf-8"
-    )
-    skills._bundle_source_root = None
-    skills._bundle_source_hash = ""
-    asyncio.run(skills._ensure_packaged_skill_bundle())
-    second = skills.sync_all_skill_assets_to_workspace(home)
-    assert second["preserved_user_edits"] == 1
-    assert (home / "skills/demo/SKILL.md").read_text(encoding="utf-8") == "user edit\n"
-    assert fake.uploads == 2
+    with tarfile.open(fileobj=io.BytesIO(fake.objects[f"skills/{NS}/skills.tar.gz"]), mode="r:gz") as tf:
+        assert tf.getnames() == [".packaged-manifest.json", "demo/SKILL.md"]
+
+
+def test_snapshot_roundtrip_after_restart(monkeypatch, tmp_path):
+    fake = _fresh_env(monkeypatch, tmp_path)
+    asyncio.run(wu.init_workspace(CHAT_ID, NS))
+
+    custom = _skills_dir() / "my-skill" / "SKILL.md"
+    custom.parent.mkdir(parents=True)
+    custom.write_text("custom", encoding="utf-8")
+    asyncio.run(wu._backup_user_skills_to_r2(_skills_dir().parent, NS))
+
+    _wipe_disk(tmp_path)
+    asyncio.run(wu.init_workspace(CHAT_ID, NS))
+
+    assert (_skills_dir() / "demo" / "SKILL.md").read_text() == "v1"
+    assert (_skills_dir() / "my-skill" / "SKILL.md").read_text() == "custom"
+    assert list(fake.objects) == [f"skills/{NS}/skills.tar.gz"]
+
+
+def test_snapshot_replaces_deleted_files(monkeypatch, tmp_path):
+    fake = _fresh_env(monkeypatch, tmp_path)
+    asyncio.run(wu.init_workspace(CHAT_ID, NS))
+    custom = _skills_dir() / "my-skill" / "SKILL.md"
+    custom.parent.mkdir(parents=True)
+    custom.write_text("custom", encoding="utf-8")
+    asyncio.run(wu._backup_user_skills_to_r2(_skills_dir().parent, NS))
+
+    custom.unlink()
+    custom.parent.rmdir()
+    asyncio.run(wu._backup_user_skills_to_r2(_skills_dir().parent, NS))
+
+    _wipe_disk(tmp_path)
+    asyncio.run(wu.init_workspace(CHAT_ID, NS))
+    assert not (_skills_dir() / "my-skill").exists()
+    assert list(fake.objects) == [f"skills/{NS}/skills.tar.gz"]
+
+
+def test_tree_fingerprint_does_not_read_content_or_hash(monkeypatch, tmp_path):
+    _fresh_env(monkeypatch, tmp_path)
+    skills = _skills_dir()
+    (skills / "demo").mkdir(parents=True, exist_ok=True)
+    path = skills / "demo" / "SKILL.md"
+    path.write_text("content", encoding="utf-8")
+
+    fingerprint = wu._skills_tree_fingerprint(skills)
+    assert fingerprint[0][0] == "demo/SKILL.md"
+    assert fingerprint[0][1] == len(b"content")
+    assert fingerprint[0][2] == path.stat().st_mtime_ns
+
+
+def test_unsafe_archive_path_is_rejected(monkeypatch, tmp_path):
+    _fresh_env(monkeypatch, tmp_path)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
+        data = b"escape"
+        info = tarfile.TarInfo("../escape")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+
+    try:
+        wu._extract_skills_archive(buffer.getvalue(), _skills_dir())
+    except ValueError as exc:
+        assert "unsafe skills archive path" in str(exc)
+    else:
+        raise AssertionError("unsafe archive path was accepted")
+
+
+def test_r2_unconfigured_keeps_local_behavior(monkeypatch, tmp_path):
+    fake = _fresh_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(wu, "is_r2_configured", lambda: False)
+    asyncio.run(wu.init_workspace(CHAT_ID, NS))
+    assert (_skills_dir() / "demo" / "SKILL.md").is_file()
+    assert fake.objects == {}

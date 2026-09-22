@@ -100,7 +100,6 @@ async def upload_bytes_to_r2(
     data: bytes,
     key: str,
     content_type: str = "application/octet-stream",
-    metadata: dict[str, str] | None = None,
 ) -> str | None:
     """Upload bytes to R2, or fall back to a local cache when R2 is unavailable."""
     if not is_r2_configured():
@@ -138,7 +137,6 @@ async def upload_bytes_to_r2(
                     Key=key,
                     Body=data,
                     ContentType=content_type,
-                    **({"Metadata": metadata} if metadata else {}),
                 )
             logger.info("R2 上传成功：%s", key)
             # R2 S3 API endpoint 并非公开 URL，带签名才能匿名读取。对外交付
@@ -256,43 +254,6 @@ async def file_exists_in_r2(key: str) -> bool:
     except Exception as e:
         logger.warning("R2 head_object failed: %s", e)
         return False
-
-
-async def get_r2_object_metadata(key: str) -> dict[str, str] | None:
-    """Return object metadata without downloading the object.
-
-    For the skills bundle this is used to compare the source content hash with
-    the bundle already stored in R2, so an unchanged deployment does not upload
-    or download the ZIP just to discover that it is current.
-    """
-    if not is_r2_configured():
-        path = _safe_local_key_path(key)
-        if not path.is_file():
-            return None
-        return {}
-
-    assert session is not None
-    try:
-        async with session.client(
-            "s3",
-            endpoint_url=R2_ENDPOINT,
-            aws_access_key_id=R2_ACCESS_KEY,
-            aws_secret_access_key=R2_SECRET_KEY,
-            region_name=R2_REGION,
-            config=_R2_CONFIG,
-        ) as s3:
-            resp = await s3.head_object(Bucket=R2_BUCKET_NAME, Key=key)
-        raw = resp.get("Metadata") or {}
-        return {str(k).lower(): str(v) for k, v in raw.items()}
-    except ClientError as e:
-        code = getattr(e, "response", {}).get("Error", {}).get("Code")
-        if code in {"404", "NoSuchKey", "NotFound"}:
-            return None
-        logger.warning("R2 head metadata error: %s", e)
-        return None
-    except Exception as e:
-        logger.warning("R2 head metadata failed: %s", e)
-        return None
 
 
 async def list_r2_objects(prefix: str) -> list[str]:

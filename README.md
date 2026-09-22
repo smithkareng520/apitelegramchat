@@ -460,7 +460,7 @@ LLM 上下文（只要高价值字段）。`tool_result_condense.py` 统一承�
 └── <chat-or-scope>/        # agent 家目录：$HOME = bash 起始 cwd = Landlock 唯一放行边界
     ├── download/            # Telegram 上传文件的落地目录
     ├── upload/              # 准备发送给用户的文件
-    ├── skills/              # 技能包目录（运行时从 R2 单 ZIP bundle 解压）
+    ├── skills/              # 技能包目录（R2 定向同步：重启后自动找回）
     └── .runtime/            # 隐藏缓存层（bin/pip/ccache/HF/tmp/... + runtime.json）
 
 <data-root>/                 # 内部状态（APITELEGRAMCHAT_DATA_DIR，对沙箱不可见）
@@ -887,18 +887,3 @@ Anthropic / Gemini 两条原生循环的共享骨架（初始化、assistant 消
 ## License
 
 见 [LICENSE](LICENSE)。
-
-
-### Skills Bundle 同步
-
-项目不会把预打包的 ZIP 提交到仓库。部署启动时，服务从项目 `.claude/skills/` 生成一个确定性的 `skills/skills.bundle.zip`，并写入 R2；ZIP 内含自己的 manifest 和 Skills 内容哈希。
-
-- Skills 未变化：通过 R2 `HEAD` 元数据比较 `skills-sha256`，不重复上传。
-- Skills 有变化：重新生成 ZIP，并覆盖 R2 中同一个 `skills/skills.bundle.zip` 对象。
-- R2 的 Skills 存储只保留这一个 ZIP，不再逐文件上传 `skills/{namespace}/...`。
-- 进程启动时只需下载/读取一次 ZIP，并解压到内部缓存；所有 workspace 共用解压后的源目录。
-- workspace 内仍保留 `.packaged-manifest.json`，用于保护用户运行期修改：服务器更新 Skills 时，只覆盖此前由系统安装且未被用户修改的文件。
-- ZIP 解压包含路径安全校验，拒绝 `..` 等路径穿越。
-- watcher 检测项目 `.claude/skills` 变化后重新打包并上传；R2 key 保持不变。
-
-可通过 `APITELEGRAMCHAT_SKILLS_BUNDLE_KEY` 修改默认 R2 key（默认 `skills/skills.bundle.zip`）。
