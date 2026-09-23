@@ -637,7 +637,8 @@ MEMORY_TOOL = {
     "function": {
         "name": "memory",
         "description": (
-            "Persistent per-chat long-term memory store. Use to remember facts, preferences, people, events, or any note that should survive across sessions (unlike short-lived conversation history). 7 actions: add / get / list / search / update / delete / clear. Each memory carries category, tags, and importance (low/medium/high). Write when the user mentions something worth remembering; search before answering preference-related questions."
+            "Persistent per-chat long-term memory. Actions: add, get, list, search, update, delete, clear. "
+            "Use for facts, preferences, people, events, or notes that should survive across sessions."
         ),
         "parameters": {
             "type": "object",
@@ -645,49 +646,61 @@ MEMORY_TOOL = {
                 "action": {
                     "type": "string",
                     "enum": ["add", "get", "list", "search", "update", "delete", "clear"],
-                    "description": "要执行的操作。默认 list。"
+                    "description": "Action to perform. Default: `list`.",
+                    "default": "list"
                 },
                 "content": {
                     "type": "string",
-                    "description": "记忆内容。add/update 必填。最多 2,000 tokens。"
+                    "description": "Memory content. Required for `add`/`update`.",
+                    "minLength": 1
                 },
                 "memory_id": {
                     "type": "string",
-                    "description": "目标记忆 id：8 位 hex。可带 # 前缀。get/update/delete 必填。"
+                    "description": "Memory id for `get`, `update`, or `delete`.",
+                    "minLength": 1
                 },
                 "category": {
                     "type": "string",
-                    "description": "记忆分类。内置：fact / preference / person / event / note；也可用自定义字符串。"
+                    "description": "Category, such as `fact`, `preference`, `person`, `event`, or `note`.",
+                    "minLength": 1
                 },
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "可选标签，最多 8 个，每个最多 24 tokens。也接受逗号/空格分隔的字符串。"
+                    "description": "Optional tags; up to 8.",
+                    "maxItems": 8
                 },
                 "importance": {
                     "type": "string",
                     "enum": ["low", "medium", "high"],
-                    "description": "重要程度，默认 medium。"
+                    "description": "Importance. Default: `medium`.",
+                    "default": "medium"
                 },
                 "query": {
                     "type": "string",
-                    "description": "搜索查询（仅 search）。对 content+tags+category 做子串匹配。"
+                    "description": "Search query for `search`; matches content, tags, and category.",
+                    "minLength": 1
                 },
                 "scope": {
                     "type": "string",
-                    "description": "清除范围。可选：all（默认）、category:<名称>、tag:<名称>。"
+                    "description": "Clear scope: `all`, `category:<name>`, or `tag:<name>`. Default: `all`.",
+                    "default": "all"
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "list/search 返回上限。默认 50，最大 500。",
+                    "minimum": 1,
+                    "maximum": 500,
+                    "description": "Maximum results for `list`/`search`. Default: 50.",
                     "default": 50
                 },
                 "source": {
                     "type": "string",
-                    "description": "记忆来源。agent（默认）或 user。"
+                    "description": "Memory source. Default: `agent`.",
+                    "default": "agent"
                 }
             },
-            "required": ["action"]
+            "required": ["action"],
+            "additionalProperties": False
         },
         "input_examples": [
             {"action": "add", "content": "用户对花生过敏", "category": "fact", "importance": "high", "tags": ["健康", "过敏"]},

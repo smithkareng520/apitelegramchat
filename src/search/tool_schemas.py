@@ -79,31 +79,20 @@ MESSAGE_USER_TOOL = {
     "type": "function",
     "function": {
         "name": "message_user",
-        "description": (
-            "Send a message to the user and optionally wait for their reply. Two use cases: "
-            "(a) ask a clarifying question — provide 2-6 concise options as buttons; "
-            "(b) message the user — omit options entirely and the question is delivered "
-            "as a plain text message, like texting a friend: you send it, wait briefly "
-            "(default 2 minutes), and if there is no reply the user is simply away. Any "
-            "text the user types next is returned as the reply. "
-            "The tool suspends until the user answers in Telegram, the user cancels, or the "
-            "timeout (default 2 minutes) elapses. A timeout returns {\"type\":\"expired\"} which "
-            "simply means the user is currently away — it is NOT an error; wrap up the turn "
-            "gracefully (after a timeout the sent message stays in the chat as plain text). "
-            "In proactive/background turns this is also the natural channel to reach the user. "
-            "Never call this tool more than once in the same tool-call batch."
-        ),
+        "description": ("Send a message to the user and optionally wait for a reply. "
+            "For a choice question, provide 2-6 options; for a plain message, omit `options`. "
+            "A timeout means the user is away, not an error. Never call more than once in one batch."),
         "parameters": {
             "type": "object",
             "properties": {
                 "question": {
                     "type": "string",
-                    "description": "消息正文（问题或通知内容）。清晰、具体；不要重复用户已明确提供的信息。"
+                    "minLength": 1, "description": "Message or question to send. Be clear and specific."
                 },
                 "options": {
                     "type": "array",
-                    "minItems": 0,
-                    "maxItems": 8,
+                    "minItems": 2,
+                    "maxItems": 6,
                     "description": (
                         "可选的选项列表。提供时渲染为按钮提问卡；完全省略（或空数组）则为"
                         "给用户发消息模式（纯文本消息，像给朋友发一条消息），等待用户自由"
@@ -112,25 +101,27 @@ MESSAGE_USER_TOOL = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "稳定的内部选项 ID。"},
-                            "label": {"type": "string", "description": "按钮上显示的简短文字。"},
-                            "description": {"type": "string", "description": "可选的补充说明。"}
+                            "id": {"type": "string", "minLength": 1, "description": "Stable option id."},
+                            "label": {"type": "string", "minLength": 1, "description": "Button label."},
+                            "description": {"type": "string", "description": "Optional supporting text."}
                         },
-                        "required": ["id", "label"]
+                        "required": ["id", "label"],
+                        "additionalProperties": False
                     }
                 },
                 "multiple": {
                     "type": "boolean",
                     "default": False,
-                    "description": "是否允许多选（仅提问模式）。多选时用户需要点击提交。"
+                    "description": "Allow multiple selections. Only used with `options`."
                 },
                 "allow_custom": {
                     "type": "boolean",
                     "default": True,
-                    "description": "是否允许用户放弃预设选项，直接输入自定义回答（仅提问模式）。"
+                    "description": "Allow a free-form reply instead of an option."
                 }
             },
-            "required": ["question"]
+            "required": ["question"],
+            "additionalProperties": False
         }
     }
 }
@@ -188,20 +179,10 @@ def build_deliver_reply_tool(default_send: bool = False) -> dict:
         "type": "function",
         "function": {
             "name": "deliver_reply",
-            "description": (
-                "仅在草稿预览关闭（静默模式，/show off）时可用：通过 send 参数决定是否"
-                "把你当前这条消息的正文（即本轮最后一条助手内容的 content 字段本身，"
-                "不含其他内容）作为一条永久富文本消息（Telegram Rich HTML）通过 "
-                "sendRichMessage 直接发送给用户，不经过草稿。send=true：发送——系统发送"
-                "的就是你当前消息的正文本身，因此正确用法是先把完整、自包含的最终回复"
-                "直接写成消息正文，再在同一条消息里调用本工具并填 send=true。"
+            "description": ("Deliver the current assistant message in silent mode. "
+                "send=true sends the current message body; false suppresses delivery. "
                 + default_clause
-                + " 重要：在正文中用文字\"提到\"或\"声称已使用\"本工具不会产生任何"
-                "效果——只有通过标准 tool_calls API 机制真正发起调用才会执行。静默模式下"
-                "你的流式输出不会自动送达用户。交付成功后不要再调用本工具，也不要输出"
-                "\"已发送/已确认\"之类的确认正文——用户已经收到，重复确认只会造成冗余"
-                "消息。需要提问或留言可用 message_user（其超时表示用户不在，不是错误）。"
-            ),
+                + " Call only for the final answer; after success, do not call again or add a confirmation."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -211,7 +192,8 @@ def build_deliver_reply_tool(default_send: bool = False) -> dict:
                         "default": bool(default_send),
                     },
                 },
-                "required": []
+                "required": [],
+                "additionalProperties": False
             }
         }
     }
@@ -228,61 +210,67 @@ SEARCH_TOOLS = [
         "function": {
             "name": "web_search",
             "description": (
-                "Search Google via Serper. One tool, four modes (controlled by `mode`): "
-                "search (default, web pages), images (text-to-image), videos (text-to-video), "
-                "lens (reverse image search — pass `image_url`). "
-                "`mode` accepts a single value or an array of values to run multiple modes "
-                "in one call (e.g. [\"search\",\"images\"]). "
-                "For in-depth reading of a result, follow up with fetch_url (one URL per call)."
+                "Search the web, images, videos, or reverse-search an image. "
+                "Set `mode` to one mode or a list of modes; use `image_url` for lens. "
+                "Use `fetch_url` to read a specific result in depth."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "搜索关键词。search/images/videos 模式必填；lens 模式可选（用作文字约束）。",
+                        "minLength": 1,
+                        "description": "Search query. Required for search/images/videos; optional for lens.",
                     },
                     "mode": {
                         "type": ["string", "array"],
-                        "items": {"type": "string", "enum": ["search", "images", "videos", "lens"]},
-                        "description": "搜索模式：search（默认，网页）/ images（搜图）/ videos（搜视频）/ lens（以图搜图）。可传数组以一次性执行多个模式。",
+                        "items": {
+                            "type": "string",
+                            "enum": ["search", "images", "videos", "lens"],
+                        },
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "description": "Search mode(s). Default: search. A list runs multiple modes in one call.",
                         "default": "search",
                     },
                     "image_url": {
                         "type": "string",
-                        "description": "lens 模式必填：要反向搜索的图片 URL。其他模式忽略。",
+                        "minLength": 1,
+                        "description": "Image URL for lens mode. Ignored by other modes.",
                     },
                     "num_results": {
                         "type": "integer",
                         "description": (
-                            f"可选：单个 mode 的结果数上限。search: 1-{_SEARCH_MAX_RESULTS}（多页聚合）；"
-                            f"images/videos/lens: 1-100。不填时默认 {_SEARCH_DEFAULT_RESULTS} 条。"
+                            f"Maximum results per mode. search: 1-{_SEARCH_MAX_RESULTS}; "
+                            f"other modes: 1-100. Default: {_SEARCH_DEFAULT_RESULTS}."
                         ),
                         "minimum": 1,
                         "maximum": 100,
+                        "default": _SEARCH_DEFAULT_RESULTS,
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "可选：search 模式下的结果偏移量（向后翻页），从 0 开始；其他模式忽略。",
+                        "description": "Result offset for search mode; ignored by other modes.",
                         "minimum": 0,
+                        "default": 0,
                     },
                     "gl": {
                         "type": "string",
-                        "description": "可选：地区码（如 us / cn / al）。不填取默认 cn。",
+                        "description": "Region code, e.g. `us` or `cn`. Default: `cn`.",
+                        "default": "cn",
                     },
                     "hl": {
                         "type": "string",
-                        "description": "可选：界面语言（如 en / zh-cn / ar）。不填取默认 zh-cn。",
+                        "description": "Interface language, e.g. `en` or `zh-cn`. Default: `zh-cn`.",
+                        "default": "zh-cn",
                     },
                     "tbs": {
                         "type": "string",
-                        "description": (
-                            "可选：时间筛选。常用值：qdr:h（过去1小时）/ qdr:d（过去24小时）/ "
-                            "qdr:w（过去一周）/ qdr:m（过去一月）/ qdr:y（过去一年）。不填不限时间。"
-                        ),
+                        "description": "Time filter, e.g. `qdr:h`, `qdr:d`, `qdr:w`, `qdr:m`, or `qdr:y`.",
                     },
                 },
                 "required": [],
+                "additionalProperties": False,
                 "anyOf": [
                     {"required": ["query"]},
                     {"required": ["image_url"]}
@@ -304,20 +292,16 @@ SEARCH_TOOLS = [
         "function": {
             "name": "fetch_url",
             "description": (
-                "Fetch and read the full content of a specific URL. Returns the page rendered as Telegram Rich Message HTML "
-                "that mirrors the original page structure and order: headings, paragraphs, lists, tables, quotes, "
-                "code blocks, links and media (images, embedded videos, iframe players such as YouTube/Bilibili, "
-                "audio) all appear at their original positions; image carousels are grouped into <tg-slideshow>. "
-                "You may quote or reuse the relevant HTML fragments (including <img>/<video>/<a> tags with their "
-                "original URLs) directly in your reply. "
-                "Use when a search result needs deeper reading or the user gave you a link. One URL per call."
+                "Fetch and read a specific URL. Use for a user-provided link or a search result in depth. "
+                "One URL per call; rich HTML preserves page structure and embedded media."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "完整的 URL"}
+                    "url": {"type": "string", "minLength": 1, "description": "Full URL, including scheme."}
                 },
-                "required": ["url"]
+                "required": ["url"],
+                "additionalProperties": False
             }
         }
     },
@@ -326,21 +310,21 @@ SEARCH_TOOLS = [
         "function": {
             "name": "wikipedia",
             "description": (
-                "Look up a topic on Wikipedia by keyword and return the full article rendered as "
-                "Telegram Rich Message HTML mirroring the original page structure: headings, "
-                "paragraphs, lists, tables (episode lists, statistics), images and links all appear "
-                "at their original positions. The keyword is resolved to the best-matching page in "
-                "one step (no separate search needed). You may quote or reuse the relevant HTML "
-                "fragments (including <table>, <img>, <a> tags) directly in your reply. "
-                "Prefer for encyclopedic / factual / definitional queries."
+                "Look up a topic on Wikipedia by keyword. Use for encyclopedic, factual, or definitional questions."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "条目标题或关键词"},
-                    "lang": {"type": "string", "description": "语言代码（zh/en）", "default": "zh"}
+                    "query": {"type": "string", "minLength": 1, "description": "Page title or keyword."},
+                    "lang": {
+                        "type": "string",
+                        "enum": ["zh", "en"],
+                        "description": "Wikipedia language. Default: `zh`.",
+                        "default": "zh",
+                    }
                 },
-                "required": ["query"]
+                "required": ["query"],
+                "additionalProperties": False
             }
         }
     },
@@ -352,10 +336,23 @@ SEARCH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "base": {"type": "string", "description": "基础货币代码（如 USD、CNY）"},
-                    "target": {"type": "string", "description": "目标货币（可选）"}
+                    "base": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 3,
+                        "pattern": "^[A-Za-z]{3}$",
+                        "description": "Base currency code, e.g. `USD`.",
+                    },
+                    "target": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 3,
+                        "pattern": "^[A-Za-z]{3}$",
+                        "description": "Optional target currency code, e.g. `CNY`.",
+                    }
                 },
-                "required": ["base"]
+                "required": ["base"],
+                "additionalProperties": False
             }
         }
     },
@@ -364,21 +361,29 @@ SEARCH_TOOLS = [
         "function": {
             "name": "weather",
             "description": (
-                "Get weather conditions and forecasts for a city. Returns current conditions, "
-                "hourly forecast, and up to 5 days of daily forecast. "
-                "Use for any weather-related question. unit='c' (default) returns Celsius, "
-                "'f' returns Fahrenheit. The `hours` parameter (default 6, max 24) controls "
-                "how many hourly entries are returned — pass a larger value when the user "
-                "asks about the rest of the day or tomorrow morning."
+                "Get current weather and forecasts for a city. `unit` controls temperature units; "
+                "`hours` controls hourly forecast length."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "city": {"type": "string", "description": "城市名（如 Beijing、Shanghai）"},
-                    "unit": {"type": "string", "enum": ["c", "f"], "default": "c"},
-                    "hours": {"type": "integer", "default": 6, "description": "返回的逐时预报条数（1-24，默认 6）。需要更长展望时传大值。"}
+                    "city": {"type": "string", "minLength": 1, "description": "City name."},
+                    "unit": {
+                        "type": "string",
+                        "enum": ["c", "f"],
+                        "description": "Temperature unit. Default: Celsius (`c`).",
+                        "default": "c",
+                    },
+                    "hours": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 24,
+                        "description": "Hourly forecast entries. Default: 6.",
+                        "default": 6,
+                    }
                 },
-                "required": ["city"]
+                "required": ["city"],
+                "additionalProperties": False
             },
             "input_examples": [
                 {"city": "Beijing", "unit": "c", "hours": 12},
@@ -391,13 +396,14 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "geocode",
-            "description": "将地址或地名转换为经纬度坐标（地理编码）。",
+            "description": "Convert an address or place name to coordinates.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "address": {"type": "string", "description": "地址或地名，如“北京市海淀区中关村”。"}
+                    "address": {"type": "string", "minLength": 1, "description": "Address or place name."}
                 },
-                "required": ["address"]
+                "required": ["address"],
+                "additionalProperties": False
             }
         }
     },
@@ -405,17 +411,27 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "route",
-            "description": "统一规划骑行、步行、驾车或公交路线。origin 与 destination 必须是高德坐标“经度,纬度”；公交跨城时必须同时提供 city 和 cityd。",
+            "description": (
+                "Plan a cycling, walking, driving, or transit route. "
+                "`origin` and `destination` must be Gaode `longitude,latitude`; "
+                "cross-city transit also needs `city` and `cityd`."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "origin": {"type": "string", "description": "起点经纬度，格式为“经度,纬度”，例如“116.397128,39.916527”。"},
-                    "destination": {"type": "string", "description": "终点经纬度，格式为“经度,纬度”。"},
-                    "mode": {"type": "string", "enum": ["cycling", "walking", "driving", "transit"], "default": "driving", "description": "骑行、步行、驾车或公交。"},
-                    "city": {"type": "string", "description": "公交起点城市；跨城公交时必填。"},
-                    "cityd": {"type": "string", "description": "公交终点城市；跨城公交时必填。"}
+                    "origin": {"type": "string", "minLength": 1, "description": "Start coordinate as `longitude,latitude`."},
+                    "destination": {"type": "string", "minLength": 1, "description": "End coordinate as `longitude,latitude`."},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["cycling", "walking", "driving", "transit"],
+                        "description": "Route mode. Default: `driving`.",
+                        "default": "driving",
+                    },
+                    "city": {"type": "string", "description": "Transit origin city for cross-city transit."},
+                    "cityd": {"type": "string", "description": "Transit destination city for cross-city transit."}
                 },
-                "required": ["origin", "destination"]
+                "required": ["origin", "destination"],
+                "additionalProperties": False
             },
             "input_examples": [
                 {"origin": "116.397128,39.916527", "destination": "116.481488,39.990464", "mode": "cycling"},
@@ -427,14 +443,15 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "distance",
-            "description": "测量两个高德经纬度坐标之间的直线距离。",
+            "description": "Measure the straight-line distance between two Gaode coordinates.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "origin": {"type": "string", "description": "起点经纬度，格式“经度,纬度”。"},
-                    "destination": {"type": "string", "description": "终点经纬度，格式“经度,纬度”。"}
+                    "origin": {"type": "string", "minLength": 1, "description": "Start coordinate as `longitude,latitude`."},
+                    "destination": {"type": "string", "minLength": 1, "description": "End coordinate as `longitude,latitude`."}
                 },
-                "required": ["origin", "destination"]
+                "required": ["origin", "destination"],
+                "additionalProperties": False
             }
         }
     },
@@ -442,14 +459,15 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "poi_keyword_search",
-            "description": "按关键词搜索 POI；有明确城市范围时传 city，不要将 POI ID 传入本工具。",
+            "description": "Search POIs by keyword. Pass `city` when the search has a clear city scope.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "keywords": {"type": "string", "description": "搜索关键词，如“故宫博物院”。"},
-                    "city": {"type": "string", "description": "可选的查询城市，如“北京”。"}
+                    "keywords": {"type": "string", "minLength": 1, "description": "POI search keywords."},
+                    "city": {"type": "string", "minLength": 1, "description": "Optional city scope."}
                 },
-                "required": ["keywords"]
+                "required": ["keywords"],
+                "additionalProperties": False
             }
         }
     },
@@ -457,15 +475,22 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "poi_nearby_search",
-            "description": "在指定中心点附近搜索 POI。location 必须是“经度,纬度”，radius 单位为米。",
+            "description": "Search POIs around a center coordinate. `location` is `longitude,latitude`; `radius` is meters.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "keywords": {"type": "string", "description": "搜索关键词，如“咖啡馆”。"},
-                    "location": {"type": "string", "description": "中心点经纬度，格式“经度,纬度”。"},
-                    "radius": {"type": "integer", "description": "半径，单位米，范围 1–50000，默认 1000。"}
+                    "keywords": {"type": "string", "minLength": 1, "description": "POI search keywords."},
+                    "location": {"type": "string", "minLength": 1, "description": "Center coordinate as `longitude,latitude`."},
+                    "radius": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50000,
+                        "description": "Search radius in meters. Default: 1000.",
+                        "default": 1000,
+                    }
                 },
-                "required": ["keywords", "location"]
+                "required": ["keywords", "location"],
+                "additionalProperties": False
             }
         }
     },
@@ -473,13 +498,14 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "poi_details",
-            "description": "根据关键词搜索或周边搜索返回的 POI ID 获取地点详情；不要传地点名称。",
+            "description": "Get POI details by an ID returned from a POI search.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "关键词搜索或周边搜索返回的 POI ID。"}
+                    "id": {"type": "string", "minLength": 1, "description": "POI ID returned by a POI search."}
                 },
-                "required": ["id"]
+                "required": ["id"],
+                "additionalProperties": False
             }
         }
     },
@@ -488,15 +514,9 @@ SEARCH_TOOLS = [
         "function": {
             "name": "text_editor",
             "description": (
-                "Safely view or edit UTF-8 text files and explore directories inside the workspace. "
-                "The available commands are: view, str_replace, create, and insert. "
-                "Always call view immediately before editing. "
-                "view: displays file contents with 1-based line numbers (supports view_range=[start_line, end_line], where -1 means end of file). "
-                "If path is a directory (or '.' for workspace root), view lists files and directories up to 2 levels deep. "
-                "create: creates a new file with file_text (fails if file already exists). "
-                "str_replace: replaces old_str with new_str. old_str must match exactly once in the file; if multiple matches occur, their line numbers are reported. "
-                "insert: inserts insert_text (or new_str) after insert_line (1-based; use 0 to insert at the beginning). "
-                "After edits, a snippet around the modified section is returned for immediate verification."
+                "View or edit UTF-8 text files in the workspace. "
+                "Commands: `view`, `str_replace`, `create`, `insert`. "
+                "View immediately before editing; `str_replace` requires exactly one match."
             ),
             "parameters": {
                 "type": "object",
@@ -508,37 +528,40 @@ SEARCH_TOOLS = [
                     },
                     "path": {
                         "type": "string",
-                        "description": "Path of a file or directory inside the workspace (e.g. 'src/main.py', '.' for root). Leading slashes and '/workspace/' prefixes are automatically normalized."
+                        "minLength": 1,
+                        "description": "Workspace path, or `.` for the workspace root."
                     },
                     "view_range": {
                         "type": "array",
                         "items": {"type": "integer"},
                         "minItems": 2,
                         "maxItems": 2,
-                        "description": "For view (files only): [start_line, end_line], 1-based; end_line=-1 reads to the end."
+                        "description": "For `view`: `[start_line, end_line]`; lines start at 1, and `-1` means end."
                     },
                     "old_str": {
                         "type": "string",
-                        "description": "For str_replace: exact existing text. It must have exactly one match in the file."
+                        "description": "For `str_replace`: exact existing text; it must occur exactly once."
                     },
                     "new_str": {
                         "type": "string",
-                        "description": "For str_replace: replacement text. Also accepted as the text to insert for insert command."
+                        "description": "Replacement text for `str_replace`, or alternate insert text for `insert`."
                     },
                     "file_text": {
                         "type": "string",
-                        "description": "For create: complete initial file content; may be empty."
+                        "description": "For `create`: complete initial file content; may be empty."
                     },
                     "insert_line": {
                         "type": "integer",
-                        "description": "For insert: insert after this 1-based line number; 0 inserts at the beginning."
+                        "minimum": 0,
+                        "description": "For `insert`: insert after this line; `0` inserts at the beginning."
                     },
                     "insert_text": {
                         "type": "string",
-                        "description": "For insert: text to add after insert_line (alternatively use new_str)."
+                        "description": "For `insert`: text to add after `insert_line`; use `new_str` instead if preferred."
                     }
                 },
-                "required": ["command", "path"]
+                "required": ["command", "path"],
+                "additionalProperties": False
             }
         }
     },
@@ -547,88 +570,10 @@ SEARCH_TOOLS = [
         "function": {
             "name": "bash",
             "description": (
-                "Execute bash commands inside the user's per-session workspace. "
-                "IMPORTANT: every call MUST fill the description parameter with one short "
-                "sentence (≤60 chars, same language as the user) saying what this command is "
-                "for — it is shown to the user as live execution progress; calls missing it "
-                "will be rejected by argument validation. "
-                "Use this tool for installs, tests, builds, running scripts, git operations, "
-                "and inspecting workspace files.\n"
-                "\n"
-                "ENVIRONMENT & NETWORK (important — read once, saves you wasted calls):\n"
-                "- Outbound network IS allowed. curl and wget are available (if the image lacks the "
-                "real binary, an equivalent Python stdlib shim is installed automatically).\n"
-                "- Network calls carry sandbox-wide default limits (Python sockets 15s via "
-                "socket.setdefaulttimeout, pip 15s, git aborts transfers below 1KB/s for 30s). "
-                "STILL set explicit limits in scripts you write (curl --connect-timeout 10 "
-                "--max-time 60; smtplib.SMTP(..., timeout=15)): unreachable hosts then fail "
-                "fast with a clear error instead of hanging.\n"
-                "- A command that produces NO output for 60s is killed as 'likely stuck' "
-                "(dead network call or interactive prompt). Keep long jobs chatty "
-                "(`pip install -v`, periodic echo) or pass the timeout parameter (5-600s) "
-                "to allow long silent runs.\n"
-                "\n"
-                "BACKGROUND TASKS (for installs/builds you don't want to wait on):\n"
-                "- run_in_background=true starts the command detached and returns a task "
-                "handle immediately; you can keep doing other work in the SAME turn or "
-                "later turns. Use it for jobs expected to run longer than ~2 minutes "
-                "(large installs, builds, dataset downloads).\n"
-                "- The task is fully independent of the interactive session: foreground "
-                "command timeouts, restart=true, and user interruptions never affect it. "
-                "Output goes to a log file (path is in the handle). There is NO idle "
-                "timeout for background tasks; a lifetime cap (default 3600s) force-kills "
-                "them eventually.\n"
-                "- When the task finishes (done/failed/stopped/expired), the system "
-                "automatically attaches a result summary to your NEXT AI request — you "
-                "don't need to poll, just relay it to the user when it arrives.\n"
-                "- Manage tasks with task_action: `status`/`output` (tail of log)/`stop` "
-                "(graceful SIGTERM then SIGKILL) each take task_id; `list` needs none. "
-                "Max 3 running tasks per chat. Note: `restart=true` does NOT kill "
-                "background tasks.\n"
-                "- Toolchain already in the image: python3 (+pip), node/npm, gcc/g++, make, cmake, "
-                "ccache, git, jq, zip/unzip, LibreOffice, pandoc, ImageMagick, poppler, tesseract.\n"
-                "- Install extra Python packages with `pip install --user <pkg>` (cache persists). "
-                "apt-get is NOT usable — the filesystem outside your workspace is read-only.\n"
-                "- If a command genuinely returns `command not found`, do NOT retry it unchanged; "
-                "substitute a python3 stdlib equivalent (urllib.request for HTTP, etc.) or use the "
-                "fetch_url tool.\n"
-                "- Very long output is preserved head+tail: if you see a truncation notice, the "
-                "middle was omitted — redirect output to a file (`cmd > out.log`) and inspect it "
-                "with grep/tail/text_editor when you need everything.\n"
-                "\n"
-                "WORKSPACE & WRITABLE SCOPE (read once — this saves 5+ wasted calls):\n"
-                "- Your starting cwd IS your home directory ($HOME, `~` resolves here). Its\n"
-                "  absolute path is in the $WORKSPACE env var (`echo $WORKSPACE`); every bash\n"
-                "  result also begins with a terminal-style prompt line — `/abs/cwd$ <command>`\n"
-                "  — showing the directory that command ran in, so you always know where you\n"
-                "  are (it updates after `cd`, just like a real shell prompt).\n"
-                "- A Landlock sandbox makes ONLY this home directory readable+writable. ALL\n"
-                "  other paths — /tmp, /home, /root, /workspace, / and even the home's parent\n"
-                "  directory — are denied: `curl -o` there fails with exit code 23, Python\n"
-                "  writes raise PermissionError, reads report Permission denied.\n"
-                "- NEVER `cd` out of the home directory to download or create files (including\n"
-                "  the habitual `cd /tmp`). Download straight into your cwd or a subdir:\n"
-                "  `curl -LO <url>`, or `mkdir -p assets && curl -o assets/x.bin <url>`.\n"
-                "- TMPDIR already points to a writable private cache inside the home (the\n"
-                "  hidden `.runtime/` directory — dot-prefixed, invisible to plain `ls`), so\n"
-                "  mktemp / Python tempfile / build-tool temp files work unchanged. Never\n"
-                "  store deliverables or user files inside `.runtime/`.\n"
-                "\n"
-                "Avoid interactive or long-running programs (vim, top, less, watch, -it shells, "
-                "daemons); they will block the session. If a command appears stuck, set restart=true "
-                "to reset the session and retry with a non-interactive variant.\n"
-                "\n"
-                "UPLOAD & DOWNLOAD DIRECTORIES (inside your workspace root):\n"
-                "- download/ holds files the user has sent you (uploaded documents etc.).\n"
-                "  Read them directly from your cwd: `ls download/`, `cat download/brief.pdf`.\n"
-                "- upload/ is the staging area for outgoing files: present_files only\n"
-                "  sends files that live under upload/. Stage a file there first\n"
-                "  (`cp report.pdf upload/report.pdf`), then present it with\n"
-                "  `present_files([\"upload/report.pdf\"])`.\n"
-                "- Both directories live at the root of your workspace (your starting cwd);\n"
-                "  use relative paths from your cwd to read and write files in them.\n"
-                "\n"
-                "To read a skill's instructions, `cd skills/<skill_id>` from your cwd."
+                "Run non-interactive bash commands in the per-session workspace. "
+                "CWD starts at `$HOME` / `$WORKSPACE`; do not leave the workspace or use `/tmp`. "
+                "Use `download/` for user uploads, `upload/` for files to present, and `.runtime/` only for temporary files. "
+                "Avoid interactive programs and daemons; use `restart=true` for a stuck session."
             ),
             "parameters": {
                 "type": "object",
@@ -636,58 +581,38 @@ SEARCH_TOOLS = [
                     "description": {
                         "type": "string",
                         "minLength": 1,
-                        "description": (
-                            "【必填】意图描述：用一句话说明本次命令的目的（≤60字，与用户语言一致），"
-                            "会作为执行进度实时展示给用户。示例：查看项目文件列表 / "
-                            "安装依赖并运行测试 / 读取用户上传的文档"
-                        )
+                        "maxLength": 120,
+                        "description": "Required progress label: one short sentence explaining the command's purpose."
                     },
                     "command": {
                         "type": "string",
-                        "description": "要执行的 bash 命令。"
+                        "description": "Bash command. Required unless restarting or using `task_action`."
                     },
                     "restart": {
                         "type": "boolean",
-                        "description": "true 则重启 bash 会话（清空状态）。"
+                        "description": "Reset the bash session before doing anything else.",
+                        "default": False,
                     },
                     "timeout": {
                         "type": "integer",
                         "minimum": 5,
                         "maximum": 600,
-                        "description": (
-                            "本次命令允许的总秒数（5-600，缺省 300）。仅用于已知会长时间静默"
-                            "运行的命令（大型构建、数据集下载等）：显式指定会同时禁用本次调用的"
-                            "「60s 无输出空闲保护」。不要用它重试挂起的网络请求——应给网络调用"
-                            "自身加超时（curl --max-time、smtplib timeout=…）。"
-                            "仅前台命令有效；run_in_background=true 时忽略（后台任务用统一的"
-                            "寿命上限兜底）。"
-                        )
+                        "description": "Foreground timeout in seconds. Default: 300; use for expected long quiet commands.",
+                        "default": 300
                     },
                     "run_in_background": {
                         "type": "boolean",
-                        "description": (
-                            "true 则把命令作为独立后台任务启动，立即返回任务句柄（task_id、"
-                            "日志路径），不阻塞当前回合。适用于预计超过 2 分钟的安装/构建/下载。"
-                            "后台任务不受前台超时、restart=true、用户插话影响；完成时系统会"
-                            "自动把结果摘要附加到下一次 AI 请求。"
-                        )
+                        "description": "Run as a background task and return its task id immediately.",
+                        "default": False
                     },
                     "task_action": {
                         "type": "string",
                         "enum": ["status", "output", "stop", "list"],
-                        "description": (
-                            "后台任务操作：status=查状态（需 task_id）；output=看日志尾部"
-                            "（需 task_id）；stop=停止任务（需 task_id，SIGTERM 优雅终止，"
-                            "超时后 SIGKILL）；list=列出本 chat 全部任务（无需 task_id）。"
-                            "与 command/run_in_background 互斥。"
-                        )
+                        "description": "`status`/`output`/`stop` need `task_id`; `list` does not. Do not combine with `command` or `run_in_background`."
                     },
                     "task_id": {
                         "type": "string",
-                        "description": (
-                            "后台任务 ID（形如 bg-1a2b3c，来自启动句柄）。task_action 为 "
-                            "status/output/stop 时必填。"
-                        )
+                        "description": "Background task id for `status`, `output`, or `stop`."
                     }
                 },
                 # command 是功能上的必填字段（没有命令的 bash 调用无意义）：
@@ -703,7 +628,8 @@ SEARCH_TOOLS = [
                 # 注意：command 不再列入 required（v2.5）——task_action 调用
                 # （list/status 等）没有 command；两者互斥由执行器给可操作
                 # 错误兜底。
-                "required": ["description"]
+                "required": ["description"],
+                "additionalProperties": False
             },
             "input_examples": [
                 {"description": "查看项目文件列表", "command": "ls -la"},
@@ -731,11 +657,13 @@ SEARCH_TOOLS = [
                 "properties": {
                     "paths": {
                         "type": "array",
-                        "items": {"type": "string"},
-                        "description": "要发送的文件路径列表，必须位于 upload/ 暂存区内（如 upload/report.pdf）。其他位置的文件请先用 bash 复制到 upload/ 再发送。"
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "description": "Workspace-relative file paths under `upload/`."
                     }
                 },
-                "required": ["paths"]
+                "required": ["paths"],
+                "additionalProperties": False
             }
         }
     },
@@ -774,25 +702,28 @@ SEARCH_TOOLS = [
                     "properties": {
                         "prompt": {
                             "type": "string",
-                            "description": "生成时：详细的图片描述。编辑时：明确的修改指令（如 '改成水彩画风格'、'移除所有行人，保持其他内容不变'）。"
+                            "minLength": 1,
+                            "description": "Detailed image prompt or edit instruction."
                         },
                         "model": {
                             "type": "string",
                             "enum": TEXT_ONLY_MODELS,
-                            "description": "图像模型。所有模型均可纯文生图（省略 image_url）；带 image_url 编辑时必须从 Dual-mode models 中选择（这些模型同样支持纯文生图，同一模型省略/携带 image_url 即切换生成/编辑）。"
+                            "description": "Image model. Editing requires a dual-mode model."
                         },
                         "image_url": {
                             "type": "string",
-                            "description": "可选。参考图 URL 或 base64 数据。省略 = 文生图；提供 = 编辑/图生图（以该图为底修改）。用户上传过图片或要求基于已有图片修改时才提供。"
+                            "description": "Reference image URL or base64 data. Omit for generation; provide for editing."
                         },
                         "aspect_ratio": {
                             "type": "string",
                             "enum": ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
+                            "description": "Output aspect ratio. Default: `1:1`.",
                             "default": "1:1"
                         },
                         "image_size": {
                             "type": "string",
                             "enum": ["1K", "2K", "4K"],
+                            "description": "Output resolution tier. Default: `1K`.",
                             "default": "1K"
                         },
                         "num_images": {
@@ -800,41 +731,17 @@ SEARCH_TOOLS = [
                             "default": 1,
                             "minimum": 1,
                             "maximum": 4,
-                            "description": "一次生成的图片数量（仅文生图模式；编辑模式固定为 1 张，忽略本参数）。"
+                            "description": "Number of generated images. Create mode only; edit mode returns one image."
                         },
                         "extra_params": {
                             "type": "object",
-                            "description": (
-                                "OPTIONAL escape hatch: raw provider-specific parameters merged "
-                                "into the request body, for options this schema doesn't expose as "
-                                "a dedicated field. Leave this out for ordinary calls — prompt / "
-                                "model / aspect_ratio / image_size / num_images / image_url already "
-                                "cover normal usage. "
-                                "Currently effective for Agnes dual-mode models "
-                                f"({', '.join(DUAL_MODE_MODELS) if DUAL_MODE_MODELS else '(none)'}), "
-                                "merged into the JSON body (known useful key: "
-                                "`extra_body.response_format`, \"url\" or \"b64_json\", to force a "
-                                "specific output encoding instead of this tool's default choice — "
-                                "e.g. {\"extra_body\": {\"response_format\": \"url\"}}). "
-                                "Also merged (same reserved-key protection) for any future model "
-                                "routed through the chat-completions image path (OpenRouter-style); "
-                                "no such model is registered right now, so this branch has no known "
-                                "useful key yet. Models using the standard OpenAI multipart "
-                                "/images/edits endpoint ignore this parameter entirely — it does not "
-                                "reach the request. "
-                                "Do NOT put model/prompt/size/ratio here (use the dedicated top-level "
-                                "params instead) and do NOT put image/extra_body.image here (use "
-                                "`image_url`) — those keys are reserved and will be silently dropped "
-                                "if included, precisely because they're already owned by other "
-                                "fields on this tool and letting extra_params override them could "
-                                "silently corrupt the request (e.g. losing the reference image). "
-                                "Only pass parameters that the target model's official API "
-                                "documentation confirms exist; unknown keys may be rejected by the "
-                                "upstream API with a 400 error."
-                            )
+                            "description": ("Optional provider-specific parameters not exposed above. "
+                                "Do not duplicate `prompt`, `model`, `image_url`, `aspect_ratio`, or `image_size."),
+                            "additionalProperties": True
                         }
                     },
-                    "required": ["prompt", "model"]
+                    "required": ["prompt", "model"],
+                    "additionalProperties": False
                 },
                 "input_examples": [
                     # 纯文生图：任意模型（此处刻意用双能力模型演示——同一
@@ -863,7 +770,7 @@ SEARCH_TOOLS = [
             "function": {
                 "name": "generate_video",
                 "description": (
-                    "Generate a short video from a text prompt. Use when the user explicitly asks to create / generate / make a video. Do NOT use for animated images or GIFs (use generate_image instead). Generation is async and may take 1-5 minutes. On success, it returns a stable HTTPS URL in the exact form `视频链接：https://...`, just like image-generation tools return image URLs. In your next final response, embed that exact URL as a separate rich-media block: <figure><video src=\"URL\"></video><figcaption>已生成视频</figcaption></figure>; never send only a bare URL or ordinary hyperlink. "
+                    "Generate a short video from a text prompt. Do not use for GIFs or animated images. "
                     f"Available models: {', '.join(VIDEO_MODELS) if VIDEO_MODELS else '(none configured)'}"
                 ),
                 "parameters": {
@@ -871,22 +778,23 @@ SEARCH_TOOLS = [
                     "properties": {
                         "prompt": {
                             "type": "string",
-                            "description": "视频场景详细描述（主体、运动、镜头、风格等）。"
+                            "description": "Video prompt: subject, motion, camera, and style."
                         },
                         "model": {
                             "type": "string",
                             "enum": VIDEO_MODELS,
-                            "description": "选择一个支持文生视频的模型。"
+                            "description": "Video generation model."
                         },
                         "duration": {
                             "type": "integer",
-                            "description": "视频时长（秒），范围 3-30，默认 5。",
+                            "description": "Duration in seconds. Default: 5.",
                             "default": 5,
                             "minimum": 3,
                             "maximum": 30
                         }
                     },
-                    "required": ["prompt", "model"]
+                    "required": ["prompt", "model"],
+                    "additionalProperties": False
                 }
             }
         }]

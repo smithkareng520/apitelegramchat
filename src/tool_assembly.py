@@ -26,9 +26,9 @@ def normalize_tool_schema(tool: dict) -> dict:
     必填，其余工具一律不声明该字段）。
 
     保留的规范化：
-    - 声明了 ``description`` 的工具（即 bash）把该字段排到 properties
-      首位，让模型在长参数（command 等）之前先看到意图描述；
-    - text_editor 把 ``command`` 排到首位（封闭枚举，便于流式推断）。
+    - 所有必填字段排在可选字段之前，保持各组内的声明顺序稳定；
+    - bash 保留 ``description`` 首位；
+    - text_editor 保留 ``command`` 首位（封闭枚举，便于流式推断）。
     """
     import copy
     tool = copy.deepcopy(tool)
@@ -36,16 +36,18 @@ def normalize_tool_schema(tool: dict) -> dict:
         params = tool["function"]["parameters"]
         props = params.get("properties")
         if isinstance(props, dict):
-            if "description" in props:
-                params["properties"] = {
-                    "description": props["description"],
-                    **{k: v for k, v in props.items() if k != "description"},
-                }
-            elif tool.get("function", {}).get("name") == "text_editor" and "command" in props:
-                params["properties"] = {
-                    "command": props["command"],
-                    **{k: v for k, v in props.items() if k != "command"},
-                }
+            required = [k for k in (params.get("required") or []) if k in props]
+            required_set = set(required)
+            optional = [k for k in props if k not in required_set]
+            ordered = required + optional
+
+            name = tool.get("function", {}).get("name")
+            if name == "bash" and "description" in props:
+                ordered = ["description"] + [k for k in ordered if k != "description"]
+            elif name == "text_editor" and "command" in props:
+                ordered = ["command"] + [k for k in ordered if k != "command"]
+
+            params["properties"] = {k: props[k] for k in ordered}
     except Exception:
         pass
     return tool

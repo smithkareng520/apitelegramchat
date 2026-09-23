@@ -644,8 +644,8 @@ TODO_TOOL = {
     "function": {
         "name": "todo",
         "description": (
-            "Persistent per-chat todo list. 8 actions: add / list / done / undone / toggle / delete / clear / edit. "
-            "Todos are stored in the dedicated state store and survive across sessions. due_at is optional and enables overdue / due-soon detection. After any write action (add/done/undone/delete/edit/clear) immediately call list so the user sees the updated state."
+            "Persistent per-chat todo list. Actions: add, list, done, undone, toggle, delete, clear, edit. "
+            "Use `due_at` for deadlines. After a write action, call `list` to verify the updated state."
         ),
         "parameters": {
             "type": "object",
@@ -653,45 +653,52 @@ TODO_TOOL = {
                 "action": {
                     "type": "string",
                     "enum": ["add", "list", "done", "undone", "toggle", "delete", "clear", "edit"],
-                    "description": "要执行的操作。默认 list。"
+                    "description": "Action to perform. Default: `list`.",
+                    "default": "list"
                 },
                 "title": {
                     "type": "string",
-                    "description": "待办标题。add 必填，edit 可选。最多 200 tokens。"
+                    "description": "Todo title. Required for `add`; optional for `edit`.",
+                    "minLength": 1
                 },
                 "todo_id": {
                     "type": "string",
-                    "description": "目标待办 id：8 位 hex 字符串。done/undone/toggle/delete/edit 必填。"
+                    "description": "Target todo id for `done`, `undone`, `toggle`, `delete`, or `edit`.",
+                    "minLength": 1
                 },
                 "priority": {
                     "type": "string",
                     "enum": ["low", "medium", "high"],
-                    "description": "优先级，默认 medium。add/edit/list(filter) 使用。"
+                    "description": "Priority. Default: `medium`.",
+                    "default": "medium"
                 },
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "可选标签，最多 8 个，每个最多 24 tokens。也接受逗号/空格分隔的字符串。"
+                    "description": "Optional tags; up to 8.",
+                    "maxItems": 8
                 },
                 "note": {
                     "type": "string",
-                    "description": "可选的较长备注（最多 500 tokens）。add/edit 使用。"
+                    "description": "Optional note for `add` or `edit`."
                 },
                 "due_at": {
                     "type": "string",
-                    "description": "可选截止时间，ISO 8601，例如 2026-08-29T18:00:00-07:00。add/edit 使用；list 返回 due_status=overdue/due_soon/upcoming/none。"
+                    "description": "Optional ISO 8601 deadline for `add` or `edit`."
                 },
                 "filter": {
                     "type": "string",
                     "enum": ["all", "pending", "done"],
-                    "description": "list/clear 的过滤条件。clear 时 done（默认）仅清除已完成，all 清空全部。"
+                    "description": "Filter for `list`/`clear`. Default: `all`.",
+                    "default": "all"
                 },
                 "tag": {
                     "type": "string",
-                    "description": "按标签过滤（仅 list）。"
+                    "description": "Filter `list` results by tag."
                 }
             },
-            "required": ["action"]
+            "required": ["action"],
+            "additionalProperties": False
         },
         "input_examples": [
             {"action": "add", "title": "买牛奶", "priority": "high", "tags": ["购物", "周末"], "due_at": "2026-08-29T18:00:00-07:00"},

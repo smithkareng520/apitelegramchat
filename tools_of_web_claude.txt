@@ -1,0 +1,1134 @@
+我目前在这个对话里可以调用的工具大致可以分成这几类，我按功能分组列出工具的函数名：
+
+**信息检索 / 搜索**
+- `web_search` — 网页搜索
+- `web_fetch` — 抓取指定网页内容
+- `image_search` — 图片搜索
+- `places_search` — 地点/商家搜索（Google Places）
+- `fetch_sports_data` — 体育赛事比分/数据
+
+**记忆系统（跨对话持久化）**
+- `memory_read`
+- `memory_write`
+- `memory_str_replace`
+- `memory_append`
+- `memory_delete`
+- `memory_list`
+
+**电脑/文件操作（沙盒环境）**
+- `bash_tool` — 执行 bash 命令
+- `create_file` — 新建文件
+- `str_replace` — 编辑文件内容
+- `view` — 查看文件/目录/图片
+- `present_files` — 把文件展示给用户
+
+**可视化 / 交互式卡片（聊天内嵌组件）**
+- `chart_display_v0` — 简单折线/柱状/散点图
+- `visualize:read_me` / `visualize:show_widget` — SVG/HTML 图表、交互组件
+- `comparison_card_display_v0` — 产品对比卡
+- `featured_card_display_v0` — 单一推荐卡
+- `product_carousel_display_v0` — 多产品轮播卡
+- `options_card_display_v0` — 方案选项卡（如健康建议）
+- `step_card_display_v0` — 步骤引导卡
+- `itinerary_display_v0` — 行程时间线
+- `places_list_display_v0` / `places_map_display_v0` — 地点列表/地图
+- `recipe_display_v0` — 菜谱卡（可调份量）
+- `quiz_display_v0` — 测验/闪卡
+- `translation_display_v0` — 翻译对照卡
+- `link_preview_display_v0` — 链接预览卡
+- `message_compose_v1` — 邮件/消息草稿生成
+- `weather_fetch` — 天气查询
+
+**用户交互辅助**
+- `ask_user_input_v0` — 提供可点选按钮收集偏好
+
+**第三方连接与插件相关**
+- `search_mcp_registry` — 搜索可连接的第三方服务
+- `suggest_connectors` — 展示连接选项
+- `search_plugins` / `suggest_plugin_install` — 插件搜索与安装建议
+- `search_skills` / `suggest_skills` — 技能搜索与添加建议
+- `show_recommendation_cards` — 推荐 Claude 其他客户端/应用（如 Claude Code、Excel 插件等）
+
+**其他**
+- `end_conversation` — 在特定情况下结束对话
+
+这些工具不是每次对话都会用到，我会根据你的具体需求选择合适的来用。如果你有具体任务，我可以直接开始，不用你自己指定用哪个工具。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+下面是我当前可用的全部工具的**完整原始定义**（工具名、description、parameters schema），按你的要求原样列出。
+
+## ask_user_input_v0
+```json
+{
+  "description": "Present tappable options to gather user preferences before providing advice. This tool displays interactive buttons that users can tap to answer, which is much easier than typing on mobile.<br><br>WHEN TO USE THIS TOOL:<br>Use this for ELICITATION - when you need to understand the user's preferences, constraints, or goals to give useful advice.<br><br>Examples of when to USE this tool:<br>- 'Help me plan a workout routine' -> Ask about goals (strength/cardio/weight loss), time available, equipment access<br>- 'Help me find a book to read' -> Ask about genres, mood, recent favorites<br>- 'I'm thinking about getting a pet' -> Ask about lifestyle, living situation, time commitment<br>- 'Help me pick a gift for my friend' -> Ask about occasion, budget, friend's interests<br><br>CRITICAL: Before asking, check the conversation — if the answer is already there or inferable (their code's language, their query's syntax, an order they already gave), use it. If you do need to ask and you're about to write clarifying questions as prose bullets, STOP — those go in this tool instead.<br><br>WHEN NOT TO USE THIS TOOL:<br>- User asks 'A or B?' (e.g., 'Should I learn Python or JavaScript?') -> They want YOUR analysis and recommendation, not the options repeated back as buttons<br>- User is venting or processing emotions (e.g., 'I'm having a bad day') -> Just listen and respond supportively<br>- User asks for your opinion (e.g., 'What do you think of eggs?') -> Give your perspective directly<br>- Factual questions (e.g., 'What's the capital of France?') -> Just answer<br>- User needs prose feedback (e.g., 'Review my code') -> Provide written analysis<br>- User already gave you a detailed prompt with specific constraints -> They've done the narrowing themselves; asking for more second-guesses them. Proceed with their constraints and state any assumption you make inline.<br><br>Always include a brief conversational message before presenting options - don't show options silently. Keep it to one question where possible — three is a ceiling, not a target — with 2-4 short, mutually exclusive options.<br><br>After calling this, your turn is done — the user's selection comes as their next message, not a tool result. Don't keep writing.",
+  "parameters": {
+    "properties": {
+      "questions": {
+        "description": "1-3 questions to ask the user",
+        "items": {
+          "properties": {
+            "options": {
+              "description": "2-4 options with short labels",
+              "items": {"description": "Short label", "type": "string"},
+              "maxItems": 4,
+              "minItems": 2,
+              "type": "array"
+            },
+            "question": {"description": "The question text shown to user", "type": "string"},
+            "type": {
+              "default": "single_select",
+              "description": "Question type: 'single_select' for choosing 1 option, 'multi-select' for choosing 1 or or more options, and 'rank_priorities' for drag-and-drop ranking between different options",
+              "enum": ["single_select", "multi_select", "rank_priorities"],
+              "type": "string"
+            }
+          },
+          "required": ["question", "options"],
+          "type": "object"
+        },
+        "maxItems": 3,
+        "minItems": 1,
+        "type": "array"
+      }
+    },
+    "required": ["questions"],
+    "type": "object"
+  }
+}
+```
+
+## bash_tool
+```json
+{
+  "description": "Run a bash command in the container",
+  "parameters": {
+    "properties": {
+      "command": {"description": "Bash command to run in container", "type": "string"},
+      "description": {"description": "Why I'm running this command", "type": "string"}
+    },
+    "required": ["command", "description"],
+    "title": "BashInput",
+    "type": "object"
+  }
+}
+```
+
+## chart_display_v0
+```json
+{
+  "description": "Display a simple chart (line, bar, or scatter) inline in the chat, rendered natively by the app. Use this for quick, standard charts of a small dataset that is already in the conversation or that you just computed or looked up: a trend over time, a comparison across a handful of categories, or the relationship between two numeric variables. Typical triggers: the user pastes or describes some numbers and asks to \"plot\", \"chart\" or \"graph\" them; a short table you produced would be clearer as a line or bar chart; the user asks how a quantity changed over a period and you have the values.\n\nPrefer this tool over the Visualizer (visualize:show_widget) for these plain charts: it renders immediately, needs no code, and matches the app's design system. Use the Visualizer or an artifact instead when the request needs anything this tool cannot draw: pie, donut, stacked or area charts, annotations or callouts, multiple panels or dashboards, interactivity beyond basic tooltips, custom styling, maps or diagrams, very large datasets, or a visual the user wants to iterate on or download. Never draw the same chart with both tools.\n\nCapabilities and limits: \"style\" is \"line\", \"bar\" or \"scatter\". Line and bar charts plot each series' \"values\" against categorical x positions, so put the x labels (dates, names, buckets) in \"x_axis.data\", one label per value, in order. Scatter charts use per-series \"points\" with numeric x and y. At most 12 series and 2,000 points per series are drawn; keep charts small and legible (ideally 6 series or fewer). \"y_axis.scale\": \"log\" is supported; axis \"min\"/\"max\" set explicit bounds for line and scatter charts (bar charts always start at zero). Give the chart a short descriptive \"title\", and set an axis \"title\" to the units when that helps interpretation. Name each series when there is more than one so a legend is drawn. Per-series \"color\" and axis \"format\" are accepted for compatibility with the mobile apps but some clients ignore them, so never rely on color alone to carry meaning.\n\nDo not use this tool when a sentence or a small table answers the question, for a single number, or when you would have to invent or estimate the data. After the chart renders, state the key takeaway in one or two sentences instead of restating every data point.",
+  "parameters": {
+    "properties": {
+      "series": {
+        "description": "Required. The data of one or more data series the chart is to display. This is an array so that you can provide multiple series at once (for a multi-line chart for example).",
+        "items": {
+          "description": "The series for the chart",
+          "properties": {
+            "color": {"description": "Optional. The color that this will show up as in the graph. Provided in hex format. This is optional and you should not provide this unless there is a semantic color of this data that you think is important.", "type": "string"},
+            "name": {"description": "Optional. The name of this data series. If a value is provided for this, it means the chart will be rendered with a Legend, and this name will be used in the legend.", "type": "string"},
+            "points": {
+              "description": "Optional. The actual data of a 2d series. This is required for a scatter chart and should be a list of points. In a bar or line chart, this should be omitted and you should use 'values' instead.",
+              "items": {
+                "description": "A point in the series",
+                "properties": {
+                  "x": {"description": "The x value of the point", "type": "number"},
+                  "y": {"description": "The y value of the point", "type": "number"}
+                },
+                "required": ["x", "y"],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "values": {
+              "description": "The actual data of a 1d series. This is required for a bar or line chart and should be a list of numbers. In a scatter plot, this should be omitted and you should use 'points' instead.",
+              "items": {"type": "number"},
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "style": {"description": "Required. The type of chart you want to create.", "enum": ["line", "bar", "scatter"], "type": "string"},
+      "title": {"description": "Optional. The title of the chart. This text will be rendered at the top of the chart.", "type": "string"},
+      "x_axis": {
+        "description": "Optional. Settings to configure the x-axis (horizontal axis) of the chart.",
+        "properties": {
+          "data": {"description": "Optional. This allows for a custom set of labels or values to be provided. This can be used if the axis is not numerical and text-based labels are required. If provided, the length of this array is expected to match the length of all of the data Series provided.", "items": {"type": "string"}, "type": "array"},
+          "format": {"description": "Optional. This is a format string used to provide a custom formatting for the grid labels. This can be an f-style format string for numbers, and a strftime-style format string for dates.", "type": "string"},
+          "max": {"description": "Optional. The max value of the range that this axis shows in the chart. If unspecified, an optimal maximum will be calculated from the data provided.", "type": "number"},
+          "min": {"description": "Optional. The min value of the range that this axis shows in the chart. If unspecified, an optimal minimum will be calculated from the data provided.", "type": "number"},
+          "scale": {"description": "Optional. Whether the axis should follow a log scale or a linear scale. Defaults to linear.", "enum": ["linear", "log"], "type": "string"},
+          "title": {"description": "Optional. The \"title\" of the axis. This is usually used to denote the units of the axis. Only provide this if it is likely to be needed to interpret the chart correctly.", "type": "string"}
+        },
+        "type": "object"
+      },
+      "y_axis": {
+        "description": "Optional. Settings to configure the y-axis (vertical axis) of the chart.",
+        "properties": {
+          "data": {"description": "Optional. This allows for a custom set of labels or values to be provided. This can be used if the axis is not numerical and text-based labels are required. If provided, the length of this array is expected to match the length of all of the data Series provided.", "items": {"type": "string"}, "type": "array"},
+          "format": {"description": "Optional. This is a format string used to provide a custom formatting for the grid labels. This can be an f-style format string for numbers, and a strftime-style format string for dates.", "type": "string"},
+          "max": {"description": "Optional. The max value of the range that this axis shows in the chart. If unspecified, an optimal maximum will be calculated from the data provided.", "type": "number"},
+          "min": {"description": "Optional. The min value of the range that this axis shows in the chart. If unspecified, an optimal minimum will be calculated from the data provided.", "type": "number"},
+          "scale": {"description": "Optional. Whether the axis should follow a log scale or a linear scale. Defaults to linear.", "enum": ["linear", "log"], "type": "string"},
+          "title": {"description": "Optional. The \"title\" of the axis. This is usually used to denote the units of the axis. Only provide this if it is likely to be needed to interpret the chart correctly.", "type": "string"}
+        },
+        "type": "object"
+      }
+    },
+    "required": ["series", "style"],
+    "type": "object"
+  }
+}
+```
+
+## comparison_card_display_v0
+```json
+{
+  "description": "Show 2–3 products side-by-side in a comparison table with aligned attribute rows. Use this for shopping questions where the user is weighing a small set of named options against the same criteria (e.g., 'iPad Air vs iPad Pro', 'compare these three monitors').\n\nDON'T use this card when:\n- There's only one product — use featured_card_display_v0 (single pick). More than three — use product_carousel_display_v0.\n- The options don't share comparable attributes (you'd be padding rows with 'N/A').\n- The user wants a single recommendation with reasoning, not a spec table — write prose.\n- The comparison is between approaches or plans rather than purchasable products.\n\nUse the SAME attribute labels in the SAME order across every product so the rows line up. Don't re-list the products or attribute values in your prose.",
+  "parameters": {
+    "properties": {
+      "products": {
+        "items": {
+          "properties": {
+            "attributes": {
+              "items": {
+                "properties": {
+                  "label": {"description": "Short attribute name (e.g. 'Display', 'Battery'). Use the SAME label set, in the SAME order, across every product so rows line up.", "type": "string"},
+                  "value": {"description": "This product's value for the attribute.", "type": "string"}
+                },
+                "required": ["label", "value"],
+                "type": "object"
+              },
+              "maxItems": 8,
+              "minItems": 2,
+              "type": "array"
+            },
+            "name": {"description": "Product or option name (a few words).", "type": "string"},
+            "price": {"description": "Display price with currency, e.g. '$1,099'. Omit when not applicable or unknown.", "type": "string"},
+            "url": {"description": "Absolute https URL of the product page. Omit if you don't have a real one — never fabricate a link.", "type": "string"}
+          },
+          "required": ["name", "attributes"],
+          "type": "object"
+        },
+        "maxItems": 3,
+        "minItems": 2,
+        "type": "array"
+      },
+      "summary": {"description": "One short sentence (under 15 words) naming what this card compares, for surfaces that can't render it. Don't repeat the attribute values. Write this last.", "type": "string"}
+    },
+    "required": ["products", "summary"],
+    "type": "object"
+  }
+}
+```
+
+## create_file
+```json
+{
+  "description": "Create a new file with content in the container. Fails if the path already exists — use str_replace to edit an existing file, or bash_tool (cat > path << 'EOF') to overwrite it.",
+  "parameters": {
+    "properties": {
+      "description": {"title": "Why I'm creating this file. ALWAYS PROVIDE THIS PARAMETER FIRST.", "type": "string"},
+      "file_text": {"title": "Content to write to the file. ALWAYS PROVIDE THIS PARAMETER LAST.", "type": "string"},
+      "path": {"title": "Path to the file to create. ALWAYS PROVIDE THIS PARAMETER SECOND.", "type": "string"}
+    },
+    "required": ["description", "path", "file_text"],
+    "title": "CreateFileInputReqOrder",
+    "type": "object"
+  }
+}
+```
+
+## end_conversation
+```json
+{
+  "description": "Use this tool to end the conversation. This tool will close the conversation and prevent any further messages from being sent.",
+  "parameters": {"properties": {}, "title": "BaseModel", "type": "object"}
+}
+```
+
+## featured_card_display_v0
+```json
+{
+  "description": "Show your single best product pick as one rich card with a name, optional price, and a blurb on why it's the pick. Use this for shopping questions where the answer is one clear recommendation (e.g., 'what's the best entry-level espresso machine', 'just tell me which one to get').\n\nDON'T use this card when:\n- The user wants several options to browse — use product_carousel_display_v0.\n- The user is weighing named options on shared criteria — use comparison_card_display_v0.\n- The blurb would just restate the name, or it's not a purchasable product — write prose.\n\nThe blurb can run up to a paragraph — say why this is the pick and what trade-offs come with it. Don't re-describe the product in your prose. Photos are added automatically — don't include image URLs.",
+  "parameters": {
+    "properties": {
+      "products": {
+        "items": {
+          "properties": {
+            "blurb": {"description": "Up to one paragraph on why this is the pick and any trade-offs. Don't restate the name or price.", "type": "string"},
+            "name": {"description": "Product name (a few words).", "type": "string"},
+            "price": {"description": "Display price with currency, e.g. '$549'. Omit when not applicable or unknown.", "type": "string"},
+            "url": {"description": "Absolute https URL of the product page. Omit if you don't have a real one — never fabricate a link.", "type": "string"}
+          },
+          "required": ["name"],
+          "type": "object"
+        },
+        "maxItems": 1,
+        "minItems": 1,
+        "type": "array"
+      },
+      "summary": {"description": "One short sentence (under 15 words) naming what this card shows, for surfaces that can't render it. Don't repeat the products. Write this last.", "type": "string"}
+    },
+    "required": ["products", "summary"],
+    "type": "object"
+  }
+}
+```
+
+## fetch_sports_data
+```json
+{
+  "description": "Use this tool whenever you need to fetch current, upcoming or recent sports data including scores, standings/rankings, and detailed game stats for the provided sports. If a user is interested in the score of an event or game, and the game is live or recent in last 24hr, fetch both the game scores and game_stats in the same turn (game stats are not available for golf and nascar). For broad queries (e.g. 'latest NBA results'), fetch both scores and standings. Do NOT rely on your memory or assume which players are in a game; fetch both scores, stats, details using the tool. Important: Bias towards fetching score and stats BEFORE responding to the user with workflow: 1) fetch score 2) fetch stats based on game id 3) only then respond to the user. PREFER using this tool over web search for data, scores, stats about recent and upcoming games.",
+  "parameters": {
+    "properties": {
+      "data_type": {"description": "Type of data to fetch. scores returns recent results, live games, and upcoming games with win probabilities. game_stats requires a game_id from scores results for detailed box score, play-by-play, and player stats.", "enum": ["scores", "standings", "game_stats"], "type": "string"},
+      "game_id": {"description": "SportRadar game/match ID (required for game_stats). Get this from the id field in scores results.", "type": "string"},
+      "league": {"description": "The sports league to query", "enum": ["nfl", "nba", "nhl", "mlb", "wnba", "ncaafb", "ncaamb", "ncaawb", "epl", "la_liga", "serie_a", "bundesliga", "ligue_1", "mls", "champions_league", "world_cup", "tennis", "golf", "nascar", "cricket", "mma"], "type": "string"},
+      "team": {"description": "Optional team name to filter scores by a specific team", "type": "string"}
+    },
+    "required": ["data_type", "league"],
+    "type": "object"
+  }
+}
+```
+
+## image_search
+```json
+{
+  "description": "Default to using image search for any query where visuals would enhance the user's understanding; skip when the deliverable is primarily textual e.g. for pure text tasks, code, technical support.",
+  "parameters": {
+    "additionalProperties": false,
+    "description": "Input parameters for the image_search tool.",
+    "properties": {
+      "max_results": {"description": "Maximum number of images to return (default: 3, minimum: 3)", "maximum": 5, "minimum": 3, "title": "Max Results", "type": "integer"},
+      "query": {"description": "Search query to find relevant images", "title": "Query", "type": "string"}
+    },
+    "required": ["query"],
+    "title": "ImageSearchToolParams",
+    "type": "object"
+  }
+}
+```
+
+## itinerary_display_v0
+```json
+{
+  "description": "Show a day-by-day travel timeline with tabbed days and a list of stops per day. Use this for trip-planning questions where the answer is an ordered itinerary across one or more days, each with at least one named stop (e.g., '3 days in Lisbon', 'plan a weekend in Kyoto').\n\nDON'T use this card when:\n- The answer is a single place — use places_map_display_v0 instead.\n- The answer is a flat list of places with no day structure — use places_map_display_v0, or places_list_display_v0 for places that did not come from places_search.\n- There are more than 7 days or more than 12 stops in a day — summarise in prose.\n- The user asked for general travel advice (visas, packing, budget) rather than a schedule.\n- Stops don't have a meaningful order within the day.\n\nKeep each blurb to one short line and day labels under ~12 chars. The card already renders the day tabs and the stop list — don't re-list the itinerary in your prose.",
+  "parameters": {
+    "properties": {
+      "days": {
+        "items": {
+          "properties": {
+            "day_label": {"description": "Tab label for this day — 'Day 1', 'Sat 14 Jun', etc. Keep it under 12 chars.", "type": "string"},
+            "stops": {
+              "items": {
+                "properties": {
+                  "blurb": {"description": "Optional. One short line on what to do or expect there.", "type": "string"},
+                  "name": {"description": "Name of the place or activity (a few words).", "type": "string"},
+                  "time": {"description": "Optional. Clock time or rough slot ('9:00 AM', 'Afternoon'). Omit for unscheduled stops.", "type": "string"}
+                },
+                "required": ["name"],
+                "type": "object"
+              },
+              "maxItems": 12,
+              "minItems": 1,
+              "type": "array"
+            }
+          },
+          "required": ["day_label", "stops"],
+          "type": "object"
+        },
+        "maxItems": 7,
+        "minItems": 1,
+        "type": "array"
+      },
+      "summary": {"description": "One short sentence (under 15 words) naming what this card shows, for surfaces that can't render it. Don't repeat the stops. Write this last.", "type": "string"},
+      "title": {"description": "Short heading for the trip (e.g. '3 days in Tokyo'). One line.", "type": "string"}
+    },
+    "required": ["days", "summary"],
+    "type": "object"
+  }
+}
+```
+
+## link_preview_display_v0
+```json
+{
+  "description": "Show 1–6 web links as preview cards with title, source, and an optional snippet. Use this when surfacing external web sources the user should open — search results, citations, or 'read more' references that back up your answer (e.g., 'find me articles on X', 'where can I read more about this').\n\nDON'T use this card when:\n- The content is in-chat (your own prose, code, or an artifact) rather than an external page.\n- You only have one link and it's incidental — inline it in prose.\n- There are more than six sources — pick the best six.\n- You don't have a real, absolute http(s) URL for an entry — never fabricate a link; drop that entry.\n\nKeep titles to one line and snippets to one or two sentences. The card already renders the link, title, and source — don't re-list the URLs in your prose.",
+  "parameters": {
+    "properties": {
+      "links": {
+        "items": {
+          "properties": {
+            "domain": {"description": "Optional display host or site name (e.g. 'Wirecutter'). Derived from url when omitted.", "type": "string"},
+            "snippet": {"description": "Optional one- or two-sentence excerpt explaining why this link is relevant.", "type": "string"},
+            "title": {"description": "Page title (one line, under ~80 chars).", "type": "string"},
+            "url": {"description": "Absolute http(s) URL the card opens. Must start with https:// or http://.", "type": "string"}
+          },
+          "required": ["url", "title"],
+          "type": "object"
+        },
+        "maxItems": 6,
+        "minItems": 1,
+        "type": "array"
+      },
+      "summary": {"description": "One short sentence (under 15 words) naming what this card shows, for surfaces that can't render it. Don't repeat the link titles. Write this last.", "type": "string"}
+    },
+    "required": ["links", "summary"],
+    "type": "object"
+  }
+}
+```
+
+## memory_append
+```json
+{
+  "description": "Add text to the end of a memory document without resending its content. The appended text is placed on a new line after the existing content. Cheaper than memory_write for adding a fact to an existing file — you send only the addition. Always pass if_version: the version token from your most recent memory_read or memory_write of this path, or the literal word new (without quotes) to create the file. Appends with if_version=new to an existing path are rejected and return the current content so you can retry with its version. Do not append a fact the file already states — update it with memory_str_replace instead; files are size-capped, so prefer editing and condensing over repeated appends. The result includes the new version token. PRIVACY: never file, for anyone, even if asked: government-ID, payment-card or financial-account numbers; immigration status; caste; a minor user's own age or date of birth; sexual history or activity; sexual, physical or other abuse; criminal history, violence or crime-victim status; suicide, self-harm or disordered eating; conduct violating Anthropic's usage policy; health or personality inferences the user did not state. Outside that list, stated health, sexual orientation, gender identity, race, ethnicity, religion, political beliefs, union membership, disability and finances follow your system prompt's privacy rules: write them as stated, in a separate write, only where those rules say a save-time consent check decides; otherwise leave them out. Omissions get no placeholder or reworded form.",
+  "parameters": {
+    "additionalProperties": false,
+    "properties": {
+      "content": {"description": "Text to add at the end of the file (UTF-8). A newline separates it from the existing content. The merged file is size-capped; oversized results are rejected with the byte limit in the error.", "minLength": 1, "title": "Content", "type": "string"},
+      "if_version": {"description": "Pass the 12-character version token from your most recent memory_read or memory_write of this file, or the literal word new (without quotes) for a file that does not yet exist. Never invent a value.", "title": "If Version", "type": "string"},
+      "path": {"description": "Path of the memory document to append to (e.g. /topics/schedule.md).", "title": "Path", "type": "string"}
+    },
+    "required": ["content", "if_version", "path"],
+    "title": "MemoryAppendParams",
+    "type": "object"
+  }
+}
+```
+
+## memory_delete
+```json
+{
+  "description": "Delete a memory document. You must pass if_version from a prior memory_read of the same path — this proves you've seen what you're deleting and catches concurrent changes. Use ONLY when the user explicitly asks to delete or forget an entire file or subject; for removing a single line, use memory_write with that line removed instead. Never delete proactively to clean up, deduplicate, or because a file looks stale.",
+  "parameters": {
+    "additionalProperties": false,
+    "properties": {
+      "if_version": {"description": "Concurrency token from the most recent memory_read of this path (shown as ``[version: <token>]`` in the read result). Required: deletes are irrecoverable, so you must read the file first and pass its current version to prove you've seen what you're removing. Never invent a value — use only a token returned by a prior tool call.", "title": "If Version", "type": "string"},
+      "path": {"description": "Path of the memory document to delete (e.g. /topics/old-hobby.md).", "title": "Path", "type": "string"}
+    },
+    "required": ["if_version", "path"],
+    "title": "MemoryDeleteParams",
+    "type": "object"
+  }
+}
+```
+
+## memory_list
+```json
+{
+  "description": "List memory documents (optionally under a path prefix), sorted by path. Returns path, size, and last-updated time for each. Results are capped; use cursor to page through large stores, or narrow with path_prefix. Set include_preview=true to also get a one-line content preview per file. Use memory_read for full content.",
+  "parameters": {
+    "additionalProperties": false,
+    "properties": {
+      "cursor": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "Path of the last entry from a previous call. Returns entries after this path. Use with the same path_prefix to page through a large directory.", "title": "Cursor"},
+      "include_preview": {"description": "If true, include a one-line preview of each file's content (the frontmatter ``description:`` value, or first non-empty body line if absent). Slower — requires reading every file. Use when deciding which files to memory_read.", "title": "Include Preview", "type": "boolean"},
+      "path_prefix": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "Optional path prefix to filter results (e.g. /topics/ lists only docs under /topics/). Include the trailing slash for a directory match. Results are capped — narrow with a prefix or page with cursor for large stores.", "title": "Path Prefix"}
+    },
+    "title": "MemoryListParams",
+    "type": "object"
+  }
+}
+```
+
+## memory_read
+```json
+{
+  "description": "Read one or more memory documents. Returns each document's content and last-updated time. Pass a list of paths to read several files in a single call instead of one call per file.",
+  "parameters": {
+    "additionalProperties": false,
+    "properties": {
+      "path": {"anyOf": [{"type": "string"}, {"items": {"type": "string"}, "maxItems": 20, "minItems": 1, "type": "array"}], "description": "Path of the memory document to read (e.g. /topics/schedule.md), or a list of up to 20 paths to read together in one call.", "title": "Path"}
+    },
+    "required": ["path"],
+    "title": "MemoryReadMultiParams",
+    "type": "object"
+  }
+}
+```
+
+## memory_str_replace
+```json
+{
+  "description": "Edit a memory document by replacing one exact text match. old_str must match the file content in exactly one place, including whitespace and newlines — zero or multiple matches are rejected (widen old_str with surrounding text until it is unique). new_str replaces it; pass an empty new_str to delete the matched text. Cheaper than memory_write for small edits — you send only the text that changes, not the whole file. Always pass if_version: the version token from your most recent memory_read or memory_write of this path; edits require one, so memory_read the file first if you do not have it. A version conflict or a failed match returns the current content so you can retry in one turn. The result includes the new version token for follow-up edits. PRIVACY: never file, for anyone, even if asked: government-ID, payment-card or financial-account numbers; immigration status; caste; a minor user's own age or date of birth; sexual history or activity; sexual, physical or other abuse; criminal history, violence or crime-victim status; suicide, self-harm or disordered eating; conduct violating Anthropic's usage policy; health or personality inferences the user did not state. Outside that list, stated health, sexual orientation, gender identity, race, ethnicity, religion, political beliefs, union membership, disability and finances follow your system prompt's privacy rules: write them as stated, in a separate write, only where those rules say a save-time consent check decides; otherwise leave them out. Omissions get no placeholder or reworded form.",
+  "parameters": {
+    "additionalProperties": false,
+    "properties": {
+      "if_version": {"description": "Pass the 12-character version token from your most recent memory_read or memory_write of this file. Required — if you do not have one, memory_read the file first. Never invent a value.", "title": "If Version", "type": "string"},
+      "new_str": {"description": "Replacement text. Pass an empty string to delete the matched text.", "title": "New Str", "type": "string"},
+      "old_str": {"description": "Exact text to replace. Must match the file content in exactly one place, including whitespace and newlines — the edit is rejected on zero or multiple matches. Make it unique by including surrounding text.", "minLength": 1, "title": "Old Str", "type": "string"},
+      "path": {"description": "Path of the memory document to edit (e.g. /topics/schedule.md).", "title": "Path", "type": "string"}
+    },
+    "required": ["if_version", "new_str", "old_str", "path"],
+    "title": "MemoryStrReplaceParams",
+    "type": "object"
+  }
+}
+```
+
+## memory_write
+```json
+{
+  "description": "Create or update a memory document with full content. Overwrites if the path already exists: content replaces the ENTIRE document — this is not an append or a patch. Include every existing line you intend to keep; any line you omit is deleted. Use this to save durable patterns you learn about the user — not today's specific events. Always pass if_version: the version token from your most recent memory_read or memory_write of this path, or the literal word new (without quotes) for a file that does not yet exist. The listing shows paths but not version tokens, so for any file already there you must memory_read it first. Writes with if_version=new to an existing path are rejected so you can't overwrite content you haven't seen. Both the rejection and a version conflict return the current content so you can merge and retry. The result includes the new version token for follow-up writes. PRIVACY: never file, for anyone, even if asked: government-ID, payment-card or financial-account numbers; immigration status; caste; a minor user's own age or date of birth; sexual history or activity; sexual, physical or other abuse; criminal history, violence or crime-victim status; suicide, self-harm or disordered eating; conduct violating Anthropic's usage policy; health or personality inferences the user did not state. Outside that list, stated health, sexual orientation, gender identity, race, ethnicity, religion, political beliefs, union membership, disability and finances follow your system prompt's privacy rules: write them as stated, in a separate write, only where those rules say a save-time consent check decides; otherwise leave them out. Omissions get no placeholder or reworded form.",
+  "parameters": {
+    "additionalProperties": false,
+    "properties": {
+      "content": {"description": "Full text content to write (UTF-8). Replaces the entire document — any line you omit is deleted. Empty or whitespace-only content is rejected. Size-capped; oversized writes are rejected with the byte limit in the error.", "title": "Content", "type": "string"},
+      "if_version": {"description": "Pass the 12-character version token from your most recent memory_read or memory_write of this file. For a file that does not yet exist (not shown in the listing), pass the literal word new (without quotes). For any file already in the listing, memory_read it first to get its version token — the listing itself does not contain version tokens. Never invent a value.", "title": "If Version", "type": "string"},
+      "path": {"description": "Path of the document to create or update (e.g. /topics/schedule.md).", "title": "Path", "type": "string"}
+    },
+    "required": ["content", "if_version", "path"],
+    "title": "MemoryWriteParams",
+    "type": "object"
+  }
+}
+```
+
+## message_compose_v1
+```json
+{
+  "description": "Draft a message (email, Slack, or text) with goal-oriented approaches based on what the user is trying to accomplish. Analyze the situation type (work disagreement, negotiation, following up, delivering bad news, asking for something, setting boundaries, apologizing, declining, giving feedback, cold outreach, responding to feedback, clarifying misunderstanding, delegating, celebrating) and identify competing goals or relationship stakes. **MULTIPLE APPROACHES** (if high-stakes, ambiguous, or competing goals): Start with a scenario summary. Generate 2-3 strategies that lead to different outcomes—not just tones. Label each clearly (e.g., \"Disagree and commit\" vs \"Push for alignment\", \"Gentle nudge\" vs \"Create urgency\", \"Rip the bandaid\" vs \"Soften the landing\"). Note what each prioritizes and trades off. **SINGLE MESSAGE** (if transactional, one clear approach, or user just needs wording help): Just draft it. For emails, include a subject line. Adapt to channel—emails longer/formal, Slack concise, texts brief. Test: Would a user choose between these based on what they want to accomplish? The card already shows each draft in full — label, subject, and body — with copy and open affordances, so do NOT repeat the draft text in your reply; add at most one or two sentences of framing (how the approaches differ, or what to customize).",
+  "parameters": {
+    "properties": {
+      "kind": {"description": "The type of message. 'email' shows a subject field and 'Open in Mail' button. 'textMessage' shows 'Open in Messages' button. 'other' shows 'Copy' button for platforms like LinkedIn, Slack, etc.", "enum": ["email", "textMessage", "other"], "type": "string"},
+      "summary_title": {"description": "A brief title that summarizes the message (shown in the share sheet)", "type": "string"},
+      "variants": {
+        "description": "Message variants representing different strategic approaches",
+        "items": {
+          "properties": {
+            "body": {"description": "The message content", "type": "string"},
+            "label": {"description": "2-4 word goal-oriented label. E.g., 'Apologetic', 'Suggest alternative', 'Hold firm', 'Push back', 'Polite decline', 'Express interest'", "type": "string"},
+            "subject": {"description": "Email subject line (only used when kind is 'email')", "type": "string"}
+          },
+          "required": ["label", "body"],
+          "type": "object"
+        },
+        "minItems": 1,
+        "type": "array"
+      }
+    },
+    "required": ["kind", "variants"],
+    "type": "object"
+  }
+}
+```
+
+## options_card_display_v0
+```json
+{
+  "description": "Show a structured set of distinct approaches the user could take, each with concrete next steps. Use this for personal-health questions where the answer is 2–6 alternative options (e.g., 'what can I do about mild knee pain'). Every option needs a one- or two-sentence description and at least two actionable bullets.\n\nDON'T use this card when:\n- The answer is one nuanced recommendation with caveats — write prose.\n- The options need explanation more than action (you'd be inventing bullets to fill the shape) — write prose.\n- The user wants A-vs-B comparison or trade-offs rather than a list of approaches.\n- It's a diagnosis question, or not a health topic.\n\nKeep each bullet to one short line. The card already shows a 'not medical advice' banner — don't add your own disclaimer, and don't re-list the options in your prose.",
+  "parameters": {
+    "properties": {
+      "options": {
+        "items": {
+          "properties": {
+            "bullets": {"description": "Concrete, actionable next steps for this option. Keep each to one short line. Every option needs at least two — if you can't write two concrete steps, this option (or this card) isn't the right fit.", "items": {"type": "string"}, "maxItems": 8, "minItems": 2, "type": "array"},
+            "description": {"description": "One or two sentences framing this option — what it is and when it helps. Don't restate the bullets.", "type": "string"},
+            "title": {"description": "Name of this option (a few words).", "type": "string"}
+          },
+          "required": ["title", "description", "bullets"],
+          "type": "object"
+        },
+        "maxItems": 8,
+        "minItems": 2,
+        "type": "array"
+      },
+      "summary": {"description": "One short sentence (under 15 words) naming what this card shows, for surfaces that can't render it. Don't repeat the options. Write this last.", "type": "string"},
+      "title": {"description": "Short heading for the set of options (one line).", "type": "string"}
+    },
+    "required": ["options", "summary"],
+    "type": "object"
+  }
+}
+```
+
+## places_list_display_v0
+```json
+{
+  "description": "Show a stacked list of places, each with up to 3 photos and a short description. Use this when the answer is a browsable set of 2–8 specific places the user might visit — cafes, hikes, neighbourhoods, hotels — and photos help more than a map (e.g., 'a few good ramen spots in Shibuya', 'best beaches near Lisbon').\n\nOnly for places you found via web search or already know — this card cannot display Google data.\n\nPass each place's name and a description — photos are added automatically from the place names; don't include image URLs.\n\nDON'T use this card when:\n- The places came from places_search — that data is Google's and this card cannot attribute it. Use places_map_display_v0.\n- The user needs to see where places are relative to each other, or wants a route — use places_map_display_v0.\n- It's a day-by-day plan — use itinerary_display_v0.\n- You only have one place — write prose with a places_map marker instead.\n\nEach place's description can run up to a paragraph — what it's like, what to order or do there, when to go. Never include ratings, review counts, or review quotes from places_search. Don't re-list the places in your prose.",
+  "parameters": {
+    "properties": {
+      "places": {
+        "items": {
+          "properties": {
+            "description": {"description": "Optional. One or two short sentences on what to do or expect there.", "type": "string"},
+            "name": {"description": "Name of the place (a few words).", "type": "string"},
+            "tips": {"description": "Optional. Up to three very short (2–4 word) practical labels, e.g. 'Book ahead', 'Go for sunset'. Not full sentences.", "items": {"type": "string"}, "maxItems": 3, "type": "array"}
+          },
+          "required": ["name"],
+          "type": "object"
+        },
+        "maxItems": 8,
+        "minItems": 1,
+        "type": "array"
+      },
+      "summary": {"description": "One short sentence (under 15 words) naming what this card shows, for surfaces that can't render it. Don't repeat the place names. Write this last.", "type": "string"}
+    },
+    "required": ["places", "summary"],
+    "type": "object"
+  }
+}
+```
+
+## places_map_display_v0
+```json
+{
+  "description": "Display locations on a map with your recommendations and insider tips.\n\nWORKFLOW:\n1. Use places_search tool first to find places and get their place_id. A brief one-sentence introduction before the search is fine.\n2. Call this tool straight after places_search, with no response text between the two calls. Pass place_id references and the backend will fetch full details.\n3. Write your picks and tips after the map, so the full written response stays together as one uninterrupted piece the person can read. Never write the recommendations between the search and the map.\n\nCRITICAL: Copy place_id values EXACTLY from places_search tool results. Place IDs are case-sensitive and must be copied verbatim - do not type from memory or modify them.\n\nTWO MODES - use ONE of:\n\nA) SIMPLE MARKERS - just show places on a map (example structure with name/lat/lng/place_id fields)\n\nB) ITINERARY - show a multi-stop trip with timing (title/narrative/days array with day_number/title/locations, travel_mode, show_route)\n\nROUTES:\n- A route is only drawn for a day-structured itinerary: stops in \"days\" AND an itinerary display.\n- Flat \"locations\" lists ALWAYS render as plain markers - never a route, even with \"show_route\": true or \"mode\": \"itinerary\". A refused route ask is stated in the tool result.\n- \"show_route\": false always wins.\n- To show a route, structure the stops into \"days\". Do not carry route settings from an earlier map onto a new unordered set of places.\n\nLOCATION FIELDS:\n- name, latitude, longitude (required)\n- place_id (recommended - copy EXACTLY from places_search tool, enables full details)\n- notes (your tour guide tip)\n- arrival_time (for itineraries)\n- address (for custom locations without place_id)",
+  "parameters": {
+    "properties": {
+      "days": {
+        "description": "Itinerary with day structure for multi-day trips. Use this OR 'locations', not both.",
+        "items": {
+          "properties": {
+            "day_number": {"description": "Day number (1, 2, 3...)", "type": "integer"},
+            "locations": {
+              "description": "Stops for this day",
+              "items": {
+                "properties": {
+                  "address": {"description": "Address for custom locations without place_id", "type": "string"},
+                  "arrival_time": {"description": "Suggested arrival time (e.g., '9:00 AM')", "type": "string"},
+                  "latitude": {"description": "Latitude coordinate", "type": "number"},
+                  "longitude": {"description": "Longitude coordinate", "type": "number"},
+                  "name": {"description": "Display name of the location", "type": "string"},
+                  "notes": {"description": "Tour guide tip or insider advice", "type": "string"},
+                  "place_id": {"description": "Google Place ID - COPY EXACTLY from places_search_tool (case-sensitive). Enables backend to fetch full details.", "type": "string"}
+                },
+                "required": ["name", "latitude", "longitude"],
+                "type": "object"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "narrative": {"description": "Tour guide story arc for the day", "type": "string"},
+            "title": {"description": "Short evocative title (e.g., 'Temple Hopping')", "type": "string"}
+          },
+          "required": ["day_number", "locations"],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "locations": {
+        "description": "Simple marker display - list of locations without day structure. Use this OR 'days', not both.",
+        "items": {
+          "properties": {
+            "address": {"description": "Address for custom locations without place_id", "type": "string"},
+            "arrival_time": {"description": "Suggested arrival time (e.g., '9:00 AM')", "type": "string"},
+            "latitude": {"description": "Latitude coordinate", "type": "number"},
+            "longitude": {"description": "Longitude coordinate", "type": "number"},
+            "name": {"description": "Display name of the location", "type": "string"},
+            "notes": {"description": "Tour guide tip or insider advice", "type": "string"},
+            "place_id": {"description": "Google Place ID - COPY EXACTLY from places_search_tool (case-sensitive). Enables backend to fetch full details.", "type": "string"}
+          },
+          "required": ["name", "latitude", "longitude"],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "mode": {"description": "Display mode. Auto-inferred: markers if locations, itinerary if days. Controls display style only - never enables a route on flat 'locations' (see show_route).", "enum": ["markers", "itinerary"], "type": "string"},
+      "narrative": {"description": "Tour guide intro for the trip", "type": "string"},
+      "show_route": {"description": "Show route between stops. Resolved server-side: routes only draw for day-structured 'days' itineraries - flat 'locations' lists never route, and true there is refused and noted in the tool result. Explicit false always wins. Default: true for itinerary, false for markers.", "type": "boolean"},
+      "title": {"description": "Title for the map or itinerary", "type": "string"},
+      "travel_mode": {"default": "driving", "description": "Travel mode for directions", "enum": ["driving", "walking", "transit", "bicycling"], "type": "string"}
+    },
+    "type": "object"
+  }
+}
+```
+
+## places_search
+```json
+{
+  "description": "Search for places, businesses, restaurants, and attractions using Google Places.\n\nSUPPORTS MULTIPLE QUERIES in a single call. Multiple queries can be used for:\n- efficient itinerary planning\n- breaking down broad or abstract requests: 'best hotels 1hr from London' does not translate well to a direct query. Rather it can be decomposed like: 'luxury hotels Oxfordshire', 'luxury hotels Cotswolds', 'luxury hotels North Downs' etc.\n\nEach query can specify max_results (1-10, default 5).\nResults are deduplicated across queries.\nFor place names that are common, make sure you include the wider area e.g. restaurants Chelsea, London (to differentiate vs Chelsea in New York).\n\nRETURNS: Array of places with place_id, name, address, coordinates, rating, photos, hours, and other details. IMPORTANT: These results are Google data. Display them to the user via places_map_display_v0, which carries the required Google attribution, or via text. When you use the map, call places_map_display_v0 straight after this search with no response text between the two calls, then write your picks after the map. Never render these results with places_list_display_v0 — that card cannot attribute Google. Irrelevant results can be disregarded and ignored, the user will not see them.",
+  "parameters": {
+    "properties": {
+      "location_bias_lat": {"description": "Optional latitude coordinate to bias results toward a specific area", "type": "number"},
+      "location_bias_lng": {"description": "Optional longitude coordinate to bias results toward a specific area", "type": "number"},
+      "location_bias_radius": {"description": "Optional radius in meters for location bias (default 5000 if lat/lng provided)", "type": "number"},
+      "queries": {
+        "description": "List of search queries (1-10 queries). Each query can specify its own max_results.",
+        "items": {
+          "properties": {
+            "max_results": {"default": 5, "description": "Maximum number of results for this query (1-10, default 5)", "maximum": 10, "minimum": 1, "type": "integer"},
+            "query": {"description": "Natural language search query (e.g., 'temples in Asakusa', 'ramen restaurants in Tokyo')", "type": "string"}
+          },
+          "required": ["query"],
+          "type": "object"
+        },
+        "maxItems": 10,
+        "minItems": 1,
+        "type": "array"
+      }
+    },
+    "required": ["queries"],
+    "type": "object"
+  }
+}
+```
+
+## present_files
+```json
+{
+  "description": "The present_files tool makes files visible to the user for viewing and rendering in the client interface.\n\nWhen to use the present_files tool:\n- Making any file available for the user to view, download, or interact with\n- Presenting multiple related files at once\n- After creating a file that should be presented to the user\nWhen NOT to use the present_files tool:\n- When you only need to read file contents for your own processing\n- For temporary or intermediate files not meant for user viewing\n\nHow it works:\n- Accepts an array of file paths from the container filesystem\n- Returns output paths where files can be accessed by the client\n- Output paths are returned in the same order as input file paths\n- Multiple files can be presented efficiently in a single call\n- If a file is not in the output directory, it will be automatically copied into that directory\n- The first input path passed in to the present_files tool, and therefore the first output path returned from it, should correspond to the file that is most relevant for the user to see first",
+  "parameters": {
+    "additionalProperties": false,
+    "properties": {
+      "filepaths": {"description": "Array of file paths identifying which files to present to the user", "items": {"type": "string"}, "minItems": 1, "title": "Filepaths", "type": "array"}
+    },
+    "required": ["filepaths"],
+    "title": "PresentFilesInputSchema",
+    "type": "object"
+  }
+}
+```
+
+## product_carousel_display_v0
+```json
+{
+  "description": "Show a paged product carousel — one product per page, each with a 3-photo strip, name, price, and a short blurb. Use this for shopping questions where the user wants to look closely at a handful of recommended products one at a time (e.g., 'walk me through 3 good entry-level espresso machines', 'show me a few standing-desk options').\n\nDON'T use this card when:\n- The user wants your single best pick, not a set to browse — use featured_card_display_v0 instead.\n- The user is weighing named options on shared criteria — use comparison_card_display_v0.\n- The blurb would just restate the name, or it's not a purchasable product — write prose.\n\nEach product's blurb can run up to a paragraph — use the space to explain why it's a fit and what trade-offs come with it. Don't re-list the products in your prose. Photos are added automatically — don't include image URLs.",
+  "parameters": {
+    "properties": {
+      "products": {
+        "items": {
+          "properties": {
+            "blurb": {"description": "Up to one paragraph on what makes this option a fit and any trade-offs. Don't restate the name or price.", "type": "string"},
+            "name": {"description": "Product name (a few words).", "type": "string"},
+            "price": {"description": "Display price with currency, e.g. '$549'. Omit when not applicable or unknown.", "type": "string"},
+            "url": {"description": "Absolute https URL of the product page. Omit if you don't have a real one — never fabricate a link.", "type": "string"}
+          },
+          "required": ["name"],
+          "type": "object"
+        },
+        "maxItems": 6,
+        "minItems": 1,
+        "type": "array"
+      },
+      "summary": {"description": "One short sentence (under 15 words) naming what this card shows, for surfaces that can't render it. Don't repeat the products. Write this last.", "type": "string"}
+    },
+    "required": ["products", "summary"],
+    "type": "object"
+  }
+}
+```
+
+## quiz_display_v0
+```json
+{
+  "description": "Generate an interactive multiple-choice quiz rendered as a card in the chat; the same questions can also be flipped through as flashcards (question on the front, correct answer and explanation on the back). Use this when the user asks for a quiz, practice questions, self-assessment, or to test their knowledge on a topic — including from documents or notes they've shared. Each question needs plausible distractors (wrong answers that seem reasonable), a clear explanation of why the correct answer is right, and optionally a hint. Keep explanations concise and educational. Default to 5 questions unless the user asks for a specific count. Give each question its own short correct_feedback and incorrect_feedback verdict labels (shown in bold before the explanation); built-in defaults cover any question without them.",
+  "parameters": {
+    "properties": {
+      "description": {"description": "Optional one-line summary of what the quiz covers.", "type": "string"},
+      "initial_mode": {"description": "Which view the card opens in. 'quiz' (default): graded multiple choice, one question at a time, with a score at the end. 'flashcards': the same questions as flip cards for review/memorization rather than testing — use when the user asks for flashcards or to study/review. The user can switch views either way.", "enum": ["quiz", "flashcards"], "type": "string"},
+      "questions": {
+        "description": "The quiz questions, in the order they should be presented by default.",
+        "items": {
+          "properties": {
+            "correct_feedback": {"description": "Optional short verdict label shown in bold before the explanation when the user picks the correct answer, replacing the default \"That's right.\" A few words in the same language as the question, ending with terminal punctuation (period or exclamation). Vary it across questions and match the quiz's tone.", "type": "string"},
+            "correct_option_id": {"description": "The id of the correct option. MUST match one of the ids in this question's options array.", "type": "string"},
+            "explanation": {"description": "Why the correct answer is correct, shown after the user answers. Keep it concise.", "type": "string"},
+            "hint": {"description": "Optional hint the user can reveal before answering. Nudge toward the answer without giving it away.", "type": "string"},
+            "id": {"description": "Unique identifier for this question within the quiz (e.g. 'q1', 'q2').", "type": "string"},
+            "incorrect_feedback": {"description": "Optional short verdict label shown in bold before the explanation when the user picks a wrong answer, replacing the default \"Not quite.\" A few words in the same language as the question, ending with terminal punctuation. Keep it encouraging, never mocking, and vary it across questions.", "type": "string"},
+            "options": {
+              "description": "The answer choices. Provide at least 2. Order them naturally; the frontend may shuffle.",
+              "items": {
+                "properties": {
+                  "id": {"description": "Short unique identifier for this option within its question (e.g. 'a', 'b', 'c', 'd'). Referenced by correct_option_id.", "type": "string"},
+                  "text": {"description": "The answer text shown to the user.", "type": "string"}
+                },
+                "required": ["id", "text"],
+                "type": "object"
+              },
+              "minItems": 2,
+              "type": "array"
+            },
+            "prompt": {"description": "The question text shown to the user.", "type": "string"},
+            "question_type": {"description": "Format of the question. Currently only 'multiple_choice' is supported.", "enum": ["multiple_choice"], "type": "string"}
+          },
+          "required": ["id", "question_type", "prompt", "options", "correct_option_id", "explanation"],
+          "type": "object"
+        },
+        "minItems": 1,
+        "type": "array"
+      },
+      "summary": {"description": "One short phrase (under 45 characters) naming what this card holds, for surfaces that can't render it — e.g. \"5-question quiz on photosynthesis\" or \"flashcards for Spanish verbs\". No trailing period — it renders as a compact label, not prose. Write this last.", "type": "string"},
+      "title": {"description": "Title of the quiz (e.g. 'Photosynthesis Basics', 'Chapter 3 Review').", "type": "string"}
+    },
+    "required": ["questions", "summary", "title"],
+    "type": "object"
+  }
+}
+```
+
+## recipe_display_v0
+```json
+{
+  "description": "Display an interactive recipe with adjustable servings. Use when the user asks for a recipe, cooking instructions, or food preparation guide. The widget allows users to scale all ingredient amounts proportionally by adjusting the servings control.",
+  "parameters": {
+    "$defs": {
+      "RecipeIngredient": {
+        "description": "Individual ingredient in a recipe.",
+        "properties": {
+          "amount": {"description": "The quantity for base_servings", "title": "Amount", "type": "number"},
+          "id": {"description": "4 character unique identifier number for this ingredient (e.g., '0001', '0002'). Used to reference in steps.", "title": "Id", "type": "string"},
+          "name": {"description": "Display name of the ingredient. For whole/countable items, fold the counting noun in here (e.g., 'garlic cloves', 'large eggs', 'medium lemon, zested').", "title": "Name", "type": "string"},
+          "unit": {"anyOf": [{"enum": ["g", "kg", "ml", "l", "tsp", "tbsp", "cup", "fl_oz", "oz", "lb", "pinch"], "type": "string"}, {"type": "null"}], "default": null, "description": "Unit of measurement. Omit for whole/countable items (e.g., 3 garlic cloves, 2 lemons) and put the counting noun in `name` instead. For salt/pepper/seasonings, give a concrete starting amount in tsp rather than a placeholder count. Weight: g, kg, oz, lb. Volume: ml, l, tsp, tbsp, cup, fl_oz.", "title": "Unit"}
+        },
+        "required": ["amount", "id", "name"],
+        "title": "RecipeIngredient",
+        "type": "object"
+      },
+      "RecipeStep": {
+        "description": "Individual step in a recipe.",
+        "properties": {
+          "content": {"description": "The full instruction text. Use {ingredient_id} to insert editable ingredient amounts inline (e.g., 'Whisk together {0001} and {0002}')", "title": "Content", "type": "string"},
+          "id": {"description": "Unique identifier for this step", "title": "Id", "type": "string"},
+          "timer_seconds": {"anyOf": [{"type": "integer"}, {"type": "null"}], "default": null, "description": "Timer duration in seconds. Include whenever the step involves waiting, cooking, baking, resting, marinating, chilling, boiling, simmering, or any time-based action. Omit only for active hands-on steps with no waiting.", "title": "Timer Seconds"},
+          "title": {"description": "Short summary of the step (e.g., 'Boil pasta', 'Make the sauce', 'Rest the dough'). Used as the timer label and step header in cooking mode.", "title": "Title", "type": "string"}
+        },
+        "required": ["content", "id", "title"],
+        "title": "RecipeStep",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "description": "Input parameters for the recipe widget tool.",
+    "properties": {
+      "base_servings": {"anyOf": [{"type": "integer"}, {"type": "null"}], "description": "The number of servings this recipe makes at base amounts (default: 4)", "title": "Base Servings"},
+      "description": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "A brief description or tagline for the recipe", "title": "Description"},
+      "ingredients": {"description": "List of ingredients with amounts", "items": {"$ref": "#/$defs/RecipeIngredient"}, "title": "Ingredients", "type": "array"},
+      "notes": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "Optional tips, variations, or additional notes about the recipe", "title": "Notes"},
+      "steps": {"description": "Cooking instructions. Reference ingredients using {ingredient_id} syntax.", "items": {"$ref": "#/$defs/RecipeStep"}, "title": "Steps", "type": "array"},
+      "title": {"description": "The name of the recipe (e.g., 'Spaghetti alla Carbonara')", "title": "Title", "type": "string"}
+    },
+    "required": ["ingredients", "steps", "title"],
+    "title": "RecipeWidgetParams",
+    "type": "object"
+  }
+}
+```
+
+## search_mcp_registry
+```json
+{
+  "description": "Search for available connectors in the MCP registry. Call this when connecting to a new MCP might help resolve the user query — whether or not they name a specific product.\n\nNamed-product examples:\n- \"check my Asana tasks\" → search [\"asana\", \"tasks\", \"todo\"]\n- \"find issues in Jira\" → search [\"jira\", \"issues\"]\n\nIntent-based examples (no product named):\n- \"help me manage my tasks\" → search [\"tasks\", \"todo\", \"project management\"]\n- \"what's on my calendar tomorrow\" → search [\"calendar\", \"schedule\", \"events\"]\n- \"did I get a reply from them yet\" → search [\"email\", \"messages\", \"inbox\"]\n- \"pull up the design mockups\" → search [\"design\", \"mockup\"]\n- \"check if the CI passed\" → search [\"ci\", \"build\", \"pipeline\"]\n- \"did the call cover Mike's latest ticket\" → thinking: \"I don't have any context about the call or meeting, let's see if there are any connectors available\" → search [\"meeting\", \"call\", \"transcript\"]\n\nIf the request implies reading the user's data (email, calendar, tasks, files, tickets, etc.) and you don't already have a tool for it, search — even if the phrasing is casual. \"Did I get a reply\" is an email check. \"What's pending\" is a task check.\n\nReturns a ranked list. If results look relevant, call suggest_connectors to present the options. If nothing matches the task, do NOT call suggest_connectors — fall through to the browser or answer directly depending on the task type (booking/action tasks go to navigate; info requests get a direct answer).",
+  "parameters": {
+    "properties": {
+      "keywords": {"description": "e.g. ['asana','tasks']", "items": {"type": "string"}, "title": "Keywords", "type": "array"}
+    },
+    "required": ["keywords"],
+    "title": "SearchMcpRegistryInput",
+    "type": "object"
+  }
+}
+```
+
+## search_plugins
+```json
+{
+  "description": "Search the user's plugin catalog for installable plugins that match their request. Call this when the request references the user's own work context — their pipeline, accounts, contracts, tickets, playbooks, templates, or company data — and you don't already have a tool that covers it. Plugins package org-specific workflows (skills, commands, and connectors), so a task can surface a plugin even when the user doesn't name one.\n\nExamples:\n- \"prep for my call with Acme\" → search [\"sales\", \"crm\", \"meeting prep\"]\n- \"review this contract against our playbook\" → search [\"legal\", \"contract\", \"playbook\"]\n- \"what's in my pipeline this week\" → search [\"sales\", \"pipeline\", \"crm\"]\n\nDo not call this for generic knowledge tasks you can answer directly (\"explain MEDDIC\", \"draft a cold email\", \"what is a SAFE note\").\n\nReturns a ranked list with id, name, description, and whether each plugin is already enabled. If results fit the request, call suggest_plugin_install with the matching not-yet-enabled plugins to render the install card. If nothing relevant, proceed normally without mentioning that you searched.",
+  "parameters": {
+    "properties": {
+      "keywords": {"description": "Keyword phrases from the task, e.g. ['sales','pipeline']", "items": {"maxLength": 64, "minLength": 1, "type": "string"}, "title": "Keywords", "type": "array"}
+    },
+    "required": ["keywords"],
+    "title": "PluginSkillSearchInput",
+    "type": "object"
+  }
+}
+```
+
+## search_skills
+```json
+{
+  "description": "Search the user's skills by keyword. Call this when the task is one a skill could make repeatable — drafting in a house style, reviews against a playbook or checklist, recurring reports, a domain workflow they'll do again — and nothing you already have covers it. The user does not need to ask about skills.\n\nExamples:\n- \"follow the team's PR guidelines\" → search [\"pr\", \"review\", \"guidelines\"]\n- \"export this as a slide deck\" → search [\"pptx\", \"slides\", \"presentation\"]\n\nReturns a ranked list with id, name, description, and whether each skill is enabled. If relevant not-yet-enabled skills come back, call suggest_skills with the same keywords to render the add card. If nothing relevant, proceed without mentioning that you searched.",
+  "parameters": {
+    "properties": {
+      "keywords": {"description": "Keyword phrases from the task, e.g. ['sales','pipeline']", "items": {"maxLength": 64, "minLength": 1, "type": "string"}, "title": "Keywords", "type": "array"}
+    },
+    "required": ["keywords"],
+    "title": "PluginSkillSearchInput",
+    "type": "object"
+  }
+}
+```
+
+## show_recommendation_cards
+```json
+{
+  "description": "Recommend 1-3 Claude apps or extensions whenever the user's current task maps to one. Be proactive: if a relevant app exists for what they're doing, show this tool—don't wait for them to ask about apps. This never replaces doing the task: complete the user's request in chat as normal and show the recommendation alongside your answer as a \"next time, this kind of work is even better in …\" suggestion. Never refuse, shorten, or hand off the current task just because an app exists. Prioritize these three whenever they fit: claude_code_desktop for anything code-related (writing, debugging, reviewing, or shipping code, scripts, or repos—use the terminal/VS Code/JetBrains variant instead only if they mention that environment); claude_design for prototypes, mockups, and visual work like designs, landing pages, slides, or one-pagers; excel for any spreadsheet work, formulas, data cleanup, or models. Examples: working on a spreadsheet → excel; building a prototype or mockup → claude_design; writing or fixing code → claude_code_desktop. Recommend the other apps when they're the clear fit instead: powerpoint for slide decks, word for drafting or editing documents, outlook for inbox triage and email replies, chrome for browsing or acting on websites, desktop for working alongside files and apps generally, ios/android for Claude on the go. For each app you recommend, also write a personalized one-line value prop in descriptions, tied to what the user is doing right now. Only include apps relevant to the current use case, sorted by relevance with the single best fit first. Recommend at most one of desktop/claude_code_desktop at a time (on the web they both install Claude Desktop). The UI shows each app with an icon, its value prop, and the right call to action for the user's platform (Install, Download, or Open—users already in the desktop app see Open instead of Download).",
+  "parameters": {
+    "properties": {
+      "app_ids": {"description": "IDs of Claude apps or extensions to recommend. desktop: Claude Desktop (hand off tasks and Claude works in your files, apps, and browser tabs while you do other things). ios / android: Claude for iOS, Claude for Android. claude_code_terminal / claude_code_vscode / claude_code_jetbrains: Claude Code in the terminal, VS Code, or JetBrains. claude_code_desktop: Claude Code in the desktop app (opens the Code tab on desktop, installs Claude Desktop on web). excel: Claude for Excel (formulas, formatting, data cleanup, models). powerpoint: Claude for PowerPoint (turn ideas into polished slides). word: Claude for Word (drafts, edits, and formats documents). outlook: Claude for Outlook (triage your inbox, draft replies, find time across calendars). chrome: Claude for Chrome (browses, clicks, and fills out forms). claude_design: Claude Design (create polished slides, prototypes and designs).", "items": {"enum": ["desktop", "ios", "android", "claude_code_terminal", "claude_code_vscode", "claude_code_jetbrains", "claude_code_desktop", "excel", "powerpoint", "word", "outlook", "chrome", "claude_design"], "type": "string"}, "type": "array"},
+      "descriptions": {"additionalProperties": {"type": "string"}, "description": "Optional personalized value props keyed by app id (each key must also appear in app_ids). One short plain-text sentence, under ~90 characters, tied to the user's current task—e.g. excel: \"Claude can build the formulas and clean up this forecast right in your sheet.\" Omit an app to use its default description.", "type": "object"}
+    },
+    "required": ["app_ids"],
+    "type": "object"
+  }
+}
+```
+
+## step_card_display_v0
+```json
+{
+  "description": "Show a numbered, step-by-step walkthrough for fixing or setting something up. Use this for tech-support and how-to questions where the answer is 3–8 ordered steps, each with a short title and a one- or two-sentence description (e.g., 'how do I reset my router', 'set up two-factor on GitHub').\n\nDON'T use this card when:\n- The answer is a single step or a one-line setting toggle — write prose.\n- The answer is non-procedural advice, background explanation, or a list of options to choose between — write prose (or use options_card_display_v0).\n- Steps don't have a meaningful order, or you'd be inventing filler steps to reach three.\n- It's a coding task where the user wants the code, not a walkthrough.\n\nKeep each step title to a few imperative words; each step's description can be a short paragraph — enough detail to actually do the step without guessing. The card already numbers and renders the steps — don't re-list them in your prose, and don't prefix titles with 'Step 1:'.",
+  "parameters": {
+    "properties": {
+      "steps": {
+        "items": {
+          "properties": {
+            "description": {"description": "A short paragraph explaining how to do this step and why it matters — enough detail to follow without guessing.", "type": "string"},
+            "title": {"description": "Name of this step (a few words, imperative).", "type": "string"}
+          },
+          "required": ["title", "description"],
+          "type": "object"
+        },
+        "maxItems": 8,
+        "minItems": 2,
+        "type": "array"
+      },
+      "summary": {"description": "One short sentence (under 15 words) naming what this card shows, for surfaces that can't render it. Don't repeat the steps. Write this last.", "type": "string"},
+      "view": {"description": "How the steps are first shown. 'stepper' (the default) reveals one step at a time — use it when steps must be done in order. 'list' shows everything at once — use it for short checklists the user will scan, not follow.", "enum": ["stepper", "list"], "type": "string"}
+    },
+    "required": ["steps", "summary"],
+    "type": "object"
+  }
+}
+```
+
+## str_replace
+```json
+{
+  "description": "Replace a unique string in a file with another string. old_str must match the raw file content exactly and appear exactly once. When copying from view output, do NOT include the line number prefix (spaces + line number + tab) — it is display-only. View the file immediately before editing; after any successful str_replace, earlier view output of that file in your context is stale — re-view before further edits to the same file. Files under /mnt/user-data/uploads, /mnt/transcripts, /mnt/skills/public, /mnt/skills/private, /mnt/skills/examples are read-only — copy them to a writable location first if you need to edit them.",
+  "parameters": {
+    "properties": {
+      "description": {"description": "REQUIRED. Why I'm making this edit", "title": "Description", "type": "string"},
+      "new_str": {"default": "", "description": "String to replace with (empty to delete)", "title": "New Str", "type": "string"},
+      "old_str": {"description": "String to replace (must be unique in file)", "title": "Old Str", "type": "string"},
+      "path": {"description": "Path to the file to edit", "title": "Path", "type": "string"}
+    },
+    "required": ["path", "description", "old_str"],
+    "title": "StrReplaceInputReqOrder",
+    "type": "object"
+  }
+}
+```
+
+## suggest_connectors
+```json
+{
+  "description": "Present connector options to the user. Each option renders with a Connect or Use button, plus a \"None of these\" option. The user's choice arrives as a follow-up message.\n\nCall this when any of the following are true:\n- A relevant option is an MCP App (tools tagged [third_party_mcp_app]) and the user did not explicitly name that company — even if the connector is already connected\n- The user has no connected tool that can fulfill the request\n- The user explicitly asks what connectors are available (e.g. \"what can help me manage my tasks\")\n- A tool call failed with an auth/credential error — pass the server UUID from the failed tool name mcp__{uuid}__{toolName} so the user can re-authenticate\n\nDo NOT call this tool unless you have already called the search_mcp_registry tool or are handling a tool auth/credential error.\nDo NOT call this if the user named a specific connected service — just use it.\n\nIf search_mcp_registry returned nothing relevant, do NOT call this — answer the user directly instead.\n\nPass directoryUuid values from search_mcp_registry results — not connector names, not guesses. If you haven't called search_mcp_registry yet, call it first to get the UUIDs. Include all relevant options in uuids (connected or not).\n\nEnd your turn after calling this with a short framing line like \"I found a few options — which would you like?\" — don't continue with a generic answer. The user's selection arrives as a follow-up message like \"Use {name} for this\" (they picked one) or \"Don't use a connector\" (they picked None of these).",
+  "parameters": {
+    "properties": {
+      "uuids": {"items": {"type": "string"}, "title": "Uuids", "type": "array"}
+    },
+    "required": ["uuids"],
+    "title": "SuggestConnectorsInput",
+    "type": "object"
+  }
+}
+```
+
+## suggest_plugin_install
+```json
+{
+  "description": "Render an inline plugin install card in the conversation. Works for one plugin or several: with multiple, the card lists them and the user can drill into each and add it. Source pluginId (from id) and pluginName (from name) from search_plugins results; write description yourself — one line describing what the plugin does for the user, not what it's called. The card handles all UI — do not describe the plugins in text after the call.\n\nDo NOT call this if:\n- The suggestion is not relevant to what the user asked about\n- You are unsure whether the plugin would actually help\n- You already rendered a suggestion this conversation and the user didn't engage\n- Every relevant plugin is already enabled\n\nSuggested ids are validated against the user's installable catalog: unknown ids are dropped from the card and the card label always comes from the catalog. The user installs from the card out of band. Write any lead-in before the call; after it, at most a brief line tying the suggestion to their task.",
+  "parameters": {
+    "$defs": {
+      "SuggestedPluginInput": {
+        "properties": {
+          "description": {"maxLength": 1024, "title": "Description", "type": "string"},
+          "pluginId": {"maxLength": 256, "minLength": 1, "title": "Pluginid", "type": "string"},
+          "pluginName": {"maxLength": 256, "minLength": 1, "title": "Pluginname", "type": "string"},
+          "skills": {"anyOf": [{"items": {"$ref": "#/$defs/SuggestedPluginSkillInput"}, "maxItems": 32, "type": "array"}, {"type": "null"}], "default": null, "title": "Skills"}
+        },
+        "required": ["description", "pluginId", "pluginName"],
+        "title": "SuggestedPluginInput",
+        "type": "object"
+      },
+      "SuggestedPluginSkillInput": {
+        "properties": {
+          "description": {"anyOf": [{"maxLength": 1024, "type": "string"}, {"type": "null"}], "default": null, "title": "Description"},
+          "name": {"maxLength": 256, "minLength": 1, "title": "Name", "type": "string"}
+        },
+        "required": ["name"],
+        "title": "SuggestedPluginSkillInput",
+        "type": "object"
+      }
+    },
+    "properties": {
+      "contextLabel": {"maxLength": 128, "minLength": 1, "title": "Contextlabel", "type": "string"},
+      "plugins": {"items": {"$ref": "#/$defs/SuggestedPluginInput"}, "maxItems": 16, "minItems": 1, "title": "Plugins", "type": "array"}
+    },
+    "required": ["contextLabel", "plugins"],
+    "title": "SuggestPluginInstallInput",
+    "type": "object"
+  }
+}
+```
+
+## suggest_skills
+```json
+{
+  "description": "Render a card of skills the user can add (not yet enabled), each with an Add button. Call this after search_skills returned relevant not-yet-enabled skills, or directly when the user asks you to recommend skills.\n\nDo NOT call this if you already rendered a suggestion this conversation and the user didn't engage, or if you are unsure a skill would actually help with the task.\n\nAlways pass keywords drawn from the task itself, not generic terms. Pass contextLabel as a short header tying the card to the task (e.g. \"For your legal work\"). The result may be empty — its note field tells you what to do next.",
+  "parameters": {
+    "properties": {
+      "contextLabel": {"anyOf": [{"maxLength": 128, "type": "string"}, {"type": "null"}], "default": null, "title": "Contextlabel"},
+      "keywords": {"description": "Keyword phrases from the task, e.g. ['legal','contract']", "items": {"maxLength": 64, "minLength": 1, "type": "string"}, "title": "Keywords", "type": "array"}
+    },
+    "required": ["keywords"],
+    "title": "SuggestSkillsInput",
+    "type": "object"
+  }
+}
+```
+
+## translation_display_v0
+```json
+{
+  "description": "Show a translation card when the user asks how to say, write or translate a specific short passage (a message, sentence, phrase or a few lines) into another language. The card shows the original and the translation side by side with copy and edit affordances, so do NOT repeat the translation in your reply — after the card, add one or two sentences of nuance only (register/politeness choice, a regional note, or what to change for a different tone). Do not use for single-word dictionary lookups, for translating long documents or files, or when the user wants an explanation of grammar rather than a rendering.",
+  "parameters": {
+    "properties": {
+      "pronunciation": {"description": "Romanization of the translation (romaji, pinyin with tone marks, etc.) when the target script is not Latin. Omit for Latin-script targets.", "type": "string"},
+      "source_lang": {"description": "BCP-47 tag of the source text (e.g. \"en\").", "type": "string"},
+      "source_language": {"description": "Display name of the source language, in the conversation's language (e.g. \"English\").", "type": "string"},
+      "source_text": {"description": "The exact text being translated, as the user gave it (lightly cleaned up; no quotes around it).", "type": "string"},
+      "summary": {"description": "One short sentence (under 15 words) naming what this card shows, for surfaces that can't render it — e.g. \"Japanese translation of your message\". Write this last.", "type": "string"},
+      "target_lang": {"description": "BCP-47 tag of the translation (e.g. \"ja\", \"es-MX\", \"zh-CN\").", "type": "string"},
+      "target_language": {"description": "Display name of the target language, in the conversation's language; include the region or variety when it matters (e.g. \"Spanish (Mexico)\").", "type": "string"},
+      "translation": {"description": "The translation, in the register that best fits the situation the user described. Plain text only — no romanization, notes or alternatives here.", "type": "string"}
+    },
+    "required": ["source_language", "source_text", "summary", "target_lang", "target_language", "translation"],
+    "type": "object"
+  }
+}
+```
+
+## view
+```json
+{
+  "description": "Supports viewing text, images, and directory listings.\n\nSupported path types:\n- Directories: Lists files and directories up to 2 levels deep, ignoring hidden items and node_modules\n- Image files (.jpg, .jpeg, .png, .gif, .webp): Displays the image visually\n- Text files: Displays numbered lines (prefix `    N\\t` is display-only — do not include it in str_replace's `old_str`). You can optionally specify a view_range to see specific lines.\n\nNote: Files with non-UTF-8 encoding will display hex escapes (e.g. \\x84) for invalid bytes",
+  "parameters": {
+    "properties": {
+      "description": {"description": "Why I need to view this", "type": "string"},
+      "path": {"description": "Absolute path to file or directory, e.g. `/repo/file.py` or `/repo`.", "type": "string"},
+      "view_range": {"anyOf": [{"maxItems": 2, "minItems": 2, "prefixItems": [{"type": "integer"}, {"type": "integer"}], "type": "array"}, {"type": "null"}], "default": null, "description": "Optional line range for text files. Format: [start_line, end_line] where lines are indexed starting at 1. Use [start_line, -1] to view from start_line to the end of the file. When not provided, the entire file is displayed, truncating from the middle if it exceeds 16,000 characters (showing beginning and end)."}
+    },
+    "required": ["description", "path"],
+    "title": "ViewInput",
+    "type": "object"
+  }
+}
+```
+
+## weather_fetch
+```json
+{
+  "description": "Display weather information. Use the user's home location to determine temperature units: Fahrenheit for US users, Celsius for others.<br><br>USE THIS TOOL WHEN:<br>- User asks about weather in a specific location<br>- User asks 'should I bring an umbrella/jacket'<br>- User is planning outdoor activities<br>- User asks 'what's it like in [city]' (weather context)<br><br>SKIP THIS TOOL WHEN:<br>- Climate or historical weather questions<br>- Weather as small talk without location specified",
+  "parameters": {
+    "additionalProperties": false,
+    "description": "Input parameters for the weather tool.",
+    "properties": {
+      "latitude": {"description": "Latitude coordinate of the location", "title": "Latitude", "type": "number"},
+      "location_name": {"description": "Human-readable name of the location (e.g., 'San Francisco, CA')", "title": "Location Name", "type": "string"},
+      "longitude": {"description": "Longitude coordinate of the location", "title": "Longitude", "type": "number"}
+    },
+    "required": ["latitude", "location_name", "longitude"],
+    "type": "object"
+  }
+}
+```
+
+## web_fetch
+```json
+{
+  "description": "Fetch the contents of a web page at a given URL.\nOnly URLs that already appear in this conversation can be fetched: ones the person provided, or ones returned by a prior web_search or web_fetch. A URL recalled from training or built by editing a seen URL's path will be rejected; call web_search or fetch a linking page instead.\nThis tool cannot access content that requires authentication, such as private Google Docs or pages behind login walls.\nDo not add www. to URLs that do not have them.\nURLs must include the schema: https://example.com is a valid URL while example.com is an invalid URL.\n",
+  "parameters": {
+    "additionalProperties": false,
+    "properties": {
+      "allowed_domains": {"anyOf": [{"items": {"type": "string"}, "type": "array"}, {"type": "null"}], "description": "List of allowed domains. If provided, only URLs from these domains will be fetched.", "examples": [["example.com", "docs.example.com"]], "title": "Allowed Domains"},
+      "blocked_domains": {"anyOf": [{"items": {"type": "string"}, "type": "array"}, {"type": "null"}], "description": "List of blocked domains. If provided, URLs from these domains will not be fetched.", "examples": [["malicious.com", "spam.example.com"]], "title": "Blocked Domains"},
+      "html_extraction_method": {"description": "The HTML extraction method to use. 'markdown' produces better content extraction than the legacy 'traf' method.", "title": "Html Extraction Method", "type": "string"},
+      "is_zdr": {"description": "Whether this is a Zero Data Retention request. When true, the fetcher should not log the URL.", "title": "Is Zdr", "type": "boolean"},
+      "text_content_token_limit": {"anyOf": [{"type": "integer"}, {"type": "null"}], "description": "Truncate text to be included in the context to approximately the given number of tokens. Has no effect on binary content.", "title": "Text Content Token Limit"},
+      "url": {"title": "Url", "type": "string"},
+      "web_fetch_pdf_extract_text": {"anyOf": [{"type": "boolean"}, {"type": "null"}], "description": "If true, extract text from PDFs. Otherwise return raw Base64-encoded bytes.", "title": "Web Fetch Pdf Extract Text"},
+      "web_fetch_rate_limit_dark_launch": {"anyOf": [{"type": "boolean"}, {"type": "null"}], "description": "If true, log rate limit hits but don't block requests (dark launch mode)", "title": "Web Fetch Rate Limit Dark Launch"},
+      "web_fetch_rate_limit_key": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "Rate limit key for limiting non-cached requests (100/hour). If not specified, no rate limit is applied.", "examples": ["conversation-12345", "user-67890"], "title": "Web Fetch Rate Limit Key"}
+    },
+    "required": ["url"],
+    "type": "object"
+  }
+}
+```
+
+## web_search
+```json
+{
+  "description": "Search the web",
+  "parameters": {
+    "additionalProperties": false,
+    "properties": {
+      "query": {"description": "Search query", "title": "Query", "type": "string"}
+    },
+    "required": ["query"],
+    "title": "AnthropicSearchParams",
+    "type": "object"
+  }
+}
+```
+
+## visualize:read_me
+```json
+{
+  "description": "Returns required context for show_widget (CSS variables, colors, typography, layout rules, examples). Call before your first show_widget call. Call again later if you need a different module. Do NOT mention or narrate this call to the user — it is an internal setup step. Call it silently and proceed directly to the visualization in your response.",
+  "parameters": {
+    "properties": {
+      "modules": {"description": "Which module(s) to load. Pick all that fit.", "items": {"enum": ["diagram", "mockup", "interactive", "data_viz", "art", "chart", "elicitation"], "type": "string"}, "type": "array"},
+      "platform": {"description": "The client platform the widget will render on. Pass 'mobile' when your system prompt indicates a mobile client (narrow ~380px viewport) so SVG viewBox and layout guidance are sized accordingly; otherwise pass 'desktop'. Defaults to 'unknown' (desktop sizing).", "enum": ["mobile", "desktop", "unknown"], "type": "string"}
+    },
+    "type": "object"
+  }
+}
+```
+
+## visualize:show_widget
+```json
+{
+  "description": "[third_party_mcp_app] Show visual content — SVG graphics, diagrams, charts, or interactive HTML widgets — that renders inline alongside your text response. Use for flowcharts, architecture diagrams, dashboards, forms, calculators, data tables, games, illustrations, or any visual content. The code is auto-detected: starts with <svg = SVG mode, otherwise HTML mode. A global sendPrompt(text) function is available — it sends a message to chat as if the user typed it. IMPORTANT: Call read_me before your first show_widget call. Do NOT narrate or mention the read_me call to the user — call it silently, then respond as if you went straight to building the visualization.",
+  "parameters": {
+    "properties": {
+      "loading_messages": {"description": "1–4 loading messages shown to the user while the visual renders, each roughly 5 words long. Write them in the same language the user is using. Use 1 for simple visuals, more for complex ones. If the topic is serious — illness, disease, pandemics, death, grief, war, conflict, poverty, disaster, trauma, abuse, addiction, medical decisions, politically charged subjects, or anything where the reader might be personally affected — keep these BORING: describe what the code is doing in the dullest generic way, no jargon-as-drama, no evocative terms. Pandemic growth model — NOT ['Simulating patient zero', 'Modeling the curve'] (documentary-narrator voice), YES ['Setting up the model', 'Running the calculation']. Cancer timeline — NOT ['Charting the battle ahead'], YES ['Laying out the stages']. If you have to ask whether it's serious, it is. Otherwise, have fun — reach for alliteration, puns, personification, wordplay, whatever lands in that language. Playful examples — revenue chart: ['Bribing bars to stand taller', 'Asking Q4 where it went']; kanban: ['Herding cards into columns', 'Dragging, dropping, not stopping'].", "items": {"type": "string"}, "maxItems": 4, "minItems": 1, "type": "array"},
+      "title": {"description": "Short snake_case identifier for this visual. Must be specific and disambiguating — if the conversation has multiple visuals, this title alone should tell you which one is being referenced (e.g. 'q4_revenue_by_product_line' not 'chart', 'oauth_login_flow' not 'diagram'). Also used as the download filename, so no spaces or special characters.", "type": "string"},
+      "widget_code": {"description": "SVG or HTML code to render. For SVG: raw SVG code starting with <svg> tag, must use CSS variables for colors. Example: <svg viewBox=\"0 0 700 400\" xmlns=\"http://www.w3.org/2000/svg\">...</svg>. For HTML: raw HTML content to render, do NOT include DOCTYPE, <html>, <head>, or <body> tags. Use CSS variables for theming. Keep background transparent and avoid top-level padding. Scripts are supported but execute after streaming completes.", "type": "string"}
+    },
+    "required": ["required"],
+    "type": "object"
+  }
+}
+```
+
+That's the complete set as defined in my current tool list.

@@ -119,7 +119,8 @@ def _unsupported_for_strict(schema: Optional[dict], depth: int = 0) -> bool:
     props = schema.get("properties")
     if t == "object" or isinstance(props, dict):
         if props is None:
-            return False
+            # Free-form objects must not be converted into an empty closed object.
+            return schema.get("additionalProperties") is not False
         if not isinstance(props, dict):
             return True
         return any(_unsupported_for_strict(sub, depth + 1) for sub in props.values())

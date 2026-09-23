@@ -838,39 +838,41 @@ SUBAGENT_TOOL = {
     "function": {
         "name": "subagent",
         "description": (
-            "Spawn a sub-agent to handle an isolated sub-task with a fresh context. The sub-agent does NOT inherit the parent's conversation history — it only sees the task description and an optional context string you provide. It runs a mini agentic loop with a restricted tool whitelist and returns a final answer. Use for: research sub-tasks, parallelizable independent sub-problems, or any case where you want to delegate a self-contained piece of work. When multiple independent subtasks exist, call subagent multiple times in the same assistant turn instead of serializing them. The sub-agent CANNOT call subagent / memory / message_user / deliver_reply (legacy names ask_user / skill are blocked too)."
+            "Delegate a self-contained sub-task to a fresh-context child agent. "
+            "Use for independent research, file work, or parallelizable sub-problems. "
+            "The child returns a final answer and cannot call subagent, memory, message_user, or deliver_reply."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "description": {
-                    "type": "string",
-                    "description": "简述本次操作目的（≤60字）。示例：派子 agent 调研量子计算最新进展"
-                },
                 "task": {
                     "type": "string",
-                    "description": "子任务描述。明确说明要让子 agent 产出什么。最多 2,000 tokens。"
+                    "minLength": 1,
+                    "description": "Self-contained task description."
                 },
                 "context": {
                     "type": "string",
-                    "description": "可选的背景上下文。最多 4,000 tokens。可用来传递父对话中的相关信息。"
+                    "description": "Optional background context from the parent."
                 },
                 "model": {
                     "type": "string",
-                    "description": "可选的模型 ID（来自 SUPPORTED_MODELS）。默认与父 agent 同款。"
+                    "description": "Optional model id. Defaults to the parent model."
                 },
                 "allowed_tools": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "可选的工具白名单。缺省时使用安全默认集（web_search/fetch_url/wikipedia/weather/bash/text_editor/todo 等）。传空数组则禁用所有工具。无论是否指定，subagent/memory/message_user/deliver_reply 始终禁用（历史遗留名 ask_user/skill 一并拦截）。"
+                    "description": "Optional tool allowlist. Omit for the safe default set; `[]` disables all tools."
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "整体超时（秒）。默认 900，范围 60-1800。",
+                    "minimum": 60,
+                    "maximum": 1800,
+                    "description": "Overall timeout in seconds. Default: 900.",
                     "default": 900
                 }
             },
-            "required": ["task"]
+            "required": ["task"],
+            "additionalProperties": False
         },
         "input_examples": [
             {"task": "调研 2025 年最热门的 3 个开源 LLM 项目，每个给出 stars / license / 一句话特色", "allowed_tools": ["web_search", "fetch_url"]},
