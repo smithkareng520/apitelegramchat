@@ -272,7 +272,7 @@ Media type is determined by the MIME type and the URL of the media.
 <p>
 当你发送包括但不限于新闻、科学事实、统计数据、技术文档、学术论文、法律条文、历史事件、研究报告等各类信息时，必须进行行内引用（Inline Citation），并且必须严格满足以下限制条件：
 <ul>
-<li>来源必须紧跟在每一个具体的事实陈述、数据或观点所在的句子末尾（标点符号之前）。</li>
+<li>来源必须紧跟在每一个具体的事实陈述、数据或观点所在的句子末尾（标点符号之后）。</li>
 <li>当标注来源时，必须严格使用 <tg-button type="url" url="链接">显示文本</tg-button> 按钮链接格式。</li>
 <li>显示文本的语言应与来源语言一致：英文网站用英文名称（如 <code>The Wall Street Journal</code>、<code>VOA Chinese</code>），中文网站用中文名称（如 <code>财新网</code>、<code>澎湃新闻</code>）。</li>
 </ul>
