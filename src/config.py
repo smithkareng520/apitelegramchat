@@ -1256,12 +1256,12 @@ SUPPORTED_MODELS["claude-opus-5"] = make_model_config(
     max_context=1000000,
     protocol="openai_responses",
 )
-SUPPORTED_MODELS["big-pickle"] = make_model_config(
-    model_id="big-pickle",
+SUPPORTED_MODELS["mimo-v2.6-flash"] = make_model_config(
+    model_id="mimo-v2.6-flash",
     provider="lfree",
     reasoning_enabled=True,
     reasoning_effort="high",
-    max_context=200000,
+    max_context=1000000,
     protocol="openai_responses",
 )
 SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
