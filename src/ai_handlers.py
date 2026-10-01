@@ -1358,15 +1358,14 @@ async def get_ai_response(
             endpoint="/v1/images/generations" if is_image_output else "/v1/chat/completions",
             model=current_model,
         )
-        # 异常路径保全（额度不足/网关错误/网络中断等）：已完成的
-        # assistant/tool 消息补齐占位后沉淀进历史，下一轮可从断点继续，
-        # 而不是整轮作废。
-        try:
-            await turn_recovery.persist_salvaged_journal(
-                chat_id, journal, reason=f"turn-error:{error_id}",
-            )
-        except Exception:
-            logger.debug("异常路径轮次保全失败（可忽略）", exc_info=True)
+        # 所有不可继续的模型错误统一走 failed-turn 生命周期：
+        # 先固定用户已经看到的草稿，再持久化可恢复的 journal。
+        await turn_recovery.finalize_failed_turn(
+            chat_id,
+            journal,
+            draft_builder=builder,
+            reason=f"turn-error:{error_id}",
+        )
         # 失败轮标记：历史末尾若仍是本轮未获回应的 user 消息（journal 为空、
         # 无任何进度可保全），下一条 user 消息将替换而非合并——请求失败后
         # 的重试不叠加上一轮的文本与图片。若已有部分进度被 salvage（末尾

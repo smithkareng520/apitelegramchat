@@ -85,7 +85,7 @@ def test_agent_run_refresh_reads_disk_without_r2_sync(monkeypatch, tmp_path):
     """A skill edit is visible on the next model call without waiting for R2."""
     monkeypatch.setenv("APITELEGRAMCHAT_WORKSPACES_DIR", str(tmp_path / "home"))
     monkeypatch.setenv("APITELEGRAMCHAT_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setattr("workspace_utils.is_r2_configured", lambda: False)
+    monkeypatch.setattr("skills_r2.is_r2_configured", lambda: False)
 
     import workspace_paths as wp
     wp.data_root.cache_clear()

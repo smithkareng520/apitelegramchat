@@ -13,6 +13,7 @@ if str(SRC) not in sys.path:
 
 import workspace_paths as wp
 import workspace_utils as wu
+import skills_r2 as sr2
 
 NS = "10001"
 CHAT_ID = 12345
@@ -55,11 +56,11 @@ def _fresh_env(monkeypatch, tmp_path) -> _FakeR2:
     wu._workspace_file_locks._locks.clear()
 
     fake = _FakeR2()
-    monkeypatch.setattr(wu, "is_r2_configured", lambda: True)
-    monkeypatch.setattr(wu, "download_from_r2", fake.download_from_r2)
-    monkeypatch.setattr(wu, "upload_bytes_to_r2", fake.upload_bytes_to_r2)
-    monkeypatch.setattr(wu, "list_r2_objects", fake.list_r2_objects)
-    monkeypatch.setattr(wu, "delete_r2_object", fake.delete_r2_object)
+    monkeypatch.setattr(sr2, "is_r2_configured", lambda: True)
+    monkeypatch.setattr(sr2, "download_from_r2", fake.download_from_r2)
+    monkeypatch.setattr(sr2, "upload_bytes_to_r2", fake.upload_bytes_to_r2)
+    monkeypatch.setattr(sr2, "list_r2_objects", fake.list_r2_objects)
+    monkeypatch.setattr(sr2, "delete_r2_object", fake.delete_r2_object)
     return fake
 
 
@@ -99,7 +100,7 @@ def test_snapshot_roundtrip_after_restart(monkeypatch, tmp_path):
     custom = _skills_dir() / "my-skill" / "SKILL.md"
     custom.parent.mkdir(parents=True)
     custom.write_text("custom", encoding="utf-8")
-    asyncio.run(wu._backup_user_skills_to_r2(_skills_dir().parent, NS))
+    asyncio.run(sr2.backup_user_skills_to_r2(_skills_dir().parent, NS))
 
     _wipe_disk(tmp_path)
     asyncio.run(wu.init_workspace(CHAT_ID, NS))
@@ -115,11 +116,11 @@ def test_snapshot_replaces_deleted_files(monkeypatch, tmp_path):
     custom = _skills_dir() / "my-skill" / "SKILL.md"
     custom.parent.mkdir(parents=True)
     custom.write_text("custom", encoding="utf-8")
-    asyncio.run(wu._backup_user_skills_to_r2(_skills_dir().parent, NS))
+    asyncio.run(sr2.backup_user_skills_to_r2(_skills_dir().parent, NS))
 
     custom.unlink()
     custom.parent.rmdir()
-    asyncio.run(wu._backup_user_skills_to_r2(_skills_dir().parent, NS))
+    asyncio.run(sr2.backup_user_skills_to_r2(_skills_dir().parent, NS))
 
     _wipe_disk(tmp_path)
     asyncio.run(wu.init_workspace(CHAT_ID, NS))
@@ -134,7 +135,7 @@ def test_tree_fingerprint_does_not_read_content_or_hash(monkeypatch, tmp_path):
     path = skills / "demo" / "SKILL.md"
     path.write_text("content", encoding="utf-8")
 
-    fingerprint = wu._skills_tree_fingerprint(skills)
+    fingerprint = sr2._skills_tree_fingerprint(skills)
     assert fingerprint[0][0] == "demo/SKILL.md"
     assert fingerprint[0][1] == len(b"content")
     assert fingerprint[0][2] == path.stat().st_mtime_ns
@@ -150,7 +151,7 @@ def test_unsafe_archive_path_is_rejected(monkeypatch, tmp_path):
         tf.addfile(info, io.BytesIO(data))
 
     try:
-        wu._extract_skills_archive(buffer.getvalue(), _skills_dir())
+        sr2._extract_skills_archive(buffer.getvalue(), _skills_dir())
     except ValueError as exc:
         assert "unsafe skills archive path" in str(exc)
     else:
@@ -159,7 +160,7 @@ def test_unsafe_archive_path_is_rejected(monkeypatch, tmp_path):
 
 def test_r2_unconfigured_keeps_local_behavior(monkeypatch, tmp_path):
     fake = _fresh_env(monkeypatch, tmp_path)
-    monkeypatch.setattr(wu, "is_r2_configured", lambda: False)
+    monkeypatch.setattr(sr2, "is_r2_configured", lambda: False)
     asyncio.run(wu.init_workspace(CHAT_ID, NS))
     assert (_skills_dir() / "demo" / "SKILL.md").is_file()
     assert fake.objects == {}

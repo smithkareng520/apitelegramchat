@@ -182,6 +182,7 @@ __all__ = [
     "finalize_pending_turns",
     "drain_completed_turns",
     "persist_salvaged_journal",
+    "finalize_failed_turn",
     "persist_user_message_entry",
     "undo_early_persist",
     "mark_failed_unanswered_user",
@@ -706,6 +707,41 @@ async def finalize_interrupted_turn(
 async def finalize_pending_turns(chat_id: int, *, reason: str = "interrupt") -> int:
     """``app._interrupt_active_generation`` 在旧任务取消完成后调用。"""
     return await finalize_interrupted_turn(chat_id, reason=reason)
+
+
+async def finalize_failed_turn(
+    chat_id: int,
+    journal: list,
+    *,
+    draft_builder=None,
+    reason: str,
+) -> list:
+    """Close a failed model turn as one lifecycle operation.
+
+    The visible draft is finalized before the turn journal is persisted so an
+    upstream API error cannot erase text that the user already saw. Draft
+    cleanup is best-effort; journal persistence remains the durable recovery
+    path.
+    """
+    if draft_builder is not None:
+        try:
+            await draft_builder.stop_flush_loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("failed-turn draft flush stop failed", exc_info=True)
+        try:
+            await draft_builder.finalize_interrupted_draft(journal=journal)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("failed-turn draft finalization failed", exc_info=True)
+
+    try:
+        return await persist_salvaged_journal(chat_id, journal, reason=reason)
+    except Exception:
+        logger.debug("failed-turn journal salvage failed", exc_info=True)
+        return []
 
 
 async def persist_salvaged_journal(chat_id: int, journal: list, *, reason: str) -> list:

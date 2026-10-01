@@ -6,8 +6,7 @@
 --------
 1. 给 AI agent 一个轻量、持久的任务管理能力——支持新增、列表、完成、
    反完成、删除、清空、编辑、改优先级。
-2. 数据按用户隔离，落在 ./state/{user_id}/todos.json，复用既有
-   workspace_utils 的 R2 同步链路，无需额外存储。
+2. 数据按用户隔离，落在 ./state/{user_id}/todos.json，通过显式的 state_r2 持久化层，无需额外存储。
 3. 给 Agent 工具结果提供富文本渲染：状态 emoji、优先级、删除线、可折叠统计区。
 """
 
@@ -26,11 +25,8 @@ from token_budget import truncate_to_token_budget
 from typing import Any, Optional
 
 
-from workspace_utils import (
-    _get_workspace_lock,
-    _sync_named_file_from_r2,
-    _sync_named_file_to_r2,
-)
+from workspace_utils import _get_workspace_lock
+from state_r2 import sync_named_file_from_r2, sync_named_file_to_r2
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +144,7 @@ async def _read_store(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> 
     lock = await _get_workspace_lock(chat_id)
     async with lock:
         try:
-            await _sync_named_file_from_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
+            await sync_named_file_from_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
         except Exception as e:
             logger.warning(f"todos: R2→local 同步失败 (chat={chat_id}): {e}")
         store = _load_local(chat_id)
@@ -170,7 +166,7 @@ async def _mutate(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> dict
     lock = await _get_workspace_lock(chat_id)
     async with lock:
         try:
-            await _sync_named_file_from_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
+            await sync_named_file_from_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
         except Exception as e:
             logger.warning(f"todos: R2→local 同步失败 (chat={chat_id}): {e}")
         store = _load_local(chat_id)
@@ -181,7 +177,7 @@ async def _mutate(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> dict
         _save_local(chat_id, store)
         # 同步回 R2（单文件，同步等待——JSON 文件很小，<1s）
         try:
-            await _sync_named_file_to_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
+            await sync_named_file_to_r2(chat_id, _todo_path(chat_id), TODO_FILENAME)
         except Exception as e:
             logger.warning(f"todos: local→R2 同步失败 (chat={chat_id}): {e}")
         return payload

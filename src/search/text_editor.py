@@ -1,4 +1,4 @@
-"""text_editor 工具：view/str_replace/create/insert/list 与 R2 持久化（自 search_engine.py 拆出）。
+"""text_editor 工具：view/str_replace/create/insert/list（自 search_engine.py 拆出）。
 
 行尾保真：所有读写按原始字节进行（CRLF 不被 universal newlines
 静默翻译成 LF）；纯 CRLF 文件在匹配/写入时整体按 CRLF 空间处理。
@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import cast
 
 from workspace_paths import workspace_workdir, workspace_namespace
-from s3_utils import upload_bytes_to_r2, delete_r2_object
 from workspace_utils import _get_workspace_lock, _ensure_runtime_workspace
 from token_budget import count_tokens
 
@@ -21,60 +20,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-# ===================== 显式持久化单个编辑文件 =====================
-# 后台持久化任务的强引用集合：asyncio.create_task 返回的 Task 若不保存
-# 引用，事件循环只持弱引用，任务可能在执行中途被垃圾回收（Python 官方
-# 文档明确要求保存引用）。任务完成后经 done 回调从集合移除，避免泄漏。
-_editor_persist_tasks: set = set()
-
-
-async def _persist_edited_file(
-    chat_id: int,
-    rel_path: str,
-    *,
-    delete: bool = False,
-    namespace: str | None = None,
-    content_bytes: bytes | None = None,
-) -> None:
-    """Persist only the file explicitly changed through text_editor.
-
-    ``content_bytes``：调用方传入本次编辑**实际写入**的字节。后台任务
-    若重新从磁盘读取，可能读到后续并发编辑的新内容（或读到写入前的
-    旧内容，取决于时序），让 R2 镜像与本次结果不一致；直传字节同时
-    消除这个竞态和一次额外 IO。
-    """
-    try:
-        result = await persist_workspace_file(
-            chat_id, rel_path, delete=delete, namespace=namespace,
-            content_bytes=content_bytes,
-        )
-        logger.debug("显式持久化成功：%s", result.get("key", rel_path))
-    except Exception as e:
-        logger.error("显式持久化失败 %s: %s", rel_path, e)
-
-
-def _spawn_persist_task(
-    chat_id: int,
-    safe_path: str,
-    *,
-    namespace: str,
-    content_bytes: bytes | None = None,
-) -> None:
-    """调度后台持久化任务，并保存 Task 引用防止被 GC 中途回收。"""
-    try:
-        task = asyncio.create_task(
-            _persist_edited_file(
-                chat_id, safe_path, namespace=namespace,
-                content_bytes=content_bytes,
-            )
-        )
-    except RuntimeError:
-        # 没有正在运行的事件循环（同步测试上下文等）：跳过后台持久化。
-        logger.debug("无运行事件循环，跳过后台持久化 %s", safe_path)
-        return
-    _editor_persist_tasks.add(task)
-    task.add_done_callback(_editor_persist_tasks.discard)
-
+# 工作区文件只保存在本地。R2 同步由明确的用户上传/专用状态机制负责；
+# text_editor 本身不因为模型编辑工作区文件而触发 R2。
 
 def _normalize_editor_text(text: str) -> str:
     if text is None:
@@ -404,8 +351,6 @@ async def execute_text_editor(
                         file.write(data)
                 except FileExistsError:
                     return "Error: File already exists."
-                _spawn_persist_task(
-                    chat_id, safe_path, namespace=resolved_namespace, content_bytes=data)
                 # 成功消息使用 workspace 相对路径：绝对路径会泄漏服务器
                 # 目录结构，也违背「一切路径相对 workspace 根」的约定。
                 return _with_latest_editor_snapshot(f"Successfully created file: {safe_path}", file_text)
@@ -474,9 +419,6 @@ async def execute_text_editor(
                 if crlf:
                     new_content = new_content.replace("\n", "\r\n")
                 _write_text_editor_file(local_path, new_content)
-                _spawn_persist_task(
-                    chat_id, safe_path, namespace=resolved_namespace,
-                    content_bytes=new_content.encode("utf-8"))
                 success_msg = f"The file {safe_path} has been edited.{normalized_note}"
                 return _with_editor_snippet_or_tail(
                     success_msg, new_content, target_line=replacement_line, new_lines=new_str_lines_count
@@ -508,9 +450,6 @@ async def execute_text_editor(
                 new_content = new_content.replace("\n", "\r\n")
 
             _write_text_editor_file(local_path, new_content)
-            _spawn_persist_task(
-                chat_id, safe_path, namespace=resolved_namespace,
-                content_bytes=new_content.encode("utf-8"))
             success_msg = f"The file {safe_path} has been edited. Successfully inserted text after line {insert_line}."
             return _with_editor_snippet_or_tail(
                 success_msg, new_content, target_line=max(1, insert_line), new_lines=text_to_insert.count("\n")
@@ -586,49 +525,3 @@ def _resolve_editor_path(workspace: Path, safe_path: str, allow_root: bool = Fal
         raise ValueError("Invalid path: symlink escapes workspace")
     return resolved
 
-def _editor_get_r2_key(chat_id: int, path: str) -> str:
-    """生成R2存储的键，按用户隔离。"""
-    safe = _editor_safe_path(path)
-    return f"{EDITOR_PREFIX}/{chat_id}/{safe}"
-
-async def persist_workspace_file(
-    chat_id: int,
-    rel_path: str,
-    *,
-    delete: bool = False,
-    namespace: str | None = None,
-    content_bytes: bytes | None = None,
-) -> dict[str, str | bool]:
-    """Persist exactly one file edited by text_editor.
-
-    The local workspace is always the source of truth. This helper only mirrors
-    the explicitly changed file to the existing R2 editor namespace; it never
-    scans or syncs the whole workspace. Namespace is accepted so callers can keep
-    a single workspace identity end-to-end, while the legacy R2 key remains keyed
-    by chat_id for backward compatibility. ``content_bytes`` lets the caller
-    persist exactly the bytes it just wrote (avoiding a re-read that could race
-    with a concurrent later edit); when omitted the file is read from disk.
-    """
-    # Resolve the namespace here as an integrity check even though the current R2
-    # key format remains chat-id based for compatibility.
-    resolved_namespace = workspace_namespace(chat_id, namespace)
-    workspace = workspace_workdir(chat_id, resolved_namespace)
-    safe = _editor_safe_path(rel_path)
-    local_path = (workspace / safe).resolve()
-    if local_path != workspace and workspace not in local_path.parents:
-        raise ValueError("path escapes workspace")
-
-    key = _editor_get_r2_key(chat_id, safe)
-    if delete:
-        deleted = await delete_r2_object(key)
-        return {"key": key, "deleted": bool(deleted)}
-
-    if content_bytes is None:
-        if not local_path.is_file():
-            raise FileNotFoundError(f"workspace file not found: {safe}")
-        data = await asyncio.to_thread(local_path.read_bytes)
-    else:
-        data = content_bytes
-    content_type = mimetypes.guess_type(safe)[0] or "application/octet-stream"
-    url = await upload_bytes_to_r2(data, key, content_type)
-    return {"key": key, "persisted": url is not None}

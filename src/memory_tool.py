@@ -6,7 +6,7 @@
 ----
 - 不同于对话历史（短期、会被自动修剪），memory 是用户希望长期保留的事实、
   偏好、要点——跨会话持久化。
-- 按用户隔离，落在 ./state/{user_id}/memories.json，复用既有 R2 同步链路。
+- 按用户隔离，落在 ./state/{user_id}/memories.json，通过显式的 state_r2 持久化层。
 - 给 AI 一组 CRUD + 检索接口：add / get / list / search / update / delete / clear。
 
 数据模型
@@ -43,11 +43,8 @@ from workspace_paths import memory_state_file
 from token_budget import truncate_to_token_budget
 from typing import Any, Optional
 
-from workspace_utils import (
-    _get_workspace_lock,
-    _sync_named_file_from_r2,
-    _sync_named_file_to_r2,
-)
+from workspace_utils import _get_workspace_lock
+from state_r2 import sync_named_file_from_r2, sync_named_file_to_r2
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +180,7 @@ async def _read_store(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> 
     lock = await _get_workspace_lock(chat_id)
     async with lock:
         try:
-            await _sync_named_file_from_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
+            await sync_named_file_from_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
         except Exception as e:
             logger.warning(f"memory: R2→local 同步失败 (chat={chat_id}): {e}")
         store = _load_local(chat_id)
@@ -201,7 +198,7 @@ async def _mutate(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> dict
     lock = await _get_workspace_lock(chat_id)
     async with lock:
         try:
-            await _sync_named_file_from_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
+            await sync_named_file_from_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
         except Exception as e:
             logger.warning(f"memory: R2→local 同步失败 (chat={chat_id}): {e}")
         store = _load_local(chat_id)
@@ -211,7 +208,7 @@ async def _mutate(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> dict
             return {"ok": False, "error": str(e), "code": e.code}
         _save_local(chat_id, store)
         try:
-            await _sync_named_file_to_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
+            await sync_named_file_to_r2(chat_id, _memory_path(chat_id), MEMORY_FILENAME)
         except Exception as e:
             logger.warning(f"memory: local→R2 同步失败 (chat={chat_id}): {e}")
         return payload

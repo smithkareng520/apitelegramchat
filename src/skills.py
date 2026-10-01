@@ -15,7 +15,7 @@ from typing import Any, Iterable
 logger = logging.getLogger(__name__)
 
 # Skill 资源层位于 workspace/skills。workspace 本身不做 R2 全量同步；
-# 但用户运行期自建/修改的技能由 workspace_utils 按 skills/{ns}/ 前缀
+# 但用户运行期自建/修改的技能由 skills_r2 按 skills/{ns}/ 前缀
 # 定向持久化到 R2（恢复 + 增量备份），打包技能仍只在首次初始化时拷入。
 SKILL_ASSETS_DIRNAME = "skills"
 
@@ -462,7 +462,7 @@ async def start_packaged_skill_auto_sync() -> None:
     # before any user message is consumed. If R2 has no snapshot, the project
     # skills are bootstrapped and the resulting snapshot is seeded to R2.
     try:
-        from workspace_utils import sync_all_existing_workspace_skills_r2
+        from skills_r2 import sync_all_existing_workspace_skills_r2
         r2_initial = await sync_all_existing_workspace_skills_r2()
         logger.info(
             "startup workspace skills R2 sync: workspaces=%s restored=%s bootstrapped=%s errors=%s",
@@ -483,9 +483,9 @@ async def start_packaged_skill_auto_sync() -> None:
     # Packaged-skill refresh may itself change workspace/skills. Persist the
     # resulting complete snapshot so R2 remains the single compressed source.
     try:
-        from workspace_utils import _backup_user_skills_to_r2, _workspace_namespace_dirs_for_skills
-        for home in _workspace_namespace_dirs_for_skills():
-            await _backup_user_skills_to_r2(home, home.name)
+        from skills_r2 import backup_user_skills_to_r2, workspace_namespace_dirs_for_skills
+        for home in workspace_namespace_dirs_for_skills():
+            await backup_user_skills_to_r2(home, home.name)
     except Exception:
         logger.warning("startup workspace skills R2 snapshot refresh failed", exc_info=True)
 
@@ -531,7 +531,7 @@ async def start_packaged_skill_auto_sync() -> None:
     if _workspace_r2_watcher_task is None or _workspace_r2_watcher_task.done():
         r2_stop = asyncio.Event()
         _workspace_r2_watcher_stop = r2_stop
-        from workspace_utils import watch_workspace_skills_r2
+        from skills_r2 import watch_workspace_skills_r2
         _workspace_r2_watcher_task = asyncio.create_task(
             watch_workspace_skills_r2(r2_stop, interval=max(1.0, _SYNC_INTERVAL_SECONDS)),
             name="workspace-skills-r2-sync",
