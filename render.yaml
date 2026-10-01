@@ -1,0 +1,134 @@
+# =====================================================================
+# render.yaml — Render 平台部署配置
+# =====================================================================
+# 使用方法:
+#   1. 把本文件放到项目根目录
+#   2. 在 Render 控制台选择 "New → Blueprint" → 选这个文件
+#   3. 所有环境变量在 Render 的 Environment 页面配置为 Secret
+#      (而不是 Plain Text)
+# =====================================================================
+
+services:
+  - type: web
+    name: telegram-bot
+    runtime: docker
+    plan: starter
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    # Give the bot enough time to finish its graceful cleanup after SIGTERM.
+    # Render uses SIGTERM for normal instance replacement/deploys and may send
+    # SIGKILL after this window if the process is still alive.
+    maxShutdownDelaySeconds: 60
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: TZ
+        value: Asia/Shanghai
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_TOKEN
+        sync: false
+      # 唯一管理员；用户名必须带 @，也同时作为未授权提示中的联系对象显示。
+      - key: ADMIN_USER
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: XAI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: XXTF_API_KEY
+        sync: false
+      - key: LFREE_API_KEY
+        sync: false
+      - key: GLM_API_KEY
+        sync: false
+      - key: MODELSCOPE_API_KEY
+        sync: false
+      - key: AGNES_API_KEY
+        sync: false
+      - key: R2_ENDPOINT
+        sync: false
+      - key: R2_ACCESS_KEY
+        sync: false
+      - key: R2_SECRET_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+      - key: R2_REGION
+        value: auto
+      - key: WEBHOOK_URL
+        sync: false
+      # ⚠️ 必须为 polling（事故根因，勿改回 webhook）：
+      # Render 的服务位于其托管 Cloudflare 之后，且该 WAF **无法由用户关闭**
+      # （官方 feature request "Let us disable the Cloudflare WAF" 长期 open）。
+      # 托管规则 "Command Injection - Generic - body" 会检查**入站请求体**，
+      # 命中 `>` / 反引号 紧邻 curl/wget 的 shell 注入特征时在边缘直接 403，
+      # 请求根本到不了容器（日志里连 TCP 打印都没有）。
+      # 而 Telegram webhook 是串行、需 2xx 签收的投递模型：这条 update 永远
+      # 拿不到 200 就一直堵在队头无限重投，导致后续所有消息一起卡死——正是
+      # ">curl -v \"test\"" 之类消息把整个 bot 打挂的原因。
+      # polling 模式改用 getUpdates，update 走**出站响应体**，不受入站请求体
+      # 规则影响，从根上消除该类误杀。
+      - key: INGEST_MODE
+        value: polling
+      - key: TELEGRAM_POLL_TIMEOUT
+        value: "25"
+      - key: TELEGRAM_POLL_LIMIT
+        value: "100"
+      # ⚠️ 必须为 false（代码默认值即 false，此处显式固化并修正历史误配）：
+      # 设 true 时每次重启/部署/健康检查失败重启都会调用
+      # setWebhook?drop_pending_updates=true，把 Telegram 侧积压的 update
+      # 永久丢弃——停机窗口内的消息不投递、不回复、日志里也永远不出现，
+      # 正是"消息凭空消失、没有任何新日志"假象的元凶之一。
+      # false 时由健康实例自动重放排干积压（bot 会迟到回复，但不丢消息）。
+      - key: DROP_PENDING_ON_STARTUP
+        value: "false"
+      - key: SERPER_API_KEY
+        sync: false
+      - key: GAODE_MCP_URL
+        sync: false
+      - key: GAODE_MCP_TOKEN
+        sync: false
+      - key: SANDBOX_MAX_PROCS
+        value: "50"
+      - key: SANDBOX_MAX_CPU_SEC
+        value: "300"
+      - key: SANDBOX_MAX_FILE_SIZE
+        value: "104857600"
+      - key: SANDBOX_MAX_OPEN_FILES
+        value: "256"
+      - key: SANDBOX_TIMEOUT_SEC
+        value: "120"
+      - key: SUBAGENT_MAX_ROUNDS
+        value: "32"
+      - key: SUBAGENT_DEFAULT_TIMEOUT
+        value: "900"
+      - key: SUBAGENT_LLM_TIMEOUT
+        value: "180"
+      - key: SUBAGENT_TOOL_TIMEOUT
+        value: "120"
+      - key: SUBAGENT_OUTER_TIMEOUT
+        value: "930"
+      # 16 个并发工具在网页抓取/MCP 场景会造成明显内存峰值；8 足够维持吞吐并降低 OOM 风险。
+      - key: MAX_CONCURRENT_TOOLS
+        value: "8"
+      - key: AI_STREAM_IDLE_TIMEOUT_SECONDS
+        value: "300"
+      - key: AI_STREAM_TOTAL_TIMEOUT_SECONDS
+        value: "1800"
+      - key: LOG_LEVEL
+        value: INFO
+    disk:
+      name: tmp
+      mountPath: /tmp
+      sizeGB: 1

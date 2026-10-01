@@ -1,0 +1,2010 @@
+"""Telegram Rich Message 草稿的增量构建、HTML 边界扫描与滚动切换。
+
+从 ai_handlers.py 拆分而来，逻辑未做改动。
+"""
+import asyncio
+import logging
+import re
+import random
+import html
+import os
+import time
+from typing import Any, List, Optional
+
+from config import STREAM_FLUSH_INTERVAL, STREAM_SILENT_FORCE_FLUSH
+from utils import (
+    send_rich_message_draft,
+    send_rich_html_message,
+    get_logger,
+    delete_message_fast,
+    mark_draft_dead,
+    is_draft_dead,
+    RateLimitError,
+)
+from markdown_converter import convert_markdown_to_telegram_html
+from ai.error_formatting import extract_domain
+from ai.attachment_content import _track_task
+from core.messages import Message
+from token_budget import count_tokens, truncate_to_token_budget
+from ai.tool_summary import (
+    _coerce_positive_int,
+    _generate_action_description,
+    _generate_initial_tool_summary,
+    _generate_pending_tool_summary,
+    _get_tool_description_from_args,
+    _initial_map_tool_summary,
+    _norm_tool_key,
+)
+from markdown_converter import (
+    convert_markdown_to_telegram_html,
+    wrap_mixed_content_as_blocks,
+    _escape_prose,
+)
+
+logger = get_logger(__name__)
+
+# ---------- 打断即时冻结（"实际发送到草稿的那里截断"） ----------
+# 打断入口（app_turns._interrupt_active_generation）在取消旧任务**之前**
+# 把当前活跃草稿加进本集合：从这一刻起，该草稿禁止再推送任何新帧。
+# 旧任务的取消信号传播到 stop_flush_loop 存在事件循环窗口，期间后台
+# 刷新循环的 0.1s tick 仍可能把"后端超前生成、尚未送达"的积压文本整帧
+# 倒给用户（用户体感：按了停止，草稿却又刷出一段）。冻结门在 flush 的
+# 入口与锁内各设一道同步检查点，杜绝这一窗口期的任何新帧；已在途的
+# 发送不中断（送达即用户所见，交由游标口径吸收）。条目在
+# stop_flush_loop（该 builder 的推流生命周期终点）统一清理。
+_FROZEN_DRAFTS: set = set()
+
+
+def freeze_draft_streaming(draft_id: object) -> None:
+    """打断入口先行冻结：该草稿自此不再推送任何新帧（在途请求除外）。"""
+    if draft_id is None:
+        return
+    _FROZEN_DRAFTS.add(draft_id)
+    logger.info("[打断冻结] 草稿推送已冻结（以实际送达为截断基准）: draft=%s", draft_id)
+
+# ---------- Telegram Rich Message 草稿滚动 ----------
+# 内部内容预算一律按 tiktoken 计算。Telegram 仍有 32,768 个解析后 Unicode
+# 字符的协议上限；该值仅作为最终的传输安全边界，并非内容预算。
+def _positive_env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+RICH_MESSAGE_TEXT_PROTOCOL_LIMIT = _positive_env_int("RICH_MESSAGE_TEXT_PROTOCOL_LIMIT", 32768)
+RICH_DRAFT_ROLLOVER_TOKEN_BUDGET = _positive_env_int(
+    "RICH_DRAFT_ROLLOVER_TOKEN_BUDGET", 6_000
+)
+RICH_MESSAGE_BLOCKS_MAX = _positive_env_int("RICH_MESSAGE_BLOCKS_MAX", 500)
+RICH_DRAFT_ROLLOVER_BLOCKS = min(
+    RICH_MESSAGE_BLOCKS_MAX - 1,
+    _positive_env_int("RICH_DRAFT_ROLLOVER_BLOCKS", 440),
+)
+# 接近上限时仅进入“本轮结束后滚动”状态；真正切换仍在完整工具批次结束后进行。
+RICH_DRAFT_ARM_TOKEN_BUDGET = min(
+    RICH_DRAFT_ROLLOVER_TOKEN_BUDGET,
+    _positive_env_int("RICH_DRAFT_ARM_TOKEN_BUDGET", 5_400),
+)
+RICH_DRAFT_ARM_BLOCKS = min(
+    RICH_DRAFT_ROLLOVER_BLOCKS,
+    _positive_env_int("RICH_DRAFT_ARM_BLOCKS", 380),
+)
+# 交互阈值较低，以避免客户端在长工具链中反复重绘过大的草稿。
+RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET = min(
+    RICH_DRAFT_ARM_TOKEN_BUDGET,
+    _positive_env_int("RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET", 3_000),
+)
+RICH_DRAFT_INTERACTIVE_BLOCKS = min(
+    RICH_DRAFT_ARM_BLOCKS,
+    _positive_env_int("RICH_DRAFT_INTERACTIVE_BLOCKS", 160),
+)
+
+# 这些标签被视为富消息中的结构块。只有在最外层结构块完全闭合后，才允许正常滚动，
+# 从而不会在 details/table/list/pre 等结构的中间截断。
+_RICH_BLOCK_TAGS = frozenset({
+    "p", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "blockquote", "details",
+    "ul", "ol", "li", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "hr",
+    "figure", "figcaption", "tg-slideshow", "tg-map", "img", "video", "audio",
+    "tg-math-block", "aside", "footer",
+})
+# API 将嵌套富消息块、列表项和表格行计入 500 块上限；table cell 只承载 RichText，
+# 因此不将 td/th 等单元格标签虚增为独立块。
+_RICH_COUNTED_BLOCK_TAGS = _RICH_BLOCK_TAGS - frozenset({"thead", "tbody", "tfoot", "td", "th", "figcaption"})
+_RICH_VOID_TAGS = frozenset({"br", "hr", "img", "video", "audio", "tg-map", "source", "meta", "link", "input"})
+_RICH_HTML_TAG_RE = re.compile(r"<!--.*?-->|<[^>]*>", re.DOTALL)
+_RICH_TAG_NAME_RE = re.compile(r"^<\s*(/)?\s*([A-Za-z][\w:-]*)")
+# Rich Message 的 details、列表和表格等容器不能只承载裸文本；服务端会将其
+# 判为没有有效内容并返回 RICH_MESSAGE_CONTENT_REQUIRED。内联样式标签不算块。
+_RICH_BLOCK_OPEN_TAG_RE = re.compile(
+    r"<\s*(?:p|h[1-6]|pre|blockquote|details|ul|ol|li|table|thead|tbody|tfoot|tr|hr|"
+    r"figure|figcaption|tg-slideshow|tg-map|img|video|audio|tg-math-block|aside|footer)\b",
+    re.IGNORECASE,
+)
+
+def _log_draft_journal_consistency(
+    chat_id: int, draft_id: int, draft_plain: str, journal: Optional[list],
+) -> None:
+    """草稿层 ↔ 历史层一致性观测（改动点3，诊断用、不改变行为）。
+
+    打断固化草稿后校验"本轮 journal 是否留有 assistant 进度"：草稿有
+    可观可见文本而 journal 无任何 assistant 文本/工具调用，即两层数据
+    结构再次失同步——正是历史上"草稿显示数到 123、模型记忆全空"回归的
+    直接特征。第一时间落 WARNING（而非再靠用户截图反馈）；一致时落
+    INFO 供事后观测。
+
+    刻意只做"journal 完全无 assistant 进度"的空值判定，不做长度比例
+    判定：草稿可见文本天然包含工具卡片摘要等内容，与 journal 的
+    assistant 正文不可同比，宽松比例只会制造噪音告警。
+    """
+    if journal is None:
+        return
+    journal_text_len = 0
+    journal_has_assistant_content = False
+    for m in journal:
+        if isinstance(m, Message) and m.role == "assistant":
+            journal_text_len += len(m.text())
+            if m.text().strip() or m.tool_calls():
+                journal_has_assistant_content = True
+    if len(draft_plain) >= 100 and not journal_has_assistant_content:
+        logger.warning(
+            "[打断保全] 草稿固化了 %s 字符可见内容，但轮次 journal 中"
+            "无任何 assistant 文本/工具调用——草稿层与历史层失同步"
+            "（LiveAssistantSlot 同步链路可能损坏，请排查）: chat=%s draft=%s",
+            len(draft_plain), chat_id, draft_id,
+        )
+    else:
+        logger.info(
+            "[打断保全] 草稿固化 %s 字符；journal assistant 进度 %s 字符"
+            "（两层一致）: chat=%s draft=%s",
+            len(draft_plain), journal_text_len, chat_id, draft_id,
+        )
+
+
+def _rich_visible_text(text: str) -> str:
+    """按 Rich Message 的近似语义计算解析后的可见字符，不计 HTML 标签和属性。"""
+    if not text:
+        return ""
+    return html.unescape(_RICH_HTML_TAG_RE.sub("", text))
+
+
+def _ensure_rich_block_content(fragment: str) -> str:
+    """为只有裸文本或内联标签的片段补上 Rich Message 所需的块级容器。
+
+    模型的推理、工具详情和最终文本均可能是普通文字或仅含 ``<b>``、``<i>``
+    等内联标签。该形态在浏览器中可显示，但 Telegram Rich Message API 会拒绝
+    嵌入在 ``<details>`` 中的此类内容。已有任意 Rich 块时保持原样，避免破坏
+    表格、列表、媒体等有效结构。
+    """
+    content = (fragment or "").strip()
+    if not content:
+        return ""
+    if _RICH_BLOCK_OPEN_TAG_RE.search(content):
+        return content
+    return f"<p>{content}</p>"
+
+
+def _render_reasoning_html(content: str) -> str:
+    """把思考原文渲染为可安全嵌入 ``<details>`` 的块级 HTML 片段。
+
+    思考（reasoning）是模型的原始独白，其中形似 HTML 标签的片段极其常见：
+    模型会复述系统提示词的标签白名单（"Allowed tags: <b>, <strong>, <p>…"）、
+    提到 ``<tg-button>``、写 "a < b" 等。这些片段必须按字面量展示，绝不能
+    被当成真实标签。因此渲染分两步：
+
+    1. 先用 ``markdown_converter._escape_prose`` 对原文做幂等转义（只转义
+       裸 ``&``，``<``/``>`` 一律转义）。之所以不用无条件逐字符转义：模型
+       有时会按提示词输出已转义实体（如 ``&lt;tg-button&gt;``），只转义
+       裸 ``&`` 才能保证幂等，不会把已有实体二次转义成 ``&amp;lt;``。
+    2. 再交给 Markdown 转换器，让思考中的 ``**粗体**``、`` `代码` ``、列表、
+       代码围栏等语法正常渲染。转义后原文里已无裸 ``<``，形似标签的片段
+       不会再被转换器当作"已有 HTML"保留，也不会触发 ``sanitize_tg_buttons``
+       对思考中按钮字样的逐帧 WARNING。
+
+    历史教训（2026-09 线上故障）：此前直接把思考原文交给 Markdown 转换器，
+    「无 Markdown 语法」的思考被短路透传、标签片段被当作已有 HTML 保留，
+    嵌入 ``<details>`` 后产生几十层非法嵌套，Telegram 以 400
+    RICH_MESSAGE_DEPTH_INVALID 拒收，草稿判死、整条消息退化为纯文本。
+
+    空内容返回空串：调用方（``_build_html*``）对空思考块整块跳过，等首个
+    字符到达后再渲染折叠块，不再输出"思考中…"占位。
+
+    结构安全：转换产物经 ``wrap_mixed_content_as_blocks`` 整理，避免
+    「文字 + Markdown 列表」混排被整体包进单个 ``<p>`` 产出
+    ``<p>…<ul>…</ul>…</p>`` 非法嵌套。
+    """
+    text = (content or "").strip()
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # 第一步：幂等转义思考原文（详见 docstring——先转义后转换是本函数的
+    # 安全不变量，顺序不能颠倒）。
+    text = _escape_prose(text)
+
+    # 第二步：Markdown 转换器处理（**粗体**、`代码`、列表、代码围栏等）。
+    converted = convert_markdown_to_telegram_html(text)
+
+    # 按块级标签切段后包 <p>：混排内容不再整体塞进单个 <p>。
+    return wrap_mixed_content_as_blocks(converted)
+
+
+def _scan_rich_html_boundaries(
+    html_content: str,
+) -> tuple[list[tuple[int, int, int, int]], int, int, int]:
+    """Return complete outer-block boundaries with exact visible-text tokens.
+
+    Each boundary is ``(source_end, visible_tokens, block_count, visible_units)``.
+    ``visible_units`` is retained only to enforce Telegram's protocol cap; all
+    draft rollover choices use ``visible_tokens``.
+    """
+    content = html_content or ""
+    boundaries: list[tuple[int, int, int, int]] = []
+    open_tags: list[str] = []
+    visible_parts: list[str] = []
+    block_count = 0
+    cursor = 0
+
+    # 性能修复（EVENT LOOP BLOCKED 根因）：原实现在每个块边界都对
+    # "累计到此处的全部可见文本" 做一次 tiktoken 全量编码，复杂度是
+    # O(块数 × 全文长度)。一个 120 块 / 6.6KB 的草稿单次扫描就要 ~290ms，
+    # 而 flush 每帧调用两次（_arm_rollover_if_needed + DEBUG 扫描），
+    # 0.65s 一帧 => 事件循环被同步 CPU 占死 ~90%，进而出现
+    # "期望休眠 10.0s 实际 20.2s" 的 lag 与健康检查失败。
+    #
+    # 改为增量累加：只对"自上个边界以来新增的片段"编码一次，累加得到
+    # 边界处的 token 数，复杂度降为 O(全文长度)。token 化不是严格可加的
+    # （跨片段的 BPE 合并会有 ±个位数偏差），但这些数值仅用于容量阈值
+    # 判断（3000/6000 token 预算），偏差远小于阈值裕度；末尾返回的总量
+    # 仍按全文精确编码一次，保证对外口径准确。
+    tokens_acc = 0          # 已计入边界的累计 token
+    units_acc = 0           # 已计入边界的累计可见字符数
+    pending_parts: list[str] = []   # 自上个边界以来新增、尚未计量的片段
+
+    def add_visible(fragment: str) -> None:
+        if fragment:
+            unescaped = html.unescape(fragment)
+            visible_parts.append(unescaped)
+            pending_parts.append(unescaped)
+
+    def append_boundary(source_end: int) -> None:
+        nonlocal tokens_acc, units_acc
+        if pending_parts:
+            delta = "".join(pending_parts)
+            pending_parts.clear()
+            tokens_acc += count_tokens(delta)
+            units_acc += len(delta)
+        boundaries.append((source_end, tokens_acc, block_count, units_acc))
+
+    for match in _RICH_HTML_TAG_RE.finditer(content):
+        add_visible(content[cursor:match.start()])
+        token = match.group(0)
+        cursor = match.end()
+        if token.startswith("<!--"):
+            continue
+        parsed = _RICH_TAG_NAME_RE.match(token)
+        if not parsed:
+            continue
+        is_close = bool(parsed.group(1))
+        tag = parsed.group(2).lower()
+        is_self_closing = token.rstrip().endswith("/>") or tag in _RICH_VOID_TAGS
+
+        if is_close:
+            for idx in range(len(open_tags) - 1, -1, -1):
+                if open_tags[idx] == tag:
+                    del open_tags[idx:]
+                    break
+            if tag in _RICH_COUNTED_BLOCK_TAGS:
+                block_count += 1
+            if not open_tags:
+                append_boundary(match.end())
+        elif is_self_closing:
+            if tag in _RICH_COUNTED_BLOCK_TAGS:
+                block_count += 1
+            if not open_tags:
+                append_boundary(match.end())
+        else:
+            open_tags.append(tag)
+
+    add_visible(content[cursor:])
+    visible_text = "".join(visible_parts)
+    # 全文总量精确编码一次（O(全文)），作为对外返回的权威口径。
+    total_tokens = count_tokens(visible_text)
+    if not open_tags and content.strip() and (not boundaries or boundaries[-1][0] != len(content)):
+        boundaries.append((len(content), total_tokens, max(1, block_count), len(visible_text)))
+    return boundaries, total_tokens, block_count, len(visible_text)
+
+
+async def _swallow_flush_task(t: "asyncio.Task", name: str, draft_id: int) -> None:
+    """后台监听 flush 子 task 的结束，仅用于日志。绝不阻塞调用方。"""
+    try:
+        await t
+    except asyncio.CancelledError:
+        logger.debug(f"{name} 已取消: draft_id={draft_id}")
+    except Exception as e:
+        logger.debug(f"{name} 异常（可忽略）: draft_id={draft_id} {e}")
+
+
+class RichMessageBuilder:
+    def __init__(self, chat_id: int) -> None:
+        self.chat_id = chat_id
+        # draft_id 必须在 2^53 (9007199254740992) 以内，否则 JSON 双精度浮点解析会丢失精度，
+        # 导致服务端把同一次请求视为不同草稿，出现两个草稿同时更新的 bug。
+        self.draft_id: int = int(time.time() * 1000000) + random.randint(0, 999)
+        self.draft_message_id: Optional[int] = None
+        self.blocks: List[str] = []
+        self.block_types: List[str] = []
+        self._tool_groups: List[dict[str, Any]] = []
+        self._current_group_idx = -1
+        self._stream_buffer: str = ""
+        self._stream_text_index: int = -1
+        self._last_flush_time: float = time.monotonic()
+        self._flush_sequence: int = 0
+        # 每次内容变更递增。刷新完成时仅在版本未变化的情况下清除 dirty，
+        # 从而既不会漏掉在途更新，也不会重复发送已由显式 flush 覆盖的同一帧。
+        self._flush_revision: int = 0
+        self._flush_task: Optional[asyncio.Task] = None
+        self._pending_flush_task: Optional[asyncio.Task] = None
+        # request_flush 合并高频更新时，若网络发送仍在进行，新内容不能仅靠
+        # “已有 pending task”被吞掉；该标记保证当前帧结束后必补发最新状态。
+        self._flush_dirty: bool = False
+        self._stop_flush = False
+        self._flush_lock = asyncio.Lock()
+        self._rollover_lock = asyncio.Lock()
+        self._rate_limited_until: float = 0.0
+        self._force_flush_requested: bool = False
+        # 容量预警与实际切换严格分离：扫描器只置位 pending；只有安全闭合点
+        #（工具返回完成/文本块结束/思考块结束）才能执行 draft swap。
+        self._rollover_pending = False
+        self._rollover_in_progress = False
+        # 防御性兜底：理论上回合边界期间不再有模型增量；若调用方违约，增量进入
+        # handoff 缓冲，永久化完成后随新草稿写入，绝不能被旧 remainder 快照覆盖。
+        self._handoff_text: list[str] | None = None
+        # 每一次滚动均记录旧草稿、新草稿和永久消息 ID，既用于诊断，也确保最终
+        # 收尾只处理当前草稿而不会重复发送已完成的段落。
+        self._rollover_history: list[dict[str, int | str | None]] = []
+        self._rollover_count: int = 0
+        # ---- 打断裁剪基准（五阶段规范：文本看前端）----
+        # 本回合用户可见文本的累计字符数：流式文本 delta（思考流不计——
+        # 思考不进入裁剪后的历史）+ 非流式 add_text（超限总结等，同样
+        # 会发给用户）。渲染确认游标（_render_confirmed_chars）是最后一帧
+        # 成功送达 / 永久化时刻的快照——用户实际看到的边界。后端超前生成、
+        # 尚未送达的文本不计入：打断保全时历史据此物理截断（"用户没看到的
+        # 等于模型没说过"）。box 单元素列表供 turn_recovery 注册表持有同一
+        # 引用，打断时零拷贝读取最新值。类型为 Optional：静默回合
+        # （SilentMessageBuilder）覆盖为 None（无渲染基准）。
+        self._visible_text_chars_total: int = 0
+        self._render_confirmed_chars: int = 0
+        self._render_cursor_box: Optional[list] = [0]
+        # 当前开启的流式块类别（"text" / "reasoning"）：append_stream_delta
+        # 按它判定是否计入可见文本计数——思考流不计入游标。
+        self._current_stream_kind: Optional[str] = None
+
+    def _get_reasoning_summary(self, content: str) -> str:
+        """从思考原文中提取单行纯文本摘要（长度不超过 30 字符）并严格转义。
+
+        摘要与折叠块正文一样按纯文本对待：正文已整体转义、标签只会按字面
+        展示，因此这里不再剥除标签（也避免了旧正则会把 “x < 5, y > 3” 中
+        的 ``< 5, y >`` 误当成标签剥掉的问题），只折叠空白、截断长度，最后
+        用 ``_escape_prose`` 幂等转义，确保 ``<summary>`` 不会被思考中出现
+        的 ``<``、``>``、``&`` 破坏。这里绝不能走 Markdown 转换器：摘要里
+        通常没有 Markdown 语法，转换器会短路透传，裸 ``<`` 会直达
+        ``<summary>``（历史版本正是因此被 Telegram 拒收）。空内容返回空串；
+        空思考块由调用方整块跳过，不会出现空 ``<summary>``。
+        """
+        if not content:
+            return ""
+        plain = re.sub(r"\s+", " ", content).strip()
+        if not plain:
+            return ""
+        if len(plain) > 30:
+            plain = plain[:30].rstrip() + "…"
+        return _escape_prose(plain)
+
+    def request_flush(self, force: bool = False) -> None:
+        """异步触发刷新，确保在途发送期间的新内容一定会补发。"""
+        if self._stop_flush:
+            return
+        # 无论是否已有在途 flush，只要状态发生变化，都记录为脏数据：若在
+        # pending task 存在时直接 return，发送期间的新增工具状态/流式文本
+        # 会被合并掉；之后没有新的 request_flush 时，用户便会看到草稿
+        # 长时间不动。
+        self._flush_dirty = True
+        self._flush_revision += 1
+        if force:
+            self._force_flush_requested = True
+        if self._pending_flush_task and not self._pending_flush_task.done():
+            return
+
+        async def _runner() -> None:
+            try:
+                while not self._stop_flush:
+                    force_now = self._force_flush_requested
+                    self._force_flush_requested = False
+                    # 显式 flush 可能已在当前 task 启动前把该版本发送出去；此时
+                    # 不重复发送，而是只等待下一次真实内容变更。
+                    if not self._flush_dirty and not force_now:
+                        break
+                    revision_before_send = self._flush_revision
+                    await self.flush(force=force_now)
+                    # 发送过程没有新版本则结束；有新版本则立即补发最新状态。
+                    if (
+                        self._flush_revision <= revision_before_send
+                        or time.monotonic() < self._rate_limited_until
+                    ):
+                        break
+            finally:
+                self._pending_flush_task = None
+                # 仅在不处于本地限流冷却时补排；冷却期由全局刷新循环等待后续发送，
+                # 防止失败帧触发紧密自旋。
+                if (
+                    (self._flush_dirty or self._force_flush_requested)
+                    and not self._stop_flush
+                    and time.monotonic() >= self._rate_limited_until
+                ):
+                    self.request_flush(force=self._force_flush_requested)
+
+        runner = _runner()
+        try:
+            self._pending_flush_task = asyncio.create_task(runner)
+        except RuntimeError:
+            # 无运行中的事件循环（同步上下文/测试直调）：显式关闭协程，
+            # 避免 "coroutine was never awaited" 资源告警。
+            runner.close()
+            self._pending_flush_task = None
+
+    # ---------- 工具组管理 ----------
+    def start_new_tool_group(self) -> int:
+        self._commit_stream_buffer()
+        if self._stream_text_index >= 0:
+            self.end_stream()
+        idx = len(self.blocks)
+        self.blocks.append("")
+        self.block_types.append("tool_group")
+        group = {
+            "items": [],
+            "placeholder_idx": idx,
+            "outer_summary": "",
+            "finished": False,
+            "text_content": "",
+        }
+        self._tool_groups.append(group)
+        self._current_group_idx = len(self._tool_groups) - 1
+        self.request_flush(force=False)
+        return self._current_group_idx
+
+    def _get_current_group(self) -> int:
+        for idx in range(len(self._tool_groups) - 1, -1, -1):
+            if not self._tool_groups[idx].get("finished", False):
+                self._current_group_idx = idx
+                return self._current_group_idx
+        return self.start_new_tool_group()
+
+    # ---------- 工具批次句柄（与 ai/draft_manager.py 同语义的裸实现） ----------
+    # DraftManager 覆盖了这两个方法以提供滚动安全语义；裸 builder 路径
+    # （未来可能的未包装调用方）退化为直接建组/收束，行为与改造前一致。
+    def begin_tool_batch(self) -> int:
+        """工具批次开始：确保存在当前组并返回批次组句柄。"""
+        return self._get_current_group()
+
+    def finish_tool_batch(self, token: int) -> None:
+        """工具批次结束：收束批次组（-1 表示空批次，无操作）。"""
+        if token == -1:
+            return
+        self.finish_group(token)
+
+    def add_tool_item(self, tool_id: str, tool_type: str, summary: str,
+                      action_description: str | None = None,
+                      search_query: str | None = None, domain: str | None = None,
+                      fn_args: dict | None = None) -> None:
+        # 入口即归一：完整 MCP 名 mcp__<server>__<tool> → 规范短名，
+        # 后续摘要 / 分组 / 模板匹配全部基于短名。
+        tool_type = _norm_tool_key(tool_type)
+        group_idx = self._get_current_group()
+        group = self._tool_groups[group_idx]
+
+        new_summary = summary
+        # web_search 的单工具进行态摘要就是搜索词；不要再生成 Search for ...。
+        # fetch_url 则按规范显示目标域名。
+        if not _get_tool_description_from_args(fn_args or {}) and domain:
+            new_summary = f"Fetching from {domain}"
+
+        for item in group["items"]:
+            if item["id"] == tool_id:
+                # 流式占位条目可能在建条目时函数名尚未到达（type 为空或
+                # 待修正）：执行批次按真实工具名补建摘要时一并回填 type。
+                if tool_type and item.get("type") != tool_type:
+                    item["type"] = tool_type
+                if search_query:
+                    item["search_query"] = search_query
+                if domain:
+                    item["domain"] = domain
+                if action_description:
+                    item["action_description"] = action_description
+                if fn_args:
+                    item["fn_args"] = fn_args
+                item["summary"] = new_summary
+                self._refresh_outer_summary(group)
+                self.request_flush(force=False)
+                return
+
+        item = {
+            "id": tool_id,
+            "type": tool_type,
+            "summary": new_summary,
+            "details_html": "",
+            "status": "running",
+            "search_query": search_query,
+            "domain": domain,
+            "action_description": action_description,
+            "fn_args": fn_args or {},  # 存储参数
+        }
+        group["items"].append(item)
+        self._refresh_outer_summary(group)
+        # 工具卡片首次出现必须强制独立成帧立即上屏。
+        #
+        # 此前这里走 request_flush(force=False)，存在一个与在途 flush 的
+        # 合并竞态：content_block_start 触发本方法时，前一段正文/思考的
+        # flush 往往仍在途（正卡在 send_rich_message_draft 的 250ms 最小
+        # 间隔等待里，持有 _flush_lock 与草稿发送锁），本次请求只置脏标
+        # 记即返回；而 flush() 是在拿到 _flush_lock 之后才构建 HTML，等
+        # 轮到构建时 input_json_delta 往往已把（通常很短的）bash command
+        # 等参数流完——空壳占位帧与"参数已完整"帧被合并成一帧，用户看到
+        # 的第一帧就是完整命令，折叠块"参数打完/开始执行后才出现"。
+        # force=True 保证：无在途 flush 时立即建帧发送；有在途 flush 时
+        # 下一轮循环以 force 发送（绕过 250ms 限流与"内容相同"短路边，
+        # send_rich_message_draft 的 force 语义），卡片骨架抢先独立上屏，
+        # 之后的参数增量再按非强制节奏自然填充。批量同步建卡（如
+        # tool_call_loop）时多个 force 会被在途 runner 合并为一帧，不会
+        # 放大请求量；服务端 429 冷却（_rate_limited_until）不受影响。
+        self.request_flush(force=True)
+
+    def attach_stream_tool_identity(self, item_id: str, new_id: str | None = None,
+                                    tool_type: str | None = None) -> bool:
+        """流式占位工具条目的身份补全（原地改绑，绝不新建条目）。
+
+        流式增量里 tool_call 的 id/函数名可能晚于参数增量到达（部分聚合
+        网关会把它们拖到流末尾才补发）。占位条目先以 ``pending_*`` id
+        上屏；真实 id / 工具名到达后由本方法原地改绑并回填：
+
+        - ``new_id``：改绑条目 id，让执行批次的 ``add_tool_item(真实 id)``
+          合并进同一条目，而不是另建一个重复的工具块；
+        - ``tool_type``：回填/修正工具名，并按最新参数重算进行态摘要
+          （含工具组外部摘要），占位期的通用文本随即被真实摘要替换。
+
+        返回是否找到并更新了条目。
+        """
+        for group in self._tool_groups:
+            for item in group["items"]:
+                if item["id"] != item_id:
+                    continue
+                changed = False
+                if new_id and new_id != item["id"]:
+                    item["id"] = new_id
+                    changed = True
+                if tool_type and item.get("type") != _norm_tool_key(tool_type):
+                    item["type"] = _norm_tool_key(tool_type)
+                    changed = True
+                if changed:
+                    if item.get("status") in ("running", "waiting"):
+                        args = item.get("fn_args") or {}
+                        if item.get("type"):
+                            new_summary = _generate_initial_tool_summary(item["type"], args)
+                            # 动作描述随参数一并刷新，工具组进行态标题
+                            # （todo/memory 等按动作细分）才能跟着参数走。
+                            item["action_description"] = _generate_action_description(
+                                item["type"], args)
+                        else:
+                            new_summary = _generate_pending_tool_summary(args)
+                        if new_summary and new_summary != item["summary"]:
+                            item["summary"] = new_summary
+                        self._refresh_outer_summary(group)
+                    else:
+                        self.request_flush(force=False)
+                return True
+        return False
+
+    def update_tool_item(self, tool_id: str, summary: str, details_html: str, status: str = "done") -> None:
+        for group in self._tool_groups:
+            for item in group["items"]:
+                if item["id"] == tool_id:
+                    item["summary"] = summary
+                    item["details_html"] = details_html
+                    item["status"] = status
+                    self._refresh_outer_summary(group)
+                    self.request_flush(force=False)
+                    return
+
+    def update_tool_preview(self, tool_id: str, preview_html: str, summary: str | None = None) -> None:
+        for group in self._tool_groups:
+            for item in group["items"]:
+                if item["id"] == tool_id:
+                    if summary and item["summary"] != summary:
+                        item["summary"] = summary
+                        self._refresh_outer_summary(group)
+                    item["details_html"] = preview_html
+                    self.request_flush(force=False)
+                    return
+
+    def update_tool_args(self, tool_id: str, fn_args: dict) -> None:
+        """流式接收工具参数期间更新条目参数，并即时刷新可见摘要。
+
+        模型提交的简短描述（``description``/``_summary``）一旦能从（可能
+        还不完整的）参数中解析出来，就直接作为条目摘要与工具组外部摘要
+        上屏，而不是先停留在通用进行态文本、等整段参数流结束后才更新；
+        完整 JSON 中途解析成功时，query/command/url 等字段同样按进行态
+        规范立即生效。已进入终态（done/error）的条目不会被覆盖。
+        """
+        args = fn_args or {}
+        for group in self._tool_groups:
+            for item in group["items"]:
+                if item["id"] != tool_id:
+                    continue
+                item["fn_args"] = args
+                if item.get("status") in ("running", "waiting"):
+                    if item.get("type"):
+                        new_summary = _generate_initial_tool_summary(item.get("type", ""), args)
+                        # 动作描述随参数一并刷新（工具组进行态标题依赖）。
+                        item["action_description"] = _generate_action_description(
+                            item.get("type", ""), args)
+                    else:
+                        # 占位条目（函数名尚未到达）：按参数形状推断进行态摘要。
+                        new_summary = _generate_pending_tool_summary(args)
+                    if new_summary and new_summary != item["summary"]:
+                        item["summary"] = new_summary
+                    self._refresh_outer_summary(group)
+                return
+
+    def append_to_current_tool_group_text(self, text: str) -> None:
+        # 可见文本计数：工具组旁白同样会发给用户（折叠块内的说明文字），
+        # 与 journal 里 content_acc 的口径一致——不计数会挤压后续直播占位
+        # 的截断预算，把用户已看到的流式文本多裁掉（历史层过度裁剪）。
+        if text:
+            self._visible_text_chars_total += len(text)
+        if self._handoff_text is not None:
+            self._handoff_text.append(text)
+            return
+        group_idx = self._get_current_group()
+        if group_idx < 0:
+            return
+        group = self._tool_groups[group_idx]
+        group["text_content"] += text
+        self.request_flush(force=False)
+
+    # ---- 修改点3：_refresh_outer_summary（工具组进行时，规范第二部分） ----
+    def _refresh_outer_summary(self, group: dict) -> None:
+        """
+        刷新工具组的外部摘要（进行时状态）
+        优先使用自定义 description，否则使用规范中的进行时固定文本。
+        """
+        if group.get("finished", False):
+            group["outer_summary"] = self._generate_group_summary(group)
+            self.request_flush(force=False)
+            return
+
+        items = group.get("items", [])
+        if not items:
+            group["outer_summary"] = ""
+            self.request_flush(force=False)
+            return
+
+        active_items = [it for it in items if it["status"] in ("running", "waiting")]
+        target = active_items[-1] if active_items else items[-1]
+        t = target["type"]
+        fn_args = target.get("fn_args", {})
+
+        # 地图工具进行态必须反映实际查询条件，避免用户只看到“Searching nearby POI”。
+        if t in {"maps_geo", "maps_regeocode", "maps_text_search", "maps_around_search",
+                 "maps_ip_location", "maps_direction_driving", "maps_direction_walking",
+                 "maps_direction_bicycling", "maps_direction_transit_integrated", "maps_distance",
+                 "maps_search_detail"}:
+            group["outer_summary"] = _initial_map_tool_summary(t, fn_args) or target.get("summary") or _generate_initial_tool_summary(t, fn_args)
+            self.request_flush(force=False)
+            return
+
+        # web_search 工具组进行态固定为 Searching the web。
+        if t == "web_search":
+            group["outer_summary"] = "Searching the web"
+            self.request_flush(force=False)
+            return
+
+        # text_editor 不声明 description（意图）参数：折叠块进行时标题
+        # 与单工具块摘要保持完全一致，一律按「动作 + 文件名 + diff 统计」
+        # 规范生成（Viewing/Creating/Editing file xxx.py +n -n）。模型即使
+        # 惯性携带 description 也不被采用，因此本分支必须位于 custom_desc
+        # 检查之前。参数流式更新期间 update_tool_args 会反复调用本函数，
+        # 折叠块标题因此随 diff 统计动态刷新。
+        if t == "text_editor":
+            group["outer_summary"] = _generate_initial_tool_summary("text_editor", fn_args)
+            self.request_flush(force=False)
+            return
+
+        custom_desc = _get_tool_description_from_args(fn_args)
+        if custom_desc:
+            group["outer_summary"] = custom_desc
+            self.request_flush(force=False)
+            return
+
+        if not t:
+            # 流式占位条目（工具名尚未到达）：fn_args 可能已能给出自定义
+            # 描述（上面已优先采用）；此处兜底为通用进行态文本。
+            group["outer_summary"] = "Working..."
+            self.request_flush(force=False)
+            return
+
+        # ---------- 按规范进行时文本 ----------
+        elif t == "fetch_url":
+            url = (fn_args.get("url") or "").strip()
+            domain = extract_domain(url) if url else ""
+            group["outer_summary"] = f"Fetching from {domain}" if domain else "Fetching a page"
+        elif t == "bash":
+            # 后台任务模式与前台命令各有专属进行态（与单条目摘要同规范）。
+            task_action = str(fn_args.get("task_action") or "").strip().lower()
+            if task_action in ("status", "output"):
+                group["outer_summary"] = "Checking background task"
+            elif task_action == "list":
+                group["outer_summary"] = "Listing background tasks"
+            elif task_action == "stop":
+                group["outer_summary"] = "Stopping background task"
+            elif fn_args.get("run_in_background"):
+                cmd = (fn_args.get("command") or "").strip()
+                if cmd:
+                    short = cmd[:30] + "..." if len(cmd) > 30 else cmd
+                    group["outer_summary"] = f"Starting background: {short}"
+                else:
+                    group["outer_summary"] = "Starting background command"
+            else:
+                cmd = (fn_args.get("command") or "").strip()
+                if cmd:
+                    short = cmd[:30] + "..." if len(cmd) > 30 else cmd
+                    group["outer_summary"] = short
+                else:
+                    group["outer_summary"] = "Running command"
+        elif t in ("ask_user", "message_user"):
+            group["outer_summary"] = "Waiting for your answer"
+        elif t in ("wikipedia", "exchange_rate", "weather", "subagent", "present_files"):
+            # 对象信息（查询词 / 币对 / 城市 / 子任务 / 文件名）直接进组标题：
+            # 与单条目摘要同规范（_generate_initial_tool_summary 已按参数生成）。
+            group["outer_summary"] = _generate_initial_tool_summary(t, fn_args)
+        elif t == "generate_image_from_text":
+            num_images = _coerce_positive_int(fn_args.get("num_images"), 1)
+            if num_images == 1:
+                group["outer_summary"] = "Generating an image"
+            else:
+                group["outer_summary"] = f"Generating {num_images} images"
+        elif t in ("generate_image", "edit_image_with_reference"):
+            # 统一图像工具：按 image_url 是否携带实时判断生成/编辑，
+            # 工具组折叠块进行态标题显示对应操作（参数流到达即可区分，
+            # 无需等工具执行结果）。
+            is_edit = bool(str(fn_args.get("image_url") or "").strip())
+            if is_edit:
+                group["outer_summary"] = "Editing an image"
+            else:
+                num_images = _coerce_positive_int(fn_args.get("num_images"), 1)
+                if num_images == 1:
+                    group["outer_summary"] = "Generating an image"
+                else:
+                    group["outer_summary"] = f"Generating {num_images} images"
+        else:
+            action = target.get("action_description") or _generate_action_description(t, fn_args)
+            group["outer_summary"] = action.capitalize() + "..." if action else "Running..."
+
+        self.request_flush(force=False)
+
+    # ---- 修改点4：_generate_group_summary（工具组结束态，规范第一部分） ----
+    # 工具组摘要的固定描述模板（单数/复数）
+    # 键为组类型（字符串），值为 (单数模板, 复数模板) 或直接为固定字符串（不区分单复数）
+    # 使用 {n} 占位符表示数量
+    _GROUP_SUMMARY_TEMPLATES = {
+        "web_search": ("Searched the web", "Searched the web"),
+        "bash": ("Ran a command", "Ran {n} commands"),
+        "text_editor_view": ("Viewed a file", "Viewed {n} files"),
+        "text_editor_edit": ("Edited a file", "Edited {n} files"),
+        "text_editor_create": ("Created a file", "Created {n} files"),
+        "text_editor_delete": ("Deleted a file", "Deleted {n} files"),
+        "present_files": ("Presented a file", "Presented {n} files"),
+        "wikipedia": ("Looked up on Wikipedia", "Looked up on Wikipedia"),
+        "fetch_url": ("Fetched a page", "Fetched {n} pages"),
+        "maps_geo": ("Geocoded a location", "Geocoded {n} locations"),
+        "nearby_search": ("Searched nearby", "Searched nearby for {n} categories"),
+        "maps_direction_driving": ("Planned a driving route", "Planned {n} driving routes"),
+        "maps_direction_walking": ("Planned a walking route", "Planned {n} walking routes"),
+        "maps_direction_bicycling": ("Planned a cycling route", "Planned {n} cycling routes"),
+        "maps_direction_transit_integrated": ("Planned a transit route", "Planned {n} transit routes"),
+        "maps_distance": ("Measured a distance", "Measured a distance"),
+        "maps_text_search": ("Searched POIs by keyword", "Searched POIs by keyword"),
+        "maps_around_search": ("Searched nearby POIs", "Searched nearby POIs"),
+        "maps_search_detail": ("Fetched POI details", "Fetched details for {n} POIs"),
+        "maps_ip_location": ("Located IP origin", "Located {n} IP origins"),
+        "exchange_rate": ("Checked exchange rates", "Checked exchange rates"),
+        "public_holidays": ("Looked up holidays", "Looked up holidays for {n} countries"),
+        "weather": ("Fetched weather", "Fetched weather for {n} cities"),
+        "convert": ("Calculated a result", "Ran {n} calculations"),
+        "generate_image_from_text": ("Generated an image", "Generated {n} images"),
+        "edit_image_with_reference": ("Edited an image", "Edited {n} images"),
+        # 统一图像工具 generate_image：组类型按 image_url 是否携带派生为
+        # image_generate / image_edit（见 _get_group_type_for_item），
+        # 完成态组摘要据此分别聚合 "Generated" / "Edited"。
+        "image_generate": ("Generated an image", "Generated {n} images"),
+        "image_edit": ("Edited an image", "Edited {n} images"),
+        "generate_video": ("Generated a video", "Generated {n} videos"),
+        "ask_user": ("Asked you a question", "Asked you questions"),
+        "message_user": ("Messaged you", "Messaged you"),
+        "deliver_reply": ("Delivered the final reply", "Delivered the final reply"),
+        "deliver_reply_silent": ("Skipped the final reply", "Skipped the final reply"),
+        "todo_list": ("Listed todos", "Listed todos"),
+        "todo_add": ("Added a todo", "Added {n} todos"),
+        "todo_done": ("Completed a todo", "Completed {n} todos"),
+        "todo_undone": ("Reopened a todo", "Reopened {n} todos"),
+        "todo_edit": ("Updated a todo", "Updated {n} todos"),
+        "todo_delete": ("Deleted a todo", "Deleted {n} todos"),
+        "todo_clear": ("Cleared the todo list", "Cleared the todo list"),
+        "memory_list": ("Listed memories", "Listed memories"),
+        "memory_search": ("Searched memories", "Searched memories"),
+        "memory_add": ("Saved a memory", "Saved {n} memories"),
+        "memory_get": ("Retrieved a memory", "Retrieved {n} memories"),
+        "memory_update": ("Updated a memory", "Updated {n} memories"),
+        "memory_delete": ("Deleted a memory", "Deleted {n} memories"),
+        "memory_clear": ("Cleared memories", "Cleared memories"),
+        "subagent": ("Ran a subagent", "Ran {n} subagents"),
+    }
+
+    def _get_group_type_for_item(self, item: dict) -> str:
+        t = item.get("type", "unknown")
+        fn_args = item.get("fn_args") or {}
+        if t in ("generate_image", "generate_image_from_text", "edit_image_with_reference"):
+            # 统一图像工具（含两个旧名兼容别名）：按 image_url 是否携带
+            # 派生组类型，完成态组摘要分别聚合 "Generated an image" /
+            # "Edited an image"（对标 text_editor 按 command 派生）。
+            # 旧名 generate_image_from_text 历史语义强制文生图，直接按
+            # 参数判断与其语义一致（该名分发时 image_url 已被丢弃）。
+            has_ref = bool(str(fn_args.get("image_url") or "").strip())
+            return "image_edit" if has_ref else "image_generate"
+        if t == "text_editor":
+            command = str(fn_args.get("command") or "")
+            if command == "view":
+                return "text_editor_view"
+            if command == "create":
+                return "text_editor_create"
+            if command == "delete":
+                return "text_editor_delete"
+            return "text_editor_edit"
+        if t == "todo":
+            # 按请求动作细分（对标 text_editor 按 command 细分）。
+            action = str(fn_args.get("action") or "list").strip().lower()
+            if action == "add":
+                return "todo_add"
+            if action == "done":
+                return "todo_done"
+            if action == "undone":
+                return "todo_undone"
+            if action == "toggle":
+                # toggle 的实际方向（完成/重开）已由 update_tool_item 写入
+                # 条目最终摘要（先于 finish_group），从摘要前缀回推。
+                summary = str(item.get("summary") or "")
+                return "todo_undone" if summary.startswith("Reopened") else "todo_done"
+            if action == "delete":
+                return "todo_delete"
+            if action == "clear":
+                return "todo_clear"
+            if action == "edit":
+                return "todo_edit"
+            return "todo_list"
+        if t == "memory":
+            action = str(fn_args.get("action") or "list").strip().lower()
+            if action in ("add", "get", "search", "update", "delete", "clear"):
+                return f"memory_{action}"
+            return "memory_list"
+        if t == "deliver_reply":
+            send = fn_args.get("send")
+            if send is False:
+                return "deliver_reply_silent"
+            if send is True:
+                return "deliver_reply"
+            # send 未填：缺省值按回合类型（USER=true / TIMER=false），
+            # 条目最终摘要已按实际结果写好，从摘要前缀回推。
+            summary = str(item.get("summary") or "")
+            return "deliver_reply_silent" if summary.startswith("Skipped") else "deliver_reply"
+        return t
+
+    def _generate_group_summary(self, group: dict) -> str:
+        """完成态工具组摘要：成功工具按类型展示，失败工具计入末尾 ``(failed n)``。
+
+        按规范只有第一个描述的首字母大写，后续描述保持小写，例如
+        ``Searched the web, fetched a page, fetched hacker news``；
+        部分失败时在末尾追加失败计数，如
+        ``Ran a command, Fetched 2 pages, (failed 1)``；全部失败时
+        只显示 ``(failed n)``（不再退化为笼统的 ``Tools failed``）。
+        """
+        items = group.get("items", [])
+        done_items = [it for it in items if it.get("status") == "done"]
+        failed_count = sum(1 for it in items if it.get("status") == "error")
+        type_order = []
+        type_counts = {}
+        for item in done_items:
+            gtype = self._get_group_type_for_item(item)
+            if gtype not in type_counts:
+                type_order.append(gtype)
+                type_counts[gtype] = 0
+            type_counts[gtype] += 1
+        # 单工具调用时，外层折叠块直接复用该工具的详细摘要；
+        # 这样用户不展开内层也能知道“查了什么 / 在哪里 / 结果如何”。
+        if len(done_items) == 1 and failed_count == 0:
+            item = done_items[0]
+            if item.get("type") in {
+                "maps_geo", "maps_regeocode", "maps_text_search", "maps_around_search",
+                "maps_search_detail", "maps_direction_driving", "maps_direction_walking",
+                "maps_direction_bicycling", "maps_direction_transit_integrated",
+                "maps_distance", "maps_ip_location", "weather", "exchange_rate",
+                "subagent", "fetch_url", "wikipedia",
+            }:
+                return str(item.get("summary") or "Tool completed")
+
+        descs = []
+        desc_types = []  # 与 descs 一一对应；失败计数段为 None
+        for gtype in type_order:
+            count = type_counts[gtype]
+            singular, plural = self._GROUP_SUMMARY_TEMPLATES.get(gtype, ("Ran an action", "Ran {n} actions"))
+            descs.append(singular if count == 1 else plural.format(n=count))
+            desc_types.append(gtype)
+        # 失败工具不再从摘要中静默消失：与成功描述并列追加计数，
+        # 用户在最外层折叠块标题上就能看到「有几个没成功」。
+        if failed_count:
+            descs.append(f"(failed {failed_count})")
+            desc_types.append(None)
+        if not descs:
+            # 无成功也无失败（如条目仍处于 running/waiting 的异常路径）。
+            return ""
+        if descs and descs[0]:
+            descs[0] = descs[0][:1].upper() + descs[0][1:]
+        for j in range(1, len(descs)):
+            if not descs[j]:
+                continue
+            # 失败计数段不做首字母小写；其余描述统一按规范小写首字母
+            # （todo / memory 已改为动词短语模板，不再豁免）。
+            if desc_types[j] is None:
+                continue
+            descs[j] = descs[j][:1].lower() + descs[j][1:]
+        return ", ".join(descs)
+
+    # ---- 修改点5：finish_group 增加默认标题 ----
+    def finish_group(self, group_idx: int | None = None) -> None:
+        if group_idx is None:
+            group_idx = len(self._tool_groups) - 1
+        if group_idx < 0 or group_idx >= len(self._tool_groups):
+            return
+        group = self._tool_groups[group_idx]
+        if group.get("finished", False):
+            return
+        group["finished"] = True
+        self._commit_stream_buffer()
+        group["outer_summary"] = self._generate_group_summary(group)
+        # 防御性兑底：正常情况下全部失败也会得到 "(failed n)"；仅当组内
+        # 既无成功也无失败条目（异常路径）时才落到通用默认标题。
+        if not group["outer_summary"]:
+            group["outer_summary"] = "Tools failed"
+        self.request_flush(force=False)
+
+    # ---------- 思考块管理 ----------
+    def remove_thinking(self) -> None:
+        self._commit_stream_buffer()
+        new_blocks = []
+        new_types = []
+        for b, t in zip(self.blocks, self.block_types):
+            if t == "html" and b.startswith("<tg-thinking>"):
+                continue
+            new_blocks.append(b)
+            new_types.append(t)
+        self.blocks = new_blocks
+        self.block_types = new_types
+        self.request_flush(force=False)
+
+    def add_initial_thinking(self, text: str = "Thinking...") -> int:
+        self._commit_stream_buffer()
+        block = f"<tg-thinking>{convert_markdown_to_telegram_html(text)}</tg-thinking>"
+        self.blocks.append(block)
+        self.block_types.append("html")
+        # 不在此处调用 request_flush，由 get_ai_response 中显式 await flush() 统一触发，
+        # 避免与显式 flush 产生重复的 sendRichMessageDraft API 调用。
+        return len(self.blocks) - 1
+
+    def set_thinking_status(self, text: str, *, force: bool = True) -> bool:
+        """更新首个仍存在的思考占位，使准备阶段也有可见进度。"""
+        safe_text = convert_markdown_to_telegram_html((text or "Thinking...").strip() or "Thinking...")
+        for index, (block, block_type) in enumerate(zip(self.blocks, self.block_types)):
+            if block_type == "html" and block.startswith("<tg-thinking>"):
+                updated = f"<tg-thinking>{safe_text}</tg-thinking>"
+                if block != updated:
+                    self.blocks[index] = updated
+                    self.request_flush(force=force)
+                return True
+        return False
+
+    def add_text(self, text: str) -> None:
+        if not text or not text.strip():
+            return
+        # 可见文本计数：非流式块（超限总结 / 兜底文案）同样会发给用户，
+        # 计入回合累计口径——与 journal 里对应的 assistant 消息文本平衡，
+        # 避免挤压后续直播占位的截断预算。
+        self._visible_text_chars_total += len(text)
+        if self._handoff_text is not None:
+            self._handoff_text.append(text)
+            return
+        self._commit_stream_buffer()
+        self.blocks.append(text)
+        self.block_types.append("text")
+        self._stream_text_index = -1
+        self.request_flush(force=False)
+
+    def replace_trailing_text(self, original: str, replacement: str = "") -> bool:
+        """替换最近一个文本块的尾部，用于从草稿中撤回模型误输出的伪工具调用 XML。"""
+        if not original:
+            return False
+        self._commit_stream_buffer()
+        for idx in range(len(self.blocks) - 1, -1, -1):
+            if self.block_types[idx] != "text":
+                continue
+            block = self.blocks[idx]
+            if not block.endswith(original):
+                continue
+            updated = block[:-len(original)] + replacement
+            if updated.strip():
+                self.blocks[idx] = updated
+            else:
+                del self.blocks[idx]
+                del self.block_types[idx]
+                if self._stream_text_index == idx:
+                    self._stream_text_index = -1
+                elif self._stream_text_index > idx:
+                    self._stream_text_index -= 1
+            self.request_flush(force=False)
+            return True
+        for group in reversed(self._tool_groups):
+            text_content = group.get("text_content", "")
+            if not text_content.endswith(original):
+                continue
+            group["text_content"] = text_content[:-len(original)] + replacement
+            self.request_flush(force=False)
+            return True
+        return False
+
+    # ---------- 流式管理 ----------
+    def begin_stream(self, stream_type: str = "text") -> None:
+        self._commit_stream_buffer()
+        self.blocks.append("")
+        self.block_types.append(stream_type)
+        self._stream_text_index = len(self.blocks) - 1
+        self._stream_buffer = ""
+        # 打断裁剪基准：记录当前流类别（text 计入可见文本计数，reasoning
+        # 不计——思考不进入裁剪后的历史）。
+        self._current_stream_kind = stream_type
+        self.request_flush(force=False)
+
+    def begin_stream_text(self) -> None:
+        self.begin_stream("text")
+
+    def begin_stream_reasoning(self) -> None:
+        self.begin_stream("reasoning")
+
+    def append_stream_delta(self, delta: str) -> None:
+        if not delta:
+            return
+        # 可见文本计数：只计文本流（思考不计入游标——思考在打断保全时
+        # 整体丢弃，不计入"用户看到的正文"边界）。
+        if self._current_stream_kind == "text":
+            self._visible_text_chars_total += len(delta)
+        if self._handoff_text is not None:
+            self._handoff_text.append(delta)
+            return
+        self._stream_buffer += delta
+        # 流式增量未必每片都调用 request_flush；将其标记为新版本，可确保一旦
+        # 当前发送结束，后台刷新不会把已累积的增量误认为已经展示。
+        self._flush_dirty = True
+        self._flush_revision += 1
+
+    def _commit_stream_buffer(self) -> None:
+        if self._stream_buffer and self._stream_text_index >= 0:
+            self.blocks[self._stream_text_index] += self._stream_buffer
+            self._stream_buffer = ""
+        elif self._stream_buffer:
+            self.blocks.append(self._stream_buffer)
+            self.block_types.append("text")
+            self._stream_buffer = ""
+
+    def _advance_render_cursor(self, chars: int) -> None:
+        """推进渲染确认游标（帧送达 / 永久化成功后调用，单调不减）。
+
+        五阶段规范"文本看前端"：chars 是"用户此刻已实际看到的回合累计
+        文本字符数"——草稿帧成功送达（send_rich_message_draft 返回）取
+        帧构建时刻的快照；滚动永久化（sendRichMessage 成功）取永久化
+        时刻的全量。box 同步更新，打断方（turn_recovery 注册表持有同一
+        引用）零拷贝读取。静默回合 box 为 None（无渲染基准，防御性短路）。
+        """
+        if self._render_cursor_box is None:
+            return
+        if chars > self._render_confirmed_chars:
+            self._render_confirmed_chars = chars
+            self._render_cursor_box[0] = chars
+
+    @property
+    def render_cursor_box(self) -> Optional[list]:
+        """渲染确认游标引用（单元素列表；打断保全裁剪的基准）。
+
+        get_ai_response 在 builder 就绪后把本引用 attach 进
+        turn_recovery 注册表；静默回合（SilentMessageBuilder）为 None——
+        不渲染草稿就没有"用户所见"基准，保全时不裁剪文本。
+        """
+        return self._render_cursor_box
+
+    def _truncate_unrendered_backlog(self) -> int:
+        """打断收尾：把"后端超前生成、尚未送达草稿"的文本积压物理裁掉。
+
+        数据保留基准（修订版）：文本以**实际送达草稿的帧**为准。渲染确认
+        游标（_render_confirmed_chars，最后一次成功送达 / 永久化时刻的回合
+        累计可见字符数）就是用户所见边界；积压 =
+        _visible_text_chars_total - _render_confirmed_chars。打断后的固化
+        消息**不得多于用户已见**：积压从显示序列尾部裁掉（送达是前缀单调
+        的，未送达内容必然集中在末端），固化消息、冻结草稿、历史记录三
+        者对齐同一游标。返回实际裁掉的字符数。
+
+        覆盖面：文本块（流式 text / add_text）与工具组旁白
+        （text_content，同样计入游标）按显示顺序从尾回裁；在途
+        _stream_buffer 先行裁掉。思考流不计入游标、不裁（固化视图保留
+        已送达的思考折叠块，历史层由 trim_interrupted_stream 另行全量
+        丢弃）。静默回合（box=None，无渲染基准）不裁剪。
+
+        过度裁剪防御：游标口径漂移（如 replace_trailing_text 撤回已计数
+        文本）会使积压大于当前草稿可裁文本。此时**整体不裁**并落
+        WARNING——无法计算正确边界时，多保留一点未送达尾巴的危害远
+        小于裁掉已送达内容（后者正是本机制要根治的 bug 类）：宁可多
+        保留，绝不多裁。
+        """
+        if self._render_cursor_box is None:
+            return 0
+        backlog = self._visible_text_chars_total - self._render_confirmed_chars
+        if backlog <= 0:
+            return 0
+        # 预扫描：当前草稿内游标口径的可裁文本总量（文本块 + 工具组旁白
+        # + 在途文本缓冲）。积压 ≤ 可裁量为正常关系（送达前缀单调）；
+        # 超限即口径漂移 → 整体不裁，绝不裁掉已送达内容。
+        available = 0
+        if self._stream_buffer and self._current_stream_kind == "text":
+            available += len(self._stream_buffer)
+        for i, b_type in enumerate(self.block_types):
+            if b_type == "text":
+                available += len(self.blocks[i])
+        for group in self._tool_groups:
+            available += len(group.get("text_content", ""))
+        if backlog > available:
+            logger.warning(
+                "[打断收尾] 未送达积压 %s 字符大于当前草稿可裁文本 %s 字符"
+                "（游标口径漂移，整体不裁，绝不多裁已送达内容）: chat=%s draft=%s",
+                backlog, available, self.chat_id, self.draft_id,
+            )
+            return 0
+        remaining = backlog
+        # 1) 在途流式缓冲（仅文本流计入游标；思考缓冲不裁）。
+        if self._stream_buffer and self._current_stream_kind == "text":
+            cut = min(remaining, len(self._stream_buffer))
+            self._stream_buffer = self._stream_buffer[: len(self._stream_buffer) - cut]
+            remaining -= cut
+        # 2) 文本块与工具组旁白按显示顺序从尾部回裁：_build_html 顺序消费
+        #    blocks，tool_group 占位与 _tool_groups 按序一一对应，逆序配对。
+        group_idx = len(self._tool_groups)
+        for i in range(len(self.blocks) - 1, -1, -1):
+            if remaining <= 0:
+                break
+            b_type = self.block_types[i]
+            if b_type == "tool_group":
+                group_idx -= 1
+                if 0 <= group_idx < len(self._tool_groups):
+                    narration = self._tool_groups[group_idx].get("text_content", "")
+                    cut = min(remaining, len(narration))
+                    if cut > 0:
+                        self._tool_groups[group_idx]["text_content"] = narration[: len(narration) - cut]
+                        remaining -= cut
+                continue
+            if b_type != "text":
+                continue
+            block = self.blocks[i]
+            cut = min(remaining, len(block))
+            new_block = block[: len(block) - cut]
+            if new_block:
+                self.blocks[i] = new_block
+            else:
+                del self.blocks[i]
+                del self.block_types[i]
+                if self._stream_text_index == i:
+                    self._stream_text_index = -1
+                elif self._stream_text_index > i:
+                    self._stream_text_index -= 1
+            remaining -= cut
+        trimmed = backlog - remaining
+        # 计数对齐：裁剪后累计可见文本 == 渲染确认游标（固化消息、冻结
+        # 草稿、历史裁剪三者共用同一基准）。预扫描度已保证 remaining == 0。
+        self._visible_text_chars_total = self._render_confirmed_chars
+        if trimmed > 0:
+            logger.info(
+                "[打断收尾] 固化消息按送达游标裁掉未渲染积压 %s 字符"
+                "（用户未看到的不出现在固化消息里）: chat=%s draft=%s",
+                trimmed, self.chat_id, self.draft_id,
+            )
+        return trimmed
+
+    def end_stream(self) -> str:
+        self._commit_stream_buffer()
+        if self._stream_text_index >= 0 and self._stream_text_index < len(self.blocks):
+            text = self.blocks[self._stream_text_index]
+        else:
+            text = ""
+        self._stream_text_index = -1
+        self._current_stream_kind = None
+        return text
+
+    def end_stream_text(self) -> str:
+        return self.end_stream()
+
+    def finalize_reasoning_block(self) -> None:
+        self._commit_stream_buffer()
+
+    def _build_tool_group_html(self, group: dict) -> str:
+        items = group.get("items", [])
+        if not items:
+            return ""
+
+        outer_summary = (group.get("outer_summary", "") or "").strip()
+        if not outer_summary:
+            # 防御性兜底：正常情况下 _refresh_outer_summary / finish_group 总会
+            # 写入一个非空摘要。如果由于某个未预见的路径（例如未来新增的状态值）
+            # 仍然为空，绝不能让整组内容从渲染结果里直接消失——那样用户会看到
+            # 草稿"卡住不动"，而实际上内容其实还在 builder 里，只是没被渲染。
+            # 进行中的组用通用占位符，已结束的组按状态兜底展示。
+            outer_summary = "Working..." if not group.get("finished", False) else "Tool activity"
+
+        text_content = group.get("text_content", "")
+
+        inner_parts = []
+        if text_content:
+            inner_parts.append(_ensure_rich_block_content(text_content))
+
+        # 工具详情直接渲染完整内容。展示层不再进行二次裁剪，避免
+        # 搜索结果等长输出出现“工具输出已截断”。
+        for item in items:
+            inner_parts.append(self._get_inner_content(item))
+
+        inner_html = "\n".join(inner_parts)
+        return f"<details><summary>{outer_summary}</summary>\n{inner_html}\n</details>"
+
+    def _get_inner_content(self, item: dict) -> str:
+        inner_summary = item["summary"]
+        details_html = (item.get("details_html") or "").strip()
+        if details_html:
+            inner_body = _ensure_rich_block_content(details_html)
+            return f"<details><summary>{inner_summary}</summary>\n{inner_body}\n</details>"
+        # details_html 为空：工具声明后仍在执行（web_search 搜索中、
+        # text_editor 编辑中、图片生成中……这些阶段尚无可展示的输出），
+        # 或极少数终态确实无输出的路径。此时一律渲染为折叠块而非裸文本，
+        # 保证同一工具组内所有条目形态一致，避免"执行中是裸文本、
+        # 结束后才突然变成折叠块"的跳变。
+        # 注意：Rich Message 的 <details> 不能只承载裸文本——正文必须是
+        # 块级内容，否则 Telegram sendRichMessageDraft 会返回 400
+        # RICH_MESSAGE_CONTENT_REQUIRED，因此占位正文用 <p> 包一层。
+        status = item.get("status")
+        if status == "waiting":
+            placeholder = "Waiting..."
+        elif status == "done":
+            placeholder = "Done"
+        elif status == "error":
+            placeholder = "Failed"
+        else:
+            # running 及未知状态
+            placeholder = "Running..."
+        return f"<details><summary>{inner_summary}</summary>\n<p>{placeholder}</p>\n</details>"
+
+    # ========== 关键修改：不再将 tool_group 合并到 reasoning 中 ==========
+    def _build_html(self, *, hide_thinking: bool = False) -> str:
+        """把块列表拼装为草稿 HTML。
+
+        ``hide_thinking=True``（原 _build_html_no_thinking）额外跳过
+        ``<tg-thinking>`` 占位块：草稿流式期显示“Thinking...”占位，
+        但终稿/滚动不应再出现它——两个版本除了这一处外完全一致，
+        合并为单实现避免双份逻辑漂移。
+        """
+        html_parts = []
+        i = 0
+        group_idx = 0
+        while i < len(self.blocks):
+            b_type = self.block_types[i]
+            block = self.blocks[i]
+
+            if hide_thinking and b_type == "html" and block.startswith("<tg-thinking>"):
+                i += 1
+                continue
+
+            if b_type == "reasoning":
+                reasoning_content = block
+                i += 1
+                # 思考字段刚开始、首个字符尚未到达（或只收到空白）时整块跳过，
+                # 不渲染任何“思考中…”占位；真实内容到达后折叠块自然出现。
+                if not reasoning_content.strip():
+                    continue
+                # 不再收集后续 tool_group，只渲染 reasoning 自身
+                summary = self._get_reasoning_summary(reasoning_content)
+                # 思考原文必须先严格转义再嵌入，否则其中的标签会被 Telegram
+                # 解析成真实格式，甚至破坏外层 <details> 折叠结构。
+                reasoning_body = _render_reasoning_html(reasoning_content)
+                html_parts.append(f"<details><summary>{summary}</summary>\n{reasoning_body}\n</details>")
+                continue
+
+            elif b_type == "tool_group":
+                if group_idx < len(self._tool_groups):
+                    html_parts.append(self._build_tool_group_html(self._tool_groups[group_idx]))
+                    group_idx += 1
+                i += 1
+                continue
+
+            else:
+                # text/html 及其他类型的块都按原样拼接。
+                content = block
+                if i == self._stream_text_index:
+                    content += self._stream_buffer
+                html_parts.append(content)
+                i += 1
+
+        result = "".join(html_parts)
+        return result if result.strip() else " "
+
+    def _build_html_no_thinking(self) -> str:
+        """终稿/滚动视图：隐藏 <tg-thinking> 占位（单实现委托）。"""
+        return self._build_html(hide_thinking=True)
+
+    # ---------- 容量预警与回合边界滚动 ----------
+    @staticmethod
+    def _plain_text_cut(text: str, token_budget: int) -> int:
+        """Pick a sentence-friendly plain-text cut that fits a token budget."""
+        if count_tokens(text) <= token_budget:
+            return len(text)
+        prefix = truncate_to_token_budget(text, token_budget, suffix="")
+        upper = max(1, len(prefix))
+        lower = max(1, int(upper * 0.80))
+        candidates = [
+            text.rfind('\n', lower, upper + 1),
+            text.rfind('。', lower, upper + 1),
+            text.rfind('！', lower, upper + 1),
+            text.rfind('？', lower, upper + 1),
+            text.rfind('. ', lower, upper + 1),
+            text.rfind(' ', lower, upper + 1),
+        ]
+        for candidate in sorted((c for c in candidates if c > 0), reverse=True):
+            if count_tokens(text[:candidate]) <= token_budget:
+                return candidate
+        return upper
+
+    def _pick_rollover_boundary(self, html_content: str) -> tuple[int | None, int, int]:
+        """Choose a complete outer-block boundary within the token budget."""
+        boundaries, visible_tokens, block_count, _visible_units = _scan_rich_html_boundaries(html_content)
+        selected = None
+        for boundary in boundaries:
+            _, tokens_at_boundary, blocks_at_boundary, units_at_boundary = boundary
+            if (
+                tokens_at_boundary <= RICH_DRAFT_ROLLOVER_TOKEN_BUDGET
+                and blocks_at_boundary <= RICH_DRAFT_ROLLOVER_BLOCKS
+                and units_at_boundary <= RICH_MESSAGE_TEXT_PROTOCOL_LIMIT - 256
+            ):
+                selected = boundary
+        return (selected[0] if selected else None), visible_tokens, block_count
+
+    def _replace_with_rollover_remainder(self, remainder: str, handoff_text: str = "") -> None:
+        """将未提交内容和交接期间的缓冲内容作为新草稿，并维持流式通道。"""
+        remainder = remainder.lstrip()
+        thinking = "<tg-thinking>Thinking...</tg-thinking>"
+        self.blocks = [thinking]
+        self.block_types = ["html"]
+        if remainder:
+            self.blocks.append(remainder)
+            self.block_types.append("text")
+        if handoff_text:
+            self.blocks.append(handoff_text)
+            self.block_types.append("text")
+        self._tool_groups = []
+        self._current_group_idx = -1
+        self._stream_buffer = ""
+        self._stream_text_index = -1
+
+    async def _register_active_draft(self, message_id: int = 0) -> None:
+        try:
+            from state import set_active_draft
+            await set_active_draft(self.chat_id, self.draft_id, message_id)
+        except Exception as exc:
+            logger.debug("更新活跃草稿状态失败: chat=%s draft=%s err=%s", self.chat_id, self.draft_id, exc)
+
+    def _arm_rollover_if_needed(self, html_content: str | None = None) -> bool:
+        """接近容量时只设置待切换标志，绝不在 flush 中创建后台滚动任务。"""
+        if self._stop_flush or self._rollover_pending or self._rollover_in_progress:
+            return self._rollover_pending
+        if html_content is None:
+            html_content = self._build_html_no_thinking()
+        _cut_at, visible_tokens, block_count = self._pick_rollover_boundary(html_content)
+        if (
+            visible_tokens < RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET
+            and block_count < RICH_DRAFT_INTERACTIVE_BLOCKS
+        ):
+            return False
+        self._rollover_pending = True
+        logger.info(
+            "草稿交互容量预警，下一完整回合边界滚动: chat=%s draft=%s tokens=%s blocks=%s "
+            "interactive_tokens=%s interactive_blocks=%s arm_tokens=%s arm_blocks=%s",
+            self.chat_id, self.draft_id, visible_tokens, block_count,
+            RICH_DRAFT_INTERACTIVE_TOKEN_BUDGET, RICH_DRAFT_INTERACTIVE_BLOCKS,
+            RICH_DRAFT_ARM_TOKEN_BUDGET, RICH_DRAFT_ARM_BLOCKS,
+        )
+        return True
+
+    def _has_pending_tool_group(self) -> bool:
+        """本轮是否还有"已建条目但尚未收束"的工具组。
+
+        滚动会经 ``_replace_with_rollover_remainder`` 清空 ``_tool_groups``。
+        若此时某个组的工具还没拿到最终状态（流式阶段已 add_tool_item、
+        但 _run_tool_calls_and_append 尚未 update_tool_item/finish_group），
+        清空后这些条目的 id 就再也匹配不上，``update_tool_item`` 会静默
+        跳过——表现为工具卡片永远停在 "Running..."，且工具输出被拆散到
+        前后两个草稿（历史问题1）。因此这是滚动的硬性安全前提。
+
+        空组（``_get_current_group`` 惰性创建、尚未加入条目）不算待收束，
+        否则会把正常的回合边界滚动一并挡掉。
+        """
+        for group in self._tool_groups:
+            if group.get("items") and not group.get("finished", False):
+                return True
+        return False
+
+    def _restore_handoff_text(self) -> None:
+        """将异常退出的交接缓冲恢复到当前构建器，避免任何流式增量丢失。"""
+        if self._handoff_text is None:
+            return
+        buffered = "".join(self._handoff_text)
+        self._handoff_text = None
+        if buffered:
+            self.blocks.append(buffered)
+            self.block_types.append("text")
+            self._stream_text_index = -1
+
+    async def rollover_at_turn_boundary(self, *, start_next_draft: bool = True) -> bool:
+        """在完整模型返回/完整工具批次后，按回合去向完成草稿分段。
+
+        调用方必须保证下一次模型请求尚未开始，且本轮并行工具均已得到最终状态。
+        到达容量阈值后，本函数总会先永久化已完成的旧段；只有 ``start_next_draft``
+        为真（即工具批次或纠错路径还会继续请求模型）时，才生成并刷新新草稿。
+        对终局文本传入假值时，函数只结束旧草稿，保留尾段给统一最终发送路径提交。
+        """
+        if self._stop_flush or self._rollover_in_progress:
+            return False
+
+        # 关键守卫：若还有未收束的工具组，绝不滚动。一旦滚动，_tool_groups
+        # 会被清空（_replace_with_rollover_remainder），流式已建条目的后续
+        # update_tool_item 就无法匹配 id、工具卡片永远停在 "Running..."。
+        if self._has_pending_tool_group():
+            return False
+
+        # 容量扫描器已经在流式过程中完成预警。这里不再重新扫描容量，
+        # 只消费 pending 标记：切换只由安全闭合点触发。
+        self._commit_stream_buffer()
+        async with self._rollover_lock:
+            if self._stop_flush or self._rollover_in_progress:
+                return False
+            if not self._rollover_pending:
+                return False
+            current_html = self._build_html_no_thinking()
+            cut_at, visible_tokens, block_count = self._pick_rollover_boundary(current_html)
+
+            used_fallback = False
+            if cut_at is not None:
+                completed_html = current_html[:cut_at].strip()
+                remainder = current_html[cut_at:]
+            else:
+                # 已到预警/切换阈值却没有完整 Rich Block 边界时，立即采用安全的
+                # 纯文本分段。不能等待下一轮或 hard guard，否则新草稿会被拖延。
+                plain = _rich_visible_text(current_html)
+                text_cut = self._plain_text_cut(plain, RICH_DRAFT_ROLLOVER_TOKEN_BUDGET)
+                completed_html = f"<p>{convert_markdown_to_telegram_html(plain[:text_cut].rstrip())}</p>"
+                remainder = f"<p>{convert_markdown_to_telegram_html(plain[text_cut:].lstrip())}</p>"
+                used_fallback = True
+
+            if not completed_html or not _rich_visible_text(completed_html).strip():
+                return False
+
+            old_draft_id = self.draft_id
+            old_draft_message_id = self.draft_message_id
+            self._rollover_in_progress = True
+            self._handoff_text = []
+
+        # 预置 None：取消可能落在赋值之前，下方 CancelledError 分支要
+        # 通过它判断“旧段是否已永久化”，未赋值时引用会 UnboundLocalError。
+        completed_message_id = None
+        try:
+            # 此处被调用在回合边界；等待永久消息期间不会启动下一次模型请求。
+            completed_message_id = await send_rich_html_message(
+                self.chat_id,
+                completed_html,
+                reassert_draft=False,
+            )
+            if not completed_message_id:
+                self._restore_handoff_text()
+                self._rollover_in_progress = False
+                logger.warning(
+                    "草稿边界滚动永久化失败，保留当前草稿重试: chat=%s draft=%s tokens=%s blocks=%s",
+                    self.chat_id, old_draft_id, visible_tokens, block_count,
+                )
+                return False
+
+            if self._stop_flush:
+                self._restore_handoff_text()
+                self._rollover_in_progress = False
+                return False
+
+            # 先停止旧草稿，再立即登记并发送新草稿。删除旧预览是后台清理，绝不阻塞新首帧。
+            await mark_draft_dead(old_draft_id)
+            async with self._rollover_lock:
+                if self._stop_flush or self.draft_id != old_draft_id:
+                    self._restore_handoff_text()
+                    self._rollover_in_progress = False
+                    return False
+
+                handoff_text = "".join(self._handoff_text or [])
+                self._handoff_text = None
+                self.draft_message_id = None
+                self._rate_limited_until = 0.0
+                self._replace_with_rollover_remainder(remainder, handoff_text)
+                self._rollover_pending = False
+                self._rollover_in_progress = False
+                self._rollover_count += 1
+
+                if start_next_draft:
+                    new_draft_id = int(time.time() * 1000000) + random.randint(0, 999)
+                    while new_draft_id == old_draft_id:
+                        new_draft_id += 1
+                    self.draft_id = new_draft_id
+                    rollover_mode = "plain_text_fallback" if used_fallback else "complete_block"
+                else:
+                    # 终局分支没有下一次模型请求：旧草稿已结束，不能创建空的新草稿。
+                    new_draft_id = None
+                    rollover_mode = "terminal_plain_text_fallback" if used_fallback else "terminal_complete_block"
+
+                # 限制 _rollover_history 长度：此前每次 rollover 都 append 一条，
+                # 没有上限，长时间运行的会话会让该 list 无限增长。保留最近 50 条
+                # 用于诊断即可。
+                self._rollover_history.append({
+                    "old_draft_id": old_draft_id,
+                    "new_draft_id": new_draft_id,
+                    "completed_message_id": completed_message_id if isinstance(completed_message_id, int) else None,
+                    "visible_tokens": count_tokens(_rich_visible_text(completed_html)),
+                    "blocks": block_count,
+                    "mode": rollover_mode,
+                })
+                if len(self._rollover_history) > 50:
+                    # 删除最早的元素，保留最近 50 条。
+                    del self._rollover_history[: len(self._rollover_history) - 50]
+
+            if start_next_draft:
+                await self._register_active_draft(0)
+                await self.flush(force=True)
+                logger.info(
+                    "草稿已在回合边界滚动: chat=%s old=%s new=%s permanent=%s chars=%s blocks=%s mode=%s",
+                    self.chat_id, old_draft_id, self.draft_id, completed_message_id,
+                    len(_rich_visible_text(completed_html)), block_count,
+                    rollover_mode,
+                )
+            else:
+                logger.info(
+                    "草稿已在终局边界结束，不创建新草稿: chat=%s draft=%s permanent=%s chars=%s blocks=%s mode=%s",
+                    self.chat_id, old_draft_id, completed_message_id,
+                    len(_rich_visible_text(completed_html)), block_count,
+                    rollover_mode,
+                )
+
+            # 打断裁剪基准：旧段已永久化送达（用户已见），滚动边界上的全部
+            # 可见文本计入渲染确认游标——防滚动后新帧送达前被打断时，游标
+            # 停在旧值把用户已看到的已永久化段落裁掉。
+            self._advance_render_cursor(self._visible_text_chars_total)
+
+            if old_draft_message_id:
+                async def _cleanup_old_preview() -> None:
+                    deleted = await delete_message_fast(self.chat_id, old_draft_message_id)
+                    if not deleted:
+                        logger.debug(
+                            "旧草稿预览异步清理未完成: chat=%s msg=%s",
+                            self.chat_id, old_draft_message_id,
+                        )
+                _track_task(_cleanup_old_preview())
+            return True
+        except asyncio.CancelledError:
+            if (
+                completed_message_id
+                and self._rollover_in_progress
+                and self.draft_id == old_draft_id
+            ):
+                # 取消落在“旧段已永久化 → 状态换血”之间（sendRichMessage
+                # 已送达、blocks 尚未替换为尾段）：立即完成换血，让
+                # blocks 只剩未永久化的尾段（含交接缓冲）。否则上层打断
+                # 固定化（finalize_interrupted_draft）会按未换血的 blocks
+                # 把已永久化段落再发一遍，产生重复永久消息。
+                handoff_text = "".join(self._handoff_text or [])
+                self._handoff_text = None
+                self._replace_with_rollover_remainder(remainder, handoff_text)
+                self._rollover_pending = False
+                self._rollover_count += 1
+            else:
+                self._restore_handoff_text()
+            self._rollover_in_progress = False
+            raise
+        except Exception:
+            self._restore_handoff_text()
+            self._rollover_in_progress = False
+            raise
+
+    async def finalize_interrupted_draft(self, journal: Optional[list] = None) -> bool:
+        """打断收尾：把草稿已累积的内容经 sendRichMessage 固定为永久消息。
+
+        与正常收尾的最终交付、回合边界滚动永久化**同源同法**：
+        - 内容构建：``_commit_stream_buffer`` + ``remove_thinking`` +
+          ``_truncate_unrendered_backlog`` + ``_build_html_no_thinking``
+          （与 get_ai_response 正常路径同一套，但额外按渲染确认游标把
+          未送达草稿的积压文本裁掉——固化内容严格等于用户实际所见，
+          不是后端已生成的全量）；
+        - 交付通道：``send_rich_html_message``（``reassert_draft=False``，
+          本轮流式已结束，不再把旧草稿回挂到新消息下方）；
+        - 清理语义：送达成功才删除瞬态草稿气泡；失败则保留冻结草稿，
+          由打断方（app._interrupt_active_generation 的 mark_dead +
+          mark_preserved_draft）兜底为可见进度现场。
+
+        草稿层 ↔ 历史层反向校验（改动点3，诊断用、不改变行为）：
+        ``journal``（轮次日志，打断保全的真值来源）传入时，固化草稿后
+        校验"本轮 journal 是否留有 assistant 进度"。草稿有可观可见文本
+        而 journal 无任何 assistant 文本/工具调用，即两层数据结构再次
+        失同步（历史上"草稿显示数到 123、模型记忆全空"回归的直接特征），
+        第一时间落 WARNING，而不是再靠用户截图反馈。
+
+        守卫：
+        - 草稿已死亡时跳过——打断若恰好落在正常收尾阶段（stop_flush 后
+          已 mark_dead），该轮交付由正常路径负责，再发会造成重复消息；
+        - 无可见内容（打断仍停留在 Thinking 占位阶段）时跳过。
+
+        取消安全：调用语境是 get_ai_response 的 CancelledError 路径
+        （旧任务正在被取消）。固定化放在后台任务中经 ``asyncio.shield``
+        等待——打断方 _cancel_old_task 的 3s 等待超时会二次取消本任务，
+        届时固定化仍在后台继续完成（含气泡清理），不会半途而废。
+        """
+        if await is_draft_dead(self.draft_id):
+            return False
+        # 滚动交接缓冲兜底（正常由 rollover 的取消路径恢复，双保险）。
+        self._restore_handoff_text()
+        self._commit_stream_buffer()
+        self.remove_thinking()
+        # "实际发送到草稿的那里截断"（数据保留基准修订版）：固化消息
+        # 不得多于用户已见——后端超前生成、尚未送达草稿的积压文本在
+        # 固化前物理裁掉（修复：打断后固化路径把整段积压“倒”给用户，
+        # 草稿仿佛又刷新了一段才停）。固化消息、冻结草稿、历史记录
+        # （turn_recovery.trim_interrupted_stream 同游标裁剪）三者对齐
+        # 同一送达边界。
+        self._truncate_unrendered_backlog()
+        final_html = self._build_html_no_thinking()
+        if not final_html.strip() or not _rich_visible_text(final_html).strip():
+            # 打断发生在任何可见内容产出之前：无可固定内容。
+            return False
+        # 草稿层 ↔ 历史层反向校验（改动点3）：见 _log_draft_journal_consistency。
+        _log_draft_journal_consistency(
+            self.chat_id, self.draft_id,
+            _rich_visible_text(final_html).strip(), journal,
+        )
+        chat_id = self.chat_id
+        draft_id = self.draft_id
+        draft_message_id = self.draft_message_id
+
+        async def _deliver_and_cleanup() -> bool:
+            try:
+                success = await send_rich_html_message(
+                    chat_id, final_html, reassert_draft=False,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "打断草稿永久化异常，保留冻结草稿作为可见兜底: chat=%s draft=%s",
+                    chat_id, draft_id, exc_info=True,
+                )
+                return False
+            if not success:
+                logger.warning(
+                    "打断草稿永久化失败，保留冻结草稿作为可见兜底: chat=%s draft=%s",
+                    chat_id, draft_id,
+                )
+                return False
+            if draft_message_id:
+                # 永久消息已送达：清理瞬态草稿气泡（与正常收尾同语义）。
+                # 保留标记（mark_preserved_draft）的意义是“没有永久替代时
+                # 保住可见现场”，此刻替代已固定，删除不属于误删清理。
+                deleted = await delete_message_fast(chat_id, draft_message_id)
+                if not deleted:
+                    logger.debug(
+                        "打断草稿气泡清理未完成: chat=%s msg=%s",
+                        chat_id, draft_message_id,
+                    )
+            return True
+
+        delivery = _track_task(_deliver_and_cleanup())
+        try:
+            return await asyncio.shield(delivery)
+        except asyncio.CancelledError:
+            # 二次取消（打断方对旧任务的等待超时）：固定化继续在后台完成；
+            # 取消照常向上传播，不打断取消协议。
+            raise
+
+    # ---------- 刷新与清理 ----------
+    async def flush(self, force: bool = False) -> None:
+        # 冻结门（入口检查点）：打断入口已冻结本草稿 → 不再推送任何新帧。
+        # 同步检查、零 await，与打断方 freeze_draft_streaming 之间不存在
+        # 取消窗口。已在途的发送不在此处中断（送达即用户所见）。
+        if self.draft_id in _FROZEN_DRAFTS:
+            return
+        now = time.monotonic()
+        if now < self._rate_limited_until:
+            logger.debug(
+                "草稿帧跳过（本地限流冷却）: chat=%s draft=%s wait_ms=%s",
+                self.chat_id, self.draft_id, int((self._rate_limited_until - now) * 1000),
+            )
+            return
+
+        # 性能修复：锁外这次 _build_html + 容量扫描是纯浪费——拿到锁后
+        # 内容会重新构建、下面还要再扫一次。热路径上每帧多一次 O(全文)
+        # 的同步 CPU 工作，直接叠加到事件循环 lag 上。改为只在锁内做一次。
+        async with self._flush_lock:
+            # 冻结门（锁内第二道检查点）：等锁期间可能恰逢打断冻结。
+            if self.draft_id in _FROZEN_DRAFTS:
+                return
+            now = time.monotonic()
+            if now < self._rate_limited_until:
+                return
+
+            html_content = self._build_html()
+            if not html_content.strip():
+                html_content = "<p>Working...</p>"
+            self._arm_rollover_if_needed(html_content)
+
+            # 打断裁剪基准：帧构建时刻的可见文本快照——发送成功后用户
+            # 看到的正是这一帧（blocks + stream_buffer），此后新到的 delta
+            # 属于"后端超前生成"，不计入游标（打断保全时会裁掉）。
+            frame_visible_chars = self._visible_text_chars_total
+
+            # 边界扫描会对全部块做逐块 token 编码（O(块数×全文)），其结果
+            # 只用于 DEBUG 日志；生产（INFO 级别）跳过，流式热路径不再
+            # 每帧做全量编码。
+            frame_tokens = frame_blocks = 0
+            if logger.isEnabledFor(logging.DEBUG):
+                _frame_boundaries, frame_tokens, frame_blocks, _frame_visible_units = _scan_rich_html_boundaries(html_content)
+            frame_revision = self._flush_revision
+            frame_started = time.monotonic()
+            try:
+                msg_id = await send_rich_message_draft(
+                    self.chat_id, self.draft_id, html_content, force=force
+                )
+                self._last_flush_time = time.monotonic()
+                if self._flush_revision == frame_revision:
+                    self._flush_dirty = False
+                self._flush_sequence += 1
+                logger.debug(
+                    "草稿帧完成: chat=%s draft=%s seq=%s force=%s result=%s tokens=%s blocks=%s elapsed_ms=%s",
+                    self.chat_id, self.draft_id, self._flush_sequence, force, msg_id,
+                    frame_tokens, frame_blocks, int((time.monotonic() - frame_started) * 1000),
+                )
+                # 帧送达成功：渲染确认游标推进到帧构建时刻的快照。
+                self._advance_render_cursor(frame_visible_chars)
+                if msg_id:
+                    self.draft_message_id = msg_id
+                    await self._register_active_draft(msg_id)
+            except RateLimitError as e:
+                retry_after = e.retry_after + 2
+                self._rate_limited_until = time.monotonic() + retry_after
+                logger.warning(
+                    f"Rate limited on draft {self.draft_id}, cooling until "
+                    f"{self._rate_limited_until:.1f} (retry_after={e.retry_after}s)"
+                )
+            except Exception as e:
+                # 优先看异常的 status_code 属性，再回退到子串匹配：
+                # 仅用 "429" 子串判断会对任何巧合含 "429" 的字符串
+                # （如 request_id）误报为 rate limit。
+                status_code = getattr(e, "status_code", None) or getattr(e, "status", None)
+                err_msg = str(e)
+                if status_code == 429 or "429" in err_msg:
+                    self._rate_limited_until = time.monotonic() + 10.0
+                    logger.warning(
+                        f"Flush hit 429 (fallback, status={status_code}), "
+                        f"cooling until {self._rate_limited_until:.1f}"
+                    )
+                else:
+                    logger.warning(f"Flush failed: {e}")
+
+    async def _stream_flush_loop(self) -> None:
+        while not self._stop_flush:
+            now = time.monotonic()
+            if now < self._rate_limited_until:
+                wait_time = self._rate_limited_until - now + 0.5
+                await asyncio.sleep(min(wait_time, 5.0))
+                if self._stop_flush:
+                    break
+                continue
+
+            await asyncio.sleep(0.1)
+            if self._stop_flush:
+                break
+            now = time.monotonic()
+            if now < self._rate_limited_until:
+                continue
+
+            time_elapsed = now - self._last_flush_time
+            # 此循环的 builder 就是当前请求唯一正在刷新的草稿。无论静默来自
+            # 普通模型、工具、图片还是视频，只要内容长时间未变化，都统一强制
+            # 重申这一帧，避免 send_rich_message_draft 因内容相同而短路。
+            silent_too_long = time_elapsed >= STREAM_SILENT_FORCE_FLUSH
+            should_flush = (
+                    (self._flush_dirty and time_elapsed >= STREAM_FLUSH_INTERVAL)
+                    or silent_too_long
+            )
+            if should_flush:
+                self._commit_stream_buffer()
+                await self.flush(force=silent_too_long)
+                # 修复：原来 silent_too_long 分支**不更新** _last_flush_time，
+                # 依赖 flush() 内部成功时的赋值。正常路径确实会更新（所以线上
+                # 观察到的保活节奏是 ~2.3s，而非失控的 0.1s），但存在真实的
+                # 漏更新路径：flush 在 RateLimitError / 通用异常分支直接返回，
+                # 以及被 _rate_limited_until 冷却短路时，都不会更新时间戳。
+                # 那些情形下 time_elapsed 会持续 >= 阈值，循环退化成每 0.1s
+                # 尝试一次 force=True 全帧重发（force 绕过"内容相同"短路与
+                # 250ms 最小间隔），与真正携带新内容的帧争抢 _flush_lock 和
+                # 每 chat 的 draft 发送锁，正是"最后一条消息迟迟刷不出来"的
+                # 竞态来源之一。这里统一兜底更新，使保活节奏在任何分支下都
+                # 严格等于 STREAM_SILENT_FORCE_FLUSH。
+                self._last_flush_time = time.monotonic()
+
+    def start_flush_loop(self) -> None:
+        if self._flush_task is None or self._flush_task.done():
+            self._stop_flush = False
+            self._flush_task = asyncio.create_task(self._stream_flush_loop())
+
+    async def stop_flush_loop(self) -> None:
+        """停止并排空草稿刷新子任务；回合边界滚动不再存在后台任务。
+
+        本方法是该 builder 推流生命周期的终点（正常收尾与打断取消均经
+        此处）：顺手清掉打断冻结登记，避免集合无限增长。固化路径
+        （finalize_interrupted_draft → send_rich_html_message）不是草稿
+        帧、不受冻结门约束，清理时机不影响固化送达。
+        """
+        # 不能直接 cancel 正在 ``sendRichMessageDraft`` 的 task。
+        #
+        # 请求一旦已经写入 socket，取消本地 coroutine 并不能撤回 Telegram
+        # 服务端可能已经接收的草稿帧；若在 ``await send_rich_message_draft``
+        # 返回前取消，_advance_render_cursor() 没有机会记账。随后打断固化
+        # 会把客户端已经看到的尾巴误判为“未送达”而裁掉。先停止生产新的
+        # flush，再让已起飞的单帧自然完成，才能让游标、历史和永久消息以
+        # 同一个 Telegram 确认边界收束。
+        self._stop_flush = True
+        self._rollover_pending = False
+        self._restore_handoff_text()
+
+        pending: list[tuple[str, asyncio.Task]] = []
+        handed_off: list[asyncio.Task] = []
+        for attr in ("_flush_task", "_pending_flush_task"):
+            task = getattr(self, attr, None)
+            if task is not None and not task.done():
+                pending.append((attr, task))
+
+        for attr, task in pending:
+            try:
+                # shield 防止本轮被取消时把已发出的 HTTP 请求也取消。超时
+                # 后 task 继续在后台完成；它不会再发新帧（_stop_flush 已置
+                # 位），只会完成当前帧并推进已确认的渲染游标。
+                await asyncio.wait_for(asyncio.shield(task), timeout=5.5)
+            except asyncio.CancelledError:
+                # 外层在等待旧轮次时再次取消也不得波及在途发送；保留 task
+                # 让其自行收束，随后把取消继续向上传播。
+                raise
+            except asyncio.TimeoutError:
+                logger.debug("%s 未在 5.5s 内停止，转入后台清理: draft_id=%s", attr, self.draft_id)
+                asyncio.create_task(_swallow_flush_task(task, attr, self.draft_id))
+                handed_off.append(task)
+            except Exception as exc:
+                logger.debug("%s 停止时出现异常（可忽略）: %s", attr, exc)
+            finally:
+                if task.done():
+                    setattr(self, attr, None)
+
+        if not handed_off:
+            # 所有已起飞的刷新均已确认结束，安全解除本轮的冻结登记。
+            _FROZEN_DRAFTS.discard(self.draft_id)
+            return
+
+        # 超时转交后台的 task 可能已通过 flush 的外层冻结检查、正等待
+        # _flush_lock。此刻若解除冻结，它会在旧轮已交给新轮之后补发一帧。
+        # 因而冻结必须持有到这些任务真正结束；_stop_flush 阻止其循环产生
+        # 新任务，冻结门则阻止已排队 flush 在拿到锁后落地。
+        draft_id = self.draft_id
+
+        async def _release_freeze_when_drained() -> None:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in handed_off),
+                return_exceptions=True,
+            )
+            _FROZEN_DRAFTS.discard(draft_id)
+
+        asyncio.create_task(_release_freeze_when_drained())
+
+
+class SilentMessageBuilder(RichMessageBuilder):
+    """静默构建器：保留 RichMessageBuilder 的全部状态机接口（agentic loop
+    依赖它们做工具组管理、流式缓冲、组收束等），但**从不向 Telegram 发送
+    任何草稿帧，也从不做滚动永久化**。
+
+    用于 /show off（静默模式）的回合——USER 与 TIMER 一致：agent 的思考、
+    工具进度对用户不可见。触达用户的渠道按事件源有所区别：模型可通过
+    deliver_reply（交付最终回复；send 缺省值按事件源区分——USER 回合
+    默认 true / TIMER 回合默认 false）或 message_user（提问/留言）触达；
+    静默 USER 回合在模型未调用 deliver_reply 且未显式 send=false 时，
+    收尾还会按默认 true 兜底发送最后一条非空 assistant 消息正文（与
+    deliver_reply 交付同源，见 get_ai_response 交付分支——收尾交付
+    **不使用** builder 静默累积的整轮草稿 HTML，以免把中间过程倾倒给
+    用户）。
+
+    约定：``silent`` 属性为 True，供下层模块用
+    ``getattr(builder, "silent", False)`` 做静默分支判断。
+    """
+
+    def __init__(self, chat_id: int) -> None:
+        super().__init__(chat_id)
+        self.silent = True
+        # 打断裁剪基准：静默回合从不渲染草稿帧——用户认知现场为空，没有
+        # "视觉所见"基准。置 None 后 get_ai_response 不 attach 游标，
+        # turn_recovery 打断保全时只剥残缺思考、不裁剪文本（保全后端
+        # 全量，让下一轮能衔接进度——静默模式交付走 deliver_reply 终稿，
+        # 中间过程文本本就不对用户可见，不存在认知偏差问题）。
+        self._render_cursor_box: Optional[list] = None
+
+    # ---------- 覆盖所有会产生 Telegram 副作用的路径 ----------
+
+    def request_flush(self, force: bool = False) -> None:
+        # 静默回合没有草稿，无需合并/补发任何帧
+        return
+
+    async def flush(self, force: bool = False) -> None:
+        # 永不发送草稿帧；draft_message_id 保持 None，
+        # 上层据此自然跳过所有"删除草稿气泡"的分支。
+        return
+
+    def start_flush_loop(self) -> None:
+        # 没有需要驱动的刷新循环
+        return
+
+    async def stop_flush_loop(self) -> None:
+        # 从未启动任何后台任务，直接返回
+        return
+
+    def _arm_rollover_if_needed(self, html_content: str | None = None) -> bool:
+        # 静默回合不存在容量滚动问题
+        return False
+
+    async def rollover_at_turn_boundary(self, *, start_next_draft: bool = True) -> bool:
+        # 关键覆盖：父类实现会把旧段"永久化"为 Telegram 消息，
+        # 这会把 agent 过程泄漏给用户。静默回合永不滚动。
+        return False
+
+    async def finalize_interrupted_draft(self, journal: Optional[list] = None) -> bool:
+        # 关键覆盖：父类实现会把打断时已累积的草稿内容经 sendRichMessage
+        # 固定为永久消息——静默回合没有可见草稿，整轮倾倒过程正文会违反
+        # /show off 语义（交付只经 deliver_reply / 收尾兜底，且只发最后
+        # 一条 assistant 正文）。静默回合的打断只走 turn_recovery 保全。
+        # journal 参数仅为签名对齐（父类的草稿层↔历史层反向校验对静默
+        # 回合无草稿可比，直接忽略）。
+        return False
+
+    async def _register_active_draft(self, message_id: int = 0) -> None:
+        # 不注册活跃草稿：打断逻辑（mark_draft_dead / clear_active_draft）
+        # 与新用户回合的草稿占位都与之无关。
+        return

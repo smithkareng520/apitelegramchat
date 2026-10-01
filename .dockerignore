@@ -1,0 +1,13 @@
+.git
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+node_modules/
+tests/
+docs/
+scripts/
+CODE_REVIEW_REPORT.md

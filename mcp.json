@@ -1,0 +1,64 @@
+{
+  "mcpServers": {
+    "gaode_mcp": {
+      "type": "streamable_http",
+      "url_env": "GAODE_MCP_URL",
+      "headers_env": {
+        "Authorization": "GAODE_MCP_TOKEN"
+      },
+      "timeout": 12,
+      "description": "高德地图官方能力（地理编码 / POI / 路径规划 / 距离）。URL 与令牌从环境变量注入。",
+      "policy": {
+        "expose": true,
+        "disabled_tools": [
+          "maps_weather"
+        ]
+      }
+    },
+    "internal_search": {
+      "type": "in_process",
+      "module": "search",
+      "description": "内置检索工具：web_search / fetch_url / wikipedia / exchange_rate / weather。",
+      "policy": {
+        "expose": true,
+        "disabled_tools": []
+      }
+    },
+    "internal_todo": {
+      "type": "in_process",
+      "module": "todo",
+      "description": "内置待办清单：按会话命名空间持久化的 todo 增删改查。",
+      "policy": {
+        "expose": true,
+        "disabled_tools": []
+      }
+    },
+    "internal_memory": {
+      "type": "in_process",
+      "module": "memory",
+      "description": "内置长期记忆：跨会话记忆的增删改查与检索。",
+      "policy": {
+        "expose": true,
+        "disabled_tools": []
+      }
+    },
+    "internal_workspace": {
+      "type": "in_process",
+      "module": "workspace",
+      "description": "内置工作区文本工具：text_editor（view / str_replace / create / insert）。",
+      "policy": {
+        "expose": true,
+        "disabled_tools": []
+      }
+    },
+    "internal_bash": {
+      "type": "in_process",
+      "module": "bash",
+      "description": "内置沙箱 bash：持久会话、后台任务与超时控制都在服务进程内。",
+      "policy": {
+        "expose": true,
+        "disabled_tools": []
+      }
+    }
+  }
+}

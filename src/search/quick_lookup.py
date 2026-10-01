@@ -1,0 +1,251 @@
+"""生活查询工具：wikipedia / exchange_rate / weather（自 search_engine.py 拆出）。"""
+
+import asyncio
+import json
+import re
+from urllib.parse import quote
+from typing import Any
+
+import aiohttp
+try:
+    from curl_cffi.requests import AsyncSession
+except Exception:  # pragma: no cover - optional dependency fallback
+    AsyncSession = None  # type: ignore
+
+from search.fetch_url import CURL_TIMEOUT, HTTP_TIMEOUT_SHORT, _truncate
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+# --------------------- wikipedia ---------------------
+async def execute_wikipedia(query: str, lang: str = "zh") -> str:
+    """Wikipedia 关键词查询 → 忠实原文结构的 Telegram Rich HTML。
+
+    链路：
+      1. list=search 把关键词解析为最匹配的页面（web_search+fetch_url 需要
+         两轮才能做到，且不保证维基百科排第一）；
+      2. action=parse 获取该页面的完整解析后 HTML（MediaWiki API 并非只有
+         纯文本：prop=extracts&explaintext 才是纯文本摘要；action=parse 的
+         prop=text 返回含表格/列表/图片的完整 HTML，比抓取网页更稳定）；
+      3. 复用 fetch_url 的富提取管线（trafilatura 结构化提取 + 媒体原位 +
+         预算感知压缩），结果格式与 fetch_url 完全一致，模型可同样复用其中
+         的 <img>/<a> 等片段；
+      4. parse 失败或富转换提不出内容时，退化为旧的纯文本摘要路径。
+    """
+    try:
+        from fetch_rich_content import build_model_facing_html
+    except Exception as e:
+        logger.error(f"[wikipedia] fetch_rich_content 导入失败: {e}")
+        build_model_facing_html = None  # type: ignore[assignment]
+
+    for l in [lang, "en"]:
+        try:
+            async with AsyncSession() as session:
+                search_resp = await session.get(
+                    f"https://{l}.wikipedia.org/w/api.php",
+                    params={"action": "query", "list": "search", "srsearch": query, "srlimit": 3, "format": "json", "utf8": 1},
+                    headers={"Accept": "application/json", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+                    impersonate="chrome120", timeout=CURL_TIMEOUT
+                )
+                if search_resp.status_code != 200:
+                    continue
+                search_data = search_resp.json()
+                results = search_data.get("query", {}).get("search", [])
+                if not results:
+                    continue
+                page_id = results[0]["pageid"]
+
+                # ---- 主路径：action=parse 完整 HTML → 富管线 ----
+                if build_model_facing_html is not None:
+                    try:
+                        parse_resp = await session.get(
+                            f"https://{l}.wikipedia.org/w/api.php",
+                            params={
+                                "action": "parse", "pageid": page_id, "prop": "text|displaytitle",
+                                "redirects": 1, "disablelimitreport": 1, "disableeditsection": 1,
+                                "disabletoc": 1, "format": "json", "utf8": 1,
+                            },
+                            headers={"Accept": "application/json", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+                            impersonate="chrome120", timeout=CURL_TIMEOUT
+                        )
+                        if parse_resp.status_code == 200:
+                            parse_data = (parse_resp.json() or {}).get("parse", {}) or {}
+                            page_html = ((parse_data.get("text") or {}).get("*") or "").strip()
+                            title = (parse_data.get("title") or results[0].get("title") or query).strip()
+                            if page_html:
+                                page_url = f"https://{l}.wikipedia.org/wiki/{quote(title)}"
+                                # CPU 密集转换放到线程池，不阻塞事件循环
+                                # （与 _build_rich_fetch_payload 同一调度方式）。
+                                rich = await asyncio.to_thread(
+                                    build_model_facing_html, page_url, page_html, None, title
+                                )
+                                if rich:
+                                    return rich
+                    except Exception as e:
+                        logger.debug(f"[wikipedia] 富 HTML 路径失败（回退纯文本摘要）: {e}")
+
+                # ---- 退化路径：纯文本摘要（历史行为）----
+                page_resp = await session.get(
+                    f"https://{l}.wikipedia.org/w/api.php",
+                    params={"action": "query", "pageids": page_id, "prop": "extracts|info", "explaintext": True, "inprop": "url", "format": "json", "utf8": 1},
+                    headers={"Accept": "application/json", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+                    impersonate="chrome120", timeout=CURL_TIMEOUT
+                )
+                if page_resp.status_code != 200:
+                    continue
+                page_data = page_resp.json()
+                pages = page_data.get("query", {}).get("pages", {})
+                page: dict[str, Any] = next(iter(pages.values()), {})
+                title = page.get("title", results[0].get("title", query))
+                extract = page.get("extract", "").strip()
+                if not extract:
+                    continue
+                extract = _truncate(extract)
+                page_url = page.get("fullurl", f"https://{l}.wikipedia.org/wiki/{quote(title)}")
+                return f"<b>Wikipedia — {title}</b><br/><br/>{extract}<br/><br/>链接：{page_url}"
+        except Exception as exc:
+            logger.warning("wikipedia 语言分支查询失败 lang=%s: %s", l, exc)
+            continue
+    return f"失败：Wikipedia 查询「{query}」未找到结果。"
+
+
+# --------------------- exchange_rate ---------------------
+async def execute_exchange_rate(base: str, target: str | None = None) -> str:
+    base = base.upper().strip()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://open.er-api.com/v6/latest/{base}", timeout=HTTP_TIMEOUT_SHORT) as resp:
+                if resp.status != 200:
+                    return f"失败：汇率查询失败（HTTP {resp.status}）"
+                data = await resp.json()
+        if data.get("result") != "success":
+            return f"失败：汇率查询失败：{data.get('error-type', '未知错误')}"
+        rates = data.get("rates", {})
+        update_time = data.get("time_last_update_utc", "未知")
+        if target:
+            target = target.upper().strip()
+            if target not in rates:
+                return f"失败：不支持的目标货币代码：{target}"
+            return f"<b>汇率查询成功</b><br/>1 {base} = {rates[target]} {target}<br/>更新时间：{update_time}"
+        major = ["CNY", "USD", "EUR", "JPY", "GBP", "HKD", "KRW", "SGD", "AUD", "CAD"]
+        lines = [f"<b>{base} 汇率</b><br/>更新时间：{update_time}<br/>"]
+        for cur in major:
+            if cur in rates and cur != base:
+                # 强制 float 转换：上游 API 偶尔返回字符串（如 "0.1234"），
+                # 直接 :.4f 会抛 ValueError 被 outer except 吞成"汇率查询出错"。
+                try:
+                    rate_val = float(rates[cur])
+                except (TypeError, ValueError):
+                    continue
+                lines.append(f"1 {base} = {rate_val:.4f} {cur}")
+        return "<br/>".join(lines)
+    except Exception as e:
+        logger.debug("execute_exchange_rate 内部忽略的异常", exc_info=True)
+        return f"失败：汇率查询出错：{str(e)[:100]}"
+
+
+# --------------------- weather ---------------------
+# 载荷瘦身：只打包 UI 卡片与模型视图真正消费的字段。
+# 此前逐时条目复制 25+ 字段（DewPoint/HeatIndex/WindChill/shortRad/diffRad、
+# 十项 chance_* 分类、气压/阵风/云量/能见度/UV …），其中绝大多数既不出现在
+# 用户卡片上、也早被模型视图丢弃 —— 每次查询白白搬运几百个字符串。现在在
+# 源头不再生产这些字段（上游 wttr.in 仍返回它们，只是不再复制进载荷）。
+_HOURLY_FIELDS = ("time", "temp", "condition", "precip", "humidity", "wind_speed", "chance_of_rain")
+_DAILY_FIELDS = ("date", "max", "min", "condition", "uvIndex", "sunrise", "sunset", "chance_of_rain")
+
+
+async def execute_weather(city: str, unit: str = "c", hours: int = 6) -> str:
+    """查询 wttr.in 天气并打包为精简 JSON。
+
+    注意：本函数返回的是 UI 卡片渲染所需的完整数据（但字段已瘦身，
+    见 _HOURLY_FIELDS / _DAILY_FIELDS）。hours 参数不在这一层生效 ——
+    发给模型的逐时条数与文本视图由 tool_result_condense.condense_for_model
+    的 weather 视图控制（默认 6 条，与工具 schema 的 hours 参数一致）。
+    """
+    url = f"https://wttr.in/{city}?format=j1"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=HTTP_TIMEOUT_SHORT) as resp:
+                text = await resp.text()
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    return json.dumps({"error": f"无法解析天气数据：{text[:200]}"}, ensure_ascii=False)
+
+                if resp.status != 200:
+                    error_msg = data.get("error", {}).get("message", text)
+                    return json.dumps({"error": f"天气查询失败（HTTP {resp.status}）：{error_msg[:200]}"}, ensure_ascii=False)
+
+                current = (data.get("current_condition") or [{}])[0]
+                current_data = {
+                    "temp": current.get(f"temp_{unit.upper()}", "N/A"),
+                    "feels_like": current.get(f"FeelsLike{unit.upper()}", "N/A"),
+                    "humidity": current.get("humidity", "N/A"),
+                    "wind": current.get("windspeedKmph", "N/A"),
+                    "wind_gust": current.get("windgustKmph", "N/A"),
+                    "pressure": current.get("pressure", "N/A"),
+                    "visibility": current.get("visibility", "N/A"),
+                    "cloudcover": current.get("cloudcover", "N/A"),
+                    "uvIndex": current.get("uvIndex", "N/A"),
+                    "precip": current.get("precipMM", "0.0"),
+                    "wind_dir": current.get("winddir16Point", "N/A"),
+                    "wind_deg": current.get("winddirDegree", "N/A"),
+                    "condition": current.get("weatherDesc", [{}])[0].get("value", "未知"),
+                    "obs_time": current.get("localObsDateTime") or current.get("observation_time", ""),
+                }
+
+                def _pick(mapping: dict, keys: tuple[str, ...]) -> dict:
+                    return {k: mapping[k] for k in keys if k in mapping}
+
+                first_day = (data.get("weather") or [{}])[0]
+                hourly_data = []
+                for h in first_day.get("hourly", [])[:24]:
+                    # wttr.in 的 time 字段是 "0"…"2300"（HHMM）。
+                    time_str = h.get("time", "0")
+                    try:
+                        val = int(time_str)
+                        time_label = f"{val // 100:02d}:00" if 0 <= val <= 2359 else str(time_str)
+                    except (ValueError, TypeError):
+                        time_label = str(time_str)
+
+                    hourly_data.append(_pick({
+                        "time": time_label,
+                        "temp": h.get(f"temp{unit.upper()}", "N/A"),
+                        "condition": h.get("weatherDesc", [{}])[0].get("value", ""),
+                        "precip": h.get("precipMM", "0"),
+                        "humidity": h.get("humidity", "N/A"),
+                        "wind_speed": h.get("windspeedKmph", "N/A"),
+                        "chance_of_rain": h.get("chanceofrain", "0"),
+                    }, _HOURLY_FIELDS))
+
+                daily_data = []
+                for day in data.get("weather", [])[:5]:
+                    astro = day.get("astronomy", [{}])[0] if day.get("astronomy") else {}
+                    first_hour = day.get("hourly", [{}])[0] if day.get("hourly") else {}
+                    daily_data.append(_pick({
+                        "date": day.get("date", ""),
+                        "max": day.get(f"maxtemp{unit.upper()}", "N/A"),
+                        "min": day.get(f"mintemp{unit.upper()}", "N/A"),
+                        "condition": first_hour.get("weatherDesc", [{}])[0].get("value", ""),
+                        "uvIndex": day.get("uvIndex", "N/A"),
+                        "sunrise": astro.get("sunrise", ""),
+                        "sunset": astro.get("sunset", ""),
+                        "chance_of_rain": first_hour.get("chanceofrain", "0"),
+                    }, _DAILY_FIELDS))
+
+                result = {
+                    "city": city,
+                    "unit": unit.upper(),
+                    "current": current_data,
+                    "hourly": hourly_data,
+                    "daily": daily_data,
+                }
+                return json.dumps(result, ensure_ascii=False)
+    except asyncio.TimeoutError:
+        return json.dumps({"error": "天气查询超时"}, ensure_ascii=False)
+    except Exception as e:
+        logger.debug("execute_weather 内部忽略的异常", exc_info=True)
+        return json.dumps({"error": f"天气查询异常：{str(e)[:100]}"}, ensure_ascii=False)
+
