@@ -119,7 +119,7 @@ def _pointer_text(name: str, relative_path: str) -> str:
 def _archive_payload(
     *,
     tool_call: dict[str, Any],
-    tool_result: dict[str, Any],
+    tool_result: "dict[str, Any] | ToolResultBlock",
     name: str,
     relative_path: str,
 ) -> bytes:
@@ -149,7 +149,7 @@ def _archive_payload(
     return (json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n").encode("utf-8")
 
 
-def _eligible_calls(history: list[Any]) -> list[tuple[int, dict[str, Any], dict[str, Any]]]:
+def _eligible_calls(history: list[Any]) -> list[tuple[int, dict[str, Any], dict[str, Any] | ToolResultBlock]]:
     """Return unarchived target tool-call/result pairs in chronological order.
 
     重构说明（Internal Message）：生产历史为 Message 列表；这里把
@@ -175,7 +175,7 @@ def _eligible_calls(history: list[Any]) -> list[tuple[int, dict[str, Any], dict[
             if isinstance(call_id, str) and call_id and not _is_archived_pointer(message.get("content")):
                 results_by_id[call_id] = (message, None)  # type: ignore[assignment]
 
-    calls: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    calls: list[tuple[int, dict[str, Any], dict[str, Any] | ToolResultBlock]] = []
     for index, message in enumerate(history):
         if isinstance(message, Message):
             if message.role != "assistant":

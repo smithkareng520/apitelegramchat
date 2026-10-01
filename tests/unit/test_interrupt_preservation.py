@@ -4,7 +4,7 @@
 
 问题回顾（修复前）：
   ``content_acc`` / ``reasoning_acc`` 是流式循环的局部变量，只有循环正常
-  跑完才经 append_assistant_message 写入 journal；``except CancelledError:
+  跑完才把 assistant 消息写入 journal；``except CancelledError:
   raise`` 在写入之前——打断一旦发生，已产出文本从未落地。草稿层（用户
   可见）保全了"数到 123"，历史层（模型记忆）完全为空。
 

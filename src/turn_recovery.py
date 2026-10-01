@@ -523,7 +523,7 @@ def _unpaired_tool_calls(journal: list) -> list[tuple[str, str]]:
     重构说明（Internal Message）：journal 统一为 Message 列表（兼容旧
     dict 直通），assistant 消息经 tool_calls() 读取结构化 ToolCallBlock。
     """
-    def _role(m):
+    def _role(m: Any) -> Any:
         return m.role if isinstance(m, Message) else m.get("role")
 
     paired: set[str] = set()
@@ -713,7 +713,7 @@ async def finalize_failed_turn(
     chat_id: int,
     journal: list,
     *,
-    draft_builder=None,
+    draft_builder: Any = None,
     reason: str,
 ) -> list:
     """Close a failed model turn as one lifecycle operation.
@@ -1081,7 +1081,7 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
         history = ctx.setdefault("conversation_history", [])
         last = history[-1] if history else None
         last_is_user = isinstance(last, Message) and last.role == "user"
-        if last_is_user:
+        if isinstance(last, Message) and last_is_user:
             last_env = _envelope_of(last)
             # Responses server-managed state：合并/替换只发生在"上一回合
             # 没有任何 assistant 输出"的前提下——被改写的 user 消息要么

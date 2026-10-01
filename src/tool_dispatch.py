@@ -148,8 +148,8 @@ async def _handle_generate_image(chat_id: int, arguments: dict, _ns: str, _cb: A
         # 别名分发时保持该语义（忽略误带的 image_url）。
         image_url = None
     return await execute_generate_image(
-        prompt=arguments.get("prompt"),
-        model=arguments.get("model"),
+        prompt=arguments.get("prompt") or "",
+        model=arguments.get("model") or "",
         aspect_ratio=arguments.get("aspect_ratio", "1:1"),
         image_size=arguments.get("image_size", "1K"),
         num_images=arguments.get("num_images", 1),
@@ -164,8 +164,8 @@ async def _handle_generate_video(chat_id: int, arguments: dict, _ns: str, _cb: A
     from search.media_tools import execute_generate_video
 
     return await execute_generate_video(
-        prompt=arguments.get("prompt"),
-        model=arguments.get("model"),
+        prompt=arguments.get("prompt") or "",
+        model=arguments.get("model") or "",
         duration=arguments.get("duration", 5),
         chat_id=chat_id,
     )

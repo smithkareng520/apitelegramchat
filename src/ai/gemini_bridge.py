@@ -62,7 +62,7 @@ from utils import get_logger
 from chat_actions import start_chat_action, stop_chat_action
 
 from ai._constants import MAX_TOOL_CALLS, STREAM_CLIENT_TIMEOUT, STREAM_READ_BUFSIZE
-from ai.errors import AIResponseParseError
+from ai.errors import AIResponseParseError, AIStreamTimeoutError
 from ai.streaming import iter_async_stream
 from ai.cache_usage import _log_cache_usage
 from ai.tool_summary import (
@@ -89,7 +89,7 @@ if TYPE_CHECKING:
 
 from core.messages import (
     AudioBlock, DocumentBlock, ImageBlock, Message, TextBlock, ToolCallBlock,
-    ToolResultBlock, VideoBlock,
+    ToolResultBlock, VideoBlock, as_message,
 )
 
 logger = get_logger(__name__)
@@ -497,16 +497,13 @@ def _convert_messages_to_gemini(messages: list) -> tuple:
     contents: list = []
     pending_function_responses: list = []
 
-    def _as_message(raw: Any) -> Message:
-        return raw if isinstance(raw, Message) else Message.from_openai_dict(raw)
-
     def _flush_function_responses() -> None:
         if pending_function_responses:
             contents.append({"role": "user", "parts": list(pending_function_responses)})
             pending_function_responses.clear()
 
     for raw in messages:
-        msg = _as_message(raw)
+        msg = as_message(raw)
         role = msg.role
         if role == "system":
             text = msg.text()
@@ -540,10 +537,10 @@ def _convert_messages_to_gemini(messages: list) -> tuple:
             continue
 
         if role == "assistant":
-            parts: list[dict[str, Any]] = []
+            assistant_parts: list[dict[str, Any]] = []
             text_content = msg.text()
             if text_content:
-                parts.append({"text": text_content})
+                assistant_parts.append({"text": text_content})
             for tc in msg.tool_calls():
                 call_args = tc.arguments if isinstance(tc.arguments, dict) else {}
                 if not isinstance(call_args, dict):
@@ -554,9 +551,9 @@ def _convert_messages_to_gemini(messages: list) -> tuple:
                 sig = _thought_signature_for(tc)
                 if sig:
                     call_part["thoughtSignature"] = sig
-                parts.append(call_part)
-            if parts:
-                contents.append({"role": "model", "parts": parts})
+                assistant_parts.append(call_part)
+            if assistant_parts:
+                contents.append({"role": "model", "parts": assistant_parts})
             continue
 
     _flush_function_responses()
@@ -646,73 +643,107 @@ def _gemini_usage_to_openai(usage_meta: Any) -> Optional[dict]:
 # part 为完整对象（无跨 chunk 参数增量）；同响应可有多个 functionCall
 # part（并行工具调用）；thought=true 的 text part 是思考摘要；末尾
 # chunk 带 finishReason 与 usageMetadata。
+def _gemini_chunk_to_events(chunk: dict[str, Any]) -> list[dict[str, Any]]:
+    """把一个 GenerateContentResponse chunk 归一化为零或多个内部事件。
+
+    流中 error 事件与安全拦截也在这里上抛为 error 事件，不能静默吞掉：
+    两者都表现为"无 candidates 的 chunk"，直接丢弃会让调用方只看到空流
+    （零事件），根因完全不可观测，也没有任何重试机会。
+    """
+    events: list[dict[str, Any]] = []
+    #   - error chunk：{"error": {"code": 503, "message": ..., "status": ...}}
+    #   - 安全拦截：{"promptFeedback": {"blockReason": "SAFETY", ...}}
+    error = chunk.get("error")
+    if isinstance(error, dict):
+        status = error.get("status") or error.get("code") or ""
+        message = str(error.get("message") or error)
+        events.append({"kind": "error", "message": message, "status": str(status)})
+        return events
+    feedback = chunk.get("promptFeedback")
+    if isinstance(feedback, dict) and feedback.get("blockReason"):
+        events.append({
+            "kind": "error",
+            "message": (f"prompt blocked by safety filters: "
+                        f"{feedback.get('blockReason')}"),
+            "status": "SAFETY_BLOCK",
+            "safety_block": True,
+        })
+        return events
+    if isinstance(chunk.get("usageMetadata"), dict):
+        events.append({"kind": "usage", "usage": chunk["usageMetadata"]})
+    candidates = chunk.get("candidates") or []
+    if not candidates:
+        return events
+    cand = candidates[0] if isinstance(candidates[0], dict) else {}
+    finish_reason = str(cand.get("finishReason") or "")
+    if finish_reason:
+        events.append({"kind": "finish", "reason": finish_reason})
+    content_obj = cand.get("content")
+    if not isinstance(content_obj, dict):
+        return events
+    for part in (content_obj.get("parts") or []):
+        if not isinstance(part, dict):
+            continue
+        fc = part.get("functionCall")
+        if isinstance(fc, dict):
+            events.append({
+                "kind": "function_call",
+                "name": str(fc.get("name") or ""),
+                "args": fc.get("args") if isinstance(fc.get("args"), dict) else {},
+                "thought_signature": part.get("thoughtSignature") or "",
+            })
+            continue
+        text = part.get("text")
+        if not (isinstance(text, str) and text):
+            continue
+        if part.get("thought"):
+            events.append({"kind": "thought", "text": text})
+        else:
+            events.append({"kind": "text", "text": text})
+    return events
+
+
+def _parse_sse_data_payload(payload: str) -> list[dict[str, Any]]:
+    """解析一条 SSE 事件的 data 载荷（可能是多行拼接后的整体 JSON）。"""
+    if not payload or payload == "[DONE]":
+        return []
+    try:
+        chunk = json.loads(payload)
+    except json.JSONDecodeError:
+        # warning 而非 debug：正常网关不会发出非法 data 载荷，出现即说明
+        # 网关/代理行为异常，静默忽略会让问题只表现为"零事件空流"。
+        logger.warning("[gemini] 无法解析的 SSE 载荷（忽略）: %.160s", payload)
+        return []
+    if not isinstance(chunk, dict):
+        return []
+    return _gemini_chunk_to_events(chunk)
+
+
 async def _iter_gemini_stream_events(resp: aiohttp.ClientResponse) -> AsyncIterator[dict[str, Any]]:
-    async for raw_line in iter_async_stream(resp.content):
-        line = raw_line.decode("utf-8", errors="replace").strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[5:].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            chunk = json.loads(payload)
-        except json.JSONDecodeError:
-            logger.debug("[gemini] 无法解析的 SSE 行（忽略）: %.160s", payload)
-            continue
-        if not isinstance(chunk, dict):
-            continue
-        # 流中 error 事件与安全拦截必须上抛，不能静默吞掉：两者都表现为
-        # "无 candidates 的 chunk"，旧逻辑直接 continue，调用方只会看到
-        # 空流（零事件），根因完全不可观测，也没有任何重试机会。
-        #   - error chunk：{"error": {"code": 503, "message": ..., "status": ...}}
-        #   - 安全拦截：{"promptFeedback": {"blockReason": "SAFETY", ...}}
-        error = chunk.get("error")
-        if isinstance(error, dict):
-            status = error.get("status") or error.get("code") or ""
-            message = str(error.get("message") or error)
-            yield {"kind": "error", "message": message, "status": str(status)}
-            continue
-        feedback = chunk.get("promptFeedback")
-        if isinstance(feedback, dict) and feedback.get("blockReason"):
-            yield {
-                "kind": "error",
-                "message": (f"prompt blocked by safety filters: "
-                            f"{feedback.get('blockReason')}"),
-                "status": "SAFETY_BLOCK",
-                "safety_block": True,
-            }
-            continue
-        if isinstance(chunk.get("usageMetadata"), dict):
-            yield {"kind": "usage", "usage": chunk["usageMetadata"]}
-        candidates = chunk.get("candidates") or []
-        if not candidates:
-            continue
-        cand = candidates[0] if isinstance(candidates[0], dict) else {}
-        finish_reason = str(cand.get("finishReason") or "")
-        if finish_reason:
-            yield {"kind": "finish", "reason": finish_reason}
-        content_obj = cand.get("content")
-        if not isinstance(content_obj, dict):
-            continue
-        for part in (content_obj.get("parts") or []):
-            if not isinstance(part, dict):
+    """按 SSE 规范切分事件：空行为事件边界，同一事件的多行 data 字段
+    以 \n 连接后整体解析（Gemini 官方是单行 data，网关/代理可能拆行）。
+
+    每段到达的字节自行按 \n 再切分，不依赖底层 readline 的行交付粒度：
+    无论传输层逐行交付还是一次交付多行（含 \r\n 行尾），事件边界判定
+    都保持一致。
+    """
+    data_lines: list[str] = []
+    async for raw in iter_async_stream(resp.content):
+        for sse_line in raw.decode("utf-8", errors="replace").split("\n"):
+            line = sse_line.strip()
+            if not line:
+                if data_lines:
+                    for event in _parse_sse_data_payload("\n".join(data_lines)):
+                        yield event
+                    data_lines = []
                 continue
-            fc = part.get("functionCall")
-            if isinstance(fc, dict):
-                yield {
-                    "kind": "function_call",
-                    "name": str(fc.get("name") or ""),
-                    "args": fc.get("args") if isinstance(fc.get("args"), dict) else {},
-                    "thought_signature": part.get("thoughtSignature") or "",
-                }
-                continue
-            text = part.get("text")
-            if not (isinstance(text, str) and text):
-                continue
-            if part.get("thought"):
-                yield {"kind": "thought", "text": text}
-            else:
-                yield {"kind": "text", "text": text}
+            if line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+            # event:/id:/注释行与 Gemini 载荷无关，忽略。
+    # 流结束但最后一个事件没有空行收尾：缓冲中的事件不能丢。
+    if data_lines:
+        for event in _parse_sse_data_payload("\n".join(data_lines)):
+            yield event
 
 
 def _build_gemini_request_body(
@@ -993,6 +1024,10 @@ async def _agentic_loop_gemini_native(
                         # ServerDisconnectedError 等）：仅零输出阶段补试一次；
                         # AIResponseParseError（流中 error/安全拦截）不是连接
                         # 类异常，直接落到外层上抛，绝不重试。
+                        # 应用层 total 期限是硬闸门，同样绝不重试（重试只会
+                        # 重放同样漫长的等待）；idle 期限按瞬态策略重试。
+                        if isinstance(e, AIStreamTimeoutError) and e.kind == "total":
+                            raise
                         if received_any or stream_attempt >= 1:
                             raise
                         logger.warning(

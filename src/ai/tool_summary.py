@@ -173,7 +173,8 @@ def _todo_summary_done(fn_args: dict, payload: dict) -> str:
     实际结果方向以 payload.todo.done 为准；payload 缺失时按请求意图兜底。
     """
     action = _requested_action(fn_args)
-    todo = payload.get("todo") if isinstance(payload.get("todo"), dict) else {}
+    todo_raw = payload.get("todo")
+    todo: dict = todo_raw if isinstance(todo_raw, dict) else {}
     label = _short_label(todo.get("title"))
     obj = f" todo {label}" if label else " a todo"
     if action == "add":
@@ -195,7 +196,7 @@ def _todo_summary_done(fn_args: dict, payload: dict) -> str:
         return f"Deleted{obj}"
     if action == "clear":
         try:
-            removed = int(payload.get("removed"))
+            removed = int(payload.get("removed"))  # type: ignore[arg-type]
         except (TypeError, ValueError):
             removed = 0
         return f"Cleared {removed} todos" if removed > 0 else "Cleared the todo list"
@@ -205,7 +206,8 @@ def _todo_summary_done(fn_args: dict, payload: dict) -> str:
 def _memory_summary_done(fn_args: dict, payload: dict) -> str:
     """memory 完成态摘要：「动作 + 记忆内容摘要」，无内容退化为基础文案。"""
     action = _requested_action(fn_args)
-    mem = payload.get("memory") if isinstance(payload.get("memory"), dict) else {}
+    mem_raw = payload.get("memory")
+    mem: dict = mem_raw if isinstance(mem_raw, dict) else {}
     label = _short_label(mem.get("content"))
     obj = f" memory: {label}" if label else " a memory"
     if action == "add":
@@ -218,7 +220,7 @@ def _memory_summary_done(fn_args: dict, payload: dict) -> str:
         return f"Deleted{obj}"
     if action == "clear":
         try:
-            removed = int(payload.get("removed"))
+            removed = int(payload.get("removed"))  # type: ignore[arg-type]
         except (TypeError, ValueError):
             removed = 0
         return f"Cleared {removed} memories" if removed > 0 else "Cleared memories"
@@ -350,7 +352,8 @@ def _done_map_tool_summary(fn_name: str, fn_args: dict, result_content: Any) -> 
     payload = _map_payload_from_result(result_content)
     if fn_name in {"maps_geo", "maps_regeocode"}:
         query = _map_location_query_label(fn_name, fn_args)
-        count = len(payload.get("geocodes")) if isinstance(payload.get("geocodes"), list) else _map_result_count(payload)
+        geocodes = payload.get("geocodes")
+        count = len(geocodes) if isinstance(geocodes, list) else _map_result_count(payload)
         if count is not None:
             noun = "match" if count == 1 else "matches"
             action = "Reverse geocoded" if fn_name == "maps_regeocode" else "Geocoded"
@@ -1229,7 +1232,7 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
             n = len(paths) if isinstance(paths, list) else 0
             return "Presented file" if n <= 1 else f"Presented {n} files"
         parts = []
-        if sent_n:
+        if sent_n and isinstance(sent, list):
             names = [str(x) for x in sent[:2]]
             listing = ", ".join(names) + ("…" if sent_n > 2 else "")
             label = "file" if sent_n == 1 else "files"

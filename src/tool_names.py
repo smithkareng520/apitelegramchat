@@ -104,10 +104,9 @@ PRESENT_FILES = "present_files"
 # =====================================================================
 def tool_family(name: str) -> str:
     """返回工具的真实族名；高德 MCP 直接使用原生 ``maps_*`` 名称。"""
-    if name in GAODE_TOOLS:
-        return split_mcp_name(name)[1]
-    if name in SEARCH_TOOLS_MCP:
-        return split_mcp_name(name)[1]
+    split = split_mcp_name(name)
+    if (name in GAODE_TOOLS or name in SEARCH_TOOLS_MCP) and split is not None:
+        return split[1]
     if name == TODO:
         return "todo"
     if name == MEMORY:

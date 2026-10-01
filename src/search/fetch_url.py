@@ -57,6 +57,8 @@ if _TRAFILATURA_CONFIG is not None:
     except Exception:
         logger.debug("module 内部忽略的异常", exc_info=True)
         pass
+
+
 # ---------- 工具函数 ----------
 def _truncate(text: str, token_budget: int = FETCH_CONTENT_TOKEN_BUDGET, suffix: str = "…（内容已按 token 预算截断）") -> str:
     return truncate_to_token_budget(text, token_budget, suffix=suffix)

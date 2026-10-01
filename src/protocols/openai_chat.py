@@ -12,7 +12,7 @@
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 from api_client import api_client
 from protocols.base import ChatProtocolAdapter
@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
     from config import ModelConfig
     from responses_state import TurnState
+    from openai import AsyncOpenAI
 
 
 class OpenAIChatAdapter(ChatProtocolAdapter):
@@ -54,7 +55,7 @@ class OpenAIChatAdapter(ChatProtocolAdapter):
                 mark_legacy_divergence(chat_id)
             except Exception:
                 pass
-        client = api_client.get_client_for_model(model_info)
+        client = cast("AsyncOpenAI", api_client.get_client_for_model(model_info))
         api_label = model_info.provider
         return await _agentic_loop_openai_compat(
             client, current_model, messages, api_label, builder,

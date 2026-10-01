@@ -4,6 +4,8 @@ import contextvars
 import time
 import uuid
 from collections import OrderedDict
+from typing import Any
+
 from config import DEFAULT_MODEL
 
 # ---------- 用户会话 ----------
@@ -71,9 +73,9 @@ async def add_media_group_message(media_group_id: str, msg: dict) -> None:
                 break
         if raw_group_id:
             chat = msg.get("chat") or {}
-            chat_id = chat.get("id")
+            raw_chat_id = chat.get("id")
             try:
-                chat_id = int(chat_id)
+                chat_id = int(raw_chat_id)  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 chat_id = None
             if chat_id is not None:
@@ -166,7 +168,7 @@ def record_album_media(media_group_id: str, chat_id: int, messages: list) -> Non
     # 最终只会找到最后一张。因此同 chat / 同 group 必须做增量合并。
     existing = album_media_registry.get(media_group_id)
     if isinstance(existing, dict) and existing.get("chat_id") == chat_id:
-        def _merge_values(old_values: list, new_values: list, key=None) -> list:
+        def _merge_values(old_values: Any = None, new_values: Any = None, key: Any = None) -> list:
             out = list(old_values or [])
             seen = {
                 (item if key is None else item.get(key))

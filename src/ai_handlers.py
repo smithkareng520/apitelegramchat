@@ -14,8 +14,8 @@ ai/ 子包下的多个职责单一的子模块：
   ai/agentic_loops.py       - 四种 agentic 循环实现
 
 本文件保留 get_ai_response / build_system_prompt 等顶层入口，并重导出
-其他文件曾经从 ai_handlers 直接导入的符号，确保外部调用方（app.py、
-search_engine.py 等）无需修改任何 import 语句。
+其他文件曾经从 ai_handlers 直接导入的符号，确保外部调用方（app.py 等）
+无需修改任何 import 语句。
 """
 import asyncio
 import json
@@ -882,6 +882,9 @@ async def get_ai_response(
         _log_stage("统一管道预检完成")
         logger.info("统一管道预检: chat=%s %s", chat_id, _preflight.describe())
         _model_route = _preflight.plan.route
+        # 各分支（媒体短路 / 媒体循环 / _call_api）共用的回合结果变量：
+        # raw_content 可为 None（_call_api 契约），显式声明避免首绑收窄。
+        raw_content: str | None
         if _preflight.verdict.blocked and not is_timer:
             # 媒体分支硬性前置不满足（生图/生视频缺文本 prompt）：空 prompt
             # 打到生成端点必败（上游 400），提前短路并复用 IMAGE/VIDEO_ERROR
@@ -924,7 +927,7 @@ async def get_ai_response(
             # 交付最终内容。禁止直接投递文件/媒体、任意 Bash/文件写入，
             # 避免 TIMER 为了"找点事做"产生副作用。
             import tool_names as _tn
-            from search_engine import build_deliver_reply_tool
+            from search.tool_schemas import build_deliver_reply_tool
             from tool_registry import get_model_tools
             from tool_assembly import prioritize_tool_defs, restrict_tool_defs
             _PROACTIVE_ALLOWED_TOOLS = {
@@ -974,7 +977,7 @@ async def get_ai_response(
             # （与 deliver_reply 交付同源）；草稿模式下系统自动发送最终
             # 回复（不暴露该工具）。
             if silent_mode:
-                from search_engine import build_deliver_reply_tool
+                from search.tool_schemas import build_deliver_reply_tool
                 raw_content, usage, new_msgs = await _call_api(
                     current_model, model_info, messages, chat_id, builder,
                     tools=None, journal=journal,

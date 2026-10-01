@@ -1083,14 +1083,16 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
 
         file_names = list(msg.get("file_names") or [])
         mime_types = list(msg.get("mime_types") or [])
-        return await _build_attachment_fallback_text(
+        # 必须包成 TextBlock：本函数契约是"永远返回块列表"；裸 str 会
+        # 在 Message.user(list(str)) 里被拆成单字符块，毁坏历史消息。
+        return [TextBlock(await _build_attachment_fallback_text(
             kind="photo",
             file_ids=file_ids,
             user_text=user_text,
             chat_id=chat_id,
             file_names=file_names,
             mime_types=mime_types,
-        )
+        ))]
 
     # ---------- 视频组（video_group，对称 photo_group） ----------
     if "file_ids" in msg and msg.get("type") == "video_group":
@@ -1107,10 +1109,10 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                     return VideoBlock(url=presigned_url)
                 return None
 
-            results = await asyncio.gather(
+            video_results = await asyncio.gather(
                 *[process_video_one(i, fid) for i, fid in enumerate(vg_file_ids)]
             )
-            content_blocks = [r for r in results if r is not None]
+            content_blocks = [r for r in video_results if r is not None]
             # 无论整体走原生还是降级，解析失败的视频都触发后台持久化，
             # 保证之后切换模型/下一轮重试时仍有机会恢复。
             failed_indices = [i for i, r in enumerate(results) if r is None]
@@ -1311,13 +1313,17 @@ async def _append_history_async(messages: list, history: list, model_info: Model
                 envelope["content"] = m.text()
                 resolved = await _resolve_multimodal_content(envelope, model_info, chat_id=chat_id)
             else:
-                resolved = [TextBlock(_strip_reply_prefix(b.text)) if "💡 引用回复:" in b.text else b
-                            for b in m.blocks]
+                resolved = [
+                    TextBlock(_strip_reply_prefix(b.text))
+                    if isinstance(b, TextBlock) and "💡 引用回复:" in b.text
+                    else b
+                    for b in m.blocks
+                ]
             out_msg = Message.user(resolved, **m.meta)
             messages.append(out_msg)
         else:
             # assistant / tool / system：文本剥引用前缀后原样透传。
-            out_blocks = []
+            out_blocks: list[Block] = []
             for b in m.blocks:
                 if isinstance(b, TextBlock) and "💡 引用回复:" in b.text:
                     out_blocks.append(TextBlock(_strip_reply_prefix(b.text)))
@@ -1337,10 +1343,26 @@ def _strip_reply_prefix(content: str) -> str:
 
 
 def _track_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
-    """启动一个后台任务并保留强引用，避免被 GC 提前回收。"""
+    """启动一个后台任务并保留强引用，避免被 GC 提前回收。
+
+    done 回调同时回收引用并检索异常：否则后台持久化失败只会以
+    "Task exception was never retrieved" 的形式出现在事件循环默认
+    异常处理器里，与本任务的来源无法关联。
+    """
+
+    def _reap(task: asyncio.Task) -> None:
+        _background_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning(
+                "后台任务异常（%s）: %s",
+                getattr(coro, "__qualname__", "unknown"),
+                task.exception(),
+                exc_info=task.exception(),
+            )
+
     t = asyncio.create_task(coro)
     _background_tasks.add(t)
-    t.add_done_callback(_background_tasks.discard)
+    t.add_done_callback(_reap)
     return t
 
 

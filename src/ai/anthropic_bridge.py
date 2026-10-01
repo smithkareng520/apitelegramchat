@@ -72,6 +72,7 @@ if TYPE_CHECKING:
 
 from core.messages import (
     DocumentBlock, ImageBlock, Message, TextBlock, ToolCallBlock, ToolResultBlock,
+    as_message,
 )
 
 logger = get_logger(__name__)
@@ -261,11 +262,8 @@ def _convert_messages_to_anthropic(messages: list) -> tuple[list[dict], list]:
             anthropic_messages.append({"role": "user", "content": list(pending_tool_results)})
             pending_tool_results.clear()
 
-    def _as_message(msg: Any) -> Message:
-        return msg if isinstance(msg, Message) else Message.from_openai_dict(msg)
-
     for raw in messages:
-        msg = _as_message(raw)
+        msg = as_message(raw)
         role = msg.role
         if role == "system":
             text = msg.text()
@@ -297,19 +295,19 @@ def _convert_messages_to_anthropic(messages: list) -> tuple[list[dict], list]:
             continue
 
         if role == "assistant":
-            blocks: list[dict] = []
+            assistant_blocks: list[dict] = []
             text_content = msg.text()
             if text_content:
-                blocks.append({"type": "text", "text": text_content})
+                assistant_blocks.append({"type": "text", "text": text_content})
             for tc in msg.tool_calls():
-                blocks.append({
+                assistant_blocks.append({
                     "type": "tool_use",
                     "id": tc.id or f"toolu_{uuid.uuid4().hex[:24]}",
                     "name": tc.name,
                     "input": tc.arguments if isinstance(tc.arguments, dict) else {},
                 })
-            if blocks:
-                anthropic_messages.append({"role": "assistant", "content": blocks})
+            if assistant_blocks:
+                anthropic_messages.append({"role": "assistant", "content": assistant_blocks})
             continue
 
     _flush_pending_tool_results()
@@ -503,8 +501,10 @@ def _is_retryable_stream_error(e: Exception) -> bool:
     if type(e).__name__ in ("APIConnectionError", "APITimeoutError"):
         return True
     # 应用层 idle/total 期限（仅零输出阶段会走到重试判定）。
+    # total 是整条流的硬闸门，重试只会重放同样漫长的等待——绝不重试；
+    # idle（两个事件之间隔太久）按既有瞬态策略处理。
     if isinstance(e, AIStreamTimeoutError):
-        return True
+        return getattr(e, "kind", "idle") != "total"
 
     # 3) 错误体 error.type 兜底判定
     body = getattr(e, "body", None)

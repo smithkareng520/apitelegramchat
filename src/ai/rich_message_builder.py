@@ -24,6 +24,7 @@ from utils import (
 from markdown_converter import convert_markdown_to_telegram_html
 from ai.error_formatting import extract_domain
 from ai.attachment_content import _track_task
+from ai._constants import _positive_env_int
 from core.messages import Message
 from token_budget import count_tokens, truncate_to_token_budget
 from ai.tool_summary import (
@@ -65,12 +66,6 @@ def freeze_draft_streaming(draft_id: object) -> None:
 # ---------- Telegram Rich Message 草稿滚动 ----------
 # 内部内容预算一律按 tiktoken 计算。Telegram 仍有 32,768 个解析后 Unicode
 # 字符的协议上限；该值仅作为最终的传输安全边界，并非内容预算。
-def _positive_env_int(name: str, default: int, *, minimum: int = 1) -> int:
-    try:
-        return max(minimum, int(os.getenv(name, str(default))))
-    except (TypeError, ValueError):
-        return default
-
 
 RICH_MESSAGE_TEXT_PROTOCOL_LIMIT = _positive_env_int("RICH_MESSAGE_TEXT_PROTOCOL_LIMIT", 32768)
 RICH_DRAFT_ROLLOVER_TOKEN_BUDGET = _positive_env_int(
@@ -941,7 +936,7 @@ class RichMessageBuilder:
                 return str(item.get("summary") or "Tool completed")
 
         descs = []
-        desc_types = []  # 与 descs 一一对应；失败计数段为 None
+        desc_types: list[str | None] = []  # 与 descs 一一对应；失败计数段为 None
         for gtype in type_order:
             count = type_counts[gtype]
             singular, plural = self._GROUP_SUMMARY_TEMPLATES.get(gtype, ("Ran an action", "Ran {n} actions"))
@@ -1909,7 +1904,7 @@ class RichMessageBuilder:
                 raise
             except asyncio.TimeoutError:
                 logger.debug("%s 未在 5.5s 内停止，转入后台清理: draft_id=%s", attr, self.draft_id)
-                asyncio.create_task(_swallow_flush_task(task, attr, self.draft_id))
+                _track_task(_swallow_flush_task(task, attr, self.draft_id))
                 handed_off.append(task)
             except Exception as exc:
                 logger.debug("%s 停止时出现异常（可忽略）: %s", attr, exc)
@@ -1935,7 +1930,10 @@ class RichMessageBuilder:
             )
             _FROZEN_DRAFTS.discard(draft_id)
 
-        asyncio.create_task(_release_freeze_when_drained())
+        # 强引用转交：本协程到此结束，事件循环只持弱引用，若不跟踪
+        # _release_freeze_when_drained 可能被 GC 回收，draft 将永远留在
+        # _FROZEN_DRAFTS 里，后续 flush 全部被冻结门拦截。
+        _track_task(_release_freeze_when_drained())
 
 
 class SilentMessageBuilder(RichMessageBuilder):

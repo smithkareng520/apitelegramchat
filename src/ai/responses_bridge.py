@@ -896,10 +896,10 @@ async def _agentic_loop_openai_responses_impl(
                                 builder.append_stream_delta(summary_text)
                                 live_slot.sync(content_acc, reasoning_acc)
                     elif itype == "function_call":
-                        item_id, entry, created = merge_function_call_item(
+                        delta_item_id, entry, created = merge_function_call_item(
                             tool_call_items, item
                         )
-                        if item_id and created and entry is not None:
+                        if delta_item_id and created and entry is not None:
                             fn_args = _safe_parse_args(entry["args_json"])
                             summary = _generate_initial_tool_summary(entry["name"], fn_args)
                             action_desc = _generate_action_description(entry["name"], fn_args)
@@ -1123,20 +1123,24 @@ async def _agentic_loop_openai_responses_impl(
             for call in tool_calls_list
             if isinstance(call, dict) and call.get("id")
         }
+        def _tr_call_id(msg: Message) -> str | None:
+            tr = msg.tool_result_block()
+            return tr.tool_call_id if tr is not None else None
+
         new_tool_messages = [
             msg for msg in loop_messages[tool_messages_start:]
             if isinstance(msg, Message)
             and msg.role == "tool"
-            and (not expected_call_ids or (msg.tool_result_block() and msg.tool_result_block().tool_call_id in expected_call_ids))
+            and (not expected_call_ids or (_tr_call_id(msg) in expected_call_ids))
         ]
         if expected_call_ids:
             found_ids = {
-                msg.tool_result_block().tool_call_id
+                tr_id
                 for msg in loop_messages
                 if isinstance(msg, Message)
                 and msg.role == "tool"
-                and msg.tool_result_block() is not None
-                and msg.tool_result_block().tool_call_id in expected_call_ids
+                and (tr_id := _tr_call_id(msg)) is not None
+                and tr_id in expected_call_ids
             }
             if found_ids != expected_call_ids:
                 raise AIResponseProtocolError(
@@ -1149,8 +1153,7 @@ async def _agentic_loop_openai_responses_impl(
                     msg for msg in loop_messages
                     if isinstance(msg, Message)
                     and msg.role == "tool"
-                    and msg.tool_result_block() is not None
-                    and msg.tool_result_block().tool_call_id in expected_call_ids
+                    and (_tr_call_id(msg) in expected_call_ids)
                 ]
         elif not new_tool_messages and status == "continue":
             raise AIResponseProtocolError(

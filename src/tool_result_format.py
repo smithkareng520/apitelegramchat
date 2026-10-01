@@ -27,7 +27,6 @@ from markdown_converter import render_telegram_fragment as convert_markdown_to_t
 from todo_tool import render_todo_card
 from memory_tool import render_memory_card
 from subagent_tool import render_subagent_card
-from ai.web_search_render import format_web_search_result as _format_web_search_result
 from tool_ui_render import (
     _format_image_generation_result,
     _render_bash_result,
@@ -117,7 +116,7 @@ def _format_background_task_result(fn_args: dict, result_str: str) -> tuple[str,
     return summary, details_html
 
 
-async def format_tool_result(fn_name: str, fn_args: dict, result_str: str):
+async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tuple[str, str]:
     """工具执行结果 →（折叠块标题, 展开详情 HTML）。"""
     fn_args = fn_args or {}
     family = tool_family(fn_name)
@@ -134,7 +133,10 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str):
         return summary, details_html
 
     if family == "web_search":
-        return _format_web_search_result(fn_args, result_str)
+        # 惰性导入：ai 包反向消费本模块（ai.tool_call_loop -> tool_executors
+        # -> tool_result_format），模块级导入会形成 import 时刻的包间环。
+        from ai.web_search_render import format_web_search_result
+        return format_web_search_result(fn_args, result_str)
 
     elif family == "fetch_url":
         url = fn_args.get('url', '')

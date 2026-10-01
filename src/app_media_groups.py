@@ -9,7 +9,7 @@ import os
 import mimetypes
 
 MEDIA_GROUP_TIMEOUT = 5
-from typing import cast
+from typing import cast, Any
 
 from config import SUPPORTED_MODELS
 from state import (
@@ -381,7 +381,7 @@ async def _process_document_group_inner(chat_id: int, media_group_id: str) -> No
     # 消除 dict 联合推断带来的宽化，运行时值恒为 str。
     await _handle_text_message(chat_id, cast(str, user_message.get("content", "")), username, user_message)
 
-async def _schedule_group(chat_id: int, group_key: str, tasks: dict, coro_factory, force: bool = False) -> None:
+async def _schedule_group(chat_id: int, group_key: str, tasks: dict, coro_factory: Any, force: bool = False) -> None:
     """统一相册聚合调度（合并原图片/视频/文档三份相同样板）。
 
     去重（同组已排队直接返回）→ create_task → 登记为当前 chat 的可取消

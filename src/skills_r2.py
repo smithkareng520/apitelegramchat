@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
+from typing import TypedDict
 
 from s3_utils import (
     upload_bytes_to_r2, download_from_r2, delete_r2_object,
@@ -132,28 +133,28 @@ async def backup_user_skills_to_r2(home: Path, namespace: str) -> None:
 
 
 async def initialize_workspace_skills(home: Path, namespace: str) -> str:
-    """初始化 workspace skills：优先恢复 R2 快照，否则从项目 skills 初始化并上传。
+    """初始化 workspace skills：优先恢复 R2 快照，否则从项目 skills 初始化。
 
-    返回 ``restored`` / ``bootstrapped`` / ``disabled``，供启动扫描和测试使用。
+    返回 ``restored`` / ``bootstrapped``，供启动扫描和测试使用。
+    R2 未配置时保持纯本地行为：直接按 copy-if-missing 复制内置 skills。
     """
-    if not is_r2_configured():
-        return "disabled"
     archive_key = _skills_archive_key(namespace)
-    existing = await download_from_r2(archive_key)
-    if existing is not None:
-        await asyncio.to_thread(
-            _extract_skills_archive, existing, home / "skills", replace_existing=True,
-        )
-        logger.info("skills R2 快照恢复完成 namespace=%s", namespace)
-        return "restored"
+    if is_r2_configured():
+        existing = await download_from_r2(archive_key)
+        if existing is not None:
+            await asyncio.to_thread(
+                _extract_skills_archive, existing, home / "skills", replace_existing=True,
+            )
+            logger.info("skills R2 快照恢复完成 namespace=%s", namespace)
+            return "restored"
 
     from skills import sync_all_skill_assets_to_workspace
 
     summary = await asyncio.to_thread(sync_all_skill_assets_to_workspace, home)
     if summary.get("errors"):
         raise RuntimeError("; ".join(summary["errors"]))
-    await backup_user_skills_to_r2(home, namespace)
-    logger.info("R2 无 skills 快照，已从项目 skills 初始化并上传 namespace=%s", namespace)
+    await backup_user_skills_to_r2(home, namespace)  # R2 未配置时内部为 no-op
+    logger.info("已从项目 skills 初始化 workspace namespace=%s", namespace)
     return "bootstrapped"
 
 
@@ -173,26 +174,33 @@ def _skills_tree_fingerprint(skills_dir: Path) -> tuple[tuple[str, int, int], ..
     return tuple(items)
 
 
-async def sync_all_existing_workspace_skills_r2() -> dict[str, object]:
+class SkillsR2SyncStats(TypedDict):
+    """启动期 R2 skills 同步统计（workspaces/restored/bootstrapped 计数 + errors）。"""
+
+    workspaces: int
+    restored: int
+    bootstrapped: int
+    errors: list[str]
+
+
+async def sync_all_existing_workspace_skills_r2() -> SkillsR2SyncStats:
     """启动时为所有已有 workspace 恢复/播种 skills R2 快照。"""
-    results: dict[str, object] = {"workspaces": 0, "restored": 0, "bootstrapped": 0, "errors": []}
-    if not is_r2_configured():
-        return results
-    for home in sorted(workspace_namespace_dirs_for_skills()):
-        try:
-            namespace = home.name
-            # 只有 namespace 目录才会进入这里；恢复逻辑本身负责创建 skills/。
-            status = await initialize_workspace_skills(home, namespace)
-            results["workspaces"] = int(results["workspaces"]) + 1
-            if status == "restored":
-                results["restored"] = int(results["restored"]) + 1
-            elif status == "bootstrapped":
-                results["bootstrapped"] = int(results["bootstrapped"]) + 1
-        except Exception as exc:
-            cast = results["errors"]
-            assert isinstance(cast, list)
-            cast.append(f"{home}: {exc}")
-    return results
+    workspaces = restored = bootstrapped = 0
+    errors: list[str] = []
+    if is_r2_configured():
+        for home in sorted(workspace_namespace_dirs_for_skills()):
+            try:
+                namespace = home.name
+                # 只有 namespace 目录才会进入这里；恢复逻辑本身负责创建 skills/。
+                status = await initialize_workspace_skills(home, namespace)
+                workspaces += 1
+                if status == "restored":
+                    restored += 1
+                elif status == "bootstrapped":
+                    bootstrapped += 1
+            except Exception as exc:
+                errors.append(f"{home}: {exc}")
+    return SkillsR2SyncStats(workspaces=workspaces, restored=restored, bootstrapped=bootstrapped, errors=errors)
 
 
 def workspace_namespace_dirs_for_skills() -> list[Path]:
@@ -234,12 +242,12 @@ async def watch_workspace_skills_r2(stop_event: asyncio.Event, interval: float =
 
         # 同一轮发现的多个 workspace 各自只上传一次。
         for namespace in sorted(pending):
-            home = next((p for p in workspace_namespace_dirs_for_skills() if p.name == namespace), None)
-            if home is None:
+            target = next((p for p in workspace_namespace_dirs_for_skills() if p.name == namespace), None)
+            if target is None:
                 continue
             try:
-                await backup_user_skills_to_r2(home, namespace)
-                fingerprints[namespace] = _skills_tree_fingerprint(home / "skills")
+                await backup_user_skills_to_r2(target, namespace)
+                fingerprints[namespace] = _skills_tree_fingerprint(target / "skills")
             except Exception:
                 logger.warning("workspace skills R2 自动同步失败 namespace=%s", namespace, exc_info=True)
         pending.clear()

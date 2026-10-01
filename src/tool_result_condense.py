@@ -280,7 +280,8 @@ def _todo_model_view(payload: dict, fn_args: dict) -> str:
     if error:
         return error
     action = _clean(payload.get("action", "")).lower() or _clean(fn_args.get("action", "")).lower() or "list"
-    todo = payload.get("todo") if isinstance(payload.get("todo"), dict) else {}
+    todo_raw = payload.get("todo")
+    todo: dict = todo_raw if isinstance(todo_raw, dict) else {}
     total = payload.get("total")
     pending = payload.get("pending")
     stats = ""
@@ -378,7 +379,8 @@ def _memory_model_view(payload: dict, fn_args: dict) -> str:
     if error:
         return error
     action = _clean(payload.get("action", "")).lower() or _clean(fn_args.get("action", "")).lower() or "list"
-    mem = payload.get("memory") if isinstance(payload.get("memory"), dict) else {}
+    mem_raw = payload.get("memory")
+    mem: dict = mem_raw if isinstance(mem_raw, dict) else {}
     total = payload.get("total")
     stats = f"当前共 {total} 条记忆。" if total is not None else ""
 
@@ -829,14 +831,16 @@ def _amap_model_view(fn_name: str, content: str) -> str:
     except Exception:
         logger.exception("amap 模型视图清洗失败，返回原始内容")
         return content
-    short_name = tn.split_mcp_name(fn_name)[1] if tn.split_mcp_name(fn_name) else fn_name
+    split = tn.split_mcp_name(fn_name)
+    short_name = split[1] if split else fn_name
     views: list[str] = []
     for doc in cleaned_docs:
         if not isinstance(doc, dict):
             views.append(json.dumps(doc, ensure_ascii=False))
             continue
-        if doc.get("status") not in (None, "1", 1, "0", 0) and _error_text(doc):
-            views.append(_error_text(doc))
+        doc_error = _error_text(doc)
+        if doc.get("status") not in (None, "1", 1, "0", 0) and doc_error:
+            views.append(doc_error)
             continue
         if str(doc.get("status")) in ("0", 0) and not doc.get("geocodes"):
             # 高德 status=0：查询失败。info 携带原因。

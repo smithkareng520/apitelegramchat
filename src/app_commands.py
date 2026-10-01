@@ -41,6 +41,7 @@ from state import (
 from utils import send_rich_html_message, query_provider_balances, get_logger
 from message_user_tool import resolve_callback as resolve_message_user_callback
 from webhook_sync import get_webhook_info, mask_webhook_url
+from media_wizard import is_wizard_callback
 from core.http_session import get_http_session
 import proactive
 import app_state
@@ -500,7 +501,7 @@ async def _handle_callback_query(cb: dict) -> None:
             )
             await _answer_callback_query(cb["id"], notice[:200], show_alert=not ok)
             return
-        elif isinstance(sel, str) and sel.startswith("mw:"):
+        elif is_wizard_callback(sel):
             # 媒体参数卡片（media_wizard）：翻页/选参/收集素材/提交/取消
             from media_wizard import handle_wizard_callback
             await handle_wizard_callback(chat_id, uid, mid, cb["id"], sel)

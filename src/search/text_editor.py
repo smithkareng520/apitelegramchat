@@ -474,9 +474,6 @@ async def execute_text_editor(
 # ===================== 文件编辑器工具实现 =====================
 
 
-# 编辑器配置
-EDITOR_PREFIX = "editor"
-
 def _editor_safe_path(path: str, allow_root: bool = False) -> str:
     """Return a normalized relative path without traversal segments.
     

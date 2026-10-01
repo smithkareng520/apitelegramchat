@@ -342,7 +342,8 @@ def tools_to_responses(tools: Optional[list[Any]]) -> Optional[list[dict[str, An
         if tool_type == "function" and "function" not in tool and tool.get("name"):
             converted.append(copy.deepcopy(tool))
             continue
-        fn = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        raw_fn = tool.get("function")
+        fn: dict[str, Any] = raw_fn if isinstance(raw_fn, dict) else {}
         name = fn.get("name")
         if not name:
             continue

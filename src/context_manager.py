@@ -28,7 +28,7 @@ from typing import Any, Optional
 
 from context_window import resolve_history_budget, split_history_blocks
 from token_budget import json_token_count, truncate_to_token_budget
-from core.messages import Message, TextBlock
+from core.messages import Message, TextBlock, as_message
 
 
 @dataclass(frozen=True)
@@ -36,10 +36,6 @@ class ContextSnapshot:
     messages: list[Any]
     dropped_messages: int
     estimated_tokens: int
-
-
-def _as_message(message: Any) -> Message:
-    return message if isinstance(message, Message) else Message.from_openai_dict(message)
 
 
 def _message_token_count(message: Any) -> int:
@@ -65,7 +61,7 @@ def _fit_message_to_token_budget(message: Any, token_budget: int) -> Any:
     if _message_token_count(message) <= token_budget:
         return message
 
-    m = _as_message(message)
+    m = as_message(message)
     # 仅纯文本（单 TextBlock）消息可无损截断；多模态/结构化消息无法
     # 在块语义内安全裁剪，放弃该消息（与旧版 content 非字符串时一致）。
     text_blocks = [b for b in m.blocks if isinstance(b, TextBlock)]

@@ -79,6 +79,40 @@ logger = get_logger(__name__)
 _DETACHED_TASKS: set = set()
 
 
+class _ToolInternalTimeout(Exception):
+    """工具执行体自身抛出的超时（网络/沙箱/MCP 等），非外层等待预算。
+
+    asyncio.wait_for 只会在外层预算耗尽时抛 TimeoutError，但工具内部
+    的 aiohttp/SDK 超时同样是 TimeoutError 子类，若不预先包装，两者
+    会混进同一个 except 分支，导致外层预算数值被套在内部超时上，
+    回传给模型的超时文案与事实不符。
+    """
+
+
+def _dispatch_capturing_internal_timeout(
+    fn_name: str, fn_args: dict, *, chat_id: int, progress_callback: Any = None,
+) -> Any:
+    """执行工具调用，把工具内部超时包装成 :class:`_ToolInternalTimeout`。
+
+    外层 wait_for 的 TimeoutError 只代表等待预算耗尽；工具自身的网络 /
+    沙箱 / MCP 超时不再与外层预算混在同一分支，上层能拿到真实的失败
+    原因而不是被改写成外层预算数值的超时文案。
+    """
+
+    async def _run() -> str:
+        try:
+            return await dispatch_tool_call(
+                fn_name, fn_args, chat_id=chat_id,
+                progress_callback=progress_callback,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise _ToolInternalTimeout(str(exc) or type(exc).__name__) from exc
+
+    return _run()
+
+
 def _detach_tool_for_final_state(
     chat_id: int, tc_id: str, fn_name: str, fn_args: dict,
     inner_task: "asyncio.Task",
@@ -189,9 +223,9 @@ def _last_assistant_text(journal: list) -> str:
             continue
         if not (isinstance(msg, dict) and msg.get("role") == "assistant"):
             continue
-        content = msg.get("content")
-        if isinstance(content, str) and content.strip():
-            return content
+        dict_content = msg.get("content")
+        if isinstance(dict_content, str) and dict_content.strip():
+            return dict_content
     return ""
 
 
@@ -524,7 +558,7 @@ async def _run_tool_calls_and_append(
                     # 主进程继续，后台任务死等确切终态（成功/失败/回滚）
                     # 后回写历史；本轮先拿到"仍在后台执行"的占位结果。
                     if fn_name in DETACHED_ON_INTERRUPT_TOOLS:
-                        inner_task = asyncio.ensure_future(dispatch_tool_call(
+                        inner_task = asyncio.ensure_future(_dispatch_capturing_internal_timeout(
                             fn_name, fn_args, chat_id=builder.chat_id,
                             progress_callback=tool_progress_callback,
                         ))
@@ -534,7 +568,9 @@ async def _run_tool_calls_and_append(
                         except asyncio.TimeoutError:
                             # 写操作超时 ≠ 失败（写库慢 ≠ 回滚）：不能像只读
                             # 工具那样回传超时标记让模型误判——脱离后台死等
-                            # 终态，本轮先告知"仍在执行"。
+                            # 终态，本轮先告知"仍在执行"。能走到这里必然是
+                            # 外层预算耗尽：工具内部超时已被包装成
+                            # _ToolInternalTimeout，落入下方 except Exception。
                             logger.warning(
                                 f"[tool] 写操作 {fn_name} 等待超 {timeout}s，"
                                 "已脱离后台继续执行等待终态"
@@ -557,7 +593,7 @@ async def _run_tool_calls_and_append(
                             raise
                     else:
                         result_str = await asyncio.wait_for(
-                            dispatch_tool_call(
+                            _dispatch_capturing_internal_timeout(
                                 fn_name, fn_args, chat_id=builder.chat_id,
                                 progress_callback=tool_progress_callback,
                             ),
@@ -566,6 +602,8 @@ async def _run_tool_calls_and_append(
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
+                # 到达这里的只能是外层等待预算耗尽（工具内部超时已被
+                # _dispatch_capturing_internal_timeout 包装改道）。
                 logger.error(f"[tool] {fn_name} timed out after {timeout}s ...")
                 # 使用统一标记，让 UI 展示友好状态、模型仍收到可操作的超时说明。
                 result_str = _TOOL_TIMEOUT_MARKER

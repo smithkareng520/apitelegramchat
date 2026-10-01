@@ -10,7 +10,7 @@ protocol="anthropic_messages" 的中转模型（如 XXTF 的 claude-opus-5）。
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 from api_client import api_client
 from protocols.base import ChatProtocolAdapter
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
     from config import ModelConfig
     from responses_state import TurnState
+    from anthropic import AsyncAnthropic
 
 
 class AnthropicMessagesAdapter(ChatProtocolAdapter):
@@ -50,7 +51,7 @@ class AnthropicMessagesAdapter(ChatProtocolAdapter):
                 mark_legacy_divergence(chat_id)
             except Exception:
                 pass
-        client = api_client.get_client_for_model(model_info)
+        client = cast("AsyncAnthropic", api_client.get_client_for_model(model_info))
         return await _agentic_loop_anthropic(
             client, current_model, messages, builder,
             tools=tools, supports_tools=supports_tools, journal=journal,

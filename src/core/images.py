@@ -4,8 +4,7 @@
 重构目标：废除"看到参考图 = edit"的隐式推断——**操作类型是任务的
 一等字段**，由任务构造方（工具层 / 原生图像循环）显式声明：
     generate   文生图，无参考图输入
-    edit       带参考图的编辑 / 图生图
-    variation  以参考图为基础生成变体（prompt 可空，适配器补默认指令）
+    edit       带参考图的编辑 / 图生图（含变体语义：同一端点同一形状）
 
 端点选择从"任务 + 模型协议"推导，收敛在 protocols/images.py 的
 适配器里：
@@ -26,28 +25,20 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
 # 任务操作类型：显式声明，不再从"有没有图片"反推。
-ImageOperation = Literal["generate", "edit", "variation"]
+ImageOperation = Literal["generate", "edit"]
 
-VALID_OPERATIONS: tuple[str, ...] = ("generate", "edit", "variation")
-
-# variation 操作在"仅接受编辑语义"的端点（/images/edits、chat modalities）
-# 上使用的默认指令：任务构造方未给 prompt 时由适配器补上。
-DEFAULT_VARIATION_PROMPT = (
-    "Generate a new variation of this image, keeping the subject and "
-    "composition recognizable while varying style and details."
-)
+VALID_OPERATIONS: tuple[str, ...] = ("generate", "edit")
 
 
 @dataclass
 class ImageTask:
-    """一次图像生成/编辑/变体任务的全部输入。
+    """一次图像生成/编辑任务的全部输入。
 
     Attributes:
-        operation:    显式操作类型（generate / edit / variation）。
-        prompt:       文本提示词；variation 允许为空（适配器补默认指令），
-                      edit 建议提供编辑指令。
+        operation:    显式操作类型（generate / edit）。
+        prompt:       文本提示词；edit 建议提供编辑指令。
         input_images: 参考图 URL 列表（http(s) 或 data:image/...;base64）。
-                      generate 语义下应为空；edit / variation 至少一张。
+                      generate 语义下应为空；edit 至少一张。
         model:        模型 ID（SUPPORTED_MODELS 的 key）。
         num_images:   生成张数（1-4，适配器按厂商上限裁剪）。
         aspect_ratio: 宽高比（"1:1" / "16:9" ...；由适配器映射为厂商参数）。
@@ -97,11 +88,8 @@ class ImageTask:
 
     @property
     def effective_prompt(self) -> str:
-        """适配器实际应使用的 prompt（variation 空提示时补默认指令）。"""
-        text = str(self.prompt or "").strip()
-        if not text and self.operation == "variation":
-            return DEFAULT_VARIATION_PROMPT
-        return text
+        """适配器实际应使用的 prompt（去首尾空白）。"""
+        return str(self.prompt or "").strip()
 
     @classmethod
     def generate(cls, prompt: str, model: str, **kwargs: Any) -> "ImageTask":
@@ -113,14 +101,6 @@ class ImageTask:
         """带参考图的编辑任务（便捷构造器）。"""
         return cls(
             operation="edit", prompt=prompt,
-            input_images=list(input_images or []), model=model, **kwargs,
-        )
-
-    @classmethod
-    def variation(cls, input_images: list[str], model: str, prompt: str = "", **kwargs: Any) -> "ImageTask":
-        """变体任务（便捷构造器；prompt 可空，适配器补默认指令）。"""
-        return cls(
-            operation="variation", prompt=prompt,
             input_images=list(input_images or []), model=model, **kwargs,
         )
 
@@ -164,7 +144,6 @@ class ImageTaskResult:
 __all__ = [
     "ImageOperation",
     "VALID_OPERATIONS",
-    "DEFAULT_VARIATION_PROMPT",
     "ImageTask",
     "ImageTaskResult",
     "ImageRequestError",

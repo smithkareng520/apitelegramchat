@@ -7,7 +7,6 @@ import logging
 from core.logging_setup import (  # noqa: F401
     get_logger,
     set_request_id,
-    setup_logging,
 )
 from core.http_session import (  # noqa: F401
     close_http_session,

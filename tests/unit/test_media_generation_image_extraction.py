@@ -393,7 +393,7 @@ def test_openai_compat_edit_never_falls_back_to_generations(monkeypatch):
 
 
 def test_image_task_edit_requires_reference_image():
-    """edit/variation 没有参考图必须直接失败，而不是偷偷变成文生图。"""
+    """edit 没有参考图必须直接失败，而不是偷偷变成文生图。"""
     try:
         ImageTask.edit("edit this", [], model="gpt-image-2")
     except ValueError as exc:

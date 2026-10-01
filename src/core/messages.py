@@ -288,15 +288,6 @@ class Message:
         kept = [b for b in self.blocks if not isinstance(b, TextBlock)]
         self.blocks = ([TextBlock(text)] if text else []) + kept
 
-    def append_text(self, text: str) -> None:
-        if not text:
-            return
-        for b in reversed(self.blocks):
-            if isinstance(b, TextBlock):
-                b.text += text
-                return
-        self.blocks.append(TextBlock(text))
-
     # ---------- OpenAI Chat Completions 互转 ----------
     def to_openai_dict(self) -> dict[str, Any]:
         """渲染为 OpenAI Chat Completions JSON（出站唯一出口）。
@@ -328,8 +319,9 @@ class Message:
         # system / user：单文本块 -> 字符串；否则 content parts 列表。
         parts = [self._block_to_wire_part(b) for b in self.blocks]
         parts = [p for p in parts if p is not None]
-        if len(parts) == 1 and parts[0].get("type") == "text":
-            out["content"] = parts[0]["text"]
+        first = parts[0] if len(parts) == 1 else None
+        if isinstance(first, dict) and first.get("type") == "text":
+            out["content"] = first["text"]
         elif parts:
             out["content"] = parts
         else:
@@ -491,11 +483,6 @@ class Message:
                     out.append(DocumentBlock(data_url=f"data:{header};base64,{source.get('data', '')}"))
             # 其它类型（audio/未知）跳过，与旧转换语义一致
         return out
-
-    # ---------- 持久化快照 ----------
-    def to_snapshot(self) -> "Message":
-        """返回用于请求的浅快照（同对象引用，无拷贝——历史对象不可变约定）。"""
-        return self
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         kinds = ",".join(b.kind() for b in self.blocks)

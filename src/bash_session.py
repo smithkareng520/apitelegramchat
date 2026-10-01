@@ -124,7 +124,7 @@ class _BashOutputBuffer:
     插入一条可读说明，让模型知道自己看到的是被裁剪过的输出。
     """
 
-    __slots__ = ("keep", "head_ratio", "_head", "_tail", "_kept", "_dropped", "_capped", "_total")
+    __slots__ = ("keep", "head_ratio", "_head", "_tail", "_kept", "_dropped", "_capped")
 
     def __init__(self, keep_chars: int = SANDBOX_OUTPUT_MAX_CHARS, head_ratio: float = 0.7) -> None:
         # 下限 200 仅防退化输入（负数/极小值）；0 视为不限制。
@@ -134,18 +134,11 @@ class _BashOutputBuffer:
         self._tail: list[str] = []
         self._kept = 0
         self._dropped = 0
-        self._total = 0
         self._capped = False
-
-    @property
-    def total_seen(self) -> int:
-        """到目前为止接收到的全部字符数（含被丢弃的中间部分）。"""
-        return self._total
 
     def add(self, text: str) -> None:
         if not text:
             return
-        self._total += len(text)
         if not self._capped:
             self._head.append(text)
             self._kept += len(text)

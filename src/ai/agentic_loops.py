@@ -167,7 +167,7 @@ def _append_bg_task_notices(messages: list, chat_id: int, namespace: str | None 
         messages.append(Message.system("\n\n".join(notices)))
 
 
-async def _media_loop_with_notices(loop_fn, **kwargs):
+async def _media_loop_with_notices(loop_fn: Any, **kwargs: Any) -> Any:
     """媒体生成循环统一入口（drain 注入点②）。
 
     image/video 原生生成循环（agentic 循环内的 POST）只能经由本 wrapper
@@ -452,11 +452,11 @@ def _media_fetch_replay_mode(failed_stream_attempt: int) -> str:
 
 
 async def _inline_wire_images_as_data_urls(
-    wire_messages: list,
+    wire_messages: list[Any],
     *,
     chat_id: int | None = None,
-    _fetch=None,
-    _resolve_file_id=None,
+    _fetch: Any = None,
+    _resolve_file_id: Any = None,
 ) -> tuple[int, int]:
     """把 wire 消息里所有 http(s) 图片内联为 base64 data URI（原地替换）。
 
@@ -1017,13 +1017,24 @@ async def _agentic_loop_openai_compat(
                         await asyncio.sleep(1.5)
                         continue
                     raise
-                except _STREAM_READ_TIMEOUT_ERRORS:
+                except _STREAM_READ_TIMEOUT_ERRORS as exc:
+                    # total 期限是整条流的硬闸门：重试只会重放同样漫长的
+                    # 等待，直接上抛；idle（首增量前无事件）与传输层读超时
+                    # 才按"零输出重试一次"处理。
+                    if isinstance(exc, AIStreamTimeoutError) and exc.kind == "total":
+                        raise
                     if received_any or stream_attempt >= 1:
                         raise
-                    logger.warning(
-                        "[%s] 第 %s 轮模型流在首个增量前读取超时，等待后重试一次",
-                        api_label, _round + 1,
-                    )
+                    if isinstance(exc, AIStreamTimeoutError):
+                        logger.warning(
+                            "[%s] 第 %s 轮模型流 idle 闸门触发（首个增量前无事件），等待后重试一次: %s",
+                            api_label, _round + 1, exc,
+                        )
+                    else:
+                        logger.warning(
+                            "[%s] 第 %s 轮模型流在首个增量前读取超时（%s），等待后重试一次",
+                            api_label, _round + 1, type(exc).__name__,
+                        )
                     await asyncio.sleep(1.0)
                 finally:
                     # 无论本轮流式正常结束、读取超时重试还是异常/取消，
@@ -1099,7 +1110,13 @@ async def _agentic_loop_openai_compat(
                 fr = str(getattr(choice, "finish_reason", "") or "")
                 if fr:
                     stream_finish_reason = fr
-                content_acc = msg.content or ""
+                raw_content = msg.content
+                if isinstance(raw_content, (list, tuple)):
+                    # 个别兼容网关在非流式响应里也返回结构化 content blocks：
+                    # 归一为纯文本，与流式路径的 c_delta 归一对齐，避免 list
+                    # 流入下游 content_acc.strip() 时 AttributeError。
+                    raw_content = _extract_native_message_text(list(raw_content))
+                content_acc = raw_content or ""
                 if supports_tools and tools and hasattr(msg, "tool_calls") and msg.tool_calls:
                     for idx, tc in enumerate(msg.tool_calls):
                         tool_calls_acc[idx] = {
@@ -1738,23 +1755,34 @@ async def _agentic_loop_native_video(
     )
 
     if provider == "agnes":
-        async with chat_action_scope(chat_id, "record_video"):
-            video_url, error, video_meta = await _request_agnes_video(
-                prompt, duration, current_model,
-                reference_images=tuple(image_ref_urls),
-                reference_videos=tuple(video_ref_urls),
-                size=overrides.get("size"),
-                aspect_ratio=overrides.get("aspect_ratio"),
-                mode=overrides.get("mode"),
-                first_frame=overrides.get("first_frame"),
-                last_frame=overrides.get("last_frame"),
-                seed=overrides.get("seed"),
-                reference_audios=tuple(overrides.get("reference_audios") or ()),
-                video_specs=tuple(overrides.get("video_specs") or ()),
-            )
+        try:
+            async with chat_action_scope(chat_id, "record_video"):
+                video_url, error, video_meta = await _request_agnes_video(
+                    prompt, duration, current_model,
+                    reference_images=tuple(image_ref_urls),
+                    reference_videos=tuple(video_ref_urls),
+                    size=overrides.get("size"),
+                    aspect_ratio=overrides.get("aspect_ratio"),
+                    mode=overrides.get("mode"),
+                    first_frame=overrides.get("first_frame"),
+                    last_frame=overrides.get("last_frame"),
+                    seed=overrides.get("seed"),
+                    reference_audios=tuple(overrides.get("reference_audios") or ()),
+                    video_specs=tuple(overrides.get("video_specs") or ()),
+                )
+        except Exception:
+            # 与图像循环对齐：异常路径也要撤走 journal 里的"视频生成中"
+            # 占位，否则占位会以合成消息残留历史（CancelledError 除外，
+            # 占位留给打断方保全）。
+            media_slot.drop()
+            raise
     elif provider == "openrouter":
-        async with chat_action_scope(chat_id, "record_video"):
-            video_url, error, video_meta = await _request_openrouter_video(prompt, duration, current_model)
+        try:
+            async with chat_action_scope(chat_id, "record_video"):
+                video_url, error, video_meta = await _request_openrouter_video(prompt, duration, current_model)
+        except Exception:
+            media_slot.drop()
+            raise
     else:
         media_slot.drop()
         return f"VIDEO_ERROR:不支持的视频提供商 {provider}", None, []

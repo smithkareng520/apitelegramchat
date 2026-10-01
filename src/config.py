@@ -46,8 +46,8 @@ ARTBLOOM_API_KEY = os.getenv("ARTBLOOM_API_KEY", "")
 
 # ---------- 高德地图 MCP 服务（@amap/amap-maps on ModelScope）----------
 # 通过 streamable_http 调用，使用 Bearer token 鉴权。
-# 未配置 GAODE_MCP_TOKEN 或 GAODE_MCP_URL 时该 MCP 服务不可用（mcp_manager 加载 mcp.json 时会跳过注册）。
-GAODE_MCP_ENABLED = os.getenv("GAODE_MCP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+# 未配置 GAODE_MCP_TOKEN 或 GAODE_MCP_URL 时该 MCP 服务不可用
+# （mcp_manager 加载 mcp.json 时因 url_env 未注入而跳过注册）。
 GAODE_MCP_URL = (os.getenv("GAODE_MCP_URL") or "").strip()
 GAODE_MCP_TOKEN = (os.getenv("GAODE_MCP_TOKEN") or "").strip()
 
@@ -301,9 +301,6 @@ class ModelConfig:
     @property
     def api_type(self) -> str:
         return self.provider
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return getattr(self, key, default)
 
 
 # =============================================================================
@@ -1035,7 +1032,7 @@ class EffectiveParams:
     max_context: int
     max_output_tokens: int
     # ---- 端点（厂商默认 -> 模型覆盖 的合并结果，含协议）----
-    endpoint: EffectiveEndpoint
+    endpoint: Optional[EffectiveEndpoint]
 
     def capability_for_modality(self, modality: str) -> bool:
         """输入模态标签 -> 该模型是否支持（鉴权判定的唯一映射出口）。
@@ -1079,13 +1076,13 @@ def resolve_effective_params(model_info: Optional[ModelConfig]) -> EffectivePara
             temperature=None, top_p=None,
             reasoning_enabled=None, reasoning_effort=None, reasoning_max_tokens=None,
             max_context=0, max_output_tokens=0,
-            endpoint=None,  # type: ignore[arg-type]
+            endpoint=None,
         )
     try:
         endpoint = get_effective_endpoint(model_info)
     except ValueError:
         # 未知厂商：保留能力视图但端点置空（鉴权照常，路由层会显式报错）。
-        endpoint = None  # type: ignore[assignment]
+        endpoint = None
     return EffectiveParams(
         provider=str(getattr(model_info, "provider", "") or ""),
         model_id=str(getattr(model_info, "model_id", "") or ""),
@@ -1675,13 +1672,6 @@ async def _r2_configured_async() -> bool:
         return False
 
 
-async def save_whitelist() -> None:
-    """把当前白名单写入本地文件并推送 R2（增删函数已自带，一般无需手动调用）。"""
-    async with whitelist_store.lock:
-        _save_whitelist_unlocked()
-        await _push_whitelist_to_r2_unlocked()
-
-
 # add/remove 状态常量：app.py 据此生成 Telegram 回复，测试据此断言。
 ADD_ADDED = "added"                       # 确实新增
 ADD_EXISTS = "exists"                     # 目标已在白名单中
@@ -1697,7 +1687,7 @@ async def add_whitelist_user(target: str) -> str:
     """原子地把 target 加入白名单：改内存 → 写本地文件 → 推送 R2。
 
     返回 ADD_* 状态字符串。"改内存集合 + 写本地 + 推 R2" 整体在
-    whitelist_store.lock 内完成，与 load_whitelist/save_whitelist 互斥：
+    whitelist_store.lock 内完成（load_whitelist / 各增删入口亦持同一把锁）：
     并发 /adduser 不会互相覆盖，R2 收到的推送顺序与操作顺序一致，
     权威存储不会出现旧状态覆盖新状态。
     """

@@ -136,7 +136,7 @@ def resolve_input_combination(user_message: Optional[dict]) -> InputCombination:
     seen: set = set()
 
     msg_type = str(user_message.get("type") or "").strip().lower()
-    kind_map = {
+    kind_map: dict[str, Modality] = {
         "photo": "photo", "photo_group": "photo",
         "audio": "audio", "voice": "audio",
         "video": "video", "video_group": "video",
@@ -153,8 +153,8 @@ def resolve_input_combination(user_message: Optional[dict]) -> InputCombination:
 
     atts = user_message.get("attachments")
     if isinstance(atts, list):
-        att_kind_map = {"photo": "photo", "image": "photo", "audio": "audio",
-                        "voice": "audio", "video": "video", "document": "document"}
+        att_kind_map: dict[str, Modality] = {"photo": "photo", "image": "photo", "audio": "audio",
+                                             "voice": "audio", "video": "video", "document": "document"}
         for att in atts:
             if not isinstance(att, dict):
                 continue

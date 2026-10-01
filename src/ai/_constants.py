@@ -16,6 +16,13 @@ def _positive_env_int(name: str, default: int, *, minimum: int = 1) -> int:
         return default
 
 
+# ---------- Agnes 图像能力（官方 size 档位 / ratio 集合，单一数据源） ----------
+# media_generation（请求参数校验）与 media_wizard（卡片选项）共同消费；
+# 厂商能力变更只需改这里。
+AGNES_IMAGE_SIZE_TIERS = ("1K", "2K", "3K", "4K")
+AGNES_IMAGE_RATIOS = ("1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9")
+
+
 # ---------- 工具调用相关 ----------
 # 每一轮用户请求最多执行 100 次真实工具调用；超过后进入无工具总结路径。
 # 不依赖模型的单轮并发数量，调用预算按实际执行的工具数精确累计。
@@ -70,7 +77,7 @@ IMAGE_GEN_TOOLS = {
     "edit_image_with_reference",
 }
 # 视频生成工具：内部已有 5 分钟轮询超时，外层 wait_for 必须不设超时，
-# 否则会被 TOOL_CALL_TIMEOUT=10 秒杀掉（与 IMAGE_GEN_TOOLS 同样的处理）。
+# 否则会被 TOOL_CALL_TIMEOUT（当前 12s）过早杀掉（与 IMAGE_GEN_TOOLS 同样豁免）。
 VIDEO_GEN_TOOLS = {_tn.GENERATE_VIDEO}
 # 所有需要跳过外层超时的"长耗时生成类"工具集合
 MEDIA_GEN_TOOLS = IMAGE_GEN_TOOLS | VIDEO_GEN_TOOLS

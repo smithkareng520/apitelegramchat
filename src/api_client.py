@@ -30,8 +30,8 @@ try:
 except ImportError:  # pragma: no cover - 依赖缺失时的降级路径
     AsyncAnthropic = None  # type: ignore[misc,assignment]
 
-# 从 config 导入厂商配置、端点合并函数以及所有 API Key 变量
-from config import PROVIDERS, get_effective_endpoint, EffectiveEndpoint, ModelConfig
+# 从 config 导入端点合并函数以及所有 API Key 变量
+from config import get_effective_endpoint, EffectiveEndpoint, ModelConfig
 import config as app_config
 
 logger = logging.getLogger(__name__)
@@ -68,7 +68,6 @@ class APIClient:
 
     def __init__(self) -> None:
         self._clients: Dict[str, Union[AsyncOpenAI, "AsyncAnthropic"]] = {}
-        self._providers = PROVIDERS  # 引用配置（仍供 fallback/未知厂商场景使用）
 
     def _get_api_key(self, env_var: str) -> Optional[str]:
         """
@@ -96,7 +95,15 @@ class APIClient:
             if not api_key:
                 raise ValueError(f"缺少 API Key: {endpoint.api_key_env}，请设置环境变量")
             logger.debug(f"创建 {endpoint.name} 原生客户端 endpoint={endpoint.endpoint}")
-            kwargs: dict[str, Any] = {}
+            # 禁用 Anthropic SDK 的内建自动重试（默认 2 次，按 Retry-After
+            # 最长可睡 60s）：429/5xx/连接错误由 anthropic_bridge 的应用层
+            # 零输出重试统一处理，与 OpenAI 分支的 max_retries=0 同理，
+            # 避免两套退避叠加导致同一请求最多 9 次出网。
+            try:
+                sdk_max_retries = max(0, int(os.getenv("ANTHROPIC_SDK_MAX_RETRIES", "0")))
+            except (TypeError, ValueError):
+                sdk_max_retries = 0
+            kwargs: dict[str, Any] = {"max_retries": sdk_max_retries}
             # 仅当端点覆盖为非 Anthropic 官方默认时才显式传入，
             # 否则沿用 AsyncAnthropic SDK 自带的官方默认值，行为与此前完全一致。
             if endpoint.endpoint and endpoint.endpoint != "https://api.anthropic.com":
@@ -163,34 +170,6 @@ class APIClient:
             endpoint = get_effective_endpoint(model_info)
             self._clients[model_id] = self._build_client(endpoint)
         return self._clients[model_id]
-
-    def get_client(self, api_type: str) -> Union[AsyncOpenAI, "AsyncAnthropic"]:
-        """
-        【向后兼容 / 无模型级覆盖场景】根据厂商名 api_type 返回客户端实例
-        （按厂商名缓存，等价于该厂商在 PROVIDERS 中的默认端点）。
-
-        注意：如果某个模型对该厂商做了端点覆盖，请改用 get_client_for_model(
-        model_info)，否则会拿到厂商默认端点的客户端而非模型覆盖后的端点。
-        本方法仅在明确知道当前厂商下所有模型都未做端点覆盖时安全使用
-        （如子系统只按厂商粒度工作、拿不到具体 model_info 的场景）。
-        """
-        if api_type not in self._clients:
-            base = self._providers.get(api_type)
-            if not base:
-                raise ValueError(f"未知厂商: {api_type}，请检查 config.py 中的 PROVIDERS")
-            endpoint = EffectiveEndpoint(
-                provider=api_type,
-                name=base.name,
-                endpoint=base.endpoint,
-                api_key_env=base.api_key_env,
-                default_headers=base.default_headers or {},
-                protocol=base.protocol,
-                supports_prompt_cache=base.supports_prompt_cache,
-                session_affinity=base.session_affinity,
-            )
-            self._clients[api_type] = self._build_client(endpoint)
-        return self._clients[api_type]
-
 
 # 全局单例
 api_client = APIClient()

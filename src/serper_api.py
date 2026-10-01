@@ -26,7 +26,7 @@ SSE 流被立即关闭 / 调用挂死"等不稳定行为。
 * SerperServerError      5xx 重试后仍失败
 * SerperUnavailableError SERPER_API_KEY 未配置 / 不可用
 
-调用方（search_engine.execute_web_search 等）只需捕获 SerperError 基类即可。
+调用方（search.serper.execute_web_search 等）只需捕获 SerperError 基类即可。
 """
 from __future__ import annotations
 

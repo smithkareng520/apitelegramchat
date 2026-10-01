@@ -30,7 +30,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Coroutine
 
 import aiohttp
 
@@ -389,6 +389,26 @@ async def _clear_pending(interaction: AskUserInteraction) -> None:
         await _clear_pending_unlocked(interaction)
 
 
+# 问答 UI 后续编辑任务的强引用集：事件循环对 task 只持弱引用，
+# 不保存引用的话任务可能被 GC 回收，"已回答/已取消"的界面编辑会
+# 静默丢失；done 回调同时检索异常，避免 "Task exception was never
+# retrieved" 噪声。
+_UI_FOLLOWUP_TASKS: set["asyncio.Task[Any]"] = set()
+
+
+def _spawn_ui_followup(coro: Coroutine[Any, Any, Any]) -> None:
+    """fire-and-forget 地执行问答界面收尾编辑（强引用 + 异常留痕）。"""
+
+    def _reap(task: "asyncio.Task[Any]") -> None:
+        _UI_FOLLOWUP_TASKS.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning("问答界面后续编辑失败: %s", task.exception())
+
+    task = asyncio.create_task(coro)
+    _UI_FOLLOWUP_TASKS.add(task)
+    task.add_done_callback(_reap)
+
+
 async def _set_markup(message_id: int | None, chat_id: int, markup: dict | None) -> None:
     if not message_id:
         return
@@ -499,7 +519,7 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
                 notice = f"已选择：{interaction.options[idx]['label']}"
                 message_id = interaction.message_id
                 await _clear_pending_unlocked(interaction)
-                asyncio.create_task(_edit_question_message(interaction, _answered_html(interaction, answer)))
+                _spawn_ui_followup(_edit_question_message(interaction, _answered_html(interaction, answer)))
                 return True, notice
         elif action == "submit":
             if not interaction.multiple:
@@ -518,7 +538,7 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
             notice = "已提交选择"
             message_id = interaction.message_id
             await _clear_pending_unlocked(interaction)
-            asyncio.create_task(_edit_question_message(interaction, _answered_html(interaction, answer)))
+            _spawn_ui_followup(_edit_question_message(interaction, _answered_html(interaction, answer)))
             return True, notice
         elif action == "custom":
             if not interaction.allow_custom:
@@ -534,12 +554,12 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
                 interaction.future.set_result({"type": "cancelled"})
             message_id = interaction.message_id
             await _clear_pending_unlocked(interaction)
-            asyncio.create_task(_edit_question_message(interaction, _answered_html(interaction, {"type": "cancelled"})))
+            _spawn_ui_followup(_edit_question_message(interaction, _answered_html(interaction, {"type": "cancelled"})))
             return True, "已取消"
         else:
             return False, "未知操作"
 
-    asyncio.create_task(_set_markup(message_id, interaction.chat_id, markup))
+    _spawn_ui_followup(_set_markup(message_id, interaction.chat_id, markup))
     return True, notice
 
 
@@ -563,7 +583,7 @@ async def resolve_text(chat_id: int, text: str) -> bool:
         if interaction.future and not interaction.future.done():
             interaction.future.set_result(answer)
         await _clear_pending_unlocked(interaction)
-    asyncio.create_task(_edit_question_message(interaction, _answered_html(interaction, answer)))
+    _spawn_ui_followup(_edit_question_message(interaction, _answered_html(interaction, answer)))
     return True
 
 

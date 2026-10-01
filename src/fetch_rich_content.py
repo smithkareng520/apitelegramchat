@@ -443,8 +443,8 @@ def _collect_dom_media(tree: Any, base_url: str) -> list[DomMedia]:
             continue
         if _is_hidden_element(el):
             continue
-        cap = _MEDIA_KIND_CAPS.get(kind)
-        if cap is not None and counts[kind] >= cap:
+        kind_cap = _MEDIA_KIND_CAPS.get(kind)
+        if kind_cap is not None and counts[kind] >= kind_cap:
             continue
         seen.add(url)
         counts[kind] += 1

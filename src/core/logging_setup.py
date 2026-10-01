@@ -22,7 +22,7 @@ class _MCPStreamableHTTPNoiseFilter(logging.Filter):
     traceback（40+ 行 httpx/httpcore 堆栈）记录 "Error parsing JSON
     response"。该异常客户端已通过「单次超时 → 分页定向重试 → 部分
     降级」处理，无需整页堆栈刷屏；降级为一行 WARNING 保留根因痕迹
-    （字节计数等信息已由 search_engine 的降级日志补足）。
+    （字节计数等信息已由 search.serper 的降级日志补足）。
     """
 
     def filter(self, record: logging.LogRecord) -> bool:

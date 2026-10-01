@@ -132,41 +132,13 @@ def finish_open_tool_group(builder: "DraftManager") -> None:
         builder.finish_group(len(builder._tool_groups) - 1)
 
 
-def append_assistant_message(
-    loop_messages: list,
-    new_history_entries: list,
-    content_acc: str,
-    tool_calls_list: list,
-    reasoning_acc: str,
-) -> Message:
-    """把本轮 assistant 消息组装为内部 Message，写入请求消息与历史双列表。
-
-    重构说明：旧版组装 OpenAI 形状 dict（含 reasoning_content / tool_calls
-    wire 字段）；现在组装为内部 Message（TextBlock / ReasoningBlock /
-    ToolCallBlock），协议形状由各适配器在出站时渲染。tool_calls_list 仍是
-    流式累积产出的 OpenAI wire 形状（由 Message.assistant_with_tool_calls
-    解析为结构化 ToolCallBlock）。
-
-    .. note::
-        四条 agentic 循环已切换到 :class:`LiveAssistantSlot`（流式期间实时
-        占位进 journal，打断保全，见该类 docstring）。本函数保留为等价
-        语义参考与兼容出口（循环外的一次性追加场景），行为与旧版逐字一致。
-    """
-    assistant_msg = Message.assistant_with_tool_calls(
-        content_acc or "", tool_calls_list, reasoning_acc,
-    )
-    loop_messages.append(assistant_msg)
-    new_history_entries.append(assistant_msg)
-    return assistant_msg
-
-
 class LiveAssistantSlot:
     """本轮 assistant 消息的实时占位（打断保全，问题修复改动点 1）。
 
     问题背景（打断信息丢失，见问题排查文档）：
     ``content_acc`` / ``reasoning_acc`` 是流式循环里的**局部变量**，只有
     ``async for chunk in comp_stream`` 循环正常跑完、走到循环末尾的
-    ``append_assistant_message`` 时才被写进 journal（new_history_entries）。
+    组装点时才被写进 journal（new_history_entries）。
     而 ``except asyncio.CancelledError: raise`` 在这之前——打断一旦发生，
     函数直接退出，已产出的文本从未落地：
 
@@ -192,7 +164,7 @@ class LiveAssistantSlot:
             content_acc += c_delta
             live.sync(content_acc, reasoning_acc)       # 每片增量后原地同步
             ...
-        # 流正常结束（原 append_assistant_message 调用点）：
+        # 流正常结束（旧实现的循环末尾组装点）：
         live.finalize(loop_messages, content_acc, tool_calls_list, reasoning_acc)
 
     取消安全性：``sync`` / ``finalize`` 全部为同步方法（无 await 窗口），
@@ -257,7 +229,7 @@ class LiveAssistantSlot:
     ) -> Message:
         """流正常结束：原地补全占位消息（tool_calls 等），并追加进请求消息列表。
 
-        与旧 ``append_assistant_message`` 的双列表语义完全等价——journal 里
+        与旧实现的"循环末尾组装后双列表追加"语义完全等价——journal 里
         的占位消息被原地升级为完整消息（而不是新增一条，正常路径不会出现
         重复的两条 assistant），同一对象追加进 loop_messages 供下一轮请求
         渲染出站。
@@ -412,7 +384,7 @@ async def over_limit_final_summary(
     *,
     api_label: str,
     loop_name: str,
-    build_synth_request: Callable[[dict], Any],
+    build_synth_request: Callable[[Any], Any],
     stream_synth: Callable[[Any], Any],
     postprocess: Optional[Callable[[str], str]] = None,
 ) -> str:

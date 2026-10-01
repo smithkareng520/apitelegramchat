@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import os
 import time
 from collections.abc import AsyncIterator
 from typing import Any
 
 from ai.errors import AIStreamTimeoutError
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_STREAM_IDLE_TIMEOUT = 300.0
 DEFAULT_STREAM_TOTAL_TIMEOUT = 1800.0
@@ -55,8 +58,11 @@ async def _close_quietly(stream: Any, iterator: Any) -> None:
                 result = close()
                 if inspect.isawaitable(result):
                     await result
-            except Exception:  # noqa: BLE001 —— best-effort 清理
-                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # best-effort 清理：记录但不覆盖原始异常。
+                logger.debug("流清理失败（%s）", type(target).__name__, exc_info=True)
             break
 
 
@@ -70,6 +76,12 @@ async def iter_async_stream(
 
     退出时（正常结束 / 超时 / 异常 / 取消）一律关闭迭代器和底层流，
     避免连接滞留在连接池里。
+
+    超时归因：闸门等待用 ``asyncio.wait`` 对 ``__anext__()`` 与
+    ``sleep(wait)`` 显式竞争——``__anext__`` 先完成时事件/异常原样采用
+    （流自身抛出的 TimeoutError 不会被误判为闸门触发），仅当 sleep
+    先完成才判定为闸门超时；两任务同一轮完成时优先消费事件，避免
+    临界到达的最后一个 chunk 丢失。
     """
     default_idle, default_total = get_stream_timeouts()
     idle = default_idle if idle_timeout is None else max(0.0, idle_timeout)
@@ -84,27 +96,47 @@ async def iter_async_stream(
             if total:
                 remaining = total - (time.monotonic() - started)
                 if remaining <= 0:
-                    raise AIStreamTimeoutError(f"AI stream exceeded total timeout ({total:.0f}s)")
+                    raise AIStreamTimeoutError(
+                        f"AI stream exceeded total timeout ({total:.0f}s)", kind="total",
+                    )
                 if wait is None or remaining < wait:
                     wait, limit_kind = remaining, "total"
 
-            waited_from = time.monotonic()
+            if wait is None:
+                # 无闸门：直接等待，流自身的异常（含 TimeoutError）原样上抛。
+                try:
+                    event = await iterator.__anext__()
+                except StopAsyncIteration:
+                    return
+                yield event
+                continue
+
+            # 有闸门：显式竞争区分"应用层闸门触发"与"流自身抛出的超时"。
+            next_task = asyncio.ensure_future(iterator.__anext__())
+            gate_task = asyncio.ensure_future(asyncio.sleep(wait))
             try:
-                event = await (
-                    iterator.__anext__()
-                    if wait is None
-                    else asyncio.wait_for(iterator.__anext__(), timeout=wait)
+                done, _ = await asyncio.wait(
+                    {next_task, gate_task}, return_when=asyncio.FIRST_COMPLETED,
                 )
+            except asyncio.CancelledError:
+                next_task.cancel()
+                gate_task.cancel()
+                await asyncio.gather(next_task, gate_task, return_exceptions=True)
+                raise
+            gate_task.cancel()
+            await asyncio.gather(gate_task, return_exceptions=True)
+
+            if next_task not in done:
+                # 闸门先触发：回收挂起的 __anext__ 再抛闸门异常。
+                next_task.cancel()
+                await asyncio.gather(next_task, return_exceptions=True)
+                raise AIStreamTimeoutError(
+                    f"AI stream {limit_kind} timeout ({wait:.0f}s)", kind=limit_kind,
+                )
+            try:
+                event = next_task.result()
             except StopAsyncIteration:
                 return
-            except (asyncio.TimeoutError, TimeoutError) as exc:  # 3.10 中二者不是同一个类
-                # 流自身抛出的 TimeoutError（如 aiohttp sock_read）不是我们的闸门，原样上抛。
-                if wait is None or time.monotonic() - waited_from < wait - 0.05:
-                    raise
-                limit = idle if limit_kind == "idle" else total
-                raise AIStreamTimeoutError(
-                    f"AI stream {limit_kind} timeout ({limit:.0f}s)"
-                ) from exc
             yield event
     finally:
         await _close_quietly(stream, iterator)

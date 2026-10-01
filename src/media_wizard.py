@@ -54,8 +54,9 @@ _SESSION_TTL_SECONDS = 2 * 3600        # 卡片会话有效期：2 小时
 # 参数声明（按模型有效参数推导卡片按钮；严格对齐官方文档）
 # ---------------------------------------------------------------------------
 # Agnes Image 2.5 Flash（与 2.1 同参）：size 档位 + ratio 官方集合
-_IMAGE_SIZE_TIERS = ("1K", "2K", "3K", "4K")
-_IMAGE_RATIOS = ("1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9")
+# （单一来源见 ai/_constants.py）
+from ai._constants import AGNES_IMAGE_SIZE_TIERS as _IMAGE_SIZE_TIERS
+from ai._constants import AGNES_IMAGE_RATIOS as _IMAGE_RATIOS
 # Agnes Video 2.5：size 档位 / aspect_ratio / seconds（字符串 "4"–"12"）
 _VIDEO_SIZES = ("720P", "1080P", "1K", "2K")
 _VIDEO_RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
@@ -434,8 +435,8 @@ def _summary_lines(sess: WizardSession) -> list[str]:
     else:
         lines.append(f"🖼 尺寸档位：<b>{sess.size or '默认（1K）'}</b>")
         lines.append(f"📐 宽高比：<b>{sess.ratio or '默认（1:1）'}</b>")
-        refs = len(sess.ref_images) + len(sess.pending_photos)
-        lines.append(f"🎨 参考图片：<b>{f'×{refs}（图生图/多图合成）' if refs else '无（文生图）'}</b>")
+        refs_count = len(sess.ref_images) + len(sess.pending_photos)
+        lines.append(f"🎨 参考图片：<b>{f'×{refs_count}（图生图/多图合成）' if refs_count else '无（文生图）'}</b>")
     for note in sess.spec.fixed_notes:
         lines.append(f"• {html.escape(note)}")
     return lines
@@ -482,7 +483,7 @@ def _picker_page(sess: WizardSession, *, title: str, current: Optional[str], opt
 
 
 def _page_mode(sess: WizardSession) -> tuple[str, dict]:
-    cur = _MODE_LABELS.get(sess.mode, "自动（按素材推断）")
+    cur = _MODE_LABELS.get(sess.mode or "", "自动（按素材推断）")
     lines = [
         "🎞 <b>生成模式</b>",
         "",
@@ -1077,14 +1078,14 @@ async def try_consume_text_message(chat_id: int, raw_text: str) -> bool:
             idx = int(sess.awaiting_input.split(":", 1)[1])
         except ValueError:
             idx = 0
-        value = _parse_number(text)
-        if value is None or value < 0:
+        seconds_value = _parse_number(text)
+        if seconds_value is None or seconds_value < 0:
             sess.collect_error = "无法识别的秒数，请发送非负数字（如 5 或 5.5）；点『返回』可取消输入。"
         else:
             if 1 <= idx <= len(sess.ref_videos):
-                if value > 0:
+                if seconds_value > 0:
                     sess.ref_videos[idx - 1]["start_seconds"] = (
-                        int(value) if float(value).is_integer() else value)
+                        int(seconds_value) if float(seconds_value).is_integer() else seconds_value)
                 else:
                     sess.ref_videos[idx - 1].pop("start_seconds", None)
             sess.awaiting_input = None

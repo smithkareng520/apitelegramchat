@@ -5,7 +5,16 @@ from typing import Any
 
 
 class AIStreamTimeoutError(TimeoutError):
-    """流在应用层 idle / total 期限内没有完成。"""
+    """流在应用层 idle / total 期限内没有完成。
+
+    ``kind`` 标明触发的是哪道闸门（``"idle"`` / ``"total"``）：
+    total 是整条流的硬期限，触发后绝不参与零输出重试；idle 表示
+    两个真实事件之间隔太久，可按既有策略重试。
+    """
+
+    def __init__(self, message: str = "", *, kind: str = "idle") -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 class AIResponseParseError(ValueError):

@@ -1138,7 +1138,7 @@ async def process_update(data: dict) -> None:
                 async with lock:
                     current_model = get_user_model(chat_id)
                     model_info = SUPPORTED_MODELS.get(current_model)
-                    supports_audio_input = model_info.audio_input if model_info else False
+                    supports_audio_input = bool(model_info.audio_input) if model_info else False
 
                 # 回复引用补齐（兼顾音频）：被引用的音频在模型支持音频输入时
                 # 直接挂附件（多音频走下游 _resolve_mixed_attachments 逐条
@@ -1355,7 +1355,7 @@ async def process_update(data: dict) -> None:
                 async with lock:
                     cm = get_user_model(chat_id)
                     model_info = SUPPORTED_MODELS.get(cm)
-                    supports_audio_input = model_info.audio_input if model_info else False
+                    supports_audio_input = bool(model_info.audio_input) if model_info else False
                     supports_document_input = bool(model_info.document_input) if model_info else False
 
                 if reply_media_items:

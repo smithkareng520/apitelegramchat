@@ -240,7 +240,7 @@ async def execute_generate_image(
     return _format_success_links(uploaded_urls, len(result.images[:num_images]))
 
 
-def _effective_image_protocol(model_info) -> str:
+def _effective_image_protocol(model_info: Any) -> str:
     """模型的有效图像协议（openai_images / openai_chat），未知厂商回落 openai_chat。"""
     if model_info is None:
         return "openai_chat"
@@ -251,7 +251,7 @@ def _effective_image_protocol(model_info) -> str:
         return "openai_chat"
 
 
-def _get_images_api_display_name(model_info) -> str:
+def _get_images_api_display_name(model_info: Any) -> str:
     """提供商展示名（ModelScope / XXTF ...），用于错误提示文案。"""
     provider_key = (getattr(model_info, "provider", "") or "") if model_info else ""
     return provider_key or "图像"

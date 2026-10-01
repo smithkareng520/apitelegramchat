@@ -37,7 +37,7 @@ from config import (
     get_sampling_params,
 )
 from utils import get_logger, strip_html_tags
-from ai._constants import OPENROUTER_PROVIDER_PREFERENCES
+from ai._constants import OPENROUTER_PROVIDER_PREFERENCES, AGNES_IMAGE_SIZE_TIERS, AGNES_IMAGE_RATIOS
 from ai.errors import first_choice
 from ai.error_formatting import _extract_error_details
 from core.images import ImageRequestError, ImageTask, ImageTaskResult
@@ -79,10 +79,10 @@ logger = get_logger(__name__)
 #     {endpoint}/images/{generations,edits}，编辑走独立 multipart
 #     /images/edits（XXTF 等标准 OpenAI Images 中转行为完全不变）。
 # =============================================================================
-_INLINE_IMAGE_SIZE_TIERS = frozenset({"1K", "2K", "3K", "4K"})
-# Agnes 官方支持的宽高比集合（size 档位 + ratio 配合使用；不在集合内的
+# Agnes 官方能力集合（单一来源见 ai/_constants.py；不在集合内的
 # aspect_ratio 不发送，走网关默认 1:1）。
-_INLINE_IMAGE_RATIOS = frozenset({"1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9"})
+_INLINE_IMAGE_SIZE_TIERS = frozenset(AGNES_IMAGE_SIZE_TIERS)
+_INLINE_IMAGE_RATIOS = frozenset(AGNES_IMAGE_RATIOS)
 _EXACT_SIZE_PATTERN = re.compile(r"^\d{3,4}[xX]\d{3,4}$")
 # 视频任务提交端点判定：URL 路径指向 /videos（子路径可带 query/尾斜）。
 # endpoint 现为唯一端点字段（API 根也经由它表达），只有指向视频子路径的
@@ -110,7 +110,7 @@ class ImagesEndpointShape:
         )
 
 
-def resolve_images_endpoint_shape(model_info: Optional[ModelConfig]):
+def resolve_images_endpoint_shape(model_info: Optional[ModelConfig]) -> "ImagesEndpointShape":
     """按模型配置的 endpoint 解析图像请求的端点与参考图形状（公共出口）。
 
     端点路由完全由唯一的 endpoint 字段支撑（URL 自身即形状声明）：
@@ -1195,13 +1195,13 @@ async def _request_openai_compat_image(
             if not image_urls:
                 endpoint = gen_endpoint
                 size = _aspect_ratio_to_openai_size(aspect_ratio)
-                payload: dict[str, Any] = {
+                generation_payload: dict[str, Any] = {
                     "model": model,
                     "prompt": clean_prompt or "请生成一张图片。",
                     "n": n,
                 }
                 if size:
-                    payload["size"] = size
+                    generation_payload["size"] = size
                 logger.debug(
                     "%s request prepared: provider=%s endpoint=%s model=%s prompt_len=%s(cleaned, raw=%s) prompt_preview=%r",
                     log_prefix, ep.name, endpoint, model,
@@ -1211,7 +1211,7 @@ async def _request_openai_compat_image(
                 return await _post_images_with_retry(
                     session, shape.generate_url,
                     endpoint=endpoint, log_prefix=log_prefix,
-                    headers=json_headers, json_payload=payload,
+                    headers=json_headers, json_payload=generation_payload,
                 )
 
             # ------------- 图生图/编辑：严格使用官方 /images/edits -------------
@@ -2319,12 +2319,12 @@ async def _request_openrouter_video(
 # =============================================================================
 # ImageTask 统一请求出口（protocols/images.py 的两个适配器落在这里）
 # -----------------------------------------------------------------------------
-# 重构说明（ImageTask）：图像任务的"操作"（generate/edit/variation）是任务的
+# 重构说明（ImageTask）：图像任务的"操作"（generate/edit）是任务的
 # 一等字段（core/images.ImageTask.operation），由任务构造方显式声明；
 # 以下两个出口只按任务与模型协议发请求并解析，不再做任何
 # "看到参考图 = edit"式的端点猜测。
 #   - _request_openai_images_task        -> /images/{generations,edits}
-#     （operation=edit/variation 且带参考图 -> 官方 multipart /images/edits，
+#     （operation=edit 且带参考图 -> 官方 multipart /images/edits，
 #      路由未实现时按既有鲁棒性回退 JSON /images/generations + image 字段；
 #      operation=generate -> /images/generations；ModelScope 一律
 #      /images/generations + 异步任务轮询，无 /images/edits 端点）
@@ -2338,7 +2338,7 @@ async def _request_openai_images_task(task: "ImageTask") -> "ImageTaskResult":
 
     端点选择由任务操作 + 提供商能力决定：
       - generate            -> JSON /images/generations
-      - edit / variation    -> multipart /images/edits（XXTF 等标准端点），
+      - edit                -> multipart /images/edits（XXTF 等标准端点），
                                失败即报错；绝不回退 /images/generations
                                （该端点不接受 image 参数，回退 = 文生图假成功）
       - modelscope          -> 一律 /images/generations（X-ModelScope-Task-Type
@@ -2392,8 +2392,7 @@ async def _request_chat_modalities_image_task(task: "ImageTask") -> "ImageTaskRe
 
     语义映射：
       - generate            -> 纯文本 prompt（modalities=["image","text"]）
-      - edit / variation    -> prompt + 参考图 image_url 内容
-                               （图生图；prompt 为空时 variation 补默认指令）
+      - edit                -> prompt + 参考图 image_url 内容（图生图）
     网关不支持 image+text 输出时按既有行为自动降级重试 image-only。
     未注册到 SUPPORTED_MODELS 的模型按 OpenRouter 兼容直连（保持旧
     execute_generate_image 对 flux 等别名的可达性）。
@@ -2435,6 +2434,10 @@ async def _request_chat_modalities_image_task(task: "ImageTask") -> "ImageTaskRe
             max_retries=0,
         )
         sampling = {}
+    # chat modalities 图像出口只支持 OpenAI 兼容客户端；anthropic 协议的
+    # 模型不会路由到这里（无 modalities 能力声明）。测试可注入鸭子类型
+    # 假客户端，因此用 cast 而非 isinstance 拦截。
+    client = cast("AsyncOpenAI", client)
 
     extra_body: dict[str, Any] = {"modalities": ["image", "text"],
                                   "provider": OPENROUTER_PROVIDER_PREFERENCES}
@@ -2453,14 +2456,17 @@ async def _request_chat_modalities_image_task(task: "ImageTask") -> "ImageTaskRe
     max_tokens = (model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192)
 
     try:
-        response = await client.chat.completions.create(
-            model=task.model,
-            messages=wire_messages,
-            max_tokens=max_tokens,
-            extra_body=extra_body,
-            stream=False,
+        # openai SDK 3.x 的 create 重载对 wire dict 形状要求严格；与
+        # agentic_loops 同法：Any 值字典解包（运行时形状不变）。
+        create_params: dict[str, Any] = {
+            "model": task.model,
+            "messages": wire_messages,
+            "max_tokens": max_tokens,
+            "extra_body": extra_body,
+            "stream": False,
             **sampling,
-        )
+        }
+        response = await client.chat.completions.create(**create_params)
     except Exception as e:
         err_text = str(e)
         # "output modalities" 含子串 "modalities"，前一条件恒被后者包含。
@@ -2482,14 +2488,15 @@ async def _request_chat_modalities_image_task(task: "ImageTask") -> "ImageTaskRe
             reserved_top_keys=_CHAT_MODALITIES_RESERVED_TOP_KEYS,
         )
         try:
-            response = await client.chat.completions.create(
-                model=task.model,
-                messages=wire_messages,
-                max_tokens=max_tokens,
-                extra_body=retry_extra,
-                stream=False,
+            retry_params: dict[str, Any] = {
+                "model": task.model,
+                "messages": wire_messages,
+                "max_tokens": max_tokens,
+                "extra_body": retry_extra,
+                "stream": False,
                 **sampling,
-            )
+            }
+            response = await client.chat.completions.create(**retry_params)
         except Exception as retry_err:
             # 降级重试也失败：合并两次错误抛 ImageRequestError，让上层
             # （execute_generate_image / 原生图像循环）按统一格式呈现，
@@ -2549,10 +2556,10 @@ async def _request_chat_modalities_image_task(task: "ImageTask") -> "ImageTaskRe
                             # （_read_remote_image_capped：Content-Length
                             # 预检 + readany 循环限读）——此前此处漏防护，
                             # 恶意/失控 upstream 可用超大响应拖垮进程。
-                            img_bytes = await _read_remote_image_capped(resp)
-                            if img_bytes is None:
+                            fetched = await _read_remote_image_capped(resp)
+                            if fetched is None:
                                 continue
-                            validated = _validate_image_bytes(img_bytes, source=img_url)
+                            validated = _validate_image_bytes(fetched, source=img_url)
                             if validated is not None:
                                 image_bytes_list.append(validated)
                         else:

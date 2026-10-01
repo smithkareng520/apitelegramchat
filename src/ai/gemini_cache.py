@@ -142,10 +142,10 @@ def _prefix_cache_safe(prefix: list) -> bool:
       * assistant+tool_calls 结尾 -> functionCall 之后必须紧跟
         functionResponse，不能从缓存续传。
     """
-    def _role(x):
+    def _role(x: Any) -> Any:
         return x.role if isinstance(x, Message) else x.get("role")
 
-    def _has_tool_calls(x):
+    def _has_tool_calls(x: Any) -> bool:
         if isinstance(x, Message):
             return bool(x.tool_calls())
         return bool(x.get("tool_calls"))

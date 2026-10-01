@@ -20,7 +20,7 @@ Conversations API。
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 from api_client import api_client
 from protocols.base import ChatProtocolAdapter
@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
     from config import ModelConfig
     from responses_state import TurnState
+    from openai import AsyncOpenAI
 
 
 class OpenAIResponsesAdapter(ChatProtocolAdapter):
@@ -49,7 +50,7 @@ class OpenAIResponsesAdapter(ChatProtocolAdapter):
     ) -> tuple[str | None, Any, list]:
         from ai.responses_bridge import _agentic_loop_openai_responses
 
-        client = api_client.get_client_for_model(model_info)
+        client = cast("AsyncOpenAI", api_client.get_client_for_model(model_info))
         api_label = model_info.provider
         return await _agentic_loop_openai_responses(
             client, current_model, messages, builder, api_label=api_label,

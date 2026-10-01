@@ -204,7 +204,7 @@ def strip_tool_traces(messages: list) -> list:
                 continue
             out.append(Message(
                 role="assistant",
-                blocks=kept_blocks,
+                blocks=list(kept_blocks),
                 name=m.name,
                 meta=dict(m.meta),
             ))

@@ -26,7 +26,11 @@ from typing import Any, Awaitable, Callable
 
 import mcp.types as types
 
-from mcpserver.context import MCPRequestContext, mutations_are_explicitly_enabled
+from mcpserver.context import (
+    MCPConfigurationError,
+    MCPRequestContext,
+    mutations_are_explicitly_enabled,
+)
 
 logger = logging.getLogger(__name__)
 

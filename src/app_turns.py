@@ -290,8 +290,9 @@ def _get_reply_media(msg: dict) -> list[dict]:
     mgid = reply.get("media_group_id")
     if mgid:
         chat = msg.get("chat") or {}
+        raw_chat_id = chat.get("id")
         try:
-            chat_id = int(chat.get("id"))
+            chat_id = int(raw_chat_id)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             chat_id = None
         entry = get_album_media(chat_id, str(mgid))
@@ -393,7 +394,7 @@ def _estimate_content_tokens(content: Any) -> int:
         return total
     return estimate_tokens(str(content))
 
-def _estimate_message_tokens(message) -> int:
+def _estimate_message_tokens(message: Any) -> int:
     """单消息 token 估算（内部 Message 与旧 dict 双形状）。"""
     if isinstance(message, Message):
         tokens = _MESSAGE_WRAPPER_TOKENS

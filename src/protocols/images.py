@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from core.images import ImageTask, ImageTaskResult
 
@@ -49,7 +49,6 @@ class OpenAIImagesAdapter(ImageProtocolAdapter):
         edit       -> /images/edits（multipart），失败即报错；
                       绝不回退 /images/generations（该端点不接受 image
                       参数，回退等于把编辑降级成文生图"假成功"）
-        variation  -> 同 edit（ModelScope / XXTF 均无 /variations 端点）
     """
 
     name = "openai_images"
@@ -83,7 +82,7 @@ IMAGE_PROTOCOLS: dict[str, ImageProtocolAdapter] = {
 }
 
 
-def _endpoint_shape_is_images(ep) -> bool:
+def _endpoint_shape_is_images(ep: Any) -> bool:
     """合并后的有效端点是否声明了 OpenAI Images 形状的完整 URL。"""
     url = str(getattr(ep, "endpoint", None) or "").strip()
     return bool(url and _IMAGES_ENDPOINT_PATH_PATTERN.search(url))

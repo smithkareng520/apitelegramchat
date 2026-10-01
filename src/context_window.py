@@ -352,6 +352,8 @@ def _tool_lines(block: list[Any]) -> list[str]:
     for message in block:
         if _msg_role(message) != "tool":
             continue
+        call_id: Any
+        content: Any
         if isinstance(message, Message):
             tr = message.tool_result_block()
             if tr is None:
@@ -377,8 +379,8 @@ def _tool_lines(block: list[Any]) -> list[str]:
                 for tc in message.tool_calls()
             ]
         elif isinstance(message, dict):
-            calls = message.get("tool_calls")
-            calls = calls if isinstance(calls, list) else []
+            raw_calls = message.get("tool_calls")
+            calls = raw_calls if isinstance(raw_calls, list) else []
         else:
             continue
         for tool_call in calls:
@@ -392,7 +394,8 @@ def _tool_lines(block: list[Any]) -> list[str]:
                 continue
             locator = _locator(name, function.get("arguments"))
             tail = ""
-            archive = archived_by_id.get(tool_call.get("id") or "")
+            raw_id = tool_call.get("id")
+            archive = archived_by_id.get(raw_id if isinstance(raw_id, str) else "")
             if archive:
                 tail = f" → 已归档 {archive}"
             lines.append(f"  T: {name}({locator}){tail}" if locator else f"  T: {name}{tail}")

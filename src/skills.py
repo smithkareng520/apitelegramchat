@@ -467,7 +467,7 @@ async def start_packaged_skill_auto_sync() -> None:
         logger.info(
             "startup workspace skills R2 sync: workspaces=%s restored=%s bootstrapped=%s errors=%s",
             r2_initial["workspaces"], r2_initial["restored"],
-            r2_initial["bootstrapped"], len(r2_initial["errors"]),
+            r2_initial["bootstrapped"], len(r2_initial["errors"] or []),
         )
     except Exception:
         logger.warning("startup workspace skills R2 sync failed", exc_info=True)

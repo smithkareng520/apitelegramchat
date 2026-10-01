@@ -17,7 +17,6 @@ from tool_dispatch import (  # noqa: F401
     tool_semaphore,
 )
 from tool_result_format import (  # noqa: F401
-    _TOOL_TIMEOUT_LABELS,
     format_tool_result,
 )
 # bash 会话管理器：app 关停时清理持久沙箱进程（唯一仍被 host 直接引用的
