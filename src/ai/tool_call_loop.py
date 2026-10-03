@@ -510,7 +510,32 @@ async def _run_tool_calls_and_append(
                         status="waiting",
                     )
                     builder.request_flush(force=True)
-                    answer = await wait_for_answer(interaction)
+
+                    # message_user 会长时间阻塞在 wait_for_answer()。即使草稿内容
+                    # 完全没有变化，也要像其它长时间运行工具一样定期重发当前草稿，
+                    # 防止 Telegram 的 draft 展示在等待期间消失。不要依赖“有新内容”
+                    # 才触发刷新；这里显式保活，并在工具结束后可靠取消。
+                    async def _keep_waiting_draft_alive() -> None:
+                        try:
+                            while interaction.status == "waiting":
+                                await asyncio.sleep(2.0)
+                                if interaction.status != "waiting":
+                                    break
+                                builder.request_flush(force=True)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.debug("message_user 草稿保活刷新失败", exc_info=True)
+
+                    keepalive_task = asyncio.create_task(_keep_waiting_draft_alive())
+                    try:
+                        answer = await wait_for_answer(interaction)
+                    finally:
+                        keepalive_task.cancel()
+                        try:
+                            await keepalive_task
+                        except asyncio.CancelledError:
+                            pass
                     result_str = answer_to_tool_result(answer)
                 elif fn_name == "deliver_reply":
                     # deliver_reply：静默模式（/show off）下模型通过 send 布尔

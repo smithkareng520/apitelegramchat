@@ -213,7 +213,9 @@ def _load_current_selection(interaction: AskUserInteraction) -> None:
                     interaction.selected_indices.add(i)
                     break
     elif answer.get("type") == "custom":
-        interaction.awaiting_custom = True
+        # 已经提交过的自定义答案应回到正常表单视图，并把答案直接显示出来。
+        # 只有用户再次点击“自定义输入”时才进入 awaiting_custom 输入态。
+        interaction.awaiting_custom = False
 
 
 def _build_keyboard(interaction: AskUserInteraction) -> dict:
@@ -273,6 +275,17 @@ def _question_html(interaction: AskUserInteraction) -> str:
         label = convert_markdown_to_telegram_html(option.get("label", ""))
         desc = convert_markdown_to_telegram_html(option.get("description", "")) if option.get("description") else ""
         lines.append(f"<p><b>• {label}</b>{f'<br/><i>{desc}</i>' if desc else ''}</p>")
+    current_answer = interaction.answers.get(interaction.current_index)
+    if current_answer and current_answer.get("type") == "custom":
+        value = truncate_to_token_budget(
+            str(current_answer.get("value", "")),
+            ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET,
+            suffix="…",
+        )
+        if value:
+            lines.append(
+                f"<p><b>→ 自定义回答：</b>{convert_markdown_to_telegram_html(value)}</p>"
+            )
     if interaction.awaiting_custom:
         lines.append("<p><i>请直接发送这一题的回答。</i></p>")
     elif q.get("options"):
