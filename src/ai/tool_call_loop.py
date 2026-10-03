@@ -44,7 +44,6 @@ from ai._constants import (
     SUBAGENT_OUTER_TIMEOUT,
     MEDIA_GEN_TOOLS,
     TOOL_ERROR_STREAK_LIMIT,
-    CONSUMER_TOOLS,
     DETACHED_ON_INTERRUPT_TOOLS,
     DETACHED_TOOL_FINAL_WAIT,
 )
@@ -338,7 +337,7 @@ async def _run_tool_calls_and_append(
 
     async def run_one(fn_name: str, fn_args: dict, tc_id: str) -> tuple[str, str, str, str, str, dict, str]:
         # 打断保全：工具真正执行完成时把结果登记到共享 dict。
-        # 批次被取消时（asyncio.gather 抛 CancelledError），已完成的工具
+        # 批次被取消时（串行执行中抛 CancelledError），已完成的工具
         # 结果由 _salvage_interrupted_batch 回填真实 tool 消息，未完成的
         # 补占位 tool 消息——保证 assistant.tool_calls 全部配对，
         # 已完成的进度不因打断丢失（见 turn_recovery.py）。
@@ -619,7 +618,7 @@ async def _run_tool_calls_and_append(
             # 输出（可能是任意格式的字符串），二者内部有大量字符串切分/正则/索引
             # 操作，遇到非预期形状的内容时可能抛出未捕获异常（IndexError /
             # KeyError / AttributeError 等）。这类异常若直接冒泡出
-            # run_one，会被外层 asyncio.gather(return_exceptions=True) 捕获成
+            # run_one，会被外层串行循环的 except Exception 捕获成
             # 一个裸 Exception，导致该 tool_call_id 既没有配对的 tool 消息，
             # 也没有更新 builder 状态（UI 上表现为该折叠块永远停在"运行中"）。
             # 这里已经拿到了真实的工具执行结果 result_str，不应该因为格式化
@@ -674,47 +673,23 @@ async def _run_tool_calls_and_append(
             completed_results[tc_id] = llm_content
             return (fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content)
 
-    # ====== 串行化"消费者"工具：同批既含 producer（如 bash cp）又含
-    # consumer（如 present_files）时，consumer 必须在 producer 落盘后才能
-    # 正确读取 upload/。如果让它们一起进 asyncio.gather，consumer 会在
-    # producer 完成前看到空目录并报"file not found"，模型需要多花
-    # 轮次补救。
-    # 处理方式：把 tool_tasks 拆成 [producers..., consumers...] 两批，
-    # 顺序 gather。仅在两批都非空时启用串行化，单批非空时等价于普通
-    # gather，不影响纯查询类多工具并发（如 多个 web_search）的性能。
-    producer_indices = [
-        i for i, (fn_name, _, _) in enumerate(tool_tasks) if fn_name not in CONSUMER_TOOLS
-    ]
-    consumer_indices = [
-        i for i, (fn_name, _, _) in enumerate(tool_tasks) if fn_name in CONSUMER_TOOLS
-    ]
-    # 打断保全：整批工具的共享完成登记（tc_id -> 真实 llm_content）。
-    # 放在闭包外层，run_one 与取消路径都能访问。
+    # ====== 同批多个工具严格按模型给出的调用顺序串行执行 ======
+    # 模型在同一轮给出的多个调用存在隐含的先后依赖（如先 bash 落盘再
+    # present_files 发送、先写后读），并行会让副作用顺序与模型意图不一致。
+    # 因此逐个 await，tool 消息天然与 tool_calls 同序，无需再排序/重组。
+    # 打断保全：已完成的工具结果由 run_one 登记到 _batch_completed_results；
+    # _batch_started 记录已开始执行的调用，取消时尚未开始的调用不能被当成
+    # "已脱离后台执行"（它们根本没执行过）。
     _batch_completed_results: dict = {}
+    _batch_started: set = set()
+    results: list[Any] = []
     try:
-        if producer_indices and consumer_indices:
-            # Phase 1: 并行执行所有 producer（如 bash 复制文件到 upload/）
-            phase1_results = await asyncio.gather(
-                *[run_one(*tool_tasks[i]) for i in producer_indices],
-                return_exceptions=True,
-            )
-            # Phase 2: producer 全部完成后，并行执行所有 consumer（如 present_files）
-            phase2_results = await asyncio.gather(
-                *[run_one(*tool_tasks[i]) for i in consumer_indices],
-                return_exceptions=True,
-            )
-            # 按 tool_tasks 的原始位置重组 results，后续的状态写入和
-            # tool_msg 配对逻辑都基于原始顺序，不需要改动。
-            results: list[Any] = [None] * len(tool_tasks)
-            for i, r in zip(producer_indices, phase1_results):
-                results[i] = r
-            for i, r in zip(consumer_indices, phase2_results):
-                results[i] = r
-        else:
-            results = await asyncio.gather(
-                *[run_one(fn, args, tid) for fn, args, tid in tool_tasks],
-                return_exceptions=True
-            )
+        for fn, args, tid in tool_tasks:
+            _batch_started.add(tid)
+            try:
+                results.append(await run_one(fn, args, tid))
+            except Exception as exc:  # noqa: BLE001 - 单个工具异常不影响后续工具
+                results.append(exc)
     except asyncio.CancelledError:
         # 用户新消息 / TIMER 唤醒打断了本批次：同步补齐 tool 消息后向上传播。
         # 只做纯同步列表操作，不做任何 await（取消路径必须最小化）。
@@ -726,6 +701,8 @@ async def _run_tool_calls_and_append(
             real_content = _batch_completed_results.get(tc_id)
             if isinstance(real_content, str) and real_content:
                 content = real_content
+            elif tc_id not in _batch_started:
+                content = INTERRUPTED_TOOL_PLACEHOLDER
             elif fn_name in DETACHED_ON_INTERRUPT_TOOLS:
                 content = DETACHED_TOOL_PLACEHOLDER
             else:
@@ -739,14 +716,16 @@ async def _run_tool_calls_and_append(
             api_label, len(tool_tasks),
             sum(1 for _, _, t in tool_tasks if t in _batch_completed_results),
             sum(1 for fn, _, t in tool_tasks
-                if t not in _batch_completed_results and fn in DETACHED_ON_INTERRUPT_TOOLS),
+                if t not in _batch_completed_results and t in _batch_started
+                and fn in DETACHED_ON_INTERRUPT_TOOLS),
             sum(1 for fn, _, t in tool_tasks
-                if t not in _batch_completed_results and fn not in DETACHED_ON_INTERRUPT_TOOLS),
+                if t not in _batch_completed_results
+                and (t not in _batch_started or fn not in DETACHED_ON_INTERRUPT_TOOLS)),
         )
         raise
 
     # ===== 根据结果标记状态 =====
-    # tool_tasks 与 results 顺序一一对应（asyncio.gather 保序），用于在
+    # tool_tasks 与 results 顺序一一对应（串行执行按序追加），用于在
     # run_one 抛出未捕获异常时（如 format_tool_result 内部报错）仍能拿到
     # 原始 tc_id / fn_name，补齐 tool 消息与 builder 状态。
     # 若对未捕获异常直接 log + continue，会：
@@ -760,24 +739,6 @@ async def _run_tool_calls_and_append(
     #   a) 得到一次 builder.update_tool_item(..., status=...) 调用；
     #   b) 追加一条配对的 role=tool 消息回传给模型。
     for idx, res in enumerate(results):
-        if isinstance(res, asyncio.CancelledError):
-            # 单个子任务被单独取消（整批取消走上方 except CancelledError
-            # 分支）：直接 raise 会跳过本批其余全部配对补齐，产生未配对的
-            # assistant.tool_calls（下一轮请求 400 或模型死循环）。这里改为
-            # 补齐占位 tool 消息 + UI 状态后继续处理其余结果。
-            try:
-                fn_name, fn_args, tc_id = tool_tasks[idx]
-            except (IndexError, ValueError):
-                fn_name, fn_args, tc_id = "unknown", {}, f"call_cancelled_{uuid.uuid4().hex[:8]}"
-            logger.warning("[%s] 工具 %s 被单独取消，补齐占位 tool 消息", api_label, tc_id)
-            builder.update_tool_item(
-                tc_id, "⚠️ 工具已取消", "<p>工具执行被取消，未获得结果。</p>",
-                status="error",
-            )
-            tool_msg = Message.tool_result(tc_id, fn_name, INTERRUPTED_TOOL_PLACEHOLDER)
-            loop_messages.append(tool_msg)
-            new_history_entries.append(tool_msg)
-            continue
         if isinstance(res, Exception):
             # 不在 except 块内，使用 exc_info 显式附加 traceback
             logger.error("工具执行异常: %s", res, exc_info=res)

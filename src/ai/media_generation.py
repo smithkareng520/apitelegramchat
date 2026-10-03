@@ -651,7 +651,6 @@ async def _request_modelscope_native_image(
                 "model": model,
                 "prompt": clean_prompt or "请根据参考图进行编辑。",
                 "image_url": image_data_urls,
-                "n": max(1, min(num_images, 4)),
             }
             response_json, status_code, error_detail, request_id = await _post_or_get_json(
                 session, "POST", request_url, json_payload=payload, request_headers=post_headers, quiet=True
@@ -672,7 +671,6 @@ async def _request_modelscope_native_image(
             payload = {
                 "model": model,
                 "prompt": clean_prompt or "请生成一张图片。",
-                "n": max(1, min(num_images, 4)),
             }
             response_json, status_code, error_detail, request_id = await _post_or_get_json(
                 session,
@@ -811,6 +809,60 @@ async def _request_modelscope_native_image(
             return last_poll_json, endpoint, '', 200, request_id
 
         return response_json, endpoint, '', 200, request_id
+
+
+async def _request_modelscope_multi(
+        *,
+        prompt: str,
+        image_urls: list[str],
+        num_images: int = 1,
+        model: str = "",
+) -> tuple[dict | None, str, str, int, str]:
+    """ModelScope 一次任务只产出一张图（官方接口没有 n 参数）。
+
+    num_images>1 时并发提交 N 个单张任务，把成功的图片合并成一个
+    {"data": [...]} 响应；部分失败时返回已成功的图片（失败原因记日志），
+    全部失败才按第一条失败原因报错。
+    """
+    count = max(1, min(int(num_images or 1), 4))
+    if count == 1:
+        return await _request_modelscope_native_image(
+            prompt=prompt, image_urls=image_urls, num_images=1, model=model)
+
+    results = await asyncio.gather(
+        *[
+            _request_modelscope_native_image(
+                prompt=prompt, image_urls=image_urls, num_images=1, model=model)
+            for _ in range(count)
+        ],
+        return_exceptions=True,
+    )
+    merged: list[dict] = []
+    first_failure: tuple[dict | None, str, str, int, str] | None = None
+    endpoint = "/images/generations"
+    request_id = ""
+    for res in results:
+        if isinstance(res, BaseException):
+            logger.warning("[NativeImage/ModelScope] 并发子任务异常: %s", res)
+            if first_failure is None:
+                first_failure = (None, endpoint, f"{type(res).__name__}: {str(res)[:200]}", 500, "")
+            continue
+        rj, endpoint, detail, status, req_id = res
+        request_id = request_id or req_id
+        items = _extract_image_items(rj, max_items=1) if isinstance(rj, dict) else []
+        if items:
+            merged.extend(items)
+        else:
+            logger.warning(
+                "[NativeImage/ModelScope] 并发子任务无图片: status=%s detail=%s",
+                status, (detail or "")[:200])
+            if first_failure is None:
+                first_failure = (rj, endpoint, detail or "未返回图片", status or 500, req_id)
+    if not merged:
+        return first_failure or (None, endpoint, "未返回图片", 500, request_id)
+    if len(merged) < count:
+        logger.warning("[NativeImage/ModelScope] 请求 %s 张，仅成功 %s 张", count, len(merged))
+    return {"data": merged}, endpoint, "", 200, request_id
 
 
 # ---- 通用 OpenAI 兼容实现的共享辅助（edits multipart / generations JSON 两路共用）----
@@ -1365,7 +1417,7 @@ async def _request_images_generations(
     """
     provider = (getattr(model_info, "provider", "") or "").strip().lower()
     if provider == "modelscope":
-        return await _request_modelscope_native_image(
+        return await _request_modelscope_multi(
             prompt=prompt,
             image_urls=image_urls,
             num_images=num_images,
