@@ -60,6 +60,16 @@ BASH_TOOL_CALL_TIMEOUT = 310
 # 默认 900s，用户可配到 1800s。外层必须给足够长的超时，否则主工具层会提前杀掉它。
 SUBAGENT_TOOLS = {_tn.SUBAGENT}
 SUBAGENT_OUTER_TIMEOUT = _positive_env_int("SUBAGENT_OUTER_TIMEOUT", 930, minimum=1)  # 900s 子 agent 上限 + 30s 缓冲
+# 并发安全工具：同一批里"连续"出现的这类调用并发执行，其余工具串行（见
+# tool_call_loop 的分批屏障）。准入条件——不改动工作区/外部状态，或是互相
+# 独立的长耗时任务：
+#   - 搜索类 MCP（web_search / fetch_url / wikipedia / exchange_rate / weather）
+#     与高德地图：纯只读网络查询，不碰工作区文件；
+#   - 子 agent：独立的多轮任务，串行等待代价大。
+# 默认串行（fail-closed）：新增工具不在此集合就不会并发；bash / text_editor /
+# memory / todo / present_files / 生成类工具有写副作用或依赖前序产物，保持串行。
+# text_editor view 虽只读，但会读到同批子 agent / bash 写出的文件，不放入。
+CONCURRENT_SAFE_TOOLS = frozenset(_tn.SEARCH_TOOLS_MCP | _tn.GAODE_TOOLS | SUBAGENT_TOOLS)
 # 统一图像工具 generate_image（image_url 缺省=文生图，提供=编辑）；
 # 两个旧名（generate_image_from_text / edit_image_with_reference）保留为
 # dispatch 层隐藏别名（历史会话旧调用仍可执行），同样纳入超时豁免。

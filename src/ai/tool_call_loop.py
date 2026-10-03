@@ -40,6 +40,7 @@ from ai._constants import (
     LONG_TOOL_CALL_TIMEOUT,
     BASH_TOOLS,
     BASH_TOOL_CALL_TIMEOUT,
+    CONCURRENT_SAFE_TOOLS,
     SUBAGENT_TOOLS,
     SUBAGENT_OUTER_TIMEOUT,
     MEDIA_GEN_TOOLS,
@@ -673,24 +674,53 @@ async def _run_tool_calls_and_append(
             completed_results[tc_id] = llm_content
             return (fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content)
 
-    # ====== 同批多个工具严格按模型给出的调用顺序串行执行 ======
-    # 模型在同一轮给出的多个调用存在隐含的先后依赖（如先 bash 落盘再
-    # present_files 发送、先写后读），并行会让副作用顺序与模型意图不一致。
-    # 因此逐个 await，tool 消息天然与 tool_calls 同序，无需再排序/重组。
+    # ====== 同批多个工具的执行策略（对齐主流 harness 的分批屏障模型）======
+    # 按调用顺序扫描：连续的"并发安全"工具（只读查询类 + 子 agent，见
+    # CONCURRENT_SAFE_TOOLS）合成一个并发组；其余每个工具单独成组、串行执行。
+    # 组与组之间是屏障——后一组必须等前一组全部完成才开始，所以 bash / 写操作
+    # 永远不会和任何其他工具同时运行，也不会和排在它前面的查询/子 agent 重叠。
+    # 模型在同一轮给出的多个调用存在隐含先后依赖（先 bash 落盘再
+    # present_files、先写后读），屏障保证副作用顺序与模型意图一致。
+    # results 按原调用位置存放，tool 消息因此始终与 tool_calls 同序。
+    # 并发度由 tool_semaphore（MAX_CONCURRENT_TOOLS）统一限流。
     # 打断保全：已完成的工具结果由 run_one 登记到 _batch_completed_results；
     # _batch_started 记录已开始执行的调用，取消时尚未开始的调用不能被当成
     # "已脱离后台执行"（它们根本没执行过）。
     _batch_completed_results: dict = {}
     _batch_started: set = set()
-    results: list[Any] = []
+    results: list[Any] = [None] * len(tool_tasks)
+    _pending_group: dict[int, "asyncio.Future"] = {}
     try:
-        for fn, args, tid in tool_tasks:
-            _batch_started.add(tid)
-            try:
-                results.append(await run_one(fn, args, tid))
-            except Exception as exc:  # noqa: BLE001 - 单个工具异常不影响后续工具
-                results.append(exc)
+        idx = 0
+        while idx < len(tool_tasks):
+            fn, args, tid = tool_tasks[idx]
+            if fn not in CONCURRENT_SAFE_TOOLS:
+                _batch_started.add(tid)
+                try:
+                    results[idx] = await run_one(fn, args, tid)
+                except Exception as exc:  # noqa: BLE001 - 单个工具异常不影响后续工具
+                    results[idx] = exc
+                idx += 1
+                continue
+            # 连续并发安全工具组：全部启动后统一等待收齐，再进入下一组。
+            _pending_group.clear()
+            while idx < len(tool_tasks) and tool_tasks[idx][0] in CONCURRENT_SAFE_TOOLS:
+                g_fn, g_args, g_tid = tool_tasks[idx]
+                _batch_started.add(g_tid)
+                _pending_group[idx] = asyncio.ensure_future(run_one(g_fn, g_args, g_tid))
+                idx += 1
+            outs = await asyncio.gather(*_pending_group.values(), return_exceptions=True)
+            for g_idx, out in zip(_pending_group.keys(), outs):
+                if isinstance(out, asyncio.CancelledError):
+                    # 组内某个工具被单独取消（非整批取消）：转成普通错误，
+                    # 走下方统一的异常配对路径，保证 tool 消息不缺失。
+                    out = RuntimeError("工具被取消，未获得结果")
+                results[g_idx] = out
+            _pending_group.clear()
     except asyncio.CancelledError:
+        # 整批被取消：已启动但未结束的并发组工具一并取消（纯同步调用）。
+        for _fut in _pending_group.values():
+            _fut.cancel()
         # 用户新消息 / TIMER 唤醒打断了本批次：同步补齐 tool 消息后向上传播。
         # 只做纯同步列表操作，不做任何 await（取消路径必须最小化）。
         # 五阶段规范·阶段4：占位回执按工具性质区分——只读工具带 aborted
