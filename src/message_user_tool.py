@@ -130,6 +130,8 @@ class AskUserInteraction:
     awaiting_custom: bool = False
     message_id: int | None = None
     created_at: float = field(default_factory=time.time)
+    # Sliding timeout: every valid user interaction refreshes the deadline.
+    last_activity_at: float = field(default_factory=time.time)
     status: str = "waiting"
     future: asyncio.Future | None = None
 
@@ -220,7 +222,8 @@ def _load_current_selection(interaction: AskUserInteraction) -> None:
 
 def _build_keyboard(interaction: AskUserInteraction) -> dict:
     if interaction.mode == "message":
-        return {"inline_keyboard": [[{"text": "Cancel", "callback_data": f"ask:{interaction.id}:cancel"}]]}
+        # 普通消息就是普通聊天消息：不显示任何交互按钮，也不存在用户侧的取消动作。
+        return {"inline_keyboard": []}
     if interaction.current_index >= len(interaction.questions):
         rows = []
         if interaction.questions:
@@ -264,7 +267,9 @@ def _question_rich_text(question: str) -> str:
 
 def _question_html(interaction: AskUserInteraction) -> str:
     if interaction.mode == "message":
-        return f"<p>💬 <b>普通消息</b></p>{_question_rich_text(interaction.message)}<p><i>直接回复文本即可。</i></p>"
+        # 普通消息从发送开始就直接呈现为普通聊天文本，不暴露 message_user
+        # 的内部等待状态，也不显示“普通消息/直接回复文本即可”等提示。
+        return _question_rich_text(interaction.message)
     if interaction.current_index >= len(interaction.questions):
         return _review_html(interaction)
     q = _current_question(interaction) or {}
@@ -366,7 +371,8 @@ async def create_ask_user_interaction(
     message_id = await send_rich_html_message(
         chat_id,
         _question_html(interaction),
-        reply_markup=_build_keyboard(interaction),
+        # 普通消息没有任何按钮；表单才使用 inline keyboard。
+        reply_markup=(_build_keyboard(interaction) if interaction.mode == "form" else None),
         reassert_draft=True,
     )
     if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0:
@@ -439,10 +445,15 @@ async def _edit_question_message(interaction: AskUserInteraction, body_html: str
 
 def _answered_html(interaction: AskUserInteraction, answer: dict[str, Any]) -> str:
     if interaction.mode == "message":
-        if answer.get("type") == "custom":
-            return f"<p>💬 <b>普通消息</b></p>{_question_rich_text(interaction.message)}<p>→ {convert_markdown_to_telegram_html(str(answer.get('value', '')))}</p>"
+        # 普通消息始终保持普通聊天消息外观；用户的回复属于下一条用户消息，
+        # 不要把“普通消息”标签或取消/回复提示重新写回机器人消息。
         return _question_rich_text(interaction.message)
     return _review_html(interaction)
+
+
+def _touch_activity(interaction: AskUserInteraction) -> None:
+    """Refresh the sliding inactivity timeout after a valid interaction."""
+    interaction.last_activity_at = time.time()
 
 
 async def _finish(interaction: AskUserInteraction, answer: dict[str, Any], *, body: str | None = None) -> None:
@@ -467,12 +478,12 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
             return False, "这个问题已经处理过了"
 
         if interaction.mode == "message":
-            if action == "cancel":
-                await _finish(interaction, {"type": "cancelled"}, body=_question_rich_text(interaction.message))
-                return True, "已取消"
-            return False, "普通消息请直接回复文本"
+            # 普通消息没有按钮，因此正常不会进入 callback；即使收到旧消息
+            # 残留的 cancel callback，也不能再提供“取消发送”语义。
+            return False, "普通消息没有可用按钮，请直接回复文本"
 
         if action == "o":
+            _touch_activity(interaction)
             q = _current_question(interaction) or {}
             try:
                 idx = int(arg)
@@ -496,6 +507,7 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
             return True, "已选择"
 
         if action == "custom":
+            _touch_activity(interaction)
             q = _current_question(interaction) or {}
             if not q.get("allowCustom", True):
                 return False, "此问题不支持自定义输入"
@@ -506,6 +518,7 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
             return True, "请直接发送这一题的回答"
 
         if action == "custom_cancel":
+            _touch_activity(interaction)
             _load_current_selection(interaction)
             markup = _build_keyboard(interaction)
             _spawn_ui_followup(_edit_question_message(interaction, _question_html(interaction), markup))
@@ -518,16 +531,19 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
                 interaction.current_index += 1
             else:
                 return False, "已经在边界"
+            _touch_activity(interaction)
             _load_current_selection(interaction)
             _spawn_ui_followup(_edit_question_message(interaction, _question_html(interaction), _build_keyboard(interaction)))
             return True, "已切换问题"
 
         if action == "review":
+            _touch_activity(interaction)
             interaction.current_index = len(interaction.questions)
             _spawn_ui_followup(_edit_question_message(interaction, _review_html(interaction), _build_keyboard(interaction)))
             return True, "已打开答案预览"
 
         if action == "submit":
+            _touch_activity(interaction)
             # Only answered questions are serialized, exactly matching the review page.
             submitted = []
             for idx, answer in sorted(interaction.answers.items()):
@@ -558,6 +574,7 @@ async def resolve_text(chat_id: int, text: str) -> bool:
             if q is None or not interaction.awaiting_custom:
                 return False
             answer = {"type": "custom", "value": truncate_to_token_budget(text, ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET, suffix="…")}
+            _touch_activity(interaction)
             interaction.answers[interaction.current_index] = answer
             interaction.awaiting_custom = False
             # Do not auto-submit. Stay on this question so the user can review/navigate.
@@ -571,7 +588,23 @@ async def resolve_text(chat_id: int, text: str) -> bool:
 async def wait_for_answer(interaction: AskUserInteraction) -> dict[str, Any]:
     assert interaction.future is not None
     try:
-        return await asyncio.wait_for(asyncio.shield(interaction.future), timeout=INTERACTION_TIMEOUT)
+        # Sliding inactivity timeout: the user gets INTERACTION_TIMEOUT seconds
+        # after the most recent valid interaction, rather than one fixed 2-minute
+        # window from the moment the form was opened.
+        while True:
+            remaining = INTERACTION_TIMEOUT - (time.time() - interaction.last_activity_at)
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(interaction.future), timeout=remaining
+                )
+            except asyncio.TimeoutError:
+                # A callback/text operation may have refreshed last_activity_at
+                # at the same moment the timer fired. Re-check before expiring.
+                if time.time() - interaction.last_activity_at < INTERACTION_TIMEOUT:
+                    continue
+                raise
     except asyncio.TimeoutError:
         async with _lock:
             if interaction.status != "waiting":
