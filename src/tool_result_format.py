@@ -317,25 +317,27 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         return summary, details_html
 
     elif family == "message_user":
-        # message_user（原 ask_user）返回的是给模型阅读的 JSON 结果信封
-        #（{"type":"choice",...} / {"type":"custom",...} /
-        # {"type":"expired"} / {"type":"cancelled"}）。与 bash / text_editor
-        # 一致：Input 展示发出的提问/消息正文（含选项），Output 以等宽
-        # 代码面板展示返回。
-        question = str(fn_args.get('question', '') or "")
-        options = fn_args.get('options')
-        input_lines = [question] if question else []
-        if isinstance(options, list) and options:
-            labels = []
-            for opt in options[:8]:
-                if isinstance(opt, dict):
-                    label = str(opt.get('label', '') or '').strip()
-                    if label:
-                        labels.append(label)
-                elif isinstance(opt, str) and opt.strip():
-                    labels.append(opt.strip())
-            if labels:
-                input_lines.append("options: " + " | ".join(labels))
+        mode = str(fn_args.get('mode') or '').strip().lower()
+        question = str(fn_args.get('question', '') or '')
+        message = str(fn_args.get('message', '') or '')
+        questions = fn_args.get('questions')
+        input_lines = []
+        if mode == 'form' or isinstance(questions, list):
+            for idx, item in enumerate(questions[:8] if isinstance(questions, list) else []):
+                if not isinstance(item, dict):
+                    continue
+                q = str(item.get('question', '') or '').strip()
+                if q:
+                    input_lines.append(f"Q{idx + 1}: {q}")
+                opts = item.get('options')
+                if isinstance(opts, list):
+                    labels = [str(o.get('label', '')).strip() for o in opts[:8] if isinstance(o, dict) and str(o.get('label', '')).strip()]
+                    if labels:
+                        input_lines.append("options: " + " | ".join(labels))
+        else:
+            text = message or question
+            if text:
+                input_lines.append(text)
         summary = "💬 Messaged you"
         details_html = ""
         if input_lines:

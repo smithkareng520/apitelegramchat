@@ -484,11 +484,11 @@ async def _run_tool_calls_and_append(
                     # （缺必填 / 类型错 / 枚举外取值）——不执行，错误回传。
                     result_str = schema_error
                 elif fn_name == "message_user":
-                    # message_user（原 ask_user）：提问 / 通知双用途。
-                    # - 带选项：出按钮卡等待用户点选；
-                    # - 无选项：作为通知/主动消息发送，等待用户自由回复，
-                    #   超时即"用户不在"（见 message_user_tool 模块）。
-                    # USER 与 TIMER 回合均可用（TIMER 主动巡检靠它触达用户）。
+                    # message_user：普通消息或多问题混合表单。普通消息的用户回复
+                    # 会被 app.py 在 spawn_turn_task 之前原子消费，因此不会打断原轮次。
+                    mode = str(fn_args.get("mode") or "").strip().lower() or None
+                    message = fn_args.get("message")
+                    questions = fn_args.get("questions")
                     question = fn_args.get("question", "")
                     options = fn_args.get("options", []) or []
                     multiple = bool(fn_args.get("multiple", False))
@@ -499,6 +499,9 @@ async def _run_tool_calls_and_append(
                         options,
                         multiple=multiple,
                         allow_custom=allow_custom,
+                        mode=mode,
+                        message=message,
+                        questions=questions,
                     )
                     builder.update_tool_item(
                         tc_id,

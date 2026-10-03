@@ -1,29 +1,16 @@
-"""Human-in-the-loop interaction for the agent: the ``message_user`` tool.
+"""Human-in-the-loop interaction for the agent.
 
-（工具原名 ask_user，现改名为 message_user——意图扩展为"向用户发消息
-并等待回复"：带选项时是提问卡，不带选项时是给用户发一条消息。
-模块文件也由 ask_user_tool.py 同步更名为 message_user_tool.py。）
-
-The agent can pause on a ``message_user`` tool call while the Telegram draft
-keeps streaming. A persistent message with an InlineKeyboard collects the
-answer; the resolved value is returned to the original tool call and the same
-agent loop continues.
-
-双用途语义：
-
-- 提问（带 options）：发按钮卡等待用户点选；
-- 给用户发消息（不带 options）：像现实中给同学发一条消息——发送后
-  等待用户自由回复；用户在下一条非命令文本里的任何回复都会作为 custom
-  答案回填工具，原轮次继续（"用户回复了就是正常"）；
-- 超时（默认 2 分钟，ASK_USER_TIMEOUT 可配）：返回 {"type": "expired"}
-  ——含义是"用户当前不在"，不是错误，就像发消息等了两分钟没人回。
-  模型据此结束回合即可，用户回来后的下一次交互会重新建立对话。
-  发消息模式超时后，已发送的消息卡片会被编辑成纯文本正文本身
-  （去掉「📨 助手消息」标题与过期提示），安静地留在聊天记录里。
+message_user 有两种模式：
+1. 普通消息：只发送一条消息并等待用户下一条普通回复；回复会原子地交给
+   原 message_user tool，不会创建新的 agent turn，也不会打断正在等待的轮次。
+2. 交互表单：一个消息里包含多个问题；每题可以单选/多选，可选自定义输入，
+   用户可用上一题/下一题切换，最后进入 Review / Submit 页面。允许只提交已
+   回答的问题，未回答的问题不会出现在最终结果里。
 """
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -36,10 +23,7 @@ import aiohttp
 
 from config import BASE_URL
 from utils import send_rich_html_message
-from markdown_converter import (
-    render_telegram_fragment as convert_markdown_to_telegram_html,
-    render_telegram_block,
-)
+from markdown_converter import render_telegram_fragment as convert_markdown_to_telegram_html, render_telegram_block
 from core.rich_media import _rich_message_html_payload
 from token_budget import truncate_to_token_budget
 
@@ -51,70 +35,84 @@ ASK_USER_OPTION_DESCRIPTION_TOKEN_BUDGET = 64
 ASK_USER_ID_TOKEN_BUDGET = 32
 ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET = 1_000
 MAX_OPTIONS = 8
-# 超时不能太长（如 24h）：一个未回答的 message_user 会把 agent 循环挂起
-# 整整一天，中间所有事件循环资源（chat lock、内存里的消息、模型 prompt
-# cache 等）都不能释放。默认 2 分钟：像现实中给同学发消息——等两分钟
-# 没人回，就是不在；足够用户看到消息并做选择，又不至于让会话僵死。
-# 如需更长等待可通过环境变量 ASK_USER_TIMEOUT 覆盖。
+MAX_QUESTIONS = 8
 INTERACTION_TIMEOUT = int(os.getenv("ASK_USER_TIMEOUT", str(2 * 60)))
 
-
-# ---------- 工具定义 ----------
-# message_user（原 ask_user）：双用途人类交互工具（host 内建工具，不经
-# MCP——依赖宿主的 Telegram 按钮卡与回复等待）。
-# - 提问：带 options，出按钮卡等用户选；
-# - 给用户发消息：不带 options，像给同学发一条消息——发送后等用户自由
-#   回复；超时（默认 2 分钟）即"用户不在"（不是错误），已发送的消息
-#   卡片会被简化成纯文本正文留在聊天记录里；用户回复了就是正常。
 MESSAGE_USER_TOOL = {
     "type": "function",
     "function": {
         "name": "message_user",
-        "description": ("Send a message to the user and optionally wait for a reply. "
-            "For a choice question, provide 2-6 options; for a plain message, omit `options`. "
-            "A timeout means the user is away, not an error. Never call more than once in one batch."),
+        "description": (
+            "Send a normal message to the user, or collect answers with one mixed question form. "
+            "Normal message mode uses `message` and waits for the user's next ordinary text reply. "
+            "Form mode uses `questions`: each question can independently be single-select "
+            "(`multiSelect: false`) or multi-select (`multiSelect: true`), every option may have "
+            "a description, and a question may allow custom text input. Questions can be mixed. "
+            "The user can navigate between questions and finally review and submit; unanswered "
+            "questions are omitted from the submitted result. Never call more than once in one batch."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "question": {
+                "mode": {
                     "type": "string",
-                    "minLength": 1, "description": "Message or question to send. Be clear and specific."
+                    "enum": ["message", "form"],
+                    "default": "message",
+                    "description": "message = 普通消息；form = 多问题混合选择表单。",
                 },
-                "options": {
+                "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "普通消息模式要发送的消息。",
+                },
+                "questions": {
                     "type": "array",
-                    "minItems": 2,
-                    "maxItems": 6,
-                    "description": (
-                        "可选的选项列表。提供时渲染为按钮提问卡；完全省略（或空数组）则为"
-                        "给用户发消息模式（纯文本消息，像给朋友发一条消息），等待用户自由"
-                        "文本回复。"
-                    ),
+                    "minItems": 1,
+                    "maxItems": MAX_QUESTIONS,
+                    "description": "混合问题列表；每个问题可独立单选、多选或允许自定义输入。",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "minLength": 1, "description": "Stable option id."},
-                            "label": {"type": "string", "minLength": 1, "description": "Button label."},
-                            "description": {"type": "string", "description": "Optional supporting text."}
+                            "question": {"type": "string", "minLength": 1},
+                            "options": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": MAX_OPTIONS,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string", "minLength": 1},
+                                        "label": {"type": "string", "minLength": 1},
+                                        "description": {"type": "string"},
+                                    },
+                                    "required": ["id", "label"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "multiSelect": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": "false = 单选；true = 多选。",
+                            },
+                            "allowCustom": {
+                                "type": "boolean",
+                                "default": True,
+                                "description": "允许点击“自定义输入”后用文字回答这一题。",
+                            },
                         },
-                        "required": ["id", "label"],
-                        "additionalProperties": False
-                    }
+                        "required": ["question"],
+                        "additionalProperties": False,
+                    },
                 },
-                "multiple": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Allow multiple selections. Only used with `options`."
-                },
-                "allow_custom": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Allow a free-form reply instead of an option."
-                }
+                # Legacy aliases are intentionally accepted at runtime only; schema guides new calls.
+                "question": {"type": "string", "description": "旧版兼容：普通消息文本。"},
+                "options": {"type": "array", "description": "旧版兼容字段。"},
+                "multiple": {"type": "boolean", "description": "旧版兼容：单个问题是否多选。"},
+                "allow_custom": {"type": "boolean", "description": "旧版兼容：是否允许自定义输入。"},
             },
-            "required": ["question"],
-            "additionalProperties": False
-        }
-    }
+            "additionalProperties": False,
+        },
+    },
 }
 
 
@@ -122,19 +120,18 @@ MESSAGE_USER_TOOL = {
 class AskUserInteraction:
     id: str
     chat_id: int
-    question: str
-    options: list[dict[str, str]]
-    multiple: bool
-    allow_custom: bool
-    message_id: int | None = None
+    mode: str
+    message: str = ""
+    questions: list[dict[str, Any]] = field(default_factory=list)
+    current_index: int = 0
+    # question index -> {type: choice/custom, selected: [...]} ; only answered questions are stored
+    answers: dict[int, dict[str, Any]] = field(default_factory=dict)
     selected_indices: set[int] = field(default_factory=set)
-    awaiting_text: bool = False
+    awaiting_custom: bool = False
+    message_id: int | None = None
     created_at: float = field(default_factory=time.time)
     status: str = "waiting"
     future: asyncio.Future | None = None
-
-    def selected_payload(self) -> list[dict[str, str]]:
-        return [self.options[i] for i in sorted(self.selected_indices) if 0 <= i < len(self.options)]
 
 
 _lock = asyncio.Lock()
@@ -162,136 +159,144 @@ def _normalized_options(options: Any) -> list[dict[str, str]]:
     for idx, raw in enumerate(options[:MAX_OPTIONS]):
         if isinstance(raw, str):
             label = truncate_to_token_budget(raw.strip(), ASK_USER_LABEL_TOKEN_BUDGET, suffix="…")
-            oid = f"option_{idx + 1}"
-            desc = ""
+            oid, desc = f"option_{idx + 1}", ""
         elif isinstance(raw, dict):
             label, desc = _option_text(raw)
             oid = truncate_to_token_budget(str(raw.get("id") or f"option_{idx + 1}").strip(), ASK_USER_ID_TOKEN_BUDGET, suffix="…")
         else:
             continue
-        if not label:
-            continue
-        out.append({"id": oid or f"option_{idx + 1}", "label": label, "description": desc})
+        if label:
+            out.append({"id": oid or f"option_{idx + 1}", "label": label, "description": desc})
     return out
 
 
-def _build_keyboard(interaction: AskUserInteraction) -> dict:
-    """Build a compact inline keyboard attached to this question only."""
-    if interaction.awaiting_text:
-        return {
-            "inline_keyboard": [[
-                {
-                    "text": "取消自定义回答",
-                    "callback_data": f"ask:{interaction.id}:cancel",
-                }
-            ]]
-        }
-
-    rows: list[list[dict[str, str]]] = []
-    option_buttons: list[dict[str, str]] = []
-    for idx, option in enumerate(interaction.options):
-        prefix = "✅ " if idx in interaction.selected_indices else ""
-        option_buttons.append({
-            "text": f"{prefix}{option['label']}",
-            "callback_data": f"ask:{interaction.id}:o:{idx}",
+def _normalize_questions(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw[:MAX_QUESTIONS]:
+        if not isinstance(item, dict):
+            continue
+        q = truncate_to_token_budget(str(item.get("question") or "").strip(), ASK_USER_QUESTION_TOKEN_BUDGET, suffix="…")
+        if not q:
+            continue
+        # Accept both the new camelCase spelling and a tolerant snake_case alias.
+        multi = bool(item.get("multiSelect", item.get("multi_select", False)))
+        custom = bool(item.get("allowCustom", item.get("allow_custom", True)))
+        out.append({
+            "question": q,
+            "options": _normalized_options(item.get("options", [])),
+            "multiSelect": multi,
+            "allowCustom": custom,
         })
+    return out
 
-    # Short choices look substantially better in two columns; long labels stay one per row.
-    two_columns = all(len(b["text"]) <= 18 for b in option_buttons) and len(option_buttons) <= 6
-    if two_columns:
-        for i in range(0, len(option_buttons), 2):
-            rows.append(option_buttons[i:i + 2])
+
+def _current_question(interaction: AskUserInteraction) -> dict[str, Any] | None:
+    if 0 <= interaction.current_index < len(interaction.questions):
+        return interaction.questions[interaction.current_index]
+    return None
+
+
+def _load_current_selection(interaction: AskUserInteraction) -> None:
+    interaction.selected_indices.clear()
+    interaction.awaiting_custom = False
+    answer = interaction.answers.get(interaction.current_index)
+    if not answer:
+        return
+    if answer.get("type") == "choice":
+        for item in answer.get("selected", []):
+            if not isinstance(item, dict):
+                continue
+            for i, option in enumerate((_current_question(interaction) or {}).get("options", [])):
+                if option.get("id") == item.get("id"):
+                    interaction.selected_indices.add(i)
+                    break
+    elif answer.get("type") == "custom":
+        interaction.awaiting_custom = True
+
+
+def _build_keyboard(interaction: AskUserInteraction) -> dict:
+    if interaction.mode == "message":
+        return {"inline_keyboard": [[{"text": "Cancel", "callback_data": f"ask:{interaction.id}:cancel"}]]}
+    if interaction.current_index >= len(interaction.questions):
+        rows = []
+        if interaction.questions:
+            rows.append([{"text": "✏️ 修改答案", "callback_data": f"ask:{interaction.id}:review"}])
+        rows.append([{"text": "Submit answers", "callback_data": f"ask:{interaction.id}:submit"}, {"text": "Cancel", "callback_data": f"ask:{interaction.id}:cancel"}])
+        return {"inline_keyboard": rows}
+
+    q = _current_question(interaction) or {}
+    if interaction.awaiting_custom:
+        rows = [[{"text": "← 返回选项", "callback_data": f"ask:{interaction.id}:custom_cancel"}]]
     else:
-        rows.extend([[button] for button in option_buttons])
+        buttons = []
+        for idx, option in enumerate(q.get("options", [])):
+            prefix = "✅ " if idx in interaction.selected_indices else ""
+            buttons.append({"text": f"{prefix}{option['label']}", "callback_data": f"ask:{interaction.id}:o:{idx}"})
+        rows = []
+        if len(buttons) <= 6 and all(len(b["text"]) <= 18 for b in buttons):
+            for i in range(0, len(buttons), 2):
+                rows.append(buttons[i:i + 2])
+        else:
+            rows.extend([[b] for b in buttons])
+        if q.get("allowCustom", True):
+            rows.append([{"text": "✏️ 自定义输入", "callback_data": f"ask:{interaction.id}:custom"}])
 
-    if interaction.multiple:
-        rows.append([{
-            "text": "✅ 提交选择",
-            "callback_data": f"ask:{interaction.id}:submit",
-        }])
-
-    if interaction.allow_custom:
-        rows.append([{
-            "text": "✏️ 自定义回答",
-            "callback_data": f"ask:{interaction.id}:custom",
-        }])
-
-    rows.append([{
-        "text": "取消",
-        "callback_data": f"ask:{interaction.id}:cancel",
-    }])
+    nav = []
+    if interaction.current_index > 0:
+        nav.append({"text": "← 上一题", "callback_data": f"ask:{interaction.id}:prev"})
+    if interaction.current_index < len(interaction.questions) - 1:
+        nav.append({"text": "下一题 →", "callback_data": f"ask:{interaction.id}:next"})
+    else:
+        nav.append({"text": "查看答案 →", "callback_data": f"ask:{interaction.id}:review"})
+    if nav:
+        rows.append(nav)
+    rows.append([{"text": "Cancel", "callback_data": f"ask:{interaction.id}:cancel"}])
     return {"inline_keyboard": rows}
 
 
 def _question_rich_text(question: str) -> str:
-    """把 LLM 提供的 question 文本渲染为块级安全的富文本正文。
-
-    此前整条链路只做纯字符转义（旧的 escape_html）：markdown 语法
-    （**粗体**、`代码`、列表等）原样留在 HTML 里。初始卡片发送时还能靠
-    sendRichMessage 发送前的兜底转换（``_rich_message_html_payload``
-    第 0 步）补救，但回答/超时后的 ``editMessageText`` 路径完全不经过
-    任何转换，用户会看到字面量 "**xx**" 与反引号——即 message 工具的
-    富文本"没有进行 markdown to telegram html 转换" 的现象。
-
-    现在在构造时统一渲染，发送与编辑两个路径渲染结果一致：
-
-    直接交给 ``convert_markdown_to_telegram_html``（配合
-    ``wrap_mixed_content_as_blocks`` 把 markdown 列表等块级产物单独
-    成块，避免被包进 ``<p>`` 产生非法嵌套）。
-
-    注意：这里不对 question 预先做逐字符转义。转换器的
-    ``_convert_inline`` 自己就会：识别形如 ``<tag ...>`` 的既有 HTML/
-    Telegram 富文本标签（如 ``<tg-button>``）并原样保留，其余裸露的
-    ``<``、``>``、``&`` 一律转义为实体（前提是文本里含有 markdown
-    语法特征，否则整段直接短路透传，见函数返回前的说明）。若先对
-    整段文本做一次无差别转义，``<tg-button ...>`` 会变成
-    ``&lt;tg-button ...&gt;``，转换器就检测不到"已有标签"，导致按钮
-    之类的富文本标签无法渲染，只能看到转义后的字面量——这正是之前
-    的问题所在。
-    """
-    text = str(question or "")
-    if not text:
-        return ""
-    return render_telegram_block(text)
+    return render_telegram_block(str(question or "")) if str(question or "") else ""
 
 
 def _question_html(interaction: AskUserInteraction) -> str:
-    """构造 message_user 消息卡片 HTML。
-
-    安全修复：question / label / description 均来自 LLM 工具调用参数，
-    不能直接拼进 HTML。三者现在统一走
-    convert_markdown_to_telegram_html：question 走
-    _question_rich_text 的富文本渲染；label / description 是纯文本
-    插值，同样交给该转换器处理裸露的 ``<``、``>``、``&`` 与既有标签。
-
-    已知行为差异（项目已删除独立的 escape_html 转义函数，改为全部
-    复用 markdown 转换器）：若 label/description 恰好不含任何 markdown
-    语法特征，转换器会短路直接原样返回，不转义裸露的 ``<``/``>``/``&``；
-    若其中出现形似 ``<tag>`` 的片段，也会被当作"已有 HTML 标签"保留
-    而非转义。这与旧版 escape_html 逐字符转义的行为不同。
-    """
-    question = _question_rich_text(interaction.question)
-    if not interaction.options:
-        # 发消息模式（给用户发消息）：无需选择，用户直接回复文本即可。
-        # 超时后本卡片会被编辑成只剩纯文本正文（见 wait_for_answer）。
-        return (
-            f"<p>📨 <b>助手消息</b></p>{question}"
-            f"<p><i>直接回复文本即可；长时间不回复本消息会自动过期。</i></p>"
-        )
-    lines = [f"<p>🤔 <b>需要你的确认</b></p>{question}"]
-    lines.append("<ul>")
-    for option in interaction.options:
+    if interaction.mode == "message":
+        return f"<p>💬 <b>普通消息</b></p>{_question_rich_text(interaction.message)}<p><i>直接回复文本即可。</i></p>"
+    if interaction.current_index >= len(interaction.questions):
+        return _review_html(interaction)
+    q = _current_question(interaction) or {}
+    index = interaction.current_index + 1
+    total = len(interaction.questions)
+    lines = [f"<p>📝 <b>问题 {index}/{total}</b></p>{_question_rich_text(q['question'])}"]
+    for option in q.get("options", []):
         label = convert_markdown_to_telegram_html(option.get("label", ""))
-        desc = option.get("description") or ""
-        if desc:
-            lines.append(f"<li><b>{label}</b>：{convert_markdown_to_telegram_html(desc)}</li>")
-        else:
-            lines.append(f"<li><b>{label}</b></li>")
-    lines.append("</ul>")
-    if interaction.multiple:
-        lines.append("<i>可多选，完成后点击“提交选择”；也可以直接回复文字。</i>")
-    else:
-        lines.append("<i>请选择一项，或直接回复文字：</i>")
+        desc = convert_markdown_to_telegram_html(option.get("description", "")) if option.get("description") else ""
+        lines.append(f"<p><b>• {label}</b>{f'<br/><i>{desc}</i>' if desc else ''}</p>")
+    if interaction.awaiting_custom:
+        lines.append("<p><i>请直接发送这一题的回答。</i></p>")
+    elif q.get("options"):
+        mode = "可多选" if q.get("multiSelect") else "单选"
+        lines.append(f"<p><i>{mode}；也可以点击“自定义输入”回答这一题。</i></p>")
+    return "".join(lines)
+
+
+def _review_html(interaction: AskUserInteraction) -> str:
+    lines = ["<p>📋 <b>Review your answers</b></p>"]
+    if len(interaction.answers) < len(interaction.questions):
+        lines.append("<p><i>You have not answered all questions</i></p>")
+    for idx, q in enumerate(interaction.questions):
+        answer = interaction.answers.get(idx)
+        if not answer:
+            continue
+        lines.append(f"<p><b>{_question_rich_text(q['question'])}</b></p>")
+        if answer.get("type") == "choice":
+            labels = [str(x.get("label", "")) for x in answer.get("selected", []) if isinstance(x, dict)]
+            lines.append(f"<p>→ {convert_markdown_to_telegram_html('，'.join(labels))}</p>")
+        elif answer.get("type") == "custom":
+            value = truncate_to_token_budget(str(answer.get("value", "")), ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET, suffix="…")
+            lines.append(f"<p>→ {convert_markdown_to_telegram_html(value)}</p>")
+    lines.append("<p><i>Ready to submit your answers?</i></p>")
     return "".join(lines)
 
 
@@ -301,22 +306,37 @@ def _answer_json(answer: dict[str, Any]) -> str:
 
 async def create_ask_user_interaction(
     chat_id: int,
-    question: str,
-    options: Any,
+    question: str = "",
+    options: Any = None,
     *,
     multiple: bool = False,
     allow_custom: bool = True,
+    mode: str | None = None,
+    message: str | None = None,
+    questions: Any = None,
 ) -> AskUserInteraction:
-    """创建一次 message_user 交互。
-
-    - options 非空：提问卡（按钮选择）；
-    - options 为空：通知模式——不显示选项按钮，用户任意文本直接作为
-      回复回填（awaiting_text 置位）。
-    """
-    question = truncate_to_token_budget(str(question or "").strip(), ASK_USER_QUESTION_TOKEN_BUDGET, suffix="…")
-    if not question:
-        raise ValueError("message_user.question 不能为空")
-    normalized = _normalized_options(options)
+    # New API: explicit mode. Legacy API is translated into the same interaction model.
+    if mode == "form" or questions is not None:
+        normalized_questions = _normalize_questions(questions)
+        if not normalized_questions:
+            raise ValueError("message_user form 至少需要一个有效问题")
+        interaction = AskUserInteraction(id=_new_id(), chat_id=chat_id, mode="form", questions=normalized_questions)
+    elif mode == "message" or message is not None or (not options and question):
+        text = truncate_to_token_budget(str(message if message is not None else question).strip(), ASK_USER_QUESTION_TOKEN_BUDGET, suffix="…")
+        if not text:
+            raise ValueError("message_user.message 不能为空")
+        interaction = AskUserInteraction(id=_new_id(), chat_id=chat_id, mode="message", message=text)
+    else:
+        # Legacy single-question call, now represented as a one-question form.
+        q = _normalize_questions([{
+            "question": question,
+            "options": options or [],
+            "multiSelect": multiple,
+            "allowCustom": allow_custom,
+        }])
+        if not q:
+            raise ValueError("message_user.question 不能为空")
+        interaction = AskUserInteraction(id=_new_id(), chat_id=chat_id, mode="form", questions=q)
 
     async with _lock:
         old_id = _pending_by_chat.get(chat_id)
@@ -326,17 +346,6 @@ async def create_ask_user_interaction(
             if old.future and not old.future.done():
                 old.future.cancel()
             _pending.pop(old_id, None)
-
-        interaction = AskUserInteraction(
-            id=_new_id(),
-            chat_id=chat_id,
-            question=question,
-            options=normalized,
-            multiple=bool(multiple) if normalized else False,
-            allow_custom=bool(allow_custom),
-            # 通知模式：没有选项可点，任何文本回复都作为 custom 答案。
-            awaiting_text=not normalized,
-        )
         interaction.future = asyncio.get_running_loop().create_future()
         _pending[interaction.id] = interaction
         _pending_by_chat[chat_id] = interaction.id
@@ -347,35 +356,17 @@ async def create_ask_user_interaction(
         reply_markup=_build_keyboard(interaction),
         reassert_draft=True,
     )
-    # send_rich_html_message 在 HTTP 200 但解析不到 message_id 时返回 True；
-    # isinstance(True, int) 为真，必须显式排除 bool，否则后续 Telegram API
-    # 收到 message_id=true 必然 400，交互卡永远无法收尾。
     if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0:
         interaction.message_id = message_id
-    else:
-        await cancel_interaction(interaction.id, remove_ui=False)
-        # 发送失败时区分语义：若已触发 403 类永久性错误熔断（用户屏蔽
-        # bot / 账号停用），向模型明确说明"用户收不到任何消息、重试无
-        # 用、结束回合即可"，避免模型在 TIMER 回合里反复重试注定失败的
-        # message_user 调用，白烧 token。
-        try:
-            import proactive
-            if proactive.is_chat_unreachable(chat_id):
-                raise RuntimeError(
-                    "无法送达：该用户当前收不到 bot 的消息（可能已屏蔽 bot 或账号停用）。"
-                    "这不是临时故障，重试也不会成功；请直接结束本回合，不要再调用 message_user。"
-                )
-        except ImportError:
-            pass
-        raise RuntimeError("无法发送 message_user 交互消息")
-    return interaction
+        return interaction
+    await cancel_interaction(interaction.id, remove_ui=False)
+    raise RuntimeError("无法发送 message_user 交互消息")
 
 
 async def get_pending_for_chat(chat_id: int) -> AskUserInteraction | None:
     async with _lock:
         interaction_id = _pending_by_chat.get(chat_id)
-        interaction = _pending.get(interaction_id) if interaction_id else None
-        return interaction
+        return _pending.get(interaction_id) if interaction_id else None
 
 
 async def _clear_pending_unlocked(interaction: AskUserInteraction) -> None:
@@ -389,21 +380,14 @@ async def _clear_pending(interaction: AskUserInteraction) -> None:
         await _clear_pending_unlocked(interaction)
 
 
-# 问答 UI 后续编辑任务的强引用集：事件循环对 task 只持弱引用，
-# 不保存引用的话任务可能被 GC 回收，"已回答/已取消"的界面编辑会
-# 静默丢失；done 回调同时检索异常，避免 "Task exception was never
-# retrieved" 噪声。
 _UI_FOLLOWUP_TASKS: set["asyncio.Task[Any]"] = set()
 
 
 def _spawn_ui_followup(coro: Coroutine[Any, Any, Any]) -> None:
-    """fire-and-forget 地执行问答界面收尾编辑（强引用 + 异常留痕）。"""
-
     def _reap(task: "asyncio.Task[Any]") -> None:
         _UI_FOLLOWUP_TASKS.discard(task)
         if not task.cancelled() and task.exception() is not None:
             logger.warning("问答界面后续编辑失败: %s", task.exception())
-
     task = asyncio.create_task(coro)
     _UI_FOLLOWUP_TASKS.add(task)
     task.add_done_callback(_reap)
@@ -412,64 +396,48 @@ def _spawn_ui_followup(coro: Coroutine[Any, Any, Any]) -> None:
 async def _set_markup(message_id: int | None, chat_id: int, markup: dict | None) -> None:
     if not message_id:
         return
-    payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id}
-    if markup is not None:
-        payload["reply_markup"] = markup
-    else:
-        payload["reply_markup"] = {"inline_keyboard": []}
+    payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": markup or {"inline_keyboard": []}}
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8, connect=3)) as session:
             async with session.post(f"{BASE_URL}/editMessageReplyMarkup", json=payload) as resp:
                 if resp.status != 200:
-                    logger.debug("ask_user editMessageReplyMarkup failed: %s %s", resp.status, (await resp.text())[:200])
-    except Exception as exc:
-        logger.debug("ask_user editMessageReplyMarkup exception: %s", exc)
+                    logger.debug("message_user edit markup failed: %s", (await resp.text())[:200])
+    except Exception:
+        logger.debug("message_user edit markup exception", exc_info=True)
 
 
-async def _edit_question_message(interaction: AskUserInteraction, body_html: str) -> None:
+async def _edit_question_message(interaction: AskUserInteraction, body_html: str, markup: dict | None = None) -> None:
     if not interaction.message_id:
         return
-    # 与所有其他发送路径一致：经 _rich_message_html_payload 构造 payload，
-    # 补上此前缺失的 markdown 兜底转换与媒体清理。此前的裸
-    # {"content", "html"} payload 是 message 工具富文本唯一未走转换的路径。
     payload = {
         "chat_id": interaction.chat_id,
         "message_id": interaction.message_id,
         "rich_message": _rich_message_html_payload(body_html),
-        "reply_markup": {"inline_keyboard": []},
+        "reply_markup": markup or {"inline_keyboard": []},
     }
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8, connect=3)) as session:
             async with session.post(f"{BASE_URL}/editMessageText", json=payload) as resp:
                 if resp.status != 200:
-                    logger.debug("ask_user editMessageText failed: %s %s", resp.status, (await resp.text())[:200])
-    except Exception as exc:
-        logger.debug("ask_user editMessageText exception: %s", exc)
+                    logger.debug("message_user edit text failed: %s", (await resp.text())[:200])
+    except Exception:
+        logger.debug("message_user edit text exception", exc_info=True)
 
 
 def _answered_html(interaction: AskUserInteraction, answer: dict[str, Any]) -> str:
-    """构造回答后的问题卡片 HTML。
+    if interaction.mode == "message":
+        if answer.get("type") == "custom":
+            return f"<p>💬 <b>普通消息</b></p>{_question_rich_text(interaction.message)}<p>→ {convert_markdown_to_telegram_html(str(answer.get('value', '')))}</p>"
+        return _question_rich_text(interaction.message)
+    return _review_html(interaction)
 
-    安全修复：q 来自 LLM 工具参数，selected 选项的 label 同样来自 LLM，
-    custom 的 value 是用户自由文本——都必须 escape，否则任意一方包含
-    HTML 字符都会注入到用户客户端的渲染上下文。
-    """
-    q = _question_rich_text(interaction.question)
-    kind = answer.get("type")
-    if kind == "choice":
-        selected = answer.get("selected") or []
-        labels = [str(item.get("label", "")) for item in selected if isinstance(item, dict)]
-        chosen_raw = "、".join(x for x in labels if x) or "已选择"
-        chosen = convert_markdown_to_telegram_html(chosen_raw)
-        return f"<p>✅ <b>已收到你的选择</b></p>{q}<p><b>{chosen}</b></p>"
-    if kind == "custom":
-        value = truncate_to_token_budget(str(answer.get("value", "")), ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET, suffix="…")
-        return f"<p>✅ <b>已收到你的回答</b></p>{q}<p><blockquote>{convert_markdown_to_telegram_html(value)}</blockquote></p>"
-    if kind == "cancelled":
-        return f"<p>✖️ <b>已取消</b></p>{q}"
-    if kind == "expired":
-        return f"<p>⌛ <b>用户未回复</b>（可能不在线）</p>{q}"
-    return f"<p>✅ <b>已收到回答</b></p>{q}"
+
+async def _finish(interaction: AskUserInteraction, answer: dict[str, Any], *, body: str | None = None) -> None:
+    interaction.status = "answered"
+    if interaction.future and not interaction.future.done():
+        interaction.future.set_result(answer)
+    await _clear_pending_unlocked(interaction)
+    _spawn_ui_followup(_edit_question_message(interaction, body or _answered_html(interaction, answer)))
 
 
 async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: str, action: str, arg: str = "") -> tuple[bool, str]:
@@ -477,99 +445,93 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
         interaction = _pending.get(interaction_id)
         if interaction is None:
             return False, "这个问题已经结束或失效了"
-        # 类型校验：Telegram 偶发会传非数值 chat_id（如 channel post），
-        # 此前直接 int() 会抛 ValueError 让整个 callback 500。先校验。
         try:
-            chat_id_int = int(chat_id) if chat_id is not None else None
-            from_id_int = int(callback_from_id) if callback_from_id is not None else None
+            if int(interaction.chat_id) != int(chat_id) or int(callback_from_id) != int(chat_id):
+                return False, "无权限"
         except (TypeError, ValueError):
             return False, "无效的 chat_id 或 callback_from_id"
-        if chat_id_int is None or from_id_int is None:
-            return False, "无效的 chat_id 或 callback_from_id"
-        if int(interaction.chat_id) != chat_id_int or from_id_int != chat_id_int:
-            return False, "无权限"
         if interaction.status != "waiting":
             return False, "这个问题已经处理过了"
 
+        if interaction.mode == "message":
+            if action == "cancel":
+                await _finish(interaction, {"type": "cancelled"}, body=_question_rich_text(interaction.message))
+                return True, "已取消"
+            return False, "普通消息请直接回复文本"
+
         if action == "o":
+            q = _current_question(interaction) or {}
             try:
                 idx = int(arg)
             except (TypeError, ValueError):
                 return False, "无效选项"
-            if idx < 0 or idx >= len(interaction.options):
+            if idx < 0 or idx >= len(q.get("options", [])):
                 return False, "无效选项"
-            if interaction.multiple:
+            if q.get("multiSelect"):
                 if idx in interaction.selected_indices:
                     interaction.selected_indices.remove(idx)
                 else:
                     interaction.selected_indices.add(idx)
-                markup = _build_keyboard(interaction)
-                notice = "已选择" if idx in interaction.selected_indices else "已取消选择"
-                message_id = interaction.message_id
             else:
-                interaction.status = "answered"
-                answer = {
-                    "type": "choice",
-                    "multiple": False,
-                    "selected": [interaction.options[idx]],
-                }
-                if interaction.future and not interaction.future.done():
-                    interaction.future.set_result(answer)
-                markup = None
-                notice = f"已选择：{interaction.options[idx]['label']}"
-                message_id = interaction.message_id
-                await _clear_pending_unlocked(interaction)
-                _spawn_ui_followup(_edit_question_message(interaction, _answered_html(interaction, answer)))
-                return True, notice
-        elif action == "submit":
-            if not interaction.multiple:
-                return False, "当前问题无需提交"
-            if not interaction.selected_indices:
-                return False, "请至少选择一个选项"
-            interaction.status = "answered"
-            answer = {
-                "type": "choice",
-                "multiple": True,
-                "selected": interaction.selected_payload(),
-            }
-            if interaction.future and not interaction.future.done():
-                interaction.future.set_result(answer)
-            markup = None
-            notice = "已提交选择"
+                interaction.selected_indices = {idx}
+            selected = [q["options"][i] for i in sorted(interaction.selected_indices)]
+            interaction.answers[interaction.current_index] = {"type": "choice", "multiple": bool(q.get("multiSelect")), "selected": selected}
+            markup = _build_keyboard(interaction)
+            body = _question_html(interaction)
             message_id = interaction.message_id
-            await _clear_pending_unlocked(interaction)
-            _spawn_ui_followup(_edit_question_message(interaction, _answered_html(interaction, answer)))
-            return True, notice
-        elif action == "custom":
-            if not interaction.allow_custom:
-                return False, "此问题不支持自定义回答"
-            interaction.awaiting_text = True
+            _spawn_ui_followup(_edit_question_message(interaction, body, markup))
+            return True, "已选择"
+
+        if action == "custom":
+            q = _current_question(interaction) or {}
+            if not q.get("allowCustom", True):
+                return False, "此问题不支持自定义输入"
+            interaction.awaiting_custom = True
             interaction.selected_indices.clear()
             markup = _build_keyboard(interaction)
-            notice = "请直接发送你的回答"
-            message_id = interaction.message_id
-        elif action == "cancel":
-            interaction.status = "cancelled"
-            if interaction.future and not interaction.future.done():
-                interaction.future.set_result({"type": "cancelled"})
-            message_id = interaction.message_id
-            await _clear_pending_unlocked(interaction)
-            _spawn_ui_followup(_edit_question_message(interaction, _answered_html(interaction, {"type": "cancelled"})))
-            return True, "已取消"
-        else:
-            return False, "未知操作"
+            _spawn_ui_followup(_edit_question_message(interaction, _question_html(interaction), markup))
+            return True, "请直接发送这一题的回答"
 
-    _spawn_ui_followup(_set_markup(message_id, interaction.chat_id, markup))
-    return True, notice
+        if action == "custom_cancel":
+            _load_current_selection(interaction)
+            markup = _build_keyboard(interaction)
+            _spawn_ui_followup(_edit_question_message(interaction, _question_html(interaction), markup))
+            return True, "已返回选项"
+
+        if action in {"prev", "next"}:
+            if action == "prev" and interaction.current_index > 0:
+                interaction.current_index -= 1
+            elif action == "next" and interaction.current_index < len(interaction.questions) - 1:
+                interaction.current_index += 1
+            else:
+                return False, "已经在边界"
+            _load_current_selection(interaction)
+            _spawn_ui_followup(_edit_question_message(interaction, _question_html(interaction), _build_keyboard(interaction)))
+            return True, "已切换问题"
+
+        if action == "review":
+            interaction.current_index = len(interaction.questions)
+            _spawn_ui_followup(_edit_question_message(interaction, _review_html(interaction), _build_keyboard(interaction)))
+            return True, "已打开答案预览"
+
+        if action == "submit":
+            # Only answered questions are serialized, exactly matching the review page.
+            submitted = []
+            for idx, answer in sorted(interaction.answers.items()):
+                if 0 <= idx < len(interaction.questions):
+                    submitted.append({"index": idx, "question": interaction.questions[idx]["question"], **answer})
+            result = {"type": "form", "answers": submitted, "answeredCount": len(submitted), "questionCount": len(interaction.questions)}
+            await _finish(interaction, result, body=_review_html(interaction))
+            return True, "已提交答案"
+
+        if action == "cancel":
+            await _finish(interaction, {"type": "cancelled"}, body="<p>✖️ <b>已取消</b></p>")
+            return True, "已取消"
+        return False, "未知操作"
 
 
 async def resolve_text(chat_id: int, text: str) -> bool:
-    """把用户的一条自由文本作为当前 message_user 的回复。
-
-    提问卡与通知卡均适用：只要还有等待中的交互，用户直接打字即视为
-    回复（"用户回复了就是正常"），不再要求先点“自定义回答”按钮。
-    命令（以 / 开头）由上层拦截，不会进入本函数。
-    """
+    """原子消费一条用户文本；成功返回 True，调用方绝不能再创建新 turn。"""
     text = str(text or "").strip()
     if not text:
         return False
@@ -578,44 +540,44 @@ async def resolve_text(chat_id: int, text: str) -> bool:
         interaction = _pending.get(interaction_id) if interaction_id else None
         if not interaction or interaction.status != "waiting":
             return False
-        interaction.status = "answered"
+        if interaction.mode == "form":
+            q = _current_question(interaction)
+            if q is None or not interaction.awaiting_custom:
+                return False
+            answer = {"type": "custom", "value": truncate_to_token_budget(text, ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET, suffix="…")}
+            interaction.answers[interaction.current_index] = answer
+            interaction.awaiting_custom = False
+            # Do not auto-submit. Stay on this question so the user can review/navigate.
+            _spawn_ui_followup(_edit_question_message(interaction, _question_html(interaction), _build_keyboard(interaction)))
+            return True
         answer = {"type": "custom", "value": truncate_to_token_budget(text, ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET, suffix="…")}
-        if interaction.future and not interaction.future.done():
-            interaction.future.set_result(answer)
-        await _clear_pending_unlocked(interaction)
-    _spawn_ui_followup(_edit_question_message(interaction, _answered_html(interaction, answer)))
-    return True
+        await _finish(interaction, answer)
+        return True
 
 
 async def wait_for_answer(interaction: AskUserInteraction) -> dict[str, Any]:
-    # 唯一构造点 create_ask_user_interaction 必然已创建 future。
     assert interaction.future is not None
     try:
-        return await asyncio.wait_for(interaction.future, timeout=INTERACTION_TIMEOUT)
+        return await asyncio.wait_for(asyncio.shield(interaction.future), timeout=INTERACTION_TIMEOUT)
     except asyncio.TimeoutError:
-        interaction.status = "expired"
-        if interaction.future and not interaction.future.done():
-            interaction.future.set_result({"type": "expired"})
-        if interaction.options:
-            # 提问卡超时：显示「用户未回复」状态卡。
-            await _edit_question_message(interaction, _answered_html(interaction, {"type": "expired"}))
+        async with _lock:
+            if interaction.status != "waiting":
+                return await asyncio.shield(interaction.future)
+            interaction.status = "expired"
+            if interaction.future and not interaction.future.done():
+                interaction.future.set_result({"type": "expired"})
+            await _clear_pending_unlocked(interaction)
+        if interaction.mode == "message":
+            await _edit_question_message(interaction, _question_rich_text(interaction.message))
         else:
-            # 发消息模式超时：把消息编辑成纯文本正文本身——去掉
-            # 「📨 助手消息」标题与「会自动过期」提示，也不显示
-            # 「用户未回复」状态。就像现实中给同学发消息：等了两分钟
-            # 没人回，消息本身安静地留在聊天记录里就够了。
-            await _edit_question_message(
-                interaction,
-                _question_rich_text(interaction.question),
-            )
-        await _clear_pending(interaction)
+            await _edit_question_message(interaction, _review_html(interaction))
         return {"type": "expired"}
     except asyncio.CancelledError:
-        interaction.status = "cancelled"
-        if interaction.future and not interaction.future.done():
-            interaction.future.cancel()
+        async with _lock:
+            if interaction.status == "waiting":
+                interaction.status = "cancelled"
+                await _clear_pending_unlocked(interaction)
         await _edit_question_message(interaction, _answered_html(interaction, {"type": "cancelled"}))
-        await _clear_pending(interaction)
         raise
 
 
@@ -627,19 +589,15 @@ async def cancel_interaction(interaction_id: str, remove_ui: bool = True) -> Non
         interaction.status = "cancelled"
         if interaction.future and not interaction.future.done():
             interaction.future.cancel()
-        message_id = interaction.message_id
-        chat_id = interaction.chat_id
         await _clear_pending_unlocked(interaction)
+        message_id, chat_id = interaction.message_id, interaction.chat_id
     if remove_ui:
         await _set_markup(message_id, chat_id, None)
 
 
 def answer_to_tool_result(answer: dict[str, Any]) -> str:
-    """把交互结果转成 message_user 工具的 tool 消息内容。"""
     result = dict(answer or {})
     result.setdefault("type", "unknown")
     if result.get("type") == "expired":
-        # "用户不在"语义：明确告诉模型这不是错误，可以结束回合，
-        # 也可以继续做不需要用户参与的事。
         result["note"] = "用户在超时时间内没有回复（用户可能不在）。这不是错误；可结束本回合，用户回来后会再联系。"
     return _answer_json(result)

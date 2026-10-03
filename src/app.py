@@ -889,6 +889,16 @@ async def process_update(data: dict) -> None:
                 await reply_unauthorized(chat_id, msg.get("message_id"))
                 return
 
+            # message_user 回复必须在任何 USER/TIMER 打断逻辑之前原子消费。
+            # 一旦成功，绝不进入 spawn_turn_task；否则普通回复偶发会被当成
+            # 新用户回合，进而取消/保全正在等待 message_user 的原 agent。
+            # 命令已经在上面处理，因此这里安全地把所有非命令文本交给 pending
+            # interaction。resolve_text 自己持有 message_user 锁，避免
+            # get_pending -> resolve_text 两步检查造成竞态。
+            if "text" in msg and not (msg.get("text") or "").startswith("/"):
+                if await resolve_message_user_text(chat_id, msg.get("text", "")):
+                    return
+
             lock = await get_chat_lock(chat_id)
             async with lock:
                 ctx = get_or_init_context(chat_id)
@@ -1329,17 +1339,6 @@ async def process_update(data: dict) -> None:
             if "text" in msg:
                 user_input = msg["text"]
 
-                # 若当前 message_user 正在等待回复，优先把这条消息交给原 agent turn，
-                # 不要启动新的 AI turn。命令仍保留为真正的 bot 指令入口。
-                # 提问卡与通知卡均适用：用户直接打字即视为回复
-                # （"用户回复了就是正常"），无需先点"自定义回答"按钮。
-                pending_ask = await get_pending_for_chat(chat_id)
-                if (
-                    pending_ask
-                    and not user_input.startswith("/")
-                    and await resolve_message_user_text(chat_id, user_input)
-                ):
-                    return
                 if await _handle_text_command(chat_id, msg, user_input):
                     return
                 # 普通文本对话

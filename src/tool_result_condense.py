@@ -463,6 +463,24 @@ def _subagent_model_view(payload: dict) -> str:
 
 def _message_user_answer_view(payload: dict) -> str:
     atype = _clean(payload.get("type", "")).lower() or "unknown"
+    if atype == "form":
+        answers = payload.get("answers")
+        if not isinstance(answers, list) or not answers:
+            return "用户提交了表单，但没有回答任何问题。"
+        lines = ["用户提交了表单答案："]
+        for item in answers:
+            if not isinstance(item, dict):
+                continue
+            q = _clean(item.get("question", ""))
+            if item.get("type") == "custom":
+                a = _clean(item.get("value", ""))
+            else:
+                selected = item.get("selected") or []
+                labels = [_clean(x.get("label", "")) for x in selected if isinstance(x, dict) and _clean(x.get("label", ""))]
+                a = "、".join(labels)
+            if q and a:
+                lines.append(f"{q} → {a}")
+        return "\n".join(lines)
     if atype == "choice":
         selected = payload.get("selected")
         labels = []
