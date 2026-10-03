@@ -1048,6 +1048,25 @@ def _route_done_summary(fn_name: str, result_content: Any) -> str | None:
     return f"Planned a {mode} route{suffix}"
 
 
+_IMAGE_TOOL_NAMES = frozenset({"generate_image", "generate_image_from_text", "edit_image_with_reference"})
+
+
+def image_result_count(fn_name: str, result_content: str) -> int | None:
+    """从图片工具的成功结果里数出实际返回的图片张数（按链接行计）。
+
+    请求张数（num_images）只是意图：供应商可能少给（ModelScope 并发子任务部分失败、
+    R2 部分上传失败），编辑任务也固定只出一张。展示文案必须按真实产出，
+    否则折叠块标题与卡片里的图片数量对不上。非图片工具 / 失败结果返回 None。
+    """
+    if _norm_tool_key(fn_name) not in _IMAGE_TOOL_NAMES:
+        return None
+    text = str(result_content or "")
+    if "✅" not in text:
+        return None
+    n = sum(1 for line in text.splitlines() if line.strip().startswith(("http://", "https://")))
+    return n or None
+
+
 def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str) -> str:
     """生成当前工具完成后的用户可见摘要。"""
     fn_args = fn_args or {}
@@ -1241,16 +1260,19 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
             parts.append(f"{failed_n} failed")
         return ", ".join(parts) if parts else "Presented files"
 
+    # 图片完成态按结果里真实的图片张数（image_result_count）；解析不到（失败文案 /
+    # 非标准结果）才退回请求张数，保证标题与下方卡片里的图片数一致。
     if fn_name == "generate_image_from_text":
-        n = _coerce_positive_int(fn_args.get("num_images"), 1)
+        n = image_result_count(fn_name, result_content) or _coerce_positive_int(fn_args.get("num_images"), 1)
         return "Generated an image" if n == 1 else f"Generated {n} images"
     # 统一图像工具：按 image_url 是否携带区分生成/编辑完成态文案
     # （旧名 edit_image_with_reference 语义固定为编辑，同样走 image_url 判断）。
     if fn_name in ("generate_image", "edit_image_with_reference"):
         is_edit = bool(str(fn_args.get("image_url") or "").strip())
         if is_edit:
-            return "Edited an image"
-        n = _coerce_positive_int(fn_args.get("num_images"), 1)
+            n = image_result_count(fn_name, result_content) or 1
+            return "Edited an image" if n == 1 else f"Edited {n} images"
+        n = image_result_count(fn_name, result_content) or _coerce_positive_int(fn_args.get("num_images"), 1)
         return "Generated an image" if n == 1 else f"Generated {n} images"
     if fn_name == "generate_video":
         return "Generated a video"

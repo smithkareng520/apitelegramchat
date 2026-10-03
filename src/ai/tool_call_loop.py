@@ -333,6 +333,19 @@ async def _run_tool_calls_and_append(
         )
         tool_tasks.append((fn_name, fn_args, tc_id))
 
+    # 同批多个工具：执行是分批屏障（串行逐个 / 并发安全工具成组），没轮到执行
+    # 的卡片先隐藏，run_one 拿到执行权时才显示——用户看到的是第一个工具
+    # 进行中→完成，然后第二个出现，而不是一排同时转圈。第一批会立刻开始执行
+    # 的工具不隐藏（避免闪一下）。
+    _hide = getattr(builder, "hide_tools_until_started", None)
+    if len(tool_tasks) > 1 and _hide is not None:
+        _first_end = 1
+        if tool_tasks[0][0] in CONCURRENT_SAFE_TOOLS:
+            while _first_end < len(tool_tasks) and tool_tasks[_first_end][0] in CONCURRENT_SAFE_TOOLS:
+                _first_end += 1
+        _deferred = [t[2] for t in tool_tasks[_first_end:]]
+        if _deferred:
+            _hide(_deferred)
     # 解耦：非阻塞刷新——工具卡片立即排队上屏，工具执行不等草稿帧发送。
     builder.request_flush()
 
@@ -359,6 +372,10 @@ async def _run_tool_calls_and_append(
         if tools and isinstance(fn_args, dict):
             fn_args, schema_error = normalize_and_validate(fn_name, fn_args, tools)
         async with tool_semaphore:
+            # 拿到执行权才算开始：被隐藏的卡片在此显示出来。
+            _reveal = getattr(builder, "reveal_tool", None)
+            if _reveal is not None:
+                _reveal(tc_id)
             # 图像 / 视频工具不设超时（内部已有轮询超时控制）
             # 子 agent 走 930s 超时（内部默认 900s，用户可配到 1800s）
             # bash 走 310s（内层沙箱 300s + 10s 外层缓冲）
@@ -690,6 +707,42 @@ async def _run_tool_calls_and_append(
     _batch_started: set = set()
     results: list[Any] = [None] * len(tool_tasks)
     _pending_group: dict[int, "asyncio.Future"] = {}
+
+    def _apply_result_ui(idx: int, res: Any) -> None:
+        """把单个工具的结果写进卡片（终态 + 摘要 + 详情）。
+
+        工具一结束就调用，而不是等整批跑完才统一回写：串行批次里先跑完的工具
+        立刻变成 done，用户看到的进度与真实执行一致。幂等——批末统一回写再调一次
+        结果相同，用来兜住取消 / 异常路径漏写的条目。
+        """
+        if isinstance(res, asyncio.CancelledError) or res is None:
+            return
+        try:
+            if isinstance(res, BaseException):
+                _fn, _args, _tid = tool_tasks[idx]
+                _err = f"Exception: tool {_fn} failed - {str(res)[:200]}"
+                builder.update_tool_item(
+                    _tid, f"⚠️ {_fn} failed",
+                    f"<p>{convert_markdown_to_telegram_html(_err)}</p>", status="error")
+                return
+            _fn, _tid, _fmt_summary, _details, _llm, _args, _safe = res
+            _failed = _tool_result_is_failure(_fn, _args, _safe, _details)
+            if _failed:
+                builder.update_tool_item(
+                    _tid, _fmt_summary or (_llm[:100] if len(_llm) > 100 else _llm),
+                    _details, status="error")
+            else:
+                builder.update_tool_item(
+                    _tid, _generate_tool_summary_done(_fn, _args, _safe), _details,
+                    status="done")
+        except Exception:  # noqa: BLE001 - UI 回写失败不能影响工具结果回传
+            logger.debug("工具结果即时回写失败 idx=%s", idx, exc_info=True)
+
+    def _on_group_future_done(idx: int, fut: "asyncio.Future") -> None:
+        if fut.cancelled():
+            return
+        exc = fut.exception()
+        _apply_result_ui(idx, exc if exc is not None else fut.result())
     try:
         idx = 0
         while idx < len(tool_tasks):
@@ -700,6 +753,7 @@ async def _run_tool_calls_and_append(
                     results[idx] = await run_one(fn, args, tid)
                 except Exception as exc:  # noqa: BLE001 - 单个工具异常不影响后续工具
                     results[idx] = exc
+                _apply_result_ui(idx, results[idx])
                 idx += 1
                 continue
             # 连续并发安全工具组：全部启动后统一等待收齐，再进入下一组。
@@ -707,7 +761,9 @@ async def _run_tool_calls_and_append(
             while idx < len(tool_tasks) and tool_tasks[idx][0] in CONCURRENT_SAFE_TOOLS:
                 g_fn, g_args, g_tid = tool_tasks[idx]
                 _batch_started.add(g_tid)
-                _pending_group[idx] = asyncio.ensure_future(run_one(g_fn, g_args, g_tid))
+                _fut = asyncio.ensure_future(run_one(g_fn, g_args, g_tid))
+                _fut.add_done_callback(lambda f, i=idx: _on_group_future_done(i, f))
+                _pending_group[idx] = _fut
                 idx += 1
             outs = await asyncio.gather(*_pending_group.values(), return_exceptions=True)
             for g_idx, out in zip(_pending_group.keys(), outs):
@@ -777,9 +833,7 @@ async def _run_tool_calls_and_append(
             except (IndexError, ValueError):
                 fn_name, fn_args, tc_id = "unknown", {}, f"call_error_{uuid.uuid4().hex[:8]}"
             err_text = f"Exception: tool {fn_name} failed - {str(res)[:200]}"
-            final_summary = f"⚠️ {fn_name} failed"
-            details_html = f"<p>{convert_markdown_to_telegram_html(err_text)}</p>"
-            builder.update_tool_item(tc_id, final_summary, details_html, status="error")
+            _apply_result_ui(idx, res)
             tool_msg = Message.tool_result(tc_id, fn_name, err_text)
             loop_messages.append(tool_msg)
             new_history_entries.append(tool_msg)
@@ -787,18 +841,9 @@ async def _run_tool_calls_and_append(
         # 元组字段顺序: (fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content)
         fn_name, tc_id, formatted_summary, details_html, llm_content, fn_args, safe_content = res
 
-        # 失败工具不进入工具组成功统计。
-        is_error = _tool_result_is_failure(fn_name, fn_args, safe_content, details_html)
-        if is_error:
-            # 优先展示格式化器生成的可读标题；模型上下文仍保留完整的可操作错误文本。
-            final_summary = formatted_summary or (llm_content[:100] if len(llm_content) > 100 else llm_content)
-            status = "error"
-        else:
-            # 成功：使用 _generate_tool_summary_done 生成描述
-            final_summary = _generate_tool_summary_done(fn_name, fn_args, safe_content)
-            status = "done"
-
-        builder.update_tool_item(tc_id, final_summary, details_html, status=status)
+        # 失败工具不进入工具组成功统计；失败 / 成功摘要的取舍见 _apply_result_ui
+        # （工具结束时已即时回写一次，这里是幂等兜底）。
+        _apply_result_ui(idx, res)
 
         # 向 LLM 发送精简后的模型视图（llm_content）：完整输出先经
         # condense_for_model 剔除无价值字段，再进入本轮请求与持久化历史。

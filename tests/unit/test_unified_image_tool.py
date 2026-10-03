@@ -278,13 +278,13 @@ def test_group_summary_distinguishes_generate_and_edit():
     group = {"items": [
         {"id": "1", "type": "generate_image", "status": "done", "fn_args": {}},
     ]}
-    assert b._generate_group_summary(group) == "Generated an image"
+    assert b._generate_group_summary(group) == "Generated image(s)"
 
     group = {"items": [
         {"id": "1", "type": "generate_image", "status": "done",
          "fn_args": {"image_url": "https://x/y.png"}},
     ]}
-    assert b._generate_group_summary(group) == "Edited an image"
+    assert b._generate_group_summary(group) == "Edited image(s)"
 
     # 混合批次：首字母大写规范 + 分别聚合
     group = {"items": [
@@ -292,7 +292,7 @@ def test_group_summary_distinguishes_generate_and_edit():
         {"id": "2", "type": "generate_image", "status": "done",
          "fn_args": {"image_url": "https://x/y.png"}},
     ]}
-    assert b._generate_group_summary(group) == "Generated an image, edited an image"
+    assert b._generate_group_summary(group) == "Generated image(s), edited image(s)"
 
 
 def test_group_summary_legacy_names_aggregate():
@@ -304,7 +304,7 @@ def test_group_summary_legacy_names_aggregate():
         {"id": "2", "type": "edit_image_with_reference", "status": "done",
          "fn_args": {"image_url": "https://x/y.png"}},
     ]}
-    assert b._generate_group_summary(group) == "Generated an image, edited an image"
+    assert b._generate_group_summary(group) == "Generated image(s), edited image(s)"
 
 
 def test_outer_summary_follows_image_url_while_running():

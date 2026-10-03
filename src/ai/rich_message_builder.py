@@ -599,6 +599,40 @@ class RichMessageBuilder:
                 return True
         return False
 
+    def hide_tools_until_started(self, tool_ids) -> None:
+        """同批里还没轮到执行的工具先不渲染（卡片已建但隐藏，不是一种状态）。
+
+        同批多个调用是串行 / 分批执行的：前一个跑完，后一个才开始。建卡时全部
+        上屏会让用户看到一排同时"进行中"的卡片，与执行语义不符。这里把尚未
+        开始的条目标成隐藏，轮到它执行时由 reveal_tool 显示——用户看到的就是
+        「第一个：进行中 → 完成，然后第二个出现：进行中 → 完成」。
+        已进入终态的条目不隐藏。
+        """
+        wanted = set(tool_ids)
+        changed = False
+        for group in self._tool_groups:
+            hit = False
+            for item in group["items"]:
+                if item["id"] in wanted and item.get("status") in ("running", "waiting"):
+                    item["hidden"] = True
+                    hit = True
+            if hit:
+                changed = True
+                self._refresh_outer_summary(group)
+        if changed:
+            self.request_flush(force=False)
+
+    def reveal_tool(self, tool_id: str) -> None:
+        """工具开始执行：显示它的卡片（走到这里时它的进行态摘要已就绪）。"""
+        for group in self._tool_groups:
+            for item in group["items"]:
+                if item["id"] == tool_id:
+                    if item.get("hidden"):
+                        item["hidden"] = False
+                        self._refresh_outer_summary(group)
+                        self.request_flush(force=False)
+                    return
+
     def update_tool_item(self, tool_id: str, summary: str, details_html: str, status: str = "done") -> None:
         for group in self._tool_groups:
             for item in group["items"]:
@@ -606,6 +640,8 @@ class RichMessageBuilder:
                     item["summary"] = summary
                     item["details_html"] = details_html
                     item["status"] = status
+                    # 终态一定要让用户看见（含被预算跳过 / 异常的条目）
+                    item["hidden"] = False
                     self._refresh_outer_summary(group)
                     self.request_flush(force=False)
                     return
@@ -683,8 +719,14 @@ class RichMessageBuilder:
             self.request_flush(force=False)
             return
 
-        active_items = [it for it in items if it["status"] in ("running", "waiting")]
-        target = active_items[-1] if active_items else items[-1]
+        # 只基于可见条目取组标题：还没轮到执行的条目是隐藏的，不参与。
+        visible_items = [it for it in items if not it.get("hidden")]
+        if not visible_items:
+            group["outer_summary"] = ""
+            self.request_flush(force=False)
+            return
+        active_items = [it for it in visible_items if it["status"] in ("running", "waiting")]
+        target = active_items[-1] if active_items else visible_items[-1]
         t = target["type"]
         fn_args = target.get("fn_args", {})
 
@@ -815,13 +857,13 @@ class RichMessageBuilder:
         "public_holidays": ("Looked up holidays", "Looked up holidays for {n} countries"),
         "weather": ("Fetched weather", "Fetched weather for {n} cities"),
         "convert": ("Calculated a result", "Ran {n} calculations"),
-        "generate_image_from_text": ("Generated an image", "Generated {n} images"),
-        "edit_image_with_reference": ("Edited an image", "Edited {n} images"),
+        "generate_image_from_text": ("Generated image(s)", "Generated image(s)"),
+        "edit_image_with_reference": ("Edited image(s)", "Edited image(s)"),
         # 统一图像工具 generate_image：组类型按 image_url 是否携带派生为
         # image_generate / image_edit（见 _get_group_type_for_item），
         # 完成态组摘要据此分别聚合 "Generated" / "Edited"。
-        "image_generate": ("Generated an image", "Generated {n} images"),
-        "image_edit": ("Edited an image", "Edited {n} images"),
+        "image_generate": ("Generated image(s)", "Generated image(s)"),
+        "image_edit": ("Edited image(s)", "Edited image(s)"),
         "generate_video": ("Generated a video", "Generated {n} videos"),
         "ask_user": ("Asked you a question", "Asked you questions"),
         "message_user": ("Messaged you", "Messaged you"),
@@ -1243,7 +1285,8 @@ class RichMessageBuilder:
         self._commit_stream_buffer()
 
     def _build_tool_group_html(self, group: dict) -> str:
-        items = group.get("items", [])
+        # 还没轮到执行的条目不渲染；整组都没有可见条目时整组不出现。
+        items = [it for it in group.get("items", []) if not it.get("hidden")]
         if not items:
             return ""
 

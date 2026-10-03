@@ -369,11 +369,16 @@ class DraftManager:
             elif kind == "group_text":
                 builder.append_to_current_tool_group_text(data.get("text", ""))
         elif etype == EventTypes.TOOL_RESULT:
-            if data.get("_kind") == "preview":
+            kind = data.get("_kind")
+            if kind == "preview":
                 builder.update_tool_preview(
                     data["tool_id"], data.get("preview_html") or "",
                     summary=data.get("summary"),
                 )
+            elif kind == "hide":
+                builder.hide_tools_until_started(data.get("tool_ids") or [])
+            elif kind == "reveal":
+                builder.reveal_tool(data["tool_id"])
             else:
                 builder.update_tool_item(
                     data["tool_id"], data.get("summary") or "",
@@ -492,6 +497,23 @@ class DraftManager:
         self.emit(EventTypes.TOOL_RESULT, {
             "tool_id": tool_id, "summary": summary,
             "details_html": details_html, "status": status,
+        })
+
+    def hide_tools_until_started(self, tool_ids: Any) -> None:
+        """同批里还没轮到执行的工具先不渲染（见 RichMessageBuilder 同名方法）。
+
+        走事件流而不是 ``__getattr__`` 透传：滚动换血期间事件要进缓冲、
+        按序回放到新草稿，直写旧 builder 会随换血丢失，且会与缓冲里
+        尚未回放的 add_tool_item 乱序。
+        """
+        self.emit(EventTypes.TOOL_RESULT, {
+            "_kind": "hide", "tool_ids": list(tool_ids),
+        })
+
+    def reveal_tool(self, tool_id: str) -> None:
+        """工具开始执行：显示它的卡片。"""
+        self.emit(EventTypes.TOOL_RESULT, {
+            "_kind": "reveal", "tool_id": tool_id,
         })
 
     def update_tool_preview(self, tool_id: str, preview_html: str,

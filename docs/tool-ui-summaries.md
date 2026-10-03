@@ -30,8 +30,8 @@
 | maps_text_search | `Searching POIs: {keywords} · {city}`（无 city 则省略） | 同左 | 单次：`Searched POIs: {keywords} · {city} · {n} results` | 单次结果展示实际关键词、城市范围与结果数 |
 | maps_around_search | `Searching nearby: {keywords} · center {lng,lat} · radius {r}` | 同左 | 单次：`Nearby POIs: {keywords} · center {lng,lat} · radius {r} · {n} results` | 单次结果展示关键词、中心坐标、半径与结果数 |
 | maps_search_detail | Fetching POI details | 同左 | Fetched POI details / Fetched details for {n} POIs | Fetched POI details |
-| generate_image · 不带 image_url（文生图） | Generating an image / Generating {n} images | 同左 | Generated an image / Generated {n} images | 同组标题 |
-| generate_image · 带 image_url（编辑） | Editing an image | 同左 | Edited an image | 同组标题 |
+| generate_image · 不带 image_url（文生图） | Generating an image / Generating {n} images（n = 请求张数） | 同左 | **Generated image(s)**（固定文案，不统计，单复同形） | Generated an image / Generated {n} images（n = 该次调用实际返回的图片张数；解析不到链接时才退回请求张数） |
+| generate_image · 带 image_url（编辑） | Editing an image | 同左 | **Edited image(s)**（固定文案，不统计） | Edited an image |
 | generate_video | Generating a video | 同左 | Generated a video / Generated {n} videos | Generated a video |
 | message_user | Waiting for your answer | Waiting for your answer | Messaged you（单复同形） | Selected: {选项…} / User provided a custom answer / User cancelled / User is away (no reply) / User answered |
 | present_files | Presenting file(s) | 同左 | Presented a file / Presented {n} files | Presented file（≤1）/ Presented {n} files |
@@ -96,16 +96,17 @@
 
 单个地图工具调用时，最外层工具组折叠块直接复用该工具的完成态摘要。`maps_geo` 当前公开 schema 主要接收 `address`，但摘要生成器同时兼容 `location` / `coordinates` / `longitude+latitude` 形式，用于反向地理编码或未来参数扩展；`maps_regeocode` 则按坐标查询对象生成 `Reverse geocoded {coordinate} · N matches`。多个地址并行/连续执行时，每个调用各自显示自己的查询对象，不把“输入地址数”和“返回匹配数”混在一个数字里。
 
-## 表3 · 通用规则（适用于所有工具）
+## 表3 · 同批多个工具的展示节奏
 
-| 规则 | 说明 |
-|---|---|
-| 组标题跟随进度 | 运行时组标题取组内**最后一个活跃工具**的文案，批量执行时随进度切换 |
-| 动作型工具实时刷新 | todo / memory 的进行态标题随参数流中的 `action` 实时变化（如 Adding a todo... → Clearing the todo list...） |
-| 完成态大小写 | 组内第一条描述首字母大写，后续全部小写（如 `Ran a command, saved a memory, added a todo`）；无任何豁免 |
-| 完成态聚合 | 成功工具按「组类型」聚合计数；todo / memory 按 action 派生组类型，generate_image 按 image_url 是否携带派生（image_generate / image_edit，对标 text_editor 按 command 派生），toggle 方向与 deliver_reply 是否静默从单块最终摘要回推 |
-| 统一图像工具新旧名 | generate_image 为统一入口（image_url 缺省=文生图、提供=编辑）；旧名 generate_image_from_text / edit_image_with_reference 仍可分发但不再进入工具清单，折叠块文案按各自语义（文生图/编辑）显示，与同名新工具一致 |
-| `description` 优先 | 参数带 `description/_summary` 时，组标题与工具标题（运行时+完成后）优先显示它；现仅 bash 声明；web_search / text_editor / todo / memory / subagent / deliver_reply 始终按规范文案生成 |
-| 单复数 | 组内同类工具 ≥2 时切复数模板；不可数对象的动作（Listed todos / Searched memories 等）单复同形 |
-| "Ran an action" 兜底 | 仅当未知工具名漏过所有分支时出现；当前全部已声明工具均有专属文案 |
-| 展开正文形态 | bash / text_editor / message_user / exchange_rate / deliver_reply 等为 `pre/code` 等宽面板；web_search 为富文本紧凑列表（标题链接 + 域名/时间/评分徽标，**不渲染** `🔍 「query」 引擎 · N/M 条` section 头与摘要 snippet——摘要只进模型上下文，前端多结果累计太长）；images / videos / lens 各 section 仍带头行；todo / memory / subagent / weather 为富文本卡片；图片 / 视频为媒体卡片 |
+同批多个调用按分批屏障模型执行（见 `src/ai/tool_call_loop.py`）：串行工具逐个跑，并发安全工具成组跑。
+前端表现是**逐个出现**：没轮到执行的工具不渲染，轮到它才显示：
+
+1. 第一个工具：进行态 → 完成态
+2. 第二个工具出现：进行态 → 完成态
+3. 依此类推
+
+实现上不是一种状态——条目只有 running / waiting / done / error，另带一个 `hidden` 渲染标志：
+批次开始时，除“第一批会立刻开始执行的工具”外都置 `hidden`，`run_one` 拿到执行权时 `reveal_tool`，
+`update_tool_item` 写入终态时也会取消隐藏（被预算跳过 / 异常的条目因此一定可见）。
+工具结果在每个工具结束时立即回写，不等整批跑完。组标题只基于可见条目；整组都不可见时整组不渲染。
+单工具批次没有隐藏。
