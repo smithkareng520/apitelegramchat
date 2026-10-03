@@ -177,16 +177,11 @@ async def execute_generate_image(
         used_endpoint = "/v1/chat/completions"
 
     def _format_success_links(uploaded_urls: list[str], total_count: int) -> str:
-        """生成图上传 R2 后的统一成功文案（部分生成/上传失败时如实说明实际张数）。"""
+        """生成图上传 R2 后的统一成功文案（部分上传失败时如实说明）。"""
         links = "\n".join(uploaded_urls)
-        actual = len(uploaded_urls)
-        if actual == total_count and actual >= num_images:
-            return f"✅ 已生成 {actual} 张图片。\n图片链接：\n{links}"
-        if actual == total_count:
-            return (f"✅ 已生成 {actual} 张图片（请求 {num_images} 张，其余未能生成）。"
-                    f"\n图片链接：\n{links}")
-        return (f"✅ 已生成 {actual} 张图片（请求 {num_images} 张，部分图片生成或上传失败）。"
-                f"\n图片链接：\n{links}")
+        if len(uploaded_urls) == total_count:
+            return f"✅ 已生成 {total_count} 张图片。\n图片链接：\n{links}"
+        return f"✅ 已生成 {total_count} 张图片（部分图片上传失败）。\n图片链接：\n{links}"
 
     # extra_params 容错：模型偶发传入非 dict（如字符串化 JSON、null）时
     # 静默忽略而非报错中断整次生图——透传参数本身是"锦上添花"，不应

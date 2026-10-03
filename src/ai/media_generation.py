@@ -858,26 +858,6 @@ async def _request_modelscope_multi(
                 status, (detail or "")[:200])
             if first_failure is None:
                 first_failure = (rj, endpoint, detail or "未返回图片", status or 500, req_id)
-    # 补偿重试：并发提交可能触发上游限流/瞬时失败（部分子任务无图）。
-    # 对缺少的张数顺序重试一次（降低并发压力），仍失败再如实少交付。
-    missing = count - len(merged)
-    if missing > 0:
-        await asyncio.sleep(2.0)
-        for _ in range(missing):
-            try:
-                rj, endpoint, detail, status, req_id = await _request_modelscope_native_image(
-                    prompt=prompt, image_urls=image_urls, num_images=1, model=model)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[NativeImage/ModelScope] 补偿重试异常: %s", exc)
-                continue
-            request_id = request_id or req_id
-            items = _extract_image_items(rj, max_items=1) if isinstance(rj, dict) else []
-            if items:
-                merged.extend(items)
-            else:
-                logger.warning(
-                    "[NativeImage/ModelScope] 补偿重试仍无图片: status=%s detail=%s",
-                    status, (detail or "")[:200])
     if not merged:
         return first_failure or (None, endpoint, "未返回图片", 500, request_id)
     if len(merged) < count:

@@ -683,11 +683,7 @@ class RichMessageBuilder:
             self.request_flush(force=False)
             return
 
-        # 组标题优先反映"正在执行"的条目；串行批次里排队等待的条目
-        # （status=waiting）只在没有任何执行中条目时才充当标题来源。
-        running_items = [it for it in items if it["status"] == "running"]
-        active_items = running_items or [
-            it for it in items if it["status"] == "waiting"]
+        active_items = [it for it in items if it["status"] in ("running", "waiting")]
         target = active_items[-1] if active_items else items[-1]
         t = target["type"]
         fn_args = target.get("fn_args", {})
@@ -906,12 +902,6 @@ class RichMessageBuilder:
             return "deliver_reply_silent" if summary.startswith("Skipped") else "deliver_reply"
         return t
 
-    @staticmethod
-    def _image_count_from_summary(summary: Any) -> int:
-        """从条目完成态摘要解析图片张数（"Generated 3 images" → 3，"an image" → 1）。"""
-        m = re.search(r"(\d+)\s+images?", str(summary or ""))
-        return max(1, int(m.group(1))) if m else 1
-
     def _generate_group_summary(self, group: dict) -> str:
         """完成态工具组摘要：成功工具按类型展示，失败工具计入末尾 ``(failed n)``。
 
@@ -931,12 +921,7 @@ class RichMessageBuilder:
             if gtype not in type_counts:
                 type_order.append(gtype)
                 type_counts[gtype] = 0
-            # 图片类按"实际图片张数"聚合：一次调用可产出多张图，
-            # 组标题不能按调用次数写成 "Generated an image"。
-            if gtype in ("image_generate", "image_edit"):
-                type_counts[gtype] += self._image_count_from_summary(item.get("summary"))
-            else:
-                type_counts[gtype] += 1
+            type_counts[gtype] += 1
         # 单工具调用时，外层折叠块直接复用该工具的详细摘要；
         # 这样用户不展开内层也能知道“查了什么 / 在哪里 / 结果如何”。
         if len(done_items) == 1 and failed_count == 0:
