@@ -690,11 +690,39 @@ async def _run_tool_calls_and_append(
     _batch_started: set = set()
     results: list[Any] = [None] * len(tool_tasks)
     _pending_group: dict[int, "asyncio.Future"] = {}
+
+    # 卡片状态与真实执行对齐：工具卡片在模型流式输出参数时就已上屏（running），
+    # 串行批次里排在后面的工具实际还没开始。若都显示"Generating…/Running…"，
+    # 用户会误以为它们在并行执行。因此：批次开始时，不属于首个执行组的工具
+    # 先标成 waiting（卡片显示 Waiting...），真正轮到它们执行时再改回 running。
+    def _mark_tool_status(task_idx: int, status: str) -> None:
+        _fn, _args, _tid = tool_tasks[task_idx]
+        try:
+            builder.update_tool_item(
+                _tid, _generate_initial_tool_summary(_fn, _args), "", status=status)
+        except Exception:
+            logger.debug("_mark_tool_status 内部忽略的异常", exc_info=True)
+
+    def _first_group_end() -> int:
+        """首个执行组的结束位置（不含）：串行工具单独成组，并发安全工具连续成组。"""
+        if not tool_tasks:
+            return 0
+        if tool_tasks[0][0] not in CONCURRENT_SAFE_TOOLS:
+            return 1
+        end = 0
+        while end < len(tool_tasks) and tool_tasks[end][0] in CONCURRENT_SAFE_TOOLS:
+            end += 1
+        return end
+
+    for _qi in range(_first_group_end(), len(tool_tasks)):
+        _mark_tool_status(_qi, "waiting")
     try:
         idx = 0
         while idx < len(tool_tasks):
             fn, args, tid = tool_tasks[idx]
             if fn not in CONCURRENT_SAFE_TOOLS:
+                if idx >= _first_group_end():
+                    _mark_tool_status(idx, "running")
                 _batch_started.add(tid)
                 try:
                     results[idx] = await run_one(fn, args, tid)
@@ -704,8 +732,11 @@ async def _run_tool_calls_and_append(
                 continue
             # 连续并发安全工具组：全部启动后统一等待收齐，再进入下一组。
             _pending_group.clear()
+            _group_needs_running_mark = idx >= _first_group_end()
             while idx < len(tool_tasks) and tool_tasks[idx][0] in CONCURRENT_SAFE_TOOLS:
                 g_fn, g_args, g_tid = tool_tasks[idx]
+                if _group_needs_running_mark:
+                    _mark_tool_status(idx, "running")
                 _batch_started.add(g_tid)
                 _pending_group[idx] = asyncio.ensure_future(run_one(g_fn, g_args, g_tid))
                 idx += 1

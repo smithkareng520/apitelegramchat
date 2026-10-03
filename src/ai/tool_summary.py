@@ -1048,6 +1048,19 @@ def _route_done_summary(fn_name: str, result_content: Any) -> str | None:
     return f"Planned a {mode} route{suffix}"
 
 
+def _actual_image_count(result_content: str, requested: int) -> int:
+    """完成态图片数以工具结果里真实的图片链接数为准（与结果卡片一致）。
+
+    请求 num_images=4 但只成功 3 张（部分失败/上传失败）时，标题不能再按
+    请求数写成 "Generated 4 images"；结果里读不到链接时才回退请求数。
+    """
+    urls = [
+        line for line in str(result_content or "").splitlines()
+        if line.strip().startswith(("http://", "https://"))
+    ]
+    return len(urls) if urls else requested
+
+
 def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str) -> str:
     """生成当前工具完成后的用户可见摘要。"""
     fn_args = fn_args or {}
@@ -1242,7 +1255,7 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         return ", ".join(parts) if parts else "Presented files"
 
     if fn_name == "generate_image_from_text":
-        n = _coerce_positive_int(fn_args.get("num_images"), 1)
+        n = _actual_image_count(result_content, _coerce_positive_int(fn_args.get("num_images"), 1))
         return "Generated an image" if n == 1 else f"Generated {n} images"
     # 统一图像工具：按 image_url 是否携带区分生成/编辑完成态文案
     # （旧名 edit_image_with_reference 语义固定为编辑，同样走 image_url 判断）。
@@ -1250,7 +1263,7 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         is_edit = bool(str(fn_args.get("image_url") or "").strip())
         if is_edit:
             return "Edited an image"
-        n = _coerce_positive_int(fn_args.get("num_images"), 1)
+        n = _actual_image_count(result_content, _coerce_positive_int(fn_args.get("num_images"), 1))
         return "Generated an image" if n == 1 else f"Generated {n} images"
     if fn_name == "generate_video":
         return "Generated a video"
