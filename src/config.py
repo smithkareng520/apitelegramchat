@@ -39,9 +39,6 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # 路径使用 /v1/responses；一个 key 覆盖 LFree 的 Responses 模型，见下方
 # PROVIDERS["lfree"] 与模型定义（"LFREE 中转"注释块）。
 LFREE_API_KEY = os.getenv("LFREE_API_KEY", "")
-# ARTBLOOM 中转（https://api.artbloom.tech）：Claude 原生 Messages 协议，
-# 端点见 PROVIDERS["artbloom"] 与模型定义（"ArtBloom 中转"注释块）。
-ARTBLOOM_API_KEY = os.getenv("ARTBLOOM_API_KEY", "")
 
 
 # ---------- 高德地图 MCP 服务（@amap/amap-maps on ModelScope）----------
@@ -398,17 +395,6 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         endpoint="https://ai.lfree.org/bot/XpBv3okYsbAV/v1",
         api_key_env="LFREE_API_KEY",
     ),
-    "artbloom": ProviderConfig(
-        name="ArtBloom",
-        # Anthropic 原生 Messages 协议中转：endpoint 填根端点，原生客户端
-        # （AsyncAnthropic）自行拼接 /v1/messages（见 api_client._build_native_client）。
-        endpoint="https://api.artbloom.tech",
-        api_key_env="ARTBLOOM_API_KEY",
-        protocol="anthropic_messages",
-        # 中转未公开原生 prompt caching（cache_control）支持，保持关闭；
-        # 实测可用后在模型侧用 supports_prompt_cache=True 开启。
-        supports_prompt_cache=False,
-    ),
 }
 
 
@@ -579,27 +565,6 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "reasoning_max_tokens": None,
         "max_output_tokens": 65536,
         "max_context": 128000,
-    },
-    "artbloom": {
-        # Claude 系模型能力对齐官方 anthropic 厂商默认（视觉/文档输入、
-        # 原生工具调用、200k 上下文）；prompt caching 中转未公开支持，
-        # 保持 False；推理控制参数未公开，一律不发送。
-        "image_input": True,
-        "audio_input": False,
-        "video_input": False,
-        "supports_tools": True,
-        "image_output": False,
-        "document_input": True,
-        "video_output": False,
-        "supports_sampling": True,
-        "supports_prompt_cache": False,
-        "temperature": None,          # None -> 不发送，走供应商默认
-        "top_p": None,                # None -> 不发送，走供应商默认
-        "reasoning_enabled": None,    # 中转未公开推理控制参数，一律不发送
-        "reasoning_effort": None,
-        "reasoning_max_tokens": None,
-        "max_output_tokens": 65536,
-        "max_context": 200000,
     },
 }
 
@@ -1302,18 +1267,6 @@ SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
     protocol="openai_responses",
 )
 
-# -----------------------------------------------------------------------------
-# ArtBloom 中转模型（https://api.artbloom.tech，Claude 原生 Messages 协议）
-# -----------------------------------------------------------------------------
-# 厂商级已声明 protocol="anthropic_messages"，能力（视觉/文档输入、工具
-# 调用、200k 上下文）全部由 _PROVIDER_DEFAULTS["artbloom"] 提供，模型侧
-# 无需重复声明；若实测该网关不支持原生 cache_control / 工具调用，在
-# 模型级单独覆盖 supports_prompt_cache / supports_tools 即可。
-SUPPORTED_MODELS["claude-opus-5-5"] = make_model_config(
-    model_id="claude-opus-5-5",
-    provider="artbloom",
-    temperature=0.5,
-)
 
 
 # ========== 默认模型 ==========
@@ -1818,7 +1771,7 @@ _SENSITIVE_EXACT = {
     "TELEGRAM_BOT_TOKEN", "GLM_API_KEY",
     "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY",
     "XAI_API_KEY", "GROQ_API_KEY", "MODELSCOPE_API_KEY", "AGNES_API_KEY",
-    "LFREE_API_KEY", "ARTBLOOM_API_KEY",
+    "LFREE_API_KEY",
     "R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY",
     "R2_BUCKET_NAME", "R2_REGION",
     "SERPER_API_KEY", "GAODE_MCP_TOKEN",
