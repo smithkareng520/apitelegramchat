@@ -226,8 +226,9 @@ def _build_keyboard(interaction: AskUserInteraction) -> dict:
     if interaction.current_index >= len(interaction.questions):
         rows = []
         if interaction.questions:
-            rows.append([{"text": "✏️ 修改答案", "callback_data": f"ask:{interaction.id}:review"}])
-        rows.append([{"text": "Submit answers", "callback_data": f"ask:{interaction.id}:submit"}, {"text": "Cancel", "callback_data": f"ask:{interaction.id}:cancel"}])
+            # Review 页的“修改答案”直接回到最后一题，继续使用上一题/下一题导航修改。
+            rows.append([{"text": "← 上一题", "callback_data": f"ask:{interaction.id}:prev"}])
+        rows.append([{"text": "Submit→", "callback_data": f"ask:{interaction.id}:submit"}, {"text": "Cancel", "callback_data": f"ask:{interaction.id}:cancel"}])
         return {"inline_keyboard": rows}
 
     q = _current_question(interaction) or {}
@@ -253,7 +254,7 @@ def _build_keyboard(interaction: AskUserInteraction) -> dict:
     if interaction.current_index < len(interaction.questions) - 1:
         nav.append({"text": "下一题 →", "callback_data": f"ask:{interaction.id}:next"})
     else:
-        nav.append({"text": "查看答案 →", "callback_data": f"ask:{interaction.id}:review"})
+        nav.append({"text": "Submit→", "callback_data": f"ask:{interaction.id}:review"})
     if nav:
         rows.append(nav)
     rows.append([{"text": "Cancel", "callback_data": f"ask:{interaction.id}:cancel"}])
@@ -299,9 +300,9 @@ def _question_html(interaction: AskUserInteraction) -> str:
 
 
 def _review_html(interaction: AskUserInteraction) -> str:
-    lines = ["<p>📋 <b>Review your answers</b></p>"]
-    if len(interaction.answers) < len(interaction.questions):
-        lines.append("<p><i>You have not answered all questions</i></p>")
+    # Review/提交后的消息只保留每道已回答问题及其结果，不显示额外的标题、
+    # 未完成提示或“Ready to submit”之类的状态文案。
+    lines = []
     for idx, q in enumerate(interaction.questions):
         answer = interaction.answers.get(idx)
         if not answer:
@@ -313,7 +314,6 @@ def _review_html(interaction: AskUserInteraction) -> str:
         elif answer.get("type") == "custom":
             value = truncate_to_token_budget(str(answer.get("value", "")), ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET, suffix="…")
             lines.append(f"<p>→ {convert_markdown_to_telegram_html(value)}</p>")
-    lines.append("<p><i>Ready to submit your answers?</i></p>")
     return "".join(lines)
 
 
