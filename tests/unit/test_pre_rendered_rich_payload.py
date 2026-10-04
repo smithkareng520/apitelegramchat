@@ -103,3 +103,15 @@ class TestSendRichHtmlMessagePassthrough:
         sig = inspect.signature(send_rich_html_message)
         names = list(sig.parameters)
         assert names.index("pre_rendered") > names.index("chat_id")
+
+
+def test_fallback_helpers_are_treated_as_pre_rendered_html():
+    """结构性 fallback 已经产出 HTML，不应再次经过 Markdown 转换。"""
+    import core.telegram_messaging as tm
+
+    src = inspect.getsource(tm.send_rich_html_message)
+    # 两条 fallback 都必须显式声明 pre_rendered=True：
+    # 1) media demotion 后的 HTML
+    # 2) plain-text fallback 生成的 <p>HTML
+    assert 'media_demoted, pre_rendered=True' in src
+    assert 'plain_html, pre_rendered=True' in src

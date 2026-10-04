@@ -718,6 +718,16 @@ async def send_rich_html_message(
                         return True
                     body = await resp.text()
                     body_lower = body.lower()
+                    # 400 是内容/结构类问题时，必须把服务端原始错误保留下来。
+                    # 过去这里只在最终 fallback 日志里写“content/structure error”，
+                    # 导致线上只能看到“为什么 fallback 了”，却看不到真正的
+                    # RICH_MESSAGE_* 错误码，无法区分 details 深度、空块、按钮、
+                    # 媒体等问题。响应通常很短，截取 2KB 足够诊断且避免刷日志。
+                    if resp.status == 400:
+                        logger.warning(
+                            "sendRichHtmlMessage 400 原始响应（长度=%s）：%s",
+                            len(body), body[:2048],
+                        )
                     # 只有明确的内容错误才进入针对性兜底。网络错误由装饰器重试，
                     # 认证、权限、限流和参数错误不能靠改 HTML 修复，必须原样失败。
                     if resp.status >= 500:
@@ -773,8 +783,11 @@ async def send_rich_html_message(
                         if media_demoted and media_demoted != html_content:
                             media_payload = {
                                 **payload,
+                                # media_demoted 是在已经渲染完成的 HTML 上做结构性
+                                # 降级（<video> -> <a> 等），不是 Markdown 原文。
+                                # 二次 Markdown 转换没有收益，反而可能重解释正文。
                                 "rich_message": _rich_message_html_payload(
-                                    media_demoted, pre_rendered=pre_rendered
+                                    media_demoted, pre_rendered=True
                                 ),
                             }
                             logger.warning(
@@ -811,8 +824,11 @@ async def send_rich_html_message(
                         if plain_html and plain_html != html_content:
                             plain_payload = {
                                 **payload,
+                                # _rich_message_plain_text_fallback 已经把原 HTML
+                                # 变成安全的 <p>/实体 HTML；这里必须标记为
+                                # pre_rendered，禁止发送层再跑一遍 Markdown 转换。
                                 "rich_message": _rich_message_html_payload(
-                                    plain_html, pre_rendered=pre_rendered
+                                    plain_html, pre_rendered=True
                                 ),
                             }
                             logger.warning(
