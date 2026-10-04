@@ -105,24 +105,37 @@ def output_text_from_items(output_items: Iterable[Any]) -> str:
     return "".join(response_item_text(item) for item in (output_items or []))
 
 
-def is_completed_function_call(item: Any) -> bool:
+def is_completed_function_call(item: Any, *, response_completed: bool = False) -> bool:
     """A tool call is executable only once its item is complete.
 
     The status field is optional on some Responses-compatible gateways, so
-    absence is treated as completed. Explicit ``in_progress`` / ``incomplete``
-    calls are never executed.
+    absence is treated as completed. Explicit ``incomplete`` / ``failed`` /
+    ``cancelled`` calls are never executed.
+
+    ``in_progress`` is normally not executable, but translating gateways
+    (chat-completions upstream -> Responses) frequently never flip a
+    function_call item's status once the stream is done. When the *response
+    itself* has already reached ``completed`` the item can no longer be in
+    progress, so ``response_completed=True`` accepts it instead of silently
+    dropping the tool call (which surfaces as an empty AI reply).
     """
     if _get(item, "type") != "function_call":
         return False
     status = _get(item, "status")
-    return status in (None, "", "completed")
+    if status in (None, "", "completed"):
+        return True
+    return bool(response_completed) and status == "in_progress"
 
 
-def response_function_calls_to_chat(output_items: Iterable[Any]) -> list[dict[str, Any]]:
+def response_function_calls_to_chat(
+    output_items: Iterable[Any],
+    *,
+    response_completed: bool = False,
+) -> list[dict[str, Any]]:
     """Project completed Responses function_call items into the executor shape."""
     calls: list[dict[str, Any]] = []
     for item in output_items or []:
-        if not is_completed_function_call(item):
+        if not is_completed_function_call(item, response_completed=response_completed):
             continue
         call_id = str(_get(item, "call_id") or _get(item, "id") or "")
         name = str(_get(item, "name") or "")

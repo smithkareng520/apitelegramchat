@@ -330,27 +330,55 @@ def _error_body_text(exc: BaseException, limit: int = 600) -> str:
     return text[:limit]
 
 
-def _is_empty_input_provider_error(exc: BaseException) -> bool:
-    """Recognize the narrow gateway failure seen on native tool continuation.
+def _is_chain_continuation_rejection(exc: BaseException) -> bool:
+    """工具续轮（previous_response_id + 纯 function_call_output）被网关拒绝。
 
-    A few OpenAI-compatible Responses gateways accept a non-empty native
-    ``function_call_output`` item at the client boundary but drop/flatten it
-    internally, then reject the resulting request with ``input must be
-    non-empty``.  This is *not* a stale ``previous_response_id`` signal.
+    网关/上游对这种续轮的拒绝措辞不固定：``input must be non-empty``、
+    ``Upstream request failed: invalid request``、``invalid_request_error``
+    ……都出现过。靠错误文本匹配会让恢复路径随措辞漂移而失效（模型一换，
+    上游一变，整回合就挂并丢掉已执行的工具结果）。
+
+    因此这里只看状态：任意 4xx 客户端错误（400/404/409/422）。恢复动作
+    ——丢弃 previous_response_id、用本地 canonical history（含
+    function_call 与其 output）全量 bootstrap 重放——是协议内合法且已验证
+    可行的路径，且每个续轮最多重试一次；若 bootstrap 也 400，说明是请求
+    本身有问题，原样上抛。401/403/429/5xx 不属于此类（鉴权、限流、服务
+    端故障与链无关）。
     """
     status = getattr(exc, "status_code", None)
-    if not isinstance(status, int) or status != 400:
-        return False
-    parts: list[str] = [str(exc)]
-    for attr in ("body", "response"):
-        value = getattr(exc, attr, None)
-        if value is not None:
-            try:
-                parts.append(json.dumps(value, ensure_ascii=False, default=str))
-            except Exception:
-                parts.append(str(value))
-    text = " ".join(parts).lower()
-    return "`input` must be non-empty" in text or "input must be non-empty" in text
+    return isinstance(status, int) and status in (400, 404, 409, 422)
+
+
+def _response_items_brief(items: list[Any]) -> list[str]:
+    """响应 output 的形状摘要（type:status），只含结构不含内容。"""
+    out: list[str] = []
+    for item in items:
+        itype = event_field(item, "type", "?")
+        status = event_field(item, "status", None)
+        out.append(f"{itype}:{status}" if status else str(itype))
+    return out
+
+
+def _function_calls_from_stream(tool_call_items: dict[str, dict]) -> list[dict[str, Any]]:
+    """从流式累积器重建 function_call（仅当权威 output 里一个都没有时兜底）。
+
+    部分网关的 ``response.completed.output`` 为空或不含 function_call，
+    只通过 ``output_item.added`` / ``function_call_arguments.*`` 事件下发
+    调用。文本有 delta 累积器兜底，function_call 此前没有——结果是模型
+    明明调了工具，回合却以“AI 响应为空”收场。
+    """
+    calls: list[dict[str, Any]] = []
+    for entry in tool_call_items.values():
+        call_id = str(entry.get("call_id") or "")
+        name = str(entry.get("name") or "")
+        if not call_id or not name:
+            continue
+        calls.append({
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": entry.get("args_json") or "{}"},
+        })
+    return calls
 
 
 # =============================================================================
@@ -566,6 +594,12 @@ async def _agentic_loop_openai_responses_impl(
     # rewrite/replace history entries, so the continuation payload is captured
     # at the wire level instead of being rediscovered through any history diff.
     pending_tool_input_items: list[dict[str, Any]] | None = None
+    # response.created 里的 id（仅诊断）：若与 response.completed 的 id 不一致，
+    # 说明网关在两个事件里给了不同的 id，是链式续轮被拒的头号嫌疑。
+    last_created_response_id: Optional[str] = None
+    # 本轮 function_call 来自流式累积器而非权威 output：服务端保存的 response
+    # 里未必有这些调用，下一请求不能走 previous_response_id 链。
+    calls_from_stream_only = False
 
     for _round in range(MAX_TOOL_CALLS):
         # Compatibility recovery is scoped to THIS tool continuation request,
@@ -573,6 +607,7 @@ async def _agentic_loop_openai_responses_impl(
         # function_call_output cycles, and each rejected native continuation
         # gets at most one canonical Responses bootstrap.
         tool_continuation_retried = False
+        calls_from_stream_only = False
         from skills_runtime import refresh_skill_catalog as _refresh_skill_catalog
         _refresh_skill_catalog(loop_messages, builder, workspace_namespace)
         # instructions 不随 previous_response_id 继承：每轮都从当前
@@ -685,6 +720,7 @@ async def _agentic_loop_openai_responses_impl(
         completed_output_items: list[Any] = []
         completed_item_ids: set[str] = set()
         current_stream_cell = [None]
+        event_counts: dict[str, int] = {}
         response_status: str = ""
         response_error_text: str = ""
         response_terminal = False
@@ -720,6 +756,10 @@ async def _agentic_loop_openai_responses_impl(
                         _conv_state.invalidate_response_chain(
                             chat_id, "previous_response_id_invalid"
                         )
+                    # 工具续轮里命中本分支时，pending 的 function_call_output
+                    # 必须丢弃：bootstrap 从 canonical history 重放（其中已含
+                    # function_call 与其 output），再发一份孤立 output 是错的。
+                    pending_tool_input_items = None
                     sync_ctx.mode = "bootstrap"
                     sync_ctx.response_id = None
                     logger.warning(
@@ -729,29 +769,30 @@ async def _agentic_loop_openai_responses_impl(
                     )
                     continue
 
-                # Compatibility recovery for gateways that advertise native
-                # Responses but drop function_call_output before validating the
-                # request.  The local request was non-empty (guarded above),
-                # so an "input must be non-empty" 400 here is a provider-side
-                # serialization/compatibility failure, not a local empty-input
-                # bug.  Rebuild once from canonical history, including the
-                # assistant function_call and tool result, and deliberately
-                # remove previous_response_id.
+                # 工具续轮（previous_response_id + 纯 function_call_output）
+                # 被网关以 4xx 拒绝。本地请求已通过非空 input 校验，且形状
+                # 符合官方规范，所以这是网关/上游的状态重建失败，不是本地
+                # 空 input bug；措辞不可靠（见 _is_chain_continuation_rejection），
+                # 只按状态码判定。恢复：去掉 previous_response_id，用
+                # canonical history（含 function_call 与其 output）全量
+                # bootstrap 一次，并记住该 (端点, 模型)。
                 if (
-                    pending_tool_input_items is not None
-                    and pending_tool_input_items
+                    pending_tool_input_items
                     and sync_ctx is not None
                     and sync_ctx.mode == "chain"
                     and sync_ctx.response_id
                     and not tool_continuation_retried
-                    and _is_empty_input_provider_error(create_exc)
+                    and _is_chain_continuation_rejection(create_exc)
                 ):
                     tool_continuation_retried = True
-                    # 留下决定性证据：网关原始错误体 + 实际发出的请求形状。
+                    # 留下决定性证据：网关原始错误体 + 实际发出的请求形状
+                    # + 两个事件里的 response id（是否一致）。
                     logger.warning(
-                        "[openai_responses] chat=%s 工具续轮 400 诊断 status=%s body=%s request=%s",
+                        "[openai_responses] chat=%s 工具续轮 %s 被拒，改走 bootstrap 重放 "
+                        "body=%s request=%s created_id=%s used_id=%s",
                         chat_id, getattr(create_exc, "status_code", None),
                         _error_body_text(create_exc), _describe_request_shape(request_kwargs),
+                        last_created_response_id, sync_ctx.response_id,
                     )
                     _conv_state.mark_tool_continuation_chain_unsupported(
                         sync_ctx.vendor_key, current_model
@@ -761,14 +802,8 @@ async def _agentic_loop_openai_responses_impl(
                     sync_ctx.response_id = None
                     if chat_id is not None:
                         _conv_state.invalidate_response_chain(
-                            chat_id, "tool_continuation_input_compatibility"
+                            chat_id, "tool_continuation_rejected"
                         )
-                    logger.warning(
-                        "[openai_responses] chat=%s gateway rejected non-empty "
-                        "function_call_output as empty input; one-time canonical "
-                        "Responses bootstrap retry",
-                        chat_id,
-                    )
                     continue
                 raise
             if sync_ctx is not None:
@@ -779,12 +814,14 @@ async def _agentic_loop_openai_responses_impl(
 
             async for event in iter_async_stream(stream):
                 etype = event_type(event)
+                event_counts[etype] = event_counts.get(etype, 0) + 1
 
                 if etype == "response.created":
                     # Useful for diagnostics; it is not enough to advance the chain.
                     created_response = event_field(event, "response")
                     created_id = event_field(created_response, "id")
                     if created_id:
+                        last_created_response_id = str(created_id)
                         logger.debug(
                             "[openai_responses] chat=%s response.created id=%s",
                             chat_id, created_id,
@@ -934,6 +971,16 @@ async def _agentic_loop_openai_responses_impl(
 
                     if terminal_status == "completed" and response_obj is not None:
                         resolved_response_id = event_field(response_obj, "id") or None
+                        if (
+                            resolved_response_id
+                            and last_created_response_id
+                            and str(resolved_response_id) != last_created_response_id
+                        ):
+                            logger.warning(
+                                "[openai_responses] chat=%s response.created id=%s 与 "
+                                "response.completed id=%s 不一致（网关 id 改写？）",
+                                chat_id, last_created_response_id, resolved_response_id,
+                            )
                         if sync_ctx is not None and resolved_response_id:
                             # A successful bootstrap/recovery response becomes a
                             # normal server-managed chain head immediately. This
@@ -1000,7 +1047,18 @@ async def _agentic_loop_openai_responses_impl(
             if authoritative_content:
                 content_acc = authoritative_content
 
-            tool_calls_list = response_function_calls_to_chat(completed_output_items)
+            tool_calls_list = response_function_calls_to_chat(
+                completed_output_items, response_completed=True
+            )
+            if not tool_calls_list and tool_call_items:
+                tool_calls_list = _function_calls_from_stream(tool_call_items)
+                if tool_calls_list:
+                    calls_from_stream_only = True
+                    logger.warning(
+                        "[openai_responses] chat=%s 权威 output 不含 function_call，"
+                        "已用流式事件累积的 %d 个调用兜底（网关 response.completed.output 不完整）",
+                        chat_id, len(tool_calls_list),
+                    )
             for call in tool_calls_list:
                 args_str = call["function"]["arguments"] or "{}"
                 try:
@@ -1028,6 +1086,15 @@ async def _agentic_loop_openai_responses_impl(
                             call["function"]["name"],
                         )
                 call["function"]["arguments"] = args_str
+
+        # 每轮一行形状摘要：空响应 / 丢工具调用这类问题没有它就只能猜。
+        logger.info(
+            "[openai_responses] chat=%s 响应摘要 status=%s id=%s output=%s "
+            "tool_calls=%d text_len=%d reasoning_len=%d events=%s",
+            chat_id, response_status or "?", resolved_response_id,
+            _response_items_brief(completed_output_items), len(tool_calls_list),
+            len(content_acc), len(reasoning_acc), event_counts,
+        )
 
         builder.end_stream()
 
@@ -1171,6 +1238,21 @@ async def _agentic_loop_openai_responses_impl(
             len(pending_tool_input_items),
             [item.get("call_id") for item in pending_tool_input_items],
         )
+        if calls_from_stream_only and status == "continue" and sync_ctx is not None:
+            # function_call 只存在于流事件里，服务端保存的 response 未必认得
+            # 这些 call_id：不发注定被拒的链式续轮，直接用 canonical history
+            # （含 function_call 与其 output）bootstrap。
+            logger.info(
+                "[openai_responses] chat=%s 调用来自流式兜底，续轮直接 bootstrap", chat_id,
+            )
+            pending_tool_input_items = None
+            sync_ctx.mode = "bootstrap"
+            sync_ctx.response_id = None
+            resolved_response_id = None
+            if chat_id is not None:
+                _conv_state.invalidate_response_chain(
+                    chat_id, "tool_calls_from_stream_only"
+                )
 
         if status == "over_limit":
 
@@ -1236,6 +1318,20 @@ async def _agentic_loop_openai_responses_impl(
             _conv_state.invalidate_response_chain(chat_id, "tool_rounds_exhausted")
 
     final_content = await ensure_final_content(builder, new_history_entries, final_content)
+
+    if not (final_content or "").strip() and resolved_response_id:
+        # 空终局（没有文本、没有工具调用）：本地历史会把这条 user 消息标成
+        # “未回应”，下一条消息将替换而非合并；但服务端链上已经有这条 user
+        # 消息及那个空 response。若照常提交链头，下一轮会在服务端看到重复
+        # 的 user 消息，甚至接在一条悬空的 function_call 之后。作废链，下一
+        # 轮用本地 canonical history bootstrap，两边重新对齐。
+        logger.warning(
+            "[openai_responses] chat=%s 空终局响应，不提交链头并作废 response chain "
+            "(response_id=%s)", chat_id, resolved_response_id,
+        )
+        resolved_response_id = None
+        if chat_id is not None:
+            _conv_state.invalidate_response_chain(chat_id, "empty_final_response")
 
     # ---- Responses response chain：回合结束提交最新 response.id --------
     # 只有 response 真正成功返回并得到有效 response.id 才推进链头（失败

@@ -104,6 +104,36 @@ old_response_id
 错误上抛，不触发 bootstrap。bootstrap 是异常恢复路径，不是常规工作
 模式——平时每一轮绝不偷偷 replay 全历史。
 
+### 例外：工具续轮（`previous_response_id` + 纯 `function_call_output`）
+
+这一类请求被网关/上游以 **任意 4xx（400/404/409/422）** 拒绝时，一律按
+“网关不支持链式续轮”处理，不再匹配错误文本：
+
+- 网关的拒绝措辞随上游而变（`input must be non-empty`、
+  `Upstream request failed: invalid request` ……），文本匹配会让恢复路径
+  在换模型/换上游后失效，整回合失败并丢掉已执行的工具结果。
+- 恢复动作：丢弃 `previous_response_id` 与 pending 的 `function_call_output`，
+  用本地 canonical history（已含 `function_call` 与其 output）bootstrap
+  一次；每个续轮最多一次，bootstrap 也被拒则原样上抛（说明请求本身有问题）。
+- 记住该 `(端点, 模型)`，之后的工具续轮直接 bootstrap；记忆带 30 分钟
+  TTL，到期后重新探测一次链式续轮。
+- 401/403/429/5xx 与链无关，不触发此恢复。
+- 每次触发都会 WARNING 输出网关原始错误体、请求形状、`response.created`
+  与 `response.completed` 的 id，用于定位网关真实原因。
+
+## function_call 的识别与兜底
+
+- 以 `response.completed.output` 为权威来源；整个 response 已 `completed`
+  时，`status=in_progress` 的 function_call 视为已完成（翻译型网关不会回写
+  item 状态），`incomplete/failed/cancelled` 仍不执行。
+- 权威 output 里一个 function_call 都没有、但流事件里累积到了调用时，用
+  累积器兜底执行；此时服务端保存的 response 未必认得这些 `call_id`，续轮
+  直接 bootstrap，不走链。
+- 空终局（无文本、无工具调用）不提交链头并作废链：本地历史会把该 user
+  消息标为未回应，服务端链却已包含它和那个空 response，提交会造成两边错位。
+- 每轮输出一行响应摘要日志（output item 的 type:status、事件计数、文本/
+  reasoning 长度），空响应类问题据此定位。
+
 ## 链失效的显式来源
 
 | 事件 | 处理 | 调用点 |

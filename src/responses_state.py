@@ -235,20 +235,31 @@ def has_active_turns(chat_id: int) -> bool:
 # 网关能力记忆：previous_response_id + 纯 function_call_output 续轮
 # ----------------------------------------------------------------------
 # 官方语义下工具续轮就是 ``previous_response_id`` + ``input=[function_call_output]``。
-# 个别 OpenAI-compatible 网关在自己的转换层里丢掉"孤立"的
-# function_call_output（对应的 function_call 只存在于它自己保存的上一条
-# response 里），随后以 ``input must be non-empty`` 拒绝。这是确定性的
-# 网关行为，同一 (端点, 模型) 上每一轮工具续轮都会复现；记住一次即可，
-# 后续工具续轮直接走 bootstrap 重放，不再白发一个注定 400 的请求。
-_tool_chain_unsupported: set[tuple[str, str]] = set()
+# 个别 OpenAI-compatible 网关（尤其是自行保存 response 状态、再翻译给上游
+# 的中转）会拒绝这种续轮：400 的措辞随上游而变（``input must be
+# non-empty`` / ``invalid request`` / ...），但同一 (端点, 模型) 上会反复
+# 复现。记住一次，后续工具续轮直接走 bootstrap 重放（full replay 靠
+# prompt_cache_key 的隐式前缀缓存，成本可控），不再白发一个注定 400 的请求。
+#
+# 记忆带 TTL：网关/上游会升级或切换路由，永久标记会让一次偶发失败把链式
+# 续轮永远关掉。TTL 到期后重新探测一次链式续轮。
+_TOOL_CHAIN_UNSUPPORTED_TTL = 30 * 60  # 秒，与 prompt cache ttl 同量级
+_tool_chain_unsupported: dict[tuple[str, str], float] = {}
 
 
 def mark_tool_continuation_chain_unsupported(vendor_key: str, model: str) -> None:
-    _tool_chain_unsupported.add((vendor_key, model))
+    _tool_chain_unsupported[(vendor_key, model)] = time.monotonic()
 
 
 def is_tool_continuation_chain_unsupported(vendor_key: str, model: str) -> bool:
-    return (vendor_key, model) in _tool_chain_unsupported
+    key = (vendor_key, model)
+    marked_at = _tool_chain_unsupported.get(key)
+    if marked_at is None:
+        return False
+    if time.monotonic() - marked_at > _TOOL_CHAIN_UNSUPPORTED_TTL:
+        _tool_chain_unsupported.pop(key, None)
+        return False
+    return True
 
 
 def derive_vendor_key(model_info: "ModelConfig") -> str:
