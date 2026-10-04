@@ -38,13 +38,12 @@ class GeminiNativeAdapter(ChatProtocolAdapter):
     ) -> tuple[str | None, Any, list]:
         from ai.gemini_bridge import _agentic_loop_gemini_native
 
-        chat_id = getattr(builder, "chat_id", None)
-        if chat_id is not None:
-            try:
-                from responses_state import mark_legacy_divergence
-                mark_legacy_divergence(chat_id)
-            except Exception:
-                pass
+        from protocols.base import invalidate_responses_chain_for
+
+        # 协议路由到了 Gemini 原生（无服务端会话）：显式作废 Responses
+        # 链头，防止下次切回 Responses 协议时续旧链丢失本回合上下文。
+        invalidate_responses_chain_for(builder)
+
         return await _agentic_loop_gemini_native(
             current_model, messages, builder,
             tools=tools, supports_tools=supports_tools, journal=journal,

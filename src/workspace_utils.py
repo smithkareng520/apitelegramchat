@@ -1,7 +1,6 @@
 # workspace_utils.py
 import asyncio
 import logging
-from pathlib import Path
 from workspace_paths import (
     agent_home, workspace_root, workspace_namespace,
     workspace_upload_root, workspace_download_root,

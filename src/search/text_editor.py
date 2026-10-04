@@ -5,9 +5,7 @@
 """
 
 import os
-import asyncio
 import tempfile
-import mimetypes
 from pathlib import Path
 from typing import cast
 

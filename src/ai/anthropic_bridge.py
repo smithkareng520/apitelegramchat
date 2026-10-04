@@ -52,7 +52,6 @@ from ai.tool_summary import (
 from ai.bridge_common import (
     LiveAssistantSlot,
     SimpleChoice,
-    SimpleFunctionCall,
     SimpleMessage,
     SimpleResponse,
     SimpleToolCall,
@@ -64,14 +63,14 @@ from ai.bridge_common import (
     over_limit_final_summary,
     run_tool_batch,
 )
-from ai.cache_usage import _log_cache_usage
+from ai.cache_usage import _log_cache_usage, usage_num
 
 if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
     from anthropic import AsyncAnthropic
 
 from core.messages import (
-    DocumentBlock, ImageBlock, Message, TextBlock, ToolCallBlock, ToolResultBlock,
+    DocumentBlock, ImageBlock, TextBlock,
     as_message,
 )
 
@@ -442,23 +441,19 @@ def _anthropic_usage_to_openai(usage: Any) -> Optional[dict]:
         logger.debug("_anthropic_usage_to_openai 归一化失败，丢弃 usage", exc_info=True)
         return None
 
-    def _num(value: Any) -> int:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return 0
-        return int(value)
 
-    prompt = (_num(d.get("input_tokens"))
-              + _num(d.get("cache_read_input_tokens"))
-              + _num(d.get("cache_creation_input_tokens")))
-    completion = _num(d.get("output_tokens"))
+    prompt = (usage_num(d.get("input_tokens"))
+              + usage_num(d.get("cache_read_input_tokens"))
+              + usage_num(d.get("cache_creation_input_tokens")))
+    completion = usage_num(d.get("output_tokens"))
     return {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": prompt + completion,
         # 保留缓存明细：cache_usage._extract_cache_usage 可直接读取，
         # anthropic 原生循环的缓存命中率从此可观测。
-        "cache_read_input_tokens": _num(d.get("cache_read_input_tokens")),
-        "cache_creation_input_tokens": _num(d.get("cache_creation_input_tokens")),
+        "cache_read_input_tokens": usage_num(d.get("cache_read_input_tokens")),
+        "cache_creation_input_tokens": usage_num(d.get("cache_creation_input_tokens")),
     }
 
 

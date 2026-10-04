@@ -42,19 +42,15 @@ class OpenAIChatAdapter(ChatProtocolAdapter):
     ) -> tuple[str | None, Any, list]:
         from ai.agentic_loops import _agentic_loop_openai_compat
 
+        from protocols.base import invalidate_responses_chain_for
+
         # Chat Completions 没有等价的服务端会话概念，协议路由到这里
         # 意味着：本回合的问答不在 Responses 服务端 response chain 里。
         # 显式作废 previous_response_id 链头——下次切回 Responses 协议
         # 时以本地全量上下文重新 bootstrap（否则续旧链会静默丢失本回合
         # 上下文）。canonical history 不受影响，Chat Completions 继续按
         # 既有行为全量重发（本协议本就是"无状态 provider"）。
-        chat_id = getattr(builder, "chat_id", None)
-        if chat_id is not None:
-            try:
-                from responses_state import mark_legacy_divergence
-                mark_legacy_divergence(chat_id)
-            except Exception:
-                pass
+        invalidate_responses_chain_for(builder)
         client = cast("AsyncOpenAI", api_client.get_client_for_model(model_info))
         api_label = model_info.provider
         return await _agentic_loop_openai_compat(

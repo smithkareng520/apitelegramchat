@@ -25,6 +25,24 @@ if TYPE_CHECKING:
     from responses_state import TurnState
 
 
+def invalidate_responses_chain_for(builder: "DraftManager") -> None:
+    """非 Responses 协议适配器在写入历史前作废 Responses 链头。
+
+    三个非 Responses 适配器（openai_chat / anthropic_messages /
+    gemini_native）路由到这里意味着本回合问答不在服务端 response
+    chain 里；不作废的话，下次切回 Responses 协议会沿旧链续写，静默
+    丢失本回合上下文。这是纯内存状态操作（responses_state 的进程内
+    dict），不存在可合理忽略的失败模式——异常直接向上传播（导入失败
+    属于部署错误，链头失效失败属于状态机错误，都应当立即暴露而不是
+    静默降级后让下一回合丢上下文）。
+    """
+    from responses_state import mark_legacy_divergence
+
+    chat_id = getattr(builder, "chat_id", None)
+    if chat_id is not None:
+        mark_legacy_divergence(chat_id)
+
+
 class ChatProtocolAdapter(ABC):
     """聊天协议适配器：包一层该协议的 agentic 循环。
 

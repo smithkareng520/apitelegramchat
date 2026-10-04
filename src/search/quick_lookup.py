@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import re
 from urllib.parse import quote
 from typing import Any
 

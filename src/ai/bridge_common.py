@@ -292,9 +292,18 @@ class MediaProgressSlot:
         return self._msg
 
     def complete(self, final_text: str) -> list:
-        """生成成功：占位原地更新为最终历史内容，返回 new_entries 列表。"""
+        """生成成功：占位原地更新为最终历史内容，返回 new_entries 列表。
+
+        必须返回 journal 本体（而非新建 ``[self._msg]``）：调用方
+        update_conversation_and_ledger 会拿 new_msgs 调
+        ``turn_recovery.note_turn_persisted``，后者按列表对象身份注销
+        in-flight 登记；返回新列表则身份永不匹配，登记滞留注册表，
+        回合结束后 drain_completed_turns 会把同一条消息二次持久化进
+        历史（模型看到重复的图片记录）。journal 为 None 时（无登记的
+        独立媒体轮）退回新建列表保底。
+        """
         self._msg.set_text(final_text)
-        return [self._msg]
+        return self._journal if self._journal is not None else [self._msg]
 
     def drop(self) -> None:
         """生成失败：整体移除占位（幂等；保持失败轮替换语义不变）。"""

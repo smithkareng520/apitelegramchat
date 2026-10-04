@@ -230,10 +230,20 @@ async def _execute_tool_for_subagent(
     if name in FORBIDDEN_TOOLS:
         return f"Error: tool '{name}' is forbidden in subagent context."
     try:
-        from tool_executors import dispatch_tool_call, tool_semaphore
+        # dispatch_tool_call 经 _dispatch_capturing_internal_timeout 间接
+        # 使用；此导入同时充当可用性预检（失败直接给出可读错误）。
+        from tool_executors import dispatch_tool_call  # noqa: F401
+        from tool_executors import tool_semaphore
     except Exception as e:
         logger.debug("_execute_tool_for_subagent 内部忽略的异常", exc_info=True)
         return f"Error: cannot import dispatch_tool_call: {e}"
+    # 与主循环 tool_call_loop 同源的超时包装：工具内部（aiohttp / SDK /
+    # MCP 等）抛出的 TimeoutError 不再与外层等待预算混在同一个 except
+    # 分支，避免把外层预算数值套在无关的内部超时上。
+    from ai.tool_call_loop import (
+        _ToolInternalTimeout,
+        _dispatch_capturing_internal_timeout,
+    )
     try:
         # 复用主 agent 同一个全局信号量：多个子 agent 并行运行时，
         # 各自发起的工具调用（web_search / bash 等）仍受总并发上限约束，
@@ -252,7 +262,9 @@ async def _execute_tool_for_subagent(
                 ):
                     exec_timeout = max(SUBAGENT_TOOL_TIMEOUT, int(requested) + 10)
             result = await asyncio.wait_for(
-                dispatch_tool_call(name, arguments or {}, chat_id=chat_id),
+                _dispatch_capturing_internal_timeout(
+                    name, arguments or {}, chat_id=chat_id,
+                ),
                 timeout=exec_timeout,
             )
         # 与主 agent 相同的模型视图精简：子 agent 的单次工具结果预算
@@ -261,8 +273,11 @@ async def _execute_tool_for_subagent(
         from tool_result_condense import condense_for_model
         condensed = condense_for_model(name, arguments or {}, str(result))
         return _truncate(condensed, fn_name=name)
+    except _ToolInternalTimeout as exc:
+        # 工具自身的内部超时（网络/沙箱/MCP），非子 agent 外层预算耗尽。
+        return f"Error: tool '{name}' timed out internally: {exc}"
     except asyncio.TimeoutError:
-        return f"Error: tool '{name}' timed out in subagent context."
+        return f"Error: tool '{name}' timed out in subagent context after {exec_timeout}s."
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -527,10 +542,17 @@ async def _subagent_agentic_loop(
         async def _exec_one(tc_entry: dict) -> tuple[str, str]:
             tc_id = tc_entry["id"]
             fn_name = tc_entry["function"]["name"]
-            try:
-                fn_args = json.loads(tc_entry["function"]["arguments"] or "{}")
-            except json.JSONDecodeError:
-                fn_args = {}
+            # 与主循环同一套参数规范化链：可修复的畸形 JSON 直接修复后
+            # 执行；不可修复的生成诊断信封并回传给子模型自纠——不再
+            # 静默把坏 JSON 丢成 {} 后照常执行（那会让工具在缺参状态下
+            # 给出误导性报错）。
+            from ai.tool_summary import _normalize_tool_arguments
+            normalized, was_corrected, _meta = _normalize_tool_arguments(
+                tc_entry["function"].get("arguments", ""))
+            fn_args = json.loads(normalized)
+            if was_corrected:
+                from ai.json_repair import invalid_arguments_message
+                return tc_id, invalid_arguments_message(fn_name, fn_args)
             result = await _execute_tool_for_subagent(fn_name, fn_args, chat_id)
             return tc_id, result
 
@@ -678,9 +700,7 @@ async def execute_subagent(
 
 
 # ---------- 富文本渲染 ----------
-def _esc(text: Any) -> str:
-    s = "" if text is None else str(text)
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+from core.text_utils import escape_html_text as _esc
 
 
 _HTML_VOID_TAGS = {

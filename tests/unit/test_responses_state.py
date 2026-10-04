@@ -23,7 +23,7 @@ def test_first_turn_bootstraps_then_commit_records_chain_head() -> None:
     assert st.commit_response(
         turn, vendor_key=VENDOR, response_id="resp_a1", model=MODEL_A,
     )
-    ref = st.get_chain()
+    ref = st.chain
     assert ref is not None
     assert ref.response_id == "resp_a1"
     assert ref.model == MODEL_A
@@ -47,7 +47,7 @@ def test_single_chain_pointer_is_overwritten_per_chat() -> None:
     st.commit_response(t1, vendor_key=VENDOR, response_id="resp_a1", model=MODEL_A)
     t2 = st.begin_turn("USER")
     st.commit_response(t2, vendor_key=VENDOR, response_id="resp_a2", model=MODEL_A)
-    assert st.get_chain().response_id == "resp_a2"
+    assert st.chain.response_id == "resp_a2"
 
     prev_id, mode = st.resolve_chain(VENDOR, MODEL_A)
     assert (prev_id, mode) == ("resp_a2", "chain")
@@ -62,7 +62,7 @@ def test_commit_without_response_id_is_rejected() -> None:
     assert not st.commit_response(
         turn, vendor_key=VENDOR, response_id=None, model=MODEL_A,
     )
-    assert st.get_chain() is None
+    assert st.chain is None
 
 
 def test_commit_after_clear_is_rejected_by_generation_fencing() -> None:
@@ -72,7 +72,7 @@ def test_commit_after_clear_is_rejected_by_generation_fencing() -> None:
     assert not st.commit_response(
         turn, vendor_key=VENDOR, response_id="late_resp", model=MODEL_A,
     )
-    assert st.get_chain() is None
+    assert st.chain is None
 
 
 def test_invalidate_chain_forces_bootstrap() -> None:
@@ -84,14 +84,14 @@ def test_invalidate_chain_forces_bootstrap() -> None:
     prev_id, mode = st.resolve_chain(VENDOR, MODEL_A)
     assert prev_id is None
     assert mode.startswith("bootstrap:")
-    assert st.get_chain().invalid_reason == "turn_interrupted_midflight"
+    assert st.chain.invalid_reason == "turn_interrupted_midflight"
 
 
 def test_invalidate_chain_is_idempotent_without_chain() -> None:
     st = rs.ResponseState()
     st.invalidate_chain("whatever")
-    assert st.get_chain() is not None  # 占位 ref，response_id 为空
-    assert st.get_chain().response_id is None
+    assert st.chain is not None  # 占位 ref，response_id 为空
+    assert st.chain.response_id is None
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +105,7 @@ def test_model_switch_breaks_chain_and_bootstraps() -> None:
     prev_id, mode = st.resolve_chain(VENDOR, MODEL_B)
     assert prev_id is None
     assert mode == f"bootstrap:{rs.MODEL_CHANGED}"
-    assert st.get_chain().response_id is None
+    assert st.chain.response_id is None
 
 
 def test_switching_back_does_not_resurrect_old_model_chain() -> None:

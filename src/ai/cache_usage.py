@@ -22,20 +22,38 @@
   降为 DEBUG 不计入命中率统计，并用本轮最近一份带缓存字段的 usage
   快照（cache_hint）尽力补齐，避免把真实命中记成假 0。
 """
-from typing import Any
+from typing import Any, overload
 
 from utils import get_logger
 
 logger = get_logger(__name__)
 
 
-def _num(value: Any) -> int | None:
-    """把 usage 字段安全转 int；bool / 非数值返回 None。"""
+@overload
+def usage_num(value: Any, default: int) -> int: ...
+@overload
+def usage_num(value: Any) -> int: ...
+@overload
+def usage_num(value: Any, default: None) -> int | None: ...
+def usage_num(value: Any, default: int | None = 0) -> int | None:
+    """usage 字段安全转 int：bool / 非数值返回 default。
+
+    三个 bridge 的 usage 归一化（gemini/responses/anthropic）曾各有一份
+    同语义的局部 _num（缺省 0，恒返回 int——归一化结果直接参与算术），
+    与本模块的 None 兜底版本四度重复，现收敛到此唯一实现。overload
+    保证缺省/传 int 时返回 int（与旧局部 _num 契约一致），仅显式传
+    default=None 时返回 Optional（供“字段缺失=未上报”的判别场景）。
+    """
     if isinstance(value, bool):
-        return None
+        return default
     if isinstance(value, (int, float)):
         return int(value)
-    return None
+    return default
+
+
+def _num(value: Any) -> int | None:
+    """把 usage 字段安全转 int；bool / 非数值返回 None。"""
+    return usage_num(value, None)
 
 
 # 三种字段形态的缓存命中字段名（dict 形状与 pydantic model_extra 通用）：

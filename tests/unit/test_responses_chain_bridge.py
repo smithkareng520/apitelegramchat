@@ -237,8 +237,8 @@ async def test_multi_turn_chain_sends_only_new_user_item(_bridge_env):
     }]
     assert first["instructions"] == "sys prompt"
     # response 成功返回 → 链头原子推进
-    assert st.get_chain().response_id == "resp_1"
-    assert st.get_chain().model == _TEST_MODEL
+    assert st.chain.response_id == "resp_1"
+    assert st.chain.model == _TEST_MODEL
 
     # ---- 回合 2：链式续接，input 只带新增 user item ----
     turn2 = st.begin_turn("USER")
@@ -264,7 +264,7 @@ async def test_multi_turn_chain_sends_only_new_user_item(_bridge_env):
         "role": "user",
         "content": [{"type": "input_text", "text": "second question"}],
     }]
-    assert st.get_chain().response_id == "resp_2"
+    assert st.chain.response_id == "resp_2"
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +309,7 @@ async def test_tool_round_continuation_with_previous_response_id(_bridge_env, mo
     }]
     assert continuation["instructions"] == "sys prompt"
     # 回合收尾：最终 response.id 提交为链头。
-    assert st.get_chain().response_id == "resp_final"
+    assert st.chain.response_id == "resp_final"
 
 
 @pytest.mark.asyncio
@@ -353,7 +353,7 @@ async def test_tool_rounds_across_multi_round_chain(_bridge_env, monkeypatch):
     assert client.calls[1]["input"][0]["output"] == "result-1"
     assert client.calls[2]["input"][0]["call_id"] == "call_2"
     assert client.calls[2]["input"][0]["output"] == "result-2"
-    assert st.get_chain().response_id == "resp_final"
+    assert st.chain.response_id == "resp_final"
 
 
 @pytest.mark.asyncio
@@ -403,7 +403,7 @@ async def test_tool_continuation_provider_empty_input_bootstraps_once(_bridge_en
         item.get("type") == "function_call_output" and item.get("call_id") == "call_1"
         for item in retry["input"]
     )
-    assert st.get_chain().response_id == "resp_boot"
+    assert st.chain.response_id == "resp_boot"
 
 
 
@@ -455,7 +455,7 @@ async def test_gateway_empty_input_is_learned_once_then_tool_rounds_skip_chain(_
     assert rs.is_tool_continuation_chain_unsupported(
         rs.derive_vendor_key(SUPPORTED_MODELS[_TEST_MODEL]), _TEST_MODEL
     )
-    assert st.get_chain().response_id == "resp_final"
+    assert st.chain.response_id == "resp_final"
 
 
 @pytest.mark.asyncio
@@ -478,7 +478,7 @@ async def test_truncated_stream_invalidates_chain_and_raises_protocol_error(_bri
             _FakeBuilder(chat_id=424012), api_label="unit-test", tools=[],
             journal=[], workspace_namespace=None, turn=turn,
         )
-    assert st.get_chain().response_id is None
+    assert st.chain.response_id is None
 
 # ---------------------------------------------------------------------------
 # 3. 异常状态：失败不推进链 / stale-ID 只 bootstrap 一次 / 中断断链
@@ -500,7 +500,7 @@ async def test_failed_create_keeps_chain_head(_bridge_env):
             workspace_namespace=None, turn=turn,
         )
     # 请求失败 → 链头保持旧值，绝不推进到不存在的 response。
-    assert st.get_chain().response_id == "resp_prev"
+    assert st.chain.response_id == "resp_prev"
 
 
 class _StaleResponseError(Exception):
@@ -541,7 +541,7 @@ async def test_stale_previous_response_id_bootstraps_once(_bridge_env):
         "role": "user",
         "content": [{"type": "input_text", "text": "hi"}],
     }]
-    assert st.get_chain().response_id == "resp_boot"
+    assert st.chain.response_id == "resp_boot"
 
 
 @pytest.mark.asyncio
@@ -600,7 +600,7 @@ async def test_midstream_failure_after_dispatch_breaks_chain(_bridge_env):
             workspace_namespace=None, turn=turn,
         )
     # 请求已出网后异常：显式断链，下一轮必须 bootstrap。
-    assert st.get_chain().response_id is None
+    assert st.chain.response_id is None
 
 
 @pytest.mark.asyncio
@@ -627,7 +627,7 @@ async def test_generic_4xx_is_not_treated_as_stale_chain(_bridge_env):
         )
     # 普通 4xx 不能证明 previous_response_id 失效：不 bootstrap、不断链。
     assert len(client.script) == 0  # 没有发生第二次请求
-    assert st.get_chain().response_id == "resp_prev"
+    assert st.chain.response_id == "resp_prev"
 
 
 # ---------------------------------------------------------------------------

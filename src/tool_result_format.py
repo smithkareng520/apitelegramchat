@@ -18,6 +18,8 @@ import html
 import json
 import logging
 import re
+
+from core.text_utils import extract_domain
 from typing import List
 
 from tool_dispatch import _TOOL_TIMEOUT_MARKER
@@ -36,10 +38,7 @@ from tool_ui_render import (
     _render_editor_result,
     _render_media_failure_result,
     _render_structured_payload,
-    extract_domain,
 )
-
-import logging
 
 logger = logging.getLogger(__name__)
 

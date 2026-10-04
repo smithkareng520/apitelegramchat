@@ -56,7 +56,9 @@ def _resolved_namespace(chat_id: object, namespace: object | None = None) -> str
         if current:
             return sanitize_namespace(current)
     except Exception:
-        pass
+        # 用户 namespace 解析失败时静默回退 per-chat namespace 会改变
+        # 工作区归属，留 debug 线索（回退本身是安全的既有行为）。
+        logger.debug("get_current_user_namespace 失败，回退 chat namespace", exc_info=True)
     return sanitize_namespace(chat_id)
 
 

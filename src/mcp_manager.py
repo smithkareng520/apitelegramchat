@@ -540,6 +540,14 @@ class _StdioConnection:
                 self._error = asyncio.CancelledError()
             raise
         except BaseException as exc:  # noqa: BLE001 —— 必须唤醒 ensure() 等待者
+            # keeper 是独立 task，不会收到主线程的 KeyboardInterrupt；
+            # 落到这里的基本是启动失败（SDK 缺失 / 连接拒绝 / 脚本崩溃）。
+            # 必须存入 self._error 唤醒 ensure() 等待者，同时留 ERROR 级
+            # 日志——否则 stdio 服务器起不来时唯一线索在等待方的异常里。
+            logger.error(
+                "cp] stdio server %s keeper 异常退出 (scope=%s)",
+                self.display_name, self._scope, exc_info=exc,
+            )
             self._error = exc
         finally:
             self.session = None

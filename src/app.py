@@ -38,10 +38,7 @@ from state import (
     set_current_user_namespace,
     mark_update_processed_if_new,
 )
-from message_user_tool import (
-    get_pending_for_chat,
-    resolve_text as resolve_message_user_text,
-)
+from message_user_tool import resolve_text as resolve_message_user_text
 from file_handlers import download_file
 from workspace_paths import workspace_download_root
 from workspace_utils import _get_workspace_lock
@@ -55,6 +52,10 @@ import app_state
 # 兼容 re-export：tests 与 telegram_polling 经 `app.update_queue` 引用（同一对象，不重赋值）
 from app_state import update_queue as update_queue  # noqa: F401
 from app_state import WEBHOOK_QUEUE_MAXSIZE as WEBHOOK_QUEUE_MAXSIZE  # noqa: F401
+
+# fire-and-forget 任务强引用集：防止启动期 webhook 自愈任务被 GC 提前
+# 回收（asyncio 官方文档要求；done 回调自动清理）。
+_WEBHOOK_SYNC_TASKS: set["asyncio.Task"] = set()
 
 # 进程级加固（幂等，fail-open）：关闭 bot 主进程的 dumpable，
 # 使同 uid 的沙箱子进程无法读 /proc/<bot>/environ（内含全部平台密钥）。
@@ -415,8 +416,11 @@ async def _startup_sync_webhook() -> None:
         "建议改用 INGEST_MODE=polling。"
     )
     # fire-and-forget：不阻塞 /health 就绪；内部自带单请求超时与总死线，
-    # 任何失败都只降级为"沿用上一次注册"。
-    asyncio.create_task(run_sync_with_deadline())
+    # 任何失败都只降级为"沿用上一次注册"。持强引用防止任务被 GC 提前
+    # 回收（asyncio 官方文档要求 fire-and-forget 任务也须保存引用）。
+    task = asyncio.create_task(run_sync_with_deadline())
+    _WEBHOOK_SYNC_TASKS.add(task)
+    task.add_done_callback(_WEBHOOK_SYNC_TASKS.discard)
 
 
 @app.after_serving

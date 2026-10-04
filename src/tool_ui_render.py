@@ -865,11 +865,6 @@ def _render_editor_result(command: str, path: str, result_str: str, arguments: d
     output = _editor_result_summary(result_str)
     return _render_editor_quote("Input", input_value) + _render_editor_quote("Output", output)
 
-def extract_domain(url: str) -> str:
-    if not url:
-        return "unknown"
-    parsed = urlparse(url)
-    return parsed.netloc or parsed.path.split('/')[0]
 
 # =====================================================================
 # Persistent runtime state

@@ -226,16 +226,6 @@ _media_model_check_callback: Optional[Callable[[int], bool]] = None
 _authorized_check_callback: Optional[Callable[[int], bool]] = None
 
 
-def is_chat_unreachable(chat_id: int) -> bool:
-    """该 chat 是否因 403 类永久性发送失败被熔断（用户屏蔽 bot 等）。
-
-    供发送失败后的上层（如 message_user 卡片发送失败）判断：向模型报告
-    “用户收不到消息”而非笼统的发送异常，避免模型反复重试注定失败的
-    message_user 调用。用户产生真实活动后由 note_user_activity 解除。
-    """
-    return chat_id in _unreachable_chats
-
-
 def register_turn_runner(cb: Callable[[int], Awaitable[None]]) -> None:
     """注册 TIMER 回合执行器（app._handle_timer_wakeup）。"""
     global _turn_runner_callback
@@ -689,14 +679,17 @@ async def interrupt_proactive_flow(chat_id: int) -> bool:
 
     if not task.done():
         task.cancel()
-        try:
-            await asyncio.wait_for(task, timeout=2.0)
-        except asyncio.TimeoutError:
+        # asyncio.wait（而非 wait_for）：TIMER 回合以 CancelledError 结束
+        # 属预期路径，wait 不会把它误当成打断流程自身的取消；打断流程
+        # 自身被取消时 CancelledError 照常向上传播，继续保全流程。
+        done, pending = await asyncio.wait({task}, timeout=2.0)
+        if pending:
             logger.warning("[proactive] chat=%s TIMER 回合取消超时（>2s），继续保全", chat_id)
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.debug("[proactive] chat=%s TIMER 回合取消时出现异常", chat_id, exc_info=True)
+        elif not task.cancelled() and task.exception() is not None:
+            logger.debug(
+                "[proactive] chat=%s TIMER 回合取消时出现异常", chat_id,
+                exc_info=task.exception(),
+            )
 
     # 旧任务已停止：轮次日志保全（只处理该任务对应的登记；
     # 仍在运行的 USER 回合登记不受影响）。

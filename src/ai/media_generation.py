@@ -2376,8 +2376,10 @@ async def _request_openrouter_video(
 # 以下两个出口只按任务与模型协议发请求并解析，不再做任何
 # "看到参考图 = edit"式的端点猜测。
 #   - _request_openai_images_task        -> /images/{generations,edits}
-#     （operation=edit 且带参考图 -> 官方 multipart /images/edits，
-#      路由未实现时按既有鲁棒性回退 JSON /images/generations + image 字段；
+#     （operation=edit 且带参考图 -> 官方 multipart /images/edits；
+#      编辑端点不可用时明确报错、绝不回退 /images/generations——把编辑
+#      降级成文生图是 2026-09-08 生产事故的"假成功"根因，见
+#      _request_openai_images_task 内的 NO fallback 分支；
 #      operation=generate -> /images/generations；ModelScope 一律
 #      /images/generations + 异步任务轮询，无 /images/edits 端点）
 #   - _request_chat_modalities_image_task -> chat.completions + modalities

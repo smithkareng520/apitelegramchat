@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 # 任务操作类型：显式声明，不再从"有没有图片"反推。
 ImageOperation = Literal["generate", "edit"]

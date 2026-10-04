@@ -160,8 +160,12 @@ Block = (
 )
 
 
-def _parse_arguments(raw: Any) -> dict:
-    """工具调用参数容错解析：dict 直通，JSON 字符串解析，失败回 {}。"""
+def parse_tool_arguments(raw: Any) -> dict:
+    """工具调用参数容错解析：dict 直通，JSON 字符串解析，失败回 {}。
+
+    历史窗口 / 工具压缩 / 消息模型三处曾各有一份同语义实现，现收敛到
+    此唯一出口（均属"读取工具参数做展示或裁剪"的非执行层场景）。
+    """
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str) and raw.strip():
@@ -245,7 +249,7 @@ class Message:
             blocks.append(ToolCallBlock(
                 id=str(tc.get("id") or "") if isinstance(tc, dict) else "",
                 name=str(fn.get("name") or ""),
-                arguments=_parse_arguments(fn.get("arguments")),
+                arguments=parse_tool_arguments(fn.get("arguments")),
                 extra=extra,
             ))
         return cls(role="assistant", blocks=blocks)
@@ -409,7 +413,7 @@ class Message:
                 blocks.append(ToolCallBlock(
                     id=str(tc.get("id") or ""),
                     name=str(fn.get("name") or ""),
-                    arguments=_parse_arguments(fn.get("arguments")),
+                    arguments=parse_tool_arguments(fn.get("arguments")),
                     extra=extra,
                 ))
             return cls(role="assistant", blocks=blocks, meta=meta)

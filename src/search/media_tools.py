@@ -1,14 +1,11 @@
 """媒体生成工具：generate_image（统一生成/编辑）/ generate_video（自 search_engine.py 拆出）。"""
 
-import asyncio
-import base64
-import re
 import uuid
 from typing import Any, Optional, cast
 
 import aiohttp
 
-from config import OPENROUTER_API_KEY, SUPPORTED_MODELS, get_openrouter_provider_preferences
+from config import SUPPORTED_MODELS, get_openrouter_provider_preferences
 from s3_utils import upload_bytes_to_r2
 from chat_actions import chat_action_scope
 from ai.media_generation import _upload_generated_images_to_r2

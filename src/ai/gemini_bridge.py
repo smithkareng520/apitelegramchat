@@ -64,7 +64,7 @@ from chat_actions import start_chat_action, stop_chat_action
 from ai._constants import MAX_TOOL_CALLS, STREAM_CLIENT_TIMEOUT, STREAM_READ_BUFSIZE
 from ai.errors import AIResponseParseError, AIStreamTimeoutError
 from ai.streaming import iter_async_stream
-from ai.cache_usage import _log_cache_usage
+from ai.cache_usage import _log_cache_usage, usage_num
 from ai.tool_summary import (
     _contains_textual_tool_call,
     _generate_action_description,
@@ -89,7 +89,7 @@ if TYPE_CHECKING:
 
 from core.messages import (
     AudioBlock, DocumentBlock, ImageBlock, Message, TextBlock, ToolCallBlock,
-    ToolResultBlock, VideoBlock, as_message,
+    VideoBlock, as_message,
 )
 
 logger = get_logger(__name__)
@@ -615,22 +615,17 @@ def _gemini_usage_to_openai(usage_meta: Any) -> Optional[dict]:
     if not isinstance(usage_meta, dict):
         return None
 
-    def _num(value: Any) -> int:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return 0
-        return int(value)
-
-    prompt = _num(usage_meta.get("promptTokenCount"))
-    candidates = _num(usage_meta.get("candidatesTokenCount"))
-    thoughts = _num(usage_meta.get("thoughtsTokenCount"))
-    cached = _num(usage_meta.get("cachedContentTokenCount"))
+    prompt = usage_num(usage_meta.get("promptTokenCount"))
+    candidates = usage_num(usage_meta.get("candidatesTokenCount"))
+    thoughts = usage_num(usage_meta.get("thoughtsTokenCount"))
+    cached = usage_num(usage_meta.get("cachedContentTokenCount"))
     if not prompt and not candidates and not thoughts:
         return None
     return {
         "prompt_tokens": prompt,
         # 思考 token 属于输出侧计费（与 OpenAI reasoning token 口径一致）。
         "completion_tokens": candidates + thoughts,
-        "total_tokens": _num(usage_meta.get("totalTokenCount"))
+        "total_tokens": usage_num(usage_meta.get("totalTokenCount"))
                         or prompt + candidates + thoughts,
         "prompt_tokens_details": {"cached_tokens": cached},
     }

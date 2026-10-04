@@ -97,9 +97,6 @@ class ResponseState:
     # ------------------------------------------------------------------
     # Responses response-chain 状态
     # ------------------------------------------------------------------
-    def get_chain(self) -> Optional[ResponseChainRef]:
-        return self.chain
-
     def invalidate_chain(self, reason: str) -> None:
         """作废当前链头（幂等）。
 

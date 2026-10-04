@@ -21,6 +21,25 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# ---------- 媒体标签解析共享 helper ----------
+# 原先在三个函数体内各嵌一份逐字相同的 _extract_src / _is_valid_url
+# （纯函数、无闭包捕获），现提升到模块级。
+
+def _extract_media_src(tag_text: str) -> str:
+    """从单个 <img>/<video>/<audio> 标签文本中提取 src 属性值。"""
+    m = re.search(r'\bsrc\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))',
+                  tag_text, re.IGNORECASE)
+    if not m:
+        return ""
+    return (m.group(2) or m.group(3) or m.group(4) or "").strip()
+
+
+def _is_valid_media_url(url: str) -> bool:
+    """媒体 src 只接受绝对 http(s) URL（相对路径/base64 一律剥离）。"""
+    u = (url or "").strip().lower()
+    return bool(u) and u.startswith(("http://", "https://"))
+
+
 def _rich_message_html_payload(html_content: str, *, pre_rendered: bool = False) -> dict:
     """构造符合 InputRichMessage 规范的 HTML 富消息。
 
@@ -179,17 +198,6 @@ def _strip_invalid_media_urls(html_content: str) -> str:
     """
     if not html_content:
         return ""
-    def _extract_src(tag_text: str) -> str:
-        m = re.search(r'\bsrc\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))',
-                      tag_text, re.IGNORECASE)
-        if not m:
-            return ""
-        return (m.group(2) or m.group(3) or m.group(4) or "").strip()
-
-    def _is_valid_url(url: str) -> bool:
-        u = (url or "").strip().lower()
-        return bool(u) and u.startswith(("http://", "https://"))
-
     # 先处理容器型 <video>...</video> / <audio>...</audio>：
     # 起始标签 src 非法时，连同内部内容一起删掉。
     def _strip_container(text: str, tag: str) -> str:
@@ -200,8 +208,8 @@ def _strip_invalid_media_urls(html_content: str) -> str:
 
         def _check(m: re.Match) -> str:
             block = m.group(0)
-            src = _extract_src(block)
-            if _is_valid_url(src):
+            src = _extract_media_src(block)
+            if _is_valid_media_url(src):
                 return block  # 合法 URL，保留
             return ""  # 非法 URL，整块删除
 
@@ -215,8 +223,8 @@ def _strip_invalid_media_urls(html_content: str) -> str:
     def _strip_img(text: str) -> str:
         def _check(m: re.Match) -> str:
             block = m.group(0)
-            src = _extract_src(block)
-            if _is_valid_url(src):
+            src = _extract_media_src(block)
+            if _is_valid_media_url(src):
                 return block
             return ""
         # <img ...> 不一定有自闭合斜杠，统一处理
@@ -519,12 +527,6 @@ def _demote_specific_media_url(html_content: str, media_kind: str, target_url: s
     if not html_content or not target_url:
         return html_content
     
-    def _extract_src(tag_text: str) -> str:
-        m = re.search(r'\bsrc\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))', tag_text, re.IGNORECASE)
-        if not m:
-            return ""
-        return (m.group(2) or m.group(3) or m.group(4) or "").strip()
-    
     def _norm_url(url: str) -> str:
         # 归一化后比较：容忍上游 src 已做 & → &amp; 转义导致的形式差异
         return html.unescape((url or "").strip())
@@ -543,7 +545,7 @@ def _demote_specific_media_url(html_content: str, media_kind: str, target_url: s
             return m.group(0)
         
         block = mm.group(0)
-        src = _extract_src(block)
+        src = _extract_media_src(block)
         
         # 只处理目标 URL
         if _norm_url(src) != _norm_url(target_url):
@@ -576,7 +578,7 @@ def _demote_specific_media_url(html_content: str, media_kind: str, target_url: s
         
         def _check(mm: re.Match) -> str:
             block = mm.group(0)
-            src = _extract_src(block)
+            src = _extract_media_src(block)
             if src and _norm_url(src) == _norm_url(target_url):
                 removed_anchors.append(_build_demoted_anchor(src))
                 return ""  # 从容器内移除
@@ -605,7 +607,7 @@ def _demote_specific_media_url(html_content: str, media_kind: str, target_url: s
     
     def _replace_bare(m: re.Match) -> str:
         block = m.group(0)
-        src = _extract_src(block)
+        src = _extract_media_src(block)
         
         # 只处理目标 URL
         if _norm_url(src) != _norm_url(target_url):
@@ -739,17 +741,6 @@ def _demote_all_media_to_links(
     if media_kinds is not None:
         media_kinds = {str(kind).lower() for kind in media_kinds}
 
-    def _extract_src(tag_text: str) -> str:
-        m = re.search(r'\bsrc\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))',
-                      tag_text, re.IGNORECASE)
-        if not m:
-            return ""
-        return (m.group(2) or m.group(3) or m.group(4) or "").strip()
-
-    def _is_valid_url(url: str) -> bool:
-        u = (url or "").strip().lower()
-        return bool(u) and u.startswith(("http://", "https://"))
-
     def _strip_inner_tags(inner: str) -> str:
         """去掉 inner 里所有 <video>/<audio>/<img>/<figcaption> 标签，
         仅保留可能存在的其他内联文本。"""
@@ -792,8 +783,8 @@ def _demote_all_media_to_links(
             kind = (mm.group(1) or mm.group(2) or "").lower()
             if media_kinds is not None and kind not in media_kinds:
                 return block
-            src = _extract_src(block)
-            if not src or not _is_valid_url(src):
+            src = _extract_media_src(block)
+            if not src or not _is_valid_media_url(src):
                 return ""  # 非法 src：整块删除（冗余兜底）
             anchors.append(_build_demoted_anchor(src))
             return ""
@@ -830,12 +821,12 @@ def _demote_all_media_to_links(
         # 取 media 标签名（video / audio / img）
         kind = (mm.group(1) or mm.group(2) or "").lower()
         block = mm.group(0)
-        src = _extract_src(block)
+        src = _extract_media_src(block)
         # figcaption 文本先提取，不论 src 是否合法，都应作为可见内容保留
         cap_text = _figcaption_text(inner)
         if media_kinds is not None and kind not in media_kinds:
             return m.group(0)
-        if not src or not _is_valid_url(src):
+        if not src or not _is_valid_media_url(src):
             # 非法 src：删除该 media 块，但保留 figcaption 文本作为可见内容
             rest = inner.replace(block, "")
             rest = _strip_inner_tags(rest).strip()
@@ -860,10 +851,10 @@ def _demote_all_media_to_links(
     def _replace_bare_media(m: re.Match) -> str:
         block = m.group(0)
         kind = (m.group(1) or m.group(2) or "").lower()
-        src = _extract_src(block)
+        src = _extract_media_src(block)
         if media_kinds is not None and kind not in media_kinds:
             return block
-        if not src or not _is_valid_url(src):
+        if not src or not _is_valid_media_url(src):
             return ""  # 非法 src：整块删除
         return _build_demoted_anchor(src)
 

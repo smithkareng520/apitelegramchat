@@ -492,9 +492,9 @@ async def execute_memory(
 
 
 # ---------- 富文本渲染 ----------
-def _esc(text: Any) -> str:
-    s = "" if text is None else str(text)
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+# _esc 统一来自 core.text_utils.escape_html_text（卡片动态片段的严格转义）。
+from core.text_utils import escape_html_text as _esc
+
 
 
 def _importance_badge(m: dict) -> str:

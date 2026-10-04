@@ -46,7 +46,7 @@ from context_window import (
     resolve_history_budget,
 )
 from tool_context_compaction import compact_older_tool_calls, _eligible_calls
-from workspace_utils import init_workspace, schedule_workspace_init
+from workspace_utils import schedule_workspace_init
 
 
 logger = get_logger(__name__)
@@ -83,6 +83,18 @@ REPLY_MARKER = "💡 引用回复:"
 
 active_tasks: dict[int, asyncio.Task] = {}
 active_tasks_lock = asyncio.Lock()
+
+# fire-and-forget 观测/清理任务的强引用集：事件循环只持弱引用，不持
+# 引用的任务可能被 GC 提前回收（取消观测丢失 / TIMER 重排静默断链）。
+_BG_TRACKED_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_tracked(coro: Any) -> "asyncio.Task":
+    """创建并跟踪一个 fire-and-forget 任务（强引用 + 完成自动清理）。"""
+    task = asyncio.create_task(coro)
+    _BG_TRACKED_TASKS.add(task)
+    task.add_done_callback(_BG_TRACKED_TASKS.discard)
+    return task
 # 消息去重已下沉到 state.mark_update_processed_if_new（原子检查+标记），
 # 这里不需要 app 级别的去重锁。
 # ==================== 打断旧轮次（保全进度 + 冻结旧草稿） ====================
@@ -461,15 +473,17 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
     在出站视图上兜底，并在下一轮的压缩事件中收敛回预算内。
     """
     _pf_start = time.monotonic()
-    _pf_lock_wait_start = time.monotonic()
     lock = await get_chat_lock(chat_id)
-    _pf_lock_wait_ms = int((time.monotonic() - _pf_lock_wait_start) * 1000)
-    if _pf_lock_wait_ms > 1000:
-        logger.warning(
-            "pre_flight_context_check 等待 chat_lock 超时: chat=%s wait_ms=%s",
-            chat_id, _pf_lock_wait_ms,
-        )
+    # 锁等待计时必须覆盖 async with 的实际排队：get_chat_lock 只是查表
+    # 返回锁对象（恒 ≈0ms），真正可能阻塞数秒的是下方获取锁的 await。
+    _pf_lock_wait_start = time.monotonic()
     async with lock:
+        _pf_lock_wait_ms = int((time.monotonic() - _pf_lock_wait_start) * 1000)
+        if _pf_lock_wait_ms > 1000:
+            logger.warning(
+                "pre_flight_context_check 等待 chat_lock 超时: chat=%s wait_ms=%s",
+                chat_id, _pf_lock_wait_ms,
+            )
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
         cm = get_user_model(chat_id)
@@ -640,8 +654,6 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
         # Responses server-managed state：回合产出（assistant/tool 消息）
         # 已由本回合的成功 response 承载在服务端链上，链头由 bridge 在
         # 回合收尾原子提交——历史落库这里不再承担任何链状态记账职责。
-        if new_msgs:
-            pass
         if usage:
             if hasattr(usage, "model_dump"):
                 usage_dict = usage.model_dump()
@@ -676,15 +688,20 @@ async def _cancel_old_task(chat_id: int) -> None:
         # 此值必须略大于 RichMessageBuilder.stop_flush_loop() 的 5.5s
         # 排空窗口；否则外层二次取消会重新制造“客户端已见、游标未记账”
         # 的竞态。
-        try:
-            await asyncio.wait_for(task, timeout=6.0)
-        except asyncio.TimeoutError:
+        # 用 asyncio.wait 而非 wait_for：wait_for 会把"旧任务以
+        # CancelledError 结束"与"调用方自身被取消"混成同一个异常，
+        # 后者必须向上传播（打断链上的取消信号不能被吸收）；wait 不
+        # 重抛子任务的取消，两条路径天然分离。
+        done, pending = await asyncio.wait({task}, timeout=6.0)
+        if pending:
             logger.warning(f"旧任务取消超时（>6s）: chat_id={chat_id}，转入后台等待其结束")
-            asyncio.create_task(_log_task_cancel(task, chat_id))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.warning(f"旧任务取消异常: chat_id={chat_id} {e}")
+            _spawn_tracked(_log_task_cancel(task, chat_id))
+        elif not task.cancelled():
+            # 旧任务吞掉取消后改抛了真实异常：取回异常（避免
+            # "Task exception was never retrieved"）并留观测记录。
+            exc = task.exception()
+            if exc is not None:
+                logger.warning(f"旧任务取消异常: chat_id={chat_id} {exc}")
 
 async def _log_task_cancel(task: "asyncio.Task", chat_id: int) -> None:
     try:
@@ -1108,5 +1125,8 @@ async def spawn_turn_task(
     task = asyncio.create_task(coro)
     async with active_tasks_lock:
         active_tasks[chat_id] = task
-    task.add_done_callback(lambda t: asyncio.create_task(_cleanup_task(chat_id, t)))
+    def _schedule_cleanup(done_task: "asyncio.Task") -> None:
+        _spawn_tracked(_cleanup_task(chat_id, done_task))
+
+    task.add_done_callback(_schedule_cleanup)
     return task

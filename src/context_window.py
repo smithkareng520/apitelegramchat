@@ -28,7 +28,6 @@
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -39,7 +38,7 @@ from token_budget import (
     json_token_count,
     truncate_to_token_budget,
 )
-from core.messages import Message
+from core.messages import Message, parse_tool_arguments
 
 
 def _msg_role(message: Any) -> Optional[str]:
@@ -319,20 +318,8 @@ def _last_assistant_text(block: list[Any]) -> str:
     return text
 
 
-def _parse_arguments(raw: object) -> dict[str, Any]:
-    if isinstance(raw, dict):
-        return raw
-    if not isinstance(raw, str) or not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
 def _locator(name: str, raw_args: object) -> str:
-    parsed = _parse_arguments(raw_args)
+    parsed = parse_tool_arguments(raw_args)
     for key in _LOCATOR_KEYS:
         value = parsed.get(key)
         if isinstance(value, str) and value.strip():

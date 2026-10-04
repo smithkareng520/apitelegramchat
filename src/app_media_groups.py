@@ -26,13 +26,14 @@ from utils import send_rich_html_message, get_logger
 from ai_handlers import get_ai_response
 from file_handlers import download_file
 from workspace_paths import workspace_download_root
-from workspace_utils import init_workspace, schedule_workspace_init
+from workspace_utils import schedule_workspace_init
 from app_turns import (
     pre_flight_context_check,
     update_conversation_and_ledger,
     active_tasks,
     active_tasks_lock,
     _cleanup_task,
+    _spawn_tracked,
     _handle_text_message,
     get_user_info,
     is_authorized,
@@ -400,7 +401,7 @@ async def _schedule_group(chat_id: int, group_key: str, tasks: dict, coro_factor
     def _done(done_task: asyncio.Task) -> None:
         if tasks.get(group_key) is done_task:
             tasks.pop(group_key, None)
-        asyncio.create_task(_cleanup_task(chat_id, done_task))
+        _spawn_tracked(_cleanup_task(chat_id, done_task))
 
     task.add_done_callback(_done)
 

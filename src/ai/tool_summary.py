@@ -13,7 +13,7 @@ from utils import get_logger
 from tool_executors import _TOOL_TIMEOUT_MARKER
 from tool_names import split_mcp_name
 from ai._constants import MAX_TOOL_CALLS
-from ai.error_formatting import extract_domain
+from core.text_utils import extract_domain
 from ai.json_repair import (
     _INVALID_TOOL_ARGUMENTS_KEY,
     _JSON_REPAIR_NOTE_KEY,
@@ -157,13 +157,6 @@ def _short_label(text: Any, limit: int = 24) -> str:
     return s[:limit] + "…" if len(s) > limit else s
 
 
-def _json_payload(result_content: Any) -> dict:
-    """尽力把工具结果解析成 dict（todo / memory / subagent 的结果都是 JSON 信封）。"""
-    try:
-        parsed = json.loads(str(result_content or ""))
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
 
 
 def _todo_summary_done(fn_args: dict, payload: dict) -> str:
@@ -231,7 +224,8 @@ def _memory_summary_done(fn_args: dict, payload: dict) -> str:
 
 
 def _map_payload_from_result(result_content: Any) -> dict:
-    """尽量解析地图工具结果 JSON；失败时返回空 dict。"""
+    """尽力把工具结果解析成 dict（todo / memory / subagent / 地图的结果
+    都是 JSON 信封）；失败时返回空 dict。dict 输入原样直通。"""
     if isinstance(result_content, dict):
         return result_content
     try:
@@ -1099,10 +1093,10 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
     # 与 text_editor 同规范：完成态摘要按「动作 + 对象」生成，不再退化为
     # 笼统的 "Ran an action"（本分支位于 custom_desc 检查之前）。
     if fn_name == "todo":
-        return _todo_summary_done(fn_args, _json_payload(result_content))
+        return _todo_summary_done(fn_args, _map_payload_from_result(result_content))
 
     if fn_name == "memory":
-        return _memory_summary_done(fn_args, _json_payload(result_content))
+        return _memory_summary_done(fn_args, _map_payload_from_result(result_content))
 
     if fn_name == "subagent":
         # 完成态带上轮次/工具调用/耗时（对标 Claude Code 的统计尾注）；

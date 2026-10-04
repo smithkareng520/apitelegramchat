@@ -40,17 +40,13 @@ class AnthropicMessagesAdapter(ChatProtocolAdapter):
     ) -> tuple[str | None, Any, list]:
         from ai.anthropic_bridge import _agentic_loop_anthropic
 
+        from protocols.base import invalidate_responses_chain_for
+
         # 协议路由到了 Anthropic（传统 Messages 协议，无服务端会话）：
         # 本回合的问答不在 Responses 服务端 response chain 里，显式作废
         # previous_response_id 链头——下次切回 Responses 协议时以本地
         # 全量上下文重新 bootstrap。canonical history 不受影响。
-        chat_id = getattr(builder, "chat_id", None)
-        if chat_id is not None:
-            try:
-                from responses_state import mark_legacy_divergence
-                mark_legacy_divergence(chat_id)
-            except Exception:
-                pass
+        invalidate_responses_chain_for(builder)
         client = cast("AsyncAnthropic", api_client.get_client_for_model(model_info))
         return await _agentic_loop_anthropic(
             client, current_model, messages, builder,

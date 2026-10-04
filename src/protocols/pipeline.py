@@ -27,6 +27,7 @@
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
@@ -34,6 +35,8 @@ from protocols.routing import ModelRoute, resolve_model_route
 
 if TYPE_CHECKING:
     from config import ModelConfig
+
+logger = logging.getLogger(__name__)
 
 # API 分支标签（请求体家族）：
 #   chat    OpenAI/Anthropic/Gemini 聊天协议（流式 agentic 循环装配请求体）
@@ -290,6 +293,9 @@ def resolve_request_plan(model_info: Optional["ModelConfig"]) -> RequestPlan:
             shape = resolve_images_endpoint_shape(model_info)
             image_style = shape.style
         except Exception:
+            # 解析失败静默回退缺省 style 会让图像请求走错形状且无线索，
+            # 留 debug 线索（回退是既有行为，不在此升级为错误）。
+            logger.debug("resolve_images_endpoint_shape 失败，image_style 回退 None", exc_info=True)
             image_style = None
 
     return RequestPlan(

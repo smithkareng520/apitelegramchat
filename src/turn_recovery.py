@@ -739,8 +739,12 @@ async def finalize_failed_turn(
 
     try:
         return await persist_salvaged_journal(chat_id, journal, reason=reason)
+    except asyncio.CancelledError:
+        raise
     except Exception:
-        logger.debug("failed-turn journal salvage failed", exc_info=True)
+        # 这是打断/失败时用户已见进度的最后持久化防线；失败只留 debug
+        # 会让数据丢失在生产环境完全不可见。
+        logger.warning("failed-turn journal salvage failed", exc_info=True)
         return []
 
 

@@ -479,10 +479,7 @@ async def execute_todo(
 
 
 # ---------- 富文本渲染 ----------
-def _esc(text: Any) -> str:
-    """HTML 转义，保证 Telegram 富文本发送安全。"""
-    s = "" if text is None else str(text)
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+from core.text_utils import escape_html_text as _esc
 
 
 def render_todo_card(payload: dict, max_items: int = 50) -> str:

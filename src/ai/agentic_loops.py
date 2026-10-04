@@ -10,7 +10,6 @@ v2.6：Gemini 从 OpenAI 兼容层（v1beta/openai/）非流式专用循环切�
 _agentic_loop_gemini_openai_compat 已移除。
 """
 import asyncio
-import json
 import aiohttp
 import httpx
 import httpx2
@@ -53,17 +52,12 @@ from ai.error_formatting import (
 )
 from ai.media_generation import (
     _clean_prompt_for_image_model,
-    _extract_image_items,
     _extract_native_message_text,
-    _extract_native_refusal_text,
     _format_native_image_notice,
     _get_images_api_display_name,
     _request_agnes_video,
-    _request_images_generations,
     _request_openrouter_video,
-    _response_items_to_bytes,
     _upload_generated_images_to_r2,
-    _validate_image_bytes,
 )
 from ai.tool_summary import (
     _contains_textual_tool_call,
@@ -73,7 +67,6 @@ from ai.tool_summary import (
     _normalize_tool_call_arguments,
     _safe_parse_args,
     _strip_textual_tool_calls,
-    _tool_limit_summary,
 )
 from ai.attachment_content import _apply_cache_control
 from ai.errors import first_choice
@@ -100,23 +93,10 @@ from core.images import ImageTask
 from core.messages import Message, TextBlock, ImageBlock, VideoBlock, render_openai_messages
 from protocols.images import dispatch_image_task
 
-# Anthropic 原生 Messages API 专用循环：独立实现，位于 anthropic_bridge.py
-# （职责分离 + 避免本已很大的文件继续膨胀）。此处重导出保持调用方
-# "from ai.agentic_loops import _agentic_loop_anthropic"
-# 这一路径可用，与 _agentic_loop_openai_compat / _agentic_loop_gemini_native
-# 并列，风格一致。
-from ai.anthropic_bridge import _agentic_loop_anthropic  # noqa: F401
-
-# Gemini 原生 API（streamGenerateContent SSE + 原生 function calling）专用
-# 循环：独立实现位于 gemini_bridge.py，与 anthropic_bridge 同构的边界转换
-# 模式。重导出保持调用方旧导入路径可用。
-from ai.gemini_bridge import _agentic_loop_gemini_native  # noqa: F401
-
 # Prompt cache 命中观测（三循环共用）：拆至独立模块 cache_usage，避免
-# gemini_bridge -> agentic_loops 的循环导入。此处重导出保持旧路径可用。
+# gemini_bridge -> agentic_loops 的循环导入。
 from ai.cache_usage import (  # noqa: F401
     _cached_from_usage,
-    _extract_cache_usage,
     _log_cache_usage,
 )
 

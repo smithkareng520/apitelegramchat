@@ -7,7 +7,6 @@ import logging
 import re
 import random
 import html
-import os
 import time
 from typing import Any, List, Optional
 
@@ -21,8 +20,7 @@ from utils import (
     is_draft_dead,
     RateLimitError,
 )
-from markdown_converter import convert_markdown_to_telegram_html
-from ai.error_formatting import extract_domain
+from core.text_utils import extract_domain
 from ai.attachment_content import _track_task
 from ai._constants import _positive_env_int
 from core.messages import Message
@@ -599,7 +597,7 @@ class RichMessageBuilder:
                 return True
         return False
 
-    def hide_tools_until_started(self, tool_ids) -> None:
+    def hide_tools_until_started(self, tool_ids: list[Any]) -> None:
         """同批里还没轮到执行的工具先不渲染（卡片已建但隐藏，不是一种状态）。
 
         同批多个调用是串行 / 分批执行的：前一个跑完，后一个才开始。建卡时全部

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Iterable
+from typing import Any
 
 
 def event_field(obj: Any, name: str, default: Any = None) -> Any:

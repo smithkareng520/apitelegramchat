@@ -80,8 +80,18 @@ async def update_model_list(
 
 
 async def _del_after(chat_id: int, msg_id: int, delay: float) -> None:
-    await asyncio.sleep(delay)
-    await delete_message(chat_id, msg_id)
+    try:
+        await asyncio.sleep(delay)
+        await delete_message(chat_id, msg_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(f"delete_after 定时删消息失败(可忽略): chat={chat_id} msg={msg_id} {e}")
+
+
+# 定时删消息任务强引用集：防止 fire-and-forget 任务被 GC 提前回收；
+# done 回调自动清理，异常经 _del_after 内部捕获不再外逸。
+_DEL_AFTER_TASKS: set["asyncio.Task"] = set()
 
 
 async def _send_via_send_message(
@@ -144,7 +154,9 @@ async def _send_via_send_message(
                     mid = res.get("result", {}).get("message_id")
                     if isinstance(mid, int) and mid > 0:
                         if delete_after is not None:
-                            asyncio.create_task(_del_after(chat_id, mid, delete_after))
+                            t = asyncio.create_task(_del_after(chat_id, mid, delete_after))
+                            _DEL_AFTER_TASKS.add(t)
+                            t.add_done_callback(_DEL_AFTER_TASKS.discard)
                         return mid
                 else:
                     body = await resp.text()

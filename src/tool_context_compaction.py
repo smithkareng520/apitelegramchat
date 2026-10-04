@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from core.messages import Message, ToolResultBlock
+from core.messages import Message, ToolResultBlock, parse_tool_arguments
 from tool_names import split_mcp_name
 from workspace_paths import workspace_workdir
 from workspace_utils import _ensure_runtime_workspace, _get_workspace_lock
@@ -65,21 +65,9 @@ def _tool_call_id(tool_call: object) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _parse_arguments(raw: object) -> dict[str, Any]:
-    if isinstance(raw, dict):
-        return raw
-    if not isinstance(raw, str):
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
 def _minimal_arguments(name: str, raw: object) -> str:
     """Keep only the stable locator fields needed to repeat a compacted call."""
-    parsed = _parse_arguments(raw)
+    parsed = parse_tool_arguments(raw)
     # 各分支的 key 集合不同，统一放宽为 dict[str, Any]（与 _parse_arguments 的返回类型一致）
     key = _norm_tool_name(name)
     if key == "wikipedia":

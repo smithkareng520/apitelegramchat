@@ -48,7 +48,6 @@ from ai.tool_summary import (
 from ai.bridge_common import (
     LiveAssistantSlot,
     SimpleChoice,
-    SimpleFunctionCall,
     SimpleMessage,
     SimpleResponse,
     SimpleToolCall,
@@ -60,7 +59,7 @@ from ai.bridge_common import (
     over_limit_final_summary,
     run_tool_batch,
 )
-from ai.cache_usage import _log_cache_usage
+from ai.cache_usage import _log_cache_usage, usage_num
 from ai.streaming import iter_async_stream
 from ai.errors import AIResponseProtocolError, ResponsesProtocolError
 from ai.response_events import (
@@ -79,9 +78,7 @@ if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
     from openai import AsyncOpenAI
 
-from core.messages import (
-    DocumentBlock, ImageBlock, Message, TextBlock, ToolCallBlock, ToolResultBlock,
-)
+from core.messages import Message
 
 logger = get_logger(__name__)
 
@@ -449,26 +446,22 @@ def _responses_usage_to_openai(usage: Any) -> Optional[dict]:
         logger.debug("_responses_usage_to_openai 归一化失败，丢弃 usage", exc_info=True)
         return None
 
-    def _num(value: Any) -> int:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return 0
-        return int(value)
 
     input_details = d.get("input_tokens_details") or {}
     cached = None
     cache_write = None
     if isinstance(input_details, dict):
         if "cached_tokens" in input_details:
-            cache_val = _num(input_details.get("cached_tokens"))
+            cache_val = usage_num(input_details.get("cached_tokens"))
             cached = cache_val
         if "cache_write_tokens" in input_details:
-            cache_write = _num(input_details.get("cache_write_tokens"))
-    prompt = _num(d.get("input_tokens"))
-    completion = _num(d.get("output_tokens"))
+            cache_write = usage_num(input_details.get("cache_write_tokens"))
+    prompt = usage_num(d.get("input_tokens"))
+    completion = usage_num(d.get("output_tokens"))
     out: dict[str, Any] = {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
-        "total_tokens": _num(d.get("total_tokens")) or (prompt + completion),
+        "total_tokens": usage_num(d.get("total_tokens")) or (prompt + completion),
     }
     if cached is not None or cache_write is not None:
         # 归一化给旧有 cache_usage 模块：cached_tokens 是 Responses
@@ -1265,7 +1258,9 @@ async def _agentic_loop_openai_responses_impl(
         except Exception:
             # 状态提交失败不会改变已经成功返回的模型结果；下一轮会从
             # canonical history bootstrap，而不是进入任何 fallback 协议。
-            logger.debug("[openai_responses] commit_response_sync 异常（忽略）", exc_info=True)
+            # 但链头丢失意味着下一轮全量重发上下文（成本与语义退化），
+            # 属状态机异常而非常规路径，warning 保证生产可见。
+            logger.warning("[openai_responses] commit_response_sync 失败（下轮将 bootstrap）", exc_info=True)
 
     return final_content, final_usage, new_history_entries
 

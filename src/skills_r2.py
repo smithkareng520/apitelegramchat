@@ -15,7 +15,6 @@ from s3_utils import (
     upload_bytes_to_r2, download_from_r2, delete_r2_object,
     list_r2_objects, is_r2_configured,
 )
-from workspace_paths import workspaces_root
 
 logger = logging.getLogger(__name__)
 

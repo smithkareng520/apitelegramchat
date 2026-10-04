@@ -44,7 +44,6 @@ from webhook_sync import get_webhook_info, mask_webhook_url
 from media_wizard import is_wizard_callback
 from core.http_session import get_http_session
 import proactive
-import app_state
 from app_state import update_queue, WEBHOOK_QUEUE_MAXSIZE
 from app_turns import (
     _cmd_match,
@@ -71,14 +70,17 @@ async def _answer_callback_query(callback_query_id: str, text: str, show_alert: 
     """应答回调查询（合并原 6 处裸建 ClientSession，复用全局 HTTP 会话）。"""
     try:
         session = await get_http_session()
-        await session.post(
+        # async with 确保连接归还连接池（裸 await 不读 body 会让连接
+        # 挂到 GC 才释放，并触发 aiohttp "Unclosed response" 告警）。
+        async with await session.post(
             f"{BASE_URL}/answerCallbackQuery",
             json={
                 "callback_query_id": callback_query_id,
                 "text": text,
                 "show_alert": show_alert,
             },
-        )
+        ):
+            pass
     except Exception as e:
         logger.debug(f"answerCallbackQuery 失败(可忽略): {e}")
 

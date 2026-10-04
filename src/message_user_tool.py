@@ -10,7 +10,6 @@ message_user 有两种模式：
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import logging
 import os
@@ -382,21 +381,10 @@ async def create_ask_user_interaction(
     raise RuntimeError("无法发送 message_user 交互消息")
 
 
-async def get_pending_for_chat(chat_id: int) -> AskUserInteraction | None:
-    async with _lock:
-        interaction_id = _pending_by_chat.get(chat_id)
-        return _pending.get(interaction_id) if interaction_id else None
-
-
 async def _clear_pending_unlocked(interaction: AskUserInteraction) -> None:
     _pending.pop(interaction.id, None)
     if _pending_by_chat.get(interaction.chat_id) == interaction.id:
         _pending_by_chat.pop(interaction.chat_id, None)
-
-
-async def _clear_pending(interaction: AskUserInteraction) -> None:
-    async with _lock:
-        await _clear_pending_unlocked(interaction)
 
 
 _UI_FOLLOWUP_TASKS: set["asyncio.Task[Any]"] = set()

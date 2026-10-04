@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Any, Awaitable, Callable, TypeVar, cast
+from urllib.parse import urlparse
 
 import logging
 
@@ -45,12 +46,25 @@ def get_current_time() -> str:
               "July", "August", "September", "October", "November", "December"]
     return f"{days[now.weekday()]}, {months[now.month - 1]} {now.day}, {now.year}"
 
-# escape_html() 已删除：项目内所有 HTML 转义统一改为调用
-# markdown_converter.convert_markdown_to_telegram_html()，不再保留独立
-# 的纯转义函数。
-#
-# 注意（迁移后的行为差异）：convert_markdown_to_telegram_html 对完全不
-# 含 markdown 语法的文本会直接原样返回（短路优化），不会转义裸露的
-# <、>、&。这与原 escape_html 逐字符转义的行为不同——原调用点里若
-# 文本恰好不含任何 markdown 特征（*、`、#、列表符号等）又带有裸露的
-# <、>、& ，转换后将不再被转义。
+# 用户可见的 markdown/自然语言文本转义统一走
+# markdown_converter.convert_markdown_to_telegram_html()（对纯文本短路
+# 原样返回）。escape_html_text 只服务于另一类场景：手工拼装富文本卡片
+# 时对**程序产出的动态片段**（标题、计数、文件名等）做严格 & < > 转义，
+# 这类内容不是 markdown，走 markdown 转换器反而不会转义裸露的 <、>、&。
+
+def escape_html_text(value: Any) -> str:
+    """纯 HTML 转义（& < >，无条件转义 &）：用于卡片 HTML 的动态片段。"""
+    s = "" if value is None else str(value)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def extract_domain(url: str) -> str:
+    """从 URL 提取展示用域名；空值/无 netloc 时给出兜底文案。
+
+    原先在 ai.error_formatting 与 tool_ui_render 各有一份逐字拷贝，
+    现收敛到此（工具结果标题与错误通知都在用它标注来源站点）。
+    """
+    if not url:
+        return "unknown"
+    parsed = urlparse(url)
+    return parsed.netloc or parsed.path.split('/')[0]

@@ -8,7 +8,6 @@
 """
 import asyncio
 import json
-import re
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Optional
@@ -48,7 +47,7 @@ from ai._constants import (
     DETACHED_ON_INTERRUPT_TOOLS,
     DETACHED_TOOL_FINAL_WAIT,
 )
-from ai.error_formatting import extract_domain
+from core.text_utils import extract_domain
 from ai.json_repair import (
     _INVALID_TOOL_ARGUMENTS_KEY,
     _JSON_REPAIR_NOTE_KEY,
@@ -790,7 +789,11 @@ async def _run_tool_calls_and_append(
                 g_fn, g_args, g_tid = tool_tasks[idx]
                 _batch_started.add(g_tid)
                 _fut = asyncio.ensure_future(run_one(g_fn, g_args, g_tid))
-                _fut.add_done_callback(lambda f, i=idx: _on_group_future_done(i, f))
+
+                def _on_done(fut: "asyncio.Future", _i: int = idx) -> None:
+                    _on_group_future_done(_i, fut)
+
+                _fut.add_done_callback(_on_done)
                 _pending_group[idx] = _fut
                 idx += 1
             outs = await asyncio.gather(*_pending_group.values(), return_exceptions=True)
@@ -803,8 +806,8 @@ async def _run_tool_calls_and_append(
             _pending_group.clear()
     except asyncio.CancelledError:
         # 整批被取消：已启动但未结束的并发组工具一并取消（纯同步调用）。
-        for _fut in _pending_group.values():
-            _fut.cancel()
+        for _pending_fut in _pending_group.values():
+            _pending_fut.cancel()
         # 用户新消息 / TIMER 唤醒打断了本批次：同步补齐 tool 消息后向上传播。
         # 只做纯同步列表操作，不做任何 await（取消路径必须最小化）。
         # 五阶段规范·阶段4：占位回执按工具性质区分——只读工具带 aborted
