@@ -234,7 +234,8 @@ def _clean_schema_for_gemini(schema: Any, depth: int = 0) -> dict:
 
     1. ``required`` ⊆ 同层 ``properties``：定义不明的 required 名字剔除，
        空 / 畸形 required 整体移除；
-    2. 声明 required / properties 的子 schema 必须带 ``type: "object"``。
+    2. 声明 required / properties 的子 schema 必须带 ``type: "object"``；
+    3. ``type: "array"`` 必须带 ``items``（缺失时兜底 ``{"type": "string"}``）。
 
     另：空 ``properties: {}`` 与不写等价，一并剥掉，避开部分 Gemini
     版本对 OBJECT 空属性的严格校验。
@@ -304,6 +305,10 @@ def _clean_schema_for_gemini(schema: Any, depth: int = 0) -> dict:
     # 空 properties 与不写 properties 等价，剥掉以避开严格校验。
     if isinstance(out.get("properties"), dict) and not out["properties"]:
         out.pop("properties", None)
+    # 硬校验不变式 3：type=array 必须声明 items（缺失即整请求 400
+    # "...items: missing field"）。来源 schema 没写时兜底为字符串元素。
+    if out.get("type") == "array" and not isinstance(out.get("items"), dict):
+        out["items"] = {"type": "string"}
     return out
 
 

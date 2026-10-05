@@ -105,7 +105,7 @@ MESSAGE_USER_TOOL = {
                 },
                 # Legacy aliases are intentionally accepted at runtime only; schema guides new calls.
                 "question": {"type": "string", "description": "旧版兼容：普通消息文本。"},
-                "options": {"type": "array", "description": "旧版兼容字段。"},
+                "options": {"type": "array", "items": {"type": "string"}, "description": "旧版兼容字段：选项文本列表。"},
                 "multiple": {"type": "boolean", "description": "旧版兼容：单个问题是否多选。"},
                 "allow_custom": {"type": "boolean", "description": "旧版兼容：是否允许自定义输入。"},
             },
