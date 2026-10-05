@@ -103,11 +103,6 @@ MESSAGE_USER_TOOL = {
                         "additionalProperties": False,
                     },
                 },
-                # Legacy aliases are intentionally accepted at runtime only; schema guides new calls.
-                "question": {"type": "string", "description": "旧版兼容：普通消息文本。"},
-                "options": {"type": "array", "items": {"type": "string"}, "description": "旧版兼容字段：选项文本列表。"},
-                "multiple": {"type": "boolean", "description": "旧版兼容：单个问题是否多选。"},
-                "allow_custom": {"type": "boolean", "description": "旧版兼容：是否允许自定义输入。"},
             },
             "additionalProperties": False,
         },
@@ -183,7 +178,7 @@ def _normalize_questions(raw: Any) -> list[dict[str, Any]]:
             continue
         # Accept both the new camelCase spelling and a tolerant snake_case alias.
         multi = bool(item.get("multiSelect", item.get("multi_select", False)))
-        custom = bool(item.get("allowCustom", item.get("allow_custom", True)))
+        custom = bool(item.get("allowCustom", True))
         out.append({
             "question": q,
             "options": _normalized_options(item.get("options", [])),
@@ -323,37 +318,21 @@ def _answer_json(answer: dict[str, Any]) -> str:
 
 async def create_ask_user_interaction(
     chat_id: int,
-    question: str = "",
-    options: Any = None,
     *,
-    multiple: bool = False,
-    allow_custom: bool = True,
     mode: str | None = None,
     message: str | None = None,
     questions: Any = None,
 ) -> AskUserInteraction:
-    # New API: explicit mode. Legacy API is translated into the same interaction model.
     if mode == "form" or questions is not None:
         normalized_questions = _normalize_questions(questions)
         if not normalized_questions:
             raise ValueError("message_user form 至少需要一个有效问题")
         interaction = AskUserInteraction(id=_new_id(), chat_id=chat_id, mode="form", questions=normalized_questions)
-    elif mode == "message" or message is not None or (not options and question):
-        text = truncate_to_token_budget(str(message if message is not None else question).strip(), ASK_USER_QUESTION_TOKEN_BUDGET, suffix="…")
+    else:
+        text = truncate_to_token_budget(str(message or "").strip(), ASK_USER_QUESTION_TOKEN_BUDGET, suffix="…")
         if not text:
             raise ValueError("message_user.message 不能为空")
         interaction = AskUserInteraction(id=_new_id(), chat_id=chat_id, mode="message", message=text)
-    else:
-        # Legacy single-question call, now represented as a one-question form.
-        q = _normalize_questions([{
-            "question": question,
-            "options": options or [],
-            "multiSelect": multiple,
-            "allowCustom": allow_custom,
-        }])
-        if not q:
-            raise ValueError("message_user.question 不能为空")
-        interaction = AskUserInteraction(id=_new_id(), chat_id=chat_id, mode="form", questions=q)
 
     async with _lock:
         old_id = _pending_by_chat.get(chat_id)
@@ -627,6 +606,13 @@ async def cancel_interaction(interaction_id: str, remove_ui: bool = True) -> Non
         message_id, chat_id = interaction.message_id, interaction.chat_id
     if remove_ui:
         await _set_markup(message_id, chat_id, None)
+
+
+def ask_preview(interaction: AskUserInteraction) -> str:
+    """工具折叠块里展示的一行预览：普通消息文本，或表单第一题。"""
+    if interaction.mode == "message":
+        return interaction.message
+    return str((interaction.questions[0] if interaction.questions else {}).get("question", ""))
 
 
 def answer_to_tool_result(answer: dict[str, Any]) -> str:

@@ -261,7 +261,7 @@ async def dispatch_tool_call(
         if tn.is_mcp_name(name):
             return await _dispatch_mcp(name, arguments, chat_id)
 
-        if name in (tn.MESSAGE_USER, "ask_user"):
+        if name == tn.MESSAGE_USER:
             # message_user 的正式分支在 tool_call_loop.run_one（需要 builder
             # 与回复等待）；这里仅防御误路由。
             return "未执行：message_user 必须由主对话循环处理，当前路径无法执行。"

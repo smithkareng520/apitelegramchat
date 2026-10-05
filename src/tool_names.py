@@ -119,7 +119,7 @@ def tool_family(name: str) -> str:
         return "generate_image"
     if name == GENERATE_VIDEO:
         return "generate_video"
-    if name in {MESSAGE_USER, "ask_user"}:
+    if name == MESSAGE_USER:
         return "message_user"
     if name == DELIVER_REPLY:
         return "deliver_reply"

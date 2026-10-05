@@ -458,7 +458,7 @@ def _subagent_model_view(payload: dict) -> str:
 
 
 # =====================================================================
-# E. message_user / ask_user 回答模型视图（纯文本）
+# E. message_user 回答模型视图（纯文本）
 # =====================================================================
 
 def _message_user_answer_view(payload: dict) -> str:

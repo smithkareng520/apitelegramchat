@@ -795,7 +795,7 @@ class RichMessageBuilder:
                     group["outer_summary"] = short
                 else:
                     group["outer_summary"] = "Running command"
-        elif t in ("ask_user", "message_user"):
+        elif t == "message_user":
             group["outer_summary"] = "Waiting for your answer"
         elif t in ("wikipedia", "exchange_rate", "weather", "subagent", "present_files"):
             # 对象信息（查询词 / 币对 / 城市 / 子任务 / 文件名）直接进组标题：
@@ -863,7 +863,6 @@ class RichMessageBuilder:
         "image_generate": ("Generated image(s)", "Generated image(s)"),
         "image_edit": ("Edited image(s)", "Edited image(s)"),
         "generate_video": ("Generated a video", "Generated {n} videos"),
-        "ask_user": ("Asked you a question", "Asked you questions"),
         "message_user": ("Messaged you", "Messaged you"),
         "deliver_reply": ("Delivered the final reply", "Delivered the final reply"),
         "deliver_reply_silent": ("Skipped the final reply", "Skipped the final reply"),

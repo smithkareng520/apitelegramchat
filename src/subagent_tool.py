@@ -109,10 +109,6 @@ SUBAGENT_CARD_PREVIEW_TOKEN_BUDGET = _env_int(
 # 任何真实工具调用；subagent / message_user / deliver_reply 是 host
 # 内建工具，名字本身即完整名。
 FORBIDDEN_TOOLS = {"subagent", tn.MEMORY, "message_user", "deliver_reply"}
-# 历史遗留名，仅作防御保留：ask_user 已更名为 message_user；skill 工具已
-# 移除（技能改为系统提示词里的技能目录 + bash 读取 SKILL.md 的工作流）。
-# 即使旧模型幻觉调用这些名字，也会在这里被直接拦下，拿到明确的错误提示。
-FORBIDDEN_TOOLS |= {"ask_user", "skill"}
 # 注意：todo / bash / text_editor 仍允许，因为子 agent 可能需要查 / 写工作区文件。
 # message_user 不允许由子 agent 调用，否则会让父 agent 陷入不可控的嵌套
 # 人工等待；deliver_reply 同理（最终交付由父 agent 负责）。

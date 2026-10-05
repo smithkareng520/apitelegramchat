@@ -26,6 +26,7 @@ from tool_executors import (
     _TOOL_TIMEOUT_MARKER,
 )
 from message_user_tool import (
+    ask_preview,
     create_ask_user_interaction,
     wait_for_answer,
     answer_to_tool_result,
@@ -488,16 +489,8 @@ async def _run_tool_calls_and_append(
                     mode = str(fn_args.get("mode") or "").strip().lower() or None
                     message = fn_args.get("message")
                     questions = fn_args.get("questions")
-                    question = fn_args.get("question", "")
-                    options = fn_args.get("options", []) or []
-                    multiple = bool(fn_args.get("multiple", False))
-                    allow_custom = bool(fn_args.get("allow_custom", True))
                     interaction = await create_ask_user_interaction(
                         builder.chat_id,
-                        question,
-                        options,
-                        multiple=multiple,
-                        allow_custom=allow_custom,
                         mode=mode,
                         message=message,
                         questions=questions,
@@ -505,7 +498,7 @@ async def _run_tool_calls_and_append(
                     builder.update_tool_item(
                         tc_id,
                         "Waiting for your answer",
-                        f"<p>{convert_markdown_to_telegram_html(truncate_to_token_budget(str(question), 64, suffix='…'))}</p>",
+                        f"<p>{convert_markdown_to_telegram_html(truncate_to_token_budget(ask_preview(interaction), 64, suffix='…'))}</p>",
                         status="waiting",
                     )
                     builder.request_flush(force=True)
