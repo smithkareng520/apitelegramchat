@@ -33,8 +33,8 @@ Telegram 的 webhook 是**串行、需 2xx 签收**的投递模型：这条 upda
 
 这不是"没人发消息"，而是**摄取通道已经死了，却没有任何人发现**：
 
-  · 旧版 `poll_updates_forever` 对 `asyncio.CancelledError` 一律
-    `raise`（注释写的是"shutdown"）。但 CancelledError 并不只来自关停：
+  · `poll_updates_forever` 不能对 `asyncio.CancelledError` 一律
+    `raise`（当作 shutdown）。因为 CancelledError 并不只来自关停：
     aiohttp 的 `ClientTimeout` 内部就是靠取消请求任务实现的，取消信号落
     在 `async with` 退出/连接归还的窗口里时会以 CancelledError（而不是
     TimeoutError）逸出；上层任何一次误取消同理。一次就够——任务退出，
@@ -210,10 +210,9 @@ async def _fetch_updates(offset: Optional[int]) -> Optional[list]:
 
     返回 update 列表；网络/协议异常返回 None（调用方据此退避重试）。
 
-    ⚠️ 本函数**自己兑现这个契约**：旧版只在文档里写"异常返回 None"，实际
-    没有任何 try/except，网络抖动一律以异常形态逸出到主循环——主循环再按
-    异常类型做判断，CancelledError 分支就此变成失聪的单点。现在网络层异常
-    在这里就地收敛成 None，只有真正的取消信号才继续向上传播。
+    ⚠️ 本函数**自己兑现"异常返回 None"这个契约**：网络层异常在这里就地
+    收敛成 None，只有真正的取消信号才继续向上传播——否则网络抖动会逸出到
+    主循环，CancelledError 分支就变成失聪的单点。
 
     注意与 webhook 的关键差异：update 内容在**响应体**里，不经过
     Cloudflare 入站请求体的 WAF 检查——这正是本次修复的核心。
@@ -332,7 +331,7 @@ async def poll_updates_forever(queue: asyncio.Queue) -> None:
             if _stop_requested:
                 logger.warning("telegram polling cancelled (shutdown/restart)")
                 raise
-            # ⚠️ 历史事故点：这里旧版无条件 raise，一次误取消就让 bot 永久
+            # ⚠️ 这里不能无条件 raise：一次误取消就会让 bot 永久
             # 失聪（进程活着、/health 200、日志只剩心跳）。取消信号不是只有
             # 关停才会来：aiohttp 的 ClientTimeout 本身就是靠取消实现的。
             _uncancel_self()
@@ -345,7 +344,7 @@ async def poll_updates_forever(queue: asyncio.Queue) -> None:
             backoff = min(backoff * 2, _BACKOFF_MAX)
         except Exception:
             # 任何未预期异常都只退避重试，轮询循环绝不能死掉——它死了
-            # 整个 bot 就彻底收不到消息（等价于旧版 webhook 被堵死）。
+            # 整个 bot 就彻底收不到消息。
             logger.exception("telegram polling loop error（%.1fs 后重试）", backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, _BACKOFF_MAX)
@@ -355,7 +354,7 @@ def _uncancel_self() -> None:
     """清掉当前任务的"正在取消"标记（Python 3.11+）。
 
     吞掉 CancelledError 却不 uncancel，任务会停留在 cancelling 状态，
-    3.11+ 下后续 await 可能被再次打断。没有该 API 的旧版本直接跳过。
+    3.11+ 下后续 await 可能被再次打断。没有该 API 的 Python 版本直接跳过。
     """
     try:
         task = asyncio.current_task()
@@ -384,7 +383,7 @@ async def _supervise(queue: asyncio.Queue) -> None:
 
     自愈两条腿（缺一不可）：
       · 子任务以任何方式结束（异常 / 被外部取消 / 意外 return）→ 按退避
-        重新拉起，而不是像旧版那样再也没人管；
+        重新拉起，不能再也没人管；
       · 子任务还活着但 STALL_SECONDS 内一次成功的 getUpdates 都没有（请求
         挂死、连接池饿死等）→ 主动取消重启。
 

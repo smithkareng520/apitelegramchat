@@ -75,16 +75,14 @@ async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) 
     `mkdir -p upload/` round before doing the real work. This is the
     initialization boundary, not a per-tool concern.
 
-    v2.3.1：upload/ 与 download/ 挂在 agent 家目录（即 workspace 根本身）
-    下；首次访问家目录时会自动把遗留布局条目迁移到位（见
-    workspace_paths.agent_home）。
+    upload/ 与 download/ 挂在 agent 家目录（即 workspace 根本身）下。
     """
     workspace = workspace_root(chat_id, namespace)
     workspace.mkdir(parents=True, exist_ok=True)
     # 显式预创建 upload/ 与 download/：两者都位于 agent 家目录下，
     # workspace_upload_root / workspace_download_root 是幂等的（mkdir
     # exist_ok + chmod 0o700），重复调用不会出错；首次调用就把这两棵
-    # 子树准备好（并顺带触发家目录的一次性迁移）。
+    # 子树准备好。
     workspace_upload_root(chat_id, namespace)
     workspace_download_root(chat_id, namespace)
 

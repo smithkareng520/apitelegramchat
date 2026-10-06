@@ -357,7 +357,7 @@ def _render_poi_cards(payload: object) -> str | None:
     """Render AMap POIs as compact, information-dense Telegram HTML cards.
 
     gaode_mcp 直连后 UI 拿到未清洗的完整载荷：每张卡片顶部可渲染首张
-    实景图（photos），其余字段与旧版一致 —— 聚焦帮人选点 / 联络的信息，
+    实景图（photos），其余字段聚焦帮人选点 / 联络的信息，
     原始坐标仍然不进卡片（用户可以在地图 App 里搜名字）。
     """
     pois = _find_poi_records(payload)

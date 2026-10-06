@@ -31,13 +31,6 @@ class _FakeR2:
         self.objects[key] = bytes(data)
         return key
 
-    async def list_r2_objects(self, prefix: str):
-        p = prefix.rstrip("/") + "/"
-        return sorted(k for k in self.objects if k.startswith(p))
-
-    async def delete_r2_object(self, key: str) -> bool:
-        return self.objects.pop(key, None) is not None
-
 
 def _fresh_env(monkeypatch, tmp_path) -> _FakeR2:
     data_dir = tmp_path / "data"
@@ -50,7 +43,6 @@ def _fresh_env(monkeypatch, tmp_path) -> _FakeR2:
 
     wp.data_root.cache_clear()
     wp.workspaces_root.cache_clear()
-    wp._home_migrated.clear()
     wu._workspace_initialized.clear()
     wu._workspace_init_lock_registry._locks.clear()
     wu._workspace_file_locks._locks.clear()
@@ -59,8 +51,6 @@ def _fresh_env(monkeypatch, tmp_path) -> _FakeR2:
     monkeypatch.setattr(sr2, "is_r2_configured", lambda: True)
     monkeypatch.setattr(sr2, "download_from_r2", fake.download_from_r2)
     monkeypatch.setattr(sr2, "upload_bytes_to_r2", fake.upload_bytes_to_r2)
-    monkeypatch.setattr(sr2, "list_r2_objects", fake.list_r2_objects)
-    monkeypatch.setattr(sr2, "delete_r2_object", fake.delete_r2_object)
     return fake
 
 
@@ -74,7 +64,6 @@ def _wipe_disk(tmp_path) -> None:
     shutil.rmtree(tmp_path / "home", ignore_errors=True)
     wp.data_root.cache_clear()
     wp.workspaces_root.cache_clear()
-    wp._home_migrated.clear()
     wu._workspace_initialized.clear()
     wu._workspace_init_lock_registry._locks.clear()
     wu._workspace_file_locks._locks.clear()

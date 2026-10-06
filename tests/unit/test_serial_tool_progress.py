@@ -84,12 +84,6 @@ def test_group_summary_is_fixed_text_not_counted():
     edit = {"image_url": "https://x/y.png"}
     assert b._generate_group_summary(group(edit)) == "Edited image(s)"
     assert b._generate_group_summary(group({}, edit)) == "Generated image(s), edited image(s)"
-    # 旧名别名同样聚合
-    legacy = {"items": [
-        {"id": "1", "type": "generate_image_from_text", "status": "done", "fn_args": {}},
-        {"id": "2", "type": "edit_image_with_reference", "status": "done", "fn_args": edit},
-    ]}
-    assert b._generate_group_summary(legacy) == "Generated image(s), edited image(s)"
 
 
 def test_hidden_items_are_not_rendered_until_revealed():

@@ -489,8 +489,7 @@ def _normalize_url_for_compare(url: str) -> str:
 def _extract_js_redirect_targets(html: str, current_url: str) -> list[str]:
     """从 HTML 的 JavaScript 中提取所有"有用"的跳转目标地址。
 
-    与旧的 naive 正则 ``window\\.location\\.href\\s*=\\s*['"]...['"]`` 相比，
-    本函数覆盖更通用的网页跳转写法：
+    覆盖通用的网页跳转写法：
 
     * 支持多种 location 别名前缀：``window.`` / ``document.`` / ``top.`` /
       ``parent.`` / ``self.`` / ``frames.``，以及无前缀的裸 ``location``；

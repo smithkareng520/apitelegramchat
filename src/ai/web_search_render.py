@@ -10,7 +10,7 @@
   紧凑列表：不渲染 section 头（引擎/条数已由折叠块摘要展示）与摘要
   snippet，只保留标题链接 + 域名/时间/评分徽标；images / videos /
   lens 仍带各自头行；
-- 失败 / 旧格式 / 空 envelope 各自兜底，保证总能拿到合法 HTML。
+- 失败 / 空 envelope 各自兜底，保证总能拿到合法 HTML。
 
 刻意避免引入 project 内部的重型模块（``api_client`` / ``subagent_tool``
 等），便于在测试中独立验证。
@@ -294,7 +294,7 @@ def _render_videos_items(items: list[dict]) -> str:
     parts: list[str] = ["<ol>"]
     for it in items:
         title = convert_markdown_to_telegram_html(it.get("title") or "无标题")
-        # 新格式用 page_link；旧日志/缓存可能仍用 link，向后兼容
+        # 不同来源的条目分别使用 page_link / link
         page = it.get("page_link") or it.get("link") or ""
         snippet = convert_markdown_to_telegram_html(it.get("snippet") or "")
         source = convert_markdown_to_telegram_html(it.get("source") or "")
@@ -419,8 +419,7 @@ def render_web_search_section(section: dict) -> str:
 def format_web_search_result(fn_args: dict, result_str: str) -> tuple[str, str]:
     """Format the web_search tool result for the Telegram rich draft.
 
-    Replaces the legacy renderer that only kept title + link and dropped
-    the snippet. Now:
+    Renders the full result envelope:
 
     - parses the multi-mode envelope into structured sections,
     - renders each mode (search / images / videos / lens) with a

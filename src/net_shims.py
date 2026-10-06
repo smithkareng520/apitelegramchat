@@ -729,7 +729,7 @@ def ensure_network_shims(runtime_bin: Path) -> None:
     """确保 curl / wget 在沙箱内可用（真实二进制缺失时安装 stdlib shim）。
 
     - 镜像里已有真二进制（新 Dockerfile 安装了 curl/wget）→ 什么都不做，
-      并清掉旧版本 shim 防止 PATH 抢占；
+      并清掉已有 shim 防止 PATH 抢占；
     - runtime bin 中已有同版本 shim → 跳过；
     - 否则原子写入（tmp + os.replace）并 chmod 755。
     任何 IO 失败只记 debug 日志：shim 是尽力而为的增强，绝不能阻断 bash。

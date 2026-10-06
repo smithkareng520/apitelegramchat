@@ -3,10 +3,9 @@
 # （持久 bash 沙箱）/ tool_result_format（结果→UI 分发）/ file_delivery
 # （文件发送）/ tool_dispatch（统一调度）。
 #
-# MCP 化重构后本 facade 大幅瘦身：地图工具包装层已移除（gaode_mcp 由
-# mcp_manager 直连），bash / text_editor / todo / memory 经 MCP stdio
-# 服务器执行（mcpserver/server.py --module ...），不再从 host 进程内分发。
-# 这里只保留既有外部调用点引用的符号。
+# gaode_mcp 由 mcp_manager 直连；bash / text_editor / todo / memory 经 MCP
+# stdio 服务器执行（mcpserver/server.py --module ...），不在 host 进程内分发。
+# 这里只保留外部调用点引用的符号。
 import logging
 
 from tool_dispatch import (  # noqa: F401

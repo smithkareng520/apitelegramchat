@@ -134,8 +134,7 @@ DEFAULT_ALLOWED_TOOLS = sorted([
     # upload/download 是 workspace 根目录的子目录，bash 可直接读写，
     # 无需显式跨边界工具（用 `ls -la upload/`）。
     tn.PRESENT_FILES,
-    # 不含 generate_image（统一图像工具，原 generate_image_from_text /
-    # edit_image_with_reference 已合并）/ generate_video（生成耗时长、
+    # 不含 generate_image / generate_video（生成耗时长、
     # 易超时，结果也难以由子 agent 直接交付），
     # 以及 subagent / memory / message_user / deliver_reply（见 FORBIDDEN_TOOLS）。
     # 注：高德地图能力以 gaode_mcp 服务器原生工具名直接暴露（maps_geo /

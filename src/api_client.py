@@ -115,7 +115,7 @@ class APIClient:
                 # 与 OpenAI 兼容客户端保持相近的超时预算：连接短、流读取
                 # 放宽到 300s（agentic 多轮工具调用后首个事件可能较晚）。
                 # cast：SDK 存根引用的 httpx 类型对象与本环境安装的 httpx
-                # Anthropic 使用旧版 httpx；这里保留其原生 SDK 所需的 timeout 类型。
+                # Anthropic SDK 依赖的 httpx 版本与此不同；这里保留其原生 SDK 所需的 timeout 类型。
                 timeout=cast(Any, httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=60.0)),
                 **kwargs,
             )

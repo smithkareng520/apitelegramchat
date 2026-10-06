@@ -601,4 +601,3 @@ def test_manager_proxies_builder_attributes(env):
     asyncio.run(scenario())
 
 
-from ai.draft_manager import AgentEvent as _AgentEvent  # noqa: F401,E402 - 兼容旧导入路径

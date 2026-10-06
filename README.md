@@ -463,7 +463,7 @@ present_files    # 发送 upload/ 暂存区文件到聊天
 ### 生成
 
 ```text
-generate_image_from_text / edit_image_with_reference / generate_video
+generate_image / generate_video
 ```
 
 ### 工具返回的「模型视图」精简

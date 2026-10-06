@@ -115,7 +115,7 @@ def tool_family(name: str) -> str:
         return "text_editor"
     if name == BASH:
         return "bash"
-    if name in {GENERATE_IMAGE, "generate_image_from_text", "edit_image_with_reference"}:
+    if name == GENERATE_IMAGE:
         return "generate_image"
     if name == GENERATE_VIDEO:
         return "generate_video"

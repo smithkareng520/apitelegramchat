@@ -103,7 +103,7 @@ async def execute_generate_image(
     image_url: Optional[str] = None,
     extra_params: Optional[dict] = None,
 ) -> str:
-    """统一图像工具入口（原 generate_image_from_text / edit_image_with_reference 合并）。
+    """统一图像工具入口。
 
     操作语义由 ``image_url`` 是否提供显式决定（不再按端点/模型猜测）：
       - 无参考图  -> ImageTask.generate（文生图）
@@ -261,7 +261,7 @@ async def execute_generate_video(
     chat_id: Optional[int] = None,
 ) -> str:
     """
-    视频生成工具：复用 ai_handlers 中已有的 _request_agnes_video / _request_openrouter_video
+    视频生成工具：复用 ai.media_generation 中的 _request_agnes_video / _request_openrouter_video
     轮询逻辑，下载视频字节并上传 R2（拿到稳定的 HTTPS URL + 正确的 video/mp4 MIME）。
 
     与 _agentic_loop_native_video 的区别：
@@ -275,8 +275,8 @@ async def execute_generate_video(
         ✅ 已生成视频。
         视频链接：https://...
     """
-    # 局部导入避免与 ai_handlers 产生循环依赖
-    from ai_handlers import (
+    # 局部导入避免循环依赖
+    from ai.media_generation import (
         _request_agnes_video,
         _request_openrouter_video,
     )

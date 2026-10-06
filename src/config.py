@@ -97,9 +97,6 @@ _VALID_PROTOCOLS = {
 }
 #: 缺省协议：无特殊声明时所有模型默认走 OpenAI 兼容 Chat Completions。
 DEFAULT_PROTOCOL = "openai_chat"
-# 历史注：本字段曾名 dedicated_loop_kind（取值 openai_compat /
-# gemini_native / anthropic_native），v3 协议层重构时一次性硬切为
-# protocol + 新命名；旧字段名与旧取值不再被接受。
 
 
 def _positive_float_env(name: str, default: float, minimum: float) -> float:
@@ -672,20 +669,6 @@ _ENDPOINT_OVERRIDE_FIELDS = (
     "endpoint",
 )
 
-# 已移除的端点字段迁移守卫：base_url 已并入 endpoint（唯一端点字段，
-# 完全靠 endpoint 支持端点路由）；edits_endpoint / image_edit_inline /
-# vision_prefer_url 属补丁式参数已精简——图像编辑形状由 endpoint 指向的
-# URL 路径推导（见 media_generation.resolve_images_endpoint_shape），图片
-# 输入统一使用 R2 预签名 URL（见 ai/attachment_content.py）。旧字段写法
-# 直接报错暴露，避免旧配置被静默吞掉后行为与预期不符。
-_REMOVED_ENDPOINT_FIELDS = (
-    "base_url",
-    "edits_endpoint",
-    "image_edit_inline",
-    "vision_prefer_url",
-)
-
-
 def make_model_config(
     model_id: str,
     provider: str,
@@ -727,45 +710,6 @@ def make_model_config(
     endpoint_overrides = {
         field: kwargs.pop(field) for field in _ENDPOINT_OVERRIDE_FIELDS if field in kwargs
     }
-
-    # 迁移守卫（模型 name 字段已删除）：展示统一用 model_id。旧字段若被
-    # 静默忽略，配置里精心起的名字会无声失效，直接报错暴露。
-    if "name" in kwargs:
-        raise ValueError(
-            f"模型 {model_id} 传入了已移除的字段 name："
-            "每模型不再另设展示名，统一用 model_id（列表/切换回执/日志"
-            "同源）。请删除 name=... 行。"
-        )
-
-    # 迁移守卫：协议字段已硬切为 protocol（新命名），旧字段写法直接报错
-    # 暴露，避免旧配置被静默吞掉后行为与预期不符。
-    for _legacy_field in ("use_dedicated_loop", "dedicated_loop_kind"):
-        if _legacy_field in kwargs:
-            raise ValueError(
-                f"模型 {model_id} 传入了已移除的字段 {_legacy_field}："
-                "协议字段已硬切为 protocol，请改用 protocol"
-                f"（合法值: {sorted(_VALID_PROTOCOLS)}，不填=继承厂商默认）。"
-            )
-    # 迁移守卫（端点字段精简）：base_url 并入 endpoint；edits_endpoint /
-    # image_edit_inline / vision_prefer_url 已移除（见 _REMOVED_ENDPOINT_FIELDS）。
-    for _removed_field in _REMOVED_ENDPOINT_FIELDS:
-        if _removed_field in kwargs:
-            raise ValueError(
-                f"模型 {model_id} 传入了已移除的字段 {_removed_field}："
-                "端点配置已精简为唯一 endpoint 字段（完整 URL）——base_url 并入"
-                " endpoint；edits_endpoint / image_edit_inline 已删除（编辑形状"
-                "由 endpoint 指向的图像端点路径推导）；vision_prefer_url 已删除"
-                "（媒体输入统一使用 R2 预签名 URL）。"
-            )
-    # 迁移守卫（能力字段改名）：旧字段名若被静默忽略，模型会无声丢失
-    # 对应输入能力（如 video=True 被丢弃后视频输入关闭），直接报错暴露。
-    for _old_name, _new_name in (("video", "video_input"),):
-        if _old_name in kwargs:
-            raise ValueError(
-                f"模型 {model_id} 传入了已改名的字段 {_old_name}："
-                f"请改用 {_new_name}（能力字段统一以 _input/_output 后缀"
-                "区分输入/输出模态）。"
-            )
 
     override_protocol = endpoint_overrides.get("protocol")
     if override_protocol is not None and override_protocol not in _VALID_PROTOCOLS:
@@ -1730,24 +1674,14 @@ MAX_CONCURRENT_TOOLS = _positive_int_env("MAX_CONCURRENT_TOOLS", 8, 1)
 #       "某些文本内容的消息永久 403、Telegram 队头阻塞、全 bot 卡死"。
 #
 #   "webhook"
-#       保持旧的 Telegram → POST /webhook 链路。仅在你已经把 WEBHOOK_URL
+#       Telegram → POST /webhook 链路。仅在你已经把 WEBHOOK_URL
 #       指向自建反向代理 / Cloudflare Worker（对请求体做过 base64 包装，
 #       见 deploy/cloudflare-webhook-proxy.js）时才应使用。直连 Render 域名
 #       时该模式存在已知的 WAF 误杀缺陷。
-#
-#   "auto"
-#       配了 WEBHOOK_URL 就用 webhook，否则 polling（兼容旧部署的过渡值）。
-_RAW_INGEST_MODE = (os.getenv("INGEST_MODE", "polling") or "polling").strip().lower()
-if _RAW_INGEST_MODE not in {"polling", "webhook", "auto"}:
-    logger.warning(
-        "INGEST_MODE=%r 不是合法取值（polling/webhook/auto），已回退为 polling",
-        _RAW_INGEST_MODE,
-    )
-    _RAW_INGEST_MODE = "polling"
-if _RAW_INGEST_MODE == "auto":
-    INGEST_MODE = "webhook" if _RAW_WEBHOOK_URL else "polling"
-else:
-    INGEST_MODE = _RAW_INGEST_MODE
+INGEST_MODE = (os.getenv("INGEST_MODE", "polling") or "polling").strip().lower()
+if INGEST_MODE not in {"polling", "webhook"}:
+    logger.warning("INGEST_MODE=%r 不是合法取值（polling/webhook），已回退为 polling", INGEST_MODE)
+    INGEST_MODE = "polling"
 
 # 单次 getUpdates 的服务端挂起时长（秒）。Telegram 建议 ≤50；25 与
 # aiohttp 请求超时（下方 +15s 余量）配合，既省请求数又能快速感知断链。

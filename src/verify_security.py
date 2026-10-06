@@ -223,7 +223,7 @@ async def check_sandbox_isolation(landlock_ok: bool) -> None:
         from sandbox import SANDBOX_USER
         got = [line.strip() for line in out.strip().splitlines() if line.strip()]
         # 三路输出全部等于沙盒身份：whoami（passwd 解析）、id -un、$USER。
-        # 若镜像未重建（passwd 里仍是旧用户名），whoami 会返回旧名 → FAIL 提示重建。
+        # 若镜像未重建（passwd 里仍是别的用户名），whoami 会返回该名 → FAIL 提示重建。
         report("4.10 沙盒身份一致（whoami/id/USER = %s）" % SANDBOX_USER,
                got == [SANDBOX_USER, SANDBOX_USER, SANDBOX_USER],
                f"got={got}" + ("" if got == [SANDBOX_USER] * 3 else "（提示：需要重建镜像使 passwd 生效）"))

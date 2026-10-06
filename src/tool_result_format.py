@@ -159,10 +159,6 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             if m:
                 # <h3> 内容是已转义的 HTML 文本（&amp; 等），原样嵌入合法。
                 title = re.sub(r'<[^>]+>', '', m.group(1)).strip() or domain
-            else:
-                m = re.search(r'🏷️\s+([^\n]+)', text)
-                if m:
-                    title = m.group(1).strip()
             summary = f"🌐 Fetched: {title}"
             details_html = f"{title} <a href=\"{url}\">{domain}</a>"
         return summary, details_html
@@ -345,13 +341,8 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         return summary, details_html
 
     elif family == "generate_image":
-        # 统一图像工具（含旧名别名）：按 image_url 是否携带判断本次
-        # 是生成还是编辑，结果折叠块标题显示对应操作。
-        is_edit = (
-            bool(str(fn_args.get("image_url") or "").strip())
-            if fn_name != "generate_image_from_text"
-            else False  # 旧名历史语义：强制文生图
-        )
+        # 按 image_url 是否携带判断本次是生成还是编辑，结果折叠块标题显示对应操作。
+        is_edit = bool(str(fn_args.get("image_url") or "").strip())
         if is_edit:
             return _format_image_generation_result(
                 result_str,
@@ -625,7 +616,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             data = None
 
         if not isinstance(data, dict):
-            # Legacy fallback: result_str was not JSON (e.g. an error string
+            # Fallback: result_str was not JSON (e.g. an error string
             # from dispatch_tool_call's top-level exception handler). Render
             # it as escaped plain text so we never break the UI.
             summary = "📂 Presenting files"

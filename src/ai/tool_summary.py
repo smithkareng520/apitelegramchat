@@ -524,15 +524,8 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
 
     # ---------- 图片类 ----------
     # 统一图像工具 generate_image：按 image_url 是否携带判断生成/编辑，
-    # 折叠块标题显示对应操作；旧工具名保留各自历史语义（generate=
-    # 文生图、edit=编辑）作为兼容路径。
-    if fn_name == "generate_image_from_text":
-        num_images = _coerce_positive_int(fn_args.get("num_images"), 1)
-        if num_images == 1:
-            return "Generating an image"
-        return f"Generating {num_images} images"
-
-    if fn_name in ("generate_image", "edit_image_with_reference"):
+    # 折叠块标题显示对应操作。
+    if fn_name == "generate_image":
         is_edit = bool(str(fn_args.get("image_url") or "").strip())
         if is_edit:
             return "Editing an image"
@@ -1041,7 +1034,7 @@ def _route_done_summary(fn_name: str, result_content: Any) -> str | None:
     return f"Planned a {mode} route{suffix}"
 
 
-_IMAGE_TOOL_NAMES = frozenset({"generate_image", "generate_image_from_text", "edit_image_with_reference"})
+_IMAGE_TOOL_NAMES = frozenset({"generate_image"})
 
 
 def image_result_count(fn_name: str, result_content: str) -> int | None:
@@ -1170,11 +1163,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         if m:
             title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1))).strip()
         if not title:
-            # 旧格式兼容：🏷️ 标记行。
-            m = re.search(r"🏷️\s+([^\n]+)", text)
-            if m:
-                title = m.group(1).strip()
-        if not title:
             m = re.search(r"<title>(.*?)</title>", text, re.I | re.S)
             if m:
                 title = re.sub(r"<[^>]+>", "", m.group(1)).strip()
@@ -1255,12 +1243,8 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
 
     # 图片完成态按结果里真实的图片张数（image_result_count）；解析不到（失败文案 /
     # 非标准结果）才退回请求张数，保证标题与下方卡片里的图片数一致。
-    if fn_name == "generate_image_from_text":
-        n = image_result_count(fn_name, result_content) or _coerce_positive_int(fn_args.get("num_images"), 1)
-        return "Generated an image" if n == 1 else f"Generated {n} images"
-    # 统一图像工具：按 image_url 是否携带区分生成/编辑完成态文案
-    # （旧名 edit_image_with_reference 语义固定为编辑，同样走 image_url 判断）。
-    if fn_name in ("generate_image", "edit_image_with_reference"):
+    # 统一图像工具：按 image_url 是否携带区分生成/编辑完成态文案。
+    if fn_name == "generate_image":
         is_edit = bool(str(fn_args.get("image_url") or "").strip())
         if is_edit:
             n = image_result_count(fn_name, result_content) or 1

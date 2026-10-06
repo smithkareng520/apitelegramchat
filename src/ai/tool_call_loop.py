@@ -25,6 +25,10 @@ from tool_executors import (
     tool_semaphore,
     _TOOL_TIMEOUT_MARKER,
 )
+from ai.subagent_progress import (
+    format_subagent_progress_html,
+    subagent_progress_phase,
+)
 from message_user_tool import (
     ask_preview,
     create_ask_user_interaction,
@@ -185,15 +189,6 @@ async def _wait_detached_tool_final_state(
         return
     except Exception:
         logger.exception(f"[tool] 脱离工具 {fn_name}({tc_id}) 终态回写历史失败")
-
-
-# ---------- 子 agent 进度预览渲染 ----------
-# 已拆分至 ai/subagent_progress.py（正则解析 + HTML 渲染是独立于工具调用
-# 编排的表现层关切）。此处保留旧名重导出，避免本文件内其余代码改动。
-from ai.subagent_progress import (
-    subagent_progress_phase as _subagent_progress_phase,
-    format_subagent_progress_html as _format_subagent_progress_html,
-)
 
 
 def _last_assistant_text(journal: list) -> str:
@@ -441,7 +436,7 @@ async def _run_tool_calls_and_append(
                                                   _emit_ref: list[float] = _emit_ref) -> None:
                     try:
                         now = time.monotonic()
-                        phase = _subagent_progress_phase(status_text)
+                        phase = subagent_progress_phase(status_text)
                         # 同一 phase 内 2s 节流；phase 切换立即推送，
                         # 保证「思考 → 执行工具 → 完成」等关键状态变化
                         # 不被合并丢掉。
@@ -449,7 +444,7 @@ async def _run_tool_calls_and_append(
                             return
                         _phase_ref[0] = phase
                         _emit_ref[0] = now
-                        preview_html = _format_subagent_progress_html(status_text)
+                        preview_html = format_subagent_progress_html(status_text)
                         builder.update_tool_preview(_tc_id, preview_html, summary=_label)
                         # update_tool_preview 内部已调用
                         # request_flush(force=False)，由 builder 全局

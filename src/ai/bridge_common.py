@@ -68,8 +68,7 @@ class BridgeLoopState:
     # 连续相同工具错误的熔断计数：key 是错误签名（首行，截 100 字符），
     # value 是连续命中次数。本轮 turn 内跨多次 _run_tool_calls_and_append
     # 调用共享同一份状态（每个 turn 由 init_bridge_loop_state 重新创建，
-    # 不跨 turn 存活）。显式字段替代旧版借用 builder 对象做
-    # setattr/getattr/vars() 反射存储的写法——熔断计数是"本轮工具循环"的
+    # 不跨 turn 存活）。熔断计数是"本轮工具循环"的
     # 状态，不属于 DraftManager（UI 渲染）的职责范围。
     error_streak: dict = field(default_factory=dict)
 

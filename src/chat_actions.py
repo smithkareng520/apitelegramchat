@@ -2,10 +2,10 @@
 
 语义约定（严格对齐 https://core.telegram.org/bots/api#sendchataction）：
 chat action 描述的是 **bot 自己** 正在对 chat 做的动作，绝不用于描述用户
-上传了什么。因此旧版在消息入口处按「用户发送的媒体类型」回发
-upload_photo / upload_voice / upload_document / upload_video 的做法全部
-移除——那些动作会被 Telegram 客户端渲染成“bot 正在上传照片/语音/…”，
-与真实语义（用户在上传）完全相反。
+上传了什么。因此不在消息入口按「用户发送的媒体类型」回发
+upload_photo / upload_voice / upload_document / upload_video——那些动作
+会被 Telegram 客户端渲染成“bot 正在上传照片/语音/…”，与真实语义
+（用户在上传）完全相反。
 
 本项目仅允许出现以下五个动作，且只允许在下列位置触发，其他位置一律
 不使用：

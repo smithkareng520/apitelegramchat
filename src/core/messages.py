@@ -21,7 +21,7 @@
     DocumentBlock / ToolCallBlock / ToolResultBlock / ReasoningBlock），
     多模态是一等公民；
   - meta:   Telegram 侧附件元数据与内部标记（TURN_FAILED_FLAG 等），
-    **永不渲染进出站请求**（替代旧版"出站前手工剔除内部字段"的约定）。
+    **永不渲染进出站请求**。
 
 互操作（兼容与出站）
 ====================
@@ -497,18 +497,18 @@ class Message:
 # 列表级辅助
 # ===========================================================================
 def render_openai_messages(messages: list) -> list[dict[str, Any]]:
-    """把 Message 列表渲染为 OpenAI wire dict 列表（兼容旧 dict 直通）。"""
+    """把 Message 列表渲染为 OpenAI wire dict 列表（已是 dict 的条目原样保留）。"""
     out: list[dict[str, Any]] = []
     for m in messages:
         if isinstance(m, Message):
             out.append(m.to_openai_dict())
         else:
-            out.append(m)  # 旧 dict 直通（双形状过渡期兼容）
+            out.append(m)
     return out
 
 
 def as_message(msg: Any) -> Message:
-    """旧 dict -> Message（Message 原样返回）——双形状适配入口。"""
+    """dict -> Message（Message 原样返回）。"""
     if isinstance(msg, Message):
         return msg
     if isinstance(msg, dict):

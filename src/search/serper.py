@@ -445,7 +445,7 @@ async def execute_web_search(
       num_results: 单 mode 的结果数上限。search: 1-50（多页聚合）；
                    images / videos / lens: 1-100。
       offset:      search mode 的偏移量（向后翻页），其他 mode 忽略；
-                   为兼容老调用方，等价于 page = offset // 10 + 1。
+                   等价于 page = offset // 10 + 1。
       mode:        "search"（默认） / "images" / "videos" / "lens"，或它们的 list。
       image_url:   lens mode 必填；其他 mode 忽略。
       gl:          地区码（如 us / cn），默认取 WEB_SEARCH_REGION。

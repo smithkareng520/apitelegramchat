@@ -285,7 +285,7 @@ def _get_reply_media(msg: dict) -> list[dict]:
 
     相册整组补齐：被引用消息属于相册（带 media_group_id）时，Telegram
     的 reply_to_message 只携带被长按回复的那**一个**分片——只看它，
-    模型只能看到一张图（旧版表现即“回复相册只带上单张图片”）。这里
+    模型只能看到一张图。这里
     先查 state.album_media_registry（相册聚合时登记的整组媒体），命中
     则返回相册的全部图片/音频/视频/文档。
 
@@ -440,8 +440,7 @@ def _estimate_message_tokens(message: Any) -> int:
 def _estimate_history_tokens(history: list) -> int:
     """按请求侧同一口径估算当前持久历史的 token 量。
 
-    旧版经由 select_request_context 生成快照再估算（每轮产生整份浅拷贝
-    且语义上依赖"滑动视图"）；新策略下历史本身就是请求上下文，直接计数。
+    历史本身就是请求上下文，直接计数。
     """
     return sum(_estimate_message_tokens(message) for message in history)
 
@@ -465,8 +464,7 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
           轮），被淘汰轮合并进历史头部稳定槽位的滚动摘要。
       一次事件清出约 40% 预算的空间，之后很多轮内不再触发（滞后 /
       hysteresis）。
-    - 旧版每轮"从历史前端逐块删到塞得下"的行为被完全取代：淘汰
-      不再是历史长度的连续函数，而是离散事件。
+    - 淘汰不是历史长度的连续函数，而是离散事件。
 
     返回 False 仅当新消息自身超过预算（即便空历史也放不下）；
     历史侧超限由请求守卫（context_manager.select_request_context）

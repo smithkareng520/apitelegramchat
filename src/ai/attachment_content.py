@@ -87,12 +87,10 @@ async def get_cached_image_data(chat_id: int | None, file_id: str) -> Optional[b
     file_id，即使临时条件消除后下一轮也无法恢复，导致历史图片"静默
     消失"。
 
-    设计取舍：旧版本在此函数末尾调用 ``_track_task(_upload_and_mark(...))``
-    做后台上传。这把"取字节"和"预防性 R2 上传"两个职责耦合在一起，导致
-    Agnes 路径（``_resolve_r2_presigned_url_for_vision``）首次访问时
-    同一张图被 ``put_object`` 两次（一次后台 + 一次同步）。重构后此函数
-    职责单一，Agnes 路径自己负责唯一的同步上传，Gemini 路径在
-    ``process_one`` 内显式触发后台上传。
+    设计取舍：本函数只负责取字节，不做 R2 上传——否则 Agnes 路径
+    （``_resolve_r2_presigned_url_for_vision``）首次访问时同一张图会被
+    ``put_object`` 两次（一次后台 + 一次同步）。Agnes 路径自己负责唯一的
+    同步上传，Gemini 路径在 ``process_one`` 内显式触发后台上传。
     """
     cache_key = file_id
     if cache_key in _image_cache:
@@ -682,9 +680,8 @@ async def _resolve_r2_presigned_url_for_vision(file_id: str) -> str:
          R2 → 签发并返回预签名 URL**。这是首次访问 Agnes 的冷路径。
 
     关键设计：本函数负责**唯一的** R2 上传调用，不通过
-    ``get_cached_image_data`` 触发后台上传。旧版本调 ``get_cached_image_data``
-    导致同一张图被 ``put_object`` 两次（后台 fire-and-forget + 本函数同步），
-    浪费一次 R2 PUT 和一次同图上行带宽。
+    ``get_cached_image_data`` 触发后台上传，否则同一张图会被 ``put_object``
+    两次（后台 fire-and-forget + 本函数同步），浪费一次 R2 PUT 和上行带宽。
 
     返回值绝不包含 bot token：Telegram 直链会泄露 token 给第三方 API。
     """
@@ -996,7 +993,6 @@ async def _resolve_mixed_attachments(
 async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_id: int | None = None) -> list[Block]:
     """把 Telegram 侧消息信封（文本 + 附件元数据）解析为内部内容块列表。
 
-    重构说明：旧版返回 OpenAI content parts 列表（或纯字符串），现在统一
     返回内部块（Block）；协议形状由各适配器在出站时渲染。支持的模态产生
     对应块（ImageBlock / AudioBlock / VideoBlock / DocumentBlock），不支持
     或解析失败时降级为文本占位块——调用方拿到的永远是合法的块列表。
@@ -1175,8 +1171,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
                         continue
                     # 原生解析失败（anthropic document 块不收非 PDF /
                     # 字节获取失败）：逐个构造文本占位（链接 + file_id），
-                    # 绝不静默丢文档——旧版这里 part 为 None 时文档直接
-                    # 消失且无任何提示。
+                    # 绝不静默丢文档。
                     fallback_texts.append(await _build_attachment_fallback_text(
                         kind="document",
                         file_ids=[fid],
@@ -1291,8 +1286,7 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
 async def _append_history_async(messages: list, history: list, model_info: ModelConfig, chat_id: int | None = None) -> None:
     """把历史消息（Message 列表）按当前模型能力重新解析后追加到 ``messages``。
 
-    重构说明（Internal Message 全链路）：历史存储统一为 Message 对象。
-    user 消息携带 Telegram 侧附件元数据（保存在 ``Message.meta``），每轮
+    历史存储为 Message 对象。user 消息携带 Telegram 侧附件元数据（保存在 ``Message.meta``），每轮
     按当前模型能力重新解析为内部块（支持多模态的模型得到原生块，不支持
     的得到文本占位）；其余角色原样透传（仅对文本做引用回复前缀剥除）。
 
@@ -1468,8 +1462,7 @@ def _apply_cache_control(messages: list) -> None:
 
     幂等性与断点回收（再平衡）：本函数会被 agentic loop 的每一轮重复
     调用（以及跨回合在共享历史副本上再次调用）。每次调用先摘除开头
-    system 段之外的全部旧标记（清理历史遗留或旧版本代码打过的尾部
-    标记），保证：
+    system 段之外的全部旧标记（上一次调用留下的尾部标记），保证：
       - 标记总数恒定 ≤2，绝不随轮次/回合累积（否则超过 Anthropic
         4 断点上限会被 400 拒绝）；
       - 断点始终打在最有利于命中的位置（system 首尾）；
@@ -1495,8 +1488,7 @@ def _apply_cache_control(messages: list) -> None:
         _mark_last_content_block_cacheable(messages[system_run_end - 1], ttl=_CACHE_SYSTEM_TTL)
 
     # 回收旧标记：system 段以外的消息全部摘除，不再重新分配尾部断点。
-    # 这一步仍然需要保留——历史消息里可能残留旧版本代码打过的尾部
-    # 标记（或上一次调用本函数时打的），必须清掉，否则会跨轮次累积，
+    # 上一次调用本函数时打的标记必须清掉，否则会跨轮次累积，
     # 超过 Anthropic 4 断点上限会被 400 拒绝。
     for msg in messages[system_run_end:]:
         _remove_message_cache_marks(msg)

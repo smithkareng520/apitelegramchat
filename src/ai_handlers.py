@@ -13,9 +13,7 @@ ai/ 子包下的多个职责单一的子模块：
   ai/rich_message_builder.py- Telegram Rich Message 草稿增量构建
   ai/agentic_loops.py       - 四种 agentic 循环实现
 
-本文件保留 get_ai_response / build_system_prompt 等顶层入口，并重导出
-其他文件曾经从 ai_handlers 直接导入的符号，确保外部调用方（app.py 等）
-无需修改任何 import 语句。
+本文件保留 get_ai_response / build_system_prompt 等顶层入口。
 """
 import asyncio
 import json
@@ -495,8 +493,7 @@ def _build_initial_messages(base_segment: str, extra_segment: str, skill_catalog
     base_segment 消息末尾打断点 1、extra_segment 消息末尾打断点 2——
     _convert_messages_to_anthropic 等转换函数会把多条 role=system
     消息用 "\n\n" 拼接进请求的顶层 system 字段（Anthropic 无 system
-    角色消息），拼接顺序与本函数 append 顺序一致，字节上等价于旧版
-    单字符串，只是缓存断点的挂载粒度从"字符串"变成了"消息"。
+    角色消息），拼接顺序与本函数 append 顺序一致，缓存断点的挂载粒度是"消息"。
     """
     messages = [Message.system(base_segment)]
     if extra_segment:
@@ -1477,8 +1474,7 @@ async def _call_api(
         tools_to_pass = tools if supports_tools else None
 
     # 协议路由（Model -> Protocol -> Adapter）：按模型的有效协议取
-    # 适配器，替代旧版 if anthropic / elif gemini / else openai 的
-    # 硬编码分支。适配器内部负责客户端获取与循环转发；新增协议只需
+    # 适配器。适配器内部负责客户端获取与循环转发；新增协议只需
     # 在 protocols/registry 注册，本函数零改动。
     adapter = resolve_chat_adapter(model_info)
     return await adapter.run_agent_loop(
@@ -1492,20 +1488,3 @@ async def _call_api(
         turn=turn,
         workspace_namespace=workspace_namespace,
     )
-
-
-
-# ========== 向后兼容重导出 ==========
-# 以下符号定义在 ai 子包中；仅保留仍有外部调用点的重导出
-# （经 AST 全仓引用分析精简）：
-# - search/media_tools.py:260 局部导入视频请求函数（避免循环依赖）；
-# - app.py:22 导入音频缓存读取。
-# 其余历史重导出（图像请求全家桶）已无消费者：调用方均直连
-# ai.media_generation，测试也直接 monkeypatch "ai.media_generation.X"。
-from ai.media_generation import (  # noqa: F401
-    _request_agnes_video,
-    _request_openrouter_video,
-)
-from ai.attachment_content import (  # noqa: F401
-    _get_cached_audio_data,
-)

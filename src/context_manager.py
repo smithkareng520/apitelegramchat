@@ -3,8 +3,8 @@
 策略（2026-09 重构，详见 CACHE_OPTIMIZATION.md 与 context_window.py）：
 
 **存储历史即请求上下文。** 历史的有界性由 app.pre_flight_context_check
-的自动压缩事件（高/低水位 + 滞后）维护，本模块不再做逐轮滑动截尾——
-旧版"从尾部回退装配"会让窗口起点每轮后移，隐式前缀缓存整段 miss。
+的自动压缩事件（高/低水位 + 滞后）维护，本模块不做逐轮滑动截尾——
+窗口起点每轮后移会让隐式前缀缓存整段 miss。
 
 select_request_context 退化为守卫，只在两种情况下工作：
 
@@ -17,8 +17,7 @@ select_request_context 退化为守卫，只在两种情况下工作：
    合法；单条消息自身超预算时按 token 预算截断该消息。
    下一次压缩事件会把持久历史收敛回预算内，兜底路径随之消失。
 
-重构说明（Internal Message）：历史统一为 Message 对象；本模块的纯逻辑
-同时接受 Message 与旧 dict（双形状过渡），token 估算基于出站投影
+历史为 Message 对象；本模块的纯逻辑同时接受 Message 与 dict，token 估算基于出站投影
 （Message.to_openai_dict()），与真实请求载荷同源。
 """
 from __future__ import annotations
@@ -63,7 +62,7 @@ def _fit_message_to_token_budget(message: Any, token_budget: int) -> Any:
 
     m = as_message(message)
     # 仅纯文本（单 TextBlock）消息可无损截断；多模态/结构化消息无法
-    # 在块语义内安全裁剪，放弃该消息（与旧版 content 非字符串时一致）。
+    # 在块语义内安全裁剪，放弃该消息。
     text_blocks = [b for b in m.blocks if isinstance(b, TextBlock)]
     if len(m.blocks) != 1 or len(text_blocks) != 1:
         return None
@@ -143,8 +142,7 @@ def select_request_context(
 
     if total_tokens <= budget:
         # 快路径：全量透传。Message 是不可变使用约定（历史追加-only），
-        # 旧版"浅拷贝防污染"针对 dict 原地改写；Message 化后出站装饰
-        # （cache_control）只落在渲染产物上，持久对象不再被触碰。
+        # 出站装饰（cache_control）只落在渲染产物上，持久对象不被触碰。
         selected = list(supported)
         used_tokens = total_tokens
     else:

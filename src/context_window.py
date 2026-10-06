@@ -1,11 +1,9 @@
 """上下文窗口核心：有界会话窗口 + 摊销式自动压缩（auto-compaction）。
 
-策略（2026-09 重构，取代旧的"逐轮滑动截尾 + 量化淘汰"方案，
-对齐 Claude Code / Cline 等主流 Agent 的上下文管理思路）：
+策略（对齐 Claude Code / Cline 等主流 Agent 的上下文管理思路）：
 
-1. **存储历史即请求上下文**。不再每轮用 select_request_context 做
-   滑动截尾视图——旧方案每轮窗口起点后移，隐式前缀缓存
-   （DeepSeek/GLM/Gemini/OpenAI）整段历史每轮全 miss。
+1. **存储历史即请求上下文**。不做逐轮滑动截尾——窗口起点每轮后移会让
+   隐式前缀缓存（DeepSeek/GLM/Gemini/OpenAI）整段历史每轮全 miss。
 2. **一个预算、双水位、滞后（hysteresis）触发**：
    - 触发水位 = budget × CONTEXT_COMPACT_TRIGGER_RATIO（默认 0.90）；
    - 压缩目标 = budget × CONTEXT_COMPACT_TARGET_RATIO（默认 0.50）。
@@ -88,7 +86,7 @@ CONTEXT_COMPACT_TARGET_RATIO = min(1.0, max(0.1, _env_float("CONTEXT_COMPACT_TAR
 CONTEXT_PROTECTED_TURNS = max(0, _env_int("CONTEXT_PROTECTED_TURNS", 6))
 #: 滚动摘要的 token 预算
 CONTEXT_DIGEST_TOKEN_BUDGET = max(200, _env_int("CONTEXT_DIGEST_TOKEN_BUDGET", 1500))
-#: 绝对预算覆盖（兼容旧 CONTEXT_MAX_TOKENS 语义；0 = 不覆盖）
+#: 绝对预算覆盖（环境变量 CONTEXT_MAX_TOKENS；0 = 不覆盖）
 CONTEXT_MAX_TOKENS_ENV = _env_int("CONTEXT_MAX_TOKENS", 0)
 
 #: 无任何模型信息时的兜底预算（与旧 select_request_context 保持一致）
@@ -121,7 +119,7 @@ def resolve_history_budget(
 ) -> int:
     """解析会话历史（含新输入）的统一 token 预算。
 
-    优先级：显式绝对覆盖（兼容旧 CONTEXT_MAX_TOKENS）> 模型推导。
+    优先级：显式绝对覆盖 > 模型推导。
     模型推导同时满足两个约束（取更紧者）：
       - ``max_context × CONTEXT_BUDGET_RATIO``（给系统提示/工具/轮内增长留余量）；
       - ``max_context − max_output``（输入 + 输出不得超过模型窗口）。

@@ -111,17 +111,16 @@ def _convert_messages_to_responses_input(
 # =============================================================================
 # Responses Prompt Cache：稳定 key + GPT-5.6 原生缓存选项
 # =============================================================================
-def _responses_prompt_cache_key(api_label: str, model: str, chat_id: Any) -> str:
+def _responses_prompt_cache_key(chat_id: Any) -> str:
     """返回与项目现有 LLM session_id 完全相同的 Responses cache key。
 
     这里不再额外 hash / 改写 session：同一 Telegram 会话使用完全相同的
     ``tg-chat-{chat_id}-{epoch}`` 字符串，同时用于 OpenAI/OpenAI-compatible
     网关的 ``session_id`` 与 Responses API 的 ``prompt_cache_key``。
 
-    ``api_label`` / ``model`` 参数保留在签名中，兼容旧调用点；故意不把它们
-    拼进 key，避免模型切换破坏同一会话的缓存桶，也保证与 session_id 一致。
+    故意不把模型名拼进 key，避免模型切换破坏同一会话的缓存桶，也保证与
+    session_id 一致。
     """
-    del api_label, model
     session_key = get_llm_session_key(chat_id if chat_id is not None else None)
     if session_key:
         # 当前 state.py 生成的 session key 远低于 Responses prompt_cache_key
@@ -136,8 +135,6 @@ _RESPONSES_TTL = "30m"
 def _add_responses_cache_options(
     request_kwargs: dict[str, Any],
     *,
-    api_label: str,
-    model: str,
     chat_id: Any,
     enabled: bool = True,
 ) -> None:
@@ -149,9 +146,7 @@ def _add_responses_cache_options(
     """
     if not enabled:
         return
-    request_kwargs["prompt_cache_key"] = _responses_prompt_cache_key(
-        api_label, model, chat_id
-    )
+    request_kwargs["prompt_cache_key"] = _responses_prompt_cache_key(chat_id)
     # implicit 自动缓存；ttl 当前只有 30m 这一档。
     request_kwargs["prompt_cache_options"] = {
         "mode": "implicit",
@@ -413,9 +408,7 @@ async def openai_responses_chat_completions_create(
         "input": input_items,
         "max_output_tokens": max_tokens,
     }
-    _add_responses_cache_options(
-        request_kwargs, api_label="responses", model=model, chat_id=None, enabled=True
-    )
+    _add_responses_cache_options(request_kwargs, chat_id=None, enabled=True)
     if instructions:
         request_kwargs["instructions"] = instructions
     if temperature is not None:
@@ -674,8 +667,6 @@ async def _agentic_loop_openai_responses_impl(
             request_kwargs["previous_response_id"] = sync_ctx.response_id
         _add_responses_cache_options(
             request_kwargs,
-            api_label=api_label,
-            model=current_model,
             chat_id=builder.chat_id,
             enabled=prompt_cache_enabled,
         )
@@ -1118,7 +1109,7 @@ async def _agentic_loop_openai_responses_impl(
                     logger.debug(
                         "[%s] responses prompt cache: key=%s cached_tokens=%s",
                         api_label,
-                        _responses_prompt_cache_key(api_label, current_model, builder.chat_id),
+                        _responses_prompt_cache_key(builder.chat_id),
                         cached,
                     )
             except Exception:
@@ -1268,8 +1259,6 @@ async def _agentic_loop_openai_responses_impl(
                 }
                 _add_responses_cache_options(
                     synth_kwargs,
-                    api_label=api_label,
-                    model=current_model,
                     chat_id=builder.chat_id,
                     enabled=prompt_cache_enabled,
                 )

@@ -140,8 +140,8 @@ def _archive_payload(
 def _eligible_calls(history: list[Any]) -> list[tuple[int, dict[str, Any], dict[str, Any] | ToolResultBlock]]:
     """Return unarchived target tool-call/result pairs in chronological order.
 
-    重构说明（Internal Message）：生产历史为 Message 列表；这里把
-    ToolCallBlock / ToolResultBlock 投影为旧 dict 形状后再复用统一的
+    生产历史为 Message 列表；这里把
+    ToolCallBlock / ToolResultBlock 投影为 dict 形状后再复用统一的
     归档与改写逻辑（改写通过引用写回 block 字段）。
     """
     results_by_id: dict[str, tuple[dict[str, Any], ToolResultBlock]] = {}

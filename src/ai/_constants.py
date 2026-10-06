@@ -70,14 +70,8 @@ SUBAGENT_OUTER_TIMEOUT = _positive_env_int("SUBAGENT_OUTER_TIMEOUT", 930, minimu
 # memory / todo / present_files / 生成类工具有写副作用或依赖前序产物，保持串行。
 # text_editor view 虽只读，但会读到同批子 agent / bash 写出的文件，不放入。
 CONCURRENT_SAFE_TOOLS = frozenset(_tn.SEARCH_TOOLS_MCP | _tn.GAODE_TOOLS | SUBAGENT_TOOLS)
-# 统一图像工具 generate_image（image_url 缺省=文生图，提供=编辑）；
-# 两个旧名（generate_image_from_text / edit_image_with_reference）保留为
-# dispatch 层隐藏别名（历史会话旧调用仍可执行），同样纳入超时豁免。
-IMAGE_GEN_TOOLS = {
-    _tn.GENERATE_IMAGE,
-    "generate_image_from_text",
-    "edit_image_with_reference",
-}
+# 统一图像工具 generate_image（image_url 缺省=文生图，提供=编辑），纳入超时豁免。
+IMAGE_GEN_TOOLS = {_tn.GENERATE_IMAGE}
 # 视频生成工具：内部已有 5 分钟轮询超时，外层 wait_for 必须不设超时，
 # 否则会被 TOOL_CALL_TIMEOUT（当前 12s）过早杀掉（与 IMAGE_GEN_TOOLS 同样豁免）。
 VIDEO_GEN_TOOLS = {_tn.GENERATE_VIDEO}

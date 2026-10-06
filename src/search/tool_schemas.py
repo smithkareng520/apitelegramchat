@@ -155,8 +155,7 @@ def _generate_image_tool() -> dict:
     return {
         "type": "function",
         "function": {
-            # 统一图像工具（原 generate_image_from_text / edit_image_with_reference
-            # 合并）：操作语义由 image_url 是否提供决定——省略 = 文生图，
+            # 统一图像工具：操作语义由 image_url 是否提供决定——省略 = 文生图，
             # 提供 = 以该图为底编辑（图生图）。
             # 显示口径（2026-09）：生成/编辑是"每次调用"的操作（由
             # image_url 是否携带决定），不是模型属性；模型只按"允许

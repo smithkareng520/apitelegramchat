@@ -520,8 +520,8 @@ async def drain_completed_turns(chat_id: int) -> None:
 def _unpaired_tool_calls(journal: list) -> list[tuple[str, str]]:
     """找出 journal 中没有配对 tool 消息的 (tool_call_id, name) 列表。
 
-    重构说明（Internal Message）：journal 统一为 Message 列表（兼容旧
-    dict 直通），assistant 消息经 tool_calls() 读取结构化 ToolCallBlock。
+    journal 为 Message 列表（dict 条目亦可），assistant 消息经 tool_calls()
+    读取结构化 ToolCallBlock。
     """
     def _role(m: Any) -> Any:
         return m.role if isinstance(m, Message) else m.get("role")
@@ -849,9 +849,9 @@ _KIND_GROUP_TYPE = {
     "video": "video_group",
     "document": "document_group",
 }
-# 允许从单数字段重建附件条目的消息类型（历史遗留消息可能没有 attachments）。
+# 允许从单数字段重建附件条目的消息类型（单发消息没有 attachments 列表）。
 _SINGLE_ATTACHMENT_TYPES = ("photo", "video", "document", "audio", "voice")
-# 解析器可按 type 路由的类型（用于判断旧消息的 type 是否仍然可路由）。
+# 解析器可按 type 路由的类型。
 _RESOLVER_TYPES = {
     "photo", "photo_group", "video", "video_group",
     "document", "document_group", "audio", "voice",
@@ -862,7 +862,7 @@ def _attachment_entries(msg: dict) -> list[dict]:
     """提取消息携带的附件条目（attachments 优先，缺失时从单数字段重建）。
 
     打断合并需要统一的附件视图：组消息（photo_group 等）、单发消息
-    （file_id 单数字段）以及历史遗留的无 attachments 消息，都要能归到
+    （file_id 单数字段）这两种形态，都要能归到
     同一个 (kind, file_id) 列表上，后续才能按 kind 判断合并形态。
     """
     atts = msg.get("attachments")
@@ -1025,8 +1025,8 @@ def _replace_failed_user_message(old: dict, new: dict) -> None:
     """
     carried_media = _attachment_entries(old) if not _attachment_entries(new) else []
     if len(carried_media) == 1:
-        # 兼容历史遗留消息：attachments 条目缺 file_name/mime_type 但单数
-        # 字段上有的，回填进条目再搬运（仅单附件时无歧义）。
+        # attachments 条目缺 file_name/mime_type 但单数字段上有的，
+        # 回填进条目再搬运（仅单附件时无歧义）。
         entry = carried_media[0]
         if not entry.get("file_name") and old.get("file_name"):
             entry["file_name"] = old["file_name"]
@@ -1059,7 +1059,7 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
 
     def _envelope_of(msg: Message) -> dict:
         """把存储的 user Message 投影回信封 dict（meta + content），复用
-        旧版纯 dict 的合并/替换算法。"""
+        纯 dict 的合并/替换算法。"""
         env = dict(msg.meta)
         env["content"] = msg.text()
         return env

@@ -19,7 +19,7 @@ from utils import (
     sticker_metadata_to_text,
     transcribe_audio_with_groq,
 )
-from ai_handlers import _get_cached_audio_data
+from ai.attachment_content import _get_cached_audio_data
 from config import (
     SUPPORTED_MODELS,
     WEBHOOK_TOKEN,
@@ -541,11 +541,10 @@ async def health_check() -> tuple[dict[str, str], int]:
     # 这些信息可能被探测方用于侧信道推断——因此响应体只有一个状态词，
     # 细节一律只进日志（见 _loop_watchdog 心跳）。
     #
-    # ⚠️ 为什么不能无条件返回 200（2026-09-15 事故核心）：
-    # 旧版写死 200，于是"进程活着但摄取通道已死"这一最致命的状态对外表现
-    # 为完全健康——Render 健康检查与 Docker HEALTHCHECK 都满意，实例永远
-    # 不会被重建，用户发消息石沉大海，日志里只剩每分钟一条心跳。
-    # 现在摄取通道断了就返回 503：连续失败触发平台自动重启，故障从"要人肉
+    # ⚠️ 为什么不能无条件返回 200：
+    # "进程活着但摄取通道已死"会对外表现为完全健康——Render 健康检查与
+    # Docker HEALTHCHECK 都满意，实例永远不会被重建，用户发消息石沉大海。
+    # 摄取通道断了就返回 503：连续失败触发平台自动重启，故障从"要人肉
     # 发现"降级为"几分钟内自愈"。
     if telegram_polling.is_ingest_broken():
         logger.critical(
@@ -591,10 +590,10 @@ async def telegram_worker() -> None:
       asyncio.create_task 派发，不在这里同步等待完成。
     - 每条 update 用 create_task 包一层再 await：task 会拷贝当前
       contextvars，process_update 内部的 set（request_id / 用户
-      namespace 等）不会泄漏到下一条 update，语义与旧版"每个 webhook
-      请求一个全新上下文"一致。
+      namespace 等）不会泄漏到下一条 update，语义等同于"每个 update
+      一个全新上下文"。
     - 任何业务异常都在这里兜底记录，绝不杀死 worker 循环。
-    - CancelledError 只有在**确实关停**时才退出。旧版把任意取消都当成
+    - CancelledError 只有在**确实关停**时才退出。若把任意取消都当成
       关停直接 raise：而 `await` 的是 process_update 的子 task，子 task 被
       打断机制（打断旧回合、媒体组重排、proactive 打断）取消时，
       CancelledError 会沿 await 链回传到这里，worker 就此静默死亡——队列
@@ -638,7 +637,7 @@ def _uncancel_current_task() -> None:
     """清掉当前任务的"正在取消"标记（Python 3.11+）。
 
     吞掉 CancelledError 却不 uncancel，任务会停留在 cancelling 状态，
-    后续 await 可能被再次打断。旧版本没有该 API，直接跳过。
+    后续 await 可能被再次打断。没有该 API 的 Python 版本直接跳过。
     """
     try:
         task = asyncio.current_task()
@@ -868,7 +867,7 @@ async def process_update(data: dict) -> None:
         # 去重（原子"检查并标记"，容量淘汰见 state._record_processed_unlocked）：
         # 放在 worker 侧而非 webhook 入口——队满被 429 拒收的 update，
         # Telegram 重投时不会被误判为重复；单一 worker 串行消费也天然
-        # 消除了旧版"webhook 并发双副本同时通过检查"的竞态。
+        # 消除了"并发双副本同时通过检查"的竞态。
         if not await mark_update_processed_if_new(uid):
             logger.info(f"telegram worker duplicate update_id={uid}, skipped")
             return

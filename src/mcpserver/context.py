@@ -44,14 +44,14 @@ class MCPRequestContext:
                 "only letters, digits, '.', '_' or '-'."
             )
         digest = hashlib.sha256(raw_scope.encode("utf-8")).digest()
-        # Legacy tool APIs take an integer chat_id; the ContextVar-bound
+        # Tool helpers take an integer chat_id; the ContextVar-bound
         # namespace (the scope itself) remains the authority for every path
         # helper, so per-chat state resolution is exact regardless of this key.
         return cls(scope=raw_scope, chat_id=int.from_bytes(digest[:8], "big", signed=False))
 
     @contextmanager
     def activate(self) -> Iterator[None]:
-        """Bind this trusted scope to legacy helpers for the duration of one call."""
+        """Bind this trusted scope to the path helpers for the duration of one call."""
         token = bind_current_user_namespace(self.scope)
         try:
             yield

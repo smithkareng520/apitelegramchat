@@ -344,7 +344,7 @@ async def _download_reference_image_bytes(session: aiohttp.ClientSession, image_
 
     - data: URL 解码后必须通过 Pillow 校验才返回。
     - http(s) 下载后检查 Content-Type 并用 Pillow 验证 magic bytes：
-      HTTP 200 + text/html 的错误页曾经会伪装成 image/jpeg 进入编辑
+      HTTP 200 + text/html 的错误页可能伪装成 image/jpeg 进入编辑
       请求（参考图从未真正送达模型），这里从源头堵住。
     """
     if not image_url:
@@ -558,7 +558,6 @@ async def _request_modelscope_native_image(
         **base_headers,
         "X-ModelScope-Task-Type": "image_generation",
     }
-    # 默认 headers 保留向后兼容（_post_or_get_json 内部已切换为显式传 headers）
     headers = base_headers
     timeout = aiohttp.ClientTimeout(total=300, connect=10, sock_read=180)
 
@@ -2073,8 +2072,8 @@ async def _request_agnes_video(
                     )
 
                     if status == "completed":
-                        # 文档：结果地址在 metadata.url；保留旧字段回退
-                        # （video_url / url / output.url）兼容历史网关响应。
+                        # 结果地址在 metadata.url；不同网关也可能放在
+                        # video_url / url / output.url。
                         metadata = data.get("metadata") or {}
                         if not isinstance(metadata, dict):
                             metadata = {}
@@ -2110,8 +2109,8 @@ async def _request_agnes_video(
                         return None, "Agnes 任务完成但未返回视频 URL", None
 
                     if status in ("failed", "error"):
-                        # 文档：失败响应 error 为对象 {message: ...}；兼容
-                        # 字符串形态与旧字段 message。
+                        # 失败响应 error 通常为对象 {message: ...}，也可能是字符串
+                        # 或顶层 message。
                         raw_error = data.get("error")
                         if isinstance(raw_error, dict):
                             error_msg = raw_error.get("message") or json.dumps(raw_error, ensure_ascii=False)
@@ -2371,7 +2370,7 @@ async def _request_openrouter_video(
 # =============================================================================
 # ImageTask 统一请求出口（protocols/images.py 的两个适配器落在这里）
 # -----------------------------------------------------------------------------
-# 重构说明（ImageTask）：图像任务的"操作"（generate/edit）是任务的
+# 图像任务的"操作"（generate/edit）是任务的
 # 一等字段（core/images.ImageTask.operation），由任务构造方显式声明；
 # 以下两个出口只按任务与模型协议发请求并解析，不再做任何
 # "看到参考图 = edit"式的端点猜测。

@@ -1,10 +1,9 @@
-"""统一图像工具 generate_image（原 generate_image_from_text / edit_image_with_reference 合并）回归测试。
+"""统一图像工具 generate_image 回归测试。
 
 覆盖四个层面：
-1. Schema：单一工具进入 SEARCH_TOOLS，旧名退出；model enum 与
+1. Schema：单一工具进入 SEARCH_TOOLS；model enum 与
    "什么模型可编辑/仅能生成"的能力说明随配置自动推导。
-2. 分发：image_url 缺省 -> 文生图；提供 -> 编辑；两个旧名别名按各自
-   历史语义路由（generate_image_from_text 强制丢弃 image_url）。
+2. 分发：image_url 缺省 -> 文生图；提供 -> 编辑。
 3. 能力硬校验：仅支持文生图的模型携带 image_url 时立即返回可操作错误。
 4. UI：工具折叠块 / 工具组折叠块（进行态与完成态）按生成/编辑分别显示；
    结果卡片标题同理。
@@ -34,12 +33,8 @@ def _tool_defs() -> dict:
 # 1. Schema 合并
 # ---------------------------------------------------------------------------
 
-def test_unified_image_tool_replaces_legacy_pair():
-    names = _tool_defs()
-    assert "generate_image" in names
-    # 旧名不再进入工具清单（dispatch 层保留隐藏别名，见别名测试）
-    assert "generate_image_from_text" not in names
-    assert "edit_image_with_reference" not in names
+def test_unified_image_tool_listed():
+    assert "generate_image" in _tool_defs()
 
 
 def test_unified_image_tool_schema_shape():
@@ -120,7 +115,7 @@ def test_input_examples_cover_generate_and_edit_shapes():
 
 
 # ---------------------------------------------------------------------------
-# 2. 分发路由（含旧名别名）
+# 2. 分发路由
 # ---------------------------------------------------------------------------
 
 class _Captured:
@@ -162,26 +157,6 @@ def test_dispatch_generate_image_without_url_is_text_to_image():
 def test_dispatch_generate_image_with_url_is_edit():
     kwargs = _dispatch("generate_image", {
         "prompt": "移除行人",
-        "model": "gpt-image-2",
-        "image_url": "https://example.com/ref.png",
-    })
-    assert kwargs["image_url"] == "https://example.com/ref.png"
-
-
-def test_dispatch_legacy_generate_alias_forces_no_reference():
-    # 旧名 generate_image_from_text 历史语义：强制文生图，
-    # 即使误带 image_url 也必须丢弃。
-    kwargs = _dispatch("generate_image_from_text", {
-        "prompt": "一只猫",
-        "model": "gpt-image-2",
-        "image_url": "https://example.com/should-be-dropped.png",
-    })
-    assert kwargs["image_url"] is None
-
-
-def test_dispatch_legacy_edit_alias_passes_reference():
-    kwargs = _dispatch("edit_image_with_reference", {
-        "prompt": "改成水彩画",
         "model": "gpt-image-2",
         "image_url": "https://example.com/ref.png",
     })
@@ -290,18 +265,6 @@ def test_group_summary_distinguishes_generate_and_edit():
     group = {"items": [
         {"id": "1", "type": "generate_image", "status": "done", "fn_args": {}},
         {"id": "2", "type": "generate_image", "status": "done",
-         "fn_args": {"image_url": "https://x/y.png"}},
-    ]}
-    assert b._generate_group_summary(group) == "Generated image(s), edited image(s)"
-
-
-def test_group_summary_legacy_names_aggregate():
-    from ai.rich_message_builder import RichMessageBuilder
-
-    b = RichMessageBuilder(chat_id=1)
-    group = {"items": [
-        {"id": "1", "type": "generate_image_from_text", "status": "done", "fn_args": {}},
-        {"id": "2", "type": "edit_image_with_reference", "status": "done",
          "fn_args": {"image_url": "https://x/y.png"}},
     ]}
     assert b._generate_group_summary(group) == "Generated image(s), edited image(s)"

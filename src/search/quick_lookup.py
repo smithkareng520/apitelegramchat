@@ -31,7 +31,7 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
       3. 复用 fetch_url 的富提取管线（trafilatura 结构化提取 + 媒体原位 +
          预算感知压缩），结果格式与 fetch_url 完全一致，模型可同样复用其中
          的 <img>/<a> 等片段；
-      4. parse 失败或富转换提不出内容时，退化为旧的纯文本摘要路径。
+      4. parse 失败或富转换提不出内容时，退化为纯文本摘要路径。
     """
     try:
         from fetch_rich_content import build_model_facing_html
@@ -85,7 +85,7 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
                     except Exception as e:
                         logger.debug(f"[wikipedia] 富 HTML 路径失败（回退纯文本摘要）: {e}")
 
-                # ---- 退化路径：纯文本摘要（历史行为）----
+                # ---- 退化路径：纯文本摘要 ----
                 page_resp = await session.get(
                     f"https://{l}.wikipedia.org/w/api.php",
                     params={"action": "query", "pageids": page_id, "prop": "extracts|info", "explaintext": True, "inprop": "url", "format": "json", "utf8": 1},

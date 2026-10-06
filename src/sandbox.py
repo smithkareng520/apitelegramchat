@@ -51,7 +51,7 @@ SANDBOX_SOCKET_TIMEOUT_SEC = int(os.getenv("SANDBOX_SOCKET_TIMEOUT_SEC", "15"))
 
 # 沙盒内固定身份（whoami / $USER / $LOGNAME / ls 属主列全部一致）。
 # 必须与镜像内 passwd 用户名同步（见 Dockerfile 的 useradd claude 行），
-# 否则 $USER 会与真实 uid 解析结果不一致。历史版本的 chat{chat_id} 已移除：
+# 否则 $USER 会与真实 uid 解析结果不一致。不使用 chat{chat_id}：
 # chat id 属于路由/计费元数据，不应以环境变量形式暴露给模型可读的 shell ——
 # 模型需要知道自己在哪个工作区时，读 $WORKSPACE 路径即可，且那是必要信息。
 SANDBOX_USER = os.getenv("APITELEGRAMCHAT_SANDBOX_USER", "claude").strip() or "claude"
@@ -544,9 +544,8 @@ def build_sandbox_env(
     #   `echo $WORKSPACE` 一次即可拿到绝对路径；系统提示词与 bash 工具
     #   description 同步引用该变量。
     #
-    # 身份说明（历史遗留问题的修复）：这里不再设置 USER=chat{chat_id}。
-    #   - 旧的 chat{id} 值从未被任何代码读取，只是展示标签，却把会话路由
-    #     id 泄露进模型可读的 shell 环境；
+    # 身份说明：不设置 USER=chat{chat_id}。
+    #   - chat{id} 只是展示标签，却会把会话路由 id 泄露进模型可读的 shell 环境；
     #   - $USER 与真实 uid 解析（whoami/id/ls 属主列）不一致还会误导模型
     #     以为自己"是"某个 chat；实际身份统一为镜像内的 claude 用户，
     #     per-chat 的隔离由 Landlock 按家目录路径强制，不靠身份标签。

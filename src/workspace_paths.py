@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
 from functools import lru_cache
 from pathlib import Path
 
@@ -19,32 +18,6 @@ _RUNTIME_DIR_NAME = os.getenv("APITELEGRAMCHAT_RUNTIME_DIR_NAME", ".runtime").st
 _SKILLS_DIR_NAME = os.getenv("APITELEGRAMCHAT_SKILLS_DIR_NAME", "skills").strip() or "skills"
 _UPLOAD_DIR_NAME = os.getenv("APITELEGRAMCHAT_UPLOAD_DIR_NAME", "upload").strip() or "upload"
 _DOWNLOAD_DIR_NAME = os.getenv("APITELEGRAMCHAT_DOWNLOAD_DIR_NAME", "download").strip() or "download"
-
-# v2.2（及更早）遗留布局留在 workspace 根下的缓存目录名 → 新布局目标名。
-# download/upload/skills/.skills_initialized 在新布局里本来就归属根，无需动；
-# 只有 runtime/ 更名为隐藏层 .runtime/，runtime.json 随迁进 .runtime/。
-# 迁移用原子 rename（同一文件系统），只移动不合并，幂等可重入。
-_LEGACY_RUNTIME_DIR = "runtime"
-_LEGACY_RUNTIME_STATE = "runtime.json"
-
-# 过渡布局（v2.3.0 草案，未曾正式发布）：家目录位于根下 claude/ 子目录。
-# 防御性兼容：若某环境短暂部署过该草案，首次访问时把 claude/ 下的条目
-# 逐个折叠回根，再删除空的 claude/ 目录。目标名相对 workspace 根。
-_INTERIM_HOME_DIR_NAME = "claude"
-_INTERIM_HOME_ENTRIES: tuple[tuple[str, str], ...] = (
-    ("download", _DOWNLOAD_DIR_NAME),
-    ("upload", _UPLOAD_DIR_NAME),
-    ("skills", _SKILLS_DIR_NAME),
-    (".runtime", _RUNTIME_DIR_NAME),
-    (".skills_initialized", ".skills_initialized"),
-    ("runtime", _LEGACY_RUNTIME_DIR),
-    ("runtime.json", _LEGACY_RUNTIME_STATE),
-)
-
-# 已完成过迁移检查的 (workspace 根, namespace)（进程内缓存；重启后靠 exists()
-# 快路径兜底——旧布局条目在新代码下不再产生，首次迁移后即恒为空操作）。
-_home_migrated: set[tuple[str, str]] = set()
-
 
 def _resolved_namespace(chat_id: object, namespace: object | None = None) -> str:
     if namespace is not None:
@@ -127,7 +100,7 @@ def sanitize_namespace(value: object) -> str:
 def workspace_root(chat_id: object, namespace: object | None = None) -> Path:
     """Return the workspace root for this chat/scope — the agent home itself.
 
-    v2.3.1 布局：workspace 根即 agent 家目录（$HOME、bash 起始 cwd 与
+    布局：workspace 根即 agent 家目录（$HOME、bash 起始 cwd 与
     Landlock 唯一放行边界三者重合）。根下只存放模型可见的用户文件层
     （download/ upload/ skills/）与隐藏缓存层 ``.runtime/``；家目录之外
     的一切路径（/home 下其他家目录、data_root、系统目录）对沙箱完全
@@ -138,123 +111,10 @@ def workspace_root(chat_id: object, namespace: object | None = None) -> Path:
     return _secure_directory(parent / ns)
 
 
-def _move_if_absent(src: Path, dst: Path) -> None:
-    """仅当源存在且目标不存在时原子改名；否则无操作（只移动不合并）。"""
-    if not src.exists() or dst.exists():
-        return
-    try:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(src, dst)
-        logger.info("Workspace migration: moved %s -> %s", src, dst)
-    except OSError as exc:
-        logger.warning("Workspace migration skipped for %s: %s", src, exc)
-
-
-def _fold_legacy_workspaces_location(root: Path, ns: str) -> None:
-    """一次性把旧位置 ``<data_root>/workspaces/<ns>`` 折叠进新家目录。
-
-    v2.3.1 及之前家目录位于 ``<data_root>/workspaces/<ns>``；工作空间根
-    改为 ``APITELEGRAMCHAT_WORKSPACES_DIR``（默认 /home）后，旧目录常与
-    新家目录不在同一文件系统（如 Render 挂载盘 vs 容器层），无法整体
-    rename。规则与既有布局迁移完全一致：只移动不合并、绝不覆盖 ——
-    仅当新家目录内不存在同名条目时逐条 ``shutil.move``（自动兼容跨
-    文件系统），随后尝试删除已空的旧目录（仍有残留则原地保留）；
-    任何失败只记日志，绝不阻断路径解析（迁移失败只影响旧数据可见性，
-    不影响新工作区可用性）。
-    """
-    legacy = data_root() / "workspaces" / ns
-    try:
-        if not legacy.is_dir() or legacy.is_symlink():
-            return
-        try:
-            if legacy.resolve() == root.resolve():
-                return  # env 指回旧位置的部署：新旧同径，无需迁移
-        except OSError:
-            return
-        moved = 0
-        for child in sorted(legacy.iterdir()):
-            dst = root / child.name
-            if dst.exists() or dst.is_symlink():
-                continue  # 绝不覆盖新家已有内容
-            shutil.move(str(child), str(dst))
-            moved += 1
-        if moved:
-            logger.info(
-                "Workspace location migration: %s -> %s (%d items)",
-                legacy, root, moved,
-            )
-        try:
-            legacy.rmdir()  # 仅当已空时成功；有残留则原地保留
-        except OSError:
-            pass
-    except Exception as exc:  # noqa: BLE001 — 迁移绝不阻断路径解析
-        logger.warning("Workspace location migration skipped namespace=%s: %s", ns, exc)
-
-
-def _migrate_legacy_layout(root: Path, ns: str) -> None:
-    """One-time migration of legacy workspace layouts to the v2.3.1 layout.
-
-    新布局：workspace 根即家目录，根下平铺 download/ upload/ skills/ 与
-    隐藏缓存层 ``.runtime/``（runtime.json 归入其中）。两种遗留布局：
-
-    - v2.3.0 过渡草案（根下 ``claude/`` 家目录，未正式发布）：把 claude/
-      下的条目逐个折叠回根，成功后删除空的 claude/ 目录；
-    - v2.2 及更早（runtime/ 与 runtime.json 平铺在根下）：仅把 runtime/
-      更名为 ``.runtime/``，runtime.json 随迁进 .runtime/；
-      download/upload/skills 本就归属根，原地不动。
-
-    迁移规则：
-
-    - 仅当目标不存在且源存在时原子移动（同一文件系统用 ``os.replace``
-      改名，跨文件系统逐条 ``shutil.move``），不做合并、不覆盖任何已
-      存在的文件 —— 中断后重跑安全，幂等可重入；
-    - 目标已存在时保留双方不动（绝不覆盖新数据）；runtime.json 是可再生
-      缓存，目标已存在时旧文件直接丢弃；
-    - 全部失败仅记日志，绝不阻断路径解析（迁移失败只影响旧数据可见性，
-      不影响新工作区可用性）。
-    """
-    try:
-        # 0) 旧位置折叠：家目录原本在 data_root/workspaces/<ns>，整目录
-        #    并入新家（升级首次访问时把用户旧文件带过来）。
-        _fold_legacy_workspaces_location(root, ns)
-
-        # 1) 过渡草案折叠：claude/ 下的条目回到根。
-        interim = root / _INTERIM_HOME_DIR_NAME
-        if interim.is_dir() and not interim.is_symlink():
-            for src_name, dst_name in _INTERIM_HOME_ENTRIES:
-                _move_if_absent(interim / src_name, root / dst_name)
-            try:
-                # 仅当目录已空时成功；仍有残留（未知文件）则原地保留。
-                interim.rmdir()
-                logger.info("Workspace migration: removed empty %s", interim)
-            except OSError:
-                pass
-
-        # 2) v2.2 遗留：runtime/ → .runtime/（隐藏缓存层）。
-        _move_if_absent(root / _LEGACY_RUNTIME_DIR, root / _RUNTIME_DIR_NAME)
-
-        # 3) runtime.json（bash 工具链清单缓存）→ .runtime/runtime.json。
-        legacy_state = root / _LEGACY_RUNTIME_STATE
-        new_state = root / _RUNTIME_DIR_NAME / _LEGACY_RUNTIME_STATE
-        if legacy_state.is_file():
-            try:
-                if new_state.exists():
-                    # 新位置已存在（更权威），旧缓存直接丢弃。
-                    legacy_state.unlink()
-                else:
-                    new_state.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(legacy_state, new_state)
-                logger.info("Workspace migration: runtime state -> %s", new_state)
-            except OSError as exc:
-                logger.warning("Workspace migration skipped for %s: %s", legacy_state, exc)
-    except Exception as exc:  # noqa: BLE001 — 迁移绝不阻断路径解析
-        logger.warning("Workspace migration failed namespace=%s: %s", ns, exc)
-
-
 def agent_home(chat_id: object, namespace: object | None = None) -> Path:
     """Return the agent home directory: $HOME, bash cwd and Landlock scope.
 
-    v2.3.1 布局（家目录即 workspace 根，默认位于 /home 下）::
+    布局（家目录即 workspace 根，默认位于 /home 下）::
 
         <workspaces_root>/<ns>/   ← 家目录：$HOME = 起始 cwd = Landlock 边界
         ├── download/  upload/  skills/
@@ -262,18 +122,10 @@ def agent_home(chat_id: object, namespace: object | None = None) -> Path:
 
     workspaces_root 默认 /home（可用 APITELEGRAMCHAT_WORKSPACES_DIR 覆盖），
     家目录之外的一切路径（其他家目录、data_root、系统目录）仍被
-    Landlock 拒绝，沙箱世界收敛到家目录子树。首次访问时一次性迁移旧
-    位置（data_root/workspaces/<ns>，见 :func:`_fold_legacy_workspaces_location`）
-    与两种遗留布局（见 :func:`_migrate_legacy_layout`），之后每次调用
-    只剩几个 ``exists()`` 快路径检查，开销可忽略。
+    Landlock 拒绝，沙箱世界收敛到家目录子树。
     """
     ns = _resolved_namespace(chat_id, namespace)
-    root = workspace_root(chat_id, ns)
-    migrate_key = (str(root), ns)
-    if migrate_key not in _home_migrated:
-        _migrate_legacy_layout(root, ns)
-        _home_migrated.add(migrate_key)
-    return root
+    return workspace_root(chat_id, ns)
 
 
 def workspace_workdir(chat_id: object, namespace: object | None = None) -> Path:

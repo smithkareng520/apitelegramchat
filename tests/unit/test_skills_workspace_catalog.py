@@ -18,7 +18,6 @@ def test_runtime_catalog_uses_workspace_skills_not_project_skills(monkeypatch, t
     import workspace_paths as wp
     wp.data_root.cache_clear()
     wp.workspaces_root.cache_clear()
-    wp._home_migrated.clear()
 
     project = tmp_path / "packaged" / "project-only"
     project.mkdir(parents=True)
@@ -90,7 +89,6 @@ def test_agent_run_refresh_reads_disk_without_r2_sync(monkeypatch, tmp_path):
     import workspace_paths as wp
     wp.data_root.cache_clear()
     wp.workspaces_root.cache_clear()
-    wp._home_migrated.clear()
 
     from core.messages import Message
     from skills_runtime import refresh_skill_catalog

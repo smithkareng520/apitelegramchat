@@ -31,13 +31,10 @@ def valid_tool_defs(tools: Iterable[Any] | None) -> list[dict]:
 def normalize_tool_schema(tool: dict) -> dict:
     """规范化发给模型的工具 schema。
 
-    历史行为（已移除）：曾把 ``description`` 强制注入每个声明了该字段的
-    工具的 ``required``——这会让 web_search 等用不到该字段的工具因「缺
-    description」被参数校验整单拒绝。现在工具是否声明/必填
-    ``description`` 完全以 schema 源码声明为准（当前只有 bash 声明且
-    必填，其余工具一律不声明该字段）。
+    工具是否声明/必填 ``description`` 完全以 schema 源码声明为准
+    （当前只有 bash 声明且必填，其余工具一律不声明该字段）。
 
-    保留的规范化：
+    规范化内容：
     - 所有必填字段排在可选字段之前，保持各组内的声明顺序稳定；
     - bash 保留 ``description`` 首位；
     - text_editor 保留 ``command`` 首位（封闭枚举，便于流式推断）。

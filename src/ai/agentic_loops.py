@@ -6,8 +6,7 @@ v2.6：Gemini 从 OpenAI 兼容层（v1beta/openai/）非流式专用循环切�
 原生 API 流式桥接（ai/gemini_bridge.py，streamGenerateContent SSE +
 原生 function calling），架构与 anthropic_bridge.py 同构的“边界转换”
 模式：loop_messages 全程 OpenAI 形状，仅请求前后做协议转换，复用同一
-套 _run_tool_calls_and_append 工具执行咽喉与草稿流式 UI。旧的
-_agentic_loop_gemini_openai_compat 已移除。
+套 _run_tool_calls_and_append 工具执行咽喉与草稿流式 UI。
 """
 import asyncio
 import aiohttp
@@ -250,7 +249,7 @@ def _session_affinity_body(
     """声明了 session_affinity 的网关返回 body 级亲和键，否则空 dict。
 
     优先读取 model_info 的"有效端点"（含模型级覆盖）；未传 model_info 时
-    退回按 api_label 直接查 PROVIDERS（旧调用路径兼容，此时看不到模型级
+    退回按 api_label 直接查 PROVIDERS（如子 agent 路径，此时看不到模型级
     session_affinity 覆盖）。
     """
     session_affinity = False
@@ -609,7 +608,7 @@ async def _agentic_loop_openai_compat(
 ) -> tuple[str | None, object | None, list]:
     """OpenAI 兼容 Chat Completions 流式循环（内部消息 -> 协议渲染）。
 
-    重构说明：本循环与其它协议循环共用内部消息（core.messages.Message），
+    本循环与其它协议循环共用内部消息（core.messages.Message），
     每轮请求前统一经 render_openai_messages 渲染为 OpenAI wire JSON；
     prompt cache 断点打在渲染后的 wire dict 上（缓存标记是纯出站装饰，
     不进入内部消息）。循环内追加的 assistant / tool / 纠错消息全部为
@@ -678,7 +677,7 @@ async def _agentic_loop_openai_compat(
         # 结果为止的完整前缀。与 extra_body 顶层自动断点（第 4 个）叠加。
         # 非流式兜底与 over-limit 合成路径复用同一份 loop_messages，
         # 无需重复打标。
-        # 重构说明（Internal Message）：断点打在渲染后的 wire dict 上
+        # 断点打在渲染后的 wire dict 上
         # （每轮重新渲染，天然无旧标记残留）；内部 Message 不携带任何
         # 缓存装饰——cache_control 是纯出站协议装饰。
         wire_messages = render_openai_messages(loop_messages)
@@ -1447,8 +1446,7 @@ async def _agentic_loop_native_image(
     """原生图像模型回合：prompt/参考图提取 -> ImageTask -> 协议分发 ->
     R2 上传 -> 富媒体消息。
 
-    重构说明（ImageTask）：旧版把参考图列表直接塞给请求函数，由其按
-    "有没有图"猜端点；现在先显式构造 ImageTask（operation=edit/generate），
+    先显式构造 ImageTask（operation=edit/generate），
     经 protocols.images.dispatch_image_task 按**模型协议**分发——
     openai_images（ModelScope/XXTF）与 openai_chat modalities
     （OpenRouter 图像模型）两条链路共用同一任务模型与后处理。

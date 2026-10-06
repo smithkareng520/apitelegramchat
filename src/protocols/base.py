@@ -46,10 +46,9 @@ def invalidate_responses_chain_for(builder: "DraftManager") -> None:
 class ChatProtocolAdapter(ABC):
     """聊天协议适配器：包一层该协议的 agentic 循环。
 
-    统一签名与旧的 ai_handlers._call_api 分发约定一致，返回
-    (final_content, final_usage, new_history_entries)。
+    返回 (final_content, final_usage, new_history_entries)。
 
-    ``turn``（responses_state.TurnState，2026-09 新增，可选）：
+    ``turn``（responses_state.TurnState，可选）：
     本回合的对话状态快照，由 get_ai_response 在回合登记时创建、经
     _call_api 透传到这里。目前只有 openai_responses 适配器会用它来
     判断是否可以复用服务端会话（见 ai/responses_bridge.py）；其余

@@ -11,10 +11,7 @@ import os
 from pathlib import Path
 from typing import TypedDict
 
-from s3_utils import (
-    upload_bytes_to_r2, download_from_r2, delete_r2_object,
-    list_r2_objects, is_r2_configured,
-)
+from s3_utils import upload_bytes_to_r2, download_from_r2, is_r2_configured
 
 logger = logging.getLogger(__name__)
 
@@ -113,17 +110,6 @@ async def backup_user_skills_to_r2(home: Path, namespace: str) -> None:
     data = await asyncio.to_thread(_pack_skills_dir, home / "skills")
     archive_key = _skills_archive_key(namespace)
     await upload_bytes_to_r2(data, archive_key, "application/gzip")
-
-    # One-time/ongoing cleanup keeps the new contract strict: R2 contains only
-    # the compressed snapshot for this namespace. This also removes objects
-    # left behind by the previous per-file + manifest implementation.
-    try:
-        legacy_keys = await list_r2_objects(_skills_r2_prefix(namespace))
-        for key in legacy_keys:
-            if key != archive_key:
-                await delete_r2_object(key)
-    except Exception:
-        logger.warning("清理旧 skills R2 对象失败 namespace=%s", namespace, exc_info=True)
 
     logger.info(
         "用户 skills 快照已上传 R2 namespace=%s: %.1f KiB",

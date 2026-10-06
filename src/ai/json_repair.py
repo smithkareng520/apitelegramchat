@@ -450,7 +450,7 @@ def _repair_with_library(candidate: str) -> Optional[dict]:
     """用 json-repair 社区标准库修复并解析为 dict。
 
     - 库不可用（未安装 / 导入失败）时返回 ``None``，调用方走自研兜底
-      引擎，行为与旧版完全一致；
+      引擎；
     - 修复后必须是 dict（工具参数是对象），否则视为失败；
     - 任何异常都吞掉——库是增强项，绝不阻塞关键路径。
     """
