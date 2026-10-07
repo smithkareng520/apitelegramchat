@@ -355,7 +355,7 @@ export OPENROUTER_REQUIRE_PARAMETERS=false   # 是否要求 provider 满足请�
 | `openai_chat` | OpenAI 兼容 Chat Completions（缺省） | OpenRouter / ModelScope / GLM / DeepSeek / Agnes / Grok 全部兼容模型 |
 | `anthropic_messages` | Anthropic 原生 Messages | `claude-opus-5`（官方 / XXTF 中转） |
 | `gemini_native` | Gemini 原生 streamGenerateContent | `gemini-3.5-flash-lite` |
-| `openai_images` | OpenAI Images（generations / edits） | `gpt-image-2`、`Qwen/Qwen-Image-Edit-2511`、`Z-Image-Turbo` |
+| `openai_images` | OpenAI Images（generations / edits） | `gpt-image-2`、`Qwen/Qwen-Image-Edit`、`Z-Image-Turbo` |
 
 路由唯一出口：`protocols/registry.get_chat_adapter(protocol)`；图像任务
 经 `protocols/images.dispatch_image_task(ImageTask)` 分发，操作类型

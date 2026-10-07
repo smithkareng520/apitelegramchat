@@ -226,7 +226,7 @@ async def execute_generate_image(
         return _format_image_api_error(
             api_name=_api_name,
             status_code=200,
-            detail="接口返回成功，但未找到可下载的图片数据。",
+            detail=result.empty_detail(),
             endpoint=result.endpoint or used_endpoint,
             model=model,
         )

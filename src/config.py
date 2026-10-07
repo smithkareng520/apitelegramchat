@@ -1109,8 +1109,8 @@ SUPPORTED_MODELS["Qwen/Qwen-Image"] = make_model_config(
     max_context=32768,
     max_output_tokens=4000,
 )
-SUPPORTED_MODELS["Qwen/Qwen-Image-Edit-2511"] = make_model_config(
-    model_id="Qwen/Qwen-Image-Edit-2511",
+SUPPORTED_MODELS["Qwen/Qwen-Image-Edit"] = make_model_config(
+    model_id="Qwen/Qwen-Image-Edit",
     provider="modelscope",
     image_input=True,
     image_output=True,

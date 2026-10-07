@@ -137,7 +137,7 @@ RUN mkdir -p /app/workspace && chown -R claude:claude /app/workspace /app/src /h
 
 USER claude
 
-HEALTHCHECK --interval=60s --timeout=5s --start-period=15s --retries=3 CMD python3 -c "import os, urllib.request; port=os.getenv('PORT', '5000'); urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=3)" || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD python3 -c "import os, urllib.request; port=os.getenv('PORT', '5000'); urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=3)" || exit 1
 
 EXPOSE 5000
 

@@ -636,7 +636,7 @@ def test_notify_generation_failure_no_double_escape(monkeypatch):
     monkeypatch.setattr(utils, "send_rich_html_message", fake_send)
     monkeypatch.setattr(turn_recovery, "mark_failed_unanswered_user", fake_mark)
 
-    notice = "⚠️ <b>ModelScope 图像接口 请求失败</b><br/>HTTP 状态：200<br/>模型：Qwen/Qwen-Image-Edit-2511"
+    notice = "⚠️ <b>ModelScope 图像接口 请求失败</b><br/>HTTP 状态：200<br/>模型：Qwen/Qwen-Image-Edit"
     run = asyncio.new_event_loop()
     run.run_until_complete(mw._notify_generation_failure(1, notice))
     run.close()
@@ -809,3 +809,26 @@ def test_run_media_generation_finalizes_card_on_failure(monkeypatch):
     assert "生成失败" in finalized_text
     assert "配额不足" in finalized_text
     assert "进行中" not in finalized_text
+
+
+def test_empty_detail_distinguishes_no_data_from_download_failure():
+    assert "没有图片数据" in ImageTaskResult().empty_detail()
+    detail = ImageTaskResult(diagnostics=["图片 #1（oss.example）：下载失败，HTTP 403"]).empty_detail()
+    assert "下载/校验失败" in detail and "HTTP 403" in detail
+
+
+def test_image_tool_error_carries_download_diagnostics(monkeypatch):
+    """工具路径（execute_generate_image）同样要带出逐项诊断，而非笼统的\"未找到图片数据\"。"""
+    import search.media_tools as tools
+
+    async def fake_dispatch(task):
+        return ImageTaskResult(
+            endpoint="/images/generations",
+            diagnostics=["图片 #1（oss.example）：下载失败，HTTP 403"],
+        )
+
+    monkeypatch.setattr(tools, "dispatch_image_task", fake_dispatch)
+    out = asyncio.new_event_loop().run_until_complete(
+        tools.execute_generate_image("一只猫", "Qwen/Qwen-Image-Edit"))
+    assert "HTTP 403" in out
+    assert "没有图片数据" not in out

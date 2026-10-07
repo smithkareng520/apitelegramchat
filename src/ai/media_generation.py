@@ -646,7 +646,6 @@ async def _request_modelscope_native_image(
             if not image_data_urls:
                 return None, endpoint, "未能读取参考图片", 400, ""
 
-            # Qwen-Image-Edit-2511 accepts reference images as an array.
             payload = {
                 "model": model,
                 "prompt": clean_prompt or "请根据参考图进行编辑。",
@@ -718,9 +717,7 @@ async def _request_modelscope_native_image(
                 )
                 return None, endpoint, "上游返回了非法的 task_id", 200, request_id
             poll_url = f"{api_root}/tasks/{task_id}"
-            poll_timeout_s = float(os.getenv("MODELSCOPE_IMAGE_POLL_TIMEOUT_S", "180"))
-            poll_timeout_s = max(30.0, min(poll_timeout_s, 300.0))
-            poll_deadline = time.monotonic() + poll_timeout_s
+            poll_deadline = time.monotonic() + 240
             poll_interval = 3.0
             poll_max_interval = 5.0
             poll_start = time.monotonic()
@@ -777,19 +774,6 @@ async def _request_modelscope_native_image(
                     )
                     return poll_json, endpoint, '', 200, request_id
 
-                # ModelScope can return HTTP 200 / SUCCEED without output_images.
-                # Do not keep polling for minutes in that state: it is a terminal
-                # response with a malformed/empty artifact and should be surfaced
-                # immediately with response keys for diagnosis.
-                if poll_task_status in {"SUCCEED", "SUCCESS", "COMPLETED", "DONE"}:
-                    keys = list(poll_json.keys())[:40]
-                    logger.warning(
-                        "[NativeImage/ModelScope] terminal success without image: "
-                        "iter=%s elapsed=%.1fs keys=%s body=%s",
-                        poll_iter, elapsed, keys, _body_preview(json.dumps(poll_json, ensure_ascii=False), 1800),
-                    )
-                    return poll_json, endpoint, "ModelScope 返回成功状态但没有 output_images", 502, request_id
-
                 is_not_found = (
                         'task not found' in err_message.lower()
                         or err_message.lower().find('not found') >= 0
@@ -821,15 +805,7 @@ async def _request_modelscope_native_image(
                 time.monotonic() - poll_start, poll_iter,
                 list(last_poll_json.keys())[:40] if isinstance(last_poll_json, dict) else type(last_poll_json).__name__,
             )
-            timeout_detail = f"ModelScope 图片任务轮询超时（{time.monotonic() - poll_start:.1f}s）"
-            logger.warning(
-                "[NativeImage/ModelScope] %s; last_status=%s keys=%s",
-                timeout_detail,
-                str(last_poll_json.get("task_status") or last_poll_json.get("status") or "UNKNOWN")
-                if isinstance(last_poll_json, dict) else "UNKNOWN",
-                list(last_poll_json.keys())[:40] if isinstance(last_poll_json, dict) else [],
-            )
-            return last_poll_json, endpoint, timeout_detail, 504, request_id
+            return last_poll_json, endpoint, '', 200, request_id
 
         return response_json, endpoint, '', 200, request_id
 

@@ -140,6 +140,23 @@ class ImageTaskResult:
     usage: Any = None
     diagnostics: list[str] = field(default_factory=list)
 
+    def empty_detail(self) -> str:
+        """images 为空时给用户看的真实原因（多行纯文本）。
+
+        有诊断 = 响应里有图片项但下载/校验全部失败；无诊断 = 响应里确实没有
+        图片数据。两种情形不能共用一句话。
+        """
+        if not self.diagnostics:
+            return "接口返回成功，但响应里没有图片数据。"
+        shown = "\n".join(f"· {line}" for line in self.diagnostics[:4])
+        if len(self.diagnostics) > 4:
+            shown += f"\n· …等共 {len(self.diagnostics)} 项"
+        return (
+            f"接口返回了 {len(self.diagnostics)} 个图片数据项，但全部下载/校验失败：\n"
+            f"{shown}\n"
+            "常见原因：图片链接有防盗链或已过期（下载到的是错误页而非图片），请直接重试一次。"
+        )
+
 
 __all__ = [
     "ImageOperation",
