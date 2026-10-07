@@ -515,6 +515,104 @@ def _clean_prompt_for_image_model(prompt: str) -> str:
     return text.strip()
 
 
+# =============================================================================
+# ModelScope 异步任务接口的"软失败"识别（2026-10-07 生产事故修复）
+# -----------------------------------------------------------------------------
+# ModelScope 网关对若干失败形态（内容审核拒绝、配额/限流、参数校验）会
+# 返回 HTTP 200 + 错误 JSON，而不是 4xx/5xx。历史实现在 POST 后只认
+# task_id / 图片字段，这类错误载荷被当成"成功"透传，用户最终只看到
+# 误导性的"接口返回成功，但响应里没有图片数据"，真实原因全部丢失。
+# 这里提供两个统一出口：错误信息提取 + 响应形状预览（可诊断报错）。
+# =============================================================================
+_MODELSCOPE_TASK_FAILED_STATES = frozenset({'FAILED', 'ERROR', 'CANCELLED', 'CANCELED'})
+_MODELSCOPE_TASK_SUCCEED_STATES = frozenset({'SUCCEED', 'SUCCESS', 'SUCCEEDED'})
+# 任务轮询总时长上限（秒）。Qwen-Image 系列实测生成 10-60s，240s 覆盖
+# 高峰排队；测试可 monkeypatch 该常量缩短。
+_MODELSCOPE_POLL_TIMEOUT_SECONDS = 240
+
+
+def _modelscope_error_message(payload: Any) -> str:
+    """从 ModelScope 200 响应体里提取真实错误信息；没有则返回空串。
+
+    识别的常见形状（均要求调用方先确认"无 task_id、无图片项"）：
+      {"errors": {"code": "...", "message": "..."}}
+      {"errors": [{"message": "..."}, ...]}
+      {"error": "...", ...}
+      {"code": "...", "message": "..."}   (code 非 0/ok/success)
+    """
+    if not isinstance(payload, dict):
+        return ''
+    errors = payload.get('errors')
+    if isinstance(errors, dict):
+        msg = str(errors.get('message') or '').strip()
+        code = str(errors.get('code') or '').strip()
+        if msg:
+            return f"{code} {msg}".strip() if code else msg
+    if isinstance(errors, list):
+        for item in errors:
+            if isinstance(item, dict):
+                msg = str(item.get('message') or '').strip()
+                if msg:
+                    return msg
+            elif isinstance(item, str) and item.strip():
+                return item.strip()
+    err_text = payload.get('error')
+    if isinstance(err_text, str) and err_text.strip():
+        return err_text.strip()
+    if isinstance(err_text, dict):
+        msg = str(err_text.get('message') or '').strip()
+        if msg:
+            return msg
+    code = str(payload.get('code') or '').strip()
+    msg = str(payload.get('message') or '').strip()
+    if code and code.lower() not in {'0', 'ok', 'success'} and msg:
+        return f"{code} {msg}".strip()
+    return ''
+
+
+def _response_shape_preview(payload: Any, *, max_keys: int = 12) -> str:
+    """生成响应形状预览（顶层键 + 短标量值），用于空响应的可诊断报错。
+
+    只展示短标量（截断 60 字符、跳过 data: 前缀）与集合的长度，绝不
+    展开 base64 / 长 URL，避免把超大字段塞进报错与日志。
+    """
+    if not isinstance(payload, dict):
+        return f"({type(payload).__name__})"
+    parts: list[str] = []
+    for key, value in list(payload.items())[:max_keys]:
+        if isinstance(value, bool):
+            parts.append(f"{key}={value}")
+        elif isinstance(value, (str, int, float)):
+            text = str(value)
+            if text.startswith('data:'):
+                parts.append(key)
+            else:
+                parts.append(f"{key}={text[:60]}")
+        elif isinstance(value, list):
+            parts.append(f"{key}[{len(value)}]")
+        elif isinstance(value, dict):
+            parts.append(f"{key}{{{len(value)}}}")
+        else:
+            parts.append(key)
+    return ', '.join(parts) if parts else '(空对象)'
+
+
+def _describe_imageless_response(response_json: Any) -> str:
+    """响应里没有任何图片项时的可诊断描述（供 ImageTaskResult.no_items_detail）。
+
+    在"接口返回成功，但响应里没有图片数据"这句原有语义上追加响应形状
+    与常见原因，把 200 空响应从"不可定位"变成"一眼可定位"（审核拦截 /
+    配额限流 / 接口变更）。
+    """
+    shape = _response_shape_preview(response_json)
+    return (
+        "接口返回成功，但响应里没有图片数据。\n"
+        f"响应顶层字段: {shape}\n"
+        "常见原因：提示词或参考图被内容审核拦截、配额/限流，或上游接口变更。"
+        "请重试一次；持续失败请更换提示词或参考图。"
+    )
+
+
 async def _request_modelscope_native_image(
         *,
         prompt: str,
@@ -645,6 +743,11 @@ async def _request_modelscope_native_image(
             image_data_urls = await _image_urls_to_data_urls(session, image_urls)
             if not image_data_urls:
                 return None, endpoint, "未能读取参考图片", 400, ""
+            # 2026-10-07：对齐通用 OpenAI 兼容路径的超大参考图降采样。
+            # Telegram 原图可达数 MB，base64 展开后请求体更大，过大的
+            # data URL 可能被上游拒绝。_shrink_data_url 对 <=3MB 的图
+            # 原样返回（恒等），小图零开销。
+            image_data_urls = [_shrink_data_url(u) for u in image_data_urls]
 
             payload = {
                 "model": model,
@@ -700,6 +803,44 @@ async def _request_modelscope_native_image(
         task_status = str(response_json.get('task_status') or response_json.get('status') or '').upper()
         task_id = str(response_json.get('task_id') or response_json.get('taskId') or '').strip()
         request_id = _extract_request_meta(response_json)[0] or request_id
+        if not task_id:
+            # ---- 2026-10-07 修复：POST 200 但无 task_id、无图片项 = "软失败" ----
+            # 不再把无法解析的 200 响应当"成功"透传（那只会让上层报出误导
+            # 性的"接口返回成功，但响应里没有图片数据"，真实原因全部丢失）。
+            error_message = _modelscope_error_message(response_json)
+            if task_status in _MODELSCOPE_TASK_FAILED_STATES:
+                detail = error_message or '任务执行失败（上游未给出原因）'
+                logger.warning(
+                    "[NativeImage/ModelScope] POST 200 with %s status, no task_id: detail=%s keys=%s",
+                    task_status, detail[:200], list(response_json.keys())[:20],
+                )
+                return None, endpoint, detail, 200, request_id
+            if task_status in _MODELSCOPE_TASK_SUCCEED_STATES:
+                detail = (
+                    f"任务状态 {task_status} 但未返回图片"
+                    f"（{_response_shape_preview(response_json)}）；"
+                    "可能被内容审核拦截或输出缺失，请重试一次。"
+                )
+                logger.warning(
+                    "[NativeImage/ModelScope] POST 200 with %s status, no task_id: keys=%s",
+                    task_status, list(response_json.keys())[:20],
+                )
+                return None, endpoint, detail, 200, request_id
+            if error_message:
+                logger.warning(
+                    "[NativeImage/ModelScope] POST 200 error payload (no task_id): %s keys=%s",
+                    error_message[:200], list(response_json.keys())[:20],
+                )
+                return None, endpoint, error_message, 200, request_id
+            shape = _response_shape_preview(response_json)
+            logger.warning(
+                "[NativeImage/ModelScope] POST 200 unrecognized payload (no task_id): keys=%s",
+                list(response_json.keys())[:20],
+            )
+            return None, endpoint, (
+                f"接口返回成功，但响应未包含任务ID与图片数据（{shape}）；"
+                "请重试一次，若持续失败请联系管理员查看日志。"
+            ), 200, request_id
         if task_id:
             logger.debug(
                 "[NativeImage/ModelScope] task response detected: task_status=%s task_id=%s",
@@ -717,12 +858,13 @@ async def _request_modelscope_native_image(
                 )
                 return None, endpoint, "上游返回了非法的 task_id", 200, request_id
             poll_url = f"{api_root}/tasks/{task_id}"
-            poll_deadline = time.monotonic() + 240
+            poll_deadline = time.monotonic() + _MODELSCOPE_POLL_TIMEOUT_SECONDS
             poll_interval = 3.0
             poll_max_interval = 5.0
             poll_start = time.monotonic()
             last_poll_json = response_json
             not_found_count = 0
+            succeed_no_items = 0
             poll_iter = 0
             await asyncio.sleep(1.5)
             IN_PROGRESS_STATES = {'PENDING', 'PROCESSING', 'RUNNING', 'QUEUED', 'QUEUING', 'STARTED'}
@@ -780,7 +922,7 @@ async def _request_modelscope_native_image(
                         or poll_status == 404
                 )
 
-                if poll_task_status in {'FAILED', 'ERROR', 'CANCELLED', 'CANCELED'}:
+                if poll_task_status in _MODELSCOPE_TASK_FAILED_STATES:
                     if is_not_found and elapsed < 30:
                         not_found_count += 1
                         logger.debug(
@@ -793,6 +935,25 @@ async def _request_modelscope_native_image(
                     detail = err_message or '任务执行失败'
                     return None, endpoint, detail, 200, request_id
 
+                if poll_task_status in _MODELSCOPE_TASK_SUCCEED_STATES:
+                    # SUCCEED 但没有图片项：短暂补查（结果字段可能晚于状态
+                    # 落库）后快速失败，绝不空转到轮询超时——2026-10-07 前
+                    # 这类任务会白等 240s 然后报误导性的"没有图片数据"。
+                    succeed_no_items += 1
+                    if succeed_no_items >= 3:
+                        detail = (
+                            f"任务状态 {poll_task_status} 但未返回图片"
+                            f"（{_response_shape_preview(poll_json)}）；"
+                            "可能被内容审核拦截或输出缺失，请重试一次。"
+                        )
+                        logger.warning(
+                            "[NativeImage/ModelScope] task %s SUCCEED without images: keys=%s",
+                            task_id[:32], list(poll_json.keys())[:20],
+                        )
+                        return None, endpoint, detail, 200, request_id
+                else:
+                    succeed_no_items = 0
+
                 logger.debug(
                     "[NativeImage/ModelScope] polling iter=%s status=%s but no images extracted, elapsed=%.1fs",
                     poll_iter, poll_task_status, elapsed,
@@ -800,14 +961,22 @@ async def _request_modelscope_native_image(
                 await asyncio.sleep(poll_interval)
                 poll_interval = min(poll_max_interval, poll_interval + 0.5)
 
-            logger.debug(
-                "[NativeImage/ModelScope] task polling timed out after %.1fs (iters=%s); returning last task JSON keys=%s",
-                time.monotonic() - poll_start, poll_iter,
-                list(last_poll_json.keys())[:40] if isinstance(last_poll_json, dict) else type(last_poll_json).__name__,
+            last_status = ''
+            if isinstance(last_poll_json, dict):
+                last_status = str(
+                    last_poll_json.get('task_status') or last_poll_json.get('status') or ''
+                ).upper()
+            logger.warning(
+                "[NativeImage/ModelScope] task polling timed out after %.1fs (iters=%s, last_status=%s, task_id=%s)",
+                time.monotonic() - poll_start, poll_iter, last_status or 'UNKNOWN', task_id[:32],
             )
-            return last_poll_json, endpoint, '', 200, request_id
-
-        return response_json, endpoint, '', 200, request_id
+            # 2026-10-07 修复：超时不能再把 last_poll_json 当"成功"返回——
+            # 此时里面必然没有图片项（有就早已返回），只会让上层报出误导
+            # 性的"接口返回成功，但响应里没有图片数据"。
+            return None, endpoint, (
+                f"任务轮询超时（{_MODELSCOPE_POLL_TIMEOUT_SECONDS} 秒，最后状态: {last_status or 'UNKNOWN'}）；"
+                "请稍后重试。"
+            ), 200, request_id
 
 
 async def _request_modelscope_multi(
@@ -2427,9 +2596,19 @@ async def _request_openai_images_task(task: "ImageTask") -> "ImageTaskResult":
             task.model, len(image_bytes_list), len(diagnostics),
             " | ".join(diagnostics)[:500],
         )
+    # 2026-10-07 修复：空响应（无图片项、无诊断）不再是"黑盒"——把响应
+    # 形状带进 no_items_detail，用户报错与日志都能看到上游实际返回了什么
+    # （错误载荷/异常状态/字段变更），替代笼统的"没有图片数据"。
+    no_items_detail = ''
+    if not image_bytes_list and not diagnostics:
+        no_items_detail = _describe_imageless_response(response_json)
+        logger.warning(
+            "[NativeImage] %s 响应无图片项: %s",
+            task.model, no_items_detail.replace("\n", " | ")[:300],
+        )
     return ImageTaskResult(
         images=image_bytes_list, endpoint=f"/v1{endpoint}", usage=usage,
-        diagnostics=diagnostics,
+        diagnostics=diagnostics, no_items_detail=no_items_detail,
     )
 
 

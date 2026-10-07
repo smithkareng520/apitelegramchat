@@ -139,13 +139,23 @@ class ImageTaskResult:
     endpoint: str = ""
     usage: Any = None
     diagnostics: list[str] = field(default_factory=list)
+    # 响应里"根本没有图片项"时的可诊断描述（含响应形状/顶层字段）。
+    # 与 diagnostics 的语义区分：diagnostics = 响应里有图片项但下载/校验
+    # 全部失败；no_items_detail = 响应里没有任何可识别的图片承载字段
+    # （2026-10-07 生产事故：ModelScope 以 HTTP 200 返回错误 JSON，历史
+    # 实现把这类响应当"成功"透传，用户只看到笼统的"没有图片数据"，
+    # 审核拒绝/配额等真实原因全部丢失）。
+    no_items_detail: str = ""
 
     def empty_detail(self) -> str:
         """images 为空时给用户看的真实原因（多行纯文本）。
 
-        有诊断 = 响应里有图片项但下载/校验全部失败；无诊断 = 响应里确实没有
-        图片数据。两种情形不能共用一句话。
+        优先级：no_items_detail（无图片项的真实形状）> diagnostics
+        （图片项下载/校验失败的逐项诊断）> 兜底一句话。三种情形不能
+        共用一句话。
         """
+        if self.no_items_detail:
+            return self.no_items_detail
         if not self.diagnostics:
             return "接口返回成功，但响应里没有图片数据。"
         shown = "\n".join(f"· {line}" for line in self.diagnostics[:4])
