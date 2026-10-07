@@ -1,3 +1,5 @@
+'''Unit tests for context manager.'''
+
 import context_manager as cm
 from core.messages import Message, TextBlock
 

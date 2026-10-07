@@ -1,14 +1,6 @@
-# =====================================================================
-# tests/unit/test_draft_manager.py — Agent Stream 与 Draft 显示层解耦验收
-# =====================================================================
-# 对应改造需求文档的三个验收场景 + UI Event Buffer + 双状态机：
-#   Test 1：超长 reasoning → Draft1 完整思考，Draft2 正文（场景一）
-#   Test 2：超长 content  → Draft1 完整 markdown，Draft2 剩余内容（场景二）
-#   Test 3：tool call + result + 下一轮回答 → tool result 立即进入上下文、
-#           Agent 不等待 UI；UI 侧工具组完整落在同一草稿（场景三）
-#   另覆盖：滚动期事件缓冲与按序回放（§9）、终局收束、容量未满不滚动、
-#           Agent/Draft 状态机独立演化（§10）。
-# =====================================================================
+'''Agent Stream 与 Draft 显示层解耦验收'''
+
+
 import asyncio
 from typing import List
 

@@ -1,38 +1,13 @@
-# =====================================================================
-# tests/unit/test_present_files_scope.py — present_files 只发 upload/ 下文件
-# =====================================================================
-# 运行方式（无需 pytest，直接 python 执行）：
-#   cd <项目根>
-#   python tests/unit/test_present_files_scope.py
-#
-# 覆盖范围：
-#   A. 边界拒绝：工作区内 upload/ 之外的文件一律拒绝（含绝对路径、
-#      ../ 逃逸、download/、根目录文件），错误信息提示先复制进 upload/
-#   B. 边界放行：upload/ 下的路径通过边界校验（不存在 -> file not found，
-#      而非边界拒绝；存在 -> 走发送流程，mock HTTP 后计入 sent）
-#   C. 不变式：无路径入参 / 非法路径行为不变
-# =====================================================================
+'''present_files 只发 upload/ 下文件'''
 
-import asyncio
-import os
-import sys
-import tempfile
+
 from contextlib import asynccontextmanager
-from pathlib import Path
-from types import SimpleNamespace
 
-# ---- 在导入任何项目模块之前，把数据目录指到独立临时目录 ----
-_TEST_ROOT = Path(tempfile.mkdtemp(prefix="present_scope_test_"))
-os.environ["APITELEGRAMCHAT_DATA_DIR"] = str(_TEST_ROOT / "data")
-os.environ["APITELEGRAMCHAT_WORKSPACES_DIR"] = str(_TEST_ROOT / "home")
+import pytest
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(_PROJECT_ROOT / "src"))
+import file_delivery
+from workspace_paths import workspace_upload_root, workspace_workdir
 
-import aiohttp  # noqa: E402
-
-import file_delivery  # noqa: E402
-from workspace_paths import workspace_workdir, workspace_upload_root  # noqa: E402
 
 PASS, FAIL = 0, 0
 _failures = []
@@ -82,13 +57,17 @@ async def fake_chat_action_scope(chat_id, action):
     yield
 
 
-def patch_http():
-    file_delivery.aiohttp.ClientSession = FakeSession
-    file_delivery.chat_action_scope = fake_chat_action_scope
+def patch_http(monkeypatch):
+    monkeypatch.setattr(file_delivery.aiohttp, "ClientSession", FakeSession)
+    monkeypatch.setattr(file_delivery, "chat_action_scope", fake_chat_action_scope)
+
+
+TEST_CHAT_ID = 9_918_247
+TEST_NAMESPACE = "present-files-test"
 
 
 async def present(paths):
-    return await file_delivery.execute_present_files(4242, paths)
+    return await file_delivery.execute_present_files(TEST_CHAT_ID, paths, namespace=TEST_NAMESPACE)
 
 
 def parse(result: str) -> dict:
@@ -107,10 +86,9 @@ def make_failed_map(data: dict) -> dict:
     return out
 
 
-async def main():
-    patch_http()
-    ws = workspace_workdir(4242)
-    up = workspace_upload_root(4242)
+async def _run_suite() -> tuple[int, int, list[str]]:
+    ws = workspace_workdir(TEST_CHAT_ID, TEST_NAMESPACE)
+    up = workspace_upload_root(TEST_CHAT_ID, TEST_NAMESPACE)
     (ws / "out.txt").write_text("root", encoding="utf-8")
     (ws / "download").mkdir(exist_ok=True)
     (ws / "download" / "x.txt").write_text("dl", encoding="utf-8")
@@ -181,15 +159,15 @@ async def main():
     await t_b_accept_upload_paths()
     await t_c_invariants()
 
-    print("\n" + "=" * 60)
-    print(f" 结果: {PASS} 通过, {FAIL} 失败")
-    if _failures:
-        print(" 失败项：")
-        for f in _failures:
-            print(f"   - {f}")
-    print("=" * 60)
-    sys.exit(1 if FAIL else 0)
+    return PASS, FAIL, list(_failures)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+@pytest.mark.asyncio
+async def test_present_files_scope_regressions(monkeypatch):
+    """present_files only sends staged files from ``upload/``."""
+    global _failures, PASS, FAIL
+    _failures = []
+    PASS = FAIL = 0
+    patch_http(monkeypatch)
+    _, failed, failures = await _run_suite()
+    assert failed == 0, "\n".join(failures)

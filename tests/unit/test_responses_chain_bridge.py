@@ -1,25 +1,8 @@
 # tests/unit/test_responses_chain_bridge.py
-"""Responses bridge 链路回归：官方 server-managed state（previous_response_id）。
+'''Responses bridge 链路回归：官方 server-managed state（previous_response_id）。'''
 
-覆盖重构后的核心行为契约：
-
-1. 普通多轮：首轮 bootstrap（全量 canonical history、无
-   previous_response_id）；提交链头后，下一轮 ``input`` 只携带本回合
-   新增的 user item，``previous_response_id`` 指向上一条成功 response。
-2. 工具轮次：function_call response 完全没有文本（``output_text == ""``）
-   时绝不判定为空——continuation 从结构化 ``output`` 中的 function_call
-   生成 ``function_call_output``，以该 response 的 id 续链。
-3. 异常状态：create 失败不推进链头；服务端明确判定 previous response
-   不存在时只做一次 Responses 内 bootstrap 重试；普通错误直接上抛；
-   流中断（已出网）显式断链。
-4. 严格禁止空 input：链式轮次若推导不出任何新增 input，在调用 SDK 前
-   抛 ``ResponsesProtocolError``，绝不发送 ``input: []``。
-"""
 from __future__ import annotations
 
-import asyncio
-import sys
-import types
 
 import pytest
 

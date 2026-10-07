@@ -1,16 +1,5 @@
-"""Tests for the emoji font fallback helpers used by the PDF skill.
+'''Tests for the emoji font fallback helpers used by the PDF skill.'''
 
-ReportLab has no automatic font fallback and the production Kaiti CJK font
-contains zero emoji glyphs, so generated PDFs garble emoji into boxes.
-
-The monochrome Noto Emoji TTF is NOT committed to this repo: the Dockerfile
-downloads a pinned, checksum-verified copy into the image at build time (see
-the "Emoji handling" section of SKILL.md). So the font is only guaranteed to
-be present when running inside the built image (or APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT
-points at a local copy for dev/testing) — tests that need the actual font
-bytes are skipped when neither is available, rather than asserting a vendored
-file that no longer exists by design.
-"""
 
 import sys
 from pathlib import Path

@@ -1,4 +1,4 @@
-import json
+'''Unit tests for responses tool continuation.'''
 
 from core.messages import Message
 from ai.response_protocol import message_to_responses_input_items, messages_to_responses_request

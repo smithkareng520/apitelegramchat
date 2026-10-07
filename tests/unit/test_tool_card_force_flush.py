@@ -1,21 +1,5 @@
-"""工具卡片首次上屏强制成帧的回归测试。
+'''工具卡片首次上屏强制成帧的回归测试。'''
 
-背景：content_block_start 建卡时走 request_flush(force=False)，若前一段
-正文/思考的 flush 仍在途（卡在 send_rich_message_draft 的 250ms 最小间隔
-等待里），建卡请求只置脏即返回；flush() 在拿到 _flush_lock 后才构建 HTML，
-等轮到构建时参数往往已流完——空壳占位帧与"参数已完整"帧合并成一帧，用户
-看到的第一帧就是完整命令，折叠块"参数打完/开始执行后才出现"。
-
-修复：add_tool_item 新建条目分支改为 request_flush(force=True)，卡片骨架
-抢先独立成帧上屏；参数增量仍按非强制节奏填充。
-
-本文件验证：
-1. 新建工具卡片触发 force=True 的独立帧；
-2. 在途正文 flush 期间建卡，卡片帧仍以 force 抢先发出（不被合并吞掉），
-   且占位帧先于参数帧出现；
-3. 合并进已有条目（同 id 重复 add）保持非强制，不放大请求量；
-4. 同步批量建卡（tool_call_loop 执行路径）合并为一帧 force。
-"""
 
 import asyncio
 import time

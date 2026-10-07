@@ -1,36 +1,19 @@
-# =====================================================================
-# tests/test_whitelist_r2.py — 白名单 R2 同步 + 权限边界 全量回归测试
-# =====================================================================
-# 运行方式（无需 pytest，直接 python 执行）：
-#   cd <项目根>
-#   python tests/test_whitelist_r2.py
-#
-# 覆盖范围：
-#   A. 归一化 / 管理员目标判断（大小写、@ 前缀、数字 ID）
-#   B. 白名单文件解析健壮性（BOM / CRLF / 空行 / 管理员条目过滤 / 非法条目）
-#   C. 本地模式（R2 未配置）：文件即数据源，增删落盘、重启恢复
-#   D. R2 模式（fake R2 后端）：启动拉取、修改推送、重启无复活、
-#      播种迁移、网络故障回退、推送失败自愈、并发一致性
-#   E. 授权边界：管理员不可被加入/删除用户白名单、大小写授权、
-#      user_id 精确匹配、内存 set 引用恒定（历史 bug 回归）
-# =====================================================================
+'''白名单 R2 同步 + 权限边界 全量回归测试'''
+
 
 import asyncio
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
-# ---- 在导入任何项目模块之前，把数据目录指到独立临时目录 ----
-_TEST_ROOT = Path(tempfile.mkdtemp(prefix="wl_r2_test_"))
-os.environ["APITELEGRAMCHAT_DATA_DIR"] = str(_TEST_ROOT / "data")
-os.environ["APITELEGRAMCHAT_WORKSPACES_DIR"] = str(_TEST_ROOT / "home")
+import pytest
+
+import config
+import s3_utils
+from workspace_paths import data_root
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(_PROJECT_ROOT / "src"))
-
-import config, s3_utils  # noqa: E402
 
 PASS, FAIL = 0, 0
 _failures = []
@@ -431,7 +414,7 @@ async def t_g_real_local_fallback():
 
     r = await config.add_whitelist_user("localmirror")
     check("G1 本地模式 add 成功", r == config.ADD_ADDED, r)
-    mirror = _TEST_ROOT / "data" / "r2_cache" / KEY
+    mirror = data_root() / "r2_cache" / KEY
     check("G2 r2_cache 本地镜像已写入", mirror.exists() and mirror.read_text(encoding="utf-8").split() == ["localmirror"],
           str(mirror))
     check("G3 本地白名单文件一致", local_file().read_text(encoding="utf-8").split() == ["localmirror"])
@@ -440,7 +423,10 @@ async def t_g_real_local_fallback():
     check("G4 真实download读回镜像", back is not None and back.decode().split() == ["localmirror"])
 
 
-async def main():
+async def _run_suite() -> tuple[int, int, list[str]]:
+    global _failures, PASS, FAIL
+    _failures = []
+    PASS = FAIL = 0
     await t_a_normalization()
     await t_b_parse()
     await t_c_local_mode()
@@ -448,16 +434,35 @@ async def main():
     await t_e_permission_edges()
     await t_f_r2key_guard()
     await t_g_real_local_fallback()
-
-    print("\n" + "=" * 60)
-    print(f" 结果: {PASS} 通过, {FAIL} 失败")
-    if _failures:
-        print(" 失败项：")
-        for f in _failures:
-            print(f"   - {f}")
-    print("=" * 60)
-    sys.exit(1 if FAIL else 0)
+    return PASS, FAIL, list(_failures)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+@pytest.mark.asyncio
+async def test_whitelist_r2_regression_suite(monkeypatch, tmp_path):
+    """Exercise local/R2 sync, recovery, authorization, and concurrency invariants."""
+    original_admin = config.ADMIN_USER
+    original_kind = config._ADMIN_USER_KIND
+    original_target = config._ADMIN_TARGET
+    original_users = set(config.WHITELIST_USERS)
+    original_r2 = (
+        s3_utils.is_r2_configured,
+        s3_utils.upload_bytes_to_r2,
+        s3_utils.download_from_r2,
+        s3_utils.file_exists_in_r2,
+    )
+    monkeypatch.setattr(config, "WHITELIST_FILE", str(tmp_path / "whitelist.txt"))
+    try:
+        _, failed, failures = await _run_suite()
+        assert failed == 0, "\n".join(failures)
+    finally:
+        config.WHITELIST_USERS.clear()
+        config.WHITELIST_USERS.update(original_users)
+        config.ADMIN_USER = original_admin
+        config._ADMIN_USER_KIND = original_kind
+        config._ADMIN_TARGET = original_target
+        (
+            s3_utils.is_r2_configured,
+            s3_utils.upload_bytes_to_r2,
+            s3_utils.download_from_r2,
+            s3_utils.file_exists_in_r2,
+        ) = original_r2

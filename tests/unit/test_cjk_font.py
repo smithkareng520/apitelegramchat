@@ -1,3 +1,5 @@
+'''Unit tests for cjk font.'''
+
 from pathlib import Path
 import inspect
 

@@ -1,7 +1,9 @@
 """Regression tests for MCP env resolution after config.py scrubs os.environ."""
 
-import json
 import asyncio
+import json
+
+import pytest
 
 
 def test_mcp_json_env_resolution_uses_runtime_snapshot(tmp_path, monkeypatch):
@@ -82,7 +84,8 @@ def test_stdio_params_start_from_runtime_snapshot(monkeypatch):
     assert params.env["APITELEGRAMCHAT_MCP_SCOPE"] == "test-scope"
 
 
-def test_list_server_tools_deduplicates_concurrent_refresh(monkeypatch):
+@pytest.mark.asyncio
+async def test_list_server_tools_deduplicates_concurrent_refresh(monkeypatch):
     import mcp_manager
 
     manager = mcp_manager.MCPManager.__new__(mcp_manager.MCPManager)
@@ -117,13 +120,10 @@ def test_list_server_tools_deduplicates_concurrent_refresh(monkeypatch):
 
     monkeypatch.setattr(manager, "_list_raw_tools", fake_list_raw_tools)
 
-    async def run():
-        return await asyncio.gather(
-            manager.list_server_tools("remote"),
-            manager.list_server_tools("remote"),
-        )
-
-    results = asyncio.run(run())
+    results = await asyncio.gather(
+        manager.list_server_tools("remote"),
+        manager.list_server_tools("remote"),
+    )
 
     assert calls["count"] == 1
     assert results[0] == results[1]

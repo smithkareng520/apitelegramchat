@@ -1,21 +1,5 @@
-"""连续相同工具错误熔断的回归测试。
+'''连续相同工具错误熔断的回归测试。'''
 
-背景（代码审查发现的问题）：熔断计数此前借用 DraftManager/
-RichMessageBuilder 对象做存储——用 ``setattr(builder, f"_streak:{msg}",
-n)`` / ``getattr`` / ``vars(builder)`` 反射遍历清理，把"本轮工具循环"的
-临时状态错误地依附在一个只负责 UI 草稿渲染的对象上。修复后改为显式的
-``error_streak: dict`` 参数，由调用方（各 bridge 的 ``BridgeLoopState``
-或等价的本地字典）在多轮 ``_run_tool_calls_and_append`` 调用之间传递。
-
-本测试覆盖三点：
-1. 连续 TOOL_ERROR_STREAK_LIMIT 次相同错误 -> 触发熔断（追加 System
-   提示消息，返回值仍是 "continue"，计数清零）；
-2. 熔断状态确实存于调用方传入的 error_streak 字典里，而不是 builder
-   实例属性上（builder 不应出现任何 "_streak:" 前缀属性）；
-3. 中途出现一次成功/不同错误会清空熔断计数（不会被不连续的偶发错误
-   误触发）。
-"""
-import asyncio
 
 import pytest
 

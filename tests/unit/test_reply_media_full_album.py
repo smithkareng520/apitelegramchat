@@ -1,19 +1,6 @@
 # -*- coding: utf-8 -*-
-"""回复引用媒体补齐（"回复消息带上全部图片/音频等"）单元测试。
+'''回复引用媒体补齐（"回复消息带上全部图片/音频等"）单元测试。'''
 
-覆盖场景（对应 state.album_media_registry / app_turns._get_reply_media /
-_get_reply_context / proactive.WAKEUP_PROMPT 的行为契约）：
-
-  - 相册聚合时登记整组媒体（图片取最大尺寸 PhotoSize，去重）；
-  - 回复相册任意分片：reply_to_message 只带一个分片，登记表补齐整组；
-  - 登记表未命中（bot 重启 / LRU 淘汰）：退化为单分片引用（旧行为）；
-  - 登记表有界（LRU 200 条）与 chat 归属隔离；
-  - 单媒体消息（photo/document/audio/voice/video/video_note）单元素列表；
-  - 无 reply_to_message 返回空列表；
-  - 引用占位文本：无 caption 媒体给出具体类型描述，有 caption 用原文；
-  - TIMER 唤醒提示词：对任务/记忆用能力描述而非指令式"调用 todo 的
-    list"，避免无对应工具的模型在正文里幻觉 tool_calls JSON。
-"""
 import asyncio
 
 import state

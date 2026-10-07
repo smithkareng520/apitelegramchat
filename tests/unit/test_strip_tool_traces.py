@@ -1,27 +1,9 @@
 # -*- coding: utf-8 -*-
-"""strip_tool_traces（能力维度全量清除）单元测试。
-
-覆盖场景（对应 tool_visibility.strip_tool_traces 的行为契约）：
-  - assistant 剔除全部 ToolCallBlock，文本保留；
-  - role=tool 消息整条移除（含未配对的孤儿结果）；
-  - 只有工具调用没有正文的 assistant 空壳整条丢弃；
-  - 未被打断的"无结果 tool_call"同样清除（drop 不需要配对回溯）；
-  - user / system 消息原样引用（零拷贝）；
-  - 持久历史对象绝不被原地修改（只改出站副本）；
-  - 旧 dict 形状直通不改写（双形状兼容层已移除，归一化由
-    _append_history_async 统一负责）；
-  - 无工具痕迹时零开销直通（返回原列表对象）；
-  - 确定性：同一输入两次调用结果一致；
-  - wire 级验证：清理后的 Message 渲染出的 OpenAI JSON 不含 tool_calls
-    键、不含 role=tool 消息（三条协议出站的共同上游）。
-"""
-import json
+'''strip_tool_traces（能力维度全量清除）单元测试。'''
 
 from core.messages import (
     Message,
-    TextBlock,
     ToolCallBlock,
-    ToolResultBlock,
     render_openai_messages,
 )
 from tool_visibility import strip_tool_traces
@@ -231,6 +213,3 @@ def test_call_only_shell_not_rendered_as_invalid_assistant():
             assert m.get("content") or m.get("tool_calls"), \
                 "非法 assistant 消息：content 为空且无 tool_calls"
 
-
-if __name__ == "__main__":
-    raise SystemExit("请用 pytest 运行：pytest tests/unit/test_strip_tool_traces.py")

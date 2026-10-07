@@ -1,6 +1,8 @@
+'''Unit tests for response protocol.'''
+
 from __future__ import annotations
 
-from core.messages import Message, TextBlock, ReasoningBlock, ToolCallBlock
+from core.messages import Message, ToolCallBlock
 from ai.response_protocol import (
     RESPONSES_OUTPUT_ITEMS_META_KEY,
     RESPONSES_OUTPUT_MODEL_META_KEY,

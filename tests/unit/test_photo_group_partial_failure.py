@@ -1,17 +1,6 @@
 # tests/unit/test_photo_group_partial_failure.py
-"""回归测试：photo_group 部分图片解析失败时不应静默丢图。
+'''回归测试：photo_group 部分图片解析失败时不应静默丢图。'''
 
-Bug 背景：用户在一条消息里发送 2 张图片（或 Telegram 相册聚合出的
-photo_group），其中 1 张因 R2 预签名失败 + base64 兜底也拿不到字节而
-解析失败。修复前 _resolve_multimodal_content 会直接把失败的图片从
-content_blocks 过滤掉，不留任何日志或提示，导致模型误以为用户只发了
-1 张图（表现为模型回复"我只看到 1 张图片"）。
-
-修复后：
-  1. 失败的 file_id 记 warning 日志；
-  2. 部分失败时注入一条文本提示，让模型如实告知用户，而不是当作
-     用户没发。
-"""
 import logging
 
 import pytest

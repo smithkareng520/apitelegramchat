@@ -1,24 +1,6 @@
-"""统一请求管道回归测试（参数分层 / 输入组合鉴权 / API 分支 / 请求体构建）。
+'''统一请求管道回归测试（参数分层 / 输入组合鉴权 / API 分支 / 请求体构建）。'''
 
-验证目标：回合入口的"一个用户回合到底怎么发出去"四步流水线全部配置
-驱动——厂商默认参数 -> 模型覆盖参数的统一合并视图（resolve_effective_params）、
-按输入组合 × 模型能力的统一鉴权出口（authorize_request）、chat/images/video
-分支解析（resolve_request_plan）、媒体请求体按（内容, api 类型, 端点）装配
-（build_media_request_body）。
 
-覆盖五个层面：
-1. 参数分层：模型覆盖 > 厂商默认（openrouter/free 示例：image_input=True
-   覆盖厂商默认 False；未覆盖字段继承厂商默认）；端点合并同规则。
-2. 输入组合解析：单一类型信封 / 混合 attachments 信封 / 空信封。
-3. 鉴权：支持模态 ok；不支持模态降级（degrade 记录原因，不阻断）；
-   媒体分支缺 prompt 硬拦截（blocked）；chat 分支永不因缺文本拦截。
-4. 分支计划：三类模型 -> chat/images/video + 协议 + 端点 + 图像形状。
-5. 请求体构建：inline（Agnes 式）硬约束不回归；multipart/chat/video
-   分支不适用 JSON 构建（返回 None）。
-"""
-import json
-
-import pytest
 
 from config import (
     PROVIDERS,
@@ -384,6 +366,3 @@ def test_run_preflight_timer_empty_message_chat_route():
     assert pf.verdict.blocked is False
     assert pf.plan.route == "chat"
 
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

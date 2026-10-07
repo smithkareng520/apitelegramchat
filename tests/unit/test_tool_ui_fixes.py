@@ -1,19 +1,5 @@
-"""针对 4 项 UI / Schema 修复的回归测试。
+'''针对 4 项 UI / Schema 修复的回归测试。'''
 
-覆盖：
-1. web_search 与信息类工具（exchange_rate）结果用富文本卡片展示
-   （web_search 为紧凑列表：标题链接 + 来源徽标，不含 section 头与
-   斜体摘要）；message_user 及其他
-   纯文本返回的工具，统一用 ``<pre><code>`` 等宽代码面板展示（与 bash /
-   text_editor 同规范）；
-2. ``description`` 不再被 normalize_tool_schema 强制注入 required，
-   且只有 bash 声明该字段；web_search 不带 description 可通过校验；
-3. memory / todo / subagent / deliver_reply 完成态摘要按「动作 + 对象」
-   生成（与 text_editor 同规范），不再退化为默认的 "Ran an action"；
-   组摘要同步按动作细分并改为动词短语，不再豁免首字母小写规范；
-4. 工具组完成态摘要统计失败条目，末尾追加 ``(failed n)``；全部失败
-   时只显示 ``(failed n)``，不再是笼统的 "Tools failed"。
-"""
 import asyncio
 
 import pytest

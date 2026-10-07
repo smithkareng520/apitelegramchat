@@ -1,3 +1,5 @@
+'''Unit tests for ai streaming.'''
+
 import asyncio
 
 import pytest

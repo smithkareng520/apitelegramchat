@@ -1,33 +1,12 @@
 # tests/unit/test_early_persist_and_input_count.py
-"""回归测试：多照片/连发消息静默丢失（2026-09-12 生产事故）。
+'''回归测试：多照片/连发消息静默丢失（2026-09-12 生产事故）。'''
 
-事故链路（用户视角："发两张图，模型只收到一张"）：
-
-  1. 用户快速连发两条带图消息（或相册分片间隔超过聚合窗口）；
-  2. 第二条的 spawn_turn_task 打断并取消第一条的回合任务；
-  3. 第一条的 user 消息原先进持久化发生在回合任务内部的
-     get_ai_response——被打断时可能尚未落库 → 消息静默消失；
-  4. 预检日志的输入组合计数又把 file_ids 与 attachments 双表示
-     各数一遍（1 张照片显示 photo×2），日志"证明"两张图都到了，
-     把排查方向带偏（前几轮补丁都在修下游解析，真正丢失在上游）。
-
-修复后的两个不变量（本文件逐条断言）：
-
-  A. 计数不变量：resolve_input_combination 对 (模态, file_id) 去重，
-     信封同时携带 file_ids 与 attachments 时每个物理附件恰好计 1 次。
-  B. 持久化不变量：spawn_turn_task 在派发前把 user 消息落库；即便
-     回合任务在 get_ai_response 之前被取消，消息也已在历史中，会被
-     下一条消息合并（两张图都进入模型请求）；消费型接管（媒体参数
-     卡片）与 pre_flight 拒绝可经 undo_early_persist 回滚。
-"""
 from __future__ import annotations
 
-import asyncio
 
 import pytest
 
 from protocols.pipeline import resolve_input_combination
-import turn_recovery
 from turn_recovery import (
     EARLY_PERSIST_FLAG,
     EARLY_PERSIST_MODE,

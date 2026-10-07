@@ -1,44 +1,6 @@
 # tests/unit/test_interrupt_preservation.py
-"""打断信息丢失修复的回归测试（对应问题排查文档的改动指南）+
-五阶段打断规范测试（2026-09 二期重构）。
+'''打断信息丢失修复的回归测试（对应问题排查文档的改动指南）+'''
 
-问题回顾（修复前）：
-  ``content_acc`` / ``reasoning_acc`` 是流式循环的局部变量，只有循环正常
-  跑完才把 assistant 消息写入 journal；``except CancelledError:
-  raise`` 在写入之前——打断一旦发生，已产出文本从未落地。草稿层（用户
-  可见）保全了"数到 123"，历史层（模型记忆）完全为空。
-
-五阶段打断规范（本次重构，数据保留基准"文本看前端、数据看后台"）：
-
-  阶段1  思考推演中打断 → 残缺思考全量丢弃（不进历史，防污染隐空间）
-  阶段2  文本输出中打断 → journal 文本按前端渲染确认游标物理截断
-         （后端 500 字 / 前端只渲染 100 字 → 历史只留 100 字）
-  阶段3  工具参数 JSON 未收完打断 → 半截 tool_use 整体剥离（无悬空）
-  阶段4a 只读工具执行中打断 → 取消拒断底层请求 + aborted 占位回执
-  阶段4b 写操作工具执行中打断 → shield 脱离后台死等终态，回写历史
-  阶段5  工具结果刚返回打断 → 调用声明与真实数据全量保留
-
-覆盖（问题文档"验证方式建议"五条 + 五阶段场景 + 机制组件单元）：
-
-  场景1  纯文本长输出中途打断 → 历史保全已产出文本（模型能看到说到哪）
-  场景2  工具参数 JSON 还没收完就打断 → journal 无悬空半截 tool_use
-  场景3  工具已完整发起、等待执行结果时打断 → assistant(tool_call) +
-         占位 tool_result 配对齐全（aborted 状态语义）
-  场景4  多轮工具调用，末轮进行到一半被打断 → 前几轮完整保留
-  场景5  打断后立刻发新消息 → 历史含进度、新消息正常追加（衔接可续）
-
-组件单元（改动点 1/3/4/5 的机制面 + 五阶段专用）：
-  - LiveAssistantSlot：sync 增量同步 / finalize 双列表同一对象 /
-         LIVE_STREAM_FLAG 直播标记生命周期（裁剪判据）
-  - _normalize_journal：空占位与"只思考"占位剔除（Codex #22602 防御）
-  - trim_interrupted_stream：阶段1/2 字段级裁剪（游标截断 / 思考丢弃 /
-         定稿消息不误伤 / synthetic 前文排除）
-  - MediaProgressSlot：媒体生成占位 complete / drop / 幂等 / synthetic 标记
-  - 草稿层↔历史层反向校验：失同步 WARNING / 一致 INFO（改动点3）
-  - persist_user_message_entry 合并分支防御性 ERROR（改动点5）
-  - attach_render_cursor：游标引用绑定 / 零拷贝读取
-  - writeback_detached_tool_result：脱离工具终态原地替换历史占位
-"""
 from __future__ import annotations
 
 import asyncio

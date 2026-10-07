@@ -1,17 +1,5 @@
-# =====================================================================
-# tests/unit/test_bash_idle_timeout.py — bash 双层超时（v2.4 防卡死）
-# =====================================================================
-# 覆盖错误日志反馈的问题：「bash 遇到网络不可达等静默挂起请求时会卡满
-# 整个总超时（300s）」。修复后 bash 读循环采用双层超时：
-#   - idle：持续无输出超过 SANDBOX_IDLE_TIMEOUT_SEC → 立即 kill（核心）；
-#   - total：总预算上限（原行为）。
-# 同时覆盖 sandbox.build_sandbox_env 的 sitecustomize 注入（沙箱内 Python
-# 进程默认 socket 超时）与常见 CLI 工具超时环境变量。
-#
-# 集成用例真实 spawn bash 进程：本机/CI 内核可能 < 5.13（Landlock 不可用），
-# 统一 monkeypatch sandbox._apply_landlock 直通；生产路径不受影响
-# （preexec_fn 运行于 fork 后的子进程，继承父进程已 patch 的模块状态）。
-# =====================================================================
+'''bash 双层超时（v2.4 防卡死）'''
+
 
 import asyncio
 import os

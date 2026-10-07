@@ -1,3 +1,5 @@
+'''Unit tests for response events.'''
+
 from types import SimpleNamespace
 
 from ai.response_events import (

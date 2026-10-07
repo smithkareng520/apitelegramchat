@@ -1,22 +1,7 @@
-"""本轮修复的回归测试（2026-10）：
+'''本轮修复的回归测试（2026-10）：'''
 
-1. streaming._close_quietly：``__aiter__`` 返回 self 且只有 ``close()``
-   的 openai SDK 流对象，超时/取消/正常结束后连接必须被释放（修复前
-   迭代器只找 aclose、同对象又不追加 stream target，close 永不调用）；
-2. agentic_loops 首增量零输出重试：openai SDK 3.x 传输层是 httpx2，
-   httpx2.ReadTimeout 必须纳入重试判定（修复前只捕 httpx.ReadTimeout，
-   重试从未生效）；
-3. gemini_bridge 流中 error / promptFeedback.blockReason 事件不再被
-   静默吞掉，转成 AIResponseParseError 上抛；
-4. responses_bridge 合成总结流：dict 形状事件经 event_type/event_field
-   读取后正常累积（修复前 getattr 全部丢弃，总结静默变空）；
-5. media_generation 生成结果图片下载：25MB 体积上限对三处下载路径
-   统一生效（Content-Length 预检 + readany 循环限读）。
-"""
 import asyncio
-import base64
 import io
-import json
 
 import httpx2
 import pytest

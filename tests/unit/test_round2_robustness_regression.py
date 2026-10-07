@@ -1,17 +1,5 @@
-"""第 2 轮审查修复的回归测试（2026-10）：
+'''第 2 轮审查修复的回归测试（2026-10）：'''
 
-1. protocols.invalidate_responses_chain_for：非 Responses 协议适配器
-   路由后必须作废 Responses 链头（修复前三份拷贝各自 try/except 静默
-   吞异常，链头失效失败会导致下次切回 Responses 协议静默丢失上下文）；
-2. subagent 工具超时归因：工具内部 TimeoutError 包装为
-   _ToolInternalTimeout（修复前与外层预算混在同一个 except 分支，
-   文案张冠李戴）；
-3. app_turns._cancel_old_task：打断链上调用方自身的取消必须向上传播，
-   只有"旧任务以 CancelledError 结束"才被吸收（修复前 wait_for 把
-   两种取消混在一起吞掉）；
-4. cache_usage.usage_num：三个 bridge 局部 _num 收敛后的共享实现
-   （bool 排除 + 缺省值语义）。
-"""
 import asyncio
 
 import pytest

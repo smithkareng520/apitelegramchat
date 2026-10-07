@@ -1,34 +1,13 @@
-"""媒体参数交互卡片（media_wizard）+ 视频请求体全 schema 回归测试。
+'''媒体参数交互卡片（media_wizard）+ 视频请求体全 schema 回归测试。'''
 
-覆盖六个层面：
-1. 视频请求体全 schema（Agnes Video 2.5 文档）：keyframe 首尾帧、
-   reference 的 images/audios/videos 对象（start_seconds/require_audio）、
-   seed、显式 mode 与媒体匹配校验（不匹配安全回退 text）、text 模式
-   绝不携带媒体字段。
-2. 参数声明推导：卡片按钮按模型有效参数生成（video 全量、images inline
-   尺寸/比例、chat 模型不出卡片）；n=1 只说明不提供按钮。
-3. 输入清洗与附件提取（引用前缀 / 📎 占位行 / 信封兼容）。
-4. 卡片渲染：主页摘要（未选择 = 模型默认）、n=1 说明、互斥警告、
-   HTML 转义；picker/mode/frames/refs/seed/videoref 各页。
-5. 回调状态机（Telegram IO 全部 mock）：翻页/选参/白名单拒绝/模式切换
-   引导跳页/收集素材/上传失败提示重传/参考视频 start_seconds 与
-   require_audio/seed 输入/文本更新提示词/提交校验与 overrides 构造。
-6. 媒体循环 media_overrides：卡片参数优先于消息内提取（video seconds/
-   size/aspect_ratio/mode/首尾帧/audios/video_specs；image 尺寸/比例/
-   参考图直通 ImageTask）。
-"""
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 
-import pytest
 
 from config import SUPPORTED_MODELS
 from core.images import ImageTaskResult
 from media_wizard import (
-    WIZARD_CALLBACK_PREFIX,
-    MediaParamSpec,
     WizardSession,
     build_submission,
     clean_prompt_text,

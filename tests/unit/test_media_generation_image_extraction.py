@@ -1,3 +1,5 @@
+'''Unit tests for media generation image extraction.'''
+
 import base64
 import asyncio
 

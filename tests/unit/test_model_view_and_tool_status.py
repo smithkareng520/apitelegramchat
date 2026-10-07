@@ -1,16 +1,6 @@
-# =====================================================================
-# tests/unit/test_model_view_and_tool_status.py
-# =====================================================================
-# 回归测试（2026-10 工具结果去 JSON 化 + 折叠块状态补齐）：
-# 1. 模型视图纯文本化：weather/todo/memory/subagent/message_user/present_files
-#    的 tool 消息不再包含 JSON；
-# 2. weather 载荷源头瘦身：工具不再生产 DewPoint/shortRad/十项 chance_* 等
-#    无价值字段（UI 卡片同步精简后不再消费它们）；
-# 3. 折叠块/折叠组状态文案补齐（对标 Claude Code）：
-#    weather/exchange_rate/wikipedia/subagent 带对象信息；bash 后台任务、
-#    maps_ip_location 等此前缺状态的工具有专属文案；路线/距离/详情完成态
-#    带结果要点；单条目工具组标题复用条目详情摘要。
-# =====================================================================
+'''tests/unit/test_model_view_and_tool_status.py'''
+
+
 import asyncio
 import json
 

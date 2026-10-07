@@ -1,10 +1,8 @@
-# =====================================================================
-# tests/unit/test_token_budget.py — token 计数与截断预算
-# =====================================================================
-# 被测关键路径：所有模型上下文预算的统一守卫层。
-# 覆盖：count_tokens 基础语义、truncate_to_token_budget 严格不超预算、
-#       truncate_to_token_budget_head_tail 头尾保留、边界与非法值、JSON 计数。
-# =====================================================================
+'''tests/unit/test_token_budget.py — token 计数与截断预算
+被测关键路径：所有模型上下文预算的统一守卫层。
+覆盖：count_tokens 基础语义、truncate_to_token_budget 严格不超预算、
+truncate_to_token_budget_head_tail 头尾保留、边界与非法值、JSON 计数。'''
+
 import json
 
 import pytest

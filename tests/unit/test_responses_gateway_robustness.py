@@ -1,15 +1,6 @@
 # tests/unit/test_responses_gateway_robustness.py
-"""生产事故回归：lfree 网关上的两类 Responses 失败。
+'''生产事故回归：lfree 网关上的两类 Responses 失败。'''
 
-1. 工具续轮（previous_response_id + 纯 function_call_output）被上游以
-   ``Upstream request failed: invalid request`` 拒绝——措辞不含
-   ``input must be non-empty``，旧代码的恢复路径靠文本匹配，直接整回合
-   失败并丢掉已执行的工具结果。
-2. 模型输出了 function_call，但网关的 ``response.completed.output`` 不含
-   它（或 item.status 停在 in_progress）——旧代码静默丢掉调用，回合以
-   “AI 响应为空”收场，同时还把带着悬空 function_call 的 response 提交成
-   了链头。
-"""
 from __future__ import annotations
 
 import pytest

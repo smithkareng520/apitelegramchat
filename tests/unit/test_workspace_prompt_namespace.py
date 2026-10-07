@@ -1,3 +1,5 @@
+'''Unit tests for workspace prompt namespace.'''
+
 from pathlib import Path
 import sys
 

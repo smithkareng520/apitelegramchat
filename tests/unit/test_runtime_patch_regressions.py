@@ -1,3 +1,5 @@
+'''Unit tests for runtime patch regressions.'''
+
 from pathlib import Path
 import ast
 

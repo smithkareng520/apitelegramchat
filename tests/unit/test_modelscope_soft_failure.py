@@ -1,29 +1,10 @@
 # -*- coding: utf-8 -*-
-"""ModelScope 图像接口"软失败"识别回归测试（2026-10-07 生产事故）。
+'''ModelScope 图像接口"软失败"识别回归测试（2026-10-07 生产事故）。'''
 
-事故现场：generate_image(edit, Qwen/Qwen-Image-Edit) 快速失败，用户看到
-    ❌ modelscope 图像接口 请求失败
-    HTTP 状态：200
-    详情：接口返回成功，但响应里没有图片数据。
-真实原因（审核拒绝/配额/参数问题）被完全吞掉。
-
-根因：ModelScope 网关对若干失败形态返回 HTTP 200 + 错误 JSON（无
-task_id、无图片字段），历史实现在 POST 后只认 task_id/图片项，这类
-错误载荷被当"成功"透传，上层只能报笼统的空响应文案。
-
-修复后契约：
-  1. POST 200 + 错误载荷（errors / code+message / FAILED 无 task_id）
-     -> 返回 (None, endpoint, 真实错误信息, 200, request_id)。
-  2. POST 200 + 无法识别的无任务形状 -> 显式失败并携带响应形状预览。
-  3. 轮询 SUCCEED 但无图片 -> 短暂补查后快速失败（不再空转 240s）。
-  4. 轮询超时 -> 显式"轮询超时"错误（不再把 last_poll_json 当成功）。
-  5. 所有 OpenAI Images 协议空响应 -> no_items_detail 携带响应形状。
-"""
 import asyncio
 import base64
 import json
 
-import pytest
 
 import ai.media_generation as mg
 from core.images import ImageTaskResult

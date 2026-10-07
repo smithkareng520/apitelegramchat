@@ -10,7 +10,6 @@
 """
 import asyncio
 
-import pytest
 
 from search.tool_schemas import (
     DUAL_MODE_MODELS,

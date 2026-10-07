@@ -1,17 +1,5 @@
-"""pre_rendered 旗标回归测试：系统构建的最终 HTML 不再被发送层二次转换。
+'''pre_rendered 旗标回归测试：系统构建的最终 HTML 不再被发送层二次转换。'''
 
-背景（2026-09-11 [5332ea8f] 错误卡片乱码事故 + 用户要求"只转一次"）：
-错误卡片构建层（ai/error_formatting.py）逐字段/逐行跑过 Markdown→HTML
-转换器后，发送层兜底（_rich_message_html_payload 第 0 步）又对整条消息
-再跑一遍——机器错误文本里的 ``***`` 脱敏掩码、URL 参数等形状会被第二遍
-误判为 Markdown 标记（粗斜体定界符配对），正是乱码事故的根源；多跑一遍
-转义也是纯风险没有收益。
-
-修复：_rich_message_html_payload / send_rich_html_message 增加
-``pre_rendered`` 旗标——调用方声明内容已是最终 HTML 时，发送层跳过
-第 0 步整篇 Markdown 转换，只保留两道结构性安全网（<tg-button> 强模式
-校验、非法媒体 URL 剥离/观看页降级），两者对任意输入幂等。
-"""
 import inspect
 
 from core.rich_media import _rich_message_html_payload

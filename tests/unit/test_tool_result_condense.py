@@ -1,12 +1,10 @@
-# =====================================================================
-# tests/unit/test_tool_result_condense.py — 工具返回「模型视图」精简层
-# =====================================================================
-# 被测关键路径：工具原始返回 → LLM 上下文的去 JSON 化管线。
-# 覆盖：weather / todo / memory / subagent / message_user / present_files /
-#       gaode maps_* 的纯文本模型视图（只给模型回答问题所需信息）、
-#       错误语义保留（熔断依赖前缀匹配，绝不能被改写）、
-#       非法/非 JSON 输入原样透传（宁多勿缺）。
-# =====================================================================
+'''tests/unit/test_tool_result_condense.py — 工具返回「模型视图」精简层
+被测关键路径：工具原始返回 → LLM 上下文的去 JSON 化管线。
+覆盖：weather / todo / memory / subagent / message_user / present_files /
+gaode maps_* 的纯文本模型视图（只给模型回答问题所需信息）、
+错误语义保留（熔断依赖前缀匹配，绝不能被改写）、
+非法/非 JSON 输入原样透传（宁多勿缺）。'''
+
 import json
 
 from tool_result_condense import condense_for_model

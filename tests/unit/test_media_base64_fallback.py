@@ -1,26 +1,5 @@
-"""base64 内联通用兜底回归测试（媒体拉取 400 的第三次尝试）。
+'''base64 内联通用兜底回归测试（媒体拉取 400 的第三次尝试）。'''
 
-背景（2026-09-11 生产 [3a64f5cd] / [5332ea8f]）：agnes-3.0-flash 等网关
-每次请求都要自行下载消息历史里的媒体 URL（R2 预签名地址）；R2 慢窗口
-会连续覆盖首次请求与 1.5s 后的 URL 重放，双双 400 后整轮报废。Agnes
-图像文档明确输入图像支持 Data URI Base64（chat 的 image_url 同形状，
-内部 ImageBlock 在 R2 不可用时早已走 data:image/...;base64,... 形状），
-故重放梯子升级为：
-
-    尝试 0（URL）→ 失败 → 原样 URL 重放（1.5s，抖动自愈）
-      → 再失败 → _inline_wire_images_as_data_urls 把 http(s) 图片全部
-                 内联为 data URI 后重放（通用兜底，网关不再访问 R2）
-
-覆盖：
-- _sniff_image_mime：magic bytes 嗅探；
-- _media_fetch_replay_mode：重放形态梯子（url → inline）；
-- _inline_wire_images_as_data_urls：part 收集范围（image_url 独占；
-  video_url/file/text 不碰；data: 天然跳过）、MIME 判定四级回退、
-  下载失败/空字节的"部分兜底"语义、detail 字段保留、原地替换。
-
-_agentic_loop_openai_compat 重放分支的闸门组合已由
-test_media_fetch_retry.py 与本文件的形态判定共同覆盖。
-"""
 import asyncio
 import base64
 

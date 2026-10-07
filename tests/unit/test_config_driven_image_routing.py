@@ -1,20 +1,5 @@
-"""配置驱动端点路由回归测试（Agnes Image 2.5 Flash 接入重构）。
+'''配置驱动端点路由回归测试（Agnes Image 2.5 Flash 接入重构）。'''
 
-验证目标：新增/接入一个走不同子端点、不同图像 API 形状的模型，只需要
-在 config.py 的模型/厂商配置里声明字段（protocol / endpoint），请求层
-自动按配置路由——不需要为任何模型或厂商新建请求分支。
-
-覆盖五个层面：
-1. 配置合并：模型声明的完整端点/协议正确落到有效端点；endpoint 指向
-   /images/generations|edits 时按完整图像端点处理（内联形状），指向
-   API 根时按官方形状推导（multipart 编辑）。
-2. 公共路由：resolve_model_route 按能力字段匹配 文本/视频/生图。
-3. 图像适配器解析：协议正确时直接路由；协议缺失但声明了 images 端点
-   时配置驱动回退；两者皆无时明确报错。
-4. inline（Agnes 式）请求形状：端点/尺寸档位/宽高比/return_base64/
-   extra_body.image/response_format 位置/tags 缺失等文档硬约束。
-5. multipart（OpenAI 官方式）行为不回归 + 视频提交端点配置化。
-"""
 import asyncio
 import base64
 import json

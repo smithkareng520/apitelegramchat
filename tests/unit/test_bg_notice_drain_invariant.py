@@ -1,34 +1,7 @@
-# =====================================================================
-# tests/unit/test_bg_notice_drain_invariant.py — drain 收敛不变式
-# =====================================================================
-# 用户诉求（本轮重构的验收标准）：
-#   "drain 接线太散，4 个手工注入点 + 多条『不消费』路径，未来任何新增
-#    模型调用路径忘了 drain 就静默丢通知，且最难测。建议把 drain+append
-#    收敛到最低公共调用点（包住 agentic 循环内的 post 和 _call_api），
-#    最多 2 个 wrapper；再加一条不变式测试：『凡到达模型调用的路径，
-#    队列必被 drain』。"
-#
-# 落地结构（src 中仅存在两个 drain 注入点）：
-#   ① ai_handlers._call_api 函数入口自守卫——全部 chat 协议模型调用
-#      （USER / TIMER / 静默 / 未来新增路由）的唯一最低公共入口；
-#   ② ai.agentic_loops._media_loop_with_notices——image/video 生成
-#      （agentic 循环内的 POST）两条循环的唯一入口，get_ai_response
-#      与媒体向导提交路径共用。
-#
-# 本文件两层守护：
-#   - 结构层（AST）：模型调用函数只能经 wrapper 触达 / 入口必含 drain，
-#     新增路径想绕开接线会在本测试直接编译期失败；
-#   - 行为层（运行时）：两个注入点真实 drain（通知作为尾部 system 消息
-#     搭车、队列清空、drain 先于模型请求发生）、push/drain 跨线程守恒
-#     （不丢不重）、重启 was-running 孤儿补推「因重启被中止」。
-#
-# 说明：subagent 的迷你 agentic 循环（subagent_tool）刻意不 drain——
-# 子 agent 持全新上下文，父 chat 的待送通知必须留给父请求搭车；且子
-# 循环只会运行在已被 _call_api drain 过的父回合内部，请求级不变式
-# 依然成立。
-# =====================================================================
+'''drain 收敛不变式'''
+
+
 import ast
-import asyncio
 import subprocess
 import sys
 import threading

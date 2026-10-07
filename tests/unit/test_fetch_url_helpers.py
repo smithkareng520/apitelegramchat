@@ -1,13 +1,10 @@
-# =====================================================================
-# tests/unit/test_fetch_url_helpers.py — fetch_url 抓取层辅助逻辑
-# =====================================================================
-# 被测关键路径：search/fetch_url.py 的编码检测/URL 清洗/重定向提取/
-# SSRF 同步校验/响应体大小上限，以及 search/caches.py 的缓存键归一化。
-# 网络请求全部用假对象替身，不发真实请求。
-# =====================================================================
+'''tests/unit/test_fetch_url_helpers.py — fetch_url 抓取层辅助逻辑
+被测关键路径：search/fetch_url.py 的编码检测/URL 清洗/重定向提取/
+SSRF 同步校验/响应体大小上限，以及 search/caches.py 的缓存键归一化。
+网络请求全部用假对象替身，不发真实请求。'''
+
 import asyncio
 
-import pytest
 
 import search.fetch_url as fu
 from search.caches import (

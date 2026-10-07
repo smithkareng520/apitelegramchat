@@ -1,24 +1,5 @@
-"""网关媒体拉取瞬态 400 的重试判定回归测试。
+'''网关媒体拉取瞬态 400 的重试判定回归测试。'''
 
-背景（2026-09-11 生产 [3a64f5cd]）：agnes-3.0-flash 等只接受 URL 输入的
-网关，每次请求都要自行下载消息历史里的媒体 URL（R2 预签名地址）。R2
-跨区域下载存在抖动——同一张图上一轮下载成功，下一轮即 400 +
-"Timed out while downloading media URL"（upstream_error）。该错误形状
-必须在首个增量前重放（与 ReadTimeout 首增量前重试同语义），
-而不是把整轮报废成"请求失败"推给用户；[5332ea8f] 进一步实证 R2 慢窗口
-会连续覆盖首次与首次重放，故重放梯子升级为：第一次原样 URL 重放
-（1.5s，抖动自愈）→ 第二次 base64 内联通用兜底重放（
-_inline_wire_images_as_data_urls，网关不再需要访问 R2；见
-test_media_base64_fallback.py）。
-
-覆盖两个纯判定助手（重试分支内联在 _agentic_loop_openai_compat 的
-except BadRequestError 里，语义即这两个函数的组合）：
-- _looks_like_transient_media_fetch_error：错误形状匹配（含生产日志原文、
-  大小写/包装变体；排除请求形状类 400 与宽泛 upstream_error）；
-- _should_retry_media_fetch_400：重试闸门（首增量前 + 至多两次 + 形状
-  匹配；[5332ea8f] 实证 R2 慢窗口会连续覆盖首次+首次重放，第二次重放
-  改用 base64 内联兜底后闸门总量不变）。
-"""
 import httpx
 import pytest
 from openai import BadRequestError

@@ -1,3 +1,5 @@
+'''Unit tests for bash output contract.'''
+
 import asyncio
 
 from bash_session import _format_bash_envelope

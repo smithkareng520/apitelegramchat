@@ -1,29 +1,6 @@
-# =====================================================================
-# tests/unit/test_truncation_notice.py — 输出截断的分类与用户提示
-# =====================================================================
-# 被测关键路径：四条 agentic 循环（openai_compat / anthropic / gemini /
-# responses）共用的「纯文本终局是否被输出长度上限截断」判定与提示追加。
-#
-# 回归背景（Code Review 发现，2026-09）：
-#   json_repair._finish_reason_cut_info 此前只被 build_invalid_arguments_
-#   envelope 消费——只在「本轮解析出了工具调用但参数 JSON 非法」时才会
-#   被查阅，用于诊断参数是否被输出上限截断。当模型本轮没有调用任何
-#   工具、只是输出了一段被 max_tokens/length 提前切断的纯文本终局回答
-#   时，finish_reason 同样带着这个信息，却从未被任何调用方读取：截断的
-#   回答会被当成完整回答直接展示给用户、写入历史，用户和模型自己都
-#   无法得知回答其实没说完。
-#
-#   同时发现 OpenAI Responses API 桥接（responses_bridge.py）此前把
-#   response.incomplete 事件名当作 finish_reason 记录，但真正的截断
-#   原因在 response.incomplete_details.reason（字面量是
-#   "max_output_tokens"，不是 "incomplete"，也不是 Chat Completions /
-#   Anthropic 使用的 "length"/"max_tokens"）——旧代码既没有提取这个
-#   字段，_finish_reason_cut_info 本身也不认识这个取值，导致该协议的
-#   截断诊断/提示永远判定为"未截断"。
-#
-# 本文件锁定修复后的行为：分类逻辑（_finish_reason_cut_info）与提示
-# 追加逻辑（append_truncation_notice_if_needed）分别覆盖。
-# =====================================================================
+'''输出截断的分类与用户提示'''
+
+
 import pytest
 
 from ai.bridge_common import append_truncation_notice_if_needed, _TRUNCATION_NOTICE

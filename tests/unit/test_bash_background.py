@@ -1,21 +1,7 @@
-# =====================================================================
-# tests/unit/test_bash_background.py — bash 后台任务（启动→句柄→查询/停止）
-# =====================================================================
-# 覆盖 bash_background 模块的核心语义：
-#   - 启动立即返回句柄（回合内不阻塞），完成通知入队（「就近搭车」）；
-#   - 寿命上限到期强制终止；stop 优雅终止；每 chat 运行数上限；
-#   - 隔离性：前台会话 idle 超时 killpg 不波及后台任务（防误杀核心）；
-#   - 应用重启恢复：孤儿探活 / 退出码未知（lost）+ 补推通知；
-#   - dispatch / execute_bash 路由转发；UI 卡片分支；L2 schema 校验。
-#
-# 进程类用例真实 spawn bash：沿用 test_bash_idle_timeout.py 的隔离方式
-# （monkeypatch _apply_landlock 直通 + tmp 目录 + 根缓存 cache_clear）。
-# preexec_fn 仅 POSIX 可用 → Windows 上跳过进程类用例（纯逻辑用例照跑）。
-# =====================================================================
+'''bash 后台任务（启动→句柄→查询/停止）'''
+
 
 import asyncio
-import os
-import signal
 import sys
 from pathlib import Path
 from typing import Any
