@@ -599,6 +599,7 @@ class MCPManager:
         self._inprocess_registry: dict[str, Any] = {}
         self._reaper_task: asyncio.Task | None = None
         self._tools_cache: dict[str, tuple[float, list[dict]]] = {}
+        self._tools_refresh_locks: dict[str, asyncio.Lock] = {}
         self._tools_cache_ttl = 300.0
         self._closed = False
 
@@ -660,29 +661,36 @@ class MCPManager:
         now = time.monotonic()
         if cached and not force_refresh and now - cached[0] < self._tools_cache_ttl:
             return cached[1]
-        try:
-            raw_tools = await self._list_raw_tools(server)
-        except Exception as exc:
-            status_code, category, detail, _retryable = _diagnose_mcp_exception(exc)
-            logger.warning(
-                "MCP list_tools failed server=%s status=%s category=%s detail=%s hint=%s",
-                server_name, status_code if status_code is not None else "unknown", category, detail or "<empty>",
-                _env_hint(server, category),
-                exc_info=True,
-            )
-            # 保留旧缓存（可能过期但聊胜于无）。
-            return cached[1] if cached else []
-        disabled = self._dynamic_disabled(server_name)
-        defs: list[dict] = []
-        for tool in raw_tools:
-            tool_name = getattr(tool, "name", "")
-            if not isinstance(tool_name, str) or not _TOOL_NAME_RE.fullmatch(tool_name):
-                continue
-            if tool_name in disabled or not server.exposes_tool(tool_name):
-                continue
-            defs.append(self._tool_def(server_name, tool))
-        self._tools_cache[server_name] = (now, defs)
-        return defs
+        lock = self._tools_refresh_locks.setdefault(server_name, asyncio.Lock())
+        async with lock:
+            # 双检：等待同服务器的另一协程刷新时，直接复用它的结果。
+            cached = self._tools_cache.get(server_name)
+            now = time.monotonic()
+            if cached and not force_refresh and now - cached[0] < self._tools_cache_ttl:
+                return cached[1]
+            try:
+                raw_tools = await self._list_raw_tools(server)
+            except Exception as exc:
+                status_code, category, detail, _retryable = _diagnose_mcp_exception(exc)
+                logger.warning(
+                    "MCP list_tools failed server=%s status=%s category=%s detail=%s hint=%s",
+                    server_name, status_code if status_code is not None else "unknown", category, detail or "<empty>",
+                    _env_hint(server, category),
+                    exc_info=True,
+                )
+                # 保留旧缓存（可能过期但聊胜于无）。
+                return cached[1] if cached else []
+            disabled = self._dynamic_disabled(server_name)
+            defs: list[dict] = []
+            for tool in raw_tools:
+                tool_name = getattr(tool, "name", "")
+                if not isinstance(tool_name, str) or not _TOOL_NAME_RE.fullmatch(tool_name):
+                    continue
+                if tool_name in disabled or not server.exposes_tool(tool_name):
+                    continue
+                defs.append(self._tool_def(server_name, tool))
+            self._tools_cache[server_name] = (now, defs)
+            return defs
 
     def _tool_def(self, server_name: str, tool: Any) -> dict:
         parameters = getattr(tool, "inputSchema", None)

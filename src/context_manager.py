@@ -48,13 +48,24 @@ def _fit_message_to_token_budget(message: Any, token_budget: int) -> Any:
     if available <= 0:
         return None
 
-    candidate_text = original
-    candidate_text = truncate_to_token_budget(original, available, suffix="…")
-    while available > 0 and _message_token_count(
-        Message(role=m.role, blocks=[TextBlock(candidate_text)], name=m.name, meta=dict(m.meta))
-    ) > token_budget:
-        available -= 1
-        candidate_text = truncate_to_token_budget(original, available, suffix="…")
+    # 原实现逐 token 递减 available：一条超大消息在预算边界附近会触发
+    # O(token_budget) 次完整 JSON 序列化 + token 编码。这里利用
+    # ``truncate_to_token_budget`` 的单调性二分查找最大可用文本预算，把
+    # 最坏复杂度降到 O(log token_budget)，同时保持最终结果严格不超预算。
+    def _candidate(budget: int) -> Message:
+        text = truncate_to_token_budget(original, budget, suffix="…")
+        return Message(role=m.role, blocks=[TextBlock(text)], name=m.name, meta=dict(m.meta))
+
+    low, high = 0, available
+    while low < high:
+        mid = (low + high + 1) // 2
+        candidate = _candidate(mid)
+        if _message_token_count(candidate) <= token_budget:
+            low = mid
+        else:
+            high = mid - 1
+
+    candidate_text = truncate_to_token_budget(original, low, suffix="…")
 
     # meta 随拷贝保留（Responses 原生 output 快照、早持久化标记等都
     # 存在 meta 里；meta 永不进出站请求体）。

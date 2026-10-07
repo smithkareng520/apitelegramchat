@@ -916,7 +916,7 @@ async def get_ai_response(
             import tool_names as _tn
             from search.tool_schemas import build_deliver_reply_tool
             from tool_registry import get_model_tools
-            from tool_assembly import prioritize_tool_defs, restrict_tool_defs
+            from tool_assembly import restrict_tool_defs
             _PROACTIVE_ALLOWED_TOOLS = {
                 _tn.WEB_SEARCH, _tn.FETCH_URL, _tn.WIKIPEDIA,
                 _tn.PRESENT_FILES, _tn.WEATHER, _tn.BASH,
@@ -925,14 +925,9 @@ async def get_ai_response(
                 _tn.MAPS_DIRECTION_DRIVING, _tn.MAPS_DIRECTION_TRANSIT,
                 _tn.TODO, _tn.MEMORY, _tn.MESSAGE_USER,
             }
-            # 运行时稳定排列：允许工具作为完整工具面的逻辑前缀，
-            # 不改动各工具定义的声明，也不影响其他回合的工具顺序。
-            ordered_search_tools = prioritize_tool_defs(
-                await get_model_tools(), _PROACTIVE_ALLOWED_TOOLS
-            )
-            timer_tools = restrict_tool_defs(
-                ordered_search_tools, _PROACTIVE_ALLOWED_TOOLS
-            )
+            # restrict_tool_defs 本身保持源定义的相对顺序；TIMER 最终只保留
+            # 允许集合，因此无需先对完整工具面做一次额外的 prioritize + deepcopy。
+            timer_tools = restrict_tool_defs(await get_model_tools(), _PROACTIVE_ALLOWED_TOOLS)
             if silent_mode:
                 # TIMER 回合的 deliver_reply：send 缺省 false（与旧行为一致）
                 # ——必须显式 send=true 才交付，收尾无兜底。

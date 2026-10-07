@@ -1,6 +1,7 @@
 """Regression tests for MCP env resolution after config.py scrubs os.environ."""
 
 import json
+import asyncio
 
 
 def test_mcp_json_env_resolution_uses_runtime_snapshot(tmp_path, monkeypatch):
@@ -79,3 +80,51 @@ def test_stdio_params_start_from_runtime_snapshot(monkeypatch):
     assert params.env["SERPER_API_KEY"] == "serper-secret"
     assert params.env["SAFE_RUNTIME_VALUE"] == "from-startup"
     assert params.env["APITELEGRAMCHAT_MCP_SCOPE"] == "test-scope"
+
+
+def test_list_server_tools_deduplicates_concurrent_refresh(monkeypatch):
+    import mcp_manager
+
+    manager = mcp_manager.MCPManager.__new__(mcp_manager.MCPManager)
+    manager.servers = {
+        "remote": mcp_manager.MCPServerConfig(
+            name="remote",
+            type="streamable_http",
+            url="https://example.com/mcp",
+        )
+    }
+    manager._stdio = {}
+    manager._inprocess_registry = {}
+    manager._reaper_task = None
+    manager._tools_cache = {}
+    manager._tools_refresh_locks = {}
+    manager._tools_cache_ttl = 300.0
+    manager._closed = False
+    monkeypatch.setattr(mcp_manager, "_MCP_SDK_AVAILABLE", True)
+
+    class Tool:
+        name = "ping"
+        description = "ping"
+        inputSchema = {"type": "object", "properties": {}}
+        meta = None
+
+    calls = {"count": 0}
+
+    async def fake_list_raw_tools(_server):
+        calls["count"] += 1
+        await asyncio.sleep(0)
+        return [Tool()]
+
+    monkeypatch.setattr(manager, "_list_raw_tools", fake_list_raw_tools)
+
+    async def run():
+        return await asyncio.gather(
+            manager.list_server_tools("remote"),
+            manager.list_server_tools("remote"),
+        )
+
+    results = asyncio.run(run())
+
+    assert calls["count"] == 1
+    assert results[0] == results[1]
+    assert results[0][0]["function"]["name"] == "mcp__remote__ping"
