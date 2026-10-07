@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # execute_generate_image 共用，此处不再保留各写一套的副本。
 # ⚠️ 收敛后必须显式从 ai.media_generation 导入 _upload_generated_images_to_r2
 # （曾因只写注释未加 import 导致 NameError：图片已生成成功，却在 R2 上传
-# 单个媒体处理失败不应使整次生成结果丢失。
+# 环节崩溃，整次生成结果丢失——历史事故见 2026-09 生产日志）。
 
 
 # 鉴权 / 配额类错误：这类错误重试永远不会成功（密钥无效/余额耗尽），

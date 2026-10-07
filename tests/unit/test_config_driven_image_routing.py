@@ -49,7 +49,9 @@ PNG_1X1_DATA_URL = "data:image/png;base64," + base64.b64encode(PNG_1X1).decode("
 AGNES_IMAGES_URL = "https://apihub.agnes-ai.com/v1/images/generations"
 
 
+# ---------------------------------------------------------------------------
 # 1. 配置合并
+# ---------------------------------------------------------------------------
 
 def test_agnes_image_25_declares_images_protocol_and_endpoint():
     cfg = SUPPORTED_MODELS["agnes-image-2.5-flash"]
@@ -121,7 +123,9 @@ def test_no_override_falls_back_to_official_derivation():
     assert shape.edits_url == "https://api.deepseek.com/v1/images/edits"
 
 
+# ---------------------------------------------------------------------------
 # 2. 公共路由（文本 / 视频 / 生图）
+# ---------------------------------------------------------------------------
 
 def test_resolve_model_route_by_capability_fields():
     assert resolve_model_route(SUPPORTED_MODELS["agnes-3.0-flash"]) == "chat"
@@ -170,7 +174,9 @@ def test_resolve_image_adapter_rejects_non_image_protocol_without_endpoint():
     assert resolve_image_adapter(cfg_with_ep) is IMAGE_PROTOCOLS["openai_images"]
 
 
+# ---------------------------------------------------------------------------
 # 3. inline（Agnes 式）payload 硬约束
+# ---------------------------------------------------------------------------
 
 def test_inline_payload_text_to_image_uses_return_base64():
     payload = build_inline_images_payload(
@@ -234,7 +240,9 @@ def test_normalize_inline_size_and_ratio():
     assert _normalize_inline_ratio("") is None
 
 
+# ---------------------------------------------------------------------------
 # 4. 请求层端到端（mock HTTP）：inline 形状真的 POST 到声明端点
+# ---------------------------------------------------------------------------
 
 class _FakeResponse:
     status = 200
@@ -353,7 +361,9 @@ def test_openai_compat_multipart_style_still_posts_to_edits_endpoint(fake_http):
     assert fake_http[0]["data"] is not None
 
 
+# ---------------------------------------------------------------------------
 # 5. 视频提交端点配置化
+# ---------------------------------------------------------------------------
 
 def test_agnes_video_endpoint_declared_in_config():
     ep = get_effective_endpoint(SUPPORTED_MODELS["agnes-video-2.5"])
@@ -558,7 +568,9 @@ def test_request_agnes_video_failed_task_extracts_error_message(monkeypatch):
     assert "message" not in error  # 不是 dict 的 json 残片
 
 
+# ---------------------------------------------------------------------------
 # 6. 分发链路贯通（task -> adapter -> 请求层 URL）
+# ---------------------------------------------------------------------------
 
 def test_dispatch_image_task_reaches_declared_endpoint(fake_http, monkeypatch):
     # R2 上传在结果后处理阶段发生；这里 monkeypatch 掉以隔离网络

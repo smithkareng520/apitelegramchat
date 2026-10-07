@@ -1,4 +1,6 @@
+# =====================================================================
 # tests/unit/test_draft_manager.py — Agent Stream 与 Draft 显示层解耦验收
+# =====================================================================
 # 对应改造需求文档的三个验收场景 + UI Event Buffer + 双状态机：
 #   Test 1：超长 reasoning → Draft1 完整思考，Draft2 正文（场景一）
 #   Test 2：超长 content  → Draft1 完整 markdown，Draft2 剩余内容（场景二）
@@ -6,6 +8,7 @@
 #           Agent 不等待 UI；UI 侧工具组完整落在同一草稿（场景三）
 #   另覆盖：滚动期事件缓冲与按序回放（§9）、终局收束、容量未满不滚动、
 #           Agent/Draft 状态机独立演化（§10）。
+# =====================================================================
 import asyncio
 from typing import List
 
@@ -24,7 +27,9 @@ from ai.draft_manager import (
 CHAT_ID = 424242
 
 
+# ---------------------------------------------------------------------
 # 测试基础设施：拦截全部 Telegram 网络出口
+# ---------------------------------------------------------------------
 class _Sends:
     """记录草稿帧 / 永久消息 / 清理动作的假传输层。"""
 
@@ -98,7 +103,9 @@ async def _flush_like_stream_loop(manager: DraftManager) -> None:
     await manager.flush()
 
 
+# ---------------------------------------------------------------------
 # DraftEventBuffer（§9）单元语义
+# ---------------------------------------------------------------------
 def test_event_buffer_push_flush_order():
     buf = DraftEventBuffer()
     assert len(buf) == 0
@@ -111,7 +118,9 @@ def test_event_buffer_push_flush_order():
     assert buf.flush() == []                        # flush 后清零
 
 
+# ---------------------------------------------------------------------
 # Test 1（场景一）：超长 reasoning → Draft1 完整思考 / Draft2 正文
+# ---------------------------------------------------------------------
 def test_1_long_reasoning_rolls_complete_at_reasoning_end(env):
     async def scenario():
         builder, manager, sends = env["builder"], env["manager"], env["sends"]
@@ -163,7 +172,9 @@ def test_1_long_reasoning_rolls_complete_at_reasoning_end(env):
     asyncio.run(scenario())
 
 
+# ---------------------------------------------------------------------
 # Test 2（场景二）：超长 content → Draft1 完整 markdown / Draft2 剩余内容
+# ---------------------------------------------------------------------
 def test_2_long_content_rolls_at_complete_markdown_block(env):
     async def scenario():
         builder, manager, sends = env["builder"], env["manager"], env["sends"]
@@ -203,9 +214,11 @@ def test_2_long_content_rolls_at_complete_markdown_block(env):
     asyncio.run(scenario())
 
 
+# ---------------------------------------------------------------------
 # Test 3（场景三）：tool call + result + 下一轮回答
 #   Agent 侧：tool result 立即进入上下文、下一轮立即开始（不等待 UI）
 #   UI 侧：tool call + tool result 完整落在同一草稿
+# ---------------------------------------------------------------------
 def test_tool_batch_end_consumes_newly_armed_rollover_without_waiting_for_next_round(env):
     """回归：tool.result 后才越过预警阈值时，tool.end 就是最近安全点。
 
@@ -250,7 +263,9 @@ def test_tool_batch_end_consumes_newly_armed_rollover_without_waiting_for_next_r
     asyncio.run(scenario())
 
 
+# ---------------------------------------------------------------------
 # Test 3（场景三）：tool call + result + 下一轮回答
+# ---------------------------------------------------------------------
 def test_3_tool_result_and_next_round_answer_same_draft(env):
     async def scenario():
         builder, manager, sends = env["builder"], env["manager"], env["sends"]
@@ -307,7 +322,9 @@ def test_3_tool_result_and_next_round_answer_same_draft(env):
     asyncio.run(scenario())
 
 
+# ---------------------------------------------------------------------
 # §9：滚动换血期间事件缓冲 + 按序回放
+# ---------------------------------------------------------------------
 def test_buffer_replay_order_during_slow_swap(env, monkeypatch):
     async def scenario():
         builder, manager, sends = env["builder"], env["manager"], env["sends"]
@@ -352,7 +369,9 @@ def test_buffer_replay_order_during_slow_swap(env, monkeypatch):
     asyncio.run(scenario())
 
 
+# ---------------------------------------------------------------------
 # 终局（turn.end）：同步收束旧段、不创建新草稿
+# ---------------------------------------------------------------------
 def test_finalize_turn_permanentizes_without_new_draft(env):
     async def scenario():
         builder, manager, sends = env["builder"], env["manager"], env["sends"]
@@ -378,7 +397,9 @@ def test_finalize_turn_permanentizes_without_new_draft(env):
     asyncio.run(scenario())
 
 
+# ---------------------------------------------------------------------
 # 容量未满：安全点零开销，绝不滚动
+# ---------------------------------------------------------------------
 def test_no_capacity_no_swap(env):
     async def scenario():
         builder, manager, sends = env["builder"], env["manager"], env["sends"]
@@ -401,7 +422,9 @@ def test_no_capacity_no_swap(env):
     asyncio.run(scenario())
 
 
+# ---------------------------------------------------------------------
 # §10：Agent / Draft 两条状态机独立演化
+# ---------------------------------------------------------------------
 def test_state_machines_evolve_independently(env):
     async def scenario():
         builder, manager, sends = env["builder"], env["manager"], env["sends"]
@@ -434,7 +457,9 @@ def test_state_machines_evolve_independently(env):
     asyncio.run(scenario())
 
 
+# ---------------------------------------------------------------------
 # §7 场景三守卫：工具组未收束时，其他安全点绝不拆散工具组
+# ---------------------------------------------------------------------
 def test_pending_tool_group_defers_rollover(env):
     async def scenario():
         builder, manager, sends = env["builder"], env["manager"], env["sends"]
@@ -456,7 +481,9 @@ def test_pending_tool_group_defers_rollover(env):
     asyncio.run(scenario())
 
 
+# ---------------------------------------------------------------------
 # 草稿预警后的超长思考：提前收束思考折叠 → 滚动 → 新草稿折叠块续写
+# ---------------------------------------------------------------------
 def test_long_reasoning_splits_fold_at_capacity_warning(env):
     """预警后思考流仍在输出：无需等 reasoning.end，首个增量即提前收束。
 
@@ -556,7 +583,9 @@ def test_reasoning_fold_split_defers_to_pending_tool_group(env):
     asyncio.run(scenario())
 
 
+# ---------------------------------------------------------------------
 # 兼容性：DraftManager 透传未拦截属性（duck typing 冒充 builder）
+# ---------------------------------------------------------------------
 def test_manager_proxies_builder_attributes(env):
     async def scenario():
         builder, manager = env["builder"], env["manager"]

@@ -52,7 +52,9 @@ __all__ = [
 ]
 
 
+# =====================================================================
 # 开关
+# =====================================================================
 def _env_flag(name: str, default: bool = True) -> bool:
     """与 proactive._env_flag 同语义的本地实现（避免跨模块私有导入）。"""
     raw = os.getenv(name)
@@ -72,7 +74,9 @@ TOOL_VISIBILITY_FILTER = _env_flag("TOOL_VISIBILITY_FILTER", True)
 SILENT_ONLY_TOOLS: frozenset[str] = frozenset({"deliver_reply"})
 
 
+# =====================================================================
 # 核心：出站消息改写（纯函数，绝不原地修改入参）
+# =====================================================================
 def apply_tool_visibility(
     messages: list,
     hidden_tools: Optional[Iterable[str]] = None,

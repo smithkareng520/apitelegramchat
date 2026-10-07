@@ -84,7 +84,10 @@ if TYPE_CHECKING:
     from openai import AsyncOpenAI
 
 logger = get_logger(__name__)
-# 日志级别由 root logger 统一控制，避免模块单独放宽日志级别。
+# 修复 BUG：此前这里硬性 setLevel(DEBUG)，无论 config.LOG_LEVEL 是 INFO
+# 还是 WARNING，本模块的所有日志都会以 DEBUG 级别透传到 root，从而
+# 在生产环境输出大量 debug 噪声。删除该行，让模块日志遵循 root logger
+# 的级别（由 utils.setup_logging 应用 LOG_LEVEL）。
 
 def _workspace_guide_html(chat_id: int | None, workspace_namespace_value: str | None = None) -> str:
     """系统提示词的「工作区与文件目录」章节（含该 chat 的家目录绝对路径）。
@@ -659,8 +662,10 @@ async def get_ai_response(
         # ── 新 user 消息提前持久化（USER 回合）────────────────────────
         # 历史末尾是上一条未获回应的 user 消息时合并（避免连续 user），
         # 否则直接追加。提前持久化让快速连发消息的合并链天然成立。
-        # spawn_turn_task 已提前持久化的消息在此跳过；这里仅兜底未走该路径的
-        # 消息（例如媒体组聚合、TIMER 注入）。
+        # 2026-09-12 修复：spawn_turn_task 已在派发前持久化（消除"回合
+        # 在落库前被打断、消息静默丢失"的窗口），带 EARLY_PERSIST_FLAG
+        # 的信封在此跳过——本入口的落库只兜底"未走 spawn_turn_task 的
+        # 路径"（媒体组聚合、TIMER 注入等）。
         if user_message is not None and not is_timer:
             if user_message.get(turn_recovery.EARLY_PERSIST_FLAG):
                 user_msg_in_history = True
@@ -1265,7 +1270,7 @@ async def get_ai_response(
             # 把过程倾倒给用户）。无可见内容或发送失败时保留冻结草稿，
             # 由打断方 mark_preserved_draft 兜底——见
             # RichMessageBuilder.finalize_interrupted_draft。
-            # 传入 journal 用于校验草稿层与历史层的一致性。
+            # journal 传入做草稿层↔历史层反向校验（改动点3，诊断用）。
             try:
                 await builder.finalize_interrupted_draft(journal=journal)
             except asyncio.CancelledError:
@@ -1303,7 +1308,7 @@ async def get_ai_response(
         # （request URL、Authorization、内部 trace 等）。
         # 外部只看到简短原因 + error_id。
         error_msg_for_user = f"内部错误 (error_id={error_id})"
-        # 保证失败路径不会把不完整结果当作成功写入历史。
+        # 修复（2026-09 生产事故）：旧写法
         #   hasattr(e, "response") and hasattr(e.response, "text")
         # 在流式请求抛出的 APIStatusError 上必炸：e.response 是未读取的
         # httpx 流式 Response，访问 .text 属性抛 httpx.ResponseNotRead，

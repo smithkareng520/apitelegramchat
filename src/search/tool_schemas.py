@@ -68,6 +68,7 @@ VIDEO_MODELS = _get_video_models()
 GENERATE_ONLY_MODELS = [m for m in TEXT_ONLY_MODELS if m not in EDIT_MODELS]
 
 
+# =============================================================================
 # deliver_reply：/show off（静默模式）下模型通过 send 布尔参数选择是否
 # 把「本轮最后一条助手消息的 content 字段」通过 sendRichMessage 交付给用户。
 # send=true：系统发送该正文（不经过草稿，也不含 reasoning 等其他字段）；
@@ -80,6 +81,7 @@ GENERATE_ONLY_MODELS = [m for m in TEXT_ONLY_MODELS if m not in EDIT_MODELS]
 # 时本工具不进入工具面，模型看不到也就不会调用，除了草稿外不会产生
 # 单独 content；历史中的调用痕迹也会从出站上下文拔除（见
 # tool_visibility.SILENT_ONLY_TOOLS）。
+# =============================================================================
 def build_deliver_reply_tool(default_send: bool = False) -> dict:
     """按本轮 send 缺省值生成 deliver_reply 工具定义。
 

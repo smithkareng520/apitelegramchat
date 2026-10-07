@@ -50,7 +50,9 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
+# ===========================================================================
 # 内容块（Blocks）
+# ===========================================================================
 @dataclass
 class TextBlock:
     """纯文本内容。"""
@@ -176,7 +178,9 @@ def parse_tool_arguments(raw: Any) -> dict:
     return {}
 
 
+# ===========================================================================
 # Message
+# ===========================================================================
 @dataclass
 class Message:
     """协议无关的内部消息。
@@ -489,7 +493,9 @@ class Message:
         return f"<Message {self.role} [{kinds}] meta={list(self.meta)}>"
 
 
+# ===========================================================================
 # 列表级辅助
+# ===========================================================================
 def render_openai_messages(messages: list) -> list[dict[str, Any]]:
     """把 Message 列表渲染为 OpenAI wire dict 列表（已是 dict 的条目原样保留）。"""
     out: list[dict[str, Any]] = []

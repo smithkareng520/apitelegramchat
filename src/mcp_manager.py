@@ -1,6 +1,7 @@
 # mcp_manager.py — 统一 MCP 客户端管理器（mcp.json 驱动）。
 #
 # 职责
+# ----
 # 1. 解析并校验项目根目录的 mcp.json（对标 Claude Code 的 .mcp.json 语义）：
 #    - streamable_http：外部 MCP（url_env / headers_env 从环境变量注入）；
 #    - stdio：内部 MCP（python3 -m mcpserver.server --module X），
@@ -119,7 +120,9 @@ class MCPToolError(RuntimeError):
         return f"❌ {feature_name}暂时不可用{suffix}。请稍后重试，并检查 MCP 部署调用日志。"
 
 
+# =====================================================================
 # 配置模型
+# =====================================================================
 @dataclass(frozen=True)
 class MCPServerConfig:
     """一个 mcp.json 中注册的 MCP 服务器。"""
@@ -348,7 +351,9 @@ def load_servers(config_path: str | None = None) -> dict[str, MCPServerConfig]:
     return servers
 
 
+# =====================================================================
 # HTTP 诊断（沿袭 mcp_client.py 的生产加固）
+# =====================================================================
 class _MCPHTTPTrace:
     """记录 MCP SDK 自行吞掉前的最后一个 HTTP 响应状态。"""
 
@@ -487,7 +492,9 @@ def _extract_text(result: Any) -> str:
     return "\n".join(parts).strip()
 
 
+# =====================================================================
 # stdio 连接（按 chat 持久子进程）
+# =====================================================================
 class _StdioConnection:
     """一个 (server, chat) 对应的持久 stdio 子进程 + MCP 会话。
 

@@ -82,7 +82,9 @@ def _next_chat_id() -> int:
     return _CHAT_SEQ
 
 
+# ===========================================================================
 # 假件：OpenAI 兼容流式客户端（SSE chunk 形状与 openai SDK 对齐）
+# ===========================================================================
 class FakeStream:
     """按序吐 chunk 的假流；chunks 耗尽后按 hang 标志挂起或正常终止。"""
 
@@ -168,7 +170,9 @@ def _finish_chunk(reason: str) -> SimpleNamespace:
     )
 
 
+# ===========================================================================
 # 假件：builder（duck-typing DraftManager；全部方法离线、无网络）
+# ===========================================================================
 class FakeBuilder:
     def __init__(self, chat_id: int):
         self.chat_id = chat_id
@@ -274,7 +278,9 @@ def _isolate(monkeypatch):
         user_contexts.pop(chat_id, None)
 
 
+# ===========================================================================
 # 组件单元：LiveAssistantSlot / _normalize_journal / MediaProgressSlot
+# ===========================================================================
 def test_live_assistant_slot_sync_and_finalize():
     """sync 随增量原地同步；finalize 升级占位并双列表共享同一对象。"""
     journal: list = []
@@ -368,7 +374,9 @@ def test_media_progress_slot_lifecycle():
     assert slot_none.complete("[视频已生成]")[0].text() == "[视频已生成]"
 
 
-# 验证草稿层与历史层的一致性，以及合并路径的防御性约束。
+# ===========================================================================
+# 组件单元：草稿层↔历史层反向校验（改动点3）与合并防御（改动点5）
+# ===========================================================================
 def test_draft_journal_consistency_warning_and_ok(caplog):
     """草稿有内容而 journal 无 assistant 进度 → WARNING；一致 → INFO。"""
     with caplog.at_level("WARNING", logger="ai.rich_message_builder"):
@@ -418,7 +426,9 @@ async def test_persist_user_message_entry_flags_residual_inflight(caplog):
         assert "合并前提" not in caplog.text
 
 
+# ===========================================================================
 # 集成回归：真实取消 openai_compat 流式循环（问题文档验证场景 1-5）
+# ===========================================================================
 async def _run_turn_and_interrupt(
     chat_id: int,
     journal: list,
@@ -718,7 +728,9 @@ async def test_normal_completion_single_assistant_message(_isolate):
     assert new_entries[0].text() == final_content
 
 
-# 打断保全的阶段 1、2、4 行为测试。
+# ===========================================================================
+# 五阶段打断规范（2026-09 二期）：阶段1/2/4 专用测试
+# ===========================================================================
 def test_live_slot_flag_lifecycle():
     """LIVE_STREAM_FLAG：流式期间携带（裁剪判据），finalize 后摘除。"""
     journal: list = []
@@ -1056,7 +1068,8 @@ async def test_interrupt_read_tool_stays_aborted_no_writeback(_isolate, monkeypa
     assert not _DETACHED_TASKS
 
 
-# 截断基准为实际发送到草稿的内容，而不是后端已经生成但尚未发送的内容。
+# ===========================================================================
+# v3 修订（2026-09-13 实测反馈）：以"实际发送到草稿"为截断基准
 #
 # 实测 bug：打断信号发出后，草稿有时还会再刷新一段文本才停。根因：
 #   1. finalize_interrupted_draft 固化时发送的是全量后端缓冲——未送达
@@ -1067,6 +1080,7 @@ async def test_interrupt_read_tool_stays_aborted_no_writeback(_isolate, monkeypa
 #   - 固化消息 == 冻结草稿最后一帧 == 历史记录（三层同一条送达边界）；
 #   - 打断入口先行冻结草稿推送（freeze_draft_streaming）；
 #   - 游标入账完整（工具组旁白同样计入可见文本）。
+# ===========================================================================
 from ai.rich_message_builder import (  # noqa: E402
     RichMessageBuilder,
     _FROZEN_DRAFTS,

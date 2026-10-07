@@ -38,7 +38,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# --------------------------------------------------------------------------
 # Font discovery
+# --------------------------------------------------------------------------
 
 # Monochrome Noto Emoji, vendored with this skill. A *monochrome* TTF is
 # required because ReportLab can only embed TrueType glyf outlines; the
@@ -102,7 +104,9 @@ def register_emoji_font(name: str = DEFAULT_EMOJI_FONT_NAME) -> str:
     return name
 
 
+# --------------------------------------------------------------------------
 # Coverage inspection
+# --------------------------------------------------------------------------
 
 def _font_char_widths(name: str) -> dict:
     """Character-width map of a registered ReportLab font."""
@@ -122,7 +126,9 @@ def _in_emoji_preferred_blocks(codepoint: int) -> bool:
     return any(lo <= codepoint <= hi for lo, hi in EMOJI_PREFERRED_BLOCKS)
 
 
+# --------------------------------------------------------------------------
 # Pure run-splitting logic (unit-testable without ReportLab)
+# --------------------------------------------------------------------------
 
 def split_font_runs(
     text: str,
@@ -191,7 +197,9 @@ def strip_unrenderable_chars(
     )
 
 
+# --------------------------------------------------------------------------
 # ReportLab-facing helpers
+# --------------------------------------------------------------------------
 
 _XML_ESCAPES = str.maketrans({"&": "&amp;", "<": "&lt;", ">": "&gt;"})
 

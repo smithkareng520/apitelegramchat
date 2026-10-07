@@ -44,7 +44,9 @@ def _format_bash_envelope(cwd: str, output: str) -> str:
 # 头部截断会把最有价值的部分默默丢掉。设为 0 表示不限制（不建议：狂刷
 # 输出的命令会撑爆内存与模型上下文）。
 SANDBOX_OUTPUT_MAX_CHARS = int(os.getenv("SANDBOX_OUTPUT_MAX_CHARS", "80000"))
-# Bash 超时双层模型（防卡死）
+# =====================================================================
+# Bash 超时双层模型（v2.4 防卡死）
+# =====================================================================
 # 旧实现只有一层总超时（SANDBOX_TIMEOUT_SEC，默认 300s）：网络不可达时
 # connect() 按内核默认 TCP 重试静默挂起（单次约 2 分钟），命令全程无输出，
 # 模型必须等满 300s 才拿到超时错误，期间整个 agent 回合被卡住（日志实例：
@@ -276,7 +278,9 @@ def _prepare_runtime_once(
     return state
 
 
+# =====================================================================
 # BashSession —— 每会话独立沙箱
+# =====================================================================
 class BashSession:
     def __init__(self, chat_id: int, namespace: str | None = None) -> None:
         self.chat_id = chat_id
@@ -286,7 +290,7 @@ class BashSession:
         # manager 的全局锁内），两把锁互不互斥；每实例锁串行化 spawn，
         # 防止并发双开 bash 导致先 spawn 的进程泄漏、新进程无看门狗。
         self._start_lock = asyncio.Lock()
-        # 布局：workspace = workdir = agent 家目录，即 workspace 根
+        # v2.3.1 布局：workspace = workdir = agent 家目录，即 workspace 根
         # 本身（$HOME / 起始 cwd / Landlock 唯一放行边界三者重合）。
         self.workspace = workspace_root(chat_id, self.namespace)
         self.workdir = workspace_workdir(chat_id, self.namespace)
@@ -670,7 +674,7 @@ class BashSession:
             prompt_cwd = self._persistent_cwd or str(self.workdir.absolute())
             # 默认 shell 启动目录为 workspace/workspace root。模型决定使用 skill 后，
             # 可自行 `cd skills/<skill_id>`；persistent bash 会保留该 cwd。
-            # 在输出 marker 前先输出一个换行，确保 marker 单独占一行。
+            # ★ 关键：在输出 marker 前先输出一个换行，确保 marker 单独占一行。
             #   如果命令输出不以换行结尾（如 cat 无换行文件、printf 无 \n），
             #   echo 的输出会粘在前一行，readline() 永远读不到以 marker 开头的行，
             #   导致整个会话 hang 死。
@@ -725,8 +729,11 @@ class BashSession:
                     pending = ""
                     keep_tail = len(marker) + 64
                     while True:
-                        # 每次读取同时受空闲超时和总超时约束：静默命令尽快失败，
-                        # 持续输出的命令仍受总预算限制。
+                        # 双层读超时（v2.4 防卡死核心）：每次 read 的预算 =
+                        # min(空闲阈值, 剩余总预算)。命令静默（如网络不可达的
+                        # connect 挂起）→ idle 先触发；持续输出但超总预算 →
+                        # total 触发。旧实现只有外层一层总超时，静默命令必然
+                        # 等满 300s。
                         remaining = total_deadline - loop.time()
                         if remaining <= 0:
                             # 超时抛出前冲刷 pending：跨 chunk 的尾部输出
@@ -743,7 +750,9 @@ class BashSession:
                                 self.proc.stdout.read(4096), timeout=read_budget
                             )
                         except asyncio.TimeoutError as exc:
-                            # 超时前先冲刷 pending，避免尾部输出因跨 chunk 缓冲而丢失。
+                            # 同上：先冲刷 pending 再抛超时。旧实现这里会
+                            # 丢掉最后不足 keep_tail 的输出（历史上 total
+                            # 超时的 partial output 也存在同样的缺口）。
                             if pending:
                                 output_buffer.add(pending)
                                 pending = ""
@@ -922,7 +931,9 @@ class BashSession:
             return
         self.proc = None
 
+# =====================================================================
 # BashSessionManager —— 多 chat 共享管理
+# =====================================================================
 class BashSessionManager:
     def __init__(self) -> None:
         self._sessions: dict[tuple[int, str], BashSession] = {}
@@ -969,10 +980,12 @@ class BashSessionManager:
 
 _bash_manager = BashSessionManager()
 
+# =====================================================================
 # execute_bash —— 工具调用入口
-# 移除 ``progress_callback`` 参数。bash 执行期间不再推送任何进度
+# v2.3：移除 ``progress_callback`` 参数。bash 执行期间不再推送任何进度
 # 预览（卡片摘要保持命令片段，最终结果由 update_tool_item 一次性写入
 # 包含 Input/Output 块级结构的完整卡片）。
+# =====================================================================
 async def execute_bash(
     chat_id: int,
     command: str = "",

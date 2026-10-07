@@ -38,7 +38,9 @@ def split_mcp_name(name: str) -> tuple[str, str] | None:
     return server, tool
 
 
+# =====================================================================
 # external: gaode_mcp（高德地图，streamable_http）
+# =====================================================================
 GAODE_SERVER = "gaode_mcp"
 
 MAPS_GEO = mcp_name(GAODE_SERVER, "maps_geo")
@@ -64,7 +66,9 @@ GAODE_TOOLS: frozenset[str] = frozenset({
 LOCATION_LOOKUP_TOOLS: frozenset[str] = GAODE_TOOLS
 
 
+# =====================================================================
 # internal stdio servers
+# =====================================================================
 SEARCH_SERVER = "internal_search"
 TODO_SERVER = "internal_todo"
 MEMORY_SERVER = "internal_memory"
@@ -84,7 +88,9 @@ TEXT_EDITOR = mcp_name(WORKSPACE_SERVER, "text_editor")
 BASH = mcp_name(BASH_SERVER, "bash")
 
 
+# =====================================================================
 # host 内建工具（不经 MCP）
+# =====================================================================
 MESSAGE_USER = "message_user"
 DELIVER_REPLY = "deliver_reply"
 SUBAGENT = "subagent"
@@ -93,7 +99,9 @@ GENERATE_VIDEO = "generate_video"
 PRESENT_FILES = "present_files"
 
 
+# =====================================================================
 # 工具族（family）：UI 渲染 / 摘要标签按族分发，避免逐名 if/elif。
+# =====================================================================
 def tool_family(name: str) -> str:
     """返回工具的真实族名；高德 MCP 直接使用原生 ``maps_*`` 名称。"""
     split = split_mcp_name(name)

@@ -1,4 +1,6 @@
+# =====================================================================
 # tests/unit/test_present_files_scope.py — present_files 只发 upload/ 下文件
+# =====================================================================
 # 运行方式（无需 pytest，直接 python 执行）：
 #   cd <项目根>
 #   python tests/unit/test_present_files_scope.py
@@ -9,6 +11,7 @@
 #   B. 边界放行：upload/ 下的路径通过边界校验（不存在 -> file not found，
 #      而非边界拒绝；存在 -> 走发送流程，mock HTTP 后计入 sent）
 #   C. 不变式：无路径入参 / 非法路径行为不变
+# =====================================================================
 
 import asyncio
 import os
@@ -46,7 +49,9 @@ def check(name: str, cond: bool, detail: str = ""):
         print(f"  [FAIL] {name} — {detail}")
 
 
+# ---------------------------------------------------------------------
 # Mock：绕开真实 Telegram HTTP（sendDocument / sendChatAction）
+# ---------------------------------------------------------------------
 class FakeResponse:
     status = 200
 

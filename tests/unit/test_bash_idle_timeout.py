@@ -1,4 +1,6 @@
-# tests/unit/test_bash_idle_timeout.py — bash 双层超时（防卡死）
+# =====================================================================
+# tests/unit/test_bash_idle_timeout.py — bash 双层超时（v2.4 防卡死）
+# =====================================================================
 # 覆盖错误日志反馈的问题：「bash 遇到网络不可达等静默挂起请求时会卡满
 # 整个总超时（300s）」。修复后 bash 读循环采用双层超时：
 #   - idle：持续无输出超过 SANDBOX_IDLE_TIMEOUT_SEC → 立即 kill（核心）；
@@ -9,6 +11,7 @@
 # 集成用例真实 spawn bash 进程：本机/CI 内核可能 < 5.13（Landlock 不可用），
 # 统一 monkeypatch sandbox._apply_landlock 直通；生产路径不受影响
 # （preexec_fn 运行于 fork 后的子进程，继承父进程已 patch 的模块状态）。
+# =====================================================================
 
 import asyncio
 import os
@@ -39,7 +42,9 @@ from sandbox import (
 )
 
 
+# ---------------------------------------------------------------------------
 # 纯逻辑：timeout 参数规范化
+# ---------------------------------------------------------------------------
 def test_normalize_timeout_defaults() -> None:
     """不传 timeout → 默认总超时 + 空闲保护同时生效。"""
     assert _normalize_requested_timeout(None) == (
@@ -86,7 +91,9 @@ def test_idle_timeout_message_is_actionable() -> None:
     assert "timeout" in msg  # bash timeout 参数逃生通道
 
 
+# ---------------------------------------------------------------------------
 # sitecustomize 注入：沙箱内 Python 默认 socket 超时
+# ---------------------------------------------------------------------------
 @pytest.fixture()
 def sandbox_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -152,7 +159,9 @@ def test_sitecustomize_sets_real_socket_default(sandbox_env: dict) -> None:
     assert proc.stdout.strip() == "15.0"
 
 
+# ---------------------------------------------------------------------------
 # 集成：真实 bash 会话的双层超时行为（Landlock 直通，见文件头说明）
+# ---------------------------------------------------------------------------
 
 def test_dumpable_prctl_einval_is_reported_once(monkeypatch: pytest.MonkeyPatch) -> None:
     """Restricted container kernels may reject PR_SET_DUMPABLE with EINVAL.

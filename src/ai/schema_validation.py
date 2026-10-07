@@ -40,7 +40,9 @@ logger = get_logger(__name__)
 _MAX_PROBLEMS = 6
 _ARGUMENTS_EXCERPT_LIMIT = 400
 
+# ---------------------------------------------------------------------------
 # 参数预处理：null 剥离 + 常见写法矫正
+# ---------------------------------------------------------------------------
 
 # 模型偶发把"未提供"表达成字符串字面量而非真正的 JSON null——与
 # json_repair._LITERAL_MAP 同一类模型怪癖在语义层的体现（那边修的是
@@ -129,7 +131,9 @@ def coerce_common_slops(fn_args: dict, schema: Optional[dict]) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
 # 校验器：jsonschema 优先，内置兜底
+# ---------------------------------------------------------------------------
 
 def _try_import_jsonschema() -> Any:
     try:
@@ -182,7 +186,9 @@ def _iter_jsonschema_errors(args: dict, schema: dict) -> Optional[list]:
     return problems
 
 
+# ---------------------------------------------------------------------------
 # 内置轻量校验器（jsonschema 不可用时的兜底；覆盖主要失败模式）
+# ---------------------------------------------------------------------------
 
 _TYPE_CHECKS = {
     "string": lambda v: isinstance(v, str),
@@ -265,7 +271,9 @@ def _builtin_validate(args: dict, schema: dict) -> list:
     return problems
 
 
+# ---------------------------------------------------------------------------
 # 错误消息渲染（与 json_repair 的诊断消息同风格）
+# ---------------------------------------------------------------------------
 
 def _summarize_params(schema: dict) -> tuple:
     """从 schema 提取 (必填列表, 可选列表)，每项形如 'command (string)'。"""
@@ -324,7 +332,9 @@ def _build_schema_error_message(
     return "\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
 # 对外入口
+# ---------------------------------------------------------------------------
 
 def validate_tool_arguments(
         fn_name: str, fn_args: dict, tools: Optional[list]) -> Optional[str]:

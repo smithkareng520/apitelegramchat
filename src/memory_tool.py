@@ -389,7 +389,7 @@ def _op_clear(store: dict, scope: str) -> tuple[dict, dict]:
         msg = f"已清空分类 {cat} 下 {removed} 条记忆"
     elif scope.startswith("tag:"):
         tag = scope.split(":", 1)[1].strip()
-        # 空 tag 不应匹配缺少该标签的记忆项。
+        # 修复 BUG：此前 tag 为空时 ``[m for m in before_list if "" not in m.get("tags", [])]``
         # 对所有记忆都返回 True（因为空串不在任何 tag list 里），导致 clear
         # 静默不删除任何条目，却返回 removed=0 的成功响应——非常容易让 LLM
         # 误以为已经清空。这里显式拒绝空 tag。

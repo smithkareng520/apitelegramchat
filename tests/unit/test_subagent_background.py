@@ -1,9 +1,12 @@
+# =====================================================================
 # tests/unit/test_subagent_background.py — 后台子 agent（启动→句柄→查询/停止）
+# =====================================================================
 # 覆盖 subagent_background 的核心语义（execute_subagent 用桩替换，不发真实 LLM 请求）：
 #   - 启动立即返回句柄，完成通知入 bash_background 共用的待送队列；
 #   - stop 不重复通知；失败 / 超时终态映射；每 chat 运行数上限；
 #   - 父回合取消不波及 runner；应用关闭取消全部且不推通知；
 #   - dispatch 路由（task_action → run_in_background → 前台）、schema 与卡片渲染。
+# =====================================================================
 
 import asyncio
 import json
@@ -59,7 +62,9 @@ def _only_task() -> "subagent_background.SubagentTask":
     return task
 
 
+# ---------------------------------------------------------------------------
 # 启动 / 完成 / 通知
+# ---------------------------------------------------------------------------
 def test_start_returns_handle_then_notice_is_queued(monkeypatch: Any) -> None:
     async def fake(**kw: Any) -> str:
         await kw["progress_callback"]("第 1/32 轮：LLM 思考中…（已耗时 1s）")
@@ -144,7 +149,9 @@ def test_per_chat_running_limit(monkeypatch: Any) -> None:
     _run(scenario())
 
 
+# ---------------------------------------------------------------------------
 # 查询 / 停止
+# ---------------------------------------------------------------------------
 def test_status_output_list_and_unknown_id(monkeypatch: Any) -> None:
     async def scenario() -> None:
         release = asyncio.Event()
@@ -198,7 +205,9 @@ def test_stop_cancels_runner_without_notice(monkeypatch: Any) -> None:
     _run(scenario())
 
 
+# ---------------------------------------------------------------------------
 # 防误杀 / 关闭 / 回收
+# ---------------------------------------------------------------------------
 def test_parent_turn_cancellation_does_not_kill_background_runner(monkeypatch: Any) -> None:
     async def scenario() -> None:
         release = asyncio.Event()
@@ -272,7 +281,9 @@ def test_long_answer_is_truncated_in_notice(monkeypatch: Any) -> None:
     _run(scenario())
 
 
+# ---------------------------------------------------------------------------
 # dispatch 路由 / schema / 卡片
+# ---------------------------------------------------------------------------
 def test_dispatch_routes_background_and_actions(monkeypatch: Any) -> None:
     import tool_dispatch
 

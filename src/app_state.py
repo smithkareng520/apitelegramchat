@@ -24,5 +24,5 @@ _loop_watchdog_task: asyncio.Task | None = None
 #   · 关停信号 → 正常退出；
 #   · 误取消（子任务取消沿 await 链回传、aiohttp 超时取消逸出等）→ 必须
 #     吸收并继续，否则一次偶发取消就让 bot 永久失聪：进程活着、/health
-#     200、心跳照常，但消息接收链路已经失效。
+#     200、心跳照常，但再也收不到任何消息（2026-09-15 事故现场）。
 _shutting_down: bool = False

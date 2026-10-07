@@ -43,19 +43,6 @@ class _MCPStreamableHTTPNoiseFilter(logging.Filter):
             record.levelname = "WARNING"
         return True
 
-class _HealthAccessNoiseFilter(logging.Filter):
-    """Suppress routine /health access logs while keeping application warnings."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if record.name.lower() not in {"gunicorn.access", "hypercorn.access", "quart.serving"}:
-            return True
-        try:
-            message = record.getMessage()
-        except Exception:
-            return True
-        return not re.search(r"\bGET\s+/health(?:\s|[?])", message)
-
-
 def setup_logging() -> bool:
     """配置 root logger。返回 True 表示完成了配置，False 表示跳过。
 
@@ -128,6 +115,19 @@ def setup_logging() -> bool:
 # root logger 会让 MCP server、tests 等宿主失去对自己 logging 配置的控制。
 if os.getenv("APITELEGRAMCHAT_REQUIRE_LOGGING", "0") in {"1", "true", "yes", "on"} or not logging.getLogger().handlers:
     setup_logging()
+
+class _HealthAccessNoiseFilter(logging.Filter):
+    """Drop routine /health HTTP access lines; keep application health warnings."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        name = record.name.lower()
+        if name not in {"gunicorn.access", "hypercorn.access", "quart.serving"}:
+            return True
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        return not re.search(r"""\\bGET\\s+/health(?:\\s|[?])""", message)
 
 logger = logging.getLogger(__name__)
 # ---------- 请求ID上下文 ----------

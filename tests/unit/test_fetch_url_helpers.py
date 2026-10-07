@@ -1,7 +1,10 @@
+# =====================================================================
 # tests/unit/test_fetch_url_helpers.py — fetch_url 抓取层辅助逻辑
+# =====================================================================
 # 被测关键路径：search/fetch_url.py 的编码检测/URL 清洗/重定向提取/
 # SSRF 同步校验/响应体大小上限，以及 search/caches.py 的缓存键归一化。
 # 网络请求全部用假对象替身，不发真实请求。
+# =====================================================================
 import asyncio
 
 import pytest
@@ -25,7 +28,9 @@ from search.fetch_url import (
 )
 
 
+# ---------------------------------------------------------------------
 # 编码检测（中文站点 GBK 兼容的关键路径）
+# ---------------------------------------------------------------------
 def test_detect_encoding_bom_has_highest_priority():
     assert _detect_html_encoding(b"\xef\xbb\xbf<html>", None) == "utf-8-sig"
     assert _detect_html_encoding(b"\xff\xfe<html>", "utf-8") == "utf-16-le"
@@ -50,7 +55,9 @@ def test_normalize_encoding_name_aliases():
     assert _normalize_encoding_name("UTF-16LE") == "utf-16-le"
 
 
+# ---------------------------------------------------------------------
 # SSRF 同步校验
+# ---------------------------------------------------------------------
 def test_is_safe_url_sync_rejects_private_and_bad_schemes():
     ok, _ = _is_safe_url_to_fetch_sync("http://127.0.0.1/admin")
     assert not ok
@@ -75,7 +82,9 @@ def test_check_ip_safe_ranges():
     assert _check_ip_safe("93.184.216.34")[0]
 
 
+# ---------------------------------------------------------------------
 # 重定向目标提取
+# ---------------------------------------------------------------------
 def test_extract_js_redirect_targets_concatenation():
     html = "<script>window.location.href = 'https://' + location.host + '/index/home.html';</script>"
     targets = _extract_js_redirect_targets(html, "http://example.com/foo/bar")
@@ -104,7 +113,9 @@ def test_normalize_url_for_compare():
     assert _normalize_url_for_compare("http://e.com/a?q=1") == _normalize_url_for_compare("http://e.com/a")
 
 
+# ---------------------------------------------------------------------
 # 响应体大小上限与流式读取
+# ---------------------------------------------------------------------
 class _FakeStreamResponse:
     """模拟 curl_cffi 流式响应：aiter_content 分块产出。"""
 
@@ -194,7 +205,9 @@ def test_fetch_html_with_curl_network_error_returns_none_status(monkeypatch):
     assert text is None and status is None
 
 
+# ---------------------------------------------------------------------
 # 缓存键归一化 / 失败不缓存
+# ---------------------------------------------------------------------
 def test_normalize_fetch_cache_key_drops_fragment_and_tracking_params():
     base = "https://e.com/a?x=1"
     key = _normalize_fetch_cache_key(base + "&utm_source=wechat&fbclid=abc#top")

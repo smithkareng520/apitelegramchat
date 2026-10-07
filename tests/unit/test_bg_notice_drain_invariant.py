@@ -1,4 +1,6 @@
+# =====================================================================
 # tests/unit/test_bg_notice_drain_invariant.py — drain 收敛不变式
+# =====================================================================
 # 用户诉求（本轮重构的验收标准）：
 #   "drain 接线太散，4 个手工注入点 + 多条『不消费』路径，未来任何新增
 #    模型调用路径忘了 drain 就静默丢通知，且最难测。建议把 drain+append
@@ -24,6 +26,7 @@
 # 子 agent 持全新上下文，父 chat 的待送通知必须留给父请求搭车；且子
 # 循环只会运行在已被 _call_api drain 过的父回合内部，请求级不变式
 # 依然成立。
+# =====================================================================
 import ast
 import asyncio
 import subprocess
@@ -48,7 +51,9 @@ _SRC = _PROJECT_ROOT / "src"
 _MODEL_LOOP_FUNCS = ("_agentic_loop_native_image", "_agentic_loop_native_video")
 
 
+# ---------------------------------------------------------------------------
 # AST 工具
+# ---------------------------------------------------------------------------
 def _src_files() -> Iterator[Path]:
     for p in sorted(_SRC.rglob("*.py")):
         if "__pycache__" in p.parts:
@@ -78,7 +83,9 @@ def _find_func(tree: ast.Module, name: str) -> Optional[ast.FunctionDef]:
     return None
 
 
+# ---------------------------------------------------------------------------
 # 结构不变式：凡到达模型调用的路径，队列必被 drain
+# ---------------------------------------------------------------------------
 def test_invariant_call_api_drains_at_entry_before_model_call() -> None:
     """注入点①：_call_api 函数体首部必须调用 _append_bg_task_notices，
     且先于 adapter.run_agent_loop（真正的模型请求）——通知必须在本轮
@@ -154,7 +161,9 @@ def test_invariant_media_wrapper_contains_drain_and_single_impl() -> None:
         f"_append_bg_task_notices 必须只在 agentic_loops.py 实现一处: {impls}")
 
 
+# ---------------------------------------------------------------------------
 # 行为验证：注入点① _call_api 真实 drain
+# ---------------------------------------------------------------------------
 def _isolate(tmp_path: Any, monkeypatch: Any) -> None:
     monkeypatch.setenv("APITELEGRAMCHAT_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("APITELEGRAMCHAT_WORKSPACES_DIR", str(tmp_path / "home"))
@@ -243,7 +252,9 @@ async def test_media_loop_wrapper_drains_and_strips_namespace(
     _reset_notices()
 
 
+# ---------------------------------------------------------------------------
 # 行为验证：push/drain 跨线程守恒（每 chat 一把锁 + 整段换空）
+# ---------------------------------------------------------------------------
 def test_push_drain_thread_conservation_no_loss_no_dup(
         tmp_path: Any, monkeypatch: Any) -> None:
     """多线程并发 push + drain：通知总数守恒——既不丢失（push 追加到
@@ -299,7 +310,9 @@ def test_push_drain_thread_conservation_no_loss_no_dup(
     _reset_notices()
 
 
+# ---------------------------------------------------------------------------
 # 行为验证：重启恢复三分（completed / was-running 活 / was-running 死）
+# ---------------------------------------------------------------------------
 def _spawn_dead_pid() -> int:
     proc = subprocess.Popen(
         ["bash", "-c", "exit 0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

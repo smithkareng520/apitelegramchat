@@ -866,4 +866,6 @@ def _render_editor_result(command: str, path: str, result_str: str, arguments: d
     return _render_editor_quote("Input", input_value) + _render_editor_quote("Output", output)
 
 
+# =====================================================================
 # Persistent runtime state
+# =====================================================================

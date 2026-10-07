@@ -43,7 +43,9 @@ async def _run(bridge, client, chat_id, turn):
     )
 
 
+# ---------------------------------------------------------------------------
 # 1. 续轮被拒：与措辞无关，按 4xx 状态恢复
+# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [400, 404, 409, 422])
 async def test_tool_continuation_rejected_with_any_wording_bootstraps(
@@ -144,7 +146,9 @@ def test_unsupported_mark_expires(monkeypatch):
     assert ("v", "m") not in rs._tool_chain_unsupported
 
 
+# ---------------------------------------------------------------------------
 # 2. function_call 不在权威 output 里
+# ---------------------------------------------------------------------------
 def _stream_only_call_events(response_id: str, call_id: str, name: str, args: str):
     return [
         {"type": "response.output_item.added",
@@ -219,7 +223,9 @@ async def test_explicitly_incomplete_function_call_is_still_not_executed(_bridge
     assert executed == []
 
 
+# ---------------------------------------------------------------------------
 # 3. 空终局不能提交链头
+# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_empty_final_response_does_not_commit_chain(_bridge_env):
     bridge = _bridge_env

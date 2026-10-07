@@ -1,9 +1,12 @@
+# =====================================================================
 # tests/unit/test_tool_result_condense.py — 工具返回「模型视图」精简层
+# =====================================================================
 # 被测关键路径：工具原始返回 → LLM 上下文的去 JSON 化管线。
 # 覆盖：weather / todo / memory / subagent / message_user / present_files /
 #       gaode maps_* 的纯文本模型视图（只给模型回答问题所需信息）、
 #       错误语义保留（熔断依赖前缀匹配，绝不能被改写）、
 #       非法/非 JSON 输入原样透传（宁多勿缺）。
+# =====================================================================
 import json
 
 from tool_result_condense import condense_for_model
@@ -25,7 +28,9 @@ def _view(fn_name, fn_args, payload):
     return condense_for_model(fn_name, fn_args, json.dumps(payload, ensure_ascii=False))
 
 
+# ---------------------------------------------------------------------
 # 错误语义逐字保留（最高优先级约束）
+# ---------------------------------------------------------------------
 def test_error_texts_pass_through_verbatim():
     for content in (
         "Error: upstream timeout",
@@ -62,7 +67,9 @@ def test_unknown_tool_unchanged():
     assert condense_for_model("text_editor", None, payload) == payload
 
 
+# ---------------------------------------------------------------------
 # weather 模型视图（纯文本）
+# ---------------------------------------------------------------------
 def _weather_payload(hourly_count: int = 24) -> dict:
     return {
         "city": "上海",
@@ -118,7 +125,9 @@ def test_weather_unrecognized_schema_falls_back_to_original():
     assert out == json.dumps(payload, ensure_ascii=False)  # 保底：宁可多给 token 也不能丢数据
 
 
+# ---------------------------------------------------------------------
 # todo 模型视图（纯文本）
+# ---------------------------------------------------------------------
 def test_todo_list_text_view():
     payload = {
         "ok": True, "action": "list", "filter": "all", "total": 3, "pending": 2, "done": 1,
@@ -173,7 +182,9 @@ def test_todo_error_envelope_becomes_failure_text():
     assert out == "失败：找不到 id 为 x 的待办"
 
 
+# ---------------------------------------------------------------------
 # memory 模型视图（纯文本）
+# ---------------------------------------------------------------------
 def test_memory_list_text_view():
     payload = {
         "ok": True, "action": "search", "total": 12, "shown": 1,
@@ -209,7 +220,9 @@ def test_memory_clear_text_view():
     assert "已清空全部 5 条记忆" in out and "当前共 0 条记忆" in out
 
 
+# ---------------------------------------------------------------------
 # subagent 模型视图（纯文本）
+# ---------------------------------------------------------------------
 def test_subagent_success_text_view_drops_echo_fields():
     payload = {
         "ok": True, "rounds": 3, "tool_calls": 5, "elapsed": 42.2,
@@ -237,7 +250,9 @@ def test_subagent_non_dict_unchanged():
     assert condense_for_model(SUBAGENT, None, content) == content
 
 
+# ---------------------------------------------------------------------
 # message_user 回答模型视图（纯文本）
+# ---------------------------------------------------------------------
 def test_message_user_choice_answer():
     payload = {"type": "choice", "question": "选哪个？",
                "selected": [{"label": "方案A", "description": ""}, {"label": "方案B"}]}
@@ -255,7 +270,9 @@ def test_message_user_custom_and_cancelled():
     assert "没有回复" in expired
 
 
+# ---------------------------------------------------------------------
 # present_files 模型视图（纯文本）
+# ---------------------------------------------------------------------
 def test_present_files_success_and_failure():
     payload = {"sent": ["report.pdf", "data.csv"],
                "failed": ["big.zip (file too large: 999 bytes)"]}
@@ -270,7 +287,9 @@ def test_present_files_error_envelope():
     assert out == "失败：No paths provided."
 
 
+# ---------------------------------------------------------------------
 # gaode maps 模型视图（纯文本；渲染/遥测字段绝不出现）
+# ---------------------------------------------------------------------
 def test_amap_geo_text_view_drops_admin_codes():
     payload = {"status": "1", "geocodes": [{
         "formatted_address": "广东省深圳市南山区", "country": "中国",

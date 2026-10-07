@@ -52,7 +52,9 @@ from tool_names import tool_family
 logger = logging.getLogger(__name__)
 
 
+# =====================================================================
 # 通用辅助
+# =====================================================================
 
 def _parse_json_stream(text: str) -> list[Any] | None:
     """解析单个 JSON 文档或相邻拼接的多个 JSON 对象/数组。
@@ -125,7 +127,9 @@ def _compact_location(value: Any) -> str:
     return f"{_fmt(lng)},{_fmt(lat)}"
 
 
+# =====================================================================
 # A. weather 模型视图（纯文本）
+# =====================================================================
 
 def _weather_line_current(current: dict, unit: str) -> str:
     temp = _clean(current.get("temp", "N/A"))
@@ -228,7 +232,9 @@ def _weather_model_view(payload: dict, hours_arg: Any) -> str:
     return "\n".join(lines)
 
 
+# =====================================================================
 # B. todo 模型视图（纯文本）
+# =====================================================================
 
 _TODO_DUE_STATUS_LABELS = {
     "overdue": "已逾期",
@@ -340,7 +346,9 @@ def _todo_model_view(payload: dict, fn_args: dict) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+# =====================================================================
 # C. memory 模型视图（纯文本）
+# =====================================================================
 
 def _memory_line(mem: dict) -> str:
     mem = mem if isinstance(mem, dict) else {}
@@ -416,7 +424,9 @@ def _memory_model_view(payload: dict, fn_args: dict) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+# =====================================================================
 # D. subagent 模型视图（纯文本）
+# =====================================================================
 
 def _subagent_model_view(payload: dict) -> str:
     error = _error_text(payload)
@@ -447,7 +457,9 @@ def _subagent_model_view(payload: dict) -> str:
     return f"{head}\n最终答复：\n{answer}"
 
 
+# =====================================================================
 # E. message_user 回答模型视图（纯文本）
+# =====================================================================
 
 def _message_user_answer_view(payload: dict) -> str:
     atype = _clean(payload.get("type", "")).lower() or "unknown"
@@ -494,7 +506,9 @@ def _message_user_answer_view(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+# =====================================================================
 # F. present_files 模型视图（纯文本）
+# =====================================================================
 
 def _present_files_view(payload: dict) -> str:
     error = _error_text(payload)
@@ -518,7 +532,9 @@ def _present_files_view(payload: dict) -> str:
     return "\n".join(lines)
 
 
+# =====================================================================
 # G. gaode maps 模型视图（纯文本）
+# =====================================================================
 # 先按原清洗规则剔除渲染/遥测专用字段（polyline、内部编码、空值…），
 # 再把剩下的业务字段转成可读文本。UI 视图仍拿完整原始载荷。
 
@@ -879,7 +895,9 @@ def _amap_model_view(fn_name: str, content: str) -> str:
     return "\n".join(v for v in views if v)
 
 
+# =====================================================================
 # 对外主入口
+# =====================================================================
 
 def condense_for_model(fn_name: str, fn_args: dict | None, content: str) -> str:
     """把工具的完整返回转换成发给 LLM 的精简视图。

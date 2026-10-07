@@ -45,11 +45,31 @@ from core.messages import ImageBlock, Message, TextBlock
 
 logger = get_logger(__name__)
 
-# 支持 OpenAI Images 兼容协议的图像请求统一走 /images/{generations,edits}。
-# 编辑任务必须使用 edits 端点，不能降级为 generations；其它模型继续走 chat + modalities。
+# =============================================================================
+# 统一图像请求（OpenAI Images 协议 /v1/images/{generations,edits}）
+# -----------------------------------------------------------------------------
+# 走统一 Images 协议出口的提供商集合。判定依据是"该提供商的图像模型
+# 支持 OpenAI Images 兼容端点"，而不是按模型逐个判断：
+#   - modelscope: 文生图与图生图共用 /images/generations（用
+#     X-ModelScope-Task-Type 头区分；ModelScope 无 /images/edits 端点）
+#   - xxtf:       中转站标准 OpenAI Images 端点（gpt-image-2 等），按官方
+#     语义分端点：文生图 -> JSON /images/generations；带参考图的编辑 ->
+#     官方规范 /images/edits（multipart/form-data，image[] 字段，见
+#     developers.openai.com "Create image edit"）。编辑请求绝不回退
+#     /images/generations——官方 generations 端点不接受 image 参数，
+#     中转站忽略该字段后编辑就变成纯文生图，HTTP 200 "假成功"但产出
+#     一张与原图无关的新图（2026-09-08 生产事故）。edits 失败时明确
+#     报错，绝不降级。另有生产鲁棒性：超大参考图先降采样再上传、
+#     "请求体未完整/请重试"类瞬态 400 同形状自动重试
+#     （详见 _request_openai_compat_image）
+# 其它提供商（如 openrouter 的 gemini 图像模型）继续走
+# chat/completions + modalities 路径，行为不变。
+# =============================================================================
 
 
+# =============================================================================
 # 配置驱动的图像端点解析（公共出口）
+# -----------------------------------------------------------------------------
 # "这个图像模型到底 POST 到哪个 URL、参考图怎么传"由模型配置的 endpoint
 # 字段决定，不再按提供商写 if-else 分支：
 #   - 模型配置声明 endpoint="https://apihub.agnes-ai.com/v1/images/generations"
@@ -58,6 +78,7 @@ logger = get_logger(__name__)
 #   - endpoint 指向 API 根（未声明图像子路径）-> 按 OpenAI 官方形状推导
 #     {endpoint}/images/{generations,edits}，编辑走独立 multipart
 #     /images/edits（XXTF 等标准 OpenAI Images 中转行为完全不变）。
+# =============================================================================
 # Agnes 官方能力集合（单一来源见 ai/_constants.py；不在集合内的
 # aspect_ratio 不发送，走网关默认 1:1）。
 _INLINE_IMAGE_SIZE_TIERS = frozenset(AGNES_IMAGE_SIZE_TIERS)
@@ -870,7 +891,14 @@ async def _request_modelscope_multi(
 # ---- 通用 OpenAI 兼容实现的共享辅助（edits multipart / generations JSON 两路共用）----
 
 # ---- 生产鲁棒性辅助：瞬态 400 重试 / 超大参考图压缩 ----
-# 编辑请求不在 generations 端点上做降级回退，避免把编辑误执行为文生图。
+#
+# 历史教训（2026-09-08 生产事故）：本文件曾有"/images/edits 失败后回退
+# /images/generations + image 字段""路由级 404/405 按 base_url 缓存 TTL"
+# 的兼容逻辑。官方 generations 端点不接受 image 参数，中转站忽略该字段
+# 后编辑请求被当纯文生图执行——HTTP 200 "成功"，实际产出一张与原图
+# 无关的全新图片（用户要求"移除行人"，结果场景/风格整体重绘）。该
+# fallback 及其路由能力缓存已彻底删除：编辑请求宁可明确失败，也绝不
+# 假成功。
 
 
 # 瞬态 400：中转站明确提示"请求体未完整/请重试"类传输层错误（生产实测
@@ -1263,9 +1291,14 @@ async def _request_openai_compat_image(
 
             # ------------- 图生图/编辑：严格使用官方 /images/edits -------------
             #
-            # /images/generations 不等价于 /images/edits；部分网关会忽略未知 image
-            # 字段并将编辑请求当作文生图。因此有参考图时只能使用 edits，
-            # 失败时明确报错，不降级到 generations。
+            # 重要：/images/generations + {"image": ...} 并不等价于官方
+            # /images/edits 协议。中转站很可能直接忽略未知字段，把编辑请求
+            # 当成纯文生图执行——用户要求"只删行人"，结果场景/风格整体
+            # 重绘（2026-09-08 生产事故：HTTP 200 "假成功"，原图从未送达
+            # 模型）。因此：
+            #   有参考图 -> 只能 POST /images/edits multipart；
+            #   edits 失败 -> 明确报错；
+            #   绝不 fallback 到 /images/generations（宁可失败，不假成功）。
             endpoint = edits_path
             image_data_urls = await _image_urls_to_data_urls(session, image_urls)
             if not image_data_urls:
@@ -2358,8 +2391,23 @@ async def _request_openrouter_video(
 
 
 
-# ImageTask 的请求方式由 operation 和模型协议决定，不根据是否存在参考图猜测操作。
-# OpenAI Images 路径使用 generations/edits；chat 模型使用 chat.completions + modalities。
+# =============================================================================
+# ImageTask 统一请求出口（protocols/images.py 的两个适配器落在这里）
+# -----------------------------------------------------------------------------
+# 图像任务的"操作"（generate/edit）是任务的
+# 一等字段（core/images.ImageTask.operation），由任务构造方显式声明；
+# 以下两个出口只按任务与模型协议发请求并解析，不再做任何
+# "看到参考图 = edit"式的端点猜测。
+#   - _request_openai_images_task        -> /images/{generations,edits}
+#     （operation=edit 且带参考图 -> 官方 multipart /images/edits；
+#      编辑端点不可用时明确报错、绝不回退 /images/generations——把编辑
+#      降级成文生图是 2026-09-08 生产事故的"假成功"根因，见
+#      _request_openai_images_task 内的 NO fallback 分支；
+#      operation=generate -> /images/generations；ModelScope 一律
+#      /images/generations + 异步任务轮询，无 /images/edits 端点）
+#   - _request_chat_modalities_image_task -> chat.completions + modalities
+#     （OpenRouter 图像模型；参考图作为消息内容输入）
+# =============================================================================
 
 
 async def _request_openai_images_task(task: "ImageTask") -> "ImageTaskResult":

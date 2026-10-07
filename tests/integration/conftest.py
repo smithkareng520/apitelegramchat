@@ -1,4 +1,6 @@
+# =====================================================================
 # tests/integration/conftest.py — 集成测试环境准备
+# =====================================================================
 # 必须在导入任何项目模块（尤其是 config.py / app.py）之前设置环境变量：
 #   - APITELEGRAMCHAT_DATA_DIR 指向独立临时目录，避免污染真实数据目录；
 #   - WEBHOOK_TOKEN / TELEGRAM_BOT_TOKEN 提供测试凭据；
@@ -6,6 +8,7 @@
 # WORKSPACES_DIR 不在这里设置：根 tests/conftest.py 已经为本进程设置过
 # 会话级隔离目录（且按目录字母序先于本文件执行），此处重复 setdefault
 # 是一个永不生效的静默冲突——工作空间隔离只认根 conftest 这一个来源。
+# =====================================================================
 import os
 import tempfile
 from pathlib import Path

@@ -175,7 +175,9 @@ async def test_single_tool_batch_has_nothing_hidden(monkeypatch):
     assert builder._tool_groups[-1]["outer_summary"] == "Generated image(s)"
 
 
+# ---------------------------------------------------------------------
 # 生产路径：tool_call_loop 拿到的是 DraftManager（事件流 + 滚动缓冲），不是裸 builder
+# ---------------------------------------------------------------------
 def _draft_manager():
     from ai.draft_manager import DraftManager
 

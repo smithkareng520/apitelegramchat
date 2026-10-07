@@ -73,7 +73,9 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+# ---------------------------------------------------------------------------
 # 可调参数（环境变量）
+# ---------------------------------------------------------------------------
 #: 历史可用预算占 max_context 的比例（其余留给系统提示 + 工具 schema + 轮内增长）
 CONTEXT_BUDGET_RATIO = min(1.0, max(0.1, _env_float("CONTEXT_BUDGET_RATIO", 0.8)))
 #: 触发压缩事件的高水位（占预算比例）
@@ -106,7 +108,9 @@ _LOCATOR_CHAR_BUDGET = 96
 _LOCATOR_KEYS = ("url", "query", "q", "path", "command", "city", "file_name", "name")
 
 
+# ---------------------------------------------------------------------------
 # 预算解析
+# ---------------------------------------------------------------------------
 def resolve_history_budget(
     model_max_context: Optional[int] = None,
     model_max_output: Optional[int] = None,
@@ -141,7 +145,9 @@ def compact_watermarks(budget: int) -> tuple[int, int]:
     return int(budget * CONTEXT_COMPACT_TRIGGER_RATIO), int(budget * CONTEXT_COMPACT_TARGET_RATIO)
 
 
+# ---------------------------------------------------------------------------
 # 结构：摘要槽位 + 用户轮块
+# ---------------------------------------------------------------------------
 def is_digest_message(message: object) -> bool:
     """识别滚动摘要消息（role=system 且正文以稳定标记开头）。
 
@@ -192,7 +198,9 @@ def _flatten(blocks: list[list[Any]]) -> list[Any]:
     return [message for block in blocks for message in block]
 
 
+# ---------------------------------------------------------------------------
 # 淘汰规划（纯函数）
+# ---------------------------------------------------------------------------
 @dataclass
 class EvictionPlan:
     """一次结构性淘汰的确定性计划（不修改入参）。"""
@@ -284,7 +292,9 @@ def make_digest_message(digest_text: str) -> Message:
     return Message.system(digest_text)
 
 
+# ---------------------------------------------------------------------------
 # 滚动摘要（确定性纯函数）
+# ---------------------------------------------------------------------------
 def _first_user_text(block: list[Any]) -> str:
     for message in block:
         if _msg_role(message) != "user":
@@ -446,7 +456,9 @@ def build_digest_text(
     return text
 
 
+# ---------------------------------------------------------------------------
 # 杂项
+# ---------------------------------------------------------------------------
 def count_history_tokens(
     history: list[Any],
     token_fn: Optional[Callable[[Any], int]] = None,

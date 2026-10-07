@@ -1,5 +1,6 @@
 """apitelegramchat 的集中式运行时配置。"""
 
+# config.py
 import asyncio
 import logging
 import os
@@ -7,8 +8,14 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+# -----------------------------------------------------------------------------
+# 日志
+# -----------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
 
+# -----------------------------------------------------------------------------
+# 环境变量
+# -----------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GLM_API_KEY = os.getenv("GLM_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
@@ -23,36 +30,67 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 MODELSCOPE_API_KEY = os.getenv("MODELSCOPE_API_KEY", "")
 AGNES_API_KEY = os.getenv("AGNES_API_KEY", "")
-# Anthropic 原生 Messages API 的鉴权。仅由 Anthropic 专用调用路径使用。
+# Anthropic 官方 API（原生 Messages API，非 OpenAI 兼容协议）。
+# 与其余厂商并存：其余厂商继续走 AsyncOpenAI + chat.completions.create，
+# 互不影响；本 key 仅供 anthropic 厂商专用循环
+# （ai/agentic_loops._agentic_loop_anthropic）使用。
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-# LFREE 中转的鉴权；Responses 模型使用 /v1/responses。
+# LFREE 中转（https://ai.lfree.org，bot token 在 URL 路径里）：当前 Responses
+# 路径使用 /v1/responses；一个 key 覆盖 LFree 的 Responses 模型，见下方
+# PROVIDERS["lfree"] 与模型定义（"LFREE 中转"注释块）。
 LFREE_API_KEY = os.getenv("LFREE_API_KEY", "")
 
 
-# 高德地图 MCP 服务：通过 streamable HTTP + Bearer token 调用。
-# 未配置 URL 或 token 时，mcp_manager 会跳过该服务。
+# ---------- 高德地图 MCP 服务（@amap/amap-maps on ModelScope）----------
+# 通过 streamable_http 调用，使用 Bearer token 鉴权。
+# 未配置 GAODE_MCP_TOKEN 或 GAODE_MCP_URL 时该 MCP 服务不可用
+# （mcp_manager 加载 mcp.json 时因 url_env 未注入而跳过注册）。
 GAODE_MCP_URL = (os.getenv("GAODE_MCP_URL") or "").strip()
 GAODE_MCP_TOKEN = (os.getenv("GAODE_MCP_TOKEN") or "").strip()
 
-# Serper 网页搜索 API；一个 key 覆盖 search / images / videos / lens 四种模式。
+# -----------------------------------------------------------------------------
+# 网页搜索：Serper 官方 REST API
+# -----------------------------------------------------------------------------
+# 直接调用 https://google.serper.dev/{search,images,videos,lens}，使用
+# X-API-KEY 头鉴权。Key 从 https://serper.dev 注册并获取，配置在
+# Render Environment 中作为 secret。一个 key 即可同时支持 4 种模式。
 SERPER_API_KEY = (os.getenv("SERPER_API_KEY", "") or "").strip()
-# Serper 单次请求超时；默认值与 web_search 的整体超时预算匹配。
+# 可选：单次请求超时（秒）；默认 12s 与外层 web_search 工具超时（45s）预算匹配。
+# 真正赋值在 _positive_float_env 定义之后（见下文 SERPER_API_TIMEOUT_RESOLVED）。
 
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
 _RAW_WEBHOOK_URL = os.getenv("WEBHOOK_URL") or ""
-# 启动时幂等注册 webhook，并记录 Telegram 的投递状态。
-# setWebhook 不会清除已有积压；DROP_PENDING_ON_STARTUP=true 才会丢弃积压消息。
+# Webhook 注册采用"启动自愈"：应用启动时（app._startup_sync_webhook →
+# webhook_sync.sync_webhook_on_startup）用 WEBHOOK_URL?token=WEBHOOK_TOKEN
+# 幂等调用 setWebhook 重注册，并输出 getWebhookInfo 观测日志
+# （pending_update_count / last_error_*），让积压可被观测。
+# 注意：setWebhook 只修"未来的投递路由"，不影响 Telegram 侧已积压的
+# update 队列；唯一清队手段是 drop_pending_updates=true（见下）。
+# DROP_PENDING_ON_STARTUP=true 时，启动注册附带 drop_pending_updates=true，
+# 在自愈注册的同时清空 Telegram 侧积压队列——停机/部署窗口内收到的消息
+# 会被**永久丢弃**（不投递、不回复），仅当宁可丢消息也不愿迟到回复时开启。
 DROP_PENDING_ON_STARTUP = os.getenv("DROP_PENDING_ON_STARTUP", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 
-# 环境变量解析工具；定义顺序必须早于其配置项初始化。
-# 合法的推理强度档位。
+# -----------------------------------------------------------------------------
+# 公共：环境变量安全解析工具
+# -----------------------------------------------------------------------------
+# 必须在使用前定义（LOG_TRUNCATE_LIMIT / MAX_CONCURRENT_TOOLS 等都依赖）。
+# 合法推理努力档位（OpenAI gpt-5 / Gemini 3 / Claude / OpenRouter 通用口径）
 VALID_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max", "minimal"}
-# Model -> Protocol 的合法取值。未显式声明时默认使用 openai_chat。
-# openai_chat / anthropic_messages / gemini_native / openai_responses / openai_images
-# 分别对应各自的请求协议。
+# 合法的协议标签（ProviderConfig.protocol 默认值与
+# ModelConfig.protocol 覆盖字段共用同一取值域）。
+# 协议选择器（Model -> Protocol，而非 Provider -> Protocol）：
+#   - "openai_chat"        OpenAI 兼容 Chat Completions（/chat/completions）
+#   - "anthropic_messages" Anthropic 原生 Messages（/v1/messages）
+#   - "gemini_native"      Gemini 原生 streamGenerateContent
+#   - "openai_responses"   OpenAI 原生 Responses API（/v1/responses，专用
+#                          循环见 ai/responses_bridge.py + 协议适配器见
+#                          protocols/openai_responses.py）
+#   - "openai_images"      OpenAI Images（/images/generations、/images/edits）
+# 未显式声明的模型一律回落 "openai_chat"（99% 兼容模型的默认路径）。
 _VALID_PROTOCOLS = {
     "openai_chat", "anthropic_messages", "gemini_native",
     "openai_responses", "openai_images",
@@ -75,12 +113,19 @@ def _positive_int_env(name: str, default: int, minimum: int) -> int:
         return default
 
 
+# 现在 _positive_float_env 已定义，可以安全赋值。
 SERPER_API_TIMEOUT = _positive_float_env("SERPER_API_TIMEOUT", 12.0, 1.0)
 
 
+# -----------------------------------------------------------------------------
+# 日志截断配置
+# -----------------------------------------------------------------------------
 LOG_TRUNCATE_LIMIT = _positive_int_env("LOG_TRUNCATE_LIMIT", 5000, 1)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
+# -----------------------------------------------------------------------------
+# 必需环境变量检查
+# -----------------------------------------------------------------------------
 def validate_runtime_config(*, strict: bool = False) -> None:
     """
     默认保持导入安全：MCP server、离线测试和单元测试可以在无 Telegram 环境变量时导入。
@@ -108,8 +153,14 @@ if os.getenv("APITELEGRAMCHAT_REQUIRE_STRICT_CONFIG", "0") in {"1", "true", "yes
         print(f"[config] {exc}", file=sys.stderr)
         raise
 
+# -----------------------------------------------------------------------------
+# 角色相关
+# -----------------------------------------------------------------------------
 SUPPORTED_ROLES = ["china", "think", "neko_catgirl", "succubus", "isla"]
 
+# =============================================================================
+# 配置驱动架构：厂商定义 + 模型定义
+# =============================================================================
 
 @dataclass
 class ProviderConfig:
@@ -140,7 +191,9 @@ class ProviderConfig:
     #   "gemini_native"      Gemini 原生 API 流式桥接
     #   "anthropic_messages" Anthropic 原生 Messages
     #   "openai_images"      OpenAI Images（图像生成）
-    # 未识别的协议标签会在配置解析阶段直接报错。
+    # 旧值 "gemini_openai_compat"（OpenAI 兼容层非流式循环）已随 v2.6
+    # Gemini 原生流式改造移除；未识别的标签在 make_model_config /
+    # get_effective_endpoint 处直接报错。
     protocol: str = DEFAULT_PROTOCOL
     # 是否支持 Prompt Caching（仅部分厂商需要显式标记）
     supports_prompt_cache: bool = False
@@ -184,7 +237,7 @@ class ModelConfig:
     max_output_tokens: Optional[int] = None
     max_context: Optional[int] = None  # <=== 【新增】最大上下文窗口
 
-    # 推理控制：开关、努力档位和 token 预算彼此独立。
+    # ===================== 推理控制（思考开关 / 努力档位 / token 上限）=====
     # 三者均可独立配置；None = 不向 API 发送任何推理控制参数（跟随模型默认）。
     # reasoning_enabled:  显式开/关思考（GLM thinking.type / ModelScope
     #                     enable_thinking / OpenRouter reasoning.enabled /
@@ -197,16 +250,38 @@ class ModelConfig:
     reasoning_effort: Optional[str] = None
     reasoning_max_tokens: Optional[int] = None
 
-    # 采样参数：None 表示使用供应商默认值。
+    # ===================== 采样参数 =====================
     # None = 不发送该字段，走供应商默认（供应商默认采样已按模型调优）；
     # 数值 = 按模型覆盖。某模型完全不支持采样时用 supports_sampling=False。
     temperature: Optional[float] = None
     top_p: Optional[float] = None
 
-    # 模型级端点覆盖：允许同一 provider 下的模型使用不同端点或协议。
-    # 模型级覆盖允许同一 provider 下使用不同端点、鉴权变量、请求头或协议。
-    # None 表示继承 provider 配置；有效值只影响当前模型。
-    # 图像/视频模型也可声明完整请求端点，路由由有效 endpoint 决定。
+    # ===================== 端点覆盖（每模型独立中转/协议）=====================
+    # 背景：中转/聚合端点常见"同一端点下不同模型协议不同"（如某端点
+    # 的 OpenAI 兼容模型走 /v1/chat/completions，Anthropic 系模型走原生
+    # Messages API，二者 502/404 互不兼容），或者"想用的模型分散在多个
+    # 中转站"。原先端点信息完全挂在 provider 级（PROVIDERS[provider]），
+    # 同一 provider 下所有模型被迫共用同一端点/key/协议，选完供应商
+    # 还要再确认这台端点这个模型走不走得通，配置心智负担很重。
+    #
+    # 以下字段全部可选，None = 沿用 provider（PROVIDERS[provider]）的默认值；
+    # 非 None = 仅对本模型生效的覆盖值，不影响同 provider 下的其它模型。
+    # 端点覆盖改三件事："连到哪、用哪个 key、带什么请求头"，以及协议
+    # 本身（protocol，单字段选择器，None=继承厂商默认）。换句话说：
+    #   - 想换端点但协议不变（同样是 OpenAI 兼容 / 同样是 Anthropic 原生）：
+    #     只填 endpoint / api_key_env（可选 default_headers）。
+    #   - 想强制该模型走某种协议（如某中转的这个模型只认 Anthropic
+    #     原生 Messages 协议，即使 provider 挂在 openrouter 之类壳下）：
+    #     填 protocol="anthropic_messages"。
+    #   - 反向需求（provider 默认走原生、某模型想回 OpenAI 兼容）：
+    #     显式填 protocol="openai_chat" 覆盖。
+    #   - 图像模型：填 protocol="openai_images"（OpenAI Images 协议）或
+    #     保持 "openai_chat"（经 chat.completions + modalities 出图）。
+    #   - 图像/视频模型还可以直接声明完整请求端点（endpoint=完整 URL，
+    #     如 "https://apihub.agnes-ai.com/v1/images/generations"），统一
+    #     请求出口会原样 POST 到该 URL——端点路由完全由 endpoint 驱动，
+    #     新增一个走不同子端点的模型不需要在请求层新建任何分支。
+    # 见 get_effective_endpoint() 获取合并后的有效端点配置。
     api_key_env: Optional[str] = None
     default_headers: Optional[Dict[str, str]] = None
     # 完整请求端点覆盖（语义见 ProviderConfig.endpoint 注释；
@@ -222,7 +297,9 @@ class ModelConfig:
         return self.provider
 
 
+# =============================================================================
 # 厂商配置表
+# =============================================================================
 PROVIDERS: Dict[str, ProviderConfig] = {
     "openrouter": ProviderConfig(
         name="OpenRouter",
@@ -318,7 +395,9 @@ PROVIDERS: Dict[str, ProviderConfig] = {
 }
 
 
+# =============================================================================
 # 厂商默认能力（模型未覆盖时使用）
+# =============================================================================
 _PROVIDER_DEFAULTS: Dict[str, Dict] = {
     "openrouter": {
         "image_input": False,
@@ -460,7 +539,13 @@ _PROVIDER_DEFAULTS: Dict[str, Dict] = {
         "max_context": 200000,
     },
     "lfree": {
-        # 保守默认：仅为已验证支持的能力开启图片输入和工具调用。
+        # 保守默认：中转能力以 2026-09-12 实测为准——
+        #   图片输入：claude-opus-5 / mimo-v2.5 / muse-spark-1.3-contributor
+        #     支持（base64 数据 URI 最稳），nv/kimi-k3 不支持（中转未把图片
+        #     传给后端，模型会声称"没收到图片"）；
+        #   工具调用：仅 nv/kimi-k3 支持原生 tool_calls，其余 3 个模型接受
+        #     tools 参数但从不返回 tool_calls（推理后拒答或在正文里模拟
+        #     工具文本），故厂商级默认 supports_tools=False。
         "image_input": False,
         "audio_input": False,
         "video_input": False,
@@ -692,8 +777,10 @@ def make_model_config(
     )
 
 
+# =============================================================================
 # 统一参数出口：所有 agentic 循环（主循环 / subagent / 回退 / 总结请求）
 # 一律通过这两个函数获取采样与推理参数，禁止在循环内硬编码。
+# =============================================================================
 def get_sampling_params(model_info: Optional[ModelConfig]) -> Dict[str, float]:
     """
     返回应并入 chat.completions.create 的采样参数（temperature / top_p）。
@@ -815,7 +902,9 @@ def get_reasoning_request_fields(
     return _REASONING_NOOP
 
 
+# =============================================================================
 # 统一参数出口：厂商默认参数 -> 模型覆盖参数（唯一合并视图）
+# -----------------------------------------------------------------------------
 # 回答"当前选定的模型到底用什么参数/能力/端点"这一个问题。分层规则：
 #   厂商默认（ProviderConfig + _PROVIDER_DEFAULTS）
 #     -> 模型覆盖（make_model_config 时已把非 None 的模型字段合并进
@@ -823,6 +912,7 @@ def get_reasoning_request_fields(
 # 能力查询（鉴权）、参数查询（请求体构建）、端点查询（路由）都应经过
 # resolve_effective_params / get_effective_endpoint，而不是各自散落读取
 # 原始配置——这是"统一模块按模型参数与输入组合鉴权、构建请求"的数据底座。
+# =============================================================================
 @dataclass
 class EffectiveParams:
     """某模型合并后的有效参数总览（厂商默认 -> 模型覆盖）。"""
@@ -925,10 +1015,14 @@ def resolve_effective_params(model_info: Optional[ModelConfig]) -> EffectivePara
     )
 
 
+# =============================================================================
 # 模型列表（所有支持的模型）
+# =============================================================================
 SUPPORTED_MODELS: Dict[str, ModelConfig] = {}
 
+# -----------------------------------------------------------------------------
 # OpenRouter 模型
+# -----------------------------------------------------------------------------
 SUPPORTED_MODELS["openrouter/free"] = make_model_config(
     model_id="openrouter/free",
     provider="openrouter",
@@ -951,7 +1045,10 @@ SUPPORTED_MODELS["openrouter/free"] = make_model_config(
 #     temperature=1.0,
 # )
 
+# -----------------------------------------------------------------------------
 # Agnes 免费模型
+# -----------------------------------------------------------------------------
+# (duplicate gemma entry removed)
 SUPPORTED_MODELS["agnes-3.0-flash"] = make_model_config(
     model_id="agnes-3.0-flash",
     provider="agnes",
@@ -962,7 +1059,9 @@ SUPPORTED_MODELS["agnes-3.0-flash"] = make_model_config(
     temperature=0.3,
 )
 
+# -----------------------------------------------------------------------------
 # ModelScope 免费模型
+# -----------------------------------------------------------------------------
 SUPPORTED_MODELS["ZhipuAI/GLM-5.3-Flash"] = make_model_config(
     model_id="ZhipuAI/GLM-5.3-Flash",
     provider="modelscope",
@@ -973,7 +1072,9 @@ SUPPORTED_MODELS["ZhipuAI/GLM-5.3-Flash"] = make_model_config(
     temperature=0.3,
 )
 
+# -----------------------------------------------------------------------------
 # Gemini 系列
+# -----------------------------------------------------------------------------
 SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
     model_id="gemini-3.5-flash-lite",
     provider="gemini",
@@ -985,7 +1086,9 @@ SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
     reasoning_effort="high",
     temperature=0.4,
 )
+# -----------------------------------------------------------------------------
 # GLM 系列
+# -----------------------------------------------------------------------------
 SUPPORTED_MODELS["GLM-4.7-Flash"] = make_model_config(
     model_id="GLM-4.7-Flash",
     provider="glm",
@@ -994,7 +1097,9 @@ SUPPORTED_MODELS["GLM-4.7-Flash"] = make_model_config(
     temperature=0.3,
 )
 
+# -----------------------------------------------------------------------------
 # 图像生成模型
+# -----------------------------------------------------------------------------
 SUPPORTED_MODELS["Qwen/Qwen-Image"] = make_model_config(
     model_id="Qwen/Qwen-Image",
     provider="modelscope",
@@ -1026,7 +1131,7 @@ SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
     model_id="agnes-image-2.5-flash",
     provider="agnes",
     image_output=True,
-    # 历史图片只在任务需要编辑/处理图片时作为输入传递；
+    # 注意（2026-09 排查"支持看图但看不到历史图片"实锤）：这里的
     # image_input=True 仅表示"可以把图片当输入模态接收"——即图片能被当作
     # 图生图/编辑的参考图使用（ai.agentic_loops._agentic_loop_native_image
     # 会从历史 user 消息里提取 ImageBlock 传给 ImageTask.edit）。它**不**
@@ -1041,12 +1146,18 @@ SUPPORTED_MODELS["agnes-image-2.5-flash"] = make_model_config(
     supports_tools=False,
     max_context=4000,
     max_output_tokens=1024,
-    # 图像模型显式使用 OpenAI Images 协议，并指定完整的图像请求端点。
+    # 图像模型：显式声明 OpenAI Images 协议 + 完整请求端点（与 2.1 同形状，
+    # 官方文档：请求/响应参数、尺寸、计费与 2.1 保持一致）。此前未声明
+    # protocol，继承厂商默认 openai_chat 后把图像请求发到
+    # /v1/chat/completions，被网关 400（"is an image model. Use
+    # /v1/images/generations"）。现在端点路由完全由配置驱动。
     protocol="openai_images",
     endpoint="https://apihub.agnes-ai.com/v1/images/generations",
 )
 
+# -----------------------------------------------------------------------------
 # 视频生成模型
+# -----------------------------------------------------------------------------
 SUPPORTED_MODELS["agnes-video-2.5-flash"] = make_model_config(
     model_id="agnes-video-2.5-flash",
     provider="agnes",
@@ -1060,7 +1171,9 @@ SUPPORTED_MODELS["agnes-video-2.5-flash"] = make_model_config(
     endpoint="https://apihub.agnes-ai.com/v1/videos",
 )
 
+# -----------------------------------------------------------------------------
 # LFREE Responses 模型（https://ai.lfree.org，OpenAI-compatible，一个 key 覆盖模型）
+# -----------------------------------------------------------------------------
 # 当前这些模型显式走 protocol="openai_responses"，运行时只调用 /v1/responses；
 #   - claude-opus-5 / mimo-v2.5 / muse-spark-1.3-contributor：图片输入 ✅
 #     （base64 数据 URI 最稳，直接传 URL 时中转下游拉取可能 400）；
@@ -1106,7 +1219,9 @@ DEFAULT_MODEL = "agnes-3.0-flash"
 assert DEFAULT_MODEL in SUPPORTED_MODELS, f"默认模型 {DEFAULT_MODEL} 未定义"
 
 
+# =============================================================================
 # 白名单管理
+# -----------------------------------------------------------------------------
 # 存储模型（R2 权威 + 本地缓存）：
 #   - R2 对象（默认 key: config/whitelist.txt，可用
 #     APITELEGRAMCHAT_WHITELIST_R2_KEY 覆盖）是唯一权威数据源。
@@ -1134,6 +1249,7 @@ assert DEFAULT_MODEL in SUPPORTED_MODELS, f"默认模型 {DEFAULT_MODEL} 未定�
 # 大小写语义：
 #   Telegram 用户名大小写不敏感，因此用户名统一归一化为小写存储与比较；
 #   纯数字 user_id 按精确字符串比较。
+# =============================================================================
 
 WHITELIST_FILE = os.getenv("APITELEGRAMCHAT_WHITELIST_FILE") or "whitelist.txt"
 # R2 白名单对象 key。R2 是扁平对象命名空间，key 里的 "/" 只是前缀约定；
@@ -1517,19 +1633,25 @@ async def snapshot_whitelist() -> list[str]:
     async with whitelist_store.lock:
         return whitelist_store.snapshot()
 
+# -----------------------------------------------------------------------------
 # 缓存 TTL
+# -----------------------------------------------------------------------------
 CACHE_TTL = _positive_int_env("CACHE_TTL", 300, 10)
 SEARCH_CACHE_TTL = _positive_int_env("SEARCH_CACHE_TTL", 300, 10)
 FETCH_CACHE_TTL = _positive_int_env("FETCH_CACHE_TTL", 3600, 10)
 
+# -----------------------------------------------------------------------------
 # S3 / R2 配置
+# -----------------------------------------------------------------------------
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
 R2_REGION = os.getenv("R2_REGION", "auto")
 
+# -----------------------------------------------------------------------------
 # 流式刷新阈值
+# -----------------------------------------------------------------------------
 # 草稿是用户感知 Agent 正在工作的唯一实时界面。默认值优先保证首字与
 # 状态变更的可见性，同时仍低于 Telegram 草稿 API 的常规刷新频率。
 STREAM_FLUSH_INTERVAL = _positive_float_env("STREAM_FLUSH_INTERVAL", 0.65, 0.25)
@@ -1537,10 +1659,14 @@ STREAM_SILENT_FORCE_FLUSH = _positive_float_env(
     "STREAM_SILENT_FORCE_FLUSH", 2.0, STREAM_FLUSH_INTERVAL
 )
 
+# -----------------------------------------------------------------------------
 # 工具调用并发数
+# -----------------------------------------------------------------------------
 MAX_CONCURRENT_TOOLS = _positive_int_env("MAX_CONCURRENT_TOOLS", 8, 1)
 
+# -----------------------------------------------------------------------------
 # Telegram update 摄取通道（长轮询 / Webhook）
+# -----------------------------------------------------------------------------
 # INGEST_MODE 决定 update 从哪条链路进入 update_queue：
 #
 #   "polling"（默认，推荐）
@@ -1564,7 +1690,9 @@ TELEGRAM_POLL_TIMEOUT = _positive_int_env("TELEGRAM_POLL_TIMEOUT", 25, 1)
 # 单次 getUpdates 最多取回多少条 update（Telegram 上限 100）。
 TELEGRAM_POLL_LIMIT = min(_positive_int_env("TELEGRAM_POLL_LIMIT", 100, 1), 100)
 
+# =============================================================================
 # 运行时环境快照 + 安全清洗
+# =============================================================================
 # config.py 在导入时先读取环境变量。MCP 配置是在后续 mcp_manager
 # 初始化时解析的，因此不能让 mcp_manager 再依赖已经被 scrub 的 os.environ。
 # 快照仅用于运行时配置解析；os.environ 仍会继续执行 secret scrub。

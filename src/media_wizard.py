@@ -50,7 +50,9 @@ WIZARD_CALLBACK_PREFIX = "mw:"
 REPLY_MARKER = "💡 引用回复:"          # 与 app_turns 同值（避免循环导入此处复制）
 _SESSION_TTL_SECONDS = 2 * 3600        # 卡片会话有效期：2 小时
 
+# ---------------------------------------------------------------------------
 # 参数声明（按模型有效参数推导卡片按钮；严格对齐官方文档）
+# ---------------------------------------------------------------------------
 # Agnes Image 2.5 Flash（与 2.1 同参）：size 档位 + ratio 官方集合
 # （单一来源见 ai/_constants.py）
 from ai._constants import AGNES_IMAGE_SIZE_TIERS as _IMAGE_SIZE_TIERS
@@ -142,7 +144,9 @@ def resolve_media_param_spec(model_info: Any) -> Optional[MediaParamSpec]:
     return None
 
 
+# ---------------------------------------------------------------------------
 # 会话状态（每 chat 一张活跃卡片）
+# ---------------------------------------------------------------------------
 @dataclass
 class WizardSession:
     """一张参数卡片会话的全部状态（未选择的参数保持 None = 走模型默认）。"""
@@ -194,7 +198,9 @@ def get_session(chat_id: int) -> Optional[WizardSession]:
     return _sessions.get(chat_id)
 
 
+# ---------------------------------------------------------------------------
 # 输入解析：提示词清洗 / 附件提取
+# ---------------------------------------------------------------------------
 def clean_prompt_text(raw: str) -> str:
     """把 Telegram 消息 content 清洗成适合做生成 prompt 的文本。
 
@@ -253,7 +259,9 @@ def extract_media_attachments(user_message: Optional[dict]) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
 # 媒体预签名 URL 解析（R2；与图片输入的统一预签名路径同源）
+# ---------------------------------------------------------------------------
 async def resolve_media_presigned_url(kind: str, file_id: str, mime_type: str = "") -> str:
     """把 Telegram file_id 解析为 R2 预签名 URL（媒体输入统一预签名）。
 
@@ -291,7 +299,9 @@ async def resolve_media_presigned_url(kind: str, file_id: str, mime_type: str = 
     return ""
 
 
+# ---------------------------------------------------------------------------
 # Telegram API（卡片消息的就地编辑 / 发送 / 回调应答）
+# ---------------------------------------------------------------------------
 async def _tg_post(method: str, payload: dict, timeout_total: int = 10) -> Optional[dict]:
     try:
         timeout = aiohttp.ClientTimeout(total=timeout_total, connect=4)
@@ -340,7 +350,9 @@ async def answer_callback(callback_id: str, text: str = "", alert: bool = False)
     await _tg_post("answerCallbackQuery", payload, timeout_total=5)
 
 
+# ---------------------------------------------------------------------------
 # 渲染（HTML 文本 + inline keyboard；所有页面就地编辑同一条消息）
+# ---------------------------------------------------------------------------
 _MODE_LABELS = {"text": "文生视频", "keyframe": "首尾帧控制", "reference": "参考生成"}
 
 
@@ -672,7 +684,9 @@ def render_page(sess: WizardSession) -> tuple[str, Optional[dict]]:
     return _page_main(sess)
 
 
+# ---------------------------------------------------------------------------
 # 卡片生命周期（回合拦截入口 / 就地重绘 / 取代旧卡）
+# ---------------------------------------------------------------------------
 async def _render_card(sess: WizardSession) -> bool:
     """把会话当前页就地渲染到卡片消息上（带失效守卫）。"""
     if _sessions.get(sess.chat_id) is not sess:
@@ -735,7 +749,9 @@ async def start_media_wizard_turn(chat_id: int, model_id: str,
     return True
 
 
+# ---------------------------------------------------------------------------
 # 回调处理（inline 按钮点击；卡片翻页/设置/收集/提交全部就地编辑）
+# ---------------------------------------------------------------------------
 def is_wizard_callback(data: Any) -> bool:
     return isinstance(data, str) and data.startswith(WIZARD_CALLBACK_PREFIX)
 
@@ -914,7 +930,9 @@ async def _dispatch_callback(sess: WizardSession, callback_id: str, data: str) -
     await answer_callback(callback_id, "未知操作")
 
 
+# ---------------------------------------------------------------------------
 # 消息消费钩子（app_turns 各消息处理器在进入正常回合前调用）
+# ---------------------------------------------------------------------------
 _SLOT_EXPECT = {
     "first_frame": "photo", "last_frame": "photo",
     "ref_image": "photo", "ref_audio": "audio", "ref_video": "video",
@@ -1087,7 +1105,9 @@ async def try_consume_text_message(chat_id: int, raw_text: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
 # 提交：构造生成请求并作为 turn 任务执行
+# ---------------------------------------------------------------------------
 def build_submission(sess: WizardSession) -> tuple[Optional[dict], str, str]:
     """校验并构造提交请求。返回 (request, 错误跳转页, 错误提示)。
 

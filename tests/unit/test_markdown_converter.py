@@ -1,7 +1,10 @@
+# =====================================================================
 # tests/unit/test_markdown_converter.py — Markdown → Telegram Rich HTML
+# =====================================================================
 # 被测关键路径：模型输出 → 用户可见消息的渲染层。
 # 覆盖：标题/强调/删除线/行内代码/代码块/链接/图片/列表/引用/表格/水平线、
 #       HTML 实体幂等（不二次转义）、URL 与 snake_case 保护、混合 HTML 直通。
+# =====================================================================
 import html as html_lib
 
 import pytest
@@ -13,7 +16,9 @@ from markdown_converter import (
 )
 
 
+# ---------------------------------------------------------------------
 # 透传与边界
+# ---------------------------------------------------------------------
 def test_plain_text_without_markdown_unchanged():
     assert convert("你好，世界") == "你好，世界"
     assert convert("2026-09-07 发布 v2.2.0") == "2026-09-07 发布 v2.2.0"
@@ -35,7 +40,9 @@ def test_snake_case_identifiers_not_italicized():
     )
 
 
+# ---------------------------------------------------------------------
 # 块级元素
+# ---------------------------------------------------------------------
 @pytest.mark.parametrize("level", range(1, 7))
 def test_headings_all_levels(level):
     marks = "#" * level
@@ -175,7 +182,9 @@ def test_spoiler_and_autolink_markdown():
     assert '<a href="https://example.com">https://example.com</a>' in out
 
 
+# ---------------------------------------------------------------------
 # 行内元素
+# ---------------------------------------------------------------------
 def test_bold_variants():
     assert convert("**加粗**") == "<b>加粗</b>"
     assert convert("__加粗__") == "<b>加粗</b>"
@@ -269,7 +278,9 @@ def test_pure_html_block_passthrough():
     assert convert(text) == text
 
 
+# ---------------------------------------------------------------------
 # HTML 实体幂等（避免二次转义 — 用户报告的核心 bug）
+# ---------------------------------------------------------------------
 def test_escape_prose_bare_ampersand():
     assert _escape_prose("AT&T") == "AT&amp;T"
 

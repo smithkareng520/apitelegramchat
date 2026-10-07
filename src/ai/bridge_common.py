@@ -314,12 +314,15 @@ class MediaProgressSlot:
             pass  # 已被移除（重复 drop / 并发保全快照后原列表被清理）
 
 
+# =============================================================================
 # 非流式一次性调用的模拟响应对象（原 anthropic_bridge / responses_bridge
 # 逐字重复的五个 _Simple* 类收敛于此）。
+# -----------------------------------------------------------------------------
 # anthropic_chat_completions_create / openai_responses_chat_completions_create
 # 的返回值形状模拟 ``await client.chat.completions.create(...)``——只暴露
 # subagent_tool.py 实际读取的 .choices[0].message.content / .tool_calls /
 # .usage 三个属性，让调用方无需按 provider 分支处理即可复用现有解析代码。
+# =============================================================================
 class SimpleFunctionCall:
     def __init__(self, name: str, arguments: str) -> None:
         self.name = name
@@ -440,8 +443,21 @@ async def over_limit_final_summary(
     return final_content
 
 
-# 纯文本终局的截断提示。复用 json_repair 的 finish_reason 分类，只有
-# length/max_tokens 表示输出达到上限时才追加；content_filter 和断流不提示。
+# 纯文本终局截断提示（四条循环共用，2026-09 新增）：
+# ---------------------------------------------------------------------------
+# 背景（bug）：_finish_reason_cut_info 此前只喂给
+# build_invalid_arguments_envelope，只在「本轮解析出了工具调用但参数 JSON
+# 非法」时才会被查阅——用于诊断参数是否被输出上限截断。但当模型本轮
+# 没有调用任何工具、只是输出了一段被 max_tokens/length 提前切断的纯文本
+# 终局回答时，finish_reason 同样带着这个信息，却从未被任何调用方读取：
+# 截断的回答会被当成完整回答直接展示给用户和写入历史，用户无法得知
+# 结尾是被截断的、模型自己也不知道（下一轮会以为已经把话说完了）。
+# 修复：四条 agentic 循环在「本轮无工具调用」分支里统一调用本函数，
+# 复用 json_repair._finish_reason_cut_info 同一套 finish_reason 分类
+# 逻辑（避免第二套截断判定标准），仅在 length/max_tokens 时追加一条
+# 简短提示；content_filter 与断流（""）不在此追加——前者展示模型没有
+# 输出内容更合适由现有空响应兜底处理，后者是连接层问题而非内容长度
+# 问题，追加"回答未完成"提示可能产生误导。
 _TRUNCATION_NOTICE = "\n\n_（回答因达到输出长度上限被截断，如需继续请回复“继续”。）_"
 
 

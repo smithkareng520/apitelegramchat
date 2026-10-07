@@ -48,7 +48,9 @@ def _video_plan():
     return resolve_request_plan(SUPPORTED_MODELS["agnes-video-2.5"])
 
 
+# ---------------------------------------------------------------------------
 # 1. build_video_request_body：全文档 schema
+# ---------------------------------------------------------------------------
 def test_video_body_keyframe_mode_with_frames():
     body = build_video_request_body(
         _video_plan(), model="agnes-video-2.5", prompt="人物转身走向窗边",
@@ -154,7 +156,9 @@ def test_video_body_seed_only_integer():
     assert "seed" not in body3
 
 
+# ---------------------------------------------------------------------------
 # 2. 参数声明推导（卡片按钮由模型有效参数决定）
+# ---------------------------------------------------------------------------
 def test_spec_video_full_buttons_n_fixed():
     spec = resolve_media_param_spec(SUPPORTED_MODELS["agnes-video-2.5"])
     assert spec.api_type == "video"
@@ -179,7 +183,9 @@ def test_spec_chat_model_returns_none():
     assert resolve_media_param_spec(SUPPORTED_MODELS["agnes-3.0-flash"]) is None
 
 
+# ---------------------------------------------------------------------------
 # 3. 输入清洗与附件提取
+# ---------------------------------------------------------------------------
 def test_clean_prompt_text_variants():
     assert clean_prompt_text("💡 引用回复: 你好") == "你好"
     assert clean_prompt_text("📎 用户上传了图片「photo_x.jpg」\n\n日落延时") == "日落延时"
@@ -199,7 +205,9 @@ def test_extract_media_attachments_envelopes():
     assert extract_media_attachments(None) == []
 
 
+# ---------------------------------------------------------------------------
 # 4. 渲染
+# ---------------------------------------------------------------------------
 def _video_session(**kwargs):
     spec = resolve_media_param_spec(SUPPORTED_MODELS["agnes-video-2.5"])
     prompt = kwargs.pop("prompt", "一只猫在草地上奔跑")
@@ -257,7 +265,9 @@ def test_render_refs_page_video_limits():
     assert "必须含音轨" in str(kb2)                 # 音轨状态也在按钮标签上
 
 
+# ---------------------------------------------------------------------------
 # 5. 回调状态机（Telegram IO mock）
+# ---------------------------------------------------------------------------
 class _IO:
     """捕获 media_wizard 的 Telegram 出站调用。"""
 
@@ -516,7 +526,9 @@ def test_build_submission_image_overrides():
     assert ov["reference_images"] == ["https://r2.example/ref.png"]
 
 
+# ---------------------------------------------------------------------------
 # 6. 媒体循环 media_overrides（卡片参数优先于消息内提取）
+# ---------------------------------------------------------------------------
 def test_video_loop_overrides_reach_request(monkeypatch):
     import ai.agentic_loops as loops
 
@@ -599,7 +611,9 @@ def test_image_loop_overrides_reach_task(monkeypatch):
     assert len(task.input_images) == 2
 
 
+# ---------------------------------------------------------------------------
 # 7. 失败通知渲染与报错语义（2026-09 ModelScope 事故回归）
+# ---------------------------------------------------------------------------
 def test_notify_generation_failure_no_double_escape(monkeypatch):
     """修复回归：HTML notice 不得被二次转义（用户曾看到 &lt;b&gt; 字面量）。
 
@@ -704,7 +718,9 @@ def test_image_loop_error_reports_download_diagnostics(monkeypatch):
     assert "&lt;" not in notice and "&gt;" not in notice
 
 
+# ---------------------------------------------------------------------------
 # 8. 提交卡片终态就地更新（修复：卡片提交后停在"进行中"不再变化）
+# ---------------------------------------------------------------------------
 def test_submit_card_shows_in_progress_not_done(monkeypatch):
     """提交瞬间卡片文案必须是"进行中"语义，不能读起来像已经生成完成。"""
     io = _IO().install(monkeypatch)

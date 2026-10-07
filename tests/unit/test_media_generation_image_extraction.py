@@ -68,10 +68,12 @@ def test_response_items_to_bytes_accepts_one_real_image_and_respects_limit():
     assert diagnostics == []      # 全部成功时无诊断
 
 
-# 回归测试：上游返回 HTTP 200 和图片 URL 时，必须正确提取图片结果。
+# ---------------------------------------------------------------------------
+# 回归测试（2026-09 ModelScope 生产事故）：中转商返回 HTTP 200 + 图片 URL，
 # 但 URL 下载下来是防盗链错误页（7627 字节 HTML）。旧代码静默拒绝后上层
 # 只会报“接口返回成功，但未找到可用图片数据”——语义完全失真。
 # 诊断必须逐项记录真实原因并透传给用户报错。
+# ---------------------------------------------------------------------------
 
 class _FakeDownloadSession:
     """按 {status, headers, body} 脚本返回响应的最小 aiohttp 会话替身。"""
@@ -310,9 +312,11 @@ def test_openrouter_chat_image_task_resolves_registered_model_without_name_error
     assert result.endpoint == "/chat/completions"
 
 
-# 回归测试：/images/edits 失败后不能降级为普通图像生成。
+# ---------------------------------------------------------------------------
+# 回归测试（2026-09-08 生产事故）：/images/edits 失败后绝不能回退
 # /images/generations —— 中转站会忽略非官方 image 字段，把编辑请求当
 # 纯文生图执行，HTTP 200 "假成功"但产出一张与原图无关的新图。
+# ---------------------------------------------------------------------------
 
 def test_openai_compat_edit_never_falls_back_to_generations(monkeypatch):
     """编辑端点失败时绝不能伪装成文生图成功。"""

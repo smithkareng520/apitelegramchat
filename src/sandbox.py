@@ -1,6 +1,17 @@
-# Landlock 沙箱、资源限制与进程树看门狗。
-# 沙箱限制在 workspace 内，并通过最小化环境变量、Landlock 和 rlimit
-# 限制子进程的文件系统、资源和进程树访问。Landlock 不依赖 userns 或特权容器。
+# =====================================================================
+# sandbox.py — Landlock 沙箱 + 资源限制 + Fork Bomb 看门狗
+# =====================================================================
+# 设计原则:
+#   1. 每个 chat_id 拿到独立的 Landlock 文件系统沙箱（限制在 workspace 内）
+#   2. 敏感环境变量不传入子进程
+#   3. Landlock 限制不可逆、子进程继承，防止访问 workspace 之外的任何路径
+#   4. 看门狗监控进程树大小，超过阈值杀掉沙箱（防 fork bomb）
+#   5. rlimit 限制 CPU/文件大小/fd 数量
+#
+# 不使用 bwrap —— Render / Heroku / 非 privileged Docker 内核禁了
+# unprivileged userns，bwrap 永远起不来。Landlock 是 Linux 5.13+ 的
+# 非特权文件系统隔离方案，不需要任何 capability。
+# =====================================================================
 
 import asyncio
 import ctypes
@@ -15,30 +26,39 @@ from net_shims import ensure_network_shims
 
 logger = logging.getLogger(__name__)
 
-# 沙箱资源限制（可通过环境变量调整）。
+# ---------- 沙箱配置（环境变量可调） ----------
 SANDBOX_MAX_PROCS = int(os.getenv("SANDBOX_MAX_PROCS", "50"))
 SANDBOX_MAX_CPU_SEC = int(os.getenv("SANDBOX_MAX_CPU_SEC", "300"))   # 5 分钟 CPU
 SANDBOX_MAX_FILE_SIZE = int(os.getenv("SANDBOX_MAX_FILE_SIZE", str(100 * 1024 * 1024)))  # 100MB/文件
 SANDBOX_MAX_OPEN_FILES = int(os.getenv("SANDBOX_MAX_OPEN_FILES", "256"))
 SANDBOX_TIMEOUT_SEC = int(os.getenv("SANDBOX_TIMEOUT_SEC", "300"))
 
-# 无输出空闲超时。
-# 命令持续无输出超过该时长即终止，避免网络阻塞、交互等待等静默卡死。
-# bash 可通过 timeout 覆盖；0 表示禁用该保护。
+# ---------- 无输出空闲超时（v2.4 bash 防卡死） ----------
+# 命令持续无输出超过该秒数即判定为卡死（典型：网络不可达时 connect 静默
+# 挂起、交互提示等待、无输出死循环），提前 kill 并向模型返回可操作的
+# 错误消息，而不是等满 SANDBOX_TIMEOUT_SEC（默认 300s）才超时。模型可
+# 通过 bash 工具的 timeout 参数为已知的长静默命令禁用本保护。0 = 禁用。
 SANDBOX_IDLE_TIMEOUT_SEC = int(os.getenv("SANDBOX_IDLE_TIMEOUT_SEC", "60"))
 # bash 工具 timeout 参数允许的硬上限（秒）；外层工具超时（BASH_TOOL_CALL_TIMEOUT）
 # 据此联动放大。
 SANDBOX_TIMEOUT_HARD_MAX = int(os.getenv("SANDBOX_TIMEOUT_HARD_MAX", "600"))
-# 沙箱内 Python 进程的默认 socket 超时，由 sitecustomize.py 注入。
-# 0 表示不注入；用于避免未设置超时的网络脚本长时间阻塞。
+# 沙箱内 Python 进程的默认 socket 超时（秒）。通过 sitecustomize.py 注入
+# socket.setdefaulttimeout()，让忘记设超时的脚本（smtplib / urllib /
+# requests / socket.create_connection）在网络不可达时快速失败，而不是按
+# 内核默认 TCP 重试挂起约 2 分钟/次。0 = 不注入。该值会写入子进程环境
+# （SANDBOX_SOCKET_TIMEOUT_SEC），由沙箱内 sitecustomize.py 读取。
 SANDBOX_SOCKET_TIMEOUT_SEC = int(os.getenv("SANDBOX_SOCKET_TIMEOUT_SEC", "15"))
 
-# 沙箱内固定身份，需与镜像中的 passwd 用户保持一致。
-# 不向 shell 暴露 chat_id；模型可通过 $WORKSPACE 获取必要的工作区信息。
+# 沙盒内固定身份（whoami / $USER / $LOGNAME / ls 属主列全部一致）。
+# 必须与镜像内 passwd 用户名同步（见 Dockerfile 的 useradd claude 行），
+# 否则 $USER 会与真实 uid 解析结果不一致。不使用 chat{chat_id}：
+# chat id 属于路由/计费元数据，不应以环境变量形式暴露给模型可读的 shell ——
+# 模型需要知道自己在哪个工作区时，读 $WORKSPACE 路径即可，且那是必要信息。
 SANDBOX_USER = os.getenv("APITELEGRAMCHAT_SANDBOX_USER", "claude").strip() or "claude"
 
-# libc：Landlock/prctl 通过 ctypes 调用。
-# 加载失败时置为 None，各调用点负责判空。
+# ---------- libc ----------
+# Any：_libc 加载失败时为 None，各调用点各自判空；若声明为 ctypes.CDLL | None，
+# _apply_landlock 内未判空直接 syscall 的既有调用点会级联报错，Any 最小且不失真。
 _libc: Any
 try:
     _libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -48,8 +68,11 @@ except OSError:
 PR_SET_NO_NEW_PRIVS = 38
 PR_SET_DUMPABLE = 11
 
-# PR_SET_DUMPABLE 属于内核级加固。容器 seccomp 可能返回 EINVAL；缓存结果，
-# 避免每个 bash 子进程重复报错。这表示安全能力状态，不是简单的日志抑制。
+# PR_SET_DUMPABLE is a kernel-level hardening primitive. Some managed/container
+# runtimes install a seccomp policy that rejects this prctl with EINVAL even
+# though Landlock and PR_SET_NO_NEW_PRIVS are available. Cache the result so a
+# restricted host is diagnosed once rather than producing one ERROR per bash
+# child. This is deliberately a security-status signal, not log suppression.
 _dumpable_state: Optional[bool] = None
 
 
@@ -128,7 +151,9 @@ def harden_parent_process() -> None:
         logger.info("Parent process hardened: PR_SET_DUMPABLE=0")
 
 
+# =====================================================================
 # Landlock（非特权文件系统隔离）
+# =====================================================================
 # Linux 5.13+ 的 Landlock 允许非特权进程限制自己的文件系统访问范围。
 # 不需要 userns / CAP_SYS_ADMIN / privileged 容器。
 #
@@ -360,7 +385,9 @@ def _apply_landlock(workspace_path: str) -> bool:
         return False
 
 
+# =====================================================================
 # preexec_fn —— fork 后 exec 前调用
+# =====================================================================
 def _preexec_sandbox(workspace_path: str) -> None:
     """Install all mandatory child restrictions before exec("bash")."""
     import resource
@@ -384,7 +411,9 @@ def _preexec_sandbox(workspace_path: str) -> None:
     resource.setrlimit(resource.RLIMIT_NOFILE, (SANDBOX_MAX_OPEN_FILES, SANDBOX_MAX_OPEN_FILES))
 
 
+# =====================================================================
 # sitecustomize 注入（沙箱内 Python 默认 socket 超时）
+# =====================================================================
 # 模型生成的 Python 脚本几乎从不主动设网络超时；一旦网络不可达（防火墙
 # 静默丢包、SMTP 端口被墙），smtplib/urllib/requests 会按内核默认 TCP
 # 重试挂起约 2 分钟/次，bash 层的空闲/总超时只能事后杀。sitecustomize.py
@@ -435,7 +464,9 @@ def _ensure_sitecustomize(runtime_bin: Path) -> None:
         logger.debug("sitecustomize injection skipped: %s", exc)
 
 
+# =====================================================================
 # 构造 bash argv / env
+# =====================================================================
 def build_sandbox_argv() -> list:
     """bash 进程的启动参数"""
     return ["/bin/bash", "--noprofile", "--norc", "-s"]
@@ -581,7 +612,9 @@ def build_sandbox_env(
     }
 
 
+# =====================================================================
 # Fork Bomb 看门狗
+# =====================================================================
 def _count_descendants(root_pid: int) -> int:
     """通过 /proc 统计进程树大小"""
     children_map: dict[int, list[int]] = {}

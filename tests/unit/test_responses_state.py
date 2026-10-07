@@ -9,7 +9,9 @@ MODEL_A = "model-a"
 MODEL_B = "model-b"
 
 
+# ---------------------------------------------------------------------------
 # 单一状态源：chat 只有一个 previous_response_id 链头
+# ---------------------------------------------------------------------------
 def test_first_turn_bootstraps_then_commit_records_chain_head() -> None:
     st = rs.ResponseState()
     turn = st.begin_turn("USER")
@@ -51,7 +53,9 @@ def test_single_chain_pointer_is_overwritten_per_chat() -> None:
     assert (prev_id, mode) == ("resp_a2", "chain")
 
 
+# ---------------------------------------------------------------------------
 # 异常状态：失败不推进链
+# ---------------------------------------------------------------------------
 def test_commit_without_response_id_is_rejected() -> None:
     st = rs.ResponseState()
     turn = st.begin_turn("USER")
@@ -90,7 +94,9 @@ def test_invalidate_chain_is_idempotent_without_chain() -> None:
     assert st.chain.response_id is None
 
 
+# ---------------------------------------------------------------------------
 # 模型 / 端点切换：断链 + 不复活旧链
+# ---------------------------------------------------------------------------
 def test_model_switch_breaks_chain_and_bootstraps() -> None:
     st = rs.ResponseState()
     t1 = st.begin_turn("USER")
@@ -128,7 +134,9 @@ def test_endpoint_partition_change_breaks_chain() -> None:
     assert mode.startswith("bootstrap:")
 
 
+# ---------------------------------------------------------------------------
 # 跨协议写入 / 恢复
+# ---------------------------------------------------------------------------
 def test_legacy_divergence_invalidates_chain() -> None:
     chat_id = 991000001
     st = rs.get_response_state_sync(chat_id)

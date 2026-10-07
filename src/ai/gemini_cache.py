@@ -62,7 +62,9 @@ from core.messages import Message
 logger = get_logger(__name__)
 
 
+# =============================================================================
 # 可调参数（环境变量）
+# =============================================================================
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -93,7 +95,9 @@ _MAX_ENTRIES = _env_int("GEMINI_EXPLICIT_CACHE_MAX_ENTRIES", 32, 1, 1000)
 _AWAIT_CREATE_S = _env_float("GEMINI_EXPLICIT_CACHE_AWAIT_CREATE_S", 3.0, 0.0, 30.0)
 
 
+# =============================================================================
 # HTTP 薄封装（测试可 monkeypatch）
+# =============================================================================
 async def _http_json(method: str, url: str, headers: dict,
                      payload: Optional[dict], timeout_s: float) -> tuple[int, dict]:
     timeout = aiohttp.ClientTimeout(total=timeout_s)
@@ -114,7 +118,9 @@ def _err_text(data: dict) -> str:
     return str(data or "")
 
 
+# =============================================================================
 # 前缀切分（纯函数）
+# =============================================================================
 def _last_turn_boundary(messages: list) -> Optional[int]:
     """当前回合起始下标 = 最后一条 user 消息的位置；无 user 返回 None。"""
     for i in range(len(messages) - 1, -1, -1):
@@ -234,7 +240,9 @@ def _parse_expire_to_monotonic(expire_time: Optional[str]) -> Optional[float]:
         return None
 
 
+# =============================================================================
 # 管理器
+# =============================================================================
 class GeminiCacheHandle:
     """一次请求对缓存的成功引用（不可变值对象）。"""
 
@@ -286,7 +294,9 @@ class GeminiExplicitCacheManager:
         self._chat_fail_streak: dict = {}              # chat_id -> int
         self._ineligible_models: set = set()
 
+    # ------------------------------------------------------------------
     # 对外主入口
+    # ------------------------------------------------------------------
     async def acquire(self, chat_id: int, model: str, messages: list,
                       gemini_tools: Optional[list],
                       convert_fn: Callable, base_url: str, headers: dict,
@@ -348,7 +358,9 @@ class GeminiExplicitCacheManager:
                 self._maybe_refresh(entry)
         return handle
 
+    # ------------------------------------------------------------------
     # 失效（请求方收到 400/404 时调用；同步摘除 + 后台删除）
+    # ------------------------------------------------------------------
     def invalidate(self, handle: GeminiCacheHandle, reason: str = "") -> None:
         if handle is None:
             return
@@ -358,7 +370,9 @@ class GeminiExplicitCacheManager:
         if entry is not None:
             self._spawn(self._delete_entry(entry))
 
+    # ------------------------------------------------------------------
     # 内部：查找 / 创建 / 续期 / 删除 / 淘汰
+    # ------------------------------------------------------------------
     def _key_for(self, model: str, tools_hash: str, prefix: list) -> str:
         return hashlib.sha1(
             _canonical([model, tools_hash, prefix]).encode("utf-8")).hexdigest()

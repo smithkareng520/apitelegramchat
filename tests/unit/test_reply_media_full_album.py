@@ -40,7 +40,9 @@ def _reply_msg(reply: dict, chat_id: int = 777) -> dict:
     return {"chat": {"id": chat_id}, "reply_to_message": reply}
 
 
+# ----------------------------------------------------------------------
 # state 相册媒体登记表
+# ----------------------------------------------------------------------
 
 def test_record_album_media_collects_all_photos():
     state.album_media_registry.clear()
@@ -120,7 +122,9 @@ def test_reply_to_album_can_resolve_incremental_registration():
     }))
     assert [it["file_id"] for it in items] == ["big1", "big2"]
 
+# ----------------------------------------------------------------------
 # _get_reply_media：相册整组补齐 + 单媒体列表化
+# ----------------------------------------------------------------------
 
 def test_reply_to_album_returns_all_photos():
     state.album_media_registry.clear()
@@ -169,7 +173,9 @@ def test_reply_media_empty_without_reply():
     assert _get_reply_media({"chat": {"id": 1}}) == []
 
 
+# ----------------------------------------------------------------------
 # _get_reply_context：媒体占位描述
+# ----------------------------------------------------------------------
 
 def test_reply_context_describes_captionless_media():
     ctx = _get_reply_context(_reply_msg({"photo": [{"file_id": "x"}]}))
@@ -186,7 +192,9 @@ def test_reply_context_prefers_quote_and_caption():
     assert "看这张图" in ctx_cap
 
 
+# ----------------------------------------------------------------------
 # WAKEUP_PROMPT：去工具化表述（防幻觉 tool_calls）
+# ----------------------------------------------------------------------
 
 def test_wakeup_prompt_avoids_tool_invocation_instructions():
     import proactive

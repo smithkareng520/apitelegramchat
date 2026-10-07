@@ -1,8 +1,11 @@
+# =====================================================================
 # tests/unit/test_web_search_filter.py — 搜索域名黑名单规则引擎
+# =====================================================================
 # 被测关键路径：web_search 结果卫生管线（规则解析 → URL 匹配 → 结果过滤
 #       → 候选数量补偿）。
 # 覆盖：三种规则语法（精确 / [*.] 根+子域 / *. 仅子域）、非法与重复规则
 #       过滤、子域名后缀安全（evil.com 反例）、过滤计数、候选数量计算。
+# =====================================================================
 import web_search_filter as wsf
 from web_search_filter import (
     DomainRule,
@@ -13,7 +16,9 @@ from web_search_filter import (
 )
 
 
+# ---------------------------------------------------------------------
 # 规则解析
+# ---------------------------------------------------------------------
 def test_exact_rule_matches_root_only():
     (rule,) = parse_blacklist_rules(["baijiahao.baidu.com"])
     assert rule.include_root is True
@@ -91,7 +96,9 @@ def test_string_input_treated_as_single_rule():
     assert rule.domain == "single.com"
 
 
+# ---------------------------------------------------------------------
 # URL 匹配
+# ---------------------------------------------------------------------
 def test_is_blacklisted_url_by_settings_default_rules():
     # 使用 web_search_settings 出厂黑名单（[*.]zhihu.com 等）
     assert is_blacklisted_search_url("https://www.zhihu.com/question/123") is True
@@ -111,7 +118,9 @@ def test_hostname_missing_or_invalid_url():
     assert is_blacklisted_search_url("") is False
 
 
+# ---------------------------------------------------------------------
 # 结果过滤
+# ---------------------------------------------------------------------
 def _result(link: str) -> dict:
     return {"title": f"title of {link}", "link": link}
 
@@ -138,7 +147,9 @@ def test_filter_results_missing_link_kept():
     assert kept == [{"title": "无 link 字段"}]
 
 
+# ---------------------------------------------------------------------
 # 候选数量计算
+# ---------------------------------------------------------------------
 def test_candidate_count_multiplies_then_caps():
     # 出厂配置：倍率 2，候选上限 50
     assert candidate_result_count(10) == 20

@@ -15,7 +15,7 @@ from markdown_converter import render_telegram_fragment as convert_markdown_to_t
 
 logger = get_logger(__name__)
 
-# 使用不可变集合，避免运行时误修改。
+# 改为 frozenset：避免误操作修改；查询性能更好（O(1) 包含判定）。
 # 同时预计算 lower-case 版本（中文无需小写，但英文要），避免在热路径
 # 上反复 .lower()。
 _CONTENT_SAFETY_KEYWORDS_RAW = (
@@ -38,7 +38,9 @@ _CONTENT_SAFETY_KEYWORDS = frozenset(
     for kw in _CONTENT_SAFETY_KEYWORDS_RAW
 )
 
+# =====================================================================
 # 机器错误文本的 Markdown 触发符惰性化
+# ---------------------------------------------------------------------
 # 错误详情是机器文本（上游网关/SDK 的原始报错），不是用户或模型写的
 # Markdown。但错误卡片会经过两遍 Markdown→HTML 转换：① 本模块构建卡片时
 # （_format_error_detail_for_display 逐行调用转换器）；② 发送层兜底
@@ -46,7 +48,7 @@ _CONTENT_SAFETY_KEYWORDS = frozenset(
 # 一遍）。转换器会把 `*` 序列配对成强调标签：`***x***`→`<b><i>x</i></b>`、
 # `**x**`→`<b>`、`*x*`→`<i>`。
 #
-# 案例（2026-09-11 [5332ea8f]）：Agnes 网关在 400 报错文本里对
+# 生产事故实锤（2026-09-11 [5332ea8f]）：Agnes 网关在 400 报错文本里对
 # R2 域名/路径/预签名参数做了 `***` 脱敏掩码——`***.BadRequestError: ...`
 # `https://***.com/***/***?X-Amz-Credential=***&...` 共 11 个掩码，两两
 # 配对后被转换器吃成 <b><i> 粗斜体对：掩码本身消失、报错被随机粗斜体
@@ -58,6 +60,7 @@ _CONTENT_SAFETY_KEYWORDS = frozenset(
 # 强调规则，两遍转换均惰性、幂等。中文界面下全角星号也是最自然的掩码
 # 写法。注意：必须同时覆盖①②两遍——只修①的话，发送层第二遍仍会把
 # 残留的 `*` 配对吃掉。
+# =====================================================================
 
 
 def _neutralize_markdown_triggers(text: str) -> str:

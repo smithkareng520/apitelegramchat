@@ -125,7 +125,9 @@ class SerperServerError(SerperError):
         super().__init__(message, category="server", status_code=status_code, retryable=True)
 
 
+# ---------------------------------------------------------------------------
 # 内部工具
+# ---------------------------------------------------------------------------
 
 def _is_configured() -> bool:
     return bool(SERPER_API_KEY)
@@ -289,7 +291,9 @@ async def _post_with_retry(
     raise SerperError(f"Serper {endpoint} exhausted retries")
 
 
+# ---------------------------------------------------------------------------
 # 公共 API：四种搜索模式
+# ---------------------------------------------------------------------------
 
 async def search(
     query: str,

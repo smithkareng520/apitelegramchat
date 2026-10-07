@@ -6,7 +6,7 @@
 #     在原页面上的原始位置；轮播图（swiper/carousel/gallery 等容器）识别为
 #     <tg-slideshow>。绝不把媒体集中堆到末尾"媒体区"。
 #   - 【Telegram 工具 UI】由 tool_executors.format_tool_result 单独生成，
-#     保持简洁展示（标题 + 来源域名链接）；本模块不负责 UI。
+#     保持与历史版本相同的简单展示（标题 + 来源域名链接），本模块不管 UI。
 #
 # 实现链路：
 #   1. trafilatura XML（保留链接/图片/格式/表格及其相对顺序）→ Telegram HTML 块；
@@ -213,7 +213,9 @@ def _is_probably_decorative(url: str) -> bool:
     return bool(re.search(r"(?:^|[/_-])(?:1x1|0x0|2x2)(?:[._/-]|$)", path))
 
 
+# ---------------------------------------------------------------------------
 # 1) DOM 媒体收集（带文档顺序位置，供"原位插入"使用）
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -481,7 +483,9 @@ def _in_boilerplate(el: Any) -> bool:
 
 
 
+# ---------------------------------------------------------------------------
 # 2) trafilatura XML → Telegram Rich HTML
+# ---------------------------------------------------------------------------
 
 # trafilatura <hi rend="#b #i"> → Telegram 标签映射。
 # rend token 全集来自 trafilatura 1.12.2 htmlprocessing.REND_TAG_MAPPING 实测：
@@ -845,7 +849,9 @@ def trafilatura_xml_to_rich_html(xml_text: str, base_url: str = "") -> list[str]
         return []
 
 
+# ---------------------------------------------------------------------------
 # 2.5) 正文 XML 提取策略（含中文页面退化检测）
+# ---------------------------------------------------------------------------
 
 _XML_BLOCK_RE = re.compile(r"<(?:p|head|list|table|quote|code|graphic|media)\b")
 _RAW_HTML_BLOCK_RE = re.compile(r"<(?:p|h[1-6]|li|blockquote|pre|table)\b", re.IGNORECASE)
@@ -1098,7 +1104,9 @@ def extract_body_blocks(html_text: str, base_url: str = "") -> list[str]:
     return _restore_severely_truncated_dom_tables(converted_blocks, html_text)
 
 
+# ---------------------------------------------------------------------------
 # 3) 结果组装（文档顺序原位插入媒体 + 轮播分组 + 预算内整块截断）
+# ---------------------------------------------------------------------------
 
 _TAG_TEXT_RE = re.compile(r"<[^>]+>")
 
