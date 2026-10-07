@@ -1,33 +1,4 @@
-"""Anthropic 原生 Messages API 桥接层。
-
-设计原则（务必先读，修改本文件前请确保理解）：
-====================================================
-1. 全局对话历史（app.py:update_conversation_and_ledger 写入的
-   ctx["conversation_history"]）是所有厂商共享的单一存储，且用户可以
-   随时在任意两次发言之间切换模型/厂商。因此持久化进历史的消息，
-   必须始终是项目原有的 OpenAI 兼容形状：
-     {"role": "user"/"assistant"/"tool"/"system", "content": ..., ...}
-   绝不能把 Anthropic 原生的 content-block 形状（tool_use / tool_result
-   块）写回 new_history_entries / loop_messages 传给调用方。
-
-2. 因此本文件的策略是"边界转换"：
-   - _agentic_loop_anthropic 接收到的 messages 参数、以及它追加进
-     new_history_entries 的内容，全部是 OpenAI 形状（与
-     _agentic_loop_openai_compat / _agentic_loop_gemini_native
-     完全一致），可以直接复用 tool_call_loop._run_tool_calls_and_append。
-   - 仅在"即将调用 Anthropic API"之前，把当前累积的 OpenAI 形状
-     loop_messages 转换成 Anthropic 的 {system, messages} 形状
-     （_convert_messages_to_anthropic）；工具 schema 转换见
-     _convert_tools_to_anthropic。
-   - Anthropic 返回的内容在写回 loop_messages / new_history_entries 前，
-     统一转换回 OpenAI 形状（content 字符串 + tool_calls 列表），
-     与其它两条循环完全同构，下游 _run_tool_calls_and_append /
-     turn_recovery / update_conversation_and_ledger 都无需改动。
-
-这样即使用户上一轮用的是 Claude，下一轮切换回 OpenAI 兼容厂商，历史
-读出来仍是标准 OpenAI 形状，不会导致任何其它厂商的请求出错——完全
-不影响现有项目行为。
-"""
+"""Anthropic Messages API 桥接层，负责内部消息与原生协议的边界转换。"""
 import asyncio
 import json
 import uuid
@@ -77,9 +48,7 @@ from core.messages import (
 logger = get_logger(__name__)
 
 
-# =============================================================================
 # 工具 schema 转换：OpenAI function-calling 形状 -> Anthropic tool 形状
-# =============================================================================
 # OpenAI: {"type": "function", "function": {"name", "description", "parameters"}}
 # Anthropic: {"name", "description", "input_schema"}
 def _sanitize_anthropic_tool_schema(schema: Any) -> dict[str, Any]:
@@ -150,11 +119,9 @@ def _convert_tools_to_anthropic(tools: Optional[list]) -> Optional[list]:
     return converted or None
 
 
-# =============================================================================
 # 消息格式转换：OpenAI 形状（role: system/user/assistant/tool）
 #             -> Anthropic 形状（顶层 system 字符串 + messages: user/assistant，
 #                                 tool 结果作为 user 消息里的 tool_result 块）
-# =============================================================================
 def _blocks_to_anthropic_content(blocks: list) -> list:
     """把内部内容块列表转换成 Anthropic content 块列表。
 
@@ -314,12 +281,10 @@ def _convert_messages_to_anthropic(messages: list) -> tuple[list[dict], list]:
     return system_blocks, anthropic_messages
 
 
-# =============================================================================
 # 非流式一次性调用：供 subagent_tool.py 复用（子 agent 是后台任务，不需要
 # 流式增量，与其原有 "普通 chat.completions.create" 语义对齐）。
 # 模拟响应对象（Simple* 五件套）由 bridge_common 提供，与 responses_bridge
 # 共享同一份实现。
-# =============================================================================
 async def anthropic_chat_completions_create(
         client: "AsyncAnthropic",
         *,
@@ -405,9 +370,7 @@ async def anthropic_chat_completions_create(
     )
 
 
-# =============================================================================
 # usage 归一：Anthropic Usage -> OpenAI 形状 dict
-# =============================================================================
 # 目的：让 _log_cache_usage / app.update_conversation_and_ledger 的既有
 # OpenAI 形状消费方无需分支处理（与 gemini_bridge._gemini_usage_to_openai
 # 同一边界转换模式）。
@@ -457,10 +420,7 @@ def _anthropic_usage_to_openai(usage: Any) -> Optional[dict]:
     }
 
 
-# =============================================================================
 # 流式请求瞬时故障重试（503 overloaded / 429 / 5xx / 连接抖动）
-# =============================================================================
-# 背景（2026-09 生产事故）：上游网关过载时返回 503 overloaded_error，
 # 错误元数据明确标注 retryable=True / safe_to_auto_retry=True /
 # max_retry_attempts=2 / retry_after_seconds=1，但 anthropic SDK 对流式
 # 请求不会自动代劳重试——异常直接抛进 _agentic_loop_anthropic，整轮
@@ -553,9 +513,7 @@ def _extract_retry_after_seconds(e: Exception) -> Optional[float]:
     return None
 
 
-# =============================================================================
 # 原生 agentic 循环
-# =============================================================================
 async def _agentic_loop_anthropic(
         client: "AsyncAnthropic",
         current_model: str,
@@ -679,23 +637,18 @@ async def _agentic_loop_anthropic(
         content_acc = ""
         reasoning_acc = ""
         tool_use_blocks: dict[int, dict] = {}
-        # 打断保全（改动点1，与 openai_compat / gemini / responses 循环同构）：
         # 流式期间 journal 始终持有一条与 content_acc / reasoning_acc 同步的
         # assistant 占位消息；tool_use 累积只在流正常结束后由 finalize 写入
-        # （改动点2：未完成的 tool_use 不入历史）。
         live_slot = LiveAssistantSlot(new_history_entries)
         current_stream_cell = [None]
-        # v2.5：Anthropic 流结束原因（max_tokens / end_turn / tool_use…）。
         stop_reason = ""
 
         switch_stream = make_switch_stream(builder, current_stream_cell)
 
         try:
             await start_chat_action(builder.chat_id, "typing")
-            # v2.6：上游瞬时故障应用层重试（503 overloaded / 429 / 5xx /
             # 连接抖动）。网关错误元数据会给出 retryable=True /
             # safe_to_auto_retry=True / max_retry_attempts=2，但 SDK 对流式
-            # 请求不代劳重试，此前一次瞬时 503 就把整轮对话炸掉。
             # 安全前提：仅在本轮「零输出」（content_acc / reasoning_acc /
             # tool_use_blocks 全空，未向 builder 流出任何内容）时重试，
             # 一旦有 partial output 立即放弃，杜绝重复内容。
@@ -750,7 +703,6 @@ async def _agentic_loop_anthropic(
                     final_message = await stream.get_final_message()
                     if getattr(final_message, "usage", None):
                         final_usage = final_message.usage
-                    # v2.5：捕获流结束原因（max_tokens = 输出上限切断），
                     # 供下方参数诊断信封定性「参数被切断」的根因。
                     stop_reason = str(getattr(final_message, "stop_reason", "") or "")
                     break  # 成功：退出重试循环
@@ -806,7 +758,6 @@ async def _agentic_loop_anthropic(
         for idx in sorted(tool_use_blocks.keys()):
             entry = tool_use_blocks[idx]
             args_str = entry["args_json"] or "{}"
-            # v2.3 Self-Correction：Anthropic 的 partial_json 拼接完成后
             # 理应是完整 JSON；解析失败时不再静默换成 "{}"（那会让工具
             # 带空参数执行、模型收不到任何参数写坏了的反馈，陷入盲重试），
             # 而是先尝试保守自动修复，失败则写入带完整诊断的可恢复信封
@@ -848,7 +799,6 @@ async def _agentic_loop_anthropic(
 
         # 块边界换草稿检查点①②（本轮最后一个块）：流已结束，最后一个思考块
         # 或文本块在此闭合，switch_stream 不会再被触发，故在此补一次检查。
-        # 历史问题1（工具流式输出被拆到新草稿）已由安全点判定内的
         # _has_pending_tool_group 守卫兜住：本轮若已建工具条目而未收束，
         # 这里不会滚动，工具批次结束后的 tool.end 安全点仍会照常触发。
         # 终局轮修复：此处 tool_calls_list 已定型（本循环无伪工具调用纠正
@@ -875,7 +825,6 @@ async def _agentic_loop_anthropic(
             content_acc = append_truncation_notice_if_needed(
                 builder, content_acc, stop_reason)
 
-        # 打断保全（改动点1）：升级 journal 里的实时占位为完整消息
         # （tool_calls / reasoning / 最终文本原地补全，同一对象进 loop_messages）。
         live_slot.finalize(loop_messages, content_acc, tool_calls_list, reasoning_acc)
 

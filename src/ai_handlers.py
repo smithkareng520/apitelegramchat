@@ -1270,7 +1270,7 @@ async def get_ai_response(
             # 把过程倾倒给用户）。无可见内容或发送失败时保留冻结草稿，
             # 由打断方 mark_preserved_draft 兜底——见
             # RichMessageBuilder.finalize_interrupted_draft。
-            # journal 传入做草稿层↔历史层反向校验（改动点3，诊断用）。
+            # 传入 journal 做草稿层与历史层的一致性校验。
             try:
                 await builder.finalize_interrupted_draft(journal=journal)
             except asyncio.CancelledError:
@@ -1308,15 +1308,7 @@ async def get_ai_response(
         # （request URL、Authorization、内部 trace 等）。
         # 外部只看到简短原因 + error_id。
         error_msg_for_user = f"内部错误 (error_id={error_id})"
-        # 修复（2026-09 生产事故）：旧写法
-        #   hasattr(e, "response") and hasattr(e.response, "text")
-        # 在流式请求抛出的 APIStatusError 上必炸：e.response 是未读取的
-        # httpx 流式 Response，访问 .text 属性抛 httpx.ResponseNotRead，
-        # 而 hasattr() 只吞 AttributeError——二次异常从错误处理器逃逸，
-        # 把真正的上游错误（如 503 overloaded）完全掩盖，用户只看到
-        # "Attempted to access streaming response content..."。
-        # 现改用安全提取函数：优先取 SDK 已解析的 e.body，
-        # httpx response.text 仅在已读时生效，永不抛异常。
+        # 错误体统一由安全提取器读取，避免未读取的流式 Response 触发二次异常。
         body = extract_error_body_text(e)
         if body:
             try:
@@ -1456,18 +1448,8 @@ async def _call_api(
         # model_info 不换 current_model 会把原模型名发到默认厂商端点，
         # 必然 400/404。supports_tools 同步按新模型重算。
         #
-        # 已知局限（未在此处修复，避免引入新的不一致）：messages 里的
-        # system 段（含技能目录/deliver_reply·message_user 说明文字）
-        # 已经在 get_ai_response 里按"降级前"的 model_info.supports_tools
-        # 组装好了。这里只重算了 tools_to_pass（决定实际发不发工具面），
-        # 没有重新调用 build_system_prompt 重建 messages——因为重建需要
-        # chat_id/username/workspace_namespace_value 等一整套上下文，
-        # 这些参数本函数并不具备，强行在这里重建容易和上游的组装顺序
-        # （base_segment/extra_segment 两段 + TIMER/静默模式追加段）
-        # 产生新的不一致。降级到未知 provider 属于配置错误触发的极端
-        # 分支，不是常规路径；常规路径（未知 provider 不出现）里
-        # supports_tools 在组装 messages 时和这里读到的完全一致，
-        # 不受此限制影响。
+        # 降级时只重算 tools_to_pass；system prompt 已按原 model_info 组装，
+        # 当前上下文不足以安全重建，保持现状避免改变消息顺序。
         model_info = SUPPORTED_MODELS.get(DEFAULT_MODEL, model_info)
         current_model = DEFAULT_MODEL
         supports_tools = bool(model_info.supports_tools)

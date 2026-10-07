@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     from config import ModelConfig
     from responses_state import TurnState
 
-
 def invalidate_responses_chain_for(builder: "DraftManager") -> None:
     """非 Responses 协议适配器在写入历史前作废 Responses 链头。
 
@@ -41,7 +40,6 @@ def invalidate_responses_chain_for(builder: "DraftManager") -> None:
     chat_id = getattr(builder, "chat_id", None)
     if chat_id is not None:
         mark_legacy_divergence(chat_id)
-
 
 class ChatProtocolAdapter(ABC):
     """聊天协议适配器：包一层该协议的 agentic 循环。
@@ -76,6 +74,5 @@ class ChatProtocolAdapter(ABC):
     ) -> tuple[str | None, Any, list]:
         """执行该协议的 agentic 循环（含工具执行与历史追加）。"""
         raise NotImplementedError
-
 
 __all__ = ["ChatProtocolAdapter"]

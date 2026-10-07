@@ -23,10 +23,8 @@ from state import bind_current_user_namespace, reset_current_user_namespace
 _SCOPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SCOPE_ENV = "APITELEGRAMCHAT_MCP_SCOPE"
 
-
 class MCPConfigurationError(RuntimeError):
     """Raised when the local MCP server was started without trusted identity."""
-
 
 @dataclass(frozen=True)
 class MCPRequestContext:
@@ -57,7 +55,6 @@ class MCPRequestContext:
             yield
         finally:
             reset_current_user_namespace(token)
-
 
 def mutations_are_explicitly_enabled() -> bool:
     """Return whether write/cost-incurring MCP tools are intentionally exposed."""

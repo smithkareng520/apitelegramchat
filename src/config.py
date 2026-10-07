@@ -191,9 +191,7 @@ class ProviderConfig:
     #   "gemini_native"      Gemini 原生 API 流式桥接
     #   "anthropic_messages" Anthropic 原生 Messages
     #   "openai_images"      OpenAI Images（图像生成）
-    # 旧值 "gemini_openai_compat"（OpenAI 兼容层非流式循环）已随 v2.6
-    # Gemini 原生流式改造移除；未识别的标签在 make_model_config /
-    # get_effective_endpoint 处直接报错。
+    # 未识别的协议标签会在配置解析时直接报错。
     protocol: str = DEFAULT_PROTOCOL
     # 是否支持 Prompt Caching（仅部分厂商需要显式标记）
     supports_prompt_cache: bool = False
@@ -257,12 +255,7 @@ class ModelConfig:
     top_p: Optional[float] = None
 
     # ===================== 端点覆盖（每模型独立中转/协议）=====================
-    # 背景：中转/聚合端点常见"同一端点下不同模型协议不同"（如某端点
-    # 的 OpenAI 兼容模型走 /v1/chat/completions，Anthropic 系模型走原生
-    # Messages API，二者 502/404 互不兼容），或者"想用的模型分散在多个
-    # 中转站"。原先端点信息完全挂在 provider 级（PROVIDERS[provider]），
-    # 同一 provider 下所有模型被迫共用同一端点/key/协议，选完供应商
-    # 还要再确认这台端点这个模型走不走得通，配置心智负担很重。
+    # 同一聚合端点可能承载不同协议的模型，因此端点、key、协议支持模型级覆盖。
     #
     # 以下字段全部可选，None = 沿用 provider（PROVIDERS[provider]）的默认值；
     # 非 None = 仅对本模型生效的覆盖值，不影响同 provider 下的其它模型。

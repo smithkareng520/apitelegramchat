@@ -1,8 +1,6 @@
 # tool_executors.py —— 兼容 facade。
-# 原 2882 行单体已按职责拆分：tool_ui_render（卡片渲染）/ bash_session
 # （持久 bash 沙箱）/ tool_result_format（结果→UI 分发）/ file_delivery
 # （文件发送）/ tool_dispatch（统一调度）。
-#
 # gaode_mcp 由 mcp_manager 直连；bash / text_editor / todo / memory 经 MCP
 # stdio 服务器执行（mcpserver/server.py --module ...），不在 host 进程内分发。
 # 这里只保留外部调用点引用的符号。

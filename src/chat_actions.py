@@ -1,49 +1,4 @@
-"""Telegram sendChatAction 状态指示器的集中管理。
-
-语义约定（严格对齐 https://core.telegram.org/bots/api#sendchataction）：
-chat action 描述的是 **bot 自己** 正在对 chat 做的动作，绝不用于描述用户
-上传了什么。因此不在消息入口按「用户发送的媒体类型」回发
-upload_photo / upload_voice / upload_document / upload_video——那些动作
-会被 Telegram 客户端渲染成“bot 正在上传照片/语音/…”，与真实语义
-（用户在上传）完全相反。
-
-本项目仅允许出现以下五个动作，且只允许在下列位置触发，其他位置一律
-不使用：
-
-  typing          模型流式输出期间（reasoning / content 字段增量真实到达，
-                  即“模型正在打字”）。非流式返回（一次拿到完整文本）不触发
-                  ——那等价于模型把文本直接粘贴发送，没有输入过程。
-  record_video    视频生成过程：generate_video 工具调用生视频模型，或原生
-                  视频模型（_agentic_loop_native_video）自身的生成阶段。
-  upload_video    bot 使用「发送视频」方法时。仅限两类位置：a) 原生视频
-                  模型路径（_agentic_loop_native_video）——模型输出就是
-                  最终要发给用户的视频，其下载 / R2 上传 / 发送全程属于
-                  发送动作；b) 携带 <video> 的永久消息发送（utils.send_
-                  rich_html_message 钩子）。generate_video 工具自身的下载 /
-                  R2 上传不触发——工具结果是 AI 收到的信息，不是 bot 在
-                  发送视频。
-  upload_document bot 使用「发送文件」方法时（present_files → sendDocument）。
-  find_location   模型调用查找位置类方法时（amap 地图工具族）。
-
-时长与循环：sendChatAction 的状态在客户端最多显示约 5 秒；超过 5 秒的
-操作必须循环重发。本模块以 4 秒为周期重发（留 1 秒余量避免闪烁断档）。
-
-状态被消息清除：bot 发出任何消息（含 sendRichMessageDraft 草稿刷新）后
-状态指示会被 Telegram 自动清除。这是 Telegram 的既定行为，无需也不应
-规避：/show on 时草稿流式本身就是“模型正在输入”的可视化，状态被草稿
-刷新反复清除属于预期设计（typing 循环每 4 秒补发一次，用户仍能周期性
-看到“正在输入”指示）。
-
-实现要点：
-  - 每 chat 一个状态对象，引用计数管理并发作用域（同一批次并行调用
-    多个地图工具时 find_location 只显示一条，全部结束才熄灭）；
-  - 同一 chat 同时只显示一个动作：引用计数最高者优先，同计数时后
-    开始的优先（反映最新进行的工作）；
-  - 新回合开始时 reset（清空引用并熄灭指示），轮次收尾/异常/打断路径
-    兜底 stop_all —— 三重防线保证后台重发任务绝不泄漏；
-  - 所有公开入口对 chat_id=None / 非法 action 均静默降级，绝不影响
-    主流程。
-"""
+"""Telegram sendChatAction 状态指示器的集中管理。"""
 
 import asyncio
 from collections.abc import AsyncIterator
@@ -69,7 +24,6 @@ VALID_CHAT_ACTIONS = frozenset({
     "find_location",   # 模型调用查找位置类（amap 地图）工具
 })
 
-
 class _ChatActionState:
     """单个 chat 的 chat action 状态（引用计数 + 单一重发循环任务）。"""
 
@@ -84,7 +38,7 @@ class _ChatActionState:
         self._shown: Optional[str] = None
         self._lock = asyncio.Lock()
 
-    # ---------- 内部：计算当前应显示的动作 ----------
+    # 内部：计算当前应显示的动作
     def _desired_action(self) -> Optional[str]:
         best_action: Optional[str] = None
         best_rc = 0
@@ -94,7 +48,7 @@ class _ChatActionState:
                 best_rc = rc
         return best_action
 
-    # ---------- 内部：切换后台重发任务（必须在持锁状态下调用） ----------
+    # 内部：切换后台重发任务（必须在持锁状态下调用）
     def _restart_task_locked(self, desired: Optional[str]) -> None:
         if self._task is not None and not self._task.done():
             self._task.cancel()
@@ -130,7 +84,7 @@ class _ChatActionState:
                 "chat action 重发循环意外退出: chat=%s action=%s", self.chat_id, action,
             )
 
-    # ---------- 对外 ----------
+    # 对外
     async def start(self, action: str) -> None:
         async with self._lock:
             rc = self._refs.get(action, 0) + 1
@@ -163,10 +117,8 @@ class _ChatActionState:
             self._refs.clear()
             self._restart_task_locked(None)
 
-
-# ---------------- 全局注册表：chat_id -> 状态 ----------------
+# 全局注册表：chat_id -> 状态
 _states: dict[int, _ChatActionState] = {}
-
 
 def _get_state(chat_id: int) -> _ChatActionState:
     state = _states.get(chat_id)
@@ -174,7 +126,6 @@ def _get_state(chat_id: int) -> _ChatActionState:
         state = _ChatActionState(chat_id)
         _states[chat_id] = state
     return state
-
 
 def _validate(chat_id: Optional[int], action: str) -> bool:
     if chat_id is None:
@@ -184,7 +135,6 @@ def _validate(chat_id: Optional[int], action: str) -> bool:
         logger.warning("chat action 被拒绝（不在白名单）: chat=%s action=%r", chat_id, action)
         return False
     return True
-
 
 async def start_chat_action(chat_id: int, action: str) -> None:
     """开始（或加入）一个 chat action 作用域。
@@ -199,7 +149,6 @@ async def start_chat_action(chat_id: int, action: str) -> None:
     except Exception:
         logger.debug("start_chat_action 异常（忽略）", exc_info=True)
 
-
 async def stop_chat_action(chat_id: int, action: str) -> None:
     """结束一个 chat action 作用域（引用计数减一，归零熄灭）。"""
     try:
@@ -212,7 +161,6 @@ async def stop_chat_action(chat_id: int, action: str) -> None:
     except Exception:
         logger.debug("stop_chat_action 异常（忽略）", exc_info=True)
 
-
 async def stop_all_chat_actions(chat_id: int) -> None:
     """熄灭该 chat 的全部 chat action（轮次收尾 / 异常路径兜底）。"""
     try:
@@ -224,7 +172,6 @@ async def stop_all_chat_actions(chat_id: int) -> None:
         await state.stop_all()
     except Exception:
         logger.debug("stop_all_chat_actions 异常（忽略）", exc_info=True)
-
 
 async def reset_chat_actions(chat_id: int) -> None:
     """新回合开始时清场：清空引用并熄灭指示。
@@ -243,7 +190,6 @@ async def reset_chat_actions(chat_id: int) -> None:
         await state.stop_all()
     except Exception:
         logger.debug("reset_chat_actions 异常（忽略）", exc_info=True)
-
 
 @asynccontextmanager
 async def chat_action_scope(chat_id: int, action: str) -> AsyncIterator[None]:

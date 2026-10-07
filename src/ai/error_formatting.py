@@ -1,7 +1,4 @@
-"""API 错误信息解析与用户可读的错误提示格式化。
-
-从 ai_handlers.py 拆分而来，逻辑未做改动。
-"""
+"""API 错误信息解析与用户可读的错误提示格式化。"""
 import ast
 import io
 import json
@@ -38,9 +35,7 @@ _CONTENT_SAFETY_KEYWORDS = frozenset(
     for kw in _CONTENT_SAFETY_KEYWORDS_RAW
 )
 
-# =====================================================================
 # 机器错误文本的 Markdown 触发符惰性化
-# ---------------------------------------------------------------------
 # 错误详情是机器文本（上游网关/SDK 的原始报错），不是用户或模型写的
 # Markdown。但错误卡片会经过两遍 Markdown→HTML 转换：① 本模块构建卡片时
 # （_format_error_detail_for_display 逐行调用转换器）；② 发送层兜底
@@ -48,7 +43,6 @@ _CONTENT_SAFETY_KEYWORDS = frozenset(
 # 一遍）。转换器会把 `*` 序列配对成强调标签：`***x***`→`<b><i>x</i></b>`、
 # `**x**`→`<b>`、`*x*`→`<i>`。
 #
-# 生产事故实锤（2026-09-11 [5332ea8f]）：Agnes 网关在 400 报错文本里对
 # R2 域名/路径/预签名参数做了 `***` 脱敏掩码——`***.BadRequestError: ...`
 # `https://***.com/***/***?X-Amz-Credential=***&...` 共 11 个掩码，两两
 # 配对后被转换器吃成 <b><i> 粗斜体对：掩码本身消失、报错被随机粗斜体
@@ -60,7 +54,6 @@ _CONTENT_SAFETY_KEYWORDS = frozenset(
 # 强调规则，两遍转换均惰性、幂等。中文界面下全角星号也是最自然的掩码
 # 写法。注意：必须同时覆盖①②两遍——只修①的话，发送层第二遍仍会把
 # 残留的 `*` 配对吃掉。
-# =====================================================================
 
 
 def _neutralize_markdown_triggers(text: str) -> str:
@@ -343,7 +336,6 @@ def _format_error_detail_for_display(detail: str) -> str:
         if lines:
             # 机器文本先惰性化 `*` 再转换：上游报错里的 `***` 脱敏掩码
             # 若直接进转换器会被配对成 <b><i> 粗斜体，掩码消失、文本切碎
-            # （2026-09-11 生产事故，见 _neutralize_markdown_triggers 注释块）。
             return "<br/>".join(
                 convert_markdown_to_telegram_html(_neutralize_markdown_triggers(line))
                 for line in lines

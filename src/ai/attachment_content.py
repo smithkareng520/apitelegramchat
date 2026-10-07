@@ -1,7 +1,4 @@
-"""多模态附件处理：图片/音频/文档的缓存获取与降级文本构造。
-
-从 ai_handlers.py 拆分而来，逻辑未做改动。
-"""
+"""多模态附件处理：缓存获取、R2 持久化与降级文本构造。"""
 import asyncio
 import base64
 import mimetypes
@@ -74,7 +71,7 @@ async def get_cached_image_data(chat_id: int | None, file_id: str) -> Optional[b
       1. In-memory TTLCache (~5 min) —— 同轮内重复访问的热路径。
       2. Permanent-failure marker (``state.is_r2_attempted``) —— 若已标记，
          直接返回 None，避免对已知无法恢复的 file_id 反复重试。
-      3. R2 / local cache —— 之前上传过的对象，下载并重新填充内存缓存。
+      3. R2 / local cache —— 已上传的对象，下载并重新填充内存缓存。
          这是 TTLCache 过期后的恢复路径，让历史图片不依赖 Telegram API。
       4. Telegram getFile —— 首次拉取；拉到后只填内存缓存，**不**触发
          R2 上传。上传由调用方按需显式触发（见 ``_upload_and_mark`` 与
@@ -191,7 +188,6 @@ async def _upload_and_mark(file_id: str, data: bytes, r2_key: str) -> None:
         await state.mark_r2_attempted(file_id)
 
 
-# =====================================================================
 # 视频输入模态：缓存获取 / R2 持久化 / 预签名 URL 解析
 # 与图片路径（get_cached_image_data / _upload_and_mark /
 # _resolve_r2_presigned_url_for_vision）完全对称，但有两个关键差异：
@@ -207,7 +203,6 @@ async def _upload_and_mark(file_id: str, data: bytes, r2_key: str) -> None:
 #      信息，视频在首次进入 fallback（模型不支持视频）路径时也会
 #      fire-and-forget 地后台上传 R2（图片的 fallback 路径不做上传，
 #      因为图片场景下 supports_image_input 的模型占比高，且图片字节便宜）。
-# =====================================================================
 
 
 def _normalize_video_mime_type(mime_type: str = "") -> str:
@@ -584,7 +579,7 @@ async def _build_native_document_block(
                       URL 不可用时退回 base64 内联；
         * 非 PDF   → 返回 None，调用方走文本占位（链接 + file_id，
                       模型可用工具读取），绝不静默内联一个错误形状。
-      URL 方案的好处：不再把整份 PDF 拉进内存转 base64（base64 膨胀
+      URL 方案避免把整份 PDF 拉进内存转 base64（base64 膨胀
       33% 且每轮请求体都带上全量字节），R2 上传一次后每轮只传 URL。
     - OpenAI 兼容协议：维持原有 base64 内联形状（DocumentBlock.data_url）。
     """
@@ -845,7 +840,6 @@ async def _build_image_block(
     img_bytes = await get_cached_image_data(chat_id, file_id) if chat_id else None
     if not img_bytes:
         # 双重失败：R2 预签名不可用 + base64 兜底也拿不到字节（Telegram
-        # getFile 失败/限流、内存 TTL 缓存已过期等）。之前这里完全静默，
         # 上层 gather 直接把 None 过滤掉，问题排查只能靠猜。
         logger.warning(
             "[_build_image_block] chat=%s file_id=%s 图片彻底解析失败："
@@ -1036,7 +1030,6 @@ async def _resolve_multimodal_content(msg: dict, model_info: ModelConfig, chat_i
             )
             # 关键修复：_build_image_block 对单张图片的失败（R2 预签名/上传
             # 失败、Telegram getFile 失败、图片解码异常等）一律返回 None，
-            # 之前这里直接过滤掉 None 且没有任何日志或提示——用户发 N 张图，
             # 只要有 1 张解析失败，模型就会静默收到 N-1 张，还以为用户只
             # 发了这么多（典型症状："我看到 1 张图片"，用户却发了 2 张）。
             # 现在：失败的 file_id 记 warning 日志（附 chat_id 便于排查），
@@ -1293,8 +1286,7 @@ async def _append_history_async(messages: list, history: list, model_info: Model
     重要：Telegram 侧的附件元数据（``file_id``、``file_ids``、``file_name``
     等）保存在 ``Message.meta``，渲染出站时**永不**写入请求体（协议适配器
     只读 blocks），否则部分网关（OpenAI / Anthropic / Gemini）会因未声明
-    字段直接 400。此前版本靠出站前手工剔除字段，是一个静默导致请求失败
-    的 BUG 根源；现在由 Message.to_openai_dict 的结构性保证替代。
+    字段直接 400；Message.to_openai_dict 保证这些元数据不会进入请求体。
     """
     for msg in history:
         m = msg if isinstance(msg, Message) else Message.from_openai_dict(msg)

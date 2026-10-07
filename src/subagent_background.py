@@ -1,27 +1,4 @@
-"""后台子 agent：启动 → 句柄 → 查询/停止，完成通知「就近搭车」。
-
-与 bash 的后台任务（bash_background）同一套使用契约：父 agent 调用
-subagent 时 ``run_in_background=true`` 立即拿到任务句柄、回合内不再
-阻塞；``task_action``（status / output / stop / list）查询或停止既有任务；
-任务终态时把摘要推入每 chat 的待送队列，下一次真正调用模型的请求把它作为
-一条尾部 system 消息带给父 agent（drain 入口见 ai.agentic_loops，队列本体
-直接复用 bash_background.push_completion_notice，两类后台任务共用一个
-队列、一次 drain）。
-
-与 bash 后台任务的差异——子 agent 是进程内协程而不是操作系统进程：
-
-- **无进程组 / 无落盘**：任务就是一个模块级 asyncio.Task，状态只存内存。
-  应用重启即丢失（shutdown_all 取消全部，且不推通知）——子 agent 不可
-  断点续跑，也没有可恢复的中间产物，重启后查询旧 task_id 会得到
-  「未找到任务」。
-- **防误杀**：runner 是模块级任务并被 ``_RUNNERS`` 强引用持有，父回合的
-  取消（用户插话 / 新消息打断）不会传播到它；只有 stop 与应用关闭会取消。
-- **超时**：沿用 subagent 自身的 ``timeout`` 参数（默认 900s，最大 1800s）
-  作为寿命上限，由 execute_subagent 内部强制；这点与 bash 后台模式
-  （忽略 timeout）不同。
-- **进度**：不再向聊天里的工具卡片推实时预览（卡片在启动调用返回时即
-  定稿），只把最近一条进度文本存进任务，供 status / output 查询。
-"""
+"""后台子 agent：启动 → 句柄 → 查询/停止，完成通知「就近搭车」。"""
 
 from __future__ import annotations
 
@@ -38,7 +15,7 @@ from bash_background import _first_line, _fmt_duration, push_completion_notice
 
 logger = logging.getLogger(__name__)
 
-# ===================== 常量（env 可调） =====================
+# 常量（env 可调）
 # 每个 chat 同时运行的后台子 agent 上限：每个子 agent 各自循环调用 LLM 与
 # 工具，无上限会把 LLM 配额与全局工具信号量吃满。
 SUBAGENT_BG_MAX_PER_CHAT = max(1, int(os.getenv("SUBAGENT_BG_MAX_PER_CHAT", "3")))
@@ -53,7 +30,6 @@ STOP_GRACE_SEC = 5.0
 
 _TERMINAL_STATUSES = frozenset({"done", "failed", "stopped", "expired"})
 _ACTIONS = ("status", "output", "stop", "list")
-
 
 @dataclass
 class SubagentTask:
@@ -70,34 +46,27 @@ class SubagentTask:
     finished_at: float | None = None
     runner: asyncio.Task[None] | None = None
 
-
 # 注册表：(chat_id, namespace) -> {task_id: SubagentTask}（仅内存）
 _TASKS: dict[tuple[int, str], dict[str, SubagentTask]] = {}
 # runner 防 GC 强引用集：父回合取消杀不掉模块级任务。
 _RUNNERS: set[asyncio.Task[None]] = set()
 
-
-# ===================== 格式化 =====================
+# 格式化
 def _label(task: SubagentTask) -> str:
     return task.description or _first_line(task.task, 40)
 
-
 def _elapsed(task: SubagentTask) -> str:
     return _fmt_duration((task.finished_at or time.time()) - task.started_at)
-
 
 def _result_stats(task: SubagentTask) -> str:
     result = task.result or {}
     return f"{result.get('rounds', 0)} 轮 · {result.get('tool_calls', 0)} 次工具调用"
 
-
 def _answer_text(task: SubagentTask) -> str:
     return str((task.result or {}).get("answer") or "").strip()
 
-
 def _error_text(task: SubagentTask) -> str:
     return str((task.result or {}).get("error") or "未知错误")
-
 
 def _format_notice(task: SubagentTask) -> str:
     """终态通知文本：首行即摘要（emoji + 任务 + 结果）。"""
@@ -117,7 +86,6 @@ def _format_notice(task: SubagentTask) -> str:
     lines.append(f"（查看完整结果：subagent 工具 task_action=output task_id={task.task_id}）")
     return "\n".join(lines)
 
-
 def _summarize_task(task: SubagentTask) -> str:
     desc = _label(task)
     if task.status == "running":
@@ -125,12 +93,10 @@ def _summarize_task(task: SubagentTask) -> str:
     marks = {"done": "✅ 已完成", "failed": "❌ 失败", "stopped": "⏹ 已停止", "expired": "⌛ 超时终止"}
     return f"- {task.task_id} {marks.get(task.status, task.status)}，用时 {_elapsed(task)}「{desc}」"
 
-
 def _listing(tasks: dict[str, SubagentTask]) -> str:
     return "\n".join(_summarize_task(t) for t in tasks.values()) or "（无任务）"
 
-
-# ===================== 终态与回收 =====================
+# 终态与回收
 def _prune_finished(chat_id: int, namespace: str) -> None:
     tasks = _TASKS.get((chat_id, namespace))
     if not tasks:
@@ -142,7 +108,6 @@ def _prune_finished(chat_id: int, namespace: str) -> None:
     finished.sort(key=lambda t: t.finished_at or 0.0)
     for old in finished[:overflow]:
         tasks.pop(old.task_id, None)
-
 
 def _finish_task(
     task: SubagentTask,
@@ -163,8 +128,7 @@ def _finish_task(
         push_completion_notice(task.chat_id, task.namespace, _format_notice(task))
     _prune_finished(task.chat_id, task.namespace)
 
-
-# ===================== runner =====================
+# runner
 async def _run_subagent(task: SubagentTask, params: dict[str, Any]) -> None:
     # 延迟导入：subagent_tool 与 ai.* 存在模块级循环依赖链。
     from subagent_tool import execute_subagent
@@ -192,8 +156,7 @@ async def _run_subagent(task: SubagentTask, params: dict[str, Any]) -> None:
         status = "failed"
     _finish_task(task, status, payload)
 
-
-# ===================== 启动 =====================
+# 启动
 async def start_background_task(
     chat_id: int,
     namespace: str,
@@ -259,8 +222,7 @@ async def start_background_task(
         "  subagent task_action=list",
     ])
 
-
-# ===================== 查询 / 停止 / 列表 =====================
+# 查询 / 停止 / 列表
 def _resolve_task(
     chat_id: int, namespace: str, task_id: str | None, action: str,
 ) -> tuple[SubagentTask | None, str]:
@@ -271,7 +233,6 @@ def _resolve_task(
     if found is None:
         return None, f"Error: 未找到任务 {task_id}（应用重启后旧任务不会保留）。当前任务：\n{_listing(tasks)}"
     return found, ""
-
 
 async def query_task(
     chat_id: int,
@@ -298,7 +259,6 @@ async def query_task(
         return _output_text(task)
     return await _stop(task)
 
-
 def _status_text(task: SubagentTask) -> str:
     head = f"后台子 agent {task.task_id}"
     if task.status == "running":
@@ -316,7 +276,6 @@ def _status_text(task: SubagentTask) -> str:
     lines.append(f"任务：{_first_line(task.task)}")
     return "\n".join(lines)
 
-
 def _output_text(task: SubagentTask) -> str:
     if task.status == "running":
         progress = task.progress or "（暂无进度）"
@@ -329,7 +288,6 @@ def _output_text(task: SubagentTask) -> str:
         return f"{head}\n{answer or '（答复为空）'}"
     reason = "超时被终止" if task.status == "expired" else "失败"
     return f"❌ 后台子 agent {task.task_id} {reason}：{_error_text(task)}"
-
 
 async def _stop(task: SubagentTask) -> str:
     if task.status != "running":
@@ -349,8 +307,7 @@ async def _stop(task: SubagentTask) -> str:
     logger.info("后台子 agent 已停止 chat_id=%s task=%s", task.chat_id, task.task_id)
     return f"⏹ 后台子 agent {task.task_id} 已停止"
 
-
-# ===================== 应用关闭 =====================
+# 应用关闭
 async def shutdown_all() -> None:
     """应用关闭时取消全部后台子 agent（不记终态、不推通知：进程即将退出）。"""
     runners = [r for r in list(_RUNNERS) if not r.done()]

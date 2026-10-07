@@ -1,34 +1,5 @@
 # -*- coding: utf-8 -*-
-"""媒体生成参数交互卡片（wizard）。
-
-触发与流程
---------
-用户对图像/视频生成模型发送 prompt（USER 回合，统一管道预检 route=image/video
-且鉴权通过）→ 不直接生成，而是发出一张"参数卡片"；用户在卡片上翻页配置参数
-（editMessageText 就地编辑同一条消息，前进/后退导航）、按需补传参考媒体
-（首尾帧 / 参考图 / 参考音频 / 参考视频），最后点"✅ 开始生成"提交——实际生成
-以 turn 任务驱动媒体循环，参数经 media_overrides 注入请求层。
-
-按钮来源（数据驱动，"根据模型的参数来判断富文本交互按钮"）
---------
-卡片按钮完全由模型有效参数推导（resolve_request_plan 的 api_type + 图像形状 +
-Agnes 官方文档参数表）：请求层不消费 / API 不接受的参数绝不出现——
-  - Agnes Image 2.5 Flash（inline 形状）：size 档位（1K–4K）、ratio（官方 8
-    比例）、参考图片（图生图 / 多图合成，extra_body.image）；
-  - Agnes Video 2.5：mode（text/keyframe/reference）、seconds（"4"–"12"）、
-    size（720P/1080P/1K/2K）、aspect_ratio（官方 6 比例）、seed、首尾帧
-    （keyframe）、参考图(≤8)/音频(≤3)/视频(≤1，含 start_seconds / require_audio)；
-    n 模型固定为 1 → 只作说明文字，不提供按钮（文档：n 传非 1 会 400）；
-  - 其他图像模型（multipart / chat modalities 形状）：请求层不消费
-    size/ratio → 只提供提示词与提交。
-
-默认与参考媒体
---------
-未选择的参数不进请求体（跟随 API 网关默认，与官方文档一致）；参考媒体统一
-经 R2 转为公开可访问 URL（与图片输入的 R2 公开 URL 优先路径同源）；上传失败 / 未取得
-URL 时卡片提示"重新发送"，绝不静默丢弃；用户发送参考视频后可就绪设置
-start_seconds（起始时间）与 require_audio（是否必须包含音轨）。
-"""
+"""媒体生成参数交互卡片（wizard）。"""
 from __future__ import annotations
 
 import asyncio
@@ -50,9 +21,7 @@ WIZARD_CALLBACK_PREFIX = "mw:"
 REPLY_MARKER = "💡 引用回复:"          # 与 app_turns 同值（避免循环导入此处复制）
 _SESSION_TTL_SECONDS = 2 * 3600        # 卡片会话有效期：2 小时
 
-# ---------------------------------------------------------------------------
 # 参数声明（按模型有效参数推导卡片按钮；严格对齐官方文档）
-# ---------------------------------------------------------------------------
 # Agnes Image 2.5 Flash（与 2.1 同参）：size 档位 + ratio 官方集合
 # （单一来源见 ai/_constants.py）
 from ai._constants import AGNES_IMAGE_SIZE_TIERS as _IMAGE_SIZE_TIERS
@@ -61,7 +30,6 @@ from ai._constants import AGNES_IMAGE_RATIOS as _IMAGE_RATIOS
 _VIDEO_SIZES = ("720P", "1080P", "1K", "2K")
 _VIDEO_RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
 _VIDEO_SECONDS = tuple(str(v) for v in range(4, 13))
-
 
 @dataclass(frozen=True)
 class MediaParamSpec:
@@ -85,7 +53,6 @@ class MediaParamSpec:
     max_ref_videos: int = 0
     # 模型固定、不提供按钮但应在卡片上说明的参数（如 n=1）
     fixed_notes: tuple[str, ...] = ()
-
 
 def resolve_media_param_spec(model_info: Any) -> Optional[MediaParamSpec]:
     """按模型有效参数解析卡片应展示的参数集合（非媒体模型返回 None）。
@@ -143,10 +110,7 @@ def resolve_media_param_spec(model_info: Any) -> Optional[MediaParamSpec]:
         )
     return None
 
-
-# ---------------------------------------------------------------------------
 # 会话状态（每 chat 一张活跃卡片）
-# ---------------------------------------------------------------------------
 @dataclass
 class WizardSession:
     """一张参数卡片会话的全部状态（未选择的参数保持 None = 走模型默认）。"""
@@ -157,23 +121,23 @@ class WizardSession:
     prompt: str
     message_id: int = 0                    # 卡片消息（就地编辑目标）
     page: str = "main"                     # main/size/ratio/seconds/mode/frames/refs/seed/videoref:N
-    # --- 已选参数（None = 未选择，提交时不发送）---
+    # 已选参数（None = 未选择，提交时不发送）
     size: Optional[str] = None
     ratio: Optional[str] = None
     seconds: Optional[str] = None          # 仅 video
     mode: Optional[str] = None             # 仅 video：None=自动
     seed: Optional[int] = None             # 仅 video
-    # --- 收集的参考媒体（R2 公开 URL）---
+    # 收集的参考媒体（R2 公开 URL）
     first_frame: Optional[str] = None      # 仅 video（keyframe）
     last_frame: Optional[str] = None
     ref_images: list[str] = field(default_factory=list)
     ref_audios: list[str] = field(default_factory=list)
     ref_videos: list[dict] = field(default_factory=list)  # {url,start_seconds?,require_audio?}
-    # --- 触发消息自带的附件（file_id，提交时才解析上传）---
+    # 触发消息自带的附件（file_id，提交时才解析上传）
     pending_photos: list[dict] = field(default_factory=list)   # [{file_id,mime}]
     pending_audios: list[dict] = field(default_factory=list)
     pending_videos: list[dict] = field(default_factory=list)
-    # --- 交互态 ---
+    # 交互态
     collect_slot: Optional[str] = None     # 等待用户发送的媒体槽位
     awaiting_input: Optional[str] = None   # "seed" | "start_seconds:<idx>"
     collect_error: Optional[str] = None    # 上一次收集失败的提示
@@ -182,9 +146,7 @@ class WizardSession:
     def touch(self) -> None:
         self.updated_at = time.monotonic()
 
-
 _sessions: dict[int, WizardSession] = {}
-
 
 def _sweep_expired() -> None:
     now = time.monotonic()
@@ -192,15 +154,11 @@ def _sweep_expired() -> None:
     for cid in stale:
         _sessions.pop(cid, None)
 
-
 def get_session(chat_id: int) -> Optional[WizardSession]:
     _sweep_expired()
     return _sessions.get(chat_id)
 
-
-# ---------------------------------------------------------------------------
 # 输入解析：提示词清洗 / 附件提取
-# ---------------------------------------------------------------------------
 def clean_prompt_text(raw: str) -> str:
     """把 Telegram 消息 content 清洗成适合做生成 prompt 的文本。
 
@@ -217,13 +175,11 @@ def clean_prompt_text(raw: str) -> str:
         return ""
     return text
 
-
 _MEDIA_KIND_ALIASES = {"photo": "photo", "image": "photo", "voice": "voice",
                        "audio": "audio", "video": "video"}
 _TYPE_KIND_MAP = {"photo": "photo", "photo_group": "photo",
                   "audio": "audio", "voice": "voice",
                   "video": "video", "video_group": "video"}
-
 
 def extract_media_attachments(user_message: Optional[dict]) -> list[dict]:
     """从 user_message 信封提取 [{kind, file_id, mime}]（与统一管道同口径）。"""
@@ -258,10 +214,7 @@ def extract_media_attachments(user_message: Optional[dict]) -> list[dict]:
             out.append({"kind": kind, "file_id": fid, "mime": mime})
     return out
 
-
-# ---------------------------------------------------------------------------
 # 媒体预签名 URL 解析（R2；与图片输入的统一预签名路径同源）
-# ---------------------------------------------------------------------------
 async def resolve_media_presigned_url(kind: str, file_id: str, mime_type: str = "") -> str:
     """把 Telegram file_id 解析为 R2 预签名 URL（媒体输入统一预签名）。
 
@@ -298,10 +251,7 @@ async def resolve_media_presigned_url(kind: str, file_id: str, mime_type: str = 
         logger.warning("媒体预签名 URL 解析失败 kind=%s fid=%s", kind, fid[:12], exc_info=True)
     return ""
 
-
-# ---------------------------------------------------------------------------
 # Telegram API（卡片消息的就地编辑 / 发送 / 回调应答）
-# ---------------------------------------------------------------------------
 async def _tg_post(method: str, payload: dict, timeout_total: int = 10) -> Optional[dict]:
     try:
         timeout = aiohttp.ClientTimeout(total=timeout_total, connect=4)
@@ -321,7 +271,6 @@ async def _tg_post(method: str, payload: dict, timeout_total: int = 10) -> Optio
         logger.warning("%s 异常: %s", method, e)
     return None
 
-
 async def send_card_message(chat_id: int, text: str, keyboard: Optional[dict]) -> int:
     """发送卡片消息（sendMessage），返回 message_id（失败返回 0）。"""
     payload: dict[str, Any] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
@@ -330,7 +279,6 @@ async def send_card_message(chat_id: int, text: str, keyboard: Optional[dict]) -
     result = await _tg_post("sendMessage", payload)
     mid = (result or {}).get("message_id")
     return int(mid) if isinstance(mid, int) and mid > 0 else 0
-
 
 async def edit_card_message(chat_id: int, message_id: int, text: str,
                             keyboard: Optional[dict]) -> bool:
@@ -342,27 +290,20 @@ async def edit_card_message(chat_id: int, message_id: int, text: str,
     }
     return await _tg_post("editMessageText", payload) is not None
 
-
 async def answer_callback(callback_id: str, text: str = "", alert: bool = False) -> None:
     payload: dict[str, Any] = {"callback_query_id": callback_id, "text": text[:200]}
     if alert:
         payload["show_alert"] = True
     await _tg_post("answerCallbackQuery", payload, timeout_total=5)
 
-
-# ---------------------------------------------------------------------------
 # 渲染（HTML 文本 + inline keyboard；所有页面就地编辑同一条消息）
-# ---------------------------------------------------------------------------
 _MODE_LABELS = {"text": "文生视频", "keyframe": "首尾帧控制", "reference": "参考生成"}
-
 
 def _btn(text: str, data: str) -> dict:
     return {"text": text, "callback_data": data}
 
-
 def _kb(rows: list) -> dict:
     return {"inline_keyboard": [[_btn(t, d) for (t, d) in row] for row in rows]}
-
 
 def _quote(text: str, limit: int = 220) -> str:
     clean = " ".join(str(text or "").split())
@@ -370,13 +311,11 @@ def _quote(text: str, limit: int = 220) -> str:
         clean = clean[:limit] + "…"
     return f"<blockquote>{html.escape(clean)}</blockquote>"
 
-
 def _model_title(sess: WizardSession) -> str:
     # 模型标识统一用 model_id（每模型命名字段 name 已删除）：卡片标题
     # 直接展示用户所选的模型 ID，与模型列表按钮同源。
     icon = "🎬" if sess.api_type == "video" else "🖼"
     return f"{icon} <b>参数配置</b> · {html.escape(sess.model_id)}"
-
 
 def _pending_line(sess: WizardSession) -> str:
     parts = []
@@ -390,7 +329,6 @@ def _pending_line(sess: WizardSession) -> str:
         return ""
     return f"📎 随消息附带：{'、'.join(parts)}（提交时自动加入参考素材）"
 
-
 def _effective_video_mode(sess: WizardSession) -> str:
     """卡片展示/提交校验用的生效模式（与请求层构建器推断规则一致）。"""
     if sess.mode in _MODE_LABELS:
@@ -400,7 +338,6 @@ def _effective_video_mode(sess: WizardSession) -> str:
     if sess.ref_images or sess.ref_audios or sess.ref_videos:
         return "reference"
     return "text"
-
 
 def _summary_lines(sess: WizardSession) -> list[str]:
     """主页参数摘要（未选择 = 模型默认）。"""
@@ -441,7 +378,6 @@ def _summary_lines(sess: WizardSession) -> list[str]:
         lines.append(f"• {html.escape(note)}")
     return lines
 
-
 def _collect_hint(sess: WizardSession) -> str:
     if sess.collect_slot == "first_frame":
         return "⬇️ 请在聊天中<b>直接发送首帧图片</b>（重新发送会替换当前首帧）"
@@ -455,14 +391,12 @@ def _collect_hint(sess: WizardSession) -> str:
         return "⬇️ 请在聊天中<b>直接发送参考视频</b>（2–12 秒，24–60FPS，≤50MB）"
     return ""
 
-
 def _await_hint(sess: WizardSession) -> str:
     if sess.awaiting_input == "seed":
         return "⬇️ 请在聊天中<b>直接发送一个整数</b>作为 seed（相同 seed 结果更可复现）"
     if sess.awaiting_input and sess.awaiting_input.startswith("start_seconds:"):
         return "⬇️ 请在聊天中<b>直接发送起始秒数</b>（如 5；发送 0 表示从头开始）"
     return ""
-
 
 def _picker_page(sess: WizardSession, *, title: str, current: Optional[str], options: tuple,
                  param: str, default_hint: str = "", per_row: int = 4,
@@ -480,7 +414,6 @@ def _picker_page(sess: WizardSession, *, title: str, current: Optional[str], opt
     rows.append([("默认（清除选择）", f"mw:set:{param}:def")])
     rows.append([("⬅️ 返回", "mw:page:main")])
     return "\n".join(lines), _kb(rows)
-
 
 def _page_mode(sess: WizardSession) -> tuple[str, dict]:
     cur = _MODE_LABELS.get(sess.mode or "", "自动（按素材推断）")
@@ -504,7 +437,6 @@ def _page_mode(sess: WizardSession) -> tuple[str, dict]:
     ]
     return "\n".join(lines), _kb(rows)
 
-
 def _page_frames(sess: WizardSession) -> tuple[str, dict]:
     ff = "✅ 已设置" if sess.first_frame else "⬜ 未设置"
     lf = "✅ 已设置" if sess.last_frame else "⬜ 未设置"
@@ -527,7 +459,6 @@ def _page_frames(sess: WizardSession) -> tuple[str, dict]:
         [("⬅️ 返回", "mw:page:main")],
     ]
     return "\n".join(lines), _kb(rows)
-
 
 def _page_refs(sess: WizardSession) -> tuple[str, dict]:
     spec = sess.spec
@@ -575,7 +506,6 @@ def _page_refs(sess: WizardSession) -> tuple[str, dict]:
     rows.append([("⬅️ 返回", "mw:page:main")])
     return "\n".join(lines), _kb(rows)
 
-
 def _page_seed(sess: WizardSession) -> tuple[str, dict]:
     cur = str(sess.seed) if sess.seed is not None else "随机（默认）"
     lines = ["🎲 <b>seed 随机种子</b>", "", f"当前：<b>{cur}</b>", "",
@@ -588,7 +518,6 @@ def _page_seed(sess: WizardSession) -> tuple[str, dict]:
         [("⬅️ 返回", "mw:page:main")],
     ]
     return "\n".join(lines), _kb(rows)
-
 
 def _page_videoref(sess: WizardSession, idx: int) -> tuple[str, dict]:
     if not (1 <= idx <= len(sess.ref_videos)):
@@ -619,7 +548,6 @@ def _page_videoref(sess: WizardSession, idx: int) -> tuple[str, dict]:
     ]
     return "\n".join(lines), _kb(rows)
 
-
 def _page_main(sess: WizardSession) -> tuple[str, dict]:
     lines = [_model_title(sess), "", "📝 <b>提示词</b>", _quote(sess.prompt),
              "", "⚙️ <b>参数</b>（未选择 = 模型默认）"]
@@ -647,7 +575,6 @@ def _page_main(sess: WizardSession) -> tuple[str, dict]:
             [("✅ 开始生成", "mw:submit"), ("❌ 取消", "mw:cancel")],
         ]
     return "\n".join(lines), _kb(rows)
-
 
 def render_page(sess: WizardSession) -> tuple[str, Optional[dict]]:
     """按会话当前页渲染卡片（HTML 文本 + inline keyboard）。"""
@@ -683,10 +610,7 @@ def render_page(sess: WizardSession) -> tuple[str, Optional[dict]]:
         return _page_videoref(sess, idx)
     return _page_main(sess)
 
-
-# ---------------------------------------------------------------------------
 # 卡片生命周期（回合拦截入口 / 就地重绘 / 取代旧卡）
-# ---------------------------------------------------------------------------
 async def _render_card(sess: WizardSession) -> bool:
     """把会话当前页就地渲染到卡片消息上（带失效守卫）。"""
     if _sessions.get(sess.chat_id) is not sess:
@@ -695,14 +619,12 @@ async def _render_card(sess: WizardSession) -> bool:
     text, keyboard = render_page(sess)
     return await edit_card_message(sess.chat_id, sess.message_id, text, keyboard)
 
-
 async def _supersede_session(chat_id: int) -> None:
     old = _sessions.pop(chat_id, None)
     if old is not None and old.message_id:
         await edit_card_message(
             chat_id, old.message_id,
             "⚠️ 此卡片已被新的生成任务取代，请使用最新卡片。", None)
-
 
 async def start_media_wizard_turn(chat_id: int, model_id: str,
                                   user_message: Optional[dict]) -> bool:
@@ -748,13 +670,9 @@ async def start_media_wizard_turn(chat_id: int, model_id: str,
     )
     return True
 
-
-# ---------------------------------------------------------------------------
 # 回调处理（inline 按钮点击；卡片翻页/设置/收集/提交全部就地编辑）
-# ---------------------------------------------------------------------------
 def is_wizard_callback(data: Any) -> bool:
     return isinstance(data, str) and data.startswith(WIZARD_CALLBACK_PREFIX)
-
 
 def _parse_int(text: str) -> Optional[int]:
     try:
@@ -762,13 +680,11 @@ def _parse_int(text: str) -> Optional[int]:
     except (TypeError, ValueError):
         return None
 
-
 def _parse_number(text: str) -> Optional[float]:
     try:
         return float(str(text or "").strip())
     except (TypeError, ValueError):
         return None
-
 
 async def handle_wizard_callback(chat_id: int, uid: int, message_id: int,
                                  callback_id: str, data: str) -> None:
@@ -783,7 +699,6 @@ async def handle_wizard_callback(chat_id: int, uid: int, message_id: int,
         logger.exception("参数卡片回调处理异常: chat=%s data=%s", chat_id, data)
         await answer_callback(callback_id, "操作失败")
 
-
 async def _dispatch_callback(sess: WizardSession, callback_id: str, data: str) -> None:
     rest = data[len(WIZARD_CALLBACK_PREFIX):]
     parts = rest.split(":", 2)
@@ -791,7 +706,7 @@ async def _dispatch_callback(sess: WizardSession, callback_id: str, data: str) -
     arg = parts[1] if len(parts) > 1 else ""
     value = parts[2] if len(parts) > 2 else ""
 
-    # ---- 提交 / 取消 ----
+    # 提交 / 取消
     if action == "submit":
         await _cb_submit(sess, callback_id)
         return
@@ -803,7 +718,7 @@ async def _dispatch_callback(sess: WizardSession, callback_id: str, data: str) -
         await answer_callback(callback_id, "已取消")
         return
 
-    # ---- 页面导航（后退/前进：所有子页返回主页或素材页）----
+    # 页面导航（后退/前进：所有子页返回主页或素材页）
     if action == "page":
         target = arg or "main"
         sess.page = target if target in {
@@ -816,7 +731,7 @@ async def _dispatch_callback(sess: WizardSession, callback_id: str, data: str) -
         await answer_callback(callback_id)
         return
 
-    # ---- 参数设置（带白名单校验：伪造回调数据不会进请求体）----
+    # 参数设置（带白名单校验：伪造回调数据不会进请求体）
     if action == "set":
         if arg in ("size", "ratio", "seconds", "mode"):
             key, val = arg, value
@@ -865,7 +780,7 @@ async def _dispatch_callback(sess: WizardSession, callback_id: str, data: str) -
         await answer_callback(callback_id, "无效操作", alert=True)
         return
 
-    # ---- 进入素材收集态 ----
+    # 进入素材收集态
     if action == "collect":
         slot = arg
         if slot not in _SLOT_EXPECT:
@@ -877,7 +792,7 @@ async def _dispatch_callback(sess: WizardSession, callback_id: str, data: str) -
         await answer_callback(callback_id, "请在聊天中直接发送素材")
         return
 
-    # ---- 清除 ----
+    # 清除
     if action == "clear":
         if arg == "first_frame":
             sess.first_frame = None
@@ -895,7 +810,7 @@ async def _dispatch_callback(sess: WizardSession, callback_id: str, data: str) -
         await answer_callback(callback_id, "已清除")
         return
 
-    # ---- seed ----
+    # seed
     if action == "seed":
         if arg == "input":
             sess.awaiting_input = "seed"
@@ -906,7 +821,7 @@ async def _dispatch_callback(sess: WizardSession, callback_id: str, data: str) -
         await answer_callback(callback_id)
         return
 
-    # ---- 参考视频子页（起始时间 / 音轨）----
+    # 参考视频子页（起始时间 / 音轨）
     if action in ("vrset", "secin", "ra", "vrdel"):
         idx = _parse_int(arg) or 0
         if action == "vrset":
@@ -929,10 +844,7 @@ async def _dispatch_callback(sess: WizardSession, callback_id: str, data: str) -
 
     await answer_callback(callback_id, "未知操作")
 
-
-# ---------------------------------------------------------------------------
 # 消息消费钩子（app_turns 各消息处理器在进入正常回合前调用）
-# ---------------------------------------------------------------------------
 _SLOT_EXPECT = {
     "first_frame": "photo", "last_frame": "photo",
     "ref_image": "photo", "ref_audio": "audio", "ref_video": "video",
@@ -940,7 +852,6 @@ _SLOT_EXPECT = {
 _SLOT_ACCEPT = {"photo": {"photo"}, "audio": {"audio", "voice"}, "video": {"video"}}
 _KIND_LABEL = {"photo": "图片", "audio": "音频/语音", "video": "视频", "voice": "语音"}
 _MEDIA_PAGES = ("frames", "refs")
-
 
 def _store_into_slot(sess: WizardSession, slot: str, url: str) -> bool:
     """把素材 URL 存入对应槽位；False = 超出文档上限被忽略。"""
@@ -966,7 +877,6 @@ def _store_into_slot(sess: WizardSession, slot: str, url: str) -> bool:
         return True
     return False
 
-
 async def try_consume_media_message(chat_id: int, user_message: Optional[dict]) -> bool:
     """卡片收集素材时接管图片/音频/视频消息。
 
@@ -976,10 +886,7 @@ async def try_consume_media_message(chat_id: int, user_message: Optional[dict]) 
     上传失败（未取得公开访问 URL）时卡片给出错误提示并保持可重传——
     用户明确要求"没有获取预签名 URL 可以要求再次上传"，绝不静默丢弃。
 
-    可观测性（2026-09-12）：消费分支一律 INFO 留痕。此前被卡片消费的
-    消息无任何日志，一旦用户反馈"发两张图只处理了一张"，无法从日志
-    区分"被卡片消费"还是"回合被打断丢失"（后者是当时真实存在的
-    缺陷），排查成本极高。
+    消费分支统一以 INFO 留痕，便于区分卡片消费与回合中断。
     """
     sess = get_session(chat_id)
     if sess is None:
@@ -1048,7 +955,6 @@ async def try_consume_media_message(chat_id: int, user_message: Optional[dict]) 
     )
     return True
 
-
 async def try_consume_text_message(chat_id: int, raw_text: str) -> bool:
     """卡片会话接管文本消息：seed/起始秒数输入，或更新提示词。
 
@@ -1104,10 +1010,7 @@ async def try_consume_text_message(chat_id: int, raw_text: str) -> bool:
     await _render_card(sess)
     return True
 
-
-# ---------------------------------------------------------------------------
 # 提交：构造生成请求并作为 turn 任务执行
-# ---------------------------------------------------------------------------
 def build_submission(sess: WizardSession) -> tuple[Optional[dict], str, str]:
     """校验并构造提交请求。返回 (request, 错误跳转页, 错误提示)。
 
@@ -1187,7 +1090,6 @@ def build_submission(sess: WizardSession) -> tuple[Optional[dict], str, str]:
     }
     return request, "", ""
 
-
 async def _cb_submit(sess: WizardSession, callback_id: str) -> None:
     request, err_page, err_msg = build_submission(sess)
     if request is None:
@@ -1210,7 +1112,6 @@ async def _cb_submit(sess: WizardSession, callback_id: str) -> None:
         await edit_card_message(
             sess.chat_id, sess.message_id,
             "❌ <b>生成任务派发失败</b>，请重试。", None)
-
 
 async def _finalize_card(
     chat_id: int, message_id: int, request: dict, *, ok: bool, note: str = "",
@@ -1244,19 +1145,12 @@ async def _finalize_card(
     except Exception:
         logger.debug("卡片终态编辑失败（可忽略）: chat=%s", chat_id, exc_info=True)
 
-
 async def _notify_generation_failure(
     chat_id: int, notice: str, *, message_id: int = 0, request: Optional[dict] = None,
 ) -> None:
     """生成失败通知（与 IMAGE/VIDEO_ERROR 的渲染语义一致）。
 
-    渲染复用 ``_render_media_failure_quote``（ai.error_formatting）——
-    修复（2026-09 生产事故）：notice 来自 ``IMAGE_ERROR:``/``VIDEO_ERROR:``
-    信号，本身已是 Telegram HTML（如 ``⚠️ <b>… 请求失败</b>…``），此前
-    ``html.escape(notice)`` 把标签再次转义，用户看到的是 ``&lt;b&gt;``
-    字面量而非加粗标题。改走与 ai_handlers IMAGE_ERROR/VIDEO_ERROR 完全
-    相同的渲染出口：unescape → 剥标签 → 严格转义后放入 <pre> 结果块，
-    纯文本 notice 同样安全。
+    notice 是 Telegram HTML，必须先规范化标签再转义为安全的 <pre> 结果块，避免 HTML 被二次转义。
 
     同时把提交卡片（若提供 message_id）编辑为"❌ 生成失败"终态，避免卡片
     停在"进行中"而失败提示只出现在另一条不相关的新消息里。
@@ -1276,7 +1170,6 @@ async def _notify_generation_failure(
         await turn_recovery.mark_failed_unanswered_user(chat_id)
     except Exception:
         logger.debug("mark_failed_unanswered_user 失败（可忽略）", exc_info=True)
-
 
 async def run_media_generation(chat_id: int, request: dict) -> None:
     """执行卡片提交的生成（turn 任务；结果媒体由媒体循环直接发送）。
@@ -1371,7 +1264,6 @@ async def run_media_generation(chat_id: int, request: dict) -> None:
         await update_conversation_and_ledger(chat_id, None, new_msgs, usage)
     except Exception:
         logger.debug("卡片生成结果沉淀历史失败（可忽略）", exc_info=True)
-
 
 __all__ = [
     "MediaParamSpec",

@@ -1,20 +1,4 @@
-"""web_search 工具结果的解析与 Telegram Rich HTML 渲染。
-
-历史上这套逻辑长在 ``tool_executors.format_tool_result`` 内部，并且只
-保留 title+link、丢掉 snippet。现在拆出来：
-
-- 解析 ``execute_web_search`` 返回的多 section envelope（search / images
-  / videos / lens）为结构化字典；
-- 用与 fetch_url / wikipedia 一致的视觉语言（``<b>`` 标题、
-  ``<code>`` 来源徽标、``<a>`` 链接）渲染每个 section；search 模式为
-  紧凑列表：不渲染 section 头（引擎/条数已由折叠块摘要展示）与摘要
-  snippet，只保留标题链接 + 域名/时间/评分徽标；images / videos /
-  lens 仍带各自头行；
-- 失败 / 空 envelope 各自兜底，保证总能拿到合法 HTML。
-
-刻意避免引入 project 内部的重型模块（``api_client`` / ``subagent_tool``
-等），便于在测试中独立验证。
-"""
+"""web_search 工具结果的解析与 Telegram Rich HTML 渲染。"""
 from __future__ import annotations
 
 import re

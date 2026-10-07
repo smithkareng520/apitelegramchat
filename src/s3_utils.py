@@ -29,16 +29,13 @@ try:
 except Exception:  # pragma: no cover - cachetools 是硬依赖，仅为防御性回退
     TTLCache = None
 
-# =====================================================================
 # 预签名 URL 记忆化（prompt cache 关键路径）
-# ---------------------------------------------------------------------
 # 预签名 URL 含签名时间戳（X-Amz-Date / X-Amz-Expires），每次重签都是
 # 不同的字符串。若每次解析附件都重新签名，历史消息里的多模态 content
 # 块（image_url / video_url）字节会变，直接打碎 LLM 的前缀缓存——
 # 从第一条含附件 URL 的历史消息起，后面的全部内容都要重新计费/计算。
 # 这里把同一 key 的预签名 URL 缓存到过期前 5 分钟，窗口内字节级稳定，
 # 同时也避免了每轮重复签名的开销。
-# =====================================================================
 # 预签名有效期：24 小时。媒体输入 URL 与对外交付 URL（生成结果、文件
 # 下载等 Telegram 渲染）全部由预签名承担，长有效期同时拉长历史消息
 # content 块的字节稳定窗口（LLM 前缀缓存友好）与交付链接的可抓取窗口。
@@ -47,7 +44,6 @@ _PRESIGN_DEFAULT_EXPIRES = 86400
 _PRESIGN_SAFETY_MARGIN = 300  # 提前 5 分钟失效，避免返回临期/过期 URL
 _presigned_url_cache = TTLCache(maxsize=512, ttl=_PRESIGN_DEFAULT_EXPIRES - _PRESIGN_SAFETY_MARGIN) if TTLCache is not None else None
 _presign_lock = asyncio.Lock()
-
 
 session = aioboto3.Session() if aioboto3 is not None else None
 _LOCAL_R2_ROOT = data_root() / "r2_cache"
@@ -63,7 +59,6 @@ _R2_CONFIG = Config(
     max_pool_connections=10,
 ) if Config is not None else None
 
-
 def _safe_local_key_path(key: str) -> Path:
     rel = Path(str(key).replace("\\", "/"))
     parts = []
@@ -75,7 +70,6 @@ def _safe_local_key_path(key: str) -> Path:
         parts.append(part)
     return _LOCAL_R2_ROOT.joinpath(*parts)
 
-
 def _local_file_url(key: str) -> str:
     """本地缓存模式的对象地址（file://）。
 
@@ -85,7 +79,6 @@ def _local_file_url(key: str) -> str:
     """
     return f"file://{_safe_local_key_path(key).resolve()}"
 
-
 def is_r2_configured() -> bool:
     """是否配置了远程 R2（含 endpoint / access key / secret / bucket）。
 
@@ -94,7 +87,6 @@ def is_r2_configured() -> bool:
     无谓链路。
     """
     return bool(aioboto3 and R2_ENDPOINT and R2_ACCESS_KEY and R2_SECRET_KEY and R2_BUCKET_NAME)
-
 
 async def upload_bytes_to_r2(
     data: bytes,
@@ -117,7 +109,7 @@ async def upload_bytes_to_r2(
     # is_r2_configured() 为真 ⇒ aioboto3 已加载 ⇒ 模块级 session 必非 None
     # （mypy 无法跨函数沿 is_r2_configured 收窄，这里显式声明该既有不变量）。
     assert session is not None
-    # 修复 BUG：max_attempts=1 让 for 循环只跑一次，下面的重试分支
+    # max_attempts=1 让 for 循环只跑一次，下面的重试分支
     # （if attempt < max_attempts - 1）永远进不去。要么改成 >1 的实际重试
     # 次数，要么删掉循环结构。这里改成 3 次重试 + 指数退避，让短暂
     # 网络/服务端抖动有自愈机会。
@@ -140,7 +132,7 @@ async def upload_bytes_to_r2(
                 )
             logger.info("R2 上传成功：%s", key)
             # R2 S3 API endpoint 并非公开 URL，带签名才能匿名读取。对外交付
-            #（生成结果、文件下载等 Telegram 渲染）与媒体输入一样统一返回
+            # （生成结果、文件下载等 Telegram 渲染）与媒体输入一样统一返回
             # 预签名 URL，使 Telegram 的媒体抓取器无需 R2 凭据也能读取刚
             # 上传的对象；调用方会在 HTML 属性中将查询参数的 & 幂等转义为
             # &amp;。不依赖任何公开域名配置。
@@ -152,7 +144,6 @@ async def upload_bytes_to_r2(
 
     logger.error("R2 上传最终失败：%s", key)
     return None
-
 
 async def generate_presigned_url(
     key: str,
@@ -199,7 +190,6 @@ async def generate_presigned_url(
             _presigned_url_cache[key] = url
         return url
 
-
 async def presigned_url_for_existing_key(key: str) -> str | None:
     """媒体输入统一出口：为已存在于 R2 的对象签发预签名 URL。
 
@@ -227,7 +217,6 @@ async def presigned_url_for_existing_key(key: str) -> str | None:
         logger.warning("presigned_url_for_existing_key presign 失败 %s: %s", key, e)
         return None
 
-
 async def file_exists_in_r2(key: str) -> bool:
     if not is_r2_configured():
         return _safe_local_key_path(key).exists()
@@ -254,7 +243,6 @@ async def file_exists_in_r2(key: str) -> bool:
     except Exception as e:
         logger.warning("R2 head_object failed: %s", e)
         return False
-
 
 async def list_r2_objects(prefix: str) -> list[str]:
     """List object keys under ``prefix`` (or the local cache when R2 is unavailable).
@@ -318,7 +306,6 @@ async def list_r2_objects(prefix: str) -> list[str]:
         logger.warning("R2 list failed: %s", e)
         return []
 
-
 async def download_from_r2(key: str) -> bytes | None:
     if not is_r2_configured():
         path = _safe_local_key_path(key)
@@ -345,7 +332,6 @@ async def download_from_r2(key: str) -> bytes | None:
     except Exception as e:
         logger.warning("R2 download failed: %s", e)
         return None
-
 
 async def delete_r2_object(key: str) -> bool:
     if not is_r2_configured():

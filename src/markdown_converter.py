@@ -1,15 +1,10 @@
-"""Markdown 到 Telegram Rich Message HTML 的转换层。
-
-用于兜底处理模型输出的 Markdown 语法，确保即使不依赖提示词约束，
-也能正确渲染为 Telegram 支持的 HTML 标签。
-"""
+"""Markdown 到 Telegram Rich Message HTML 的转换层。"""
 import re
 import html as html_lib
 import logging
 from typing import List, Tuple
 
 logger = logging.getLogger(__name__)
-
 
 # 只匹配「不是合法 HTML 实体开头」的裸 & ——即后面没有紧跟
 # `name;` / `#123;` / `#x1F;` 形式的分号结尾序列。
@@ -21,7 +16,7 @@ _BARE_AMP_RE = re.compile(r'&(?![A-Za-z][A-Za-z0-9]*;|#[0-9]+;|#[xX][0-9A-Fa-f]+
 # 这些块一旦已经是 HTML，就应当作为“原子块”保留；只转换块与块之间的
 # 自由文本/Markdown，而不能因为其中出现一个 <pre> 或 <details> 就把整条消息
 # 短路。
-# _RICH_BLOCK_SPLIT_RE 用于最终块级包装；_OPAQUE_HTML_SPLIT_RE 只用于
+# RICH_BLOCK_SPLIT_RE 用于最终块级包装；_OPAQUE_HTML_SPLIT_RE 只用于
 # Markdown 转换阶段。列表、段落、details、表格等“容器”并不需要整块冻结，
 # 这样其中意外出现的 Markdown 仍能被修复；pre/media/button/math 等则视为
 # 不可安全猜测其内部语义的 opaque block。
@@ -73,7 +68,6 @@ _BLOCK_START_PREFIXES = (
     '<hr', '<img', '<tg-map',
 )
 
-
 def _escape_prose(text: str) -> str:
     """转义正文中裸露的 `<`、`>`、`&`，但保留已有的 HTML 实体。
 
@@ -88,8 +82,7 @@ def _escape_prose(text: str) -> str:
     text = _BARE_AMP_RE.sub('&amp;', text)
     return text.replace('<', '&lt;').replace('>', '&gt;')
 
-
-# ---- <tg-button> 强模式校验与降级 ----
+# <tg-button> 强模式校验与降级
 # Telegram RichMessage 的 <tg-button> 是强模式标签：type 必填；
 # type="url" 时 url 必填，type="copy_text" 时 text 必填，
 # type="callback_data" 时 data 必填且须为 1-64 字节（UTF-8 编码后，
@@ -120,14 +113,12 @@ _TG_BUTTON_CALLBACK_DATA_MAX_BYTES = 64
 # callback_data 消费者，必须与 app_commands.py 中的判断保持一致。
 _TG_BUTTON_CALLBACK_DATA_PREFIX = "tgb:"
 
-
 def _parse_tg_button_attrs(attrs_str: str) -> dict:
     """把 <tg-button ...> 的属性串解析为 dict（双引号/单引号均可）。"""
     attrs: dict = {}
     for key, dq, sq in _TG_BUTTON_ATTR_RE.findall(attrs_str):
         attrs[key.lower()] = dq if dq else sq
     return attrs
-
 
 def _tg_button_invalid_reason(attrs: dict, inner: str) -> str | None:
     """返回 None 表示按钮合法，否则返回不合法原因（用于日志与测试）。"""
@@ -172,7 +163,6 @@ def _tg_button_invalid_reason(attrs: dict, inner: str) -> str | None:
     if "<" in inner:
         return "按钮显示文本不允许包含 HTML 标签（含嵌套 tg-button）"
     return None
-
 
 def sanitize_tg_buttons(html: str) -> str:
     """校验并修复 Telegram <tg-button> 标签，非法按钮降级为字面量文本。
@@ -250,7 +240,6 @@ def sanitize_tg_buttons(html: str) -> str:
     out.append(html[prev:])
     return "".join(out)
 
-
 def _convert_mixed_document(text: str) -> str:
     """转换 HTML/Markdown 混合文档，同时保持 HTML 容器嵌套结构。
 
@@ -269,7 +258,6 @@ def _convert_mixed_document(text: str) -> str:
     for index, fragment in enumerate(shelf):
         converted = converted.replace(f'\x00RICH{index}\x00', fragment)
     return converted
-
 
 def _readable_plaintext_fallback(text: str) -> str:
     """Markdown/HTML 转换异常时生成可发送的、可读的纯文本 HTML。
@@ -295,7 +283,6 @@ def _readable_plaintext_fallback(text: str) -> str:
     value = html_lib.unescape(value)
     return html_lib.escape(value, quote=False).replace('\n', '<br/>')
 
-
 def convert_markdown_to_telegram_html(text: str) -> str:
     """将 Markdown / 混合 HTML 转为 Telegram Rich Message HTML。
 
@@ -320,7 +307,6 @@ def convert_markdown_to_telegram_html(text: str) -> str:
     except Exception:
         logger.exception('Markdown → Telegram HTML 转换异常，已回退为可读纯文本')
         return _readable_plaintext_fallback(text)
-
 
 def _contains_markdown(text: str) -> bool:
     """检测文本是否包含 Markdown 语法。"""
@@ -352,7 +338,6 @@ def _contains_markdown(text: str) -> bool:
     
     return False
 
-
 def _convert(text: str) -> str:
     """执行 Markdown 到 HTML 的转换。"""
     lines = text.split('\n')
@@ -364,7 +349,7 @@ def _convert(text: str) -> str:
         
         # 代码块（需要先处理，避免内部被转义）。流式阶段可能只有开始围栏
         # 没有结束围栏；此时不要擅自把半成品闭合成 <pre>，否则代码里的
-        # **bold** / [link](...) 会被错误解析。保留围栏本身，等待下一帧补齐。
+        # bold** / [link](...) 会被错误解析。保留围栏本身，等待下一帧补齐。
         if line.strip().startswith('```'):
             closing_index = None
             for j in range(i + 1, len(lines)):
@@ -439,7 +424,6 @@ def _convert(text: str) -> str:
     
     return '\n'.join(result)
 
-
 def _convert_heading(line: str) -> str:
     """转换标题。"""
     match = re.match(r'^(#{1,6})\s+(.+)$', line.strip())
@@ -449,7 +433,6 @@ def _convert_heading(line: str) -> str:
     level = len(match.group(1))
     content = _convert_inline(match.group(2))
     return f'<h{level}>{content}</h{level}>'
-
 
 def _extract_code_block(lines: List[str]) -> Tuple[str, int]:
     """提取代码块。返回 (HTML, 消耗的行数)。"""
@@ -468,7 +451,7 @@ def _extract_code_block(lines: List[str]) -> Tuple[str, int]:
     # 转义代码内容。用 _escape_prose 而非 html_lib.escape：后者对
     # 「已按提示词输出合法实体」的代码（如 &lt;、&amp;）会二次转义成
     # &amp;lt;，Telegram 会把字面量 &amp;lt; 原样画给用户。
-    # _escape_prose 只转义裸 &，对已转义实体幂等。
+    # escape_prose 只转义裸 &，对已转义实体幂等。
     code_content = '\n'.join(code_lines)
     escaped_code = _escape_prose(code_content)
     
@@ -479,12 +462,10 @@ def _extract_code_block(lines: List[str]) -> Tuple[str, int]:
     
     return html, i + 1  # +1 for closing ```
 
-
 def _is_table_row(line: str) -> bool:
     """检测是否为表格行。"""
     stripped = line.strip()
     return stripped.startswith('|') and stripped.endswith('|') and stripped.count('|') >= 2
-
 
 def _is_table_delimiter(line: str) -> bool:
     """判断一行是否确实是 Markdown 表格分隔线。"""
@@ -494,7 +475,6 @@ def _is_table_delimiter(line: str) -> bool:
     if not cells:
         return False
     return all(bool(re.fullmatch(r':?-{1,}:?', cell.strip())) for cell in cells)
-
 
 def _extract_table(lines: List[str]) -> Tuple[str, int]:
     """提取表格。返回 (HTML, 消耗的行数)。"""
@@ -538,7 +518,6 @@ def _extract_table(lines: List[str]) -> Tuple[str, int]:
     
     return ''.join(html_parts), i
 
-
 def _parse_table_row(line: str) -> List[str]:
     """解析表格行，返回单元格列表。"""
     # 移除首尾的 |
@@ -551,7 +530,6 @@ def _parse_table_row(line: str) -> List[str]:
     # 分割单元格
     cells = [cell.strip() for cell in stripped.split('|')]
     return cells
-
 
 def _extract_blockquote(lines: List[str]) -> Tuple[str, int]:
     """提取引用块。返回 (HTML, 消耗的行数)。"""
@@ -579,7 +557,6 @@ def _extract_blockquote(lines: List[str]) -> Tuple[str, int]:
     
     return f'<blockquote>{" ".join(converted_lines) if converted_lines else ""}</blockquote>', i
 
-
 def _extract_unordered_list(lines: List[str]) -> Tuple[str, int]:
     """提取无序列表。返回 (HTML, 消耗的行数)。"""
     list_items = []
@@ -603,7 +580,6 @@ def _extract_unordered_list(lines: List[str]) -> Tuple[str, int]:
     html = '<ul>' + ''.join(list_items) + '</ul>'
     return html, i
 
-
 def _extract_ordered_list(lines: List[str]) -> Tuple[str, int]:
     """提取有序列表。返回 (HTML, 消耗的行数)。"""
     list_items = []
@@ -621,7 +597,6 @@ def _extract_ordered_list(lines: List[str]) -> Tuple[str, int]:
     
     html = '<ol>' + ''.join(list_items) + '</ol>'
     return html, i
-
 
 def _convert_inline(text: str) -> str:
     """转换行内格式（粗体、斜体、代码、链接等）。
@@ -642,12 +617,12 @@ def _convert_inline(text: str) -> str:
         return f'\x00{len(shelf) - 1}\x00'
 
     # 1) 行内代码：必须先处理，内容整体转义并保护，内部星号/下划线/HTML 标签不再参与解析
-    #    如果后处理，代码中的 `<b>` 会被第 2 步误认为真实标签而保护，导致无法转义
-    #    用 _escape_prose 而非 html_lib.escape：sendRichMessage 在发送前会对
-    #    已转换 HTML 再跑一遍本转换器（_rich_message_html_payload 第 0 步），
-    #    此时行内代码内容往往已含第一遍转义出的实体（&lt; 等），
-    #    html.escape 会二次转义成 &amp;lt;（用户看到字面量 "&lt;"）。
-    #    _escape_prose 对已有实体幂等，两遍转换结果一致。
+    # 如果后处理，代码中的 `<b>` 会被第 2 步误认为真实标签而保护，导致无法转义
+    # 用 _escape_prose 而非 html_lib.escape：sendRichMessage 在发送前会对
+    # 已转换 HTML 再跑一遍本转换器（_rich_message_html_payload 第 0 步），
+    # 此时行内代码内容往往已含第一遍转义出的实体（&lt; 等），
+    # html.escape 会二次转义成 &amp;lt;（用户看到字面量 "&lt;"）。
+    # escape_prose 对已有实体幂等，两遍转换结果一致。
     text = re.sub(
         r'`([^`]+)`',
         lambda m: _park(f'<code>{_escape_prose(m.group(1))}</code>'),
@@ -668,10 +643,10 @@ def _convert_inline(text: str) -> str:
     )
 
     # 3) 既有 HTML 标签原样保留（支持 HTML/Markdown 混排）。
-    #    要求真实标签形状（<字母/!/开头），避免把比较表达式
-    #    （如 `a < b && c > d`）误认成标签。
-    #    注意：此时行内代码已被保护，代码中的 `<b>` 已转义为 &lt;b&gt; 并存入保护区，
-    #    不会被此规则再次匹配。
+    # 要求真实标签形状（<字母/!/开头），避免把比较表达式
+    # （如 `a < b && c > d`）误认成标签。
+    # 注意：此时行内代码已被保护，代码中的 `<b>` 已转义为 &lt;b&gt; 并存入保护区，
+    # 不会被此规则再次匹配。
     text = re.sub(r'<[a-zA-Z!/][^>]*>', lambda m: _park(m.group(0)), text)
 
     # 4) 图片（须先于链接，否则 ![]() 的 [] 会被链接规则吃掉）
@@ -691,8 +666,8 @@ def _convert_inline(text: str) -> str:
     )
 
     # 6) 剩下的是纯文本：转义裸露的 < > &，避免 "a < b" 被当成标签。
-    #    用 _escape_prose 而非 html.escape：模型按提示词输出的正文里
-    #    已包含合法实体（&amp;、&lt;、&#39;），二次转义会让用户看到字面量。
+    # 用 _escape_prose 而非 html.escape：模型按提示词输出的正文里
+    # 已包含合法实体（&amp;、&lt;、&#39;），二次转义会让用户看到字面量。
     text = _escape_prose(text)
 
     # 7) 强调符号（此时已无代码/URL 干扰）
@@ -705,8 +680,8 @@ def _convert_inline(text: str) -> str:
     text = re.sub(r'(?<![\w\\])_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)', r'<i>\1</i>', text)
 
     # 8) 回填保护片段。嵌套场景（如行内代码内部又包含已保护的标签）
-    #    需要迭代回填，否则内层占位符会以原始 \x00 字节残留。上限防呆：
-    #    正常输入嵌套不超过 2-3 层；循环次数耗尽仍有残留时保持现状返回。
+    # 需要迭代回填，否则内层占位符会以原始 \x00 字节残留。上限防呆：
+    # 正常输入嵌套不超过 2-3 层；循环次数耗尽仍有残留时保持现状返回。
     def _unpark(m: re.Match) -> str:
         return shelf[int(m.group(1))]
 
@@ -716,11 +691,9 @@ def _convert_inline(text: str) -> str:
         text = re.sub(r"\x00(\d+)\x00", _unpark, text)
     return text
 
-
 def _escape_attr(url: str) -> str:
     """转义要写入 href/src 属性的 URL。"""
     return html_lib.escape(url, quote=True)
-
 
 def render_telegram_fragment(text: str) -> str:
     """统一入口（片段级）：Markdown 转换 + HTML 转义 + tg-button 校验。
@@ -740,7 +713,6 @@ def render_telegram_fragment(text: str) -> str:
     """
     return convert_markdown_to_telegram_html(text)
 
-
 def render_telegram_block(text: str) -> str:
     """统一入口（块级）：Markdown 转换 + tg-button 校验 + 块级结构修复。
 
@@ -756,7 +728,6 @@ def render_telegram_block(text: str) -> str:
     3. 按块级标签切段，纯文本段落分别包 <p>
     """
     return wrap_mixed_content_as_blocks(convert_markdown_to_telegram_html(text))
-
 
 def wrap_mixed_content_as_blocks(converted: str) -> str:
     """把 Markdown 转换产物整理为 Telegram Rich Message 合法的块级序列。

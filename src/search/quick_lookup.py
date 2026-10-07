@@ -1,4 +1,4 @@
-"""生活查询工具：wikipedia / exchange_rate / weather（自 search_engine.py 拆出）。"""
+"""提供 Wikipedia、汇率和天气查询工具。"""
 
 import asyncio
 import json
@@ -17,8 +17,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
-# --------------------- wikipedia ---------------------
 async def execute_wikipedia(query: str, lang: str = "zh") -> str:
     """Wikipedia 关键词查询 → 忠实原文结构的 Telegram Rich HTML。
 
@@ -56,7 +54,6 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
                     continue
                 page_id = results[0]["pageid"]
 
-                # ---- 主路径：action=parse 完整 HTML → 富管线 ----
                 if build_model_facing_html is not None:
                     try:
                         parse_resp = await session.get(
@@ -75,7 +72,6 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
                             title = (parse_data.get("title") or results[0].get("title") or query).strip()
                             if page_html:
                                 page_url = f"https://{l}.wikipedia.org/wiki/{quote(title)}"
-                                # CPU 密集转换放到线程池，不阻塞事件循环
                                 # （与 _build_rich_fetch_payload 同一调度方式）。
                                 rich = await asyncio.to_thread(
                                     build_model_facing_html, page_url, page_html, None, title
@@ -85,7 +81,6 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
                     except Exception as e:
                         logger.debug(f"[wikipedia] 富 HTML 路径失败（回退纯文本摘要）: {e}")
 
-                # ---- 退化路径：纯文本摘要 ----
                 page_resp = await session.get(
                     f"https://{l}.wikipedia.org/w/api.php",
                     params={"action": "query", "pageids": page_id, "prop": "extracts|info", "explaintext": True, "inprop": "url", "format": "json", "utf8": 1},
@@ -109,8 +104,6 @@ async def execute_wikipedia(query: str, lang: str = "zh") -> str:
             continue
     return f"失败：Wikipedia 查询「{query}」未找到结果。"
 
-
-# --------------------- exchange_rate ---------------------
 async def execute_exchange_rate(base: str, target: str | None = None) -> str:
     base = base.upper().strip()
     try:
@@ -144,16 +137,9 @@ async def execute_exchange_rate(base: str, target: str | None = None) -> str:
         logger.debug("execute_exchange_rate 内部忽略的异常", exc_info=True)
         return f"失败：汇率查询出错：{str(e)[:100]}"
 
-
-# --------------------- weather ---------------------
 # 载荷瘦身：只打包 UI 卡片与模型视图真正消费的字段。
-# 此前逐时条目复制 25+ 字段（DewPoint/HeatIndex/WindChill/shortRad/diffRad、
-# 十项 chance_* 分类、气压/阵风/云量/能见度/UV …），其中绝大多数既不出现在
-# 用户卡片上、也早被模型视图丢弃 —— 每次查询白白搬运几百个字符串。现在在
-# 源头不再生产这些字段（上游 wttr.in 仍返回它们，只是不再复制进载荷）。
 _HOURLY_FIELDS = ("time", "temp", "condition", "precip", "humidity", "wind_speed", "chance_of_rain")
 _DAILY_FIELDS = ("date", "max", "min", "condition", "uvIndex", "sunrise", "sunset", "chance_of_rain")
-
 
 async def execute_weather(city: str, unit: str = "c", hours: int = 6) -> str:
     """查询 wttr.in 天气并打包为精简 JSON。

@@ -1,13 +1,4 @@
-"""四种 agentic 循环实现：OpenAI 兼容流式 / Gemini 原生流式 / 原生图片 / 原生视频。
-
-从 ai_handlers.py 拆分而来。
-
-v2.6：Gemini 从 OpenAI 兼容层（v1beta/openai/）非流式专用循环切换为
-原生 API 流式桥接（ai/gemini_bridge.py，streamGenerateContent SSE +
-原生 function calling），架构与 anthropic_bridge.py 同构的“边界转换”
-模式：loop_messages 全程 OpenAI 形状，仅请求前后做协议转换，复用同一
-套 _run_tool_calls_and_append 工具执行咽喉与草稿流式 UI。
-"""
+"""提供 OpenAI 兼容及原生媒体的 agentic 循环实现。"""
 import asyncio
 import aiohttp
 import httpx
@@ -70,9 +61,6 @@ from ai.tool_summary import (
 from ai.attachment_content import _apply_cache_control
 from ai.errors import first_choice
 from ai.streaming import AIStreamTimeoutError, iter_async_stream
-# bridge_common 骨架：switch_stream 状态机 / 工具批次 / over-limit 合成 /
-# 终局兜底 / assistant 组装 —— 与两条原生 bridge 循环共用同一份实现，
-# 消除本循环内逐字重复的内联版本。
 from ai.bridge_common import (
     LiveAssistantSlot,
     MediaProgressSlot,
@@ -92,16 +80,13 @@ from core.images import ImageTask
 from core.messages import Message, TextBlock, ImageBlock, VideoBlock, render_openai_messages
 from protocols.images import dispatch_image_task
 
-# Prompt cache 命中观测（三循环共用）：拆至独立模块 cache_usage，避免
-# gemini_bridge -> agentic_loops 的循环导入。
 from ai.cache_usage import (  # noqa: F401
     _cached_from_usage,
     _log_cache_usage,
 )
 
 if TYPE_CHECKING:
-    # 仅供类型注解使用；运行时由调用方传入，避免运行时循环导入。
-    from ai.draft_manager import DraftManager
+        from ai.draft_manager import DraftManager
 
 logger = get_logger(__name__)
 
@@ -109,25 +94,8 @@ logger = get_logger(__name__)
 from skills_runtime import refresh_skill_catalog as _refresh_skill_catalog
 
 
-# ===================== 后台任务通知 drain 注入点（收敛） =====================
-# 后台 bash 任务（bash_background）终态时把摘要推入每 chat 待送队列；
-# 下一次真正调用模型的请求构建消息时 drain，合并为一条尾部 system 消息
-# 搭车发出——不新建回合、不挑回合类型，什么请求来了就搭什么车。缓存
-# 语义：稳定前缀 [system, …history…, user_msg] 与上一轮逐字节一致，通知
-# 只出现在尾部（分叉点=通知本身，不重排任何既有消息）；通知不持久化、
-# 历史 append-only。
-#
-# 注入点曾散落在 get_ai_response 里 4 处手工调用——新增模型调用路径
-# 忘了接线就会静默丢通知且最难测。现已收敛为两个最低公共入口，即
-# 结构性不变式「凡到达模型调用的路径，队列必被 drain」的落点（由
-# tests/unit/test_bg_notice_drain_invariant.py 守护）：
-#   ① ai_handlers._call_api —— 全部 chat 协议模型调用的唯一入口（函数
-#      入口自守卫 drain）；
-#   ② _media_loop_with_notices —— image/video 生成（agentic 循环内的
-#      POST）两条循环的唯一入口，get_ai_response 与媒体向导提交路径
-#      共用。
-# 不调用模型的路径（媒体参数卡片、preflight 短路等）不消费，通知留给
-# 下一次请求。
+# 后台任务通知只在模型调用入口 drain，并作为尾部 system 消息发送；不持久化。
+# 非模型路径不消费，通知留给下一次请求。
 
 
 def _append_bg_task_notices(messages: list, chat_id: int, namespace: str | None = None) -> None:
@@ -200,41 +168,17 @@ def _openrouter_extra_body(
     session_key: Optional[str] = None,
 ) -> dict:
     body: dict = {"provider": OPENROUTER_PROVIDER_PREFERENCES.copy()}
-    # session_key 由调用方在 loop 开始时解析一次传入（保证同一 loop 内
-    # 全部轮次共用同一键）；未传入时按 chat_id 现场解析（子 agent 等
-    # 调用方兼容路径）。
+    # loop 内固定同一 session key；未提供时按 chat_id 解析。
     key = session_key or _openrouter_session_id(chat_id)
     if key:
         body["session_id"] = key
-    # Anthropic 系模型的"自动缓存"：顶层 cache_control 由网关翻译成打在
-    # 最后一个可缓存块上的断点，并随对话增长自动前移。这让 agentic loop
-    # 的每一轮（含 tool 结果之后的内容）都能作为缓存前缀被下一轮命中，
-    # 下一轮用户请求也能直接命中上一轮的完整前缀（含工具调用中段）——
-    # 这就是"断点 4"，交给自动机制处理，_apply_cache_control 不再手动
-    # 遍历消息找尾部位置打标记。与 _apply_cache_control 的 2 个显式
-    # 断点（system 段首尾，断点 1 + 断点 2）叠加后总数为 3，不超过
-    # Anthropic 的 4 断点上限（2 显式 + 1 自动，还留 1 个余量）。
+    # 顶层 cache_control 由网关作为自动缓存断点处理，无需手动标记第 4 断点。
     if supports_prompt_cache:
         body["cache_control"] = {"type": "ephemeral"}
     return body
 
 
-# =====================================================================
-# 会话亲和（session affinity）：agnes 等聚合网关的多副本缓存隔离缓解。
-# 背景（2026-09 排查结论，agnes 缓存命中率偏低的根因）：
-#   apihub.agnes-ai.com 实测链路为 Cloudflare -> new-api -> LiteLLM ->
-#   多个上游推理副本（响应头 x-litellm-model-name / x-new-api-version），
-#   按请求随机分发且各副本前缀缓存互相隔离。直接 API 探针证实：同一
-#   逐字节稳定前缀的连续请求，命中率随落在哪个副本在 0%~100% 间随机
-#   波动；插入另一会话的噪声请求后，原会话甚至共享 system prompt 头
-#   都可能瞬间清零。客户端侧 prompt 构建已逐字节稳定（system prompt
-#   当日内稳定、历史只追加、R2 预签名 URL 55 分钟内记忆化），非根因。
-#   OpenRouter 同样的问题靠 body.session_id 粘性路由解决；agnes 未见
-#   官方文档，这里 best-effort 同时下发 body.session_id 与
-#   X-Session-Id 请求头（键格式与 OpenRouter 完全一致）：网关任何一层
-#   支持任一形式即可从第一个请求起粘住同一副本；都不支持时未知字段
-#   /请求头被安全忽略，零副作用（已实测带 session_id 的请求 HTTP 200）。
-# =====================================================================
+# 会话亲和用于缓解聚合网关多副本之间的缓存隔离；body 和 header 均 best-effort。
 def _session_affinity_key(chat_id: Optional[int] = None, session_key: Optional[str] = None) -> str:
     """会话亲和键：与 OpenRouter 的 session_id 同源同格式（可轮换）。"""
     return session_key or _openrouter_session_id(chat_id)
@@ -329,33 +273,7 @@ def _merged_extra_body(
     return body
 
 
-# =============================================================================
-# 网关侧媒体拉取瞬态失败判定（400 upstream_error 家族）
-# -----------------------------------------------------------------------------
-# 特征场景（2026-09-11 生产 [3a64f5cd]）：agnes-3.0-flash 等只接受 URL 输入
-# 的网关，每次请求都要自行下载消息历史里的媒体 URL（R2 预签名地址）。
-# R2 跨区域下载存在抖动——同一张图上一轮下载成功（3s），下一轮即超时：
-#   400 {"message": "... An exception occurred while loading IMAGE data at
-#        index 0: ... Timed out while downloading media URL: https://...
-#        ?X-Amz-Expires=...", "type": "upstream_error"}
-# 这类错误表明"网关拉取我们引用的媒体失败"，请求体本身没有问题——在
-# 首个增量前重放是安全的（与下方读超时零输出重试同语义）。
-# 必须与请求形状类 400（参数错误 / schema 拒绝，需要模型自纠）严格区分，
-# 后者绝不能吞掉重试。
-#
-# 重放梯子（2026-09-11 [5332ea8f] 之后的升级，用户指示"用 base64 通用兑底"）：
-#   尝试 0（URL）→ 失败 → 1.5s 后原样重放（尝试 1，URL，抖动自愈）
-#     → 再失败 → 把消息里的 http(s) 图片全部内联为 base64 data URI 后重放
-#       （尝试 2，_inline_wire_images_as_data_urls，通用兑底）。
-# 依据：Agnes 图像文档明确输入图像支持 Data URI Base64（chat 的
-# image_url 同样接受 data:image/...;base64,...，内部 ImageBlock 早已
-# 在 R2 不可用时走同形状）；图像端点链路（media_generation）更是本来就
-# 自行下载参考图后以 data URI 内联。内联后网关无需再访问 R2，彻底绕开
-# 其下载链路——不再受 R2 慢窗口连续覆盖的影响（[5332ea8f] 实证同一
-# 慢窗口会连续击落 URL 重放）。视频/音频/文档不内联：体积可达数十 MB，
-# 内联会让请求体爆炸，仍走 URL（若命中这三类媒体拉取失败，内联数为 0
-# 时按无兑底可用快速抛出，见重放分支）。
-# =============================================================================
+# 400 upstream_error 仅在网关拉取媒体 URL 失败且尚无增量时重放；图片可转 base64。
 _GATEWAY_MEDIA_FETCH_ERROR_MARKERS = (
     "timed out while downloading media url",
     "an exception occurred while loading image data",
@@ -364,33 +282,21 @@ _GATEWAY_MEDIA_FETCH_ERROR_MARKERS = (
     "an exception occurred while loading file data",
 )
 
-# 媒体拉取失败的首增量前重放次数上限（总请求数 = 1 + _MEDIA_FETCH_MAX_REPLAYS）。
-# 生产实证（2026-09-11 [5332ea8f]）：R2 慢窗口往往不止覆盖一次重试——首
-# 次请求与 1.5s 后的 URL 重放都撞在同一个窗口里双双 400。第二次重放
-# 不再原样重试 URL，而是改用 base64 内联通用兑底（见上方梯子说明），
-# 上限仍然是硬闸门，绝不无限重试。
+# 首增量前的媒体重放有硬上限，避免无限重试。
 _MEDIA_FETCH_MAX_REPLAYS = 2
 
-# base64 内联兑底的单图字节上限（Telegram 照片通常 ≤ 数 MB；超过上限
-# 的图片保持 URL 不动，避免单个请求体失控）。
+# 单图超过上限时保持 URL，避免请求体失控。
 _MEDIA_INLINE_MAX_BYTES = 15 * 1024 * 1024
-# 内联兑底下载阶段的总超时：兑底本身已是第三次尝试，不能在下载上久等。
 _MEDIA_INLINE_FETCH_TIMEOUT = aiohttp.ClientTimeout(total=20, connect=5)
 
-# 首增量前读超时的零输出重试判定：openai SDK 3.x 的传输层是 httpx2
-# （见 api_client._build_client 对 httpx2.Timeout 的说明），流式迭代中
-# 抛出的读超时是 httpx2.ReadTimeout，与 httpx（v1）的 ReadTimeout 是
-# 两个互不为子类的类层级——只捕 httpx 版本会让重试永远不生效。
-# 兼容保留 httpx.ReadTimeout（SDK 未来换回/并存 httpx 时不失效），
-# AIStreamTimeoutError 是本仓应用层 idle/total 闸门抛出的领域异常。
+# 同时兼容 httpx/httpx2 的 ReadTimeout；应用层超时由 AIStreamTimeoutError 表示。
 _STREAM_READ_TIMEOUT_ERRORS = (
     httpx2.ReadTimeout,
     httpx.ReadTimeout,
     AIStreamTimeoutError,
 )
 
-# URL 扩展名 → image MIME 的兑底映射（magic sniff 与 Content-Type 都拿
-# 不到时用；大小写不敏感）。
+# magic sniff 和 Content-Type 都失败时按 URL 扩展名兜底。
 _MEDIA_INLINE_EXT_MIME = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -417,16 +323,7 @@ def _sniff_image_mime(data: bytes) -> str:
 
 
 def _media_fetch_replay_mode(failed_stream_attempt: int) -> str:
-    """第 failed_stream_attempt 次尝试刚失败后，本次重放应采用的形态。
-
-    - "url"：原样重放同一请求（首次抖动自愈；请求体逐字节不变，
-      幂等性最强，对 prompt cache 最友好）。
-    - "inline"：base64 内联兑底重放（把 http(s) 图片替换为 data URI，
-      网关不再需要下载）。
-
-    纯判定便于单测；调用方先用 _should_retry_media_fetch_400 过闸门，
-    本函数只在闸门放行后被调用（即 failed_stream_attempt ∈ {0, 1}）。
-    """
+    """返回失败后的媒体重放方式。"""
     return "url" if failed_stream_attempt <= 0 else "inline"
 
 
@@ -437,39 +334,9 @@ async def _inline_wire_images_as_data_urls(
     _fetch: Any = None,
     _resolve_file_id: Any = None,
 ) -> tuple[int, int]:
-    """把 wire 消息里所有 http(s) 图片内联为 base64 data URI（原地替换）。
+    """将 wire 消息中的 http(s) 图片原地替换为 base64 data URI。
 
-    base64 通用兑底的核心步骤：Agnes 等网关对输入图像同时接受公共 URL
-    与 Data URI Base64（图像端点文档明示；chat image_url 同形状）。当
-    网关侧下载 URL 连续失败时，由我方自行下载图片字节（我方到 R2 的
-    链路正常，超时只发生在网关出口），替换 ``image_url.url`` 后重放，
-    网关彻底不再需要访问 R2。
-
-    处理范围与边界：
-      - 只处理 ``{"type": "image_url", "image_url": {"url": ...}}`` part；
-        ``video_url`` / ``file`` / ``input_audio`` 明确不内联（视频可达
-        数十 MB，内联会让请求体爆炸），保持 URL 原样；
-      - 已经是 ``data:`` 的 part 天然跳过；
-      - 下载失败 / 非 200 / 超过 _MEDIA_INLINE_MAX_BYTES 的图片保持 URL
-        原样（部分兑底：能内联几张是几张）；
-      - MIME 判定顺序：magic bytes 嗅探 → 响应 Content-Type（仅接受
-        image/*）→ URL 扩展名 → image/jpeg 兑底；
-      - ``image_url.detail`` 等其它字段原样保留；
-      - 原地替换传入的 wire dicts，无返回值副作用面（wire 消息是本轮
-        临时渲染产物，下一轮 _round 会从内部消息重新渲染，不污染历史）。
-
-    Args:
-        wire_messages: render_openai_messages 产出的 OpenAI wire dict 列表。
-        _fetch: 测试注入点——``async def(url) -> tuple[bytes, str]``
-            （返回响应字节与 Content-Type）；默认 None 时用 aiohttp 真实下载。
-
-    Returns:
-        (成功内联数, 失败保持 URL 数)。没有 http 图片时返回 (0, 0)。
-
-    ``chat_id`` / ``_resolve_file_id``：优先从本轮 attachment layer 建立的
-    URL->file_id 映射恢复原始附件字节，再退回直接下载 URL。这样网关
-    首轮拉取失败时，不会因为“二次下载同一个预签名 URL”再丢掉其中一张图。
-    """
+优先复用附件缓存；仅处理图片，并受大小和下载超时限制。"""
     targets: list[tuple[dict, str]] = []
     for msg in wire_messages:
         if not isinstance(msg, dict):
@@ -495,8 +362,7 @@ async def _inline_wire_images_as_data_urls(
                         resp.request_info, resp.history,
                         status=resp.status, message=f"status {resp.status}",
                     )
-                # OOM 防护：Content-Length 预拒绝 + 分块累积超限即中止
-                # （服务器不声明长度/谎报时，逐块检查仍然生效）。
+                # 同时限制 Content-Length 和实际累计大小，防止 OOM。
                 declared = resp.headers.get("Content-Length")
                 if declared and declared.isdigit() and int(declared) > _MEDIA_INLINE_MAX_BYTES:
                     raise ValueError(f"image exceeds inline cap: {declared} bytes")
@@ -512,9 +378,7 @@ async def _inline_wire_images_as_data_urls(
     fetch = _fetch or _default_fetch
 
     async def _inline_one(part: dict, url: str) -> bool:
-        # 最优先：通过本轮附件解析阶段建立的 URL -> file_id 映射，直接
-        # 复用 get_cached_image_data。这里拿到的字节与首轮 ImageBlock
-        # 使用的是同一附件，避免再次依赖 R2 预签名 URL 的匿名 HTTP GET。
+        # 优先复用本轮附件缓存，避免再次访问预签名 URL。
         if _resolve_file_id is not None and chat_id is not None:
             try:
                 file_id = str(_resolve_file_id(url) or "")
@@ -640,9 +504,7 @@ async def _agentic_loop_openai_compat(
     sampling_params = get_sampling_params(model_info)
     reasoning_top, reasoning_extra = get_reasoning_request_fields(model_info, api_label)
     prompt_cache_enabled = bool(model_info and model_info.supports_prompt_cache)
-    # 会话亲和键在整个 loop 内只解析一次：loop 内全部轮次（含工具追加轮）
-    # 共用同一 session_id，保证粘性路由与前缀缓存不因中途轮换漂移；
-    # 三个请求出口（主流式/非流式兑底/over-limit 合成）共用。
+    # 整个 loop 固定同一 session_id，避免粘性路由和缓存前缀漂移。
     loop_session_key = _openrouter_session_id(builder.chat_id)
     # 会话亲和请求头（agnes 等聚合网关多副本缓存隔离缓解）：声明了
     # session_affinity 的网关才非空。
@@ -650,11 +512,8 @@ async def _agentic_loop_openai_compat(
         api_label, builder.chat_id, session_key=loop_session_key, model_info=model_info
     )
 
-    # L0 预防层（主流：OpenAI Structured Outputs）：对能安全规范化的工具
-    # 注入 strict:true + 递归 schema 规范化（全部必填 + additionalProperties:false
-    # + 可选字段可空）。per-tool best-effort，schema 复杂（union/anyOf）的工具
-    # 原样发送；网关拒绝时运行时自动降级（见下方 except BadRequestError）。
-    # 手动总开关：环境变量 DISABLE_STRICT_TOOL_SCHEMA=1。
+    # 对可规范化的工具注入 strict schema；复杂 schema 保持原样，拒绝时降级。
+    # DISABLE_STRICT_TOOL_SCHEMA=1 可关闭。
     request_tools = strict_tools_for_request(api_label, tools)
 
     for _round in range(MAX_TOOL_CALLS):
@@ -668,18 +527,7 @@ async def _agentic_loop_openai_compat(
         stream_item_ids: dict = {}
         stream_item_names: dict = {}
 
-        # OpenAI 兼容路径的手动缓存（OpenRouter 上 Anthropic 系模型）：
-        # 每轮请求前重打显式 cache_control 断点（函数内部先回收旧标记再
-        # 从尾部重新分配，总量恒 ≤3，幂等）。仅靠入口处（get_ai_response
-        # 预处理）一次性打标的话，loop 内追加的 tool 结果与 assistant
-        # (tool_calls) 消息会落在全部显式断点之外；每轮重打让最新的
-        # 工具输出进入显式缓存覆盖，loop 内 2..N 轮直接命中到最新工具
-        # 结果为止的完整前缀。与 extra_body 顶层自动断点（第 4 个）叠加。
-        # 非流式兜底与 over-limit 合成路径复用同一份 loop_messages，
-        # 无需重复打标。
-        # 断点打在渲染后的 wire dict 上
-        # （每轮重新渲染，天然无旧标记残留）；内部 Message 不携带任何
-        # 缓存装饰——cache_control 是纯出站协议装饰。
+        # 每轮在 wire 消息上重打显式 cache_control 断点；内部 Message 不带缓存装饰。
         wire_messages = render_openai_messages(loop_messages)
         if prompt_cache_enabled:
             _apply_cache_control(wire_messages)
@@ -687,37 +535,25 @@ async def _agentic_loop_openai_compat(
         content_acc = ""
         reasoning_acc = ""
         tool_calls_acc: dict = {}
-        # 打断保全（改动点1）：本轮 assistant 消息的实时占位——流式期间
-        # journal 始终持有一条与 content_acc / reasoning_acc 同步的消息，
-        # 取消发生在任何 await 点上都能被 finalize_interrupted_turn 保全。
-        # tool_calls 只在 finalize（流正常结束）写入（改动点2：流式中途
-        # 的半截参数 JSON 整体丢弃，绝不进历史）。四条循环同构接入。
+        # journal 实时持有 assistant 占位；tool_calls 仅在流正常结束后写入。
         live_slot = LiveAssistantSlot(new_history_entries)
         # 每轮重置缓存字段快照：hint 必须与本轮 token 数同源，
         # 跨轮复用会把上一轮的命中量安到本轮头上。
         usage_with_cache = None
         in_reasoning = False
         received_any = False
-        # v2.5：本轮流结束原因（length / stop / tool_calls / content_filter…）。
-        # 初始 None = 尚未见到任何终止事件；流被完整消费却仍为 None 时，
-        # 归一化层会把 ""（断流证据）传入诊断信封——空参数/截断参数的
-        # 根因自此可被准确区分（输出上限 vs 断流 vs 模型自身语法错）。
+        # None 表示尚未见终止事件；完整消费仍为 None 时用 "" 表示断流。
         stream_finish_reason: Optional[str] = None
         # 本轮"第一个出现的内容类型"：'tool'（先出现工具调用）或 'content'（先出现思考/文本）。
         # 只有第一次出现时才据此决定是否要关闭上一个未闭合的工具块，之后不再重复判断。
         round_leading_kind = None
 
-        # 草稿流切换状态机（与两条原生 bridge 循环共用 make_switch_stream）：
-        # 同一流类型幂等返回；切换前结束当前流，并在"此前确有流"时触发
-        # 块边界换草稿检查点（非阻塞事件，由 DraftManager 容量阈值决定
-        # 是否真实滚动，§8/§9）。状态存于 cell，代替本循环原先逐字相同
-        # 的 nonlocal current_stream 闭包。
+        # 流切换由共享状态机处理；检查点非阻塞且受 DraftManager 容量控制。
         current_stream_cell = [None]
         switch_stream = make_switch_stream(builder, current_stream_cell)
 
         try:
-            # SDK create() 重载不接受 dict[str, object] 的 ** 解包；
-            # 请求载荷本就是动态 JSON 形状，按 Any 标注。
+            # SDK 重载不接受 dict[str, object] 解包；请求载荷是动态 JSON。
             create_params: dict[str, Any] = {
                 "model": current_model,
                 "messages": wire_messages,
@@ -928,29 +764,14 @@ async def _agentic_loop_openai_compat(
                                     builder.update_tool_args(stream_item_ids[idx], parsed_args)
                     break
                 except BadRequestError as exc:
-                    # strict 工具 schema 被网关拒绝（聚合网关对 strict 的支持
-                    # 参差不齐，OpenRouter/ModelScope/agnes 等转发厂商行为各异）：
-                    # 标记该 api_label（进程内记忆），摘除 strict 后用原始
-                    # schema 立即重试一次，后续轮次不再撞墙。报错文本不指向
-                    # schema/strict 时按原样抛出，不误降级。
+                    # 网关拒绝 strict schema 时记忆该 api_label，去掉 strict 后仅重试一次。
                     if (request_tools is not tools
                             and looks_like_strict_tool_rejection(str(exc))):
                         mark_strict_tools_rejected(api_label, str(exc))
                         request_tools = tools
                         create_params["tools"] = tools
                         continue
-                    # 网关侧媒体拉取瞬态失败（如 Agnes 下载消息历史里的
-                    # R2 预签名 URL 超时，400 + upstream_error）：请求体
-                    # 本身没有问题，首个增量前重放是安全的——与下方
-                    # ReadTimeout 重试同语义。重放梯子（见模块常量区说明）：
-                    #   第 1 次重放（stream_attempt=0 失败后）：1.5s 后原样
-                    #     URL 重放，抖动自愈；
-                    #   第 2 次重放（stream_attempt=1 失败后）：base64 内联
-                    #     通用兜底——把消息里的 http(s) 图片替换为 data URI
-                    #     后重放，网关不再需要访问 R2（[5332ea8f] 实证同一
-                    #     R2 慢窗口会连续击落 URL 重放，原样重试无效）。
-                    # 内联数为 0（无 http 图片/全部下载失败）时兜底不可用，
-                    # 快速抛出，避免注定失败的第三次 400 再等一轮。
+                    # 媒体拉取失败仅在首个增量前重放：先原样重试，再将图片内联为 base64。
                     if _should_retry_media_fetch_400(
                         exc, received_any=received_any, stream_attempt=stream_attempt
                     ):
@@ -1126,8 +947,7 @@ async def _agentic_loop_openai_compat(
                 raise
 
         tool_calls_list = [tool_calls_acc[i] for i in sorted(tool_calls_acc.keys())] if tool_calls_acc else []
-        # v2.5：流被完整消费却从未见到终止事件，且本轮确实产出了工具调用 →
-        # 记为 ""（断流证据，非"无信息"），供归一化层定性空参数/截断参数。
+        # 有工具调用但无终止事件时标记为空，供归一化层识别断流。
         if stream_finish_reason is None and tool_calls_list:
             stream_finish_reason = ""
         try:
@@ -1147,10 +967,7 @@ async def _agentic_loop_openai_compat(
         for idx, tc in enumerate(tool_calls_list):
             if not tc.get("id"):
                 tc["id"] = f"call_{_round}_{idx}_{uuid.uuid4().hex[:8]}"
-        # ★ 流结束：把仍处于占位 id 的条目改绑到最终 id（含上面补发的合成
-        # id），并回填函数名。这样 _run_tool_calls_and_append 里的
-        # add_tool_item(真实 id, ...) 会合并进已经显示的条目，而不是另建
-        # 一个重复的工具块。acc 索引与 tool_calls_list 位置按排序键对齐。
+        # 流结束后把占位工具条目改绑到最终 id，避免重复 UI 条目。
         if stream_item_ids:
             for acc_idx in sorted(tool_calls_acc.keys()):
                 tc_entry = tool_calls_acc[acc_idx]
@@ -1184,19 +1001,7 @@ async def _agentic_loop_openai_compat(
         if reasoning_acc:
             builder.finalize_reasoning_block()
 
-        # 块边界换草稿检查点①②（本轮最后一个块）：流已结束，最后一个思考块
-        # 或文本块在此闭合，switch_stream 不会再被触发，故在此补一次检查。
-        # 历史问题1（工具流式输出被拆到新草稿）已由安全点判定内的
-        # _has_pending_tool_group 守卫兜住：本轮若已建工具条目而未收束，
-        # 这里不会滚动，工具批次结束后的 tool.end 安全点仍会照常触发。
-        # 终局轮修复：此处 tool_calls_list / textual_tool_call 均已定型。
-        # 解耦改造：中途安全点（还会继续请求模型时）只发射事件，满容量
-        # 时由 DraftManager 在后台滚动，Agent 立即继续（§8）；终局轮
-        # （无后续请求）必须走 finalize_turn 同步收束——把"只永久化旧段、
-        # 不创建新草稿"留给终局分支完成，避免容量预警被以
-        # start_next_draft=True 抢先消费——创建一个永远无人写入、只显示
-        # "Thinking..." 的幽灵草稿，随后被 get_ai_response 收尾
-        # mark_dead + 删除（表现为回复交付后闪现的 Thinking 气泡）。
+        # 最后一个块在此闭合；有后续请求时仅发射非阻塞检查点，终局直接收束旧草稿。
         will_request_again = bool(tool_calls_list) or bool(textual_tool_call)
         if will_request_again:
             # 非阻塞安全点：满容量时后台滚动；工具批次/纠错重试立即开始。
@@ -1206,22 +1011,13 @@ async def _agentic_loop_openai_compat(
             # 终局：等待旧段永久化（不开新草稿）；未滚动时保底刷一帧。
             builder.request_flush()
 
-        # 纯文本终局截断提示：仅对"本轮确实是干净的纯文本终局"追加
-        # （不含 textual_tool_call 分支——那是模型把工具调用写成了 XML
-        # 文本的另一类问题，final_content 由下方分支自行给出安全说明，
-        # 与"输出长度不够把话说完"无关，两者不应混在一起提示）。必须在
-        # live_slot.finalize 之前算出追加后的文本，否则 journal/
-        # loop_messages 定稿的仍是未追加提示的 content_acc（与
-        # anthropic_bridge / gemini_bridge / responses_bridge 同一修复，
-        # 理由见 bridge_common.append_truncation_notice_if_needed）。
+        # 纯文本终局在定稿前追加截断提示，避免 journal 留下未提示的正文。
         if not tool_calls_list and not textual_tool_call:
             content_acc = append_truncation_notice_if_needed(
                 builder, content_acc, stream_finish_reason)
 
         # assistant 消息组装 + 双列表追加（与两条原生 bridge 循环共用骨架）。
-        # 打断保全（改动点1）：改为"升级已存在的占位消息"而不是新增一条——
-        # journal 里的实时占位原地补全 tool_calls / reasoning / 最终文本，
-        # 同一对象追加进 loop_messages（正常路径不出现重复 assistant 消息）。
+        # 原地升级 journal 占位，并将同一对象追加到请求消息。
         live_slot.finalize(loop_messages, content_acc, tool_calls_list, reasoning_acc)
 
         # 文本伪工具调用最多纠正三次；达到次数后直接给出安全状态说明，而不是
@@ -1317,9 +1113,7 @@ async def _agentic_loop_openai_compat(
     return final_content, final_usage, new_history_entries
 
 
-# =====================================================================
 # 原生图像循环的 prompt / 参考图提取（Internal Message 原生）
-# =====================================================================
 def _extract_native_image_urls_from_user_message(msg: Message) -> list[str]:
     """从单条 user 消息（内部 Message）中提取全部参考图 URL。
 
@@ -1431,9 +1225,7 @@ def _extract_image_prompt_and_reference_urls(msgs: list) -> tuple[str, list[str]
     return prompt, image_urls
 
 
-# =====================================================================
 # 原生图像循环（ImageTask 驱动：任务显式声明操作，协议适配器决定端点）
-# =====================================================================
 async def _agentic_loop_native_image(
         client: AsyncOpenAI,
         current_model: str,
@@ -1495,10 +1287,7 @@ async def _agentic_loop_native_image(
         if model_info is None:
             return f"IMAGE_ERROR:未知图像模型 {current_model}", None, []
 
-        # 打断保全（改动点4）：发起生成请求前先往 journal 放进度占位——
-        # 生成是原子性调用（无“半张图”中间态），等待返回的几十秒里被打断
-        # 时，占位提供“模型上一轮确实在生成图片”的上下文；请求成功后原地
-        # 更新为最终结果，失败路径整体移除（保持失败轮替换语义不变）。
+        # 发起媒体请求前写进度占位；成功定稿，失败移除，取消时保留。
         media_slot = MediaProgressSlot(
             journal,
             f"[图片生成中] 指令: {clean_prompt or prompt_text or '(无)'}"[:300],
@@ -1574,23 +1363,15 @@ async def _agentic_loop_native_image(
             history_content = f"[图片已生成] 指令: {clean_prompt or '(无)'} | {final_notice}".strip(" |")
         else:
             history_content = final_notice or "（已生成图片）"
-        # 打断保全（改动点4）：占位原地定稿为最终历史内容（journal 中恰一条，
-        # 不与占位叠加；journal=None 时 complete 仍返回有效 new_entries）。
+        # 占位原地定稿，避免 journal 中出现重复消息。
         new_entries = media_slot.complete(history_content)
         return final_content, result.usage, new_entries
 
     except Exception as e:
         logger.exception(f"Native image model request failed: {e}")
-        # 打断保全（改动点4）：异常路径移除进度占位——失败轮保持“历史末尾
-        # 仍是 user 消息”，mark_failed_unanswered_user / 下一条消息的替换
-        # 语义不变。（CancelledError 不是 Exception，不走本分支：占位留在
-        # journal 由打断方保全。）
+        # 异常时移除进度占位；CancelledError 由打断路径保全。
         media_slot.drop()
-        # 修复：旧写法 hasattr(e, "response") and hasattr(e.response, "text")
-        # 在流式响应未读取时会抛 httpx.ResponseNotRead（hasattr 只吞
-        # AttributeError），且旧代码 `await e.response.text()` 对同步
-        # str 属性 await 必抛 TypeError——两处都会让错误日志提取
-        # 静默失效甚至二次崩溃。改用安全的 extract_error_body_text。
+        # 统一用安全的错误体提取器，兼容未读取响应和同步文本属性。
         _err_body = extract_error_body_text(e)
         if _err_body:
             logger.error(f"Response body: {_err_body[:1000]}")
@@ -1704,11 +1485,7 @@ async def _agentic_loop_native_video(
     #   "录制"视频），每 4 秒循环重发，覆盖动辄数十秒到数分钟的生成过程；
     # - 发送阶段（视频下载 / R2 上传 / sendRichMessage 携带 <video>）
     #   -> upload_video（bot 正在发送视频）。
-    # 打断保全（改动点4）：发起生成请求前先往 journal 放进度占位——
-    # 视频生成动辄数十秒到数分钟，等待期间被打断时，占位提供“模型上一轮
-    # 确实在生成视频”的上下文；成功后原地定稿为最终历史内容，失败路径
-    # 整体移除（保持失败轮替换语义不变），取消路径留在 journal 由打断方
-    # 保全（CancelledError 不走 except Exception）。
+    # 视频生成耗时较长，先写入进度占位；成功定稿，失败移除，取消由打断路径保全。
     media_slot = MediaProgressSlot(
         journal,
         f"[视频生成中] 提示词: {prompt[:200]}" if prompt else "[视频生成中]",
@@ -1781,10 +1558,7 @@ async def _agentic_loop_native_video(
                 if dl_resp.status == 200:
                     # 修复 OOM 风险：限制为 200MB（足够任何合理的 720p 视频片段），
                     # 超限则拒绝并回退到原始 URL。防护必须在"读取"阶段生效：
-                    # 1) Content-Length 预拒绝（服务器声明超限直接放弃）；
-                    # 2) 分块流式累积，超限即中止（服务器不声明长度/谎报时，
-                    #    旧实现 resp.read() 仍会把整个 body 读进内存才检查，
-                    #    防护形同虚设）。
+                    # 先检查 Content-Length，再分块读取，避免超大响应进入内存。
                     _MAX_VIDEO_BYTES = 200 * 1024 * 1024
                     declared_len_raw = dl_resp.headers.get("Content-Length")
                     declared_len: Optional[int] = None
@@ -1888,7 +1662,7 @@ async def _agentic_loop_native_video(
         media_slot.drop()
         return "VIDEO_ERROR:视频发送失败", None, []
 
-    # 生成历史记录（打断保全改动点4：占位原地定稿，journal 中恰一条）
+    # 占位原地定稿，避免 journal 中出现重复消息。
     history_content = f"[视频已生成] 提示词: {prompt[:200]}" if prompt else "[视频已生成]"
     new_entries = media_slot.complete(history_content)
 

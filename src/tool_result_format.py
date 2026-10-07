@@ -1,18 +1,4 @@
-"""format_tool_result：工具原始结果 → (summary, details_html) UI 分发。
-
-MCP 化重构后的分发口径
-----------------------
-工具名先经 tool_names.tool_family() 归一到「工具族」再分发，渲染器只感知
-族名（web_search / weather / maps_* / todo / memory ...），
-不感知 mcp__<server>__<tool> 的完整名 —— 外部/内部 MCP 工具与 host 内建
-工具共用同一套卡片渲染器。
-
-结果策略（只给用户有帮助的）：
-  - 有专属卡片的工具（POI 卡 / 路线卡 / 天气卡 / todo 卡 / 子 agent 卡 ...）
-    渲染结构化富文本，突出用户决策字段；
-  - 未知 MCP 工具走通用结构化面板（裁剪 + 转义），绝不把上游原文整篇刷屏；
-  - 敏感/超时路径只展示友好状态，不泄露内部细节。
-"""
+"""format_tool_result：工具原始结果 → (summary, details_html) UI 分发。"""
 
 import html
 import json
@@ -42,8 +28,7 @@ from tool_ui_render import (
 
 logger = logging.getLogger(__name__)
 
-
-# ---------- 工具结果格式化 ----------
+# 工具结果格式化
 
 # Magic marker emitted by ai_handlers.run_one on asyncio.TimeoutError.
 # format_tool_result intercepts this BEFORE any other branch so we can
@@ -76,7 +61,6 @@ _TOOL_TIMEOUT_LABELS = {
     "deliver_reply": "Reply delivery",
 }
 
-
 # 进行中卡片沿用时的友好名称（family → 展示名）。
 _FAMILY_LABELS = {
     "maps_geo": "📍 地理编码",
@@ -92,14 +76,12 @@ _FAMILY_LABELS = {
     "exchange_rate": "💱 汇率查询",
 }
 
-
 def _is_background_task_call(fn_args: dict) -> bool:
     """按调用参数识别后台任务模式的 bash / subagent 调用：启动（run_in_background）
     或 task_action 查询/停止。task_id 单独出现不构成后台调用（防御形状）。"""
     if not isinstance(fn_args, dict):
         return False
     return bool(fn_args.get("run_in_background")) or bool(fn_args.get("task_action"))
-
 
 def _format_background_task_result(fn_args: dict, result_str: str) -> tuple[str, str] | None:
     """后台任务结果的卡片渲染：summary = 结果首行（自带状态徽标），
@@ -114,13 +96,12 @@ def _format_background_task_result(fn_args: dict, result_str: str) -> tuple[str,
     details_html = _render_editor_quote("Output", text)
     return summary, details_html
 
-
 async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tuple[str, str]:
     """工具执行结果 →（折叠块标题, 展开详情 HTML）。"""
     fn_args = fn_args or {}
     family = tool_family(fn_name)
 
-    # ---- 通用拦截：超时标记 ----
+    # 通用拦截：超时标记
     if result_str == _TOOL_TIMEOUT_MARKER:
         label = _TOOL_TIMEOUT_LABELS.get(family, fn_name)
         summary = f"⏱️ {label} timed out"
@@ -133,7 +114,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
     if family == "web_search":
         # 惰性导入：ai 包反向消费本模块（ai.tool_call_loop -> tool_executors
-        # -> tool_result_format），模块级导入会形成 import 时刻的包间环。
+        # > tool_result_format），模块级导入会形成 import 时刻的包间环。
         from ai.web_search_render import format_web_search_result
         return format_web_search_result(fn_args, result_str)
 
@@ -152,8 +133,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             summary = f"🌐 Failed to fetch {domain}"
             details_html = "Unable to retrieve content. Check the URL or try again later."
         else:
-            # 展示保持历史样式：仅标题 + 来源域名链接。富 HTML 是给模型看的，
-            # 不在 Telegram 工具折叠面板中渲染（避免长消息 + 重复内容）。
+            # 展示仅保留标题 + 来源域名链接；富 HTML 仅供模型使用。
             title = domain
             m = re.search(r'<h3[^>]*>(.*?)</h3>', text, re.S | re.I)
             if m:
@@ -170,7 +150,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 error_msg = weather_data["error"]
                 summary = "🌤️ 天气查询失败"
                 # 上游错误文本必须转义：未转义时其中的 < > & 会打坏
-                # Rich Message 结构（旧实现直接内插，属注入面）。
+                # Rich Message 结构直接内插会形成注入面。
                 # 走 _render_code_text 复用总量兑底，错误信息也可能很长。
                 details_html = _render_code_text(str(error_msg))
                 return summary, details_html
@@ -363,8 +343,8 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         # 视频通过 <figure><video> 内嵌在工具结果卡片里渲染（Telegram Rich Message
         # 支持视频 block 与文本同消息共存，参见 Rich Message Formatting Options）。
         # execute_generate_video 返回的结构：
-        #   ✅ 已生成视频。
-        #   视频链接：https://...
+        # ✅ 已生成视频。
+        # 视频链接：https://...
         if "✅" in result_str:
             url_match = re.search(r'视频链接：(https?://[^\s]+)', result_str)
             if url_match:
@@ -394,7 +374,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = _render_media_failure_result(result_str, "视频生成未完成，请稍后重试。")
         return summary, details_html
 
-    # ===================== 高德地图工具（gaode_mcp 原生直连） =====================
+    # 高德地图工具（gaode_mcp 原生直连）
     # 模型直接调用 mcp__gaode_mcp__maps_*；UI 按族渲染结构化卡片（POI 卡 /
     # 路线卡 / 距离表 / geocode 卡）。载荷是高德原生 JSON（未做模型视图清洗
     # 的完整版），POI 卡片因此可以展示 photos 实景图。
@@ -442,11 +422,11 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = _render_editor_result(command, path, result_str, fn_args)
         return summary, details_html
 
-    # ===================== Todo 工具格式化 =====================
+    # Todo 工具格式化
     # internal_todo MCP 服务器返回 JSON 字符串（给 AI 阅读）。UI 渲染富文本卡片：
-    #   - 顶部统计：总数 / 已完成 / 待办
-    #   - 列表项：状态 emoji + 优先级徽章 + 标题（完成则加删除线）+ 标签 chips
-    #   - 长列表自动截断并提示
+    # 顶部统计：总数 / 已完成 / 待办
+    # 列表项：状态 emoji + 优先级徽章 + 标题（完成则加删除线）+ 标签 chips
+    # 长列表自动截断并提示
     elif family == "todo":
         try:
             payload = json.loads(result_str)
@@ -498,7 +478,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = render_todo_card(payload)
         return summary, details_html
 
-    # ===================== Memory 工具格式化 =====================
+    # Memory 工具格式化
     elif family == "memory":
         try:
             payload = json.loads(result_str)
@@ -538,7 +518,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = render_memory_card(payload)
         return summary, details_html
 
-    # ===================== Subagent 工具格式化 =====================
+    # Subagent 工具格式化
     elif family == "subagent":
         # 后台模式（启动句柄 / task_action 查询与停止）：结果是首行自带
         # 状态徽标的纯文本，与 bash 后台任务同一渲染。
@@ -566,9 +546,9 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = render_subagent_card(payload)
         return summary, details_html
 
-    # ===================== Bash 工具格式化 =====================
+    # Bash 工具格式化
     elif family == "bash":
-        # 后台任务模式（v2.5）：启动句柄 / task_action 查询与停止的结果
+        # 后台任务模式：启动句柄 / task_action 查询与停止的结果
         # 不走终端信封，直接以结果首行做 summary——bash_background 生成
         # 文本时首行已自带 emoji 徽标 + 任务标识，天然可作卡片摘要；
         # 全文放 Output 引用块。非后台调用返回 None，落回通用信封渲染。
@@ -585,7 +565,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         intent = _get_tool_description_from_args(fn_args) or ""
         # Bash 命令本身的非零退出码是命令结果，不是工具执行失败。
         # 工具级异常（超时、会话崩溃、命令被安全策略拒绝等）由统一
-        # _tool_result_is_failure / timeout 路径负责判定。
+        # tool_result_is_failure / timeout 路径负责判定。
         if intent:
             summary = intent
         else:
@@ -606,7 +586,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
     elif family == "present_files":
         # execute_present_files returns a JSON payload:
-        #   {"sent": [...], "failed": [...]}   (+ "error": str only on early failure)
+        # {"sent": [...], "failed": [...]}   (+ "error": str only on early failure)
         # The model context receives this raw JSON (so it can reply concisely,
         # e.g. "Files sent"), while the UI gets a rich, detailed report built
         # from the parsed structure.
@@ -635,7 +615,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         sent_count = len(sent)
         failed_count = len(failed)
 
-        # ---- Summary with correct pluralization (guards None / 0) ----
+        # Summary with correct pluralization (guards None / 0)
         if sent_count == 0:
             summary = "📂 No files sent"
         elif sent_count == 1:
@@ -643,7 +623,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         else:
             summary = f"📂 Presented {sent_count} files"
 
-        # ---- Details: HTML list of successes and failures ----
+        # Details: HTML list of successes and failures
         details_parts: List[str] = []
         if sent:
             items = "".join(f"<li>{convert_markdown_to_telegram_html(str(f))}</li>" for f in sent)

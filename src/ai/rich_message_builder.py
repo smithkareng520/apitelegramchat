@@ -1,7 +1,4 @@
-"""Telegram Rich Message 草稿的增量构建、HTML 边界扫描与滚动切换。
-
-从 ai_handlers.py 拆分而来，逻辑未做改动。
-"""
+"""Telegram Rich Message 草稿的增量构建、HTML 渲染与滚动切换。"""
 import asyncio
 import logging
 import re
@@ -123,7 +120,7 @@ def _log_draft_journal_consistency(
     打断固化草稿后校验"本轮 journal 是否留有 assistant 进度"：草稿有
     可观可见文本而 journal 无任何 assistant 文本/工具调用，即两层数据
     结构再次失同步——正是历史上"草稿显示数到 123、模型记忆全空"回归的
-    直接特征。第一时间落 WARNING（而非再靠用户截图反馈）；一致时落
+    直接特征。发现后记录 WARNING；一致时记录
     INFO 供事后观测。
 
     刻意只做"journal 完全无 assistant 进度"的空值判定，不做长度比例
@@ -420,7 +417,6 @@ class RichMessageBuilder:
                         break
                     revision_before_send = self._flush_revision
                     await self.flush(force=force_now)
-                    # 发送过程没有新版本则结束；有新版本则立即补发最新状态。
                     if (
                         self._flush_revision <= revision_before_send
                         or time.monotonic() < self._rate_limited_until
@@ -536,7 +532,6 @@ class RichMessageBuilder:
         self._refresh_outer_summary(group)
         # 工具卡片首次出现必须强制独立成帧立即上屏。
         #
-        # 此前这里走 request_flush(force=False)，存在一个与在途 flush 的
         # 合并竞态：content_block_start 触发本方法时，前一段正文/思考的
         # flush 往往仍在途（正卡在 send_rich_message_draft 的 250ms 最小
         # 间隔等待里，持有 _flush_lock 与草稿发送锁），本次请求只置脏标
@@ -1120,7 +1115,6 @@ class RichMessageBuilder:
             self._handoff_text.append(delta)
             return
         self._stream_buffer += delta
-        # 流式增量未必每片都调用 request_flush；将其标记为新版本，可确保一旦
         # 当前发送结束，后台刷新不会把已累积的增量误认为已经展示。
         self._flush_dirty = True
         self._flush_revision += 1
@@ -1594,7 +1588,6 @@ class RichMessageBuilder:
                     new_draft_id = None
                     rollover_mode = "terminal_plain_text_fallback" if used_fallback else "terminal_complete_block"
 
-                # 限制 _rollover_history 长度：此前每次 rollover 都 append 一条，
                 # 没有上限，长时间运行的会话会让该 list 无限增长。保留最近 50 条
                 # 用于诊断即可。
                 self._rollover_history.append({
@@ -1628,7 +1621,6 @@ class RichMessageBuilder:
 
             # 打断裁剪基准：旧段已永久化送达（用户已见），滚动边界上的全部
             # 可见文本计入渲染确认游标——防滚动后新帧送达前被打断时，游标
-            # 停在旧值把用户已看到的已永久化段落裁掉。
             self._advance_render_cursor(self._visible_text_chars_total)
 
             if old_draft_message_id:
@@ -1715,7 +1707,6 @@ class RichMessageBuilder:
         if not final_html.strip() or not _rich_visible_text(final_html).strip():
             # 打断发生在任何可见内容产出之前：无可固定内容。
             return False
-        # 草稿层 ↔ 历史层反向校验（改动点3）：见 _log_draft_journal_consistency。
         _log_draft_journal_consistency(
             self.chat_id, self.draft_id,
             _rich_visible_text(final_html).strip(), journal,

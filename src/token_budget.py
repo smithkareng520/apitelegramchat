@@ -1,10 +1,4 @@
-"""Shared, exact token counting and truncation helpers.
-
-All model-facing content budgets in the application are expressed in tokens.  The
-module uses ``tiktoken``'s ``o200k_base`` encoding by default, which is the
-current OpenAI-family encoding suitable for multilingual (including Chinese)
-content.  Deployments can override it with ``TOKEN_BUDGET_ENCODING``.
-"""
+"""Shared, exact token counting and truncation helpers."""
 from __future__ import annotations
 
 import os
@@ -13,9 +7,7 @@ from typing import Any, Optional
 
 import tiktoken
 
-
 DEFAULT_ENCODING_NAME = os.getenv("TOKEN_BUDGET_ENCODING", "o200k_base")
-
 
 @lru_cache(maxsize=4)
 def _get_encoding(name: str) -> tiktoken.Encoding:
@@ -25,7 +17,6 @@ def _get_encoding(name: str) -> tiktoken.Encoding:
     except ValueError:
         return tiktoken.get_encoding("cl100k_base")
 
-
 def count_tokens(value: Any, *, encoding_name: str = DEFAULT_ENCODING_NAME) -> int:
     """Return the exact token count of a value after converting it to text."""
     if value is None:
@@ -34,7 +25,6 @@ def count_tokens(value: Any, *, encoding_name: str = DEFAULT_ENCODING_NAME) -> i
     if not text:
         return 0
     return len(_get_encoding(encoding_name).encode(text, disallowed_special=()))
-
 
 def truncate_to_token_budget(
     value: Any,
@@ -69,7 +59,6 @@ def truncate_to_token_budget(
 
     keep = token_budget - len(encoded_suffix)
     return encoding.decode(encoded[:keep]) + suffix
-
 
 def truncate_to_token_budget_head_tail(
     value: Any,
@@ -129,7 +118,6 @@ def truncate_to_token_budget_head_tail(
     # 预算极小时退化为普通截断，保证输出永远合法。
     return encoding.decode(encoded[:token_budget])
 
-
 def json_token_count(value: Any) -> int:
     """Count a JSON-like value without requiring callers to duplicate serialization."""
     import json
@@ -138,7 +126,6 @@ def json_token_count(value: Any) -> int:
         return count_tokens(json.dumps(value, ensure_ascii=False, default=str))
     except (TypeError, ValueError):
         return count_tokens(value)
-
 
 __all__ = [
     "DEFAULT_ENCODING_NAME",

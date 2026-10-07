@@ -1,17 +1,13 @@
-# =====================================================================
 # sandbox.py — Landlock 沙箱 + 资源限制 + Fork Bomb 看门狗
-# =====================================================================
 # 设计原则:
-#   1. 每个 chat_id 拿到独立的 Landlock 文件系统沙箱（限制在 workspace 内）
-#   2. 敏感环境变量不传入子进程
-#   3. Landlock 限制不可逆、子进程继承，防止访问 workspace 之外的任何路径
-#   4. 看门狗监控进程树大小，超过阈值杀掉沙箱（防 fork bomb）
-#   5. rlimit 限制 CPU/文件大小/fd 数量
-#
+# 1. 每个 chat_id 拿到独立的 Landlock 文件系统沙箱（限制在 workspace 内）
+# 2. 敏感环境变量不传入子进程
+# 3. Landlock 限制不可逆、子进程继承，防止访问 workspace 之外的任何路径
+# 4. 看门狗监控进程树大小，超过阈值杀掉沙箱（防 fork bomb）
+# 5. rlimit 限制 CPU/文件大小/fd 数量
 # 不使用 bwrap —— Render / Heroku / 非 privileged Docker 内核禁了
 # unprivileged userns，bwrap 永远起不来。Landlock 是 Linux 5.13+ 的
 # 非特权文件系统隔离方案，不需要任何 capability。
-# =====================================================================
 
 import asyncio
 import ctypes
@@ -26,14 +22,14 @@ from net_shims import ensure_network_shims
 
 logger = logging.getLogger(__name__)
 
-# ---------- 沙箱配置（环境变量可调） ----------
+# 沙箱配置（环境变量可调）
 SANDBOX_MAX_PROCS = int(os.getenv("SANDBOX_MAX_PROCS", "50"))
 SANDBOX_MAX_CPU_SEC = int(os.getenv("SANDBOX_MAX_CPU_SEC", "300"))   # 5 分钟 CPU
 SANDBOX_MAX_FILE_SIZE = int(os.getenv("SANDBOX_MAX_FILE_SIZE", str(100 * 1024 * 1024)))  # 100MB/文件
 SANDBOX_MAX_OPEN_FILES = int(os.getenv("SANDBOX_MAX_OPEN_FILES", "256"))
 SANDBOX_TIMEOUT_SEC = int(os.getenv("SANDBOX_TIMEOUT_SEC", "300"))
 
-# ---------- 无输出空闲超时（v2.4 bash 防卡死） ----------
+# 无输出空闲超时
 # 命令持续无输出超过该秒数即判定为卡死（典型：网络不可达时 connect 静默
 # 挂起、交互提示等待、无输出死循环），提前 kill 并向模型返回可操作的
 # 错误消息，而不是等满 SANDBOX_TIMEOUT_SEC（默认 300s）才超时。模型可
@@ -56,9 +52,9 @@ SANDBOX_SOCKET_TIMEOUT_SEC = int(os.getenv("SANDBOX_SOCKET_TIMEOUT_SEC", "15"))
 # 模型需要知道自己在哪个工作区时，读 $WORKSPACE 路径即可，且那是必要信息。
 SANDBOX_USER = os.getenv("APITELEGRAMCHAT_SANDBOX_USER", "claude").strip() or "claude"
 
-# ---------- libc ----------
+# libc
 # Any：_libc 加载失败时为 None，各调用点各自判空；若声明为 ctypes.CDLL | None，
-# _apply_landlock 内未判空直接 syscall 的既有调用点会级联报错，Any 最小且不失真。
+# apply_landlock 内未判空直接 syscall 的既有调用点会级联报错，Any 最小且不失真。
 _libc: Any
 try:
     _libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -75,7 +71,6 @@ PR_SET_DUMPABLE = 11
 # child. This is deliberately a security-status signal, not log suppression.
 _dumpable_state: Optional[bool] = None
 
-
 def _set_no_new_privs() -> bool:
     """阻止 setuid 提权；失败时返回 False。"""
     if _libc is None:
@@ -86,7 +81,6 @@ def _set_no_new_privs() -> bool:
         logger.error("prctl(NO_NEW_PRIVS) failed: %s", os.strerror(err))
         return False
     return True
-
 
 def _set_undumpable() -> bool:
     """Try to disable dumpability and report the host capability accurately.
@@ -135,7 +129,6 @@ def _set_undumpable() -> bool:
         )
     return False
 
-
 def harden_parent_process() -> None:
     """对 bot 主进程本身套用 dumpable=0（启动时调用一次）。
 
@@ -150,20 +143,16 @@ def harden_parent_process() -> None:
     if _set_undumpable():
         logger.info("Parent process hardened: PR_SET_DUMPABLE=0")
 
-
-# =====================================================================
 # Landlock（非特权文件系统隔离）
-# =====================================================================
 # Linux 5.13+ 的 Landlock 允许非特权进程限制自己的文件系统访问范围。
 # 不需要 userns / CAP_SYS_ADMIN / privileged 容器。
-#
 # 原理：fork 后 exec 前，在子进程里调 landlock_create_ruleset +
 # landlock_add_rule + landlock_restrict_self，给自己加规则：
-#   - agent 家目录（即 workspace 根，含 upload/download/skills 与
-#     隐藏缓存层 .runtime/）：可读写
-#   - /usr /bin /lib /etc：只读 + 可执行（bash/python 能跑）
-#   - /dev /proc /sys：只读（/dev/null /dev/urandom 等可读）
-#   - 其他（父目录、state/、/home、/app 源码）：全部拒绝
+# agent 家目录（即 workspace 根，含 upload/download/skills 与
+# 隐藏缓存层 .runtime/）：可读写
+# /usr /bin /lib /etc：只读 + 可执行（bash/python 能跑）
+# /dev /proc /sys：只读（/dev/null /dev/urandom 等可读）
+# 其他（父目录、state/、/home、/app 源码）：全部拒绝
 # 限制不可逆，子进程继承。
 
 # Landlock 常量（<linux/landlock.h>）
@@ -183,9 +172,7 @@ LANDLOCK_ACCESS_FS_MAKE_FIFO = 1 << 10
 LANDLOCK_ACCESS_FS_MAKE_BLOCK = 1 << 11
 LANDLOCK_ACCESS_FS_MAKE_SYM = 1 << 12
 
-# x86_64 syscall 号
-# x86_64 syscall numbers. The deployment image is x86_64; fail closed on
-# unsupported architectures rather than guessing syscall numbers.
+# Landlock syscall numbers；不支持的架构直接禁用，避免猜测编号。
 _SYS_LANDLOCK_SYSCALLS = {
     "x86_64": (444, 445, 446),
     "amd64": (444, 445, 446),
@@ -200,7 +187,7 @@ try:
 except KeyError:
     SYS_LANDLOCK_CREATE_RULESET = SYS_LANDLOCK_ADD_RULE = SYS_LANDLOCK_RESTRICT_SELF = -1
 
-# 所有 v1 的 access flags（Linux 5.13+ 通用）
+# 所有 的 access flags（Linux 5.13+ 通用）
 _LANDLOCK_ALL_ACCESS_V1 = (
     LANDLOCK_ACCESS_FS_EXECUTE |
     LANDLOCK_ACCESS_FS_WRITE_FILE |
@@ -217,10 +204,8 @@ _LANDLOCK_ALL_ACCESS_V1 = (
     LANDLOCK_ACCESS_FS_MAKE_SYM
 )
 
-
 class _LandlockRulesetAttr(ctypes.Structure):
     _fields_ = [("handled_access_fs", ctypes.c_uint64)]
-
 
 class _LandlockPathBeneathAttr(ctypes.Structure):
     _fields_ = [
@@ -228,13 +213,10 @@ class _LandlockPathBeneathAttr(ctypes.Structure):
         ("parent_fd", ctypes.c_int32),
     ]
 
-
 class SandboxSetupError(RuntimeError):
     """The filesystem sandbox could not be installed."""
 
-
 _landlock_abi: Optional[int] = None
-
 
 def _landlock_abi_version() -> int:
     """Return the Landlock ABI version, or 0 when unavailable.
@@ -262,10 +244,8 @@ def _landlock_abi_version() -> int:
     logger.info("Landlock supported (ABI %d)", _landlock_abi)
     return _landlock_abi
 
-
 def _landlock_supported() -> bool:
     return _landlock_abi_version() >= 1
-
 
 def _handled_access_mask(abi: int) -> int:
     """Return only access bits understood by the detected ABI."""
@@ -277,7 +257,6 @@ def _handled_access_mask(abi: int) -> int:
     if abi >= 3:
         mask |= 1 << 14
     return mask
-
 
 def _apply_landlock(workspace_path: str) -> bool:
     """Install a deny-by-default Landlock filesystem policy for the child.
@@ -384,10 +363,7 @@ def _apply_landlock(workspace_path: str) -> bool:
         logger.error("Landlock policy installation failed: %s", exc)
         return False
 
-
-# =====================================================================
 # preexec_fn —— fork 后 exec 前调用
-# =====================================================================
 def _preexec_sandbox(workspace_path: str) -> None:
     """Install all mandatory child restrictions before exec("bash")."""
     import resource
@@ -410,10 +386,7 @@ def _preexec_sandbox(workspace_path: str) -> None:
     resource.setrlimit(resource.RLIMIT_FSIZE, (SANDBOX_MAX_FILE_SIZE, SANDBOX_MAX_FILE_SIZE))
     resource.setrlimit(resource.RLIMIT_NOFILE, (SANDBOX_MAX_OPEN_FILES, SANDBOX_MAX_OPEN_FILES))
 
-
-# =====================================================================
 # sitecustomize 注入（沙箱内 Python 默认 socket 超时）
-# =====================================================================
 # 模型生成的 Python 脚本几乎从不主动设网络超时；一旦网络不可达（防火墙
 # 静默丢包、SMTP 端口被墙），smtplib/urllib/requests 会按内核默认 TCP
 # 重试挂起约 2 分钟/次，bash 层的空闲/总超时只能事后杀。sitecustomize.py
@@ -442,7 +415,6 @@ if _t:
         pass
 '''
 
-
 def _ensure_sitecustomize(runtime_bin: Path) -> None:
     """把 sitecustomize.py 原子写入 runtime bin（经 PYTHONPATH 生效）。
 
@@ -463,14 +435,10 @@ def _ensure_sitecustomize(runtime_bin: Path) -> None:
     except OSError as exc:
         logger.debug("sitecustomize injection skipped: %s", exc)
 
-
-# =====================================================================
 # 构造 bash argv / env
-# =====================================================================
 def build_sandbox_argv() -> list:
     """bash 进程的启动参数"""
     return ["/bin/bash", "--noprofile", "--norc", "-s"]
-
 
 def build_sandbox_env(
     workspace: Path,
@@ -539,40 +507,39 @@ def build_sandbox_env(
     # Keep runtime_bin first only for local wrappers. The actual compiler remains the
     # system toolchain baked into the image; no apt/pip install happens per Bash run.
     # ★ 工作区自我描述：让模型不用"猜"自己在哪、哪里可写。生产日志显示
-    #   模型习惯性 `cd /tmp` 下载文件，而 Landlock 只放行家目录子树，
-    #   curl -o 直接 exit 23，平均浪费 5-7 轮试错才撞到正确路径。现在
-    #   `echo $WORKSPACE` 一次即可拿到绝对路径；系统提示词与 bash 工具
-    #   description 同步引用该变量。
-    #
+    # 模型习惯性 `cd /tmp` 下载文件，而 Landlock 只放行家目录子树，
+    # curl -o 直接 exit 23，平均浪费 5-7 轮试错才撞到正确路径。现在
+    # `echo $WORKSPACE` 一次即可拿到绝对路径；系统提示词与 bash 工具
+    # description 同步引用该变量。
     # 身份说明：不设置 USER=chat{chat_id}。
-    #   - chat{id} 只是展示标签，却会把会话路由 id 泄露进模型可读的 shell 环境；
-    #   - $USER 与真实 uid 解析（whoami/id/ls 属主列）不一致还会误导模型
-    #     以为自己"是"某个 chat；实际身份统一为镜像内的 claude 用户，
-    #     per-chat 的隔离由 Landlock 按家目录路径强制，不靠身份标签。
+    # chat{id} 只是展示标签，却会把会话路由 id 泄露进模型可读的 shell 环境；
+    # $USER 与真实 uid 解析（whoami/id/ls 属主列）不一致还会误导模型
+    # 以为自己"是"某个 chat；实际身份统一为镜像内的 claude 用户，
+    # per-chat 的隔离由 Landlock 按家目录路径强制，不靠身份标签。
     return {
         "PATH": f"{runtime_bin}:{cache_root / 'python_user' / 'bin'}:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
         # ★ HOME = agent 家目录（workspace 根）：`~` 就是模型可见的工作区根，
-        #   `ls` 默认只见 download/ upload/ skills/ 与用户自己的文件；
-        #   缓存层在隐藏的 .runtime/ 下（点前缀不进普通 ls），且个别仍按
-        #   POSIX 惯例写 $HOME 点文件的工具（git config --global 等）也
-        #   只是往模型自己的家目录写隐藏文件，无碍观瞻亦无越界。
+        # `ls` 默认只见 download/ upload/ skills/ 与用户自己的文件；
+        # 缓存层在隐藏的 .runtime/ 下（点前缀不进普通 ls），且个别仍按
+        # POSIX 惯例写 $HOME 点文件的工具（git config --global 等）也
+        # 只是往模型自己的家目录写隐藏文件，无碍观瞻亦无越界。
         "HOME": workdir_abs,
         "USER": SANDBOX_USER,
         "LOGNAME": SANDBOX_USER,
         "WORKSPACE": workdir_abs,
         "WORKDIR": workdir_abs,
         # ★ PYTHONPATH 指向 runtime bin：其中的 sitecustomize.py 在沙箱内
-        #   每个 Python 进程启动时自动执行（注入默认 socket 超时）。该目录
-        #   只含 shim 可执行脚本与 sitecustomize.py，无可导入模块名冲突，
-        #   不会遮蔽标准库或 site-packages。
+        # 每个 Python 进程启动时自动执行（注入默认 socket 超时）。该目录
+        # 只含 shim 可执行脚本与 sitecustomize.py，无可导入模块名冲突，
+        # 不会遮蔽标准库或 site-packages。
         "PYTHONPATH": str(runtime_bin),
         # sitecustomize.py 读取该值设置 socket.setdefaulttimeout。
         "SANDBOX_SOCKET_TIMEOUT_SEC": str(SANDBOX_SOCKET_TIMEOUT_SEC),
-        # ---------- 常见 CLI 工具的网络超时 ----------
+        # 常见 CLI 工具的网络超时
         # 网络不可达时让命令快速失败，而不是按各自默认值挂起数分钟：
-        #   - pip：连接超时 15s（官方环境变量，等价 --timeout）；
-        #   - git：传输速率低于 1KB/s 持续 30s 即中止（覆盖 clone/fetch 静默卡死）；
-        #   - npm：fetch 阶段 60s 超时 + 最多重试 2 次（npm 默认 300s）。
+        # pip：连接超时 15s（官方环境变量，等价 --timeout）；
+        # git：传输速率低于 1KB/s 持续 30s 即中止（覆盖 clone/fetch 静默卡死）；
+        # npm：fetch 阶段 60s 超时 + 最多重试 2 次（npm 默认 300s）。
         "PIP_DEFAULT_TIMEOUT": "15",
         "GIT_HTTP_LOW_SPEED_LIMIT": "1000",
         "GIT_HTTP_LOW_SPEED_TIME": "30",
@@ -611,10 +578,7 @@ def build_sandbox_env(
         "KERAS_HOME": str(cache_root / "keras"),
     }
 
-
-# =====================================================================
 # Fork Bomb 看门狗
-# =====================================================================
 def _count_descendants(root_pid: int) -> int:
     """通过 /proc 统计进程树大小"""
     children_map: dict[int, list[int]] = {}
@@ -645,7 +609,6 @@ def _count_descendants(root_pid: int) -> int:
         count += 1
         queue.extend(children_map.get(pid, []))
     return count
-
 
 async def watchdog(proc: asyncio.subprocess.Process,
                    max_procs: int = SANDBOX_MAX_PROCS,
@@ -687,7 +650,6 @@ async def watchdog(proc: asyncio.subprocess.Process,
         except Exception as e:
             logger.debug(f"watchdog tick error: {e}")
         await asyncio.sleep(interval)
-
 
 # 在父进程（import 时）预热 Landlock ABI 探测缓存。
 # preexec_fn 运行在 fork 之后、exec 之前的子进程里；若首次探测发生在

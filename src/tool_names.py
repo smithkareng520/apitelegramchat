@@ -1,14 +1,10 @@
 # tool_names.py — MCP 工具名的单一数据源。
-#
 # 所有 MCP 工具在模型视角统一采用 Claude Code 的命名约定：
-#
-#     mcp__<server>__<tool>
-#
+# mcp__<server>__<tool>
 # server 名与 tool 名都来自 mcp.json 及各 MCP 服务器自身的 list_tools，
 # 本模块只把「会出现在策略集合 / UI 渲染 / 模型视图 / 系统提示」里的名字
 # 收敛成常量与纯函数，避免同一字符串散落十几处文件（上一代地图工具名的
 # 主要维护痛点）。
-#
 # host 内建工具（message_user / deliver_reply / subagent / generate_image /
 # generate_video / present_files）不经 MCP 暴露 —— 它们依赖宿主进程的
 # Telegram 会话、草稿流与 LLM 编排能力，属于 Claude Code 里“内建工具”
@@ -17,15 +13,12 @@ from __future__ import annotations
 
 MCP_PREFIX = "mcp__"
 
-
 def mcp_name(server: str, tool: str) -> str:
     """按 Claude Code 约定拼出模型视角的完整工具名。"""
     return f"{MCP_PREFIX}{server}__{tool}"
 
-
 def is_mcp_name(name: str) -> bool:
     return isinstance(name, str) and name.startswith(MCP_PREFIX)
-
 
 def split_mcp_name(name: str) -> tuple[str, str] | None:
     """拆出 (server, tool)；非 MCP 名返回 None。"""
@@ -37,10 +30,7 @@ def split_mcp_name(name: str) -> tuple[str, str] | None:
         return None
     return server, tool
 
-
-# =====================================================================
 # external: gaode_mcp（高德地图，streamable_http）
-# =====================================================================
 GAODE_SERVER = "gaode_mcp"
 
 MAPS_GEO = mcp_name(GAODE_SERVER, "maps_geo")
@@ -65,10 +55,7 @@ GAODE_TOOLS: frozenset[str] = frozenset({
 # 执行期间向用户显示 find_location 聊天动作的位置类工具。
 LOCATION_LOOKUP_TOOLS: frozenset[str] = GAODE_TOOLS
 
-
-# =====================================================================
 # internal stdio servers
-# =====================================================================
 SEARCH_SERVER = "internal_search"
 TODO_SERVER = "internal_todo"
 MEMORY_SERVER = "internal_memory"
@@ -87,10 +74,7 @@ MEMORY = mcp_name(MEMORY_SERVER, "memory")
 TEXT_EDITOR = mcp_name(WORKSPACE_SERVER, "text_editor")
 BASH = mcp_name(BASH_SERVER, "bash")
 
-
-# =====================================================================
 # host 内建工具（不经 MCP）
-# =====================================================================
 MESSAGE_USER = "message_user"
 DELIVER_REPLY = "deliver_reply"
 SUBAGENT = "subagent"
@@ -98,10 +82,7 @@ GENERATE_IMAGE = "generate_image"
 GENERATE_VIDEO = "generate_video"
 PRESENT_FILES = "present_files"
 
-
-# =====================================================================
 # 工具族（family）：UI 渲染 / 摘要标签按族分发，避免逐名 if/elif。
-# =====================================================================
 def tool_family(name: str) -> str:
     """返回工具的真实族名；高德 MCP 直接使用原生 ``maps_*`` 名称。"""
     split = split_mcp_name(name)

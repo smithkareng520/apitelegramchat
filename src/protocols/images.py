@@ -24,10 +24,8 @@ if TYPE_CHECKING:
 
 # 图像端点 URL 特征：路径以 /images/generations 或 /images/edits 结尾（可带
 # query/尾斜）。用于"模型未显式声明图像协议，但声明了图像端点"时的配置
-# 驱动回退路由（新增一个图像模型只需在 config 里写 endpoint，不需要在
-# 本文件新建分支）。
+# 配置 endpoint 即可驱动图像协议回退路由。
 _IMAGES_ENDPOINT_PATH_PATTERN = re.compile(r"/images/(?:generations|edits)(?:[/?#]|$)")
-
 
 class ImageProtocolAdapter:
     """图像协议适配器契约。"""
@@ -37,7 +35,6 @@ class ImageProtocolAdapter:
 
     async def run_image_task(self, task: ImageTask) -> ImageTaskResult:
         raise NotImplementedError
-
 
 class OpenAIImagesAdapter(ImageProtocolAdapter):
     """OpenAI Images 协议（/images/generations、/images/edits）。
@@ -58,7 +55,6 @@ class OpenAIImagesAdapter(ImageProtocolAdapter):
 
         return await _request_openai_images_task(task)
 
-
 class ChatModalitiesImageAdapter(ImageProtocolAdapter):
     """Chat Completions + modalities 图像链路（OpenRouter 等）。
 
@@ -74,19 +70,15 @@ class ChatModalitiesImageAdapter(ImageProtocolAdapter):
 
         return await _request_chat_modalities_image_task(task)
 
-
-# 协议 -> 图像适配器（单例）。
 IMAGE_PROTOCOLS: dict[str, ImageProtocolAdapter] = {
     "openai_images": OpenAIImagesAdapter(),
     "openai_chat": ChatModalitiesImageAdapter(),
 }
 
-
 def _endpoint_shape_is_images(ep: Any) -> bool:
     """合并后的有效端点是否声明了 OpenAI Images 形状的完整 URL。"""
     url = str(getattr(ep, "endpoint", None) or "").strip()
     return bool(url and _IMAGES_ENDPOINT_PATH_PATTERN.search(url))
-
 
 def resolve_image_adapter(model_info: "ModelConfig") -> ImageProtocolAdapter:
     """按模型配置取图像适配器（配置驱动 + 端点特征优先回退）。
@@ -132,7 +124,6 @@ def resolve_image_adapter(model_info: "ModelConfig") -> ImageProtocolAdapter:
         "/images/generations|edits 的 endpoint）"
     )
 
-
 async def dispatch_image_task(task: ImageTask) -> ImageTaskResult:
     """ImageTask 的统一分发入口。
 
@@ -147,7 +138,6 @@ async def dispatch_image_task(task: ImageTask) -> ImageTaskResult:
         raise ValueError(f"未知图像模型: {task.model!r}，请检查 SUPPORTED_MODELS")
     adapter = resolve_image_adapter(model_info)
     return await adapter.run_image_task(task)
-
 
 __all__ = [
     "ImageProtocolAdapter",

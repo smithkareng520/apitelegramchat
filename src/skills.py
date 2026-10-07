@@ -21,10 +21,8 @@ SKILL_ASSETS_DIRNAME = "skills"
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
 
-
 def _normalize_key(key: str) -> str:
     return key.strip().lower().replace(" ", "_").replace("-", "_")
-
 
 def _parse_scalar(value: str) -> Any:
     raw = value.strip()
@@ -44,7 +42,6 @@ def _parse_scalar(value: str) -> Any:
     if lower in {"false", "no"}:
         return False
     return raw
-
 
 def _parse_frontmatter_lines(lines: list[str]) -> dict[str, Any]:
     meta: dict[str, Any] = {}
@@ -85,7 +82,6 @@ def _parse_frontmatter_lines(lines: list[str]) -> dict[str, Any]:
 
     return meta
 
-
 def _read_skill_header(skill_md: Path) -> dict[str, Any]:
     try:
         with skill_md.open("r", encoding="utf-8") as fh:
@@ -103,7 +99,6 @@ def _read_skill_header(skill_md: Path) -> dict[str, Any]:
     except Exception:
         logger.debug("_read_skill_header 内部忽略的异常", exc_info=True)
         return {}
-
 
 def _candidate_skill_roots() -> list[Path]:
     roots: list[Path] = []
@@ -134,10 +129,8 @@ def _candidate_skill_roots() -> list[Path]:
         out.append(resolved)
     return out
 
-
 def discover_skill_roots() -> list[Path]:
     return [root for root in _candidate_skill_roots() if root.exists() and root.is_dir()]
-
 
 @dataclass(frozen=True)
 class SkillRecord:
@@ -161,7 +154,6 @@ class SkillRecord:
             "allowed_tools": self.allowed_tools,
         }
 
-
 def _workspace_skill_roots(
     chat_id: int,
     workspace_namespace: str | None = None,
@@ -174,7 +166,6 @@ def _workspace_skill_roots(
         logger.debug("_workspace_skill_roots 内部忽略的异常", exc_info=True)
         return []
     return [root]
-
 
 def load_skill_records(
     *,
@@ -247,8 +238,6 @@ def _read_full_skill(skill_path: Path) -> tuple[dict[str, Any], str]:
     header, body = match.group(1), match.group(2).strip()
     return _parse_frontmatter_lines(header.splitlines()), body
 
-
-
 def skill_catalog_brief(
     chat_id: int | None = None,
     workspace_namespace: str | None = None,
@@ -267,7 +256,6 @@ def skill_catalog_brief(
         f"{rec.name} - {rec.description.strip() if rec.description else '(no description)'}"
         for rec in records
     )
-
 
 def get_skill_catalog(
     chat_id: int | None = None,
@@ -289,7 +277,6 @@ def get_skill_catalog(
         "featured": featured,
         "skills": [rec.to_catalog_item() for rec in records],
     }
-
 
 def read_skill(
     skill_id: str,
@@ -321,7 +308,6 @@ def read_skill(
             }
     return {"error": f"Unknown skill: {skill_id}"}
 
-
 def _project_skill_source_root() -> Path | None:
     """Return the highest-priority packaged skill root used for bootstrap.
 
@@ -338,12 +324,10 @@ def _project_skill_source_root() -> Path | None:
             return root
     return None
 
-
 def _iter_files(root: Path) -> Iterable[Path]:
     for path in root.rglob("*"):
         if path.is_file():
             yield path
-
 
 _SYNC_INTERVAL_SECONDS = max(2, float(os.getenv("SKILLS_AUTO_SYNC_INTERVAL_SECONDS", "5")))
 _sync_watcher_task: asyncio.Task[None] | None = None
@@ -351,12 +335,10 @@ _sync_watcher_stop: asyncio.Event | None = None
 _workspace_r2_watcher_task: asyncio.Task[None] | None = None
 _workspace_r2_watcher_stop: asyncio.Event | None = None
 
-
 def _is_safe_relpath(rel: str) -> bool:
     if not rel or rel.startswith("/"):
         return False
     return all(part not in {"", ".", ".."} for part in Path(rel).parts)
-
 
 def _atomic_copy(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -369,7 +351,6 @@ def _atomic_copy(src: Path, dst: Path) -> None:
             tmp.unlink()
         except FileNotFoundError:
             pass
-
 
 def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
     """Populate a runtime workspace with packaged skills (copy-if-missing).
@@ -411,7 +392,6 @@ def sync_all_skill_assets_to_workspace(workspace_root: Path) -> dict[str, Any]:
         summary["errors"].append(str(exc))
     return summary
 
-
 def _workspace_namespace_dirs() -> list[Path]:
     try:
         from workspace_paths import workspaces_root
@@ -421,7 +401,6 @@ def _workspace_namespace_dirs() -> list[Path]:
     if not root.is_dir():
         return []
     return [p for p in sorted(root.iterdir()) if p.is_dir() and not p.is_symlink()]
-
 
 def sync_packaged_skills_for_existing_workspaces() -> dict[str, Any]:
     """Refresh packaged skills for every workspace that already exists on disk."""
@@ -436,7 +415,6 @@ def sync_packaged_skills_for_existing_workspaces() -> dict[str, Any]:
             results["errors"].append(f"{home}: {exc}")
     return results
 
-
 def _packaged_source_fingerprint() -> str:
     root = _project_skill_source_root()
     if root is None:
@@ -450,7 +428,6 @@ def _packaged_source_fingerprint() -> str:
         except OSError:
             continue
     return hashlib.sha256("\n".join(sorted(items)).encode()).hexdigest()
-
 
 async def start_packaged_skill_auto_sync() -> None:
     """Synchronize existing workspaces immediately, then watch for source changes."""
@@ -537,7 +514,6 @@ async def start_packaged_skill_auto_sync() -> None:
             name="workspace-skills-r2-sync",
         )
 
-
 async def stop_packaged_skill_auto_sync() -> None:
     global _sync_watcher_task, _sync_watcher_stop, _workspace_r2_watcher_task, _workspace_r2_watcher_stop
 
@@ -565,7 +541,6 @@ async def stop_packaged_skill_auto_sync() -> None:
     _sync_watcher_stop = None
     _workspace_r2_watcher_task = None
     _workspace_r2_watcher_stop = None
-
 
 def read_skill_text(
     skill_id: str,

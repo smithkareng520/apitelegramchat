@@ -1,30 +1,4 @@
-"""OpenAI 原生 Responses API（/v1/responses）桥接层。
-
-设计原则（官方 server-managed state，单一状态源）：
-1. 多轮上下文的唯一载体是服务端 response chain：每个 chat 只保存一个
-   ``previous_response_id``，成功创建 response 后原子推进链头。本地
-   canonical history 只在 bootstrap（异常恢复）时全量重放；不再维护
-   "水位 + 增量历史"镜像，也不再做 manual replay fallback。
-2. 普通轮次：``input`` 只携带本回合新增的用户内容（``[user_item]``），
-   ``previous_response_id`` 指向上一条成功 response。
-3. 工具轮次：从 ``response.completed`` 的权威结构化 ``output`` 识别
-   ``function_call``，执行工具后以 ``previous_response_id=response.id``
-   + ``input=[function_call_output]`` 续链。工具调用 response 完全可能
-   没有最终文本——绝不以 ``output_text == ""`` 判定 response 为空，
-   也绝不从 raw_content / assistant 文本 / 历史切片推导 continuation。
-4. 严格禁止空 input：调用 SDK 前做协议级 invariant，空 input 直接抛
-   ``ResponsesProtocolError``；不用假消息骗过供应商。
-5. ``instructions`` 不随 previous_response_id 继承：每轮都从当前
-   canonical system prompt 显式传入。
-6. 异常状态：只有 response 成功返回且携带有效 ``response.id`` 才推进
-   链头；请求失败保持旧链头。previous_response_id 被服务端判定失效时，
-   仅用 Responses API 做一次全量 bootstrap 重试；不存在 Chat
-   Completions / Conversations fallback。回合中断（请求已出网）后
-   显式断链，下一轮 bootstrap。
-
-Responses API 的协议差异（input、function_call item、reasoning 参数、SSE
-事件）仍由本模块负责边界转换，内部 agent/tool/history 骨架保持不变。
-"""
+"""OpenAI 原生 Responses API 桥接层，负责 server-managed response chain。"""
 import json
 import uuid
 from dataclasses import dataclass
@@ -83,9 +57,7 @@ from core.messages import Message
 logger = get_logger(__name__)
 
 
-# =============================================================================
 # Responses API protocol boundary
-# =============================================================================
 # Keep the bridge orchestration-focused. Wire-shape conversion lives in the
 # provider-neutral helper so it can be exhaustively unit-tested without loading
 # the whole agent runtime.
@@ -108,9 +80,7 @@ def _convert_messages_to_responses_input(
     model: Optional[str] = None,
 ) -> tuple[str, list]:
     return messages_to_responses_request(messages, model=model)
-# =============================================================================
 # Responses Prompt Cache：稳定 key + GPT-5.6 原生缓存选项
-# =============================================================================
 def _responses_prompt_cache_key(chat_id: Any) -> str:
     """返回与项目现有 LLM session_id 完全相同的 Responses cache key。
 
@@ -154,9 +124,7 @@ def _add_responses_cache_options(
     }
 
 
-# =============================================================================
 # Responses response-chain 状态：只使用 previous_response_id（单一状态源）
-# =============================================================================
 @dataclass
 class _TurnSyncContext:
     """一次 agent turn 内的 Responses 链状态。
@@ -376,9 +344,7 @@ def _function_calls_from_stream(tool_call_items: dict[str, dict]) -> list[dict[s
     return calls
 
 
-# =============================================================================
 # 非流式一次性调用：供 subagent_tool.py 复用
-# =============================================================================
 # 模拟响应对象（Simple* 五件套）由 bridge_common 提供，与 anthropic_bridge
 # 共享同一份实现。
 async def openai_responses_chat_completions_create(
@@ -439,9 +405,7 @@ async def openai_responses_chat_completions_create(
     )
 
 
-# =============================================================================
 # usage 归一：Responses ResponseUsage -> OpenAI Chat Completions 形状 dict
-# =============================================================================
 # 目的：让 _log_cache_usage / app.update_conversation_and_ledger 的既有
 # OpenAI 形状消费方无需分支处理（与 anthropic_bridge._anthropic_usage_to_openai
 # / gemini_bridge._gemini_usage_to_openai 同一边界转换模式）。
@@ -496,9 +460,7 @@ def _responses_usage_to_openai(usage: Any) -> Optional[dict]:
     return out
 
 
-# =============================================================================
 # 原生 agentic 循环
-# =============================================================================
 async def _agentic_loop_openai_responses(
         client: "AsyncOpenAI",
         current_model: str,
@@ -694,10 +656,8 @@ async def _agentic_loop_openai_responses_impl(
         # 重置，item 结束（output_item.done）时读取——同一 item 生命周期
         # 内一一对应，不会跨 item 误判。
         reasoning_seen_via_delta = False
-        # 打断保全（改动点1，与 openai_compat / anthropic / gemini 循环同构）：
         # 流式期间 journal 始终持有一条与 content_acc / reasoning_acc 同步的
         # assistant 占位消息；function_call 累积只在流正常结束后由 finalize
-        # 写入（改动点2：未完成的调用不入历史）。
         live_slot = LiveAssistantSlot(new_history_entries)
         # output_index -> {"call_id","name","args_json"}（function_call
         # 累积；键用 output_index 而非 item_id，因为 arguments.delta 事件
@@ -1131,7 +1091,6 @@ async def _agentic_loop_openai_responses_impl(
         )
         # 纯文本终局截断提示：必须在 live_slot.finalize 之前算出追加后的
         # 文本（与 anthropic_bridge / gemini_bridge 同一修复，理由见
-        # bridge_common）。response_status 此前只在事件名为 incomplete/
         # failed 时才有值，现在已改为优先携带 incomplete_details.reason
         # （见上方事件处理分支），"max_output_tokens" 会被
         # _finish_reason_cut_info 按 length/max_tokens 同类归一识别。
@@ -1139,7 +1098,6 @@ async def _agentic_loop_openai_responses_impl(
             content_acc = append_truncation_notice_if_needed(
                 builder, content_acc, response_status)
 
-        # 打断保全（改动点1）：升级 journal 里的实时占位为完整消息
         # （tool_calls / reasoning / 最终文本原地补全，同一对象进 loop_messages）。
         finalized_assistant_msg = live_slot.finalize(loop_messages, content_acc, tool_calls_list, reasoning_acc)
         if response_status == "completed" and completed_output_items:

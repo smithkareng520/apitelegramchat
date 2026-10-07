@@ -1,25 +1,4 @@
-"""请求侧上下文守卫（request-time guard）。
-
-策略（2026-09 重构，详见 CACHE_OPTIMIZATION.md 与 context_window.py）：
-
-**存储历史即请求上下文。** 历史的有界性由 app.pre_flight_context_check
-的自动压缩事件（高/低水位 + 滞后）维护，本模块不做逐轮滑动截尾——
-窗口起点每轮后移会让隐式前缀缓存整段 miss。
-
-select_request_context 退化为守卫，只在两种情况下工作：
-
-1. **快路径（常态）**：历史在预算内 → 原样返回全部消息（浅拷贝），
-   一字节不改 → 请求前缀与上一轮完全一致，provider 端 prompt/KV
-   缓存全量命中；
-2. **兜底路径（罕见）**：持久历史超出预算（压缩事件失败、会话中途
-   切换到小窗口模型、异常路径）→ 从最老的用户轮块开始**按块**淘汰
-   出站视图（不改写摘要、不触碰持久历史），保证发出去的请求永远
-   合法；单条消息自身超预算时按 token 预算截断该消息。
-   下一次压缩事件会把持久历史收敛回预算内，兜底路径随之消失。
-
-历史为 Message 对象；本模块的纯逻辑同时接受 Message 与 dict，token 估算基于出站投影
-（Message.to_openai_dict()），与真实请求载荷同源。
-"""
+"""请求侧上下文守卫（request-time guard）。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -29,13 +8,11 @@ from context_window import resolve_history_budget, split_history_blocks
 from token_budget import json_token_count, truncate_to_token_budget
 from core.messages import Message, TextBlock, as_message
 
-
 @dataclass(frozen=True)
 class ContextSnapshot:
     messages: list[Any]
     dropped_messages: int
     estimated_tokens: int
-
 
 def _message_token_count(message: Any) -> int:
     # token 估算与出站载荷同源：Message 按其 OpenAI 投影计数
@@ -44,14 +21,12 @@ def _message_token_count(message: Any) -> int:
         return json_token_count(message.to_openai_dict())
     return json_token_count(message)
 
-
 def _is_supported(message: object) -> bool:
     if isinstance(message, Message):
         return message.role in {"user", "assistant", "tool", "system"}
     return isinstance(message, dict) and message.get("role") in {
         "user", "assistant", "tool", "system"
     }
-
 
 def _fit_message_to_token_budget(message: Any, token_budget: int) -> Any:
     """Trim an oversized plain-text message so the selected context stays bounded."""
@@ -86,7 +61,6 @@ def _fit_message_to_token_budget(message: Any, token_budget: int) -> Any:
     fitted = Message(role=m.role, blocks=[TextBlock(candidate_text)], name=m.name, meta=dict(m.meta))
     return fitted if _message_token_count(fitted) <= token_budget else None
 
-
 def _tail_fit_messages(messages: list, max_tokens: int) -> tuple[list, int]:
     """尾部装配兜底：从末尾回退累积，塞不下时按预算截断首条入选消息。
 
@@ -115,7 +89,6 @@ def _tail_fit_messages(messages: list, max_tokens: int) -> tuple[list, int]:
         used_tokens += message_tokens
 
     return list(reversed(selected_reversed)), used_tokens
-
 
 def select_request_context(
     history: list,

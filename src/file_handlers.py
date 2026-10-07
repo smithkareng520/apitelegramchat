@@ -15,7 +15,7 @@ from s3_utils import upload_bytes_to_r2, file_exists_in_r2, download_from_r2
 
 logger = logging.getLogger(__name__)
 
-# ---------- 文件下载锁 ----------
+# 文件下载锁
 # 用 LRUCache 避免 dict 无界增长（每个 file_id 一把锁，长期运行会累积）。
 _DOWNLOAD_LOCKS_MAX = 256
 _download_locks: LRUCache = LRUCache(maxsize=_DOWNLOAD_LOCKS_MAX)
@@ -30,14 +30,13 @@ async def _get_download_lock(file_id: str) -> asyncio.Lock:
             _download_locks[file_id] = asyncio.Lock()
         return _download_locks[file_id]
 
-# ========== 获取文件路径 ==========
+# 获取文件路径
 async def get_file_path(file_id: str) -> str | None:
     """通过 Telegram API 获取文件的下载路径"""
     try:
         # 对 file_id 进行 URL 编码，防止异常字符破坏 URL
         encoded_fid = quote(file_id, safe="")
-        # 必须设置超时：此前没有 timeout，Telegram API stall 时会
-        # 无限期挂起，间接阻塞所有等待该 file_id 的协程。
+        # 必须设置超时，避免 Telegram API stall 阻塞等待该 file_id 的协程。
         timeout = aiohttp.ClientTimeout(total=15, connect=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(f"{BASE_URL}/getFile?file_id={encoded_fid}") as response:
@@ -60,11 +59,11 @@ async def get_file_path(file_id: str) -> str | None:
         logger.error(f"获取文件路径失败: {safe_msg}")
         return None
 
-# ---------- R2 键生成 ----------
+# R2 键生成
 def _get_r2_key(file_id: str) -> str:
     return f"telegram/{file_id}"
 
-# ---------- 从 Telegram 下载 ----------
+# 从 Telegram 下载
 async def _telegram_download(file_id: str, file_path: str) -> bool:
     try:
         file_real_path = await get_file_path(file_id)
@@ -87,7 +86,7 @@ async def _telegram_download(file_id: str, file_path: str) -> bool:
         logger.error(f"文件下载失败: {safe_msg}")
         return False
 
-# ---------- 主下载函数（含 R2 缓存） ----------
+# 主下载函数（含 R2 缓存）
 async def download_file(file_id: str, file_path: str) -> bool:
     lock = await _get_download_lock(file_id)
     async with lock:

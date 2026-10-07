@@ -1085,30 +1085,11 @@ async def spawn_turn_task(
 ) -> asyncio.Task:
     """派发新回合任务并登记为可打断任务（process_update 各分支共用样板）。
 
-    合并原先在 process_update 各消息分支重复 8 处的派发样板：
-    打断旧回合 → create_task → 写入 active_tasks → 挂自动清理回调。
+    先打断旧回合，再提前持久化 user 消息，最后创建新任务。
 
-    提前持久化（user_message 非空时，2026-09-12 生产事故修复）：
-    ------------------------------------------------------------------
-    user 消息原先在回合任务内部的 get_ai_response 才落库——从 create_task
-    到落库之间有 1~2 秒以上的窗口（wizard 消费检查、pre_flight 上下文
-    检查、草稿首帧等都在落库之前）。用户快速连发两条消息时，第二条的
-    spawn_turn_task 会打断并取消第一条的回合任务；若第一条尚未落库，
-    它就**静默消失**：历史里没有、无任何日志、模型只看到第二条
-    （生产表现："发两张图模型只收到一张"、"两条消息只回了最后一条"）。
-
-    修复：在打断旧回合**之后**、创建新任务**之前**，由本函数直接调用
-    turn_recovery.persist_user_message_entry 落库。次序要点：
-      1. 必须在 _interrupt_active_generation 之后——旧回合的 journal
-         保全（finalize_pending_turns）会先把已完成的 assistant/tool
-         消息写入历史，新的 user 消息才能落在它们之后，保持
-         user→assistant 的时序正确；
-      2. 落库带 EARLY_PERSIST_FLAG：回合任务内的 get_ai_response 看到
-         标记会跳过重复落库（见 ai_handlers.get_ai_response）；
-      3. 消费型接管（媒体参数卡片收素材）与 pre_flight 拒绝的分支，
-         由各 handler 调 turn_recovery.undo_early_persist 回滚。
-    落库失败不阻断派发：get_ai_response 内的既有落库路径（标记缺失时
-    仍会执行）自动兜底。
+    提前持久化必须发生在打断保全之后，保证历史顺序正确；
+    ``EARLY_PERSIST_FLAG`` 防止回合任务重复落库，消费型接管或 pre-flight
+    拒绝时由 ``undo_early_persist`` 回滚。持久化失败不阻断派发，由回合任务兜底。
     """
     await _interrupt_active_generation(chat_id)
     if user_message is not None and isinstance(user_message, dict):

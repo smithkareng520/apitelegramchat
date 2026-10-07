@@ -6,7 +6,7 @@
   - get_chat_adapter(protocol)：唯一合法的聊天协议取用出口。
 
 原 ai_handlers._call_api / api_client._build_client 里的
-if anthropic / else openai 分支判断全部由本表替代——新增协议时只需
+协议分支统一由注册表选择；新增协议只需注册适配器。
 注册一行，调用方零改动。
 """
 from __future__ import annotations
@@ -23,14 +23,12 @@ from protocols.openai_responses import OpenAIResponsesAdapter
 if TYPE_CHECKING:
     from config import ModelConfig
 
-# 协议 -> 聊天适配器（单例；适配器本身无状态，可安全全局复用）。
 CHAT_PROTOCOLS: Dict[str, ChatProtocolAdapter] = {
     "openai_chat": OpenAIChatAdapter(),
     "anthropic_messages": AnthropicMessagesAdapter(),
     "gemini_native": GeminiNativeAdapter(),
     "openai_responses": OpenAIResponsesAdapter(),
 }
-
 
 def get_chat_adapter(protocol: str) -> ChatProtocolAdapter:
     """按协议标签取聊天适配器（协议路由唯一出口）。
@@ -47,12 +45,10 @@ def get_chat_adapter(protocol: str) -> ChatProtocolAdapter:
         )
     return adapter
 
-
 def resolve_chat_adapter(model_info: "ModelConfig") -> ChatProtocolAdapter:
     """按 ModelConfig 的有效端点协议解析聊天适配器（便捷封装）。"""
     from config import get_effective_endpoint
 
     return get_chat_adapter(get_effective_endpoint(model_info).protocol)
-
 
 __all__ = ["CHAT_PROTOCOLS", "get_chat_adapter", "resolve_chat_adapter"]

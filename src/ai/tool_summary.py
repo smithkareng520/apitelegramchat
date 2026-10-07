@@ -1,10 +1,4 @@
-"""工具调用的摘要/描述生成、参数解析与失败判定。
-
-从 ai_handlers.py 拆分而来。v2.3 起参数规范化接入 json_repair 的自动修复
-与精准诊断（Self-Correction 增强）：修复成功直接用修复后的参数执行工具，
-省掉一整轮模型重试；修复失败则把解析器报错/位置/病因写进可恢复信封，
-由执行层渲染成给模型的定向修复指引。
-"""
+"""工具调用的摘要生成、参数解析与失败判定。"""
 import json
 import re
 from typing import Any, Optional, cast
@@ -157,8 +151,6 @@ def _short_label(text: Any, limit: int = 24) -> str:
     return s[:limit] + "…" if len(s) > limit else s
 
 
-
-
 def _todo_summary_done(fn_args: dict, payload: dict) -> str:
     """todo 完成态摘要：「动作 + 待办标题」，无标题退化为基础文案。
 
@@ -220,7 +212,6 @@ def _memory_summary_done(fn_args: dict, payload: dict) -> str:
     if action == "search":
         return "Searched memories"
     return "Listed memories"
-
 
 
 def _map_payload_from_result(result_content: Any) -> dict:
@@ -309,9 +300,7 @@ def _map_location_query_label(fn_name: str, fn_args: dict) -> str:
     return ""
 
 
-# =====================================================================
 # MCP 工具名规范化
-# =====================================================================
 def _norm_tool_key(fn_name: str) -> str:
     """完整 MCP 名只去掉 mcp__server__ 前缀，不映射旧工具别名。"""
     split = split_mcp_name(fn_name or "")
@@ -502,7 +491,6 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
         return f"Fetching from {domain}" if domain else "Fetching a page"
 
     if fn_name == "bash":
-        # 后台任务模式的专属进行态（此前与前台命令共用 "Running command"）。
         task_action = str(fn_args.get("task_action") or "").strip().lower()
         if task_action in ("status", "output"):
             return "Checking background task"
@@ -810,7 +798,7 @@ def _normalize_tool_arguments(
 ) -> tuple[str, bool, dict]:
     """规范化单个工具调用的参数，返回 ``(JSON 字符串, 是否写入可恢复错误, 元信息)``。
 
-    v2.3 Self-Correction 增强后的处理链（优先级从高到低）：
+    处理链（优先级从高到低）：
 
     1. 原文即合法 JSON object → 重新序列化（去冗余空白），元信息
        ``{"kind": "valid"}``；
@@ -909,11 +897,8 @@ def _normalize_tool_call_arguments(
 ) -> int:
     """就地规范化一个模型返回中的所有工具参数，并返回写入可恢复错误的数量。
 
-    v2.3：自动修复与不可修复分别记日志——修复意味着零重试成本直接恢复，
-    不可修复才走可恢复错误路径。两者都不再把坏字符串写回下一轮请求。
-    v2.5：``stream_finish_reason``（可选）为空参数/截断参数的根因定性和
-    指引方向提供决定性证据（length = 输出上限切断；"" = 断流；
-    stop/tool_calls = 正常结束、语法问题在模型自身）。
+    自动修复与不可修复分别记日志；``stream_finish_reason``（可选）用于
+    判定空参数或截断参数的根因。
     """
     corrected = 0
     repaired_count = 0
@@ -1158,7 +1143,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         if _tool_result_is_failure(fn_name, fn_args, result_content):
             return f"Failed to fetch {domain}" if domain else "Failed to fetch page"
         title = None
-        # 新版 fetch_url 结果为 Telegram Rich HTML，标题在 <h3>…</h3>。
         m = re.search(r"<h3[^>]*>(.*?)</h3>", text, re.S | re.I)
         if m:
             title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1))).strip()
@@ -1174,7 +1158,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         text = str(result_content or "").strip()
         if _tool_result_is_failure(fn_name, fn_args, result_content):
             return f"Failed to look up {query}" if query else "Failed to look up on Wikipedia"
-        # 新版结果为 Telegram Rich HTML，标题在 <h3>…</h3>；
         # 退化路径（纯文本摘要）为 <b>Wikipedia — 标题</b>。
         title = None
         m = re.search(r"<h3[^>]*>(.*?)</h3>", text, re.S | re.I)
@@ -1218,7 +1201,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
         return "Ran a command"
 
     if fn_name == "present_files":
-        # 完成态从结果信封读取真实成败（此前只看请求参数里的路径数）。
         try:
             payload = json.loads(str(result_content or ""))
         except (json.JSONDecodeError, TypeError, ValueError):

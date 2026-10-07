@@ -1,14 +1,5 @@
 # todo_tool.py
-"""
-任务 / 待办清单工具。
-
-设计目标
---------
-1. 给 AI agent 一个轻量、持久的任务管理能力——支持新增、列表、完成、
-   反完成、删除、清空、编辑、改优先级。
-2. 数据按用户隔离，落在 ./state/{user_id}/todos.json，通过显式的 state_r2 持久化层，无需额外存储。
-3. 给 Agent 工具结果提供富文本渲染：状态 emoji、优先级、删除线、可折叠统计区。
-"""
+"""任务 / 待办清单工具。"""
 
 from __future__ import annotations
 
@@ -24,13 +15,12 @@ from workspace_paths import todo_state_file
 from token_budget import truncate_to_token_budget
 from typing import Any, Optional
 
-
 from workspace_utils import _get_workspace_lock
 from state_r2 import sync_named_file_from_r2, sync_named_file_to_r2
 
 logger = logging.getLogger(__name__)
 
-# ---------- 常量 ----------
+# 常量
 TODO_FILENAME = "todos.json"
 VALID_PRIORITIES = ("low", "medium", "high")
 VALID_FILTERS = ("all", "pending", "done")
@@ -46,20 +36,16 @@ PRIORITY_META: dict[str, dict[str, Any]] = {
     "low":    {"emoji": "🟢", "label": "低", "weight": 1},
 }
 
-
-# ---------- 存储层 ----------
+# 存储层
 def _todo_path(chat_id: int) -> Path:
     return todo_state_file(chat_id)
-
 
 def _new_id() -> str:
     """8 位短 id，足够避免单 chat 内冲突。"""
     return uuid.uuid4().hex[:8]
 
-
 def _empty_store() -> dict:
     return {"todos": [], "updated_at": 0}
-
 
 def _load_local(chat_id: int) -> dict:
     """从本地读取 todos.json。文件不存在或损坏时返回空 store。"""
@@ -76,7 +62,6 @@ def _load_local(chat_id: int) -> dict:
         logger.warning(f"todos.json 读取失败 (chat={chat_id}): {e}")
         return _empty_store()
 
-
 def _save_local(chat_id: int, store: dict) -> None:
     """以原子方式写入本地，并保证目录存在。
 
@@ -90,7 +75,6 @@ def _save_local(chat_id: int, store: dict) -> None:
     tmp.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
 
-
 def _find_todo(todos: list, todo_id: Optional[str]) -> tuple[int, dict] | None:
     """返回 (index, todo) 或 None。"""
     if not todo_id:
@@ -100,7 +84,6 @@ def _find_todo(todos: list, todo_id: Optional[str]) -> tuple[int, dict] | None:
         if str(t.get("id", "")).lstrip("#") == target:
             return i, t
     return None
-
 
 def _normalize_priority(value: Optional[str]) -> str:
     if not value:
@@ -112,7 +95,6 @@ def _normalize_priority(value: Optional[str]) -> str:
     alias = {"p0": "high", "p1": "high", "p2": "medium", "p3": "low",
              "高": "high", "中": "medium", "低": "low"}
     return alias.get(v, "medium")
-
 
 def _normalize_tags(tags: Any) -> list[str]:
     if tags is None:
@@ -135,8 +117,7 @@ def _normalize_tags(tags: Any) -> list[str]:
             break
     return out
 
-
-# ---------- 业务逻辑 ----------
+# 业务逻辑
 async def _read_store(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> dict:
     """
     读取型操作：先从 R2 拉取最新内容到本地，再执行读取，不回写 store。
@@ -153,7 +134,6 @@ async def _read_store(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> 
         except _TodoError as e:
             return {"ok": False, "error": str(e), "code": e.code}
         return payload
-
 
 async def _mutate(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> dict:
     """
@@ -182,7 +162,6 @@ async def _mutate(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> dict
             logger.warning(f"todos: local→R2 同步失败 (chat={chat_id}): {e}")
         return payload
 
-
 class _TodoError(Exception):
     """业务级错误，会被 _mutate 捕获并转成结构化 error。"""
 
@@ -191,8 +170,7 @@ class _TodoError(Exception):
         self.message = message
         self.code = code
 
-
-# ---------- 各操作的实现 ----------
+# 各操作的实现
 def _normalize_due_at(value: Optional[str]) -> Optional[str]:
     """规范化可选截止时间；保留 ISO 8601 字符串，便于模型和日志判断。"""
     if value is None or not str(value).strip():
@@ -206,7 +184,6 @@ def _normalize_due_at(value: Optional[str]) -> Optional[str]:
         # 无时区时按服务器本地时间保存；模型通常会根据当前时间提示词理解用户时区。
         return dt.isoformat(timespec="minutes")
     return dt.isoformat(timespec="minutes")
-
 
 def _due_status(due_at: Optional[str]) -> str:
     if not due_at:
@@ -223,7 +200,6 @@ def _due_status(due_at: Optional[str]) -> str:
     except Exception:
         logger.debug("_due_status 内部忽略的异常", exc_info=True)
         return "unknown"
-
 
 def _op_add(store: dict, title: Optional[str], priority: str, tags: list[str], note: Optional[str], due_at: Optional[str]) -> tuple[dict, dict]:
     title = (title or "").strip()
@@ -254,7 +230,6 @@ def _op_add(store: dict, title: Optional[str], priority: str, tags: list[str], n
         "pending": sum(1 for t in store["todos"] if not t["done"]),
     }
     return store, payload
-
 
 def _op_list(store: dict, filter_: str, tag: Optional[str], priority: Optional[str]) -> tuple[dict, dict]:
     todos = store["todos"]
@@ -298,7 +273,6 @@ def _op_list(store: dict, filter_: str, tag: Optional[str], priority: Optional[s
     }
     return store, payload
 
-
 def _op_toggle(store: dict, todo_id: Optional[str], force: Optional[bool]) -> tuple[dict, dict]:
     found = _find_todo(store["todos"], todo_id)
     if not found:
@@ -326,7 +300,6 @@ def _op_toggle(store: dict, todo_id: Optional[str], force: Optional[bool]) -> tu
         "pending": sum(1 for t in store["todos"] if not t["done"]),
     }
 
-
 def _op_delete(store: dict, todo_id: Optional[str]) -> tuple[dict, dict]:
     found = _find_todo(store["todos"], todo_id)
     if not found:
@@ -340,7 +313,6 @@ def _op_delete(store: dict, todo_id: Optional[str]) -> tuple[dict, dict]:
         "total": len(store["todos"]),
         "pending": sum(1 for t in store["todos"] if not t["done"]),
     }
-
 
 def _op_clear(store: dict, filter_: str) -> tuple[dict, dict]:
     """清空：done=只清已完成；all=清全部。"""
@@ -364,7 +336,6 @@ def _op_clear(store: dict, filter_: str) -> tuple[dict, dict]:
         "total": len(store["todos"]),
         "pending": sum(1 for t in store["todos"] if not t["done"]),
     }
-
 
 def _op_edit(store: dict, todo_id: Optional[str], title: Optional[str],
              priority: Optional[str], tags: Any, note: Optional[str],
@@ -401,7 +372,6 @@ def _op_edit(store: dict, todo_id: Optional[str], title: Optional[str],
         "pending": sum(1 for t in store["todos"] if not t["done"]),
     }
 
-
 def _todo_summary(t: dict) -> dict:
     """精简的待办摘要，用于 AI 上下文与回调渲染。"""
     return {
@@ -417,8 +387,7 @@ def _todo_summary(t: dict) -> dict:
         "completed_at": t.get("completed_at"),
     }
 
-
-# ---------- 工具入口 ----------
+# 工具入口
 async def execute_todo(
     chat_id: int,
     action: str = "list",
@@ -477,10 +446,8 @@ async def execute_todo(
         )
     return json.dumps(payload, ensure_ascii=False)
 
-
-# ---------- 富文本渲染 ----------
+# 富文本渲染
 from core.text_utils import escape_html_text as _esc
-
 
 def render_todo_card(payload: dict, max_items: int = 50) -> str:
     """
@@ -534,7 +501,7 @@ def render_todo_card(payload: dict, max_items: int = 50) -> str:
             f"<p><i>修改字段：{', '.join(payload.get('changed', [])) or '无'}</i></p>"
         )
 
-    # ---- list 渲染 ----
+    # list 渲染
     todos = payload.get("todos", []) or []
     total = payload.get("total", 0)
     done = payload.get("done", 0)
@@ -590,19 +557,16 @@ def render_todo_card(payload: dict, max_items: int = 50) -> str:
         + list_html
     )
 
-
 def _priority_badge(t: dict) -> str:
     p = t.get("priority", "medium")
     meta = PRIORITY_META.get(p, PRIORITY_META["medium"])
     return f"<b>{meta['emoji']} {meta['label']}</b>"
-
 
 def _tag_chips(t: dict) -> str:
     tags = t.get("tags", []) or []
     if not tags:
         return ""
     return " ".join(f"<code>#{_esc(tag)}</code>" for tag in tags[:MAX_TAGS])
-
 
 def _render_todo_item(t: dict) -> str:
     """单个待办的 <li>。"""
@@ -627,8 +591,7 @@ def _render_todo_item(t: dict) -> str:
         line += note_html
     return f"<li>{line}</li>"
 
-
-# ---------- 工具定义（OpenAI function-calling schema） ----------
+# 工具定义（OpenAI function-calling schema）
 # 注意：description 字段是给 AI 阅读的「工具说明书」。
 # 全部用纯文本，不使用 Markdown 语法（如 **bold**、`code`、# 标题等），
 # 与系统提示词风格保持一致——AI 输出时也不会把这些符号带进回复。

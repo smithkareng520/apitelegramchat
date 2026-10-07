@@ -1,4 +1,4 @@
-"""媒体生成工具：generate_image（统一生成/编辑）/ generate_video（自 search_engine.py 拆出）。"""
+"""提供图像与视频生成工具。"""
 
 import uuid
 from typing import Any, Optional, cast
@@ -19,21 +19,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
-# --------------------- image API helpers ---------------------
-# 图片响应解析 / 下载 / 转字节（_extract_image_items、_response_items_to_bytes）
-# 与生成图上传 R2（_upload_generated_images_to_r2）已统一收敛到
-# ai.media_generation，供 agentic 原生图像循环与本文件的
-# execute_generate_image 共用，此处不再保留各写一套的副本。
-# ⚠️ 收敛后必须显式从 ai.media_generation 导入 _upload_generated_images_to_r2
-# （曾因只写注释未加 import 导致 NameError：图片已生成成功，却在 R2 上传
-# 环节崩溃，整次生成结果丢失——历史事故见 2026-09 生产日志）。
-
+# 生图上传由 ai.media_generation 统一处理，供原生图像循环和本文件复用。
 
 # 鉴权 / 配额类错误：这类错误重试永远不会成功（密钥无效/余额耗尽），
 # 必须在工具结果里明确告诉模型“请勿重试”，否则模型会像遭遇临时故障
-# 一样连续重试（生产日志实测：403 Key limit exceeded 后同一轮又连发
-# 3 次无效调用，白白浪费工具轮次与上下文）。
 _NON_RETRYABLE_STATUSES = frozenset({401, 402, 403})
 _NON_RETRYABLE_KEYWORDS = (
     "key limit exceeded",
@@ -47,7 +36,6 @@ _NON_RETRYABLE_KEYWORDS = (
     "permission denied",
     "payment required",
 )
-
 
 def _non_retryable_hint(status_code: int, detail: str) -> str:
     """按状态码 + 错误详情判定非重试类错误，返回附加提示（无需提示返回空串）。"""
@@ -70,7 +58,6 @@ def _non_retryable_hint(status_code: int, detail: str) -> str:
         )
     return ""
 
-
 def _format_image_api_error(api_name: str, status_code: int, detail: str = "", request_id: str = "", endpoint: str = "", model: str = "") -> str:
     parts = [f"❌ {api_name} 请求失败"]
     if status_code:
@@ -92,7 +79,6 @@ def _format_image_api_error(api_name: str, status_code: int, detail: str = "", r
     if hint:
         parts.append(f"⚠️ {hint}")
     return "<br/>".join(parts)
-
 
 async def execute_generate_image(
     prompt: str,
@@ -141,7 +127,6 @@ async def execute_generate_image(
     model_info = SUPPORTED_MODELS.get(model)
     num_images = min(max(num_images, 1), 4)
 
-    # ---- 能力硬校验：仅生成模型不可携带参考图 ----
     # 统一工具后 image_url 由模型自行决定是否携带；选错模型（仅文生图
     # 却带了 image_url）时给出可操作错误，引导其改选双能力模型
     # （生成+编辑二合一，同样支持纯文生图），而不是把注定失败的请求
@@ -185,7 +170,6 @@ async def execute_generate_image(
     # 成为生图失败的新故障点。
     clean_extra_params = extra_params if isinstance(extra_params, dict) else {}
 
-    # ---- 显式构造 ImageTask：操作类型由调用入参决定，不再隐式推断 ----
     if image_url:
         task = ImageTask.edit(prompt, [image_url], model=model,
                               num_images=1, aspect_ratio=aspect_ratio, image_size=image_size,
@@ -236,7 +220,6 @@ async def execute_generate_image(
         return "❌ 图片生成成功，但 R2 上传全部失败，请稍后重试。"
     return _format_success_links(uploaded_urls, len(result.images[:num_images]))
 
-
 def _effective_image_protocol(model_info: Any) -> str:
     """模型的有效图像协议（openai_images / openai_chat），未知厂商回落 openai_chat。"""
     if model_info is None:
@@ -247,12 +230,10 @@ def _effective_image_protocol(model_info: Any) -> str:
     except Exception:
         return "openai_chat"
 
-
 def _get_images_api_display_name(model_info: Any) -> str:
     """提供商展示名（ModelScope / XXTF ...），用于错误提示文案。"""
     provider_key = (getattr(model_info, "provider", "") or "") if model_info else ""
     return provider_key or "图像"
-
 
 async def execute_generate_video(
     prompt: str,
@@ -275,7 +256,6 @@ async def execute_generate_video(
         ✅ 已生成视频。
         视频链接：https://...
     """
-    # 局部导入避免循环依赖
     from ai.media_generation import (
         _request_agnes_video,
         _request_openrouter_video,

@@ -37,7 +37,6 @@ logger = logging.getLogger(__name__)
 JsonObject = dict[str, Any]
 ToolHandler = Callable[[MCPRequestContext, JsonObject], Awaitable[str]]
 
-
 @dataclass(frozen=True)
 class ToolSpec:
     """一个 MCP 工具的完整声明（MCP 原生形态，非 OpenAI 包装）。"""
@@ -61,7 +60,6 @@ class ToolSpec:
                 pass
         return tool
 
-
 @dataclass(frozen=True)
 class ModuleSpec:
     """一个内部 MCP 模块 = 一个可独立启动的 stdio 服务器。"""
@@ -72,13 +70,11 @@ class ModuleSpec:
     # mutating 模块需要显式 opt-in（host 自身拉起时会设置对应环境变量）。
     mutating: bool = False
 
-
 def _text(description: str, min_length: int | None = None) -> JsonObject:
     field_: JsonObject = {"type": "string", "description": description}
     if min_length is not None:
         field_["minLength"] = min_length
     return field_
-
 
 def _int(description: str, minimum: int | None = None, maximum: int | None = None) -> JsonObject:
     field_: JsonObject = {"type": "integer", "description": description}
@@ -87,7 +83,6 @@ def _int(description: str, minimum: int | None = None, maximum: int | None = Non
     if maximum is not None:
         field_["maximum"] = maximum
     return field_
-
 
 def _schema(properties: JsonObject, required: tuple[str, ...] = ()) -> JsonObject:
     schema: JsonObject = {
@@ -99,7 +94,6 @@ def _schema(properties: JsonObject, required: tuple[str, ...] = ()) -> JsonObjec
         schema["required"] = list(required)
     return schema
 
-
 async def _invoke(function: Callable[..., Any], *args: Any, **kwargs: Any) -> str:
     result = function(*args, **kwargs)
     if inspect.isawaitable(result):
@@ -110,10 +104,6 @@ async def _invoke(function: Callable[..., Any], *args: Any, **kwargs: Any) -> st
         return json.dumps(result, ensure_ascii=False)
     return str(result)
 
-
-# =====================================================================
-# search 模块
-# =====================================================================
 async def _web_search(ctx: MCPRequestContext, args: JsonObject) -> str:
     from search.serper import execute_web_search
 
@@ -129,30 +119,25 @@ async def _web_search(ctx: MCPRequestContext, args: JsonObject) -> str:
         tbs=args.get("tbs"),
     )
 
-
 async def _fetch_url(ctx: MCPRequestContext, args: JsonObject) -> str:
     from search.fetch_url import execute_fetch_url
 
     return await _invoke(execute_fetch_url, args.get("url", ""))
-
 
 async def _wikipedia(ctx: MCPRequestContext, args: JsonObject) -> str:
     from search.quick_lookup import execute_wikipedia
 
     return await _invoke(execute_wikipedia, args.get("query", ""), args.get("lang", "zh"))
 
-
 async def _exchange_rate(ctx: MCPRequestContext, args: JsonObject) -> str:
     from search.quick_lookup import execute_exchange_rate
 
     return await _invoke(execute_exchange_rate, args.get("base", "USD"), args.get("target"))
 
-
 async def _weather(ctx: MCPRequestContext, args: JsonObject) -> str:
     from search.quick_lookup import execute_weather
 
     return await _invoke(execute_weather, args.get("city", ""), args.get("unit", "c"), args.get("hours", 6))
-
 
 SEARCH_MODULE = ModuleSpec(
     name="search",
@@ -247,21 +232,15 @@ SEARCH_MODULE = ModuleSpec(
     ),
 )
 
-
-# =====================================================================
-# todo / memory 模块
-# =====================================================================
 async def _todo(ctx: MCPRequestContext, args: JsonObject) -> str:
     from todo_tool import execute_todo
 
     return await _invoke(execute_todo, ctx.chat_id, **args)
 
-
 async def _memory(ctx: MCPRequestContext, args: JsonObject) -> str:
     from memory_tool import execute_memory
 
     return await _invoke(execute_memory, ctx.chat_id, **args)
-
 
 TODO_MODULE = ModuleSpec(
     name="todo",
@@ -359,10 +338,6 @@ MEMORY_MODULE = ModuleSpec(
     ),
 )
 
-
-# =====================================================================
-# workspace / bash 模块
-# =====================================================================
 async def _text_editor(ctx: MCPRequestContext, args: JsonObject) -> str:
     from search.text_editor import execute_text_editor
 
@@ -379,7 +354,6 @@ async def _text_editor(ctx: MCPRequestContext, args: JsonObject) -> str:
         insert_text=args.get("insert_text"),
         file_text=args.get("file_text"),
     )
-
 
 TEXT_EDITOR_MODULE = ModuleSpec(
     name="workspace",
@@ -421,7 +395,6 @@ TEXT_EDITOR_MODULE = ModuleSpec(
     ),
 )
 
-
 async def _bash(ctx: MCPRequestContext, args: JsonObject) -> str:
     from bash_session import execute_bash
 
@@ -437,7 +410,6 @@ async def _bash(ctx: MCPRequestContext, args: JsonObject) -> str:
         task_id=args.get("task_id"),
         description=str(args.get("description") or ""),
     )
-
 
 BASH_MODULE = ModuleSpec(
     name="bash",
@@ -478,15 +450,10 @@ BASH_MODULE = ModuleSpec(
     ),
 )
 
-
-# =====================================================================
-# 模块注册表
-# =====================================================================
 MODULES: dict[str, ModuleSpec] = {
     spec.name: spec
     for spec in (SEARCH_MODULE, TODO_MODULE, MEMORY_MODULE, TEXT_EDITOR_MODULE, BASH_MODULE)
 }
-
 
 def tools_for_modules(module_names: list[str], *, allow_mutations: bool | None = None) -> list[ToolSpec]:
     """收集模块工具；mutating 模块需显式 opt-in.
@@ -509,7 +476,6 @@ def tools_for_modules(module_names: list[str], *, allow_mutations: bool | None =
             continue
         specs.extend(spec.tools)
     return specs
-
 
 class ToolRegistry:
     """为一个受信 scope 暴露确定性、最小权限的 MCP 工具集。"""
@@ -536,7 +502,6 @@ class ToolRegistry:
             # 异常类型 + 简短 message 放进 error text，便于调用方定位；
             # 不放完整 traceback（含敏感字段）。
             return _error_result(f"Tool execution failed: {type(exc).__name__}: {exc}")
-
 
 def _error_result(message: str) -> types.CallToolResult:
     return types.CallToolResult(content=[types.TextContent(type="text", text=message)], isError=True)

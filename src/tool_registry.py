@@ -1,13 +1,11 @@
 # tool_registry.py — 模型视角工具清单的统一装配。
-#
 # 工具分两类：
-#   1. host 内建工具（不经 MCP）：message_user / deliver_reply / subagent /
-#      generate_image / generate_video / present_files —— 依赖宿主进程的
-#      Telegram 会话、草稿流与 LLM 编排，等价于 Claude Code 的内建工具；
-#   2. MCP 工具：来自 mcp.json 注册的服务器，模型视角名
-#      ``mcp__<server>__<tool>``，schema 经 list_tools 协议发现（内部 in_process/stdio 服务器的目录与本进程
-#      共享同一份 mcpserver.catalogue，外部 streamable_http 服务器走真实协议发现 + TTL 缓存）。
-#
+# 1. host 内建工具（不经 MCP）：message_user / deliver_reply / subagent /
+# generate_image / generate_video / present_files —— 依赖宿主进程的
+# Telegram 会话、草稿流与 LLM 编排，等价于 Claude Code 的内建工具；
+# 2. MCP 工具：来自 mcp.json 注册的服务器，模型视角名
+# ``mcp__<server>__<tool>``，schema 经 list_tools 协议发现（内部 in_process/stdio 服务器的目录与本进程
+# 共享同一份 mcpserver.catalogue，外部 streamable_http 服务器走真实协议发现 + TTL 缓存）。
 # 本模块是 SEARCH_TOOLS 时代之后的单一工具面入口：主 agent、TIMER 工具面、
 # 子 agent 白名单、各协议桥接层都从这里取工具定义。
 from __future__ import annotations
@@ -21,13 +19,11 @@ logger = logging.getLogger(__name__)
 
 _tools_cache: list[dict] | None = None
 
-
 def _media_tool_defs() -> list[dict]:
     """图像 / 视频生成工具（依赖模型目录，按可用性裁剪）。"""
     from search.tool_schemas import build_media_tool_defs
 
     return build_media_tool_defs()
-
 
 def builtin_tool_defs() -> list[dict]:
     """host 内建工具定义（顺序稳定）。"""
@@ -45,7 +41,6 @@ def builtin_tool_defs() -> list[dict]:
     # deliver_reply 按回合类型追加（见 ai_handlers）；这里不进入默认面。
     del build_deliver_reply_tool
     return defs
-
 
 def _catalogue_defs(server_name: str) -> list[dict] | None:
     """受信内部 MCP：直接从共享目录读取工具定义，免 transport 探测。"""
@@ -76,7 +71,6 @@ def _catalogue_defs(server_name: str) -> list[dict] | None:
             defs.append({"type": "function", "function": function})
     return defs
 
-
 def _modules_of(server: Any) -> list[str]:
     """从 stdio 启动参数中解析 --module（支持重复与多值）。"""
     modules: list[str] = []
@@ -98,7 +92,6 @@ def _modules_of(server: Any) -> list[str]:
         return sorted(MODULES)
     return modules
 
-
 async def mcp_tool_defs() -> list[dict]:
     """全部已暴露 MCP 工具的模型视角定义（顺序 = mcp.json 声明序）。"""
     defs: list[dict] = []
@@ -109,7 +102,6 @@ async def mcp_tool_defs() -> list[dict]:
         else:
             defs.extend(await mcp_manager.list_server_tools(server_name))
     return defs
-
 
 async def get_model_tools() -> list[dict]:
     """默认（USER / 草稿模式）回合的完整模型工具面。"""

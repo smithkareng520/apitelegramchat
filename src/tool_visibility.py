@@ -1,43 +1,5 @@
 # tool_visibility.py
-"""出站历史中工具调用痕迹的插拔过滤器（纯函数，只改出站副本）。
-
-本模块只做两件事，两者都围绕同一核心动作——把出站历史副本中的
-assistant tool_calls 与配对 role=tool 消息成对拔除：
-
-1. 开关维度插拔（apply_tool_visibility）
-   静默专属工具 ``deliver_reply`` 只在 /show off（静默）回合的工具面
-   里暴露（模型通过 send 布尔参数决定是否发送；send 缺省值按事件源
-   区分——静默 USER 回合默认 true，静默 TIMER 回合默认 false，因此
-   /show on 下模型看不到该工具也就不会产生除草稿外的单独发送）。
-   非静默回合除了不提供工具定义（见 ai_handlers._call_api），出站
-   历史副本中已有的调用痕迹也一并拔除，避免模型看到并模仿调用一个
-   当前不可用的工具；回到静默回合时痕迹在原位置原样插回。
-
-2. 能力维度全清（strip_tool_traces）
-   ``supports_tools=False`` 的模型（图像模型等）切进一个充满工具痕迹
-   的对话时，出站历史里的痕迹原样透传会出问题：严格网关（Anthropic
-   原生等，要求消息含 tool_use/tool_result 块时请求必须声明 tools）
-   直接 400；宽松网关虽然接受，但痕迹照常占上下文并诱导模型模仿输出
-   文本形态的工具调用（且与 _NO_TOOLS_SECTION 的系统提示自相矛盾）。
-   全量 DROP：assistant 消息剔除全部 ToolCallBlock（文本保留）、
-   role=tool 消息整条移除、剔除后既无文本也无剩余调用的 assistant
-   空壳整条丢弃。
-
-三条硬性保证
-============
-
-1. **只改出站副本，绝不改持久历史**：需要改写的消息一律重建新 Message。
-2. **结构合法性**：被移除的 tool_call 与其配对 tool 消息总是成对处理，
-   出站消息里不存在悬空 ``tool_call_id``（否则多数供应商直接 400）。
-3. **确定性**：同一份历史在同一开关组合下的改写结果逐字节一致，
-   隐式前缀缓存不会因本模块而额外退化。
-
-注入点：ai_handlers.get_ai_response（apply_tool_visibility 之后、
-strip_tool_traces 之后、_append_history_async 之前），三条协议路径
-（openai_chat / anthropic_messages / gemini_native）共用该入口，
-一处清理全覆盖。环境变量 ``TOOL_VISIBILITY_FILTER=false`` 可整体
-关闭（等价于拔掉本模块）。
-"""
+"""出站历史中工具调用痕迹的插拔过滤器（纯函数，只改出站副本）。"""
 
 from __future__ import annotations
 
@@ -51,17 +13,13 @@ __all__ = [
     "strip_tool_traces",
 ]
 
-
-# =====================================================================
 # 开关
-# =====================================================================
 def _env_flag(name: str, default: bool = True) -> bool:
     """与 proactive._env_flag 同语义的本地实现（避免跨模块私有导入）。"""
     raw = os.getenv(name)
     if raw is None or not str(raw).strip():
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
 
 # 总开关：false = 整个过滤器直通（等价于拔掉本模块）。
 TOOL_VISIBILITY_FILTER = _env_flag("TOOL_VISIBILITY_FILTER", True)
@@ -73,10 +31,7 @@ TOOL_VISIBILITY_FILTER = _env_flag("TOOL_VISIBILITY_FILTER", True)
 # 痕迹在原位置原样保留（插回原位置）。持久历史从不被改动。
 SILENT_ONLY_TOOLS: frozenset[str] = frozenset({"deliver_reply"})
 
-
-# =====================================================================
 # 核心：出站消息改写（纯函数，绝不原地修改入参）
-# =====================================================================
 def apply_tool_visibility(
     messages: list,
     hidden_tools: Optional[Iterable[str]] = None,
@@ -152,7 +107,6 @@ def apply_tool_visibility(
                 continue
         out.append(m)
     return out
-
 
 def strip_tool_traces(messages: list) -> list:
     """把出站消息列表中的全部工具调用痕迹 DROP（能力维度过滤）。

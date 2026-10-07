@@ -11,14 +11,10 @@ logger = logging.getLogger(__name__)
 # 工作区是本地运行时文件系统。R2 持久化由具体业务模块拥有，
 # 普通 workspace 文件没有通用的 R2 同步入口。
 
-
 class _LockRegistry:
     """按需创建、按 key 复用的 asyncio.Lock 注册表。
 
-    把此前暴露为模块级全局变量的两组 "dict + 注册表锁 + get-or-create"
-    （_workspace_locks/_workspace_locks_lock、_workspace_init_locks/
-    _workspace_init_locks_lock）收拢进类：可变 dict 不再可被任意导入方
-    绕过锁直接改写，get_or_create 在注册表锁内原子完成。
+    封装 workspace 锁注册表，避免调用方直接修改可变字典；get_or_create 在注册表锁内原子完成。
 
     并发模型说明（为什么不用 contextvars）：这里的锁按 workspace key
     全局共享——同一个 workspace 的所有并发协程必须互斥，属于「跨任务
@@ -41,7 +37,6 @@ class _LockRegistry:
                 self._locks[key] = lock
             return lock
 
-
 # workspace 访问锁：保护同一聊天的本地文件操作，避免并发修改。
 _workspace_file_locks = _LockRegistry()
 
@@ -49,16 +44,13 @@ _workspace_initialized: set[str] = set()
 # workspace 初始化专用锁；与文件操作锁分离，避免嵌套死锁。
 _workspace_init_lock_registry = _LockRegistry()
 
-
 async def _get_workspace_lock(chat_id: int, namespace: str | None = None) -> asyncio.Lock:
     """获取或创建该用户/作用域的 workspace 锁。"""
     return await _workspace_file_locks.get_or_create(workspace_namespace(chat_id, namespace))
 
-
 async def _get_workspace_init_lock(key: str) -> asyncio.Lock:
     """获取 workspace 初始化专用锁；与文件操作锁分离，避免嵌套死锁。"""
     return await _workspace_init_lock_registry.get_or_create(key)
-
 
 async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) -> None:
     """Ensure the runtime workspace tree (agent home + upload/ + download/) exists.
@@ -86,7 +78,6 @@ async def _ensure_runtime_workspace(chat_id: int, namespace: str | None = None) 
     workspace_upload_root(chat_id, namespace)
     workspace_download_root(chat_id, namespace)
 
-
 async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = None) -> None:
     """Initialize packaged/runtime skills once for this workspace."""
     resolved_namespace = workspace_namespace(chat_id, namespace)
@@ -108,8 +99,7 @@ async def _ensure_workspace_initialized(chat_id: int, namespace: str | None = No
                 resolved_namespace, exc,
             )
 
-
-# ========== 可选：初始化工作区（后台执行） ==========
+# 可选：初始化工作区（后台执行）
 
 async def init_workspace(chat_id: int, namespace: str | None = None) -> None:
     """Initialize the workspace and packaged skills once for this workspace."""
@@ -118,13 +108,11 @@ async def init_workspace(chat_id: int, namespace: str | None = None) -> None:
     except Exception as e:
         logger.error(f"Workspace 初始化失败: {e}")
 
-
 # 后台 init_workspace 任务强引用集：事件循环只持有任务的弱引用，若调用方
 # 不保存返回值，任务可能在执行中途被 GC 回收（CPython asyncio 官方文档
 # 明确警告的坑），表现为 workspace 预初始化静默消失、首个工具调用退化为
 # 同步 no-op 初始化。此集合保证任务存活到自然结束。
 _workspace_init_tasks: set = set()
-
 
 def schedule_workspace_init(chat_id: int, namespace: str | None = None) -> asyncio.Task:
     """后台调度 init_workspace 并保留强引用（fire-and-forget 的安全封装）。

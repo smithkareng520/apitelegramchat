@@ -1,15 +1,4 @@
-"""原生图片/视频生成模型的请求与响应解析。
-
-从 ai_handlers.py 拆分而来，逻辑未做改动。
-
-图像生成统一入口（OpenAI Images 协议）：
-所有走 OpenAI Images 协议的提供商（ModelScope / XXTF 等）共用
-:func:`_request_images_generations` 一个请求出口——端点选择、鉴权、
-请求头、payload 构造、参考图下载、响应解析全部在此合并；厂商差异
-（ModelScope 的异步任务轮询、xxtf 的官方 /images/edits multipart 形状）
-作为该出口内部的分支处理，调用方（agentic 原生图像循环 / 工具图像
-生成）不再按提供商各写一套。
-"""
+"""原生图片/视频生成模型的请求与响应解析。"""
 import asyncio
 import json
 import io
@@ -45,9 +34,7 @@ from core.messages import ImageBlock, Message, TextBlock
 
 logger = get_logger(__name__)
 
-# =============================================================================
 # 统一图像请求（OpenAI Images 协议 /v1/images/{generations,edits}）
-# -----------------------------------------------------------------------------
 # 走统一 Images 协议出口的提供商集合。判定依据是"该提供商的图像模型
 # 支持 OpenAI Images 兼容端点"，而不是按模型逐个判断：
 #   - modelscope: 文生图与图生图共用 /images/generations（用
@@ -58,18 +45,14 @@ logger = get_logger(__name__)
 #     developers.openai.com "Create image edit"）。编辑请求绝不回退
 #     /images/generations——官方 generations 端点不接受 image 参数，
 #     中转站忽略该字段后编辑就变成纯文生图，HTTP 200 "假成功"但产出
-#     一张与原图无关的新图（2026-09-08 生产事故）。edits 失败时明确
 #     报错，绝不降级。另有生产鲁棒性：超大参考图先降采样再上传、
 #     "请求体未完整/请重试"类瞬态 400 同形状自动重试
 #     （详见 _request_openai_compat_image）
 # 其它提供商（如 openrouter 的 gemini 图像模型）继续走
 # chat/completions + modalities 路径，行为不变。
-# =============================================================================
 
 
-# =============================================================================
 # 配置驱动的图像端点解析（公共出口）
-# -----------------------------------------------------------------------------
 # "这个图像模型到底 POST 到哪个 URL、参考图怎么传"由模型配置的 endpoint
 # 字段决定，不再按提供商写 if-else 分支：
 #   - 模型配置声明 endpoint="https://apihub.agnes-ai.com/v1/images/generations"
@@ -78,7 +61,6 @@ logger = get_logger(__name__)
 #   - endpoint 指向 API 根（未声明图像子路径）-> 按 OpenAI 官方形状推导
 #     {endpoint}/images/{generations,edits}，编辑走独立 multipart
 #     /images/edits（XXTF 等标准 OpenAI Images 中转行为完全不变）。
-# =============================================================================
 # Agnes 官方能力集合（单一来源见 ai/_constants.py；不在集合内的
 # aspect_ratio 不发送，走网关默认 1:1）。
 _INLINE_IMAGE_SIZE_TIERS = frozenset(AGNES_IMAGE_SIZE_TIERS)
@@ -190,7 +172,6 @@ def _normalize_inline_ratio(aspect_ratio: str | None) -> str | None:
     """归一化 inline 风格的 ratio 参数（仅在官方支持集合内才发送）。"""
     value = str(aspect_ratio or "").strip()
     return value if value in _INLINE_IMAGE_RATIOS else None
-
 
 
 # ---- extra_params 安全合并（通用工具，两条图像链路共用）----
@@ -515,15 +496,11 @@ def _clean_prompt_for_image_model(prompt: str) -> str:
     return text.strip()
 
 
-# =============================================================================
-# ModelScope 异步任务接口的"软失败"识别（2026-10-07 生产事故修复）
-# -----------------------------------------------------------------------------
 # ModelScope 网关对若干失败形态（内容审核拒绝、配额/限流、参数校验）会
 # 返回 HTTP 200 + 错误 JSON，而不是 4xx/5xx。历史实现在 POST 后只认
 # task_id / 图片字段，这类错误载荷被当成"成功"透传，用户最终只看到
 # 误导性的"接口返回成功，但响应里没有图片数据"，真实原因全部丢失。
 # 这里提供两个统一出口：错误信息提取 + 响应形状预览（可诊断报错）。
-# =============================================================================
 _MODELSCOPE_TASK_FAILED_STATES = frozenset({'FAILED', 'ERROR', 'CANCELLED', 'CANCELED'})
 _MODELSCOPE_TASK_SUCCEED_STATES = frozenset({'SUCCEED', 'SUCCESS', 'SUCCEEDED'})
 # 任务轮询总时长上限（秒）。Qwen-Image 系列实测生成 10-60s，240s 覆盖
@@ -1037,7 +1014,6 @@ async def _request_modelscope_multi(
 
 # ---- 生产鲁棒性辅助：瞬态 400 重试 / 超大参考图压缩 ----
 #
-# 历史教训（2026-09-08 生产事故）：本文件曾有"/images/edits 失败后回退
 # /images/generations + image 字段""路由级 404/405 按 base_url 缓存 TTL"
 # 的兼容逻辑。官方 generations 端点不接受 image 参数，中转站忽略该字段
 # 后编辑请求被当纯文生图执行——HTTP 200 "成功"，实际产出一张与原图
@@ -1439,7 +1415,6 @@ async def _request_openai_compat_image(
             # 重要：/images/generations + {"image": ...} 并不等价于官方
             # /images/edits 协议。中转站很可能直接忽略未知字段，把编辑请求
             # 当成纯文生图执行——用户要求"只删行人"，结果场景/风格整体
-            # 重绘（2026-09-08 生产事故：HTTP 200 "假成功"，原图从未送达
             # 模型）。因此：
             #   有参考图 -> 只能 POST /images/edits multipart；
             #   edits 失败 -> 明确报错；
@@ -1798,8 +1773,8 @@ async def _read_remote_image_capped(resp: "aiohttp.ClientResponse", *, max_bytes
     chat modalities 提取路径），替代过去"只有两处有防护、一处漏网"的
     复制粘贴状态。
 
-    注意（2026-09 生产事故）：不能 ``resp.content.read(n)``——语义是
-    "最多读 n 字节"，响应分块传输时立即返回 buffer 中已到达的部分，
+    不能 ``resp.content.read(n)``——语义是“最多读 n 字节”，响应分块传输时
+    可能只返回已到达的部分，
     85KB 的 PNG 会被读成半张（缺 IEND 尾部）→ PIL verify 判"损坏或
     截断"误拒。必须循环 readany() 读到 EOF，边读边限体积。
     """
@@ -2534,11 +2509,7 @@ async def _request_openrouter_video(
     return None, f"OpenRouter 轮询超时 ({max_wait} 秒)", None
 
 
-
-
-# =============================================================================
 # ImageTask 统一请求出口（protocols/images.py 的两个适配器落在这里）
-# -----------------------------------------------------------------------------
 # 图像任务的"操作"（generate/edit）是任务的
 # 一等字段（core/images.ImageTask.operation），由任务构造方显式声明；
 # 以下两个出口只按任务与模型协议发请求并解析，不再做任何
@@ -2546,13 +2517,11 @@ async def _request_openrouter_video(
 #   - _request_openai_images_task        -> /images/{generations,edits}
 #     （operation=edit 且带参考图 -> 官方 multipart /images/edits；
 #      编辑端点不可用时明确报错、绝不回退 /images/generations——把编辑
-#      降级成文生图是 2026-09-08 生产事故的"假成功"根因，见
 #      _request_openai_images_task 内的 NO fallback 分支；
 #      operation=generate -> /images/generations；ModelScope 一律
 #      /images/generations + 异步任务轮询，无 /images/edits 端点）
 #   - _request_chat_modalities_image_task -> chat.completions + modalities
 #     （OpenRouter 图像模型；参考图作为消息内容输入）
-# =============================================================================
 
 
 async def _request_openai_images_task(task: "ImageTask") -> "ImageTaskResult":
@@ -2709,8 +2678,7 @@ async def _request_chat_modalities_image_task(task: "ImageTask") -> "ImageTaskRe
         if "modalities" not in err_text or _status in (401, 402, 403, 429):
             raise
         logger.warning(f"Native image model does not support image+text output, retrying image-only: {e}")
-        # 降级重试保持与首次请求一致的 n 参数（num_images>1 时首次请求带 n，
-        # 旧代码重试时丢失 n 导致多图请求静默退化为单图）。
+        # 降级重试保持与首次请求一致的 n 参数，避免多图请求退化为单图。
         retry_extra: dict[str, Any] = {"modalities": ["image"],
                                        "provider": OPENROUTER_PROVIDER_PREFERENCES}
         if int(task.num_images or 1) > 1:
@@ -2786,7 +2754,6 @@ async def _request_chat_modalities_image_task(task: "ImageTask") -> "ImageTaskRe
                                 continue
                             # 下载体积上限与其他两处生成结果图片下载共用
                             # （_read_remote_image_capped：Content-Length
-                            # 预检 + readany 循环限读）——此前此处漏防护，
                             # 恶意/失控 upstream 可用超大响应拖垮进程。
                             fetched = await _read_remote_image_capped(resp)
                             if fetched is None:

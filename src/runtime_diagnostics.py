@@ -5,13 +5,11 @@ import os
 from pathlib import Path
 from typing import Any
 
-
 def _read_int(path: str) -> int | None:
     try:
         return int(Path(path).read_text().strip())
     except (OSError, ValueError):
         return None
-
 
 def memory_snapshot() -> dict[str, Any]:
     """Return RSS + cgroup memory information without optional dependencies."""
@@ -24,7 +22,7 @@ def memory_snapshot() -> dict[str, Any]:
     except (OSError, ValueError, IndexError):
         pass
 
-    # cgroup v2 is standard on current managed container hosts.
+    # cgroup is standard on current managed container hosts.
     limit = _read_int("/sys/fs/cgroup/memory.max")
     current = _read_int("/sys/fs/cgroup/memory.current")
     if limit == 2**63 - 1:
@@ -37,7 +35,6 @@ def memory_snapshot() -> dict[str, Any]:
         "pid": os.getpid(),
         "ppid": os.getppid(),
     }
-
 
 def format_memory(snapshot: dict[str, Any] | None = None) -> str:
     s = snapshot or memory_snapshot()

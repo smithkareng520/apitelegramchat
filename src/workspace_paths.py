@@ -11,9 +11,9 @@ logger = logging.getLogger(__name__)
 _NAMESPACE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _STATE_DIR_NAME = os.getenv("APITELEGRAMCHAT_STATE_DIR_NAME", "state").strip() or "state"
 # 运行时缓存层（pip/ccache/HF/tmp/bin/...）是家目录内的隐藏目录：
-#   - 点前缀让普通 `ls` 看不见，模型视角的家目录只剩用户文件；
-#   - 位于家目录内部（家目录即 Landlock 放行边界），缓存天然可写，
-#     无需为放行缓存而扩大边界。
+# 点前缀让普通 `ls` 看不见，模型视角的家目录只剩用户文件；
+# 位于家目录内部（家目录即 Landlock 放行边界），缓存天然可写，
+# 无需为放行缓存而扩大边界。
 _RUNTIME_DIR_NAME = os.getenv("APITELEGRAMCHAT_RUNTIME_DIR_NAME", ".runtime").strip() or ".runtime"
 _SKILLS_DIR_NAME = os.getenv("APITELEGRAMCHAT_SKILLS_DIR_NAME", "skills").strip() or "skills"
 _UPLOAD_DIR_NAME = os.getenv("APITELEGRAMCHAT_UPLOAD_DIR_NAME", "upload").strip() or "upload"
@@ -34,7 +34,6 @@ def _resolved_namespace(chat_id: object, namespace: object | None = None) -> str
         logger.debug("get_current_user_namespace 失败，回退 chat namespace", exc_info=True)
     return sanitize_namespace(chat_id)
 
-
 def _secure_directory(path: Path) -> Path:
     """Create a private runtime directory without accepting a final symlink."""
     expanded = path.expanduser()
@@ -50,7 +49,6 @@ def _secure_directory(path: Path) -> Path:
         raise RuntimeError(f"Unable to protect runtime directory {resolved}: {exc}") from exc
     return resolved
 
-
 @lru_cache(maxsize=1)
 def data_root() -> Path:
     """Return the private root for internal runtime state.
@@ -61,7 +59,6 @@ def data_root() -> Path:
     """
     base = os.getenv("APITELEGRAMCHAT_DATA_DIR", "/tmp/apitelegramchat_data")
     return _secure_directory(Path(base))
-
 
 @lru_cache(maxsize=1)
 def workspaces_root() -> Path:
@@ -89,13 +86,11 @@ def workspaces_root() -> Path:
         ) from exc
     return path
 
-
 def sanitize_namespace(value: object) -> str:
     raw = "default" if value is None else str(value).strip()
     raw = raw or "default"
     safe = _NAMESPACE_RE.sub("_", raw)
     return safe.strip("._") or "default"
-
 
 def workspace_root(chat_id: object, namespace: object | None = None) -> Path:
     """Return the workspace root for this chat/scope — the agent home itself.
@@ -109,7 +104,6 @@ def workspace_root(chat_id: object, namespace: object | None = None) -> Path:
     ns = _resolved_namespace(chat_id, namespace)
     parent = workspaces_root()
     return _secure_directory(parent / ns)
-
 
 def agent_home(chat_id: object, namespace: object | None = None) -> Path:
     """Return the agent home directory: $HOME, bash cwd and Landlock scope.
@@ -127,7 +121,6 @@ def agent_home(chat_id: object, namespace: object | None = None) -> Path:
     ns = _resolved_namespace(chat_id, namespace)
     return workspace_root(chat_id, ns)
 
-
 def workspace_workdir(chat_id: object, namespace: object | None = None) -> Path:
     """Return the agent home directory used as the bash cwd (= workspace root).
 
@@ -144,27 +137,21 @@ def workspace_workdir(chat_id: object, namespace: object | None = None) -> Path:
     workspace_skills_root(chat_id, namespace)
     return home.resolve()
 
-
 def state_root() -> Path:
     return _secure_directory(data_root() / _STATE_DIR_NAME)
-
 
 def chat_state_root(chat_id: object, namespace: object | None = None) -> Path:
     ns = _resolved_namespace(chat_id, namespace)
     return _secure_directory(state_root() / ns)
 
-
 def state_file(chat_id: object, filename: str, namespace: object | None = None) -> Path:
     return chat_state_root(chat_id, namespace) / filename
-
 
 def memory_state_file(chat_id: object, namespace: object | None = None) -> Path:
     return state_file(chat_id, "memories.json", namespace)
 
-
 def todo_state_file(chat_id: object, namespace: object | None = None) -> Path:
     return state_file(chat_id, "todos.json", namespace)
-
 
 def workspace_namespace(chat_id: object, namespace: object | None = None) -> str:
     """Return the canonical workspace namespace for this tool invocation.
@@ -174,7 +161,6 @@ def workspace_namespace(chat_id: object, namespace: object | None = None) -> str
     the request ContextVar repeatedly across async tasks/subtasks.
     """
     return _resolved_namespace(chat_id, namespace)
-
 
 def runtime_cache_root(chat_id: object, namespace: object | None = None) -> Path:
     """隐藏缓存层（家目录内 ``.runtime/``），完全独立于用户文件同步层。
@@ -194,7 +180,6 @@ def workspace_skills_root(chat_id: object, namespace: object | None = None) -> P
     """
     return _secure_directory(agent_home(chat_id, namespace) / _SKILLS_DIR_NAME)
 
-
 def workspace_upload_root(chat_id: object, namespace: object | None = None) -> Path:
     """Staging area for files the model wants to send to the user.
 
@@ -207,7 +192,6 @@ def workspace_upload_root(chat_id: object, namespace: object | None = None) -> P
     workspace directory.
     """
     return _secure_directory(agent_home(chat_id, namespace) / _UPLOAD_DIR_NAME)
-
 
 def workspace_download_root(chat_id: object, namespace: object | None = None) -> Path:
     """Landing area for files the user uploaded via Telegram.

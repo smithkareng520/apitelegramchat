@@ -1,29 +1,4 @@
-"""上下文窗口核心：有界会话窗口 + 摊销式自动压缩（auto-compaction）。
-
-策略（对齐 Claude Code / Cline 等主流 Agent 的上下文管理思路）：
-
-1. **存储历史即请求上下文**。不做逐轮滑动截尾——窗口起点每轮后移会让
-   隐式前缀缓存（DeepSeek/GLM/Gemini/OpenAI）整段历史每轮全 miss。
-2. **一个预算、双水位、滞后（hysteresis）触发**：
-   - 触发水位 = budget × CONTEXT_COMPACT_TRIGGER_RATIO（默认 0.90）；
-   - 压缩目标 = budget × CONTEXT_COMPACT_TARGET_RATIO（默认 0.50）。
-   历史在预算内时一字节不动（前缀稳定 → 缓存全量命中）；一旦超过
-   触发水位，就一次性压回目标水位，而不是"刚好塞得下"。清出来的
-   空间够后续很多轮增长，两次事件之间请求前缀字节级一致。
-3. **压缩事件的两级杠杆**（由 app.pre_flight_context_check 编排）：
-   - L1（无损）：把较老的工具负载归档成指针（payload → workspace
-     归档文件，模型可用 text_editor 取回，见 tool_context_compaction）；
-   - L2（结构）：从最老的用户轮块开始整块淘汰，保护最近
-     CONTEXT_PROTECTED_TURNS 轮；被淘汰的轮合并进**滚动摘要**
-     （conversation digest），存放在历史头部的稳定槽位。
-4. **摘要（digest）是确定性纯函数**：同一输入永远产出同一字节，
-   不含时间戳等易变内容；只在压缩事件中被重写一次。摘要本身受
-   token 预算约束（超限时从最老的行开始丢弃）。
-
-本模块只包含纯逻辑（无 IO、无 app 依赖），方便单元验证；
-异步编排（归档落盘、锁）在 app.pre_flight_context_check。
-请求侧的最后防线（守卫）见 context_manager.select_request_context。
-"""
+"""上下文窗口核心：有界会话窗口 + 摊销式自动压缩（auto-compaction）。"""
 from __future__ import annotations
 
 import os
@@ -38,7 +13,6 @@ from token_budget import (
 )
 from core.messages import Message, parse_tool_arguments
 
-
 def _msg_role(message: Any) -> Optional[str]:
     """双形状取角色：Message.role / dict["role"]。"""
     if isinstance(message, Message):
@@ -47,7 +21,6 @@ def _msg_role(message: Any) -> Optional[str]:
         role = message.get("role")
         return role if isinstance(role, str) else None
     return None
-
 
 def _msg_text(message: Any) -> str:
     """双形状取文本（Message 取 TextBlock 拼接；dict 取 content）。"""
@@ -58,13 +31,11 @@ def _msg_text(message: Any) -> str:
         return content if isinstance(content, str) else ""
     return ""
 
-
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, "") or default)
     except (TypeError, ValueError):
         return default
-
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -72,45 +43,39 @@ def _env_float(name: str, default: float) -> float:
     except (TypeError, ValueError):
         return default
 
-
-# ---------------------------------------------------------------------------
 # 可调参数（环境变量）
-# ---------------------------------------------------------------------------
-#: 历史可用预算占 max_context 的比例（其余留给系统提示 + 工具 schema + 轮内增长）
+# : 历史可用预算占 max_context 的比例（其余留给系统提示 + 工具 schema + 轮内增长）
 CONTEXT_BUDGET_RATIO = min(1.0, max(0.1, _env_float("CONTEXT_BUDGET_RATIO", 0.8)))
-#: 触发压缩事件的高水位（占预算比例）
+# : 触发压缩事件的高水位（占预算比例）
 CONTEXT_COMPACT_TRIGGER_RATIO = min(1.0, max(0.3, _env_float("CONTEXT_COMPACT_TRIGGER_RATIO", 0.90)))
-#: 压缩事件要压回的目标水位（占预算比例）
+# : 压缩事件要压回的目标水位（占预算比例）
 CONTEXT_COMPACT_TARGET_RATIO = min(1.0, max(0.1, _env_float("CONTEXT_COMPACT_TARGET_RATIO", 0.50)))
-#: 永不淘汰的最近用户轮数（活跃工作集）
+# : 永不淘汰的最近用户轮数（活跃工作集）
 CONTEXT_PROTECTED_TURNS = max(0, _env_int("CONTEXT_PROTECTED_TURNS", 6))
-#: 滚动摘要的 token 预算
+# : 滚动摘要的 token 预算
 CONTEXT_DIGEST_TOKEN_BUDGET = max(200, _env_int("CONTEXT_DIGEST_TOKEN_BUDGET", 1500))
-#: 绝对预算覆盖（环境变量 CONTEXT_MAX_TOKENS；0 = 不覆盖）
+# : 绝对预算覆盖（环境变量 CONTEXT_MAX_TOKENS；0 = 不覆盖）
 CONTEXT_MAX_TOKENS_ENV = _env_int("CONTEXT_MAX_TOKENS", 0)
 
-#: 无任何模型信息时的兜底预算（与旧 select_request_context 保持一致）
+# : 无任何模型信息时的兜底预算（与旧 select_request_context 保持一致）
 FALLBACK_BUDGET_TOKENS = 50000
 
-#: 摘要消息的稳定标记（同时是摘要槽位的识别方式）
+# : 摘要消息的稳定标记（同时是摘要槽位的识别方式）
 DIGEST_MARKER = "[conversation digest]"
-#: 摘要正文里标注"更早内容因预算省略"的提示行
+# : 摘要正文里标注"更早内容因预算省略"的提示行
 _DIGEST_OVERFLOW_NOTE = "(更早轮次已因摘要 token 预算省略)"
 _DIGEST_HEADER_RE = re.compile(
     r"^" + re.escape(DIGEST_MARKER) + r"[^\n]*?(\d+)[^\n]*轮[^\n]*$", re.MULTILINE
 )
 
-#: 摘要里每行的 token 上限（U/A 行）
+# : 摘要里每行的 token 上限（U/A 行）
 _LINE_TOKEN_BUDGET = 48
-#: 工具调用 locator 的字符上限
+# : 工具调用 locator 的字符上限
 _LOCATOR_CHAR_BUDGET = 96
-#: 构造 T 行时优先展示的参数键（与 tool_context_compaction 的定位字段对齐)
+# : 构造 T 行时优先展示的参数键（与 tool_context_compaction 的定位字段对齐)
 _LOCATOR_KEYS = ("url", "query", "q", "path", "command", "city", "file_name", "name")
 
-
-# ---------------------------------------------------------------------------
 # 预算解析
-# ---------------------------------------------------------------------------
 def resolve_history_budget(
     model_max_context: Optional[int] = None,
     model_max_output: Optional[int] = None,
@@ -134,20 +99,15 @@ def resolve_history_budget(
         return max(1024, budget)
     return FALLBACK_BUDGET_TOKENS
 
-
 def effective_digest_budget(budget: int) -> int:
     """摘要实际 token 预算：绝不超过总预算的 1/4（小窗口模型保护）。"""
     return max(200, min(CONTEXT_DIGEST_TOKEN_BUDGET, budget // 4 or 200))
-
 
 def compact_watermarks(budget: int) -> tuple[int, int]:
     """返回 (触发水位, 目标水位)，供事件触发判断使用。"""
     return int(budget * CONTEXT_COMPACT_TRIGGER_RATIO), int(budget * CONTEXT_COMPACT_TARGET_RATIO)
 
-
-# ---------------------------------------------------------------------------
 # 结构：摘要槽位 + 用户轮块
-# ---------------------------------------------------------------------------
 def is_digest_message(message: object) -> bool:
     """识别滚动摘要消息（role=system 且正文以稳定标记开头）。
 
@@ -161,7 +121,6 @@ def is_digest_message(message: object) -> bool:
         and isinstance(message.get("content"), str)
         and message["content"].startswith(DIGEST_MARKER)
     )
-
 
 def split_history_blocks(
     messages: list[Any],
@@ -193,14 +152,10 @@ def split_history_blocks(
         blocks.append(current)
     return digest_msg, blocks
 
-
 def _flatten(blocks: list[list[Any]]) -> list[Any]:
     return [message for block in blocks for message in block]
 
-
-# ---------------------------------------------------------------------------
 # 淘汰规划（纯函数）
-# ---------------------------------------------------------------------------
 @dataclass
 class EvictionPlan:
     """一次结构性淘汰的确定性计划（不修改入参）。"""
@@ -222,7 +177,6 @@ class EvictionPlan:
     @property
     def kept_messages(self) -> list[dict[str, Any]]:
         return _flatten(self.kept_blocks)
-
 
 def plan_turn_eviction(
     messages: list[Any],
@@ -265,7 +219,6 @@ def plan_turn_eviction(
         protected_turns=protected_turns,
     )
 
-
 def apply_eviction_plan(
     history: list[Any],
     plan: EvictionPlan,
@@ -286,15 +239,11 @@ def apply_eviction_plan(
         new_digest = make_digest_message(digest_text)
     history[:] = [new_digest] + kept
 
-
 def make_digest_message(digest_text: str) -> Message:
     """构造摘要消息（生产路径：内部 Message；meta 为空）。"""
     return Message.system(digest_text)
 
-
-# ---------------------------------------------------------------------------
 # 滚动摘要（确定性纯函数）
-# ---------------------------------------------------------------------------
 def _first_user_text(block: list[Any]) -> str:
     for message in block:
         if _msg_role(message) != "user":
@@ -305,7 +254,6 @@ def _first_user_text(block: list[Any]) -> str:
         return "[多模态消息：图片/文件/语音等]"
     return ""
 
-
 def _last_assistant_text(block: list[Any]) -> str:
     text = ""
     for message in block:
@@ -314,7 +262,6 @@ def _last_assistant_text(block: list[Any]) -> str:
             if candidate.strip():
                 text = candidate.strip()
     return text
-
 
 def _locator(name: str, raw_args: object) -> str:
     parsed = parse_tool_arguments(raw_args)
@@ -327,9 +274,7 @@ def _locator(name: str, raw_args: object) -> str:
             return f'{key}="{snippet}"'
     return ""
 
-
 _ARCHIVED_POINTER_RE = re.compile(r"archived at (\S+\.json)")
-
 
 def _tool_lines(block: list[Any]) -> list[str]:
     """块内工具调用骨架行：名称 + 定位参数 + 归档指针（如有）。"""
@@ -386,7 +331,6 @@ def _tool_lines(block: list[Any]) -> list[str]:
             lines.append(f"  T: {name}({locator}){tail}" if locator else f"  T: {name}{tail}")
     return lines
 
-
 def _skeleton_lines(block: list[Any]) -> list[str]:
     """单个被淘汰轮的摘要骨架（2-4 行，全部确定性生成）。"""
     lines: list[str] = []
@@ -401,7 +345,6 @@ def _skeleton_lines(block: list[Any]) -> list[str]:
     lines.extend(_tool_lines(block))
     return lines
 
-
 def _parse_prev_digest(prev_text: Optional[str]) -> tuple[int, list[str]]:
     """从旧摘要正文提取 (累计轮数, 骨架行列表)；无旧摘要返回 (0, [])。"""
     if not isinstance(prev_text, str) or not prev_text.startswith(DIGEST_MARKER):
@@ -411,7 +354,6 @@ def _parse_prev_digest(prev_text: Optional[str]) -> tuple[int, list[str]]:
     match = _DIGEST_HEADER_RE.search(prev_text)
     prev_turns = int(match.group(1)) if match else 0
     return prev_turns, body_lines
-
 
 def build_digest_text(
     prev_text: Optional[str],
@@ -455,17 +397,13 @@ def build_digest_text(
         text = truncate_to_token_budget(text, max(64, budget_tokens), suffix="…")
     return text
 
-
-# ---------------------------------------------------------------------------
 # 杂项
-# ---------------------------------------------------------------------------
 def count_history_tokens(
     history: list[Any],
     token_fn: Optional[Callable[[Any], int]] = None,
 ) -> int:
     token_fn = token_fn or json_token_count
     return sum(token_fn(message) for message in history)
-
 
 __all__ = [
     "CONTEXT_BUDGET_RATIO",

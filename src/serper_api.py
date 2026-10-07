@@ -1,33 +1,4 @@
-"""serper_api.py — Serper (google.serper.dev) 直接 HTTP 客户端
-
-设计目标
-=========
-替代原先通过 ModelScope MCP 转发的 google_search 调用，直接对接
-Serper 官方 REST API，避开上游 MCP 网关经常出现的"响应体中途被截断 /
-SSE 流被立即关闭 / 调用挂死"等不稳定行为。
-
-支持四个端点：
-  * search  → https://google.serper.dev/search   普通网页搜索
-  * images  → https://google.serper.dev/images   文字搜图
-  * videos  → https://google.serper.dev/videos   视频搜索
-  * lens    → https://google.serper.dev/lens     以图搜图（reverse image search）
-
-请求与响应格式严格遵循 https://serper.dev 的官方文档；单次请求 body 是
-单个 JSON 对象；响应也是单个 JSON 对象（不是数组）。批量请求（数组 body）
-在本项目中暂未使用——保持每个 mode × page 一次独立请求，便于失败隔离与
-定向重试。
-
-错误分类
-========
-* SerperAuthError        401/403 — API key 错误 / 配额耗尽
-* SerperRateLimitError   429     — 限流
-* SerperTimeoutError     网络超时 / 5xx 期间重试耗尽
-* SerperRequestError     4xx（除上面三类） / 上游返回非 JSON
-* SerperServerError      5xx 重试后仍失败
-* SerperUnavailableError SERPER_API_KEY 未配置 / 不可用
-
-调用方（search.serper.execute_web_search 等）只需捕获 SerperError 基类即可。
-"""
+"""serper_api.py — Serper (google.serper.dev) 直接 HTTP 客户端"""
 from __future__ import annotations
 
 import asyncio
@@ -50,7 +21,6 @@ ENDPOINTS = {
     "videos": "/videos",
     "lens":   "/lens",
 }
-
 
 class SerperError(RuntimeError):
     """所有 Serper API 错误的基类。"""
@@ -94,51 +64,40 @@ class SerperError(RuntimeError):
             )
         return f"❌ {feature_name}暂时不可用{suffix}。请稍后重试。"
 
-
 class SerperUnavailableError(SerperError):
     def __init__(self, message: str = "SERPER_API_KEY is not configured") -> None:
         super().__init__(message, category="unconfigured", retryable=False)
-
 
 class SerperAuthError(SerperError):
     def __init__(self, message: str, status_code: int | None = 401) -> None:
         super().__init__(message, category="authentication", status_code=status_code, retryable=False)
 
-
 class SerperRateLimitError(SerperError):
     def __init__(self, message: str, status_code: int | None = 429) -> None:
         super().__init__(message, category="rate_limited", status_code=status_code, retryable=False)
-
 
 class SerperTimeoutError(SerperError):
     def __init__(self, message: str) -> None:
         super().__init__(message, category="timeout", retryable=True)
 
-
 class SerperRequestError(SerperError):
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message, category="request", status_code=status_code, retryable=False)
-
 
 class SerperServerError(SerperError):
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message, category="server", status_code=status_code, retryable=True)
 
-
-# ---------------------------------------------------------------------------
 # 内部工具
-# ---------------------------------------------------------------------------
 
 def _is_configured() -> bool:
     return bool(SERPER_API_KEY)
-
 
 def _headers() -> dict[str, str]:
     return {
         "X-API-KEY": SERPER_API_KEY,
         "Content-Type": "application/json",
     }
-
 
 def _classify_status(status_code: int, body_text: str) -> tuple[str, bool]:
     """根据 HTTP 状态码与响应体片段，归类错误并给出是否值得重试。"""
@@ -156,7 +115,6 @@ def _classify_status(status_code: int, body_text: str) -> tuple[str, bool]:
     if 400 <= status_code <= 499:
         return "request", False
     return "unknown", True
-
 
 def _build_payload(
     *,
@@ -200,7 +158,6 @@ def _build_payload(
     if num is not None and mode in {"images", "videos", "lens"}:
         payload["num"] = max(1, min(int(num), SERPER_MAX_NUM))
     return payload
-
 
 async def _post_with_retry(
     *,
@@ -290,10 +247,7 @@ async def _post_with_retry(
         raise last_exc
     raise SerperError(f"Serper {endpoint} exhausted retries")
 
-
-# ---------------------------------------------------------------------------
 # 公共 API：四种搜索模式
-# ---------------------------------------------------------------------------
 
 async def search(
     query: str,
@@ -311,7 +265,6 @@ async def search(
         num=num, page=page, gl=gl, hl=hl, tbs=tbs,
     )
     return await _post_with_retry(endpoint=ENDPOINTS["search"], payload=payload, timeout=timeout)
-
 
 async def images(
     query: str,
@@ -331,7 +284,6 @@ async def images(
     )
     return await _post_with_retry(endpoint=ENDPOINTS["images"], payload=payload, timeout=timeout)
 
-
 async def videos(
     query: str,
     *,
@@ -348,7 +300,6 @@ async def videos(
         num=num, page=page, gl=gl, hl=hl, tbs=tbs,
     )
     return await _post_with_retry(endpoint=ENDPOINTS["videos"], payload=payload, timeout=timeout)
-
 
 async def lens(
     image_url: str,

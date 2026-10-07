@@ -1,8 +1,4 @@
-"""R2 persistence for runtime workspace skills.
-
-Ordinary workspace files are local-only. This module owns the explicit
-``workspace/skills`` snapshot lifecycle.
-"""
+"""R2 persistence for runtime workspace skills."""
 from __future__ import annotations
 
 import asyncio
@@ -21,21 +17,17 @@ logger = logging.getLogger(__name__)
 _SKILLS_R2_PREFIX = "skills"
 _SKILLS_ARCHIVE_NAME = "skills.tar.gz"
 
-
 def _skills_r2_prefix(namespace: str) -> str:
     return f"{_SKILLS_R2_PREFIX}/{namespace}"
 
-
 def _skills_archive_key(namespace: str) -> str:
     return f"{_skills_r2_prefix(namespace)}/{_SKILLS_ARCHIVE_NAME}"
-
 
 def _is_safe_skill_relpath(rel: str) -> bool:
     """远端归档内的相对路径必须落在 skills/ 内部。"""
     if not rel or rel.startswith("/"):
         return False
     return all(part not in ("", ".", "..") for part in Path(rel).parts)
-
 
 def _pack_skills_dir(skills_dir: Path) -> bytes:
     """把 skills/ 打成 gzip tar；只收录普通文件，避免符号链接逃逸。"""
@@ -53,7 +45,6 @@ def _pack_skills_dir(skills_dir: Path) -> bytes:
                     continue
                 archive.add(path, arcname=rel, recursive=False)
     return buffer.getvalue()
-
 
 def _extract_skills_archive(data: bytes, skills_dir: Path, *, replace_existing: bool = True) -> int:
     """安全解压 skills 快照，拒绝绝对路径/.. 路径和符号链接条目。"""
@@ -102,7 +93,6 @@ def _extract_skills_archive(data: bytes, skills_dir: Path, *, replace_existing: 
             restored += 1
     return restored
 
-
 async def backup_user_skills_to_r2(home: Path, namespace: str) -> None:
     """重新打包整个 skills/ 并覆盖 R2 快照。"""
     if not is_r2_configured():
@@ -115,7 +105,6 @@ async def backup_user_skills_to_r2(home: Path, namespace: str) -> None:
         "用户 skills 快照已上传 R2 namespace=%s: %.1f KiB",
         namespace, len(data) / 1024,
     )
-
 
 async def initialize_workspace_skills(home: Path, namespace: str) -> str:
     """初始化 workspace skills：优先恢复 R2 快照，否则从项目 skills 初始化。
@@ -142,7 +131,6 @@ async def initialize_workspace_skills(home: Path, namespace: str) -> str:
     logger.info("已从项目 skills 初始化 workspace namespace=%s", namespace)
     return "bootstrapped"
 
-
 def _skills_tree_fingerprint(skills_dir: Path) -> tuple[tuple[str, int, int], ...]:
     """仅用路径/大小/mtime_ns 检测变化，不读取内容、不计算 sha256。"""
     if not skills_dir.is_dir():
@@ -158,7 +146,6 @@ def _skills_tree_fingerprint(skills_dir: Path) -> tuple[tuple[str, int, int], ..
         items.append((path.relative_to(skills_dir).as_posix(), stat.st_size, stat.st_mtime_ns))
     return tuple(items)
 
-
 class SkillsR2SyncStats(TypedDict):
     """启动期 R2 skills 同步统计（workspaces/restored/bootstrapped 计数 + errors）。"""
 
@@ -166,7 +153,6 @@ class SkillsR2SyncStats(TypedDict):
     restored: int
     bootstrapped: int
     errors: list[str]
-
 
 async def sync_all_existing_workspace_skills_r2() -> SkillsR2SyncStats:
     """启动时为所有已有 workspace 恢复/播种 skills R2 快照。"""
@@ -187,7 +173,6 @@ async def sync_all_existing_workspace_skills_r2() -> SkillsR2SyncStats:
                 errors.append(f"{home}: {exc}")
     return SkillsR2SyncStats(workspaces=workspaces, restored=restored, bootstrapped=bootstrapped, errors=errors)
 
-
 def workspace_namespace_dirs_for_skills() -> list[Path]:
     """返回 workspace 根下的 namespace 目录，避免依赖 chat_id 反解。"""
     try:
@@ -198,7 +183,6 @@ def workspace_namespace_dirs_for_skills() -> list[Path]:
     if not root.is_dir():
         return []
     return [p for p in sorted(root.iterdir()) if p.is_dir() and not p.is_symlink()]
-
 
 async def watch_workspace_skills_r2(stop_event: asyncio.Event, interval: float = 2.0) -> None:
     """轮询已有 workspace 的 skills/，变化后 debounce 并覆盖上传 R2 快照。"""
@@ -236,5 +220,4 @@ async def watch_workspace_skills_r2(stop_event: asyncio.Event, interval: float =
             except Exception:
                 logger.warning("workspace skills R2 自动同步失败 namespace=%s", namespace, exc_info=True)
         pending.clear()
-
 

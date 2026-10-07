@@ -1,12 +1,4 @@
-"""Human-in-the-loop interaction for the agent.
-
-message_user 有两种模式：
-1. 普通消息：只发送一条消息并等待用户下一条普通回复；回复会原子地交给
-   原 message_user tool，不会创建新的 agent turn，也不会打断正在等待的轮次。
-2. 交互表单：一个消息里包含多个问题；每题可以单选/多选，可选自定义输入，
-   用户可用上一题/下一题切换，最后进入 Review / Submit 页面。允许只提交已
-   回答的问题，未回答的问题不会出现在最终结果里。
-"""
+"""Human-in-the-loop interaction for the agent."""
 from __future__ import annotations
 
 import asyncio
@@ -109,7 +101,6 @@ MESSAGE_USER_TOOL = {
     },
 }
 
-
 @dataclass
 class AskUserInteraction:
     id: str
@@ -129,15 +120,12 @@ class AskUserInteraction:
     status: str = "waiting"
     future: asyncio.Future | None = None
 
-
 _lock = asyncio.Lock()
 _pending: dict[str, AskUserInteraction] = {}
 _pending_by_chat: dict[int, str] = {}
 
-
 def _new_id() -> str:
     return uuid.uuid4().hex[:12]
-
 
 def _option_text(option: dict[str, Any]) -> tuple[str, str]:
     label = str(option.get("label") or option.get("title") or option.get("id") or "选项").strip()
@@ -146,7 +134,6 @@ def _option_text(option: dict[str, Any]) -> tuple[str, str]:
         truncate_to_token_budget(label, ASK_USER_LABEL_TOKEN_BUDGET, suffix="…"),
         truncate_to_token_budget(desc, ASK_USER_OPTION_DESCRIPTION_TOKEN_BUDGET, suffix="…"),
     )
-
 
 def _normalized_options(options: Any) -> list[dict[str, str]]:
     if not isinstance(options, list):
@@ -164,7 +151,6 @@ def _normalized_options(options: Any) -> list[dict[str, str]]:
         if label:
             out.append({"id": oid or f"option_{idx + 1}", "label": label, "description": desc})
     return out
-
 
 def _normalize_questions(raw: Any) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
@@ -187,12 +173,10 @@ def _normalize_questions(raw: Any) -> list[dict[str, Any]]:
         })
     return out
 
-
 def _current_question(interaction: AskUserInteraction) -> dict[str, Any] | None:
     if 0 <= interaction.current_index < len(interaction.questions):
         return interaction.questions[interaction.current_index]
     return None
-
 
 def _load_current_selection(interaction: AskUserInteraction) -> None:
     interaction.selected_indices.clear()
@@ -212,7 +196,6 @@ def _load_current_selection(interaction: AskUserInteraction) -> None:
         # 已经提交过的自定义答案应回到正常表单视图，并把答案直接显示出来。
         # 只有用户再次点击“自定义输入”时才进入 awaiting_custom 输入态。
         interaction.awaiting_custom = False
-
 
 def _build_keyboard(interaction: AskUserInteraction) -> dict:
     if interaction.mode == "message":
@@ -255,10 +238,8 @@ def _build_keyboard(interaction: AskUserInteraction) -> dict:
     rows.append([{"text": "Cancel", "callback_data": f"ask:{interaction.id}:cancel"}])
     return {"inline_keyboard": rows}
 
-
 def _question_rich_text(question: str) -> str:
     return render_telegram_block(str(question or "")) if str(question or "") else ""
-
 
 def _question_html(interaction: AskUserInteraction) -> str:
     if interaction.mode == "message":
@@ -293,7 +274,6 @@ def _question_html(interaction: AskUserInteraction) -> str:
         lines.append(f"<p><i>{mode}；也可以点击“自定义输入”回答这一题。</i></p>")
     return "".join(lines)
 
-
 def _review_html(interaction: AskUserInteraction) -> str:
     # Review/提交后的消息只保留每道已回答问题及其结果，不显示额外的标题、
     # 未完成提示或“Ready to submit”之类的状态文案。
@@ -311,10 +291,8 @@ def _review_html(interaction: AskUserInteraction) -> str:
             lines.append(f"<p>→ {convert_markdown_to_telegram_html(value)}</p>")
     return "".join(lines)
 
-
 def _answer_json(answer: dict[str, Any]) -> str:
     return json.dumps(answer, ensure_ascii=False, separators=(",", ":"))
-
 
 async def create_ask_user_interaction(
     chat_id: int,
@@ -359,15 +337,12 @@ async def create_ask_user_interaction(
     await cancel_interaction(interaction.id, remove_ui=False)
     raise RuntimeError("无法发送 message_user 交互消息")
 
-
 async def _clear_pending_unlocked(interaction: AskUserInteraction) -> None:
     _pending.pop(interaction.id, None)
     if _pending_by_chat.get(interaction.chat_id) == interaction.id:
         _pending_by_chat.pop(interaction.chat_id, None)
 
-
 _UI_FOLLOWUP_TASKS: set["asyncio.Task[Any]"] = set()
-
 
 def _spawn_ui_followup(coro: Coroutine[Any, Any, Any]) -> None:
     def _reap(task: "asyncio.Task[Any]") -> None:
@@ -377,7 +352,6 @@ def _spawn_ui_followup(coro: Coroutine[Any, Any, Any]) -> None:
     task = asyncio.create_task(coro)
     _UI_FOLLOWUP_TASKS.add(task)
     task.add_done_callback(_reap)
-
 
 async def _set_markup(message_id: int | None, chat_id: int, markup: dict | None) -> None:
     if not message_id:
@@ -390,7 +364,6 @@ async def _set_markup(message_id: int | None, chat_id: int, markup: dict | None)
                     logger.debug("message_user edit markup failed: %s", (await resp.text())[:200])
     except Exception:
         logger.debug("message_user edit markup exception", exc_info=True)
-
 
 async def _edit_question_message(interaction: AskUserInteraction, body_html: str, markup: dict | None = None) -> None:
     if not interaction.message_id:
@@ -409,7 +382,6 @@ async def _edit_question_message(interaction: AskUserInteraction, body_html: str
     except Exception:
         logger.debug("message_user edit text exception", exc_info=True)
 
-
 def _answered_html(interaction: AskUserInteraction, answer: dict[str, Any]) -> str:
     if interaction.mode == "message":
         # 普通消息始终保持普通聊天消息外观；用户的回复属于下一条用户消息，
@@ -417,11 +389,9 @@ def _answered_html(interaction: AskUserInteraction, answer: dict[str, Any]) -> s
         return _question_rich_text(interaction.message)
     return _review_html(interaction)
 
-
 def _touch_activity(interaction: AskUserInteraction) -> None:
     """Refresh the sliding inactivity timeout after a valid interaction."""
     interaction.last_activity_at = time.time()
-
 
 async def _finish(interaction: AskUserInteraction, answer: dict[str, Any], *, body: str | None = None) -> None:
     interaction.status = "answered"
@@ -429,7 +399,6 @@ async def _finish(interaction: AskUserInteraction, answer: dict[str, Any], *, bo
         interaction.future.set_result(answer)
     await _clear_pending_unlocked(interaction)
     _spawn_ui_followup(_edit_question_message(interaction, body or _answered_html(interaction, answer)))
-
 
 async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: str, action: str, arg: str = "") -> tuple[bool, str]:
     async with _lock:
@@ -525,7 +494,6 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
             return True, "已取消"
         return False, "未知操作"
 
-
 async def resolve_text(chat_id: int, text: str) -> bool:
     """原子消费一条用户文本；成功返回 True，调用方绝不能再创建新 turn。"""
     text = str(text or "").strip()
@@ -550,7 +518,6 @@ async def resolve_text(chat_id: int, text: str) -> bool:
         answer = {"type": "custom", "value": truncate_to_token_budget(text, ASK_USER_CUSTOM_ANSWER_TOKEN_BUDGET, suffix="…")}
         await _finish(interaction, answer)
         return True
-
 
 async def wait_for_answer(interaction: AskUserInteraction) -> dict[str, Any]:
     assert interaction.future is not None
@@ -593,7 +560,6 @@ async def wait_for_answer(interaction: AskUserInteraction) -> dict[str, Any]:
         await _edit_question_message(interaction, _answered_html(interaction, {"type": "cancelled"}))
         raise
 
-
 async def cancel_interaction(interaction_id: str, remove_ui: bool = True) -> None:
     async with _lock:
         interaction = _pending.get(interaction_id)
@@ -607,13 +573,11 @@ async def cancel_interaction(interaction_id: str, remove_ui: bool = True) -> Non
     if remove_ui:
         await _set_markup(message_id, chat_id, None)
 
-
 def ask_preview(interaction: AskUserInteraction) -> str:
     """工具折叠块里展示的一行预览：普通消息文本，或表单第一题。"""
     if interaction.mode == "message":
         return interaction.message
     return str((interaction.questions[0] if interaction.questions else {}).get("question", ""))
-
 
 def answer_to_tool_result(answer: dict[str, Any]) -> str:
     result = dict(answer or {})

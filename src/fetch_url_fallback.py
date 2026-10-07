@@ -8,7 +8,6 @@ from web_search_settings import (
     FETCH_URL_ROOT_FALLBACK_PATHS,
 )
 
-
 def _configured_paths(paths: Any) -> tuple[str, ...]:
     """返回格式合法、去重后的同站点回退路径。"""
     if isinstance(paths, str):
@@ -38,9 +37,7 @@ def _configured_paths(paths: Any) -> tuple[str, ...]:
         normalized.append(path)
     return tuple(normalized)
 
-
 ROOT_FALLBACK_PATHS = _configured_paths(FETCH_URL_ROOT_FALLBACK_PATHS)
-
 
 def root_fallback_urls(url: str) -> tuple[str, ...]:
     """为合格的根路径 URL 生成同 origin 的首页回退候选地址。

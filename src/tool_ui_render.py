@@ -1,9 +1,4 @@
-"""工具结果卡片 UI 渲染工具箱（自 tool_executors.py 拆出）。
-
-结构化 JSON → POI 卡 / 地图卡 / 路线卡 / 距离卡；bash 结果信封
-解析与终端回放渲染；编辑器结果引用块；行宽/行数裁剪与转义。
-全部为纯函数，供 tool_result_format 与 bash_session 复用。
-"""
+"""工具结果卡片 UI 渲染工具箱（自 tool_executors.py 拆出）。"""
 
 import os
 import re
@@ -19,7 +14,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
 _ANSI_ESCAPE_RE = re.compile(
     r'\x1B(?:'
     r'\][^\x07\x1b]*(?:\x07|\x1b\\)|'  # OSC (Operating System Command)
@@ -28,13 +22,11 @@ _ANSI_ESCAPE_RE = re.compile(
     r')'
 )
 
-
 def _strip_ansi(text: str) -> str:
     """Remove ANSI escape sequences (colors, cursor navigation, hyperlinks, OSC titles)."""
     if not text:
         return ""
     return _ANSI_ESCAPE_RE.sub('', text)
-
 
 _UI_TAIL_LINES = 10
 _UI_VALUE_TOKEN_BUDGET = 120
@@ -44,7 +36,6 @@ _SENSITIVE_RESULT_KEYS = {
     "password", "cookie", "signature", "x-amz-signature",
 }
 
-
 def _tail_text_lines(text: str, count: int = _UI_TAIL_LINES) -> tuple[list[str], int, int]:
     """Return the visible tail together with its one-based first line and total lines."""
     lines = (text or "").rstrip("\n").splitlines()
@@ -52,7 +43,6 @@ def _tail_text_lines(text: str, count: int = _UI_TAIL_LINES) -> tuple[list[str],
     if total <= count:
         return lines, 1, total
     return lines[-count:], total - count + 1, total
-
 
 def _numbered_text(text: str, *, max_lines: int = _UI_TAIL_LINES) -> str:
     lines, first_line, total = _tail_text_lines(text, max_lines)
@@ -67,7 +57,6 @@ def _numbered_text(text: str, *, max_lines: int = _UI_TAIL_LINES) -> str:
         f"{line_no:>{width}} │ {line}" for line_no, line in enumerate(lines, start=first_line)
     )
     return prefix + body
-
 
 def _render_code_panel(
     title: str,
@@ -90,19 +79,16 @@ def _render_code_panel(
         f"<pre><code>{_escape_code_text(display)}</code></pre></details>"
     )
 
-
 def _trim_ui_value(value: object, token_budget: int = _UI_VALUE_TOKEN_BUDGET) -> str:
     text = str(value if value is not None else "")
     text = re.sub(r"\s+", " ", text).strip()
     return truncate_to_token_budget(text, token_budget, suffix="…")
-
 
 def _looks_like_http_url(value: object) -> bool:
     if not isinstance(value, str):
         return False
     parsed = urlparse(value.strip())
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-
 
 def _display_key(key: object) -> str:
     raw = str(key)
@@ -115,14 +101,12 @@ def _display_key(key: object) -> str:
     }
     return labels.get(raw.lower(), raw.replace("_", " "))
 
-
 def _compact_json(value: object, token_budget: int = _UI_VALUE_TOKEN_BUDGET) -> str:
     try:
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
         encoded = str(value)
     return _trim_ui_value(encoded, token_budget)
-
 
 def _render_structured_value(value: object, *, depth: int = 0) -> str:
     if value is None:
@@ -177,7 +161,6 @@ def _render_structured_value(value: object, *, depth: int = 0) -> str:
         return "<table bordered striped>" + "".join(rows) + "</table>"
     return convert_markdown_to_telegram_html(_trim_ui_value(value))
 
-
 def _parse_structured_payload(result_str: str) -> object | None:
     """Parse a JSON document *or* a stream of adjacent JSON objects from MCP text."""
     raw = (result_str or "").strip()
@@ -219,7 +202,6 @@ def _parse_structured_payload(result_str: str) -> object | None:
         return None
     return values[0] if len(values) == 1 else values
 
-
 def _find_poi_records(payload: object) -> list[dict] | None:
     """Find AMap-like POI records in direct, wrapped, or concatenated MCP output."""
     if isinstance(payload, dict):
@@ -249,12 +231,10 @@ def _find_poi_records(payload: object) -> list[dict] | None:
                 return found
     return None
 
-
 def _poi_biz_ext(poi: dict) -> dict:
     """Return the AMap ``biz_ext`` object when present."""
     value = poi.get("biz_ext")
     return value if isinstance(value, dict) else {}
-
 
 def _poi_photo_url(poi: dict) -> str:
     """从 POI 的 photos 里取首张图的 URL（缺失/形状异常返回空串）。
@@ -275,7 +255,6 @@ def _poi_photo_url(poi: dict) -> str:
                 return value.strip()
     return ""
 
-
 def _poi_value(poi: dict, *keys: str) -> str:
     """Read a non-empty POI field from top level or known nested containers."""
     containers = [poi]
@@ -289,11 +268,9 @@ def _poi_value(poi: dict, *keys: str) -> str:
                 return _trim_ui_value(value, 180)
     return ""
 
-
 def _poi_biz_ext_value(poi: dict, key: str) -> str:
     """Read one of AMap's business-detail fields from ``biz_ext`` or top-level."""
     return _poi_value(poi, key)
-
 
 def _poi_category(poi: dict) -> str:
     """Collapse AMap's semicolon-separated type hierarchy to a concise label."""
@@ -309,7 +286,6 @@ def _poi_category(poi: dict) -> str:
         return parts[0]
     return f"{parts[0]}/{parts[-1]}"
 
-
 def _poi_tags(poi: dict) -> str:
     """Return concise feature tags without exposing raw category codes."""
     raw = _poi_value(poi, "tag")
@@ -322,7 +298,6 @@ def _poi_tags(poi: dict) -> str:
             unique.append(part)
     return "、".join(unique[:5])
 
-
 def _poi_hours(poi: dict) -> str:
     """Read whichever business-hours field the upstream AMap/MCP shape provides."""
     for key in (
@@ -333,7 +308,6 @@ def _poi_hours(poi: dict) -> str:
         if value:
             return value
     return ""
-
 
 def _phone_link(phone: str) -> str:
     """Make one simple phone value clickable; keep compound values as text."""
@@ -347,11 +321,9 @@ def _phone_link(phone: str) -> str:
         return _escape_text(number)
     return f'<a href="tel:{html.escape(compact, quote=True)}">{_escape_text(number)}</a>'
 
-
 def _escape_text(value: object) -> str:
     """Escape data as plain text; do not interpret POI names as Markdown."""
     return html.escape(str(value if value is not None else ""), quote=False)
-
 
 def _render_poi_cards(payload: object) -> str | None:
     """Render AMap POIs as compact, information-dense Telegram HTML cards.
@@ -419,7 +391,6 @@ def _render_poi_cards(payload: object) -> str | None:
         )
     return "".join(cards)
 
-
 def _render_poi_photo(poi: dict) -> str | None:
     """渲染 POI 首张实景图（仅 http/https URL；不合法或缺失时返回 None）。"""
     url = _poi_photo_url(poi)
@@ -429,13 +400,11 @@ def _render_poi_photo(poi: dict) -> str | None:
     # img 独立成段并限制显示宽度：多张卡片叠加时不会把草稿撑爆。
     return f'<p><img src="{safe_url}" maxwidth="480" rounded/></p>'
 
-
 def _int_value(value: object) -> int | None:
     try:
         return int(float(str(value)))
     except (TypeError, ValueError):
         return None
-
 
 def _format_distance(value: object) -> str:
     meters = _int_value(value)
@@ -444,7 +413,6 @@ def _format_distance(value: object) -> str:
     if meters >= 1000:
         return f"{meters / 1000:.1f} 公里"
     return f"{meters} 米"
-
 
 def _format_duration(value: object) -> str:
     seconds = _int_value(value)
@@ -455,14 +423,11 @@ def _format_duration(value: object) -> str:
         return f"{minutes // 60} 小时 {minutes % 60} 分钟"
     return f"约 {minutes} 分钟"
 
-
 def _dict(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
-
 def _list_of_dicts(value: object) -> list[dict]:
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
-
 
 def _render_map_location_card(payload: object, tool_name: str) -> str | None:
     """地理编码结果卡片：地址→坐标，内容本就短小（区域+坐标+匹配级别），
@@ -490,7 +455,6 @@ def _render_map_location_card(payload: object, tool_name: str) -> str | None:
 
     return None
 
-
 def _collect_route_steps(path: dict, limit: int = 8) -> list[str]:
     steps = _list_of_dicts(path.get("steps"))
     rendered = []
@@ -499,7 +463,6 @@ def _collect_route_steps(path: dict, limit: int = 8) -> list[str]:
         if instruction:
             rendered.append(instruction)
     return rendered
-
 
 def _render_route_path(path: dict, index: int, *, open_first: bool = False) -> str:
     distance = _format_distance(path.get("distance"))
@@ -512,7 +475,6 @@ def _render_route_path(path: dict, index: int, *, open_first: bool = False) -> s
         suffix = f"<p><i>其余 {total - len(steps)} 步已折叠</i></p>" if total > len(steps) else ""
         body += f"<details><summary>导航步骤（{total}）</summary><ol>{items}</ol>{suffix}</details>"
     return f"<details{' open' if open_first else ''}><summary>方案 {index} · {convert_markdown_to_telegram_html(distance)} · {convert_markdown_to_telegram_html(duration)}</summary>{body}</details>"
-
 
 def _render_transit_plan(transit: dict, index: int) -> str:
     duration = _format_duration(transit.get("duration"))
@@ -535,7 +497,6 @@ def _render_transit_plan(transit: dict, index: int) -> str:
     else:
         body += "<p><i>该方案以步行为主。</i></p>"
     return f"<details{' open' if index == 1 else ''}><summary>方案 {index} · {convert_markdown_to_telegram_html(duration)} · 步行 {convert_markdown_to_telegram_html(walking)}</summary>{body}</details>"
-
 
 def _render_map_route_card(payload: object) -> str | None:
     data = _dict(payload)
@@ -564,7 +525,6 @@ def _render_map_route_card(payload: object) -> str | None:
         return title + cards
     return None
 
-
 def _render_distance_card(payload: object) -> str | None:
     records = _list_of_dicts(_dict(payload).get("results"))
     if not records:
@@ -585,7 +545,6 @@ def _render_distance_card(payload: object) -> str | None:
         + "".join(rows) + "</table>" + suffix
     )
 
-
 def _render_map_payload(payload: object, tool_name: str) -> str | None:
     poi_cards = _render_poi_cards(payload)
     if poi_cards:
@@ -604,12 +563,11 @@ def _render_map_payload(payload: object, tool_name: str) -> str | None:
             return card
     return None
 
-
 def _render_structured_payload(result_str: str, *, map_tool: str) -> str | None:
     payload = _parse_structured_payload(result_str)
     if payload is None:
         return None
-    # _render_map_payload 内部已先尝试 POI 卡片，无需在此重算同一纯函数。
+    # render_map_payload 内部已先尝试 POI 卡片，无需在此重算同一纯函数。
     map_card = _render_map_payload(payload, map_tool)
     if map_card:
         return map_card
@@ -619,7 +577,6 @@ def _render_structured_payload(result_str: str, *, map_tool: str) -> str | None:
         "<p><b>结构化结果</b><br/><i>已将服务返回转换为可阅读字段；详情可展开查看。</i></p>"
         + _render_structured_value(payload)
     )
-
 
 # 所有工具的完成态展示统一走 text_editor 风格的 Input/Output 引用块；
 # Input 或 Output 任一超过这个行数都做截断，避免长内容把消息撑爆。
@@ -633,7 +590,6 @@ _TOOL_UI_MAX_LINE_CHARS = max(80, int(os.getenv("TOOL_UI_MAX_LINE_CHARS", "240")
 # <pre> 块的最终总量兑底（原始字符数，转义前）。正常路径远达不到：工具卡片
 # 已被行数×行宽双重钳住；此值只拦截直接把大文本塞进 <pre> 的旁路调用。
 _PRE_BLOCK_MAX_CHARS = max(_TOOL_UI_MAX_LINE_CHARS * 4, int(os.getenv("PRE_BLOCK_MAX_CHARS", "8000")))
-
 
 def _clip_ui_line(line: str, max_chars: int | None = None) -> str:
     """超宽行保头保尾：关键信息可能在一行的任意位置。
@@ -650,7 +606,6 @@ def _clip_ui_line(line: str, max_chars: int | None = None) -> str:
     omitted = len(line) - head_len - tail_len
     return f"{line[:head_len]}…（本行过长，省略 {omitted} 字符）…{line[-tail_len:]}"
 
-
 def _clip_ui_lines(text: str) -> str:
     """对一段已定稿的多行文本逐行做宽度裁剪（行数不再变动）。"""
     if not text:
@@ -658,7 +613,6 @@ def _clip_ui_lines(text: str) -> str:
     if len(text) <= _TOOL_UI_MAX_LINE_CHARS:
         return text  # 快路径：整体都不超宽，无需逐行
     return "\n".join(_clip_ui_line(line) for line in text.splitlines())
-
 
 def _truncate_ui_lines(text: str, max_lines: int = _TOOL_UI_MAX_LINES) -> str:
     """Keep only the first max_lines lines; append a truncation note if cut.
@@ -674,7 +628,6 @@ def _truncate_ui_lines(text: str, max_lines: int = _TOOL_UI_MAX_LINES) -> str:
         return _clip_ui_lines(text)
     kept = "\n".join(_clip_ui_line(line) for line in lines[:max_lines])
     return f"{kept}\n…（已截断，共 {len(lines)} 行，仅显示前 {max_lines} 行）"
-
 
 def _truncate_ui_lines_head_tail(text: str, max_lines: int = _TOOL_UI_MAX_LINES) -> str:
     """Keep the first ~60% and the last ~40% lines; note the omitted middle.
@@ -694,7 +647,6 @@ def _truncate_ui_lines_head_tail(text: str, max_lines: int = _TOOL_UI_MAX_LINES)
     tail = "\n".join(_clip_ui_line(line) for line in lines[-tail_lines:])
     return f"{head}\n…（已截断，共 {len(lines)} 行，省略中间 {omitted} 行）\n{tail}"
 
-
 def _escape_code_text(text: str) -> str:
     """严格转义代码/终端文本中的 HTML 特殊字符（``&``、``<``、``>`` 一律转义）。
 
@@ -708,7 +660,6 @@ def _escape_code_text(text: str) -> str:
     if not text:
         return ""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
 
 def _render_code_text(text: str, *, language: str | None = None) -> str:
     """把纯文本渲染为**保留缩进与空白**的等宽代码块。
@@ -743,13 +694,10 @@ def _render_code_text(text: str, *, language: str | None = None) -> str:
     class_attr = f' class="language-{html.escape(language, quote=True)}"' if language else ""
     return f"<pre><code{class_attr}>{body}</code></pre>"
 
-
 def _render_editor_quote(label: str, value: str, truncator: Callable[[str], str] = _truncate_ui_lines, *, language: str | None = None) -> str:
     """Render a tool's input or output as a monospace code block that preserves indentation.
 
-    截断到 ``_TOOL_UI_MAX_LINES`` 行后放进 ``<pre><code>``：文件摘录、终端
-    回放、diff 与行号 gutter（``12 │ code``）都依赖等宽字体和逐字保留的
-    空白才能对齐，旧实现用 ``<blockquote>`` + ``<br/>`` 会把缩进折叠掉。
+    截断到 ``_TOOL_UI_MAX_LINES`` 行后使用 ``<pre><code>``，以保留缩进、diff 和行号 gutter 的对齐。
     """
     text = value if isinstance(value, str) else str(value or "")
     if not text:
@@ -757,7 +705,6 @@ def _render_editor_quote(label: str, value: str, truncator: Callable[[str], str]
     else:
         text = truncator(text)
     return f"<p><b>{convert_markdown_to_telegram_html(label)}</b></p>{_render_code_text(text, language=language)}"
-
 
 def _render_media_failure_result(result_str: str, fallback: str) -> str:
     """Render media-generation failures in the same quote format as text_editor.
@@ -767,14 +714,11 @@ def _render_media_failure_result(result_str: str, fallback: str) -> str:
     """
     raw = result_str if isinstance(result_str, str) else str(result_str or "")
     raw = html.unescape(raw)
-    # 修复 BUG：原先写的是 r"<br\\s*/?\\s*>" —— 在 raw-string 里 \\s 是字面量 "\s"
-    # 而非正则的空白匹配，导致这个 <br> 替换实际上从未生效。
-    # 改成 r"<br\s*/?\s*>" 后才会正确匹配 <br>、<br/>、<br />。
+    # 正则中的 \s 必须保留为正则空白匹配，才能覆盖 <br>、<br/>、<br />。
     raw = re.sub(r"<br\s*/?\s*>", "\n", raw, flags=re.IGNORECASE)
     raw = re.sub(r"<[^>]+>", "", raw)
     message = html.unescape(raw).strip() or fallback
     return _render_editor_quote("Result", message)
-
 
 def _format_image_generation_result(
     result_str: str,
@@ -807,7 +751,6 @@ def _format_image_generation_result(
             return summary, details_html
     return failure_summary, _render_media_failure_result(result_str, failure_fallback)
 
-
 def _parse_bash_envelope(result_str: str) -> tuple[str, str] | None:
     """解析 Bash 模型结果信封 → ``(cwd, output)``。"""
     lines = (result_str or "").splitlines()
@@ -832,12 +775,10 @@ def _render_bash_result(result_str: str, fn_args: dict | None = None) -> str:
         )
     return _render_editor_quote("Output", output, language="bash")
 
-
 def _editor_result_summary(result_str: str) -> str:
     """Discard internal snapshot metadata; front-end Output shows the result text."""
     message, _marker, _snapshot = (result_str or "").partition("Latest file snapshot (tail 10):\n")
     return message.strip() or result_str or ""
-
 
 def _render_editor_result(command: str, path: str, result_str: str, arguments: dict | None = None) -> str:
     """Render text-editor calls as explicit, quote-formatted Input and Output."""
@@ -865,7 +806,4 @@ def _render_editor_result(command: str, path: str, result_str: str, arguments: d
     output = _editor_result_summary(result_str)
     return _render_editor_quote("Input", input_value) + _render_editor_quote("Output", output)
 
-
-# =====================================================================
 # Persistent runtime state
-# =====================================================================

@@ -1,14 +1,8 @@
-"""工具列表装配辅助函数。
-
-这里不改写工具 schema 的源码声明顺序，而是在请求装配时生成稳定的新列表：
-优先集合会被放到列表前部，其他工具保持原有相对顺序。所有发送给网关的
-工具定义都会先过滤掉非 dict 元素，避免严格端点因字面 [] 等非法元素返回 400。
-"""
+"""工具列表装配辅助函数。"""
 from collections.abc import Iterable
 from typing import Any
 
 from tool_names import split_mcp_name
-
 
 def _schema_key(name: str) -> str:
     """完整工具名（mcp__<server>__<tool> 或短名）→ 规范短名。
@@ -19,14 +13,11 @@ def _schema_key(name: str) -> str:
     split = split_mcp_name(name or "")
     return split[1] if split else (name or "")
 
-
 def valid_tool_defs(tools: Iterable[Any] | None) -> list[dict]:
     """返回可发送的工具定义，只保留 dict，保持原始顺序。"""
     if not tools:
         return []
     return [normalize_tool_schema(tool) for tool in tools if isinstance(tool, dict)]
-
-
 
 def normalize_tool_schema(tool: dict) -> dict:
     """规范化发给模型的工具 schema。
@@ -61,12 +52,10 @@ def normalize_tool_schema(tool: dict) -> dict:
         pass
     return tool
 
-
 def tool_name(tool: dict) -> str:
     """安全读取 OpenAI 风格工具定义的函数名。"""
     function = tool.get("function")
     return function.get("name", "") if isinstance(function, dict) else ""
-
 
 def prioritize_tool_defs(
     tools: Iterable[Any] | None,
@@ -84,7 +73,6 @@ def prioritize_tool_defs(
     return [tool for tool in valid if tool_name(tool) in priority] + [
         tool for tool in valid if tool_name(tool) not in priority
     ]
-
 
 def restrict_tool_defs(
     tools: Iterable[Any] | None,

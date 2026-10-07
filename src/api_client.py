@@ -1,20 +1,5 @@
 # api_client.py
-"""
-统一 API 客户端工厂（协议驱动）
-支持通过 config.py 中的 PROVIDERS 字典动态添加新厂商，也支持每个模型
-单独覆盖端点（endpoint / api_key_env / 协议），详见
-config.get_effective_endpoint()。
-
-客户端构造按"协议"分流（protocol -> SDK client）：
-  - anthropic_messages -> AsyncAnthropic
-  - 其它协议（openai_chat 及一切带 endpoint 的兼容端点）-> AsyncOpenAI
-  - gemini_native / openai_images 的主链路不经过 SDK 客户端
-    （协议适配器内直连 aiohttp），但 subagent 等兼容层调用方仍可拿到
-    AsyncOpenAI 客户端访问同一厂商的 OpenAI 兼容端点。
-
-安全改进：所有 API Key 从 config 模块的变量中读取（而非 os.environ），
-配合 config.py 的 scrub_environment() 实现环境变量完全清洗。
-"""
+"""统一 API 客户端工厂（协议驱动）"""
 
 import logging
 import os
@@ -38,12 +23,11 @@ logger = logging.getLogger(__name__)
 
 # 使用原生 SDK（而非 AsyncOpenAI）的协议集合。新增协议只需加进这里 +
 # config.py 的 ProviderConfig/ModelConfig 的 protocol 字段，
-# _build_client 会自动分流，其余协议的构造逻辑不受影响。
+# build_client 会自动分流，其余协议的构造逻辑不受影响。
 # 注意：这里判断的是"有效协议"（protocol），而不是 provider
 # 名字——同一个 provider 壳下的不同模型可能通过端点覆盖各自声明不同的
 # protocol（见 get_effective_endpoint）。
 _NATIVE_SDK_PROTOCOLS = {"anthropic_messages"}
-
 
 class APIClient:
     """
@@ -105,7 +89,7 @@ class APIClient:
                 sdk_max_retries = 0
             kwargs: dict[str, Any] = {"max_retries": sdk_max_retries}
             # 仅当端点覆盖为非 Anthropic 官方默认时才显式传入，
-            # 否则沿用 AsyncAnthropic SDK 自带的官方默认值，行为与此前完全一致。
+            # 否则沿用 AsyncAnthropic SDK 自带的官方默认值。
             if endpoint.endpoint and endpoint.endpoint != "https://api.anthropic.com":
                 kwargs["base_url"] = endpoint.endpoint
             if endpoint.default_headers:

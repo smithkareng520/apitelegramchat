@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """模型级公共路由方法：按模型配置字段匹配 文本 / 视频 / 生图 链路。
 
-这是"新增模型不需要新建请求分支"的顶层体现：回合调度方（ai_handlers）
+路由按模型能力选择执行链路，回合调度方无需维护模型分支。
 与工具层只需要问一次 :func:`resolve_model_route`，就能拿到该模型应进入
 的执行链路；后续的端点选择继续由协议层（registry / images）与请求层
 （media_generation.resolve_images_endpoint_shape / _request_agnes_video）
@@ -14,12 +14,10 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from config import ModelConfig
 
-# 模型路由标签：
 #   video: 原生视频生成模型（video_output=True）-> 视频任务循环
 #   image: 原生图像生成模型（image_output=True）-> 图像任务循环
 #   chat:  其余模型 -> 常规 agentic chat 循环（工具调用/纯文本）
 ModelRoute = Literal["video", "image", "chat"]
-
 
 def resolve_model_route(model_info: "ModelConfig | None") -> ModelRoute:
     """按模型配置字段返回应进入的执行链路（公共路由唯一出口）。
@@ -39,6 +37,5 @@ def resolve_model_route(model_info: "ModelConfig | None") -> ModelRoute:
     if bool(getattr(model_info, "image_output", False)):
         return "image"
     return "chat"
-
 
 __all__ = ["ModelRoute", "resolve_model_route"]

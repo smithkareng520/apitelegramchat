@@ -1,48 +1,4 @@
-"""Gemini 显式缓存（cachedContent API）管理器。
-
-背景（2026-09-05 线上观测）：
-====================================================================
-Gemini 隐式缓存（implicit caching，usageMetadata.cachedContentTokenCount）
-有三个固有短板，导致活跃 agentic 会话命中率长期偏低：
-
-1. 缓存建立是**异步**的：一个前缀要 ~1-2 分钟才变成可命中——同一回合
-   的工具循环（第 1 轮 prompt + functionCall/functionResponse = 第 2 轮
-   prompt，间隔仅数秒）永远赶不上；
-2. 缓存锚点**阶梯式**推进（实测 16.2K → 32.4K → 44.6K，每级间隔 3+
-   分钟），活跃对话的未缓存尾巴持续增长，阶梯内命中率单调下滑；
-3. TTL 仅 ~5 分钟，空闲即全灭（实测空闲 5m43s 后 Cached 归 0）。
-
-方案：用**显式缓存**把"system prompt + 稳定历史前缀"主动建成
-cachedContents 对象（TTL 10-30 分钟、命中即续期），请求体引用
-cachedContent 并只发送当前回合的后缀。cached input 计价为普通 input
-的 1/4，storage 按小时计费——对 11K-49K 输入的高频轮次显著划算。
-
-设计约束（务必遵守）：
-====================================================================
-1. **纯增量能力**：只服务 Gemini 原生循环（gemini_bridge），不触碰
-   OpenAI / Anthropic 的任何缓存策略；manager 不 import gemini_bridge
-   （convert_fn / base_url / headers 由调用方注入），避免循环导入。
-2. **绝不影响主流程**：acquire 的任何异常都吞掉并返回 None（回退全量
-   请求）；请求被 Gemini 拒绝（400/404）时由调用方回退重试一次并
-   invalidate 本条目（自我愈合，覆盖 TTL 竞态 / 工具面变化等一切
-   "缓存与请求不一致"的场景）。
-3. **前缀切分安全性**：缓存内容 = system 消息 + 最后一条 user 消息
-   之前的全部历史；前缀收尾必须是合法悬挂点——仅允许 assistant 消息
-   且不带 tool_calls（否则跨缓存边界会出现连续 user / 缺
-   functionResponse 的非法序列）。转换函数对 prefix / suffix 分别调用
-   与全量转换结果逐字节一致（合并逻辑只发生在相邻同角色之间，悬挂点
-   已排除跨界合并）。
-4. **键控**：key = sha1(model + tools声明 + prefix 消息逐条相等比较)。
-   历史是 append-only 的（合并/改写会改变既有消息 → 相等比较失配 →
-   自然换新 key 重建），因此命中即保证逐字节一致。
-
-环境变量：
-  GEMINI_EXPLICIT_CACHE=0            总开关（默认开）
-  GEMINI_EXPLICIT_CACHE_TTL_S        缓存 TTL，默认 900（15 分钟）
-  GEMINI_EXPLICIT_CACHE_MIN_TOKENS   创建阈值（前缀估算 token），默认 4096
-  GEMINI_EXPLICIT_CACHE_MAX_ENTRIES  常驻条目上限（LRU 淘汰），默认 32
-  GEMINI_EXPLICIT_CACHE_AWAIT_CREATE_S  acquire 等待在建缓存的时长上限，默认 3
-"""
+"""Gemini cachedContent API 的显式缓存管理。"""
 import asyncio
 import copy
 import hashlib
@@ -62,9 +18,7 @@ from core.messages import Message
 logger = get_logger(__name__)
 
 
-# =============================================================================
 # 可调参数（环境变量）
-# =============================================================================
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -95,9 +49,7 @@ _MAX_ENTRIES = _env_int("GEMINI_EXPLICIT_CACHE_MAX_ENTRIES", 32, 1, 1000)
 _AWAIT_CREATE_S = _env_float("GEMINI_EXPLICIT_CACHE_AWAIT_CREATE_S", 3.0, 0.0, 30.0)
 
 
-# =============================================================================
 # HTTP 薄封装（测试可 monkeypatch）
-# =============================================================================
 async def _http_json(method: str, url: str, headers: dict,
                      payload: Optional[dict], timeout_s: float) -> tuple[int, dict]:
     timeout = aiohttp.ClientTimeout(total=timeout_s)
@@ -118,9 +70,7 @@ def _err_text(data: dict) -> str:
     return str(data or "")
 
 
-# =============================================================================
 # 前缀切分（纯函数）
-# =============================================================================
 def _last_turn_boundary(messages: list) -> Optional[int]:
     """当前回合起始下标 = 最后一条 user 消息的位置；无 user 返回 None。"""
     for i in range(len(messages) - 1, -1, -1):
@@ -240,9 +190,7 @@ def _parse_expire_to_monotonic(expire_time: Optional[str]) -> Optional[float]:
         return None
 
 
-# =============================================================================
 # 管理器
-# =============================================================================
 class GeminiCacheHandle:
     """一次请求对缓存的成功引用（不可变值对象）。"""
 
@@ -294,9 +242,7 @@ class GeminiExplicitCacheManager:
         self._chat_fail_streak: dict = {}              # chat_id -> int
         self._ineligible_models: set = set()
 
-    # ------------------------------------------------------------------
     # 对外主入口
-    # ------------------------------------------------------------------
     async def acquire(self, chat_id: int, model: str, messages: list,
                       gemini_tools: Optional[list],
                       convert_fn: Callable, base_url: str, headers: dict,
@@ -358,9 +304,7 @@ class GeminiExplicitCacheManager:
                 self._maybe_refresh(entry)
         return handle
 
-    # ------------------------------------------------------------------
     # 失效（请求方收到 400/404 时调用；同步摘除 + 后台删除）
-    # ------------------------------------------------------------------
     def invalidate(self, handle: GeminiCacheHandle, reason: str = "") -> None:
         if handle is None:
             return
@@ -370,9 +314,7 @@ class GeminiExplicitCacheManager:
         if entry is not None:
             self._spawn(self._delete_entry(entry))
 
-    # ------------------------------------------------------------------
     # 内部：查找 / 创建 / 续期 / 删除 / 淘汰
-    # ------------------------------------------------------------------
     def _key_for(self, model: str, tools_hash: str, prefix: list) -> str:
         return hashlib.sha1(
             _canonical([model, tools_hash, prefix]).encode("utf-8")).hexdigest()

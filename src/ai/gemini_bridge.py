@@ -1,49 +1,4 @@
-"""Gemini 原生 API 桥接层（streamGenerateContent SSE 流式 + 原生 function calling）。
-
-设计原则（与 anthropic_bridge.py 完全同构，务必先读，修改本文件前请确保理解）：
-====================================================================
-1. 全局对话历史（app.py:update_conversation_and_ledger 写入的
-   ctx["conversation_history"]）是所有厂商共享的单一存储，且用户可以
-   随时在任意两次发言之间切换模型/厂商。因此持久化进历史的消息，
-   必须始终是项目原有的 OpenAI 兼容形状：
-     {"role": "user"/"assistant"/"tool"/"system", "content": ..., ...}
-   绝不能把 Gemini 原生的 contents / parts / functionCall 形状写回
-   new_history_entries / loop_messages 传给调用方。
-
-2. 因此本文件的策略是"边界转换"：
-   - _agentic_loop_gemini_native 接收到的 messages 参数、以及它追加进
-     new_history_entries 的内容，全部是 OpenAI 形状（与
-     _agentic_loop_openai_compat / _agentic_loop_anthropic 完全一致），
-     可以直接复用 tool_call_loop._run_tool_calls_and_append。
-   - 仅在"即将调用 Gemini 原生 API"之前，把当前累积的 OpenAI 形状
-     loop_messages 转换成 Gemini 原生的 {systemInstruction, contents}
-     形状（_convert_messages_to_gemini）；工具 schema 转换与清洗见
-     _convert_tools_to_gemini。
-   - Gemini 返回的内容在写回 loop_messages / new_history_entries 前，
-     统一转换回 OpenAI 形状（content 字符串 + tool_calls 列表），
-     与其它两条循环完全同构，下游 _run_tool_calls_and_append /
-     turn_recovery / update_conversation_and_ledger 都无需改动。
-
-3. 协议选择（重要）：
-   - 使用 Gemini 原生 v1beta generateContent 协议
-     （models/{model}:streamGenerateContent?alt=sse），**绝不**经过
-     OpenAI 兼容端点（v1beta/openai/）模拟流式。
-   - 传输层沿用本项目 Gemini 既有路径的 aiohttp 直连（与原生图片/
-     视频循环、旧 Gemini 兼容循环一致），不引入 google-genai SDK
-     新依赖；SSE 解析按当前官方流式响应结构实现（每个 data: 行一个
-     GenerateContentResponse JSON，functionCall part 为完整对象，
-     不存在跨 chunk 的参数增量拼接）。
-   - thought signature：原生 API 在 functionCall part 上返回
-     thoughtSignature，下一轮请求必须原样回传。历史存储沿用既有
-     OpenAI 形状里的 tc["thought_signature"] /
-     tc["extra_content"]["google"]["thought_signature"] 双字段格式
-     （与旧 Gemini 兼容循环完全一致），转换时还原到原生 part 上，
-     保证切换模型/重启后历史语义不丢。
-
-这样即使用户上一轮用的是 Gemini，下一轮切换回 OpenAI 兼容厂商或
-Claude，历史读出来仍是标准 OpenAI 形状，不会导致任何其它厂商的请求
-出错——完全不影响现有项目行为。
-"""
+"""Gemini 原生 API 桥接层，负责 SSE 流式响应与原生 function calling。"""
 import asyncio
 import copy
 import json
@@ -98,9 +53,7 @@ logger = get_logger(__name__)
 _GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
-# =============================================================================
 # 工具 schema 转换：OpenAI function-calling 形状 -> Gemini functionDeclarations
-# =============================================================================
 # OpenAI:   {"type": "function", "function": {"name", "description", "parameters"}}
 # Gemini:   [{"functionDeclarations": [{"name", "description", "parameters"}]}]
 #
@@ -346,9 +299,7 @@ def _convert_tools_to_gemini(tools: Optional[list]) -> Optional[list]:
     return [{"functionDeclarations": declarations}] if declarations else None
 
 
-# =============================================================================
 # 消息格式转换：OpenAI 形状 -> Gemini 原生 (systemInstruction, contents)
-# =============================================================================
 # 规则（与 anthropic_bridge 同构的边界转换）：
 #   - role=system -> 拼接进顶层 systemInstruction（Gemini 无 system 角色）
 #   - role=user   -> role=user，content parts 转原生 part
@@ -572,9 +523,7 @@ def _convert_messages_to_gemini(messages: list) -> tuple:
     return system_instruction, contents
 
 
-# =============================================================================
 # 推理控制：config 统一出口（get_reasoning_request_fields）-> 原生 thinkingConfig
-# =============================================================================
 # config.py 的 gemini 分支产出 OpenAI 兼容层形状（顶层 reasoning_effort +
 # extra_body.google.thinking_config.thinkingBudget），本桥接在其上解码为
 # 原生 generationConfig.thinkingConfig，保证推理控制仍以 config.py 为
@@ -610,9 +559,7 @@ def _gemini_thinking_config(model_info: Optional[ModelConfig]) -> Optional[dict]
     return thinking
 
 
-# =============================================================================
 # usage 归一：Gemini usageMetadata -> OpenAI 形状 dict
-# =============================================================================
 # 目的：让 _log_cache_usage / update_conversation_and_ledger 的既有
 # token 台账与缓存命中率观测（Gemini 隐式缓存 cachedContentTokenCount）
 # 在原生路径上继续工作，且返回值形状与旧兼容循环一致（dict）。
@@ -636,9 +583,7 @@ def _gemini_usage_to_openai(usage_meta: Any) -> Optional[dict]:
     }
 
 
-# =============================================================================
 # SSE 流解析：Gemini streamGenerateContent?alt=sse -> 归一化事件
-# =============================================================================
 # 每个事件是一条 "data: {JSON}"（GenerateContentResponse）。functionCall
 # part 为完整对象（无跨 chunk 参数增量）；同响应可有多个 functionCall
 # part（并行工具调用）；thought=true 的 text part 是思考摘要；末尾
@@ -792,9 +737,7 @@ async def _post_gemini_stream(session: "aiohttp.ClientSession", url: str,
     return resp
 
 
-# =============================================================================
 # 原生 agentic 循环（Gemini 原生流式）
-# =============================================================================
 async def _agentic_loop_gemini_native(
         current_model: str,
         messages: list,
@@ -847,13 +790,10 @@ async def _agentic_loop_gemini_native(
         content_acc = ""
         reasoning_acc = ""
         tool_calls_list: list = []
-        # 打断保全（改动点1，与 openai_compat / anthropic / responses 循环同构）：
         # 流式期间 journal 始终持有一条与 content_acc / reasoning_acc 同步的
         # assistant 占位消息。Gemini 的 functionCall 事件虽携带完整参数（无
         # 半截 JSON 问题），但按四循环统一约束，tool_calls 仍只在流正常结束
-        # 后由 finalize 写入（改动点2），流式期间占位只同步文本与思考。
         live_slot = LiveAssistantSlot(new_history_entries)
-        # v2.5 语义与 OpenAI 循环对齐：None=尚未见到终止事件；流被完整
         # 消费却仍为 None 且本轮有工具调用时，记 ""（断流证据）。
         finish_reason: Optional[str] = None
         usage_meta: Optional[dict] = None
@@ -1053,7 +993,6 @@ async def _agentic_loop_gemini_native(
                 api_label, _round + 1,
             )
 
-        # 断流证据（v2.5 语义，与 OpenAI 循环一致）：流被完整消费却从未
         # 见到终止事件，且本轮确实产出了工具调用。
         if finish_reason is None and tool_calls_list:
             finish_reason = ""
@@ -1098,7 +1037,6 @@ async def _agentic_loop_gemini_native(
 
         # 块边界换草稿检查点①②（本轮最后一个块）：流已结束，最后一个思考块
         # 或文本块在此闭合，switch_stream 不会再被触发，故在此补一次检查。
-        # 历史问题1（工具流式输出被拆到新草稿）已由安全点判定内的
         # _has_pending_tool_group 守卫兜住：本轮若已建工具条目而未收束，
         # 这里不会滚动，工具批次结束后的 tool.end 安全点仍会照常触发。
         # 终局轮修复：此处 tool_calls_list 已定型。本循环对伪工具调用文本
@@ -1127,7 +1065,6 @@ async def _agentic_loop_gemini_native(
             content_acc = append_truncation_notice_if_needed(
                 builder, content_acc, finish_reason)
 
-        # 打断保全（改动点1）：升级 journal 里的实时占位为完整消息
         # （tool_calls / reasoning / 最终文本原地补全，同一对象进 loop_messages）。
         live_slot.finalize(loop_messages, content_acc, tool_calls_list, reasoning_acc)
 

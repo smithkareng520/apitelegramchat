@@ -1,32 +1,4 @@
-"""后台 bash 任务：启动 → 句柄 → 查询/停止，完成通知「就近搭车」。
-
-与交互会话（bash_session.BashSession）的关键差异——防误杀三保障：
-
-- **独立进程组**（start_new_session=True）：交互会话超时的 killpg、
-  ``restart=true``、heredoc 隔离执行的清理都按 pgid 杀自己的进程组，
-  波及不到后台任务；
-- **启动即返回句柄**：回合内没有任何 await 挂在后台进程上，用户插话
-  触发的 ``task.cancel()`` 在协程 await 链上找不到传播路径；
-- **monitor 为模块级任务 + 防 GC 引用集**（复刻 tool_call_loop 的
-  ``_DETACHED_TASKS`` 模式）：轮次取消不传播到模块级任务，只有应用
-  关闭（shutdown_all）会终止它们。
-
-超时语义：后台任务**没有 idle 超时**（输出直接落盘，无读循环可卡），
-只有寿命上限兜底（BASH_TASK_MAX_LIFETIME_SEC，默认 3600s）——
-``timeout`` 参数是前台概念，后台模式忽略。
-
-完成通知（缓存安全设计）：任务终态时把格式化摘要推入每 chat 的待送
-队列；下一次**真正调用 AI 的请求**构建消息时 drain 并作为一条尾部
-system 消息搭车发出（见 ai_handlers.get_ai_response）。历史只增不改：
-启动调用的句柄结果写一次永不改写，通知不持久化——稳定前缀逐字节一致，
-前缀缓存全额命中，分叉点恰在通知本身。
-
-历史回收（BASH_TASK_FINISHED_RETENTION，默认 20）：每 (chat_id,
-namespace) 只保留最近 N 个已终结任务，超出部分在下一次 _finish_task
-或注册表恢复时连同 .json/.log/.exit 一起删除。只回收终态任务，运行中
-任务不受影响——防止长期运行的 chat 反复起后台任务后，内存注册表与
-磁盘 tasks 目录无限增长（task_action=list 也随之越列越长）。
-"""
+"""后台 bash 任务：启动 → 句柄 → 查询/停止，完成通知「就近搭车」。"""
 
 import asyncio
 import functools
@@ -50,7 +22,7 @@ from sandbox import (
 
 logger = logging.getLogger(__name__)
 
-# ===================== 常量（env 可调） =====================
+# 常量（env 可调）
 # 单个后台任务的寿命上限（秒）：到期无论输出与否强制 killpg。
 BASH_TASK_MAX_LIFETIME_SEC = int(os.getenv("BASH_TASK_MAX_LIFETIME_SEC", "3600"))
 # 每个 chat 同时运行的后台任务上限（防任务堆积吃满 SANDBOX_MAX_PROCS）。
@@ -74,12 +46,11 @@ BASH_TASK_FINISHED_RETENTION = int(os.getenv("BASH_TASK_FINISHED_RETENTION", "20
 _TERMINAL_STATUSES = frozenset({"done", "failed", "stopped", "expired", "lost"})
 _TASK_ID_RE = re.compile(r"bg-[0-9a-f]{8}")
 
-
-# ===================== 危险命令黑名单 =====================
+# 危险命令黑名单
 # 自 BashSession._is_safe 抽出为模块级函数：后台任务启动与前台交互会话
 # 共用同一份最小黑名单（设计原则不变：只拦极端灾难模式，其余靠沙箱兜底）。
 _DANGEROUS_PATTERNS = [
-    # rm -rf / 或 rm -rf /*
+    # rm -rf / 或 rm -rf /
     (re.compile(r'\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*)\s+/(?:\s|$|\*)'),
      "rm -rf /"),
     # fork bomb
@@ -99,7 +70,6 @@ _DANGEROUS_PATTERNS = [
      "anonymous fork function"),
 ]
 
-
 def _command_is_safe(command: str) -> bool:
     """最小黑名单，仅拦极端操作；其余靠 Landlock/rlimit 沙箱兜底。"""
     if not command or not command.strip():
@@ -110,8 +80,7 @@ def _command_is_safe(command: str) -> bool:
             return False
     return True
 
-
-# ===================== 任务数据结构 =====================
+# 任务数据结构
 @dataclass
 class BackgroundTask:
     task_id: str
@@ -133,7 +102,6 @@ class BackgroundTask:
     exit_code: int | None = None
     finished_at: float | None = None
 
-
 # 注册表：(chat_id, namespace) -> {task_id: BackgroundTask}
 _TASKS: dict[tuple[int, str], dict[str, BackgroundTask]] = {}
 # 懒加载标记：tasks 目录只扫描一次（避免每次查询都遍历磁盘）。
@@ -144,11 +112,9 @@ _MONITOR_TASKS: set[asyncio.Task] = set()
 # 由 ai_handlers.get_ai_response 在下一次 AI 请求构建消息时 drain。
 _PENDING_NOTICES: dict[tuple[int, str], list[str]] = {}
 
-
-# ===================== 磁盘状态 =====================
+# 磁盘状态
 def _tasks_dir(chat_id: int, namespace: str) -> Path:
     return workspace_paths.runtime_cache_root(chat_id, namespace) / "tasks"
-
 
 def _dump_state(task: BackgroundTask) -> None:
     """把任务元数据写入 .json（终态时随后补写 .exit 崩溃安全标记）。"""
@@ -173,7 +139,6 @@ def _dump_state(task: BackgroundTask) -> None:
     except OSError:
         logger.debug("后台任务状态写入失败", exc_info=True)
 
-
 def _mark_terminal_on_disk(task: BackgroundTask) -> None:
     """终态落盘：.json 更新 + .exit 标记（顺序保证：先 json 后 exit，
     重启扫描以 .exit 的存在与否判定「终态已记录」还是「进程遗孤」。）"""
@@ -183,7 +148,6 @@ def _mark_terminal_on_disk(task: BackgroundTask) -> None:
             task.status, encoding="utf-8")
     except OSError:
         logger.debug("后台任务终态标记写入失败", exc_info=True)
-
 
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
@@ -195,7 +159,6 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-
 
 def _pid_matches_command(pid: int, command: str) -> bool:
     """孤儿进程身份校验：/proc/<pid>/cmdline 必须仍含原命令片段。
@@ -218,7 +181,6 @@ def _pid_matches_command(pid: int, command: str) -> bool:
         return False
     return needle in cmdline or needle.replace(" ", "\x00") in cmdline
 
-
 def _signal_task_process(task: BackgroundTask, sig: int) -> bool:
     """向任务进程组发信号。后台进程以 start_new_session 启动，pid 即 pgid，
     killpg 连子进程一起覆盖。孤儿（proc 为 None）先做身份校验再发。"""
@@ -236,8 +198,7 @@ def _signal_task_process(task: BackgroundTask, sig: int) -> bool:
     except (ProcessLookupError, PermissionError):
         return False
 
-
-# ===================== 输出尾部 =====================
+# 输出尾部
 def _tail_file(path: str | Path, max_lines: int, max_chars: int) -> str:
     """读取日志尾部（最多回看 256KB，避免大日志整读进内存）。"""
     p = Path(path)
@@ -267,11 +228,9 @@ def _tail_file(path: str | Path, max_lines: int, max_chars: int) -> str:
         body = f"...（更早输出已省略，完整内容见日志文件）\n{body}"
     return body
 
-
 def _first_line(text: str, limit: int = 120) -> str:
     line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
     return line if len(line) <= limit else line[: limit - 1] + "…"
-
 
 def _fmt_duration(seconds: float) -> str:
     s = int(max(0, seconds))
@@ -283,8 +242,7 @@ def _fmt_duration(seconds: float) -> str:
     h, m2 = divmod(m, 60)
     return f"{h}h{m2:02d}m"
 
-
-# ===================== 完成通知队列 =====================
+# 完成通知队列
 # 单 chat 待送通知上限：长期没有 AI 请求时防无限堆积（丢最旧，任务状态
 # 仍可随时 task_action=status 查询，不因通知丢弃而丢失信息）。
 _PENDING_NOTICES_MAX_PER_CHAT = 20
@@ -296,7 +254,6 @@ _PENDING_NOTICES_MAX_PER_CHAT = 20
 # pop 走队列，push 追加到已孤儿化的列表上→通知无声丢失）。每
 # (chat_id, namespace) 一把 threading.Lock，粒度与队列键一致。
 _NOTICE_LOCKS: dict[tuple[int, str], threading.Lock] = {}
-
 
 def _notice_lock(chat_id: int, namespace: str) -> threading.Lock:
     """取（或惰性创建）该 chat 的通知队列锁。
@@ -313,7 +270,6 @@ def _notice_lock(chat_id: int, namespace: str) -> threading.Lock:
         lock = _NOTICE_LOCKS.setdefault(key, threading.Lock())
     return lock
 
-
 def push_completion_notice(chat_id: int, namespace: str, text: str) -> None:
     """任务终态通知入队（持锁），等待下一次 AI 请求搭车（见 drain_completion_notices）。"""
     dropped: str | None = None
@@ -325,7 +281,6 @@ def push_completion_notice(chat_id: int, namespace: str, text: str) -> None:
     if dropped is not None:
         logger.warning(
             "后台任务通知队列溢出（chat=%s），丢弃最旧一条: %.80s", chat_id, dropped)
-
 
 def drain_completion_notices(chat_id: int, namespace: str | None = None) -> list[str]:
     """原子「整段换空」：锁内一次性 pop 整个待送队列（发完即消费，不持久化）。
@@ -344,7 +299,6 @@ def drain_completion_notices(chat_id: int, namespace: str | None = None) -> list
     with _notice_lock(chat_id, ns):
         queue = _PENDING_NOTICES.pop((chat_id, ns), None)
     return list(queue or [])
-
 
 def _format_notice(task: BackgroundTask) -> str:
     """终态通知文本：首行即卡片摘要（emoji + 任务 + 结果），供
@@ -368,8 +322,7 @@ def _format_notice(task: BackgroundTask) -> str:
     lines.append(f"（查看完整输出：bash 工具 task_action=output task_id={task.task_id}）")
     return "\n".join(lines)
 
-
-# ===================== 注册表懒加载（重启恢复） =====================
+# 注册表懒加载（重启恢复）
 def _ensure_registry_loaded(chat_id: int, namespace: str) -> None:
     """扫描 tasks 目录恢复注册表（每 key 一次）。
 
@@ -437,13 +390,10 @@ def _ensure_registry_loaded(chat_id: int, namespace: str) -> None:
         else:
             # was-running 且进程已死：补推「因重启被中止」，不再无声消失。
             _finish_task(task, status="lost", exit_code=None, notify=True)
-    # completed 分支（磁盘上早已终态、本次直接 continue 恢复）不经过
-    # _finish_task，不会触发其内部的裁剪；这里统一补一次，防止「旧安装
-    # 多年积累的历史任务文件」在重启后被整批读入内存又从不清理。
+    # completed 分支不经过 finish_task，这里统一补一次终态任务裁剪。
     _prune_finished_tasks(chat_id, namespace)
 
-
-# ===================== 终态与通知 =====================
+# 终态与通知
 def _finish_task(
     task: BackgroundTask,
     status: str,
@@ -471,7 +421,6 @@ def _finish_task(
     if notify:
         push_completion_notice(task.chat_id, task.namespace, _format_notice(task))
     _prune_finished_tasks(task.chat_id, task.namespace)
-
 
 def _prune_finished_tasks(chat_id: int, namespace: str) -> None:
     """回收超出 BASH_TASK_FINISHED_RETENTION 的已终结任务（内存 + 磁盘）。
@@ -507,7 +456,6 @@ def _prune_finished_tasks(chat_id: int, namespace: str) -> None:
         chat_id, namespace, len(overflow), BASH_TASK_FINISHED_RETENTION,
     )
 
-
 def _cancel_aux_tasks(task: BackgroundTask) -> None:
     for attr in ("monitor", "watchdog"):
         t = getattr(task, attr)
@@ -515,8 +463,7 @@ def _cancel_aux_tasks(task: BackgroundTask) -> None:
             t.cancel()
         setattr(task, attr, None)
 
-
-# ===================== monitor =====================
+# monitor
 async def _monitor_task(task: BackgroundTask) -> None:
     """等待后台进程退出并记录终态。应用关闭时 monitor 被 cancel——
     此时**不写终态**（.exit 缺失），下次启动按孤儿/lost 恢复，不会把
@@ -549,7 +496,6 @@ async def _monitor_task(task: BackgroundTask) -> None:
             task.watchdog.cancel()
         task.watchdog = None
 
-
 async def _monitor_orphan(task: BackgroundTask) -> None:
     """应用重启遗留的存活孤儿：无 proc 句柄，只能按 pid 轮询探活。
     身份校验（cmdline 匹配）防止 pid 复用导致的误杀。"""
@@ -568,8 +514,7 @@ async def _monitor_orphan(task: BackgroundTask) -> None:
     except asyncio.CancelledError:
         raise
 
-
-# ===================== 启动 =====================
+# 启动
 def _interactive_last_cwd(chat_id: int, namespace: str) -> str:
     """取交互会话的最后 cwd，让后台任务与前台命令的目录观感一致。
     仅读取，不触发生成；会话不存在/未 cd 过则回退工作区根。"""
@@ -581,7 +526,6 @@ def _interactive_last_cwd(chat_id: int, namespace: str) -> str:
     except Exception:
         logger.debug("读取交互会话 cwd 失败（回退工作区根）", exc_info=True)
     return ""
-
 
 async def start_background_task(
     chat_id: int,
@@ -677,8 +621,7 @@ async def start_background_task(
     ]
     return "\n".join(lines)
 
-
-# ===================== 查询 / 停止 / 列表 =====================
+# 查询 / 停止 / 列表
 def _summarize_task(task: BackgroundTask) -> str:
     desc = task.description or _first_line(task.command, 40)
     if task.status == "running":
@@ -693,7 +636,6 @@ def _summarize_task(task: BackgroundTask) -> str:
     labels = {"stopped": "⏹ 已停止", "expired": "⌛ 超寿命终止", "lost": "❔ 因重启被中止（退出码未知）"}
     return f"- {task.task_id} {labels.get(task.status, task.status)}「{desc}」"
 
-
 def _resolve_task(chat_id: int, namespace: str, task_id: str | None, action: str) -> tuple[BackgroundTask | None, str]:
     tasks = _TASKS.get((chat_id, namespace), {})
     if not task_id:
@@ -704,7 +646,6 @@ def _resolve_task(chat_id: int, namespace: str, task_id: str | None, action: str
         listing = "\n".join(_summarize_task(t) for t in tasks.values()) or "（无任务）"
         return None, f"Error: 未找到任务 {task_id}。当前任务：\n{listing}"
     return task, ""
-
 
 async def query_task(
     chat_id: int,
@@ -801,8 +742,7 @@ async def query_task(
     logger.info("后台任务已停止 chat_id=%s task=%s (%s)", chat_id, task.task_id, method)
     return f"⏹ 后台任务 {task.task_id} 已停止（{method}）"
 
-
-# ===================== 应用关闭 =====================
+# 应用关闭
 async def shutdown_all() -> None:
     """应用关闭时终止全部后台任务。
 

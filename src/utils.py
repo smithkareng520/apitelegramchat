@@ -1,5 +1,4 @@
 # utils.py —— 兼容 facade。
-# 原 2301 行单体已按职责拆分至 core/ 包（logging / http / rich_media /
 # telegram_messaging 等）。本文件只 re-export 存在外部调用点的符号
 # （经 AST 全仓引用分析精简）；新代码请直接 import core.*。
 import logging
@@ -42,5 +41,5 @@ from core.message_extract import (  # noqa: F401
     transcribe_audio_with_groq,
 )
 
-# 保持与拆分前一致的模块级 logger 名（"utils"）
+# 保持模块级 logger 名为 "utils"。
 logger = logging.getLogger(__name__)

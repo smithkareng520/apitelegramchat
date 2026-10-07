@@ -1,73 +1,5 @@
 # telegram_polling.py
-"""Telegram getUpdates 长轮询摄取通道（webhook 的等价替代）。
-
-为什么需要这个模块（事故根因 1：入站 WAF 误杀）
-------------------------------------------------------------------
-Render 的所有服务默认位于 Cloudflare 边缘之后，且**用户无法关闭或调整**
-其托管 WAF 规则集（官方 feature request 长期 open）。该规则集里有一条
-"Command Injection - Generic - body"：它检查**入站请求体**，命中
-`>` / 反引号等 shell 重定向/替换符紧邻 `curl` / `wget` 并带参数的模式时，
-直接在边缘返回 403，请求根本不会到达容器。
-
-于是 Telegram 投递 `>curl -v "test"` 这类消息时：
-
-    Telegram → POST /webhook（body 含 ">curl -v ...")
-             → Cloudflare 边缘 WAF 命中 → 403
-             → 应用完全无感知（无日志、无 TCP 打印）
-
-Telegram 的 webhook 是**串行、需 2xx 签收**的投递模型：这条 update 不被
-签收就永远排在队头，按指数退避无限重投，**后续所有消息一起被堵死**——
-正是"消息积压之后不能响应任何 Webhook 请求"的现象。
-
-修复思路：不去和 WAF 规则搏斗（Render 上也改不了），而是**换一条数据流
-方向**。改用 getUpdates 长轮询后，update 内容位于我们发起的 HTTPS 请求的
-**响应体**里。Cloudflare 的入站请求体检查对出站响应不生效。
-
-为什么还要加主管任务（事故根因 2：轮询任务静默死亡）
-------------------------------------------------------------------
-2026-09-15 现场：进程活着、event loop 健康（loop_lag=0.00s）、/health 恒
-返回 200、心跳每分钟准点输出 `queue=0/1000 active_tasks=0 tasks=12` 一动
-不动，但**连续数十分钟没有任何一行 "telegram polling fetched" /
-"queued update_id" / "telegram worker processing update"**——用户发消息
-石沉大海。
-
-这不是"没人发消息"，而是**摄取通道已经死了，却没有任何人发现**：
-
-  · `poll_updates_forever` 不能对 `asyncio.CancelledError` 一律
-    `raise`（当作 shutdown）。因为 CancelledError 并不只来自关停：
-    aiohttp 的 `ClientTimeout` 内部就是靠取消请求任务实现的，取消信号落
-    在 `async with` 退出/连接归还的窗口里时会以 CancelledError（而不是
-    TimeoutError）逸出；上层任何一次误取消同理。一次就够——任务退出，
-    **进程永久失聪**。
-  · 没有任何主管：`_telegram_polling_task` 在 before_serving 里创建后，
-    除了关停路径再没人看过它一眼，`.done()` 永远没人检查。
-  · `/health` 是写死的 200：Render 健康检查与 Docker HEALTHCHECK 都认为
-    实例健康，于是**永远不会重启**，故障可以挂到天荒地老。
-  · 心跳不含摄取通道状态：日志里"空闲"和"失聪"长得一模一样，事后无法
-    区分——这正是本次排查最费劲的地方。
-
-因此本模块现在提供三层保障：
-
-  1. **循环自愈**：非关停来源的 CancelledError 不再杀死循环，记 CRITICAL
-     后 uncancel 并继续（关停/主管重启会先置 `_stop_requested`，语义不被
-     稀释）。
-  2. **主管重启**：`_supervise` 持有轮询子任务，子任务无论以何种方式结束
-     都按退避重新拉起；并监测"停摆"（连续 STALL_SECONDS 没有一次成功的
-     getUpdates，含正常空轮询），超时即强制重启。
-  3. **对外可观测**：`ingest_state()` / `is_ingest_broken()` 供 /health 与
-     心跳使用——摄取通道死了，健康检查必须跟着变红，让平台重启实例。
-
-设计要点（不变部分）
-------------------------------------------------------------------
-1. 复用既有 update_queue / telegram_worker：轮询器只负责把 update 投进
-   队列，业务链路（去重、chat lock、AI 派发）完全不动。
-2. offset 严格按 "max(update_id)+1" 推进，且**只有成功入队后才推进**，
-   与 webhook 的"至少一次"语义一致，不丢消息。
-3. 队列满时不丢弃、不推进 offset：等待队列腾出空间后重投，天然背压。
-4. 网络错误指数退避（1s→32s 封顶），Telegram 409/401 等致命错误单独提示。
-5. 启动前先 deleteWebhook：Telegram 不允许 webhook 与 getUpdates 并存
-   （否则 getUpdates 恒返回 409 Conflict）。
-"""
+"""Telegram getUpdates 长轮询摄取通道（webhook 的等价替代）。"""
 import asyncio
 import logging
 import os
@@ -104,22 +36,19 @@ STALL_SECONDS = float(
     os.getenv("TELEGRAM_POLL_STALL_SECONDS", str((TELEGRAM_POLL_TIMEOUT + 15) * 3))
 )
 
-# ---------------------------------------------------------------------------
 # 摄取通道运行期状态（供 /health、心跳、/webhookinfo 读取）
-# ---------------------------------------------------------------------------
-# _started：本进程是否真的启动过摄取通道。webhook 模式与测试进程为 False，
-#           此时 is_ingest_broken() 恒为 False——健康检查只对"本该运行却
-#           没在跑"的情况变红，不误伤未启用轮询的部署。
+# started：本进程是否真的启动过摄取通道。webhook 模式与测试进程为 False，
+# 此时 is_ingest_broken() 恒为 False——健康检查只对"本该运行却
+# 没在跑"的情况变红，不误伤未启用轮询的部署。
 _started = False
-# _shutting_down：应用正在关停（after_serving 置位）。
+# shutting_down：应用正在关停（after_serving 置位）。
 _shutting_down = False
-# _stop_requested：本次取消是"有意为之"（关停或主管发起的重启）。轮询循环
-#                  据此区分「该退出」与「被误取消，必须自愈」。
+# stop_requested：本次取消是"有意为之"（关停或主管发起的重启）。轮询循环
+# 据此区分「该退出」与「被误取消，必须自愈」。
 _stop_requested = False
 _last_success_monotonic: Optional[float] = None
 _poll_task: Optional[asyncio.Task] = None
 _restart_count = 0
-
 
 def mark_shutdown() -> None:
     """关停开始：让轮询循环把随后的 CancelledError 当作真正的退出信号。"""
@@ -127,17 +56,14 @@ def mark_shutdown() -> None:
     _shutting_down = True
     _stop_requested = True
 
-
 def _note_success() -> None:
     global _last_success_monotonic
     _last_success_monotonic = time.monotonic()
-
 
 def _seconds_since_success() -> Optional[float]:
     if _last_success_monotonic is None:
         return None
     return time.monotonic() - _last_success_monotonic
-
 
 def ingest_state() -> dict:
     """摄取通道快照（纯内存读取，无 IO，可在健康检查热路径调用）。"""
@@ -153,7 +79,6 @@ def ingest_state() -> dict:
         "restarts": _restart_count,
     }
 
-
 def is_ingest_broken() -> bool:
     """摄取通道是否处于"本该在收消息却收不到"的状态。
 
@@ -167,7 +92,6 @@ def is_ingest_broken() -> bool:
         return False
     state = ingest_state()
     return (not state["alive"]) or bool(state["stalled"])
-
 
 async def delete_webhook(*, drop_pending: bool = False, timeout: float = 15.0) -> bool:
     """注销 webhook，把投递权交还 getUpdates。
@@ -203,7 +127,6 @@ async def delete_webhook(*, drop_pending: bool = False, timeout: float = 15.0) -
     except Exception:
         logger.error("❌ deleteWebhook 请求异常", exc_info=True)
         return False
-
 
 async def _fetch_updates(offset: Optional[int]) -> Optional[list]:
     """执行一次 getUpdates。
@@ -267,7 +190,6 @@ async def _fetch_updates(offset: Optional[int]) -> Optional[list]:
     # 成功拿到一次应答（哪怕是空列表）——链路活着，刷新停摆判定基准。
     _note_success()
     return payload.get("result") or []
-
 
 async def poll_updates_forever(queue: asyncio.Queue) -> None:
     """长轮询主循环：把 update 投进既有 update_queue，业务链路完全复用。
@@ -349,7 +271,6 @@ async def poll_updates_forever(queue: asyncio.Queue) -> None:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, _BACKOFF_MAX)
 
-
 def _uncancel_self() -> None:
     """清掉当前任务的"正在取消"标记（Python 3.11+）。
 
@@ -364,7 +285,6 @@ def _uncancel_self() -> None:
     except Exception:
         logger.debug("uncancel 当前任务失败（忽略）", exc_info=True)
 
-
 async def _reap(task: asyncio.Task) -> None:
     """取消并等待子任务收尾，吞掉取消异常。"""
     if task.done():
@@ -376,7 +296,6 @@ async def _reap(task: asyncio.Task) -> None:
         pass
     except Exception:
         logger.debug("轮询子任务收尾异常（忽略）", exc_info=True)
-
 
 async def _supervise(queue: asyncio.Queue) -> None:
     """轮询主管：保证"摄取通道一直在跑"，并在停摆时强制重启。
@@ -450,7 +369,6 @@ async def _supervise(queue: asyncio.Queue) -> None:
                 logger.error("telegram polling 子任务意外正常返回（不应发生）")
 
     logger.info("telegram polling supervisor exited (shutting_down=%s)", _shutting_down)
-
 
 async def start_polling(queue: asyncio.Queue) -> asyncio.Task:
     """注销 webhook 并启动长轮询主管任务（供 app 启动钩子调用）。

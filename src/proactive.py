@@ -1,77 +1,5 @@
 # proactive.py
-"""统一上下文的主动唤醒（TIMER 事件源）调度器。
-
-背景与设计
-==========
-
-本模块让 Agent 拥有"自己的活动时间"：像人一样不定期地被唤醒；每次唤醒
-与用户主动发消息（USER 事件源）共用同一份会话历史（统一上下文）。
-
-调度节奏（本轮重构：事件驱动单 timer 模型）
-==========================================
-
-核心规则（简单、无需复杂计算）：
-
-- 一开始就随机 30~60min 布置第一次唤醒（没有"空闲启动阈值"）；
-- timer 到点触发一次 TIMER 回合；**回合结束后**再随机 30~60min 布置下一次；
-- 用户发送任何消息：先取消挂起的 timer（不提前触发），等当前 agent 回合
-  （含被打断后续上的 USER 回合）完整结束后，再随机 30~60min 布置下一次；
-- 若 2 小时内用户都没有主动发过消息：暂停 1 小时再触发，之后继续保持
-  "每 1h 看一眼"的慢节奏（用户一回来就恢复正常 30~60min）；
-- ``/clear`` 后：timer 重置为随机 30~60min 下一次。
-
-打断链路：用户消息打断进行中的 TIMER 回合时，先取消后台任务并经
-turn_recovery 保全已完成的进度，随后 USER 回合正常续上；该回合结束时
-再随机 30~60min 布置下一次——即"打断不影响节奏，只重算下一次"。
-
-白名单与媒体模型隔离
-====================
-
-- 通过 ``register_authorized_check`` 注册的回调，在 ``note_user_activity``
-  与 ``_fire_turn`` 两个入口都做白名单二次校验：非授权 chat 永远不会被
-  创建 timer 任务、永远不会触发 TIMER 回合——这意味着即使按钮回调绕过了
-  上层 ``is_authorized`` 检查，非白名单用户也收不到任何 TIMER 主动消息。
-  不同 chat 的 timer 完全独立（``_schedules`` 以 chat_id 为 key），多用户
-  共用同一 bot 时互不干扰。用户被移出白名单后：已挂起的 timer 触发时会被
-  ``_fire_turn`` 的白名单门禁拦截（SKIP_UNAUTHORIZED，不重排下一次，
-  timer 自然死亡）；用户重新入白名单并产生任意活动后调度自动恢复。
-- 用户屏蔽/封禁 bot（Telegram 对该 chat 返回 403 Forbidden 类永久错误）
-  时的熔断：发送层（utils 的各发送函数）识别到 403/"chat not found"
-  等永久性错误后调用 ``notify_chat_unreachable``——停用该 chat 的调度
-  （取消挂起 timer/watch、移除 schedule），避免 TIMER 继续每 30~60min
-  空转一轮完整 LLM 回合却永远送达不了。用户解除屏蔽并再次发消息/
-  点按钮时，``note_user_activity`` 会清除不可达标记并自动恢复调度
-  （一次活动即视为"用户回来了"；若实际上仍被屏蔽，下一轮 403 会再次
-  熔断，自愈式收敛，最多浪费一轮）。
-- 通过 ``register_media_model_check`` 注册的回调，在 ``_fire_turn`` 创建
-  runner 任务之前判断当前模型是否为原生图片/视频生成模型：
-  * 是 → 不创建 runner 任务、不调用 ``note_turn_finished``、不布置下一次；
-    timer 自然"死亡"，等用户切换回对话型模型并通过任意活动（发消息 /
-    点击按钮）触发 ``note_user_activity`` 后再恢复。
-  * 否 → 正常运行 TIMER 回合，回合结束时按原节奏布置下一次。
-  这一设计的关键：因为根本不产生 agent 回合，所以也不会触发"回合结束
-  时重置"——timer 不会自递归调度，正好满足"媒体模型时段彻底静默"的需求。
-
-实现要点
-========
-
-- 每个 chat 维护一个挂起的 timer 任务（``_timer_fires``）与一个用户事件
-  监视协程（``_user_event_watcher``）；没有轮询状态机；
-- 用户输入分两类：会启动 agent 回合的消息（回合结束时由
-  ``note_turn_finished`` 布置下一次）与纯命令/按钮（不产生回合，由
-  watcher 在短暂延迟后布置下一次）；
-- 进行中的 TIMER 回合登记在 ``_active_flows``（chat_id -> task）：
-  用于 busy 互斥与用户打断。
-
-线程与并发模型
-==============
-
-- 所有状态由 ``_schedules_lock`` 保护；timer/watch 任务在持锁期间创建，
-  在锁外运行；
-- 回合被用户消息打断时取消任务并触发 turn_recovery 轮次日志保全
-  （已完成的 assistant/tool 进度沉淀进历史），全程静默、不发任何
-  "已停止"提示。
-"""
+"""统一上下文的主动唤醒（TIMER 事件源）调度器。"""
 
 import asyncio
 import logging
@@ -82,16 +10,12 @@ from typing import Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-
-# =====================================================================
 # 配置（全部可用环境变量覆盖）
-# =====================================================================
 def _env_flag(name: str, default: bool = True) -> bool:
     raw = os.getenv(name)
     if raw is None or not str(raw).strip():
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
 
 def _env_seconds(name: str, default: int, *, minimum: int = 1) -> int:
     raw = os.getenv(name)
@@ -101,14 +25,8 @@ def _env_seconds(name: str, default: int, *, minimum: int = 1) -> int:
         value = default
     return max(minimum, value)
 
-
 PROACTIVE_ENABLED = _env_flag("PROACTIVE_ENABLED", True)
-# 两次唤醒之间的随机间隔（默认 30~60min；像人一样不定期）。之前是
-# 5~20min，太短——TIMER 回合会追加与 USER 回合不同的 system 说明文字
-# （见 ai_handlers.get_ai_response 的 is_timer 分支），过于频繁的唤醒
-# 等于频繁在"稳定的 system 前缀"后面插入一段易变内容，加剧断点 2
-# 的失效频率，也让 Anthropic 1h TTL 缓存条目更难撑满有效期；调大间隔
-# 后两次 TIMER 之间的时间跨度更可能覆盖 1h TTL 窗口，缓存收益更高。
+# 两次唤醒之间随机间隔 30~60 分钟，减少 TIMER 对缓存前缀的扰动。
 PROACTIVE_INTERVAL_MIN_SECONDS = _env_seconds("PROACTIVE_INTERVAL_MIN_SECONDS", 30 * 60)
 PROACTIVE_INTERVAL_MAX_SECONDS = _env_seconds("PROACTIVE_INTERVAL_MAX_SECONDS", 60 * 60)
 # 用户连续多久没发消息 → 暂停 1h 再触发（慢节奏：每 1h 看一眼）
@@ -119,10 +37,7 @@ PROACTIVE_REST_SECONDS = _env_seconds("PROACTIVE_REST_SECONDS", 3600)
 # 在此窗口后没有回合运行，就直接布置下一次唤醒）
 _PROACTIVE_WATCH_DELAY = _env_seconds("PROACTIVE_WATCH_DELAY", 2, minimum=1)
 
-
-# =====================================================================
 # 唤醒提示词
-# =====================================================================
 # 措辞约定（避免工具调用幻觉）：对模型工具面可能存在、也可能被裁剪
 # 的能力（任务清单/长期记忆等），用"可以查看任务、记忆"这类自然语言
 # 能力描述，而不是"调用 todo 工具的 list 操作"这类指令式表述——
@@ -182,16 +97,10 @@ true、收尾有兜底）。注意：deliver_reply 必须通过 tool_calls API �
 - 编造用户没说过的承诺、时间或事实。
 """
 
-
-# =====================================================================
 # 回合注册表：进行中的 TIMER 回合（busy 互斥 + 打断句柄）
-# =====================================================================
 _active_flows: dict[int, asyncio.Task] = {}
 
-
-# =====================================================================
 # 调度器：事件驱动单 timer 模型
-# =====================================================================
 class _ChatSchedule:
     """单个 chat 的调度状态：最近用户活动 + 挂起的下一次唤醒计时。"""
 
@@ -202,7 +111,6 @@ class _ChatSchedule:
         self.last_user_message = time.monotonic()
         self.timer_task: Optional[asyncio.Task] = None
         self.watch_task: Optional[asyncio.Task] = None
-
 
 _schedules: dict[int, _ChatSchedule] = {}
 _schedules_lock = asyncio.Lock()
@@ -217,26 +125,23 @@ _unreachable_chats: set[int] = set()
 _turn_runner_callback: Optional[Callable[[int], Awaitable[None]]] = None
 _busy_check_callback: Optional[Callable[[int], bool]] = None
 # 由 app.py 注册的回调：判断该 chat 当前是否为原生图片/视频生成模型
-#   （image_output 或 video_output）。返回 True 时 _fire_turn 不会创建
-#   runner 任务、不会布置下一次 timer（详见模块 docstring）。
+# （image_output 或 video_output）。返回 True 时 _fire_turn 不会创建
+# runner 任务、不会布置下一次 timer（详见模块 docstring）。
 _media_model_check_callback: Optional[Callable[[int], bool]] = None
 # 由 app.py 注册的回调：判断该 chat_id 是否在白名单内。返回 False 时
-#   note_user_activity 与 _fire_turn 都会直接返回，不会为该 chat 创建
-#   任何 timer / 主动消息——保证非白名单用户永远收不到 TIMER 主动消息。
+# note_user_activity 与 _fire_turn 都会直接返回，不会为该 chat 创建
+# 任何 timer / 主动消息——保证非白名单用户永远收不到 TIMER 主动消息。
 _authorized_check_callback: Optional[Callable[[int], bool]] = None
-
 
 def register_turn_runner(cb: Callable[[int], Awaitable[None]]) -> None:
     """注册 TIMER 回合执行器（app._handle_timer_wakeup）。"""
     global _turn_runner_callback
     _turn_runner_callback = cb
 
-
 def register_busy_check(cb: Callable[[int], bool]) -> None:
     """注册"该 chat 是否有 USER 流程进行中"的判断回调。"""
     global _busy_check_callback
     _busy_check_callback = cb
-
 
 def register_media_model_check(cb: Callable[[int], bool]) -> None:
     """注册"该 chat 当前模型是否为原生媒体生成模型"的判断回调。
@@ -248,7 +153,6 @@ def register_media_model_check(cb: Callable[[int], bool]) -> None:
     global _media_model_check_callback
     _media_model_check_callback = cb
 
-
 def register_authorized_check(cb: Callable[[int], bool]) -> None:
     """注册"该 chat 是否在白名单内"的判断回调。
 
@@ -259,7 +163,6 @@ def register_authorized_check(cb: Callable[[int], bool]) -> None:
     global _authorized_check_callback
     _authorized_check_callback = cb
 
-
 def _is_chat_authorized(chat_id: int) -> bool:
     """该 chat 是否在白名单内（未注册回调或回调异常时按授权处理，
     以免白名单机制异常导致全量用户被静默）。"""
@@ -269,7 +172,6 @@ def _is_chat_authorized(chat_id: int) -> bool:
     except Exception:
         logger.debug("[proactive] chat=%s authorized check 异常，按授权处理", chat_id, exc_info=True)
     return True
-
 
 def _busy_now(chat_id: int) -> bool:
     """该 chat 当前是否有 agent 回合在运行（USER 或 TIMER）。"""
@@ -282,23 +184,19 @@ def _busy_now(chat_id: int) -> bool:
         logger.debug("[proactive] chat=%s busy check 失败，按空闲处理", chat_id, exc_info=True)
     return False
 
-
 def _cancel_task(task: Optional[asyncio.Task]) -> None:
     if task is not None and not task.done():
         task.cancel()
-
 
 def _disarm_locked(sched: _ChatSchedule) -> None:
     """取消挂起的唤醒计时（须持 _schedules_lock）。"""
     _cancel_task(sched.timer_task)
     sched.timer_task = None
 
-
 def _cancel_watcher_locked(sched: _ChatSchedule) -> None:
     """取消用户事件观望协程（须持 _schedules_lock）。"""
     _cancel_task(sched.watch_task)
     sched.watch_task = None
-
 
 def _next_delay(sched: _ChatSchedule) -> tuple[float, str]:
     """计算下一次唤醒延迟：2h 无用户消息 → 暂停 1h；否则随机 30~60min。"""
@@ -308,7 +206,6 @@ def _next_delay(sched: _ChatSchedule) -> tuple[float, str]:
     lo = min(PROACTIVE_INTERVAL_MIN_SECONDS, PROACTIVE_INTERVAL_MAX_SECONDS)
     hi = max(PROACTIVE_INTERVAL_MIN_SECONDS, PROACTIVE_INTERVAL_MAX_SECONDS)
     return float(random.randint(lo, hi)), "normal"
-
 
 def _arm_next_locked(sched: _ChatSchedule) -> None:
     """布置该 chat 的下一次唤醒（须持 _schedules_lock）。"""
@@ -322,7 +219,6 @@ def _arm_next_locked(sched: _ChatSchedule) -> None:
         sched.chat_id, max(1, round(delay / 60)),
         "暂停后看一眼" if mode == "rest" else "随机间隔",
     )
-
 
 async def _timer_fires(chat_id: int, delay: float, mode: str) -> None:
     """挂起到点后触发一次 TIMER 回合；忙碌时静默改期。"""
@@ -350,7 +246,7 @@ async def _timer_fires(chat_id: int, delay: float, mode: str) -> None:
                     _arm_next_locked(sched)
             return
         await _fire_turn(chat_id)
-        # _fire_turn 创建回合任务后立即返回；回合完整结束时由 _run 的
+        # fire_turn 创建回合任务后立即返回；回合完整结束时由 _run 的
         # finally 调 note_turn_finished 布置下一次，被用户消息打断则不改期
         # （随后接管的新 USER 回合结束时再布置）。
     except asyncio.CancelledError:
@@ -361,7 +257,6 @@ async def _timer_fires(chat_id: int, delay: float, mode: str) -> None:
             sched = _schedules.get(chat_id)
             if sched is not None:
                 _arm_next_locked(sched)
-
 
 async def _user_event_watcher(chat_id: int) -> None:
     """用户事件后的观望协程：没有 agent 回合接管时布置下一次唤醒。
@@ -391,7 +286,6 @@ async def _user_event_watcher(chat_id: int) -> None:
         raise
     except Exception:
         logger.debug("[proactive] chat=%s watcher 异常（可忽略）", chat_id, exc_info=True)
-
 
 async def note_user_activity(chat_id: int, *, private: bool = True) -> None:
     """记录一次用户活动，并挂起主动唤醒计时。
@@ -443,7 +337,6 @@ async def note_user_activity(chat_id: int, *, private: bool = True) -> None:
         _cancel_watcher_locked(sched)
         sched.watch_task = asyncio.create_task(_user_event_watcher(chat_id))
 
-
 async def note_turn_finished(chat_id: int) -> None:
     """一个 agent 回合（USER 或 TIMER）完整结束：布置下一次唤醒。
 
@@ -457,7 +350,6 @@ async def note_turn_finished(chat_id: int) -> None:
             return
         _cancel_watcher_locked(sched)
         _arm_next_locked(sched)
-
 
 async def reset_proactive_timer(chat_id: int) -> None:
     """重置该 chat 的唤醒节奏：立即布置随机 30~60min 的下一次。
@@ -477,7 +369,6 @@ async def reset_proactive_timer(chat_id: int) -> None:
             PROACTIVE_INTERVAL_MAX_SECONDS // 60,
         )
 
-
 async def deactivate_chat(chat_id: int, *, reason: str = "") -> None:
     """停止对某个 chat 的主动唤醒调度：取消挂起 timer/watch、移除 schedule。
 
@@ -495,7 +386,6 @@ async def deactivate_chat(chat_id: int, *, reason: str = "") -> None:
         "[proactive] chat=%s 已停用主动唤醒%s",
         chat_id, f"（{reason}）" if reason else "",
     )
-
 
 async def notify_chat_unreachable(chat_id: int, reason: str = "") -> None:
     """发送层识别到 403 类永久性错误（用户屏蔽 bot / 账号注销 / 被踢出）后
@@ -520,7 +410,6 @@ async def notify_chat_unreachable(chat_id: int, reason: str = "") -> None:
         )
     await deactivate_chat(chat_id, reason=reason or "chat unreachable")
 
-
 async def _sleep_or_stop(seconds: float) -> bool:
     """睡眠指定秒数；调度器停止时提前返回 True；被取消时抛 CancelledError。"""
     try:
@@ -528,7 +417,6 @@ async def _sleep_or_stop(seconds: float) -> bool:
         return True
     except asyncio.TimeoutError:
         return False
-
 
 async def _fire_turn(chat_id: int) -> None:
     """触发一次 TIMER 唤醒回合；回合正常结束后布置下一次。
@@ -616,11 +504,7 @@ async def _fire_turn(chat_id: int) -> None:
     task.add_done_callback(_log_unexpected)
     logger.info("[TIMER] chat=%s 决策=RUN：开始主动巡检（回顾→跟进→找话题）", chat_id)
 
-
-
-# =====================================================================
 # 生命周期与打断
-# =====================================================================
 async def start_proactive_scheduler() -> None:
     """应用启动时初始化调度器（chat 在首次用户活动时才被跟踪）。"""
     if not PROACTIVE_ENABLED:
@@ -633,7 +517,6 @@ async def start_proactive_scheduler() -> None:
         PROACTIVE_INTERVAL_MIN_SECONDS, PROACTIVE_INTERVAL_MAX_SECONDS,
         PROACTIVE_MAX_IDLE_SECONDS, PROACTIVE_REST_SECONDS,
     )
-
 
 async def stop_proactive_scheduler() -> None:
     """应用关停：取消所有挂起的 timer/watch 任务与进行中的 TIMER 回合。"""
@@ -657,7 +540,6 @@ async def stop_proactive_scheduler() -> None:
         except asyncio.TimeoutError:
             logger.warning("[proactive] 关停时部分任务未及时结束")
     logger.info("[proactive] 调度器已停止")
-
 
 async def interrupt_proactive_flow(chat_id: int) -> bool:
     """用户发来新消息：打断进行中的 TIMER 回合并保全其进度。

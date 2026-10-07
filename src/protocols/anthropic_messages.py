@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from responses_state import TurnState
     from anthropic import AsyncAnthropic
 
-
 class AnthropicMessagesAdapter(ChatProtocolAdapter):
     name = "anthropic_messages"
 
@@ -53,6 +52,5 @@ class AnthropicMessagesAdapter(ChatProtocolAdapter):
             tools=tools, supports_tools=supports_tools, journal=journal,
             workspace_namespace=workspace_namespace,
         )
-
 
 __all__ = ["AnthropicMessagesAdapter"]

@@ -1,44 +1,4 @@
-"""tool_result_condense.py — 工具返回内容的「模型视图」精简层。
-
-定位
-----
-工具的原始返回（result_str）同时服务两个消费者：
-  1. UI 草稿渲染（tool_executors.format_tool_result）——结构化卡片依赖
-     原始 JSON 载荷，保持不动；
-  2. LLM 上下文（role=tool 消息 + 会话历史）。
-
-模型视图原则（v3：去 JSON 化）
-------------------------------
-JSON 是给程序读的，不是给模型读的。大段 JSON 让模型把 token 花在
-解析结构与跳过无关字段上，真正回答问题所需的信息反而被稀释。本模块
-把「完整 JSON」转换成「模型视图」——按工具逐一判断模型回答用户问题
-真正需要什么，只把这些内容用紧凑的纯文本给模型：
-
-  - weather: 当前实况一行 + 逐时（hours 参数控制条数，默认 6）+ 逐日；
-    只保留温度/天气/降水/风力/湿度等高价值字段，月相、露点、辐射等
-    从源头就不进载荷（见 search/quick_lookup.py 的载荷瘦身）；
-  - todo / memory: 逐条「动作 + 对象 + id」纯文本——id 是模型后续
-    done/delete/edit 必需的句柄，其余内部字段（created_at /
-    completed_at / changed / ok 等）对模型零信息量，全部丢弃；
-  - subagent: 终态 + 统计一行 + 最终答复正文；任务回声（task_preview）、
-    展示名（model_name）、内部码（ok/code）不再重复给模型；
-  - message_user: 用户的回答转成一句话（选了什么/自定义回答/取消/离开），
-    不再回 JSON 信封；
-  - present_files: 成功/失败清单一行化；
-  - gaode maps_*: POI 列表 / 路线步骤 / 距离表转成可读文本。polyline、
-    tmcs、行政区划内部编码、photos 等渲染与遥测专用字段先按原清洗规则
-    剔除，再转文本 —— 模型永远看不到坐标串与格网号；
-  - 其他工具（web_search / fetch_url / wikipedia / bash / text_editor …）
-    本来就是文本形态，原样返回。
-
-安全性约定
-----------
-  - 错误与超时文本逐字保留（错误连击熔断靠前缀匹配）；JSON 信封里的
-    ``{"error": ...}`` 转写成「失败：…」文本，语义不变且仍可被失败判定
-    识别（失败判定在原始 safe_content 上进行，双保险）；
-  - 任何解析失败都原样返回（绝不能改变错误语义）；
-  - 精简失败时退回完整内容 —— 宁多勿缺。
-"""
+"""tool_result_condense.py — 工具返回内容的「模型视图」精简层。"""
 
 from __future__ import annotations
 
@@ -51,10 +11,7 @@ from tool_names import tool_family
 
 logger = logging.getLogger(__name__)
 
-
-# =====================================================================
 # 通用辅助
-# =====================================================================
 
 def _parse_json_stream(text: str) -> list[Any] | None:
     """解析单个 JSON 文档或相邻拼接的多个 JSON 对象/数组。
@@ -84,14 +41,12 @@ def _parse_json_stream(text: str) -> list[Any] | None:
         cursor = next_cursor
     return values or None
 
-
 def _parse_single_object(text: str) -> dict | None:
     """尽力把工具结果解析成单个 JSON object；否则 None。"""
     values = _parse_json_stream(text)
     if values and isinstance(values[0], dict) and len(values) == 1:
         return values[0]
     return None
-
 
 def _error_text(payload: dict) -> str | None:
     """JSON 错误信封 → 「失败：…」文本（保持可被失败判定识别的语义）。"""
@@ -100,15 +55,12 @@ def _error_text(payload: dict) -> str | None:
         return f"失败：{error.strip()}"
     return None
 
-
 def _clean(value: Any) -> str:
     """字段值 → 单行短文本：压空白、去空。"""
     return " ".join(str(value if value is not None else "").split())
 
-
 def _no_value(value: Any) -> bool:
     return value is None or value == "" or value == [] or value == {}
-
 
 def _compact_location(value: Any) -> str:
     """经纬度串压缩到 4 位小数（模型定位足够，省 token）。"""
@@ -126,10 +78,7 @@ def _compact_location(value: Any) -> str:
         return s
     return f"{_fmt(lng)},{_fmt(lat)}"
 
-
-# =====================================================================
 # A. weather 模型视图（纯文本）
-# =====================================================================
 
 def _weather_line_current(current: dict, unit: str) -> str:
     temp = _clean(current.get("temp", "N/A"))
@@ -156,7 +105,6 @@ def _weather_line_current(current: dict, unit: str) -> str:
         parts.append(f"UV{uv}")
     return "，".join(parts)
 
-
 def _weather_line_hourly(h: dict, unit: str) -> str:
     bits = [
         _clean(h.get("time", "")),
@@ -177,7 +125,6 @@ def _weather_line_hourly(h: dict, unit: str) -> str:
         bits.append(f"风速{wind_speed}km/h")
     return " ".join(bits)
 
-
 def _weather_line_daily(d: dict, unit: str) -> str:
     bits = [
         _clean(d.get("date", "")),
@@ -195,7 +142,6 @@ def _weather_line_daily(d: dict, unit: str) -> str:
     if sunrise and sunset:
         bits.append(f"日出{sunrise} 日落{sunset}")
     return " ".join(bits)
-
 
 def _weather_model_view(payload: dict, hours_arg: Any) -> str:
     error = _error_text(payload)
@@ -231,16 +177,12 @@ def _weather_model_view(payload: dict, hours_arg: Any) -> str:
         lines.extend("  " + _weather_line_daily(d, unit) for d in daily if isinstance(d, dict))
     return "\n".join(lines)
 
-
-# =====================================================================
 # B. todo 模型视图（纯文本）
-# =====================================================================
 
 _TODO_DUE_STATUS_LABELS = {
     "overdue": "已逾期",
     "due_soon": "24小时内到期",
 }
-
 
 def _todo_item_line(todo: dict) -> str:
     todo = todo if isinstance(todo, dict) else {}
@@ -269,11 +211,9 @@ def _todo_item_line(todo: dict) -> str:
         parts.append("（" + "，".join(extras) + "）")
     return " ".join(parts)
 
-
 def _todo_note_line(todo: dict) -> str:
     note = _clean((todo or {}).get("note", ""))
     return f"    备注：{note}" if note else ""
-
 
 def _todo_model_view(payload: dict, fn_args: dict) -> str:
     error = _error_text(payload)
@@ -345,10 +285,7 @@ def _todo_model_view(payload: dict, fn_args: dict) -> str:
     # 未知 action（防御）：退回原 JSON
     return json.dumps(payload, ensure_ascii=False)
 
-
-# =====================================================================
 # C. memory 模型视图（纯文本）
-# =====================================================================
 
 def _memory_line(mem: dict) -> str:
     mem = mem if isinstance(mem, dict) else {}
@@ -372,7 +309,6 @@ def _memory_line(mem: dict) -> str:
             extras.append("标签 " + " ".join(f"#{t}" for t in cleaned))
     suffix = f"（{'，'.join(extras)}）" if extras else ""
     return f"- {prefix}{content}{suffix}"
-
 
 def _memory_model_view(payload: dict, fn_args: dict) -> str:
     error = _error_text(payload)
@@ -423,10 +359,7 @@ def _memory_model_view(payload: dict, fn_args: dict) -> str:
         return f"{message}。{stats}"
     return json.dumps(payload, ensure_ascii=False)
 
-
-# =====================================================================
 # D. subagent 模型视图（纯文本）
-# =====================================================================
 
 def _subagent_model_view(payload: dict) -> str:
     error = _error_text(payload)
@@ -456,10 +389,7 @@ def _subagent_model_view(payload: dict) -> str:
         return head + "\n（最终答复为空）"
     return f"{head}\n最终答复：\n{answer}"
 
-
-# =====================================================================
 # E. message_user 回答模型视图（纯文本）
-# =====================================================================
 
 def _message_user_answer_view(payload: dict) -> str:
     atype = _clean(payload.get("type", "")).lower() or "unknown"
@@ -505,10 +435,7 @@ def _message_user_answer_view(payload: dict) -> str:
         return note or "用户在超时时间内没有回复（用户可能不在）。可结束本回合，用户回来后会再联系。"
     return json.dumps(payload, ensure_ascii=False)
 
-
-# =====================================================================
 # F. present_files 模型视图（纯文本）
-# =====================================================================
 
 def _present_files_view(payload: dict) -> str:
     error = _error_text(payload)
@@ -531,10 +458,7 @@ def _present_files_view(payload: dict) -> str:
             lines.append(f"  （其余 {len(failed_items) - 5} 个失败已省略）")
     return "\n".join(lines)
 
-
-# =====================================================================
 # G. gaode maps 模型视图（纯文本）
-# =====================================================================
 # 先按原清洗规则剔除渲染/遥测专用字段（polyline、内部编码、空值…），
 # 再把剩下的业务字段转成可读文本。UI 视图仍拿完整原始载荷。
 
@@ -562,10 +486,8 @@ _AMAP_DROP_KEYS = frozenset({
 
 _AMAP_BIZ_EXT_DROP_KEYS = frozenset({"meal_ordering"})
 
-
 def _amap_is_empty(value: Any) -> bool:
     return value is None or value == "" or value == [] or value == {}
-
 
 def _condense_amap_node(node: Any, *, in_biz_ext: bool = False) -> Any:
     """递归清洗高德结构。未知形状原样返回，绝不抛异常。"""
@@ -586,13 +508,11 @@ def _condense_amap_node(node: Any, *, in_biz_ext: bool = False) -> Any:
         return [item for item in cleaned_list if not _amap_is_empty(item)]
     return node
 
-
 _AMAP_BIZ_PROMOTE_KEYS = (
     "rating", "cost", "tag", "atag", "business_area", "website", "email",
     "parking_type", "opentime2", "open_time", "opentime", "business_hours",
     "opening_hours", "hours",
 )
-
 
 def _normalize_amap_poi(poi: dict[str, Any]) -> dict[str, Any]:
     """把 biz_ext 里的高价值字段提升到 POI 顶层（模型直读）。"""
@@ -604,7 +524,6 @@ def _normalize_amap_poi(poi: dict[str, Any]) -> dict[str, Any]:
                 out[key] = biz_ext[key]
         out.pop("biz_ext", None)
     return out
-
 
 def _normalize_amap_payload(payload: Any) -> Any:
     if isinstance(payload, dict):
@@ -626,14 +545,12 @@ def _normalize_amap_payload(payload: Any) -> Any:
         return [_normalize_amap_payload(item) for item in payload]
     return payload
 
-
 _POI_TEXT_FIELDS = (
     "name", "alias", "address", "location", "tel", "website", "distance",
     "rating", "cost", "opentime2", "open_time", "opentime", "business_hours",
     "opening_hours", "hours", "business_area", "tag", "atag", "parking_type",
     "type", "email",
 )
-
 
 def _poi_text_line(poi: dict, index: int | None = None) -> str:
     poi = _normalize_amap_poi(_condense_amap_node(poi) if poi else {})
@@ -656,7 +573,6 @@ def _poi_text_line(poi: dict, index: int | None = None) -> str:
     prefix = f"{index}. " if index is not None else ""
     return f"{prefix}" + "｜".join(bits) + id_txt
 
-
 def _amap_geo_view(payload: dict) -> str:
     geocodes = payload.get("geocodes")
     if not isinstance(geocodes, list) or not geocodes:
@@ -678,7 +594,6 @@ def _amap_geo_view(payload: dict) -> str:
         lines.append(f"（其余 {len(geocodes) - 5} 条已省略）")
     return "\n".join(lines)
 
-
 def _amap_regeocode_view(payload: dict) -> str:
     regeo = payload.get("regeocode")
     if not isinstance(regeo, dict):
@@ -697,7 +612,6 @@ def _amap_regeocode_view(payload: dict) -> str:
             area_bits.append(_clean(value))
     area = "，".join(dict.fromkeys(area_bits))
     return f"逆地理编码结果：{address}" + (f"（{area}）" if area and area != address else "")
-
 
 def _amap_poi_list_view(payload: dict, keyword: str = "") -> str:
     pois = payload.get("pois")
@@ -720,13 +634,11 @@ def _amap_poi_list_view(payload: dict, keyword: str = "") -> str:
         lines.append(f"（其余 {len(pois) - 10} 条已省略；可加 city/缩窄关键词再查）")
     return "\n".join(lines)
 
-
 def _amap_detail_view(payload: dict) -> str:
     if not isinstance(payload, dict) or "name" not in payload:
         return json.dumps(payload, ensure_ascii=False)
     line = _poi_text_line(payload)
     return f"POI 详情：{line}" if line else json.dumps(payload, ensure_ascii=False)
-
 
 def _format_distance(value: Any) -> str:
     text = _clean(value)
@@ -737,7 +649,6 @@ def _format_distance(value: Any) -> str:
     if meters >= 1000:
         return f"{meters / 1000:.1f}km"
     return f"{meters:g}m" if meters else text
-
 
 def _format_duration(value: Any) -> str:
     text = _clean(value)
@@ -750,7 +661,6 @@ def _format_duration(value: Any) -> str:
         hours = int(minutes // 60)
         return f"{hours}小时{int(round(minutes % 60))}分钟"
     return f"{minutes:.0f}分钟" if minutes >= 1 else f"{seconds:g}秒"
-
 
 def _amap_direction_view(payload: dict, mode_label: str) -> str:
     route = payload.get("route")
@@ -810,7 +720,6 @@ def _amap_direction_view(payload: dict, mode_label: str) -> str:
         return json.dumps(payload, ensure_ascii=False)
     return "\n".join(lines)
 
-
 def _amap_distance_view(payload: dict) -> str:
     results = payload.get("results")
     if not isinstance(results, list) or not results:
@@ -828,7 +737,6 @@ def _amap_distance_view(payload: dict) -> str:
         lines.append(f"（其余 {len(results) - 10} 条已省略）")
     return "\n".join(lines)
 
-
 def _amap_ip_location_view(payload: dict) -> str:
     if not isinstance(payload, dict):
         return json.dumps(payload, ensure_ascii=False)
@@ -838,7 +746,6 @@ def _amap_ip_location_view(payload: dict) -> str:
         return json.dumps(payload, ensure_ascii=False)
     area = " ".join(x for x in (province, city) if x and x != "[]")
     return f"IP 归属地：{area}"
-
 
 def _amap_model_view(fn_name: str, content: str) -> str:
     values = _parse_json_stream(content)
@@ -894,10 +801,7 @@ def _amap_model_view(fn_name: str, content: str) -> str:
             views.append(json.dumps(doc, ensure_ascii=False))
     return "\n".join(v for v in views if v)
 
-
-# =====================================================================
 # 对外主入口
-# =====================================================================
 
 def condense_for_model(fn_name: str, fn_args: dict | None, content: str) -> str:
     """把工具的完整返回转换成发给 LLM 的精简视图。

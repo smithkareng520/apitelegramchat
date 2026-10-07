@@ -20,7 +20,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
 # 模型可见的 host 内建工具定义。执行实现仍由 execute_present_files 提供，
 # 此 schema 负责把工具正式暴露到 tool_registry -> get_model_tools()。
 PRESENT_FILES_TOOL = {
@@ -53,7 +52,6 @@ PRESENT_FILES_TOOL = {
         ]
     }
 }
-
 
 async def execute_present_files(chat_id: int, paths: List[str], namespace: str | None = None) -> str:
     """Send files from the ``upload/`` staging directory to the chat.
@@ -96,7 +94,7 @@ async def execute_present_files(chat_id: int, paths: List[str], namespace: str |
                     failed.append(f"{path} (invalid path)")
                     continue
 
-                # ----- 统一 workspace-relative 路径解析 -----
+                # 统一 workspace-relative 路径解析
                 # 所有相对路径都相对于唯一 workspace 根目录解析。
                 raw_path = path.strip()
                 while raw_path.startswith("./"):
@@ -171,5 +169,4 @@ async def execute_present_files(chat_id: int, paths: List[str], namespace: str |
         # "error" 键。成功路径不再输出 "error": null —— 对模型而言是零信息
         # 字段，且会诱使模型在回复里重复说明“没有错误”。
         return json.dumps({"sent": sent, "failed": failed})
-
 

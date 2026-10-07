@@ -1,152 +1,5 @@
 # turn_recovery.py
-"""Agent 轮次打断保全（turn journal + graceful close）。
-
-背景与问题
-==========
-
-旧架构里，用户主动发消息（或 TIMER 唤醒）会**取消并丢弃**当前进行中的
-agent 轮次：轮次内已经完成的 assistant 消息、工具调用与工具结果只存在于
-任务局部变量 ``new_history_entries`` 里，任务被取消后全部丢失——已花的
-token、已执行的工具进度全部作废，新轮次只能从零开始。
-
-本模块把"进行中轮次的消息流水"登记为**轮次日志（turn journal）**：
-
-- ``get_ai_response`` 开始时 ``register_inflight_turn`` 登记一个空 journal
-  （列表引用），agentic 循环照常往里追加 assistant / tool 消息；
-- 轮次**正常**结束：``update_conversation_and_ledger`` 在把 new_msgs 写入
-  持久历史的同一把 chat 锁内调用 ``note_turn_persisted`` 注销登记
-  （注销点必须在"消息已 append"之后，保证取消竞态下不会双写也不会漏写）；
-- 轮次被**打断**：打断方（``proactive.interrupt_proactive_flow`` /
-  ``app._interrupt_active_generation``）在旧任务完全停止后调用
-  ``finalize_interrupted_turn`` / ``finalize_pending_turns``，把 journal
-  里的已完成消息沉淀进持久历史；
-- 轮次**异常**（额度不足 / 网关错误等）：``ai_handlers.get_ai_response``
-  的异常路径调用 ``persist_salvaged_journal``，进度不因错误而丢失。
-
-补齐结构（placeholder tool_result）
-==================================
-
-OpenAI 兼容协议要求 assistant 消息里的每个 ``tool_calls[i].id`` 都必须有
-配对的 ``role=tool`` 消息。打断可能发生在工具执行前 / 执行中 / 批次结果
-回写前，此时 journal 末尾会残留未配对的 tool_use。``_normalize_journal``
-为所有未配对的 tool_call 追加占位结果：
-
-    {"role": "tool", "tool_call_id": <id>, "name": <name>,
-     "content": "用户打断，未执行"}
-
-（``ai/tool_call_loop.py`` 在取消路径上会先把**已经执行完**的工具结果回填
-真实 tool 消息，只剩真正未完成的才落到占位——最大化保留进度。）
-
-流式文本的实时保全（2026-09 新增）
-==================================
-
-旧问题：纯文本流式输出中途被打断时，``content_acc`` 是循环局部变量、
-从未写入 journal——草稿层（用户可见）保全了内容，历史层（模型记忆）
-完全为空。修复后（见 ``ai/bridge_common.py`` 的 ``LiveAssistantSlot``）：
-四条 agentic 循环在流式期间把文本/思考增量**实时同步**进 journal 里的
-占位 assistant 消息，打断发生在任何时间点都能被本模块保全。配套防御：
-
-- ``_normalize_journal`` 剔除"无正文且无 tool_calls"的空 assistant 占位
-  （模型一字未吐即被打断；Codex #22602——空 assistant 消息会让严格网关
-  拒绝下一轮请求）。"只吐了思考、没吐正文"的占位同样剔除：思考块按
-  官方原则不可部分保全，且 content=null 的出站形状与上述雷同。
-- 流式中途未完成的 tool_call 参数 JSON 由循环侧**整体不写入**
-  （LiveAssistantSlot 只在 finalize 写 tool_calls），journal 不会出现
-  "有 tool_use 却永远没有配对 tool_result"的悬空状态。
-
-五阶段打断规范（2026-09 二期，本次重构）
-========================================
-
-按打断发生时的物理阶段执行确定性动作，数据保留基准"文本看前端、
-数据看后台"：
-
-- **阶段 1（思考推演中）**：残缺思考**全量丢弃**（
-  ``trim_interrupted_stream`` 剥离 ReasoningBlock）——未完成的逻辑推导
-  前提已失效，残缺思考会污染模型下一轮隐空间；
-- **阶段 2（文本输出中）**：文本按**前端渲染确认游标**物理截断——后端
-  超前生成、用户尚未在草稿上看到的文本一律裁掉（"用户没看到的等于
-  模型没说过的"，对齐认知现场，防"我明明解释过"幻觉）。游标由
-  RichMessageBuilder 维护（最后一帧成功送达时刻的回合累计可见文本
-  字符数），经 ``render_cursor_box`` 引用注册进 ``_InFlightEntry``；
-  静默回合（/show off）不渲染草稿 → 无游标 → 不裁剪（保全后端全量以
-  衔接进度）；
-- **阶段 3（工具参数生成中）**：半截 JSON 整体剥离（循环侧已不写入）；
-- **阶段 4（工具执行中）**：只读工具——取消传播直接拒断底层网络请求，
-  占位回执带 ``aborted`` 状态语义；写操作（bash / text_editor / memory /
-  todo，见 ``ai._constants.DETACHED_ON_INTERRUPT_TOOLS``）——
-  ``asyncio.shield`` 让执行脱离主进程后台死等确切终态（成功/失败/回滚），
-  终态由 ``writeback_detached_tool_result`` 轮询回写进历史（原地替换占位
-  tool 消息的 content）；
-- **阶段 5（工具结果刚返回）**：调用声明与真实数据结果全量保留（既有
-  ``_batch_completed_results`` 回填机制）。
-
-user 消息落位（OpenAI 格式）
-============================
-
-- 打断发生在任何 assistant 输出之前：journal 为空，历史末尾仍是上一条
-  user 消息 → 新 user 消息由 ``persist_user_message_entry`` **合并**进
-  该消息（content 以空行拼接；媒体附件按 kind 归一——同类升级为
-  photo_group / video_group / document_group 数组，混合 kind / 多音频
-  保留 attachments 列表由解析器逐个解析），避免连续两条 user；
-- 上一轮**请求失败**（异常 / IMAGE_ERROR / VIDEO_ERROR / 空响应等，
-  历史末尾残留未获回应的 user 消息且被打上 TURN_FAILED_FLAG）：新
-  user 消息**整体替换**该失败轮消息而不合并——重试语义下每条文本、
-  每张图片只保留新消息的一份，绝不随重试次数叠加（旧实现把重发内容
-  反复合并进同一条 user 消息，文本越拼越长、同一张参考图重复出现，
-  "越积攒越多"）。新消息不带媒体时，把失败轮的媒体原样搬移一份过来
-  （不带旧文本），保证用户上传的图片/文档不因一次请求失败从历史中
-  消失，原生图像模型的重试也仍能拿到参考图；
-- 打断发生在 tool_call 之后：占位 tool 消息补齐配对，新 user 消息直接
-  追加在 tool 消息之后（OpenAI 允许 tool 后跟 user，tool 角色不破坏
-  user 交替）；
-- 打断发生在工具结果已回填、模型生成最终文本时：无需补结构，新 user
-  消息直接追加。
-
-新 user 消息由 ``persist_user_message_entry`` 在轮次开始时（get_ai_response
-内）**提前持久化**并打上 early-persisted 标记，旧
-``update_conversation_and_ledger`` 见到标记后跳过重复 append。提前持久化
-让"快速连发多条消息"的合并链天然成立：msg2 打断 msg1 → msg2 并入 user1；
-msg3 再打断 → 若 msg2 的轮次仍无任何输出，msg3 继续并入同一条 user 消息。
-
-静默回复交付标记（按事件源区分默认值）
-================================
-
-``/show off``（静默模式）下，模型通过 ``deliver_reply`` 工具的 send 布尔
-参数选择是否把最终内容发给用户——send=true 时发送的是 agent 轮次
-最后一条助手消息的 content 字段（由 ``ai/tool_call_loop`` 在 journal 里
-回溯解析后传入 executor，不含 reasoning 等其他字段）。send 的**缺省值
-（不填）按事件源区分**，在每轮 agent 开始时由 ``reset_turn_delivery_state``
-重置：
-
-- **USER 回合**（用户主动发消息）：默认 **true**——不填按发送处理；
-  模型整轮都不调用 deliver_reply 时，``get_ai_response`` 收尾会按默认
-  交付兜底发送最终回复（用户主动提问理应收到回答）——兜底发送的内容
-  与工具交付**同源**：同为 agent 轮次最后一条非空 assistant 消息的
-  content 本身（同样经 sendRichMessage 直发，不使用整轮草稿累积，
-  也不附带中间轮次的过程文本与工具卡片）；只有显式填 ``send=false``
-  才会标记 ``_reply_suppressed``，本轮对用户完全静默。
-- **TIMER 回合**（后台主动巡检）：默认 **false**——不填 / false / 不调用
-  均不发送，与旧行为一致，必须显式填 ``send=true`` 才发送；收尾无
-  兜底直发。
-
-executor 发送成功后调用 ``mark_reply_delivered`` 记录"本轮已经主动交付过"
-（对 USER 回合意味着收尾不再兜底）；``run_one`` 在显式 ``send=false`` 时
-调用 ``mark_reply_suppressed`` 记录"本轮显式抑制"。``get_ai_response``
-收尾时用 ``pop_reply_delivered`` / ``pop_reply_suppressed`` 读取并清除，
-据此决定 USER 静默回合是否需要兜底发送。三类标记都是轮次开始时重置，
-上一轮的取值不会泄漏到本轮（也顺带清理了异常/打断路径残留的旧标记）。
-
-锁顺序约定（防 ABBA 死锁）
-==========================
-
-- 注册表操作全部是同步原子操作（append / pop / filter，无 await 窗口），
-  **不**与 chat 锁交叉持有；
-- 持久化路径（finalize / note_turn_persisted 的调用方）先完成注册表
-  原子操作，再获取 chat 锁写历史；
-- ``update_conversation_and_ledger`` 持 chat 锁期间调用
-  ``note_turn_persisted``（只做注册表原子操作），两者不会形成
-  跨路径的锁等待。
-"""
+"""Agent 轮次打断保全（turn journal + graceful close）。"""
 from __future__ import annotations
 
 import asyncio
@@ -238,7 +91,6 @@ EARLY_PERSIST_TS = "__apitc_early_persist_ts__"
 # 时必须剥离，否则每轮请求都会把引用全文重发给模型，污染上下文并浪费 token。
 REPLY_MARKER = "💡 引用回复:"
 
-
 def _strip_reply_prefix(content: str) -> str:
     """剥离 user content 开头的引用回复前缀块，返回净文本。
 
@@ -268,7 +120,6 @@ TURN_FAILED_FLAG = "__apitc_turn_failed__"
 # 这里只是兜底；超时则按当前 journal 快照保全）。
 _FINALIZE_TASK_WAIT_SECONDS = 1.5
 
-
 @dataclass
 class _InFlightEntry:
     chat_id: int
@@ -282,7 +133,6 @@ class _InFlightEntry:
     # 每帧送达后原地更新 box[0]）。None / 缺失 = 无渲染基准（静默回合），
     # trim 不裁剪文本。
     render_cursor_ref: Optional[list] = None
-
 
 # chat_id -> 该 chat 进行中（或尚未注销）的轮次登记，按注册顺序排列。
 # 注册表只做同步原子操作（append / pop / filter），asyncio 单线程模型下
@@ -303,16 +153,12 @@ _reply_suppressed: set[int] = set()
 # 重置为 false（保持旧行为）。
 _default_send: set[int] = set()
 
-
-# =====================================================================
 # 登记与注销
-# =====================================================================
 def _current_task() -> Optional[asyncio.Task]:
     try:
         return asyncio.current_task()
     except RuntimeError:
         return None
-
 
 def _read_render_cursor(ref: Optional[list]) -> Optional[int]:
     """读取渲染确认游标的当前值（异常客错 → None = 不裁剪）。"""
@@ -323,7 +169,6 @@ def _read_render_cursor(ref: Optional[list]) -> Optional[int]:
     except Exception:
         return None
     return value if isinstance(value, int) and value >= 0 else None
-
 
 def attach_render_cursor(chat_id: int, journal: list, cursor_ref: Optional[list]) -> None:
     """把 builder 的渲染确认游标绑定到该轮次的登记条目（同步原子）。
@@ -340,7 +185,6 @@ def attach_render_cursor(chat_id: int, journal: list, cursor_ref: Optional[list]
     for entry in entries:
         if entry.journal is journal:
             entry.render_cursor_ref = cursor_ref
-
 
 def trim_interrupted_stream(journal: list, render_cursor: Optional[int]) -> bool:
     """打断保全的字段级裁剪（五阶段规范：阶段1/2/3 的落地）。
@@ -415,7 +259,6 @@ def trim_interrupted_stream(journal: list, render_cursor: Optional[int]) -> bool
     msg.meta.pop(LIVE_STREAM_FLAG, None)
     return True
 
-
 def _pop_registry_entries(chat_id: int, *, expect_task: Optional[asyncio.Task] = None, only_done: bool = False) -> list[_InFlightEntry]:
     """同步弹出符合条件的登记条目（无 await，天然原子，取消安全）。
 
@@ -440,7 +283,6 @@ def _pop_registry_entries(chat_id: int, *, expect_task: Optional[asyncio.Task] =
     else:
         _inflight.pop(chat_id, None)
     return targets
-
 
 async def register_inflight_turn(chat_id: int, journal: list, event_source: str = "USER") -> None:
     """登记一个进行中的 agent 轮次（journal 由 agentic 循环持续追加）。
@@ -467,7 +309,6 @@ async def register_inflight_turn(chat_id: int, journal: list, event_source: str 
         chat_id, entry.event_source, id(journal),
     )
 
-
 def note_turn_persisted(chat_id: int, new_msgs: list) -> None:
     """轮次消息已写入持久历史（update_conversation_and_ledger 内调用）。
 
@@ -490,7 +331,6 @@ def note_turn_persisted(chat_id: int, new_msgs: list) -> None:
             chat_id, id(new_msgs),
         )
 
-
 def deregister_turn(chat_id: int, journal: list) -> None:
     """显式注销（异常路径内部持久化后使用）。"""
     if chat_id is None or journal is None:
@@ -500,7 +340,6 @@ def deregister_turn(chat_id: int, journal: list) -> None:
         return
     remaining = [e for e in entries if e.journal is not journal]
     _inflight[chat_id] = remaining
-
 
 async def drain_completed_turns(chat_id: int) -> None:
     """把"任务已结束但尚未持久化"的陈旧登记保全进历史（如空回复轮次）。"""
@@ -513,10 +352,7 @@ async def drain_completed_turns(chat_id: int) -> None:
         except Exception:
             logger.debug("陈旧登记保全失败（可忽略）", exc_info=True)
 
-
-# =====================================================================
 # 补齐结构与持久化
-# =====================================================================
 def _unpaired_tool_calls(journal: list) -> list[tuple[str, str]]:
     """找出 journal 中没有配对 tool 消息的 (tool_call_id, name) 列表。
 
@@ -569,7 +405,6 @@ def _unpaired_tool_calls(journal: list) -> list[tuple[str, str]]:
             unpaired.append((tc_id, str(name or "unknown")))
     return unpaired
 
-
 def _is_persistable_assistant(msg: Any) -> bool:
     """判断 assistant 消息是否携带可出站的实质内容（打断保全过滤）。
 
@@ -604,7 +439,6 @@ def _is_persistable_assistant(msg: Any) -> bool:
         return has_text or bool(msg.get("tool_calls"))
     return True
 
-
 def _normalize_journal(journal: list) -> list:
     """返回补齐占位 tool 消息后的 journal 副本（原列表不被修改）。
 
@@ -631,7 +465,6 @@ def _normalize_journal(journal: list) -> list:
         normalized.extend(placeholders)
     return normalized
 
-
 async def _append_journal_to_history(chat_id: int, journal: list) -> None:
     """把（已补齐结构的）journal 消息追加进持久历史。"""
     if not journal:
@@ -649,7 +482,6 @@ async def _append_journal_to_history(chat_id: int, journal: list) -> None:
         "[turn-recovery] chat=%s 已保全轮次进度 %s 条消息（历史总长=%s）",
         chat_id, len(journal), len(get_or_init_context(chat_id).get("conversation_history") or []),
     )
-
 
 async def _persist_one_entry(entry: _InFlightEntry, *, reason: str) -> list:
     """等待任务收尾（若仍在跑）并把该轮 journal 保全进历史。"""
@@ -680,7 +512,6 @@ async def _persist_one_entry(entry: _InFlightEntry, *, reason: str) -> list:
     )
     return journal
 
-
 async def finalize_interrupted_turn(
     chat_id: int, *, expect_task: Optional[asyncio.Task] = None, reason: str = "interrupt"
 ) -> int:
@@ -703,11 +534,9 @@ async def finalize_interrupted_turn(
         salvaged += len(journal)
     return salvaged
 
-
 async def finalize_pending_turns(chat_id: int, *, reason: str = "interrupt") -> int:
     """``app._interrupt_active_generation`` 在旧任务取消完成后调用。"""
     return await finalize_interrupted_turn(chat_id, reason=reason)
-
 
 async def finalize_failed_turn(
     chat_id: int,
@@ -747,7 +576,6 @@ async def finalize_failed_turn(
         logger.warning("failed-turn journal salvage failed", exc_info=True)
         return []
 
-
 async def persist_salvaged_journal(chat_id: int, journal: list, *, reason: str) -> list:
     """异常路径（额度不足/网关错误等）保全进度：补齐结构并写历史。"""
     if chat_id is None:
@@ -767,7 +595,6 @@ async def persist_salvaged_journal(chat_id: int, journal: list, *, reason: str) 
     )
     return normalized
 
-
 def _render_cursor_of_journal(journal: list) -> Optional[int]:
     """按 journal 对象身份回查渲染游标（异常路径用，找不到返回 None）。"""
     for entries in _inflight.values():
@@ -776,16 +603,12 @@ def _render_cursor_of_journal(journal: list) -> Optional[int]:
                 return _read_render_cursor(entry.render_cursor_ref)
     return None
 
-
-# =====================================================================
 # 脱离工具（写操作）终态回写
-# =====================================================================
 # 回写轮询间隔：历史中该 tool_call_id 的 tool 消息可能尚未写入（打断方
 # 保全 / 正常收尾都在异步进行），等待其出现后原地替换。
 _DETACHED_WRITEBACK_POLL = 2.0
 # 回写等待上限：超过则放弃（该轮次历史本身未能落库，无处可写）。
 _DETACHED_WRITEBACK_WAIT = 600.0
-
 
 async def writeback_detached_tool_result(
     chat_id: int, tool_call_id: str, tool_name: str, content: str,
@@ -837,10 +660,7 @@ async def writeback_detached_tool_result(
             # 进程关闭等场景：回写中止（下次启动后无从追补，但绝不向上炸日志）
             return False
 
-
-# =====================================================================
 # 新 user 消息的提前持久化与合并
-# =====================================================================
 _ARRAY_KEYS = ("file_ids", "file_names", "mime_types", "attachments")
 
 # 同类多附件可归一的组形态（_resolve_multimodal_content 原生支持多附件）。
@@ -856,7 +676,6 @@ _RESOLVER_TYPES = {
     "photo", "photo_group", "video", "video_group",
     "document", "document_group", "audio", "voice",
 }
-
 
 def _attachment_entries(msg: dict) -> list[dict]:
     """提取消息携带的附件条目（attachments 优先，缺失时从单数字段重建）。
@@ -881,7 +700,6 @@ def _attachment_entries(msg: dict) -> list[dict]:
             entry["mime_type"] = msg["mime_type"]
         return [entry]
     return []
-
 
 def _merge_user_message(old: dict, new: dict) -> None:
     """把新 user 消息合并进历史末尾的旧 user 消息（原地修改 old）。
@@ -960,7 +778,6 @@ def _merge_user_message(old: dict, new: dict) -> None:
     if not old.get("mime_type") and new.get("mime_type"):
         old["mime_type"] = new["mime_type"]
 
-
 def _apply_attachment_entries(msg: dict, entries: list[dict]) -> None:
     """把附件条目写到消息上（归一化规则与 _merge_user_message 保持一致）。
 
@@ -1011,7 +828,6 @@ def _apply_attachment_entries(msg: dict, entries: list[dict]) -> None:
         msg["attachments"] = entries
         return
 
-
 def _replace_failed_user_message(old: dict, new: dict) -> None:
     """用新 user 消息整体替换失败轮的 user 消息（原地修改 old，保持槽位身份）。
 
@@ -1039,7 +855,6 @@ def _replace_failed_user_message(old: dict, new: dict) -> None:
             old[key] = value
     if carried_media:
         _apply_attachment_entries(old, carried_media)
-
 
 async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
     """轮次开始时把新 user 消息写入持久历史（必要时合并/替换上一条 user）。
@@ -1103,12 +918,7 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
                 )
             else:
                 # 打断发生在任何 assistant 输出之前：合并，避免连续两条 user。
-                # 防御性断言（改动点5）：合并的前提是"旧轮次无任何 assistant
-                # 输出"——此刻注册表里不应再有带未保全 journal 的旧登记
-                # （顺序上 _interrupt_active_generation → finalize_pending_
-                # turns 已跑完；本轮自己的登记 journal 为空，不会误报）。
-                # 若仍有，说明前提被打破（旧轮实际有输出却走了合并），
-                # ERROR 落日志即可从日志直接定位，不必再靠用户截图反推。
+                # 合并前提是旧轮次没有 assistant 输出；残留登记说明时序被破坏。
                 residual = [
                     e for e in _inflight.get(chat_id, [])
                     if e.journal  # 非空 journal = 旧轮有进度未被保全
@@ -1133,16 +943,11 @@ async def persist_user_message_entry(chat_id: int, user_message: dict) -> bool:
     user_message[EARLY_PERSIST_FLAG] = True
     return True
 
-
 async def undo_early_persist(chat_id: int, user_message: dict) -> None:
     """回滚一次提前持久化（消费型接管 / pre_flight 拒绝时恢复原状）。
 
-    背景（2026-09-12 生产事故修复）：spawn_turn_task 在派发回合任务前
-    先把 user 消息持久化，消除"回合在 persist 前被下一条消息打断、
-    消息静默丢失"的窗口。代价是：消息入库后，媒体参数卡片接管
-    （try_consume_media_message / try_consume_text_message）或
-    pre_flight_context_check 拒绝时需要撤回这条入库——本函数就是那个
-    撤回入口。
+    ``spawn_turn_task`` 会在派发回合任务前提前持久化 user 消息；媒体参数卡片接管
+    或 pre-flight 拒绝时需要撤回这条入库记录。
 
     语义：
       - mode=appended：历史末尾就是本次 append 的那条 → 校验 TS 一致后
@@ -1194,7 +999,6 @@ async def undo_early_persist(chat_id: int, user_message: dict) -> None:
     user_message.pop(EARLY_PERSIST_MODE, None)
     user_message.pop(EARLY_PERSIST_TS, None)
 
-
 async def mark_failed_unanswered_user(chat_id: int) -> None:
     """轮次失败收尾时调用：给历史末尾未获回应的 user 消息打失败标记。
 
@@ -1223,10 +1027,7 @@ async def mark_failed_unanswered_user(chat_id: int) -> None:
                 chat_id,
             )
 
-
-# =====================================================================
 # 静默模式 deliver_reply 交付标记（轮次开始时重置，收尾时读取清除）
-# =====================================================================
 def reset_turn_delivery_state(chat_id: int, *, default_send: bool) -> None:
     """agent 轮次开始时重置本轮交付状态，并设定 send 的缺省值。
 
@@ -1248,17 +1049,14 @@ def reset_turn_delivery_state(chat_id: int, *, default_send: bool) -> None:
     else:
         _default_send.discard(chat_id)
 
-
 def default_send_value(chat_id: int) -> bool:
     """读取本轮 deliver_reply 的 send 缺省值（tool_call_loop.run_one 用）。"""
     return chat_id is not None and chat_id in _default_send
-
 
 def mark_reply_delivered(chat_id: int) -> None:
     """deliver_reply executor 成功发送后调用。"""
     if chat_id is not None:
         _reply_delivered.add(chat_id)
-
 
 def pop_reply_delivered(chat_id: int) -> bool:
     """get_ai_response 收尾时读取并清除本轮交付标记。"""
@@ -1269,12 +1067,10 @@ def pop_reply_delivered(chat_id: int) -> bool:
         return True
     return False
 
-
 def mark_reply_suppressed(chat_id: int) -> None:
     """模型显式调用 deliver_reply(send=false) 后调用：本轮抑制兜底交付。"""
     if chat_id is not None:
         _reply_suppressed.add(chat_id)
-
 
 def pop_reply_suppressed(chat_id: int) -> bool:
     """get_ai_response 收尾时读取并清除本轮显式抑制标记。"""

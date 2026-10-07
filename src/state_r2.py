@@ -31,7 +31,6 @@ async def sync_named_file_from_r2(chat_id: int, local_path: Path, remote_name: s
         with open(local_path, "wb") as f:
             f.write(data)
 
-
 async def sync_named_file_to_r2(chat_id: int, local_path: Path, remote_name: str) -> None:
     """
     将 local_path 上传到 R2 的 state/{ns}/{remote_name}。
@@ -49,5 +48,4 @@ async def sync_named_file_to_r2(chat_id: int, local_path: Path, remote_name: str
         await upload_bytes_to_r2(data, key, "application/json")
     else:
         await delete_r2_object(key)
-
 

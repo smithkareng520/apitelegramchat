@@ -1,34 +1,5 @@
 # memory_tool.py
-"""
-长期记忆工具。
-
-定位
-----
-- 不同于对话历史（短期、会被自动修剪），memory 是用户希望长期保留的事实、
-  偏好、要点——跨会话持久化。
-- 按用户隔离，落在 ./state/{user_id}/memories.json，通过显式的 state_r2 持久化层。
-- 给 AI 一组 CRUD + 检索接口：add / get / list / search / update / delete / clear。
-
-数据模型
---------
-每条 memory：
-  {
-    "id":        8 位短 id
-    "content":   记忆正文（最多 2,000 tokens）
-    "category":  分类标签（fact / preference / person / event / note / custom...）
-    "tags":      [str, ...]   可选标签
-    "importance":low/medium/high
-    "created_at": unix
-    "updated_at": unix
-    "source":    "agent" / "user"   来源（谁写入的）
-  }
-
-检索
-----
-- list 按 category / tag / importance 过滤
-- search 用简单的子串匹配（大小写不敏感）扫 content + tags + category，
-  无外部依赖、零成本、跨语言可用
-"""
+"""长期记忆工具。"""
 
 from __future__ import annotations
 
@@ -48,7 +19,7 @@ from state_r2 import sync_named_file_from_r2, sync_named_file_to_r2
 
 logger = logging.getLogger(__name__)
 
-# ---------- 常量 ----------
+# 常量
 MEMORY_FILENAME = "memories.json"
 VALID_IMPORTANCE = ("low", "medium", "high")
 MEMORY_CONTENT_TOKEN_BUDGET = 2_000
@@ -71,19 +42,15 @@ CATEGORY_EMOJI = {
     "note":        "📝",
 }
 
-
-# ---------- 存储层 ----------
+# 存储层
 def _memory_path(chat_id: int) -> Path:
     return memory_state_file(chat_id)
-
 
 def _new_id() -> str:
     return uuid.uuid4().hex[:8]
 
-
 def _empty_store() -> dict:
     return {"memories": [], "updated_at": 0}
-
 
 def _load_local(chat_id: int) -> dict:
     path = _memory_path(chat_id)
@@ -100,7 +67,6 @@ def _load_local(chat_id: int) -> dict:
         logger.warning(f"memories.json 读取失败 (chat={chat_id}): {e}")
         return _empty_store()
 
-
 def _save_local(chat_id: int, store: dict) -> None:
     """以原子方式把 store 写到 memories.json。
 
@@ -116,7 +82,6 @@ def _save_local(chat_id: int, store: dict) -> None:
     tmp.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
 
-
 def _find_memory(memories: list, mid: Optional[str]) -> tuple[int, dict] | None:
     if not mid:
         return None
@@ -125,7 +90,6 @@ def _find_memory(memories: list, mid: Optional[str]) -> tuple[int, dict] | None:
         if str(m.get("id", "")).lstrip("#") == target:
             return i, m
     return None
-
 
 def _normalize_importance(value: Optional[str]) -> str:
     if not value:
@@ -136,7 +100,6 @@ def _normalize_importance(value: Optional[str]) -> str:
     alias = {"p0": "high", "p1": "high", "p2": "medium", "p3": "low",
              "高": "high", "中": "medium", "低": "low"}
     return alias.get(v, "medium")
-
 
 def _normalize_tags(tags: Any) -> list[str]:
     if tags is None:
@@ -157,21 +120,18 @@ def _normalize_tags(tags: Any) -> list[str]:
             break
     return out
 
-
 def _normalize_category(value: Optional[str]) -> str:
     if not value:
         return "note"
     v = truncate_to_token_budget(str(value).strip().lower(), 32, suffix="…")
     return v or "note"
 
-
-# ---------- 业务逻辑 ----------
+# 业务逻辑
 class _MemoryError(Exception):
     def __init__(self, message: str, code: str = "memory_error") -> None:
         super().__init__(message)
         self.message = message
         self.code = code
-
 
 async def _read_store(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> dict:
     """
@@ -189,7 +149,6 @@ async def _read_store(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> 
         except _MemoryError as e:
             return {"ok": False, "error": str(e), "code": e.code}
         return payload
-
 
 async def _mutate(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> dict:
     """
@@ -212,7 +171,6 @@ async def _mutate(chat_id: int, fn: Callable[[dict], tuple[dict, dict]]) -> dict
         except Exception as e:
             logger.warning(f"memory: local→R2 同步失败 (chat={chat_id}): {e}")
         return payload
-
 
 def _op_add(store: dict, content: Optional[str], category: str, tags: list[str],
             importance: str, source: str) -> tuple[dict, dict]:
@@ -242,7 +200,6 @@ def _op_add(store: dict, content: Optional[str], category: str, tags: list[str],
         "total": len(store["memories"]),
     }
 
-
 def _op_get(store: dict, mid: Optional[str]) -> tuple[dict, dict]:
     found = _find_memory(store["memories"], mid)
     if not found:
@@ -250,7 +207,6 @@ def _op_get(store: dict, mid: Optional[str]) -> tuple[dict, dict]:
     _, mem = found
     return store, {"ok": True, "action": "get", "memory": _mem_summary(mem),
                    "total": len(store["memories"])}
-
 
 def _op_list(store: dict, category: Optional[str], tag: Any,
              importance: Optional[str], limit: int) -> tuple[dict, dict]:
@@ -293,7 +249,6 @@ def _op_list(store: dict, category: Optional[str], tag: Any,
         "shown": len(filtered),
     }
 
-
 def _op_search(store: dict, query: str, limit: int) -> tuple[dict, dict]:
     q = (query or "").strip().lower()
     if not q:
@@ -325,7 +280,6 @@ def _op_search(store: dict, query: str, limit: int) -> tuple[dict, dict]:
         "total": len(memories),
         "memories": [_mem_summary(m) for m in matches],
     }
-
 
 def _op_update(store: dict, mid: Optional[str], content: Optional[str],
                category: Optional[str], tags: Any, importance: Optional[str]) -> tuple[dict, dict]:
@@ -359,7 +313,6 @@ def _op_update(store: dict, mid: Optional[str], content: Optional[str],
         "total": len(store["memories"]),
     }
 
-
 def _op_delete(store: dict, mid: Optional[str]) -> tuple[dict, dict]:
     found = _find_memory(store["memories"], mid)
     if not found:
@@ -372,7 +325,6 @@ def _op_delete(store: dict, mid: Optional[str]) -> tuple[dict, dict]:
         "memory": _mem_summary(mem),
         "total": len(store["memories"]),
     }
-
 
 def _op_clear(store: dict, scope: str) -> tuple[dict, dict]:
     """scope = all / category:<name> / tag:<name>"""
@@ -389,10 +341,7 @@ def _op_clear(store: dict, scope: str) -> tuple[dict, dict]:
         msg = f"已清空分类 {cat} 下 {removed} 条记忆"
     elif scope.startswith("tag:"):
         tag = scope.split(":", 1)[1].strip()
-        # 修复 BUG：此前 tag 为空时 ``[m for m in before_list if "" not in m.get("tags", [])]``
-        # 对所有记忆都返回 True（因为空串不在任何 tag list 里），导致 clear
-        # 静默不删除任何条目，却返回 removed=0 的成功响应——非常容易让 LLM
-        # 误以为已经清空。这里显式拒绝空 tag。
+        # 空 tag 会静默返回 0，容易让调用方误以为已清空，因此显式拒绝。
         if not tag:
             raise _MemoryError("clear tag 不能为空", "bad_scope")
         before_list = list(store["memories"])
@@ -410,7 +359,6 @@ def _op_clear(store: dict, scope: str) -> tuple[dict, dict]:
         "total": len(store["memories"]),
     }
 
-
 def _mem_summary(m: dict) -> dict:
     return {
         "id": m.get("id"),
@@ -423,8 +371,7 @@ def _mem_summary(m: dict) -> dict:
         "source": m.get("source", "agent"),
     }
 
-
-# ---------- 工具入口 ----------
+# 工具入口
 async def execute_memory(
     chat_id: int,
     action: str = "list",
@@ -490,31 +437,25 @@ async def execute_memory(
     return json.dumps({"ok": False, "error": f"未知 action: {action}", "code": "bad_action"},
                       ensure_ascii=False)
 
-
-# ---------- 富文本渲染 ----------
-# _esc 统一来自 core.text_utils.escape_html_text（卡片动态片段的严格转义）。
+# 富文本渲染
+# esc 统一来自 core.text_utils.escape_html_text（卡片动态片段的严格转义）。
 from core.text_utils import escape_html_text as _esc
-
-
 
 def _importance_badge(m: dict) -> str:
     p = m.get("importance", "medium")
     meta = IMPORTANCE_META.get(p, IMPORTANCE_META["medium"])
     return f"<b>{meta['emoji']} {meta['label']}</b>"
 
-
 def _category_badge(m: dict) -> str:
     c = m.get("category", "note")
     emoji = CATEGORY_EMOJI.get(c, "🏷️")
     return f"<code>{emoji} {_esc(c)}</code>"
-
 
 def _tag_chips(m: dict) -> str:
     tags = m.get("tags", []) or []
     if not tags:
         return ""
     return " ".join(f"<code>#{_esc(t)}</code>" for t in tags[:MAX_TAGS])
-
 
 def render_memory_card(payload: dict, max_items: int = 30) -> str:
     """将 execute_memory 返回的 payload 渲染成 Telegram 富文本卡片。"""
@@ -567,7 +508,7 @@ def render_memory_card(payload: dict, max_items: int = 30) -> str:
         extra_html = (f"<p><i>… 还有 {extra} 条未显示</i></p>" if extra > 0 else "")
         return header + f"<p>命中 <b>{payload.get('matches', 0)}</b> / {payload.get('total', 0)} 条</p><hr/><ol>{items}</ol>{extra_html}"
 
-    # ---- list 渲染 ----
+    # list 渲染
     memories = payload.get("memories", []) or []
     total = payload.get("total", 0)
     shown = payload.get("shown", len(memories))
@@ -599,7 +540,6 @@ def render_memory_card(payload: dict, max_items: int = 30) -> str:
                   if extra > 0 else "")
     return header + f"<p>{stat}</p><p>{extra_line}</p><hr/><ol>{items}</ol>{extra_html}"
 
-
 def _render_memory_item(m: dict) -> str:
     badge = _importance_badge(m)
     cat = _category_badge(m)
@@ -611,7 +551,6 @@ def _render_memory_item(m: dict) -> str:
     if tags:
         parts.append(tags)
     return f"<li>{' '.join(parts[:1])} {' '.join(parts[1:])}</li>"
-
 
 def _render_memory_detail(m: dict) -> str:
     if not m:
@@ -625,8 +564,7 @@ def _render_memory_detail(m: dict) -> str:
         parts.append(f"<p><i>创建于 {m['created_at']} · 更新于 {m.get('updated_at', m['created_at'])} · 来源 {m.get('source', 'agent')}</i></p>")
     return "".join(parts)
 
-
-# ---------- 工具定义（OpenAI function-calling schema） ----------
+# 工具定义（OpenAI function-calling schema）
 # 注意：description 字段是给 AI 阅读的「工具说明书」，全部用纯文本，
 # 不使用 Markdown 语法，与系统提示词风格保持一致。
 # MEMORY_TOOL schema 已迁至 mcpserver/catalogue.py（内部 MCP 服务器单一数据源）。

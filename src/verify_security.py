@@ -1,10 +1,7 @@
-# =====================================================================
 # verify_security.py — 部署后安全自检脚本
-# =====================================================================
 # 用法:
-#   1. 在容器内执行：python -m verify_security
-#   2. 所有测试项应通过；失败项说明该防御层失效
-# =====================================================================
+# 1. 在容器内执行：python -m verify_security
+# 2. 所有测试项应通过；失败项说明该防御层失效
 
 import asyncio
 import logging
@@ -20,10 +17,8 @@ logger = logging.getLogger(__name__)
 # ANSI 颜色码仅在 TTY 输出，避免污染 CI/CD 日志。
 _USE_COLOR = sys.stdout.isatty()
 
-
 def _color(code: int, text: str) -> str:
     return f"\033[{code}m{text}\033[0m" if _USE_COLOR else text
-
 
 PASS = _color(32, "[PASS]")
 FAIL = _color(31, "[FAIL]")
@@ -31,7 +26,6 @@ WARN = _color(33, "[WARN]")
 INFO = _color(36, "[INFO]")
 
 results: list[tuple[str, bool]] = []
-
 
 def report(name: str, ok: bool, detail: str = "") -> None:
     status = PASS if ok else FAIL
@@ -41,19 +35,14 @@ def report(name: str, ok: bool, detail: str = "") -> None:
     print(line)
     results.append((name, ok))
 
-
 def warn(name: str, detail: str) -> None:
     print(f"{WARN} {name} — {detail}")
     results.append((name, True))  # warn 不算 fail
 
-
 def info(name: str, detail: str) -> None:
     print(f"{INFO} {name} — {detail}")
 
-
-# ----------------------------------------------------------------------
 # 1. 容器身份检查
-# ----------------------------------------------------------------------
 def check_user() -> bool:
     uid = os.getuid()
     report("1.1 非 root 运行", uid != 0, f"uid={uid}")
@@ -71,24 +60,17 @@ def check_user() -> bool:
             warn("1.3 dumpable 自检", str(e))
     return uid != 0
 
-
 def check_no_sudo() -> None:
     has_sudo = shutil.which("sudo") is not None
     has_su = shutil.which("su") is not None
     report("1.2 sudo/su 不可用", not (has_sudo or has_su),
            f"sudo={has_sudo} su={has_su}")
 
-
-# ----------------------------------------------------------------------
 # 2. 敏感环境变量检查
-# ----------------------------------------------------------------------
 def check_env_scrubbed() -> None:
     """检查 os.environ 中是否还有敏感变量。
 
-    安全修复：此前直接把残留变量名打印到 stdout / 日志，这本身
-    是一种信息泄露（虽然只打印名字不打印值，但泄露"我们用了
-    STRIPE_SECRET_KEY"等本身也是 leak）。改成只打印数量，名字
-    仅在 DEBUG 级别输出。
+    仅输出残留变量数量；变量名只在 DEBUG 级别输出，避免泄露敏感配置名称。
     """
     sensitive_patterns = ("TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL")
     leaked = []
@@ -107,10 +89,7 @@ def check_env_scrubbed() -> None:
     report("2.1 敏感环境变量已清洗", not leaked,
            f"残留 {len(leaked)} 个敏感变量（详见 DEBUG 日志）" if leaked else "无敏感变量泄漏")
 
-
-# ----------------------------------------------------------------------
 # 3. Landlock 沙箱可用性
-# ----------------------------------------------------------------------
 def check_landlock() -> bool:
     from sandbox import _landlock_supported
     ok = _landlock_supported()
@@ -118,10 +97,7 @@ def check_landlock() -> bool:
            "Linux 5.13+ required" if not ok else "OK")
     return ok
 
-
-# ----------------------------------------------------------------------
 # 4. 沙箱内隔离测试
-# ----------------------------------------------------------------------
 async def check_sandbox_isolation(landlock_ok: bool) -> None:
     """Run independent commands and assert filesystem confinement."""
     if not landlock_ok:
@@ -171,7 +147,7 @@ async def check_sandbox_isolation(landlock_ok: bool) -> None:
         )
         try:
             # 提升到 15s：Landlock + rlimit + bash 启动在冷容器里
-            # 经常超过 5s，旧值会产生假阴性 FAIL。
+            # 经常超过 5s，阈值过低会产生假阴性 FAIL。
             out, _ = await asyncio.wait_for(proc.communicate(cmd.encode()), timeout=15)
             return proc.returncode or 0, out.decode("utf-8", errors="replace")
         finally:
@@ -238,10 +214,7 @@ async def check_sandbox_isolation(landlock_ok: bool) -> None:
         outside_target.unlink(missing_ok=True)
         shutil.rmtree(workspace, ignore_errors=True)
 
-
-# ----------------------------------------------------------------------
 # 5. 资源限制检查
-# ----------------------------------------------------------------------
 def check_resource_limits() -> None:
     import resource
     try:
@@ -260,10 +233,7 @@ def check_resource_limits() -> None:
         logger.debug("check_resource_limits 内部忽略的异常", exc_info=True)
         warn("5.2 NOFILE 限制", str(e))
 
-
-# ----------------------------------------------------------------------
 # 6. Workspace 权限检查
-# ----------------------------------------------------------------------
 def check_workspace_perms() -> None:
     # 用真实 data_root 路径而非硬编码 /app，否则非 /app 部署永远跳过检查。
     try:
@@ -283,10 +253,7 @@ def check_workspace_perms() -> None:
     report("6.2 workspace 属主 = 当前用户", owner_uid == current_uid,
            f"owner={owner_uid} current={current_uid}")
 
-
-# ----------------------------------------------------------------------
 # 7. setuid 检查
-# ----------------------------------------------------------------------
 def check_setuid() -> None:
     """扫描 /usr /bin 下的 setuid 二进制"""
     found = []
@@ -308,10 +275,7 @@ def check_setuid() -> None:
     report("7.1 无 setuid 二进制", not found,
            f"发现 setuid: {found[:5]}" if found else "无")
 
-
-# ----------------------------------------------------------------------
 # 主流程
-# ----------------------------------------------------------------------
 async def main() -> None:
     print("=" * 70)
     print(" Bash 沙箱安全自检")
@@ -366,7 +330,6 @@ async def main() -> None:
     print("=" * 70)
 
     sys.exit(0 if failed == 0 else 1)
-
 
 if __name__ == "__main__":
     asyncio.run(main())

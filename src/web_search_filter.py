@@ -13,7 +13,6 @@ from web_search_settings import (
     WEB_SEARCH_MAX_RESULTS,
 )
 
-
 @dataclass(frozen=True)
 class DomainRule:
     """一条已解析的域名黑名单规则。"""
@@ -29,14 +28,12 @@ class DomainRule:
             return True
         return self.include_subdomains and hostname.endswith(f".{self.domain}")
 
-
 def _positive_int_setting(value: Any, default: int, *, minimum: int = 1) -> int:
     """读取可编辑配置中的正整数；非法值回退到安全默认值。"""
     try:
         return max(minimum, int(value))
     except (TypeError, ValueError):
         return default
-
 
 def parse_blacklist_rules(domains: Any) -> tuple[DomainRule, ...]:
     """解析逐条黑名单规则，并忽略格式无效或重复的项目。
@@ -89,7 +86,6 @@ def parse_blacklist_rules(domains: Any) -> tuple[DomainRule, ...]:
             parsed.append(rule)
     return tuple(parsed)
 
-
 SEARCH_MAX_RESULTS = _positive_int_setting(WEB_SEARCH_MAX_RESULTS, 50)
 SEARCH_DEFAULT_RESULTS = min(
     _positive_int_setting(WEB_SEARCH_DEFAULT_RESULTS, 10),
@@ -106,7 +102,6 @@ SEARCH_CANDIDATE_MULTIPLIER = _positive_int_setting(
 BLACKLIST_RULES = parse_blacklist_rules(BLACKLIST_DOMAINS)
 BLACKLISTED_SEARCH_DOMAINS = tuple(rule.domain for rule in BLACKLIST_RULES)
 
-
 def is_blacklisted_search_url(url: str) -> bool:
     """判断 URL 主机名是否命中任一逐条配置的黑名单规则。"""
     if not WEB_SEARCH_DOMAIN_FILTER_ENABLED or not BLACKLIST_RULES:
@@ -120,7 +115,6 @@ def is_blacklisted_search_url(url: str) -> bool:
 
     hostname = hostname.lower().rstrip(".")
     return any(rule.matches(hostname) for rule in BLACKLIST_RULES)
-
 
 def filter_blacklisted_search_results(items: list[dict]) -> tuple[list[dict], int]:
     """过滤黑名单域名结果，并返回保留结果与过滤数量。"""
@@ -136,7 +130,6 @@ def filter_blacklisted_search_results(items: list[dict]) -> tuple[list[dict], in
             continue
         kept.append(item)
     return kept, filtered_count
-
 
 def candidate_result_count(requested: int) -> int:
     """计算为补足过滤后的结果而向上游请求的候选数量。"""

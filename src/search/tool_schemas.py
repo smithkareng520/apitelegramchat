@@ -1,4 +1,4 @@
-"""媒体生成工具目录与 schema 数据底座（自 search_engine.py 拆出后重构）。
+"""提供媒体生成与交付工具的 schema 数据。
 
 职责收敛
 --------
@@ -15,13 +15,11 @@ mcp.json 服务器（如 gaode_mcp）的 list_tools；模型视角名称由
 tool_registry 统一装配为 ``mcp__<server>__<tool>``。
 """
 
-
 from config import SUPPORTED_MODELS
 
 import logging
 
 logger = logging.getLogger(__name__)
-
 
 def _get_image_models_by_capability() -> tuple[list[str], list[str]]:
     """
@@ -53,13 +51,10 @@ TEXT_ONLY_MODELS, EDIT_MODELS = _get_image_models_by_capability()
 # 的两个互斥桶——EDIT_MODELS 里的模型同样能省略 image_url 纯文生图。
 DUAL_MODE_MODELS = list(EDIT_MODELS)
 
-
 def _get_video_models() -> list[str]:
     """返回所有支持原生视频生成的模型 ID（video_output=True）。"""
     return [model_id for model_id, cfg in SUPPORTED_MODELS.items() if cfg.video_output]
 
-
-# ----- 视频生成模型目录 -----
 VIDEO_MODELS = _get_video_models()
 
 # 仅支持文生图（不可携带参考图编辑）的图像模型 = 全部图像模型 - 双能力模型。
@@ -67,8 +62,6 @@ VIDEO_MODELS = _get_video_models()
 # 可选（省略=生成、提供=编辑）；仅生成模型不接受 image_url。
 GENERATE_ONLY_MODELS = [m for m in TEXT_ONLY_MODELS if m not in EDIT_MODELS]
 
-
-# =============================================================================
 # deliver_reply：/show off（静默模式）下模型通过 send 布尔参数选择是否
 # 把「本轮最后一条助手消息的 content 字段」通过 sendRichMessage 交付给用户。
 # send=true：系统发送该正文（不经过草稿，也不含 reasoning 等其他字段）；
@@ -79,9 +72,7 @@ GENERATE_ONLY_MODELS = [m for m in TEXT_ONLY_MODELS if m not in EDIT_MODELS]
 # 不调用均不发送，必须显式填 true。上一轮交付或抑制与否不影响本轮，
 # 缺省值由 get_ai_response 在每轮 agent 开始时重置。草稿开启（/show on）
 # 时本工具不进入工具面，模型看不到也就不会调用，除了草稿外不会产生
-# 单独 content；历史中的调用痕迹也会从出站上下文拔除（见
 # tool_visibility.SILENT_ONLY_TOOLS）。
-# =============================================================================
 def build_deliver_reply_tool(default_send: bool = False) -> dict:
     """按本轮 send 缺省值生成 deliver_reply 工具定义。
 
@@ -140,7 +131,6 @@ def build_deliver_reply_tool(default_send: bool = False) -> dict:
     }
     return tool
 
-
 def build_media_tool_defs() -> list[dict]:
     """host 内建媒体生成工具定义（按模型目录可用性裁剪）。"""
     defs: list[dict] = []
@@ -150,15 +140,13 @@ def build_media_tool_defs() -> list[dict]:
         defs.append(_generate_video_tool())
     return defs
 
-
 def _generate_image_tool() -> dict:
     return {
         "type": "function",
         "function": {
             # 统一图像工具：操作语义由 image_url 是否提供决定——省略 = 文生图，
             # 提供 = 以该图为底编辑（图生图）。
-            # 显示口径（2026-09）：生成/编辑是"每次调用"的操作（由
-            # image_url 是否携带决定），不是模型属性；模型只按"允许
+            # 生成或编辑由每次调用是否携带 image_url 决定。
             # 不允许携带 image_url"分两档——双能力模型（image_url 可选，
             # 同一端点不带 URL 即生成、带 URL 即编辑，如
             # agnes-image-2.5-flash）与仅生成模型（不接受 image_url）。
@@ -244,7 +232,6 @@ def _generate_image_tool() -> dict:
             ]
         }
     }
-
 
 def _generate_video_tool() -> dict:
     return {

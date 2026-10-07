@@ -31,33 +31,29 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
 def _format_bash_envelope(cwd: str, output: str) -> str:
     """把 Bash 结果压缩为模型需要的最小信息：cwd + 原始输出。"""
     body = str(output or "").rstrip("\n")
     header = f"Cwd: {str(cwd or '').strip()}"
     return header if not body else f"{header}\n{body}"
 
-# ---------- Bash 输出上限（环境变量可调） ----------
+# Bash 输出上限（环境变量可调）
 # 单条 Bash 命令返回给模型的内容上限（字符数）。超限时「保留开头 + 结尾、
 # 省略中间」：编译错误、traceback、日志摘要几乎总是出现在输出末尾，纯
 # 头部截断会把最有价值的部分默默丢掉。设为 0 表示不限制（不建议：狂刷
 # 输出的命令会撑爆内存与模型上下文）。
 SANDBOX_OUTPUT_MAX_CHARS = int(os.getenv("SANDBOX_OUTPUT_MAX_CHARS", "80000"))
-# =====================================================================
-# Bash 超时双层模型（v2.4 防卡死）
-# =====================================================================
-# 旧实现只有一层总超时（SANDBOX_TIMEOUT_SEC，默认 300s）：网络不可达时
+# Bash 超时双层模型
+# 当前实现只有一层总超时（SANDBOX_TIMEOUT_SEC，默认 300s）：网络不可达时
 # connect() 按内核默认 TCP 重试静默挂起（单次约 2 分钟），命令全程无输出，
 # 模型必须等满 300s 才拿到超时错误，期间整个 agent 回合被卡住（日志实例：
 # SMTP 发信技能在沙箱里挂满整个工具超时窗口）。
-#
 # 现在的读循环对每次 stdout.read() 施加 min(空闲阈值, 剩余总预算) 的独立
 # 超时：
-#   - 空闲超时（idle）：持续无输出超过 SANDBOX_IDLE_TIMEOUT_SEC（默认 60s）
-#     → 立即 kill，返回可操作错误（提示给网络调用加显式超时 / 用 bash 的
-#     timeout 参数声明长静默命令）；
-#   - 总超时（total）：无论是否有输出，超过总预算 → kill（原行为）。
+# 空闲超时（idle）：持续无输出超过 SANDBOX_IDLE_TIMEOUT_SEC（默认 60s）
+# → 立即 kill，返回可操作错误（提示给网络调用加显式超时 / 用 bash 的
+# timeout 参数声明长静默命令）；
+# 总超时（total）：无论是否有输出，超过总预算 → kill（原行为）。
 # 模型显式传 timeout 参数时禁用 idle 保护（已知的长静默构建/下载场景），
 # 两者由 _normalize_requested_timeout 统一解析。
 class _BashIdleTimeout(Exception):
@@ -67,14 +63,12 @@ class _BashIdleTimeout(Exception):
         super().__init__(f"no output for {idle_sec:.0f}s")
         self.idle_sec = idle_sec
 
-
 class _BashTotalTimeout(Exception):
     """命令运行超过总超时预算（无论是否有输出）。"""
 
     def __init__(self, total_sec: float) -> None:
         super().__init__(f"exceeded total {total_sec:.0f}s")
         self.total_sec = total_sec
-
 
 def _format_idle_timeout_message(idle_sec: float) -> str:
     """空闲超时的模型可读错误：说清原因 + 给出可操作的自纠路径。"""
@@ -90,7 +84,6 @@ def _format_idle_timeout_message(idle_sec: float) -> str:
         "bash `timeout` parameter set (e.g. timeout=300) to disable this "
         "idle guard for that call."
     )
-
 
 def _normalize_requested_timeout(timeout: int | None) -> tuple[int, int | None]:
     """把模型请求的 bash timeout 参数规范化为 (total_timeout, idle_timeout)。
@@ -111,14 +104,10 @@ def _normalize_requested_timeout(timeout: int | None) -> tuple[int, int | None]:
     value = max(5, min(value, SANDBOX_TIMEOUT_HARD_MAX))
     return value, None
 
-
 class _BashOutputBuffer:
     """Bounded accumulator for subprocess output: keeps head + rolling tail.
 
-    旧实现把全部输出无限累积进内存，再一刀切只留开头 20000 字符，存在
-    两个问题：
-      1. 狂刷输出的命令（`yes`、误写的热循环、`find /`）会让应用 OOM；
-      2. 头部截断丢掉了几乎必然位于结尾的错误信息。
+    固定字符预算同时保留开头和滚动尾部，避免无限累积并保留末尾错误信息。
     本缓冲区用固定字符预算同时解决两者：预算内原样保留；超预算后保留
     开头 head_ratio 比例 + 滚动尾部，中间丢弃并精确计数，最终在结果里
     插入一条可读说明，让模型知道自己看到的是被裁剪过的输出。
@@ -204,7 +193,6 @@ class _BashOutputBuffer:
         return head + note + tail
 _RUNTIME_STATE_FILENAME = "runtime.json"
 
-
 def _runtime_state_path(chat_id: int, namespace: str | None = None) -> Path:
     """工具链清单缓存路径：家目录内的隐藏缓存层 ``.runtime/`` 下。
 
@@ -212,7 +200,6 @@ def _runtime_state_path(chat_id: int, namespace: str | None = None) -> Path:
     ``.runtime/``：对模型隐藏，且仍在 Landlock 放行边界（家目录子树）内。
     """
     return runtime_cache_root(chat_id, namespace) / _RUNTIME_STATE_FILENAME
-
 
 def _tool_version(exe: str) -> str | None:
     path = shutil.which(exe)
@@ -236,7 +223,6 @@ def _tool_version(exe: str) -> str | None:
         return None
     line = (proc.stdout or "").splitlines()
     return line[0].strip()[:300] if line else None
-
 
 def _prepare_runtime_once(
     chat_id: int,
@@ -277,10 +263,7 @@ def _prepare_runtime_once(
         logger.warning("Unable to persist runtime state chat_id=%s: %s", chat_id, exc)
     return state
 
-
-# =====================================================================
 # BashSession —— 每会话独立沙箱
-# =====================================================================
 class BashSession:
     def __init__(self, chat_id: int, namespace: str | None = None) -> None:
         self.chat_id = chat_id
@@ -290,7 +273,7 @@ class BashSession:
         # manager 的全局锁内），两把锁互不互斥；每实例锁串行化 spawn，
         # 防止并发双开 bash 导致先 spawn 的进程泄漏、新进程无看门狗。
         self._start_lock = asyncio.Lock()
-        # v2.3.1 布局：workspace = workdir = agent 家目录，即 workspace 根
+        # 布局：workspace = workdir = agent 家目录，即 workspace 根
         # 本身（$HOME / 起始 cwd / Landlock 唯一放行边界三者重合）。
         self.workspace = workspace_root(chat_id, self.namespace)
         self.workdir = workspace_workdir(chat_id, self.namespace)
@@ -327,13 +310,13 @@ class BashSession:
         # 家目录（workdir），模型几乎立刻会跑 `cp out.txt upload/out.txt`
         # 或 `cat download/x.pdf`。如果不在这里预创建，bash 进程已经
         # 在跑、第一次 execute() 时才补创建，会出两个问题：
-        #   1) 如果 execute() 里 _ensure_runtime_workspace 抛异常被
-        #      try/except 吞掉，目录就永远不存在，cp 第一次必然失败，
-        #      模型不得不多跑一轮 `mkdir -p upload && cp ...` 才能补救；
-        #   2) _ensure_runtime_workspace(self.chat_id) 没传 namespace，
-        #      依赖 ContextVar；如果 bash 工具从 background task 里
-        #      调用、ContextVar 不可见，upload/ 会被建到错误的 namespace
-        #      下，bash 进程实际看到的 cwd 下仍然没有 upload/。
+        # 1) 如果 execute() 里 _ensure_runtime_workspace 抛异常被
+        # try/except 吞掉，目录就永远不存在，cp 第一次必然失败，
+        # 模型不得不多跑一轮 `mkdir -p upload && cp ...` 才能补救；
+        # 2) _ensure_runtime_workspace(self.chat_id) 没传 namespace，
+        # 依赖 ContextVar；如果 bash 工具从 background task 里
+        # 调用、ContextVar 不可见，upload/ 会被建到错误的 namespace
+        # 下，bash 进程实际看到的 cwd 下仍然没有 upload/。
         # 用 self.namespace 直接走 workspace_upload_root /
         # workspace_download_root，确保和 bash 进程的 cwd 完全一致。
         workspace_upload_root(self.chat_id, self.namespace)
@@ -355,11 +338,11 @@ class BashSession:
                     _prepare_runtime_once, self.chat_id, cache_root, self.namespace
                 )
 
-        # ★ Landlock：把文件系统访问限制在 agent 家目录（workdir =
-        #   workspace 根）内，upload/、download/、skills/ 与隐藏缓存层
-        #   .runtime/ 都在这里；家目录之外的一切路径（/home 下其他家
-        #   目录、data_root、系统目录）默认拒绝。通过 functools.partial
-        #   把家目录路径传给 preexec。
+        # ★ Landlock：把文件系统访问限制在 agent 家目录（workdir
+        # workspace 根）内，upload/、download/、skills/ 与隐藏缓存层
+        # .runtime/ 都在这里；家目录之外的一切路径（/home 下其他家
+        # 目录、data_root、系统目录）默认拒绝。通过 functools.partial
+        # 把家目录路径传给 preexec。
         import functools
         preexec = functools.partial(
             _preexec_sandbox,
@@ -395,10 +378,9 @@ class BashSession:
             watchdog(self.proc), name=f"watchdog-{self.chat_id}"
         )
 
-
-    # ===================== 命令安全检查（最小黑名单） =====================
+    # 命令安全检查（最小黑名单）
     # 设计原则: 不限制语法（heredoc/管道/重定向/&&/|| 全部允许），
-    #          只拦截极端灾难模式，剩余靠沙箱兜底
+    # 只拦截极端灾难模式，剩余靠沙箱兜底
     # 模式表已抽到 bash_background._DANGEROUS_PATTERNS（后台任务启动与
     # 前台会话共用同一份）；本方法只保留 chat 维度的日志语境。
     def _is_safe(self, command: str) -> bool:
@@ -518,7 +500,7 @@ class BashSession:
             assert proc.stdout is not None
             while True:
                 # 双层读超时：每次 read 预算 = min(空闲阈值, 剩余总预算)。
-                # 旧实现每次 read 都用完整总超时且无总上限——静默挂起等满
+                # 当前实现每次 read 都用完整总超时且无总上限——静默挂起等满
                 # 300s、持续输出则永不超时；现在两种情况都有界。
                 remaining = total_deadline - loop.time()
                 if remaining <= 0:
@@ -601,7 +583,7 @@ class BashSession:
         # 一致，模型看提示符即可自行推断。
         return _format_bash_envelope(actual_cwd, output)
 
-    # ===================== 执行命令 =====================
+    # 执行命令
     async def execute(
         self,
         command: str,
@@ -627,14 +609,14 @@ class BashSession:
         一次性写入包含 Input/Output 块级结构的完整卡片。
         """
         # ★ init 在 workspace lock 外面执行：R2 网络同步可能耗时数秒，
-        #   不应阻塞其他工具调用获取 workspace lock。init 只需要 init_lock
-        #   （在 _ensure_workspace_initialized 内部获取），与 workspace lock 独立。
-        #   init 失败不阻断 bash：本地 workspace 可能不全但 bash 仍可运行。
+        # 不应阻塞其他工具调用获取 workspace lock。init 只需要 init_lock
+        # （在 _ensure_workspace_initialized 内部获取），与 workspace lock 独立。
+        # init 失败不阻断 bash：本地 workspace 可能不全但 bash 仍可运行。
         # ★ 显式传 self.namespace：避免依赖 ContextVar 在 background task
-        #   里不可见时把 upload/download 建到错误的 namespace 下。
-        #   start() 已经预创建过这两棵子树，这里只是兜底——任何路径下
-        #   失败都不会让 cp 报 "No such file or directory"，因为 start()
-        #   时目录已经存在。
+        # 里不可见时把 upload/download 建到错误的 namespace 下。
+        # start() 已经预创建过这两棵子树，这里只是兜底——任何路径下
+        # 失败都不会让 cp 报 "No such file or directory"，因为 start()
+        # 时目录已经存在。
         try:
             await _ensure_runtime_workspace(self.chat_id, self.namespace)
         except asyncio.CancelledError:
@@ -651,14 +633,7 @@ class BashSession:
                 # 给出更可操作的错误信息，让模型知道为什么被拒、该怎么做。
                 return f"Error: Command rejected for security reasons: {command}"
 
-            # Any command containing a heredoc, OR any command bash would
-            # consider syntactically unterminated (unclosed quote/backtick/
-            # paren — e.g. a truncated `python3 -c "..."` multi-line string),
-            # is executed in a one-shot shell instead of the persistent one.
-            # A persistent stdin-backed shell blocks forever on unterminated
-            # input and silently consumes our synthetic end marker as part of
-            # it, which is what previously caused ~300s hangs before the
-            # sandbox timeout kicked in and force-restarted the session.
+            # Heredoc 或未闭合语法必须在一次性 shell 中执行；持久 shell 会等待输入，无法可靠收到结束标记。
             has_heredoc = bool(re.search(r"<<-?\s*(?:[\"']?[A-Za-z_][A-Za-z0-9_]*[\"']?)", command))
             if has_heredoc or await self._is_unterminated(command):
                 return await self._execute_heredoc_isolated(
@@ -675,31 +650,31 @@ class BashSession:
             # 默认 shell 启动目录为 workspace/workspace root。模型决定使用 skill 后，
             # 可自行 `cd skills/<skill_id>`；persistent bash 会保留该 cwd。
             # ★ 关键：在输出 marker 前先输出一个换行，确保 marker 单独占一行。
-            #   如果命令输出不以换行结尾（如 cat 无换行文件、printf 无 \n），
-            #   echo 的输出会粘在前一行，readline() 永远读不到以 marker 开头的行，
-            #   导致整个会话 hang 死。
+            # 如果命令输出不以换行结尾（如 cat 无换行文件、printf 无 \n），
+            # echo 的输出会粘在前一行，readline() 永远读不到以 marker 开头的行，
+            # 导致整个会话 hang 死。
             # 同时记录命令结束后的真实 PWD，用于结果显示；不会改变 shell 状态。
             # ★ 包裹命令的三个关键点：
-            #   1) $? 必须放在引号外（若把 $? 包进单引号，bash 不展开，
-            #      退出码永远是 unknown）；
-            #   2) 退出码必须在命令结束的下一刻立刻捕获（__rc=$?），
-            #      否则中间的 echo/printf 会把 $? 重置为 0，失败命令
-            #      在模型眼里和成功无异；
-            #   3) 模型生成的多行命令（如 `python3 -c "..."` 跨行书写）
-            #      几乎总带尾随换行，直接用 "; __rc=$?..." 拼接会让分号
-            #      落在新一行的行首——bash 对行首的孤立分号直接报
-            #      syntax error near unexpected token `;'——marker 永远不会
-            #      被输出，退出码停留在 unknown。
-            #      因此先 rstrip() 去掉尾随空白/换行，再用 "\n" 换行拼接
-            #      退出码捕获。换行在 bash 里同样是命令分隔符，且能正确
-            #      终结行尾注释（`cmd # note` 后直接拼 `;` 会把整段包装
-            #      代码吞进注释，导致 marker 丢失、会话卡到超时）。
-            #   另：每次执行使用带唯一后缀的退出码变量名（__rc_<tag>）。
-            #   持久 shell 里同名变量会在多次 execute() 之间残留，若某次
-            #   赋值被跳过（如命令以反斜杠续行符结尾时，`__rc=$?` 会被
-            #   join 进上一条命令的参数里），echo 会读到上一次的陈旧退出码，
-            #   把失败伪装成成功。唯一变量名保证最坏情况是 "unknown"
-            #   而不是错误的旧值。
+            # 1) $? 必须放在引号外（若把 $? 包进单引号，bash 不展开，
+            # 退出码永远是 unknown）；
+            # 2) 退出码必须在命令结束的下一刻立刻捕获（__rc=$?），
+            # 否则中间的 echo/printf 会把 $? 重置为 0，失败命令
+            # 在模型眼里和成功无异；
+            # 3) 模型生成的多行命令（如 `python3 -c "..."` 跨行书写）
+            # 几乎总带尾随换行，直接用 "; __rc=$?..." 拼接会让分号
+            # 落在新一行的行首——bash 对行首的孤立分号直接报
+            # syntax error near unexpected token `;'——marker 永远不会
+            # 被输出，退出码停留在 unknown。
+            # 因此先 rstrip() 去掉尾随空白/换行，再用 "\n" 换行拼接
+            # 退出码捕获。换行在 bash 里同样是命令分隔符，且能正确
+            # 终结行尾注释（`cmd # note` 后直接拼 `;` 会把整段包装
+            # 代码吞进注释，导致 marker 丢失、会话卡到超时）。
+            # 另：每次执行使用带唯一后缀的退出码变量名（__rc_<tag>）。
+            # 持久 shell 里同名变量会在多次 execute() 之间残留，若某次
+            # 赋值被跳过（如命令以反斜杠续行符结尾时，`__rc=$?` 会被
+            # join 进上一条命令的参数里），echo 会读到上一次的陈旧退出码，
+            # 把失败伪装成成功。唯一变量名保证最坏情况是 "unknown"
+            # 而不是错误的旧值。
             rc_var = f"__rc_{tag}"
             cmd_body = command.rstrip()
             full_cmd = (
@@ -729,11 +704,10 @@ class BashSession:
                     pending = ""
                     keep_tail = len(marker) + 64
                     while True:
-                        # 双层读超时（v2.4 防卡死核心）：每次 read 的预算 =
+                        # 双层读超时：每次 read 的预算
                         # min(空闲阈值, 剩余总预算)。命令静默（如网络不可达的
                         # connect 挂起）→ idle 先触发；持续输出但超总预算 →
-                        # total 触发。旧实现只有外层一层总超时，静默命令必然
-                        # 等满 300s。
+                        # total 触发；静默命令由 idle 超时提前结束。
                         remaining = total_deadline - loop.time()
                         if remaining <= 0:
                             # 超时抛出前冲刷 pending：跨 chunk 的尾部输出
@@ -750,9 +724,7 @@ class BashSession:
                                 self.proc.stdout.read(4096), timeout=read_budget
                             )
                         except asyncio.TimeoutError as exc:
-                            # 同上：先冲刷 pending 再抛超时。旧实现这里会
-                            # 丢掉最后不足 keep_tail 的输出（历史上 total
-                            # 超时的 partial output 也存在同样的缺口）。
+                            # 先冲刷 pending，避免超时丢失尚未写入缓冲的尾部输出。
                             if pending:
                                 output_buffer.add(pending)
                                 pending = ""
@@ -783,7 +755,7 @@ class BashSession:
                             pending = pending[-keep_tail:]
 
                 # 内层 read_until_marker 已按 deadline/idle 精确控时并抛出
-                # _BashIdleTimeout / _BashTotalTimeout；外层 wait_for 仅作
+                # BashIdleTimeout / _BashTotalTimeout；外层 wait_for 仅作
                 # 调度抖动兜底（+15s 缓冲，保证内层先触发）。
                 await asyncio.wait_for(
                     read_until_marker(), timeout=total_timeout + 15.0
@@ -876,7 +848,7 @@ class BashSession:
                 logger.exception(f"Bash execute error chat_id={self.chat_id}")
                 return f"Error: {str(e)}"
 
-    # ===================== 超时公共清理 =====================
+    # 超时公共清理
     async def _kill_and_close_session(self) -> None:
         """超时后的公共清理：SIGKILL 整个进程组并关闭/重启会话。
 
@@ -893,7 +865,7 @@ class BashSession:
         # 重启会话
         await self.close()
 
-    # ===================== 关闭会话 =====================
+    # 关闭会话
     async def close(self) -> None:
         # 取消看门狗
         if self._watchdog_task and not self._watchdog_task.done():
@@ -931,9 +903,7 @@ class BashSession:
             return
         self.proc = None
 
-# =====================================================================
 # BashSessionManager —— 多 chat 共享管理
-# =====================================================================
 class BashSessionManager:
     def __init__(self) -> None:
         self._sessions: dict[tuple[int, str], BashSession] = {}
@@ -980,12 +950,10 @@ class BashSessionManager:
 
 _bash_manager = BashSessionManager()
 
-# =====================================================================
 # execute_bash —— 工具调用入口
-# v2.3：移除 ``progress_callback`` 参数。bash 执行期间不再推送任何进度
+# 移除 ``progress_callback`` 参数。bash 执行期间不再推送任何进度
 # 预览（卡片摘要保持命令片段，最终结果由 update_tool_item 一次性写入
 # 包含 Input/Output 块级结构的完整卡片）。
-# =====================================================================
 async def execute_bash(
     chat_id: int,
     command: str = "",

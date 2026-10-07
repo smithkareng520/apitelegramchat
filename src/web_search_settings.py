@@ -1,19 +1,14 @@
-"""网页搜索的可编辑配置。
-
-部署者可直接修改本文件，无需改动搜索逻辑。修改后请重启应用，使配置重新加载。
-"""
+"""网页搜索的可编辑配置。"""
 
 # 是否在 web_search 的搜索结果中启用域名黑名单过滤。
 WEB_SEARCH_DOMAIN_FILTER_ENABLED = True
 
 # 黑名单规则。每一项自行决定匹配范围，不再使用全局匹配模式：
-#
 # 1. "example.com"：只匹配精确主机名 example.com。
 # 2. "[*.]example.com"：匹配 example.com 及其全部子域名，例如
-#    www.example.com、news.example.com。这是屏蔽整个站点时推荐的写法。
+# www.example.com、news.example.com。这是屏蔽整个站点时推荐的写法。
 # 3. "*.example.com"：只匹配 example.com 的子域名，不匹配 example.com 本身。
-#    适合仅需屏蔽某类二级/多级子域名的情况。
-#
+# 适合仅需屏蔽某类二级/多级子域名的情况。
 # 仅填写域名规则，不要填写协议、端口、路径、查询参数或其他通配符。
 BLACKLIST_DOMAINS = (
     # 问答与社交平台：屏蔽根域名与所有子域名。

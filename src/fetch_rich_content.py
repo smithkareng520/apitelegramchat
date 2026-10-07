@@ -1,31 +1,28 @@
 # fetch_rich_content.py — fetch_url 的面向模型 Telegram Rich HTML 提取引擎
-#
 # 目标（两类受众严格分离）：
-#   - 【模型上下文】execute_fetch_url 的返回值：忠实于原网页文档顺序的
-#     Telegram HTML——标题/段落/列表/表格/链接/图片/视频/播放器都出现在它们
-#     在原页面上的原始位置；轮播图（swiper/carousel/gallery 等容器）识别为
-#     <tg-slideshow>。绝不把媒体集中堆到末尾"媒体区"。
-#   - 【Telegram 工具 UI】由 tool_executors.format_tool_result 单独生成，
-#     保持与历史版本相同的简单展示（标题 + 来源域名链接），本模块不管 UI。
-#
+# 【模型上下文】execute_fetch_url 的返回值：忠实于原网页文档顺序的
+# Telegram HTML——标题/段落/列表/表格/链接/图片/视频/播放器都出现在它们
+# 在原页面上的原始位置；轮播图（swiper/carousel/gallery 等容器）识别为
+# <tg-slideshow>。绝不把媒体集中堆到末尾"媒体区"。
+# 【Telegram 工具 UI】由 tool_executors.format_tool_result 单独生成，
+# 展示仅保留标题 + 来源域名链接，本模块不负责 UI。
 # 实现链路：
-#   1. trafilatura XML（保留链接/图片/格式/表格及其相对顺序）→ Telegram HTML 块；
-#   2. 原始 HTML DOM 单次文档序遍历，收集带"文档位置"（order_idx/path）的媒体：
-#      内嵌 <video>/<audio>、<iframe>/<embed> 播放器（规范化为观看链接）、
-#      懒加载图片（data-src/srcset）；
-#   3. 把每个正文块锚定到 DOM 元素（文本前向贪心匹配 / 图片 URL 匹配），
-#      将 trafilatura 丢弃的媒体按原始位置插回正文流；
-#   4. 轮播图检测：同容器内 >=2 张图片 → <tg-slideshow>（保持原位置）；
-#   5. 固定字符预算内"整块截断"（绝不截断在标签中间）。
-#
+# 1. trafilatura XML（保留链接/图片/格式/表格及其相对顺序）→ Telegram HTML 块；
+# 2. 原始 HTML DOM 单次文档序遍历，收集带"文档位置"（order_idx/path）的媒体：
+# 内嵌 <video>/<audio>、<iframe>/<embed> 播放器（规范化为观看链接）、
+# 懒加载图片（data-src/srcset）；
+# 3. 把每个正文块锚定到 DOM 元素（文本前向贪心匹配 / 图片 URL 匹配），
+# 将 trafilatura 丢弃的媒体按原始位置插回正文流；
+# 4. 轮播图检测：同容器内 >=2 张图片 → <tg-slideshow>（保持原位置）；
+# 5. 固定字符预算内"整块截断"（绝不截断在标签中间）。
 # 设计约束（对齐系统提示词与 rich_message_builder 的解析规则）：
-#   - 媒体（<img>/<video>/<audio>/<figure>）必须作为独立块级元素，严禁出现在
-#     <p>/<li>/<td>/行内容器中 → 转换时统一"提升为兄弟块"；
-#   - <li> 与表格单元格内仅允许行内格式元素 → 嵌套列表/媒体一律提升到列表之后；
-#   - <tg-slideshow> 内只放裸 <img src="..."/>，不放 <figure>；
-#   - 失败结果（"失败：xxx"）仍由 search_engine 以纯文本生成，本模块只负责成功路径；
-#   - 输出总量受 20,000 token 预算约束，并按完整 HTML 块裁剪，避免截断
-#     到标签中间。
+# 媒体（<img>/<video>/<audio>/<figure>）必须作为独立块级元素，严禁出现在
+# <p>/<li>/<td>/行内容器中 → 转换时统一"提升为兄弟块"；
+# <li> 与表格单元格内仅允许行内格式元素 → 嵌套列表/媒体一律提升到列表之后；
+# <tg-slideshow> 内只放裸 <img src="..."/>，不放 <figure>；
+# 失败结果（"失败：xxx"）仍由 search_engine 以纯文本生成，本模块只负责成功路径；
+# 输出总量受 20,000 token 预算约束，并按完整 HTML 块裁剪，避免截断
+# 到标签中间。
 from __future__ import annotations
 
 import html as _html
@@ -130,20 +127,17 @@ _EMBED_HOST_LABELS = [
     (re.compile(r"(^|\.)weibo\.com$", re.I), "微博"),
 ]
 
-
 def esc(text: Optional[str]) -> str:
     """转义文本节点的 < > &（lxml 已把实体解码为纯文本，标准转义即可）。"""
     if text is None:
         return ""
     return _html.escape(str(text), quote=False)
 
-
 def esc_attr(value: Optional[str]) -> str:
     """转义将写入 href/src 等属性的值。"""
     if value is None:
         return ""
     return _html.escape(str(value), quote=True)
-
 
 def _sanitize_url(raw: Optional[str], base_url: str = "") -> Optional[str]:
     """规范化 URL：仅 http/https、去掉 fragment、基于 base_url 补全相对路径。"""
@@ -173,7 +167,6 @@ def _sanitize_url(raw: Optional[str], base_url: str = "") -> Optional[str]:
         return None
     return urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, "")) or candidate
 
-
 def _pick_srcset_best(srcset: Optional[str]) -> Optional[str]:
     """从 srcset 中选择描述尺寸最大的候选（启发式：数值最大者通常最清晰）。"""
     if not srcset:
@@ -198,7 +191,6 @@ def _pick_srcset_best(srcset: Optional[str]) -> Optional[str]:
             best_url, best_w = url, width
     return best_url
 
-
 def _is_probably_decorative(url: str) -> bool:
     """过滤图标 / 间距图 / 跟踪像素等装饰性图片。"""
     try:
@@ -212,11 +204,7 @@ def _is_probably_decorative(url: str) -> bool:
     # 1x1 / 0x0 尺寸特征（含路径中的尺寸段）。
     return bool(re.search(r"(?:^|[/_-])(?:1x1|0x0|2x2)(?:[._/-]|$)", path))
 
-
-# ---------------------------------------------------------------------------
 # 1) DOM 媒体收集（带文档顺序位置，供"原位插入"使用）
-# ---------------------------------------------------------------------------
-
 
 @dataclass
 class DomMedia:
@@ -239,7 +227,6 @@ class DomMedia:
     skip: bool = False
     boilerplate: bool = False  # 位于 nav/footer/aside 等样板区域内
 
-
 def _parse_dom(html_text: str) -> Optional[Any]:
     """解析原始 HTML 为 lxml 树（容错：utf-8 recover → 裸 fromstring → None）。"""
     if _lxml_html is None or not html_text:
@@ -254,7 +241,6 @@ def _parse_dom(html_text: str) -> Optional[Any]:
             logger.debug(f"[fetch_rich] DOM 解析失败: {e}")
             return None
 
-
 def _meta_content(tree: Any, names: set[str]) -> str:
     for meta in tree.iter("meta"):
         key = (meta.get("property") or meta.get("name") or meta.get("itemprop") or "").strip().lower()
@@ -263,7 +249,6 @@ def _meta_content(tree: Any, names: set[str]) -> str:
             if content:
                 return content
     return ""
-
 
 def _canonicalize_embed(raw_url: str, base_url: str) -> Optional[tuple[str, str]]:
     """把 iframe/embed 的 src 规范化为观看页链接。返回 (url, provider_label)。"""
@@ -298,13 +283,11 @@ def _canonicalize_embed(raw_url: str, base_url: str) -> Optional[tuple[str, str]
             return url, label
     return url, "嵌入内容"
 
-
 # 轮播/画廊容器特征（class/id/role/data-component 文本）。
 _CAROUSEL_HINT_RE = re.compile(
     r"(swiper|carousel|slider|slideshow|gallery|slick|splide|glide|flickity|owl|slides)",
     re.IGNORECASE,
 )
-
 
 def _zero_measure(value: Optional[str]) -> bool:
     """width/height 属性是否表示零尺寸（兼容 0 / 0px / 0% 等写法）。"""
@@ -312,7 +295,6 @@ def _zero_measure(value: Optional[str]) -> bool:
         return False
     v = value.strip().lower()
     return v in {"0", "0px", "0%", "0.0", "0em", "0rem", "0pt", "0vh", "0vw"}
-
 
 def _is_hidden_element(el: Any) -> bool:
     """过滤隐藏 / 零尺寸的跟踪型媒体元素。
@@ -335,7 +317,6 @@ def _is_hidden_element(el: Any) -> bool:
     if _zero_measure(el.get("width")) or _zero_measure(el.get("height")):
         return True
     return bool(re.search(r"(?:width|height):0(?:px|%|em|rem|pt|vh|vw)?(?:;|$)", style))
-
 
 def _find_carousel_ancestor(el: Any) -> Optional[str]:
     """返回轮播容器的 XPath。
@@ -363,14 +344,12 @@ def _find_carousel_ancestor(el: Any) -> Optional[str]:
         return outermost
     return outermost
 
-
 _IMG_LAZY_ATTRS = (
     "src", "data-src", "data-original", "data-lazy-src", "data-actualsrc",
     "data-echo", "data-url", "data-image", "data-original-src",
 )
 
 _MEDIA_KIND_CAPS = {"video": MAX_VIDEOS, "audio": MAX_AUDIOS, "embed": MAX_EMBEDS}
-
 
 def _collect_dom_media(tree: Any, base_url: str) -> list[DomMedia]:
     """单次文档序遍历收集全部媒体，携带 order_idx/path/carousel 位置信息。
@@ -460,10 +439,8 @@ def _collect_dom_media(tree: Any, base_url: str) -> list[DomMedia]:
         ))
     return media
 
-
 # 样板区域标签：这些容器内的媒体（导航图、页脚 widget 等）不属于正文内容。
 _BOILERPLATE_TAGS = frozenset({"nav", "footer", "aside"})
-
 
 def _in_boilerplate(el: Any) -> bool:
     """媒体元素是否位于 nav/footer/aside 样板容器内。
@@ -480,18 +457,13 @@ def _in_boilerplate(el: Any) -> bool:
         return False
     return False
 
-
-
-
-# ---------------------------------------------------------------------------
 # 2) trafilatura XML → Telegram Rich HTML
-# ---------------------------------------------------------------------------
 
 # trafilatura <hi rend="#b #i"> → Telegram 标签映射。
 # rend token 全集来自 trafilatura 1.12.2 htmlprocessing.REND_TAG_MAPPING 实测：
-#   #b(b/strong) #i(i/em) #u(u) #t(kbd/samp/tt/var 等宽) #sub(sub) #sup(sup)；
+# #b(b/strong) #i(i/em) #u(u) #t(kbd/samp/tt/var 等宽) #sub(sub) #sup(sup)；
 # 删除线走独立的 <del> 元素（见 _convert_inline_element），rend="overstrike"
-# 在多数版本的输出中已被清理，此处仅作防御性兜底。
+# 输出通常已清理，此处仅作防御性兜底。
 _REND_MAP = {
     "#b": "b", "b": "b", "bold": "b",
     "#i": "i", "i": "i", "italic": "i", "em": "i",
@@ -504,7 +476,6 @@ _REND_MAP = {
     "#mark": "mark", "mark": "mark",
 }
 
-
 def _rend_to_tags(rend: Optional[str]) -> list[str]:
     if not rend:
         return []
@@ -515,19 +486,16 @@ def _rend_to_tags(rend: Optional[str]) -> list[str]:
             tags.append(tag)
     return tags
 
-
 class _ConvertContext:
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url
         self.used_media_urls: set[str] = set()
-
 
 def _local_name(el: Any) -> str:
     name = getattr(el, "tag", "")
     if not isinstance(name, str):
         return ""
     return name.rsplit("}", 1)[-1].lower()
-
 
 def _convert_inline_element(el: Any, ctx: "_ConvertContext") -> tuple[str, list[str]]:
     """转换单个行内元素（含其标签）。返回 (行内 HTML, 需提升的媒体块列表)。"""
@@ -567,7 +535,6 @@ def _convert_inline_element(el: Any, ctx: "_ConvertContext") -> tuple[str, list[
     # 未知行内元素：透明处理。
     return inner, media_blocks
 
-
 def _convert_inline_content(el: Any, ctx: "_ConvertContext") -> tuple[str, list[str]]:
     """转换元素的混合内容（el.text + 子元素 + 各 tail）。"""
     parts: list[str] = []
@@ -582,7 +549,6 @@ def _convert_inline_content(el: Any, ctx: "_ConvertContext") -> tuple[str, list[
         if child.tail:
             parts.append(esc(child.tail))
     return "".join(parts), media_blocks
-
 
 def _render_media_element(el: Any, ctx: "_ConvertContext") -> Optional[str]:
     """<graphic>/<media> → <img/> 或 <video/>/<audio/> 独立块。"""
@@ -615,17 +581,14 @@ def _render_media_element(el: Any, ctx: "_ConvertContext") -> Optional[str]:
         return f'<audio src="{esc_attr(url)}"/>'
     return None
 
-
 # 仅由标点/空白组成的"碎片段落"（维基百科信息框等场景会产生 <p>：</p>）。
 _PUNCT_ONLY_RE = re.compile(r"^[\s\u3000、：:，。；;·•—–\-\|/\\()（）\[\]【】<>«»“”‘’'\"`~!！?？…*#+= ]+$")
-
 
 def _is_punct_only(text: str) -> bool:
     """判断可见文本是否只有标点/空白（用于过滤碎片段落）。"""
     if not text:
         return True
     return bool(_PUNCT_ONLY_RE.match(text))
-
 
 def _render_table(el: Any, ctx: "_ConvertContext") -> str:
     rows_html: list[str] = []
@@ -658,7 +621,6 @@ def _render_table(el: Any, ctx: "_ConvertContext") -> str:
         # 空表格（如维基百科信息框的布局表格）不输出。
         return ""
     return f'<table bordered striped>{"".join(rows_html)}</table>'
-
 
 def _render_list(el: Any, ctx: "_ConvertContext") -> tuple[str, list[str]]:
     """渲染 <list>。<li> 仅承载行内内容；嵌套列表与媒体提升为列表之后的兄弟块。"""
@@ -695,7 +657,6 @@ def _render_list(el: Any, ctx: "_ConvertContext") -> tuple[str, list[str]]:
         return "", after_blocks
     return f"<{outer}>{''.join(items)}</{outer}>", after_blocks
 
-
 # 这些 trafilatura 元素在容器层级出现时应视为"行内片段"，与前后兄弟合并成段，
 # 而不是各自渲染成独立块（维基百科 favor_precision 输出会把 <ref> 直接挂在
 # <main> 下，尾巴文本散落为 ：、等碎片）。
@@ -703,7 +664,6 @@ _CONTAINER_BLOCK_CHILDREN = frozenset({
     "p", "head", "header", "list", "table", "quote", "code", "graphic", "media",
     "figure", "comments", "comment", "doc", "main", "article", "body", "front", "div",
 })
-
 
 def _render_container(el: Any, ctx: "_ConvertContext") -> list[str]:
     """渲染容器元素：块级子元素逐个输出，行内子元素与尾巴合并为段落。"""
@@ -733,7 +693,6 @@ def _render_container(el: Any, ctx: "_ConvertContext") -> list[str]:
                 inline_acc.append(esc(child.tail))
     _flush_inline()
     return out
-
 
 def _render_block(el: Any, ctx: "_ConvertContext") -> list[str]:
     """把 trafilatura XML 的块级元素渲染为 Telegram HTML 块列表。"""
@@ -828,7 +787,6 @@ def _render_block(el: Any, ctx: "_ConvertContext") -> list[str]:
     # 未知块级元素：按容器语义透明递归（行内子元素同样合并成段）。
     return _render_container(el, ctx)
 
-
 def trafilatura_xml_to_rich_html(xml_text: str, base_url: str = "") -> list[str]:
     """trafilatura XML 输出 → Telegram Rich HTML 块列表。失败返回 []。"""
     if _etree is None or not xml_text or not xml_text.strip():
@@ -848,10 +806,7 @@ def trafilatura_xml_to_rich_html(xml_text: str, base_url: str = "") -> list[str]
         logger.warning(f"[fetch_rich] XML→HTML 转换异常: {e}")
         return []
 
-
-# ---------------------------------------------------------------------------
 # 2.5) 正文 XML 提取策略（含中文页面退化检测）
-# ---------------------------------------------------------------------------
 
 _XML_BLOCK_RE = re.compile(r"<(?:p|head|list|table|quote|code|graphic|media)\b")
 _RAW_HTML_BLOCK_RE = re.compile(r"<(?:p|h[1-6]|li|blockquote|pre|table)\b", re.IGNORECASE)
@@ -861,10 +816,8 @@ _RAW_HTML_BLOCK_RE = re.compile(r"<(?:p|h[1-6]|li|blockquote|pre|table)\b", re.I
 _DOM_TABLE_MIN_DATA_ROWS = 3
 _DOM_TABLE_MIN_ROW_DELTA = 3
 
-
 def _collapse_table_text(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
-
 
 def _table_cell_text(cell: Any) -> str:
     """Extract only visible text from one DOM cell; never retain source HTML."""
@@ -882,7 +835,6 @@ def _table_cell_text(cell: Any) -> str:
             logger.debug("_table_cell_text 内部忽略的异常", exc_info=True)
             return ""
     return _collapse_table_text(" ".join(texts))
-
 
 def _table_rows_from_dom(table: Any) -> list[list[dict[str, object]]]:
     """Read direct rows/cells from one table, excluding rows of nested tables."""
@@ -920,7 +872,6 @@ def _table_rows_from_dom(table: Any) -> list[list[dict[str, object]]]:
             rows.append(cells)
     return rows
 
-
 def _table_signature(rows: list[list[dict[str, object]]]) -> tuple[tuple[str, ...], str] | None:
     """Return a conservative identity key: first headers plus first data key."""
     if len(rows) < 2:
@@ -943,14 +894,12 @@ def _table_signature(rows: list[list[dict[str, object]]]) -> tuple[tuple[str, ..
         return None
     return header, first_data
 
-
 def _is_raw_table_fallback_candidate(rows: list[list[dict[str, object]]]) -> bool:
     if len(rows) < _DOM_TABLE_MIN_DATA_ROWS + 1:
         return False
     if sum(1 for cell in rows[0] if str(cell["text"])) < 3:
         return False
     return _table_signature(rows) is not None
-
 
 def _render_safe_dom_table(rows: list[list[dict[str, object]]]) -> str:
     """Render validated raw DOM table data using only escaped text and safe spans."""
@@ -972,7 +921,6 @@ def _render_safe_dom_table(rows: list[list[dict[str, object]]]) -> str:
             output_rows.append("<tr>" + "".join(cells) + "</tr>")
     return '<table bordered striped>' + "".join(output_rows) + "</table>" if output_rows else ""
 
-
 def _rich_table_rows(block: str) -> list[list[dict[str, object]]]:
     """Parse one converter-produced Rich HTML table back into normalized rows."""
     if _lxml_html is None or not block or not block.lstrip().startswith("<table"):
@@ -984,7 +932,6 @@ def _rich_table_rows(block: str) -> list[list[dict[str, object]]]:
         logger.debug("_rich_table_rows 内部忽略的异常", exc_info=True)
         return []
     return _table_rows_from_dom(table) if table is not None else []
-
 
 def _restore_severely_truncated_dom_tables(body_blocks: list[str], html_text: str) -> list[str]:
     """Replace only a uniquely matched Rich table proven to have lost many rows.
@@ -1042,14 +989,11 @@ def _restore_severely_truncated_dom_tables(body_blocks: list[str], html_text: st
         logger.info("[fetch_rich] 已回填 %s 张经验证丢行的原始 DOM 表格", replaced)
     return restored
 
-
 def _xml_block_count(xml_text: str) -> int:
     return len(_XML_BLOCK_RE.findall(xml_text or ""))
 
-
 def _raw_html_block_count(html_text: str) -> int:
     return len(_RAW_HTML_BLOCK_RE.findall(html_text or ""))
-
 
 def extract_body_blocks(html_text: str, base_url: str = "") -> list[str]:
     """用 trafilatura 提取正文并转为 Telegram HTML 块列表。
@@ -1103,10 +1047,7 @@ def extract_body_blocks(html_text: str, base_url: str = "") -> list[str]:
     converted_blocks = trafilatura_xml_to_rich_html(xml_text, base_url)
     return _restore_severely_truncated_dom_tables(converted_blocks, html_text)
 
-
-# ---------------------------------------------------------------------------
 # 3) 结果组装（文档顺序原位插入媒体 + 轮播分组 + 预算内整块截断）
-# ---------------------------------------------------------------------------
 
 _TAG_TEXT_RE = re.compile(r"<[^>]+>")
 
@@ -1115,15 +1056,12 @@ _BLOCK_MEDIA_SRC_RE = re.compile(
     r'<(?:img|video|audio)\b[^>]*?\bsrc\s*=\s*"([^"]+)"', re.IGNORECASE
 )
 
-
 def _block_media_srcs(block: str) -> list[str]:
     """提取块内 <img>/<video>/<audio> 的 src 属性（已反转义）。"""
     return [_html.unescape(u) for u in _BLOCK_MEDIA_SRC_RE.findall(block or "")]
 
-
 def _normalize_heading_text(text: str) -> str:
     return re.sub(r"\s+", "", _TAG_TEXT_RE.sub("", text or "")).lower()
-
 
 def _squeeze_oversized_block(block: str, token_budget: int) -> str:
     """单个块超出整个预算时的兑底：提取可见文本做头尾截断。
@@ -1144,7 +1082,6 @@ def _squeeze_oversized_block(block: str, token_budget: int) -> str:
         suffix="…[此块超长，已头尾截断]",
     )
     return f"<p>{esc(squeezed)}</p>"
-
 
 def _truncate_blocks(blocks: list[str], token_budget: int) -> tuple[list[str], bool]:
     """Keep complete top-level HTML blocks within an exact token budget.
@@ -1170,18 +1107,15 @@ def _truncate_blocks(blocks: list[str], token_budget: int) -> tuple[list[str], b
         break
     return kept, truncated or len(kept) < len(blocks)
 
-
 def _norm_text(text: str) -> str:
     """归一化文本用于锚点匹配：去全部空白（含全角空格）。"""
     return re.sub(r"[\s\u3000]+", "", text or "")
-
 
 # 可作为锚点候选的 DOM 块级标签（不含 div/body 等容器，避免锚点过度前移）。
 _ANCHOR_CANDIDATE_TAGS = frozenset({
     "p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "pre",
     "td", "th", "figcaption",
 })
-
 
 def _anchor_text_match(block_text: str, cand_text: str) -> bool:
     """块文本与 DOM 候选文本的匹配判定。
@@ -1198,7 +1132,6 @@ def _anchor_text_match(block_text: str, cand_text: str) -> bool:
         return True
     return len(block_text) >= 8 and cand_text.startswith(block_text)
 
-
 def _media_url_key(url: str) -> tuple[str, str]:
     """图片锚定的宽松匹配键：host + path（丢弃 query/fragment）。
 
@@ -1210,7 +1143,6 @@ def _media_url_key(url: str) -> tuple[str, str]:
     except Exception:
         return ("", url)
     return ((parts.hostname or "").lower(), parts.path or "/")
-
 
 def _anchor_entries(entries: list[dict], tree: Any, media: list[DomMedia]) -> list[dict]:
     """为每个正文块确定 DOM 锚点（order/path）。
@@ -1271,7 +1203,6 @@ def _anchor_entries(entries: list[dict], tree: Any, media: list[DomMedia]) -> li
             entry["order"], entry["path"] = anchor
     return entries
 
-
 def _is_standalone_img_block(block: str) -> bool:
     """块是否为单个图片块（<img/> 或 <figure><img/>…</figure>）。"""
     if not block:
@@ -1279,7 +1210,6 @@ def _is_standalone_img_block(block: str) -> bool:
     if len(re.findall(r"<img\b", block, re.IGNORECASE)) != 1:
         return False
     return bool(re.match(r"^<(img|figure)\b", block.strip(), re.IGNORECASE))
-
 
 def _group_carousel_runs(entries: list[dict], url_to_carousel: dict[str, str]) -> list[dict]:
     """把"连续的、同轮播容器"的图片块合并成一个 <tg-slideshow> 条目。"""
@@ -1320,7 +1250,6 @@ def _group_carousel_runs(entries: list[dict], url_to_carousel: dict[str, str]) -
     _flush()
     return out
 
-
 def _render_dom_media_block(m: DomMedia) -> str:
     """把 DOM 收集的媒体渲染为块级 Telegram HTML（在原位插入）。"""
     if m.kind == "video":
@@ -1345,7 +1274,6 @@ def _render_dom_media_block(m: DomMedia) -> str:
         return f'<figure><img src="{esc_attr(m.url)}"/><figcaption>{cap}</figcaption></figure>'
     return f'<img src="{esc_attr(m.url)}"/>'
 
-
 def _assign_proportional_anchor_orders(entries: list[dict], media: list[DomMedia]) -> None:
     """零锚点退路：把正文块按序均匀映射到 DOM 媒体序号区间上。
 
@@ -1359,7 +1287,6 @@ def _assign_proportional_anchor_orders(entries: list[dict], media: list[DomMedia
     n = len(entries)
     for i, entry in enumerate(entries):
         entry["order"] = int(max_order * (i + 1) / (n + 1))
-
 
 def _sort_entries_by_anchor(entries: list[dict]) -> list[dict]:
     """按锚点 order 稳定排序正文块，使块本身回到 DOM 文档顺序。
@@ -1379,7 +1306,6 @@ def _sort_entries_by_anchor(entries: list[dict]) -> list[dict]:
         keyed.append((order, idx, entry))
     keyed.sort(key=lambda t: (t[0], t[1]))
     return [t[2] for t in keyed]
-
 
 def _interleave(entries: list[dict], dropped: list[tuple[int, str]]) -> list[str]:
     """按锚点顺序把 dropped 媒体块插入正文块流。
@@ -1408,7 +1334,6 @@ def _interleave(entries: list[dict], dropped: list[tuple[int, str]]) -> list[str
         pi += 1
     return result
 
-
 def _fallback_paragraph_blocks(fallback_text: str) -> list[str]:
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", fallback_text or "") if p.strip()]
     if not paragraphs and fallback_text:
@@ -1418,9 +1343,7 @@ def _fallback_paragraph_blocks(fallback_text: str) -> list[str]:
         for p in paragraphs[:40]
     ]
 
-
 _SAME_ORIGIN_LINK_RE = re.compile(r'<a href="([^"]*)">(.*?)</a>', re.DOTALL)
-
 
 def _demote_same_origin_links(blocks: list[str], base_url: str) -> list[str]:
     """把指向同源（同 host）的 <a> 链接降级为纯锚文本，跨域链接保留。
@@ -1447,7 +1370,6 @@ def _demote_same_origin_links(blocks: list[str], base_url: str) -> list[str]:
         return m.group(0)
 
     return [_SAME_ORIGIN_LINK_RE.sub(_demote, b) for b in blocks]
-
 
 def _build_source_meta_block(
     url: str,
@@ -1485,7 +1407,6 @@ def _build_source_meta_block(
         f"{time_line}\n"
         "</details>"
     )
-
 
 def build_model_facing_html(
     url: str,
@@ -1585,7 +1506,6 @@ def build_model_facing_html(
         suffix="…[内容已按 token 预算截断]",
     )
 
-
 def _apply_carousels(entries: list[dict], media: list[DomMedia]) -> tuple[list[dict], list[tuple[int, str]]]:
     """轮播归并 + 收集需要原位插入的 dropped 媒体。
 
@@ -1612,7 +1532,7 @@ def _apply_carousels(entries: list[dict], media: list[DomMedia]) -> tuple[list[d
             url_to_carousel.setdefault(m.url, m.carousel)
             by_carousel.setdefault(m.carousel, []).append(m)
 
-    # ---- 轮播归并决策 ----
+    # 轮播归并决策
     extra_slideshows: list[tuple[int, str, str]] = []  # (order, path, html)
     remove_urls: set[str] = set()
     for imgs in by_carousel.values():
@@ -1645,10 +1565,10 @@ def _apply_carousels(entries: list[dict], media: list[DomMedia]) -> tuple[list[d
             kept_entries.append(entry)
         entries = kept_entries
 
-    # ---- 连续同轮播图片块 → slideshow ----
+    # 连续同轮播图片块 → slideshow
     entries = _group_carousel_runs(entries, url_to_carousel)
 
-    # ---- dropped 媒体（原位插入；nav/footer/aside 样板区域内的不插入）----
+    # dropped 媒体（原位插入；nav/footer/aside 样板区域内的不插入）
     dropped: list[tuple[int, str]] = []
     for m in media:
         if m.skip or m.url in kept_urls or m.boilerplate:
@@ -1657,8 +1577,6 @@ def _apply_carousels(entries: list[dict], media: list[DomMedia]) -> tuple[list[d
     for order, _path, slide_html in extra_slideshows:
         dropped.append((order, slide_html))
     return entries, dropped
-
-
 
 def extract_title_from_html(html_text: str) -> str:
     """og:title / twitter:title 优先，其次 <title>。"""
@@ -1682,7 +1600,6 @@ def extract_title_from_html(html_text: str) -> str:
         pass
     return ""
 
-
 # 兜底文本（无结构化正文时）的样板区剔除：nav/footer/aside 容器，以及
 # cookie 弹窗/订阅框/推广位等常见噪音容器（class/id/role 特征词）。
 _FALLBACK_BOILERPLATE_TAGS = frozenset({"nav", "footer", "aside"})
@@ -1691,7 +1608,6 @@ _FALLBACK_NOISE_HINT_RE = re.compile(
     r"sidebar|footer|nav|contentinfo|social|share)",
     re.IGNORECASE,
 )
-
 
 def _in_fallback_boilerplate(el: Any) -> bool:
     """兜底文本段落是否位于样板/噪音容器内。"""
@@ -1708,7 +1624,6 @@ def _in_fallback_boilerplate(el: Any) -> bool:
         logger.debug("_in_fallback_boilerplate 内部忽略的异常", exc_info=True)
         return False
     return False
-
 
 def build_fallback_text_from_html(html_text: str, token_budget: int = FALLBACK_TOTAL_TOKEN_BUDGET) -> str:
     """提取不到结构化正文时的纯文本兜底（meta description + 段落文本）。"""

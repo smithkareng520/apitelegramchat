@@ -19,7 +19,6 @@ if TYPE_CHECKING:
     from config import ModelConfig
     from responses_state import TurnState
 
-
 class GeminiNativeAdapter(ChatProtocolAdapter):
     name = "gemini_native"
 
@@ -49,6 +48,5 @@ class GeminiNativeAdapter(ChatProtocolAdapter):
             tools=tools, supports_tools=supports_tools, journal=journal,
             workspace_namespace=workspace_namespace,
         )
-
 
 __all__ = ["GeminiNativeAdapter"]

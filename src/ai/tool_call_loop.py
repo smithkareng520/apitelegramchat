@@ -1,10 +1,6 @@
-"""并行执行模型请求的工具调用，并将结果写回消息历史。
+"""执行模型工具调用并将结果写回消息历史。
 
-从 ai_handlers.py 拆分而来。v2.4 起接入工具参数主流四层管线：本模块是
-三层循环（OpenAI 兼容 / Gemini / Anthropic）共用的执行咽喉，在分发前
-执行 L2 语义校验（null 剥离 → 常见写法容错 → JSON Schema 校验，见
- schema_validation.py），校验失败不执行工具，错误作为工具结果回传
-模型自纠。
+分发前执行参数规范化和 JSON Schema 校验；校验失败时不执行工具。
 """
 import asyncio
 import json
@@ -351,18 +347,11 @@ async def _run_tool_calls_and_append(
         # 补占位 tool 消息——保证 assistant.tool_calls 全部配对，
         # 已完成的进度不因打断丢失（见 turn_recovery.py）。
         completed_results = _batch_completed_results
-        # v2.3：参数由 json_repair 自动修复时携带的透明提示键——在进入
-        # 工具分发前取出（不能让内部标记键流进工具参数），执行完毕后
-        # 附加到结果末尾，让模型知道参数被修过、验证结果是否符合意图。
+        # 取出自动修复的提示键，避免内部标记流入工具参数。
         repair_note = ""
         if isinstance(fn_args, dict):
             repair_note = str(fn_args.pop(_JSON_REPAIR_NOTE_KEY, "") or "")
-        # v2.4 L2 语义校验层（主流：分发前按工具 schema 校验）：
-        # strict 结构化输出的可选字段以 null 表达 → 剥掉（executor 的
-        # .get(k, default) 默认值语义保留）；字符串布尔/数字按 schema
-        # 容错矫正（省一轮模型重试）；再按工具真实 schema 校验。
-        # 校验失败 → 不执行工具，错误消息作为该工具的结果回传模型自纠
-        # （Error: 开头，与诊断信封同风格，并参与连击熔断签名）。
+        # 先按工具 schema 规范化和校验；失败则不执行并回传错误供模型自纠。
         schema_error = None
         if tools and isinstance(fn_args, dict):
             fn_args, schema_error = normalize_and_validate(fn_name, fn_args, tools)
@@ -381,9 +370,7 @@ async def _run_tool_calls_and_append(
             elif fn_name in SUBAGENT_TOOLS:
                 timeout = SUBAGENT_OUTER_TIMEOUT
             elif fn_name in BASH_TOOLS:
-                # v2.4：bash 支持 per-call timeout 参数（5-600s，用于已知长
-                # 静默命令）。显式指定时外层上限随之放大（+10s 清理缓冲），
-                # 保证不会出现外层先杀仍在正常运行的沙箱命令。
+                # per-call timeout 范围为 5–600s，外层额外保留 10s 清理缓冲。
                 requested = (
                     fn_args.get("timeout")
                     if isinstance(fn_args, dict) else None
@@ -401,21 +388,7 @@ async def _run_tool_calls_and_append(
             else:
                 timeout = TOOL_CALL_TIMEOUT
 
-            # ===== 进度预览策略（v2.3 重构） =====
-            # - Bash：完全不推送实时预览。原始 stdout 对用户价值有限
-            #   （多为命令日志，最终结果卡片已包含头尾完整输出），
-            #   频繁刷新草稿只换来视觉抖动 + Telegram API 限流压力。
-            #   卡片保持初始摘要（命令片段），由最终 update_tool_item
-            #   一次性写入完整结果卡片。
-            # - 子 agent：把每轮 LLM 调用前 / 工具执行前的状态渲染成
-            #   结构化进度卡片（轮数 / 已耗时 / 当前阶段 / 工具名），
-            #   让用户能真正看到子 agent 在干什么，而不是一行 italic
-            #   化的灰色状态句。
-            # - 刷新节流：子 agent 进度回调本身加 2.0s 硬节流（phase
-            #   切换时立即突破节流，保证关键状态变化可见），同时
-            #   不再调 builder.flush(force=True)，改由 update_tool_preview
-            #   内部的 request_flush(force=False) 走全局合并循环，避免
-            #   每次进度回调都立即触发一次草稿 patch。
+            # Bash 不推实时 stdout；子 agent 按 phase 预览，并以 2s 节流刷新。
             tool_progress_callback = None
             # 后台子 agent 的启动 / task_action 调用几乎瞬间返回，不挂
             # 「运行中」进度卡片（后台进度只存进任务，供 status/output 查询）。
@@ -468,15 +441,10 @@ async def _run_tool_calls_and_append(
             try:
                 invalid_arguments = fn_args.get(_INVALID_TOOL_ARGUMENTS_KEY)
                 if invalid_arguments:
-                    # v2.3 Self-Correction 增强：不再回传一句笼统的
-                    # “malformed JSON”，而是把 json_repair 诊断信封里的
-                    # 解析器报错原文（行/列/字符位置）、出错位置上下文
-                    # （^ 指示）、病因清单、原始参数摘录和针对性修复规则
-                    # 全部渲染出来，让模型一轮即可精准自纠。
+                    # 返回详细解析诊断，便于模型一次自纠。
                     result_str = invalid_arguments_message(fn_name, fn_args)
                 elif schema_error:
-                    # v2.4 L2 语义校验：参数是合法 JSON 但不符合工具 schema
-                    # （缺必填 / 类型错 / 枚举外取值）——不执行，错误回传。
+                    # schema 不通过时不执行工具，错误回传给模型自纠。
                     result_str = schema_error
                 elif fn_name == "message_user":
                     # message_user：普通消息或多问题混合表单。普通消息的用户回复
@@ -642,21 +610,10 @@ async def _run_tool_calls_and_append(
             except Exception as e:
                 logger.exception(f"[tool] {fn_name} failed: {e}")
                 result_str = f"Exception: tool {fn_name} failed - {truncate_to_token_budget(str(e), 64, suffix='…')}"
-            # v2.3：参数被自动修复过 → 在真实结果后附加透明提示，让模型
-            # 能对冲“修复猜测与原意图不一致”的风险（去核对结果），并
-            # 学习下次直接产出严格合法的 JSON。
+            # 参数被自动修复时附加提示，让模型核对结果并修正后续调用。
             if repair_note and isinstance(result_str, str) and result_str and result_str != _TOOL_TIMEOUT_MARKER:
                 result_str = f"{result_str}\n\n{repair_note}"
-            # format_tool_result / _truncate_tool_result 处理的是工具的原始
-            # 输出（可能是任意格式的字符串），二者内部有大量字符串切分/正则/索引
-            # 操作，遇到非预期形状的内容时可能抛出未捕获异常（IndexError /
-            # KeyError / AttributeError 等）。这类异常若直接冒泡出
-            # run_one，会被外层串行循环的 except Exception 捕获成
-            # 一个裸 Exception，导致该 tool_call_id 既没有配对的 tool 消息，
-            # 也没有更新 builder 状态（UI 上表现为该折叠块永远停在"运行中"）。
-            # 这里已经拿到了真实的工具执行结果 result_str，不应该因为格式化
-            # 阶段的 bug 丢掉它——格式化失败就退化为纯文本展示，而不是让整个
-            # 工具调用从模型上下文和 UI 里"消失"。
+            # 格式化失败时仍保留真实工具结果，避免 tool 消息或 UI 条目丢失。
             try:
                 # bash 结果走「头尾保留」截断：报错几乎总在输出末尾，
                 # 纯头部截断会让模型看不到失败原因。
@@ -676,17 +633,7 @@ async def _run_tool_calls_and_append(
             if safe_content == _TOOL_TIMEOUT_MARKER:
                 llm_content = f"Error: tool {fn_name} timed out. Please try again or refine the request."
             else:
-                # 模型视图：按工具剔除对模型无价值的字段（weather 的月相/
-                # 露点/低频概率与超出 hours 的逐时条目、subagent 的任务回声
-                # 字段等）。UI 草稿的 details_html 已在上方从完整 safe_content
-                # 生成，用户可见的展示不受影响；发给模型的 tool 消息与历史
-                # 存档均使用精简后的 llm_content。
-                #
-                # 顺序刻意是「先精简、后截断」：对原始 result_str 精简后再套
-                # token 预算，截断预算只花在有价值的字段上——若先截断再精简，
-                # 20k 预算会被 24h 低价值逐时数据/路线坐标串吃光，把 POI
-                # 名称、导航步骤等真正有用的字段挤出模型视野（且被截断的
-                # JSON 无法再解析，精简层会整体失效）。
+                # 先精简再截断，避免低价值字段耗尽模型 token 预算。
                 try:
                     model_view = condense_for_model(fn_name, fn_args, result_str)
                 except Exception:
@@ -829,20 +776,7 @@ async def _run_tool_calls_and_append(
         )
         raise
 
-    # ===== 根据结果标记状态 =====
-    # tool_tasks 与 results 顺序一一对应（串行执行按序追加），用于在
-    # run_one 抛出未捕获异常时（如 format_tool_result 内部报错）仍能拿到
-    # 原始 tc_id / fn_name，补齐 tool 消息与 builder 状态。
-    # 若对未捕获异常直接 log + continue，会：
-    #   1) 该 tool_call_id 永远没有配对的 tool 消息 -> 下一轮请求里
-    #      assistant.tool_calls 与 tool 消息数量不一致，多数供应商会
-    #      直接 400，或者模型陷入重试/困惑的死循环；
-    #   2) builder 里对应的工具条目 status 永远停在 "running"，UI 上
-    #      表现为一个折叠块永远转圈、草稿只在无关地方微调 —— 也就是
-    #      "刷新但没有新信息、后端却仍在跑" 的现象。
-    # 因此无论 run_one 是否抛出未捕获异常，都保证每个 tool_call 都会：
-    #   a) 得到一次 builder.update_tool_item(..., status=...) 调用；
-    #   b) 追加一条配对的 role=tool 消息回传给模型。
+    # 每个 tool_call 都必须补齐 UI 状态和配对的 role=tool 消息，即使执行或格式化异常。
     for idx, res in enumerate(results):
         if isinstance(res, Exception):
             # 不在 except 块内，使用 exc_info 显式附加 traceback
@@ -864,10 +798,7 @@ async def _run_tool_calls_and_append(
         # （工具结束时已即时回写一次，这里是幂等兜底）。
         _apply_result_ui(idx, res)
 
-        # 向 LLM 发送精简后的模型视图（llm_content）：完整输出先经
-        # condense_for_model 剔除无价值字段，再进入本轮请求与持久化历史。
-        # UI 侧的 details_html / 失败判定仍基于完整 safe_content
-        #（见上方各处），二者互不影响。
+        # LLM 使用精简后的 llm_content；UI 仍使用完整 safe_content。
         tool_msg = Message.tool_result(tc_id, fn_name, llm_content)
         loop_messages.append(tool_msg)
         new_history_entries.append(tool_msg)
@@ -888,10 +819,7 @@ async def _run_tool_calls_and_append(
             tool_msg = Message.tool_result(skipped_id, skipped_name, skipped_content)
             loop_messages.append(tool_msg)
             new_history_entries.append(tool_msg)
-            # 流式路径已为全部 tool call 建过 UI 条目；被跳过的调用若不
-            # 显式收尾，折叠块会永远停留在 "Running..."。openai-compat
-            # 流式路径已在 agentic_loops 里 add_tool_item（update 在此处
-            # 生效）；未建条目的路径（如 Gemini）update_tool_item 静默跳过。
+            # 被预算跳过的调用也要收尾 UI 条目，避免停留在 Running。
             builder.update_tool_item(
                 skipped_id,
                 "Not executed (budget)",
@@ -902,11 +830,8 @@ async def _run_tool_calls_and_append(
             "[%s] 工具调用预算已耗尽：已执行=%s，跳过=%s，上限=%s",
             api_label, tool_call_count_ref[0], len(skipped_tool_calls), MAX_TOOL_CALLS,
         )
-    # 一个模型返回中声明的全部工具已得到最终状态；这才是允许草稿切换的原子边界。
-    # tool.end 事件会触发安全点检查：满容量时由 DraftManager 后台滚动，
-    # Agent 不等待（§8）。finish_tool_batch(-1)（空批次）在两种实现中均为无操作。
+    # 全部工具定稿后才允许草稿切换；刷新保持非阻塞。
     builder.finish_tool_batch(group_idx)
-    # 解耦：非阻塞刷新（后台合并循环发送）。
     builder.request_flush()
 
     if tool_call_count_ref[0] >= MAX_TOOL_CALLS:
@@ -918,10 +843,7 @@ async def _run_tool_calls_and_append(
         if isinstance(res, tuple) and len(res) >= 5:
             llm_content = res[4]
             if isinstance(llm_content, str) and llm_content.startswith(("Error:", "Exception:")):
-                # v2.3：签名取首行（截 100 字符）而非前 80 字符跨行拼接——
-                # 诊断增强后的错误消息首行是稳定的（工具名+错误类别），
-                # 其后才是含行列位置等易变细节的行；取首行可保证同一错误
-                # 反复发生时熔断计数准确命中，不会因细节差异而漏判。
+                # 只取稳定的首行作为熔断签名。
                 error_msgs.append(llm_content.split("\n", 1)[0][:100])
     if error_msgs and len(set(error_msgs)) == 1 and len(error_msgs) == len(results):
         signature = error_msgs[0]
@@ -940,8 +862,7 @@ async def _run_tool_calls_and_append(
             error_streak[signature] = 0
             return "continue"
     else:
-        # 本批次结果不是"清一色同一错误"（有成功、或错误签名不一致）：
-        # 熔断计数清零，不让不连续的偶发错误累积触发熔断。
+        # 非同一错误时清零熔断计数。
         error_streak.clear()
 
     return "continue"

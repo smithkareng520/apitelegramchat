@@ -38,22 +38,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# API 分支标签（请求体家族）：
 #   chat    OpenAI/Anthropic/Gemini 聊天协议（流式 agentic 循环装配请求体）
 #   images  OpenAI Images 协议（生成/编辑/多图合成，media_generation 装配）
 #   video   视频任务提交协议（media_generation._request_agnes_video 等装配）
 ApiBranch = Literal["chat", "images", "video"]
 
-# 输入模态标签（与 Telegram 附件 kind / EffectiveParams.capability_for_modality 对齐）
 Modality = Literal["photo", "audio", "video", "document"]
 
 _MEDIA_ROUTES: frozenset = frozenset({"image", "video"})
 _ROUTE_TO_API: dict = {"image": "images", "video": "video", "chat": "chat"}
 
-
-# ---------------------------------------------------------------------------
-# ② 输入组合：本轮用户输入了什么
-# ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class InputCombination:
     """用户输入组合（文本 + 各模态附件数量的不可变快照）。"""
@@ -96,7 +90,6 @@ class InputCombination:
             parts.append(f"document×{self.document_count}")
         return "+".join(parts)
 
-
 def _count_kind(modality: Modality, count: dict, file_id: Any, seen: set) -> None:
     """按 (模态, file_id) 去重计数。
 
@@ -114,7 +107,6 @@ def _count_kind(modality: Modality, count: dict, file_id: Any, seen: set) -> Non
         return
     seen.add(key)
     count[modality] = count.get(modality, 0) + 1
-
 
 def resolve_input_combination(user_message: Optional[dict]) -> InputCombination:
     """从 Telegram 侧消息信封解析输入组合（纯函数，无 IO）。
@@ -171,10 +163,6 @@ def resolve_input_combination(user_message: Optional[dict]) -> InputCombination:
         document_count=int(counts.get("document", 0)),
     )
 
-
-# ---------------------------------------------------------------------------
-# ② 鉴权：输入组合 vs 模型有效参数
-# ---------------------------------------------------------------------------
 @dataclass
 class AuthVerdict:
     """鉴权结论：请求能否继续、哪些模态降级、媒体分支是否被硬性拦截。"""
@@ -193,7 +181,6 @@ class AuthVerdict:
         if self.blocked:
             parts.append(f"blocked({self.block_reason})")
         return " ".join(parts)
-
 
 def authorize_request(
     model_info: Optional["ModelConfig"],
@@ -238,10 +225,6 @@ def authorize_request(
         block_reason=block_reason,
     )
 
-
-# ---------------------------------------------------------------------------
-# ③ API 分支：chat / images / video（协议 + 端点 + 形状）
-# ---------------------------------------------------------------------------
 @dataclass
 class RequestPlan:
     """某模型本次请求的完整分支计划（数据驱动路由的解析结果）。"""
@@ -260,7 +243,6 @@ class RequestPlan:
         if self.image_style:
             bits.append(f"shape={self.image_style}")
         return " ".join(bits)
-
 
 def resolve_request_plan(model_info: Optional["ModelConfig"]) -> RequestPlan:
     """解析模型应进入的 API 分支（chat / images / video）+ 端点 + 形状。
@@ -305,13 +287,7 @@ def resolve_request_plan(model_info: Optional["ModelConfig"]) -> RequestPlan:
         session_affinity=bool(getattr(ep, "session_affinity", False)) if ep else False,
     )
 
-
-# ---------------------------------------------------------------------------
-# ④ 请求体构建：按（请求内容，api 类型，端点）装配
-# ---------------------------------------------------------------------------
-# Agnes Video 2.5 文档硬约束（https://wiki.agnes-ai.com）：
-#   - 时长字段叫 seconds（字符串 "4"–"12"，默认 "5"）——发 duration 会被
-#     网关 400 "duration is not an allowed request field"（2026-09-11 生产事故）；
+# Agnes Video 2.5 文档硬约束：seconds 为 "4"–"12" 字符串，默认 "5"；发送 duration 会被网关拒绝。
 #   - mode 必填：text（纯文本，禁止携带任何媒体字段）/ keyframe（首尾帧）/
 #     reference（images/audios/videos 至少一类非空）；
 #   - size 档位：720P / 1080P / 1K / 2K（不接受像素尺寸）；画幅用
@@ -327,7 +303,6 @@ _VIDEO_MAX_AUDIOS = 3
 _VIDEO_MAX_REFERENCE_VIDEOS = 1
 _VIDEO_SECONDS_MIN, _VIDEO_SECONDS_MAX, _VIDEO_SECONDS_DEFAULT = 4, 12, 5
 
-
 def normalize_video_seconds(seconds: Any = None) -> str:
     """把任意输入（int/str/None）归一为文档合法的 seconds 字符串。
 
@@ -341,16 +316,13 @@ def normalize_video_seconds(seconds: Any = None) -> str:
     value = max(_VIDEO_SECONDS_MIN, min(value, _VIDEO_SECONDS_MAX))
     return str(value)
 
-
 def _normalize_video_size(size: Optional[str]) -> Optional[str]:
     value = str(size or "").strip().upper()
     return value if value in _VIDEO_SIZE_TIERS else None
 
-
 def _normalize_video_ratio(ratio: Optional[str]) -> Optional[str]:
     value = str(ratio or "").strip()
     return value if value in _VIDEO_RATIOS else None
-
 
 def _normalize_video_seed(seed: Any) -> Optional[int]:
     """归一化 seed：仅接受真实整数（bool 不是合法 seed），非法返回 None。"""
@@ -360,7 +332,6 @@ def _normalize_video_seed(seed: Any) -> Optional[int]:
         return int(seed)
     except (TypeError, ValueError):
         return None
-
 
 def _normalize_video_specs(specs: Any) -> list[dict]:
     """归一化参考视频对象数组（文档：videos[].{url, start_seconds, require_audio}）。
@@ -393,7 +364,6 @@ def _normalize_video_specs(specs: Any) -> list[dict]:
         out.append(obj)
     return out
 
-
 def _resolve_video_mode(
     mode: Optional[str],
     images: list,
@@ -423,7 +393,6 @@ def _resolve_video_mode(
     if images or audios or videos:
         return "reference"
     return "text"
-
 
 def build_video_request_body(
     plan: RequestPlan,
@@ -512,10 +481,6 @@ def build_video_request_body(
             payload["videos"] = videos
     return payload
 
-
-# ---------------------------------------------------------------------------
-# ①+②+③ 组合：回合入口的一次性预检
-# ---------------------------------------------------------------------------
 @dataclass
 class TurnPreflight:
     """回合预检结果：有效参数 + 输入组合 + 鉴权结论 + 分支计划。"""
@@ -531,7 +496,6 @@ class TurnPreflight:
             f"auth=[{self.verdict.summary()}] "
             f"plan=[{self.plan.describe()}]"
         )
-
 
 def run_preflight(model_info: Optional["ModelConfig"], user_message: Optional[dict]) -> TurnPreflight:
     """回合入口的统一预检：参数分层 -> 输入组合 -> 鉴权 -> 分支。
@@ -549,7 +513,6 @@ def run_preflight(model_info: Optional["ModelConfig"], user_message: Optional[di
     return TurnPreflight(
         params=params, combination=combination, verdict=verdict, plan=plan,
     )
-
 
 __all__ = [
     "ApiBranch",

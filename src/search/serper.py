@@ -1,8 +1,7 @@
-"""Serper 搜索客户端：web_search 工具与四类 mode 的解析/格式化（自 search_engine.py 拆出）。"""
+"""提供 Serper 搜索与结果格式化。"""
 
 import asyncio
 from typing import Any
-
 
 from web_search_settings import WEB_SEARCH_LANGUAGE, WEB_SEARCH_REGION
 from web_search_filter import (
@@ -24,15 +23,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
 # images/videos/lens 单请求的 num_results 上限（serper 文档口径）。
 _SEARCH_MEDIA_MAX_RESULTS = 100
 class SerperSearchTransientError(Exception):
     """Serper 上游临时未返回结果（例如 organic 为空），可重试。"""
 
-
 SERPER_PAGE_SIZE = 10  # search 端点单页固定 10 条
-
 
 def _serper_api_timeout() -> float:
     """读取 SERPER_API_TIMEOUT 配置（默认 12s）。"""
@@ -44,7 +40,6 @@ def _serper_api_timeout() -> float:
         logger.debug("_serper_api_timeout 内部忽略的异常", exc_info=True)
         pass
     return _SERPER_DEFAULT_TIMEOUT
-
 
 def _parse_serper_search_result(data: dict[str, Any] | None) -> list[dict]:
     """从 serper.dev /search 响应中提取 organic 列表为统一字段。
@@ -90,7 +85,6 @@ def _parse_serper_search_result(data: dict[str, Any] | None) -> list[dict]:
         })
     return items
 
-
 def _parse_serper_images_result(data: dict[str, Any] | None) -> list[dict]:
     """从 serper.dev /images 响应中提取图片列表为统一字段。"""
     if not isinstance(data, dict):
@@ -117,7 +111,6 @@ def _parse_serper_images_result(data: dict[str, Any] | None) -> list[dict]:
             "height": result.get("imageHeight"),
         })
     return items
-
 
 def _parse_serper_videos_result(data: dict[str, Any] | None) -> list[dict]:
     """从 serper.dev /videos 响应中提取视频列表为统一字段。
@@ -160,7 +153,6 @@ def _parse_serper_videos_result(data: dict[str, Any] | None) -> list[dict]:
         })
     return items
 
-
 def _parse_serper_lens_result(data: dict[str, Any] | None) -> list[dict]:
     """从 serper.dev /lens 响应中提取 organic 列表为统一字段。"""
     if not isinstance(data, dict):
@@ -186,7 +178,6 @@ def _parse_serper_lens_result(data: dict[str, Any] | None) -> list[dict]:
         })
     return items
 
-
 async def _serper_search_one_mode(
     mode: str,
     *,
@@ -211,9 +202,7 @@ async def _serper_search_one_mode(
         # search 端点 num 实际是 page 数：每页固定 10 条。把 num_results 折算成页。
         requested_num = num if isinstance(num, int) and num > 0 else _SEARCH_DEFAULT_RESULTS
         requested_num = min(max(requested_num, 1), _SEARCH_MAX_CANDIDATES)
-        # 处理 offset（向后翻页）
         offset = max(int(page or 1) - 1, 0) * SERPER_PAGE_SIZE if page else 0
-        # page 数从 1 开始
         first_page = offset // SERPER_PAGE_SIZE + 1
         last_idx = offset + requested_num - 1
         last_page = last_idx // SERPER_PAGE_SIZE + 1
@@ -285,7 +274,6 @@ async def _serper_search_one_mode(
 
     raise SerperSearchTransientError(f"unknown serper mode: {mode}")
 
-
 def _format_search_results(items: list, query: str, engine: str, requested: int | None = None) -> str:
     """渲染 search 模式的 envelope section。
 
@@ -316,7 +304,6 @@ def _format_search_results(items: list, query: str, engine: str, requested: int 
         lines.append(block)
     return "\n".join(lines)
 
-
 def _format_image_results(items: list, query: str, requested: int | None = None) -> str:
     success_count = len(items)
     requested_count = requested if isinstance(requested, int) and requested > 0 else success_count
@@ -333,7 +320,6 @@ def _format_image_results(items: list, query: str, requested: int | None = None)
             f"   页面：{link}\n"
         )
     return "\n".join(lines)
-
 
 def _format_video_results(items: list, query: str, requested: int | None = None) -> str:
     """渲染 videos 模式的 envelope section。
@@ -375,7 +361,6 @@ def _format_video_results(items: list, query: str, requested: int | None = None)
         lines.append(block)
     return "\n".join(lines)
 
-
 def _format_lens_results(items: list, image_url: str, requested: int | None = None) -> str:
     success_count = len(items)
     requested_count = requested if isinstance(requested, int) and requested > 0 else success_count
@@ -392,7 +377,6 @@ def _format_lens_results(items: list, image_url: str, requested: int | None = No
             f"   图片：{image_url_item}\n"
         )
     return "\n".join(lines)
-
 
 def _normalize_modes(mode: str | list[str] | None) -> list[str]:
     """把 mode 参数规范化为去重后的有序 list。默认 ["search"]。"""
@@ -418,7 +402,6 @@ def _normalize_modes(mode: str | list[str] | None) -> list[str]:
             out.append(normalized)
         return out or ["search"]
     return ["search"]
-
 
 async def execute_web_search(
     query: str | None = None,
@@ -456,7 +439,6 @@ async def execute_web_search(
     # 避免两份归一化逻辑各自漂移、缓存 key 碎片化） ----
     modes = _normalize_modes(mode)
     requested = _normalize_requested_results(num_results)
-    # offset 只对 search mode 生效（schema/docstring 均如此声明）。
     # <10 等价于第 1 页，与不带 offset 归一到同一缓存 key，避免 p:1/p:null 碎片。
     page: int | None = None
     if offset is not None and "search" in modes:
@@ -491,7 +473,6 @@ async def execute_web_search(
         _search_cache[cache_key] = result
     return result
 
-
 def _normalize_requested_results(num_results: int | None) -> int:
     """归一化 num_results：非法/缺省回退默认值；全局上限 100（schema 口径）。
 
@@ -503,7 +484,6 @@ def _normalize_requested_results(num_results: int | None) -> int:
         return max(1, min(int(num_results), _SEARCH_MEDIA_MAX_RESULTS))
     except (TypeError, ValueError):
         return _SEARCH_DEFAULT_RESULTS
-
 
 async def _execute_web_search_uncached(
     modes: list[str],
@@ -583,12 +563,10 @@ async def _execute_web_search_uncached(
             return _format_video_results(items[:_num_for(single_mode)], query_str, requested=_num_for(single_mode))
         if single_mode == "lens" and items:
             return _format_lens_results(items[:_num_for(single_mode)], (image_url or "").strip(), requested=_num_for(single_mode))
-        # 无结果
         if single_mode == "lens":
             return f"❌ 未找到与图片「{(image_url or '').strip()}」相关的结果。"
         return f"❌ 未找到与「{query_str}」相关的结果。"
 
-    # 多 mode：并发执行，逐 mode 拼接结果
     async def _run_one(m: str) -> tuple[str, str | None, Exception | None]:
         try:
             items = await _serper_search_one_mode(

@@ -1,23 +1,4 @@
-"""dispatch_tool_call —— 工具统一路由分发。
-
-架构（MCP 化重构后）
---------------------
-工具分两类：
-
-1. MCP 工具（名字以 ``mcp__`` 开头，即 mcp__<server>__<tool>）：
-   全部经 mcp_manager.call_tool 走 MCP 协议执行 —— 外部服务器
-   （gaode_mcp，streamable_http）与内部服务器（internal_search / todo /
-   memory / workspace / bash，stdio 子进程）同一条路径，没有任何本地
-   包装层。模型视图裁剪（condense_for_model）与用户视图渲染
-   （format_tool_result）由 tool_call_loop 分层处理。
-
-2. host 内建工具：message_user / deliver_reply / subagent /
-   generate_image / generate_video / present_files —— 依赖宿主进程的
-   Telegram 会话、草稿流与 LLM 编排，在 BUILTIN_HANDLERS 表内直接分发。
-
-deliver_reply 的专用分支在 ai/tool_call_loop.run_one（需要轮次日志回溯）；
-本模块只保留其防御路径。
-"""
+"""dispatch_tool_call —— 工具统一路由分发。"""
 
 import asyncio
 import json
@@ -33,13 +14,12 @@ from workspace_paths import workspace_namespace
 
 logger = logging.getLogger(__name__)
 
-# ---------- 信号量控制并发工具调用 ----------
+# 信号量控制并发工具调用
 tool_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TOOLS)
 
 _TOOL_TIMEOUT_MARKER = "__TOOL_TIMEOUT__"
 
 TOOL_RESPONSE_TOKEN_BUDGET = int(os.getenv("TOOL_RESPONSE_TOKEN_BUDGET", "20000"))
-
 
 def _truncate_tool_result(result: str, fn_name: str | None = None) -> str:
     """Bound every model-facing tool result by an exact 20k-token budget.
@@ -60,7 +40,6 @@ def _truncate_tool_result(result: str, fn_name: str | None = None) -> str:
 
 def _error_json(message: str, *, code: str = "tool_error") -> str:
     return json.dumps({"status": "error", "code": code, "message": message}, ensure_ascii=False)
-
 
 async def execute_deliver_reply(chat_id: int, content: Any) -> str:
     """deliver_reply：静默模式（/show off）下交付最终回复给用户。
@@ -118,15 +97,11 @@ async def execute_deliver_reply(chat_id: int, content: Any) -> str:
         )
     return "失败：消息发送失败（网络或 Telegram 错误），可稍后重试。"
 
-
-# =====================================================================
 # host 内建工具 handler 表
-# =====================================================================
 BuiltinHandler = Callable[
     [int, dict, str, Callable[[str], Awaitable[None]] | None], Awaitable[str]
 ]
 # 签名: (chat_id, arguments, resolved_namespace, progress_callback) -> result_str
-
 
 async def _handle_generate_image(chat_id: int, arguments: dict, _ns: str, _cb: Any) -> str:
     from search.media_tools import execute_generate_image
@@ -144,7 +119,6 @@ async def _handle_generate_image(chat_id: int, arguments: dict, _ns: str, _cb: A
         extra_params=arguments.get("extra_params"),
     )
 
-
 async def _handle_generate_video(chat_id: int, arguments: dict, _ns: str, _cb: Any) -> str:
     from search.media_tools import execute_generate_video
 
@@ -154,7 +128,6 @@ async def _handle_generate_video(chat_id: int, arguments: dict, _ns: str, _cb: A
         duration=arguments.get("duration", 5),
         chat_id=chat_id,
     )
-
 
 async def _handle_subagent(chat_id: int, arguments: dict, ns: str, progress_callback: Any) -> str:
     """路由优先级与 bash 一致：task_action → run_in_background → 前台执行。"""
@@ -191,7 +164,6 @@ async def _handle_subagent(chat_id: int, arguments: dict, ns: str, progress_call
         progress_callback=progress_callback,
     )
 
-
 async def _handle_present_files(chat_id: int, arguments: dict, resolved_namespace: str, _cb: Any) -> str:
     from file_delivery import execute_present_files
 
@@ -200,7 +172,6 @@ async def _handle_present_files(chat_id: int, arguments: dict, resolved_namespac
         paths = [paths]
     return await execute_present_files(chat_id, paths, namespace=resolved_namespace)
 
-
 BUILTIN_HANDLERS: dict[str, BuiltinHandler] = {
     tn.GENERATE_IMAGE: _handle_generate_image,
     tn.GENERATE_VIDEO: _handle_generate_video,
@@ -208,10 +179,7 @@ BUILTIN_HANDLERS: dict[str, BuiltinHandler] = {
     tn.PRESENT_FILES: _handle_present_files,
 }
 
-
-# =====================================================================
 # 主分发入口
-# =====================================================================
 async def dispatch_tool_call(
     name: str,
     arguments: dict,
@@ -233,7 +201,7 @@ async def dispatch_tool_call(
         handler = BUILTIN_HANDLERS.get(name)
         if handler is not None:
             # 地图/位置类工具执行期间显示 find_location（MCP 工具在
-            # _dispatch_mcp 内统一包裹）。
+            # dispatch_mcp 内统一包裹）。
             return await handler(chat_id, arguments, resolved_namespace, progress_callback)
 
         if tn.is_mcp_name(name):
@@ -263,7 +231,6 @@ async def dispatch_tool_call(
         # 顶层异常：只记录日志，返回用户友好消息，不暴露内部细节
         logger.exception(f"dispatch_tool_call 顶层异常 [{name}]: {e}")
         return "⚠️ 工具执行出错，请稍后重试或换一种方式。"
-
 
 async def _dispatch_mcp(name: str, arguments: dict, chat_id: int) -> str:
     """MCP 工具统一执行路径（外部 streamable_http 与内部 stdio 同构）。"""

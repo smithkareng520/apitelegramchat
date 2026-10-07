@@ -18,10 +18,8 @@ from workspace_paths import (
     workspace_upload_root,
 )
 
-
 class ResourceNotFoundError(ValueError):
     """Raised when a client requests a URI outside the advertised resource set."""
-
 
 class ResourceService:
     """Expose metadata-only workspace resources for one trusted scope."""

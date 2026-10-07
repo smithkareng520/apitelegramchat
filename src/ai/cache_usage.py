@@ -65,8 +65,7 @@ _CACHE_FIELD_NAMES = ("cache_read_input_tokens", "prompt_cache_hit_tokens")
 def _extract_cached_tokens(usage: Any) -> int | None:
     """从 usage（dict 或 pydantic 对象）中只提取缓存命中数字。
 
-    原先这段提取逻辑在 _cached_from_usage 与 _extract_cache_usage 内
-    逐字重复两份，收敛于此单一实现。取不到返回 None（=网关未上报）。
+    取不到返回 None（=网关未上报）。
     """
     if usage is None:
         return None

@@ -30,7 +30,6 @@ os.environ.setdefault(
     "APITELEGRAMCHAT_DATA_DIR",
     os.path.join(os.path.dirname(__file__), "..", ".smoke-data"))
 
-
 async def main() -> int:
     from mcp_manager import mcp_manager, load_servers
     from tool_names import is_mcp_name
@@ -96,7 +95,6 @@ async def main() -> int:
     await mcp_manager.aclose()
     print("\nSMOKE OK — mcp.json 驱动的 MCP 架构端到端连通")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))

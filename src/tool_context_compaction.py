@@ -1,10 +1,4 @@
-"""Archive large tool payloads and replace old history entries with durable pointers.
-
-The archive is deliberately kept inside the private workspace so the model can
-retrieve a prior payload with the existing ``text_editor`` tool.  Only selected
-read-mostly tools are compacted; tool-call/result pairing and provider-required
-IDs are always retained.
-"""
+"""Archive large tool payloads and replace old history entries with durable pointers."""
 from __future__ import annotations
 
 import asyncio
@@ -28,12 +22,10 @@ ARCHIVE_DIR = ".context-archive/tool-results"
 TARGET_TOOLS = frozenset({"wikipedia", "fetch_url", "text_editor"})
 _POINTER_PREFIX = "Tool result archived at "
 
-
 def _norm_tool_name(name: str) -> str:
     """完整工具名（mcp__<server>__<tool>）→ 规范短名；短名原样返回。"""
     split = split_mcp_name(name or "")
     return split[1] if split else (name or "")
-
 
 @dataclass(frozen=True)
 class ToolCompactionStats:
@@ -43,10 +35,8 @@ class ToolCompactionStats:
     compacted_calls: int = 0
     archived_bytes: int = 0
 
-
 def _is_archived_pointer(content: object) -> bool:
     return isinstance(content, str) and content.startswith(_POINTER_PREFIX)
-
 
 def _tool_name(tool_call: object) -> str:
     if not isinstance(tool_call, dict):
@@ -57,13 +47,11 @@ def _tool_name(tool_call: object) -> str:
     name = function.get("name")
     return name if isinstance(name, str) else ""
 
-
 def _tool_call_id(tool_call: object) -> str:
     if not isinstance(tool_call, dict):
         return ""
     value = tool_call.get("id")
     return value if isinstance(value, str) else ""
-
 
 def _minimal_arguments(name: str, raw: object) -> str:
     """Keep only the stable locator fields needed to repeat a compacted call."""
@@ -80,21 +68,14 @@ def _minimal_arguments(name: str, raw: object) -> str:
         compact = parsed
     return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
 
-
 def _archive_relative_path(call_id: str) -> str:
     """生成归档文件的相对路径。
 
-    修复：原 digest 包含 round_index（history 数组下标），一旦之前的
-    消息被裁剪或压缩（例如 select_request_context 截尾之后），同一
-    次 tool_call 的 round_index 就变了，重新归档会生成不同的 digest，
-    让旧的 archive 文件成为孤儿（无法被引用、永远占据 workspace）。
-    改用 call_id 一个稳定标识：call_id 由 LLM 在生成 tool_call 时给出，
-    在整个会话内不变。
+    使用稳定的 call_id 生成路径，避免历史裁剪或压缩改变归档标识。
     """
     safe_call_id = re.sub(r'[^A-Za-z0-9_-]', '_', str(call_id or ""))[:32] or "anon"
     digest = hashlib.sha256(f"{call_id}".encode("utf-8")).hexdigest()[:16]
     return f"{ARCHIVE_DIR}/call-{safe_call_id}-{digest}.json"
-
 
 def _pointer_text(name: str, relative_path: str) -> str:
     return (
@@ -102,7 +83,6 @@ def _pointer_text(name: str, relative_path: str) -> str:
         f"Use text_editor view with path {json.dumps(relative_path, ensure_ascii=False)} "
         f"to retrieve the original {name} call and result if needed."
     )
-
 
 def _archive_payload(
     *,
@@ -135,7 +115,6 @@ def _archive_payload(
         },
     }
     return (json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n").encode("utf-8")
-
 
 def _eligible_calls(history: list[Any]) -> list[tuple[int, dict[str, Any], dict[str, Any] | ToolResultBlock]]:
     """Return unarchived target tool-call/result pairs in chronological order.
@@ -193,7 +172,6 @@ def _eligible_calls(history: list[Any]) -> list[tuple[int, dict[str, Any], dict[
                 if name in TARGET_TOOLS and result is not None:
                     calls.append((index, tool_call, result[0]))
     return calls
-
 
 async def compact_older_tool_calls(
     chat_id: int,

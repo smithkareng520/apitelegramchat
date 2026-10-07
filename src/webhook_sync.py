@@ -1,30 +1,5 @@
 # webhook_sync.py
-"""Telegram Webhook 启动自愈注册与投递链路观测。
-
-背景（为什么需要这个模块）：
-- Telegram 的 webhook 是"至少一次、需确认"的投递模型：update 只有在
-  服务端以 2xx 签收后才会离开 Telegram 侧的队列；部署窗口/停机/非 2xx
-  （如 403 token 不匹配）导致的投递失败会留在队列里按指数退避重放——
-  这就是"积压消息"的来源。
-- setWebhook 只修改"未来的投递路由"，**不影响**存量队列：重启、重注册
-  从来不是清积压的手段。唯一清队手段是 drop_pending_updates=true
-  （setWebhook / deleteWebhook 都接受该参数）。
-
-本模块的职责：
-1. 启动自愈注册：用 WEBHOOK_URL?token=WEBHOOK_TOKEN 幂等调用 setWebhook，
-   保证注册信息与环境变量恒等（手工注册残留的旧 token 会被替换，避免
-   "?token=旧值 vs WEBHOOK_TOKEN 新值"不一致造成的全体 403 → 无限积压）；
-   可选附带 drop_pending_updates=true（DROP_PENDING_ON_STARTUP 开关）。
-2. 观测：拉取 getWebhookInfo，把 pending_update_count、last_error_* 打进
-   日志——积压从"用户感知"变成"启动即可见"。同份数据由 /webhookinfo
-   管理员命令在聊天里随时查看（见 app.py）。
-
-设计约束：
-- 任何失败都只降级（沿用上一次注册继续运行），绝不抛出、绝不阻塞启动。
-- 日志/回显里的注册 URL 一律先过 mask_webhook_url() 脱敏 token。
-- 敏感值一律从 config 模块属性取（config.scrub_environment() 会在导入期
-  把 WEBHOOK_TOKEN / WEBHOOK_URL 从 os.environ 抹掉，不能再读环境变量）。
-"""
+"""Telegram Webhook 启动自愈注册与投递链路观测。"""
 import re
 import time
 import asyncio
@@ -55,7 +30,6 @@ SECRET_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 # 等无人消费的类型，减少无谓的投递与重试。
 ALLOWED_UPDATES = ["message", "callback_query"]
 
-
 def build_webhook_full_url(raw_url: str, token: str) -> str:
     """把 WEBHOOK_URL 和 WEBHOOK_TOKEN 拼成带鉴权 query 的完整注册 URL。
 
@@ -79,7 +53,6 @@ def build_webhook_full_url(raw_url: str, token: str) -> str:
         (parts.scheme, parts.netloc, parts.path, urlencode(query_pairs), parts.fragment)
     )
 
-
 def mask_webhook_url(full_url: str) -> str:
     """日志/聊天回显用：把 query 里 token 的值整体替换为 ***。
 
@@ -102,7 +75,6 @@ def mask_webhook_url(full_url: str) -> str:
         # 理论上 urlsplit 对任何字符串都不抛；防御性兜底：整串打码。
         return "***"
 
-
 def secret_token_for_registration() -> Optional[str]:
     """WEBHOOK_TOKEN 满足 Telegram secret_token 字符集时返回它，否则 None。
 
@@ -115,7 +87,6 @@ def secret_token_for_registration() -> Optional[str]:
         return WEBHOOK_TOKEN
     return None
 
-
 def _fmt_last_error(info: dict) -> Optional[str]:
     """从 getWebhookInfo result 里格式化最近一次投递错误（含本地时间）。"""
     msg = info.get("last_error_message")
@@ -124,7 +95,6 @@ def _fmt_last_error(info: dict) -> Optional[str]:
     ts = info.get("last_error_date")
     when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "未知时间"
     return f"[{when}] {msg}"
-
 
 async def get_webhook_info(*, timeout: float = 10.0) -> Optional[dict]:
     """调用 getWebhookInfo，返回 result dict；失败返回 None（观测不抛错）。"""
@@ -146,7 +116,6 @@ async def get_webhook_info(*, timeout: float = 10.0) -> Optional[dict]:
     except Exception:
         logger.warning("getWebhookInfo 请求失败", exc_info=True)
         return None
-
 
 async def sync_webhook_on_startup(*, timeout: float = 15.0) -> Optional[dict]:
     """启动自愈：幂等重注册 webhook + getWebhookInfo 观测日志。
@@ -219,7 +188,6 @@ async def sync_webhook_on_startup(*, timeout: float = 15.0) -> Optional[dict]:
         else:
             logger.info(summary)
     return info
-
 
 async def run_sync_with_deadline(deadline: float = 20.0) -> None:
     """带总死线的自愈入口（供启动钩子的 fire-and-forget 任务调用）。

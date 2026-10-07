@@ -23,7 +23,6 @@ if TYPE_CHECKING:
     from responses_state import TurnState
     from openai import AsyncOpenAI
 
-
 class OpenAIChatAdapter(ChatProtocolAdapter):
     name = "openai_chat"
 
@@ -58,6 +57,5 @@ class OpenAIChatAdapter(ChatProtocolAdapter):
             tools=tools, supports_tools=supports_tools, journal=journal,
             workspace_namespace=workspace_namespace,
         )
-
 
 __all__ = ["OpenAIChatAdapter"]

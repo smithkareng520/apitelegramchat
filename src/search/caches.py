@@ -1,4 +1,4 @@
-"""web_search / fetch_url 结果的双 TTL 缓存（自 search_engine.py 拆出）。"""
+"""提供 web_search 与 fetch_url 的 TTL 缓存。"""
 
 import json
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -11,7 +11,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
 # fetch 缓存键中要剥离的常见跟踪参数：同一页面挂不同 utm/fbclid 等参数
 # 时视为同一份内容，避免重复抓取与缓存条目膨胀。只影响缓存键——实际
 # 抓取仍使用原始 URL。
@@ -20,7 +19,6 @@ _TRACKING_QUERY_PARAMS = frozenset({
     "utm_id", "fbclid", "gclid", "yclid", "msclkid", "spm", "scm", "from",
 })
 
-
 # ---------- 缓存 ----------
 _fetch_cache = TTLCache(maxsize=200, ttl=FETCH_CACHE_TTL)
 
@@ -28,7 +26,6 @@ _fetch_cache = TTLCache(maxsize=200, ttl=FETCH_CACHE_TTL)
 # 直接返回上次的格式化结果，省 Serper 配额与延迟；TTL 由 SEARCH_CACHE_TTL
 # 控制（默认 300s，与 fetch 缓存同一套环境变量风格）。
 _search_cache = TTLCache(maxsize=200, ttl=SEARCH_CACHE_TTL)
-
 
 def _search_cache_key(
     modes: list[str],
@@ -57,7 +54,6 @@ def _search_cache_key(
         separators=(",", ":"),
     )
 
-
 def _is_cacheable_search_result(value: object) -> bool:
     """只缓存成功结果与确定性空结果；服务错误/异常不缓存，保证可重试。"""
     if not isinstance(value, str) or not value:
@@ -65,7 +61,6 @@ def _is_cacheable_search_result(value: object) -> bool:
     if value.startswith("❌ 未找到"):
         return True  # 确定性空结果，短期内复用可省配额
     return not value.startswith("❌")
-
 
 def _normalize_fetch_cache_key(url: str) -> str:
     """Drop fragment 与常见跟踪参数，让同一页面映射到同一条缓存。"""
@@ -84,15 +79,12 @@ def _normalize_fetch_cache_key(url: str) -> str:
         logger.debug("_normalize_fetch_cache_key 内部忽略的异常", exc_info=True)
         return url
 
-# ========== 缓存函数 ==========
 def get_fetch_cache(url: str) -> str | None:
     return _fetch_cache.get(_normalize_fetch_cache_key(url))
-
 
 def set_fetch_cache(url: str, content: str) -> None:
     """写入 fetch 缓存。
 
-    重要安全修复：此前所有失败结果（以 ``失败：`` 开头的字符串）也被写
     入缓存。这意味着任何一次网络抖动导致的失败都会让该 URL 在
     ``FETCH_CACHE_TTL``（默认 1 小时）内对所有后续调用直接返回缓存的
     失败字符串，即使网络已恢复也不会重试。现在改为只缓存成功结果，

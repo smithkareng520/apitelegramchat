@@ -8,7 +8,6 @@ from core.messages import Message, TextBlock
 if TYPE_CHECKING:
     from ai.draft_manager import DraftManager
 
-
 def refresh_skill_catalog(
     loop_messages: list,
     builder: "DraftManager",

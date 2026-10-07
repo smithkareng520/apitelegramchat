@@ -1,21 +1,18 @@
 # mcp_manager.py — 统一 MCP 客户端管理器（mcp.json 驱动）。
-#
 # 职责
-# ----
 # 1. 解析并校验项目根目录的 mcp.json（对标 Claude Code 的 .mcp.json 语义）：
-#    - streamable_http：外部 MCP（url_env / headers_env 从环境变量注入）；
-#    - stdio：内部 MCP（python3 -m mcpserver.server --module X），
-#      env 条目支持 ``${VAR}`` 形式的宿主环境插值；
-#    - policy.expose / policy.disabled_tools：模型视角的暴露策略。
+# streamable_http：外部 MCP（url_env / headers_env 从环境变量注入）；
+# stdio：内部 MCP（python3 -m mcpserver.server --module X），
+# env 条目支持 ``${VAR}`` 形式的宿主环境插值；
+# policy.expose / policy.disabled_tools：模型视角的暴露策略。
 # 2. 工具发现：list_tools 聚合为模型视角统一命名
-#       mcp__<server>__<tool>
-#    并给出 OpenAI function 格式的工具定义（host 与子 agent 共用）。
+# mcp__<server>__<tool>
+# 并给出 OpenAI function 格式的工具定义（host 与子 agent 共用）。
 # 3. 工具调用：dispatch 只需要 ``call_tool(name, args, chat_id)``——
-#    - stdio 服务器按 (chat, server) 懒生成持久子进程（scope=会话命名空间），
-#      空闲超时自动回收；进程意外退出自动重启一次；
-#    - streamable_http 保持逐调用会话 + 并发信号量 + 故障分类（沿袭上一代
-#      mcp_client.py 对 ModelScope 网关的生产加固，不再维护独立抽象层）。
-#
+# stdio 服务器按 (chat, server) 懒生成持久子进程（scope=会话命名空间），
+# 空闲超时自动回收；进程意外退出自动重启一次；
+# streamable_http 保持逐调用会话 + 并发信号量 + 故障分类（沿袭上一代
+# mcp_client.py 对 ModelScope 网关的生产加固，不再维护独立抽象层）。
 # 结果策略：本模块只做「传输 + 发现」，返回 MCP 工具的原始文本结果；
 # 模型视图裁剪（condense_for_model）与用户视图渲染（format_tool_result）
 # 在 dispatch / tool_call_loop 分层处理，保证“给 AI 的只有有用的”。
@@ -62,7 +59,6 @@ except Exception as exc:  # pragma: no cover - optional deployment dependency
     create_mcp_http_client = None  # type: ignore[assignment]
     _MCP_SDK_AVAILABLE = False
     logger.warning("MCP SDK unavailable; MCP tool calls are disabled: %s", exc)
-
 
 class MCPToolError(RuntimeError):
     """MCP 连接或工具调用失败，并保留可安全展示的诊断信息。"""
@@ -119,10 +115,7 @@ class MCPToolError(RuntimeError):
             return f"❌ {feature_name}请求超时。请稍后重试。"
         return f"❌ {feature_name}暂时不可用{suffix}。请稍后重试，并检查 MCP 部署调用日志。"
 
-
-# =====================================================================
 # 配置模型
-# =====================================================================
 @dataclass(frozen=True)
 class MCPServerConfig:
     """一个 mcp.json 中注册的 MCP 服务器。"""
@@ -152,11 +145,9 @@ class MCPServerConfig:
             return True
         return tool_name in self.exposed_tools
 
-
 def _runtime_env_get(name: str) -> str:
     """读取 config.py 导入时捕获的运行时环境，而非已 scrub 的 os.environ。"""
     return (RUNTIME_ENV.get(name) or "").strip()
-
 
 def _load_config_path(explicit: str | None = None) -> Path:
     if explicit:
@@ -167,7 +158,6 @@ def _load_config_path(explicit: str | None = None) -> Path:
     # mcp.json 与 src/ 同级（项目根）。
     return Path(__file__).resolve().parent.parent / "mcp.json"
 
-
 def _interpolate(value: str) -> str:
     """解析 ``${VAR}`` 形式的环境变量插值；缺失时替换为空串。"""
     match = _ENV_INTERP_RE.fullmatch(value.strip())
@@ -175,13 +165,11 @@ def _interpolate(value: str) -> str:
         return _runtime_env_get(match.group(1))
     return value
 
-
 def _resolve_python_command(command: str) -> str:
     """容器镜像里可能只有 python3；显式 python 时优雅降级。"""
     if command in {"python", "python3"}:
         return sys_executable()
     return command
-
 
 def sys_executable() -> str:
     """优先返回项目可用的 python3 解释器路径。"""
@@ -192,7 +180,6 @@ def sys_executable() -> str:
     import sys
 
     return sys.executable or "python3"
-
 
 def _resolve_pythonpath(value: str) -> str:
     """把 mcp.json 里的相对 PYTHONPATH（如 ``src``）解析为项目根上的绝对路径。"""
@@ -206,7 +193,6 @@ def _resolve_pythonpath(value: str) -> str:
             candidate = (project_root / item).resolve()
         parts.append(str(candidate))
     return os.pathsep.join(parts)
-
 
 def _parse_policy(raw: Any, server_name: str) -> frozenset[str] | None:
     if not isinstance(raw, dict):
@@ -225,10 +211,8 @@ def _parse_policy(raw: Any, server_name: str) -> frozenset[str] | None:
         return None
     return None
 
-
 # list_tools 时按服务器动态剔除的禁用工具（policy.disabled_tools）。
 _DYNAMIC_DISABLED: dict[str, frozenset[str]] = {}
-
 
 def _build_server(name: str, raw: Any) -> MCPServerConfig:
     if not isinstance(raw, dict):
@@ -324,7 +308,6 @@ def _build_server(name: str, raw: Any) -> MCPServerConfig:
         )
     raise ValueError(f"{name}: unknown MCP server type {server_type!r}")
 
-
 def load_servers(config_path: str | None = None) -> dict[str, MCPServerConfig]:
     path = _load_config_path(config_path)
     if not path.is_file():
@@ -350,10 +333,7 @@ def load_servers(config_path: str | None = None) -> dict[str, MCPServerConfig]:
             logger.warning("MCP server registration rejected: %s", exc)
     return servers
 
-
-# =====================================================================
 # HTTP 诊断（沿袭 mcp_client.py 的生产加固）
-# =====================================================================
 class _MCPHTTPTrace:
     """记录 MCP SDK 自行吞掉前的最后一个 HTTP 响应状态。"""
 
@@ -363,7 +343,6 @@ class _MCPHTTPTrace:
         status_code = getattr(response, "status_code", None)
         if isinstance(status_code, int):
             self.status_code = status_code
-
 
 def _tracing_http_client_factory(trace: _MCPHTTPTrace) -> Callable[..., Any]:
     def factory(*args: Any, **kwargs: Any) -> Any:
@@ -376,7 +355,6 @@ def _tracing_http_client_factory(trace: _MCPHTTPTrace) -> Callable[..., Any]:
         return client
 
     return factory
-
 
 def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
     chain: list[BaseException] = []
@@ -396,13 +374,11 @@ def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
             pending.extend(item for item in nested if isinstance(item, BaseException))
     return tuple(chain)
 
-
 def _truncate_safe_detail(value: Any, limit: int = 500) -> str:
     text = str(value or "").strip().replace("\n", " ")
     text = re.sub(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+", r"\1***", text)
     text = re.sub(r"(?i)(api[_-]?key\s*[:=]\s*)[^\s,;]+", r"\1***", text)
     return text[:limit]
-
 
 def _env_hint(server: MCPServerConfig, category: str) -> str:
     """鉴权/端点类失败时，在日志里直接指出应检查的环境变量名。"""
@@ -414,7 +390,6 @@ def _env_hint(server: MCPServerConfig, category: str) -> str:
     if category == "endpoint" and server.url_env:
         return f"check env: {server.url_env}"
     return "-"
-
 
 def _classify_failure(status_code: int | None, detail: str) -> tuple[str, bool]:
     normalized = detail.lower()
@@ -431,7 +406,6 @@ def _classify_failure(status_code: int | None, detail: str) -> tuple[str, bool]:
     if status_code is not None and 400 <= status_code <= 499:
         return "request", False
     return "unknown", True
-
 
 def _diagnose_mcp_exception(
     exc: BaseException,
@@ -468,7 +442,6 @@ def _diagnose_mcp_exception(
     category, retryable = _classify_failure(status_code, detail)
     return status_code, category, detail, retryable
 
-
 # 同一时刻允许并发打开的外部 HTTP MCP 会话总数。
 # ModelScope 的 streamable HTTP 网关在并发会话数升高时表现不稳定
 # （响应体截断 / SSE GET 流被立即关闭），限流到 2 降低上游抖动概率。
@@ -479,9 +452,7 @@ def _max_http_concurrency() -> int:
     except (TypeError, ValueError):
         return 2
 
-
 _HTTP_CALL_SEMAPHORE = asyncio.Semaphore(_max_http_concurrency())
-
 
 def _extract_text(result: Any) -> str:
     parts: list[str] = []
@@ -491,10 +462,7 @@ def _extract_text(result: Any) -> str:
             parts.append(text)
     return "\n".join(parts).strip()
 
-
-# =====================================================================
 # stdio 连接（按 chat 持久子进程）
-# =====================================================================
 class _StdioConnection:
     """一个 (server, chat) 对应的持久 stdio 子进程 + MCP 会话。
 
@@ -620,7 +588,6 @@ class _StdioConnection:
     def idle_for(self) -> float:
         return time.monotonic() - self.last_used
 
-
 class MCPManager:
     """mcp.json 驱动的统一 MCP 客户端管理器。"""
 
@@ -635,7 +602,7 @@ class MCPManager:
         self._tools_cache_ttl = 300.0
         self._closed = False
 
-    # ---------- 工具发现 ----------
+    # 工具发现
     def _full_name(self, server_name: str, tool_name: str) -> str:
         return f"mcp__{server_name}__{tool_name}"
 
@@ -744,7 +711,7 @@ class MCPManager:
             defs.extend(await self.list_server_tools(server_name))
         return defs
 
-    # ---------- 工具调用 ----------
+    # 工具调用
     def _make_connection(self, server: MCPServerConfig, *, scope: str) -> _StdioConnection:
         params = self._stdio_params(server, scope)
         return _StdioConnection(params, scope, display_name=server.name)
@@ -902,7 +869,7 @@ class MCPManager:
             )
         return text
 
-    # ---------- 生命周期 ----------
+    # 生命周期
     def _ensure_reaper(self) -> None:
         if self._reaper_task is None or self._reaper_task.done():
             try:
@@ -936,7 +903,6 @@ class MCPManager:
         if self._reaper_task is not None:
             self._reaper_task.cancel()
             self._reaper_task = None
-
 
 # 进程级单例：host 与子 agent 共用同一个管理器（同一个 per-chat 连接池）。
 mcp_manager = MCPManager()

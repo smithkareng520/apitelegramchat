@@ -1,39 +1,5 @@
 # subagent_tool.py
-"""
-子 Agent 工具。
-
-定位
-----
-让主 agent 能派生一个子 agent 去处理一个独立的子任务。
-典型场景：
-  - 主 agent 接到大任务后，把"研究 X 部分"派给子 agent
-  - 子 agent 拥有干净的上下文（不继承主对话历史），仅看到任务描述 + 可选上下文
-  - 子 agent 可以调用一组受限的工具
-  - 子 agent 跑完返回最终答复，主 agent 据此继续
-
-实现要点
---------
-- 子 agent 的 LLM 调用复用 api_client + SUPPORTED_MODELS（与主 agent 同一套基础设施）
-- 走一个最小化的 OpenAI 兼容 agentic loop：
-    1. 构造 system_prompt + user 任务消息
-    2. 调用 LLM，若返回 tool_calls 则并发执行
-    3. 把 tool 结果塞回 messages，继续下一轮
-    4. 直到 LLM 不再返回 tool_calls，取最终 content 作为答复
-- 工具白名单：默认使用 DEFAULT_ALLOWED_TOOLS 安全子集（检索/地图/文件/
-  bash/text_editor/todo 等，不含 message_user / memory / subagent 与
-  图像视频生成工具），调用方可在 allowed_tools 里进一步限制为子集
-- 安全护栏：
-    - 最大循环轮数：MAX_SUBAGENT_ROUNDS = 32（可通过环境变量 SUBAGENT_MAX_ROUNDS 调整）
-    - 最大单次工具结果预算：20,000 tokens（可通过环境变量 SUBAGENT_TOOL_RESULT_TOKEN_BUDGET 调整）
-    - 总体超时：DEFAULT_TIMEOUT = 900s（可通过环境变量 SUBAGENT_DEFAULT_TIMEOUT 调整）
-    - 禁止子 agent 递归调用 subagent 工具（防爆炸）
-- 不带流式输出（子 agent 是后台任务，用户不需要看 token 流），用普通 chat.completions.create
-
-返回
-----
-JSON 字符串，包含：
-  ok / subagent_model / rounds / tool_calls / answer / elapsed / error
-"""
+"""子 Agent 工具。"""
 
 from __future__ import annotations
 
@@ -66,7 +32,6 @@ from token_budget import count_tokens, truncate_to_token_budget
 
 logger = logging.getLogger(__name__)
 
-
 def _env_int(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
     """读取整数型环境变量，解析失败时回退默认值，并可选地夹紧范围。"""
     raw = os.getenv(name)
@@ -80,8 +45,7 @@ def _env_int(name: str, default: int, *, min_value: int | None = None, max_value
         value = min(max_value, value)
     return value
 
-
-# ---------- 安全护栏 ----------
+# 安全护栏
 MAX_SUBAGENT_ROUNDS = _env_int("SUBAGENT_MAX_ROUNDS", 32, min_value=1, max_value=128)
 SUBAGENT_TOOL_RESULT_TOKEN_BUDGET = _env_int(
     "SUBAGENT_TOOL_RESULT_TOKEN_BUDGET", 20_000, min_value=256, max_value=20_000
@@ -101,7 +65,6 @@ SUBAGENT_ANSWER_TOKEN_BUDGET = _env_int(
 SUBAGENT_CARD_PREVIEW_TOKEN_BUDGET = _env_int(
     "SUBAGENT_CARD_PREVIEW_TOKEN_BUDGET", 1_000, min_value=128, max_value=4_000
 )
-
 
 # 子 agent 不允许调用的工具（防递归 / 防爆炸 / 防资源滥用）。
 # MCP 化后模型可见名统一为 mcp__<server>__<tool>（见 tool_names），
@@ -160,7 +123,6 @@ SUBAGENT_SYSTEM_PROMPT_TEMPLATE = """\
 - 如果调用了 web_search 等检索工具，在引用信息后附上来源链接。
 """
 
-
 async def _filter_tools(allowed: Optional[list[str]]) -> list[dict]:
     """根据白名单从统一工具面里挑出子 agent 可用的工具定义。
 
@@ -203,7 +165,6 @@ async def _filter_tools(allowed: Optional[list[str]]) -> list[dict]:
             out.append(t)
     return out
 
-
 def _truncate(s: str, token_budget: int = SUBAGENT_TOOL_RESULT_TOKEN_BUDGET, fn_name: str | None = None) -> str:
     # bash 结果用「头尾保留」策略：命令报错几乎总在结尾，纯头部截断
     # 会让子 agent 看不到失败原因而盲目重试。
@@ -215,7 +176,6 @@ def _truncate(s: str, token_budget: int = SUBAGENT_TOOL_RESULT_TOKEN_BUDGET, fn_
         token_budget,
         suffix="\n…[子 agent 视野已按 token 预算截断]",
     )
-
 
 async def _execute_tool_for_subagent(
     name: str, arguments: dict, chat_id: int
@@ -244,7 +204,7 @@ async def _execute_tool_for_subagent(
         # 各自发起的工具调用（web_search / bash 等）仍受总并发上限约束，
         # 避免 N 个子 agent 同时爆发出 N×M 个不受控的外部请求。
         async with tool_semaphore:
-            # v2.4：bash 的 per-call timeout 参数（5-600s）显式指定时，
+            # bash 的 per-call timeout 参数（5-600s）显式指定时，
             # 子 agent 外层上限随之放大（+10s 清理缓冲），与主循环
             # tool_call_loop 的联动逻辑保持一致，避免外层先杀正常长命令。
             exec_timeout = SUBAGENT_TOOL_TIMEOUT
@@ -278,7 +238,6 @@ async def _execute_tool_for_subagent(
     except Exception as e:
         logger.debug("_execute_tool_for_subagent 内部忽略的异常", exc_info=True)
         return f"Error: tool '{name}' failed: {str(e)[:200]}"
-
 
 async def _create_chat_completion(client: Any, model_info: Optional[ModelConfig], create_params: dict) -> Any:
     """按厂商分流的一次性（非流式）补全调用。
@@ -325,7 +284,6 @@ async def _create_chat_completion(client: Any, model_info: Optional[ModelConfig]
             reasoning=create_params.get("reasoning"),
         )
     return await client.chat.completions.create(**create_params)
-
 
 async def _subagent_agentic_loop(
     client: Any,
@@ -415,13 +373,13 @@ async def _subagent_agentic_loop(
             if reasoning_top:
                 create_params.update(reasoning_top)
             # 会话亲和 + 手动/自动缓存与主 agent 统一（_merged_extra_body）：
-            # - OpenRouter：provider 路由偏好 + body.session_id 粘性路由
-            #   （从第一次请求就生效，多轮工具循环的前缀缓存不因路由漂移
-            #   而失效）+ Anthropic 系模型的顶层自动 cache_control（断点
-            #   随消息增长自动前移，每轮的工具结果都能被下一轮命中）。
-            # - agnes 等声明 session_affinity 的网关：body.session_id +
-            #   X-Session-Id 请求头（与主 agent 同键，副本粘性）。
-            # - 其余厂商：仅透传 reasoning_extra（与旧行为一致）。
+            # OpenRouter：provider 路由偏好 + body.session_id 粘性路由
+            # （从第一次请求就生效，多轮工具循环的前缀缓存不因路由漂移
+            # 而失效）+ Anthropic 系模型的顶层自动 cache_control（断点
+            # 随消息增长自动前移，每轮的工具结果都能被下一轮命中）。
+            # agnes 等声明 session_affinity 的网关：body.session_id +
+            # X-Session-Id 请求头（与主 agent 同键，副本粘性）。
+            # 其余厂商：仅透传 reasoning_extra（与旧行为一致）。
             # 延迟导入避免模块级循环（agentic_loops -> tool_call_loop ->
             # tool_executors -> subagent_tool，见文件头同型注释）。
             from ai.agentic_loops import (
@@ -585,7 +543,6 @@ async def _subagent_agentic_loop(
         "answer": "",
     }
 
-
 async def execute_subagent(
     chat_id: int,
     task: str,
@@ -693,16 +650,13 @@ async def execute_subagent(
     result["task_preview"] = task[:80]
     return json.dumps(result, ensure_ascii=False)
 
-
-# ---------- 富文本渲染 ----------
+# 富文本渲染
 from core.text_utils import escape_html_text as _esc
-
 
 _HTML_VOID_TAGS = {
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
     "meta", "param", "source", "track", "wbr",
 }
-
 
 class _HTMLPreviewTruncator(HTMLParser):
     """Keep a structurally valid HTML preview within an exact token budget."""
@@ -795,7 +749,6 @@ class _HTMLPreviewTruncator(HTMLParser):
     def render(self) -> tuple[str, bool]:
         return "".join(self.parts) + self._closing_html(), self.truncated
 
-
 def _truncate_html_preview(fragment: str, token_budget: int = SUBAGENT_CARD_PREVIEW_TOKEN_BUDGET) -> tuple[str, bool]:
     """截取富文本 token 预算内的预览，绝不在标签或实体中间切断。"""
     text = fragment or ""
@@ -815,7 +768,6 @@ def _truncate_html_preview(fragment: str, token_budget: int = SUBAGENT_CARD_PREV
         pass
     safe_text = truncate_to_token_budget(text, token_budget, suffix="…")
     return truncate_to_token_budget(_esc(safe_text), token_budget, suffix="…"), True
-
 
 def render_subagent_card(payload: dict) -> str:
     """把 execute_subagent 的返回渲染成父 agent 看到的工具结果卡片。"""
@@ -857,8 +809,7 @@ def render_subagent_card(payload: dict) -> str:
         f"{truncation_note}"
     )
 
-
-# ---------- 工具定义（OpenAI function-calling schema） ----------
+# 工具定义（OpenAI function-calling schema）
 # 注意：description 字段是给 AI 阅读的「工具说明书」，全部用纯文本，
 # 不使用 Markdown 语法，与系统提示词风格保持一致。
 SUBAGENT_TOOL = {

@@ -22,7 +22,6 @@ TOOL = {"type": "function", "name": "get_time", "description": "返回当前时�
         "parameters": {"type": "object", "properties": {}, "required": []}}
 USER = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "现在几点？请调用 get_time 工具回答。"}]}
 
-
 def post(body):
     body = {"model": MODEL, "stream": True, "store": True, "max_output_tokens": 512, **body}
     events, status, err = [], None, ""
@@ -40,7 +39,6 @@ def post(body):
                     pass
     done = next((e["response"] for e in events if e.get("type") == "response.completed"), None)
     return status, err, done
-
 
 st, err, r1 = post({"input": [USER], "tools": [TOOL], "tool_choice": "required"})
 if not r1:

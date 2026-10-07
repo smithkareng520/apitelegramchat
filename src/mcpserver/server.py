@@ -33,7 +33,6 @@ logger = logging.getLogger(__name__)
 SERVER_NAME = "apitelegramchat"
 from version import __version__ as SERVER_VERSION  # noqa: E402  包元数据唯一来源
 
-
 def create_server(context: MCPRequestContext, module_names: list[str], *, with_resources: bool) -> Server:
     """Create a stdio SDK server for one trusted local scope."""
     tools = ToolRegistry(module_names)
@@ -62,7 +61,6 @@ def create_server(context: MCPRequestContext, module_names: list[str], *, with_r
 
     return server
 
-
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="mcpserver.server", description="apitelegramchat internal MCP tools")
     group = parser.add_mutually_exclusive_group()
@@ -76,7 +74,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     group.add_argument("--modules", dest="modules", nargs="+", help="Alias of --module (accepts multiple values).")
     return parser.parse_args(argv)
 
-
 async def run_stdio(module_names: list[str], *, with_resources: bool) -> None:
     """Run a single local MCP connection over SDK-managed stdio transport."""
     context = MCPRequestContext.from_environment()
@@ -88,7 +85,6 @@ async def run_stdio(module_names: list[str], *, with_resources: bool) -> None:
             server.create_initialization_options(),
             raise_exceptions=False,
         )
-
 
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -111,7 +107,6 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(run_stdio(module_names, with_resources=with_resources))
     except KeyboardInterrupt:
         logger.info("MCP server stopped by signal")
-
 
 if __name__ == "__main__":
     main()

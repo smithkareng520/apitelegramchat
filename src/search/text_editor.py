@@ -1,4 +1,4 @@
-"""text_editor 工具：view/str_replace/create/insert/list（自 search_engine.py 拆出）。
+"""提供工作区文本文件的查看与编辑工具。
 
 行尾保真：所有读写按原始字节进行（CRLF 不被 universal newlines
 静默翻译成 LF）；纯 CRLF 文件在匹配/写入时整体按 CRLF 空间处理。
@@ -17,7 +17,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
 # 工作区文件只保存在本地。R2 同步由明确的用户上传/专用状态机制负责；
 # text_editor 本身不因为模型编辑工作区文件而触发 R2。
 
@@ -26,28 +25,20 @@ def _normalize_editor_text(text: str) -> str:
         return ""
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
-
 def _read_editor_content(path: Path) -> str:
     """Read a UTF-8 text file preserving its exact line-ending bytes.
 
-    旧实现用 ``Path.read_text``（universal newlines）：读取时把 CRLF/CR
-    全部翻译成 LF，任何一次 str_replace/insert 都会把 CRLF 文件整体
-    静默改写成 LF 风格（编辑一行 = 重写全文件行尾）。这里按原始字节
-    读回并 decode，行尾原样保留，由各命令自行决定是否（以及在哪个
-    空间里）做行尾归一化。
+    按原始字节读取并解码，保留 CRLF/CR/LF 行尾，由各命令决定是否归一化。
     """
     return path.read_bytes().decode("utf-8")
-
 
 def _is_pure_crlf(content: str) -> bool:
     """True 当文件行尾全部是 CRLF（每个 ``\n`` 都属于某个 ``\r\n``）。"""
     return content.count("\r\n") > 0 and content.count("\n") == content.count("\r\n")
 
-
 def _is_plain_int(value: object) -> bool:
     """int 且不是 bool（bool 是 int 的子类，True 会被当成 1 放行）。"""
     return isinstance(value, int) and not isinstance(value, bool)
-
 
 # 文本编辑器输出与读入体积上限（可用环境变量覆盖）。
 # - 单行截断：超长行（minified JS / base64 单行）截到 2000 字符，
@@ -62,14 +53,12 @@ _EDITOR_VIEW_TOKEN_BUDGET = int(os.getenv("TEXT_EDITOR_VIEW_TOKEN_BUDGET", "2000
 _EDITOR_MAX_VIEW_BYTES = int(os.getenv("TEXT_EDITOR_MAX_VIEW_BYTES", str(16 * 1024 * 1024)))
 _EDITOR_MAX_EDIT_BYTES = int(os.getenv("TEXT_EDITOR_MAX_EDIT_BYTES", str(64 * 1024 * 1024)))
 
-
 def _format_editor_line(line_no: int, text: str, width: int) -> str:
     """Format a text-editor view line with an absolute 1-based line number."""
     text = text.rstrip("\r\n")
     if len(text) > _EDITOR_MAX_LINE_CHARS:
         text = text[:_EDITOR_MAX_LINE_CHARS] + "…[line truncated]"
     return f"{line_no:>{width}}: {text}"
-
 
 def _render_view_output(
     lines: list[str], start: int, end: int, total_lines: int, width: int,
@@ -111,7 +100,6 @@ def _render_view_output(
         return note
     return "\n".join(kept) + "\n" + note
 
-
 def _latest_editor_snapshot(content: str, max_lines: int = 10) -> str:
     """Return the tail of a file with absolute line numbers for the chat UI."""
     lines = _normalize_editor_text(content).splitlines()
@@ -121,13 +109,10 @@ def _latest_editor_snapshot(content: str, max_lines: int = 10) -> str:
     width = len(str(len(lines)))
     return "\n".join(_format_editor_line(index, lines[index - 1], width) for index in range(start, len(lines) + 1))
 
-
 def _with_latest_editor_snapshot(message: str, content: str) -> str:
     return f"{message}\n\nLatest file snapshot (tail 10):\n{_latest_editor_snapshot(content)}"
 
-
 SNIPPET_LINES = 4
-
 
 def _format_editor_snippet(
     content: str,
@@ -157,13 +142,11 @@ def _format_editor_snippet(
         "Review the changes and make sure they are as expected. Edit the file again if necessary."
     )
 
-
 def _with_editor_snippet_or_tail(message: str, content: str, target_line: int | None = None, new_lines: int = 0) -> str:
     if target_line is not None and target_line >= 1:
         snippet = _format_editor_snippet(content, target_line, total_new_lines=new_lines)
         return f"{message}\n\n{snippet}"
     return _with_latest_editor_snapshot(message, content)
-
 
 def _list_directory_contents(dir_path: Path, display_name: str, max_depth: int = 2) -> str:
     """List directory contents up to max_depth levels deep, excluding hidden items."""
@@ -173,7 +156,6 @@ def _list_directory_contents(dir_path: Path, display_name: str, max_depth: int =
         for current_root, dirs, files in os.walk(dir_path):
             current_path = Path(current_root)
             depth = len(current_path.parts) - root_level
-            # 过滤隐藏目录
             dirs[:] = [d for d in dirs if not d.startswith(".")]
             if depth >= max_depth:
                 dirs.clear()
@@ -205,7 +187,6 @@ def _list_directory_contents(dir_path: Path, display_name: str, max_depth: int =
         f"excluding hidden items:\n{listing}\n"
     )
 
-
 def _write_text_editor_file(local_path: Path, new_content: str) -> None:
     """Atomically replace an existing UTF-8 text file while preserving its mode.
 
@@ -229,7 +210,6 @@ def _write_text_editor_file(local_path: Path, new_content: str) -> None:
             pass
         raise
 
-
 def _file_too_large_error(action: str, local_path: Path, limit_bytes: int) -> str:
     """体积上限错误：读入整个大文件会 OOM 全进程，必须提前拒绝。"""
     size_mb = local_path.stat().st_size / (1024 * 1024)
@@ -239,14 +219,12 @@ def _file_too_large_error(action: str, local_path: Path, limit_bytes: int) -> st
         "Inspect or edit it with bash (head/tail/grep/sed) instead."
     )
 
-
 def _permission_error(command: str) -> str:
     if command == "view":
         return "Error: Permission denied. Cannot read file."
     if command == "create":
         return "Error: Permission denied. Cannot create file."
     return "Error: Permission denied. Cannot write to file."
-
 
 # ---------- 主函数 ----------
 async def execute_text_editor(
@@ -286,7 +264,6 @@ async def execute_text_editor(
         return f"Error: Cannot access workspace: {exc.strerror or str(exc)}"
     except RuntimeError as exc:
         # _secure_directory 拒绝符号链接化的 runtime 目录时抛 RuntimeError，
-        # 此前会直接冒泡成裸异常（不在任何 except 分支里）。
         return f"Error: Cannot access workspace: {exc}"
 
     lock = await _get_workspace_lock(chat_id, resolved_namespace)
@@ -349,7 +326,6 @@ async def execute_text_editor(
                         file.write(data)
                 except FileExistsError:
                     return "Error: File already exists."
-                # 成功消息使用 workspace 相对路径：绝对路径会泄漏服务器
                 # 目录结构，也违背「一切路径相对 workspace 根」的约定。
                 return _with_latest_editor_snapshot(f"Successfully created file: {safe_path}", file_text)
 
@@ -422,8 +398,6 @@ async def execute_text_editor(
                     success_msg, new_content, target_line=replacement_line, new_lines=new_str_lines_count
                 )
 
-            # command == "insert"
-            # 兼容官方参数名：insert_text (20250728) 和 new_str (20241022)
             actual_insert_text = insert_text if insert_text is not None else new_str
             if not _is_plain_int(insert_line) or not isinstance(actual_insert_text, str):
                 return "Error: insert_line must be an integer between 0 and the file's line count, and insert_text (or new_str) must be a string."
@@ -464,13 +438,11 @@ async def execute_text_editor(
         except (ValueError, RuntimeError) as exc:
             # ValueError：_resolve_editor_path 检出逃逸 workspace 的符号
             # 链接、或写入时遇到不可编码字符（UnicodeEncodeError 是
-            # ValueError 子类）。此前这类异常会直接冒泡成裸 Exception
+            # ValueError 子类）。
             # （except 链只接 OSError 家族），主循环兜底成 "Exception: ..."
             # 丢失 Error: 前缀约定与恢复指引，MCP 入口（invoke 无兜底）
             # 则直接把调用打崩。RuntimeError：workspace 根目录异常。
             return f"Error: {exc}"
-# ===================== 文件编辑器工具实现 =====================
-
 
 def _editor_safe_path(path: str, allow_root: bool = False) -> str:
     """Return a normalized relative path without traversal segments.
@@ -506,7 +478,6 @@ def _editor_safe_path(path: str, allow_root: bool = False) -> str:
     if norm.startswith("..") or norm.startswith("/") or os.path.isabs(norm):
         raise ValueError("Invalid path: directory traversal not allowed")
     return norm
-
 
 def _resolve_editor_path(workspace: Path, safe_path: str, allow_root: bool = False) -> Path:
     """Resolve a path and reject any file or parent symlink escaping workspace."""
