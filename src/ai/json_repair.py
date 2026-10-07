@@ -43,10 +43,8 @@ from utils import get_logger
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
 # 与 provider 交互的信封常量（单一数据源；tool_summary 重新导出以保持
-# 导入路径兼容）。
-# ---------------------------------------------------------------------------
+# 保持现有导入路径兼容。
 
 # 流式调用偶发截断/拼接异常时，不能把原始坏字符串写回下一轮请求，否则
 # 网关会在模型开始生成前直接 400。此标记本身是合法 JSON，并让执行层
@@ -58,7 +56,7 @@ _PARSE_ERROR_KEY = "parse_error"
 _ERROR_CONTEXT_KEY = "error_context"
 _DIAGNOSED_ISSUES_KEY = "diagnosed_issues"
 _TRUNCATED_KEY = "looks_truncated"
-# v2.5：流结束原因观测。None = 调用方无信息（保持旧行为）；
+# 流结束原因观测。None = 调用方无信息（保持旧行为）；
 # "length" / "max_tokens" / "content_filter" = 确认被上限/过滤器切断；
 # "" = 流消费完毕但从未见到终止事件（网关断流）；
 # "stop" / "tool_calls" / "end_turn" / "tool_use" 等 = 正常结束。
@@ -102,9 +100,7 @@ _MARKDOWN_FENCE_RE = re.compile(
 )
 
 
-# ---------------------------------------------------------------------------
 # 出错位置上下文
-# ---------------------------------------------------------------------------
 
 def _error_location_context(doc: str, pos: Optional[int], window: int = 48) -> str:
     """渲染解析器报错位置的上下文片段，形如::
@@ -150,9 +146,7 @@ def _error_location_context(doc: str, pos: Optional[int], window: int = 48) -> s
         return ""
 
 
-# ---------------------------------------------------------------------------
 # 字符级、字符串感知的 JSON 重写器
-# ---------------------------------------------------------------------------
 
 def _rewrite_jsonish(raw: str, allow_close: bool) -> tuple[str, list, bool]:
     """对 JSON 风格字符串做保守语法修复，返回 ``(重写结果, 修复说明, 是否截断)``。
@@ -435,9 +429,7 @@ def _extract_jsonish(raw: str) -> tuple[str, list]:
     return s, fixes
 
 
-# ---------------------------------------------------------------------------
 # 公开 API：修复 / 诊断 / 消息渲染
-# ---------------------------------------------------------------------------
 
 # json-repair 社区标准库（可选依赖）的函数句柄缓存：
 # None = 尚未探测；False = 不可用（未安装）；其余 = 可调用的 repair_json。
@@ -616,7 +608,7 @@ def build_invalid_arguments_envelope(
             reason = "arguments were empty — provide the required arguments as a JSON object"
             issues = ["arguments field was empty or whitespace-only"]
             truncated = False
-            # v2.5：带 id/name 的工具调用不会自愿发空参数；若流结束原因
+            # 带 id/name 的工具调用不会自愿发空参数；若流结束原因
             # 显示异常截断（上限/断流），根因几乎必是「参数还没开始生成就
             # 被切断」——明说根因并标记截断，让分块降级指引生效。
             if cut:
@@ -648,7 +640,7 @@ def build_invalid_arguments_envelope(
         for f in rewrite_fixes:
             if f not in issues:
                 issues.append(f)
-        # v2.5：流结束原因佐证——finish_reason=length 与截断判定互相印证，
+        # 流结束原因佐证——finish_reason=length 与截断判定互相印证，
         # 把根因写进病因清单（含 "cut off"，供消息层渲染专属段）。
         if cut:
             marker = f"response was cut off mid-generation — {cut_cause}"
@@ -759,7 +751,7 @@ def invalid_arguments_message(fn_name: str, fn_args: dict) -> str:
 
         parts = [first_line, ""]
         parts.append(f"[Parser error] {parse_error}")
-        # v2.5：流结束原因专属段——把「传输层被切断」与「模型写坏了 JSON"
+        # 流结束原因专属段——把「传输层被切断」与「模型写坏了 JSON"
         # 两种根因彻底分开。前者重引号没用，必须缩输出/分块；后者才是
         # 语法修复路径。正常结束（stop/tool_calls）时明确告诉模型
         # 「问题在你自己的 JSON」，避免误归因。
@@ -799,7 +791,7 @@ def invalid_arguments_message(fn_name: str, fn_args: dict) -> str:
         for rule in _rules_for_issues(issues + ([reason] if not issues else [])):
             parts.append(f"- {rule}")
         if truncated:
-            # v2.4：截断专属补充指引。诊断层无法从截断的参数里区分"偶发流断连"
+            # 截断专属补充指引。诊断层无法从截断的参数里区分"偶发流断连"
             # 还是"单参数载荷超限"，但"重发完整参数"对后者是死循环陷阱——
             # 同样的巨参数会以同样的方式再次被切断。因此明确给出重试上限与
             # 分块降级策略，避免模型在超大 file_text/new_str 上反复撞墙。

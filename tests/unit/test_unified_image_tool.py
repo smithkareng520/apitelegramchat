@@ -29,9 +29,7 @@ def _tool_defs() -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
 # 1. Schema 合并
-# ---------------------------------------------------------------------------
 
 def test_unified_image_tool_listed():
     assert "generate_image" in _tool_defs()
@@ -114,9 +112,7 @@ def test_input_examples_cover_generate_and_edit_shapes():
         assert examples[2]["model"] in DUAL_MODE_MODELS
 
 
-# ---------------------------------------------------------------------------
 # 2. 分发路由
-# ---------------------------------------------------------------------------
 
 class _Captured:
     def __init__(self):
@@ -163,9 +159,7 @@ def test_dispatch_generate_image_with_url_is_edit():
     assert kwargs["image_url"] == "https://example.com/ref.png"
 
 
-# ---------------------------------------------------------------------------
 # 3. 能力硬校验：仅文生图模型 + image_url -> 立即可操作错误
-# ---------------------------------------------------------------------------
 
 def _run_execute_generate_image(monkeypatch, *, model_info, image_url):
     import search.media_tools as mt
@@ -222,9 +216,7 @@ def test_generate_only_model_without_image_url_still_works(monkeypatch):
     assert captured["task"].operation == "generate"
 
 
-# ---------------------------------------------------------------------------
 # 4. UI 折叠块：生成 / 编辑 分别显示
-# ---------------------------------------------------------------------------
 
 def test_initial_summary_follows_image_url():
     from ai.tool_summary import _generate_initial_tool_summary

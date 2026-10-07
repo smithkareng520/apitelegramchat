@@ -1,7 +1,5 @@
-# =====================================================================
 # tests/unit/test_model_view_and_tool_status.py
-# =====================================================================
-# 回归测试（2026-10 工具结果去 JSON 化 + 折叠块状态补齐）：
+# 验证工具结果的模型视图和折叠块状态保持一致。
 # 1. 模型视图纯文本化：weather/todo/memory/subagent/message_user/present_files
 #    的 tool 消息不再包含 JSON；
 # 2. weather 载荷源头瘦身：工具不再生产 DewPoint/shortRad/十项 chance_* 等
@@ -10,7 +8,6 @@
 #    weather/exchange_rate/wikipedia/subagent 带对象信息；bash 后台任务、
 #    maps_ip_location 等此前缺状态的工具有专属文案；路线/距离/详情完成态
 #    带结果要点；单条目工具组标题复用条目详情摘要。
-# =====================================================================
 import asyncio
 import json
 
@@ -23,9 +20,7 @@ from ai.tool_summary import (
 from tool_result_format import format_tool_result
 
 
-# ---------------------------------------------------------------------
 # 折叠块进行态：对象信息进入标题 / 此前缺失状态的工具有专属文案
-# ---------------------------------------------------------------------
 def test_running_summaries_carry_object_context():
     assert _generate_initial_tool_summary("weather", {"city": "北京"}) == "Fetching weather for 北京"
     assert _generate_initial_tool_summary("weather", {}) == "Fetching weather"
@@ -74,9 +69,7 @@ def test_action_description_includes_subagent_task():
         == "delegating to a subagent: 写周报"
 
 
-# ---------------------------------------------------------------------
 # 折叠块完成态：结果要点进入标题
-# ---------------------------------------------------------------------
 def test_done_weather_summary_from_result_payload():
     result = json.dumps({"city": "北京", "unit": "C",
                          "current": {"temp": "25", "condition": "多云"}}, ensure_ascii=False)
@@ -130,9 +123,7 @@ def test_done_present_files_summary_reflects_real_outcome():
         == "Sent 1 file (a.pdf), 1 failed"
 
 
-# ---------------------------------------------------------------------
 # 工具组：单条目组标题复用条目详情摘要；bash 后台任务组标题
-# ---------------------------------------------------------------------
 def _builder_with_item(fn_name: str, fn_args: dict, summary: str = "") -> RichMessageBuilder:
     builder = RichMessageBuilder(chat_id=1)
     builder.add_tool_item("tc1", fn_name, summary or f"{fn_name} placeholder", fn_args=fn_args)
@@ -167,9 +158,7 @@ def test_group_done_title_reuses_single_item_summary():
     assert builder._tool_groups[0]["outer_summary"] == "Fetched weather: 北京 25°C 多云"
 
 
-# ---------------------------------------------------------------------
 # weather 工具源头瘦身 + UI 卡片兼容
-# ---------------------------------------------------------------------
 def test_weather_tool_payload_contract():
     # execute_weather 依赖网络；这里验证其载荷字段契约与消费者一致：
     # 模型视图 / UI 卡片消费的字段 ⊆ 工具生产的字段（源头瘦身不加无用字段）。

@@ -1,7 +1,5 @@
-# =====================================================================
 # tests/unit/test_ingest_supervisor.py
-# =====================================================================
-# 回归护栏：2026-09-15「进程活着但永久失聪」事故。
+# 回归测试：更新摄取任务失效时，服务健康状态应反映实际可用性。
 #
 # 现场特征：/health 恒 200、loop_lag=0.00s、心跳每分钟准点，但
 # queue=0 / active_tasks=0 / tasks=12 连续数十分钟一动不动，日志里
@@ -13,7 +11,6 @@
 #   2. 轮询子任务无论以何种方式结束，主管都必须把它拉起来；
 #   3. 子任务活着但长时间拉不到东西（停摆）时，主管必须强制重启；
 # 外加：摄取通道断了 is_ingest_broken() 必须为真（/health 据此返回 503）。
-# =====================================================================
 import asyncio
 
 import pytest
@@ -39,9 +36,7 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-# ---------------------------------------------------------------------
 # 1. 误取消不得杀死轮询循环
-# ---------------------------------------------------------------------
 def test_stray_cancellation_does_not_kill_poll_loop(monkeypatch):
     """aiohttp 超时取消逸出这类误取消，循环必须吸收后继续。
 
@@ -83,9 +78,7 @@ def test_stray_cancellation_does_not_kill_poll_loop(monkeypatch):
     assert calls["n"] >= 4
 
 
-# ---------------------------------------------------------------------
 # 2. 子任务死掉，主管必须拉起来
-# ---------------------------------------------------------------------
 def test_supervisor_restarts_dead_poll_loop(monkeypatch):
     """轮询子任务异常退出后，主管按退避重启，通道不会永久失聪。"""
     monkeypatch.setattr(tp, "_BACKOFF_MIN", 0.01)
@@ -120,9 +113,7 @@ def test_supervisor_restarts_dead_poll_loop(monkeypatch):
     assert tp._restart_count >= 2
 
 
-# ---------------------------------------------------------------------
 # 3. 停摆（任务活着但拉不到东西）也要重启
-# ---------------------------------------------------------------------
 def test_supervisor_restarts_stalled_poll_loop(monkeypatch):
     """子任务还在跑但长时间没有一次成功的 getUpdates → 强制重启。
 
@@ -158,9 +149,7 @@ def test_supervisor_restarts_stalled_poll_loop(monkeypatch):
     assert starts["n"] >= 2, "停摆的轮询子任务没有被主管强制重启"
 
 
-# ---------------------------------------------------------------------
 # 4. 摄取通道断了，健康判定必须变红
-# ---------------------------------------------------------------------
 def test_is_ingest_broken_only_after_start():
     """没启用轮询（webhook 模式 / 单测进程）时不得误报不健康。"""
     assert tp.is_ingest_broken() is False

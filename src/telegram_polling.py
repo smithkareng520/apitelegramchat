@@ -104,9 +104,7 @@ STALL_SECONDS = float(
     os.getenv("TELEGRAM_POLL_STALL_SECONDS", str((TELEGRAM_POLL_TIMEOUT + 15) * 3))
 )
 
-# ---------------------------------------------------------------------------
 # 摄取通道运行期状态（供 /health、心跳、/webhookinfo 读取）
-# ---------------------------------------------------------------------------
 # _started：本进程是否真的启动过摄取通道。webhook 模式与测试进程为 False，
 #           此时 is_ingest_broken() 恒为 False——健康检查只对"本该运行却
 #           没在跑"的情况变红，不误伤未启用轮询的部署。

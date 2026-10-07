@@ -36,9 +36,7 @@ def _available_emoji_font_path(emoji_font_module):
         return None
 
 
-# ---------------------------------------------------------------------------
 # Static / packaging checks
-# ---------------------------------------------------------------------------
 
 def test_repo_does_not_vendor_the_emoji_font():
     """The font is installed by the Dockerfile, not committed to the repo."""
@@ -70,9 +68,7 @@ def test_emoji_preferred_blocks_cover_common_dingbats(emoji_font_module):
         assert emoji_font_module._in_emoji_preferred_blocks(codepoint)
 
 
-# ---------------------------------------------------------------------------
 # Pure run-splitting logic (no ReportLab needed)
-# ---------------------------------------------------------------------------
 
 def _widths(chars: str) -> dict:
     return {ord(ch): 600 for ch in chars}
@@ -137,9 +133,7 @@ def test_invalid_policy_rejected(emoji_font_module):
         emoji_font_module.split_font_runs("x", BASE, EMOJI, on_missing="nuke")
 
 
-# ---------------------------------------------------------------------------
 # ReportLab integration (skipped when reportlab/font is unavailable)
-# ---------------------------------------------------------------------------
 
 def test_register_and_markup_end_to_end(emoji_font_module):
     reportlab = pytest.importorskip("reportlab")

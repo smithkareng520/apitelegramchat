@@ -195,17 +195,13 @@ __all__ = [
 ]
 
 # 打断时未执行/被取消的【只读】工具调用的占位回执（tool 消息 content）。
-# 五阶段规范·阶段4a：必须带 aborted（已中止）状态语义，保证调用声明与
-# 回执绝对成对闭合——网关不会因悬空 tool_use 报 400，模型也不会把
-# "没有结果"误读成"执行成功"。
+# 中止的只读调用必须写入 aborted 回执，保持 tool_call 与 tool_result 成对闭合。
 INTERRUPTED_TOOL_PLACEHOLDER = (
     "用户打断，工具调用已中止（aborted）：执行未完成、没有结果返回；"
     "请根据新指令决定是否需要重新发起。"
 )
 
-# 打断时仍在执行的【写操作】工具的占位回执（阶段4b）：写操作不可安全
-# 中止（中止≠回滚），已脱离主进程后台死等确切终态；终态到达后由
-# writeback_detached_tool_result 原地替换本占位——回填前模型不得假定成败。
+# 写操作不能通过取消实现回滚；先记录占位结果，后台任务完成后再原地回写终态。
 DETACHED_TOOL_PLACEHOLDER = (
     "用户打断，但该工具是不可中止的写操作：已脱离本轮在后台继续执行，"
     "确切终态（成功/失败/回滚）稍后自动回填本条目；在回填前请勿假定其成败。"
@@ -233,9 +229,7 @@ EARLY_PERSIST_MODE = "__apitc_early_persist_mode__"
 # meta 永不出站（见 core/messages.py），不会进入请求体。
 EARLY_PERSIST_TS = "__apitc_early_persist_ts__"
 
-# 引用回复前缀标记（与 app_turns/media_wizard 同值；此处复制以避免循环导入）。
-# 引用前缀只服务当前请求的上下文提示（拼在 user content 开头），持久化历史
-# 时必须剥离，否则每轮请求都会把引用全文重发给模型，污染上下文并浪费 token。
+# 引用前缀只服务当前请求；持久化历史前必须剥离，避免重复注入上下文。
 REPLY_MARKER = "💡 引用回复:"
 
 
@@ -284,10 +278,7 @@ class _InFlightEntry:
     render_cursor_ref: Optional[list] = None
 
 
-# chat_id -> 该 chat 进行中（或尚未注销）的轮次登记，按注册顺序排列。
-# 注册表只做同步原子操作（append / pop / filter），asyncio 单线程模型下
-# 不存在中途让出，故无需 asyncio.Lock——这也让"写历史 + 注销登记"
-# 可以在 chat 锁内连成一个无取消窗口的原子区间（见 note_turn_persisted）。
+# 每个 chat 的进行中轮次按注册顺序保存。操作均为同步列表变更，无需额外锁。
 _inflight: dict[int, list[_InFlightEntry]] = {}
 
 # chat_id -> 本轮是否已通过 deliver_reply 主动交付过回复。
@@ -304,9 +295,7 @@ _reply_suppressed: set[int] = set()
 _default_send: set[int] = set()
 
 
-# =====================================================================
 # 登记与注销
-# =====================================================================
 def _current_task() -> Optional[asyncio.Task]:
     try:
         return asyncio.current_task()
@@ -514,9 +503,7 @@ async def drain_completed_turns(chat_id: int) -> None:
             logger.debug("陈旧登记保全失败（可忽略）", exc_info=True)
 
 
-# =====================================================================
 # 补齐结构与持久化
-# =====================================================================
 def _unpaired_tool_calls(journal: list) -> list[tuple[str, str]]:
     """找出 journal 中没有配对 tool 消息的 (tool_call_id, name) 列表。
 
@@ -777,9 +764,7 @@ def _render_cursor_of_journal(journal: list) -> Optional[int]:
     return None
 
 
-# =====================================================================
 # 脱离工具（写操作）终态回写
-# =====================================================================
 # 回写轮询间隔：历史中该 tool_call_id 的 tool 消息可能尚未写入（打断方
 # 保全 / 正常收尾都在异步进行），等待其出现后原地替换。
 _DETACHED_WRITEBACK_POLL = 2.0
@@ -838,9 +823,7 @@ async def writeback_detached_tool_result(
             return False
 
 
-# =====================================================================
 # 新 user 消息的提前持久化与合并
-# =====================================================================
 _ARRAY_KEYS = ("file_ids", "file_names", "mime_types", "attachments")
 
 # 同类多附件可归一的组形态（_resolve_multimodal_content 原生支持多附件）。
@@ -1224,9 +1207,7 @@ async def mark_failed_unanswered_user(chat_id: int) -> None:
             )
 
 
-# =====================================================================
 # 静默模式 deliver_reply 交付标记（轮次开始时重置，收尾时读取清除）
-# =====================================================================
 def reset_turn_delivery_state(chat_id: int, *, default_send: bool) -> None:
     """agent 轮次开始时重置本轮交付状态，并设定 send 的缺省值。
 

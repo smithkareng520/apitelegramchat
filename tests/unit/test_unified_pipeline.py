@@ -39,9 +39,7 @@ AGNES_IMAGES_URL = "https://apihub.agnes-ai.com/v1/images/generations"
 AGNES_VIDEOS_URL = "https://apihub.agnes-ai.com/v1/videos"
 
 
-# ---------------------------------------------------------------------------
 # 1. 参数分层：厂商默认 -> 模型覆盖
-# ---------------------------------------------------------------------------
 
 def test_model_override_beats_provider_default():
     # 用户示例模型：openrouter/free 显式声明 image_input=True / supports_tools=False
@@ -103,9 +101,7 @@ def test_none_model_returns_safe_empty_params():
     assert params.supports_tools is False
 
 
-# ---------------------------------------------------------------------------
 # 2. 输入组合解析
-# ---------------------------------------------------------------------------
 
 def test_combination_plain_text():
     c = resolve_input_combination({"content": "你好"})
@@ -153,9 +149,7 @@ def test_combination_none_and_non_string_content():
     assert resolve_input_combination({"content": None}).text == ""
 
 
-# ---------------------------------------------------------------------------
 # 3. 鉴权：输入组合 vs 模型能力
-# ---------------------------------------------------------------------------
 
 def test_auth_text_and_photo_to_vision_model_ok():
     # 用户示例场景：openrouter/free image_input=True，用户输入文本+图片 -> 鉴权通过
@@ -222,9 +216,7 @@ def test_auth_chat_route_never_blocked_by_missing_text():
     assert empty.blocked is False
 
 
-# ---------------------------------------------------------------------------
 # 4. 分支计划：chat / images / video
-# ---------------------------------------------------------------------------
 
 def test_plan_chat_model():
     plan = resolve_request_plan(SUPPORTED_MODELS["agnes-3.0-flash"])
@@ -267,9 +259,7 @@ def test_plan_none_model_falls_back_to_chat():
     assert plan.api_type == "chat"
 
 
-# ---------------------------------------------------------------------------
 # 7. 视频请求体构建（Agnes Video 2.5 文档 schema）
-# ---------------------------------------------------------------------------
 
 def test_normalize_video_seconds_clamps_to_doc_range():
     # 文档：seconds 为字符串 "4"–"12"，默认 "5"
@@ -350,9 +340,7 @@ def test_build_video_body_non_video_plan_returns_none():
     assert build_video_request_body(plan, model="x", prompt="y") is None
 
 
-# ---------------------------------------------------------------------------
 # 6. run_preflight：回合入口的一次性组合
-# ---------------------------------------------------------------------------
 
 def test_run_preflight_end_to_end_vision_turn():
     pf = run_preflight(SUPPORTED_MODELS["openrouter/free"], {

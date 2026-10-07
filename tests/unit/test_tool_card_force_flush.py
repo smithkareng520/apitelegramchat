@@ -45,9 +45,7 @@ def _make_builder() -> RichMessageBuilder:
     return RichMessageBuilder(chat_id=1)
 
 
-# =========================================================================
 # 1. 新建工具卡片：必须以 force=True 独立成帧
-# =========================================================================
 
 def test_new_tool_card_sends_forced_frame_immediately(sent_frames):
     async def scenario():
@@ -65,9 +63,7 @@ def test_new_tool_card_sends_forced_frame_immediately(sent_frames):
     asyncio.run(scenario())
 
 
-# =========================================================================
 # 2. 核心竞态：在途正文 flush 期间建卡，占位卡片帧仍抢先独立上屏
-# =========================================================================
 
 def test_card_frame_survives_inflight_text_flush(sent_frames):
     async def scenario():
@@ -98,9 +94,7 @@ def test_card_frame_survives_inflight_text_flush(sent_frames):
     asyncio.run(scenario())
 
 
-# =========================================================================
 # 3. 合并进已有条目：保持非强制
-# =========================================================================
 
 def test_merge_into_existing_item_stays_non_forced(monkeypatch):
     b = _make_builder()
@@ -123,9 +117,7 @@ def test_merge_into_existing_item_stays_non_forced(monkeypatch):
     assert not any(flags[3:]), "合并进已有条目不应再触发强制帧"
 
 
-# =========================================================================
 # 4. 同步批量建卡：多个 force 合并为一帧，不放大请求量
-# =========================================================================
 
 def test_sync_batch_adds_collapse_into_one_forced_frame(sent_frames):
     async def scenario():

@@ -1,6 +1,4 @@
-# =====================================================================
 # net_shims.py — curl / wget 的 Python stdlib 兜底 shim
-# =====================================================================
 # 背景：若运行环境没有安装 curl/wget（Landlock 沙箱本身并不拦截网络），
 # 模型执行 `curl https://...` 得到的只是
 # "command not found"，白白浪费一次工具调用（还得靠模型自己聪明地改用
@@ -18,7 +16,6 @@
 #   - 语义对齐：退出码、-f/--fail、-L 重定向、--compressed、-w 常用变量
 #     等与真 curl 对齐；不支持的旗标会以 curl 同款退出码 2 明确报错，
 #     让模型知道该换基础写法而不是反复撞墙。
-# =====================================================================
 
 import logging
 import os
@@ -27,9 +24,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# ----------------------------------------------------------------------
 # curl shim 源码（独立脚本，禁止 import 本项目任何模块）
-# ----------------------------------------------------------------------
 # 注意：shim 文件头的 marker 注释（net-shim-v1）用于版本识别，改版本时同步更新。
 _CURL_SHIM_SOURCE = r'''#!/usr/bin/python3
 # apitelegramchat curl shim (marker: net-shim-v1)
@@ -509,9 +504,7 @@ if __name__ == "__main__":
         sys.exit(130)
 '''
 
-# ----------------------------------------------------------------------
 # wget shim 源码（独立脚本）
-# ----------------------------------------------------------------------
 _WGET_SHIM_SOURCE = r'''#!/usr/bin/python3
 # apitelegramchat wget shim (marker: net-shim-v1)
 # Stdlib-only wget fallback used when the image has no real wget.

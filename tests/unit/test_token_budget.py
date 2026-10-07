@@ -1,10 +1,7 @@
-# =====================================================================
 # tests/unit/test_token_budget.py — token 计数与截断预算
-# =====================================================================
 # 被测关键路径：所有模型上下文预算的统一守卫层。
 # 覆盖：count_tokens 基础语义、truncate_to_token_budget 严格不超预算、
 #       truncate_to_token_budget_head_tail 头尾保留、边界与非法值、JSON 计数。
-# =====================================================================
 import json
 
 import pytest
@@ -22,9 +19,7 @@ LONG_TEXT = (
 )
 
 
-# ---------------------------------------------------------------------
 # count_tokens
-# ---------------------------------------------------------------------
 def test_count_tokens_empty_and_none():
     assert count_tokens("") == 0
     assert count_tokens(None) == 0
@@ -48,9 +43,7 @@ def test_count_tokens_chinese_text():
     assert count_tokens("你好世界" * 10) > short
 
 
-# ---------------------------------------------------------------------
 # truncate_to_token_budget
-# ---------------------------------------------------------------------
 def test_truncate_within_budget_returns_original():
     assert truncate_to_token_budget(LONG_TEXT, 10_000) == LONG_TEXT
     assert truncate_to_token_budget("短文本", 100) == "短文本"
@@ -101,9 +94,7 @@ def test_truncate_non_string_value():
     assert count_tokens(out) <= 20
 
 
-# ---------------------------------------------------------------------
 # truncate_to_token_budget_head_tail
-# ---------------------------------------------------------------------
 def test_head_tail_within_budget_returns_original():
     assert truncate_to_token_budget_head_tail(LONG_TEXT, 10_000) == LONG_TEXT
 
@@ -144,9 +135,7 @@ def test_head_tail_boundary_values():
     assert count_tokens(tiny) <= 3
 
 
-# ---------------------------------------------------------------------
 # json_token_count
-# ---------------------------------------------------------------------
 def test_json_token_count_matches_manual_serialization():
     value = {"city": "上海", "temps": [20, 21, 22], "ok": True}
     assert json_token_count(value) == count_tokens(

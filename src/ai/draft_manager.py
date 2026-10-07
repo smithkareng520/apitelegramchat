@@ -59,9 +59,7 @@ from utils import get_logger
 logger = get_logger(__name__)
 
 
-# =====================================================================
 # Agent Event Stream（§4.1）：所有 Agent 输出转换为事件
-# =====================================================================
 class EventTypes:
     """Agent Event Stream 的标准事件类型（§4.1 事件表）。
 
@@ -115,9 +113,7 @@ class AgentEvent:
         return f"AgentEvent(seq={self.seq}, type={self.type!r}, data_len={data_len})"
 
 
-# =====================================================================
 # 状态机（§10）：两条状态机完全独立
-# =====================================================================
 class AgentPhase(str, Enum):
     """Agent 执行状态机：由 Agent Event 驱动，与 Draft 状态无关。"""
 
@@ -152,9 +148,7 @@ _PHASE_BY_EVENT = {
 }
 
 
-# =====================================================================
 # UI Event Buffer（§9）
-# =====================================================================
 class DraftEventBuffer:
     """滚动换血期间的事件缓存：push 暂存、flush 按序回放。
 
@@ -187,9 +181,7 @@ class DraftEventBuffer:
 _PENDING_GROUP_TOKEN = -2
 
 
-# =====================================================================
 # Draft Manager（§5）：纯展示层
-# =====================================================================
 class DraftManager:
     """消费 Agent Event Stream、渲染 Draft 并在安全点后台滚动。
 
@@ -232,9 +224,7 @@ class DraftManager:
         # _split_content_stream_for_rollover）。
         self._content_split_pending = False
 
-    # ------------------------------------------------------------------
     # duck-typing 兼容层：未拦截的属性一律透传内部 builder
-    # ------------------------------------------------------------------
     def __getattr__(self, name: str) -> Any:
         # 仅在常规查找失败时调用；_builder 在 __init__ 已入实例字典，
         # 不存在递归风险（__init__ 未完成时 _builder 缺失会 AttributeError）。
@@ -245,9 +235,7 @@ class DraftManager:
         """当前缓冲区中的事件数（观测用）。"""
         return len(self._buffer)
 
-    # ------------------------------------------------------------------
     # Agent Event Stream 入口（§4 / §9）——同步、非阻塞
-    # ------------------------------------------------------------------
     def emit(self, event_type: str, data: Any = None, **meta: Any) -> AgentEvent:
         """构造并提交一个 Agent Event；立即返回，绝不等待 UI。"""
         self._event_seq += 1
@@ -297,9 +285,7 @@ class DraftManager:
         await self._builder.flush(force=force)
         self._sync_draft_phase()
 
-    # ------------------------------------------------------------------
     # 事件 → builder 渲染
-    # ------------------------------------------------------------------
     def _apply(self, event: AgentEvent) -> None:
         """把单个事件应用到 builder（同步渲染；永不阻塞）。"""
         etype, data = event.type, event.data
@@ -393,7 +379,7 @@ class DraftManager:
             # finalize_turn() 同步收束（rollover(start_next_draft=False)，
             # 只永久化旧段、不创建新草稿——与终局轮 will_request_again
             # 语义一致）。若在此调度 start_next_draft=True 的后台滚动，
-            # 终局会闪现只含尾段/占位的"幽灵草稿"（历史问题2）。
+            # 避免终局短暂显示只含尾段或占位内容的草稿。
             pass
         elif etype == EventTypes.TOOL_GROUP_NEW:
             builder.start_new_tool_group()
@@ -415,10 +401,8 @@ class DraftManager:
         else:
             builder.finish_group(None)
 
-    # ------------------------------------------------------------------
     # 便捷发射端：与 RichMessageBuilder 同签名，循环零成本切换
     #（滚动期间自动转缓冲，§9）
-    # ------------------------------------------------------------------
     def begin_stream_reasoning(self) -> None:
         self.emit(EventTypes.REASONING_START)
 
@@ -564,9 +548,7 @@ class DraftManager:
         self._event_seq += 1
         return self._event_seq
 
-    # ------------------------------------------------------------------
-    # 安全点 API（§7 / §8）：替代原先 await rollover_at_turn_boundary
-    # ------------------------------------------------------------------
+    # 安全点 API：在明确的流边界触发草稿滚动。
     def on_stream_block_closed(self, kind: str) -> None:
         """流式块闭合安全点（switch_stream 块边界检查点①②的非阻塞替代）。
 
@@ -618,9 +600,7 @@ class DraftManager:
         self.agent_phase = AgentPhase.DONE
         return ok
 
-    # ------------------------------------------------------------------
     # 思考折叠提前收束（草稿预警后的超长思考续写）
-    # ------------------------------------------------------------------
     def _maybe_split_reasoning_fold_for_rollover(self) -> None:
         """草稿预警后思考流仍在输出：提前收束思考折叠并调度滚动。
 
@@ -677,9 +657,7 @@ class DraftManager:
         self._open_stream_kind = "reasoning"
         self._reasoning_split_pending = True
 
-    # ------------------------------------------------------------------
     # 正文流提前收束（草稿预警后的超长正文续写，与思考折叠对称）
-    # ------------------------------------------------------------------
     def _maybe_split_content_stream_for_rollover(self) -> None:
         """草稿预警后正文流仍在输出：提前收束当前正文块并调度滚动。
 
@@ -739,9 +717,7 @@ class DraftManager:
         self._open_stream_kind = "content"
         self._content_split_pending = True
 
-    # ------------------------------------------------------------------
     # 安全点判定与后台滚动调度
-    # ------------------------------------------------------------------
     def _handle_safe_boundary(self) -> None:
         """安全切换点统一入口（非阻塞）。
 
@@ -766,7 +742,7 @@ class DraftManager:
         ):
             return  # 幂等：已有滚动在排队/执行
 
-        # 关键修复：不要只读取旧的 _rollover_pending。
+        # 同时检查当前滚动请求，避免遗漏尚未合并的状态。
         # 容量预警通常在异步 flush() 中 arm，但 tool.end / text.end /
         # reasoning.end 是“最近退出点”，如果这里不立即补扫，就会错过
         # 这个安全边界，直到下一次 flush 才把 pending 置上，最终只能等
@@ -874,9 +850,7 @@ class DraftManager:
         except Exception:
             logger.debug("等待后台滚动结束时出现异常（已按失败处理）", exc_info=True)
 
-    # ------------------------------------------------------------------
     # 生命周期覆盖：stop_flush_loop 同时取消后台滚动
-    # ------------------------------------------------------------------
     async def stop_flush_loop(self) -> None:
         """停止刷新循环（扩展：取消在途滚动 → 回放缓冲 → 委托 builder）。
 

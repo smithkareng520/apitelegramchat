@@ -1,10 +1,7 @@
-# =====================================================================
 # tests/unit/test_context_window.py — 上下文窗口核心（压缩/淘汰/摘要）
-# =====================================================================
 # 被测关键路径：会话历史的预算管理核心。
 # 覆盖：摘要消息识别、轮块划分、淘汰规划（目标水位 + 受保护轮次 + 摘要槽位
 #       永不淘汰）、计划落地、滚动摘要确定性与预算约束、预算解析与水位。
-# =====================================================================
 import json
 
 import pytest
@@ -38,9 +35,7 @@ def user_block(text: str, replies: int = 1):
     return block
 
 
-# ---------------------------------------------------------------------
 # 摘要消息识别
-# ---------------------------------------------------------------------
 def test_is_digest_message_positive_and_negative():
     assert is_digest_message(make_digest_message(DIGEST_MARKER + " 早期 2 轮…"))
     assert not is_digest_message({"role": "user", "content": DIGEST_MARKER + " x"})
@@ -49,9 +44,7 @@ def test_is_digest_message_positive_and_negative():
     assert not is_digest_message("不是 dict")
 
 
-# ---------------------------------------------------------------------
 # 轮块划分
-# ---------------------------------------------------------------------
 def test_split_history_blocks_empty():
     digest, blocks = split_history_blocks([])
     assert digest is None
@@ -99,9 +92,7 @@ def test_split_history_blocks_consecutive_users_split():
     assert len(blocks) == 2
 
 
-# ---------------------------------------------------------------------
 # 淘汰规划
-# ---------------------------------------------------------------------
 def test_plan_eviction_reaches_target():
     history = []
     for i in range(5):
@@ -175,9 +166,7 @@ def test_eviction_plan_properties():
     assert plan.kept_messages == [{"role": "user", "content": "c"}]
 
 
-# ---------------------------------------------------------------------
 # 计划落地
-# ---------------------------------------------------------------------
 def test_apply_eviction_plan_splices_history_in_place():
     digest_old = make_digest_message(DIGEST_MARKER + " 早期 1 轮")
     history = [digest_old] + user_block("旧问题") + user_block("新问题")
@@ -193,9 +182,7 @@ def test_apply_eviction_plan_splices_history_in_place():
     assert history[2] == {"role": "assistant", "content": "回复：新问题"}
 
 
-# ---------------------------------------------------------------------
 # 滚动摘要
-# ---------------------------------------------------------------------
 def test_build_digest_deterministic():
     block = user_block("确定性检查 **重点**")
     a = build_digest_text(None, [block], budget_tokens=1500)
@@ -272,9 +259,7 @@ def test_build_digest_locator_truncated_to_char_budget():
     assert "…" in text
 
 
-# ---------------------------------------------------------------------
 # 预算解析与水位
-# ---------------------------------------------------------------------
 def test_resolve_history_budget_fallback():
     assert resolve_history_budget(None, None) == cw.FALLBACK_BUDGET_TOKENS == 50000
 

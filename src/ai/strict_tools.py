@@ -44,9 +44,7 @@ from utils import get_logger
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
 # 开关与运行时降级状态
-# ---------------------------------------------------------------------------
 
 _TRUTHY = {"1", "true", "yes", "on"}
 # api_label -> 被网关拒绝（进程内记忆，避免每轮重试撞墙）
@@ -94,9 +92,7 @@ def looks_like_strict_tool_rejection(error_text: str) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
 # 递归规范化
-# ---------------------------------------------------------------------------
 
 def _unsupported_for_strict(schema: Optional[dict], depth: int = 0) -> bool:
     """递归判定 schema 是否含 strict 模式无法安全表达的构造。
@@ -224,9 +220,7 @@ def _strictify_tool(tool: Any) -> Optional[dict]:
     return {"type": "function", "function": strict_fn}
 
 
-# ---------------------------------------------------------------------------
 # 对外入口
-# ---------------------------------------------------------------------------
 
 def strict_tools_for_request(api_label: str, tools: Optional[list]) -> Optional[list]:
     """为请求准备工具列表：能规范化的工具注入 strict，其余原样。

@@ -24,9 +24,7 @@ import pytest
 from ai.streaming import AIStreamTimeoutError, iter_async_stream
 
 
-# ---------------------------------------------------------------------------
 # 1) openai SDK 形状（__aiter__ -> self，只有 close()）的流对象清理
-# ---------------------------------------------------------------------------
 class OpenAISelfIteratorStream:
     """模拟 openai SDK 的 AsyncStream：__aiter__ 返回 self、无 aclose、
     只有（同步）close()。旧 _close_quietly 对这种形状什么都不调。"""
@@ -82,9 +80,7 @@ async def test_close_quietly_releases_self_iterator_stream_on_cancel():
     assert stream.closed
 
 
-# ---------------------------------------------------------------------------
 # 2) httpx2.ReadTimeout 属于首增量零输出重试判定集合
-# ---------------------------------------------------------------------------
 def test_httpx2_read_timeout_is_retryable_for_zero_output_retry():
     from ai.agentic_loops import _STREAM_READ_TIMEOUT_ERRORS
 
@@ -99,9 +95,7 @@ def test_httpx2_read_timeout_is_retryable_for_zero_output_retry():
     assert _ASTE in _STREAM_READ_TIMEOUT_ERRORS
 
 
-# ---------------------------------------------------------------------------
 # 3) gemini 流中 error / 安全拦截事件上抛
-# ---------------------------------------------------------------------------
 class _FakeAiohttpLikeContent:
     def __init__(self, lines):
         self._lines = lines
@@ -145,9 +139,7 @@ async def test_gemini_prompt_feedback_block_is_surfaced():
     assert any(e["kind"] == "usage" for e in events)
 
 
-# ---------------------------------------------------------------------------
 # 4) responses 合成总结流：dict 形状事件必须被读取
-# ---------------------------------------------------------------------------
 def test_response_events_helpers_accept_dict_events():
     from ai.response_events import event_field, event_type
 
@@ -160,9 +152,7 @@ def test_response_events_helpers_accept_dict_events():
     assert event_field({"delta": None}, "delta", "") is None
 
 
-# ---------------------------------------------------------------------------
 # 5) 生成结果图片下载 25MB 上限
-# ---------------------------------------------------------------------------
 def _png_bytes(width: int = 8, height: int = 8) -> bytes:
     from PIL import Image
 

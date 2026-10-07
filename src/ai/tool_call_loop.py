@@ -351,13 +351,13 @@ async def _run_tool_calls_and_append(
         # 补占位 tool 消息——保证 assistant.tool_calls 全部配对，
         # 已完成的进度不因打断丢失（见 turn_recovery.py）。
         completed_results = _batch_completed_results
-        # v2.3：参数由 json_repair 自动修复时携带的透明提示键——在进入
+        # json_repair 注入的提示键仅用于后续诊断，进入执行层前会移除。
         # 工具分发前取出（不能让内部标记键流进工具参数），执行完毕后
         # 附加到结果末尾，让模型知道参数被修过、验证结果是否符合意图。
         repair_note = ""
         if isinstance(fn_args, dict):
             repair_note = str(fn_args.pop(_JSON_REPAIR_NOTE_KEY, "") or "")
-        # v2.4 L2 语义校验层（主流：分发前按工具 schema 校验）：
+        # L2 语义校验层（主流：分发前按工具 schema 校验）：
         # strict 结构化输出的可选字段以 null 表达 → 剥掉（executor 的
         # .get(k, default) 默认值语义保留）；字符串布尔/数字按 schema
         # 容错矫正（省一轮模型重试）；再按工具真实 schema 校验。
@@ -381,7 +381,7 @@ async def _run_tool_calls_and_append(
             elif fn_name in SUBAGENT_TOOLS:
                 timeout = SUBAGENT_OUTER_TIMEOUT
             elif fn_name in BASH_TOOLS:
-                # v2.4：bash 支持 per-call timeout 参数（5-600s，用于已知长
+                # bash 支持 per-call timeout 参数（5-600s，用于已知长
                 # 静默命令）。显式指定时外层上限随之放大（+10s 清理缓冲），
                 # 保证不会出现外层先杀仍在正常运行的沙箱命令。
                 requested = (
@@ -401,7 +401,7 @@ async def _run_tool_calls_and_append(
             else:
                 timeout = TOOL_CALL_TIMEOUT
 
-            # ===== 进度预览策略（v2.3 重构） =====
+            # ===== 进度预览策略（重构后的策略） =====
             # - Bash：完全不推送实时预览。原始 stdout 对用户价值有限
             #   （多为命令日志，最终结果卡片已包含头尾完整输出），
             #   频繁刷新草稿只换来视觉抖动 + Telegram API 限流压力。
@@ -468,14 +468,14 @@ async def _run_tool_calls_and_append(
             try:
                 invalid_arguments = fn_args.get(_INVALID_TOOL_ARGUMENTS_KEY)
                 if invalid_arguments:
-                    # v2.3 Self-Correction 增强：不再回传一句笼统的
+                    # Self-Correction 增强：不再回传一句笼统的
                     # “malformed JSON”，而是把 json_repair 诊断信封里的
                     # 解析器报错原文（行/列/字符位置）、出错位置上下文
                     # （^ 指示）、病因清单、原始参数摘录和针对性修复规则
                     # 全部渲染出来，让模型一轮即可精准自纠。
                     result_str = invalid_arguments_message(fn_name, fn_args)
                 elif schema_error:
-                    # v2.4 L2 语义校验：参数是合法 JSON 但不符合工具 schema
+                    # L2 语义校验：参数是合法 JSON 但不符合工具 schema
                     # （缺必填 / 类型错 / 枚举外取值）——不执行，错误回传。
                     result_str = schema_error
                 elif fn_name == "message_user":
@@ -642,8 +642,7 @@ async def _run_tool_calls_and_append(
             except Exception as e:
                 logger.exception(f"[tool] {fn_name} failed: {e}")
                 result_str = f"Exception: tool {fn_name} failed - {truncate_to_token_budget(str(e), 64, suffix='…')}"
-            # v2.3：参数被自动修复过 → 在真实结果后附加透明提示，让模型
-            # 能对冲“修复猜测与原意图不一致”的风险（去核对结果），并
+            # 自动修复参数时附加透明提示，让模型知道实际执行参数可能与原始参数不同。
             # 学习下次直接产出严格合法的 JSON。
             if repair_note and isinstance(result_str, str) and result_str and result_str != _TOOL_TIMEOUT_MARKER:
                 result_str = f"{result_str}\n\n{repair_note}"
@@ -797,7 +796,7 @@ async def _run_tool_calls_and_append(
         for _pending_fut in _pending_group.values():
             _pending_fut.cancel()
         # 用户新消息 / TIMER 唤醒打断了本批次：同步补齐 tool 消息后向上传播。
-        # 只做纯同步列表操作，不做任何 await（取消路径必须最小化）。
+        # 取消路径只执行同步列表操作，不引入 await。
         # 五阶段规范·阶段4：占位回执按工具性质区分——只读工具带 aborted
         # 状态（已中止、无结果）；写操作带"已脱离后台执行"状态（终态稍后
         # 回填，回填前不得假定成败）。已执行完的真实结果一律优先回填
@@ -918,7 +917,7 @@ async def _run_tool_calls_and_append(
         if isinstance(res, tuple) and len(res) >= 5:
             llm_content = res[4]
             if isinstance(llm_content, str) and llm_content.startswith(("Error:", "Exception:")):
-                # v2.3：签名取首行（截 100 字符）而非前 80 字符跨行拼接——
+                # 签名取首行（截 100 字符）而非前 80 字符跨行拼接——
                 # 诊断增强后的错误消息首行是稳定的（工具名+错误类别），
                 # 其后才是含行列位置等易变细节的行；取首行可保证同一错误
                 # 反复发生时熔断计数准确命中，不会因细节差异而漏判。

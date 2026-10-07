@@ -83,9 +83,7 @@ from typing import Awaitable, Callable, Optional
 logger = logging.getLogger(__name__)
 
 
-# =====================================================================
 # 配置（全部可用环境变量覆盖）
-# =====================================================================
 def _env_flag(name: str, default: bool = True) -> bool:
     raw = os.getenv(name)
     if raw is None or not str(raw).strip():
@@ -103,7 +101,7 @@ def _env_seconds(name: str, default: int, *, minimum: int = 1) -> int:
 
 
 PROACTIVE_ENABLED = _env_flag("PROACTIVE_ENABLED", True)
-# 两次唤醒之间的随机间隔（默认 30~60min；像人一样不定期）。之前是
+# 两次唤醒之间使用随机间隔，避免固定周期触发。
 # 5~20min，太短——TIMER 回合会追加与 USER 回合不同的 system 说明文字
 # （见 ai_handlers.get_ai_response 的 is_timer 分支），过于频繁的唤醒
 # 等于频繁在"稳定的 system 前缀"后面插入一段易变内容，加剧断点 2
@@ -120,9 +118,7 @@ PROACTIVE_REST_SECONDS = _env_seconds("PROACTIVE_REST_SECONDS", 3600)
 _PROACTIVE_WATCH_DELAY = _env_seconds("PROACTIVE_WATCH_DELAY", 2, minimum=1)
 
 
-# =====================================================================
 # 唤醒提示词
-# =====================================================================
 # 措辞约定（避免工具调用幻觉）：对模型工具面可能存在、也可能被裁剪
 # 的能力（任务清单/长期记忆等），用"可以查看任务、记忆"这类自然语言
 # 能力描述，而不是"调用 todo 工具的 list 操作"这类指令式表述——
@@ -183,15 +179,11 @@ true、收尾有兜底）。注意：deliver_reply 必须通过 tool_calls API �
 """
 
 
-# =====================================================================
 # 回合注册表：进行中的 TIMER 回合（busy 互斥 + 打断句柄）
-# =====================================================================
 _active_flows: dict[int, asyncio.Task] = {}
 
 
-# =====================================================================
 # 调度器：事件驱动单 timer 模型
-# =====================================================================
 class _ChatSchedule:
     """单个 chat 的调度状态：最近用户活动 + 挂起的下一次唤醒计时。"""
 
@@ -618,9 +610,7 @@ async def _fire_turn(chat_id: int) -> None:
 
 
 
-# =====================================================================
 # 生命周期与打断
-# =====================================================================
 async def start_proactive_scheduler() -> None:
     """应用启动时初始化调度器（chat 在首次用户活动时才被跟踪）。"""
     if not PROACTIVE_ENABLED:

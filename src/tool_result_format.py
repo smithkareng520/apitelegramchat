@@ -442,7 +442,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
         details_html = _render_editor_result(command, path, result_str, fn_args)
         return summary, details_html
 
-    # ===================== Todo 工具格式化 =====================
+    # Todo 工具结果格式化
     # internal_todo MCP 服务器返回 JSON 字符串（给 AI 阅读）。UI 渲染富文本卡片：
     #   - 顶部统计：总数 / 已完成 / 待办
     #   - 列表项：状态 emoji + 优先级徽章 + 标题（完成则加删除线）+ 标签 chips
@@ -568,7 +568,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
 
     # ===================== Bash 工具格式化 =====================
     elif family == "bash":
-        # 后台任务模式（v2.5）：启动句柄 / task_action 查询与停止的结果
+        # 后台任务模式：启动、查询和停止结果的格式化。
         # 不走终端信封，直接以结果首行做 summary——bash_background 生成
         # 文本时首行已自带 emoji 徽标 + 任务标识，天然可作卡片摘要；
         # 全文放 Output 引用块。非后台调用返回 None，落回通用信封渲染。

@@ -20,9 +20,7 @@ import responses_state as rs
 from protocols.base import invalidate_responses_chain_for
 
 
-# ---------------------------------------------------------------------------
 # 1) 非 Responses 协议路由后的链头作废
-# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_invalidate_responses_chain_for_invalidates_existing_chain():
     chat_id = 911001
@@ -75,9 +73,7 @@ async def test_invalidate_responses_chain_for_propagates_errors(monkeypatch):
         invalidate_responses_chain_for(_Builder())
 
 
-# ---------------------------------------------------------------------------
 # 2) subagent 工具超时归因（内部超时 vs 外层预算）
-# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_subagent_tool_internal_timeout_is_attributed_to_tool(monkeypatch):
     from subagent_tool import _execute_tool_for_subagent
@@ -120,9 +116,7 @@ async def test_subagent_forbidden_tool_is_rejected():
     assert "forbidden" in result
 
 
-# ---------------------------------------------------------------------------
 # 3) _cancel_old_task：调用方自身取消向上传播
-# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_cancel_old_task_propagates_caller_cancellation():
     from app_turns import _cancel_old_task, active_tasks, active_tasks_lock
@@ -176,9 +170,7 @@ async def test_cancel_old_task_absorbs_expected_child_cancellation():
     assert old_task.done()
 
 
-# ---------------------------------------------------------------------------
 # 4) cache_usage.usage_num 共享实现
-# ---------------------------------------------------------------------------
 def test_usage_num_semantics():
     from ai.cache_usage import usage_num
 
@@ -191,9 +183,7 @@ def test_usage_num_semantics():
     assert usage_num(True, default=None) is None
 
 
-# ---------------------------------------------------------------------------
 # 5) MediaProgressSlot.complete 返回 journal 本体（身份匹配注销 in-flight）
-# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_media_complete_returns_journal_identity_for_persisted_note():
     from ai.bridge_common import MediaProgressSlot
@@ -220,7 +210,7 @@ async def test_media_complete_returns_journal_identity_for_persisted_note():
 async def test_media_complete_without_journal_still_returns_entries():
     from ai.bridge_common import MediaProgressSlot
 
-    # journal=None（media_wizard 独立媒体轮）：退回新建列表，行为同旧版
+    # journal=None 的独立媒体轮应创建新的 journal 列表。
     slot = MediaProgressSlot(None, "[图片生成中]")
     new_msgs = slot.complete("done")
     assert new_msgs == [slot.message]

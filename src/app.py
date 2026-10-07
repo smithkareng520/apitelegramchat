@@ -560,9 +560,7 @@ async def health_check() -> tuple[dict[str, str], int]:
 
 # ---------- 权限辅助 ----------
 
-# ---------------------------------------------------------------------------
 # Webhook 入口（非阻塞）+ 后台 update worker
-# ---------------------------------------------------------------------------
 # 数据流（入口与业务彻底解耦）：
 #
 #   Telegram
@@ -652,9 +650,7 @@ async def _startup_start_telegram_worker() -> None:
     """启动后台 update 消费 worker（webhook 非阻塞化的另一半）。"""
     app_state._telegram_worker_task = asyncio.create_task(telegram_worker(), name="telegram-worker")
 
-# ---------------------------------------------------------------------------
 # Event loop watchdog（循环健康心跳）
-# ---------------------------------------------------------------------------
 # 目的：把"消息没有任何日志"这类事故在事后日志里 10 秒定位。单进程单 loop
 # 架构下（quart run = 1 worker），任何同步阻塞 / CPU 密集任务都会冻结整个
 # loop：期间 webhook 无法 ACK、日志无法写出、/health 无法响应——表现恰好
@@ -832,9 +828,7 @@ async def process_update(data: dict) -> None:
         # 协程，这里的 set 不会泄漏到下一条 update）。
         set_request_id(str(uuid.uuid4())[:8])
 
-        # 排障期用于确认"消息是否真的进到了应用"的临时打点。根因已定位为
-        # 边缘 WAF 拦截（消息压根到不了这里），改用 polling 后不再需要无条件
-        # 打印用户原文——降级为 DEBUG，避免把消息内容长期写进生产日志。
+        # 原文仅用于 DEBUG 级排障，避免生产日志长期记录用户消息。
         if logger.isEnabledFor(logging.DEBUG):
             _dbg = data.get("message") or {}
             logger.debug(

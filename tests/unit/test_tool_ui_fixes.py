@@ -25,10 +25,8 @@ from tool_assembly import normalize_tool_schema, valid_tool_defs
 from tool_result_format import format_tool_result
 
 
-# =========================================================================
 # 问题 1：message_user 等纯文本返回统一 <pre><code> 面板；
-#         web_search / 信息类工具保留富文本卡片展示（从旧版恢复）
-# =========================================================================
+#         web_search 等信息类工具保留富文本卡片展示。
 
 def test_web_search_result_rich_cards():
     envelope = (
@@ -100,9 +98,7 @@ def test_unknown_tool_output_wrapped_in_code_panel():
     assert "raw &lt;text&gt;" in details
 
 
-# =========================================================================
 # 问题 2：description 仅 bash 声明且必填
-# =========================================================================
 
 def test_normalize_tool_schema_does_not_inject_required_description():
     tool = {
@@ -169,7 +165,7 @@ def test_internal_schemas_description_only_on_bash():
 
     bash_params = by_name[tn.BASH]["function"]["parameters"]
     assert "description" in bash_params["properties"]
-    # v2.5 起 command 不再列入 required：task_action 调用（list/status 等）
+    # 起 command 不再列入 required：task_action 调用（list/status 等）
     # 没有 command，与 command 互斥，由执行器给可操作错误兜底。
     assert bash_params["required"] == ["description"]
     assert "command" not in bash_params["required"]
@@ -196,9 +192,7 @@ def test_web_search_without_description_passes_validation():
     assert args["query"] == "球球大作战 最新活动"
 
 
-# =========================================================================
 # 问题 3：todo / memory / subagent / deliver_reply 按动作拆分摘要
-# =========================================================================
 
 def _builder():
     return RichMessageBuilder(chat_id=1)
@@ -383,9 +377,7 @@ def test_update_tool_args_refreshes_action_description():
     assert b._tool_groups[idx]["outer_summary"] == "Adding a todo..."
 
 
-# =========================================================================
 # 问题 4：组摘要追加 (failed n)
-# =========================================================================
 
 def test_group_summary_mixed_failures():
     b = _builder()
@@ -438,9 +430,7 @@ def test_finish_group_five_tools_two_failed():
     b.finish_group(idx)
     assert b._tool_groups[idx]["outer_summary"] == "Ran 2 commands, fetched a page, (failed 2)"
 
-# =========================================================================
 # 地图工具摘要：折叠块必须直接说明“查了什么 / 在哪里 / 查到多少”
-# =========================================================================
 
 def test_map_tool_running_summaries_show_real_inputs():
     from ai.tool_summary import _generate_initial_tool_summary

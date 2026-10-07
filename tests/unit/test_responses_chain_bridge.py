@@ -26,9 +26,7 @@ import pytest
 from core.messages import Message
 
 
-# ---------------------------------------------------------------------------
 # 测试用模型注册（config 驱动架构：厂商 + 模型）
-# ---------------------------------------------------------------------------
 from config import PROVIDERS, SUPPORTED_MODELS, ModelConfig, ProviderConfig
 
 _TEST_PROVIDER = "unit-test-responses-provider"
@@ -50,9 +48,7 @@ if _TEST_MODEL not in SUPPORTED_MODELS:
     )
 
 
-# ---------------------------------------------------------------------------
 # Fakes
-# ---------------------------------------------------------------------------
 class _FakeResponsesClient:
     """脚本化 AsyncOpenAI.responses 替身：记录 kwargs、回放事件流。"""
 
@@ -203,9 +199,7 @@ def _fresh_state(chat_id: int):
     return rs, rs.get_response_state_sync(chat_id)
 
 
-# ---------------------------------------------------------------------------
 # 1. 普通多轮：bootstrap → commit → 只发新增 user item
-# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_multi_turn_chain_sends_only_new_user_item(_bridge_env):
     bridge = _bridge_env
@@ -267,9 +261,7 @@ async def test_multi_turn_chain_sends_only_new_user_item(_bridge_env):
     assert st.chain.response_id == "resp_2"
 
 
-# ---------------------------------------------------------------------------
 # 2. 工具轮次：function_call（无文本）→ function_call_output 续链
-# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_tool_round_continuation_with_previous_response_id(_bridge_env, monkeypatch):
     bridge = _bridge_env
@@ -480,9 +472,7 @@ async def test_truncated_stream_invalidates_chain_and_raises_protocol_error(_bri
         )
     assert st.chain.response_id is None
 
-# ---------------------------------------------------------------------------
 # 3. 异常状态：失败不推进链 / stale-ID 只 bootstrap 一次 / 中断断链
-# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_failed_create_keeps_chain_head(_bridge_env):
     bridge = _bridge_env
@@ -630,9 +620,7 @@ async def test_generic_4xx_is_not_treated_as_stale_chain(_bridge_env):
     assert st.chain.response_id == "resp_prev"
 
 
-# ---------------------------------------------------------------------------
 # 4. 空 input invariant：调用 SDK 前失败
-# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_empty_input_raises_protocol_error_before_sdk_call(_bridge_env):
     bridge = _bridge_env
@@ -656,9 +644,7 @@ async def test_empty_input_raises_protocol_error_before_sdk_call(_bridge_env):
     assert client.calls == []  # 绝不向供应商发出 input: []
 
 
-# ---------------------------------------------------------------------------
 # 5. _turn_input_messages 纯函数
-# ---------------------------------------------------------------------------
 def test_turn_input_messages_tail_after_last_assistant():
     from ai.responses_bridge import _turn_input_messages
 

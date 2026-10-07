@@ -136,7 +136,7 @@ async def _interrupt_active_generation(chat_id: int) -> None:
         logger.debug("_interrupt_active_generation 内部忽略的异常", exc_info=True)
         draft_info = None
 
-    # 0.2) 【即时冻结】在取消旧任务**之前**把草稿推送冻结（
+    # 0.2) 取消旧任务前先冻结草稿，避免取消窗口继续产生可见增量。
     #    "实际发送到草稿的那里截断"）：打断信号从 task.cancel() 传播到
     #    旧任务内部的 stop_flush_loop 存在事件循环窗口，期间后台刷新循环
     #    的 0.1s tick 仍可能把未送达的积压文本整帧倒给用户（体感：按了
@@ -540,7 +540,7 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
                     archived_calls += region_pass.compacted_calls
                     if region_pass.compacted_calls:
                         history_est = _estimate_history_tokens(history)
-                # 载荷变指针后历史变小，重新规划（往往可以少淘汰几轮）。
+                # 指针化会缩短历史；重新规划以使用新的预算。
                 plan = plan_turn_eviction(
                     history,
                     target_tokens=history_target,
@@ -561,11 +561,8 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
                     budget_tokens=effective_digest_budget(budget),
                 )
                 apply_eviction_plan(history, plan, digest_text)
-                # Responses 链状态：结构性淘汰（滑动窗口/摘要合并）后本地
-                # 历史与旧 response chain 不再一一对应 ⇒ 显式作废链头，
-                # 下一轮以压缩后的完整上下文重新 bootstrap（官方定义的
-                # 异常恢复路径）。注意：L1 工具负载归档（指针化）不改历史
-                # 结构（条数不变），不断链。
+                # 结构性压缩会使本地历史与旧 Responses 链失配，因此必须断链并重新 bootstrap。
+        # 仅做工具负载指针化时历史结构不变，无需断链。
                 try:
                     from responses_state import invalidate_response_chain
                     invalidate_response_chain(chat_id, "local_compaction_eviction")
@@ -574,7 +571,7 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
                 history_est = _estimate_history_tokens(history)
                 evicted_blocks = len(plan.evicted_blocks)
                 evicted_messages = plan.evicted_message_count
-                # 结构性淘汰后旧台账不再与剩余历史一一对应。
+                # 结构性淘汰后，旧台账与剩余历史不再保持一一对应。
                 ctx["token_ledger"] = []
                 ctx["last_prompt_tokens"] = 0
                 ctx["last_completion_tokens"] = 0
@@ -588,7 +585,7 @@ async def pre_flight_context_check(chat_id: int, new_user_message: dict) -> bool
             int((time.monotonic() - _pf_start) * 1000),
         )
 
-        # 唯一不可服务情形：新消息自身超预算（空历史也放不下）。
+        # 仅当新消息自身就超过预算时无法继续服务。
         if new_input_est >= budget:
             return False
         if history_est + new_input_est > budget:
@@ -651,7 +648,7 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
             turn_recovery.note_turn_persisted(chat_id, new_msgs)
         # Responses server-managed state：回合产出（assistant/tool 消息）
         # 已由本回合的成功 response 承载在服务端链上，链头由 bridge 在
-        # 回合收尾原子提交——历史落库这里不再承担任何链状态记账职责。
+        # 回合收尾在此原子提交历史；链状态由对应的生命周期路径维护。
         if usage:
             if hasattr(usage, "model_dump"):
                 usage_dict = usage.model_dump()
@@ -681,15 +678,8 @@ async def _cancel_old_task(chat_id: int) -> None:
         task = active_tasks.pop(chat_id, None)
     if task is not None and not task.done():
         task.cancel()
-        # 给旧任务足够的退出窗口：它的 finally 会排空已起飞的草稿请求，
-        # 让 Telegram 成功确认的最后一帧先推进渲染游标，再固化与写历史。
-        # 此值必须略大于 RichMessageBuilder.stop_flush_loop() 的 5.5s
-        # 排空窗口；否则外层二次取消会重新制造“客户端已见、游标未记账”
-        # 的竞态。
-        # 用 asyncio.wait 而非 wait_for：wait_for 会把"旧任务以
-        # CancelledError 结束"与"调用方自身被取消"混成同一个异常，
-        # 后者必须向上传播（打断链上的取消信号不能被吸收）；wait 不
-        # 重抛子任务的取消，两条路径天然分离。
+        # 给旧任务足够时间排空已发送草稿，并先推进渲染游标再固化历史。
+        # 使用 asyncio.wait 保留“旧任务被取消”和“当前调用方被取消”两种语义。
         done, pending = await asyncio.wait({task}, timeout=6.0)
         if pending:
             logger.warning(f"旧任务取消超时（>6s）: chat_id={chat_id}，转入后台等待其结束")

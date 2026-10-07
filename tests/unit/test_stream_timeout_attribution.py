@@ -22,9 +22,7 @@ from ai.streaming import iter_async_stream
 assert _AIStreamTimeoutErrorAlias is AIStreamTimeoutError  # 单一来源
 
 
-# ---------------------------------------------------------------------------
 # 1) iter_async_stream：闸门竞争与超时归因
-# ---------------------------------------------------------------------------
 class _FakeStream:
     """按脚本交付事件的最小流对象；记录 aclose 调用。"""
 
@@ -119,9 +117,7 @@ def test_ai_stream_timeout_error_kind_metadata():
     assert AIStreamTimeoutError("y", kind="total").kind == "total"
 
 
-# ---------------------------------------------------------------------------
 # 2) total 硬期限绝不重试（anthropic 分类器）
-# ---------------------------------------------------------------------------
 def test_anthropic_never_retries_total_gate():
     from ai.anthropic_bridge import _is_retryable_stream_error
 
@@ -129,9 +125,7 @@ def test_anthropic_never_retries_total_gate():
     assert not _is_retryable_stream_error(AIStreamTimeoutError("total hit", kind="total"))
 
 
-# ---------------------------------------------------------------------------
 # 3) 工具调用：外层等待预算 vs 工具内部超时
-# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_tool_internal_timeout_is_retagged(monkeypatch):
     async def fake_dispatch(fn_name, fn_args, chat_id=None, progress_callback=None):
@@ -180,9 +174,7 @@ async def test_tool_cancellation_is_not_retagged(monkeypatch):
         await inner
 
 
-# ---------------------------------------------------------------------------
 # 4) Gemini SSE：不依赖行交付粒度的事件切分
-# ---------------------------------------------------------------------------
 class _FakeContent:
     def __init__(self, chunks):
         self._chunks = chunks

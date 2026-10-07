@@ -1,10 +1,7 @@
-# =====================================================================
 # verify_security.py — 部署后安全自检脚本
-# =====================================================================
 # 用法:
 #   1. 在容器内执行：python -m verify_security
 #   2. 所有测试项应通过；失败项说明该防御层失效
-# =====================================================================
 
 import asyncio
 import logging
@@ -51,9 +48,7 @@ def info(name: str, detail: str) -> None:
     print(f"{INFO} {name} — {detail}")
 
 
-# ----------------------------------------------------------------------
 # 1. 容器身份检查
-# ----------------------------------------------------------------------
 def check_user() -> bool:
     uid = os.getuid()
     report("1.1 非 root 运行", uid != 0, f"uid={uid}")
@@ -79,9 +74,7 @@ def check_no_sudo() -> None:
            f"sudo={has_sudo} su={has_su}")
 
 
-# ----------------------------------------------------------------------
 # 2. 敏感环境变量检查
-# ----------------------------------------------------------------------
 def check_env_scrubbed() -> None:
     """检查 os.environ 中是否还有敏感变量。
 
@@ -108,9 +101,7 @@ def check_env_scrubbed() -> None:
            f"残留 {len(leaked)} 个敏感变量（详见 DEBUG 日志）" if leaked else "无敏感变量泄漏")
 
 
-# ----------------------------------------------------------------------
 # 3. Landlock 沙箱可用性
-# ----------------------------------------------------------------------
 def check_landlock() -> bool:
     from sandbox import _landlock_supported
     ok = _landlock_supported()
@@ -119,9 +110,7 @@ def check_landlock() -> bool:
     return ok
 
 
-# ----------------------------------------------------------------------
 # 4. 沙箱内隔离测试
-# ----------------------------------------------------------------------
 async def check_sandbox_isolation(landlock_ok: bool) -> None:
     """Run independent commands and assert filesystem confinement."""
     if not landlock_ok:
@@ -239,9 +228,7 @@ async def check_sandbox_isolation(landlock_ok: bool) -> None:
         shutil.rmtree(workspace, ignore_errors=True)
 
 
-# ----------------------------------------------------------------------
 # 5. 资源限制检查
-# ----------------------------------------------------------------------
 def check_resource_limits() -> None:
     import resource
     try:
@@ -261,9 +248,7 @@ def check_resource_limits() -> None:
         warn("5.2 NOFILE 限制", str(e))
 
 
-# ----------------------------------------------------------------------
 # 6. Workspace 权限检查
-# ----------------------------------------------------------------------
 def check_workspace_perms() -> None:
     # 用真实 data_root 路径而非硬编码 /app，否则非 /app 部署永远跳过检查。
     try:
@@ -284,9 +269,7 @@ def check_workspace_perms() -> None:
            f"owner={owner_uid} current={current_uid}")
 
 
-# ----------------------------------------------------------------------
 # 7. setuid 检查
-# ----------------------------------------------------------------------
 def check_setuid() -> None:
     """扫描 /usr /bin 下的 setuid 二进制"""
     found = []
@@ -309,9 +292,7 @@ def check_setuid() -> None:
            f"发现 setuid: {found[:5]}" if found else "无")
 
 
-# ----------------------------------------------------------------------
 # 主流程
-# ----------------------------------------------------------------------
 async def main() -> None:
     print("=" * 70)
     print(" Bash 沙箱安全自检")

@@ -1,6 +1,4 @@
-# =====================================================================
 # tests/unit/test_bash_background.py — bash 后台任务（启动→句柄→查询/停止）
-# =====================================================================
 # 覆盖 bash_background 模块的核心语义：
 #   - 启动立即返回句柄（回合内不阻塞），完成通知入队（「就近搭车」）；
 #   - 寿命上限到期强制终止；stop 优雅终止；每 chat 运行数上限；
@@ -11,7 +9,6 @@
 # 进程类用例真实 spawn bash：沿用 test_bash_idle_timeout.py 的隔离方式
 # （monkeypatch _apply_landlock 直通 + tmp 目录 + 根缓存 cache_clear）。
 # preexec_fn 仅 POSIX 可用 → Windows 上跳过进程类用例（纯逻辑用例照跑）。
-# =====================================================================
 
 import asyncio
 import os
@@ -44,9 +41,7 @@ requires_posix = pytest.mark.skipif(
 )
 
 
-# ---------------------------------------------------------------------------
 # 隔离夹具
-# ---------------------------------------------------------------------------
 def _isolate(tmp_path: Any, monkeypatch: Any) -> None:
     monkeypatch.setenv("APITELEGRAMCHAT_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("APITELEGRAMCHAT_WORKSPACES_DIR", str(tmp_path / "home"))
@@ -82,9 +77,7 @@ async def _wait_terminal(task: "bash_background.BackgroundTask", timeout: float 
     assert task.status != "running", "任务未在限时内进入终态"
 
 
-# ---------------------------------------------------------------------------
 # 纯逻辑：危险命令黑名单（模块级抽出后与前台会话共用）
-# ---------------------------------------------------------------------------
 def test_command_is_safe_rejects_disasters() -> None:
     assert not _command_is_safe("")
     assert not _command_is_safe("   ")
@@ -99,9 +92,7 @@ def test_command_is_safe_allows_normal_commands() -> None:
     assert _command_is_safe("dd if=/dev/zero of=/dev/null count=1")
 
 
-# ---------------------------------------------------------------------------
 # 纯逻辑：UI 卡片分支（tool_result_format）
-# ---------------------------------------------------------------------------
 def test_is_background_task_call_detection() -> None:
     from tool_result_format import _format_background_task_result, _is_background_task_call
 
@@ -133,9 +124,7 @@ def test_format_background_task_result_card() -> None:
     assert "exit code 0" in summary2
 
 
-# ---------------------------------------------------------------------------
 # 纯逻辑：L2 schema 校验接受新参数
-# ---------------------------------------------------------------------------
 def _bash_tool_defs() -> list:
     """bash 工具定义（MCP 化后来自 mcpserver.catalogue，模型视角全名）。"""
     import tool_names as tn
@@ -182,9 +171,7 @@ def test_l2_schema_accepts_background_params(tmp_path: Any, monkeypatch: Any) ->
     assert err4
 
 
-# ---------------------------------------------------------------------------
 # 纯逻辑：通知队列 push/drain 与上限
-# ---------------------------------------------------------------------------
 def test_notice_queue_drain_and_cap(tmp_path: Any, monkeypatch: Any) -> None:
     _isolate(tmp_path, monkeypatch)
     _reset_registries()
@@ -300,9 +287,7 @@ def test_finish_task_triggers_prune(tmp_path: Any, monkeypatch: Any) -> None:
         _reset_registries()
 
 
-# ---------------------------------------------------------------------------
 # 进程集成（POSIX）
-# ---------------------------------------------------------------------------
 @requires_posix
 def test_start_returns_handle_and_completes_with_notice(tmp_path: Any, monkeypatch: Any) -> None:
     """启动立即返回句柄；完成后通知入队（含输出尾部与退出码）；.exit 落盘。"""

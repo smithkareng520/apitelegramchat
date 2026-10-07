@@ -75,9 +75,7 @@ class ResponseState:
     chain: Optional[ResponseChainRef] = None
     active_turn_ids: set[str] = field(default_factory=set)
 
-    # ------------------------------------------------------------------
     # 回合登记（generation fencing）
-    # ------------------------------------------------------------------
     def begin_turn(self, event_source: str) -> TurnState:
         turn = TurnState(
             turn_id=uuid.uuid4().hex[:16],
@@ -94,9 +92,7 @@ class ResponseState:
     def is_turn_current(self, turn: TurnState) -> bool:
         return turn.generation == self.generation
 
-    # ------------------------------------------------------------------
     # Responses response-chain 状态
-    # ------------------------------------------------------------------
     def invalidate_chain(self, reason: str) -> None:
         """作废当前链头（幂等）。
 
@@ -231,9 +227,7 @@ def has_active_turns(chat_id: int) -> bool:
     return bool(get_response_state_sync(chat_id).active_turn_ids)
 
 
-# ----------------------------------------------------------------------
 # 网关能力记忆：previous_response_id + 纯 function_call_output 续轮
-# ----------------------------------------------------------------------
 # 官方语义下工具续轮就是 ``previous_response_id`` + ``input=[function_call_output]``。
 # 个别 OpenAI-compatible 网关（尤其是自行保存 response 状态、再翻译给上游
 # 的中转）会拒绝这种续轮：400 的措辞随上游而变（``input must be
@@ -268,9 +262,7 @@ def derive_vendor_key(model_info: "ModelConfig") -> str:
     return f"{endpoint.provider}|{endpoint.endpoint}|{endpoint.protocol}"
 
 
-# ----------------------------------------------------------------------
 # 重启恢复（规则：只恢复 ID，不伪造历史）
-# ----------------------------------------------------------------------
 def export_chain_state() -> dict[str, dict[str, Any]]:
     """导出全部 chat 的链头快照：``{chat_id: {vendor_key, model,
     previous_response_id, updated_at}}``。

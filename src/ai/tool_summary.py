@@ -309,9 +309,7 @@ def _map_location_query_label(fn_name: str, fn_args: dict) -> str:
     return ""
 
 
-# =====================================================================
 # MCP 工具名规范化
-# =====================================================================
 def _norm_tool_key(fn_name: str) -> str:
     """完整 MCP 名只去掉 mcp__server__ 前缀，不映射旧工具别名。"""
     split = split_mcp_name(fn_name or "")

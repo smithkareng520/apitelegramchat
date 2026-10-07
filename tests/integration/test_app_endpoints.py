@@ -1,6 +1,4 @@
-# =====================================================================
 # tests/integration/test_app_endpoints.py — Quart 应用端点集成测试
-# =====================================================================
 # 被测关键路径：真实 app 模块（完整依赖图）实例化 Quart 应用 → HTTP 端点。
 # 覆盖：
 #   1. 扁平化重构后整个模块图可正常导入（app.py 及其全部传递依赖）；
@@ -8,7 +6,6 @@
 #   3. /webhook 鉴权：缺 token / 错误 token 一律 403，正确 token 放行；
 #   4. 双路径鉴权：URL query ?token= 与 X-Telegram-Bot-Api-Secret-Token 头；
 #   5. polling 模式下 webhook 投递被忽略且不入队（与生产部署一致）。
-# =====================================================================
 import asyncio
 import json
 
@@ -35,9 +32,7 @@ def run(coro):
     return asyncio.run(coro)
 
 
-# ---------------------------------------------------------------------
 # 模块图完整性
-# ---------------------------------------------------------------------
 def test_flattened_module_graph_imports():
     """重构后 app 模块图完整导入，Quart 应用实例就绪。"""
     assert app_module.app.name == "app"
@@ -50,9 +45,7 @@ def test_flattened_module_graph_imports():
     assert __version__ == "2.3.1"
 
 
-# ---------------------------------------------------------------------
 # /health
-# ---------------------------------------------------------------------
 def test_health_returns_ok(client):
     resp = run(client.get("/health"))
     assert resp.status_code == 200
@@ -73,9 +66,7 @@ def test_health_leaks_no_internal_stats(client):
         assert forbidden not in body.lower()
 
 
-# ---------------------------------------------------------------------
 # /webhook 鉴权
-# ---------------------------------------------------------------------
 def test_webhook_without_token_forbidden(client):
     resp = run(client.get("/webhook"))
     assert resp.status_code == 403
@@ -123,9 +114,7 @@ def test_webhook_token_via_header_wins_over_bad_query(client):
     assert resp.status_code == 200
 
 
-# ---------------------------------------------------------------------
 # polling 模式下的 webhook 投递处理
-# ---------------------------------------------------------------------
 def test_webhook_post_ignored_in_polling_mode(client):
     assert INGEST_MODE == "polling"
     queue_before = app_module.update_queue.qsize()
@@ -147,9 +136,7 @@ def test_webhook_get_with_token_and_polling_still_alive(client):
     assert resp.status_code == 200
 
 
-# ---------------------------------------------------------------------
 # /health 反映摄取通道存活（2026-09-15 失聪事故回归护栏）
-# ---------------------------------------------------------------------
 # 旧版 /health 写死 200：进程活着但 getUpdates 轮询任务已死时，Render
 # 健康检查与 Docker HEALTHCHECK 都认为实例健康，永远不重启，用户发消息
 # 石沉大海。现在摄取通道断了必须返回 503，让平台自动重建实例。

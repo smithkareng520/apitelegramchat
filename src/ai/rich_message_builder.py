@@ -42,15 +42,8 @@ from markdown_converter import (
 
 logger = get_logger(__name__)
 
-# ---------- 打断即时冻结（"实际发送到草稿的那里截断"） ----------
-# 打断入口（app_turns._interrupt_active_generation）在取消旧任务**之前**
-# 把当前活跃草稿加进本集合：从这一刻起，该草稿禁止再推送任何新帧。
-# 旧任务的取消信号传播到 stop_flush_loop 存在事件循环窗口，期间后台
-# 刷新循环的 0.1s tick 仍可能把"后端超前生成、尚未送达"的积压文本整帧
-# 倒给用户（用户体感：按了停止，草稿却又刷出一段）。冻结门在 flush 的
-# 入口与锁内各设一道同步检查点，杜绝这一窗口期的任何新帧；已在途的
-# 发送不中断（送达即用户所见，交由游标口径吸收）。条目在
-# stop_flush_loop（该 builder 的推流生命周期终点）统一清理。
+# 打断时先冻结当前草稿，再取消旧任务。冻结门阻止取消传播窗口内产生新的草稿帧；
+# 已在途的发送允许完成，并由渲染游标记录为用户已见内容。
 _FROZEN_DRAFTS: set = set()
 
 
@@ -238,18 +231,8 @@ def _scan_rich_html_boundaries(
     block_count = 0
     cursor = 0
 
-    # 性能修复（EVENT LOOP BLOCKED 根因）：原实现在每个块边界都对
-    # "累计到此处的全部可见文本" 做一次 tiktoken 全量编码，复杂度是
-    # O(块数 × 全文长度)。一个 120 块 / 6.6KB 的草稿单次扫描就要 ~290ms，
-    # 而 flush 每帧调用两次（_arm_rollover_if_needed + DEBUG 扫描），
-    # 0.65s 一帧 => 事件循环被同步 CPU 占死 ~90%，进而出现
-    # "期望休眠 10.0s 实际 20.2s" 的 lag 与健康检查失败。
-    #
-    # 改为增量累加：只对"自上个边界以来新增的片段"编码一次，累加得到
-    # 边界处的 token 数，复杂度降为 O(全文长度)。token 化不是严格可加的
-    # （跨片段的 BPE 合并会有 ±个位数偏差），但这些数值仅用于容量阈值
-    # 判断（3000/6000 token 预算），偏差远小于阈值裕度；末尾返回的总量
-    # 仍按全文精确编码一次，保证对外口径准确。
+    # 流式热路径使用增量 token 统计，避免反复编码完整草稿。
+    # 增量值只用于容量阈值判断；最终对外报告的总量仍使用完整文本精确计算。
     tokens_acc = 0          # 已计入边界的累计 token
     units_acc = 0           # 已计入边界的累计可见字符数
     pending_parts: list[str] = []   # 自上个边界以来新增、尚未计量的片段
@@ -534,9 +517,9 @@ class RichMessageBuilder:
         }
         group["items"].append(item)
         self._refresh_outer_summary(group)
-        # 工具卡片首次出现必须强制独立成帧立即上屏。
+        # 工具卡片首次出现时必须独立成帧，确保立即可见。
         #
-        # 此前这里走 request_flush(force=False)，存在一个与在途 flush 的
+        # 这里直接合并到现有 flush，避免与在途 flush 产生竞态。
         # 合并竞态：content_block_start 触发本方法时，前一段正文/思考的
         # flush 往往仍在途（正卡在 send_rich_message_draft 的 250ms 最小
         # 间隔等待里，持有 _flush_lock 与草稿发送锁），本次请求只置脏标
@@ -584,7 +567,7 @@ class RichMessageBuilder:
                         if item.get("type"):
                             new_summary = _generate_initial_tool_summary(item["type"], args)
                             # 动作描述随参数一并刷新，工具组进行态标题
-                            # （todo/memory 等按动作细分）才能跟着参数走。
+                            # todo、memory 等动作按具体动作选择参数摘要。
                             item["action_description"] = _generate_action_description(
                                 item["type"], args)
                         else:
@@ -700,7 +683,7 @@ class RichMessageBuilder:
         group["text_content"] += text
         self.request_flush(force=False)
 
-    # ---- 修改点3：_refresh_outer_summary（工具组进行时，规范第二部分） ----
+    # 工具组进行中的摘要：统一生成第二部分。
     def _refresh_outer_summary(self, group: dict) -> None:
         """
         刷新工具组的外部摘要（进行时状态）
@@ -728,7 +711,7 @@ class RichMessageBuilder:
         t = target["type"]
         fn_args = target.get("fn_args", {})
 
-        # 地图工具进行态必须反映实际查询条件，避免用户只看到“Searching nearby POI”。
+        # 地图工具的进行态应包含实际查询条件。
         if t in {"maps_geo", "maps_regeocode", "maps_text_search", "maps_around_search",
                  "maps_ip_location", "maps_direction_driving", "maps_direction_walking",
                  "maps_direction_bicycling", "maps_direction_transit_integrated", "maps_distance",
@@ -820,7 +803,7 @@ class RichMessageBuilder:
 
         self.request_flush(force=False)
 
-    # ---- 修改点4：_generate_group_summary（工具组结束态，规范第一部分） ----
+    # 工具组结束态摘要：统一生成第一部分。
     # 工具组摘要的固定描述模板（单数/复数）
     # 键为组类型（字符串），值为 (单数模板, 复数模板) 或直接为固定字符串（不区分单复数）
     # 使用 {n} 占位符表示数量
@@ -990,7 +973,7 @@ class RichMessageBuilder:
             descs[j] = descs[j][:1].lower() + descs[j][1:]
         return ", ".join(descs)
 
-    # ---- 修改点5：finish_group 增加默认标题 ----
+    # 工具组结束时提供默认标题。
     def finish_group(self, group_idx: int | None = None) -> None:
         if group_idx is None:
             group_idx = len(self._tool_groups) - 1
@@ -1325,7 +1308,7 @@ class RichMessageBuilder:
             placeholder = "Running..."
         return f"<details><summary>{inner_summary}</summary>\n<p>{placeholder}</p>\n</details>"
 
-    # ========== 关键修改：不再将 tool_group 合并到 reasoning 中 ==========
+    # tool_group 不再并入 reasoning。
     def _build_html(self, *, hide_thinking: bool = False) -> str:
         """把块列表拼装为草稿 HTML。
 
@@ -1354,7 +1337,7 @@ class RichMessageBuilder:
                     continue
                 # 不再收集后续 tool_group，只渲染 reasoning 自身
                 summary = self._get_reasoning_summary(reasoning_content)
-                # 思考原文必须先严格转义再嵌入，否则其中的标签会被 Telegram
+                # 思考内容嵌入 Telegram HTML 前必须先严格转义。
                 # 解析成真实格式，甚至破坏外层 <details> 折叠结构。
                 reasoning_body = _render_reasoning_html(reasoning_content)
                 html_parts.append(f"<details><summary>{summary}</summary>\n{reasoning_body}\n</details>")
@@ -1715,7 +1698,7 @@ class RichMessageBuilder:
         if not final_html.strip() or not _rich_visible_text(final_html).strip():
             # 打断发生在任何可见内容产出之前：无可固定内容。
             return False
-        # 草稿层 ↔ 历史层反向校验（改动点3）：见 _log_draft_journal_consistency。
+        # 校验草稿层与历史层的一致性，详见 _log_draft_journal_consistency。
         _log_draft_journal_consistency(
             self.chat_id, self.draft_id,
             _rich_visible_text(final_html).strip(), journal,
@@ -1778,7 +1761,7 @@ class RichMessageBuilder:
             )
             return
 
-        # 性能修复：锁外这次 _build_html + 容量扫描是纯浪费——拿到锁后
+        # 在锁内统一执行最终渲染和容量检查，避免重复计算。
         # 内容会重新构建、下面还要再扫一次。热路径上每帧多一次 O(全文)
         # 的同步 CPU 工作，直接叠加到事件循环 lag 上。改为只在锁内做一次。
         async with self._flush_lock:
@@ -1800,7 +1783,7 @@ class RichMessageBuilder:
             frame_visible_chars = self._visible_text_chars_total
 
             # 边界扫描会对全部块做逐块 token 编码（O(块数×全文)），其结果
-            # 只用于 DEBUG 日志；生产（INFO 级别）跳过，流式热路径不再
+            # 仅用于 DEBUG 日志；INFO 级别跳过，避免增加流式热路径开销。
             # 每帧做全量编码。
             frame_tokens = frame_blocks = 0
             if logger.isEnabledFor(logging.DEBUG):
@@ -1876,7 +1859,7 @@ class RichMessageBuilder:
             if should_flush:
                 self._commit_stream_buffer()
                 await self.flush(force=silent_too_long)
-                # 修复：原来 silent_too_long 分支**不更新** _last_flush_time，
+                # 即使静默输出超过长度限制，也要推进 flush 时间基准，避免重复触发。
                 # 依赖 flush() 内部成功时的赋值。正常路径确实会更新（所以线上
                 # 观察到的保活节奏是 ~2.3s，而非失控的 0.1s），但存在真实的
                 # 漏更新路径：flush 在 RateLimitError / 通用异常分支直接返回，
@@ -2027,7 +2010,7 @@ class SilentMessageBuilder(RichMessageBuilder):
         # 固定为永久消息——静默回合没有可见草稿，整轮倾倒过程正文会违反
         # /show off 语义（交付只经 deliver_reply / 收尾兜底，且只发最后
         # 一条 assistant 正文）。静默回合的打断只走 turn_recovery 保全。
-        # journal 参数仅为签名对齐（父类的草稿层↔历史层反向校验对静默
+        # journal 参数用于与父类的草稿层↔历史层一致性校验保持同一接口。
         # 回合无草稿可比，直接忽略）。
         return False
 

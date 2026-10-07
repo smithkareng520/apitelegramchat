@@ -111,9 +111,7 @@ async def _invoke(function: Callable[..., Any], *args: Any, **kwargs: Any) -> st
     return str(result)
 
 
-# =====================================================================
 # search 模块
-# =====================================================================
 async def _web_search(ctx: MCPRequestContext, args: JsonObject) -> str:
     from search.serper import execute_web_search
 
@@ -248,9 +246,7 @@ SEARCH_MODULE = ModuleSpec(
 )
 
 
-# =====================================================================
 # todo / memory 模块
-# =====================================================================
 async def _todo(ctx: MCPRequestContext, args: JsonObject) -> str:
     from todo_tool import execute_todo
 
@@ -360,9 +356,7 @@ MEMORY_MODULE = ModuleSpec(
 )
 
 
-# =====================================================================
 # workspace / bash 模块
-# =====================================================================
 async def _text_editor(ctx: MCPRequestContext, args: JsonObject) -> str:
     from search.text_editor import execute_text_editor
 
@@ -479,9 +473,7 @@ BASH_MODULE = ModuleSpec(
 )
 
 
-# =====================================================================
 # 模块注册表
-# =====================================================================
 MODULES: dict[str, ModuleSpec] = {
     spec.name: spec
     for spec in (SEARCH_MODULE, TODO_MODULE, MEMORY_MODULE, TEXT_EDITOR_MODULE, BASH_MODULE)

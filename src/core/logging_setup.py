@@ -3,6 +3,7 @@
 import os
 import sys
 import logging
+import re
 from logging import handlers as logging_handlers
 import contextvars
 from typing import Any
@@ -63,6 +64,13 @@ def setup_logging() -> bool:
     logging.getLogger('botocore').setLevel(logging.WARNING)
     logging.getLogger('aiobotocore').setLevel(logging.WARNING)
     logging.getLogger('urllib3').setLevel(logging.WARNING)
+    # Render/Docker probes /health every few seconds. Their access records are
+    # operationally useless at INFO level and can drown out real events.
+    health_filter = _HealthAccessNoiseFilter()
+    for access_name in ("gunicorn.access", "hypercorn.access", "quart.serving"):
+        access_logger = logging.getLogger(access_name)
+        if not any(isinstance(f, _HealthAccessNoiseFilter) for f in access_logger.filters):
+            access_logger.addFilter(health_filter)
     # ModelScope MCP 网关会立即关闭 SSE GET 流，导致 SDK 客户端不停
     # 重连并每次打印一条 INFO（"GET stream disconnected, reconnecting
     # in 1000ms..."），大量冲刷日志。重连本身无害且自动进行，调高该
@@ -107,6 +115,19 @@ def setup_logging() -> bool:
 # root logger 会让 MCP server、tests 等宿主失去对自己 logging 配置的控制。
 if os.getenv("APITELEGRAMCHAT_REQUIRE_LOGGING", "0") in {"1", "true", "yes", "on"} or not logging.getLogger().handlers:
     setup_logging()
+
+class _HealthAccessNoiseFilter(logging.Filter):
+    """Drop routine /health HTTP access lines; keep application health warnings."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        name = record.name.lower()
+        if name not in {"gunicorn.access", "hypercorn.access", "quart.serving"}:
+            return True
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        return not re.search(r"""\\bGET\\s+/health(?:\\s|[?])""", message)
 
 logger = logging.getLogger(__name__)
 # ---------- 请求ID上下文 ----------

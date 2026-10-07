@@ -1,6 +1,4 @@
-# =====================================================================
 # tests/unit/test_fetch_rich_content.py — fetch_url 富内容提取引擎
-# =====================================================================
 # 被测关键路径：fetch_rich_content.py 的媒体收集/锚定/穿插/截断/兜底。
 # 重点回归：
 #   - 图片不限量（按原始结构全量收集，仅受 token 预算约束）
@@ -8,7 +6,6 @@
 #   - 单块超预算时头尾截断而不是整页丢弃
 #   - 隐藏元素判定按 class 分词，不误杀 hidden-print
 #   - 兜底文本剔除 nav/footer/cookie 弹窗等噪音段落
-# =====================================================================
 import pytest
 
 from fetch_rich_content import (
@@ -35,9 +32,7 @@ from token_budget import count_tokens
 BASE = "https://example.com/article"
 
 
-# ---------------------------------------------------------------------
 # URL 清洗 / 图片选择
-# ---------------------------------------------------------------------
 def test_sanitize_url_blocks_dangerous_schemes():
     assert _sanitize_url("javascript:alert(1)") is None
     assert _sanitize_url("data:text/html;base64,AAAA") is None
@@ -68,9 +63,7 @@ def test_media_url_key_drops_query_and_is_case_insensitive_host():
     assert key1 == key2 == ("cdn.example.com", "/a/img.jpg")
 
 
-# ---------------------------------------------------------------------
 # 隐藏元素 / 碎片段落
-# ---------------------------------------------------------------------
 def _el(attrs):
     tree = _parse_dom("<html><body><img " + " ".join(
         f'{k}="{v}"' for k, v in attrs.items()
@@ -96,9 +89,7 @@ def test_is_punct_only_detects_fragment_paragraphs():
     assert not _is_punct_only("这是正常中文段落")
 
 
-# ---------------------------------------------------------------------
 # 图片不限量：20 张正文图片全部收集
-# ---------------------------------------------------------------------
 def test_collect_dom_media_images_are_not_capped():
     imgs = "".join(
         f'<img src="https://example.com/gallery/pic-{i:02d}.jpg"/>' for i in range(20)
@@ -127,9 +118,7 @@ def test_collect_dom_media_still_filters_hidden_and_boilerplate():
     assert nav and nav[0].boilerplate
 
 
-# ---------------------------------------------------------------------
 # 锚定：宽松 URL 匹配 + 零锚点比例兜底
-# ---------------------------------------------------------------------
 def test_anchor_entries_relaxed_url_match_ignores_query_diff():
     html = (
         '<html><body><p>第一段足够长的正文文本内容。</p>'
@@ -175,9 +164,7 @@ def test_interleave_spreads_media_instead_of_dumping_at_tail():
     assert len(result) == 5
 
 
-# ---------------------------------------------------------------------
 # 截断：整块优先，单块超预算头尾兜底
-# ---------------------------------------------------------------------
 def test_truncate_blocks_keeps_complete_blocks_within_budget():
     blocks = ["<p>" + "内容段落。" * 10 + "</p>", "<p>短段。</p>"]
     kept, truncated = _truncate_blocks(blocks, count_tokens(blocks[0]) + 50)
@@ -207,9 +194,7 @@ def test_truncate_blocks_drops_middle_oversized_block_with_notice():
     assert truncated and kept == [b1]
 
 
-# ---------------------------------------------------------------------
 # 端到端：图片按结构位置穿插 + 轮播归并
-# ---------------------------------------------------------------------
 def test_build_model_facing_html_places_images_at_structure_position():
     html = (
         "<html><head><title>结构测试</title></head><body>"
@@ -278,9 +263,7 @@ def test_build_model_facing_html_groups_carousel_into_slideshow():
         assert u in slide
 
 
-# ---------------------------------------------------------------------
 # 标题 / 兜底文本
-# ---------------------------------------------------------------------
 def test_extract_title_from_html_prefers_og_title():
     html = (
         "<html><head>"

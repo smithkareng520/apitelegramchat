@@ -119,9 +119,7 @@ async def execute_deliver_reply(chat_id: int, content: Any) -> str:
     return "失败：消息发送失败（网络或 Telegram 错误），可稍后重试。"
 
 
-# =====================================================================
 # host 内建工具 handler 表
-# =====================================================================
 BuiltinHandler = Callable[
     [int, dict, str, Callable[[str], Awaitable[None]] | None], Awaitable[str]
 ]
@@ -209,9 +207,7 @@ BUILTIN_HANDLERS: dict[str, BuiltinHandler] = {
 }
 
 
-# =====================================================================
 # 主分发入口
-# =====================================================================
 async def dispatch_tool_call(
     name: str,
     arguments: dict,

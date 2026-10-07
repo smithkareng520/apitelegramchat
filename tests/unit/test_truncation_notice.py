@@ -1,10 +1,8 @@
-# =====================================================================
 # tests/unit/test_truncation_notice.py — 输出截断的分类与用户提示
-# =====================================================================
 # 被测关键路径：四条 agentic 循环（openai_compat / anthropic / gemini /
 # responses）共用的「纯文本终局是否被输出长度上限截断」判定与提示追加。
 #
-# 回归背景（Code Review 发现，2026-09）：
+# 验证截断提示与实际输出状态保持一致。
 #   json_repair._finish_reason_cut_info 此前只被 build_invalid_arguments_
 #   envelope 消费——只在「本轮解析出了工具调用但参数 JSON 非法」时才会
 #   被查阅，用于诊断参数是否被输出上限截断。当模型本轮没有调用任何
@@ -23,7 +21,6 @@
 #
 # 本文件锁定修复后的行为：分类逻辑（_finish_reason_cut_info）与提示
 # 追加逻辑（append_truncation_notice_if_needed）分别覆盖。
-# =====================================================================
 import pytest
 
 from ai.bridge_common import append_truncation_notice_if_needed, _TRUNCATION_NOTICE
@@ -40,9 +37,7 @@ class _FakeBuilder:
         self.added.append(text)
 
 
-# ---------------------------------------------------------------------
 # _finish_reason_cut_info：三种协议的截断拼写必须被同等识别
-# ---------------------------------------------------------------------
 @pytest.mark.parametrize("finish_reason", [
     "length",             # OpenAI Chat Completions
     "max_tokens",         # Anthropic Messages API（stop_reason）
@@ -83,9 +78,7 @@ def test_finish_reason_cut_info_none_means_no_information():
     assert cause == ""
 
 
-# ---------------------------------------------------------------------
 # append_truncation_notice_if_needed：只在"输出长度上限"时追加提示
-# ---------------------------------------------------------------------
 @pytest.mark.parametrize("finish_reason", [
     "length", "max_tokens", "max_output_tokens", "MAX_TOKENS",
 ])

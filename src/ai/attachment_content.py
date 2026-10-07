@@ -191,7 +191,6 @@ async def _upload_and_mark(file_id: str, data: bytes, r2_key: str) -> None:
         await state.mark_r2_attempted(file_id)
 
 
-# =====================================================================
 # 视频输入模态：缓存获取 / R2 持久化 / 预签名 URL 解析
 # 与图片路径（get_cached_image_data / _upload_and_mark /
 # _resolve_r2_presigned_url_for_vision）完全对称，但有两个关键差异：
@@ -207,7 +206,6 @@ async def _upload_and_mark(file_id: str, data: bytes, r2_key: str) -> None:
 #      信息，视频在首次进入 fallback（模型不支持视频）路径时也会
 #      fire-and-forget 地后台上传 R2（图片的 fallback 路径不做上传，
 #      因为图片场景下 supports_image_input 的模型占比高，且图片字节便宜）。
-# =====================================================================
 
 
 def _normalize_video_mime_type(mime_type: str = "") -> str:

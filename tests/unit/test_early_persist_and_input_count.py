@@ -50,9 +50,7 @@ def _photo_envelope(fids: list[str], text: str = "回答") -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
 # A. 输入组合计数：去重联合计数
-# ---------------------------------------------------------------------------
 def test_input_count_dual_representation_counts_once():
     """信封同时携带 file_ids 与 attachments（同一附件两种表示）：计 1 次。
 
@@ -117,9 +115,7 @@ def test_input_count_audio_mixed_kinds():
     assert combo.audio_count == 2
 
 
-# ---------------------------------------------------------------------------
 # B. 提前持久化 + 回滚
-# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_spawn_early_persist_appended_then_undo():
     """appended 路径：入库 → meta 带 TS → undo 精确弹出该条。"""
@@ -207,9 +203,7 @@ async def test_undo_conservative_when_tail_changed():
     assert history == snapshot, "TS 不命中时不得误删历史消息"
 
 
-# ---------------------------------------------------------------------------
 # C. spawn_turn_task 提前持久化接线（打断旧回合之后、创建任务之前）
-# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_spawn_turn_task_persists_before_task_starts(monkeypatch):
     """spawn_turn_task(user_message=...)：落库发生在派发前（任务尚未运行）。"""

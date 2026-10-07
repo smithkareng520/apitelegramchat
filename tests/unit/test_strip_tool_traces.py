@@ -39,9 +39,7 @@ def _tool_result(call_id, name, content):
     return Message.tool_result(call_id, name, content)
 
 
-# ---------------------------------------------------------------------------
 # Message 路径
-# ---------------------------------------------------------------------------
 def test_assistant_text_kept_tool_calls_removed():
     history = [
         Message.system("sys"),
@@ -136,9 +134,7 @@ def test_parallel_calls_and_results_all_gone():
     assert out[0].tool_calls() == []
 
 
-# ---------------------------------------------------------------------------
 # 旧 dict 形状（直通契约）
-# ---------------------------------------------------------------------------
 def test_legacy_dict_shapes_passthrough():
     """旧 dict 形状：直通不改写（双形状兼容层已移除）。
 
@@ -169,9 +165,7 @@ def test_legacy_dict_shapes_passthrough():
     assert out == history
 
 
-# ---------------------------------------------------------------------------
 # 直通与确定性
-# ---------------------------------------------------------------------------
 def test_no_traces_passthrough_returns_same_list():
     """无工具痕迹：零开销直通，返回原列表对象。"""
     history = [Message.system("s"), Message.user_text("u"),
@@ -194,9 +188,7 @@ def test_deterministic_output():
         assert a.to_openai_dict() == b.to_openai_dict()
 
 
-# ---------------------------------------------------------------------------
 # wire 级验证（三条协议出站的共同上游：OpenAI 渲染出口）
-# ---------------------------------------------------------------------------
 def test_rendered_openai_wire_has_no_tool_traces():
     history = [
         Message.system("sys"),
