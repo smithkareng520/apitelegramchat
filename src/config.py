@@ -2,6 +2,7 @@
 
 # config.py
 import asyncio
+import copy
 import logging
 import os
 import sys
@@ -21,8 +22,17 @@ GLM_API_KEY = os.getenv("GLM_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 XAI_API_KEY = os.getenv("XAI_API_KEY", "")
 
-# OpenRouter 全局路由偏好：默认价格优先、允许自动回退；可用环境变量覆盖。
-OPENROUTER_PROVIDER_SORT = (os.getenv("OPENROUTER_PROVIDER_SORT") or "price").strip() or "price"
+# OpenRouter 全局路由偏好：默认 sort=price、允许自动回退；可用环境变量覆盖。
+# 必须显式设 sort：不设时 OpenRouter 会在每个带工具的请求上启用 Auto Exacto
+# （按工具调用质量重排 provider），重排会与 session_id 的粘性路由冲突、
+# 打散前缀缓存；显式 sort 即官方的关闭方式。
+_OPENROUTER_SORT_VALUES = ("price", "throughput", "latency")
+OPENROUTER_PROVIDER_SORT = (os.getenv("OPENROUTER_PROVIDER_SORT") or "price").strip().lower()
+if OPENROUTER_PROVIDER_SORT not in _OPENROUTER_SORT_VALUES:
+    raise ValueError(
+        f"OPENROUTER_PROVIDER_SORT={OPENROUTER_PROVIDER_SORT!r} 无效，"
+        f"合法值: {list(_OPENROUTER_SORT_VALUES)}"
+    )
 OPENROUTER_ALLOW_FALLBACKS = os.getenv("OPENROUTER_ALLOW_FALLBACKS", "true").strip().lower() in {"1", "true", "yes", "on"}
 OPENROUTER_REQUIRE_PARAMETERS = os.getenv("OPENROUTER_REQUIRE_PARAMETERS", "false").strip().lower() in {"1", "true", "yes", "on"}
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
@@ -284,6 +294,17 @@ class ModelConfig:
     # None = 继承厂商默认；显式声明即覆盖，无独立开关字段。
     protocol: Optional[str] = None
     session_affinity: Optional[bool] = None
+
+    # ===================== OpenRouter 模型级路由 =====================
+    # 叠加在全局偏好（get_openrouter_provider_preferences）之上的 provider
+    # 路由字段，仅 provider="openrouter" 可用，如
+    # {"only": ["google-vertex/europe"], "allow_fallbacks": False}。
+    # sort 请用下面的 route，与这里的 sort 二选一。
+    provider_routing: Optional[Dict[str, Any]] = None
+    # 排序变体 "nitro"（最快）/ "floor"（最便宜）/ "exacto"（工具调用最稳）：
+    # 发请求时拼成模型名后缀（见 get_wire_model_name），并取代全局 sort。
+    # 仅 provider="openrouter"，对话循环与子 agent 生效，图像生成不使用。
+    route: Optional[str] = None
 
     @property
     def api_type(self) -> str:
@@ -638,14 +659,102 @@ def _merge_with_defaults(provider: str, overrides: dict) -> dict:
     return merged
 
 
-def get_openrouter_provider_preferences() -> dict:
-    """返回所有 OpenRouter 请求共用的路由偏好。"""
-    prefs = {
+# OpenRouter 排序变体：模型 ID 后缀，任意模型可用。
+#   :nitro  按吞吐排序（并放开 priority 档位端点）
+#   :floor  按价格排序（并放开 flex 档位端点）
+#   :exacto 按工具调用可靠性排序
+# 多个变体并存时以最后一个为准；变体决定该请求的 sort，因此请求体不再带 sort。
+OPENROUTER_SORT_VARIANTS = ("nitro", "floor", "exacto")
+
+_PROVIDER_ROUTING_LIST_KEYS = ("order", "only", "ignore", "quantizations")
+_PROVIDER_ROUTING_BOOL_KEYS = (
+    "allow_fallbacks", "require_parameters", "zdr", "enforce_distillable_text",
+)
+_PROVIDER_ROUTING_KEYS = frozenset({
+    *_PROVIDER_ROUTING_LIST_KEYS,
+    *_PROVIDER_ROUTING_BOOL_KEYS,
+    "data_collection", "sort",
+    "preferred_min_throughput", "preferred_max_latency", "max_price",
+})
+
+
+def openrouter_sort_variant(model_id: str) -> Optional[str]:
+    """返回模型 ID 末尾的排序变体（nitro/floor/exacto），没有则 None。"""
+    found = [part for part in model_id.split(":")[1:] if part in OPENROUTER_SORT_VARIANTS]
+    return found[-1] if found else None
+
+
+def effective_sort_variant(model_info: Optional["ModelConfig"]) -> Optional[str]:
+    """模型实际生效的排序变体：route 参数优先，其次模型 ID 里手写的后缀。"""
+    if model_info is None:
+        return None
+    return getattr(model_info, "route", None) or openrouter_sort_variant(
+        getattr(model_info, "model_id", "") or ""
+    )
+
+
+def get_wire_model_name(model_key: str, model_info: Optional["ModelConfig"] = None) -> str:
+    """请求里实际发送的模型名：配置的模型名，设了 route 时再拼 :<route> 后缀。"""
+    route = getattr(model_info, "route", None)
+    return f"{model_key}:{route}" if route else model_key
+
+
+def _validate_provider_routing(model_id: str, routing: Any) -> Dict[str, Any]:
+    """校验模型级 provider 路由字段，拼错键或类型错误在启动时暴露。"""
+    if not isinstance(routing, dict):
+        raise ValueError(f"模型 {model_id} 的 provider_routing 必须是 dict")
+    unknown = sorted(set(routing) - _PROVIDER_ROUTING_KEYS)
+    if unknown:
+        raise ValueError(
+            f"模型 {model_id} 的 provider_routing 含未知字段 {unknown}，"
+            f"合法字段: {sorted(_PROVIDER_ROUTING_KEYS)}"
+        )
+    for key in _PROVIDER_ROUTING_LIST_KEYS:
+        value = routing.get(key)
+        if value is not None and not (
+            isinstance(value, list) and value and all(isinstance(v, str) and v for v in value)
+        ):
+            raise ValueError(f"模型 {model_id} 的 provider_routing.{key} 必须是非空字符串列表")
+    for key in _PROVIDER_ROUTING_BOOL_KEYS:
+        value = routing.get(key)
+        if value is not None and not isinstance(value, bool):
+            raise ValueError(f"模型 {model_id} 的 provider_routing.{key} 必须是 bool")
+    data_collection = routing.get("data_collection")
+    if data_collection is not None and data_collection not in ("allow", "deny"):
+        raise ValueError(f"模型 {model_id} 的 provider_routing.data_collection 必须是 allow/deny")
+    sort = routing.get("sort")
+    if sort is not None:
+        sort_by = sort.get("by") if isinstance(sort, dict) else sort
+        if sort_by not in _OPENROUTER_SORT_VALUES:
+            raise ValueError(
+                f"模型 {model_id} 的 provider_routing.sort={sort!r} 无效，"
+                f"合法值: {list(_OPENROUTER_SORT_VALUES)}"
+            )
+        if openrouter_sort_variant(model_id):
+            raise ValueError(
+                f"模型 {model_id} 已用 :{openrouter_sort_variant(model_id)} 后缀决定排序，"
+                "不能再设 provider_routing.sort"
+            )
+    return dict(routing)
+
+
+def get_openrouter_provider_preferences(model_info: Optional["ModelConfig"] = None) -> dict:
+    """返回 OpenRouter 请求的 provider 路由偏好。
+
+    全局偏好（环境变量）打底；传入 model_info 时，设了 route（或模型 ID 带排序变体后缀）则
+    去掉全局 sort（由变体决定；exacto 会显式启用 Exacto 排序），再用
+    model_info.provider_routing 覆盖。
+    """
+    prefs: Dict[str, Any] = {
         "sort": OPENROUTER_PROVIDER_SORT,
         "allow_fallbacks": OPENROUTER_ALLOW_FALLBACKS,
     }
     if OPENROUTER_REQUIRE_PARAMETERS:
         prefs["require_parameters"] = True
+    if model_info is not None:
+        if effective_sort_variant(model_info):
+            prefs.pop("sort", None)
+        prefs.update(copy.deepcopy(getattr(model_info, "provider_routing", None) or {}))
     return prefs
 
 
@@ -720,6 +829,25 @@ def make_model_config(
             f"请先在文件顶部加一行 {override_api_key_env} = os.getenv({override_api_key_env!r}, \"\")"
         )
 
+    provider_routing = kwargs.pop("provider_routing", None)
+    if provider_routing is not None:
+        if provider != "openrouter":
+            raise ValueError(f"模型 {model_id} 的 provider_routing 仅支持 provider=\"openrouter\"")
+        provider_routing = _validate_provider_routing(model_id, provider_routing)
+
+    route = kwargs.pop("route", None)
+    if route is not None:
+        if provider != "openrouter":
+            raise ValueError(f"模型 {model_id} 的 route 仅支持 provider=\"openrouter\"")
+        if route not in OPENROUTER_SORT_VARIANTS:
+            raise ValueError(
+                f"模型 {model_id} 的 route={route!r} 无效，合法值: {list(OPENROUTER_SORT_VARIANTS)}"
+            )
+        if openrouter_sort_variant(model_id):
+            raise ValueError(f"模型 {model_id} 已带排序后缀，不能再设 route")
+        if provider_routing and "sort" in provider_routing:
+            raise ValueError(f"模型 {model_id} 设了 route，不能再设 provider_routing.sort")
+
     merged = _merge_with_defaults(provider, kwargs)
 
     # 推理努力档位校验：拼错会在运行期被网关 400，尽早暴露。
@@ -767,6 +895,8 @@ def make_model_config(
         protocol=endpoint_overrides.get("protocol"),
         session_affinity=endpoint_overrides.get("session_affinity"),
         endpoint=endpoint_overrides.get("endpoint"),
+        provider_routing=provider_routing,
+        route=route,
     )
 
 
@@ -1026,6 +1156,19 @@ SUPPORTED_MODELS["openrouter/free"] = make_model_config(
     temperature=0.5,
     max_context=200000,
 )
+# 路由示例：route 选排序（nitro 最快 / floor 最便宜 / exacto 工具调用最稳）；
+# provider_routing 固定端点（此处只走 Vertex 欧洲区、不回退）。
+# SUPPORTED_MODELS["google/gemini-3-pro"] = make_model_config(
+#     model_id="google/gemini-3-pro",
+#     provider="openrouter",
+#     reasoning_enabled=True,
+#     provider_routing={"only": ["google-vertex/europe"], "allow_fallbacks": False},
+# )
+# SUPPORTED_MODELS["moonshotai/kimi-k2-0905"] = make_model_config(
+#     model_id="moonshotai/kimi-k2-0905",
+#     provider="openrouter",
+#     route="exacto",
+# )
 # SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
 #     model_id="anthropic/claude-sonnet-5",
 #     provider="openrouter",

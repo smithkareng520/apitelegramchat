@@ -331,10 +331,41 @@ prompt/KV 缓存全量命中。每轮日志输出 `prompt cache usage: {...}`
 ### OpenRouter 路由
 
 ```bash
-export OPENROUTER_PROVIDER_SORT=price        # Provider 路由排序
+export OPENROUTER_PROVIDER_SORT=price        # Provider 路由排序：price / throughput / latency
 export OPENROUTER_ALLOW_FALLBACKS=true       # 是否允许上游 fallback
 export OPENROUTER_REQUIRE_PARAMETERS=false   # 是否要求 provider 满足请求参数
 ```
+
+`sort` 必须显式设置：不设时 OpenRouter 会对带工具的请求自动启用 Auto Exacto，
+每个请求按工具调用质量重排 provider，容易与 `session_id` 粘性路由冲突、打散
+前缀缓存；显式 `sort`（或 `:floor` 后缀）是官方的关闭方式。
+
+单个模型的路由在 `config.py` 里配置：
+
+- **排序变体**：`route="nitro"`（最快）/ `"floor"`（最便宜）/ `"exacto"`（工具调用最稳）。
+  请求时自动拼成模型名后缀（`moonshotai/kimi-k2-0905` → `moonshotai/kimi-k2-0905:exacto`），
+  并取代全局 `sort`（`exacto` 即显式选用 Exacto 排序）；不能与 `provider_routing.sort`
+  同时设置。仅对话循环与子 agent 生效，图像生成不使用。
+- **固定端点**：`provider_routing`（仅 OpenRouter 模型），叠加在全局偏好之上，
+  字段同 OpenRouter 的 `provider` 对象，启动时校验键名与类型：
+
+```python
+SUPPORTED_MODELS["google/gemini-3-pro"] = make_model_config(
+    model_id="google/gemini-3-pro",
+    provider="openrouter",
+    reasoning_enabled=True,
+    provider_routing={"only": ["google-vertex/europe"], "allow_fallbacks": False},
+)
+SUPPORTED_MODELS["moonshotai/kimi-k2-0905"] = make_model_config(
+    model_id="moonshotai/kimi-k2-0905",
+    provider="openrouter",
+    route="exacto",
+)
+```
+
+区域端点的 slug 以模型页 Providers 里的复制按钮为准；`only` 加
+`allow_fallbacks=False` 后该端点不可用时请求直接报错，不会换别家。
+主 agent、子 agent 都按模型读取这份配置，图像生成工具仍用全局偏好。
 
 每个请求还携带会话亲和键 `session_id`（`tg-chat-{chat_id}-{纪元token}`），
 粘性路由从第一次请求即生效；`/clear` 清空历史时轮换纪元 token，新建会话。

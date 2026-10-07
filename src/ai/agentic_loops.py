@@ -14,6 +14,8 @@ from config import (
     get_sampling_params,
     get_reasoning_request_fields,
     get_effective_endpoint,
+    get_openrouter_provider_preferences,
+    get_wire_model_name,
     ModelConfig,
 )
 from state import get_llm_session_key
@@ -29,7 +31,6 @@ from s3_utils import upload_bytes_to_r2
 from ai._constants import (
     MAX_TOOL_CALLS,
     MAX_PLAIN_TEXT_TOOL_CALL_RETRIES,
-    OPENROUTER_PROVIDER_PREFERENCES,
 )
 from ai.error_formatting import (
     _format_api_error_notice,
@@ -166,8 +167,9 @@ def _openrouter_extra_body(
     chat_id: Optional[int] = None,
     supports_prompt_cache: bool = False,
     session_key: Optional[str] = None,
+    model_info: Optional[ModelConfig] = None,
 ) -> dict:
-    body: dict = {"provider": OPENROUTER_PROVIDER_PREFERENCES.copy()}
+    body: dict = {"provider": get_openrouter_provider_preferences(model_info)}
     # loop 内固定同一 session key；未提供时按 chat_id 解析。
     key = session_key or _openrouter_session_id(chat_id)
     if key:
@@ -261,6 +263,7 @@ def _merged_extra_body(
             chat_id=chat_id,
             supports_prompt_cache=supports_prompt_cache,
             session_key=session_key,
+            model_info=model_info,
         )
     else:
         # agnes 等声明了 session_affinity 的聚合网关：body 级会话亲和键
@@ -555,7 +558,7 @@ async def _agentic_loop_openai_compat(
         try:
             # SDK 重载不接受 dict[str, object] 解包；请求载荷是动态 JSON。
             create_params: dict[str, Any] = {
-                "model": current_model,
+                "model": get_wire_model_name(current_model, model_info),
                 "messages": wire_messages,
                 "stream": True,
                 "max_tokens": max_tokens,
@@ -864,7 +867,7 @@ async def _agentic_loop_openai_compat(
             try:
                 # 与上方 create_params 同理：** 解包需 Any 值类型。
                 fallback_params: dict[str, Any] = {
-                    "model": current_model,
+                    "model": get_wire_model_name(current_model, model_info),
                     "messages": wire_messages,
                     "stream": False,
                     "max_tokens": max_tokens,
@@ -1064,7 +1067,7 @@ async def _agentic_loop_openai_compat(
             def _build_synth_request(extra_msg: Message) -> dict[str, Any]:
                 # 与上方 create_params 同理：** 解包需 Any 值类型。
                 synth_params: dict[str, Any] = {
-                    "model": current_model,
+                    "model": get_wire_model_name(current_model, model_info),
                     "messages": render_openai_messages(loop_messages + [extra_msg]),
                     "stream": True,
                     "max_tokens": max_tokens,

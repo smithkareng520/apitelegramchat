@@ -21,6 +21,7 @@ from config import (
     DEFAULT_MODEL,
     get_sampling_params,
     get_reasoning_request_fields,
+    get_wire_model_name,
     ModelConfig,
 )
 from state import get_llm_session_key
@@ -359,7 +360,7 @@ async def _subagent_agentic_loop(
 
         try:
             create_params = {
-                "model": model,
+                "model": get_wire_model_name(model, model_info),
                 "messages": wire_for_cache,
                 "stream": False,
                 "max_tokens": (model_info.max_output_tokens if model_info and model_info.max_output_tokens else 8192),
@@ -392,6 +393,7 @@ async def _subagent_agentic_loop(
                 chat_id=chat_id,
                 supports_prompt_cache=subagent_supports_cache,
                 session_key=subagent_session_key,
+                model_info=model_info,
             )
             if extra_body is not None:
                 create_params["extra_body"] = extra_body

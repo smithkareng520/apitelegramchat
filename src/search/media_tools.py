@@ -5,12 +5,10 @@ from typing import Any, Optional, cast
 
 import aiohttp
 
-from config import SUPPORTED_MODELS, get_openrouter_provider_preferences
+from config import SUPPORTED_MODELS
 from s3_utils import upload_bytes_to_r2
 from chat_actions import chat_action_scope
 from ai.media_generation import _upload_generated_images_to_r2
-
-OPENROUTER_PROVIDER_PREFERENCES = get_openrouter_provider_preferences()
 
 from core.images import ImageTask, ImageRequestError
 from protocols.images import dispatch_image_task
