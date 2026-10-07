@@ -807,8 +807,9 @@ async def webhook() -> tuple:
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        # 入口意外异常返回 500 让 Telegram 重投：去重标记发生在 worker 侧，
-        # 此时该 update 一定尚未入队/未被标记，重投不会产生重复处理。
+        # 入口意外异常返回 500 让 Telegram 重投。正常情况下，业务 update 的去重
+        # 标记发生在 worker 侧；若异常发生在 put_nowait 之后，则不能假定“尚未入队”，
+        # 因此重复投递仍由 worker 侧去重机制兜底。
         logger.exception(f"Webhook 入口顶层异常: {e}")
         return "Internal Server Error", 500
     finally:

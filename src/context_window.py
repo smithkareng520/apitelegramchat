@@ -44,35 +44,35 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 # 可调参数（环境变量）
-# : 历史可用预算占 max_context 的比例（其余留给系统提示 + 工具 schema + 轮内增长）
+# 历史可用预算占 max_context 的比例（其余留给系统提示 + 工具 schema + 轮内增长）
 CONTEXT_BUDGET_RATIO = min(1.0, max(0.1, _env_float("CONTEXT_BUDGET_RATIO", 0.8)))
-# : 触发压缩事件的高水位（占预算比例）
+# 触发压缩事件的高水位（占预算比例）
 CONTEXT_COMPACT_TRIGGER_RATIO = min(1.0, max(0.3, _env_float("CONTEXT_COMPACT_TRIGGER_RATIO", 0.90)))
-# : 压缩事件要压回的目标水位（占预算比例）
+# 压缩事件要压回的目标水位（占预算比例）
 CONTEXT_COMPACT_TARGET_RATIO = min(1.0, max(0.1, _env_float("CONTEXT_COMPACT_TARGET_RATIO", 0.50)))
-# : 永不淘汰的最近用户轮数（活跃工作集）
+# 不参与结构性淘汰的最近用户轮数（活跃工作集）
 CONTEXT_PROTECTED_TURNS = max(0, _env_int("CONTEXT_PROTECTED_TURNS", 6))
-# : 滚动摘要的 token 预算
+# 滚动摘要的 token 预算
 CONTEXT_DIGEST_TOKEN_BUDGET = max(200, _env_int("CONTEXT_DIGEST_TOKEN_BUDGET", 1500))
-# : 绝对预算覆盖（环境变量 CONTEXT_MAX_TOKENS；0 = 不覆盖）
+# 绝对预算覆盖（环境变量 CONTEXT_MAX_TOKENS；0 = 不覆盖）
 CONTEXT_MAX_TOKENS_ENV = _env_int("CONTEXT_MAX_TOKENS", 0)
 
-# : 无任何模型信息时的兜底预算（与旧 select_request_context 保持一致）
+# 无任何模型信息时的兜底预算（与旧 select_request_context 保持一致）
 FALLBACK_BUDGET_TOKENS = 50000
 
-# : 摘要消息的稳定标记（同时是摘要槽位的识别方式）
+# 摘要消息的稳定标记（同时是摘要槽位的识别方式）
 DIGEST_MARKER = "[conversation digest]"
-# : 摘要正文里标注"更早内容因预算省略"的提示行
+# 摘要正文里标注“更早内容因预算省略”的提示行
 _DIGEST_OVERFLOW_NOTE = "(更早轮次已因摘要 token 预算省略)"
 _DIGEST_HEADER_RE = re.compile(
     r"^" + re.escape(DIGEST_MARKER) + r"[^\n]*?(\d+)[^\n]*轮[^\n]*$", re.MULTILINE
 )
 
-# : 摘要里每行的 token 上限（U/A 行）
+# 摘要里每行的 token 上限（U/A 行）
 _LINE_TOKEN_BUDGET = 48
-# : 工具调用 locator 的字符上限
+# 工具调用 locator 的字符上限
 _LOCATOR_CHAR_BUDGET = 96
-# : 构造 T 行时优先展示的参数键（与 tool_context_compaction 的定位字段对齐)
+# 构造 T 行时优先展示的参数键（与 tool_context_compaction 的定位字段对齐）
 _LOCATOR_KEYS = ("url", "query", "q", "path", "command", "city", "file_name", "name")
 
 # 预算解析
@@ -189,7 +189,7 @@ def plan_turn_eviction(
 
     - target_tokens 通常 = 目标水位 − 新输入估算（历史侧目标）；
     - 最近 protected_turns 个用户轮块受保护，宁可停在水位之上也不动；
-    - 摘要槽位永不淘汰（它是被淘汰信息的唯一载体）；
+    - 摘要槽位不参与结构性淘汰（它是被淘汰对话的汇总载体）；
     - 单块超大时允许越过 target（块粒度淘汰），后续由请求侧守卫兜底。
     """
     token_fn = token_fn or json_token_count

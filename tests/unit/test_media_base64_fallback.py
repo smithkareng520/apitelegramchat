@@ -168,8 +168,8 @@ class TestInlineWireImages:
         assert part["image_url"]["url"] == "https://r2.example/x.jpg"
 
     def test_mime_fallback_content_type_then_ext_then_default(self):
-        # magic 认不出 + Content-Type 非 image/* → URL 扩展名或 jpeg 兑底：
-        # .bin 不在扩展名表 → jpeg 兑底；.PNG（大小写不敏感）→ image/png
+        # magic 认不出 + Content-Type 非 image/* → URL 扩展名或 jpeg 兜底：
+        # .bin 不在扩展名表 → jpeg 兜底；.PNG（大小写不敏感）→ image/png
         part_bin = _image_part("https://r2.example/a.bin")
         part_ext = _image_part("https://r2.example/photo.PNG?sig=1")
         part_default = _image_part("https://r2.example/noext")

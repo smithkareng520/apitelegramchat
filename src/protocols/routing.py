@@ -5,7 +5,7 @@
 与工具层只需要问一次 :func:`resolve_model_route`，就能拿到该模型应进入
 的执行链路；后续的端点选择继续由协议层（registry / images）与请求层
 （media_generation.resolve_images_endpoint_shape / _request_agnes_video）
-按配置解析。整条链路上没有任何按模型/厂商硬编码的分支。
+按配置解析。该路由本身不按厂商名称硬编码分支；具体协议与媒体端点仍由配置和下游适配层决定。
 """
 from __future__ import annotations
 

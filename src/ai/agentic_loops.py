@@ -396,7 +396,7 @@ async def _inline_wire_images_as_data_urls(
                             return True
                 except Exception as e:
                     logger.warning(
-                        "base64 内联兑底：按 file_id 复用图片字节失败，回退 URL 下载：%s… (%s: %s)",
+                        "base64 内联兜底：按 file_id 复用图片字节失败，回退 URL 下载：%s… (%s: %s)",
                         url[:120], type(e).__name__, str(e)[:120],
                     )
 
@@ -404,7 +404,7 @@ async def _inline_wire_images_as_data_urls(
             data, content_type = await fetch(url)
         except Exception as e:
             logger.warning(
-                "base64 内联兑底：图片下载失败，保持 URL 原样：%s… (%s: %s)",
+                "base64 内联兜底：图片下载失败，保持 URL 原样：%s… (%s: %s)",
                 url[:120], type(e).__name__, str(e)[:120],
             )
             return False
@@ -453,7 +453,7 @@ def _should_retry_media_fetch_400(
         则重放会产生半个模型回合，必须直接抛出）；
       - 尚未用完重试机会（stream_attempt < _MEDIA_FETCH_MAX_REPLAYS，
         至多补试两次；重放形态见 :func:`_media_fetch_replay_mode`——
-        第一次原样 URL 重放，第二次 base64 内联兑底重放）；
+        第一次原样 URL 重放，第二次 base64 内联兜底重放）；
       - 错误形状确属网关媒体拉取失败（见
         :func:`_looks_like_transient_media_fetch_error`）。
     """

@@ -211,7 +211,7 @@ def trim_interrupted_stream(journal: list, render_cursor: Optional[int]) -> bool
     占位的预算、把用户已看到的流式文本多裁掉。
 
     原地修改（打断时刻的固化语义）；裁剪/剥离后消息变空由
-    ``_normalize_journal`` 的 _is_persistable_assistant 过滤兑底。
+    ``_normalize_journal`` 的 _is_persistable_assistant 过滤兜底。
     返回是否实际触到了直播占位。
     """
     target_idx: Optional[int] = None

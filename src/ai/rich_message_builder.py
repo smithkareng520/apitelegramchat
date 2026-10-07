@@ -997,7 +997,7 @@ class RichMessageBuilder:
         group["finished"] = True
         self._commit_stream_buffer()
         group["outer_summary"] = self._generate_group_summary(group)
-        # 防御性兑底：正常情况下全部失败也会得到 "(failed n)"；仅当组内
+        # 防御性兜底：正常情况下全部失败也会得到 "(failed n)"；仅当组内
         # 既无成功也无失败条目（异常路径）时才落到通用默认标题。
         if not group["outer_summary"]:
             group["outer_summary"] = "Tools failed"

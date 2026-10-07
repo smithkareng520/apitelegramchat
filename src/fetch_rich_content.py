@@ -1064,7 +1064,7 @@ def _normalize_heading_text(text: str) -> str:
     return re.sub(r"\s+", "", _TAG_TEXT_RE.sub("", text or "")).lower()
 
 def _squeeze_oversized_block(block: str, token_budget: int) -> str:
-    """单个块超出整个预算时的兑底：提取可见文本做头尾截断。
+    """单个块超出整个预算时的兜底：提取可见文本做头尾截断。
 
     结构化截断（保标签完整）在此场景下等价于整块丢弃——块比全部预算还大，
     过去会导致整页一个字都拿不到。退化为纯文本头尾截断会丢失标签结构
@@ -1088,7 +1088,7 @@ def _truncate_blocks(blocks: list[str], token_budget: int) -> tuple[list[str], b
 
     单个块放不进剩余预算时整块丢弃（保持"不截断在标签中间"约束）；但若
     第一个块就放不下（kept 为空），整页会一个字都不剩——此时对该块做
-    头尾截断兑底，保证超长页面至少能给出主要内容概貌。
+    头尾截断兜底，保证超长页面至少能给出主要内容概貌。
     """
     kept: list[str] = []
     used_tokens = 0
@@ -1311,7 +1311,7 @@ def _interleave(entries: list[dict], dropped: list[tuple[int, str]]) -> list[str
     """按锚点顺序把 dropped 媒体块插入正文块流。
 
     插入条件为媒体 order <= 当前块 order：真实锚定场景中媒体与文本元素的
-    order_idx 不会相等（不同 DOM 元素），等号只在零锚点比例兑底的合成
+    order_idx 不会相等（不同 DOM 元素），等号只在零锚点比例兜底的合成
     order 上出现——此时媒体应落在其比例位置所在的块之前，而不是被严格
     小于条件挤到尾部。
     """

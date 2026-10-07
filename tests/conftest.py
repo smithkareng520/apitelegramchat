@@ -19,7 +19,7 @@ if str(_SRC) not in sys.path:
 # ---- 在导入任何项目模块之前，把工作空间根指到独立临时目录 ----
 # workspace_paths.workspaces_root() 默认 /home 且带 lru_cache：不隔离的话，
 # 未显式设置环境的测试会在真实 /home 下创建目录。这里给一个会话级临时
-# 目录兑底；需要精确路径断言的测试自行 setenv 并清缓存。
+# 目录兜底；需要精确路径断言的测试自行 setenv 并清缓存。
 # （本变量全进程只此一处设置；tests/integration/conftest.py 不再重复
 # setdefault——目录字母序决定了那里的 setdefault 永不生效，只会留下
 # "看似双重隔离、实为静默冲突"的陷阱。）

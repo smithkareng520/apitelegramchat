@@ -63,7 +63,7 @@ from ai.agentic_loops import (
     _agentic_loop_native_video,
     _media_loop_with_notices,
 )
-# 协议路由（Model -> Protocol -> Adapter）：聊天协议的唯一分发出口。
+# 协议路由（Model -> Protocol -> Adapter）：聊天协议的统一分发入口。
 from protocols import resolve_chat_adapter
 # 模型级公共路由：按模型配置字段匹配 文本/视频/生图 链路（新增模型
 # 无需在调度处新建分支）。
@@ -73,7 +73,7 @@ from protocols import resolve_model_route
 from protocols import run_preflight
 from core.messages import Message
 # chat action 状态指示：回合开始时清场（防止上一回合被取消时残留的
-# 后台重发任务跨回合存活）、收尾时兑底熄灭（正常/异常/取消路径均生效）。
+# 后台重发任务跨回合存活）、收尾时兜底熄灭（正常/异常/取消路径均生效）。
 from chat_actions import reset_chat_actions, stop_all_chat_actions
 
 if TYPE_CHECKING:
@@ -1058,7 +1058,7 @@ async def get_ai_response(
         if raw_content and isinstance(raw_content, str) and raw_content.startswith("VIDEO_ERROR:"):
             error_notice = raw_content.split(":", 1)[1].strip()
             error_html = _render_media_failure_quote(error_notice)
-            # 失败提示单独发一条永久消息（与 IMAGE_ERROR 一致；同援
+            # 失败提示单独发一条永久消息（与 IMAGE_ERROR 一致；同样
             # pre_rendered=True：引用块已是最终 HTML，不重过转换器）
             await send_rich_html_message(chat_id, error_html, reassert_draft=False, pre_rendered=True)
             if builder.draft_message_id:
@@ -1398,7 +1398,7 @@ async def get_ai_response(
             except Exception:
                 logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
                 pass
-        # chat action 兑底熄灭：typing / record_video / upload_video /
+        # chat action 兜底熄灭：typing / record_video / upload_video /
         # upload_document / find_location 的作用域在各自调用点正常收尾，
         # 这里是最后一道防线，确保任何退出路径（含异常与取消）都不会
         # 留下持续重发的状态指示。

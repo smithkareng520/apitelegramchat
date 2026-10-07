@@ -587,7 +587,7 @@ _TOOL_UI_MAX_LINES = 20
 # （rollover 只能在块边界切分），最终把草稿撑到超过滚动预算，消息被
 # 迫分裂成多条。因此在垂直（行数）之外再设水平（单行宽度）预算。
 _TOOL_UI_MAX_LINE_CHARS = max(80, int(os.getenv("TOOL_UI_MAX_LINE_CHARS", "240")))
-# <pre> 块的最终总量兑底（原始字符数，转义前）。正常路径远达不到：工具卡片
+# <pre> 块的最终总量兜底（原始字符数，转义前）。正常路径远达不到：工具卡片
 # 已被行数×行宽双重钳住；此值只拦截直接把大文本塞进 <pre> 的旁路调用。
 _PRE_BLOCK_MAX_CHARS = max(_TOOL_UI_MAX_LINE_CHARS * 4, int(os.getenv("PRE_BLOCK_MAX_CHARS", "8000")))
 

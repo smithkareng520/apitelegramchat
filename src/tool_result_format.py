@@ -151,7 +151,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 summary = "🌤️ 天气查询失败"
                 # 上游错误文本必须转义：未转义时其中的 < > & 会打坏
                 # Rich Message 结构直接内插会形成注入面。
-                # 走 _render_code_text 复用总量兑底，错误信息也可能很长。
+                # 走 _render_code_text 复用总量兜底，错误信息也可能很长。
                 details_html = _render_code_text(str(error_msg))
                 return summary, details_html
 
@@ -247,7 +247,7 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             return summary, details_html
 
         except json.JSONDecodeError:
-            # 严格转义 + <pre> 总量兑底：_render_code_text 内部先裁剪后转义，
+            # 严格转义 + <pre> 总量兜底：_render_code_text 内部先裁剪后转义，
             # 避免单行 60KB 的错误响应把块与整条草稿撑爆，也不会切断实体。
             summary = "🌤️ 天气数据"
             details_html = _render_code_text(result_str[:60000])

@@ -914,7 +914,7 @@ async def _request_modelscope_native_image(
 
                 if poll_task_status in _MODELSCOPE_TASK_SUCCEED_STATES:
                     # SUCCEED 但没有图片项：短暂补查（结果字段可能晚于状态
-                    # 落库）后快速失败，绝不空转到轮询超时——2026-10-07 前
+                    # 落库）后快速失败，绝不空转到轮询超时——此前
                     # 这类任务会白等 240s 然后报误导性的"没有图片数据"。
                     succeed_no_items += 1
                     if succeed_no_items >= 3:

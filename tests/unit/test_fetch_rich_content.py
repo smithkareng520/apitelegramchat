@@ -238,7 +238,7 @@ def test_build_model_facing_html_places_images_at_structure_position():
 
 
 def test_build_model_facing_html_zero_anchor_fallback_avoids_tail_dump():
-    # 正文块文本与 DOM 完全不同（零锚点）→ 比例兑底 → 图片穿插而非堆尾
+    # 正文块文本与 DOM 完全不同（零锚点）→ 比例兜底 → 图片穿插而非堆尾
     html = (
         "<html><body>"
         "<p>网页原始段落甲，内容与提取块完全不同足够长。</p>"

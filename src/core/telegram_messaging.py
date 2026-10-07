@@ -636,7 +636,7 @@ async def send_rich_html_message(
 
     pre_rendered:
       False — 内容可能仍含 Markdown，发送层第 0 步会先做一遍
-              Markdown→HTML 兑底转换（模型内容路径的默认行为）。
+              Markdown→HTML 兜底转换（模型内容路径的默认行为）。
       True  — 调用方已构建好最终 HTML（构建层已完成唯一一次 Markdown
               转换，如错误卡片 / 媒体失败引用块 / <figure> 媒体卡），
               发送层跳过整篇再转换，只保留 tg-button 校验与媒体 URL

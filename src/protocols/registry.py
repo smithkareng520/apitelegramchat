@@ -6,7 +6,7 @@
   - get_chat_adapter(protocol)：唯一合法的聊天协议取用出口。
 
 原 ai_handlers._call_api / api_client._build_client 里的
-协议分支统一由注册表选择；新增协议只需注册适配器。
+协议分支统一由注册表选择；新增聊天协议需要同步配置中的协议枚举，并在这里注册对应适配器。
 注册一行，调用方零改动。
 """
 from __future__ import annotations

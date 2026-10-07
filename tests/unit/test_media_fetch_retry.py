@@ -7,7 +7,7 @@
 必须在首个增量前重放（与 ReadTimeout 首增量前重试同语义），
 而不是把整轮报废成"请求失败"推给用户；[5332ea8f] 进一步实证 R2 慢窗口
 会连续覆盖首次与首次重放，故重放梯子升级为：第一次原样 URL 重放
-（1.5s，抖动自愈）→ 第二次 base64 内联通用兑底重放（
+（1.5s，抖动自愈）→ 第二次 base64 内联通用兜底重放（
 _inline_wire_images_as_data_urls，网关不再需要访问 R2；见
 test_media_base64_fallback.py）。
 
@@ -17,7 +17,7 @@ except BadRequestError 里，语义即这两个函数的组合）：
   大小写/包装变体；排除请求形状类 400 与宽泛 upstream_error）；
 - _should_retry_media_fetch_400：重试闸门（首增量前 + 至多两次 + 形状
   匹配；[5332ea8f] 实证 R2 慢窗口会连续覆盖首次+首次重放，第二次重放
-  改用 base64 内联兑底后闸门总量不变）。
+  改用 base64 内联兜底后闸门总量不变）。
 """
 import httpx
 import pytest
@@ -111,13 +111,13 @@ class TestShouldRetryMediaFetch400:
     def test_second_replay_allowed(self):
         # [5332ea8f] 实证：首次与 1.5s 后的重放可能撞在同一个 R2 慢窗口里
         # 双双 400，故第二次重放（stream_attempt=1）仍然放行——形态改为
-        # base64 内联通用兑底（见 _media_fetch_replay_mode）
+        # base64 内联通用兜底（见 _media_fetch_replay_mode）
         exc = _bad_request(PRODUCTION_ERROR_TEXT)
         assert _should_retry_media_fetch_400(exc, received_any=False, stream_attempt=1)
 
     def test_hard_stop_after_two_replays(self):
         # 第三次尝试（stream_attempt=2）失败必须放行给上层，不能无限重试
-        # （第二次重放已是内联兑底，仍失败说明问题不在媒体下载）
+        # （第二次重放已是内联兜底，仍失败说明问题不在媒体下载）
         exc = _bad_request(PRODUCTION_ERROR_TEXT)
         assert not _should_retry_media_fetch_400(exc, received_any=False, stream_attempt=2)
 
