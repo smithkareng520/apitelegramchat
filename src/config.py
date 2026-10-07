@@ -1030,7 +1030,7 @@ SUPPORTED_MODELS["openrouter/free"] = make_model_config(
     reasoning_enabled=True,
     reasoning_effort="high",
     supports_tools=False,
-    temperature=0.7,
+    temperature=0.5,
     max_context=200000,
 )
 # SUPPORTED_MODELS["anthropic/claude-sonnet-5"] = make_model_config(
@@ -1056,7 +1056,7 @@ SUPPORTED_MODELS["agnes-3.0-flash"] = make_model_config(
     reasoning_effort="high",
     max_context=512000,
     image_input=True,
-    temperature=0.5,
+    temperature=0.3,
 )
 
 # -----------------------------------------------------------------------------
@@ -1069,7 +1069,7 @@ SUPPORTED_MODELS["ZhipuAI/GLM-5.3-Flash"] = make_model_config(
     reasoning_enabled=True,
     reasoning_effort="max",
     image_input=True,
-    temperature=0.5,
+    temperature=0.3,
 )
 
 # -----------------------------------------------------------------------------
@@ -1084,7 +1084,7 @@ SUPPORTED_MODELS["gemini-3.5-flash-lite"] = make_model_config(
     # 如需精确控制可改用 reasoning_max_tokens（映射 thinkingBudget）。
     reasoning_enabled=True,
     reasoning_effort="high",
-    temperature=0.5,
+    temperature=0.4,
 )
 # -----------------------------------------------------------------------------
 # GLM 系列
@@ -1094,7 +1094,7 @@ SUPPORTED_MODELS["GLM-4.7-Flash"] = make_model_config(
     provider="glm",
     max_context=200000,
     reasoning_enabled=True,
-    temperature=0.5,
+    temperature=0.3,
 )
 
 # -----------------------------------------------------------------------------
@@ -1189,8 +1189,8 @@ SUPPORTED_MODELS["space-bunny"] = make_model_config(
     reasoning_enabled=True,
     reasoning_effort="high",
     max_context=1000000,
-    protocol="openai_responses",
-    temperature=0.5,
+    protocol="openai_chat",
+    temperature=0.3,
 )
 SUPPORTED_MODELS["mimo-v2.6-flash"] = make_model_config(
     model_id="mimo-v2.6-flash",
@@ -1198,7 +1198,8 @@ SUPPORTED_MODELS["mimo-v2.6-flash"] = make_model_config(
     reasoning_enabled=True,
     reasoning_effort="high",
     max_context=1000000,
-    protocol="openai_responses",
+    temperature=0.3,
+    protocol="openai_chat",
 )
 SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
     model_id="muse-spark-1.3-contributor",
@@ -1207,8 +1208,8 @@ SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
     reasoning_enabled=True,
     reasoning_effort="high",
     max_context=1000000,
-    temperature=1.0,
-    protocol="openai_responses",
+    temperature=0.3,
+    protocol="openai_chat",
 )
 
 
