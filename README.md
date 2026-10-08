@@ -421,7 +421,7 @@ Anthropic（Claude）模型经 OpenRouter 接入即可使用；Anthropic 原生 
 | 命令 | 作用 |
 |---|---|
 | `/model` | 打开模型选择列表（仅私聊）。点击按钮切换，列表就地打 √ 并定时清理 |
-| `/role` | 选择系统角色（`china` / `think` / `neko_catgirl` / `succubus` / `isla`）。角色是系统提示词的一部分，不是模型本身；再次点击取消 |
+| `/role` | 选择系统角色（角色名与提示词统一在 `src/roles.py` 中编辑）。角色是系统提示词的一部分，不是模型本身；再次点击取消 |
 | `/clear` | 清空当前会话历史与 active skill，轮换 LLM 会话亲和键，重置主动唤醒计时 |
 | `/show` | 草稿预览开关：`on`（默认，实时草稿）/ `off`（静默模式：USER 回合收尾默认交付最后一条正文，TIMER 回合由模型 `deliver_reply` 自主交付）/ 不带参数查看状态 |
 | `/balance [svc]` | 查询 DeepSeek / OpenRouter 余额 |

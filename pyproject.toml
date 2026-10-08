@@ -67,6 +67,7 @@ py-modules = [
   "net_shims",
   "proactive",
   "responses_state",
+  "roles",
   "s3_utils",
   "sandbox",
   "serper_api",

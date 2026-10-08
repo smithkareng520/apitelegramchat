@@ -441,8 +441,7 @@ async def _handle_callback_query(cb: dict) -> None:
                     notice = "已取消角色设定"
                 else:
                     await set_user_role(chat_id, sel)
-                    rn = {"china": "中国", "think": "思考", "neko_catgirl": "猫娘", "succubus": "魅魔", "isla": "Isla"}.get(sel, sel)
-                    notice = f"已切换到: <b>{rn}</b>"
+                    notice = f"已切换到: <b>{sel}</b>"
                 cr = await get_user_role(chat_id)
                 if role_message_ids.get(chat_id) == mid:
                     ok = await update_role_list(chat_id, mid, SUPPORTED_ROLES, cr)
