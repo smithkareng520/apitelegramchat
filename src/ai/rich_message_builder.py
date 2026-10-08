@@ -626,13 +626,14 @@ class RichMessageBuilder:
                         self.request_flush(force=False)
                     return
 
-    def update_tool_item(self, tool_id: str, summary: str, details_html: str, status: str = "done") -> None:
+    def update_tool_item(self, tool_id: str, summary: str, details_html: str, status: str = "done", result_count: Optional[int] = None) -> None:
         for group in self._tool_groups:
             for item in group["items"]:
                 if item["id"] == tool_id:
                     item["summary"] = summary
                     item["details_html"] = details_html
                     item["status"] = status
+                    item["result_count"] = result_count
                     # 终态一定要让用户看见（含被预算跳过 / 异常的条目）
                     item["hidden"] = False
                     self._refresh_outer_summary(group)
@@ -853,20 +854,20 @@ class RichMessageBuilder:
         "message_user": ("Messaged you", "Messaged you"),
         "deliver_reply": ("Delivered the final reply", "Delivered the final reply"),
         "deliver_reply_silent": ("Skipped the final reply", "Skipped the final reply"),
-        "todo_list": ("Listed todos", "Listed todos"),
+        "todo_list": ("Listed todos", "Listed {n} todos"),
         "todo_add": ("Added a todo", "Added {n} todos"),
-        "todo_done": ("Completed a todo", "Completed {n} todos"),
-        "todo_undone": ("Reopened a todo", "Reopened {n} todos"),
-        "todo_edit": ("Updated a todo", "Updated {n} todos"),
+        "todo_complete": ("Completed a todo", "Completed {n} todos"),
+        "todo_reopen": ("Reopened a todo", "Reopened {n} todos"),
+        "todo_update": ("Updated a todo", "Updated {n} todos"),
         "todo_delete": ("Deleted a todo", "Deleted {n} todos"),
-        "todo_clear": ("Cleared the todo list", "Cleared the todo list"),
-        "memory_list": ("Listed memories", "Listed memories"),
-        "memory_search": ("Searched memories", "Searched memories"),
+        "todo_clear": ("Cleared todos", "Cleared {n} todos"),
+        "memory_list": ("Listed memories", "Listed {n} memories"),
+        "memory_search": ("Searched memories", "Searched memories · {n} matches"),
         "memory_add": ("Saved a memory", "Saved {n} memories"),
         "memory_get": ("Retrieved a memory", "Retrieved {n} memories"),
         "memory_update": ("Updated a memory", "Updated {n} memories"),
         "memory_delete": ("Deleted a memory", "Deleted {n} memories"),
-        "memory_clear": ("Cleared memories", "Cleared memories"),
+        "memory_clear": ("Cleared memories", "Cleared {n} memories"),
         "subagent": ("Ran a subagent", "Ran {n} subagents"),
     }
 
@@ -888,31 +889,28 @@ class RichMessageBuilder:
                 return "text_editor_delete"
             return "text_editor_edit"
         if t == "todo":
-            # 按请求动作细分（对标 text_editor 按 command 细分）。
             action = str(fn_args.get("action") or "list").strip().lower()
-            if action == "add":
-                return "todo_add"
-            if action == "done":
-                return "todo_done"
-            if action == "undone":
-                return "todo_undone"
-            if action == "toggle":
-                # toggle 的实际方向（完成/重开）已由 update_tool_item 写入
-                # 条目最终摘要（先于 finish_group），从摘要前缀回推。
-                summary = str(item.get("summary") or "")
-                return "todo_undone" if summary.startswith("Reopened") else "todo_done"
-            if action == "delete":
-                return "todo_delete"
-            if action == "clear":
-                return "todo_clear"
-            if action == "edit":
-                return "todo_edit"
-            return "todo_list"
+            mapping = {
+                "add": "todo_add", "add_many": "todo_add",
+                "complete": "todo_complete", "complete_many": "todo_complete",
+                "reopen": "todo_reopen", "reopen_many": "todo_reopen",
+                "update": "todo_update", "update_many": "todo_update",
+                "delete": "todo_delete", "delete_many": "todo_delete",
+                "clear": "todo_clear",
+                "list": "todo_list",
+            }
+            return mapping.get(action, "todo_list")
         if t == "memory":
             action = str(fn_args.get("action") or "list").strip().lower()
-            if action in ("add", "get", "search", "update", "delete", "clear"):
-                return f"memory_{action}"
-            return "memory_list"
+            mapping = {
+                "add": "memory_add", "add_many": "memory_add",
+                "get": "memory_get", "get_many": "memory_get",
+                "search": "memory_search", "list": "memory_list",
+                "update": "memory_update", "update_many": "memory_update",
+                "delete": "memory_delete", "delete_many": "memory_delete",
+                "clear": "memory_clear",
+            }
+            return mapping.get(action, "memory_list")
         if t == "deliver_reply":
             send = fn_args.get("send")
             if send is False:
@@ -944,7 +942,12 @@ class RichMessageBuilder:
             if gtype not in type_counts:
                 type_order.append(gtype)
                 type_counts[gtype] = 0
-            type_counts[gtype] += 1
+            count_value = item.get("result_count")
+            try:
+                count_value = int(count_value) if count_value is not None else 1
+            except (TypeError, ValueError):
+                count_value = 1
+            type_counts[gtype] += max(0, count_value)
         # 单工具调用时，外层折叠块直接复用该工具的详细摘要；
         # 这样用户不展开内层也能知道“查了什么 / 在哪里 / 结果如何”。
         if len(done_items) == 1 and failed_count == 0:

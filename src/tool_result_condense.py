@@ -215,13 +215,27 @@ def _todo_note_line(todo: dict) -> str:
     note = _clean((todo or {}).get("note", ""))
     return f"    备注：{note}" if note else ""
 
+def _batch_failure_lines(failed: Any) -> list[str]:
+    if not isinstance(failed, list):
+        return []
+    lines: list[str] = []
+    for item in failed[:50]:
+        if not isinstance(item, dict):
+            continue
+        ident = _clean(item.get("id") or item.get("index") or "")
+        error = _clean(item.get("error") or item.get("code") or "失败")
+        prefix = f"{ident}: " if ident else ""
+        lines.append(f"- {prefix}{error}")
+    if len(failed) > 50:
+        lines.append(f"- 其余 {len(failed) - 50} 项失败详情省略。")
+    return lines
+
+
 def _todo_model_view(payload: dict, fn_args: dict) -> str:
     error = _error_text(payload)
     if error:
         return error
     action = _clean(payload.get("action", "")).lower() or _clean(fn_args.get("action", "")).lower() or "list"
-    todo_raw = payload.get("todo")
-    todo: dict = todo_raw if isinstance(todo_raw, dict) else {}
     total = payload.get("total")
     pending = payload.get("pending")
     stats = ""
@@ -230,13 +244,16 @@ def _todo_model_view(payload: dict, fn_args: dict) -> str:
         if pending is not None:
             stats += f"，未完成 {pending} 项"
         stats += "。"
+
+    todo_raw = payload.get("todo")
+    todo: dict = todo_raw if isinstance(todo_raw, dict) else {}
     label = _clean(todo.get("title", ""))
     tid = _clean(todo.get("id", ""))
     who = f"「{label}」" if label else "待办"
     if tid:
         who += f"（id={tid}）"
 
-    if action == "list" or (action not in {"add", "done", "undone", "toggle", "delete", "clear", "edit"} and payload.get("todos") is not None):
+    if action == "list":
         todos = payload.get("todos")
         if not isinstance(todos, list):
             return json.dumps(payload, ensure_ascii=False)
@@ -245,12 +262,46 @@ def _todo_model_view(payload: dict, fn_args: dict) -> str:
             return f"{header}\n（当前筛选下没有待办项）"
         lines = [header]
         for t in todos:
-            if isinstance(t, dict):
-                lines.append(f"- {_todo_item_line(t)}")
-                note_line = _todo_note_line(t)
-                if note_line:
-                    lines.append(note_line)
+            if not isinstance(t, dict):
+                continue
+            lines.append(f"- {_todo_item_line(t)}")
+            note_line = _todo_note_line(t)
+            if note_line:
+                lines.append(note_line)
         return "\n".join(lines)
+
+    if action in {"add_many", "complete_many", "reopen_many", "update_many", "delete_many"}:
+        affected = payload.get("affected_count", 0)
+        requested = payload.get("requested_count", 0)
+        if action == "add_many":
+            verb = "已批量添加"
+            items = payload.get("todos", [])
+        elif action == "complete_many":
+            verb = "已批量完成"
+            items = [x.get("todo") for x in (payload.get("updated", []) or []) if isinstance(x, dict)]
+        elif action == "reopen_many":
+            verb = "已批量重开"
+            items = [x.get("todo") for x in (payload.get("updated", []) or []) if isinstance(x, dict)]
+        elif action == "update_many":
+            verb = "已批量更新"
+            items = payload.get("updated", [])
+        else:
+            verb = "已批量删除"
+            items = payload.get("deleted", [])
+        lines = [f"{verb} {affected}/{requested} 项。"]
+        for item in (items or []):
+            if isinstance(item, dict):
+                if action in {"complete_many", "reopen_many", "update_many"}:
+                    item = item.get("todo", item)
+                lines.append(f"- {_todo_item_line(item)}")
+        failed_lines = _batch_failure_lines(payload.get("failed"))
+        if failed_lines:
+            lines.append(f"失败 {len(payload.get('failed', []))} 项：")
+            lines.extend(failed_lines)
+        if stats:
+            lines.append(stats)
+        return "\n".join(lines)
+
     if action == "add":
         extra = ""
         priority = _clean(todo.get("priority", ""))
@@ -260,29 +311,20 @@ def _todo_model_view(payload: dict, fn_args: dict) -> str:
         if due_at:
             extra += f"，截止 {due_at}"
         return f"已添加待办 {who}{extra}。{stats}"
-    if action in ("done", "undone", "toggle"):
-        done_flag = todo.get("done")
-        if done_flag is True:
-            verb = "已完成待办"
-        elif done_flag is False:
-            verb = "已重开待办"
-        else:
-            verb = "已更新待办"
+    if action in ("complete", "reopen"):
+        verb = "已完成待办" if action == "complete" else "已重开待办"
         if payload.get("changed") is False:
-            verb = f"待办状态未变化（仍为{'已完成' if done_flag else '未完成'}）"
+            verb = f"待办状态未变化（仍为{'已完成' if todo.get('done') else '未完成'}）"
         return f"{verb} {who}。{stats}"
     if action == "delete":
         return f"已删除待办 {who}。剩余 {total if total is not None else '0'} 项。"
     if action == "clear":
         message = _clean(payload.get("message", ""))
         return f"{message}。剩余 {total if total is not None else '0'} 项，未完成 {pending if pending is not None else '0'} 项。"
-    if action == "edit":
+    if action == "update":
         changed = payload.get("changed")
-        changed_txt = ""
-        if isinstance(changed, list) and changed:
-            changed_txt = f"，修改字段：{'、'.join(_clean(c) for c in changed)}"
+        changed_txt = f"，修改字段：{'、'.join(_clean(c) for c in changed)}" if isinstance(changed, list) and changed else ""
         return f"已更新待办 {who}{changed_txt}。{stats}"
-    # 未知 action（防御）：退回原 JSON
     return json.dumps(payload, ensure_ascii=False)
 
 # C. memory 模型视图（纯文本）
@@ -332,25 +374,58 @@ def _memory_model_view(payload: dict, fn_args: dict) -> str:
         suffix = f"（{'，'.join(bits)}）" if bits else ""
         return f"「{content}」{suffix}"
 
-    if action in ("list", "search") or payload.get("memories") is not None:
+    if action in ("list", "search", "get_many"):
         memories = payload.get("memories")
         if not isinstance(memories, list):
             return json.dumps(payload, ensure_ascii=False)
-        header = f"记忆检索结果：{stats}" if stats else "记忆检索结果："
+        header = "记忆检索结果：" if action != "get_many" else "记忆批量读取结果："
+        if action == "search":
+            header = f"记忆搜索结果：{_clean(payload.get('query', ''))}。"
+        if stats:
+            header += f" {stats}"
         if not memories:
             return f"{header}\n（没有匹配的记忆）"
         lines = [header]
         lines.extend(_memory_line(m) for m in memories if isinstance(m, dict))
+        failed_lines = _batch_failure_lines(payload.get("failed"))
+        if failed_lines:
+            lines.append(f"失败 {len(payload.get('failed', []))} 条：")
+            lines.extend(failed_lines)
         return "\n".join(lines)
+
+    if action in ("add_many", "update_many", "delete_many"):
+        affected = payload.get("affected_count", 0)
+        requested = payload.get("requested_count", 0)
+        if action == "add_many":
+            verb = "已批量保存"
+            memories = payload.get("memories", [])
+        elif action == "update_many":
+            verb = "已批量更新"
+            memories = payload.get("updated", [])
+        else:
+            verb = "已批量删除"
+            memories = payload.get("deleted", [])
+        lines = [f"{verb} {affected}/{requested} 条。"]
+        for item in memories or []:
+            if isinstance(item, dict):
+                if action == "update_many":
+                    item = item.get("memory", item)
+                lines.append(_memory_line(item))
+        failed_lines = _batch_failure_lines(payload.get("failed"))
+        if failed_lines:
+            lines.append(f"失败 {len(payload.get('failed', []))} 条：")
+            lines.extend(failed_lines)
+        if stats:
+            lines.append(stats)
+        return "\n".join(lines)
+
     if action == "add":
         return f"已保存记忆 {_mem_desc(mem)}（id={_clean(mem.get('id', ''))}）。{stats}"
     if action == "get":
         return f"记忆详情（id={_clean(mem.get('id', ''))}）：{_clean(mem.get('content', ''))}"
     if action == "update":
         changed = payload.get("changed")
-        changed_txt = ""
-        if isinstance(changed, list) and changed:
-            changed_txt = f"，修改字段：{'、'.join(_clean(c) for c in changed)}"
+        changed_txt = f"，修改字段：{'、'.join(_clean(c) for c in changed)}" if isinstance(changed, list) and changed else ""
         return f"已更新记忆（id={_clean(mem.get('id', ''))}{changed_txt}）：{_clean(mem.get('content', ''))}。{stats}"
     if action == "delete":
         return f"已删除记忆（id={_clean(mem.get('id', ''))}）：{_clean(mem.get('content', ''))}。剩余 {total if total is not None else '0'} 条。"

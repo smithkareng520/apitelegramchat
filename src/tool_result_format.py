@@ -454,9 +454,20 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             summary = f"➕ 新增 {t.get('title', '')[:30]}"
             details_html = render_todo_card(payload)
             return summary, details_html
-        if action in ("done", "undone", "toggle"):
+        if action in ("add_many", "complete_many", "reopen_many", "update_many", "delete_many"):
+            action_label = {
+                "add_many": "➕ 批量新增",
+                "complete_many": "✅ 批量完成",
+                "reopen_many": "↩️ 批量重开",
+                "update_many": "📝 批量更新",
+                "delete_many": "🗑️ 批量删除",
+            }[action]
+            summary = f"{action_label} {payload.get('affected_count', 0)} 项"
+            details_html = render_todo_card(payload)
+            return summary, details_html
+        if action in ("complete", "reopen"):
             t = payload.get("todo", {})
-            icon = "✅" if t.get("done") else "↩️"
+            icon = "✅" if action == "complete" else "↩️"
             summary = f"{icon} {t.get('title', '')[:30]}"
             details_html = render_todo_card(payload)
             return summary, details_html
@@ -469,9 +480,9 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             summary = f"🧹 清理 {payload.get('removed', 0)} 条"
             details_html = render_todo_card(payload)
             return summary, details_html
-        if action == "edit":
+        if action == "update":
             t = payload.get("todo", {})
-            summary = f"📝 编辑 {t.get('title', '')[:30]}"
+            summary = f"📝 更新 {t.get('title', '')[:30]}"
             details_html = render_todo_card(payload)
             return summary, details_html
         summary = "📋 待办操作"
@@ -499,6 +510,15 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
             summary = f"🧠 记忆库：{total} 条 · 显示 {shown} 条"
         elif action == "search":
             summary = f"🔎 记忆搜索：{payload.get('matches', 0)} / {payload.get('total', 0)} 条命中"
+        elif action in ("add_many", "get_many", "update_many", "delete_many"):
+            labels = {
+                "add_many": "🧠 批量保存",
+                "get_many": "🔎 批量读取",
+                "update_many": "📝 批量更新",
+                "delete_many": "🗑️ 批量删除",
+            }
+            count = payload.get("affected_count", payload.get("found_count", 0))
+            summary = f"{labels[action]} {count} 条"
         elif action == "add":
             m = payload.get("memory", {})
             summary = f"🧠 保存 #{m.get('id', '?')} {m.get('content', '')[:30]}"

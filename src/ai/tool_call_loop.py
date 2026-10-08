@@ -61,6 +61,7 @@ from ai.tool_summary import (
     _generate_action_description,
     _generate_initial_tool_summary,
     _generate_tool_summary_done,
+    _extract_result_count,
     _kind_of_value,
     _normalize_tool_arguments,
     _tool_result_is_failure,
@@ -692,11 +693,11 @@ async def _run_tool_calls_and_append(
             if _failed:
                 builder.update_tool_item(
                     _tid, _fmt_summary or (_llm[:100] if len(_llm) > 100 else _llm),
-                    _details, status="error")
+                    _details, status="error", result_count=None)
             else:
                 builder.update_tool_item(
                     _tid, _generate_tool_summary_done(_fn, _args, _safe), _details,
-                    status="done")
+                    status="done", result_count=_extract_result_count(_fn, _safe))
         except Exception:  # noqa: BLE001 - UI 回写失败不能影响工具结果回传
             logger.debug("工具结果即时回写失败 idx=%s", idx, exc_info=True)
 

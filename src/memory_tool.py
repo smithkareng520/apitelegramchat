@@ -27,6 +27,7 @@ MEMORY_TAG_TOKEN_BUDGET = 24
 MEMORY_CARD_CONTENT_TOKEN_BUDGET = 200
 MAX_TAGS = 8
 MAX_MEMORIES = 1000  # 单 chat 上限，防止失控增长
+MAX_BATCH_ITEMS = 100
 
 IMPORTANCE_META = {
     "high":   {"emoji": "🔴", "label": "高"},
@@ -247,6 +248,7 @@ def _op_list(store: dict, category: Optional[str], tag: Any,
         "memories": [_mem_summary(m) for m in filtered],
         "total": len(memories),
         "shown": len(filtered),
+        "result_count": len(filtered),
     }
 
 def _op_search(store: dict, query: str, limit: int) -> tuple[dict, dict]:
@@ -277,9 +279,33 @@ def _op_search(store: dict, query: str, limit: int) -> tuple[dict, dict]:
         "action": "search",
         "query": query,
         "matches": len(matches),
+        "result_count": len(matches),
         "total": len(memories),
         "memories": [_mem_summary(m) for m in matches],
     }
+
+def _store_stats(store: dict) -> dict:
+    return {"total": len(store["memories"])}
+
+
+def _normalize_id_list(values: Any, field_name: str = "ids") -> list[str]:
+    if not isinstance(values, list) or not values:
+        raise _MemoryError(f"{field_name} 必须是非空数组", "invalid_ids")
+    if len(values) > MAX_BATCH_ITEMS:
+        raise _MemoryError(f"{field_name} 最多 {MAX_BATCH_ITEMS} 项", "batch_too_large")
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        value_s = str(value or "").strip().lstrip("#")
+        if not value_s:
+            raise _MemoryError(f"{field_name} 不能包含空 id", "invalid_ids")
+        if value_s not in seen:
+            seen.add(value_s)
+            out.append(value_s)
+    if not out:
+        raise _MemoryError(f"{field_name} 不能为空", "invalid_ids")
+    return out
+
 
 def _op_update(store: dict, mid: Optional[str], content: Optional[str],
                category: Optional[str], tags: Any, importance: Optional[str]) -> tuple[dict, dict]:
@@ -310,8 +336,11 @@ def _op_update(store: dict, mid: Optional[str], content: Optional[str],
         "action": "update",
         "memory": _mem_summary(mem),
         "changed": changed,
-        "total": len(store["memories"]),
+        "affected_count": 1,
+        "changed_count": 1 if changed else 0,
+        **_store_stats(store),
     }
+
 
 def _op_delete(store: dict, mid: Optional[str]) -> tuple[dict, dict]:
     found = _find_memory(store["memories"], mid)
@@ -323,8 +352,128 @@ def _op_delete(store: dict, mid: Optional[str]) -> tuple[dict, dict]:
         "ok": True,
         "action": "delete",
         "memory": _mem_summary(mem),
-        "total": len(store["memories"]),
+        "affected_count": 1,
+        **_store_stats(store),
     }
+
+
+def _op_add_many(store: dict, items: Any) -> tuple[dict, dict]:
+    if not isinstance(items, list) or not items:
+        raise _MemoryError("memories 必须是非空数组", "invalid_items")
+    if len(items) > MAX_BATCH_ITEMS:
+        raise _MemoryError(f"memories 最多 {MAX_BATCH_ITEMS} 项", "batch_too_large")
+    added: list[dict] = []
+    failed: list[dict] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            failed.append({"index": index, "code": "invalid_item", "error": "每个 memory 必须是对象"})
+            continue
+        try:
+            _store, payload = _op_add(
+                store,
+                item.get("content"),
+                item.get("category") or "note",
+                item.get("tags"),
+                item.get("importance") or "medium",
+                item.get("source") or "agent",
+            )
+            store = _store
+            added.append(payload["memory"])
+        except _MemoryError as exc:
+            failed.append({"index": index, "code": exc.code, "error": str(exc)})
+    return store, {
+        "ok": True,
+        "action": "add_many",
+        "requested_count": len(items),
+        "affected_count": len(added),
+        "memories": added,
+        "failed": failed,
+        **_store_stats(store),
+    }
+
+
+def _op_get_many(store: dict, memory_ids: Any) -> tuple[dict, dict]:
+    ids = _normalize_id_list(memory_ids, "memory_ids")
+    found_items: list[dict] = []
+    failed: list[dict] = []
+    for mid in ids:
+        found = _find_memory(store["memories"], mid)
+        if not found:
+            failed.append({"id": mid, "code": "not_found", "error": f"找不到 id 为 {mid} 的记忆"})
+            continue
+        _idx, mem = found
+        found_items.append(_mem_summary(mem))
+    return store, {
+        "ok": True,
+        "action": "get_many",
+        "requested_count": len(ids),
+        "found_count": len(found_items),
+        "result_count": len(found_items),
+        "memories": found_items,
+        "failed": failed,
+        **_store_stats(store),
+    }
+
+
+def _op_update_many(store: dict, updates: Any) -> tuple[dict, dict]:
+    if not isinstance(updates, list) or not updates:
+        raise _MemoryError("updates 必须是非空数组", "invalid_items")
+    if len(updates) > MAX_BATCH_ITEMS:
+        raise _MemoryError(f"updates 最多 {MAX_BATCH_ITEMS} 项", "batch_too_large")
+    updated: list[dict] = []
+    failed: list[dict] = []
+    for index, item in enumerate(updates):
+        if not isinstance(item, dict):
+            failed.append({"index": index, "code": "invalid_item", "error": "每个 update 必须是对象"})
+            continue
+        mid = item.get("memory_id")
+        try:
+            _store, payload = _op_update(
+                store,
+                mid,
+                item.get("content"),
+                item.get("category"),
+                item.get("tags"),
+                item.get("importance"),
+            )
+            store = _store
+            updated.append({"changed": payload.get("changed", []), "memory": payload["memory"]})
+        except _MemoryError as exc:
+            failed.append({"id": str(mid or ""), "code": exc.code, "error": str(exc)})
+    return store, {
+        "ok": True,
+        "action": "update_many",
+        "requested_count": len(updates),
+        "affected_count": len(updated),
+        "changed_count": sum(1 for item in updated if item.get("changed")),
+        "updated": updated,
+        "failed": failed,
+        **_store_stats(store),
+    }
+
+
+def _op_delete_many(store: dict, memory_ids: Any) -> tuple[dict, dict]:
+    ids = _normalize_id_list(memory_ids, "memory_ids")
+    deleted: list[dict] = []
+    failed: list[dict] = []
+    for mid in ids:
+        found = _find_memory(store["memories"], mid)
+        if not found:
+            failed.append({"id": mid, "code": "not_found", "error": f"找不到 id 为 {mid} 的记忆"})
+            continue
+        idx, mem = found
+        store["memories"].pop(idx)
+        deleted.append(_mem_summary(mem))
+    return store, {
+        "ok": True,
+        "action": "delete_many",
+        "requested_count": len(ids),
+        "affected_count": len(deleted),
+        "deleted": deleted,
+        "failed": failed,
+        **_store_stats(store),
+    }
+
 
 def _op_clear(store: dict, scope: str) -> tuple[dict, dict]:
     """scope = all / category:<name> / tag:<name>"""
@@ -341,7 +490,6 @@ def _op_clear(store: dict, scope: str) -> tuple[dict, dict]:
         msg = f"已清空分类 {cat} 下 {removed} 条记忆"
     elif scope.startswith("tag:"):
         tag = scope.split(":", 1)[1].strip()
-        # 空 tag 会静默返回 0，容易让调用方误以为已清空，因此显式拒绝。
         if not tag:
             raise _MemoryError("clear tag 不能为空", "bad_scope")
         before_list = list(store["memories"])
@@ -355,8 +503,9 @@ def _op_clear(store: dict, scope: str) -> tuple[dict, dict]:
         "action": "clear",
         "scope": scope,
         "removed": removed,
+        "affected_count": removed,
         "message": msg,
-        "total": len(store["memories"]),
+        **_store_stats(store),
     }
 
 def _mem_summary(m: dict) -> dict:
@@ -377,6 +526,9 @@ async def execute_memory(
     action: str = "list",
     content: Optional[str] = None,
     memory_id: Optional[str] = None,
+    memory_ids: Any = None,
+    memories: Any = None,
+    updates: Any = None,
     category: Optional[str] = None,
     tags: Any = None,
     importance: Optional[str] = None,
@@ -385,11 +537,7 @@ async def execute_memory(
     limit: int = 50,
     source: str = "agent",
 ) -> str:
-    """
-    memory 工具主入口。返回 JSON 字符串。
-
-    action: add | get | list | search | update | delete | clear
-    """
+    """长期记忆工具主入口。单项动作与显式 *_many 批量动作。"""
     action = (action or "list").strip().lower()
     try:
         limit_i = max(1, min(int(limit or 50), 500))
@@ -397,45 +545,32 @@ async def execute_memory(
         limit_i = 50
 
     if action == "add":
-        return json.dumps(
-            await _mutate(chat_id, lambda s: _op_add(s, content, category or "note", tags,
-                                                      importance or "medium", source)),
-            ensure_ascii=False,
-        )
-    if action == "get":
-        return json.dumps(
-            await _read_store(chat_id, lambda s: _op_get(s, memory_id)),
-            ensure_ascii=False,
-        )
-    if action == "list":
-        return json.dumps(
-            await _read_store(chat_id, lambda s: _op_list(s, category, tags, importance, limit_i)),
-            ensure_ascii=False,
-        )
-    if action == "search":
-        return json.dumps(
-            await _read_store(chat_id, lambda s: _op_search(s, query or "", limit_i)),
-            ensure_ascii=False,
-        )
-    if action == "update":
-        return json.dumps(
-            await _mutate(chat_id, lambda s: _op_update(s, memory_id, content, category, tags, importance)),
-            ensure_ascii=False,
-        )
-    if action == "delete":
-        return json.dumps(
-            await _mutate(chat_id, lambda s: _op_delete(s, memory_id)),
-            ensure_ascii=False,
-        )
-    if action == "clear":
-        s = scope or "all"
-        return json.dumps(
-            await _mutate(chat_id, lambda store: _op_clear(store, s)),
-            ensure_ascii=False,
-        )
+        payload = await _mutate(chat_id, lambda s: _op_add(s, content, category or "note", tags,
+                                                            importance or "medium", source))
+    elif action == "add_many":
+        payload = await _mutate(chat_id, lambda s: _op_add_many(s, memories))
+    elif action == "get":
+        payload = await _read_store(chat_id, lambda s: _op_get(s, memory_id))
+    elif action == "get_many":
+        payload = await _read_store(chat_id, lambda s: _op_get_many(s, memory_ids))
+    elif action == "list":
+        payload = await _read_store(chat_id, lambda s: _op_list(s, category, tags, importance, limit_i))
+    elif action == "search":
+        payload = await _read_store(chat_id, lambda s: _op_search(s, query or "", limit_i))
+    elif action == "update":
+        payload = await _mutate(chat_id, lambda s: _op_update(s, memory_id, content, category, tags, importance))
+    elif action == "update_many":
+        payload = await _mutate(chat_id, lambda s: _op_update_many(s, updates))
+    elif action == "delete":
+        payload = await _mutate(chat_id, lambda s: _op_delete(s, memory_id))
+    elif action == "delete_many":
+        payload = await _mutate(chat_id, lambda s: _op_delete_many(s, memory_ids))
+    elif action == "clear":
+        payload = await _mutate(chat_id, lambda store: _op_clear(store, scope or "all"))
+    else:
+        payload = {"ok": False, "error": f"未知 action: {action}", "code": "bad_action"}
 
-    return json.dumps({"ok": False, "error": f"未知 action: {action}", "code": "bad_action"},
-                      ensure_ascii=False)
+    return json.dumps(payload, ensure_ascii=False)
 
 # 富文本渲染
 # esc 统一来自 core.text_utils.escape_html_text（卡片动态片段的严格转义）。
@@ -467,6 +602,40 @@ def render_memory_card(payload: dict, max_items: int = 30) -> str:
                 f"<p>{_esc(payload.get('error', '未知错误'))}</p>")
 
     action = payload.get("action", "list")
+
+    if action in ("add_many", "get_many", "update_many", "delete_many"):
+        if action == "add_many":
+            title = "🧠 <b>已批量保存</b>"
+            items = payload.get("memories", []) or []
+            count = payload.get("affected_count", 0)
+        elif action == "get_many":
+            title = "🔎 <b>已批量读取</b>"
+            items = payload.get("memories", []) or []
+            count = payload.get("found_count", 0)
+        elif action == "update_many":
+            title = "📝 <b>已批量更新</b>"
+            items = payload.get("updated", []) or []
+            count = payload.get("affected_count", 0)
+        else:
+            title = "🗑️ <b>已批量删除</b>"
+            items = payload.get("deleted", []) or []
+            count = payload.get("affected_count", 0)
+        parts = [f"<p>{title} {count} 条</p>"]
+        if items:
+            rendered_items = []
+            for item in items[:30]:
+                if action == "update_many" and isinstance(item, dict):
+                    item = item.get("memory", item)
+                rendered_items.append(_render_memory_item(item if isinstance(item, dict) else {}))
+            parts.append("<ol>" + "".join(rendered_items) + "</ol>")
+            if len(items) > 30:
+                parts.append(f"<p><i>… 还有 {len(items) - 30} 条</i></p>")
+        failed = payload.get("failed", []) or []
+        if failed:
+            parts.append(f"<p>⚠️ 失败 {len(failed)} 条</p>")
+        if "total" in payload:
+            parts.append(f"<p><i>当前共 {payload.get('total', 0)} 条记忆</i></p>")
+        return "".join(parts)
 
     if action == "add":
         m = payload.get("memory", {})

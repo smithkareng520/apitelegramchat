@@ -163,20 +163,36 @@ def test_todo_add_text_view():
     assert "changed" not in out          # 修改字段列表对 add 是噪音
 
 
-def test_todo_toggle_done_text_view():
+def test_todo_complete_text_view():
     payload = {
-        "ok": True, "action": "toggle", "changed": True,
+        "ok": True, "action": "complete", "changed": True, "affected_count": 1,
         "todo": {"id": "t1", "title": "买牛奶", "done": True, "priority": "medium",
                  "tags": [], "note": "", "due_at": None, "due_status": "none"},
         "total": 5, "pending": 2,
     }
-    out = _view(TODO, {"action": "done"}, payload)
+    out = _view(TODO, {"action": "complete"}, payload)
     assert "已完成待办" in out and "买牛奶" in out and "id=t1" in out
     assert "当前共 5 项，未完成 2 项" in out
 
 
+def test_todo_batch_text_view():
+    payload = {
+        "ok": True, "action": "complete_many", "requested_count": 3, "affected_count": 2,
+        "changed_count": 1, "unchanged_count": 1,
+        "updated": [
+            {"changed": True, "todo": {"id": "t1", "title": "买牛奶", "done": True, "priority": "medium", "tags": []}},
+            {"changed": False, "todo": {"id": "t2", "title": "写周报", "done": True, "priority": "high", "tags": []}},
+        ],
+        "failed": [{"id": "bad", "code": "not_found", "error": "找不到"}],
+        "total": 5, "pending": 2,
+    }
+    out = _view(TODO, {"action": "complete_many"}, payload)
+    assert "已批量完成 2/3 项" in out
+    assert "买牛奶" in out and "写周报" in out and "bad: 找不到" in out
+
+
 def test_todo_error_envelope_becomes_failure_text():
-    out = _view(TODO, {"action": "done"}, {"ok": False, "error": "找不到 id 为 x 的待办", "code": "not_found"})
+    out = _view(TODO, {"action": "complete"}, {"ok": False, "error": "找不到 id 为 x 的待办", "code": "not_found"})
     assert out == "失败：找不到 id 为 x 的待办"
 
 
@@ -209,6 +225,21 @@ def test_memory_add_text_view():
     out = _view(MEMORY, {"action": "add"}, payload)
     assert "已保存记忆" in out and "用户偏好简洁回复" in out and "id=m2" in out
     assert "当前共 13 条记忆" in out
+
+
+def test_memory_batch_text_view():
+    payload = {
+        "ok": True, "action": "update_many", "requested_count": 2, "affected_count": 2,
+        "changed_count": 1,
+        "updated": [
+            {"changed": ["content"], "memory": {"id": "m1", "content": "黑咖啡", "category": "preference", "tags": []}},
+            {"changed": [], "memory": {"id": "m2", "content": "晚上工作", "category": "fact", "tags": []}},
+        ],
+        "failed": [], "total": 4,
+    }
+    out = _view(MEMORY, {"action": "update_many"}, payload)
+    assert "已批量更新 2/2 条" in out
+    assert "id=m1" in out and "id=m2" in out
 
 
 def test_memory_clear_text_view():

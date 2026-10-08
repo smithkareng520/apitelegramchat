@@ -321,6 +321,7 @@ class DraftManager:
                     data["tool_id"], data.get("summary") or "",
                     data.get("details_html") or "",
                     status=data.get("status") or "done",
+                    result_count=data.get("result_count"),
                 )
         elif etype == EventTypes.TOOL_END:
             self._dispatch_finish_group(data)
@@ -427,10 +428,11 @@ class DraftManager:
         return True
 
     def update_tool_item(self, tool_id: str, summary: str,
-                         details_html: str, status: str = "done") -> None:
+                         details_html: str, status: str = "done",
+                         result_count: Optional[int] = None) -> None:
         self.emit(EventTypes.TOOL_RESULT, {
             "tool_id": tool_id, "summary": summary,
-            "details_html": details_html, "status": status,
+            "details_html": details_html, "status": status, "result_count": result_count,
         })
 
     def hide_tools_until_started(self, tool_ids: Any) -> None:

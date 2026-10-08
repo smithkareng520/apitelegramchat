@@ -204,6 +204,15 @@ def test_group_summary_todo_plural():
     ]}
     assert b._generate_group_summary(group) == "Added 2 todos"
 
+def test_group_summary_uses_business_count_not_call_count():
+    b = _builder()
+    group = {"items": [
+        {"id": "1", "type": "todo", "status": "done", "fn_args": {"action": "add_many"}, "result_count": 8},
+        {"id": "2", "type": "todo", "status": "done", "fn_args": {"action": "add_many"}, "result_count": 3},
+        {"id": "3", "type": "memory", "status": "done", "fn_args": {"action": "delete_many"}, "result_count": 5},
+    ]}
+    assert b._generate_group_summary(group) == "Added 11 todos, deleted 5 memories"
+
 
 def test_group_summary_verb_phrases_lowercased():
     """todo / memory 改为动词短语后不再豁免首字母小写规范。"""
@@ -239,13 +248,11 @@ def test_single_block_done_summaries_todo():
     add = '{"ok":true,"action":"add","todo":{"title":"买牛奶","done":false}}'
     assert done("todo", {"action": "add"}, add) == "Added todo 买牛奶"
     assert done("todo", {"action": "list"}, '{"ok":true,"action":"list","total":3}') == "Listed todos"
-    toggle_done = '{"ok":true,"action":"toggle","todo":{"title":"买牛奶","done":true}}'
-    toggle_undone = '{"ok":true,"action":"toggle","todo":{"title":"买牛奶","done":false}}'
-    assert done("todo", {"action": "done", "todo_id": "ab"}, toggle_done) == "Completed todo 买牛奶"
-    assert done("todo", {"action": "undone", "todo_id": "ab"}, toggle_undone) == "Reopened todo 买牛奶"
-    assert done("todo", {"action": "toggle", "todo_id": "ab"}, toggle_done) == "Completed todo 买牛奶"
-    assert done("todo", {"action": "toggle", "todo_id": "ab"}, toggle_undone) == "Reopened todo 买牛奶"
-    assert done("todo", {"action": "edit"}, '{"ok":true,"action":"edit","todo":{"title":"新标题"}}') == "Updated todo 新标题"
+    complete = '{"ok":true,"action":"complete","todo":{"title":"买牛奶","done":true}}'
+    reopen = '{"ok":true,"action":"reopen","todo":{"title":"买牛奶","done":false}}'
+    assert done("todo", {"action": "complete", "todo_id": "ab"}, complete) == "Completed todo 买牛奶"
+    assert done("todo", {"action": "reopen", "todo_id": "ab"}, reopen) == "Reopened todo 买牛奶"
+    assert done("todo", {"action": "update"}, '{"ok":true,"action":"update","todo":{"title":"新标题"}}') == "Updated todo 新标题"
     assert done("todo", {"action": "delete"}, '{"ok":true,"action":"delete","todo":{"title":"旧任务"}}') == "Deleted todo 旧任务"
     assert done("todo", {"action": "clear"}, '{"ok":true,"action":"clear","removed":4}') == "Cleared 4 todos"
     assert done("todo", {"action": "clear"}, '{"ok":true,"action":"clear","removed":0}') == "Cleared the todo list"
@@ -302,8 +309,8 @@ def test_deliver_reply_failure_uses_dedicated_title():
 def test_single_block_running_summaries():
     from ai.tool_summary import _generate_initial_tool_summary as running
     assert running("todo", {"action": "add"}) == "Adding a todo"
-    assert running("todo", {"action": "done"}) == "Completing a todo"
-    assert running("todo", {"action": "undone"}) == "Reopening a todo"
+    assert running("todo", {"action": "complete"}) == "Completing a todo"
+    assert running("todo", {"action": "reopen"}) == "Reopening a todo"
     assert running("todo", {}) == "Listing todos"
     assert running("memory", {"action": "add"}) == "Saving a memory"
     assert running("memory", {"action": "search"}) == "Searching memories"
@@ -316,12 +323,9 @@ def test_group_type_derivation_for_action_tools():
     b = _builder()
     assert b._get_group_type_for_item({"type": "todo", "fn_args": {"action": "add"}}) == "todo_add"
     assert b._get_group_type_for_item({"type": "todo", "fn_args": {}}) == "todo_list"
-    assert b._get_group_type_for_item({"type": "todo", "fn_args": {"action": "done"}}) == "todo_done"
-    # toggle 方向从条目最终摘要回推
-    assert b._get_group_type_for_item(
-        {"type": "todo", "fn_args": {"action": "toggle"}, "summary": "Completed todo 买牛奶"}) == "todo_done"
-    assert b._get_group_type_for_item(
-        {"type": "todo", "fn_args": {"action": "toggle"}, "summary": "Reopened todo 买牛奶"}) == "todo_undone"
+    assert b._get_group_type_for_item({"type": "todo", "fn_args": {"action": "complete"}}) == "todo_complete"
+    assert b._get_group_type_for_item({"type": "todo", "fn_args": {"action": "reopen"}}) == "todo_reopen"
+    assert b._get_group_type_for_item({"type": "todo", "fn_args": {"action": "update_many"}}) == "todo_update"
     assert b._get_group_type_for_item({"type": "memory", "fn_args": {"action": "search"}}) == "memory_search"
     assert b._get_group_type_for_item({"type": "memory", "fn_args": {"action": "bad"}}) == "memory_list"
     assert b._get_group_type_for_item(

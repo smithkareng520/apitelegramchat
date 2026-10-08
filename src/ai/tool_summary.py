@@ -152,71 +152,89 @@ def _short_label(text: Any, limit: int = 24) -> str:
 
 
 def _todo_summary_done(fn_args: dict, payload: dict) -> str:
-    """todo 完成态摘要：「动作 + 待办标题」，无标题退化为基础文案。
-
-    done/undone 在执行器里都走 _op_toggle（结果 action 统一为 toggle），
-    实际结果方向以 payload.todo.done 为准；payload 缺失时按请求意图兜底。
-    """
     action = _requested_action(fn_args)
+    count = _coerce_nonnegative_int(payload.get("affected_count"), None)
+    if count is None:
+        count = _coerce_nonnegative_int(payload.get("result_count"), None)
+    if count is None and action == "list":
+        count = _coerce_nonnegative_int(payload.get("shown"), None)
     todo_raw = payload.get("todo")
     todo: dict = todo_raw if isinstance(todo_raw, dict) else {}
     label = _short_label(todo.get("title"))
     obj = f" todo {label}" if label else " a todo"
     if action == "add":
         return f"Added{obj}"
-    if action == "done":
+    if action == "add_many":
+        return f"Added {count if count is not None else 0} todos"
+    if action == "complete":
         return f"Completed{obj}"
-    if action == "undone":
+    if action == "complete_many":
+        return f"Completed {count if count is not None else 0} todos"
+    if action == "reopen":
         return f"Reopened{obj}"
-    if action == "toggle":
-        done_flag = todo.get("done")
-        if done_flag is True:
-            return f"Completed{obj}"
-        if done_flag is False:
-            return f"Reopened{obj}"
+    if action == "reopen_many":
+        return f"Reopened {count if count is not None else 0} todos"
+    if action == "update":
         return f"Updated{obj}"
-    if action == "edit":
-        return f"Updated{obj}"
+    if action == "update_many":
+        return f"Updated {count if count is not None else 0} todos"
     if action == "delete":
         return f"Deleted{obj}"
+    if action == "delete_many":
+        return f"Deleted {count if count is not None else 0} todos"
     if action == "clear":
-        try:
-            removed = int(payload.get("removed"))  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            removed = 0
-        return f"Cleared {removed} todos" if removed > 0 else "Cleared the todo list"
-    return "Listed todos"
+        if count is None:
+            count = _coerce_nonnegative_int(payload.get("removed"), None)
+        if count == 0:
+            return "Cleared the todo list"
+        return f"Cleared {count if count is not None else 0} todos"
+    if action == "list":
+        return f"Listed {count} todos" if count is not None else "Listed todos"
+    return "Completed todo action"
 
 
 def _memory_summary_done(fn_args: dict, payload: dict) -> str:
-    """memory 完成态摘要：「动作 + 记忆内容摘要」，无内容退化为基础文案。"""
     action = _requested_action(fn_args)
+    count = _coerce_nonnegative_int(payload.get("affected_count"), None)
+    if count is None:
+        count = _coerce_nonnegative_int(payload.get("result_count"), None)
+    if count is None:
+        count = _coerce_nonnegative_int(payload.get("found_count"), None)
     mem_raw = payload.get("memory")
     mem: dict = mem_raw if isinstance(mem_raw, dict) else {}
     label = _short_label(mem.get("content"))
     obj = f" memory: {label}" if label else " a memory"
     if action == "add":
         return f"Saved{obj}"
+    if action == "add_many":
+        return f"Saved {count if count is not None else 0} memories"
     if action == "get":
         return f"Retrieved{obj}"
+    if action == "get_many":
+        return f"Retrieved {count if count is not None else 0} memories"
     if action == "update":
         return f"Updated{obj}"
+    if action == "update_many":
+        return f"Updated {count if count is not None else 0} memories"
     if action == "delete":
         return f"Deleted{obj}"
+    if action == "delete_many":
+        return f"Deleted {count if count is not None else 0} memories"
     if action == "clear":
-        try:
-            removed = int(payload.get("removed"))  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            removed = 0
-        return f"Cleared {removed} memories" if removed > 0 else "Cleared memories"
+        if count is None:
+            count = _coerce_nonnegative_int(payload.get("removed"), None)
+        if count == 0:
+            return "Cleared the memory store"
+        return f"Cleared {count if count is not None else 0} memories"
     if action == "search":
-        return "Searched memories"
-    return "Listed memories"
+        return f"Searched memories · {count} matches" if count is not None else "Searched memories"
+    if action == "list":
+        return f"Listed {count} memories" if count is not None else "Listed memories"
+    return "Completed memory action"
 
 
 def _map_payload_from_result(result_content: Any) -> dict:
-    """尽力把工具结果解析成 dict（todo / memory / subagent / 地图的结果
-    都是 JSON 信封）；失败时返回空 dict。dict 输入原样直通。"""
+    """尽力把工具结果解析成 dict。"""
     if isinstance(result_content, dict):
         return result_content
     try:
@@ -225,6 +243,35 @@ def _map_payload_from_result(result_content: Any) -> dict:
         return {}
     return payload if isinstance(payload, dict) else {}
 
+
+def _coerce_nonnegative_int(value: Any, default: Optional[int] = 0) -> Optional[int]:
+    try:
+        num = int(value)
+        return num if num >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _extract_result_count(fn_name: str, result_content: Any) -> Optional[int]:
+    """Extract business-object count for UI grouping; never use call count as a proxy."""
+    name = _norm_tool_key(fn_name)
+    if name not in {"todo", "memory"}:
+        return None
+    payload = _map_payload_from_result(result_content)
+    if not payload or not payload.get("ok"):
+        return None
+    for key in ("affected_count", "result_count", "found_count"):
+        value = _coerce_nonnegative_int(payload.get(key), None)
+        if value is not None:
+            return value
+    action = str(payload.get("action") or "").lower()
+    if action == "clear":
+        return _coerce_nonnegative_int(payload.get("removed"), None)
+    if action == "list":
+        return _coerce_nonnegative_int(payload.get("shown"), None)
+    if action == "search":
+        return _coerce_nonnegative_int(payload.get("matches"), None)
+    return 1 if action in {"add", "get", "update", "delete", "complete", "reopen"} else None
 
 def _short_summary_text(value: Any, limit: int = 54) -> str:
     """压缩空白并截断工具折叠块标题，避免 Telegram summary 过长。"""
@@ -439,32 +486,32 @@ def _generate_initial_tool_summary(fn_name: str, fn_args: dict) -> str:
     # description 也不被采用（因此本分支必须位于 custom_desc 检查之前）。
     if fn_name == "todo":
         action = _requested_action(fn_args)
-        if action == "add":
-            return "Adding a todo"
-        if action == "done":
-            return "Completing a todo"
-        if action == "undone":
-            return "Reopening a todo"
-        if action in ("toggle", "edit"):
-            return "Updating a todo"
-        if action == "delete":
-            return "Deleting a todo"
+        if action in ("add", "add_many"):
+            return "Adding todos" if action.endswith("_many") else "Adding a todo"
+        if action in ("complete", "complete_many"):
+            return "Completing todos" if action.endswith("_many") else "Completing a todo"
+        if action in ("reopen", "reopen_many"):
+            return "Reopening todos" if action.endswith("_many") else "Reopening a todo"
+        if action in ("update", "update_many"):
+            return "Updating todos" if action.endswith("_many") else "Updating a todo"
+        if action in ("delete", "delete_many"):
+            return "Deleting todos" if action.endswith("_many") else "Deleting a todo"
         if action == "clear":
             return "Clearing the todo list"
         return "Listing todos"
 
     if fn_name == "memory":
         action = _requested_action(fn_args)
-        if action == "add":
-            return "Saving a memory"
+        if action in ("add", "add_many"):
+            return "Saving memories" if action.endswith("_many") else "Saving a memory"
+        if action in ("get", "get_many"):
+            return "Retrieving memories" if action.endswith("_many") else "Retrieving a memory"
         if action == "search":
             return "Searching memories"
-        if action == "get":
-            return "Retrieving a memory"
-        if action == "update":
-            return "Updating a memory"
-        if action == "delete":
-            return "Deleting a memory"
+        if action in ("update", "update_many"):
+            return "Updating memories" if action.endswith("_many") else "Updating a memory"
+        if action in ("delete", "delete_many"):
+            return "Deleting memories" if action.endswith("_many") else "Deleting a memory"
         if action == "clear":
             return "Clearing memories"
         return "Listing memories"
@@ -639,11 +686,15 @@ def _generate_action_description(fn_name: str, fn_args: Optional[dict] = None) -
         action = _requested_action(fn_args)
         return {
             "add": "adding a todo",
-            "done": "completing a todo",
-            "undone": "reopening a todo",
-            "toggle": "updating a todo",
-            "edit": "updating a todo",
+            "add_many": "adding todos",
+            "complete": "completing a todo",
+            "complete_many": "completing todos",
+            "reopen": "reopening a todo",
+            "reopen_many": "reopening todos",
+            "update": "updating a todo",
+            "update_many": "updating todos",
             "delete": "deleting a todo",
+            "delete_many": "deleting todos",
             "clear": "clearing the todo list",
         }.get(action, "listing todos")
 
@@ -651,9 +702,13 @@ def _generate_action_description(fn_name: str, fn_args: Optional[dict] = None) -
         action = _requested_action(fn_args)
         return {
             "add": "saving a memory",
+            "add_many": "saving memories",
             "get": "retrieving a memory",
+            "get_many": "retrieving memories",
             "update": "updating a memory",
+            "update_many": "updating memories",
             "delete": "deleting a memory",
+            "delete_many": "deleting memories",
             "clear": "clearing memories",
             "search": "searching memories",
         }.get(action, "listing memories")

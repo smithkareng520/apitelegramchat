@@ -29,6 +29,7 @@ TODO_TAG_TOKEN_BUDGET = 24
 TODO_NOTE_TOKEN_BUDGET = 500
 MAX_TODOS = 500  # 单 chat 上限，防止失控增长
 MAX_TAGS = 8
+MAX_BATCH_ITEMS = 100
 
 PRIORITY_META: dict[str, dict[str, Any]] = {
     "high":   {"emoji": "🔴", "label": "高", "weight": 3},
@@ -267,38 +268,62 @@ def _op_list(store: dict, filter_: str, tag: Optional[str], priority: Optional[s
         "tag": tag,
         "priority": priority,
         "todos": [_todo_summary(t) for t in filtered],
+        "shown": len(filtered),
+        "result_count": len(filtered),
         "total": len(todos),
         "pending": sum(1 for t in todos if not t.get("done")),
         "done": sum(1 for t in todos if t.get("done")),
     }
     return store, payload
 
-def _op_toggle(store: dict, todo_id: Optional[str], force: Optional[bool]) -> tuple[dict, dict]:
+def _store_stats(store: dict) -> dict:
+    total = len(store["todos"])
+    pending = sum(1 for t in store["todos"] if not t.get("done"))
+    done = total - pending
+    return {"total": total, "pending": pending, "done": done}
+
+
+def _normalize_id_list(values: Any, field_name: str = "ids") -> list[str]:
+    if not isinstance(values, list) or not values:
+        raise _TodoError(f"{field_name} 必须是非空数组", "invalid_ids")
+    if len(values) > MAX_BATCH_ITEMS:
+        raise _TodoError(f"{field_name} 最多 {MAX_BATCH_ITEMS} 项", "batch_too_large")
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        value_s = str(value or "").strip().lstrip("#")
+        if not value_s:
+            raise _TodoError(f"{field_name} 不能包含空 id", "invalid_ids")
+        if value_s not in seen:
+            seen.add(value_s)
+            out.append(value_s)
+    if not out:
+        raise _TodoError(f"{field_name} 不能为空", "invalid_ids")
+    return out
+
+
+def _batch_item_error(item_id: Optional[str], exc: _TodoError) -> dict:
+    return {"id": item_id, "code": exc.code, "error": str(exc)}
+
+
+def _op_complete(store: dict, todo_id: Optional[str], done: bool) -> tuple[dict, dict]:
     found = _find_todo(store["todos"], todo_id)
     if not found:
         raise _TodoError(f"找不到 id 为 {todo_id} 的待办", "not_found")
     _idx, todo = found
-    new_state = (not todo["done"]) if force is None else bool(force)
-    if todo["done"] == new_state:
-        # 状态未变
-        return store, {
-            "ok": True,
-            "action": "toggle",
-            "todo": _todo_summary(todo),
-            "changed": False,
-            "total": len(store["todos"]),
-            "pending": sum(1 for t in store["todos"] if not t["done"]),
-        }
-    todo["done"] = new_state
-    todo["completed_at"] = int(time.time()) if new_state else None
+    changed = bool(todo.get("done")) != done
+    todo["done"] = done
+    todo["completed_at"] = int(time.time()) if done else None
     return store, {
         "ok": True,
-        "action": "toggle",
+        "action": "complete" if done else "reopen",
         "todo": _todo_summary(todo),
-        "changed": True,
-        "total": len(store["todos"]),
-        "pending": sum(1 for t in store["todos"] if not t["done"]),
+        "changed": changed,
+        "affected_count": 1,
+        "changed_count": 1 if changed else 0,
+        **_store_stats(store),
     }
+
 
 def _op_delete(store: dict, todo_id: Optional[str]) -> tuple[dict, dict]:
     found = _find_todo(store["todos"], todo_id)
@@ -310,9 +335,135 @@ def _op_delete(store: dict, todo_id: Optional[str]) -> tuple[dict, dict]:
         "ok": True,
         "action": "delete",
         "todo": _todo_summary(todo),
-        "total": len(store["todos"]),
-        "pending": sum(1 for t in store["todos"] if not t["done"]),
+        "affected_count": 1,
+        **_store_stats(store),
     }
+
+
+def _op_complete_many(store: dict, todo_ids: Any, done: bool) -> tuple[dict, dict]:
+    ids = _normalize_id_list(todo_ids, "todo_ids")
+    updated: list[dict] = []
+    failed: list[dict] = []
+    for todo_id in ids:
+        found = _find_todo(store["todos"], todo_id)
+        if not found:
+            failed.append({"id": todo_id, "code": "not_found", "error": f"找不到 id 为 {todo_id} 的待办"})
+            continue
+        _idx, todo = found
+        changed = bool(todo.get("done")) != done
+        todo["done"] = done
+        todo["completed_at"] = int(time.time()) if done else None
+        updated.append({"id": todo_id, "changed": changed, "todo": _todo_summary(todo)})
+
+    changed_count = sum(1 for item in updated if item["changed"])
+    return store, {
+        "ok": True,
+        "action": "complete_many" if done else "reopen_many",
+        "requested_count": len(ids),
+        "affected_count": len(updated),
+        "changed_count": changed_count,
+        "unchanged_count": len(updated) - changed_count,
+        "updated": updated,
+        "failed": failed,
+        **_store_stats(store),
+    }
+
+
+def _op_delete_many(store: dict, todo_ids: Any) -> tuple[dict, dict]:
+    ids = _normalize_id_list(todo_ids, "todo_ids")
+    deleted: list[dict] = []
+    failed: list[dict] = []
+    for todo_id in ids:
+        found = _find_todo(store["todos"], todo_id)
+        if not found:
+            failed.append({"id": todo_id, "code": "not_found", "error": f"找不到 id 为 {todo_id} 的待办"})
+            continue
+        idx, todo = found
+        store["todos"].pop(idx)
+        deleted.append(_todo_summary(todo))
+    return store, {
+        "ok": True,
+        "action": "delete_many",
+        "requested_count": len(ids),
+        "affected_count": len(deleted),
+        "deleted": deleted,
+        "failed": failed,
+        **_store_stats(store),
+    }
+
+
+def _op_add_many(store: dict, items: Any) -> tuple[dict, dict]:
+    if not isinstance(items, list) or not items:
+        raise _TodoError("todos 必须是非空数组", "invalid_items")
+    if len(items) > MAX_BATCH_ITEMS:
+        raise _TodoError(f"todos 最多 {MAX_BATCH_ITEMS} 项", "batch_too_large")
+    added: list[dict] = []
+    failed: list[dict] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            failed.append({"index": index, "code": "invalid_item", "error": "每个 todo 必须是对象"})
+            continue
+        try:
+            _store, payload = _op_add(
+                store,
+                item.get("title"),
+                item.get("priority") or "medium",
+                item.get("tags"),
+                item.get("note"),
+                item.get("due_at"),
+            )
+            store = _store
+            added.append(payload["todo"])
+        except _TodoError as exc:
+            failed.append(_batch_item_error(str(item.get("title") or ""), exc))
+    return store, {
+        "ok": True,
+        "action": "add_many",
+        "requested_count": len(items),
+        "affected_count": len(added),
+        "todos": added,
+        "failed": failed,
+        **_store_stats(store),
+    }
+
+
+def _op_update_many(store: dict, updates: Any) -> tuple[dict, dict]:
+    if not isinstance(updates, list) or not updates:
+        raise _TodoError("updates 必须是非空数组", "invalid_items")
+    if len(updates) > MAX_BATCH_ITEMS:
+        raise _TodoError(f"updates 最多 {MAX_BATCH_ITEMS} 项", "batch_too_large")
+    updated: list[dict] = []
+    failed: list[dict] = []
+    for index, item in enumerate(updates):
+        if not isinstance(item, dict):
+            failed.append({"index": index, "code": "invalid_item", "error": "每个 update 必须是对象"})
+            continue
+        todo_id = item.get("todo_id")
+        try:
+            _store, payload = _op_edit(
+                store,
+                todo_id,
+                item.get("title"),
+                item.get("priority"),
+                item.get("tags"),
+                item.get("note"),
+                item.get("due_at"),
+            )
+            store = _store
+            updated.append({"changed": payload.get("changed", []), "todo": payload["todo"]})
+        except _TodoError as exc:
+            failed.append(_batch_item_error(str(todo_id or ""), exc))
+    return store, {
+        "ok": True,
+        "action": "update_many",
+        "requested_count": len(updates),
+        "affected_count": len(updated),
+        "changed_count": sum(1 for item in updated if item.get("changed")),
+        "updated": updated,
+        "failed": failed,
+        **_store_stats(store),
+    }
+
 
 def _op_clear(store: dict, filter_: str) -> tuple[dict, dict]:
     """清空：done=只清已完成；all=清全部。"""
@@ -332,10 +483,11 @@ def _op_clear(store: dict, filter_: str) -> tuple[dict, dict]:
         "action": "clear",
         "filter": filter_,
         "removed": removed,
+        "affected_count": removed,
         "message": msg,
-        "total": len(store["todos"]),
-        "pending": sum(1 for t in store["todos"] if not t["done"]),
+        **_store_stats(store),
     }
+
 
 def _op_edit(store: dict, todo_id: Optional[str], title: Optional[str],
              priority: Optional[str], tags: Any, note: Optional[str],
@@ -365,11 +517,12 @@ def _op_edit(store: dict, todo_id: Optional[str], title: Optional[str],
         changed.append("due_at")
     return store, {
         "ok": True,
-        "action": "edit",
+        "action": "update",
         "todo": _todo_summary(todo),
         "changed": changed,
-        "total": len(store["todos"]),
-        "pending": sum(1 for t in store["todos"] if not t["done"]),
+        "affected_count": 1,
+        "changed_count": 1 if changed else 0,
+        **_store_stats(store),
     }
 
 def _todo_summary(t: dict) -> dict:
@@ -393,6 +546,9 @@ async def execute_todo(
     action: str = "list",
     title: Optional[str] = None,
     todo_id: Optional[str] = None,
+    todo_ids: Any = None,
+    todos: Any = None,
+    updates: Any = None,
     priority: Optional[str] = None,
     tags: Any = None,
     note: Optional[str] = None,
@@ -400,49 +556,45 @@ async def execute_todo(
     filter: Optional[str] = None,
     tag: Optional[str] = None,
 ) -> str:
-    """
-    todo 工具的主入口。返回 JSON 字符串供 AI 阅读，渲染层另做。
-
-    action: add | list | done | undone | delete | clear | edit
-    """
+    """Todo 工具主入口。单项动作与显式 *_many 批量动作。"""
     action = (action or "list").strip().lower()
     filter_ = (filter or "all").strip().lower()
     if filter_ not in VALID_FILTERS:
         filter_ = "all"
 
-    # TIMER 主动巡检可能会查看 Todo（提示词以"查看任务清单"能力描述，
-    # 工具存在时模型自然调用）；这里记录操作元数据，
-    # 不记录任务标题/备注，避免后台日志泄露不必要的用户内容。
-    logger.info(
-        "[TIMER-TODO] chat=%s action=%s filter=%s todo_id=%s",
-        chat_id, action, filter_, todo_id or "-",
-    )
-
     if action == "add":
         payload = await _mutate(chat_id, lambda s: _op_add(s, title, priority or "medium", tags, note, due_at))
+    elif action == "add_many":
+        payload = await _mutate(chat_id, lambda s: _op_add_many(s, todos))
     elif action == "list":
         payload = await _read_store(chat_id, lambda s: _op_list(s, filter_, tag, priority))
-    elif action == "done":
-        payload = await _mutate(chat_id, lambda s: _op_toggle(s, todo_id, True))
-    elif action == "undone":
-        payload = await _mutate(chat_id, lambda s: _op_toggle(s, todo_id, False))
-    elif action == "toggle":
-        payload = await _mutate(chat_id, lambda s: _op_toggle(s, todo_id, None))
+    elif action == "complete":
+        payload = await _mutate(chat_id, lambda s: _op_complete(s, todo_id, True))
+    elif action == "reopen":
+        payload = await _mutate(chat_id, lambda s: _op_complete(s, todo_id, False))
+    elif action == "complete_many":
+        payload = await _mutate(chat_id, lambda s: _op_complete_many(s, todo_ids, True))
+    elif action == "reopen_many":
+        payload = await _mutate(chat_id, lambda s: _op_complete_many(s, todo_ids, False))
     elif action == "delete":
         payload = await _mutate(chat_id, lambda s: _op_delete(s, todo_id))
+    elif action == "delete_many":
+        payload = await _mutate(chat_id, lambda s: _op_delete_many(s, todo_ids))
     elif action == "clear":
-        # 默认只清已完成，避免误删
         f = filter_ if filter_ in ("done", "all") else "done"
         payload = await _mutate(chat_id, lambda s: _op_clear(s, f))
-    elif action == "edit":
+    elif action == "update":
         payload = await _mutate(chat_id, lambda s: _op_edit(s, todo_id, title, priority, tags, note, due_at))
+    elif action == "update_many":
+        payload = await _mutate(chat_id, lambda s: _op_update_many(s, updates))
     else:
         payload = {"ok": False, "error": f"未知 action: {action}", "code": "bad_action"}
 
     if isinstance(payload, dict):
         logger.info(
-            "[TIMER-TODO] chat=%s result ok=%s total=%s pending=%s",
-            chat_id, payload.get("ok"), payload.get("total", "-"), payload.get("pending", "-"),
+            "[TIMER-TODO] chat=%s result ok=%s affected=%s total=%s pending=%s",
+            chat_id, payload.get("ok"), payload.get("affected_count", "-"),
+            payload.get("total", "-"), payload.get("pending", "-"),
         )
     return json.dumps(payload, ensure_ascii=False)
 
@@ -462,6 +614,40 @@ def render_todo_card(payload: dict, max_items: int = 50) -> str:
 
     action = payload.get("action", "list")
 
+    # 批量动作：数量口径始终使用 affected_count，而不是调用次数。
+    if action in ("add_many", "complete_many", "reopen_many", "delete_many", "update_many"):
+        affected = payload.get("affected_count", 0)
+        failed = payload.get("failed", []) or []
+        if action == "add_many":
+            verb = "已批量新增"
+            items = payload.get("todos", []) or []
+        elif action == "complete_many":
+            verb = "已批量完成"
+            items = payload.get("updated", []) or []
+        elif action == "reopen_many":
+            verb = "已批量重开"
+            items = payload.get("updated", []) or []
+        elif action == "delete_many":
+            verb = "已批量删除"
+            items = payload.get("deleted", []) or []
+        else:
+            verb = "已批量更新"
+            items = payload.get("updated", []) or []
+        parts = [f"<p>✅ <b>{verb} {affected} 项</b></p>"]
+        if items:
+            rendered = []
+            for item in items[:50]:
+                value = item.get("todo", item) if isinstance(item, dict) else {}
+                rendered.append(_render_todo_item(value if isinstance(value, dict) else {}))
+            parts.append("<ol>" + "".join(rendered) + "</ol>")
+            if len(items) > 50:
+                parts.append(f"<p><i>… 还有 {len(items) - 50} 项</i></p>")
+        if failed:
+            parts.append(f"<p>⚠️ 失败 {len(failed)} 项</p>")
+        if "total" in payload:
+            parts.append(f"<p><i>当前共 {payload.get('total', 0)} 项 · 未完成 {payload.get('pending', 0)} 项</i></p>")
+        return "".join(parts)
+
     # 非列表动作给一个简洁的确认卡片
     if action == "add":
         t = payload.get("todo", {})
@@ -470,7 +656,7 @@ def render_todo_card(payload: dict, max_items: int = 50) -> str:
             f"<p>{_priority_badge(t)} {_esc(t.get('title'))} {_tag_chips(t)}</p>"
             f"<p><i>当前共 {payload.get('total', 0)} 项，待办 {payload.get('pending', 0)} 项</i></p>"
         )
-    if action in ("done", "undone", "toggle"):
+    if action in ("complete", "reopen"):
         t = payload.get("todo", {})
         icon = "✅" if t.get("done") else "↩️"
         verb = "标记为已完成" if t.get("done") else "标记为未完成"
@@ -493,7 +679,7 @@ def render_todo_card(payload: dict, max_items: int = 50) -> str:
             f"<p>🧹 <b>{_esc(payload.get('message', '已清空'))}</b></p>"
             f"<p><i>剩余 {payload.get('total', 0)} 项，未完成 {payload.get('pending', 0)} 项</i></p>"
         )
-    if action == "edit":
+    if action == "update":
         t = payload.get("todo", {})
         return (
             f"<p>📝 <b>已编辑</b></p>"

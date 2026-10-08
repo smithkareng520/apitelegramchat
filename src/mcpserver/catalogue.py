@@ -250,43 +250,79 @@ TODO_MODULE = ModuleSpec(
         ToolSpec(
             name="todo",
             description=(
-                "Persistent per-chat todo list. Actions: add, list, done, undone, toggle, delete, clear, edit. "
-                "Use `due_at` for deadlines. After a write action, call `list` to verify the updated state."
+                "Persistent per-chat todo list. Use one action per call. "
+                "Single-item actions: add, list, complete, reopen, update, delete, clear. "
+                "Batch actions: add_many, complete_many, reopen_many, update_many, delete_many. "
+                "Batch actions are best-effort: successful items are applied and failures are returned per item. "
+                "Use list only when you need the current set; write results already include affected counts and ids."
             ),
             input_schema=_schema(
                 {
                     "action": {
                         "type": "string",
-                        "enum": ["add", "list", "done", "undone", "toggle", "delete", "clear", "edit"],
-                        "description": "Action to perform. Default: `list`.",
-                        "default": "list",
+                        "enum": ["add", "add_many", "list", "complete", "complete_many", "reopen", "reopen_many", "update", "update_many", "delete", "delete_many", "clear"],
+                        "description": "Action to perform.",
                     },
-                    "title": _text("Todo title. Required for `add`; optional for `edit`.", 1),
-                    "todo_id": _text("Target todo id for `done`, `undone`, `toggle`, `delete`, or `edit`.", 1),
+                    "title": _text("Todo title for `add`; optional fields for `update`.", 1),
+                    "todo_id": _text("Target todo id for `complete`, `reopen`, `update`, or `delete`.", 1),
+                    "todo_ids": {
+                        "type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 100,
+                        "description": "Todo ids for `complete_many`, `reopen_many`, or `delete_many`.",
+                    },
+                    "todos": {
+                        "type": "array", "minItems": 1, "maxItems": 100,
+                        "description": "Todo objects for `add_many`; each object accepts title, priority, tags, note, due_at.",
+                        "items": {
+                            "type": "object", "additionalProperties": False,
+                            "properties": {
+                                "title": _text("Todo title.", 1),
+                                "priority": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium"},
+                                "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                                "note": _text("Optional note."),
+                                "due_at": _text("Optional ISO 8601 deadline."),
+                            },
+                            "required": ["title"],
+                        },
+                    },
+                    "updates": {
+                        "type": "array", "minItems": 1, "maxItems": 100,
+                        "description": "Todo update objects for `update_many`; each item requires todo_id and can change any other editable field.",
+                        "items": {
+                            "type": "object", "additionalProperties": False,
+                            "properties": {
+                                "todo_id": _text("Todo id.", 1),
+                                "title": _text("New title.", 1),
+                                "priority": {"type": "string", "enum": ["low", "medium", "high"]},
+                                "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                                "note": _text("New note."),
+                                "due_at": _text("New ISO 8601 deadline."),
+                            },
+                            "required": ["todo_id"],
+                        },
+                    },
                     "priority": {
                         "type": "string",
                         "enum": ["low", "medium", "high"],
-                        "description": "Priority. Default: `medium`.",
-                        "default": "medium",
+                        "description": "Priority for `add`; optional for `update`.",
                     },
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags; up to 8.", "maxItems": 8},
-                    "note": _text("Optional note for `add` or `edit`."),
-                    "due_at": _text("Optional ISO 8601 deadline for `add` or `edit`."),
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for `add`/`update`; up to 8.", "maxItems": 8},
+                    "note": _text("Note for `add`/`update`."),
+                    "due_at": _text("ISO 8601 deadline for `add`/`update`."),
                     "filter": {
                         "type": "string",
                         "enum": ["all", "pending", "done"],
-                        "description": "Filter for `list`/`clear`. Default: `all`.",
-                        "default": "all",
+                        "description": "Filter for `list`/`clear`. `clear` only accepts `all` or `done`.",
                     },
-                    "tag": _text("Filter `list` by tag, or scope `clear` to a tag."),
+                    "tag": _text("Tag filter for `list`.", 1),
                 },
-                (),
+                ("action",),
             ),
             handler=_todo,
             input_examples=(
                 {"action": "add", "title": "归还图书馆书籍", "priority": "high", "due_at": "2026-10-08"},
-                {"action": "list", "filter": "pending"},
-                {"action": "done", "todo_id": "a1b2c3d4"},
+                {"action": "add_many", "todos": [{"title": "买牛奶"}, {"title": "写周报", "priority": "high"}]},
+                {"action": "complete_many", "todo_ids": ["a1b2c3d4", "e5f6a7b8"]},
+                {"action": "update_many", "updates": [{"todo_id": "a1b2c3d4", "priority": "high"}]},
             ),
         ),
     ),
@@ -300,39 +336,73 @@ MEMORY_MODULE = ModuleSpec(
         ToolSpec(
             name="memory",
             description=(
-                "Persistent per-chat long-term memory. Actions: add, get, list, search, update, delete, clear. "
-                "Use for facts, preferences, people, events, or notes that should survive across sessions."
+                "Persistent per-chat long-term memory. Single-item actions: add, get, list, search, update, delete, clear. "
+                "Batch actions: add_many, get_many, update_many, delete_many. "
+                "Use batch actions when several ids or memory records are known; writes return affected counts and ids, so a follow-up list is usually unnecessary."
             ),
             input_schema=_schema(
                 {
                     "action": {
                         "type": "string",
-                        "enum": ["add", "get", "list", "search", "update", "delete", "clear"],
-                        "description": "Action to perform. Default: `list`.",
-                        "default": "list",
+                        "enum": ["add", "add_many", "get", "get_many", "list", "search", "update", "update_many", "delete", "delete_many", "clear"],
+                        "description": "Action to perform.",
                     },
-                    "content": _text("Memory content. Required for `add`/`update`.", 1),
-                    "memory_id": _text("Memory id for `get`, `update`, or `delete`.", 1),
-                    "category": _text("Category, such as `fact`, `preference`, `person`, `event`, or `note`.", 1),
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags; up to 8.", "maxItems": 8},
+                    "content": _text("Memory content for `add`; optional for `update`.", 1),
+                    "memory_id": _text("Target memory id for `get`, `update`, or `delete`.", 1),
+                    "memory_ids": {
+                        "type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 100,
+                        "description": "Memory ids for `get_many` or `delete_many`.",
+                    },
+                    "memories": {
+                        "type": "array", "minItems": 1, "maxItems": 100,
+                        "description": "Memory objects for `add_many`; each object accepts content, category, tags, importance, source.",
+                        "items": {
+                            "type": "object", "additionalProperties": False,
+                            "properties": {
+                                "content": _text("Memory content.", 1),
+                                "category": _text("Category."),
+                                "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                                "importance": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium"},
+                                "source": _text("Memory source."),
+                            },
+                            "required": ["content"],
+                        },
+                    },
+                    "updates": {
+                        "type": "array", "minItems": 1, "maxItems": 100,
+                        "description": "Memory update objects for `update_many`; each item requires memory_id and can change content, category, tags, importance.",
+                        "items": {
+                            "type": "object", "additionalProperties": False,
+                            "properties": {
+                                "memory_id": _text("Memory id.", 1),
+                                "content": _text("New content.", 1),
+                                "category": _text("New category."),
+                                "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                                "importance": {"type": "string", "enum": ["low", "medium", "high"]},
+                            },
+                            "required": ["memory_id"],
+                        },
+                    },
+                    "category": _text("Category for `add`/`list`/`update`."),
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for `add`/`list`/`update`; up to 8.", "maxItems": 8},
                     "importance": {
                         "type": "string",
                         "enum": ["low", "medium", "high"],
-                        "description": "Importance. Default: `medium`.",
-                        "default": "medium",
+                        "description": "Importance for `add`/`list`/`update`.",
                     },
-                    "query": _text("Search query for `search`; matches content, tags, and category.", 1),
-                    "scope": _text("Clear scope: `all`, `category:<name>`, or `tag:<name>`. Default: `all`."),
+                    "query": _text("Search query for `search`.", 1),
+                    "scope": _text("Clear scope: `all`, `category:<name>`, or `tag:<name>`."),
                     "limit": _int("Maximum results for `list`/`search`. Default: 50.", 1, 500),
-                    "source": _text("Memory source. Default: `agent`."),
+                    "source": _text("Memory source for `add`."),
                 },
                 ("action",),
             ),
             handler=_memory,
             input_examples=(
-                {"action": "add", "content": "用户对花生过敏", "category": "fact", "importance": "high", "tags": ["健康", "过敏"]},
-                {"action": "search", "query": "过敏"},
-                {"action": "update", "memory_id": "a1b2c3d4", "content": "用户对花生和海鲜过敏", "importance": "high"},
+                {"action": "add", "content": "用户喜欢黑咖啡", "category": "preference"},
+                {"action": "add_many", "memories": [{"content": "用户喜欢黑咖啡", "category": "preference"}, {"content": "用户常在晚上工作", "category": "fact"}]},
+                {"action": "get_many", "memory_ids": ["a1b2c3d4", "e5f6a7b8"]},
+                {"action": "delete_many", "memory_ids": ["a1b2c3d4", "e5f6a7b8"]},
             ),
         ),
     ),
