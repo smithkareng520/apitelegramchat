@@ -54,5 +54,4 @@ async def close_http_session() -> None:
                 await _http_session.close()
             except Exception:
                 logger.debug("close_http_session 内部忽略的异常", exc_info=True)
-                pass
         _http_session = None

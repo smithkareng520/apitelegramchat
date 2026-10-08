@@ -613,7 +613,6 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
     "写入"与"注销"原子成对，取消竞态下既不双写也不漏写。
     """
     lock = await get_chat_lock(chat_id)
-    appended_any = False
     async with lock:
         ctx = get_or_init_context(chat_id)
         history = ctx.setdefault("conversation_history", [])
@@ -632,7 +631,6 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
                 k: v for k, v in user_message.items() if k != "content"
             })
             history.append(user_entry)
-            appended_any = True
         # 历史标记清理：早持久化的消息进入历史时去掉内部标记。
         if isinstance(user_message, dict):
             user_message.pop(turn_recovery.EARLY_PERSIST_FLAG, None)
@@ -645,7 +643,6 @@ async def update_conversation_and_ledger(chat_id: int, user_message: dict | None
             elif isinstance(msg, dict) and msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
                 msg["content"] = msg["content"].strip()
             history.append(msg)
-            appended_any = True
         # 消息已落历史：立即注销该轮的 in-flight 登记（在释放 chat 锁前）。
         if new_msgs:
             turn_recovery.note_turn_persisted(chat_id, new_msgs)
@@ -1040,7 +1037,6 @@ async def _handle_timer_wakeup(chat_id: int) -> None:
             history_count = len(ctx.get("conversation_history", []) or [])
         except Exception:
             logger.debug("_handle_timer_wakeup 内部忽略的异常", exc_info=True)
-            pass
         logger.info(
             "[TIMER] chat=%s 开始主动巡检：model=%s history_messages=%s username=%s",
             chat_id, cm, history_count, username,

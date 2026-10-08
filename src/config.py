@@ -167,7 +167,8 @@ if os.getenv("APITELEGRAMCHAT_REQUIRE_STRICT_CONFIG", "0") in {"1", "true", "yes
 # 角色相关
 # -----------------------------------------------------------------------------
 # 角色列表统一在 roles.py 中编辑（增删角色/改提示词只需改那一个文件）。
-from roles import ROLE_NAMES as SUPPORTED_ROLES
+# 再导出：app_commands.py 等模块从 config 导入 SUPPORTED_ROLES。
+from roles import ROLE_NAMES as SUPPORTED_ROLES  # noqa: F401
 
 # =============================================================================
 # 配置驱动架构：厂商定义 + 模型定义

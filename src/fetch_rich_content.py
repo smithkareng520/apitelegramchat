@@ -416,7 +416,6 @@ def _collect_dom_media(tree: Any, base_url: str) -> list[DomMedia]:
                                 break
                 except Exception:
                     logger.debug("_collect_dom_media 内部忽略的异常", exc_info=True)
-                    pass
 
         if not kind or not url or url in seen:
             continue
@@ -1597,7 +1596,6 @@ def extract_title_from_html(html_text: str) -> str:
             return truncate_to_token_budget(re.sub(r"\s+", " ", title_el.text).strip(), TITLE_TOKEN_BUDGET, suffix="…")
     except Exception:
         logger.debug("extract_title_from_html 内部忽略的异常", exc_info=True)
-        pass
     return ""
 
 # 兜底文本（无结构化正文时）的样板区剔除：nav/footer/aside 容器，以及

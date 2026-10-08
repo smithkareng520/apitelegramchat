@@ -844,7 +844,6 @@ def _safe_parse_args(args_str: str) -> dict:
                 return repaired
         except Exception:
             logger.debug("_safe_parse_args 修复兜底内部忽略的异常", exc_info=True)
-            pass
     return fast_fields
 
 
@@ -1005,7 +1004,6 @@ def _tool_result_is_failure(fn_name: str, fn_args: dict, result_content: Any, de
                 return True
         except Exception:
             logger.debug("_tool_result_is_failure 内部忽略的异常", exc_info=True)
-            pass
     return False
 
 
@@ -1240,7 +1238,6 @@ def _generate_tool_summary_done(fn_name: str, fn_args: dict, result_content: str
                 return "User is away (no reply)"
         except Exception:
             logger.debug("_generate_tool_summary_done 内部忽略的异常", exc_info=True)
-            pass
         return "User answered"
 
     if fn_name == "bash":

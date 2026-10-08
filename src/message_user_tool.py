@@ -438,7 +438,6 @@ async def resolve_callback(chat_id: int, callback_from_id: int, interaction_id: 
             interaction.answers[interaction.current_index] = {"type": "choice", "multiple": bool(q.get("multiSelect")), "selected": selected}
             markup = _build_keyboard(interaction)
             body = _question_html(interaction)
-            message_id = interaction.message_id
             _spawn_ui_followup(_edit_question_message(interaction, body, markup))
             return True, "已选择"
 

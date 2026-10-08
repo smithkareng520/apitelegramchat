@@ -87,7 +87,6 @@ async def delete_message_fast(chat_id: int, message_id: int) -> bool:
                 return True
     except Exception:
         logger.debug("delete_message_fast 内部忽略的异常", exc_info=True)
-        pass
 
     timeout = aiohttp.ClientTimeout(total=3, connect=2)
     try:
@@ -103,7 +102,6 @@ async def delete_message_fast(chat_id: int, message_id: int) -> bool:
                             deleted_message_ids.add(message_id)
                     except Exception:
                         logger.debug("delete_message_fast 内部忽略的异常", exc_info=True)
-                        pass
                     return True
                 if r.status == 400:
                     body = await r.text()
@@ -114,7 +112,6 @@ async def delete_message_fast(chat_id: int, message_id: int) -> bool:
                                 deleted_message_ids.add(message_id)
                         except Exception:
                             logger.debug("delete_message_fast 内部忽略的异常", exc_info=True)
-                            pass
                         return True
                 return False
     except asyncio.CancelledError:
@@ -292,14 +289,12 @@ async def _reassert_active_draft_content(chat_id: int, draft_id: int) -> None:
                             )
                     except Exception:
                         logger.debug("_reassert_active_draft_content 内部忽略的异常", exc_info=True)
-                        pass
                 else:
                     body = ""
                     try:
                         body = await resp.text()
                     except Exception:
                         logger.debug("_reassert_active_draft_content 内部忽略的异常", exc_info=True)
-                        pass
                     logger.debug(
                         f"reassert draft failed: chat={chat_id} draft={draft_id} "
                         f"status={resp.status} body={body[:120]}"
@@ -348,7 +343,6 @@ async def serialize_with_active_draft(chat_id: int, *, reassert: bool = True) ->
                     return
             except Exception:
                 logger.debug("serialize_with_active_draft 内部忽略的异常", exc_info=True)
-                pass
             await _reassert_active_draft_content(chat_id, draft_id)
 
 
@@ -446,7 +440,6 @@ async def send_rich_message_draft(
                                     return msg_id
                             except Exception:
                                 logger.debug("send_rich_message_draft 内部忽略的异常", exc_info=True)
-                                pass
                             return 0
 
                         if resp.status == 429:
@@ -531,7 +524,6 @@ async def send_rich_message_draft(
                                                     return demoted_msg_id
                                             except Exception:
                                                 logger.debug("send_rich_message_draft 内部忽略的异常", exc_info=True)
-                                                pass
                                             return 0
                                         demoted_body = await demoted_resp.text()
                                         logger.warning(

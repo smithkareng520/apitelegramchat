@@ -389,7 +389,9 @@ def _blocks_to_gemini_parts(blocks: list) -> list:
             # Gemini 当前模型未开启该能力，防御性降级为文本占位。
             parts.append({"text": "[收到一个文档附件，当前模型不支持原生文档输入]"})
         else:
-            parts.append({"text": f"[不支持的内容类型: {getattr(block, 'kind', lambda: type(block).__name__)()}]"})
+            # 已知块型都有 kind() 方法；防御性兜底未知块型时退化用类名。
+            kind = block.kind() if callable(getattr(block, "kind", None)) else type(block).__name__
+            parts.append({"text": f"[不支持的内容类型: {kind}]"})
     return parts
 
 

@@ -550,8 +550,6 @@ def _extract_blockquote(lines: List[str]) -> Tuple[str, int]:
         else:
             break
     
-    # 递归处理引用内容（可能包含其他格式）
-    quote_content = '\n'.join(quote_lines)
     # 对引用内容也进行行内转换
     converted_lines = [_convert_inline(l) if l.strip() else '' for l in quote_lines]
     

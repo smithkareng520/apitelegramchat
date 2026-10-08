@@ -335,7 +335,7 @@ def test_callback_mode_keyframe_guides_to_frames(monkeypatch):
 
 
 def test_media_collect_success_and_failure_retry(monkeypatch):
-    io = _IO().install(monkeypatch)
+    _IO().install(monkeypatch)
     sess = _register(_video_session(message_id=55), monkeypatch)
     sess.collect_slot = "first_frame"
 
@@ -365,7 +365,7 @@ def test_media_collect_success_and_failure_retry(monkeypatch):
 
 
 def test_media_collect_mismatched_kind_consumed_with_hint(monkeypatch):
-    io = _IO().install(monkeypatch)
+    _IO().install(monkeypatch)
     sess = _register(_video_session(message_id=55), monkeypatch)
     sess.collect_slot = "ref_audio"
     run = asyncio.new_event_loop()
@@ -455,8 +455,6 @@ def test_submit_builds_overrides_and_finishes(monkeypatch):
     sess.last_frame = "https://r2.example/l.png"
 
     spawned: list = []
-
-    import media_wizard as mw
 
     class _FakeTurnModule:
         @staticmethod
@@ -704,8 +702,6 @@ def test_submit_card_shows_in_progress_not_done(monkeypatch):
     """提交瞬间卡片文案必须是"进行中"语义，不能读起来像已经生成完成。"""
     io = _IO().install(monkeypatch)
     sess = _register(_video_session(message_id=55), monkeypatch)
-
-    import media_wizard as mw
 
     class _FakeTurnModule:
         @staticmethod

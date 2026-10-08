@@ -112,7 +112,6 @@ def _candidate_skill_roots() -> list[Path]:
         roots.append(Path(__file__).resolve().parents[1] / ".claude" / "skills")
     except Exception:
         logger.debug("_candidate_skill_roots 内部忽略的异常", exc_info=True)
-        pass
 
     seen: set[str] = set()
     out: list[Path] = []

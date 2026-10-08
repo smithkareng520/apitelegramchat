@@ -10,7 +10,6 @@
 #   5. polling 模式下 webhook 投递被忽略且不入队（与生产部署一致）。
 # =====================================================================
 import asyncio
-import json
 
 import pytest
 

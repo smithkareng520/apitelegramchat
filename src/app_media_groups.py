@@ -258,7 +258,6 @@ async def _process_document_group_once(chat_id: int, media_group_id: str) -> Non
             )
         except Exception:
             logger.debug("_process_document_group_once 内部忽略的异常", exc_info=True)
-            pass
     finally:
         if not _interrupted:
             try:

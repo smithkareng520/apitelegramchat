@@ -164,7 +164,7 @@ async def _handle_admin_commands(chat_id: int, msg: dict, text: str, username: s
         if not users:
             await send_rich_html_message(chat_id, "📋 <b>白名单为空</b>", reply_parameters=_reply_params(msg["message_id"]))
         else:
-            users_list = "".join(f"<li><code>{str(u)}</code></li>" for u in users)
+            users_list = "".join(f"<li><code>{u!s}</code></li>" for u in users)
             await send_rich_html_message(chat_id, f"📋 <b>当前白名单用户：</b>\n<ul>{users_list}</ul>", reply_parameters=_reply_params(msg["message_id"]))
         return True
     elif _cmd_match(text, "/webhookinfo"):
@@ -217,7 +217,7 @@ async def _handle_admin_commands(chat_id: int, msg: dict, text: str, username: s
         last_err_msg = info.get("last_error_message")
         if last_err_msg:
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_err_date)) if last_err_date else "未知时间"
-            lines.append(f"最近投递错误：<code>{str(ts)} / {str(last_err_msg)[:200]}</code>")
+            lines.append(f"最近投递错误：<code>{ts!s} / {str(last_err_msg)[:200]}</code>")
         else:
             lines.append("最近投递错误：无 ✅")
         lines.append("</blockquote>")

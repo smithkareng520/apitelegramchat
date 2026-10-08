@@ -55,7 +55,6 @@ if _TRAFILATURA_CONFIG is not None:
         _TRAFILATURA_CONFIG.set("DEFAULT", "DOWNLOAD_TIMEOUT", str(TRAFILATURA_TIMEOUT))
     except Exception:
         logger.debug("module 内部忽略的异常", exc_info=True)
-        pass
 
 # ---------- 工具函数 ----------
 def _truncate(text: str, token_budget: int = FETCH_CONTENT_TOKEN_BUDGET, suffix: str = "…（内容已按 token 预算截断）") -> str:
@@ -72,7 +71,6 @@ def _get_title_from_html(html_content: str) -> str:
             return truncate_to_token_budget(title, FETCH_TITLE_TOKEN_BUDGET, suffix="…") if title else "无标题"
     except Exception:
         logger.debug("_get_title_from_html 内部忽略的异常", exc_info=True)
-        pass
     return "无标题"
 
 # 字符编码检测：优先级与 WHATWG / HTML5 规范对齐。
@@ -126,7 +124,6 @@ def _detect_html_encoding(raw: bytes, http_encoding: str | None) -> str:
                 return _normalize_encoding_name(enc)
     except Exception:
         logger.debug("_detect_html_encoding 内部忽略的异常", exc_info=True)
-        pass
     try:
         # charset_normalizer 是 requests / chardet 的常见替代品
         from charset_normalizer import from_bytes
@@ -137,7 +134,6 @@ def _detect_html_encoding(raw: bytes, http_encoding: str | None) -> str:
                 return _normalize_encoding_name(enc)
     except Exception:
         logger.debug("_detect_html_encoding 内部忽略的异常", exc_info=True)
-        pass
     return "utf-8"
 
 def _normalize_encoding_name(name: str) -> str:

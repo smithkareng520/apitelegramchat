@@ -43,7 +43,7 @@ def test_runtime_catalog_uses_workspace_skills_not_project_skills(monkeypatch, t
 
 
 def test_agent_run_refreshes_skill_catalog_in_place(monkeypatch):
-    from core.messages import Message, TextBlock
+    from core.messages import Message
     from skills_runtime import refresh_skill_catalog as _refresh_skill_catalog
 
     old = """

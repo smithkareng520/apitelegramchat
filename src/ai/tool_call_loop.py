@@ -428,7 +428,7 @@ async def _run_tool_calls_and_append(
                         raise
                     except Exception:
                         logger.debug("tool_progress_callback 内部忽略的异常", exc_info=True)
-                        pass  # 进度推送失败不能影响工具本身
+                        # 进度推送失败不能影响工具本身
 
                 # 立即把卡片从「刚开始」推到「运行中」，避免用户在子
                 # agent 首次 LLM 调用完成前看到空进度。

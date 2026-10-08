@@ -1652,7 +1652,9 @@ def _extract_image_items(response_json: dict, max_items: int = 4) -> list[dict]:
                     # 仅在已知图片容器（如 data/images）内接受裸 URL。
                     _push_url(elem)
                 elif isinstance(elem, dict):
-                    explicit = _extract_explicit_image_fields(elem, allow_bare_url=True)
+                    # dict 自身明确声明的图片字段（b64_json/image_url/url…）
+                    # 在此直接吸收；该函数通过 _push_* 产出结果，返回值无需使用。
+                    _extract_explicit_image_fields(elem, allow_bare_url=True)
                     # 允许继续进入“消息/内容/图片数组”等已知图片容器，
                     # 但不扫描错误、元数据、debug 等任意字段。
                     for key in ('images', 'output_images', 'data', 'results', 'choices', 'output', 'message', 'content'):

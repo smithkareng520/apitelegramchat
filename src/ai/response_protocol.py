@@ -255,7 +255,6 @@ def message_to_responses_input_items(
 
     if message.role == "assistant":
         native_items = message.meta.get(RESPONSES_OUTPUT_ITEMS_META_KEY)
-        native_model = message.meta.get(RESPONSES_OUTPUT_MODEL_META_KEY)
         if (
             isinstance(native_items, list)
             and native_items

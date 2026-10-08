@@ -711,7 +711,7 @@ def test_live_slot_flag_lifecycle():
 def test_media_progress_slot_synthetic_flag():
     """媒体进度占位带 SYNTHETIC 标记：不参与裁剪的前文合计。"""
     journal: list = []
-    slot = MediaProgressSlot(journal, "[图片生成中] 指令: 画一只猫")
+    MediaProgressSlot(journal, "[图片生成中] 指令: 画一只猫")
     assert journal[0].meta.get(SYNTHETIC_ASSISTANT_FLAG) is True
     assert journal[0].text() == "[图片生成中] 指令: 画一只猫"
 

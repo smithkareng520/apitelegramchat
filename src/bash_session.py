@@ -531,7 +531,6 @@ class BashSession:
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
             except Exception:
                 logger.debug("_execute_heredoc_isolated 内部忽略的异常", exc_info=True)
-                pass
             raise
 
         partial_output = ""
@@ -556,7 +555,6 @@ class BashSession:
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
             except Exception:
                 logger.debug("_execute_heredoc_isolated 内部忽略的异常", exc_info=True)
-                pass
             if kind == "idle":
                 msg = _format_idle_timeout_message(sec)
             else:
@@ -567,10 +565,10 @@ class BashSession:
 
         await proc.wait()
         output = output_buffer.finalize()
-        exit_code = proc.returncode if proc.returncode is not None else "unknown"
         marker_match = re.search(rf"(?m)^{re.escape(marker)}\s+(-?\d+)\s*$", output)
         if marker_match:
-            exit_code = marker_match.group(1)
+            # marker 的作用是把退出码带回来并从输出中剔除；退出码本身按
+            # 输出契约（见 tests/unit/test_bash_output_contract.py）不进信封。
             output = re.sub(rf"(?m)^{re.escape(marker)}\s+-?\d+\s*$\n?", "", output)
         cwd_match = re.search(r"(?m)^__ONE_SHOT_CWD__\s+(.+)$", output)
         actual_cwd = cwd_match.group(1).strip() if cwd_match else cwd
@@ -643,10 +641,9 @@ class BashSession:
             tag = uuid.uuid4().hex[:8]
             marker = f"__END_{tag}__"
             cwd_marker = f"__CWD_{tag}__"
-            # 信封提示符取 persistent shell 当前 cwd（命令的真实执行位置）。
-            # 隔离执行（heredoc）不回写 _persistent_cwd，因此提示符不会
-            # 被子 shell 的 cd 污染，永远真实。
-            prompt_cwd = self._persistent_cwd or str(self.workdir.absolute())
+            # 信封提示符取命令结束后的真实 PWD（下方从 cwd_marker 输出提取），
+            # cd 之后下一条命令的提示符随之变化；隔离执行（heredoc）不会把
+            # 子 shell 的 cd 污染到持久 shell 状态。
             # 默认 shell 启动目录为 workspace/workspace root。模型决定使用 skill 后，
             # 可自行 `cd skills/<skill_id>`；persistent bash 会保留该 cwd。
             # ★ 关键：在输出 marker 前先输出一个换行，确保 marker 单独占一行。
@@ -846,7 +843,7 @@ class BashSession:
 
             except Exception as e:
                 logger.exception(f"Bash execute error chat_id={self.chat_id}")
-                return f"Error: {str(e)}"
+                return f"Error: {e!s}"
 
     # 超时公共清理
     async def _kill_and_close_session(self) -> None:
@@ -945,7 +942,6 @@ class BashSessionManager:
                     await s.close()
                 except Exception:
                     logger.debug("cleanup_all 内部忽略的异常", exc_info=True)
-                    pass
             self._sessions.clear()
 
 _bash_manager = BashSessionManager()

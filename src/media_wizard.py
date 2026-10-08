@@ -170,8 +170,16 @@ def clean_prompt_text(raw: str) -> str:
         text = text.split(REPLY_MARKER)[-1].strip()
     lines = [ln for ln in text.splitlines() if not ln.strip().startswith("📎 用户")]
     text = "\n".join(lines).strip()
-    if text in {"请描述这张图片的内容", "请分析这个视频", "请分析这段音频",
-                "请分析这段语音", "请分析这段音频", "请分析这个文件"}:
+    # 与 app.py / app_media_groups.py 在“用户回复媒体但未输入文字”时
+    # 生成的占位指令语保持同口径（此前“请分析这段音频”重复出现两次，
+    # 导致图片/组图/多图等生产变体未被识别为无正文）。
+    if text in {
+        "请描述这张图片的内容", "请描述这组图片的内容",
+        "请分析这张图片", "请分析这些图片",
+        "请分析这个视频", "请分析这些视频", "请分析这组视频的内容",
+        "请分析这段音频", "请分析这些音频",
+        "请分析这段语音", "请分析这个文件",
+    }:
         return ""
     return text
 

@@ -38,7 +38,6 @@ def _serper_api_timeout() -> float:
             return float(SERPER_API_TIMEOUT)
     except Exception:
         logger.debug("_serper_api_timeout 内部忽略的异常", exc_info=True)
-        pass
     return _SERPER_DEFAULT_TIMEOUT
 
 def _parse_serper_search_result(data: dict[str, Any] | None) -> list[dict]:

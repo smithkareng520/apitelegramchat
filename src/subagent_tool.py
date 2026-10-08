@@ -313,7 +313,7 @@ async def _subagent_agentic_loop(
                 await progress_callback(status_text)
             except Exception:
                 logger.debug("_report 内部忽略的异常", exc_info=True)
-                pass  # 进度回调失败不能影响子 agent 主流程
+                # 进度回调失败不能影响子 agent 主流程
 
     # 支持工具调用？
     model_info = SUPPORTED_MODELS.get(model)
@@ -482,7 +482,6 @@ async def _subagent_agentic_loop(
                 })
         except Exception:
             logger.debug("_subagent_agentic_loop 内部忽略的异常", exc_info=True)
-            pass
         assistant_msg = Message.assistant_with_tool_calls(content or "", tc_list)
         loop_messages.append(assistant_msg)
 
@@ -767,7 +766,6 @@ def _truncate_html_preview(fragment: str, token_budget: int = SUBAGENT_CARD_PREV
     except Exception:
         # 模型输出不应因预览格式化失败而令整个工具卡片消失。
         logger.debug("_truncate_html_preview 内部忽略的异常", exc_info=True)
-        pass
     safe_text = truncate_to_token_budget(text, token_budget, suffix="…")
     return truncate_to_token_budget(_esc(safe_text), token_budget, suffix="…"), True
 

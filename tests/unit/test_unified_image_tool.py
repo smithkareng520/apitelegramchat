@@ -217,7 +217,6 @@ def test_generate_only_model_without_image_url_still_works(monkeypatch):
         prompt="test", model="text-only-model", image_url=None,
     ))
     assert "已生成" in result
-    from core.images import ImageTask
     assert captured["task"].operation == "generate"
 
 

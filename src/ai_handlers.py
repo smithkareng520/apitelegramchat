@@ -27,7 +27,6 @@ from config import (
     DEFAULT_MODEL,
     PROVIDERS,
     ModelConfig,
-    get_effective_endpoint,
     LOG_TRUNCATE_LIMIT,
 )
 from utils import (
@@ -54,7 +53,6 @@ from ai.error_formatting import (
 )
 from ai.attachment_content import (
     _append_history_async,
-    _apply_cache_control,
     _resolve_multimodal_content,
 )
 from ai.rich_message_builder import RichMessageBuilder
@@ -67,9 +65,8 @@ from ai.agentic_loops import (
 )
 # 协议路由（Model -> Protocol -> Adapter）：聊天协议的统一分发入口。
 from protocols import resolve_chat_adapter
-# 模型级公共路由：按模型配置字段匹配 文本/视频/生图 链路（新增模型
-# 无需在调度处新建分支）。
-from protocols import resolve_model_route
+# 模型级公共路由（resolve_model_route）由 protocols.pipeline 统一使用，
+# 本模块不再直接引用；如需模型链路信息请通过 run_preflight 的预检结果。
 # 统一请求管道：参数分层（厂商默认->模型覆盖）-> 输入组合鉴权 -> API
 # 分支（chat/images/video：协议+端点+形状），回合入口一次性预检。
 from protocols import run_preflight
@@ -79,10 +76,9 @@ from core.messages import Message
 from chat_actions import reset_chat_actions, stop_all_chat_actions
 
 if TYPE_CHECKING:
-    # 仅供 cast("AsyncOpenAI"/"AsyncAnthropic", client) 类型收窄使用：
+    # 仅供 cast("AsyncOpenAI", client) 类型收窄使用：
     # 运行时客户端由 api_client.get_client_for_model 按协议分发，
     # cast 不产生任何运行时开销（避免模块级重复导入 SDK）。
-    from anthropic import AsyncAnthropic
     from openai import AsyncOpenAI
 
 logger = get_logger(__name__)
@@ -604,7 +600,6 @@ async def get_ai_response(
                 await set_active_draft(chat_id, builder.draft_id, 0)
             except Exception:
                 logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
-                pass
             await builder.flush(force=True)
             # 首帧发出后，用真实 message_id 覆盖占位值。
             if builder.draft_message_id:
@@ -613,7 +608,6 @@ async def get_ai_response(
                     await set_active_draft(chat_id, builder.draft_id, builder.draft_message_id)
                 except Exception:
                     logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
-                    pass
             builder.start_flush_loop()
             _log_stage("首帧草稿已发送+刷新循环启动")
 
@@ -892,7 +886,6 @@ async def get_ai_response(
                 await mark_draft_dead(builder.draft_id)
             except Exception:
                 logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
-                pass
 
         if raw_content == "MEDIA_WIZARD":
             # 媒体参数卡片已作为永久消息送达：清理"Thinking..."草稿气泡，
@@ -1300,7 +1293,6 @@ async def get_ai_response(
                 await clear_active_draft(chat_id, builder.draft_id)
             except Exception:
                 logger.debug("get_ai_response 内部忽略的异常", exc_info=True)
-                pass
         # chat action 兜底熄灭：typing / record_video / upload_video /
         # upload_document / find_location 的作用域在各自调用点正常收尾，
         # 这里是最后一道防线，确保任何退出路径（含异常与取消）都不会
@@ -1309,7 +1301,6 @@ async def get_ai_response(
             await stop_all_chat_actions(chat_id)
         except Exception:
             logger.debug("stop_all_chat_actions 异常（可忽略）", exc_info=True)
-            pass
 
 
 async def _call_api(
