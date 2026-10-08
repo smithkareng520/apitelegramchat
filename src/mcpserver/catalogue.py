@@ -18,6 +18,7 @@ scope 即命名空间，todo / memory / workspace / bash 的路径解析与 host
 """
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 import logging
@@ -51,12 +52,12 @@ class ToolSpec:
         tool = types.Tool(
             name=self.name,
             description=self.description,
-            inputSchema=self.input_schema,
+            inputSchema=copy.deepcopy(self.input_schema),
         )
         if self.input_examples:
             try:
-                tool.meta = {"input_examples": list(self.input_examples)}
-            except Exception:  # pragma: no cover - meta 非关键路径
+                tool.meta = {"input_examples": copy.deepcopy(self.input_examples)}
+            except (AttributeError, TypeError):  # pragma: no cover - SDK meta 兼容性
                 pass
         return tool
 

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import contextlib
 import json
 import logging
@@ -139,6 +140,7 @@ class MCPServerConfig:
     header_env_names: tuple[str, ...] = ()
     # 策略
     exposed_tools: frozenset[str] | None = None   # None=全部暴露；空集=全部禁用
+    disabled_tools: frozenset[str] = frozenset()
 
     def exposes_tool(self, tool_name: str) -> bool:
         if self.exposed_tools is None:
@@ -194,25 +196,23 @@ def _resolve_pythonpath(value: str) -> str:
         parts.append(str(candidate))
     return os.pathsep.join(parts)
 
-def _parse_policy(raw: Any, server_name: str) -> frozenset[str] | None:
+def _parse_policy(raw: Any, server_name: str) -> tuple[frozenset[str] | None, frozenset[str]]:
+    """解析暴露策略，返回 (allowlist, disabled_tools)。
+
+    禁用名单属于服务器配置本身，不应落到模块级全局；否则同一进程里
+    多次加载不同 mcp.json 时会把旧服务器状态泄漏到新配置。
+    """
     if not isinstance(raw, dict):
-        return None
+        return None, frozenset()
     if raw.get("expose") is False:
-        return frozenset()
+        return frozenset(), frozenset()
     disabled = raw.get("disabled_tools")
     if isinstance(disabled, list):
-        disabled_set = {str(item) for item in disabled if isinstance(item, str)}
+        disabled_set = frozenset(str(item) for item in disabled if isinstance(item, str))
         if disabled_set:
             logger.info("MCP server %s disables tools: %s", server_name, sorted(disabled_set))
-        # disabled_tools 无法在解析期减去远端实际工具列表（未知），
-        # 交给 list_tools 时的动态过滤；这里返回哨兵 —— 用 None 表示
-        # “动态过滤”，同时把禁用名单存入模块级 _DYNAMIC_DISABLED。
-        _DYNAMIC_DISABLED[server_name] = frozenset(disabled_set)
-        return None
-    return None
-
-# list_tools 时按服务器动态剔除的禁用工具（policy.disabled_tools）。
-_DYNAMIC_DISABLED: dict[str, frozenset[str]] = {}
+        return None, disabled_set
+    return None, frozenset()
 
 def _build_server(name: str, raw: Any) -> MCPServerConfig:
     if not isinstance(raw, dict):
@@ -223,11 +223,13 @@ def _build_server(name: str, raw: Any) -> MCPServerConfig:
         allowed_modules = {"search", "todo", "memory", "workspace", "bash"}
         if module not in allowed_modules:
             raise ValueError(f"{name}: in_process module must be one of {sorted(allowed_modules)}")
+        exposed_tools, disabled_tools = _parse_policy(raw.get("policy"), name)
         return MCPServerConfig(
             name=name,
             type="in_process",
             module=module,
-            exposed_tools=_parse_policy(raw.get("policy"), name),
+            exposed_tools=exposed_tools,
+            disabled_tools=disabled_tools,
         )
     if server_type == "stdio":
         command = str(raw.get("command") or "").strip()
@@ -244,6 +246,7 @@ def _build_server(name: str, raw: Any) -> MCPServerConfig:
             idle_timeout = float(raw.get("idle_timeout") or 900)
         except (TypeError, ValueError):
             idle_timeout = 900.0
+        exposed_tools, disabled_tools = _parse_policy(raw.get("policy"), name)
         return MCPServerConfig(
             name=name,
             type="stdio",
@@ -251,7 +254,8 @@ def _build_server(name: str, raw: Any) -> MCPServerConfig:
             args=args,
             env=env,
             idle_timeout=max(60.0, idle_timeout),
-            exposed_tools=_parse_policy(raw.get("policy"), name),
+            exposed_tools=exposed_tools,
+            disabled_tools=disabled_tools,
         )
     if server_type == "streamable_http":
         url_env = str(raw.get("url_env") or "").strip()
@@ -295,6 +299,7 @@ def _build_server(name: str, raw: Any) -> MCPServerConfig:
         except (TypeError, ValueError):
             timeout = 12.0
         timeout = min(max(timeout, 1.0), 60.0)
+        exposed_tools, disabled_tools = _parse_policy(raw.get("policy"), name)
         return MCPServerConfig(
             name=name,
             type="streamable_http",
@@ -302,7 +307,8 @@ def _build_server(name: str, raw: Any) -> MCPServerConfig:
             headers=headers,
             timeout=timeout,
             allowed_hosts=allowed_hosts,
-            exposed_tools=_parse_policy(raw.get("policy"), name),
+            exposed_tools=exposed_tools,
+            disabled_tools=disabled_tools,
             url_env=url_env,
             header_env_names=tuple(header_env_names),
         )
@@ -446,7 +452,8 @@ def _diagnose_mcp_exception(
 # ModelScope 的 streamable HTTP 网关在并发会话数升高时表现不稳定
 # （响应体截断 / SSE GET 流被立即关闭），限流到 2 降低上游抖动概率。
 def _max_http_concurrency() -> int:
-    raw = (os.getenv("EXTERNAL_MCP_MAX_CONCURRENCY") or "").strip()
+    """读取启动环境中的外部 MCP 并发上限，范围固定为 1..8。"""
+    raw = _runtime_env_get("EXTERNAL_MCP_MAX_CONCURRENCY")
     try:
         return max(1, min(int(raw), 8))
     except (TypeError, ValueError):
@@ -513,7 +520,7 @@ class _StdioConnection:
             # 必须存入 self._error 唤醒 ensure() 等待者，同时留 ERROR 级
             # 日志——否则 stdio 服务器起不来时唯一线索在等待方的异常里。
             logger.error(
-                "cp] stdio server %s keeper 异常退出 (scope=%s)",
+                "[mcp] stdio server %s keeper 异常退出 (scope=%s)",
                 self.display_name, self._scope, exc_info=exc,
             )
             self._error = exc
@@ -608,7 +615,8 @@ class MCPManager:
         return f"mcp__{server_name}__{tool_name}"
 
     def _dynamic_disabled(self, server_name: str) -> frozenset[str]:
-        return _DYNAMIC_DISABLED.get(server_name, frozenset())
+        server = self.servers.get(server_name)
+        return server.disabled_tools if server is not None else frozenset()
 
     async def _get_inprocess_registry(self, server: MCPServerConfig) -> Any:
         registry = self._inprocess_registry.get(server.name)
@@ -660,14 +668,14 @@ class MCPManager:
         cached = self._tools_cache.get(server_name)
         now = time.monotonic()
         if cached and not force_refresh and now - cached[0] < self._tools_cache_ttl:
-            return cached[1]
+            return copy.deepcopy(cached[1])
         lock = self._tools_refresh_locks.setdefault(server_name, asyncio.Lock())
         async with lock:
             # 双检：等待同服务器的另一协程刷新时，直接复用它的结果。
             cached = self._tools_cache.get(server_name)
             now = time.monotonic()
             if cached and not force_refresh and now - cached[0] < self._tools_cache_ttl:
-                return cached[1]
+                return copy.deepcopy(cached[1])
             try:
                 raw_tools = await self._list_raw_tools(server)
             except Exception as exc:
@@ -679,7 +687,7 @@ class MCPManager:
                     exc_info=True,
                 )
                 # 保留旧缓存（可能过期但聊胜于无）。
-                return cached[1] if cached else []
+                return copy.deepcopy(cached[1]) if cached else []
             disabled = self._dynamic_disabled(server_name)
             defs: list[dict] = []
             for tool in raw_tools:
@@ -690,7 +698,7 @@ class MCPManager:
                     continue
                 defs.append(self._tool_def(server_name, tool))
             self._tools_cache[server_name] = (now, defs)
-            return defs
+            return copy.deepcopy(defs)
 
     def _tool_def(self, server_name: str, tool: Any) -> dict:
         parameters = getattr(tool, "inputSchema", None)

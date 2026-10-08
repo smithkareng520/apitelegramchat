@@ -47,3 +47,43 @@
 - 定向测试集：`94 passed, 2 skipped`。
 - 2 个 skip 为仓库已有的真实 `tiktoken` 编码表依赖，在离线环境按现有规则跳过。
 - 当前执行环境仍缺少仓库声明的部分依赖（例如 `httpx2`），因此无法诚实地宣称完整测试套件全量通过。
+
+# 第二轮工具面与 MCP 稳定性优化 — 2026-10-09
+
+本轮重点检查 `tool_registry`、MCP 工具发现/缓存、内部 MCP schema 与工具 schema 规范化。
+
+## 生产代码优化
+
+1. `src/tool_registry.py`
+   - 保留工具总表缓存，但不再把缓存中的可变 dict 直接返回给调用方。
+   - `get_model_tools()` 每次返回深拷贝，避免协议转换、工具过滤或测试修改嵌套 schema 后污染后续请求。
+   - 增加 `invalidate_model_tools_cache()`，为运行时模型能力/工具配置发生变化时提供明确失效入口。
+
+2. `src/mcp_manager.py`
+   - `MCPServerConfig` 新增 `disabled_tools`，将 `policy.disabled_tools` 从模块级全局状态改为服务器实例状态。
+   - 修复重复加载不同 `mcp.json` 时旧禁用名单可能串到新配置的问题。
+   - `list_server_tools()` 对 TTL 缓存做深拷贝保护，调用方无法反向修改 manager 内部缓存。
+   - `EXTERNAL_MCP_MAX_CONCURRENCY` 改为从 `RUNTIME_ENV` 启动快照读取，修复 secret scrub 后从 `os.environ` 读取导致配置可能失效的问题。
+   - 修正 stdio keeper 异常日志前缀中的明显笔误。
+
+3. `src/mcpserver/catalogue.py`
+   - `ToolSpec.as_mcp_tool()` 对 `inputSchema` / `input_examples` 做深拷贝，避免 MCP SDK 调用方修改 catalogue 中的单例 schema。
+   - 将原先过宽的 `except Exception` 收紧为 SDK 属性/类型兼容性相关异常。
+
+4. `src/tool_assembly.py`
+   - `normalize_tool_schema()` 去除会吞掉真实编程错误的 blanket `except Exception`。
+   - 改为逐层检查工具 / function / parameters / properties 的运行时形状；格式异常时保持原 schema，不再静默掩盖其它 bug。
+
+## 新增回归覆盖
+
+- MCP `disabled_tools` 配置隔离。
+- MCP 工具 TTL 缓存返回值隔离。
+- `EXTERNAL_MCP_MAX_CONCURRENCY` 使用启动环境快照及 1..8 边界。
+- host 工具总表深拷贝隔离。
+- host 工具总表缓存显式失效。
+
+## 当前验证
+
+- `python -m compileall -q src tests`：通过。
+- 对关键变更执行独立直接回归脚本：通过。
+- 当前执行环境未安装仓库声明的完整依赖（包括 `mcp`、`tiktoken` 等），因此没有把无法在本环境完成的 pytest 全量结果冒充为通过。

@@ -128,3 +128,102 @@ async def test_list_server_tools_deduplicates_concurrent_refresh(monkeypatch):
     assert calls["count"] == 1
     assert results[0] == results[1]
     assert results[0][0]["function"]["name"] == "mcp__remote__ping"
+
+
+def test_load_servers_keeps_disabled_tools_scoped_to_each_config(tmp_path, monkeypatch):
+    import mcp_manager
+
+    monkeypatch.setattr(mcp_manager, "RUNTIME_ENV", {})
+
+    first = tmp_path / "first.json"
+    first.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "remote": {
+                        "type": "streamable_http",
+                        "url": "https://example.com/mcp",
+                        "policy": {"disabled_tools": ["blocked"]},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    second = tmp_path / "second.json"
+    second.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "remote": {
+                        "type": "streamable_http",
+                        "url": "https://example.com/mcp",
+                        "policy": {"disabled_tools": []},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    first_server = mcp_manager.load_servers(str(first))["remote"]
+    second_server = mcp_manager.load_servers(str(second))["remote"]
+
+    assert first_server.disabled_tools == frozenset({"blocked"})
+    assert second_server.disabled_tools == frozenset()
+
+
+def test_list_server_tools_returns_isolated_cached_definitions(monkeypatch):
+    import mcp_manager
+
+    manager = mcp_manager.MCPManager.__new__(mcp_manager.MCPManager)
+    manager.servers = {
+        "remote": mcp_manager.MCPServerConfig(
+            name="remote",
+            type="streamable_http",
+            url="https://example.com/mcp",
+        )
+    }
+    manager._stdio = {}
+    manager._inprocess_registry = {}
+    manager._reaper_task = None
+    manager._tools_cache = {}
+    manager._tools_refresh_locks = {}
+    manager._tools_cache_ttl = 300.0
+    manager._closed = False
+    monkeypatch.setattr(mcp_manager, "_MCP_SDK_AVAILABLE", True)
+
+    class Tool:
+        name = "ping"
+        description = "ping"
+        inputSchema = {
+            "type": "object",
+            "properties": {"nested": {"type": "object", "properties": {}}},
+        }
+        meta = None
+
+    async def fake_list_raw_tools(_server):
+        return [Tool()]
+
+    monkeypatch.setattr(manager, "_list_raw_tools", fake_list_raw_tools)
+
+    async def scenario():
+        first = await manager.list_server_tools("remote")
+        first[0]["function"]["parameters"]["properties"]["nested"]["properties"]["leak"] = {"type": "string"}
+        second = await manager.list_server_tools("remote")
+        assert "leak" not in second[0]["function"]["parameters"]["properties"]["nested"]["properties"]
+
+    asyncio.run(scenario())
+
+
+def test_max_http_concurrency_uses_runtime_environment_snapshot(monkeypatch):
+    import mcp_manager
+
+    monkeypatch.setattr(mcp_manager, "RUNTIME_ENV", {"EXTERNAL_MCP_MAX_CONCURRENCY": "6"})
+    assert mcp_manager._max_http_concurrency() == 6
+
+    monkeypatch.setattr(mcp_manager, "RUNTIME_ENV", {"EXTERNAL_MCP_MAX_CONCURRENCY": "999"})
+    assert mcp_manager._max_http_concurrency() == 8
+
+    monkeypatch.setattr(mcp_manager, "RUNTIME_ENV", {"EXTERNAL_MCP_MAX_CONCURRENCY": "0"})
+    assert mcp_manager._max_http_concurrency() == 1

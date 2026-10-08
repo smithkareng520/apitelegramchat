@@ -10,6 +10,7 @@
 # 子 agent 白名单、各协议桥接层都从这里取工具定义。
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any
 
@@ -103,11 +104,22 @@ async def mcp_tool_defs() -> list[dict]:
             defs.extend(await mcp_manager.list_server_tools(server_name))
     return defs
 
-async def get_model_tools() -> list[dict]:
-    """默认（USER / 草稿模式）回合的完整模型工具面。"""
+def invalidate_model_tools_cache() -> None:
+    """清空 host 工具总表缓存；供运行时配置/模型能力变更时调用。"""
     global _tools_cache
-    if _tools_cache is not None:
-        return _tools_cache
-    defs = [*builtin_tool_defs(), *await mcp_tool_defs()]
-    _tools_cache = defs
-    return defs
+    _tools_cache = None
+
+
+async def get_model_tools() -> list[dict]:
+    """默认（USER / 草稿模式）回合的完整模型工具面。
+
+    缓存只保存内部基准副本；每次返回深拷贝，避免任一协议适配器、
+    tool filter 或测试修改嵌套 schema 后污染后续请求。外部 MCP 的
+    发现/TTL 缓存仍由 ``MCPManager`` 自己负责。
+    """
+    global _tools_cache
+    if _tools_cache is None:
+        # 缓存自身也与模块级工具常量彻底脱钩；后续任何调用方或测试
+        # 修改常量对象，都不会反向修改缓存基准。
+        _tools_cache = copy.deepcopy([*builtin_tool_defs(), *await mcp_tool_defs()])
+    return copy.deepcopy(_tools_cache)

@@ -31,25 +31,30 @@ def normalize_tool_schema(tool: dict) -> dict:
     - text_editor 保留 ``command`` 首位（封闭枚举，便于流式推断）。
     """
     import copy
+
     tool = copy.deepcopy(tool)
-    try:
-        params = tool["function"]["parameters"]
-        props = params.get("properties")
-        if isinstance(props, dict):
-            required = [k for k in (params.get("required") or []) if k in props]
-            required_set = set(required)
-            optional = [k for k in props if k not in required_set]
-            ordered = required + optional
+    function = tool.get("function")
+    if not isinstance(function, dict):
+        return tool
+    params = function.get("parameters")
+    if not isinstance(params, dict):
+        return tool
+    props = params.get("properties")
+    if not isinstance(props, dict):
+        return tool
 
-            name = _schema_key(tool.get("function", {}).get("name"))
-            if name == "bash" and "description" in props:
-                ordered = ["description"] + [k for k in ordered if k != "description"]
-            elif name == "text_editor" and "command" in props:
-                ordered = ["command"] + [k for k in ordered if k != "command"]
+    required = [k for k in (params.get("required") or []) if k in props]
+    required_set = set(required)
+    optional = [k for k in props if k not in required_set]
+    ordered = required + optional
 
-            params["properties"] = {k: props[k] for k in ordered}
-    except Exception:
-        pass
+    name = _schema_key(function.get("name"))
+    if name == "bash" and "description" in props:
+        ordered = ["description"] + [k for k in ordered if k != "description"]
+    elif name == "text_editor" and "command" in props:
+        ordered = ["command"] + [k for k in ordered if k != "command"]
+
+    params["properties"] = {k: props[k] for k in ordered}
     return tool
 
 def tool_name(tool: dict) -> str:
