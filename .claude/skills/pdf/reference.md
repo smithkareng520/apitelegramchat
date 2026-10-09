@@ -167,99 +167,24 @@ async function mergePDFs() {
 }
 ```
 
-### pdfjs-dist (Apache License)
+### Text, coordinates and annotations without pdfjs-dist
 
-PDF.js is Mozilla's JavaScript library for rendering PDFs in the browser.
+The image does not ship `pdfjs-dist` (large, and no script uses it). Use `pdfplumber` (text with coordinates) and `pypdf` (annotations) instead:
 
-#### Basic PDF Loading and Rendering
-```javascript
-import * as pdfjsLib from 'pdfjs-dist';
+```python
+import pdfplumber
+from pypdf import PdfReader
 
-// Configure worker (important for performance)
-pdfjsLib.GlobalWorkerOptions.workerSrc = './pdf.worker.js';
+with pdfplumber.open("document.pdf") as pdf:
+    for i, page in enumerate(pdf.pages, 1):
+        print(f"--- Page {i} ---")
+        print(page.extract_text())
+        words = page.extract_words()          # [{'text', 'x0', 'x1', 'top', 'bottom'}, ...]
 
-async function renderPDF() {
-    // Load PDF
-    const loadingTask = pdfjsLib.getDocument('document.pdf');
-    const pdf = await loadingTask.promise;
-
-    console.log(`Loaded PDF with ${pdf.numPages} pages`);
-
-    // Get first page
-    const page = await pdf.getPage(1);
-    const viewport = page.getViewport({ scale: 1.5 });
-
-    // Render to canvas
-    const canvas = document.createElement('canvas');
-    const context = canvas.getContext('2d');
-    canvas.height = viewport.height;
-    canvas.width = viewport.width;
-
-    const renderContext = {
-        canvasContext: context,
-        viewport: viewport
-    };
-
-    await page.render(renderContext).promise;
-    document.body.appendChild(canvas);
-}
-```
-
-#### Extract Text with Coordinates
-```javascript
-import * as pdfjsLib from 'pdfjs-dist';
-
-async function extractText() {
-    const loadingTask = pdfjsLib.getDocument('document.pdf');
-    const pdf = await loadingTask.promise;
-
-    let fullText = '';
-
-    // Extract text from all pages
-    for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const textContent = await page.getTextContent();
-
-        const pageText = textContent.items
-            .map(item => item.str)
-            .join(' ');
-
-        fullText += `\n--- Page ${i} ---\n${pageText}`;
-
-        // Get text with coordinates for advanced processing
-        const textWithCoords = textContent.items.map(item => ({
-            text: item.str,
-            x: item.transform[4],
-            y: item.transform[5],
-            width: item.width,
-            height: item.height
-        }));
-    }
-
-    console.log(fullText);
-    return fullText;
-}
-```
-
-#### Extract Annotations and Forms
-```javascript
-import * as pdfjsLib from 'pdfjs-dist';
-
-async function extractAnnotations() {
-    const loadingTask = pdfjsLib.getDocument('annotated.pdf');
-    const pdf = await loadingTask.promise;
-
-    for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const annotations = await page.getAnnotations();
-
-        annotations.forEach(annotation => {
-            console.log(`Annotation type: ${annotation.subtype}`);
-            console.log(`Content: ${annotation.contents}`);
-            console.log(`Coordinates: ${JSON.stringify(annotation.rect)}`);
-        });
-    }
-}
+for i, page in enumerate(PdfReader("annotated.pdf").pages, 1):
+    for annot in page.get("/Annots", []):
+        a = annot.get_object()
+        print(i, a.get("/Subtype"), a.get("/Contents"), a.get("/Rect"))
 ```
 
 ## Advanced Command-Line Operations
@@ -425,17 +350,9 @@ doc.build(elements)
 
 ## Complex Workflows
 
+## Chinese / CJK text
 
-## Chinese / CJK fonts
-
-Use the renderer-specific font documented below:
-
-| Renderer | Font | Path | Notes |
-|---|---|---|---|
-| ReportLab | AR PL UKai CN (`ukai.ttc`, subfont 0) | `/usr/share/fonts/truetype/arphic/ukai.ttc` | Kaiti-style TrueType collection; embed with `TTFont(..., subfontIndex=0)` |
-| LibreOffice / DOCX | Noto Sans CJK SC | `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` | CFF collection; use as a system font, not with ReportLab `TTFont` |
-
-For ReportLab, use `scripts/cjk_font.py` or register the TrueType font explicitly. Do not pass the Noto CJK TTC to `TTFont`: ReportLab will reject CFF/PostScript outlines.
+The image installs no fonts. ReportLab writes CJK text with its built-in CID fonts (`STSong-Light`, `MSung-Light`, `HeiseiMin-W3`, `HYSMyeongJo-Medium`), which are drawn by the reader's viewer and are not embedded. Use `scripts/cjk_font.py` (`register_fonts(lang=...)`) and `scripts/emoji_font.py`; see SKILL.md "Chinese / CJK text". Verify Chinese output with `pypdf`/`pdfplumber`, not page images or `pdftotext` (no CJK system font, no `poppler-data`).
 
 ### Extract Figures/Images from PDF
 
@@ -599,18 +516,7 @@ qpdf --replace-input corrupted.pdf
 ```
 
 ### Text Extraction Issues
-```python
-# Fallback to OCR for scanned PDFs
-import pytesseract
-from pdf2image import convert_from_path
-
-def extract_text_with_ocr(pdf_path):
-    images = convert_from_path(pdf_path)
-    text = ""
-    for i, image in enumerate(images):
-        text += pytesseract.image_to_string(image)
-    return text
-```
+Scanned (image-only) PDFs have no text layer; OCR is not available in this environment, so rasterize pages with `pdf2image` and inspect them visually instead.
 
 ## License Information
 
@@ -621,4 +527,3 @@ def extract_text_with_ocr(pdf_path):
 - **poppler-utils**: GPL-2 License
 - **qpdf**: Apache License
 - **pdf-lib**: MIT License
-- **pdfjs-dist**: Apache License

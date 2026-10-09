@@ -1,8 +1,20 @@
-"""Shared CJK font helpers for the PDF skill.
+"""Font-free CJK helpers for the PDF skill (small-image friendly).
 
-ReportLab can embed both standalone TrueType fonts and TrueType collections
-(TTC). The production PDF path uses AR PL UKai CN, a free Kaiti-style CJK
-font with Japanese kana and broad Han coverage.
+The Docker image installs **no font files**. ReportLab already ships the
+Adobe CID-keyed CJK fonts as *references* (no font file needed): the PDF
+stores the character codes and the viewer (Acrobat, Chrome, Edge, Preview,
+iOS/Android viewers, ...) draws them with a CJK font installed on the
+reader's machine. Nothing is embedded, so generated PDFs stay tiny.
+
+Trade-offs to remember:
+* The glyph shapes depend on the viewer's system font.
+* Server-side rasterisation (pdftoppm / pdf2image) inside this image has no
+  CJK font, so Chinese shows as blanks there. Verify text with
+  ``pypdf`` / ``pdftotext`` instead of page images.
+
+Optional escape hatch: if a deployment mounts a TrueType font and sets
+``APITELEGRAMCHAT_REPORTLAB_CJK_FONT`` (and ``..._SUBFONT_INDEX`` for TTC),
+that font is embedded instead. It is never required.
 """
 
 from __future__ import annotations
@@ -10,93 +22,87 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# AR PL UKai is a Kaiti-style TrueType collection. Subfont 0 is the CN flavor.
-# Keep the path configurable so downstream images can relocate the font without
-# patching the skill again.
-REPORTLAB_CJK_FONT = Path(
-    os.environ.get(
-        "APITELEGRAMCHAT_REPORTLAB_CJK_FONT",
-        "/usr/share/fonts/truetype/arphic/ukai.ttc",
-    )
-)
+# language -> built-in ReportLab CID font (no file on disk needed)
+CID_FONTS = {
+    "zh": "STSong-Light",         # Simplified Chinese (Adobe-GB1)
+    "zh-tw": "MSung-Light",       # Traditional Chinese (Adobe-CNS1)
+    "ja": "HeiseiMin-W3",         # Japanese (Adobe-Japan1)
+    "ko": "HYSMyeongJo-Medium",   # Korean (Adobe-Korea1)
+}
+DEFAULT_CJK_FONT_NAME = "CJK"
+
+_override = os.environ.get("APITELEGRAMCHAT_REPORTLAB_CJK_FONT", "").strip()
+REPORTLAB_CJK_FONT = Path(_override) if _override else None
 REPORTLAB_CJK_SUBFONT_INDEX = int(
     os.environ.get("APITELEGRAMCHAT_REPORTLAB_CJK_SUBFONT_INDEX", "0")
 )
-LO_CJK_FONT = Path(
-    os.environ.get(
-        "APITELEGRAMCHAT_CJK_FONT_FILE",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    )
-)
 
 
-def register_reportlab_cjk_font(name: str = "CJKKai") -> str:
-    """Register the production Kaiti-style CJK font with ReportLab.
+def register_reportlab_cjk_font(name: str = DEFAULT_CJK_FONT_NAME, lang: str = "zh") -> str:
+    """Register a CJK font and return the name to use as ``fontName``.
 
-    The default resource is the first (CN) face in ``ukai.ttc``. ReportLab's
-    TTFont parser supports TTC resources through ``subfontIndex``.
+    Uses the optional TrueType override when configured, otherwise the
+    built-in CID font for ``lang`` (``zh``, ``zh-tw``, ``ja``, ``ko``); in that case the returned name is the
+    CID font's own name (e.g. ``STSong-Light``), not ``name``.
+    Also registers a font family so ``<b>``/``<i>`` inside Paragraph markup
+    keep the CJK font instead of switching to Helvetica (which has no CJK).
     """
     from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
 
-    if not REPORTLAB_CJK_FONT.is_file():
-        raise FileNotFoundError(
-            f"Missing ReportLab Kaiti CJK font: {REPORTLAB_CJK_FONT}. "
-            "Install the production `fonts-arphic-ukai` package instead of "
-            "downloading a font at runtime."
-        )
+    if REPORTLAB_CJK_FONT is not None:
+        from reportlab.pdfbase.ttfonts import TTFont
 
-    pdfmetrics.registerFont(
-        TTFont(
-            name,
-            str(REPORTLAB_CJK_FONT),
-            subfontIndex=REPORTLAB_CJK_SUBFONT_INDEX,
+        if not REPORTLAB_CJK_FONT.is_file():
+            raise FileNotFoundError(
+                f"APITELEGRAMCHAT_REPORTLAB_CJK_FONT points to a missing file: "
+                f"{REPORTLAB_CJK_FONT}. Unset it to use the built-in CID font."
+            )
+        pdfmetrics.registerFont(
+            TTFont(name, str(REPORTLAB_CJK_FONT), subfontIndex=REPORTLAB_CJK_SUBFONT_INDEX)
         )
-    )
+    else:
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
+        try:
+            cid_name = CID_FONTS[lang]
+        except KeyError:
+            raise ValueError(f"lang must be one of {sorted(CID_FONTS)}, got {lang!r}") from None
+        pdfmetrics.registerFont(UnicodeCIDFont(cid_name))
+        name = cid_name  # built-in CID fonts are addressed by their own name
+    pdfmetrics.registerFontFamily(name, normal=name, bold=name, italic=name, boldItalic=name)
     return name
 
 
-def font_supports_text(text: str, name: str = "CJKKai") -> tuple[str, ...]:
-    """Return characters missing from a registered ReportLab font."""
-    font = pdfmetrics_get_font(name)
-    char_widths = getattr(font.face, "charWidths", {})
-    return tuple(dict.fromkeys(ch for ch in text if ord(ch) not in char_widths))
+def font_supports_text(text: str, name: str = DEFAULT_CJK_FONT_NAME) -> tuple[str, ...]:
+    """Characters a *embedded* TrueType override cannot draw.
 
-
-def pdfmetrics_get_font(name: str):
-    """Resolve a registered ReportLab font without importing private internals."""
+    Built-in CID fonts carry no glyph table, so coverage is up to the viewer;
+    for them this returns ``()``.
+    """
     from reportlab.pdfbase import pdfmetrics
 
-    return pdfmetrics.getFont(name)
+    font = pdfmetrics.getFont(name)
+    widths = getattr(getattr(font, "face", None), "charWidths", None)
+    if not widths:
+        return ()
+    return tuple(dict.fromkeys(ch for ch in text if ord(ch) not in widths))
 
 
 def assert_cjk_runtime() -> None:
-    """Fail early when production CJK font resources are not present."""
-    missing = [p for p in (REPORTLAB_CJK_FONT, LO_CJK_FONT) if not p.is_file()]
-    if missing:
-        paths = ", ".join(str(p) for p in missing)
-        raise FileNotFoundError(f"Missing production CJK font resources: {paths}")
+    """Fail early only when an explicitly configured font file is missing."""
+    if REPORTLAB_CJK_FONT is not None and not REPORTLAB_CJK_FONT.is_file():
+        raise FileNotFoundError(f"Missing configured CJK font: {REPORTLAB_CJK_FONT}")
 
 
-def register_fonts(
-    cjk_name: str = "CJKKai",
-    emoji_name: str = "EmojiMono",
-) -> tuple[str, str]:
-    """Register the CJK font and the monochrome emoji font in one call.
+def register_fonts(cjk_name: str = DEFAULT_CJK_FONT_NAME, lang: str = "zh") -> str:
+    """Register the CJK font; returns the font name to use in ``fontName=``.
 
-    ReportLab has no automatic font fallback, so PDFs that may contain
-    emoji need both fonts registered. Emoji-bearing text must then go
-    through ``emoji_font.to_fallback_markup()`` (Paragraphs) or
-    ``emoji_font.draw_mixed_string()`` (canvas) — see the skill SKILL.md
-    "Emoji handling" section.
+    There is no emoji font any more: run text through
+    ``emoji_font.to_fallback_markup()`` / ``safe_paragraph()`` /
+    ``draw_mixed_string()`` so emoji are replaced or dropped instead of
+    rendering as black boxes.
 
-    Returns ``(cjk_name, emoji_name)``.
-
-    After calling this, always use custom ParagraphStyles with ``fontName='CJKKai'``
-    instead of default styles (which use Helvetica and don't support Chinese).
+    ReportLab's default styles use Helvetica (no CJK). Always build styles
+    with ``fontName=<returned name>``.
     """
-    from emoji_font import register_emoji_font
-
-    register_reportlab_cjk_font(cjk_name)
-    register_emoji_font(emoji_name)
-    return cjk_name, emoji_name
+    return register_reportlab_cjk_font(cjk_name, lang)

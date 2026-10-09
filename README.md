@@ -736,8 +736,8 @@ docker build -t apitelegramchat .
 docker run --rm --env-file .env -p 5000:5000 apitelegramchat
 ```
 
-镜像包含 Python 3 / Node.js 22 / gcc / cmake / LibreOffice / Pandoc /
-ImageMagick / Tesseract / Poppler / qpdf 等 Skill 依赖，以非 root 用户
+镜像包含 Python 3 / Node.js 22 / gcc / cmake / LibreOffice Writer / Pandoc /
+ImageMagick / Poppler / qpdf 等 Skill 依赖，以非 root 用户
 （UID/GID 2000）运行，默认 `PORT=5000`、
 `APITELEGRAMCHAT_DATA_DIR=/tmp/apitelegramchat_data`（内部状态）与
 `APITELEGRAMCHAT_WORKSPACES_DIR=/home`（工作空间根，`/home` 已在镜像内
@@ -907,24 +907,23 @@ serper.dev 控制台（免费版 2,500 次/月）。
 MCP 默认只暴露 `READ_ONLY_SPECS`；mutation 工具需要显式 opt-in，且
 scope 未设置时 Server 直接拒绝启动。
 
-### 8. 生成的 PDF 里 emoji 变成方块/乱码
+### 8. 生成的 PDF / Word 里中文或 emoji 不显示
 
-ReportLab 不会自动做字体 fallback。现在项目把这件事集中在
-`.claude/skills/pdf/scripts/emoji_font.py`：先用 `register_fonts()` 做一次
-初始化，正文优先使用 `safe_paragraph(text, style)`；底层 canvas 代码使用
-`draw_mixed_string()` / `string_width_mixed()`。`to_fallback_markup()` 仍然保留
-用于兼容旧代码，并且现在可以直接接收 `ParagraphStyle`，不再需要先手工
-取 `style.fontName`。
+为节省镜像体积，镜像**不安装任何字体，也不含 OCR**，LibreOffice 只装 Writer。
 
-fallback 层按实际注册字体的 glyph coverage 判断，并尽量按 Unicode grapheme
-cluster 保持完整，因此 ZWJ emoji、变体选择符、肤色修饰和旗帜序列不再
-轻易被拆成多个不完整字符。双字体都不支持的字符默认删除，传
-`missing_report=[]` 可以记录被省略的字符，避免悄悄丢内容。
+- **PDF 技能**：`.claude/skills/pdf/scripts/cjk_font.py` 用 ReportLab 内置的 CID
+  中日韩字体（如 `STSong-Light`），PDF 里只保存字符编码，由**阅读器所在设备**的
+  字体绘制，因此不嵌入字体、文件很小；字形取决于阅读器。emoji 无法绘制，
+  `emoji_font.py` 会把常见符号换成普通符号（`✅`→`√`、`❌`→`×`），其余删除并
+  通过 `missing_report` 报告。如需完全嵌入字体，自行挂载 TrueType 字体并设置
+  `APITELEGRAMCHAT_REPORTLAB_CJK_FONT`（`.ttc` 另设 `..._SUBFONT_INDEX`）。
+- **Word 技能**：docx 只记录字体名（`eastAsia: "Microsoft YaHei"`），中文和
+  emoji 在用户的 Word 里正常显示。
+- **镜像内预览**：没有字体也没有 `poppler-data`，渲染出的页面图和 `pdftotext`
+  看不到这些 PDF 的中文，属正常现象；请用 `pypdf` / `pdfplumber` 验证文字，
+  页面图只用来检查版式。
 
-生产镜像仍然在构建时下载并校验单色 `NotoEmoji-Regular.ttf`；系统里的
-`NotoColorEmoji` 继续给 LibreOffice/DOCX 路径使用，而不会直接喂给 ReportLab。
-运行 `python3 .claude/skills/pdf/scripts/check_cjk_runtime.py` 可检查 CJK +
-emoji 运行时依赖。
+运行 `python3 .claude/skills/pdf/scripts/check_cjk_runtime.py` 可做无字体的自检。
 
 ---
 

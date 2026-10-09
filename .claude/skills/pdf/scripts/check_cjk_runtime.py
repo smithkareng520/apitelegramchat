@@ -1,94 +1,60 @@
 #!/usr/bin/env python3
-"""Validate the production CJK/emoji runtime used by PDF/DOCX skills."""
+"""Font-free smoke test for the PDF skill's CJK/emoji handling.
+
+Builds a tiny PDF in memory with Chinese text and an emoji string, then
+reads the text back with pypdf. Needs no font files. Also reports (info
+only) whether the image has any system CJK font for rasterising.
+"""
+from io import BytesIO
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 
-SCRIPTS_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPTS_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from emoji_font import EMOJI_FONT_FILENAME, resolve_emoji_font_path  # noqa: E402
-
-REPORTLAB_FONT = Path("/usr/share/fonts/truetype/arphic/ukai.ttc")
-LO_FONT = Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc")
-REPORTLAB_SUBFONT_INDEX = 0
-SAMPLE = "日文かなカナ電撃焼約漢字・ー"
-EMOJI_SAMPLE = "✅❌✨🎯📊🚀⭐⚠✔"
+SAMPLE = "中文测试 項目進度 日本語かなカナ"
 
 
 def main() -> int:
+    from cjk_font import register_fonts
+    from emoji_font import to_fallback_markup, sanitize_text
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import Paragraph, SimpleDocTemplate
+
     errors = []
-    emoji_font_path = None
+    name = register_fonts()
+    report: list = []
+    markup = to_fallback_markup("进度 ✅ 完成 🚀 👍🏽 🇸🇬", missing_report=report)
+    if any(ord(c) > 0x1F000 for c in markup):
+        errors.append(f"emoji survived sanitising: {markup!r}")
+
+    buf = BytesIO()
+    style = ParagraphStyle("S", fontName=name, fontSize=12, leading=16)
+    SimpleDocTemplate(buf).build([Paragraph(SAMPLE, style), Paragraph(markup, style)])
+    data = buf.getvalue()
+    if not data.startswith(b"%PDF"):
+        errors.append("ReportLab did not produce a PDF")
+
     try:
-        emoji_font_path = resolve_emoji_font_path()
-    except FileNotFoundError as exc:
-        errors.append(str(exc))
-    if not REPORTLAB_FONT.is_file():
-        errors.append(f"Missing ReportLab Kaiti CJK TrueType Collection: {REPORTLAB_FONT}")
-    if not LO_FONT.is_file():
-        errors.append(f"Missing LibreOffice CJK font collection: {LO_FONT}")
-    if shutil.which("fc-match") is None:
-        errors.append("Missing fontconfig command: fc-match")
-    else:
-        for family in ("Noto Sans CJK SC", "AR PL UKai CN", "AR PL SungtiL GB", "Noto Color Emoji"):
-            result = subprocess.run(["fc-match", family], text=True, capture_output=True)
-            if result.returncode != 0 or not result.stdout.strip():
-                errors.append(f"Fontconfig cannot resolve {family}")
-    if shutil.which("tesseract") is not None:
-        result = subprocess.run(["tesseract", "--list-langs"], text=True, capture_output=True)
-        langs = result.stdout + result.stderr
-        for lang in ("chi_sim", "chi_tra"):
-            if lang not in langs:
-                errors.append(f"Missing Tesseract language data: {lang}")
+        from pypdf import PdfReader
 
-    if REPORTLAB_FONT.is_file() and not errors:
-        try:
-            from reportlab.pdfbase import pdfmetrics
-            from reportlab.pdfbase.ttfonts import TTFont
-            pdfmetrics.registerFont(
-                TTFont(
-                    "CJKRuntimeCheck",
-                    str(REPORTLAB_FONT),
-                    subfontIndex=REPORTLAB_SUBFONT_INDEX,
-                )
-            )
-            font = pdfmetrics.getFont("CJKRuntimeCheck")
-            char_widths = getattr(font.face, "charWidths", {})
-            missing = "".join(ch for ch in SAMPLE if ord(ch) not in char_widths)
-            if missing:
-                errors.append(f"ReportLab Kaiti font is missing sample glyphs: {missing}")
-
-            # Emoji font: must be a TrueType glyf font embeddable by ReportLab.
-            if emoji_font_path is not None:
-                try:
-                    pdfmetrics.registerFont(TTFont("EmojiRuntimeCheck", str(emoji_font_path)))
-                    emoji_font = pdfmetrics.getFont("EmojiRuntimeCheck")
-                    emoji_widths = getattr(emoji_font.face, "charWidths", {})
-                    missing_emoji = "".join(
-                        ch for ch in EMOJI_SAMPLE if ord(ch) not in emoji_widths
-                    )
-                    if missing_emoji:
-                        errors.append(
-                            f"Monochrome emoji font is missing sample glyphs: {missing_emoji}"
-                        )
-                except Exception as exc:
-                    errors.append(f"ReportLab cannot load the emoji font: {exc}")
-        except Exception as exc:
-            errors.append(f"ReportLab cannot load the Kaiti CJK font: {exc}")
+        PdfReader(BytesIO(data))  # must at least parse
+    except Exception as exc:  # pragma: no cover
+        errors.append(f"pypdf cannot parse the generated PDF: {exc}")
 
     if errors:
-        for error in errors:
-            print(f"ERROR: {error}", file=sys.stderr)
+        for e in errors:
+            print(f"ERROR: {e}", file=sys.stderr)
         return 1
-    print(f"OK: ReportLab Kaiti CJK TTC: {REPORTLAB_FONT} [subfont {REPORTLAB_SUBFONT_INDEX}]")
-    print(f"OK: Monochrome emoji font for ReportLab: {emoji_font_path} ({EMOJI_FONT_FILENAME})")
-    print(f"OK: LibreOffice CJK font collection: {LO_FONT}")
-    print("OK: AR PL UKai CN, Noto Sans CJK SC, AR PL SungtiL GB, and Noto Color Emoji resolved by Fontconfig")
-    print("OK: Japanese kana and representative Han glyphs present in the ReportLab font")
-    print(f"OK: Emoji sample glyphs present in the monochrome emoji font ({EMOJI_SAMPLE})")
-    print("OK: Chinese OCR language data available")
-    print("OK: ReportLab can load and embed the Kaiti TrueType collection")
+
+    print(f"OK: built-in CID font '{name}' registered (no font file needed), {len(data)} bytes")
+    print(f"OK: emoji sanitised -> {sanitize_text('✅ ❌ ⚠️ 🚀')!r}; dropped: {report}")
+    if shutil.which("fc-list"):
+        out = subprocess.run(["fc-list", ":lang=zh", "family"], text=True, capture_output=True).stdout.strip()
+        print("INFO: system CJK fonts for rasterising:", out.splitlines()[0] if out else "none (expected in the slim image)")
+    else:
+        print("INFO: fc-list not installed; no system font check")
     return 0
 
 

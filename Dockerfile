@@ -11,17 +11,6 @@ ENV APITELEGRAMCHAT_DATA_DIR=/tmp/apitelegramchat_data
 # data_root 前缀。/home 必须对运行用户可写（见下方 chown）。
 ENV APITELEGRAMCHAT_WORKSPACES_DIR=/home
 ENV TZ=Asia/Shanghai
-# Stable CJK font used by PDF generation and server-side Office rendering.
-ENV APITELEGRAMCHAT_CJK_FONT=NotoSansCJKsc
-ENV APITELEGRAMCHAT_CJK_FONT_FILE=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
-# ReportLab needs a TrueType outline for embedding; Noto CJK uses CFF outlines.
-ENV APITELEGRAMCHAT_REPORTLAB_CJK_FONT=/usr/share/fonts/truetype/arphic/ukai.ttc
-ENV APITELEGRAMCHAT_REPORTLAB_CJK_SUBFONT_INDEX=0
-# ReportLab 也无法自动 fallback：emoji 走单色 Noto Emoji（glyf 轮廓，可嵌入；
-# 系统里的 NotoColorEmoji.ttf 是 CBDT 位图，ReportLab 不能嵌入）。
-# 该字体不随项目文件提交，构建时从上游下载并校验 checksum，见下方下载层。
-ENV APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT=/usr/share/fonts/truetype/noto-emoji-mono/NotoEmoji-Regular.ttf
-
 # 配置系统时区为上海（CST/UTC+8）
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
@@ -31,6 +20,8 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 # 托管平台一定允许某个内核接口。
 # 不需要 bubblewrap —— bwrap 依赖的 unprivileged userns 在部分托管容器中
 # 被宿主策略禁用；Landlock 更适合本项目的非特权文件系统边界。
+# 小体积镜像：不装任何字体、不装 OCR；LibreOffice 只装 Writer（docx 技能的
+# 转换/渲染/接受修订只需要 Writer，不装 Calc/Impress/Draw 等）。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
@@ -48,39 +39,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
-        libreoffice \
+        libreoffice-writer \
         poppler-utils \
         qpdf \
         pandoc \
         imagemagick \
-        tesseract-ocr \
-        tesseract-ocr-chi-sim \
-        tesseract-ocr-chi-tra \
-        fontconfig \
-        fonts-noto-cjk \
-        fonts-noto-color-emoji \
-        fonts-arphic-gbsn00lp \
-        fonts-arphic-ukai \
-    && fc-cache -f -v >/dev/null \
-    && fc-match "Noto Sans CJK SC" >/dev/null \
-    && fc-match "Noto Color Emoji" >/dev/null \
-    && test -f /usr/share/fonts/truetype/arphic-gbsn00lp/gbsn00lp.ttf \
-    && test -f /usr/share/fonts/truetype/arphic/ukai.ttc \
-    && tesseract --list-langs 2>/dev/null | grep -qx "chi_sim" \
-    && tesseract --list-langs 2>/dev/null | grep -qx "chi_tra" \
     && rm -rf /var/lib/apt/lists/*
-
-# 单色 Noto Emoji 字体（ReportLab emoji fallback 用）：不随项目文件提交，
-# 构建时从上游固定 tag 下载，并校验 sha256，避免供应链投毒或静默替换。
-# 固定 tag（而非 main 分支）是为了可复现构建：上游文件内容不会因为分支
-# 更新而变化，checksum 长期有效，下次升级字体版本时一并更新下面两行。
-ENV NOTO_EMOJI_VERSION=v2.034
-ENV NOTO_EMOJI_SHA256=415dc6290378574135b64c808dc640c1df7531973290c4970c51fdeb849cb0c5
-RUN mkdir -p /usr/share/fonts/truetype/noto-emoji-mono \
-    && curl -fsSL -o /usr/share/fonts/truetype/noto-emoji-mono/NotoEmoji-Regular.ttf \
-        "https://raw.githubusercontent.com/googlefonts/noto-emoji/${NOTO_EMOJI_VERSION}/fonts/NotoEmoji-Regular.ttf" \
-    && echo "${NOTO_EMOJI_SHA256}  /usr/share/fonts/truetype/noto-emoji-mono/NotoEmoji-Regular.ttf" | sha256sum -c - \
-    && fc-cache -f -v >/dev/null
 
 # 基础镜像 node:22-bookworm-slim 自带系统用户 node（/home/node，uid/gid
 # 通常为 1000），未被后续任何步骤 chown。而 workspaces_root() 默认把
@@ -113,12 +77,6 @@ COPY README.md ./
 # 项目根（/app/mcp.json）加载；缺失会导致全部 MCP 工具（含内部 stdio
 # 服务器与 gaode_mcp）不可用，必须在镜像内。
 COPY mcp.json ./
-
-# 校验下载的单色 emoji 字体已就位，且 emoji_font.py 的 resolve_emoji_font_path()
-# 真的能解析到它（不依赖 reportlab，只查路径与 TrueType magic）。此时 .claude
-# 已 COPY 进镜像，才能 import 到技能脚本目录下的 emoji_font 模块。
-RUN test -f "$APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT" \
-    && python3 -c "import sys; sys.path.insert(0, '/app/.claude/skills/pdf/scripts'); from emoji_font import resolve_emoji_font_path; p = resolve_emoji_font_path(); assert open(p, 'rb').read(4) == b'\\x00\\x01\\x00\\x00', 'not a TrueType font'; print('EmojiMono OK:', p)"
 
 RUN python3 -m pip install --break-system-packages --no-cache-dir --upgrade pip && \
     python3 -m pip install --break-system-packages --no-cache-dir -r requirements.txt && \

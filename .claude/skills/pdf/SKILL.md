@@ -1,6 +1,6 @@
 ---
 name: pdf
-description: Use this skill whenever the user wants to do anything with PDF files. This includes reading or extracting text/tables from PDFs, combining or merging multiple PDFs into one, splitting PDFs apart, rotating pages, adding watermarks, creating new PDFs, filling PDF forms, encrypting/decrypting PDFs, extracting images, and OCR on scanned PDFs to make them searchable. If the user mentions a .pdf file or asks to produce one, use this skill.
+description: Use this skill whenever the user wants to do anything with PDF files. This includes reading or extracting text/tables from PDFs, combining or merging multiple PDFs into one, splitting PDFs apart, rotating pages, adding watermarks, creating new PDFs, filling PDF forms, encrypting/decrypting PDFs, extracting images. OCR is not available in this environment. If the user mentions a .pdf file or asks to produce one, use this skill.
 license: Proprietary. LICENSE.txt has complete terms
 ---
 
@@ -187,84 +187,37 @@ squared = Paragraph("x<super>2</super> + y<super>2</super>", styles['Normal'])
 For canvas-drawn text (not Paragraph objects), manually adjust font the size and position rather than using Unicode subscripts/superscripts.
 
 
-## Chinese / CJK font requirements (production)
+## Chinese / CJK text (no font files in the image)
 
-The production Docker image installs **two different CJK font resources for two different renderers**. Treat both as image/runtime dependencies; do not install or download fonts during a normal user request.
+The Docker image is slim: it installs **no font files and no OCR**. Do not download or install fonts during a user request.
 
-### ReportLab: embedded Kaiti-style CJK font
+ReportLab can still write Chinese/Japanese/Korean PDFs because it ships the Adobe CID fonts as *references*: the PDF stores character codes and the **reader's** viewer draws them with a CJK font installed on the reader's device. Nothing is embedded, so files stay small.
 
-ReportLab `TTFont` can embed TrueType fonts and TrueType collections (TTC). The production PDF path uses the first face of Debian's **AR PL UKai** collection, which is a Kaiti-style Unicode font. The CN face covers Hiragana and Katakana and has broad Han coverage, making it a better fit for mixed Chinese/Japanese text than the old Arphic Song fallback.
-
-- Font file: `/usr/share/fonts/truetype/arphic/ukai.ttc`
-- TTC subfont: `0` (AR PL UKai CN)
-- Recommended registered name: `CJKKai`
-- Package: `fonts-arphic-ukai`
-
-Register it before drawing or laying out CJK text:
-
-```python
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-
-font_path = "/usr/share/fonts/truetype/arphic/ukai.ttc"
-pdfmetrics.registerFont(TTFont("CJKKai", font_path, subfontIndex=0))
-```
-
-Then use `fontName="CJKKai"` in Platypus styles/tables or `canvas.setFont("CJKKai", size)` for canvas text. This embeds the selected Kaiti face into the generated PDF. The bundled `scripts/cjk_font.py` helper already applies the configured TTC subfont index.
-
-### LibreOffice / DOCX: Noto Sans CJK SC
-
-For DOCX generation and server-side LibreOffice rendering, use **Noto Sans CJK SC**. The production image provides it through `fonts-noto-cjk`:
-
-- Fontconfig family: `Noto Sans CJK SC`
-- Font collection: `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc`
-
-Do not try to feed this TTC file to ReportLab `TTFont`; it uses CFF outlines.
-
-### General rules
-
-- Chinese/CJK text must never use ReportLab's built-in `Helvetica`, `Times-Roman`, or `Courier`.
-- Do not use `Arial` as a server-side assumption; it is not guaranteed to exist in the Linux image.
-- When a PDF contains Chinese/Japanese text, choose an actual CJK font and verify the output by rendering pages to images.
-- If the required CJK font is missing, fail clearly instead of silently falling back to a non-CJK font.
-- Emoji require the dedicated `EmojiMono` fallback font and the `emoji_font.py` helpers (see the "Emoji handling" section above). Never feed emoji to ReportLab with only the CJK font registered.
-- OCR of simplified/traditional Chinese is supported by the preinstalled `chi_sim` and `chi_tra` Tesseract language data.
-
-### Recommended helper
-
-For scripts, prefer the bundled `scripts/cjk_font.py` helper so font paths and ReportLab registration stay consistent with the image.
-
-## Emoji handling (MANDATORY for any content that may contain emoji)
-
-ReportLab has **no automatic font fallback**: every character is drawn with the one font selected for the text object, and any glyph missing from that font renders as an empty box / black square. The production Kaiti CJK font (`AR PL UKai`) contains **zero emoji glyphs**, so emoji characters (✅ ❌ ✨ 🎯 📊 🚀 👍 …) that reach ReportLab directly become garbage in the PDF.
-
-The image ships the **monochrome Noto Emoji** font (real TrueType glyf outlines, embeddable) and the skill bundles it at `.claude/skills/pdf/fonts/NotoEmoji-Regular.ttf`. System **color** emoji fonts (e.g. `NotoColorEmoji.ttf`, CBDT/CBLC bitmaps) can **never** be embedded by ReportLab — do not use them.
+| Language | Built-in font | `lang` |
+|---|---|---|
+| Simplified Chinese | `STSong-Light` | `zh` (default) |
+| Traditional Chinese | `MSung-Light` | `zh-tw` |
+| Japanese | `HeiseiMin-W3` | `ja` |
+| Korean | `HYSMyeongJo-Medium` | `ko` |
 
 ### Rules
 
-1. Register both fonts before building any PDF: `cjk_font.register_fonts()` registers `CJKKai` + `EmojiMono` in one call.
-2. Any string that may contain emoji must go through the fallback helpers in `scripts/emoji_font.py` — never pass raw emoji text to `Paragraph(...)` or `canvas.drawString(...)`.
-3. Characters covered by neither font are dropped (with an optional report) instead of garbling the layout. Keep the report and log it if content fidelity matters.
-4. Emoji render in monochrome (black outline, inherits the paragraph's text color). Color emoji in ReportLab PDFs is not possible; if the user explicitly needs color emoji, render that paragraph as an image or strip the emoji instead.
-5. For canvas text (tables drawn manually, headers, watermarks), use `draw_mixed_string` / `string_width_mixed`, not `drawString`.
+- Always call `register_fonts()` from `scripts/cjk_font.py` and use the **returned name** as `fontName` (e.g. in `ParagraphStyle`, `TableStyle ('FONTNAME', ...)`, `canvas.setFont`). It also makes `<b>`/`<i>` keep the CJK font.
+- Never leave Chinese text on ReportLab's default styles (`Normal`, `Title`, `Heading1`, ...): they use Helvetica and turn Chinese into black boxes.
+- For PDFs with no CJK text, plain `Helvetica` is fine and gives nicer Latin glyphs.
+- Emoji cannot be drawn (no emoji font). Pass any text that may contain emoji through `scripts/emoji_font.py`: common ones become plain symbols (`✅`→`√`, `❌`→`×`, `⚠️`→`(!)`), the rest are dropped and listed in `missing_report`. Tell the user if something was dropped.
+- Glyph shapes depend on the viewer. The PDF is not self-contained: if the user needs a fully embedded font, they must provide a TrueType font file and set `APITELEGRAMCHAT_REPORTLAB_CJK_FONT` (plus `APITELEGRAMCHAT_REPORTLAB_CJK_SUBFONT_INDEX` for `.ttc`), which `register_fonts()` then embeds.
 
-### IMPORTANT: Common Mistake to Avoid
+### Verifying output in this image
 
-<b>❌ WRONG</b> — Do NOT pass a ParagraphStyle object to `to_fallback_markup()`:
+There is no CJK system font and no `poppler-data` here, so **page images and `pdftotext` cannot show Chinese from these PDFs** (blank glyphs or "Missing language pack" warnings). That is expected, not a bug in your PDF. Verify with Python instead:
+
 ```python
-# 错误：传入 styles['BodyTextCJK'] 对象会导致 KeyError
-text = to_fallback_markup("你好 🎯", styles['BodyTextCJK'])  
+from pypdf import PdfReader
+print(PdfReader("report.pdf").pages[0].extract_text())   # Chinese text should read back correctly
 ```
 
-<b>✅ CORRECT</b> — Pass the font name string as the second argument:
-```python
-# 正确：字体名称字符串 "CJKKai"
-markup = to_fallback_markup("你好 🎯", "CJKKai")
-story.append(Paragraph(markup, styles['BodyTextCJK']))
-```
-
-<b>关键规则</b>：
-<ul><li><code>to_fallback_markup(text, base_font)</code> 的第二个参数是 <b>字体名称字符串</b>（如 `"CJKKai"`），不是 ParagraphStyle 对象</li><li><code>Paragraph(markup, style)</code> 的第二个参数才是 ParagraphStyle 对象</li></ul>
+Use page images only to check layout (margins, table widths, page count).
 
 ### Paragraph example
 
@@ -272,102 +225,56 @@ story.append(Paragraph(markup, styles['BodyTextCJK']))
 import sys
 sys.path.insert(0, "/app/.claude/skills/pdf/scripts")
 
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from cjk_font import register_fonts
-from emoji_font import to_fallback_markup
+from emoji_font import safe_paragraph
 
-register_fonts()  # registers CJKKai + EmojiMono
+cjk = register_fonts()                      # -> "STSong-Light"
+normal = ParagraphStyle("NormalCN", parent=getSampleStyleSheet()["Normal"],
+                        fontName=cjk, fontSize=11, leading=18)
 
-# ⚠️ 关键：永远不要直接用 styles["Normal"] 等默认样式写中文，它们的 fontName
-#     是 Helvetica/Times-Roman，会显示黑框。必须显式指定 fontName="CJKKai"
-normal = ParagraphStyle('NormalCN', parent=getSampleStyleSheet()['Normal'],
-                        fontName='CJKKai', fontSize=11, leading=18)
-
-missing = []  # 收集两个字体都无法渲染的字符（正常情况下只收集到换行符）
-text = "项目进度：✅ 已完成 80% 🚀 预计下周交付"
-# to_fallback_markup 返回值是 XML-escaped 字符串，第二个参数是字体名称
-markup = to_fallback_markup(text, missing_report=missing)
-story = [Paragraph(markup, normal)]
-
+missing = []                                # emoji that had to be dropped
+story = [
+    safe_paragraph("项目进度：✅ 已完成 80% 🚀 预计下周交付", normal, missing_report=missing),
+    Spacer(1, 12),
+    # Paragraph tags are allowed only with allow_markup=True (escape &, <, > yourself)
+    safe_paragraph("<b>重点</b>：按时验收", normal, allow_markup=True),
+]
 SimpleDocTemplate("report.pdf").build(story)
+print("dropped:", missing)                  # e.g. ['🚀']
 ```
 
 ### Canvas example
 
 ```python
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
 from cjk_font import register_fonts
 from emoji_font import draw_mixed_string, string_width_mixed
 
-register_fonts()
-
+cjk = register_fonts()
 c = canvas.Canvas("out.pdf", pagesize=letter)
 text = "验收结果：✔ 通过 3 项 ❌ 未通过 1 项"
-width = string_width_mixed(text, 12)
-draw_mixed_string(c, (letter[0] - width) / 2, 700, text, 12)
+width = string_width_mixed(text, 12, cjk)
+draw_mixed_string(c, (letter[0] - width) / 2, 700, text, 12, cjk)
 c.save()
 ```
 
-### Emoji font facts
+### Tables
 
-- Registered name: `EmojiMono`
-- File: `.claude/skills/pdf/fonts/NotoEmoji-Regular.ttf` (vendored, Apache-2.0)
-- Override path: `APITELEGRAMCHAT_REPORTLAB_EMOJI_FONT`
-- Covers all standard emoji codepoints including ZWJ sequences and skin-tone modifiers; variation selector U+FE0F is zero-width
-- Does **not** cover CJK, kana, arrows (→), math symbols (± × ÷ ≠ ≈), circled numbers (①) — those come from the CJK font, which is exactly what the fallback logic arranges
-
-The runtime check `scripts/check_cjk_runtime.py` verifies the emoji font presence, embeddability, and sample glyph coverage alongside the CJK checks.
-
-<h3>⚠️ 重要：中文PDF生成的常见陷阱</h3>
-
-<b>问题描述：</b>ReportLab 的默认样式（如 <code>styles['Normal']</code>、<code>styles['Title']</code>、<code>styles['Heading1']</code> 等）的 <code>fontName</code> 默认是 <code>Helvetica</code>、<code>Helvetica-Bold</code>、<code>Courier</code> 等西文字体，<b>不支持任何中文字符</b>。如果直接使用这些样式而不修改字体，中文会显示为黑框（复制出来是"n"）。
-
-<b>系统可用中文字体：</b>
-<ul><li><code>AR PL UKai CN</code>（楷体风格）- 路径：<code>/usr/share/fonts/truetype/arphic/ukai.ttc</code></li><li><code>Noto Sans CJK SC</code>（黑体风格）- 路径：<code>/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc</code></li><li><code>Noto Serif CJK SC</code>（宋体风格）- 路径：<code>/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc</code></li><li><code>AR PL SungtiL GB</code>（宋体风格）- 路径：<code>/usr/share/fonts/truetype/arphic-gbsn00lp/gbsn00lp.ttf</code></li></ul>
-
-<b>正确做法：</b>
-
-<pre><code class="language-python">from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-
-styles = getSampleStyleSheet()
-
-# ❌ 错误：直接使用默认样式（fontName='Helvetica'，不支持中文）
-story.append(Paragraph("这是一段中文", styles['Normal']))
-
-# ✅ 正确方法1：定义自定义样式并指定中文字体
-cn_style = ParagraphStyle(
-    'ChineseStyle',
-    parent=styles['Normal'],
-    fontName='CJKKai',  # 必须指定中文字体！
-    fontSize=11,
-    leading=18
-)
-story.append(Paragraph("这是一段中文", cn_style))
-
-# ✅ 正确方法2：修改默认样式的字体（影响所有使用该样式的文本）
-styles['Normal'].fontName = 'CJKKai'
-story.append(Paragraph("这是一段中文", styles['Normal']))
-
-# ✅ 正确方法3：在表格样式中明确指定字体
+```python
 from reportlab.platypus import Table, TableStyle
-data = [['姓名', '张山'], ['年龄', '25']]
-table = Table(data)
-table.setStyle(TableStyle([
-    ('FONTNAME', (0, 0), (-1, -1), 'CJKKai'),  # 表格单元格也需指定字体
-    ...
-]))
+table = Table([["姓名", "张三"], ["年龄", "25"]])
+table.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), cjk)]))   # cells need the CJK font too
+```
 
-# ✅ 正确方法4：使用 cjk_font.py 的 helper（推荐）
-from cjk_font import register_fonts
-register_fonts()  # 注册 CJKKai 和 EmojiMono 字体
-# 然后所有样式都使用 fontName='CJKKai'</code></pre>
-
-<b>检查清单：</b>
-<ul><li>所有使用 <code>Paragraph()</code> 的样式都必须包含 <code>fontName='CJKKai'</code></li><li>表格中的 <code>TableStyle</code> 必须设置 <code>('FONTNAME', ..., 'CJKKai')</code></li><li>不要依赖默认样式的字体设置，它们都是西文字体</li><li>生成PDF后务必检查输出，确认中文正常显示</li></ul>
+Run `python3 scripts/check_cjk_runtime.py` for a font-free smoke test of this setup.
 
 ## Command-Line Tools
 
 ### pdftotext (poppler-utils)
+Works for Latin text. For PDFs with CJK text use `pypdf`/`pdfplumber` instead (the image has no `poppler-data`).
 ```bash
 # Extract text
 pdftotext input.pdf output.txt
@@ -408,25 +315,6 @@ pdftk input.pdf rotate 1east output rotated.pdf
 ```
 
 ## Common Tasks
-
-### Extract Text from Scanned PDFs
-```python
-# Requires: pip install pytesseract pdf2image
-import pytesseract
-from pdf2image import convert_from_path
-
-# Convert PDF to images
-images = convert_from_path('scanned.pdf')
-
-# OCR each page
-text = ""
-for i, image in enumerate(images):
-    text += f"Page {i+1}:\n"
-    text += pytesseract.image_to_string(image)
-    text += "\n\n"
-
-print(text)
-```
 
 ### Add Watermark
 ```python
@@ -482,7 +370,6 @@ with open("encrypted.pdf", "wb") as output:
 | Extract tables | pdfplumber | `page.extract_tables()` |
 | Create PDFs | reportlab | Canvas or Platypus |
 | Command line merge | qpdf | `qpdf --empty --pages ...` |
-| OCR scanned PDFs | pytesseract | Convert to image first |
 | Fill PDF forms | pdf-lib or pypdf (see FORMS.md) | See FORMS.md |
 
 ## Next Steps

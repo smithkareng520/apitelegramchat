@@ -1,6 +1,6 @@
 ---
 name: docx
-description: Create, edit, inspect, and deliver Word documents (.docx) with deterministic styles, CJK-safe text, images/tables, and mandatory render-based QA. Prefer the simplest native docx-js workflow for new documents and OOXML only when the high-level API cannot express the required feature.
+description: Create, edit, inspect, and deliver Word documents (.docx) with deterministic styles, CJK-safe text (no server fonts needed), images/tables, and structural validation plus layout-only render checks. Prefer the simplest native docx-js workflow for new documents and OOXML only when the high-level API cannot express the required feature.
 license: Proprietary. LICENSE.txt has complete terms
 ---
 
@@ -8,11 +8,19 @@ license: Proprietary. LICENSE.txt has complete terms
 
 Use this skill for `.docx` creation, editing, review, redlines/comments, templates, forms, or DOCX↔PDF workflows.
 
+## Slim-image constraints (read first)
+
+This image installs **no fonts** and only LibreOffice Writer. Consequences:
+
+- A DOCX only *names* its fonts; the reader's Word supplies the glyphs. Chinese and emoji therefore display correctly on the user's device even though this image has no CJK/emoji font. Never try to install or embed fonts.
+- LibreOffice renders here (QA PNGs, DOCX→PDF) show Chinese and emoji as blanks or boxes. That is expected, not a document bug. Use renders only to check **layout**; verify text content by reading the XML or text, not the PNGs.
+- A DOCX→PDF conversion made here has the same blank-glyph problem for CJK/emoji. If the user needs a PDF with Chinese, build it with the pdf skill (ReportLab CID fonts) instead of converting this DOCX.
+
 ## The default workflow
 
-**Create/edit → validate → render → inspect every page → fix → render again → deliver.**
+**Create/edit → validate → (layout render only when it matters) → deliver.**
 
-Do not treat XML inspection or successful file creation as visual verification. Rendering catches clipped text, missing glyphs, bad page breaks, broken tables, image shifts, and header/footer drift.
+Validation (`validate.py`) is mandatory. A render is worth doing when the document has tables, images, headers/footers, columns or tight page limits; skip it for plain text documents. Keep renders small (`--pages 2`, default 80 dpi) and keep them out of the deliverable.
 
 ### New document
 
@@ -22,7 +30,7 @@ Use `docx` (docx-js) unless the task clearly benefits from editing an existing O
 npm install
 node build-docx.js
 python scripts/office/validate.py output.docx
-python scripts/render_docx.py output.docx --output_dir .qa/docx
+python scripts/render_docx.py output.docx --output_dir .qa/docx --pages 2   # optional, layout only
 ```
 
 ### Existing document
@@ -34,32 +42,24 @@ python scripts/office/unpack.py input.docx unpacked/
 # edit with the smallest possible change
 python scripts/office/pack.py unpacked/ output.docx
 python scripts/office/validate.py output.docx
-python scripts/render_docx.py output.docx --output_dir .qa/docx
 ```
 
 ## Text, fonts, and Unicode
 
 ### Chinese / CJK
 
-Use `Noto Sans CJK SC` for Normal and heading styles in the Linux runtime. Do not assume Arial is installed.
+Set the font as an object so Latin and East Asian text each get a sensible font, and the reader's Word picks the right glyphs. Do not name a server font (there is none).
 
-For mixed Chinese + Latin text, using `Noto Sans CJK SC` for the whole document is the safest default unless a corporate font is required.
+```javascript
+const FONT = { ascii: "Arial", hAnsi: "Arial", cs: "Arial", eastAsia: "Microsoft YaHei" };
+// Word falls back automatically if a font is missing (PingFang SC on macOS, Noto/Droid on Android).
+```
+
+Use `eastAsia: "SimSun"` for a formal Song-style look. Put `FONT` on the default document style and on every heading style (see Styles below). Do not set `font: "Noto Sans CJK SC"`: it exists only in images that install it.
 
 ### Emoji and uncommon Unicode
 
-Do not replace emoji manually and do not split a visible emoji sequence into separate runs just because it contains several code points. ZWJ sequences, skin-tone modifiers, variation selectors, and regional-indicator flags should remain intact.
-
-For body text, pass the original Unicode string directly to `TextRun`. If the target Office/rendering environment does not contain a suitable emoji font, prefer an explicit emoji-capable font fallback or convert the emoji to an image; do not silently delete characters.
-
-When a task is known to contain heavy emoji or symbol content, add a small fixture covering at least:
-
-- `👍🏽`
-- `❤️`
-- `👨‍👩‍👧‍👦`
-- `🇸🇬`
-- mixed CJK + emoji
-
-Then render it and inspect the actual pages.
+Pass the original Unicode string straight to `TextRun`; do not split ZWJ sequences, skin-tone modifiers, variation selectors or flags into separate runs, and do not strip emoji. Word/Office/phones draw them with their own emoji font. Emoji will not show in renders made inside this image; that is expected.
 
 ## Page size and margins
 
@@ -78,23 +78,23 @@ For landscape, pass the portrait dimensions and set `orientation: PageOrientatio
 
 ## Styles
 
-Override built-in heading IDs so Word/LibreOffice/TOC see the same semantic hierarchy.
+Override built-in heading IDs so Word/LibreOffice/TOC see the same semantic hierarchy. `FONT` is the object defined in the CJK section above.
 
 ```javascript
 const doc = new Document({
   styles: {
     default: {
-      document: { run: { font: "Noto Sans CJK SC", size: 24 } }
+      document: { run: { font: FONT, size: 24 } }
     },
     paragraphStyles: [
       {
         id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal",
-        quickFormat: true, run: { font: "Noto Sans CJK SC", size: 32, bold: true },
+        quickFormat: true, run: { font: FONT, size: 32, bold: true },
         paragraph: { spacing: { before: 240, after: 240 }, outlineLevel: 0 }
       },
       {
         id: "Heading2", name: "Heading 2", basedOn: "Normal", next: "Normal",
-        quickFormat: true, run: { font: "Noto Sans CJK SC", size: 28, bold: true },
+        quickFormat: true, run: { font: FONT, size: 28, bold: true },
         paragraph: { spacing: { before: 180, after: 180 }, outlineLevel: 1 }
       }
     ]
@@ -190,31 +190,26 @@ Use `ExternalHyperlink` for URLs and `InternalHyperlink` + bookmarks for in-docu
 
 ## Validation and QA helpers
 
-The skill package includes a canonical renderer at `scripts/render_docx.py` and Office XML validation under `scripts/office/`.
-
-Render one or more documents:
+`scripts/office/validate.py` checks the OOXML structure. `scripts/render_docx.py` renders pages for a layout check:
 
 ```bash
-python scripts/render_docx.py report.docx --output_dir .qa/report --emit_pdf
+python scripts/render_docx.py report.docx --output_dir .qa/report --pages 2
 ```
 
-Inspect **every** generated `page-*.png` at 100% zoom. Check:
+Look at the generated `page-*.png` for:
 
-- no clipped or overlapping text
-- no missing CJK/emoji glyphs or black squares
-- tables fit and continue correctly across pages
-- headings stay with the intended following content
-- images are not stretched or shifted unexpectedly
-- headers/footers and page numbers align correctly
-- tracked changes/comments behave as intended (comments may require XML-level checks)
+- clipped or overlapping text, and tables that overflow the page
+- tables continuing correctly across pages, headings staying with their content
+- images stretched or shifted; header/footer and page-number alignment
+- tracked changes/comments behaving as intended (comments may need XML-level checks)
 
-If any check fails, fix the source and render again. Do not ship an unverified DOCX.
+Ignore missing or boxed Chinese/emoji glyphs in these images (no fonts in this image). If a layout check fails, fix the source and render again.
 
 ## Specialized operations
 
 The existing scripts are the preferred building blocks:
 
-- `scripts/accept_changes.py` - accept tracked changes
+- `scripts/accept_changes.py` - accept tracked changes (needs LibreOffice Writer)
 - `scripts/comment.py` - comment operations
 - `scripts/office/validate.py` - OOXML validation
 - `scripts/office/unpack.py` / `pack.py` - deterministic OOXML editing
