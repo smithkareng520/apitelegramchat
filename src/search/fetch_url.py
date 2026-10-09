@@ -207,7 +207,7 @@ async def _aclose_response(response: Any) -> None:
     except Exception:
         logger.debug("关闭 curl_cffi 响应失败（忽略）", exc_info=True)
 
-async def _fetch_html_with_curl(url: str) -> tuple[str | None, int | None]:
+async def _fetch_html_with_curl(url: str, *, include_final_url: bool = False) -> tuple[str | None, int | None] | tuple[str | None, int | None, str]:
     """curl_cffi 抓取 HTML，返回 (html, http_status)；失败时 html 为 None。
 
     status 不为 None 表示拿到了 HTTP 响应（含 4xx/5xx），调用方据此区分
@@ -227,8 +227,9 @@ async def _fetch_html_with_curl(url: str) -> tuple[str | None, int | None]:
             )
             try:
                 status = int(getattr(response, "status_code", 0) or 0)
+                final_url = str(getattr(response, "url", "") or url)
                 if status != 200:
-                    return None, status
+                    return (None, status, final_url) if include_final_url else (None, status)
                 try:
                     declared = int(response.headers.get("Content-Length") or 0)
                 except (TypeError, ValueError):
@@ -238,22 +239,23 @@ async def _fetch_html_with_curl(url: str) -> tuple[str | None, int | None]:
                         "[fetch_url] 响应体超限（%s bytes > %s），放弃：%s",
                         declared, CONTENT_MAX_BYTES, url,
                     )
-                    return None, status
+                    return (None, status, final_url) if include_final_url else (None, status)
                 raw = await _read_response_capped(response, CONTENT_MAX_BYTES)
                 if not raw:
-                    return None, status
+                    return (None, status, final_url) if include_final_url else (None, status)
                 # 优先按 HTTP 头 + meta + chardet 检测的编码解码，避免 GBK 站点被
                 # 错误地按 UTF-8 解析产生馊字标题。
                 http_enc = getattr(response, "encoding", None)
                 decoded = _decode_html_bytes(raw, http_enc)
                 if decoded is not None:
-                    return decoded, status
-                return (response.text or None), status
+                    return (decoded, status, final_url) if include_final_url else (decoded, status)
+                body = response.text or None
+                return (body, status, final_url) if include_final_url else (body, status)
             finally:
                 await _aclose_response(response)
     except Exception as e:
         logger.error(f"curl_cffi 请求异常: {e}, URL: {url}")
-        return None, None
+        return (None, None, url) if include_final_url else (None, None)
 
 async def _download_html_with_trafilatura(url: str) -> str | None:
     """curl_cffi 失败时用 trafilatura 自带下载器兜底获取原始 HTML。
@@ -668,7 +670,7 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
         try:
             # 先用 curl_cffi 获取 HTML（返回 (html, status)，status 用于区分
             # 网络层失败与确定性 4xx）
-            html, http_status = await _fetch_html_with_curl(url)
+            html, http_status, final_url = await _fetch_html_with_curl(url, include_final_url=True)
             if http_status is not None:
                 last_http_status = http_status
             # 4xx（除 429）是确定性失败：重试与 trafilatura 兜底都不会改变
@@ -703,7 +705,10 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
 
             # 转 Telegram Rich HTML（CPU 密集，放线程池避免阻塞事件循环）。
             # 内容 + 内嵌视频/播放器/音频/图片 都在这一步提取。
-            payload = await asyncio.to_thread(_build_rich_fetch_payload, url, html, fetched_at)
+            # HTTP 重定向后的最终地址作为正文来源；JS/Meta 跳转仍由下方递归处理，
+            # 因为它们需要先解析当前 HTML 才能知道目标。
+            effective_url = final_url or url
+            payload = await asyncio.to_thread(_build_rich_fetch_payload, effective_url, html, fetched_at)
             if payload:
                 set_fetch_cache(url, payload)
                 return payload

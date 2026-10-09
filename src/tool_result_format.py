@@ -140,7 +140,12 @@ async def format_tool_result(fn_name: str, fn_args: dict, result_str: str) -> tu
                 # <h3> 内容是已转义的 HTML 文本（&amp; 等），原样嵌入合法。
                 title = re.sub(r'<[^>]+>', '', m.group(1)).strip() or domain
             summary = f"🌐 Fetched: {title}"
-            details_html = f"{title} <a href=\"{url}\">{domain}</a>"
+            # 正文来源链接由 fetch_url 的结果头部给出，优先使用实际落地 URL；
+            # 折叠摘要仍保留原始调用目的，不改变工具组标题语义。
+            source_match = re.search(r'<a\s+href="(https?://[^" ]+)"[^>]*>', text, re.I)
+            result_url = source_match.group(1) if source_match else url
+            result_domain = extract_domain(result_url) or domain
+            details_html = f"{title} <a href=\"{result_url}\">{result_domain}</a>"
         return summary, details_html
 
     elif family == "weather":

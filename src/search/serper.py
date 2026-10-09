@@ -273,6 +273,57 @@ async def _serper_search_one_mode(
 
     raise SerperSearchTransientError(f"unknown serper mode: {mode}")
 
+
+
+async def _resolve_result_url(url: str) -> str:
+    """尽力解析搜索结果的 HTTP 重定向，失败时保留上游 URL。
+
+    仅访问公开 HTTP(S) URL，并限制超时；不改变搜索结果标题/摘要。
+    """
+    from urllib.parse import urlsplit
+    parts = urlsplit(str(url or "").strip())
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        return url
+    try:
+        from curl_cffi.requests import AsyncSession
+        # 复用 fetch_url 的 SSRF 校验，避免搜索结果链接成为内网探测入口。
+        from search.fetch_url import _is_safe_url_to_fetch
+        safe, _ = await _is_safe_url_to_fetch(url)
+        if not safe:
+            return url
+        async with AsyncSession() as session:
+            response = await session.get(
+                url, timeout=5, impersonate="chrome120", stream=True,
+                headers={"Accept": "text/html,application/xhtml+xml,*/*"},
+            )
+            try:
+                final_url = str(getattr(response, "url", "") or url).strip()
+                final_parts = urlsplit(final_url)
+                if final_parts.scheme not in {"http", "https"} or not final_parts.hostname:
+                    return url
+                final_safe, _ = await _is_safe_url_to_fetch(final_url)
+                return final_url if final_safe else url
+            finally:
+                close = getattr(response, "aclose", None)
+                if close:
+                    await close()
+    except Exception:
+        logger.debug("搜索结果重定向解析失败，保留原链接：%s", url, exc_info=True)
+        return url
+
+
+async def _resolve_search_item_urls(items: list[dict]) -> list[dict]:
+    """并发解析搜索结果落地 URL，限制并发避免拖慢搜索响应。"""
+    semaphore = asyncio.Semaphore(6)
+    async def resolve(item: dict) -> dict:
+        async with semaphore:
+            resolved = await _resolve_result_url(str(item.get("link") or ""))
+        if resolved and resolved != item.get("link"):
+            item = {**item, "link": resolved}
+        return item
+    return await asyncio.gather(*(resolve(item) for item in items))
+
+
 def _format_search_results(items: list, query: str, engine: str, requested: int | None = None) -> str:
     """渲染 search 模式的 envelope section。
 
@@ -554,6 +605,7 @@ async def _execute_web_search_uncached(
                     filtered_count, ", ".join(_BLACKLISTED_SEARCH_DOMAINS),
                 )
             if items:
+                items = await _resolve_search_item_urls(items)
                 return _format_search_results(items, query_str, "Serper / Google", requested=_num_for(single_mode))
             return f"❌ 未找到与「{query_str}」相关的结果。"
         if single_mode == "images" and items:
@@ -587,6 +639,8 @@ async def _execute_web_search_uncached(
                     )
             items = items[:_num_for(m)]
             if m == "search":
+                if items:
+                    items = await _resolve_search_item_urls(items)
                 text = _format_search_results(items, query_str, "Serper / Google", requested=_num_for(m)) if items else None
             elif m == "images":
                 text = _format_image_results(items, query_str, requested=_num_for(m)) if items else None
