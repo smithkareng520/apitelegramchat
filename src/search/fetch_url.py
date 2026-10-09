@@ -49,6 +49,10 @@ try:
 except (TypeError, ValueError):
     CONTENT_MAX_BYTES = 4 * 1024 * 1024
 
+# 跳转检测只扫描 HTML 头部：客户端跳转几乎总在文档前部，扫描 4MB 全文
+# 既无必要，也会放大任何正则的最坏耗时。
+REDIRECT_SCAN_MAX_CHARS = 512 * 1024
+
 _TRAFILATURA_CONFIG = use_config()
 if _TRAFILATURA_CONFIG is not None:
     try:
@@ -481,7 +485,7 @@ def _extract_js_redirect_targets(html: str, current_url: str) -> list[str]:
         r"""(?:window\.|document\.|top\.|parent\.|self\.|frames\.)?"""
         r"""location(?:\.(?:href|replace|assign))?(?!\w)"""
         r"""\s*(?:=|\()\s*"""
-        r"""(?P<expr>(?:[^;'"()]+|'[^']*'|"[^"]*")+?)"""
+        r"""(?P<expr>(?:[^;'"()]|'[^']*'|"[^"]*"){1,500}?)"""
         r"""\s*(?:\)|;)""",
         re.IGNORECASE,
     )
@@ -717,7 +721,11 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
             # 同一 if/else 中的多个分支会被全部收集，按文档顺序尝试——
             # 这样移动端 / 桌面端不同路径的页面也能命中一个能抓取的候选。
             redirect_base_url = final_url or url
-            for js_target in _extract_js_redirect_targets(html, redirect_base_url):
+            scan_html = html[:REDIRECT_SCAN_MAX_CHARS]
+            js_targets = await asyncio.to_thread(
+                _extract_js_redirect_targets, scan_html, redirect_base_url,
+            )
+            for js_target in js_targets:
                 if time.monotonic() - start_time > 30:
                     logger.warning("[fetch_url] JS 候选超出总超时：%s", url)
                     break
@@ -733,7 +741,10 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
                     url, js_target,
                 )
 
-            for meta_target in _extract_meta_refresh_targets(html, redirect_base_url):
+            meta_targets = await asyncio.to_thread(
+                _extract_meta_refresh_targets, scan_html, redirect_base_url,
+            )
+            for meta_target in meta_targets:
                 if time.monotonic() - start_time > 30:
                     logger.warning("[fetch_url] Meta 候选超出总超时：%s", url)
                     break

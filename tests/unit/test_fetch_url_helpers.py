@@ -219,3 +219,18 @@ def test_fetch_cache_rejects_failure_payloads():
     set_fetch_cache(url, "<h3>ok</h3>")
     assert get_fetch_cache(url) == "<h3>ok</h3>"
     assert get_fetch_cache(url + "#other") == "<h3>ok</h3>"   # fragment 归一化命中
+
+
+def test_extract_js_redirect_targets_no_catastrophic_backtracking():
+    """回归：`location = <长普通文本>(` 曾触发指数级回溯，冻死事件循环。"""
+    import time
+    samples = [
+        "location = " + "a" * 60 + "(",
+        "<a href=/s?location=" + "x" * 60,
+        "location = " + "Hello world this is text " * 20 + "(",
+        "location = " + "a" * 200_000,
+    ]
+    for html in samples:
+        start = time.monotonic()
+        _extract_js_redirect_targets(html, "http://example.com/a")
+        assert time.monotonic() - start < 1.0
