@@ -1148,15 +1148,13 @@ SUPPORTED_MODELS: Dict[str, ModelConfig] = {}
 # -----------------------------------------------------------------------------
 # OpenRouter 模型
 # -----------------------------------------------------------------------------
-SUPPORTED_MODELS["openrouter/free"] = make_model_config(
-    model_id="openrouter/free",
+SUPPORTED_MODELS["nvidia/nemotron-3-ultra-550b-a55b:free"] = make_model_config(
+    model_id="nvidia/nemotron-3-ultra-550b-a55b:free",
     provider="openrouter",
-    image_input=True,
     reasoning_enabled=True,
     reasoning_effort="high",
-    supports_tools=False,
-    temperature=0.5,
-    max_context=200000,
+    temperature=0.3,
+    max_context=1000000,
 )
 # 路由示例：route 选排序（nitro 最快 / floor 最便宜 / exacto 工具调用最稳）；
 # provider_routing 固定端点（此处只走 Vertex 欧洲区、不回退）。
@@ -1200,12 +1198,22 @@ SUPPORTED_MODELS["agnes-3.0-flash"] = make_model_config(
 # -----------------------------------------------------------------------------
 # ModelScope 免费模型
 # -----------------------------------------------------------------------------
-SUPPORTED_MODELS["ZhipuAI/GLM-5.3-Flash"] = make_model_config(
-    model_id="ZhipuAI/GLM-5.3-Flash",
+SUPPORTED_MODELS["deepseek-ai/DeepSeek-V4.1-Flash"] = make_model_config(
+    model_id="deepseek-ai/DeepSeek-V4.1-Flash",
     provider="modelscope",
     max_context=1000000,
     reasoning_enabled=True,
-    reasoning_effort="max",
+    reasoning_effort="high",
+    image_input=True,
+    temperature=0.3,
+)
+
+SUPPORTED_MODELS["moonshotai/Kimi-K3"] = make_model_config(
+    model_id="moonshotai/Kimi-K3",
+    provider="modelscope",
+    max_context=1000000,
+    reasoning_enabled=True,
+    reasoning_effort="high",
     image_input=True,
     temperature=0.3,
 )
@@ -1330,8 +1338,8 @@ SUPPORTED_MODELS["space-bunny"] = make_model_config(
     protocol="openai_chat",
     temperature=0.3,
 )
-SUPPORTED_MODELS["mimo-v2.6-flash"] = make_model_config(
-    model_id="mimo-v2.6-flash",
+SUPPORTED_MODELS["nemotron-3.5-lightning"] = make_model_config(
+    model_id="nemotron-3.5-lightning",
     provider="lfree",
     reasoning_enabled=True,
     reasoning_effort="high",
@@ -1339,16 +1347,7 @@ SUPPORTED_MODELS["mimo-v2.6-flash"] = make_model_config(
     temperature=0.3,
     protocol="openai_chat",
 )
-SUPPORTED_MODELS["muse-spark-1.3-contributor"] = make_model_config(
-    model_id="muse-spark-1.3-contributor",
-    provider="lfree",
-    image_input=True,
-    reasoning_enabled=True,
-    reasoning_effort="high",
-    max_context=1000000,
-    temperature=0.3,
-    protocol="openai_chat",
-)
+
 
 
 
