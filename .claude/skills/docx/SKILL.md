@@ -44,6 +44,62 @@ python scripts/office/pack.py unpacked/ output.docx
 python scripts/office/validate.py output.docx
 ```
 
+## Zero-dependency fallback (stdlib only)
+
+When the environment has **no `docx-js`/`python-docx` and no `matplotlib`** (offline / minimal /
+forbidden installs), use the two pure-stdlib helpers in `scripts/`. They need **only the Python 3
+standard library** (`zipfile`, `zlib`, `struct`, `math`) and are safe to reuse across runs.
+
+- **`scripts/minichart.py`** — draws `bar / hbar / line / donut` charts into a pixel buffer and writes
+  a real PNG (zlib) using a built-in 5x7 bitmap font. **English labels only** (no CJK in the PNG):
+  ```bash
+  python3 scripts/minichart.py bar out.png --labels Q1,Q2,Q3,Q4 --values 87,66,87,92 \
+    --title "KFT Quarterly" --ylabel KRW
+  python3 scripts/minichart.py donut out.png --values Mobile:1740:#3B82C4,#PC:1184:#4FB3A9 \
+    --title "KFT Platforms"
+  ```
+  ```python
+  import minichart as mc
+  mc.bar_chart("out.png", ["A", "B"], [1, 2], title="T", ylabel="V")
+  ```
+
+- **`scripts/minidocx.py`** — builds a valid WordprocessingML `.docx` by hand (no third-party),
+  embedding PNG images, tables, bullets, headings and page breaks. CJK-safe: the default East-Asian
+  font is set, so Chinese in the **body** still renders on the reader's device:
+  ```python
+  import minidocx
+  d = minidocx.Docx(title="Report")
+  d.add_heading("Section", 1)
+  d.add_para([("normal ", {}), ("bold", {"bold": True}), (" rest", {})])
+  d.add_bullet("point one")
+  d.add_table(["A", "B"], [["1", "2"]], widths_pt=[60, 120])
+  d.add_image("chart.png", width_pt=452, caption="Fig 1")
+  d.add_page_break()
+  d.save("out.docx")
+  ```
+
+Combined 0-dependency pipeline (charts + doc), then validate as usual:
+```bash
+python3 scripts/minichart.py bar chart.png --labels X,Y --values 1,2 --title "T"
+python3 - <<'PY'
+import sys; sys.path.insert(0, "scripts")
+import minidocx
+d = minidocx.Docx()
+d.add_heading("Report", 1); d.add_para("Body text.")
+d.add_image("chart.png", width_pt=452, caption="Figure 1")
+d.add_table(["k", "v"], [["a", "b"]])
+d.save("report.docx")
+PY
+python3 scripts/office/validate.py report.docx
+```
+
+Notes:
+- Keep document body in Chinese via `minidocx` (renders on the user's device); keep `minichart` PNG
+  labels in English (no CJK font is installed on this image).
+- `minidocx` auto-sizes images from the PNG header; for non-PNG, pass `height_pt` explicitly.
+- Prefer the default `docx-js` + `matplotlib` workflow when available; use this fallback when they are
+  not installed or not allowed.
+
 ## Text, fonts, and Unicode
 
 ### Chinese / CJK
