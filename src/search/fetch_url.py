@@ -703,16 +703,10 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
             # 结束后的时间，两者在慢速站点上可能相差数秒。
             fetched_at = time.time()
 
-            # 转 Telegram Rich HTML（CPU 密集，放线程池避免阻塞事件循环）。
-            # 内容 + 内嵌视频/播放器/音频/图片 都在这一步提取。
-            # HTTP 重定向后的最终地址作为正文来源；JS/Meta 跳转仍由下方递归处理，
-            # 因为它们需要先解析当前 HTML 才能知道目标。
-            effective_url = final_url or url
-            payload = await asyncio.to_thread(_build_rich_fetch_payload, effective_url, html, fetched_at)
-            if payload:
-                set_fetch_cache(url, payload)
-                return payload
-
+            # 先识别客户端跳转，再构建当前页正文。某些跳转中间页也包含少量
+            # 可提取文本；若先返回 payload，就会把中间页误当最终落地页。
+            # 仅当候选目标抓取成功时才采用目标结果；候选失败则继续处理当前页，
+            # 避免站点中普通的 location 赋值影响可用正文。
             # ---- 检测 JavaScript 重定向（含字符串拼接表达式）----
             # 单字面量正则匹配 `window.location.href = '...'` 在遇到
             # `'https://' + host + '/index/' + search` 这种拼接时会捕获到
@@ -722,7 +716,8 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
             # 让流程继续往下走 Meta Refresh 与根路径回退。
             # 同一 if/else 中的多个分支会被全部收集，按文档顺序尝试——
             # 这样移动端 / 桌面端不同路径的页面也能命中一个能抓取的候选。
-            for js_target in _extract_js_redirect_targets(html, url):
+            redirect_base_url = final_url or url
+            for js_target in _extract_js_redirect_targets(html, redirect_base_url):
                 if time.monotonic() - start_time > 30:
                     logger.warning("[fetch_url] JS 候选超出总超时：%s", url)
                     break
@@ -738,7 +733,7 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
                     url, js_target,
                 )
 
-            for meta_target in _extract_meta_refresh_targets(html, url):
+            for meta_target in _extract_meta_refresh_targets(html, redirect_base_url):
                 if time.monotonic() - start_time > 30:
                     logger.warning("[fetch_url] Meta 候选超出总超时：%s", url)
                     break
@@ -753,6 +748,14 @@ async def execute_fetch_url(url: str, redirect_depth: int = 0, start_time: float
                     "[fetch_url] Meta Refresh 目标抓取失败，尝试根路径回退：%s -> %s",
                     url, meta_target,
                 )
+
+            # JS / Meta 候选都未成功时，再返回当前 HTML 的正文；这保留了
+            # 有正文的普通页面，也避免跳转目标暂时不可用时把原页判成失败。
+            effective_url = final_url or url
+            payload = await asyncio.to_thread(_build_rich_fetch_payload, effective_url, html, fetched_at)
+            if payload:
+                set_fetch_cache(url, payload)
+                return payload
 
             # 未提取到有效正文 / JS 与 Meta 跳转均不可用：仅根路径可继续
             # 尝试配置的同站点首页路径（如 splash page 的 `/index/`）。

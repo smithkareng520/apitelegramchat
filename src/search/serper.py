@@ -276,40 +276,63 @@ async def _serper_search_one_mode(
 
 
 async def _resolve_result_url(url: str) -> str:
-    """尽力解析搜索结果的 HTTP 重定向，失败时保留上游 URL。
+    """解析搜索结果的 HTTP 重定向，失败时保留上游 URL。
 
-    仅访问公开 HTTP(S) URL，并限制超时；不改变搜索结果标题/摘要。
+    每一跳都先执行 SSRF 校验，再发起下一次请求；禁止 HTTP 客户端自动
+    跟随重定向，避免公开 URL 将请求重定向到内网/环回地址。最多跟随 8 跳。
     """
-    from urllib.parse import urlsplit
-    parts = urlsplit(str(url or "").strip())
-    if parts.scheme not in {"http", "https"} or not parts.hostname:
-        return url
+    from urllib.parse import urljoin, urlsplit
+    original_url = str(url or "").strip()
+    current_url = original_url
+    if not current_url:
+        return original_url
     try:
         from curl_cffi.requests import AsyncSession
-        # 复用 fetch_url 的 SSRF 校验，避免搜索结果链接成为内网探测入口。
         from search.fetch_url import _is_safe_url_to_fetch
-        safe, _ = await _is_safe_url_to_fetch(url)
-        if not safe:
-            return url
+        seen: set[str] = set()
         async with AsyncSession() as session:
-            response = await session.get(
-                url, timeout=5, impersonate="chrome120", stream=True,
-                headers={"Accept": "text/html,application/xhtml+xml,*/*"},
-            )
-            try:
-                final_url = str(getattr(response, "url", "") or url).strip()
-                final_parts = urlsplit(final_url)
-                if final_parts.scheme not in {"http", "https"} or not final_parts.hostname:
-                    return url
-                final_safe, _ = await _is_safe_url_to_fetch(final_url)
-                return final_url if final_safe else url
-            finally:
-                close = getattr(response, "aclose", None)
-                if close:
-                    await close()
+            for _ in range(9):  # 初始请求 + 最多 8 次跳转
+                parts = urlsplit(current_url)
+                if parts.scheme not in {"http", "https"} or not parts.hostname:
+                    return original_url
+                safe, _ = await _is_safe_url_to_fetch(current_url)
+                if not safe:
+                    return original_url
+                if current_url in seen:
+                    return original_url
+                seen.add(current_url)
+                response = await session.get(
+                    current_url, timeout=5, impersonate="chrome120", stream=True,
+                    allow_redirects=False,
+                    headers={"Accept": "text/html,application/xhtml+xml,*/*"},
+                )
+                try:
+                    status = int(getattr(response, "status_code", 0) or 0)
+                    headers = getattr(response, "headers", {}) or {}
+                    location = headers.get("Location") or headers.get("location")
+                    if status not in {301, 302, 303, 307, 308} or not location:
+                        # 最后一跳再次校验 URL，不能信任响应对象里的 url 字段。
+                        final_url = str(getattr(response, "url", "") or current_url).strip()
+                        final_parts = urlsplit(final_url)
+                        if final_parts.scheme not in {"http", "https"} or not final_parts.hostname:
+                            return original_url
+                        final_safe, _ = await _is_safe_url_to_fetch(final_url)
+                        return final_url if final_safe else original_url
+                    next_url = urljoin(current_url, str(location).strip())
+                finally:
+                    close = getattr(response, "aclose", None)
+                    if close:
+                        await close()
+                next_parts = urlsplit(next_url)
+                if next_parts.scheme not in {"http", "https"} or not next_parts.hostname:
+                    return original_url
+                # 下一轮循环会在发请求前校验目标，当前仅拒绝畸形/非 HTTP URL。
+                current_url = next_url
+        logger.debug("搜索结果重定向超过 8 跳，保留原链接：%s", original_url)
+        return original_url
     except Exception:
-        logger.debug("搜索结果重定向解析失败，保留原链接：%s", url, exc_info=True)
-        return url
+        logger.debug("搜索结果重定向解析失败，保留原链接：%s", original_url, exc_info=True)
+        return original_url
 
 
 async def _resolve_search_item_urls(items: list[dict]) -> list[dict]:
