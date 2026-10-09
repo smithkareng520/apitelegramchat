@@ -1148,13 +1148,14 @@ SUPPORTED_MODELS: Dict[str, ModelConfig] = {}
 # -----------------------------------------------------------------------------
 # OpenRouter 模型
 # -----------------------------------------------------------------------------
-SUPPORTED_MODELS["nvidia/nemotron-3-ultra-550b-a55b:free"] = make_model_config(
-    model_id="nvidia/nemotron-3-ultra-550b-a55b:free",
+SUPPORTED_MODELS["dots-studio/dots-3-note-preview:free"] = make_model_config(
+    model_id="dots-studio/dots-3-note-preview:free",
     provider="openrouter",
     reasoning_enabled=True,
     reasoning_effort="high",
+    image_input=True,
     temperature=0.3,
-    max_context=1000000,
+    max_context=512000,
 )
 # 路由示例：route 选排序（nitro 最快 / floor 最便宜 / exacto 工具调用最稳）；
 # provider_routing 固定端点（此处只走 Vertex 欧洲区、不回退）。
@@ -1208,16 +1209,6 @@ SUPPORTED_MODELS["deepseek-ai/DeepSeek-V4.1-Flash"] = make_model_config(
     temperature=0.3,
 )
 
-SUPPORTED_MODELS["moonshotai/Kimi-K3"] = make_model_config(
-    model_id="moonshotai/Kimi-K3",
-    provider="modelscope",
-    max_context=1000000,
-    reasoning_enabled=True,
-    reasoning_effort="high",
-    image_input=True,
-    temperature=0.3,
-)
-
 # -----------------------------------------------------------------------------
 # Gemini 系列
 # -----------------------------------------------------------------------------
@@ -1246,15 +1237,6 @@ SUPPORTED_MODELS["GLM-4.7-Flash"] = make_model_config(
 # -----------------------------------------------------------------------------
 # 图像生成模型
 # -----------------------------------------------------------------------------
-SUPPORTED_MODELS["Qwen/Qwen-Image"] = make_model_config(
-    model_id="Qwen/Qwen-Image",
-    provider="modelscope",
-    image_output=True,
-    # 图像模型显式声明 OpenAI Images 协议（ModelScope 图像端点）。
-    protocol="openai_images",
-    max_context=32768,
-    max_output_tokens=4000,
-)
 SUPPORTED_MODELS["Qwen/Qwen-Image-Edit"] = make_model_config(
     model_id="Qwen/Qwen-Image-Edit",
     provider="modelscope",
@@ -1264,6 +1246,7 @@ SUPPORTED_MODELS["Qwen/Qwen-Image-Edit"] = make_model_config(
     max_context=32768,
     max_output_tokens=4000,
 )
+
 SUPPORTED_MODELS["Tongyi-MAI/Z-Image-Turbo"] = make_model_config(
     model_id="Tongyi-MAI/Z-Image-Turbo",
     provider="modelscope",
