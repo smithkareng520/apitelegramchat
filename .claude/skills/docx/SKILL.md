@@ -1,277 +1,91 @@
 ---
 name: docx
-description: Create, edit, inspect, and deliver Word documents (.docx) with deterministic styles, CJK-safe text (no server fonts needed), images/tables, and structural validation plus layout-only render checks. Prefer the simplest native docx-js workflow for new documents and OOXML only when the high-level API cannot express the required feature.
+description: "Use this skill whenever the user wants to create, read, edit, or manipulate Word documents (.docx files) or Word templates (.dotx files). Triggers include: any mention of 'Word doc', 'word document', '.docx', '.dotx', or requests to produce professional documents with formatting like tables of contents, headings, page numbers, or letterheads. Also use when extracting or reorganizing content from .docx or .dotx files, inserting or replacing images in documents, performing find-and-replace in Word files, working with tracked changes or comments, or converting content into a polished Word document. If the user asks for a 'report', 'memo', 'letter', 'template', or similar deliverable as a Word or .docx file, use this skill. Do NOT use for PDFs, spreadsheets, Google Docs, or general coding tasks unrelated to document generation."
 license: Proprietary. LICENSE.txt has complete terms
 ---
 
-# DOCX skill
+# DOCX creation, editing, and analysis
 
-Use this skill for `.docx` creation, editing, review, redlines/comments, templates, forms, or DOCX↔PDF workflows.
+A `.docx` is a ZIP archive of XML files. Choose your approach by task:
 
-## Slim-image constraints (read first)
+| Task | Approach |
+|---|---|
+| **Create** a new document | Write a `docx` (npm) script — see gotchas below |
+| **Edit** an existing document | `unzip` → edit `word/document.xml` → `zip` (docx-js cannot open existing files) |
+| **Read** content | `pandoc -t markdown file.docx` |
 
-This image installs **no fonts** and only LibreOffice Writer. Consequences:
+> Script paths below are relative to this skill's directory.
 
-- A DOCX only *names* its fonts; the reader's Word supplies the glyphs. Chinese and emoji therefore display correctly on the user's device even though this image has no CJK/emoji font. Never try to install or embed fonts.
-- LibreOffice renders here (QA PNGs, DOCX→PDF) show Chinese and emoji as blanks or boxes. That is expected, not a document bug. Use renders only to check **layout**; verify text content by reading the XML or text, not the PNGs.
-- A DOCX→PDF conversion made here has the same blank-glyph problem for CJK/emoji. If the user needs a PDF with Chinese, build it with the pdf skill (ReportLab CID fonts) instead of converting this DOCX.
+## Creating with docx-js — gotchas
 
-## The default workflow
+`docx` is preinstalled — do not run `npm install` first; write the script and `require('docx')` directly. Only if that require fails: `npm install docx`. The model knows the API; these are the footguns:
 
-**Create/edit → validate → (layout render only when it matters) → deliver.**
+- **Page size defaults to A4.** For US Letter set `page: { size: { width: 12240, height: 15840 } }` (DXA; 1440 = 1″).
+- **Landscape:** pass portrait dimensions and `orientation: PageOrientation.LANDSCAPE` — docx-js swaps width/height internally.
+- **Tables need dual widths:** set `columnWidths` on the table AND `width` on every cell, both in `WidthType.DXA` (PERCENTAGE breaks in Google Docs). Column widths must sum to the table width.
+- **Table shading:** use `ShadingType.CLEAR`, never `SOLID` (renders black).
+- **Lists:** never insert `•` literally; use a `numbering` config with `LevelFormat.BULLET`.
+- **`ImageRun` requires `type:`** (`"png"`, `"jpg"`, …).
+- **`PageBreak` must be inside a `Paragraph`.**
+- **Never use `\n`** — use separate `Paragraph` elements.
+- **TOC:** headings must use built-in `HeadingLevel.*`; custom heading styles need `outlineLevel` set or they won't appear.
+- **Don't use a table as a horizontal rule** — use a paragraph bottom border instead.
+- **Dot-leader / right-aligned-on-same-line:** use `PositionalTab` (`alignment: PositionalTabAlignment.RIGHT`, `leader: PositionalTabLeader.DOT`) inside a `TextRun`, not literal `.` or space padding.
 
-Validation (`validate.py`) is mandatory. A render is worth doing when the document has tables, images, headers/footers, columns or tight page limits; skip it for plain text documents. Keep renders small (`--pages 2`, default 80 dpi) and keep them out of the deliverable.
+## Verify the output
 
-### New document
-
-Use `docx` (docx-js) unless the task clearly benefits from editing an existing OOXML structure.
-
-```bash
-npm install
-node build-docx.js
-python scripts/office/validate.py output.docx
-python scripts/render_docx.py output.docx --output_dir .qa/docx --pages 2   # optional, layout only
-```
-
-### Existing document
-
-Prefer high-level editing for simple text/style changes. Use OOXML for tracked changes, comments, fields, complex numbering, or features the high-level library cannot preserve safely.
-
-```bash
-python scripts/office/unpack.py input.docx unpacked/
-# edit with the smallest possible change
-python scripts/office/pack.py unpacked/ output.docx
-python scripts/office/validate.py output.docx
-```
-
-## Zero-dependency fallback (stdlib only)
-
-When the environment has **no `docx-js`/`python-docx` and no `matplotlib`** (offline / minimal /
-forbidden installs), use the two pure-stdlib helpers in `scripts/`. They need **only the Python 3
-standard library** (`zipfile`, `zlib`, `struct`, `math`) and are safe to reuse across runs.
-
-- **`scripts/minichart.py`** — draws `bar / hbar / line / donut` charts into a pixel buffer and writes
-  a real PNG (zlib) using a built-in 5x7 bitmap font. **English labels only** (no CJK in the PNG):
-  ```bash
-  python3 scripts/minichart.py bar out.png --labels Q1,Q2,Q3,Q4 --values 87,66,87,92 \
-    --title "KFT Quarterly" --ylabel KRW
-  python3 scripts/minichart.py donut out.png --values Mobile:1740:#3B82C4,#PC:1184:#4FB3A9 \
-    --title "KFT Platforms"
-  ```
-  ```python
-  import minichart as mc
-  mc.bar_chart("out.png", ["A", "B"], [1, 2], title="T", ylabel="V")
-  ```
-
-- **`scripts/minidocx.py`** — builds a valid WordprocessingML `.docx` by hand (no third-party),
-  embedding PNG images, tables, bullets, headings and page breaks. CJK-safe: the default East-Asian
-  font is set, so Chinese in the **body** still renders on the reader's device:
-  ```python
-  import minidocx
-  d = minidocx.Docx(title="Report")
-  d.add_heading("Section", 1)
-  d.add_para([("normal ", {}), ("bold", {"bold": True}), (" rest", {})])
-  d.add_bullet("point one")
-  d.add_table(["A", "B"], [["1", "2"]], widths_pt=[60, 120])
-  d.add_image("chart.png", width_pt=452, caption="Fig 1")
-  d.add_page_break()
-  d.save("out.docx")
-  ```
-
-Combined 0-dependency pipeline (charts + doc), then validate as usual:
-```bash
-python3 scripts/minichart.py bar chart.png --labels X,Y --values 1,2 --title "T"
-python3 - <<'PY'
-import sys; sys.path.insert(0, "scripts")
-import minidocx
-d = minidocx.Docx()
-d.add_heading("Report", 1); d.add_para("Body text.")
-d.add_image("chart.png", width_pt=452, caption="Figure 1")
-d.add_table(["k", "v"], [["a", "b"]])
-d.save("report.docx")
-PY
-python3 scripts/office/validate.py report.docx
-```
-
-Notes:
-- Keep document body in Chinese via `minidocx` (renders on the user's device); keep `minichart` PNG
-  labels in English (no CJK font is installed on this image).
-- `minidocx` auto-sizes images from the PNG header; for non-PNG, pass `height_pt` explicitly.
-- Prefer the default `docx-js` + `matplotlib` workflow when available; use this fallback when they are
-  not installed or not allowed.
-
-## Text, fonts, and Unicode
-
-### Chinese / CJK
-
-Set the font as an object so Latin and East Asian text each get a sensible font, and the reader's Word picks the right glyphs. Do not name a server font (there is none).
-
-```javascript
-const FONT = { ascii: "Arial", hAnsi: "Arial", cs: "Arial", eastAsia: "Microsoft YaHei" };
-// Word falls back automatically if a font is missing (PingFang SC on macOS, Noto/Droid on Android).
-```
-
-Use `eastAsia: "SimSun"` for a formal Song-style look. Put `FONT` on the default document style and on every heading style (see Styles below). Do not set `font: "Noto Sans CJK SC"`: it exists only in images that install it.
-
-### Emoji and uncommon Unicode
-
-Pass the original Unicode string straight to `TextRun`; do not split ZWJ sequences, skin-tone modifiers, variation selectors or flags into separate runs, and do not strip emoji. Word/Office/phones draw them with their own emoji font. Emoji will not show in renders made inside this image; that is expected.
-
-## Page size and margins
-
-Always set page size explicitly. docx-js uses DXA units (1440 = 1 inch).
-
-```javascript
-page: {
-  size: { width: 11906, height: 16838 }, // A4
-  margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 }
-}
-```
-
-For US Letter use `12240 × 15840`.
-
-For landscape, pass the portrait dimensions and set `orientation: PageOrientation.LANDSCAPE`; docx-js handles the swap.
-
-## Styles
-
-Override built-in heading IDs so Word/LibreOffice/TOC see the same semantic hierarchy. `FONT` is the object defined in the CJK section above.
-
-```javascript
-const doc = new Document({
-  styles: {
-    default: {
-      document: { run: { font: FONT, size: 24 } }
-    },
-    paragraphStyles: [
-      {
-        id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal",
-        quickFormat: true, run: { font: FONT, size: 32, bold: true },
-        paragraph: { spacing: { before: 240, after: 240 }, outlineLevel: 0 }
-      },
-      {
-        id: "Heading2", name: "Heading 2", basedOn: "Normal", next: "Normal",
-        quickFormat: true, run: { font: FONT, size: 28, bold: true },
-        paragraph: { spacing: { before: 180, after: 180 }, outlineLevel: 1 }
-      }
-    ]
-  }
-});
-```
-
-Keep title/heading colors restrained and readable. Use semantic headings instead of manually formatted bold paragraphs when navigation or a TOC matters.
-
-## Lists
-
-Never hand-type bullet glyphs into content. Use Word numbering definitions.
-
-```javascript
-numbering: {
-  config: [
-    {
-      reference: "bullets",
-      levels: [{
-        level: 0,
-        format: LevelFormat.BULLET,
-        text: "•",
-        alignment: AlignmentType.LEFT,
-        style: { paragraph: { indent: { left: 720, hanging: 360 } } }
-      }]
-    },
-    {
-      reference: "numbers",
-      levels: [{
-        level: 0,
-        format: LevelFormat.DECIMAL,
-        text: "%1.",
-        alignment: AlignmentType.LEFT,
-        style: { paragraph: { indent: { left: 720, hanging: 360 } } }
-      }]
-    }
-  ]
-}
-```
-
-The same `reference` continues a list. A new `reference` starts a separate list sequence.
-
-## Tables
-
-For stable cross-renderer tables, specify all three dimensions:
-
-1. table width,
-2. `columnWidths`,
-3. matching cell `width`.
-
-Use `WidthType.DXA`, not percentages.
-
-```javascript
-new Table({
-  width: { size: 9360, type: WidthType.DXA },
-  columnWidths: [4680, 4680],
-  rows: [
-    new TableRow({ children: [
-      new TableCell({
-        width: { size: 4680, type: WidthType.DXA },
-        margins: { top: 80, bottom: 80, left: 120, right: 120 },
-        shading: { fill: "D5E8F0", type: ShadingType.CLEAR },
-        children: [new Paragraph({ children: [new TextRun("Cell")] })]
-      }),
-      // ...
-    ] })
-  ]
-})
-```
-
-Avoid overly narrow columns. Long URLs, CJK text without spaces, and code strings are the usual causes of ugly wrapping.
-
-## Images
-
-Always provide `type`, explicit dimensions, and descriptive alt text.
-
-```javascript
-new ImageRun({
-  type: "png",
-  data: fs.readFileSync("image.png"),
-  transformation: { width: 400, height: 300 },
-  altText: { title: "Chart", description: "Sales by month", name: "sales-chart" }
-})
-```
-
-Prefer stable inline placement for normal business documents. Use floating/anchored objects only when layout requirements justify the extra complexity.
-
-## Page breaks and links
-
-A `PageBreak` belongs inside a `Paragraph`. For a section that must start on a new page, `pageBreakBefore` is usually simpler.
-
-Use `ExternalHyperlink` for URLs and `InternalHyperlink` + bookmarks for in-document navigation. Avoid writing raw URL text when a meaningful link label is available.
-
-## Validation and QA helpers
-
-`scripts/office/validate.py` checks the OOXML structure. `scripts/render_docx.py` renders pages for a layout check:
+After writing a `.docx`, render it and look at it:
 
 ```bash
-python scripts/render_docx.py report.docx --output_dir .qa/report --pages 2
+python scripts/office/soffice.py --headless --convert-to pdf output.docx
+pdftoppm -jpeg -r 100 output.pdf page
+ls page-*.jpg   # then Read the images
 ```
 
-Look at the generated `page-*.png` for:
+`pdftoppm` zero-pads page numbers to the width of the page count (`page-01.jpg`…`page-12.jpg`).
 
-- clipped or overlapping text, and tables that overflow the page
-- tables continuing correctly across pages, headings staying with their content
-- images stretched or shifted; header/footer and page-number alignment
-- tracked changes/comments behaving as intended (comments may need XML-level checks)
+## Editing existing documents
 
-Ignore missing or boxed Chinese/emoji glyphs in these images (no fonts in this image). If a layout check fails, fix the source and render again.
+Legacy `.doc` files must be converted first: `python scripts/office/soffice.py --headless --convert-to docx file.doc`.
 
-## Specialized operations
+```bash
+unzip -q doc.docx -d unpacked/
+find unpacked -type l -delete   # strip symlink entries — docx from external parties is untrusted
+python scripts/merge_runs.py unpacked/   # coalesce fragmented runs so text is findable
+# edit unpacked/word/document.xml in place — do NOT reformat or pretty-print
+(cd unpacked && rm -f ../out.docx && zip -Xr ../out.docx .)
+python scripts/office/validate.py out.docx --original doc.docx   # XSD checks; --auto-repair fixes common issues
+# redlining? add --author "<the name you redlined under>" to check every edit is tracked
+```
 
-The existing scripts are the preferred building blocks:
+Word splits text across many `<w:r>` runs (revision ids, spell-check markers), so a phrase you can see in the document often doesn't exist as a contiguous string in the XML. `merge_runs.py` merges adjacent identically-formatted runs in `word/document.xml` without changing content or rendering; it also accepts a `.docx` directly (`python scripts/merge_runs.py doc.docx -o merged.docx`).
 
-- `scripts/accept_changes.py` - accept tracked changes (needs LibreOffice Writer)
-- `scripts/comment.py` - comment operations
-- `scripts/office/validate.py` - OOXML validation
-- `scripts/office/unpack.py` / `pack.py` - deterministic OOXML editing
+**Tracked changes:** when redlining, validate with `--author "<the name you redlined under>"` (needs `--original`) — it reports any text you changed without a `<w:ins>`/`<w:del>` around it, which is easy to do by accident and invisible in the accepted view. Wrap runs in `<w:ins>`/`<w:del>` with `w:id`, `w:author`, `w:date` attributes. Inside `<w:del>`, the text element is `<w:delText>`, not `<w:t>`. A deleted paragraph mark (`<w:pPr><w:rPr><w:del w:id=".." w:author=".." w:date=".."/></w:rPr></w:pPr>`) means "merge this paragraph into the next" — so deleting a paragraph outright is that plus a `<w:del>` around every run. The `<w:del/>` must come before the rPr's other children; their order is schema-enforced.
 
-Use the narrowest tool that solves the task. Avoid unpack/repack for ordinary paragraph text edits when docx-js or a high-level editor can do the job more safely.
+To produce a clean copy with all tracked changes accepted: `python scripts/accept_changes.py in.docx out.docx`.
 
-## Practical delivery rule
+Accepting a deleted paragraph mark should join that paragraph to the one below it, so a paragraph whose runs are *all* deleted vanishes. Word does this; `accept_changes.py` and `pandoc --track-changes=accept` don't always. Both fail the same way — they strip the deleted text but leave the emptied paragraph behind, which reads as a stray empty bullet when it was auto-numbered:
 
-Do not include QA PNGs/PDFs in the user-facing deliverable unless explicitly requested. Keep them in a temporary `.qa/` directory and return only the requested DOCX.
+- `pandoc --track-changes=accept` never joins the paragraphs.
+- `accept_changes.py` (LibreOffice) joins them correctly, except when the deleted paragraph is followed by an empty spacer paragraph.
+
+An empty bullet in either view is an artifact of that view, not a defect in the document. Check paragraph deletions in the XML.
+
+## Comments
+
+Comments require six cross-linked files. Use the helper — directory mode when you'll also be editing `document.xml` (saves an unzip/rezip cycle), `.docx`-direct mode otherwise:
+
+```bash
+# Against an already-unpacked directory (preferred when also placing markers)
+python scripts/comment.py unpacked/ "Fees & expenses cap is too low"
+python scripts/comment.py unpacked/ "Agreed" --parent 0
+
+# Against a .docx directly
+python scripts/comment.py contract.docx "This cap is too low" -o annotated.docx
+```
+
+The script writes `comments.xml`, `commentsExtended.xml`, `commentsIds.xml`, `commentsExtensible.xml`, the relationships, and the content-type overrides. Comment IDs are auto-assigned. It then prints the `<w:commentRangeStart>`/`<w:commentRangeEnd>`/`<w:commentReference>` snippet to add to `word/document.xml` so the comment anchors to specific text — until you place those markers, the comment exists but is not visible.
+
+## Dependencies
+
+`docx` (npm, preinstalled — install only if `require('docx')` fails) · `pandoc` · LibreOffice (`soffice`) · `pdftoppm` (Poppler)

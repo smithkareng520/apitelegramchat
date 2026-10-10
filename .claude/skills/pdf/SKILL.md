@@ -1,6 +1,6 @@
 ---
 name: pdf
-description: Use this skill whenever the user wants to do anything with PDF files. This includes reading or extracting text/tables from PDFs, combining or merging multiple PDFs into one, splitting PDFs apart, rotating pages, adding watermarks, creating new PDFs, filling PDF forms, encrypting/decrypting PDFs, extracting images. OCR is not available in this environment. If the user mentions a .pdf file or asks to produce one, use this skill.
+description: Use this skill whenever the user wants to do anything with PDF files. This includes reading or extracting text/tables from PDFs, combining or merging multiple PDFs into one, splitting PDFs apart, rotating pages, adding watermarks, creating new PDFs, filling PDF forms, encrypting/decrypting PDFs, extracting images, and OCR on scanned PDFs to make them searchable. If the user mentions a .pdf file or asks to produce one, use this skill.
 license: Proprietary. LICENSE.txt has complete terms
 ---
 
@@ -186,95 +186,9 @@ squared = Paragraph("x<super>2</super> + y<super>2</super>", styles['Normal'])
 
 For canvas-drawn text (not Paragraph objects), manually adjust font the size and position rather than using Unicode subscripts/superscripts.
 
-
-## Chinese / CJK text (no font files in the image)
-
-The Docker image is slim: it installs **no font files and no OCR**. Do not download or install fonts during a user request.
-
-ReportLab can still write Chinese/Japanese/Korean PDFs because it ships the Adobe CID fonts as *references*: the PDF stores character codes and the **reader's** viewer draws them with a CJK font installed on the reader's device. Nothing is embedded, so files stay small.
-
-| Language | Built-in font | `lang` |
-|---|---|---|
-| Simplified Chinese | `STSong-Light` | `zh` (default) |
-| Traditional Chinese | `MSung-Light` | `zh-tw` |
-| Japanese | `HeiseiMin-W3` | `ja` |
-| Korean | `HYSMyeongJo-Medium` | `ko` |
-
-### Rules
-
-- Always call `register_fonts()` from `scripts/cjk_font.py` and use the **returned name** as `fontName` (e.g. in `ParagraphStyle`, `TableStyle ('FONTNAME', ...)`, `canvas.setFont`). It also makes `<b>`/`<i>` keep the CJK font.
-- Never leave Chinese text on ReportLab's default styles (`Normal`, `Title`, `Heading1`, ...): they use Helvetica and turn Chinese into black boxes.
-- For PDFs with no CJK text, plain `Helvetica` is fine and gives nicer Latin glyphs.
-- Emoji cannot be drawn (no emoji font). Pass any text that may contain emoji through `scripts/emoji_font.py`: common ones become plain symbols (`✅`→`√`, `❌`→`×`, `⚠️`→`(!)`), the rest are dropped and listed in `missing_report`. Tell the user if something was dropped.
-- Glyph shapes depend on the viewer. The PDF is not self-contained: if the user needs a fully embedded font, they must provide a TrueType font file and set `APITELEGRAMCHAT_REPORTLAB_CJK_FONT` (plus `APITELEGRAMCHAT_REPORTLAB_CJK_SUBFONT_INDEX` for `.ttc`), which `register_fonts()` then embeds.
-
-### Verifying output in this image
-
-There is no CJK system font and no `poppler-data` here, so **page images and `pdftotext` cannot show Chinese from these PDFs** (blank glyphs or "Missing language pack" warnings). That is expected, not a bug in your PDF. Verify with Python instead:
-
-```python
-from pypdf import PdfReader
-print(PdfReader("report.pdf").pages[0].extract_text())   # Chinese text should read back correctly
-```
-
-Use page images only to check layout (margins, table widths, page count).
-
-### Paragraph example
-
-```python
-import sys
-sys.path.insert(0, "/app/.claude/skills/pdf/scripts")
-
-from reportlab.platypus import SimpleDocTemplate, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from cjk_font import register_fonts
-from emoji_font import safe_paragraph
-
-cjk = register_fonts()                      # -> "STSong-Light"
-normal = ParagraphStyle("NormalCN", parent=getSampleStyleSheet()["Normal"],
-                        fontName=cjk, fontSize=11, leading=18)
-
-missing = []                                # emoji that had to be dropped
-story = [
-    safe_paragraph("项目进度：✅ 已完成 80% 🚀 预计下周交付", normal, missing_report=missing),
-    Spacer(1, 12),
-    # Paragraph tags are allowed only with allow_markup=True (escape &, <, > yourself)
-    safe_paragraph("<b>重点</b>：按时验收", normal, allow_markup=True),
-]
-SimpleDocTemplate("report.pdf").build(story)
-print("dropped:", missing)                  # e.g. ['🚀']
-```
-
-### Canvas example
-
-```python
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
-from cjk_font import register_fonts
-from emoji_font import draw_mixed_string, string_width_mixed
-
-cjk = register_fonts()
-c = canvas.Canvas("out.pdf", pagesize=letter)
-text = "验收结果：✔ 通过 3 项 ❌ 未通过 1 项"
-width = string_width_mixed(text, 12, cjk)
-draw_mixed_string(c, (letter[0] - width) / 2, 700, text, 12, cjk)
-c.save()
-```
-
-### Tables
-
-```python
-from reportlab.platypus import Table, TableStyle
-table = Table([["姓名", "张三"], ["年龄", "25"]])
-table.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), cjk)]))   # cells need the CJK font too
-```
-
-Run `python3 scripts/check_cjk_runtime.py` for a font-free smoke test of this setup.
-
 ## Command-Line Tools
 
 ### pdftotext (poppler-utils)
-Works for Latin text. For PDFs with CJK text use `pypdf`/`pdfplumber` instead (the image has no `poppler-data`).
 ```bash
 # Extract text
 pdftotext input.pdf output.txt
@@ -315,6 +229,25 @@ pdftk input.pdf rotate 1east output rotated.pdf
 ```
 
 ## Common Tasks
+
+### Extract Text from Scanned PDFs
+```python
+# Requires: pip install pytesseract pdf2image
+import pytesseract
+from pdf2image import convert_from_path
+
+# Convert PDF to images
+images = convert_from_path('scanned.pdf')
+
+# OCR each page
+text = ""
+for i, image in enumerate(images):
+    text += f"Page {i+1}:\n"
+    text += pytesseract.image_to_string(image)
+    text += "\n\n"
+
+print(text)
+```
 
 ### Add Watermark
 ```python
@@ -370,6 +303,7 @@ with open("encrypted.pdf", "wb") as output:
 | Extract tables | pdfplumber | `page.extract_tables()` |
 | Create PDFs | reportlab | Canvas or Platypus |
 | Command line merge | qpdf | `qpdf --empty --pages ...` |
+| OCR scanned PDFs | pytesseract | Convert to image first |
 | Fill PDF forms | pdf-lib or pypdf (see FORMS.md) | See FORMS.md |
 
 ## Next Steps

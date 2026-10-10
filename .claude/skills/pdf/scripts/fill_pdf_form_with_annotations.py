@@ -73,11 +73,7 @@ def fill_pdf_form(input_pdf_path, fields_json_path, output_pdf_path):
         if not text:
             continue
         
-        font_name = entry_text.get("font", "Helvetica")
-        # pypdf FreeText annotations reference annotation fonts; this script does not embed CJK fonts.
-        # Chinese text should use a ReportLab overlay (see SKILL.md).
-        if any("\u4e00" <= ch <= "\u9fff" for ch in text):
-            print("Warning: Chinese text in FreeText annotations is not portable; draw the text with a ReportLab overlay (cjk_font.register_fonts() + emoji_font.draw_mixed_string()) and merge it with pypdf.", file=sys.stderr)
+        font_name = entry_text.get("font", "Arial")
         font_size = str(entry_text.get("font_size", 14)) + "pt"
         font_color = entry_text.get("font_color", "000000")
 
