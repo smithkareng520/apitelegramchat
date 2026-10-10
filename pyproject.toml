@@ -30,6 +30,9 @@ dependencies = [
   "PyYAML>=6,<7",
   "json-repair>=0.30,<1",
   "jsonschema>=4.23,<5",
+  "openpyxl>=3.1,<4",
+  "pandas>=2.2,<3",
+  "markitdown[docx,pdf,pptx,xlsx]>=0.1.0",
 ]
 
 [project.optional-dependencies]

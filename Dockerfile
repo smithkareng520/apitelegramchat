@@ -20,7 +20,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 # 托管平台一定允许某个内核接口。
 # 不需要 bubblewrap —— bwrap 依赖的 unprivileged userns 在部分托管容器中
 # 被宿主策略禁用；Landlock 更适合本项目的非特权文件系统边界。
-# 小体积镜像：不装任何字体、不装 OCR；LibreOffice 只装 Writer（docx 技能的
+# 小体积镜像：安装轻量 Liberation/DejaVu 字体、不装 OCR；LibreOffice 只装 Writer（docx 技能的
 # 转换/渲染/接受修订只需要 Writer，不装 Calc/Impress/Draw 等）。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -33,13 +33,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
         python3-pip \
         python3-venv \
-        build-essential \
-        cmake \
-        ccache \
-        libgl1 \
-        libglib2.0-0 \
-        libgomp1 \
         libreoffice-writer \
+        fonts-liberation2 \
+        fonts-dejavu-core \
         poppler-utils \
         qpdf \
         pandoc \

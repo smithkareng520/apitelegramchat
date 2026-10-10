@@ -25,3 +25,8 @@ pdf2image==1.17.0
 PyYAML>=6,<7
 # token 计数与文本处理
 tiktoken==0.11.0
+
+# Skill dependencies (non-OCR; keep OCR engines/packages intentionally excluded)
+openpyxl>=3.1,<4
+pandas>=2.2,<3
+markitdown[docx,pdf,pptx,xlsx]>=0.1.0
